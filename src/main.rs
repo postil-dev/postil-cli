@@ -11,6 +11,7 @@ use postil_cli::config::{
     self, RuntimeConfig, RuntimeFileConfig, RuntimeOverrides, Severity, resolve_target,
 };
 use postil_cli::github::{CheckOutput, GithubClient, check_conclusion};
+use postil_cli::local;
 use postil_cli::openrouter::{self, OpenRouterClient};
 use postil_cli::review::{
     ReviewEnvelope, TokenUsage, apply_config, is_model_output_error, parse_envelope, review_body,
@@ -70,6 +71,10 @@ struct ReviewArgs {
     base: Option<String>,
     #[arg(long)]
     diff_file: Option<PathBuf>,
+    #[arg(long, value_name = "DIR")]
+    local_dir: Option<PathBuf>,
+    #[arg(long)]
+    post: bool,
 }
 
 #[tokio::main]
@@ -126,7 +131,7 @@ async fn run_review(args: ReviewArgs) -> Result<ExitCode> {
         let diff = source.read(runtime.diff_limit)?;
         let repo_config = match &runtime.file_review_config {
             Some(config) => config.clone(),
-            None => load_local_repo_config()?,
+            None => source.load_repo_config()?,
         };
         (diff, repo_config, None, None, source.label())
     } else {
@@ -351,19 +356,31 @@ enum LocalDiffSource {
     Staged,
     Base(String),
     DiffFile(PathBuf),
+    LocalDir(PathBuf),
 }
 
 impl LocalDiffSource {
     fn from_args(args: &ReviewArgs) -> Result<Option<Self>> {
-        let requested =
-            args.staged as u8 + args.base.is_some() as u8 + args.diff_file.is_some() as u8;
+        let requested = args.staged as u8
+            + args.base.is_some() as u8
+            + args.diff_file.is_some() as u8
+            + args.local_dir.is_some() as u8;
+        if args.post && requested > 0 {
+            anyhow::bail!(
+                "--post reviews the pull request diff from GitHub metadata; do not combine it with --staged, --base, --diff-file, or --local-dir"
+            );
+        }
         if requested > 1 {
-            anyhow::bail!("choose only one local diff source: --staged, --base, or --diff-file");
+            anyhow::bail!(
+                "choose only one local diff source: --staged, --base, --diff-file, or --local-dir"
+            );
         }
         Ok(if args.staged {
             Some(Self::Staged)
         } else if let Some(base) = args.base.as_ref() {
             Some(Self::Base(base.clone()))
+        } else if let Some(path) = args.local_dir.as_ref() {
+            Some(Self::LocalDir(path.clone()))
         } else {
             args.diff_file
                 .as_ref()
@@ -376,6 +393,7 @@ impl LocalDiffSource {
             Self::Staged => "staged changes".to_string(),
             Self::Base(base) => format!("{base}...HEAD"),
             Self::DiffFile(path) => format!("diff file {}", path.display()),
+            Self::LocalDir(path) => format!("local directory {}", path.display()),
         }
     }
 
@@ -389,8 +407,16 @@ impl LocalDiffSource {
             Self::DiffFile(path) => {
                 fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?
             }
+            Self::LocalDir(path) => return local::collect_diff(path, limit),
         };
         Ok(limit_text(diff, limit))
+    }
+
+    fn load_repo_config(&self) -> Result<postil_cli::config::RepoReviewConfig> {
+        match self {
+            Self::LocalDir(path) => local::load_repo_config(path),
+            Self::Staged | Self::Base(_) | Self::DiffFile(_) => load_local_repo_config(),
+        }
     }
 }
 

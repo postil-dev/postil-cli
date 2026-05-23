@@ -211,6 +211,7 @@ impl RuntimeConfig {
             env::var("OPENROUTER_API_KEY").ok(),
             file.openrouter_api_key,
             "OPENROUTER_API_KEY",
+            true,
         )?;
 
         Ok(Self {
@@ -288,11 +289,14 @@ fn pick_required(
     env: Option<String>,
     file: Option<String>,
     name: &str,
+    required: bool,
 ) -> Result<String> {
-    flag.or(env)
-        .or(file)
-        .filter(|v| !v.trim().is_empty())
-        .ok_or_else(|| anyhow!("{name} is not set"))
+    let value = flag.or(env).or(file).filter(|v| !v.trim().is_empty());
+    if required {
+        value.ok_or_else(|| anyhow!("{name} is not set"))
+    } else {
+        Ok(value.unwrap_or_default())
+    }
 }
 
 fn pick_optional(

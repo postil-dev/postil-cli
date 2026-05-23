@@ -10,6 +10,130 @@ use wiremock::{
 };
 
 #[tokio::test]
+async fn reviews_local_directory_without_github_context() {
+    let openrouter = MockServer::start().await;
+    let openrouter_uri = openrouter.uri();
+    let dir = tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    git(&repo, ["init"]);
+    git(&repo, ["config", "user.email", "test@example.com"]);
+    git(&repo, ["config", "user.name", "Test User"]);
+    fs::write(repo.join("src.txt"), "old\n").unwrap();
+    git(&repo, ["add", "."]);
+    git(&repo, ["commit", "-m", "initial"]);
+    fs::write(repo.join("src.txt"), "old\nnew\n").unwrap();
+
+    let output = dir.path().join("result.json");
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "{\"summary\":\"Needs work.\",\"findings\":[{\"path\":\"src.txt\",\"line\":2,\"severity\":\"warn\",\"body\":\"Check this change.\"}]}"} }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        })))
+        .mount(&openrouter)
+        .await;
+
+    Command::cargo_bin("postil")
+        .unwrap()
+        .env_remove("GITHUB_TOKEN")
+        .env("OPENROUTER_API_KEY", "test-openrouter")
+        .args([
+            "review",
+            "--local-dir",
+            repo.to_str().unwrap(),
+            "--openrouter-api-url",
+            &openrouter_uri,
+            "--review-model",
+            "xiaomi/mimo-v2.5-pro",
+            "--output-json",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("local diff (local directory"))
+        .stdout(predicate::str::contains("neutral (1 findings"));
+
+    let result: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(output).unwrap()).unwrap();
+    assert_eq!(result["modelUsed"], "xiaomi/mimo-v2.5-pro");
+    assert_eq!(result["findings"][0]["path"], "src.txt");
+}
+
+#[tokio::test]
+async fn truncates_local_directory_diff_on_utf8_boundary() {
+    let openrouter = MockServer::start().await;
+    let openrouter_uri = openrouter.uri();
+    let dir = tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    git(&repo, ["init"]);
+    git(&repo, ["config", "user.email", "test@example.com"]);
+    git(&repo, ["config", "user.name", "Test User"]);
+    fs::write(repo.join("src.txt"), "old\n").unwrap();
+    git(&repo, ["add", "."]);
+    git(&repo, ["commit", "-m", "initial"]);
+    fs::write(repo.join("src.txt"), "old\né\n").unwrap();
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("[diff truncated]"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "{\"summary\":\"\",\"findings\":[]}"} }]
+        })))
+        .mount(&openrouter)
+        .await;
+
+    Command::cargo_bin("postil")
+        .unwrap()
+        .env_remove("GITHUB_TOKEN")
+        .env("OPENROUTER_API_KEY", "test-openrouter")
+        .args([
+            "review",
+            "--local-dir",
+            repo.to_str().unwrap(),
+            "--openrouter-api-url",
+            &openrouter_uri,
+            "--review-model",
+            "xiaomi/mimo-v2.5-pro",
+            "--diff-limit",
+            "63",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("local diff (local directory"));
+}
+
+#[tokio::test]
+async fn skips_large_untracked_files_in_local_directory_mode() {
+    let dir = tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    git(&repo, ["init"]);
+    git(&repo, ["config", "user.email", "test@example.com"]);
+    git(&repo, ["config", "user.name", "Test User"]);
+    fs::write(repo.join("src.txt"), "old\n").unwrap();
+    git(&repo, ["add", "."]);
+    git(&repo, ["commit", "-m", "initial"]);
+    fs::write(repo.join("large.txt"), "x".repeat(4096)).unwrap();
+
+    Command::cargo_bin("postil")
+        .unwrap()
+        .env_remove("GITHUB_TOKEN")
+        .env("OPENROUTER_API_KEY", "test-openrouter")
+        .args([
+            "review",
+            "--local-dir",
+            repo.to_str().unwrap(),
+            "--diff-limit",
+            "128",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("empty diff - nothing to review"));
+}
+
+#[tokio::test]
 async fn posts_review_check_and_json_output() {
     let github = MockServer::start().await;
     let openrouter = MockServer::start().await;
@@ -73,6 +197,7 @@ review:
         .unwrap()
         .args([
             "review",
+            "--post",
             "--config",
             config.to_str().unwrap(),
             "--output-json",
@@ -86,6 +211,20 @@ review:
         serde_json::from_str(&fs::read_to_string(output).unwrap()).unwrap();
     assert_eq!(result["modelUsed"], "xiaomi/mimo-v2.5-pro");
     assert_eq!(result["findings"][0]["severity"], "warn");
+}
+
+fn git<const N: usize>(repo: &std::path::Path, args: [&str; N]) {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[tokio::test]
