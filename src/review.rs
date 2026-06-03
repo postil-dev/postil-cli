@@ -5,6 +5,8 @@ use serde_json::Value;
 
 use crate::config::{RepoReviewConfig, Severity};
 
+const STATUS_ICON_BASE_URL: &str = "https://postil.dev/status";
+
 const BASE_SYSTEM_PROMPT: &str = r#"You are Postil, a low-noise review gate for agent-speed development. You receive a unified diff for a pull request and produce structured findings as JSON.
 
 Product doctrine:
@@ -205,7 +207,7 @@ pub fn apply_config(
     Ok(envelope)
 }
 
-pub fn status_line(envelope: &ReviewEnvelope, inline_comments: usize, label: &str) -> String {
+pub fn status_line(envelope: &ReviewEnvelope, _inline_comments: usize, label: &str) -> String {
     let mut errors = 0;
     let mut warnings = 0;
     let mut infos = 0;
@@ -216,9 +218,24 @@ pub fn status_line(envelope: &ReviewEnvelope, inline_comments: usize, label: &st
             Severity::Info => infos += 1,
         }
     }
-    format!(
-        "Postil status: {label} | errors={errors} warnings={warnings} info={infos} inline_comments={inline_comments}"
-    )
+    let mut status = String::new();
+    for _ in 0..errors {
+        status.push_str(&status_icon("error"));
+    }
+    for _ in 0..warnings {
+        status.push_str(&status_icon("warn"));
+    }
+    for _ in 0..infos {
+        status.push_str(&status_icon("info"));
+    }
+    if status.is_empty() {
+        status.push_str(&status_icon(if label == "clean" { "pass" } else { "warn" }));
+    }
+    format!("status: {status}")
+}
+
+fn status_icon(kind: &str) -> String {
+    format!("![{kind}]({STATUS_ICON_BASE_URL}/{kind}.svg)")
 }
 
 pub fn append_status(body: &str, status: &str) -> String {
@@ -352,7 +369,7 @@ mod tests {
         };
         assert_eq!(
             review_body(&clean, 0, "clean"),
-            "Postil status: clean | errors=0 warnings=0 info=0 inline_comments=0"
+            "status: ![pass](https://postil.dev/status/pass.svg)"
         );
 
         let dirty = ReviewEnvelope {
