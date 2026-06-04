@@ -5,8 +5,6 @@ use serde_json::Value;
 
 use crate::config::{RepoReviewConfig, Severity};
 
-const STATUS_ICON_BASE_URL: &str = "https://postil.dev/status";
-
 const BASE_SYSTEM_PROMPT: &str = r#"You are Postil, a low-noise review gate for agent-speed development. You receive a unified diff for a pull request and produce structured findings as JSON.
 
 Product doctrine:
@@ -27,7 +25,8 @@ Rules:
 - Use info only for merge-relevant human escalation, durable guardrail suggestions, or material uncertainty.
 - If the diff has no merge-relevant findings, return an empty summary string and an empty findings array.
 - Return at most 25 findings.
-- Keep each finding body under 1200 characters.
+- Keep each finding body to 1-2 short sentences. State the merge risk or intent mismatch first, then the fix. Do not teach basic concepts.
+- Wrap code identifiers, env vars, file names, commands, config keys, and bot handles in backticks.
 
 Reply with ONLY a single JSON object, no prose, no markdown fence:
 {
@@ -207,41 +206,93 @@ pub fn apply_config(
     Ok(envelope)
 }
 
-pub fn status_line(envelope: &ReviewEnvelope, _inline_comments: usize, label: &str) -> String {
-    let mut errors = 0;
-    let mut warnings = 0;
-    let mut infos = 0;
-    for finding in &envelope.findings {
-        match finding.severity {
-            Severity::Error => errors += 1,
-            Severity::Warn => warnings += 1,
-            Severity::Info => infos += 1,
-        }
-    }
+pub fn status_line(envelope: &ReviewEnvelope, _inline_comments: usize, _label: &str) -> String {
     let mut status = String::new();
-    for _ in 0..errors {
-        status.push_str(&status_icon("error"));
-    }
-    for _ in 0..warnings {
-        status.push_str(&status_icon("warn"));
-    }
-    for _ in 0..infos {
-        status.push_str(&status_icon("info"));
+    for finding in &envelope.findings {
+        status.push_str(severity_mark(finding.severity));
     }
     if status.is_empty() {
-        status.push_str(&status_icon(if label == "clean" { "pass" } else { "warn" }));
+        String::new()
+    } else {
+        format!("status: {status}")
     }
-    format!("status: {status}")
 }
 
-fn status_icon(kind: &str) -> String {
-    format!("![{kind}]({STATUS_ICON_BASE_URL}/{kind}.svg)")
+pub fn severity_mark(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Error => "❌",
+        Severity::Warn => "⚠️",
+        Severity::Info => "ℹ️",
+    }
+}
+
+pub fn markdown_body(body: &str) -> String {
+    let mut formatted = String::with_capacity(body.len());
+    let mut token = String::new();
+    let mut in_code = false;
+
+    for ch in body.chars() {
+        if ch == '`' {
+            flush_token(&mut formatted, &mut token, in_code);
+            in_code = !in_code;
+            formatted.push(ch);
+        } else if is_token_char(ch) {
+            token.push(ch);
+        } else {
+            flush_token(&mut formatted, &mut token, in_code);
+            formatted.push(ch);
+        }
+    }
+    flush_token(&mut formatted, &mut token, in_code);
+    formatted
+}
+
+fn flush_token(formatted: &mut String, token: &mut String, in_code: bool) {
+    if token.is_empty() {
+        return;
+    }
+    let punctuation_len = token
+        .chars()
+        .rev()
+        .take_while(|ch| matches!(ch, '.' | ',' | ';' | ':' | ')' | ']'))
+        .map(char::len_utf8)
+        .sum::<usize>();
+    let core_len = token.len() - punctuation_len;
+    let (core, punctuation) = token.split_at(core_len);
+    if !in_code && should_code_format(core) {
+        formatted.push('`');
+        formatted.push_str(core);
+        formatted.push('`');
+        formatted.push_str(punctuation);
+    } else {
+        formatted.push_str(token);
+    }
+    token.clear();
+}
+
+fn is_token_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '/' | '.' | '@')
+}
+
+fn should_code_format(token: &str) -> bool {
+    let uppercase_count = token.chars().filter(|ch| ch.is_ascii_uppercase()).count();
+    token.starts_with('@')
+        || token.contains('/')
+        || token.ends_with(".yml")
+        || token.ends_with(".yaml")
+        || token.ends_with(".json")
+        || token.ends_with(".toml")
+        || token.chars().any(|ch| ch == '_')
+        || uppercase_count >= 2
 }
 
 pub fn append_status(body: &str, status: &str) -> String {
     let trimmed = body.trim();
+    let status = status.trim();
     if trimmed.is_empty() {
         status.to_string()
+    } else if status.is_empty() {
+        trimmed.to_string()
     } else {
         format!("{trimmed}\n\n{status}")
     }
@@ -357,6 +408,8 @@ mod tests {
         assert!(prompt.contains("accountable humans"));
         assert!(prompt.contains("self-dismissing findings"));
         assert!(prompt.contains("empty summary string"));
+        assert!(prompt.contains("1-2 short sentences"));
+        assert!(prompt.contains("Wrap code identifiers"));
     }
 
     #[test]
@@ -367,10 +420,7 @@ mod tests {
             usage: TokenUsage::default(),
             model_used: "m".into(),
         };
-        assert_eq!(
-            review_body(&clean, 0, "clean"),
-            "status: ![pass](https://postil.dev/status/pass.svg)"
-        );
+        assert_eq!(review_body(&clean, 0, "clean"), "");
 
         let dirty = ReviewEnvelope {
             summary: String::new(),
@@ -385,5 +435,58 @@ mod tests {
             model_used: "m".into(),
         };
         assert!(review_body(&dirty, 1, "needs-attention").contains("merge-relevant"));
+    }
+
+    #[test]
+    fn status_line_repeats_severity_marks_without_counters() {
+        let envelope = ReviewEnvelope {
+            summary: String::new(),
+            findings: vec![
+                Finding {
+                    path: "src/lib.rs".into(),
+                    line: 1,
+                    severity: Severity::Info,
+                    kind: None,
+                    body: "context".into(),
+                },
+                Finding {
+                    path: "src/lib.rs".into(),
+                    line: 2,
+                    severity: Severity::Warn,
+                    kind: None,
+                    body: "risk".into(),
+                },
+                Finding {
+                    path: "src/lib.rs".into(),
+                    line: 3,
+                    severity: Severity::Error,
+                    kind: None,
+                    body: "bug".into(),
+                },
+            ],
+            usage: TokenUsage::default(),
+            model_used: "m".into(),
+        };
+
+        assert_eq!(
+            status_line(&envelope, 3, "needs-attention"),
+            "status: ℹ️⚠️❌"
+        );
+    }
+
+    #[test]
+    fn markdown_body_formats_code_like_tokens_once() {
+        assert_eq!(
+            markdown_body("TRIGGER_PROJECT_ID is written to GITHUB_ENV by @postil-dev."),
+            "`TRIGGER_PROJECT_ID` is written to `GITHUB_ENV` by `@postil-dev`."
+        );
+        assert_eq!(
+            markdown_body("Already `GITHUB_ENV` stays as code."),
+            "Already `GITHUB_ENV` stays as code."
+        );
+        assert_eq!(
+            markdown_body("The fallback uses safe env handling."),
+            "The fallback uses safe env handling."
+        );
     }
 }

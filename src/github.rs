@@ -6,7 +6,7 @@ use serde_json::json;
 
 use crate::{
     config::{RepoReviewConfig, ReviewTarget, translate_coderabbit, translate_kodo},
-    review::{Finding, ReviewEnvelope},
+    review::{Finding, ReviewEnvelope, markdown_body, severity_mark, status_line},
     text::limit_text,
 };
 
@@ -128,7 +128,7 @@ impl GithubClient {
                 path: f.path.clone(),
                 line: f.line,
                 side: "RIGHT",
-                body: format!("**{}** · {}", f.severity.as_str().to_uppercase(), f.body),
+                body: render_inline_comment(f),
             })
             .collect();
         let payload = PullReviewRequest {
@@ -309,21 +309,11 @@ impl CheckOutput {
     }
 
     pub fn from_envelope(envelope: &ReviewEnvelope) -> Self {
-        let mut errors = 0;
-        let mut warnings = 0;
-        for finding in &envelope.findings {
-            match finding.severity {
-                crate::config::Severity::Error => errors += 1,
-                crate::config::Severity::Warn => warnings += 1,
-                crate::config::Severity::Info => {}
-            }
-        }
-        let title = if errors > 0 {
-            format!("{errors} error{}", if errors == 1 { "" } else { "s" })
-        } else if warnings > 0 {
-            format!("{warnings} warning{}", if warnings == 1 { "" } else { "s" })
-        } else {
+        let status = status_line(envelope, envelope.findings.len(), "");
+        let title = if status.is_empty() {
             "No merge-relevant findings".to_string()
+        } else {
+            status
         };
         let text = if envelope.findings.is_empty() {
             None
@@ -339,11 +329,19 @@ impl CheckOutput {
                     "See inline review comments.".to_string()
                 }
             } else {
-                envelope.summary.clone()
+                markdown_body(envelope.summary.trim())
             },
             text,
         }
     }
+}
+
+fn render_inline_comment(finding: &Finding) -> String {
+    format!(
+        "{} {}",
+        severity_mark(finding.severity),
+        markdown_body(finding.body.trim())
+    )
 }
 
 fn render_findings(findings: &[Finding]) -> String {
@@ -351,11 +349,11 @@ fn render_findings(findings: &[Finding]) -> String {
         .iter()
         .map(|f| {
             format!(
-                "**{}** `{}`:{}\n\n{}",
-                f.severity.as_str().to_uppercase(),
+                "{} `{}`:{}\n\n{}",
+                severity_mark(f.severity),
                 f.path,
                 f.line,
-                f.body
+                markdown_body(f.body.trim())
             )
         })
         .collect::<Vec<_>>()
@@ -377,5 +375,63 @@ pub fn check_conclusion(envelope: &ReviewEnvelope) -> &'static str {
         "neutral"
     } else {
         "success"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        config::Severity,
+        review::{FindingKind, TokenUsage},
+    };
+
+    fn envelope(findings: Vec<Finding>) -> ReviewEnvelope {
+        ReviewEnvelope {
+            summary: String::new(),
+            findings,
+            usage: TokenUsage::default(),
+            model_used: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn inline_comment_uses_icon_and_code_formatting() {
+        let finding = Finding {
+            path: ".github/workflows/trigger-deploy.yml".to_string(),
+            line: 53,
+            severity: Severity::Error,
+            kind: Some(FindingKind::Risk),
+            body: "TRIGGER_PROJECT_ID and TRIGGER_SECRET_KEY are written to GITHUB_ENV."
+                .to_string(),
+        };
+
+        assert_eq!(
+            render_inline_comment(&finding),
+            "❌ `TRIGGER_PROJECT_ID` and `TRIGGER_SECRET_KEY` are written to `GITHUB_ENV`."
+        );
+    }
+
+    #[test]
+    fn check_output_uses_compact_status_title() {
+        let output = CheckOutput::from_envelope(&envelope(vec![
+            Finding {
+                path: "src/lib.rs".to_string(),
+                line: 1,
+                severity: Severity::Info,
+                kind: None,
+                body: "needs review".to_string(),
+            },
+            Finding {
+                path: "src/lib.rs".to_string(),
+                line: 2,
+                severity: Severity::Warn,
+                kind: None,
+                body: "risk".to_string(),
+            },
+        ]));
+
+        assert_eq!(output.title, "status: ℹ️⚠️");
+        assert_eq!(output.summary, "See inline review comments.");
     }
 }
