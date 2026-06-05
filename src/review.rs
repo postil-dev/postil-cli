@@ -5,8 +5,6 @@ use serde_json::Value;
 
 use crate::config::{RepoReviewConfig, Severity};
 
-const STATUS_ICON_BASE_URL: &str = "https://postil.dev/status";
-
 const BASE_SYSTEM_PROMPT: &str = r#"You are Postil, a low-noise review gate for agent-speed development. You receive a unified diff for a pull request and produce structured findings as JSON.
 
 Product doctrine:
@@ -207,35 +205,25 @@ pub fn apply_config(
     Ok(envelope)
 }
 
-pub fn status_line(envelope: &ReviewEnvelope, _inline_comments: usize, label: &str) -> String {
-    let mut errors = 0;
-    let mut warnings = 0;
-    let mut infos = 0;
-    for finding in &envelope.findings {
-        match finding.severity {
-            Severity::Error => errors += 1,
-            Severity::Warn => warnings += 1,
-            Severity::Info => infos += 1,
-        }
-    }
-    let mut status = String::new();
-    for _ in 0..errors {
-        status.push_str(&status_icon("error"));
-    }
-    for _ in 0..warnings {
-        status.push_str(&status_icon("warn"));
-    }
-    for _ in 0..infos {
-        status.push_str(&status_icon("info"));
-    }
-    if status.is_empty() {
-        status.push_str(&status_icon(if label == "clean" { "pass" } else { "warn" }));
-    }
-    format!("status: {status}")
+pub fn severity_marks(findings: &[Finding]) -> String {
+    findings
+        .iter()
+        .map(|finding| match finding.severity {
+            Severity::Error => "!!!",
+            Severity::Warn => "!!",
+            Severity::Info => "!",
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
-fn status_icon(kind: &str) -> String {
-    format!("![{kind}]({STATUS_ICON_BASE_URL}/{kind}.svg)")
+pub fn status_line(envelope: &ReviewEnvelope, _inline_comments: usize, _label: &str) -> String {
+    let marks = severity_marks(&envelope.findings);
+    if marks.is_empty() {
+        "status: clean".to_string()
+    } else {
+        format!("status: {marks}")
+    }
 }
 
 pub fn append_status(body: &str, status: &str) -> String {
@@ -248,6 +236,9 @@ pub fn append_status(body: &str, status: &str) -> String {
 }
 
 pub fn review_body(envelope: &ReviewEnvelope, inline_comments: usize, label: &str) -> String {
+    if envelope.findings.is_empty() {
+        return String::new();
+    }
     append_status(
         if envelope.summary.trim().is_empty() && !envelope.findings.is_empty() {
             "Postil found merge-relevant review findings."
@@ -367,10 +358,7 @@ mod tests {
             usage: TokenUsage::default(),
             model_used: "m".into(),
         };
-        assert_eq!(
-            review_body(&clean, 0, "clean"),
-            "status: ![pass](https://postil.dev/status/pass.svg)"
-        );
+        assert_eq!(review_body(&clean, 0, "clean"), "");
 
         let dirty = ReviewEnvelope {
             summary: String::new(),
@@ -385,5 +373,7 @@ mod tests {
             model_used: "m".into(),
         };
         assert!(review_body(&dirty, 1, "needs-attention").contains("merge-relevant"));
+        assert!(review_body(&dirty, 1, "needs-attention").contains("status: !!"));
+        assert!(!review_body(&dirty, 1, "needs-attention").contains("!["));
     }
 }
