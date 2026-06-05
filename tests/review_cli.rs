@@ -263,6 +263,62 @@ review:
 }
 
 #[tokio::test]
+async fn updates_existing_check_run_without_head_sha() {
+    let github = MockServer::start().await;
+    let openrouter = MockServer::start().await;
+    let dir = cache_test_dir("check-run-update-no-sha");
+    let config = dir.join("postil.yaml");
+    fs::write(
+        &config,
+        format!(
+            r#"
+githubToken: test-github
+openrouterApiKey: test-openrouter
+githubApiUrl: {}
+openrouterApiUrl: {}
+repo: owner/repo
+pr: 42
+checkRunId: 123
+reviewModel: xiaomi/mimo-v2.5-pro
+noInline: true
+"#,
+            github.uri(),
+            openrouter.uri()
+        ),
+    )
+    .unwrap();
+
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls/42"))
+        .and(header("accept", "application/vnd.github.v3.diff"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("diff\n+ok"))
+        .mount(&github)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "{\"summary\":\"\",\"findings\":[]}"} }]
+        })))
+        .mount(&openrouter)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/repos/owner/repo/check-runs/123"))
+        .and(body_string_contains(r#""status":"completed""#))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&github)
+        .await;
+
+    Command::cargo_bin("postil")
+        .unwrap()
+        .args(["review", "--config", config.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("success (0 findings"));
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
 async fn reviews_local_diff_file_without_github_config() {
     let openrouter = MockServer::start().await;
     let dir = cache_test_dir("local-diff-file");

@@ -208,40 +208,20 @@ impl GithubClient {
         output: CheckOutput,
         started_at: &str,
     ) -> Result<()> {
-        let Some(head_sha) = target.head_sha.as_deref() else {
-            return Ok(());
-        };
         let now = Utc::now().to_rfc3339();
-        let mut payload = json!({
-            "name": check_name,
-            "head_sha": head_sha,
-            "status": "completed",
-            "conclusion": conclusion,
-            "started_at": started_at,
-            "completed_at": now,
-            "output": output,
-        });
-        if check_run_id.is_some() {
-            payload
-                .as_object_mut()
-                .expect("payload object")
-                .remove("name");
-            payload
-                .as_object_mut()
-                .expect("payload object")
-                .remove("head_sha");
-            payload
-                .as_object_mut()
-                .expect("payload object")
-                .remove("started_at");
-        }
-        let (method, url) = if let Some(id) = check_run_id {
+        let (method, url, payload) = if let Some(id) = check_run_id {
             (
                 reqwest::Method::PATCH,
                 format!(
                     "{}/repos/{}/{}/check-runs/{}",
                     self.base_url, target.owner, target.repo, id
                 ),
+                json!({
+                    "status": "completed",
+                    "conclusion": conclusion,
+                    "completed_at": now,
+                    "output": output,
+                }),
             )
         } else {
             (
@@ -250,6 +230,18 @@ impl GithubClient {
                     "{}/repos/{}/{}/check-runs",
                     self.base_url, target.owner, target.repo
                 ),
+                json!({
+                    "name": check_name,
+                    "head_sha": target
+                        .head_sha
+                        .as_deref()
+                        .context("head sha is required when creating a check run")?,
+                    "status": "completed",
+                    "conclusion": conclusion,
+                    "started_at": started_at,
+                    "completed_at": now,
+                    "output": output,
+                }),
             )
         };
         let res = self
