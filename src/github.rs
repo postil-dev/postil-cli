@@ -6,7 +6,7 @@ use serde_json::json;
 
 use crate::{
     config::{RepoReviewConfig, ReviewTarget, translate_coderabbit, translate_kodo},
-    review::{Finding, ReviewEnvelope},
+    review::{Finding, ReviewEnvelope, severity_marks},
     text::limit_text,
 };
 
@@ -138,7 +138,11 @@ impl GithubClient {
             } else {
                 "COMMENT"
             },
-            body,
+            body: if body.trim().is_empty() {
+                None
+            } else {
+                Some(body)
+            },
             comments: if comments.is_empty() {
                 None
             } else {
@@ -169,6 +173,9 @@ impl GithubClient {
     }
 
     pub async fn post_issue_comment(&self, target: &ReviewTarget, body: &str) -> Result<()> {
+        if body.trim().is_empty() {
+            return Ok(());
+        }
         let res = self
             .http
             .post(format!(
@@ -278,7 +285,8 @@ struct PullReviewRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     commit_id: Option<String>,
     event: &'a str,
-    body: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     comments: Option<Vec<ReviewComment>>,
 }
@@ -309,21 +317,11 @@ impl CheckOutput {
     }
 
     pub fn from_envelope(envelope: &ReviewEnvelope) -> Self {
-        let mut errors = 0;
-        let mut warnings = 0;
-        for finding in &envelope.findings {
-            match finding.severity {
-                crate::config::Severity::Error => errors += 1,
-                crate::config::Severity::Warn => warnings += 1,
-                crate::config::Severity::Info => {}
-            }
-        }
-        let title = if errors > 0 {
-            format!("{errors} error{}", if errors == 1 { "" } else { "s" })
-        } else if warnings > 0 {
-            format!("{warnings} warning{}", if warnings == 1 { "" } else { "s" })
-        } else {
+        let marks = severity_marks(&envelope.findings);
+        let title = if marks.is_empty() {
             "No merge-relevant findings".to_string()
+        } else {
+            marks
         };
         let text = if envelope.findings.is_empty() {
             None
@@ -334,7 +332,7 @@ impl CheckOutput {
             title,
             summary: if envelope.summary.trim().is_empty() {
                 if envelope.findings.is_empty() {
-                    "No merge-relevant findings.".to_string()
+                    String::new()
                 } else {
                     "See inline review comments.".to_string()
                 }
@@ -342,6 +340,59 @@ impl CheckOutput {
                 envelope.summary.clone()
             },
             text,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        config::Severity,
+        review::{FindingKind, TokenUsage},
+    };
+
+    #[test]
+    fn clean_check_output_has_no_recap_body() {
+        let output = CheckOutput::from_envelope(&ReviewEnvelope {
+            summary: String::new(),
+            findings: Vec::new(),
+            usage: TokenUsage::default(),
+            model_used: "m".into(),
+        });
+
+        assert_eq!(output.title, "No merge-relevant findings");
+        assert_eq!(output.summary, "");
+        assert_eq!(output.text, None);
+    }
+
+    #[test]
+    fn dirty_check_output_uses_repeated_severity_marks() {
+        let output = CheckOutput::from_envelope(&ReviewEnvelope {
+            summary: String::new(),
+            findings: vec![
+                finding(Severity::Error),
+                finding(Severity::Warn),
+                finding(Severity::Warn),
+                finding(Severity::Info),
+            ],
+            usage: TokenUsage::default(),
+            model_used: "m".into(),
+        });
+
+        assert_eq!(output.title, "!!! !! !! !");
+        assert!(!output.title.contains("warning"));
+        assert!(!output.title.contains("error"));
+        assert!(!output.summary.contains("No merge-relevant"));
+    }
+
+    fn finding(severity: Severity) -> Finding {
+        Finding {
+            path: "src/lib.rs".into(),
+            line: 1,
+            severity,
+            kind: Some(FindingKind::Risk),
+            body: "risk".into(),
         }
     }
 }
