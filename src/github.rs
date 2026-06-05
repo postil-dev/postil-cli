@@ -6,7 +6,7 @@ use serde_json::json;
 
 use crate::{
     config::{RepoReviewConfig, ReviewTarget, translate_coderabbit, translate_kodo},
-    review::{Finding, ReviewEnvelope, severity_marks},
+    review::{Finding, ReviewEnvelope, markdown_body, severity_mark, status_line},
     text::limit_text,
 };
 
@@ -128,7 +128,7 @@ impl GithubClient {
                 path: f.path.clone(),
                 line: f.line,
                 side: "RIGHT",
-                body: format!("**{}** · {}", f.severity.as_str().to_uppercase(), f.body),
+                body: render_inline_comment(f),
             })
             .collect();
         let payload = PullReviewRequest {
@@ -309,11 +309,11 @@ impl CheckOutput {
     }
 
     pub fn from_envelope(envelope: &ReviewEnvelope) -> Self {
-        let marks = severity_marks(&envelope.findings);
-        let title = if marks.is_empty() {
+        let status = status_line(envelope, envelope.findings.len(), "");
+        let title = if envelope.findings.is_empty() {
             "No merge-relevant findings".to_string()
         } else {
-            marks
+            status.clone()
         };
         let text = if envelope.findings.is_empty() {
             None
@@ -322,18 +322,24 @@ impl CheckOutput {
         };
         Self {
             title,
-            summary: if envelope.summary.trim().is_empty() {
-                if envelope.findings.is_empty() {
-                    String::new()
-                } else {
-                    "See inline review comments.".to_string()
-                }
+            summary: if envelope.findings.is_empty() {
+                String::new()
+            } else if envelope.summary.trim().is_empty() {
+                "See inline review comments.".to_string()
             } else {
-                envelope.summary.clone()
+                markdown_body(envelope.summary.trim())
             },
             text,
         }
     }
+}
+
+fn render_inline_comment(finding: &Finding) -> String {
+    format!(
+        "{} {}",
+        severity_mark(finding.severity),
+        markdown_body(finding.body.trim())
+    )
 }
 
 #[cfg(test)]
@@ -372,10 +378,38 @@ mod tests {
             model_used: "m".into(),
         });
 
-        assert_eq!(output.title, "!!! !! !! !");
+        assert_eq!(output.title, "status: ❌⚠️⚠️ℹ️");
         assert!(!output.title.contains("warning"));
         assert!(!output.title.contains("error"));
         assert!(!output.summary.contains("No merge-relevant"));
+    }
+
+    #[test]
+    fn inline_comment_uses_icon_and_code_formatting() {
+        assert_eq!(
+            render_inline_comment(&Finding {
+                path: "src/lib.rs".into(),
+                line: 1,
+                severity: Severity::Error,
+                kind: Some(FindingKind::Risk),
+                body: "TRIGGER_PROJECT_ID is missing before trigger-deploy.yml runs.".into(),
+            }),
+            "❌ `TRIGGER_PROJECT_ID` is missing before `trigger-deploy.yml` runs."
+        );
+    }
+
+    #[test]
+    fn clean_check_output_ignores_stale_summary() {
+        let output = CheckOutput::from_envelope(&ReviewEnvelope {
+            summary: "Multiple issues need attention.".to_string(),
+            findings: Vec::new(),
+            usage: TokenUsage::default(),
+            model_used: "test".to_string(),
+        });
+
+        assert_eq!(output.title, "No merge-relevant findings");
+        assert_eq!(output.summary, "");
+        assert_eq!(output.text, None);
     }
 
     fn finding(severity: Severity) -> Finding {
@@ -395,10 +429,10 @@ fn render_findings(findings: &[Finding]) -> String {
         .map(|f| {
             format!(
                 "**{}** `{}`:{}\n\n{}",
-                f.severity.as_str().to_uppercase(),
+                severity_mark(f.severity),
                 f.path,
                 f.line,
-                f.body
+                markdown_body(f.body.trim())
             )
         })
         .collect::<Vec<_>>()

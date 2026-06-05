@@ -187,7 +187,7 @@ review:
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [{"message": {"content": "{\"summary\":\"Clean.\",\"findings\":[]}"} }]
+            "choices": [{"message": {"content": "{\"summary\":\"\",\"findings\":[]}"} }]
         })))
         .mount(&openrouter)
         .await;
