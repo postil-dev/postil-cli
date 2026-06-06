@@ -21,7 +21,7 @@ impl GithubClient {
     pub fn new(base_url: String, token: String) -> Result<Self> {
         Ok(Self {
             http: Client::builder()
-                .user_agent("postil-reviewer/0.1.0")
+                .user_agent("postil-cli/0.1.0")
                 .build()
                 .context("build GitHub HTTP client")?,
             base_url: base_url.trim_end_matches('/').to_string(),

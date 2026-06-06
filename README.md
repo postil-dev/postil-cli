@@ -1,4 +1,4 @@
-# Postil Reviewer
+# Postil CLI
 
 `postil` is the low-noise review gate binary for Postil. Hosted Postil workers,
 the GitHub Action, and local review commands all run this CLI; the website does
@@ -24,12 +24,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: postil-dev/postil-reviewer@main
+      # Same-org @main is intentional here so Postil can iterate on its own review gate quickly.
+      - uses: postil-dev/postil-action@main
         with:
           api-key: ${{ secrets.OPENROUTER_API_KEY }}
 ```
 
-The Action installs the `postil` binary from this repository revision, then runs
+The Action installs the `postil` binary from `postil-dev/postil-cli`, then runs
 `postil review` against the pull request.
 
 Local CLI:

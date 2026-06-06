@@ -1,8 +1,8 @@
 [package]
-name = "postil-reviewer"
+name = "postil-cli"
 version = "0.1.0"
 edition = "2024"
-description = "Rust review bot binary for Postil"
+description = "Review gate CLI for Postil"
 license = "Apache-2.0"
 
 [[bin]]

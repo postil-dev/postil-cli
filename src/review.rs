@@ -235,7 +235,7 @@ pub fn severity_marks(findings: &[Finding]) -> String {
 pub fn status_line(envelope: &ReviewEnvelope, _inline_comments: usize, _label: &str) -> String {
     let marks = severity_marks(&envelope.findings);
     if marks.is_empty() {
-        "status: clean".to_string()
+        String::new()
     } else {
         format!("status: {marks}")
     }
@@ -516,6 +516,18 @@ mod tests {
             status_line(&envelope, 3, "needs-attention"),
             "status: ℹ️⚠️❌"
         );
+    }
+
+    #[test]
+    fn status_line_is_empty_for_clean_envelopes() {
+        let envelope = ReviewEnvelope {
+            summary: String::new(),
+            findings: Vec::new(),
+            usage: TokenUsage::default(),
+            model_used: "m".into(),
+        };
+
+        assert_eq!(status_line(&envelope, 0, "clean"), "");
     }
 
     #[test]
