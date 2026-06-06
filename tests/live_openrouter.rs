@@ -1,4 +1,4 @@
-use postil_reviewer::{
+use postil_cli::{
     config::RepoReviewConfig,
     openrouter::OpenRouterClient,
     review::{TokenUsage, parse_envelope, system_prompt},

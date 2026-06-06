@@ -25,7 +25,8 @@ Rules:
 - Use info only for merge-relevant human escalation, durable guardrail suggestions, or material uncertainty.
 - If the diff has no merge-relevant findings, return an empty summary string and an empty findings array.
 - Return at most 25 findings.
-- Keep each finding body under 1200 characters.
+- Keep each finding body to 1-2 short sentences. State the merge risk or intent mismatch first, then the fix. Do not teach basic concepts.
+- Wrap code identifiers, env vars, file names, commands, config keys, and bot handles in backticks.
 
 Reply with ONLY a single JSON object, no prose, no markdown fence:
 {
@@ -131,6 +132,13 @@ fn parse_value(value: Value, usage: TokenUsage, model_used: String) -> ReviewEnv
             model_used,
         );
     };
+    if !summary.trim().is_empty() && items.is_empty() {
+        return invalid_model_output(
+            "Model output included review summary text without grounded findings; review must be retried before merge.",
+            usage,
+            model_used,
+        );
+    }
     let mut findings = Vec::with_capacity(items.len());
     for item in items {
         let Ok(finding) = serde_json::from_value::<Finding>(item.clone()) else {
@@ -201,29 +209,88 @@ pub fn apply_config(
     if !findings.iter().any(|f| f.path == ".postil/model-output") {
         findings.truncate(cfg.max_findings);
     }
+    if findings.is_empty() {
+        envelope.summary.clear();
+    }
     envelope.findings = findings;
     Ok(envelope)
+}
+
+pub fn severity_mark(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Error => "❌",
+        Severity::Warn => "⚠️",
+        Severity::Info => "ℹ️",
+    }
 }
 
 pub fn severity_marks(findings: &[Finding]) -> String {
     findings
         .iter()
-        .map(|finding| match finding.severity {
-            Severity::Error => "!!!",
-            Severity::Warn => "!!",
-            Severity::Info => "!",
-        })
+        .map(|finding| severity_mark(finding.severity))
         .collect::<Vec<_>>()
-        .join(" ")
+        .join("")
 }
 
 pub fn status_line(envelope: &ReviewEnvelope, _inline_comments: usize, _label: &str) -> String {
     let marks = severity_marks(&envelope.findings);
     if marks.is_empty() {
-        "status: clean".to_string()
+        String::new()
     } else {
         format!("status: {marks}")
     }
+}
+
+pub fn markdown_body(body: &str) -> String {
+    let mut formatted = String::new();
+    let mut token = String::new();
+    let mut in_code = false;
+    for ch in body.chars() {
+        if ch == '`' {
+            flush_token(&mut formatted, &mut token, in_code);
+            in_code = !in_code;
+            formatted.push(ch);
+        } else if ch.is_whitespace() {
+            flush_token(&mut formatted, &mut token, in_code);
+            formatted.push(ch);
+        } else {
+            token.push(ch);
+        }
+    }
+    flush_token(&mut formatted, &mut token, in_code);
+    formatted
+}
+
+fn flush_token(formatted: &mut String, token: &mut String, in_code: bool) {
+    if token.is_empty() {
+        return;
+    }
+    if in_code {
+        formatted.push_str(token);
+        token.clear();
+        return;
+    }
+
+    let core_len = token.trim_end_matches(['.', ',', ';', ':', ')']).len();
+    let (core, suffix) = token.split_at(core_len);
+    if !core.is_empty() && should_code_format(core) {
+        formatted.push('`');
+        formatted.push_str(core);
+        formatted.push('`');
+        formatted.push_str(suffix);
+    } else {
+        formatted.push_str(token);
+    }
+    token.clear();
+}
+
+fn should_code_format(token: &str) -> bool {
+    token.starts_with('@')
+        || token.contains("::")
+        || token.contains('/')
+        || token.contains('.')
+        || token.contains('_')
+        || token.contains('-')
 }
 
 pub fn append_status(body: &str, status: &str) -> String {
@@ -287,6 +354,19 @@ mod tests {
     }
 
     #[test]
+    fn summary_without_findings_fails_closed() {
+        let env = parse_envelope(
+            "{\"summary\":\"Multiple issues need attention.\",\"findings\":[]}",
+            TokenUsage::default(),
+            "m".into(),
+        );
+        assert_eq!(env.findings.len(), 1);
+        assert_eq!(env.findings[0].severity, Severity::Error);
+        assert_eq!(env.findings[0].path, ".postil/model-output");
+        assert!(env.findings[0].body.contains("without grounded findings"));
+    }
+
+    #[test]
     fn filters_findings() {
         let envelope = ReviewEnvelope {
             summary: "s".into(),
@@ -340,6 +420,29 @@ mod tests {
     }
 
     #[test]
+    fn filtering_all_findings_clears_summary() {
+        let envelope = ReviewEnvelope {
+            summary: "This warning was filtered.".into(),
+            usage: TokenUsage::default(),
+            model_used: "m".into(),
+            findings: vec![Finding {
+                path: "src/a.rs".into(),
+                line: 1,
+                severity: Severity::Info,
+                kind: None,
+                body: "i".into(),
+            }],
+        };
+        let cfg = RepoReviewConfig {
+            severity_threshold: Severity::Warn,
+            ..RepoReviewConfig::default()
+        };
+        let filtered = apply_config(envelope, &cfg).unwrap();
+        assert!(filtered.findings.is_empty());
+        assert!(filtered.summary.is_empty());
+    }
+
+    #[test]
     fn prompt_encodes_low_noise_doctrine() {
         let prompt = system_prompt(&RepoReviewConfig::default());
         assert!(prompt.contains("Silence is a feature"));
@@ -348,6 +451,7 @@ mod tests {
         assert!(prompt.contains("accountable humans"));
         assert!(prompt.contains("self-dismissing findings"));
         assert!(prompt.contains("empty summary string"));
+        assert!(prompt.contains("Wrap code identifiers"));
     }
 
     #[test]
@@ -373,7 +477,72 @@ mod tests {
             model_used: "m".into(),
         };
         assert!(review_body(&dirty, 1, "needs-attention").contains("merge-relevant"));
-        assert!(review_body(&dirty, 1, "needs-attention").contains("status: !!"));
+        assert!(review_body(&dirty, 1, "needs-attention").contains("status: ⚠️"));
         assert!(!review_body(&dirty, 1, "needs-attention").contains("!["));
+    }
+
+    #[test]
+    fn status_line_uses_compact_emoji_marks_from_findings() {
+        let envelope = ReviewEnvelope {
+            summary: String::new(),
+            findings: vec![
+                Finding {
+                    path: "src/lib.rs".into(),
+                    line: 1,
+                    severity: Severity::Info,
+                    kind: None,
+                    body: "info".into(),
+                },
+                Finding {
+                    path: "src/lib.rs".into(),
+                    line: 2,
+                    severity: Severity::Warn,
+                    kind: None,
+                    body: "warn".into(),
+                },
+                Finding {
+                    path: "src/lib.rs".into(),
+                    line: 3,
+                    severity: Severity::Error,
+                    kind: None,
+                    body: "error".into(),
+                },
+            ],
+            usage: TokenUsage::default(),
+            model_used: "m".into(),
+        };
+
+        assert_eq!(
+            status_line(&envelope, 3, "needs-attention"),
+            "status: ℹ️⚠️❌"
+        );
+    }
+
+    #[test]
+    fn status_line_is_empty_for_clean_envelopes() {
+        let envelope = ReviewEnvelope {
+            summary: String::new(),
+            findings: Vec::new(),
+            usage: TokenUsage::default(),
+            model_used: "m".into(),
+        };
+
+        assert_eq!(status_line(&envelope, 0, "clean"), "");
+    }
+
+    #[test]
+    fn markdown_body_formats_code_like_tokens_once() {
+        assert_eq!(
+            markdown_body("Set TRIGGER_PROJECT_ID before trigger-deploy.yml runs."),
+            "Set `TRIGGER_PROJECT_ID` before `trigger-deploy.yml` runs."
+        );
+        assert_eq!(
+            markdown_body("Already `GITHUB_ENV` stays as code."),
+            "Already `GITHUB_ENV` stays as code."
+        );
+        assert_eq!(
+            markdown_body("The fallback uses safe env handling."),
+            "The fallback uses safe env handling."
+        );
     }
 }

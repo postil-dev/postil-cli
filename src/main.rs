@@ -7,16 +7,16 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
-use postil_reviewer::config::{
+use postil_cli::config::{
     self, RuntimeConfig, RuntimeFileConfig, RuntimeOverrides, Severity, resolve_target,
 };
-use postil_reviewer::github::{CheckOutput, GithubClient, check_conclusion};
-use postil_reviewer::openrouter::{self, OpenRouterClient};
-use postil_reviewer::review::{
+use postil_cli::github::{CheckOutput, GithubClient, check_conclusion};
+use postil_cli::openrouter::{self, OpenRouterClient};
+use postil_cli::review::{
     ReviewEnvelope, TokenUsage, apply_config, is_model_output_error, parse_envelope, review_body,
     system_prompt,
 };
-use postil_reviewer::text::limit_text;
+use postil_cli::text::limit_text;
 
 #[derive(Debug, Parser)]
 #[command(name = "postil", about = "Postil low-noise review gate")]
@@ -410,16 +410,16 @@ fn git_diff(args: &[&str]) -> Result<String> {
     String::from_utf8(output.stdout).context("read git diff output")
 }
 
-fn load_local_repo_config() -> Result<postil_reviewer::config::RepoReviewConfig> {
+fn load_local_repo_config() -> Result<postil_cli::config::RepoReviewConfig> {
     for path in [".postil.yaml", ".postil.yml", ".postil.json"] {
         let path_ref = Path::new(path);
         if path_ref.exists() {
             let text = fs::read_to_string(path_ref)
                 .with_context(|| format!("read {}", path_ref.display()))?;
-            return postil_reviewer::config::RepoReviewConfig::from_text(path, &text);
+            return postil_cli::config::RepoReviewConfig::from_text(path, &text);
         }
     }
-    Ok(postil_reviewer::config::RepoReviewConfig::default())
+    Ok(postil_cli::config::RepoReviewConfig::default())
 }
 
 fn review_user_content(source_label: &str, diff: &str) -> String {
