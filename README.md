@@ -4,36 +4,18 @@
 the GitHub Action, and local review commands all run this CLI; the website does
 not contain review logic.
 
-## Usage
+## Install
 
-GitHub Actions:
+The practical install paths live in [INSTALL.md](./INSTALL.md). The short
+version:
 
-```yaml
-name: Postil review
-
-on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-
-permissions:
-  contents: read
-  pull-requests: write
-
-jobs:
-  review:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      # Same-org @main is intentional here so Postil can iterate on its own review gate quickly.
-      - uses: postil-dev/postil-action@main
-        with:
-          api-key: ${{ secrets.OPENROUTER_API_KEY }}
+```bash
+cargo install --git https://github.com/postil-dev/postil-cli --locked --force
 ```
 
-The Action installs the `postil` binary from `postil-dev/postil-cli`, then runs
-`postil review` against the pull request.
+## Usage
 
-Local CLI:
+Review a pull request:
 
 ```bash
 postil review --repo owner/repo --pr 123 --sha HEAD_SHA
@@ -57,7 +39,7 @@ By default, the command also reads GitHub Actions context:
 Review models are configured with `REVIEW_MODEL` or `REVIEW_MODEL_CASCADE`.
 The default model is `deepseek/deepseek-v4-pro`.
 
-## Configuration
+## Review modes
 
 Runtime configuration is env-first, with full CLI and file parity. Precedence is:
 
@@ -122,6 +104,32 @@ Hosted workers that already created an in-progress check-run should pass
 
 If a model response is not valid Postil JSON, the CLI fails closed by converting
 that response into an `error` finding at `.postil/model-output:1`.
+
+## GitHub Action
+
+The Action in [postil-dev/postil-action](https://github.com/postil-dev/postil-action)
+installs the `postil` binary from this repository, then runs `postil review`.
+
+```yaml
+name: Postil review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: postil-dev/postil-action@main
+        with:
+          api-key: ${{ secrets.OPENROUTER_API_KEY }}
+```
 
 ## Testing
 
