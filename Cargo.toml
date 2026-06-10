@@ -1,0 +1,47 @@
+[package]
+name = "postil-cli"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Low-noise pull-request review gate. The Postil review engine."
+repository = "https://github.com/postil-dev/postil-cli"
+readme = "README.md"
+
+[[bin]]
+name = "postil"
+path = "src/main.rs"
+
+[lib]
+name = "postil"
+path = "src/lib.rs"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+console = "0.15"
+globset = "0.4"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+similar = { version = "2", features = ["text"] }
+thiserror = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "process", "signal", "time", "io-util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = { version = "2", features = ["serde"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+serial_test = "3"
+tempfile = "3"
+wiremock = "0.6"

@@ -1,0 +1,4 @@
+enabled: true
+review:
+  enabled: true
+  onClean: skip
