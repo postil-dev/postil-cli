@@ -110,12 +110,11 @@ impl Forge for GitHub {
         Ok(Self::check_ok(resp, "diff fetch").await?.text().await?)
     }
 
-    async fn fetch_diff_since(&self, since_sha: &str) -> Result<String> {
-        let meta = self.fetch_pr_meta().await?;
+    async fn fetch_diff_since(&self, since_sha: &str, head_sha: &str) -> Result<String> {
         let resp = self
             .request(
                 reqwest::Method::GET,
-                self.url(&format!("/compare/{since_sha}...{}", meta.head_sha)),
+                self.url(&format!("/compare/{since_sha}...{head_sha}")),
             )
             .header("Accept", "application/vnd.github.v3.diff")
             .send()

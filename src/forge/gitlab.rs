@@ -181,14 +181,12 @@ impl Forge for GitLab {
         Ok(Self::assemble_unified(&items))
     }
 
-    async fn fetch_diff_since(&self, since_sha: &str) -> Result<String> {
-        let mr = self.mr().await?;
+    async fn fetch_diff_since(&self, since_sha: &str, head_sha: &str) -> Result<String> {
         let resp = self
             .request(
                 reqwest::Method::GET,
                 self.url(&format!(
-                    "/repository/compare?from={since_sha}&to={}",
-                    mr.diff_refs.head_sha
+                    "/repository/compare?from={since_sha}&to={head_sha}"
                 )),
             )
             .send()

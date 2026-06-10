@@ -162,7 +162,7 @@ async fn remote_review<F: Forge>(
     let incremental = args.since_sha.as_deref();
     let diff_text = match incremental {
         Some(since) if since != head_sha => forge
-            .fetch_diff_since(since)
+            .fetch_diff_since(since, head_sha)
             .await
             .context("incremental diff fetch")?,
         Some(_) => String::new(),

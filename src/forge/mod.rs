@@ -36,8 +36,10 @@ pub trait Forge {
     async fn fetch_pr_meta(&self) -> Result<PrMeta>;
     /// Unified diff of the full PR.
     async fn fetch_diff(&self) -> Result<String>;
-    /// Unified diff covering `since_sha..head` only (incremental reviews).
-    async fn fetch_diff_since(&self, since_sha: &str) -> Result<String>;
+    /// Unified diff covering `since_sha..head_sha` only (incremental reviews).
+    /// `head_sha` is the SHA the caller is reviewing, not whatever the PR's
+    /// head happens to be at fetch time — a later push must not widen the diff.
+    async fn fetch_diff_since(&self, since_sha: &str, head_sha: &str) -> Result<String>;
     /// Post the batched review: one summary plus inline comments per finding.
     async fn post_review(&self, summary: &str, findings: &[Finding], head_sha: &str) -> Result<()>;
     /// Ensure both check runs exist (in_progress); returns (advisory_id, gate_id).
