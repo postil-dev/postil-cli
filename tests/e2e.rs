@@ -233,6 +233,73 @@ async fn cascade_falls_back_to_next_model() {
 }
 
 #[tokio::test]
+async fn hosted_path_completes_provided_check_run_ids_without_creating_new_ones() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .and(header("Accept", "application/vnd.github.v3.diff"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(DIFF))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "t", "body": null,
+            "head": {"sha": "h1"}, "base": {"sha": "b1"}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path_regex(r"^/repos/acme/api/check-runs/(901|902)$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .args([
+            "review",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--sha",
+            "h1",
+            "--check-run-id",
+            "901",
+            "--gate-check-run-id",
+            "902",
+            "--output-json",
+        ])
+        .assert()
+        .code(0);
+
+    let reqs = server.received_requests().await.unwrap();
+    // The worker owns check-run creation; the CLI must not create its own.
+    assert!(
+        !reqs.iter().any(|r| r.method == wiremock::http::Method::POST
+            && r.url.path() == "/repos/acme/api/check-runs")
+    );
+    // Both pre-created runs completed.
+    let patched: Vec<&str> = reqs
+        .iter()
+        .filter(|r| r.method == wiremock::http::Method::PATCH)
+        .map(|r| r.url.path())
+        .collect();
+    assert!(patched.contains(&"/repos/acme/api/check-runs/901"));
+    assert!(patched.contains(&"/repos/acme/api/check-runs/902"));
+}
+
+#[tokio::test]
 async fn github_flow_posts_review_and_completes_both_checks() {
     let server = MockServer::start().await;
     // LLM
