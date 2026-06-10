@@ -1,0 +1,332 @@
+//! Review orchestration: one engine for local, CI, and hosted runs.
+
+use std::path::PathBuf;
+
+use anyhow::{Context, Result, anyhow};
+
+use crate::config::{Config, GateLevel};
+use crate::diff::{self, DiffIndex};
+use crate::envelope::{Envelope, Finding, Gate, Usage, fail_closed_finding};
+use crate::filter;
+use crate::forge::{CheckState, Forge, PrMeta, check_summary, github::GitHub, gitlab::GitLab};
+use crate::llm::LlmClient;
+use crate::local::{self, LocalSource};
+use crate::output;
+use crate::prompt::{self, PrContext};
+
+const MAX_DIFF_BYTES: usize = 400_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForgeKind {
+    GitHub,
+    GitLab,
+    Local,
+}
+
+pub struct ReviewArgs {
+    pub forge: ForgeKind,
+    pub repo: Option<String>,
+    pub pr: Option<u64>,
+    pub sha: Option<String>,
+    pub staged: bool,
+    pub base: Option<String>,
+    pub diff_file: Option<PathBuf>,
+    pub check_run_id: Option<String>,
+    pub gate_check_run_id: Option<String>,
+    pub since_sha: Option<String>,
+    pub baseline: Option<PathBuf>,
+    pub output_json: bool,
+    pub fail_on: Option<String>,
+    pub config: Option<PathBuf>,
+    pub model: Option<String>,
+    pub no_post: bool,
+}
+
+pub async fn run(args: ReviewArgs) -> Result<i32> {
+    let cwd = std::env::current_dir()?;
+    let mut cfg = Config::load(&cwd, args.config.as_deref())?;
+    if let Some(m) = &args.model {
+        cfg.model = m.clone();
+    }
+    if let Some(fo) = &args.fail_on {
+        cfg.gate_fail_on =
+            GateLevel::parse(fo).ok_or_else(|| anyhow!("invalid --fail-on {fo:?}"))?;
+    }
+
+    match args.forge {
+        ForgeKind::Local => run_local(&args, &cfg).await,
+        ForgeKind::GitHub => {
+            let repo = require_repo(&args)?;
+            let forge = GitHub::new(&repo, require_pr(&args)?)?;
+            run_remote(&args, &cfg, &forge, &repo).await
+        }
+        ForgeKind::GitLab => {
+            let repo = require_repo(&args)?;
+            let forge = GitLab::new(&repo, require_pr(&args)?)?;
+            run_remote(&args, &cfg, &forge, &repo).await
+        }
+    }
+}
+
+fn require_repo(args: &ReviewArgs) -> Result<String> {
+    args.repo
+        .clone()
+        .or_else(|| std::env::var("GITHUB_REPOSITORY").ok())
+        .ok_or_else(|| anyhow!("--repo owner/name is required for remote review"))
+}
+
+fn require_pr(args: &ReviewArgs) -> Result<u64> {
+    args.pr
+        .ok_or_else(|| anyhow!("--pr <number> is required for remote review"))
+}
+
+async fn run_local(args: &ReviewArgs, cfg: &Config) -> Result<i32> {
+    let source = if let Some(path) = &args.diff_file {
+        LocalSource::DiffFile(path.clone())
+    } else if args.staged {
+        LocalSource::Staged
+    } else if let Some(base) = &args.base {
+        LocalSource::Base(base.clone())
+    } else {
+        return Err(anyhow!(
+            "local review needs one of --staged, --base <ref>, or --diff-file <path>"
+        ));
+    };
+    let diff_text = local::acquire(&source).await?;
+    let head_sha = local::head_sha().await;
+    let envelope = review_diff(cfg, &diff_text, None, args, head_sha, None).await?;
+    finish(args, cfg, envelope, None::<&GitHub>).await
+}
+
+async fn run_remote<F: Forge>(
+    args: &ReviewArgs,
+    cfg: &Config,
+    forge: &F,
+    repo: &str,
+) -> Result<i32> {
+    let meta = forge.fetch_pr_meta().await?;
+    let head_sha = args.sha.clone().unwrap_or_else(|| meta.head_sha.clone());
+
+    // Own the check-runs early so a crash can still be reported against them.
+    let checks = if args.no_post {
+        None
+    } else if let (Some(a), Some(g)) = (&args.check_run_id, &args.gate_check_run_id) {
+        Some((a.clone(), g.clone()))
+    } else {
+        match forge.start_checks(&head_sha).await {
+            Ok(ids) => Some(ids),
+            Err(e) => {
+                // CI tokens without checks:write still get review + exit code.
+                eprintln!("postil: cannot create check runs ({e:#}); continuing without");
+                None
+            }
+        }
+    };
+
+    let result = remote_review(args, cfg, forge, repo, &meta, &head_sha).await;
+    match result {
+        Ok(envelope) => {
+            if let Some((a, g)) = &checks {
+                let gate_state = if envelope.gate.failing {
+                    CheckState::Failure
+                } else {
+                    CheckState::Success
+                };
+                forge
+                    .complete_checks(a, g, CheckState::Success, gate_state, &envelope)
+                    .await?;
+            }
+            finish(args, cfg, envelope, Some(forge)).await
+        }
+        Err(e) => {
+            // Fail closed: an errored run must never read as a pass.
+            if let Some((a, g)) = &checks {
+                let envelope = error_envelope(cfg, &e, &head_sha, &meta);
+                let _ = forge
+                    .complete_checks(a, g, CheckState::Neutral, CheckState::Failure, &envelope)
+                    .await;
+            }
+            Err(e)
+        }
+    }
+}
+
+async fn remote_review<F: Forge>(
+    args: &ReviewArgs,
+    cfg: &Config,
+    forge: &F,
+    repo: &str,
+    meta: &PrMeta,
+    head_sha: &str,
+) -> Result<Envelope> {
+    let incremental = args.since_sha.as_deref();
+    let diff_text = match incremental {
+        Some(since) if since != head_sha => forge
+            .fetch_diff_since(since)
+            .await
+            .context("incremental diff fetch")?,
+        Some(_) => String::new(),
+        None => forge.fetch_diff().await.context("diff fetch")?,
+    };
+    review_diff(
+        cfg,
+        &diff_text,
+        Some(meta),
+        args,
+        Some(head_sha.to_string()),
+        Some(repo),
+    )
+    .await
+}
+
+/// Core engine: diff text in, envelope out. No forge I/O.
+async fn review_diff(
+    cfg: &Config,
+    diff_text: &str,
+    meta: Option<&PrMeta>,
+    args: &ReviewArgs,
+    head_sha: Option<String>,
+    repo: Option<&str>,
+) -> Result<Envelope> {
+    let baseline: Vec<Finding> = match &args.baseline {
+        Some(path) => {
+            let raw = std::fs::read_to_string(path)
+                .with_context(|| format!("reading baseline {}", path.display()))?;
+            let env: Envelope = serde_json::from_str(&raw).context("parsing baseline envelope")?;
+            env.findings
+        }
+        None => Vec::new(),
+    };
+
+    let parsed = diff::parse(diff_text);
+    let index = DiffIndex::build(&parsed);
+    let incremental = args.since_sha.is_some();
+
+    let mut summary = String::new();
+    let mut model_used = "none (empty diff)".to_string();
+    let mut usage = Usage::default();
+    let mut suppressed = 0u32;
+    let mut findings: Vec<Finding> = Vec::new();
+
+    if !cfg.enabled {
+        model_used = "none (disabled by config)".to_string();
+    } else if !parsed.is_empty() {
+        let (annotated, _truncated) = diff::render_annotated(&parsed, MAX_DIFF_BYTES);
+        let ctx = PrContext {
+            repo,
+            title: meta.map(|m| m.title.as_str()),
+            body: meta.map(|m| m.body.as_str()),
+            incremental,
+        };
+        let system = prompt::system_prompt(cfg);
+        let user = prompt::user_prompt(&ctx, &annotated, cfg.max_findings);
+        let client = LlmClient::from_env(cfg)?;
+        match client.review(cfg, &system, &user).await {
+            Ok(model_review) => {
+                let outcome = filter::apply(cfg, &index, model_review.findings)?;
+                model_used = model_review.model_used;
+                usage = model_review.usage;
+                suppressed = outcome.suppressed;
+                if outcome.all_ungrounded {
+                    findings = vec![fail_closed_finding(&format!(
+                        "model reported {} finding(s), none grounded in the diff",
+                        outcome.ungrounded
+                    ))];
+                } else {
+                    summary = model_review.summary;
+                    findings = outcome.kept;
+                }
+            }
+            Err(e) => {
+                model_used = cfg.model_chain().join(" -> ");
+                findings = vec![fail_closed_finding(&format!("{e:#}"))];
+            }
+        }
+    }
+
+    // Reconcile against the previous review (incremental or full re-review).
+    let rec = filter::reconcile(&baseline, &index, &findings);
+    findings.extend(rec.carried);
+
+    let gate_failing = findings.iter().any(|f| cfg.gate_fail_on.fails(f.severity));
+    let silent = findings.is_empty();
+    let counts = Envelope::counts_of(&findings, suppressed);
+    let buckets = Envelope::buckets_of(&findings);
+
+    Ok(Envelope {
+        version: 1,
+        summary: if silent { String::new() } else { summary },
+        silent,
+        findings,
+        resolved: rec.resolved,
+        counts,
+        confidence_buckets: buckets,
+        gate: Gate {
+            fail_on: cfg.gate_fail_on.as_str().to_string(),
+            failing: gate_failing,
+        },
+        model_used,
+        usage,
+        base_sha: meta.map(|m| m.base_sha.clone()),
+        head_sha,
+        since_sha: args.since_sha.clone(),
+    })
+}
+
+async fn finish<F: Forge>(
+    args: &ReviewArgs,
+    cfg: &Config,
+    envelope: Envelope,
+    forge: Option<&F>,
+) -> Result<i32> {
+    if let Some(forge) = forge
+        && !args.no_post
+    {
+        let should_comment =
+            !envelope.silent || matches!(cfg.on_clean, crate::config::OnClean::Comment);
+        if should_comment {
+            let summary = if envelope.silent {
+                "Postil reviewed this change and found nothing that affects the merge decision."
+                    .to_string()
+            } else {
+                check_summary(&envelope)
+            };
+            let head = envelope.head_sha.clone().unwrap_or_default();
+            forge
+                .post_review(&summary, &envelope.findings, &head)
+                .await
+                .context("posting review")?;
+        }
+    }
+
+    if args.output_json {
+        output::print_envelope_json(&envelope)?;
+    } else {
+        output::print_pretty(&envelope);
+    }
+    Ok(if envelope.gate.failing { 1 } else { 0 })
+}
+
+fn error_envelope(cfg: &Config, err: &anyhow::Error, head_sha: &str, meta: &PrMeta) -> Envelope {
+    let findings = vec![fail_closed_finding(&format!("{err:#}"))];
+    let counts = Envelope::counts_of(&findings, 0);
+    let buckets = Envelope::buckets_of(&findings);
+    Envelope {
+        version: 1,
+        summary: "Postil could not complete this review and is failing closed.".to_string(),
+        silent: false,
+        findings,
+        resolved: vec![],
+        counts,
+        confidence_buckets: buckets,
+        gate: Gate {
+            fail_on: cfg.gate_fail_on.as_str().to_string(),
+            failing: true,
+        },
+        model_used: cfg.model_chain().join(" -> "),
+        usage: Usage::default(),
+        base_sha: Some(meta.base_sha.clone()),
+        head_sha: Some(head_sha.to_string()),
+        since_sha: None,
+    }
+}

@@ -1,0 +1,32 @@
+[package]
+name = "postil-cli"
+version = "0.1.0"
+edition = "2024"
+description = "Postil: a low-noise AI review gate. Silent on clean PRs, hard gate on real risk."
+license = "Apache-2.0"
+repository = "https://github.com/postil-dev/postil-cli"
+
+[[bin]]
+name = "postil"
+path = "src/main.rs"
+
+[lib]
+name = "postil_cli"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1.0.102"
+clap = { version = "4.6.1", features = ["derive"] }
+globset = "0.4.18"
+owo-colors = "4.3.0"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "charset"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+serde_yaml = "0.9.34"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "process", "time"] }
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+predicates = "3.1.4"
+tempfile = "3.27.0"
+wiremock = "0.6.5"

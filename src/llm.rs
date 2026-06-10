@@ -1,0 +1,426 @@
+//! OpenAI-compatible chat client with model cascade, one JSON-repair retry,
+//! optional multi-model consensus, and fail-closed semantics.
+//!
+//! Works against OpenRouter (default), Ollama, vLLM, LiteLLM, Azure OpenAI, or
+//! any other endpoint that speaks `POST {base}/chat/completions`.
+
+use anyhow::{Context, Result, anyhow};
+use serde::Deserialize;
+use serde_json::json;
+
+use crate::config::Config;
+use crate::envelope::{Finding, Usage};
+
+#[derive(Debug, Clone)]
+pub struct ModelReview {
+    pub summary: String,
+    pub findings: Vec<Finding>,
+    pub model_used: String,
+    pub usage: Usage,
+}
+
+/// Raw shape we ask the model for. Findings are validated leniently here and
+/// strictly (grounding, ranges) by the caller.
+#[derive(Debug, Deserialize)]
+struct RawReview {
+    #[serde(default)]
+    summary: String,
+    #[serde(default)]
+    findings: Vec<RawFinding>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawFinding {
+    path: String,
+    line: u32,
+    #[serde(default)]
+    end_line: Option<u32>,
+    severity: String,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default = "default_confidence")]
+    confidence: f64,
+    #[serde(default)]
+    title: String,
+    body: String,
+}
+
+fn default_confidence() -> f64 {
+    0.5
+}
+
+pub struct LlmClient {
+    http: reqwest::Client,
+    api_base: String,
+    api_key: String,
+}
+
+impl LlmClient {
+    pub fn from_env(cfg: &Config) -> Result<Self> {
+        let api_key = std::env::var("POSTIL_API_KEY")
+            .or_else(|_| std::env::var("OPENROUTER_API_KEY"))
+            .map_err(|_| {
+                anyhow!(
+                    "no API key: set POSTIL_API_KEY (or OPENROUTER_API_KEY). \
+                     Postil never proxies your inference; bring your own key."
+                )
+            })?;
+        Ok(LlmClient {
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(180))
+                .build()?,
+            api_base: cfg.api_base.trim_end_matches('/').to_string(),
+            api_key,
+        })
+    }
+
+    /// Run the review. With `consensus > 1`, the first N models of the chain are
+    /// each consulted and only findings two or more models agree on are kept.
+    pub async fn review(&self, cfg: &Config, system: &str, user: &str) -> Result<ModelReview> {
+        let chain = cfg.model_chain();
+        if cfg.consensus > 1 && chain.len() > 1 {
+            let n = cfg.consensus.min(chain.len());
+            let runs = chain[..n]
+                .iter()
+                .map(|m| self.review_with_model(m, system, user));
+            let results = futures_join_all(runs).await;
+            let ok: Vec<ModelReview> = results.into_iter().flatten().collect();
+            match ok.len() {
+                0 => Err(anyhow!("all {n} consensus models failed")),
+                1 => Ok(ok.into_iter().next().unwrap()),
+                _ => Ok(consensus_merge(ok)),
+            }
+        } else {
+            let mut last_err = None;
+            for model in &chain {
+                match self.review_with_model(model, system, user).await {
+                    Ok(r) => return Ok(r),
+                    Err(e) => {
+                        eprintln!("postil: model {model} failed: {e:#}");
+                        last_err = Some(e);
+                    }
+                }
+            }
+            Err(last_err.unwrap_or_else(|| anyhow!("empty model chain")))
+        }
+    }
+
+    async fn review_with_model(
+        &self,
+        model: &str,
+        system: &str,
+        user: &str,
+    ) -> Result<ModelReview> {
+        let mut usage = Usage::default();
+        let content = self.chat(model, system, user, &mut usage).await?;
+        match parse_review(&content) {
+            Ok(raw) => Ok(into_review(raw, model, usage)),
+            Err(parse_err) => {
+                // One repair attempt: ask the same model to fix its own JSON.
+                let repair_user = format!(
+                    "The following was supposed to be a single valid JSON object matching the \
+                     review schema but failed to parse ({parse_err}). Output ONLY the corrected \
+                     JSON object, nothing else:\n\n{content}"
+                );
+                let repaired = self
+                    .chat(
+                        model,
+                        "You repair malformed JSON. Output only valid JSON.",
+                        &repair_user,
+                        &mut usage,
+                    )
+                    .await
+                    .context("JSON repair call failed")?;
+                let raw = parse_review(&repaired)
+                    .map_err(|e| anyhow!("model output invalid after repair: {e}"))?;
+                Ok(into_review(raw, model, usage))
+            }
+        }
+    }
+
+    async fn chat(
+        &self,
+        model: &str,
+        system: &str,
+        user: &str,
+        usage: &mut Usage,
+    ) -> Result<String> {
+        let body = json!({
+            "model": model,
+            "temperature": 0.1,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        });
+        let resp = self
+            .http
+            .post(format!("{}/chat/completions", self.api_base))
+            .bearer_auth(&self.api_key)
+            .header("HTTP-Referer", "https://postil.dev")
+            .header("X-Title", "Postil")
+            .json(&body)
+            .send()
+            .await
+            .context("request to model endpoint failed")?;
+        let status = resp.status();
+        let text = resp.text().await.context("reading model response")?;
+        if !status.is_success() {
+            let snippet: String = text.chars().take(300).collect();
+            return Err(anyhow!("model endpoint returned {status}: {snippet}"));
+        }
+        let parsed: ChatResponse =
+            serde_json::from_str(&text).context("model endpoint returned non-JSON body")?;
+        if let Some(u) = parsed.usage {
+            usage.prompt_tokens += u.prompt_tokens.unwrap_or(0);
+            usage.completion_tokens += u.completion_tokens.unwrap_or(0);
+        }
+        parsed
+            .choices
+            .into_iter()
+            .next()
+            .and_then(|c| c.message.content)
+            .ok_or_else(|| anyhow!("model response had no choices/content"))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatResponse {
+    #[serde(default)]
+    choices: Vec<Choice>,
+    usage: Option<ChatUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Choice {
+    message: Message,
+}
+
+#[derive(Debug, Deserialize)]
+struct Message {
+    content: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatUsage {
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+}
+
+/// Extract and validate the review JSON from model text. Tolerates code fences
+/// and leading/trailing prose, nothing else.
+fn parse_review(content: &str) -> Result<RawReview, String> {
+    let json_str = extract_json_object(content).ok_or("no JSON object found")?;
+    serde_json::from_str::<RawReview>(json_str).map_err(|e| e.to_string())
+}
+
+fn extract_json_object(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut escape = false;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_str {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&text[start..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn into_review(raw: RawReview, model: &str, usage: Usage) -> ModelReview {
+    use crate::envelope::{Kind, Severity};
+    let findings = raw
+        .findings
+        .into_iter()
+        .filter_map(|f| {
+            let severity = Severity::parse(&f.severity)?;
+            let kind = match f.kind.as_deref() {
+                Some("humanEscalation") | Some("human_escalation") => Kind::HumanEscalation,
+                Some("guardrail") => Kind::Guardrail,
+                Some("uncertainty") => Kind::Uncertainty,
+                _ => Kind::Risk,
+            };
+            let title = if f.title.trim().is_empty() {
+                let body_head: String = f.body.chars().take(80).collect();
+                body_head
+            } else {
+                f.title
+            };
+            Some(Finding {
+                path: f.path.trim_start_matches("./").to_string(),
+                line: f.line,
+                end_line: f.end_line.filter(|e| *e >= f.line),
+                severity,
+                kind,
+                confidence: f.confidence.clamp(0.0, 1.0),
+                title,
+                body: f.body,
+            })
+        })
+        .collect();
+    ModelReview {
+        summary: raw.summary.trim().to_string(),
+        findings,
+        model_used: model.to_string(),
+        usage,
+    }
+}
+
+/// Keep findings at least two models agree on (same path, lines within 5).
+/// Confidence becomes the max among agreeing reports.
+fn consensus_merge(mut runs: Vec<ModelReview>) -> ModelReview {
+    let total_usage = Usage {
+        prompt_tokens: runs.iter().map(|r| r.usage.prompt_tokens).sum(),
+        completion_tokens: runs.iter().map(|r| r.usage.completion_tokens).sum(),
+    };
+    let models: Vec<String> = runs.iter().map(|r| r.model_used.clone()).collect();
+    let primary = runs.remove(0);
+    let mut kept: Vec<Finding> = Vec::new();
+    let all_others: Vec<&Finding> = runs.iter().flat_map(|r| r.findings.iter()).collect();
+    for f in primary.findings {
+        let agreers = all_others
+            .iter()
+            .filter(|o| o.path == f.path && o.line.abs_diff(f.line) <= 5)
+            .collect::<Vec<_>>();
+        if !agreers.is_empty() {
+            let max_conf = agreers
+                .iter()
+                .map(|o| o.confidence)
+                .fold(f.confidence, f64::max);
+            kept.push(Finding {
+                confidence: max_conf,
+                ..f
+            });
+        }
+    }
+    ModelReview {
+        summary: primary.summary,
+        findings: kept,
+        model_used: format!("consensus({})", models.join(", ")),
+        usage: total_usage,
+    }
+}
+
+/// Sequential await; consensus N is small so we avoid the futures crate.
+async fn futures_join_all<F, T>(futs: impl IntoIterator<Item = F>) -> Vec<Option<T>>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    let mut out = Vec::new();
+    for f in futs {
+        out.push(f.await.ok());
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::envelope::{Kind, Severity};
+
+    #[test]
+    fn extracts_json_from_fenced_output() {
+        let text = "Here you go:\n```json\n{\"summary\": \"s\", \"findings\": []}\n```";
+        let raw = parse_review(text).unwrap();
+        assert_eq!(raw.summary, "s");
+    }
+
+    #[test]
+    fn extracts_json_with_nested_braces_and_strings() {
+        let text = r#"{"summary": "has } brace and \" quote", "findings": []} trailing"#;
+        let raw = parse_review(text).unwrap();
+        assert!(raw.summary.contains("} brace"));
+    }
+
+    #[test]
+    fn rejects_non_json() {
+        assert!(parse_review("I could not review this.").is_err());
+    }
+
+    #[test]
+    fn into_review_normalizes() {
+        let raw = RawReview {
+            summary: " s ".into(),
+            findings: vec![RawFinding {
+                path: "./src/a.rs".into(),
+                line: 5,
+                end_line: Some(3), // invalid: before start, dropped
+                severity: "CRITICAL".into(),
+                kind: Some("human_escalation".into()),
+                confidence: 1.7,
+                title: "".into(),
+                body: "a body".into(),
+            }],
+        };
+        let r = into_review(raw, "m", Usage::default());
+        let f = &r.findings[0];
+        assert_eq!(f.path, "src/a.rs");
+        assert_eq!(f.severity, Severity::Error);
+        assert_eq!(f.kind, Kind::HumanEscalation);
+        assert_eq!(f.confidence, 1.0);
+        assert_eq!(f.end_line, None);
+        assert_eq!(f.title, "a body");
+    }
+
+    fn mk(model: &str, path: &str, line: u32, conf: f64) -> ModelReview {
+        ModelReview {
+            summary: format!("{model} summary"),
+            findings: vec![Finding {
+                path: path.into(),
+                line,
+                end_line: None,
+                severity: Severity::Warn,
+                kind: Kind::Risk,
+                confidence: conf,
+                title: "t".into(),
+                body: "b".into(),
+            }],
+            model_used: model.into(),
+            usage: Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+            },
+        }
+    }
+
+    #[test]
+    fn consensus_keeps_agreement_drops_solo() {
+        let a = mk("a", "x.rs", 10, 0.6);
+        let mut b = mk("b", "x.rs", 12, 0.9);
+        b.findings.push(Finding {
+            path: "solo.rs".into(),
+            line: 1,
+            end_line: None,
+            severity: Severity::Error,
+            kind: Kind::Risk,
+            confidence: 0.99,
+            title: "solo".into(),
+            body: "b".into(),
+        });
+        let merged = consensus_merge(vec![a, b]);
+        assert_eq!(merged.findings.len(), 1);
+        assert_eq!(merged.findings[0].confidence, 0.9);
+        assert_eq!(merged.usage.prompt_tokens, 20);
+        assert!(merged.model_used.starts_with("consensus("));
+    }
+}
