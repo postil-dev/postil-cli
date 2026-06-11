@@ -87,8 +87,9 @@ pub fn reconcile(
     let mut resolved = Vec::new();
     let mut carried = Vec::new();
     for f in baseline {
-        // Synthetic fail-closed findings never carry forward; each run re-earns trust.
-        if f.path == ".postil/model-output" {
+        // Synthetic findings (fail-closed, provider, truncation) never carry
+        // forward; each run re-earns trust and re-detects its own limits.
+        if f.path.starts_with(".postil/") {
             continue;
         }
         let end = f.end_line.unwrap_or(f.line);

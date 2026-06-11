@@ -148,8 +148,21 @@ async fn run_remote<F: Forge>(
                 } else {
                     CheckState::Success
                 };
+                // An operational failure inside the review (provider outage,
+                // unusable output) must stay visible on the advisory check —
+                // green-on-green would make an outage look like a clean pass
+                // when the gate stands aside under `gate.onError: advisory`.
+                let operational = envelope.findings.iter().any(|f| {
+                    f.path == crate::envelope::OPERATIONAL_PATH
+                        || f.path == crate::envelope::PROVIDER_PATH
+                });
+                let advisory_state = if operational {
+                    CheckState::Neutral
+                } else {
+                    CheckState::Success
+                };
                 forge
-                    .complete_checks(a, g, CheckState::Success, gate_state, &envelope)
+                    .complete_checks(a, g, advisory_state, gate_state, &envelope)
                     .await?;
             }
             finish(args, cfg, envelope, Some(forge)).await
@@ -268,7 +281,15 @@ async fn review_diff(
             }
             Err(e) => {
                 model_used = cfg.model_chain().join(" -> ");
-                findings = vec![fail_closed_finding(&format!("{e:#}"))];
+                let detail = format!("{e:#}");
+                // Provider-class failures (outage, timeout) are the only ones
+                // `gate.onError: advisory` may stand aside for; unusable model
+                // content is attacker-influenceable and always fails closed.
+                findings = vec![if e.downcast_ref::<crate::llm::ProviderError>().is_some() {
+                    crate::envelope::provider_error_finding(&detail)
+                } else {
+                    fail_closed_finding(&detail)
+                }];
             }
         }
         // A truncated review must never read as a full pass: the unreviewed
@@ -297,13 +318,15 @@ async fn review_diff(
     findings.extend(rec.carried);
 
     // Operational findings (model unreachable/unusable) fail the gate by default
-    // — fail closed. `gate.onError: advisory` lets the gate stand aside on an
-    // outage so a provider blip does not freeze every merge; the finding still
-    // shows in the output and on the advisory check.
+    // — fail closed. `gate.onError: advisory` lets the gate stand aside on a
+    // provider outage so a blip does not freeze every merge; the finding still
+    // shows in the output and the advisory check goes neutral. Unusable model
+    // output (OPERATIONAL_PATH) never bypasses the gate: a malicious diff can
+    // induce it via prompt injection.
     let advisory_on_error = cfg.gate_on_error == OnError::Advisory;
     let gate_failing = findings.iter().any(|f| {
         cfg.gate_fail_on.fails(f.severity)
-            && !(advisory_on_error && f.path == crate::envelope::OPERATIONAL_PATH)
+            && !(advisory_on_error && f.path == crate::envelope::PROVIDER_PATH)
     });
     let silent = findings.is_empty();
     let counts = Envelope::counts_of(&findings, suppressed);
@@ -335,6 +358,20 @@ async fn finish<F: Forge>(
     envelope: Envelope,
     forge: Option<&F>,
 ) -> Result<i32> {
+    // Persist artifacts before any forge I/O: a posting hiccup must not
+    // discard the completed review's SARIF or envelope output.
+    if let Some(path) = &args.sarif {
+        let sarif = crate::sarif::to_sarif(&envelope);
+        std::fs::write(path, serde_json::to_string_pretty(&sarif)?)
+            .with_context(|| format!("writing SARIF to {}", path.display()))?;
+    }
+
+    if args.output_json {
+        output::print_envelope_json(&envelope)?;
+    } else {
+        output::print_pretty(&envelope);
+    }
+
     if let Some(forge) = forge
         && !args.no_post
     {
@@ -354,23 +391,13 @@ async fn finish<F: Forge>(
                 .context("posting review")?;
         }
     }
-
-    if let Some(path) = &args.sarif {
-        let sarif = crate::sarif::to_sarif(&envelope);
-        std::fs::write(path, serde_json::to_string_pretty(&sarif)?)
-            .with_context(|| format!("writing SARIF to {}", path.display()))?;
-    }
-
-    if args.output_json {
-        output::print_envelope_json(&envelope)?;
-    } else {
-        output::print_pretty(&envelope);
-    }
     Ok(if envelope.gate.failing { 1 } else { 0 })
 }
 
 fn error_envelope(cfg: &Config, err: &anyhow::Error, head_sha: &str, meta: &PrMeta) -> Envelope {
-    let findings = vec![fail_closed_finding(&format!("{err:#}"))];
+    // Pre-review failures (PR meta or diff fetch) are forge transport errors,
+    // not model content — provider class.
+    let findings = vec![crate::envelope::provider_error_finding(&format!("{err:#}"))];
     let counts = Envelope::counts_of(&findings, 0);
     let buckets = Envelope::buckets_of(&findings);
     let blocking = cfg.gate_on_error == OnError::Block;

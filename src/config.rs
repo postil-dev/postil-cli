@@ -23,14 +23,15 @@ pub enum OnClean {
 }
 
 /// What the gate does when the review cannot complete (model outage, rate-limit
-/// exhaustion, malformed output). Default is fail closed.
+/// exhaustion). Default is fail closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OnError {
     /// Operational error fails the gate. Nothing merges on a broken review.
     Block,
-    /// Operational error passes the gate (advisory only). An outage does not
-    /// freeze every merge in the org; the review check still shows the error.
+    /// Provider outage passes the gate (advisory only): an outage does not
+    /// freeze every merge in the org; the review check goes neutral. Unusable
+    /// model output still blocks — that class is attacker-influenceable.
     Advisory,
 }
 
@@ -367,7 +368,7 @@ gate:
   failOn: error           # the postil/gate check fails at/above: info | warn | error | never
   # onError: block          # block (default, fail closed) | advisory — gate outcome when
   #                         # the review itself errors (model outage). advisory keeps an
-  #                         # outage from freezing merges; the review check still shows red.
+  #                         # outage from freezing merges; the review check goes neutral, not green.
 
 model:
   name: deepseek/deepseek-v4-pro

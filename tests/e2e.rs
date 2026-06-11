@@ -194,12 +194,47 @@ async fn advisory_on_error_lets_gate_stand_aside() {
         .map(|r| r.body_json().unwrap())
         .collect();
     assert_eq!(patches.len(), 2);
-    // Neither check is a failure; the gate stands aside on the operational error.
+    // The gate stands aside (success) but the outage stays visible: the
+    // advisory check goes neutral, never green-on-green.
     let conclusions: Vec<&str> = patches
         .iter()
         .map(|p| p["conclusion"].as_str().unwrap())
         .collect();
-    assert!(!conclusions.contains(&"failure"));
+    assert_eq!(conclusions, vec!["neutral", "success"]);
+}
+
+#[tokio::test]
+async fn advisory_does_not_bypass_unusable_output() {
+    let server = MockServer::start().await;
+    // Valid HTTP, garbage content twice (initial + repair): content-class
+    // failure. A malicious diff can induce this, so advisory must not bypass.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "I cannot review this diff, sorry."}}]
+        })))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    std::fs::write(
+        dir.path().join(".postil.yaml"),
+        "gate:\n  onError: advisory\n",
+    )
+    .unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .code(1);
+    let env: Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+    assert_eq!(env["findings"][0]["path"], ".postil/model-output");
+    assert_eq!(env["gate"]["failing"], true);
 }
 
 #[tokio::test]
@@ -225,7 +260,8 @@ async fn error_default_fails_closed_and_blocks() {
     let env: Value =
         serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
     assert_eq!(env["gate"]["failing"], true);
-    assert_eq!(env["findings"][0]["path"], ".postil/model-output");
+    // An HTTP-level model failure is provider-class, not unusable output.
+    assert_eq!(env["findings"][0]["path"], ".postil/provider");
 }
 
 #[tokio::test]

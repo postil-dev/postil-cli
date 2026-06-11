@@ -135,10 +135,16 @@ impl Envelope {
     }
 }
 
-/// Path marker for synthetic operational findings (model unreachable/unusable),
-/// as opposed to findings grounded in the diff. `gate.onError: advisory` keys
-/// off this to let the gate stand aside on an outage.
+/// Path marker for synthetic unusable-output findings (the model answered but
+/// the output could not be validated). A malicious diff can induce this class
+/// via prompt injection, so it always fails the gate — even under
+/// `gate.onError: advisory`.
 pub const OPERATIONAL_PATH: &str = ".postil/model-output";
+
+/// Path marker for synthetic provider findings (endpoint unreachable, HTTP
+/// errors, timeouts): outage-class failures the diff content cannot induce.
+/// This is the only class `gate.onError: advisory` lets stand aside.
+pub const PROVIDER_PATH: &str = ".postil/provider";
 
 /// The synthetic finding emitted when the model produced unusable output.
 /// Postil fails closed: a review that could not be trusted is an error, not a pass.
@@ -154,6 +160,23 @@ pub fn fail_closed_finding(detail: &str) -> Finding {
         body: format!(
             "Postil could not obtain a valid, diff-grounded review from the configured \
              model(s) and is failing closed rather than passing unreviewed code.\n\nDetail: {detail}"
+        ),
+    }
+}
+
+/// The synthetic finding emitted when the provider could not be reached at all.
+pub fn provider_error_finding(detail: &str) -> Finding {
+    Finding {
+        path: PROVIDER_PATH.to_string(),
+        line: 1,
+        end_line: None,
+        severity: Severity::Error,
+        kind: Kind::Uncertainty,
+        confidence: 1.0,
+        title: "Model provider unavailable".to_string(),
+        body: format!(
+            "Postil could not complete the model request and is failing closed rather \
+             than passing unreviewed code.\n\nDetail: {detail}"
         ),
     }
 }

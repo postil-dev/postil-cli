@@ -60,15 +60,32 @@ pub struct LlmClient {
 /// Retries per model on transient provider errors before the cascade moves on.
 const TRANSIENT_RETRIES: u32 = 2;
 
+/// Marker context attached to transport/provider-level failures (endpoint
+/// unreachable, HTTP error status, timeout, malformed HTTP envelope) — the
+/// class a malicious diff cannot induce. `gate.onError: advisory` stands aside
+/// only for errors carrying this marker; unusable model *content* (which
+/// prompt injection can cause) always fails closed.
+#[derive(Debug, Clone, Copy)]
+pub struct ProviderError;
+
+impl std::fmt::Display for ProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("model provider request failed")
+    }
+}
+
 fn retryable_status(status: u16) -> bool {
     matches!(status, 429 | 500 | 502 | 503 | 529)
 }
 
 impl LlmClient {
     pub fn from_env(cfg: &Config) -> Result<Self> {
-        let api_key = std::env::var("POSTIL_API_KEY")
-            .or_else(|_| std::env::var("OPENROUTER_API_KEY"))
-            .map_err(|_| {
+        // Set-but-empty must not shadow the fallback: CI commonly exports
+        // POSTIL_API_KEY="" when the input was omitted.
+        let api_key = ["POSTIL_API_KEY", "OPENROUTER_API_KEY"]
+            .iter()
+            .find_map(|name| std::env::var(name).ok().filter(|v| !v.trim().is_empty()))
+            .ok_or_else(|| {
                 anyhow!(
                     "no API key: set POSTIL_API_KEY (or OPENROUTER_API_KEY). \
                      Postil never proxies your inference; bring your own key."
@@ -76,7 +93,9 @@ impl LlmClient {
             })?;
         Ok(LlmClient {
             http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(180))
+                // Generation time scales with diff size; a thorough review of a
+                // truncation-limit diff can exceed 3 minutes of streaming.
+                .timeout(std::time::Duration::from_secs(600))
                 .build()?,
             api_base: cfg.api_base.trim_end_matches('/').to_string(),
             api_key,
@@ -100,15 +119,24 @@ impl LlmClient {
                 })
                 .collect();
             let mut ok: Vec<ModelReview> = Vec::new();
+            let mut last_err: Option<anyhow::Error> = None;
             for h in handles {
                 match h.await {
                     Ok(Ok(r)) => ok.push(r),
-                    Ok(Err(e)) => eprintln!("postil: consensus model failed: {e:#}"),
+                    Ok(Err(e)) => {
+                        eprintln!("postil: consensus model failed: {e:#}");
+                        last_err = Some(e);
+                    }
                     Err(e) => eprintln!("postil: consensus task panicked: {e}"),
                 }
             }
             match ok.len() {
-                0 => Err(anyhow!("all {n} consensus models failed")),
+                // Wrap the last failure so its error class (provider vs
+                // content) survives for gate.onError classification.
+                0 => Err(match last_err {
+                    Some(e) => e.context(format!("all {n} consensus models failed")),
+                    None => anyhow!("all {n} consensus models failed"),
+                }),
                 1 => Ok(ok.into_iter().next().unwrap()),
                 _ => Ok(consensus_merge(ok)),
             }
@@ -178,6 +206,19 @@ impl LlmClient {
     }
 
     async fn chat(
+        &self,
+        model: &str,
+        system: &str,
+        user: &str,
+        usage: &mut Usage,
+    ) -> Result<String> {
+        self.chat_inner(model, system, user, usage)
+            .await
+            .map_err(|e| e.context(ProviderError))
+    }
+
+    /// Transport + HTTP envelope handling; every error here is provider-class.
+    async fn chat_inner(
         &self,
         model: &str,
         system: &str,
@@ -351,34 +392,54 @@ fn into_review(raw: RawReview, model: &str, usage: Usage) -> ModelReview {
 }
 
 /// Keep findings at least two models agree on (same path, lines within 5).
-/// Confidence becomes the max among agreeing reports.
-fn consensus_merge(mut runs: Vec<ModelReview>) -> ModelReview {
+/// Agreement is symmetric: a finding two secondary models report is kept even
+/// if the primary missed it. The earliest run's wording represents a cluster
+/// (so the primary's phrasing wins when it participates); confidence becomes
+/// the max among agreeing reports.
+fn consensus_merge(runs: Vec<ModelReview>) -> ModelReview {
     let total_usage = Usage {
         prompt_tokens: runs.iter().map(|r| r.usage.prompt_tokens).sum(),
         completion_tokens: runs.iter().map(|r| r.usage.completion_tokens).sum(),
     };
     let models: Vec<String> = runs.iter().map(|r| r.model_used.clone()).collect();
-    let primary = runs.remove(0);
+    let summary = runs[0].summary.clone();
+    // Flatten in run order; greedy clustering then anchors each cluster on its
+    // earliest report.
+    let tagged: Vec<(usize, Finding)> = runs
+        .into_iter()
+        .enumerate()
+        .flat_map(|(i, r)| r.findings.into_iter().map(move |f| (i, f)))
+        .collect();
+    let mut consumed = vec![false; tagged.len()];
     let mut kept: Vec<Finding> = Vec::new();
-    let all_others: Vec<&Finding> = runs.iter().flat_map(|r| r.findings.iter()).collect();
-    for f in primary.findings {
-        let agreers = all_others
-            .iter()
-            .filter(|o| o.path == f.path && o.line.abs_diff(f.line) <= 5)
-            .collect::<Vec<_>>();
-        if !agreers.is_empty() {
-            let max_conf = agreers
-                .iter()
-                .map(|o| o.confidence)
-                .fold(f.confidence, f64::max);
+    for i in 0..tagged.len() {
+        if consumed[i] {
+            continue;
+        }
+        let (anchor_run, anchor) = &tagged[i];
+        let mut runs_agreeing = std::collections::HashSet::from([*anchor_run]);
+        let mut max_conf = anchor.confidence;
+        let mut members = vec![i];
+        for (j, (run, f)) in tagged.iter().enumerate().skip(i + 1) {
+            if consumed[j] || f.path != anchor.path || f.line.abs_diff(anchor.line) > 5 {
+                continue;
+            }
+            runs_agreeing.insert(*run);
+            max_conf = max_conf.max(f.confidence);
+            members.push(j);
+        }
+        for &j in &members {
+            consumed[j] = true;
+        }
+        if runs_agreeing.len() >= 2 {
             kept.push(Finding {
                 confidence: max_conf,
-                ..f
+                ..anchor.clone()
             });
         }
     }
     ModelReview {
-        summary: primary.summary,
+        summary,
         findings: kept,
         model_used: format!("consensus({})", models.join(", ")),
         usage: total_usage,
@@ -474,5 +535,38 @@ mod tests {
         assert_eq!(merged.findings[0].confidence, 0.9);
         assert_eq!(merged.usage.prompt_tokens, 20);
         assert!(merged.model_used.starts_with("consensus("));
+    }
+
+    #[test]
+    fn consensus_keeps_secondary_agreement_missed_by_primary() {
+        // Models b and c agree on y.rs:30; the primary never saw it. Symmetric
+        // agreement must keep it, anchored on b's wording.
+        let a = mk("a", "x.rs", 10, 0.6);
+        let b = mk("b", "y.rs", 30, 0.7);
+        let c = mk("c", "y.rs", 33, 0.8);
+        let merged = consensus_merge(vec![a, b, c]);
+        assert_eq!(merged.findings.len(), 1);
+        assert_eq!(merged.findings[0].path, "y.rs");
+        assert_eq!(merged.findings[0].line, 30);
+        assert_eq!(merged.findings[0].confidence, 0.8);
+    }
+
+    #[test]
+    fn consensus_same_model_twice_is_not_agreement() {
+        // Two nearby findings from one run must not corroborate each other.
+        let a = mk("a", "x.rs", 10, 0.6);
+        let mut b = mk("b", "y.rs", 30, 0.7);
+        b.findings.push(Finding {
+            path: "y.rs".into(),
+            line: 32,
+            end_line: None,
+            severity: Severity::Warn,
+            kind: Kind::Risk,
+            confidence: 0.9,
+            title: "t2".into(),
+            body: "b2".into(),
+        });
+        let merged = consensus_merge(vec![a, b]);
+        assert!(merged.findings.is_empty());
     }
 }
