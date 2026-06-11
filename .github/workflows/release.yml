@@ -4,12 +4,6 @@ on:
   push:
     tags: ["v*"]
 
-permissions:
-  contents: write
-  # Keyless signing: Sigstore issues a short-lived cert against the workflow's
-  # OIDC identity. No private key to store or rotate.
-  id-token: write
-
 jobs:
   build:
     strategy:
@@ -20,17 +14,26 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
           - target: x86_64-apple-darwin
-            os: macos-13
+            # macos-13 (the last plain Intel image) was retired in Dec 2025;
+            # macos-15-intel is the designated replacement.
+            os: macos-15-intel
           - target: aarch64-apple-darwin
             os: macos-latest
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      # Keyless signing: Sigstore issues a short-lived cert against the
+      # workflow's OIDC identity. No private key to store or rotate.
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - uses: sigstore/cosign-installer@v3
+      - run: cargo test --quiet
+      # SHA-pinned: this action handles the OIDC token.
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
       - run: cargo build --quiet --release --target ${{ matrix.target }}
       - name: Package, checksum, and sign
         env:
@@ -48,16 +51,38 @@ jobs:
           # Keyless Sigstore signature + certificate (provenance / authenticity).
           # Verify later with:
           #   cosign verify-blob "$art" --signature "$art.sig" --certificate "$art.pem" \
-          #     --certificate-identity-regexp 'https://github.com/postil-dev/postil-cli/.*' \
+          #     --certificate-identity-regexp 'https://github.com/postil-dev/postil-cli/\.github/workflows/release\.yml@refs/tags/.*' \
           #     --certificate-oidc-issuer https://token.actions.githubusercontent.com
           cosign sign-blob --yes \
             --output-signature "$art.sig" \
             --output-certificate "$art.pem" \
             "$art"
-      - uses: softprops/action-gh-release@v2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          files: |
+          name: release-${{ matrix.target }}
+          path: |
             target/${{ matrix.target }}/release/postil-${{ matrix.target }}.tar.gz
             target/${{ matrix.target }}/release/postil-${{ matrix.target }}.tar.gz.sha256
             target/${{ matrix.target }}/release/postil-${{ matrix.target }}.tar.gz.sig
             target/${{ matrix.target }}/release/postil-${{ matrix.target }}.tar.gz.pem
+          if-no-files-found: error
+          retention-days: 1
+
+  # Single fan-in publisher: four matrix legs racing to create the same
+  # release is a known 422 flake in action-gh-release.
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      # SHA-pinned: this action publishes the release assets.
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
