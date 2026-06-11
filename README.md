@@ -123,6 +123,19 @@ Hosted workers that already created an in-progress check-run should pass
 If a model response is not valid Postil JSON, the CLI fails closed by converting
 that response into an `error` finding at `.postil/model-output:1`.
 
+## Local Directory Reviews
+
+To review changes in a local Git working tree without GitHub context, pass
+`--local-dir`:
+
+```bash
+OPENROUTER_API_KEY=... postil review --local-dir . --output-json postil-review.json
+```
+
+Local mode reviews tracked changes against `HEAD` plus untracked text files
+under the requested directory, loads the same repository config files from the
+working tree, and skips GitHub review comments and check-runs.
+
 ## Testing
 
 ```bash
