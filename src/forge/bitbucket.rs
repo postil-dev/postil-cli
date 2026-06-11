@@ -166,8 +166,11 @@ impl Forge for Bitbucket {
     }
 
     async fn fetch_diff_since(&self, since_sha: &str, head_sha: &str) -> Result<String> {
-        // Bitbucket diff spec `{to}..{from}` renders the changes that take the
-        // repo from `from` to `to`; we want since..head, so spec is head..since.
+        // Bitbucket's `diff/{spec}` two-dot form is `{to}..{from}`: it renders the
+        // changes that take the repo from `from` to `to`. We want everything new
+        // between `since` and `head`, so `to` = head and `from` = since. Atlassian's
+        // docs are ambiguous on the order and we have no live instance in CI, so
+        // this ordering is best-evidence, not verified end to end — see ROADMAP.
         let resp = self
             .request(
                 reqwest::Method::GET,

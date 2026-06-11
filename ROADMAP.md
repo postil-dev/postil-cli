@@ -23,6 +23,10 @@
 
 - Sign release artifacts (cosign/minisign) and verify the signature in the installer;
   the current checksum guards against corruption, not a compromised release.
+- Validate the Bitbucket and Azure DevOps incremental (`--since-sha`) diff paths against
+  live instances. The full-PR-diff paths are exercised by tests; the incremental ones
+  depend on API conventions (Bitbucket's `diff/{spec}` two-dot order; Azure's
+  changed-file reconstruction) that we have not yet confirmed end to end.
 - Bitbucket inline-comment threading and Azure DevOps iteration-aware diffs for very
   large PRs.
 - Learning from dismissals: feed comment-resolution outcomes from the hosted platform

@@ -392,7 +392,10 @@ fn unified_file_diff(path: &str, old: &str, new: &str, is_add: bool, is_delete: 
     out
 }
 
-/// Minimal percent-encoding for the `path` query parameter.
+/// Minimal percent-encoding for the `path` query-parameter value. `/` is left
+/// literal on purpose: it appears after `?`, so it is unambiguously part of the
+/// query value (not the URL path), Azure accepts it, and some gateways reject an
+/// over-encoded `%2F`. Everything outside the RFC 3986 unreserved set is encoded.
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
