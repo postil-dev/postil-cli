@@ -99,9 +99,11 @@ pub enum Command {
         /// Issue number the mention is on.
         #[arg(long)]
         issue: Option<u64>,
-        /// The maintainer's message text (the mention body).
-        #[arg(long)]
-        comment: String,
+        /// The maintainer's message text (the mention body). Falls back to the
+        /// POSTIL_COMMENT environment variable — prefer that for automation:
+        /// argv is visible in `ps` and clap would reject text starting with `-`.
+        #[arg(long, allow_hyphen_values = true)]
+        comment: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
         #[arg(long)]

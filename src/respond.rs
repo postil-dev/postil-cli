@@ -22,8 +22,9 @@ pub struct RespondArgs {
     pub pr: Option<u64>,
     /// The issue number, when the mention is on an issue.
     pub issue: Option<u64>,
-    /// The maintainer's comment text (the mention).
-    pub comment: String,
+    /// The maintainer's comment text (the mention). When None, read from the
+    /// POSTIL_COMMENT environment variable — the safe path for automation.
+    pub comment: Option<String>,
     pub config: Option<PathBuf>,
     pub model: Option<String>,
     /// Print the answer instead of posting it.
@@ -48,6 +49,12 @@ pub async fn run(args: RespondArgs) -> Result<i32> {
         .clone()
         .or_else(|| std::env::var("GITHUB_REPOSITORY").ok())
         .ok_or_else(|| anyhow!("--repo owner/name is required"))?;
+    let comment = args
+        .comment
+        .clone()
+        .or_else(|| std::env::var("POSTIL_COMMENT").ok())
+        .filter(|c| !c.trim().is_empty())
+        .ok_or_else(|| anyhow!("the mention text is required: --comment or POSTIL_COMMENT"))?;
 
     // PR mentions get the diff for grounding; issue mentions get the issue body.
     let (number, context) = if let Some(pr) = args.pr {
@@ -86,7 +93,7 @@ pub async fn run(args: RespondArgs) -> Result<i32> {
     let system = prompt::respond_system_prompt(&cfg);
     let user = format!(
         "{context}\n--- Maintainer's message to you ---\n{}\n\nReply to the message above.",
-        args.comment.trim()
+        comment.trim()
     );
     let client = LlmClient::from_env(&cfg)?;
     let (answer, model_used) = client.answer(&cfg, &system, &user).await?;
