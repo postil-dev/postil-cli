@@ -73,8 +73,6 @@ struct ReviewArgs {
     diff_file: Option<PathBuf>,
     #[arg(long, value_name = "DIR")]
     local_dir: Option<PathBuf>,
-    #[arg(long)]
-    post: bool,
 }
 
 #[tokio::main]
@@ -365,11 +363,6 @@ impl LocalDiffSource {
             + args.base.is_some() as u8
             + args.diff_file.is_some() as u8
             + args.local_dir.is_some() as u8;
-        if args.post && requested > 0 {
-            anyhow::bail!(
-                "--post reviews the pull request diff from GitHub metadata; do not combine it with --staged, --base, --diff-file, or --local-dir"
-            );
-        }
         if requested > 1 {
             anyhow::bail!(
                 "choose only one local diff source: --staged, --base, --diff-file, or --local-dir"
@@ -399,10 +392,22 @@ impl LocalDiffSource {
 
     fn read(&self, limit: usize) -> Result<String> {
         let diff = match self {
-            Self::Staged => git_diff(&["diff", "--cached", "--no-ext-diff", "--unified=80"])?,
+            Self::Staged => git_diff(&[
+                "diff",
+                "--cached",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--unified=80",
+            ])?,
             Self::Base(base) => {
                 let range = format!("{base}...HEAD");
-                git_diff(&["diff", "--no-ext-diff", "--unified=80", &range])?
+                git_diff(&[
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--unified=80",
+                    &range,
+                ])?
             }
             Self::DiffFile(path) => {
                 fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?

@@ -132,9 +132,9 @@ To review changes in a local Git working tree without GitHub context, pass
 OPENROUTER_API_KEY=... postil review --local-dir . --output-json postil-review.json
 ```
 
-Local mode reviews tracked changes against `HEAD` plus untracked text files,
-loads the same repository config files from the working tree, and skips GitHub
-review comments and check-runs.
+Local mode reviews tracked changes against `HEAD` plus untracked text files
+under the requested directory, loads the same repository config files from the
+working tree, and skips GitHub review comments and check-runs.
 
 ## Testing
 

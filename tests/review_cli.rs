@@ -106,6 +106,8 @@ async fn truncates_local_directory_diff_on_utf8_boundary() {
 
 #[tokio::test]
 async fn skips_large_untracked_files_in_local_directory_mode() {
+    let openrouter = MockServer::start().await;
+    let openrouter_uri = openrouter.uri();
     let dir = tempdir().unwrap();
     let repo = dir.path().join("repo");
     fs::create_dir(&repo).unwrap();
@@ -117,6 +119,16 @@ async fn skips_large_untracked_files_in_local_directory_mode() {
     git(&repo, ["commit", "-m", "initial"]);
     fs::write(repo.join("large.txt"), "x".repeat(4096)).unwrap();
 
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("large.txt"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "{\"summary\":\"\",\"findings\":[]}"} }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        })))
+        .mount(&openrouter)
+        .await;
+
     Command::cargo_bin("postil")
         .unwrap()
         .env_remove("GITHUB_TOKEN")
@@ -125,12 +137,17 @@ async fn skips_large_untracked_files_in_local_directory_mode() {
             "review",
             "--local-dir",
             repo.to_str().unwrap(),
+            "--openrouter-api-url",
+            &openrouter_uri,
+            "--review-model",
+            "xiaomi/mimo-v2.5-pro",
             "--diff-limit",
             "128",
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("empty diff - nothing to review"));
+        .stdout(predicate::str::contains("local diff (local directory"))
+        .stdout(predicate::str::contains("success (0 findings"));
 }
 
 #[tokio::test]
@@ -197,7 +214,6 @@ review:
         .unwrap()
         .args([
             "review",
-            "--post",
             "--config",
             config.to_str().unwrap(),
             "--output-json",
@@ -215,7 +231,13 @@ review:
 
 fn git<const N: usize>(repo: &std::path::Path, args: [&str; N]) {
     let output = std::process::Command::new("git")
-        .arg("-C")
+        .args([
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-C",
+        ])
         .arg(repo)
         .args(args)
         .output()
