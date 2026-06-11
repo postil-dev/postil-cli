@@ -89,7 +89,10 @@ impl Bitbucket {
     }
 
     fn request(&self, method: reqwest::Method, url: String) -> reqwest::RequestBuilder {
-        let rb = self.http.request(method, url).header("User-Agent", "postil");
+        let rb = self
+            .http
+            .request(method, url)
+            .header("User-Agent", "postil");
         match &self.auth {
             Auth::Bearer(t) => rb.bearer_auth(t),
             Auth::Basic { user, pass } => rb.basic_auth(user, Some(pass)),
@@ -118,13 +121,7 @@ impl Bitbucket {
         Ok(Self::check_ok(resp, "PR fetch").await?.json().await?)
     }
 
-    async fn set_status(
-        &self,
-        sha: &str,
-        key: &str,
-        state: &str,
-        description: &str,
-    ) -> Result<()> {
+    async fn set_status(&self, sha: &str, key: &str, state: &str, description: &str) -> Result<()> {
         let resp = self
             .request(
                 reqwest::Method::POST,
@@ -182,7 +179,12 @@ impl Forge for Bitbucket {
         Ok(Self::check_ok(resp, "compare fetch").await?.text().await?)
     }
 
-    async fn post_review(&self, summary: &str, findings: &[Finding], _head_sha: &str) -> Result<()> {
+    async fn post_review(
+        &self,
+        summary: &str,
+        findings: &[Finding],
+        _head_sha: &str,
+    ) -> Result<()> {
         for f in findings {
             if f.body.starts_with("[carried from previous review]") {
                 continue;
@@ -241,8 +243,13 @@ impl Forge for Bitbucket {
     }
 
     async fn start_checks(&self, head_sha: &str) -> Result<(String, String)> {
-        self.set_status(head_sha, "postil/review", "INPROGRESS", "review in progress")
-            .await?;
+        self.set_status(
+            head_sha,
+            "postil/review",
+            "INPROGRESS",
+            "review in progress",
+        )
+        .await?;
         self.set_status(head_sha, "postil/gate", "INPROGRESS", "gate pending")
             .await?;
         Ok(("postil/review".to_string(), "postil/gate".to_string()))
@@ -265,10 +272,19 @@ impl Forge for Bitbucket {
             // No neutral on Bitbucket; an errored run must not read as a pass.
             CheckState::Failure | CheckState::Neutral => "FAILED",
         };
-        self.set_status(&head, "postil/review", map(advisory), &check_summary(envelope))
-            .await?;
+        self.set_status(
+            &head,
+            "postil/review",
+            map(advisory),
+            &check_summary(envelope),
+        )
+        .await?;
         let gate_desc = if envelope.gate.failing {
-            format!("failing at {}: {}", envelope.gate.fail_on, check_title(envelope))
+            format!(
+                "failing at {}: {}",
+                envelope.gate.fail_on,
+                check_title(envelope)
+            )
         } else {
             format!("passing (failOn: {})", envelope.gate.fail_on)
         };

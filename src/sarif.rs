@@ -28,10 +28,22 @@ fn rule_id(kind: Kind) -> &'static str {
 
 fn rule_descriptions() -> Vec<Value> {
     [
-        (Kind::Risk, "Concrete defect: bug, security, or correctness issue."),
-        (Kind::HumanEscalation, "A consequential decision an accountable human must confirm."),
-        (Kind::Guardrail, "Violation of a stated repository guardrail."),
-        (Kind::Uncertainty, "Something critical could not be verified from the diff."),
+        (
+            Kind::Risk,
+            "Concrete defect: bug, security, or correctness issue.",
+        ),
+        (
+            Kind::HumanEscalation,
+            "A consequential decision an accountable human must confirm.",
+        ),
+        (
+            Kind::Guardrail,
+            "Violation of a stated repository guardrail.",
+        ),
+        (
+            Kind::Uncertainty,
+            "Something critical could not be verified from the diff.",
+        ),
     ]
     .into_iter()
     .map(|(k, desc)| {
@@ -108,7 +120,10 @@ mod tests {
             confidence_buckets: Envelope::buckets_of(&findings),
             findings,
             resolved: vec![],
-            gate: Gate { fail_on: "error".into(), failing: true },
+            gate: Gate {
+                fail_on: "error".into(),
+                failing: true,
+            },
             model_used: "m".into(),
             usage: Usage::default(),
             base_sha: None,
@@ -133,8 +148,14 @@ mod tests {
         let r = &s["runs"][0]["results"][0];
         assert_eq!(r["ruleId"], "postil/risk");
         assert_eq!(r["level"], "error");
-        assert_eq!(r["locations"][0]["physicalLocation"]["region"]["startLine"], 12);
-        assert_eq!(r["locations"][0]["physicalLocation"]["region"]["endLine"], 14);
+        assert_eq!(
+            r["locations"][0]["physicalLocation"]["region"]["startLine"],
+            12
+        );
+        assert_eq!(
+            r["locations"][0]["physicalLocation"]["region"]["endLine"],
+            14
+        );
         assert_eq!(r["properties"]["confidence"], 0.9);
         let _ = &s["$schema"];
         assert_eq!(s["version"], "2.1.0");

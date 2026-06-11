@@ -119,7 +119,8 @@ async fn sarif_is_written_for_local_review() {
         .arg(&sarif_path)
         .assert()
         .code(1);
-    let sarif: Value = serde_json::from_str(&std::fs::read_to_string(&sarif_path).unwrap()).unwrap();
+    let sarif: Value =
+        serde_json::from_str(&std::fs::read_to_string(&sarif_path).unwrap()).unwrap();
     assert_eq!(sarif["version"], "2.1.0");
     let result = &sarif["runs"][0]["results"][0];
     assert_eq!(result["ruleId"], "postil/risk");
@@ -679,7 +680,9 @@ async fn bitbucket_flow_posts_comment_and_sets_statuses() {
         .mount(&server)
         .await;
     Mock::given(method("POST"))
-        .and(path_regex(r"^/repositories/acme/api/commit/.+/statuses/build$"))
+        .and(path_regex(
+            r"^/repositories/acme/api/commit/.+/statuses/build$",
+        ))
         .respond_with(ResponseTemplate::new(201).set_body_json(json!({})))
         .mount(&server)
         .await;
@@ -797,12 +800,16 @@ async fn azure_flow_reconstructs_diff_and_posts_thread() {
         .mount(&server)
         .await;
     Mock::given(method("POST"))
-        .and(path("/myorg/myproj/_apis/git/repositories/myrepo/pullRequests/7/statuses"))
+        .and(path(
+            "/myorg/myproj/_apis/git/repositories/myrepo/pullRequests/7/statuses",
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .mount(&server)
         .await;
     Mock::given(method("POST"))
-        .and(path("/myorg/myproj/_apis/git/repositories/myrepo/pullRequests/7/threads"))
+        .and(path(
+            "/myorg/myproj/_apis/git/repositories/myrepo/pullRequests/7/threads",
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .mount(&server)
         .await;

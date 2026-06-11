@@ -62,10 +62,7 @@ impl GitHub {
     /// Title and body of an issue or PR (the issues API covers both).
     pub async fn fetch_issue(&self, number: u64) -> Result<(String, String)> {
         let resp = self
-            .request(
-                reqwest::Method::GET,
-                self.url(&format!("/issues/{number}")),
-            )
+            .request(reqwest::Method::GET, self.url(&format!("/issues/{number}")))
             .send()
             .await
             .context("fetching issue")?;

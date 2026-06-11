@@ -93,8 +93,7 @@ impl LlmClient {
                 .iter()
                 .map(|m| {
                     let client = self.clone();
-                    let (model, system, user) =
-                        (m.clone(), system.to_string(), user.to_string());
+                    let (model, system, user) = (m.clone(), system.to_string(), user.to_string());
                     tokio::spawn(
                         async move { client.review_with_model(&model, &system, &user).await },
                     )

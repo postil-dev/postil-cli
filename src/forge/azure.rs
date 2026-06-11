@@ -161,7 +161,10 @@ impl Azure {
             .send()
             .await
             .context("fetching change list")?;
-        let diff: DiffResponse = Self::check_ok(resp, "change list fetch").await?.json().await?;
+        let diff: DiffResponse = Self::check_ok(resp, "change list fetch")
+            .await?
+            .json()
+            .await?;
 
         let mut out = String::new();
         for change in &diff.changes {
@@ -191,7 +194,13 @@ impl Azure {
         Ok(out)
     }
 
-    async fn set_status(&self, sha: &str, name: &str, state: &str, description: &str) -> Result<()> {
+    async fn set_status(
+        &self,
+        sha: &str,
+        name: &str,
+        state: &str,
+        description: &str,
+    ) -> Result<()> {
         // PR statuses live under the PR, keyed by genre/name.
         let body = json!({
             "state": state,
@@ -238,7 +247,12 @@ impl Forge for Azure {
         self.build_diff(since_sha, head_sha).await
     }
 
-    async fn post_review(&self, summary: &str, findings: &[Finding], _head_sha: &str) -> Result<()> {
+    async fn post_review(
+        &self,
+        summary: &str,
+        findings: &[Finding],
+        _head_sha: &str,
+    ) -> Result<()> {
         for f in findings {
             if f.body.starts_with("[carried from previous review]") {
                 continue;
@@ -334,10 +348,19 @@ impl Forge for Azure {
             // No neutral on Azure; an errored run must not read as a pass.
             CheckState::Failure | CheckState::Neutral => "failed",
         };
-        self.set_status(&head, "postil/review", map(advisory), &check_summary(envelope))
-            .await?;
+        self.set_status(
+            &head,
+            "postil/review",
+            map(advisory),
+            &check_summary(envelope),
+        )
+        .await?;
         let gate_desc = if envelope.gate.failing {
-            format!("failing at {}: {}", envelope.gate.fail_on, check_title(envelope))
+            format!(
+                "failing at {}: {}",
+                envelope.gate.fail_on,
+                check_title(envelope)
+            )
         } else {
             format!("passing (failOn: {})", envelope.gate.fail_on)
         };
