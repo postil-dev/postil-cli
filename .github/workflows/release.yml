@@ -6,6 +6,9 @@ on:
 
 permissions:
   contents: write
+  # Keyless signing: Sigstore issues a short-lived cert against the workflow's
+  # OIDC identity. No private key to store or rotate.
+  id-token: write
 
 jobs:
   build:
@@ -27,15 +30,34 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+      - uses: sigstore/cosign-installer@v3
       - run: cargo build --quiet --release --target ${{ matrix.target }}
-      - name: Package
+      - name: Package, checksum, and sign
+        env:
+          COSIGN_YES: "true"
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf postil-${{ matrix.target }}.tar.gz postil
-          sha256sum postil-${{ matrix.target }}.tar.gz > postil-${{ matrix.target }}.tar.gz.sha256 \
-            || shasum -a 256 postil-${{ matrix.target }}.tar.gz > postil-${{ matrix.target }}.tar.gz.sha256
+          art="postil-${{ matrix.target }}.tar.gz"
+          tar czf "$art" postil
+          # SHA-256 checksum (corruption / transit integrity).
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$art" > "$art.sha256"
+          else
+            shasum -a 256 "$art" > "$art.sha256"
+          fi
+          # Keyless Sigstore signature + certificate (provenance / authenticity).
+          # Verify later with:
+          #   cosign verify-blob "$art" --signature "$art.sig" --certificate "$art.pem" \
+          #     --certificate-identity-regexp 'https://github.com/postil-dev/postil-cli/.*' \
+          #     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+          cosign sign-blob --yes \
+            --output-signature "$art.sig" \
+            --output-certificate "$art.pem" \
+            "$art"
       - uses: softprops/action-gh-release@v2
         with:
           files: |
             target/${{ matrix.target }}/release/postil-${{ matrix.target }}.tar.gz
             target/${{ matrix.target }}/release/postil-${{ matrix.target }}.tar.gz.sha256
+            target/${{ matrix.target }}/release/postil-${{ matrix.target }}.tar.gz.sig
+            target/${{ matrix.target }}/release/postil-${{ matrix.target }}.tar.gz.pem
