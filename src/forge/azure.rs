@@ -42,8 +42,9 @@ struct PrResponse {
     title: String,
     #[serde(default)]
     description: String,
-    last_merge_source_commit: MergeCommit,
-    last_merge_target_commit: MergeCommit,
+    // Absent on PRs with merge conflicts; surfaced as an actionable error.
+    last_merge_source_commit: Option<MergeCommit>,
+    last_merge_target_commit: Option<MergeCommit>,
 }
 
 #[derive(Deserialize)]
@@ -55,17 +56,25 @@ struct ChangeItem {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct Change {
     #[serde(default)]
     item: Option<ChangeItem>,
-    #[serde(rename = "changeType", default)]
+    #[serde(default)]
     change_type: String,
+    /// Original path for renames; content lookups on the base side use it.
+    #[serde(default)]
+    source_server_item: Option<String>,
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct DiffResponse {
     #[serde(default)]
     changes: Vec<Change>,
+    /// False when the change list is paginated and this page is partial.
+    #[serde(default)]
+    all_changes_included: Option<bool>,
 }
 
 impl Azure {
@@ -151,23 +160,50 @@ impl Azure {
         Ok(Self::check_ok(resp, "item fetch").await?.text().await?)
     }
 
+    /// The full change list across pages. `/diffs/commits` pages `changes`
+    /// ($top defaults to 100); consuming one page would silently review only
+    /// part of a large PR and pass the rest unseen — so this paginates to
+    /// exhaustion and fails closed on a runaway list rather than truncating.
+    async fn change_list(&self, base_sha: &str, head_sha: &str) -> Result<Vec<Change>> {
+        const PAGE: usize = 100;
+        const MAX_CHANGES: usize = 20_000;
+        let mut changes: Vec<Change> = Vec::new();
+        loop {
+            let q = format!(
+                "baseVersion={base_sha}&baseVersionType=commit&\
+                 targetVersion={head_sha}&targetVersionType=commit&\
+                 $top={PAGE}&$skip={}",
+                changes.len()
+            );
+            let resp = self
+                .request(reqwest::Method::GET, self.url("/diffs/commits", &q))
+                .send()
+                .await
+                .context("fetching change list")?;
+            let page: DiffResponse = Self::check_ok(resp, "change list fetch")
+                .await?
+                .json()
+                .await?;
+            let n = page.changes.len();
+            changes.extend(page.changes);
+            // A short page with no explicit "more" marker means exhaustion.
+            if n == 0 || (n < PAGE && page.all_changes_included != Some(false)) {
+                return Ok(changes);
+            }
+            if changes.len() > MAX_CHANGES {
+                return Err(anyhow!(
+                    "PR change list exceeds {MAX_CHANGES} entries; refusing to review a \
+                     truncated change set"
+                ));
+            }
+        }
+    }
+
     async fn build_diff(&self, base_sha: &str, head_sha: &str) -> Result<String> {
-        let q = format!(
-            "baseVersion={base_sha}&baseVersionType=commit&\
-             targetVersion={head_sha}&targetVersionType=commit"
-        );
-        let resp = self
-            .request(reqwest::Method::GET, self.url("/diffs/commits", &q))
-            .send()
-            .await
-            .context("fetching change list")?;
-        let diff: DiffResponse = Self::check_ok(resp, "change list fetch")
-            .await?
-            .json()
-            .await?;
+        let changes = self.change_list(base_sha, head_sha).await?;
 
         let mut out = String::new();
-        for change in &diff.changes {
+        for change in &changes {
             let Some(item) = &change.item else { continue };
             if item.is_folder || item.path.is_empty() {
                 continue;
@@ -176,10 +212,16 @@ impl Azure {
             let ct = change.change_type.to_ascii_lowercase();
             let is_add = ct.contains("add");
             let is_delete = ct.contains("delete");
+            // Renames keep their history under the original path on the base side.
+            let base_path = change
+                .source_server_item
+                .as_deref()
+                .map(|p| p.trim_start_matches('/'))
+                .unwrap_or(path);
             let old = if is_add {
                 String::new()
             } else {
-                self.item_at(path, base_sha).await?
+                self.item_at(base_path, base_sha).await?
             };
             let new = if is_delete {
                 String::new()
@@ -189,9 +231,73 @@ impl Azure {
             if old == new {
                 continue;
             }
+            // Binary content cannot be line-diffed; mark it like git does so
+            // the path is still visible in the review context.
+            if old.contains('\0') || new.contains('\0') {
+                out.push_str(&format!(
+                    "diff --git a/{path} b/{path}\nBinary files a/{path} and b/{path} differ\n"
+                ));
+                continue;
+            }
             out.push_str(&unified_file_diff(path, &old, &new, is_add, is_delete));
         }
         Ok(out)
+    }
+
+    /// Post one finding as an anchored thread, falling back to a non-anchored
+    /// thread when Azure rejects the inline position.
+    async fn post_finding(&self, f: &Finding) -> Result<()> {
+        // Azure threads anchor to a file + line range with right-side context.
+        let body = json!({
+            "comments": [{
+                "parentCommentId": 0,
+                "commentType": 1,
+                "content": format!(
+                    "**{}** ({} / {} confidence)\n\n{}",
+                    f.title, f.severity.as_str(), super::format_confidence(f.confidence), f.body
+                ),
+            }],
+            "status": 1,
+            "threadContext": {
+                "filePath": format!("/{}", f.path),
+                "rightFileStart": { "line": f.line, "offset": 1 },
+                "rightFileEnd": { "line": f.end_line.unwrap_or(f.line), "offset": 1 },
+            },
+        });
+        let resp = self
+            .request(
+                reqwest::Method::POST,
+                self.url(&format!("/pullRequests/{}/threads", self.pr), ""),
+            )
+            .json(&body)
+            .send()
+            .await
+            .context("posting review thread")?;
+        if resp.status().is_success() {
+            return Ok(());
+        }
+        let note = json!({
+            "comments": [{
+                "parentCommentId": 0,
+                "commentType": 1,
+                "content": format!(
+                    "`{}:{}` **{}** ({})\n\n{}",
+                    f.path, f.line, f.title, f.severity.as_str(), f.body
+                ),
+            }],
+            "status": 1,
+        });
+        let resp = self
+            .request(
+                reqwest::Method::POST,
+                self.url(&format!("/pullRequests/{}/threads", self.pr), ""),
+            )
+            .json(&note)
+            .send()
+            .await
+            .context("posting fallback thread")?;
+        Self::check_ok(resp, "thread post").await?;
+        Ok(())
     }
 
     async fn set_status(
@@ -226,21 +332,21 @@ impl Azure {
 impl Forge for Azure {
     async fn fetch_pr_meta(&self) -> Result<PrMeta> {
         let pr = self.pr().await?;
+        let (source, target) =
+            merge_commits(pr.last_merge_source_commit, pr.last_merge_target_commit)?;
         Ok(PrMeta {
             title: pr.title,
             body: pr.description,
-            head_sha: pr.last_merge_source_commit.commit_id,
-            base_sha: pr.last_merge_target_commit.commit_id,
+            head_sha: source.commit_id,
+            base_sha: target.commit_id,
         })
     }
 
     async fn fetch_diff(&self) -> Result<String> {
         let pr = self.pr().await?;
-        self.build_diff(
-            &pr.last_merge_target_commit.commit_id,
-            &pr.last_merge_source_commit.commit_id,
-        )
-        .await
+        let (source, target) =
+            merge_commits(pr.last_merge_source_commit, pr.last_merge_target_commit)?;
+        self.build_diff(&target.commit_id, &source.commit_id).await
     }
 
     async fn fetch_diff_since(&self, since_sha: &str, head_sha: &str) -> Result<String> {
@@ -253,59 +359,15 @@ impl Forge for Azure {
         findings: &[Finding],
         _head_sha: &str,
     ) -> Result<()> {
+        // One failed comment must not drop the rest: post everything we can,
+        // then report the failures together.
+        let mut failures: Vec<String> = Vec::new();
         for f in findings {
             if f.body.starts_with("[carried from previous review]") {
                 continue;
             }
-            // Azure threads anchor to a file + line range with right-side context.
-            let body = json!({
-                "comments": [{
-                    "parentCommentId": 0,
-                    "commentType": 1,
-                    "content": format!(
-                        "**{}** ({} / {} confidence)\n\n{}",
-                        f.title, f.severity.as_str(), super::format_confidence(f.confidence), f.body
-                    ),
-                }],
-                "status": 1,
-                "threadContext": {
-                    "filePath": format!("/{}", f.path),
-                    "rightFileStart": { "line": f.line, "offset": 1 },
-                    "rightFileEnd": { "line": f.end_line.unwrap_or(f.line), "offset": 1 },
-                },
-            });
-            let resp = self
-                .request(
-                    reqwest::Method::POST,
-                    self.url(&format!("/pullRequests/{}/threads", self.pr), ""),
-                )
-                .json(&body)
-                .send()
-                .await
-                .context("posting review thread")?;
-            if !resp.status().is_success() {
-                // Fall back to a non-anchored thread.
-                let note = json!({
-                    "comments": [{
-                        "parentCommentId": 0,
-                        "commentType": 1,
-                        "content": format!(
-                            "`{}:{}` **{}** ({})\n\n{}",
-                            f.path, f.line, f.title, f.severity.as_str(), f.body
-                        ),
-                    }],
-                    "status": 1,
-                });
-                let resp = self
-                    .request(
-                        reqwest::Method::POST,
-                        self.url(&format!("/pullRequests/{}/threads", self.pr), ""),
-                    )
-                    .json(&note)
-                    .send()
-                    .await
-                    .context("posting fallback thread")?;
-                Self::check_ok(resp, "thread post").await?;
+            if let Err(e) = self.post_finding(f).await {
+                failures.push(format!("{}:{}: {e:#}", f.path, f.line));
             }
         }
         if !summary.is_empty() {
@@ -323,7 +385,15 @@ impl Forge for Azure {
                 .context("posting summary thread")?;
             Self::check_ok(resp, "summary post").await?;
         }
-        Ok(())
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "{} finding comment(s) failed to post: {}",
+                failures.len(),
+                failures.join("; ")
+            ))
+        }
     }
 
     async fn start_checks(&self, head_sha: &str) -> Result<(String, String)> {
@@ -367,6 +437,20 @@ impl Forge for Azure {
         self.set_status(&head, "postil/gate", map(gate), &gate_desc)
             .await?;
         Ok(())
+    }
+}
+
+/// Both merge commits, or an actionable error: Azure omits them on PRs with
+/// merge conflicts, where there is no merge preview to diff.
+fn merge_commits(
+    source: Option<MergeCommit>,
+    target: Option<MergeCommit>,
+) -> Result<(MergeCommit, MergeCommit)> {
+    match (source, target) {
+        (Some(s), Some(t)) => Ok((s, t)),
+        _ => Err(anyhow!(
+            "PR has no merge commits (does it have merge conflicts?); resolve conflicts and re-run"
+        )),
     }
 }
 

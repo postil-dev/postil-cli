@@ -109,6 +109,48 @@ impl Bitbucket {
         Err(anyhow!("Bitbucket {what} failed: {status}: {snippet}"))
     }
 
+    /// Post one finding inline, falling back to a top-level comment when the
+    /// API refuses the inline position.
+    async fn post_finding(&self, f: &Finding) -> Result<()> {
+        let body = json!({
+            "content": { "raw": format!(
+                "**{}** ({} / {} confidence)\n\n{}",
+                f.title,
+                f.severity.as_str(),
+                super::format_confidence(f.confidence),
+                f.body
+            )},
+            "inline": { "path": f.path, "to": f.line },
+        });
+        let resp = self
+            .request(
+                reqwest::Method::POST,
+                self.url(&format!("/pullrequests/{}/comments", self.pr)),
+            )
+            .json(&body)
+            .send()
+            .await
+            .context("posting inline comment")?;
+        if resp.status().is_success() {
+            return Ok(());
+        }
+        let note = json!({ "content": { "raw": format!(
+            "`{}:{}` **{}** ({})\n\n{}",
+            f.path, f.line, f.title, f.severity.as_str(), f.body
+        )}});
+        let resp = self
+            .request(
+                reqwest::Method::POST,
+                self.url(&format!("/pullrequests/{}/comments", self.pr)),
+            )
+            .json(&note)
+            .send()
+            .await
+            .context("posting fallback comment")?;
+        Self::check_ok(resp, "comment post").await?;
+        Ok(())
+    }
+
     async fn pr_meta(&self) -> Result<PrResponse> {
         let resp = self
             .request(
@@ -188,46 +230,15 @@ impl Forge for Bitbucket {
         findings: &[Finding],
         _head_sha: &str,
     ) -> Result<()> {
+        // One failed comment must not drop the rest: post everything we can,
+        // then report the failures together.
+        let mut failures: Vec<String> = Vec::new();
         for f in findings {
             if f.body.starts_with("[carried from previous review]") {
                 continue;
             }
-            let body = json!({
-                "content": { "raw": format!(
-                    "**{}** ({} / {} confidence)\n\n{}",
-                    f.title,
-                    f.severity.as_str(),
-                    super::format_confidence(f.confidence),
-                    f.body
-                )},
-                "inline": { "path": f.path, "to": f.line },
-            });
-            let resp = self
-                .request(
-                    reqwest::Method::POST,
-                    self.url(&format!("/pullrequests/{}/comments", self.pr)),
-                )
-                .json(&body)
-                .send()
-                .await
-                .context("posting inline comment")?;
-            // An inline position the API refuses falls back to a top-level
-            // comment rather than dropping the finding.
-            if !resp.status().is_success() {
-                let note = json!({ "content": { "raw": format!(
-                    "`{}:{}` **{}** ({})\n\n{}",
-                    f.path, f.line, f.title, f.severity.as_str(), f.body
-                )}});
-                let resp = self
-                    .request(
-                        reqwest::Method::POST,
-                        self.url(&format!("/pullrequests/{}/comments", self.pr)),
-                    )
-                    .json(&note)
-                    .send()
-                    .await
-                    .context("posting fallback comment")?;
-                Self::check_ok(resp, "comment post").await?;
+            if let Err(e) = self.post_finding(f).await {
+                failures.push(format!("{}:{}: {e:#}", f.path, f.line));
             }
         }
         if !summary.is_empty() {
@@ -242,7 +253,15 @@ impl Forge for Bitbucket {
                 .context("posting summary comment")?;
             Self::check_ok(resp, "summary post").await?;
         }
-        Ok(())
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "{} finding comment(s) failed to post: {}",
+                failures.len(),
+                failures.join("; ")
+            ))
+        }
     }
 
     async fn start_checks(&self, head_sha: &str) -> Result<(String, String)> {
