@@ -396,7 +396,10 @@ async fn finish<F: Forge>(
 
 fn error_envelope(cfg: &Config, err: &anyhow::Error, head_sha: &str, meta: &PrMeta) -> Envelope {
     // Pre-review failures (PR meta or diff fetch) are forge transport errors,
-    // not model content — provider class.
+    // not model content — provider class. A PR author can induce a subset
+    // (merge-conflict PRs, >20k-file change lists), so advisory mode bypasses
+    // those too; accepted because a conflicted PR cannot merge anyway and a
+    // 20k-file PR is conspicuous, but revisit if either proves abusable.
     let findings = vec![crate::envelope::provider_error_finding(&format!("{err:#}"))];
     let counts = Envelope::counts_of(&findings, 0);
     let buckets = Envelope::buckets_of(&findings);
