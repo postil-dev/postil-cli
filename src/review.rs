@@ -4,11 +4,14 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
 
-use crate::config::{Config, GateLevel};
+use crate::config::{Config, GateLevel, OnError};
 use crate::diff::{self, DiffIndex};
 use crate::envelope::{Envelope, Finding, Gate, Usage, fail_closed_finding};
 use crate::filter;
-use crate::forge::{CheckState, Forge, PrMeta, check_summary, github::GitHub, gitlab::GitLab};
+use crate::forge::{
+    CheckState, Forge, PrMeta, azure::Azure, bitbucket::Bitbucket, check_summary, github::GitHub,
+    gitlab::GitLab,
+};
 use crate::llm::LlmClient;
 use crate::local::{self, LocalSource};
 use crate::output;
@@ -20,6 +23,8 @@ const MAX_DIFF_BYTES: usize = 400_000;
 pub enum ForgeKind {
     GitHub,
     GitLab,
+    Bitbucket,
+    Azure,
     Local,
 }
 
@@ -36,6 +41,7 @@ pub struct ReviewArgs {
     pub since_sha: Option<String>,
     pub baseline: Option<PathBuf>,
     pub output_json: bool,
+    pub sarif: Option<PathBuf>,
     pub fail_on: Option<String>,
     pub config: Option<PathBuf>,
     pub model: Option<String>,
@@ -63,6 +69,16 @@ pub async fn run(args: ReviewArgs) -> Result<i32> {
         ForgeKind::GitLab => {
             let repo = require_repo(&args)?;
             let forge = GitLab::new(&repo, require_pr(&args)?)?;
+            run_remote(&args, &cfg, &forge, &repo).await
+        }
+        ForgeKind::Bitbucket => {
+            let repo = require_repo(&args)?;
+            let forge = Bitbucket::new(&repo, require_pr(&args)?)?;
+            run_remote(&args, &cfg, &forge, &repo).await
+        }
+        ForgeKind::Azure => {
+            let repo = require_repo(&args)?;
+            let forge = Azure::new(&repo, require_pr(&args)?)?;
             run_remote(&args, &cfg, &forge, &repo).await
         }
     }
@@ -139,11 +155,18 @@ async fn run_remote<F: Forge>(
             finish(args, cfg, envelope, Some(forge)).await
         }
         Err(e) => {
-            // Fail closed: an errored run must never read as a pass.
+            // Fail closed by default: an errored run must never read as a silent
+            // pass. `gate.onError: advisory` opts a repo out of blocking on
+            // operational errors (provider outage) — the advisory check still
+            // shows the error; only the gate stands aside.
             if let Some((a, g)) = &checks {
                 let envelope = error_envelope(cfg, &e, &head_sha, &meta);
+                let gate_state = match cfg.gate_on_error {
+                    OnError::Block => CheckState::Failure,
+                    OnError::Advisory => CheckState::Success,
+                };
                 let _ = forge
-                    .complete_checks(a, g, CheckState::Neutral, CheckState::Failure, &envelope)
+                    .complete_checks(a, g, CheckState::Neutral, gate_state, &envelope)
                     .await;
             }
             Err(e)
@@ -211,7 +234,7 @@ async fn review_diff(
     if !cfg.enabled {
         model_used = "none (disabled by config)".to_string();
     } else if !parsed.is_empty() {
-        let (annotated, _truncated) = diff::render_annotated(&parsed, MAX_DIFF_BYTES);
+        let (annotated, truncated) = diff::render_annotated(&parsed, MAX_DIFF_BYTES);
         let ctx = PrContext {
             repo,
             title: meta.map(|m| m.title.as_str()),
@@ -219,7 +242,13 @@ async fn review_diff(
             incremental,
         };
         let system = prompt::system_prompt(cfg);
-        let user = prompt::user_prompt(&ctx, &annotated, cfg.max_findings);
+        let mut user = prompt::user_prompt(&ctx, &annotated, cfg.max_findings);
+        if truncated {
+            user.push_str(
+                "\n\n[NOTE: the diff was truncated at the size limit; review only what \
+                 is shown above.]",
+            );
+        }
         let client = LlmClient::from_env(cfg)?;
         match client.review(cfg, &system, &user).await {
             Ok(model_review) => {
@@ -242,13 +271,40 @@ async fn review_diff(
                 findings = vec![fail_closed_finding(&format!("{e:#}"))];
             }
         }
+        // A truncated review must never read as a full pass: the unreviewed
+        // tail is surfaced as an explicit uncertainty finding.
+        if truncated {
+            findings.push(Finding {
+                path: ".postil/diff".to_string(),
+                line: 1,
+                end_line: None,
+                severity: crate::envelope::Severity::Info,
+                kind: crate::envelope::Kind::Uncertainty,
+                confidence: 1.0,
+                title: "Diff truncated at the review size limit".to_string(),
+                body: format!(
+                    "This change exceeds the {} KB review limit; only the first part was \
+                     reviewed. Files beyond the cut were not assessed. Split the change \
+                     or review the remainder manually.",
+                    MAX_DIFF_BYTES / 1000
+                ),
+            });
+        }
     }
 
     // Reconcile against the previous review (incremental or full re-review).
     let rec = filter::reconcile(&baseline, &index, &findings);
     findings.extend(rec.carried);
 
-    let gate_failing = findings.iter().any(|f| cfg.gate_fail_on.fails(f.severity));
+    // Operational findings (model unreachable/unusable) fail the gate by default
+    // — fail closed. `gate.onError: advisory` lets the gate stand aside on an
+    // outage so a provider blip does not freeze every merge; the finding still
+    // shows in the output and on the advisory check.
+    let advisory_on_error = cfg.gate_on_error == OnError::Advisory;
+    let gate_failing = findings.iter().any(|f| {
+        cfg.gate_fail_on.fails(f.severity)
+            && !(advisory_on_error && f.path == crate::envelope::OPERATIONAL_PATH)
+    });
     let silent = findings.is_empty();
     let counts = Envelope::counts_of(&findings, suppressed);
     let buckets = Envelope::buckets_of(&findings);
@@ -299,6 +355,12 @@ async fn finish<F: Forge>(
         }
     }
 
+    if let Some(path) = &args.sarif {
+        let sarif = crate::sarif::to_sarif(&envelope);
+        std::fs::write(path, serde_json::to_string_pretty(&sarif)?)
+            .with_context(|| format!("writing SARIF to {}", path.display()))?;
+    }
+
     if args.output_json {
         output::print_envelope_json(&envelope)?;
     } else {
@@ -311,9 +373,16 @@ fn error_envelope(cfg: &Config, err: &anyhow::Error, head_sha: &str, meta: &PrMe
     let findings = vec![fail_closed_finding(&format!("{err:#}"))];
     let counts = Envelope::counts_of(&findings, 0);
     let buckets = Envelope::buckets_of(&findings);
+    let blocking = cfg.gate_on_error == OnError::Block;
     Envelope {
         version: 1,
-        summary: "Postil could not complete this review and is failing closed.".to_string(),
+        summary: if blocking {
+            "Postil could not complete this review and is failing closed.".to_string()
+        } else {
+            "Postil could not complete this review. The gate is passing because this \
+             repository sets gate.onError: advisory; the error is shown on postil/review."
+                .to_string()
+        },
         silent: false,
         findings,
         resolved: vec![],
@@ -321,7 +390,7 @@ fn error_envelope(cfg: &Config, err: &anyhow::Error, head_sha: &str, meta: &PrMe
         confidence_buckets: buckets,
         gate: Gate {
             fail_on: cfg.gate_fail_on.as_str().to_string(),
-            failing: true,
+            failing: blocking,
         },
         model_used: cfg.model_chain().join(" -> "),
         usage: Usage::default(),

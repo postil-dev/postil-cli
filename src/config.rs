@@ -1,7 +1,7 @@
 //! Resolved review configuration.
 //!
 //! Precedence: CLI flags > environment > `.postil.{yaml,yml,json}` >
-//! `.coderabbit.yaml` (translated) > `.kodo.yaml` (translated) > defaults.
+//! `.coderabbit.yaml` (translated) > defaults.
 
 use std::path::{Path, PathBuf};
 
@@ -20,6 +20,18 @@ pub enum OnClean {
     Skip,
     /// Post a one-line confirmation comment.
     Comment,
+}
+
+/// What the gate does when the review cannot complete (model outage, rate-limit
+/// exhaustion, malformed output). Default is fail closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OnError {
+    /// Operational error fails the gate. Nothing merges on a broken review.
+    Block,
+    /// Operational error passes the gate (advisory only). An outage does not
+    /// freeze every merge in the org; the review check still shows the error.
+    Advisory,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,11 +76,16 @@ pub struct Config {
     pub focus: Vec<String>,
     pub on_clean: OnClean,
     pub gate_fail_on: GateLevel,
+    /// Gate behavior on operational error. Default: fail closed.
+    pub gate_on_error: OnError,
     pub model: String,
     pub cascade: Vec<String>,
     pub api_base: String,
     /// Run the first N models of [model + cascade] and keep agreeing findings.
     pub consensus: usize,
+    /// Contents of `.postil/guardrails.md`, injected into the prompt as repo
+    /// rules. Findings that violate one are emitted as `kind: guardrail`.
+    pub guardrails: Option<String>,
     /// Where the config came from, for `postil config` provenance.
     pub source: String,
 }
@@ -85,10 +102,12 @@ impl Default for Config {
             focus: Vec::new(),
             on_clean: OnClean::Skip,
             gate_fail_on: GateLevel::Severity(Severity::Error),
+            gate_on_error: OnError::Block,
             model: DEFAULT_MODEL.to_string(),
             cascade: Vec::new(),
             api_base: DEFAULT_API_BASE.to_string(),
             consensus: 1,
+            guardrails: None,
             source: "defaults".to_string(),
         }
     }
@@ -127,6 +146,7 @@ pub struct ReviewSection {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct GateSection {
     pub fail_on: Option<String>,
+    pub on_error: Option<OnError>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -158,15 +178,18 @@ impl Config {
                 .with_context(|| format!("translating {}", path.display()))?;
             c.source = format!("{} (translated)", rel_name(&path));
             c
-        } else if let Some(path) = find_first(root, &[".kodo.yaml", ".kodo.yml"]) {
-            let mut c = Self::from_kodo(&path)
-                .with_context(|| format!("translating {}", path.display()))?;
-            c.source = format!("{} (translated)", rel_name(&path));
-            c
         } else {
             Config::default()
         };
         cfg.apply_env();
+        // Repo guardrails are a separate file so they can be long-form prose.
+        let guardrails_path = root.join(".postil").join("guardrails.md");
+        if let Ok(text) = std::fs::read_to_string(&guardrails_path) {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                cfg.guardrails = Some(trimmed.to_string());
+            }
+        }
         Ok(cfg)
     }
 
@@ -213,11 +236,15 @@ impl Config {
         {
             self.on_clean = oc;
         }
-        if let Some(g) = f.gate
-            && let Some(fo) = g.fail_on
-        {
-            self.gate_fail_on = GateLevel::parse(&fo)
-                .with_context(|| format!("invalid gate.failOn {fo:?} (info|warn|error|never)"))?;
+        if let Some(g) = f.gate {
+            if let Some(fo) = g.fail_on {
+                self.gate_fail_on = GateLevel::parse(&fo).with_context(|| {
+                    format!("invalid gate.failOn {fo:?} (info|warn|error|never)")
+                })?;
+            }
+            if let Some(oe) = g.on_error {
+                self.gate_on_error = oe;
+            }
         }
         if let Some(m) = f.model {
             if let Some(n) = m.name {
@@ -271,32 +298,6 @@ impl Config {
             .and_then(|r| r.get("enabled"))
             .and_then(|v| v.as_bool())
         {
-            cfg.enabled = enabled;
-        }
-        Ok(cfg)
-    }
-
-    /// Best-effort `.kodo.yaml` translation: ignore globs + severity threshold.
-    fn from_kodo(path: &Path) -> Result<Config> {
-        let raw = std::fs::read_to_string(path)?;
-        let doc: serde_yaml::Value = serde_yaml::from_str(&raw)?;
-        let mut cfg = Config::default();
-        if let Some(ignore) = doc.get("ignore").and_then(|v| v.as_sequence()) {
-            cfg.ignore = ignore
-                .iter()
-                .filter_map(|v| v.as_str())
-                .map(str::to_string)
-                .collect();
-        }
-        if let Some(t) = doc
-            .get("review")
-            .and_then(|r| r.get("severity_threshold"))
-            .and_then(|v| v.as_str())
-            .and_then(Severity::parse)
-        {
-            cfg.severity_threshold = t;
-        }
-        if let Some(enabled) = doc.get("enabled").and_then(|v| v.as_bool()) {
             cfg.enabled = enabled;
         }
         Ok(cfg)
@@ -364,6 +365,9 @@ review:
 
 gate:
   failOn: error           # the postil/gate check fails at/above: info | warn | error | never
+  # onError: block          # block (default, fail closed) | advisory — gate outcome when
+  #                         # the review itself errors (model outage). advisory keeps an
+  #                         # outage from freezing merges; the review check still shows red.
 
 model:
   name: deepseek/deepseek-v4-pro
@@ -423,19 +427,6 @@ mod tests {
     }
 
     #[test]
-    fn kodo_translation() {
-        let dir = tempfile::tempdir().unwrap();
-        write(
-            dir.path(),
-            ".kodo.yaml",
-            "ignore:\n  - \"vendor/**\"\nreview:\n  severity_threshold: warn\n",
-        );
-        let c = Config::load(dir.path(), None).unwrap();
-        assert_eq!(c.ignore, vec!["vendor/**".to_string()]);
-        assert_eq!(c.severity_threshold, Severity::Warn);
-    }
-
-    #[test]
     fn unknown_keys_fail_loudly() {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), ".postil.yaml", "severtyThreshold: warn\n");
@@ -448,6 +439,27 @@ mod tests {
         let mut c = Config::default();
         c.apply_file(f).unwrap();
         assert_eq!(c.max_findings, 20);
+    }
+
+    #[test]
+    fn guardrails_file_is_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".postil")).unwrap();
+        write(
+            dir.path(),
+            ".postil/guardrails.md",
+            "# Rules\n- No raw SQL in handlers.\n",
+        );
+        let c = Config::load(dir.path(), None).unwrap();
+        assert!(c.guardrails.as_deref().unwrap().contains("No raw SQL"));
+    }
+
+    #[test]
+    fn gate_on_error_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), ".postil.yaml", "gate:\n  onError: advisory\n");
+        let c = Config::load(dir.path(), None).unwrap();
+        assert_eq!(c.gate_on_error, OnError::Advisory);
     }
 
     #[test]

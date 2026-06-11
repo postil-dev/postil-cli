@@ -1,8 +1,10 @@
 //! Forge abstraction: everything Postil needs from a code host.
 //!
-//! v1 ships GitHub and GitLab (including self-managed via custom base URL).
-//! Bitbucket and Azure DevOps implement this same trait when they land.
+//! Ships GitHub, GitLab, Bitbucket, and Azure DevOps — each covering its
+//! self-managed/server variant through a custom base-URL environment variable.
 
+pub mod azure;
+pub mod bitbucket;
 pub mod github;
 pub mod gitlab;
 

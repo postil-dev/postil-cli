@@ -27,10 +27,16 @@ acquire diff ──> parse + index ──> prompt ──> model (cascade/consens
 - `review.rs` — orchestration; owns fail-closed semantics (`fail_closed_finding`) and
   check-run lifecycle ordering (checks are created before the model runs so a crash can
   still be reported against them).
-- `forge/` — trait + GitHub and GitLab implementations. The gate check is never
-  `neutral`: an errored run is a failed gate.
-- `config.rs` — precedence (flags > env > .postil.* > .coderabbit.yaml > .kodo.yaml >
-  defaults), `deny_unknown_fields` so typos fail loudly.
+- `forge/` — trait + GitHub, GitLab, Bitbucket, and Azure DevOps implementations (each
+  with a self-managed/server base-URL override). Azure has no PR-diff endpoint, so it
+  reconstructs a unified diff from changed-file content with `similar`. The gate check is
+  never `neutral`: an errored run is a failed gate unless `gate.onError: advisory`.
+- `respond.rs` — interactive bot (`postil respond`): answers an @postil mention on a PR
+  or issue, grounded in the diff/issue, and posts one reply. Review-and-answer only; it
+  never opens PRs or pushes commits.
+- `sarif.rs` — envelope → SARIF 2.1.0 for code-scanning ingestion (`--sarif`).
+- `config.rs` — precedence (flags > env > .postil.* > .coderabbit.yaml > defaults),
+  `deny_unknown_fields` so typos fail loudly.
 
 ## Invariants
 

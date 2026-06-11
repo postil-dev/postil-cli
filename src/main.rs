@@ -3,7 +3,7 @@ use clap::Parser;
 use postil_cli::cli::{Cli, Command, ForgeArg, HookAction};
 use postil_cli::config::{Config, STARTER_CONFIG};
 use postil_cli::review::{ForgeKind, ReviewArgs};
-use postil_cli::{doctor, hook, plan, review};
+use postil_cli::{doctor, hook, plan, respond, review};
 
 #[tokio::main]
 async fn main() {
@@ -33,6 +33,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
             since_sha,
             baseline,
             output_json,
+            sarif,
             fail_on,
             config,
             model,
@@ -42,6 +43,8 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
             let kind = match forge {
                 Some(ForgeArg::Github) => ForgeKind::GitHub,
                 Some(ForgeArg::Gitlab) => ForgeKind::GitLab,
+                Some(ForgeArg::Bitbucket) => ForgeKind::Bitbucket,
+                Some(ForgeArg::Azure) => ForgeKind::Azure,
                 Some(ForgeArg::Local) => ForgeKind::Local,
                 None if local_mode => ForgeKind::Local,
                 None if repo.is_some() || pr.is_some() => ForgeKind::GitHub,
@@ -60,7 +63,37 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
                 since_sha,
                 baseline,
                 output_json,
+                sarif,
                 fail_on,
+                config,
+                model,
+                no_post,
+            })
+            .await
+        }
+        Command::Respond {
+            forge,
+            repo,
+            pr,
+            issue,
+            comment,
+            config,
+            model,
+            no_post,
+        } => {
+            let kind = match forge {
+                ForgeArg::Github => ForgeKind::GitHub,
+                ForgeArg::Gitlab => ForgeKind::GitLab,
+                ForgeArg::Bitbucket => ForgeKind::Bitbucket,
+                ForgeArg::Azure => ForgeKind::Azure,
+                ForgeArg::Local => ForgeKind::Local,
+            };
+            respond::run(respond::RespondArgs {
+                forge: kind,
+                repo,
+                pr,
+                issue,
+                comment,
                 config,
                 model,
                 no_post,
@@ -93,6 +126,20 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
                 }
             );
             println!("gate.failOn: {}", cfg.gate_fail_on.as_str());
+            println!(
+                "gate.onError: {}",
+                match cfg.gate_on_error {
+                    postil_cli::config::OnError::Block => "block",
+                    postil_cli::config::OnError::Advisory => "advisory",
+                }
+            );
+            println!(
+                "guardrails: {}",
+                match &cfg.guardrails {
+                    Some(g) => format!(".postil/guardrails.md ({} chars)", g.len()),
+                    None => "none".to_string(),
+                }
+            );
             println!("model.name: {}", cfg.model);
             println!("model.cascade: {:?}", cfg.cascade);
             println!("model.apiBase: {}", cfg.api_base);

@@ -2,7 +2,7 @@
 
 use assert_cmd::Command;
 use serde_json::{Value, json};
-use wiremock::matchers::{header, method, path, path_regex};
+use wiremock::matchers::{header, method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const DIFF: &str = "\
@@ -23,6 +23,13 @@ fn llm_content(findings: Value) -> Value {
             "findings": findings
         }).to_string()}}],
         "usage": {"prompt_tokens": 100, "completion_tokens": 50}
+    })
+}
+
+fn llm_text(text: &str) -> Value {
+    json!({
+        "choices": [{"message": {"content": text}}],
+        "usage": {"prompt_tokens": 80, "completion_tokens": 30}
     })
 }
 
@@ -86,6 +93,138 @@ async fn local_review_reports_grounded_finding_and_gates() {
     assert_eq!(env["gate"]["failing"], true);
     assert_eq!(env["counts"]["error"], 1);
     assert_eq!(env["usage"]["promptTokens"], 100);
+}
+
+#[tokio::test]
+async fn sarif_is_written_for_local_review() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(llm_content(json!([finding_at(41, "error", 0.92)]))),
+        )
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let sarif_path = dir.path().join("out.sarif");
+    postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--sarif")
+        .arg(&sarif_path)
+        .assert()
+        .code(1);
+    let sarif: Value = serde_json::from_str(&std::fs::read_to_string(&sarif_path).unwrap()).unwrap();
+    assert_eq!(sarif["version"], "2.1.0");
+    let result = &sarif["runs"][0]["results"][0];
+    assert_eq!(result["ruleId"], "postil/risk");
+    assert_eq!(result["level"], "error");
+    assert_eq!(
+        result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
+        "src/auth.rs"
+    );
+    assert_eq!(sarif["runs"][0]["properties"]["gateFailing"], true);
+}
+
+#[tokio::test]
+async fn advisory_on_error_lets_gate_stand_aside() {
+    let server = MockServer::start().await;
+    // Non-retryable model error so the run fails fast; it becomes an
+    // operational fail-closed finding rather than a propagated error.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("bad request"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .and(header("Accept", "application/vnd.github.v3.diff"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(DIFF))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "t", "body": "b",
+            "head": {"sha": "headsha111"}, "base": {"sha": "basesha222"}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/api/check-runs"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": 11})))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path_regex(r"^/repos/acme/api/check-runs/\d+$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/api/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".postil.yaml"),
+        "gate:\n  onError: advisory\n",
+    )
+    .unwrap();
+    postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .args(["review", "--repo", "acme/api", "--pr", "7", "--output-json"])
+        .assert()
+        .code(0); // fail-open: an outage does not block the merge
+
+    let reqs = server.received_requests().await.unwrap();
+    let patches: Vec<Value> = reqs
+        .iter()
+        .filter(|r| r.method == wiremock::http::Method::PATCH)
+        .map(|r| r.body_json().unwrap())
+        .collect();
+    assert_eq!(patches.len(), 2);
+    // Neither check is a failure; the gate stands aside on the operational error.
+    let conclusions: Vec<&str> = patches
+        .iter()
+        .map(|p| p["conclusion"].as_str().unwrap())
+        .collect();
+    assert!(!conclusions.contains(&"failure"));
+}
+
+#[tokio::test]
+async fn error_default_fails_closed_and_blocks() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("bad request"))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    // No config: default gate.onError is block — an unusable review fails closed.
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .code(1);
+    let env: Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+    assert_eq!(env["gate"]["failing"], true);
+    assert_eq!(env["findings"][0]["path"], ".postil/model-output");
 }
 
 #[tokio::test]
@@ -511,6 +650,313 @@ async fn incremental_review_resolves_and_carries_baseline_findings() {
     );
     assert_eq!(env["gate"]["failing"], true);
     assert_eq!(env["sinceSha"], "abc123");
+}
+
+#[tokio::test]
+async fn bitbucket_flow_posts_comment_and_sets_statuses() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(llm_content(json!([finding_at(41, "error", 0.95)]))),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repositories/acme/api/pullrequests/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "Add login",
+            "summary": {"raw": "PR body"},
+            "source": {"commit": {"hash": "headsha111"}},
+            "destination": {"commit": {"hash": "basesha222"}}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repositories/acme/api/pullrequests/7/diff"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(DIFF))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/repositories/acme/api/commit/.+/statuses/build$"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repositories/acme/api/pullrequests/7/comments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("BITBUCKET_API_URL", server.uri())
+        .env("BITBUCKET_TOKEN", "bb-test-token")
+        .env_remove("BITBUCKET_USER")
+        .args([
+            "review",
+            "--forge",
+            "bitbucket",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--output-json",
+        ])
+        .assert()
+        .code(1);
+    let env: Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+    assert_eq!(env["headSha"], "headsha111");
+
+    let reqs = server.received_requests().await.unwrap();
+    let statuses: Vec<Value> = reqs
+        .iter()
+        .filter(|r| r.url.path().ends_with("/statuses/build"))
+        .map(|r| r.body_json().unwrap())
+        .collect();
+    // Two on start (INPROGRESS) + two on complete.
+    assert_eq!(statuses.len(), 4);
+    let gate_final = statuses
+        .iter()
+        .rev()
+        .find(|s| s["key"] == "postil/gate")
+        .unwrap();
+    assert_eq!(gate_final["state"], "FAILED");
+    let review_final = statuses
+        .iter()
+        .rev()
+        .find(|s| s["key"] == "postil/review")
+        .unwrap();
+    assert_eq!(review_final["state"], "SUCCESSFUL");
+    // Inline comment anchored to the cited path/line.
+    let comment = reqs
+        .iter()
+        .find(|r| {
+            r.method == wiremock::http::Method::POST
+                && r.url.path().ends_with("/comments")
+                && r.body_json::<Value>()
+                    .map(|b| b.get("inline").is_some())
+                    .unwrap_or(false)
+        })
+        .expect("inline comment posted");
+    let body: Value = comment.body_json().unwrap();
+    assert_eq!(body["inline"]["path"], "src/auth.rs");
+    assert_eq!(body["inline"]["to"], 41);
+}
+
+#[tokio::test]
+async fn azure_flow_reconstructs_diff_and_posts_thread() {
+    let server = MockServer::start().await;
+    // Small file: line 2 changes; the model flags line 2.
+    let old_content = "fn login() {\n    let token = sanitize(user_input);\n}\n";
+    let new_content = "fn login() {\n    let token = user_input;\n}\n";
+    let az_finding = json!([{
+        "path": "src/auth.rs", "line": 2, "severity": "error", "kind": "risk",
+        "confidence": 0.95, "title": "Unsanitized input reaches query",
+        "body": "user_input flows into the token without sanitization."
+    }]);
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(az_finding)))
+        .mount(&server)
+        .await;
+    let pr_path = "/myorg/myproj/_apis/git/repositories/myrepo/pullRequests/7";
+    Mock::given(method("GET"))
+        .and(path(pr_path))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "Add login", "description": "PR body",
+            "lastMergeSourceCommit": {"commitId": "HEAD"},
+            "lastMergeTargetCommit": {"commitId": "BASE"}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/myorg/myproj/_apis/git/repositories/myrepo/diffs/commits",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "changes": [{"item": {"path": "/src/auth.rs"}, "changeType": "edit"}]
+        })))
+        .mount(&server)
+        .await;
+    let items_path = "/myorg/myproj/_apis/git/repositories/myrepo/items";
+    Mock::given(method("GET"))
+        .and(path(items_path))
+        .and(query_param("version", "BASE"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(old_content))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(items_path))
+        .and(query_param("version", "HEAD"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(new_content))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/myorg/myproj/_apis/git/repositories/myrepo/pullRequests/7/statuses"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/myorg/myproj/_apis/git/repositories/myrepo/pullRequests/7/threads"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("AZURE_DEVOPS_API_URL", server.uri())
+        .env("AZURE_DEVOPS_TOKEN", "az-test-pat")
+        .args([
+            "review",
+            "--forge",
+            "azure",
+            "--repo",
+            "myorg/myproj/myrepo",
+            "--pr",
+            "7",
+            "--output-json",
+        ])
+        .assert()
+        .code(1);
+    let env: Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+    // The finding survived: reconstruction grounded line 2 in the rebuilt diff.
+    assert_eq!(env["headSha"], "HEAD");
+    assert_eq!(env["findings"][0]["line"], 2);
+    assert_eq!(env["gate"]["failing"], true);
+
+    let reqs = server.received_requests().await.unwrap();
+    let thread = reqs
+        .iter()
+        .find(|r| r.url.path().ends_with("/threads"))
+        .expect("review thread posted");
+    let body: Value = thread.body_json().unwrap();
+    assert_eq!(body["threadContext"]["filePath"], "/src/auth.rs");
+    assert_eq!(body["threadContext"]["rightFileStart"]["line"], 2);
+}
+
+#[tokio::test]
+async fn respond_to_pr_mention_posts_grounded_reply() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_text(
+            "Line 41 interpolates `user_input` straight into the query — that is the \
+             injection risk. Parameterize it.",
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/5"))
+        .and(header("Accept", "application/vnd.github.v3.diff"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(DIFF))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/5"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "Add login", "body": "PR body",
+            "head": {"sha": "h"}, "base": {"sha": "b"}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/api/issues/5/comments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .args([
+            "respond",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "5",
+            "--comment",
+            "@postil is this safe?",
+        ])
+        .assert()
+        .success();
+
+    let reqs = server.received_requests().await.unwrap();
+    let comment = reqs
+        .iter()
+        .find(|r| r.url.path() == "/repos/acme/api/issues/5/comments")
+        .expect("reply posted");
+    let body: Value = comment.body_json().unwrap();
+    let text = body["body"].as_str().unwrap();
+    assert!(text.contains("injection risk"));
+    assert!(text.contains("Postil ·")); // footer with model attribution
+}
+
+#[tokio::test]
+async fn respond_to_issue_mention_uses_issue_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_text(
+            "This looks like a connection-pool exhaustion under load, not a logic bug.",
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/issues/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "Timeouts under load",
+            "body": "Requests hang after ~200 concurrent users."
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/api/issues/9/comments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .args([
+            "respond",
+            "--repo",
+            "acme/api",
+            "--issue",
+            "9",
+            "--comment",
+            "@postil what do you think is happening?",
+        ])
+        .assert()
+        .success();
+
+    let reqs = server.received_requests().await.unwrap();
+    // The model was given the issue body as grounding.
+    let llm = reqs
+        .iter()
+        .find(|r| r.url.path() == "/chat/completions")
+        .unwrap();
+    let sent: Value = llm.body_json().unwrap();
+    let user_msg = sent["messages"][1]["content"].as_str().unwrap();
+    assert!(user_msg.contains("200 concurrent users"));
+    assert!(reqs.iter().any(|r| {
+        r.method == wiremock::http::Method::POST
+            && r.url.path() == "/repos/acme/api/issues/9/comments"
+    }));
 }
 
 #[test]

@@ -23,6 +23,8 @@ pub struct Cli {
 pub enum ForgeArg {
     Github,
     Gitlab,
+    Bitbucket,
+    Azure,
     Local,
 }
 
@@ -67,6 +69,9 @@ pub enum Command {
         /// Print the envelope JSON on stdout (machine consumers).
         #[arg(long)]
         output_json: bool,
+        /// Write SARIF 2.1.0 to this path for code-scanning ingestion.
+        #[arg(long)]
+        sarif: Option<PathBuf>,
         /// Exit 1 at/above this severity: info|warn|error|never. Overrides gate.failOn.
         #[arg(long)]
         fail_on: Option<String>,
@@ -77,6 +82,31 @@ pub enum Command {
         #[arg(long)]
         model: Option<String>,
         /// Do not post comments or checks to the forge; report locally only.
+        #[arg(long)]
+        no_post: bool,
+    },
+    /// Reply to an @postil mention on a pull request or issue (interactive bot).
+    Respond {
+        /// Code host. Only github is supported today.
+        #[arg(long, value_enum, default_value = "github")]
+        forge: ForgeArg,
+        /// Repository as owner/name.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Pull request number the mention is on.
+        #[arg(long)]
+        pr: Option<u64>,
+        /// Issue number the mention is on.
+        #[arg(long)]
+        issue: Option<u64>,
+        /// The maintainer's message text (the mention body).
+        #[arg(long)]
+        comment: String,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        model: Option<String>,
+        /// Print the reply instead of posting it.
         #[arg(long)]
         no_post: bool,
     },

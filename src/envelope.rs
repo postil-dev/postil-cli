@@ -135,11 +135,16 @@ impl Envelope {
     }
 }
 
+/// Path marker for synthetic operational findings (model unreachable/unusable),
+/// as opposed to findings grounded in the diff. `gate.onError: advisory` keys
+/// off this to let the gate stand aside on an outage.
+pub const OPERATIONAL_PATH: &str = ".postil/model-output";
+
 /// The synthetic finding emitted when the model produced unusable output.
 /// Postil fails closed: a review that could not be trusted is an error, not a pass.
 pub fn fail_closed_finding(detail: &str) -> Finding {
     Finding {
-        path: ".postil/model-output".to_string(),
+        path: OPERATIONAL_PATH.to_string(),
         line: 1,
         end_line: None,
         severity: Severity::Error,

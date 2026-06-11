@@ -50,10 +50,18 @@ fn default_confidence() -> f64 {
     0.5
 }
 
+#[derive(Clone)]
 pub struct LlmClient {
     http: reqwest::Client,
     api_base: String,
     api_key: String,
+}
+
+/// Retries per model on transient provider errors before the cascade moves on.
+const TRANSIENT_RETRIES: u32 = 2;
+
+fn retryable_status(status: u16) -> bool {
+    matches!(status, 429 | 500 | 502 | 503 | 529)
 }
 
 impl LlmClient {
@@ -81,11 +89,25 @@ impl LlmClient {
         let chain = cfg.model_chain();
         if cfg.consensus > 1 && chain.len() > 1 {
             let n = cfg.consensus.min(chain.len());
-            let runs = chain[..n]
+            let handles: Vec<_> = chain[..n]
                 .iter()
-                .map(|m| self.review_with_model(m, system, user));
-            let results = futures_join_all(runs).await;
-            let ok: Vec<ModelReview> = results.into_iter().flatten().collect();
+                .map(|m| {
+                    let client = self.clone();
+                    let (model, system, user) =
+                        (m.clone(), system.to_string(), user.to_string());
+                    tokio::spawn(
+                        async move { client.review_with_model(&model, &system, &user).await },
+                    )
+                })
+                .collect();
+            let mut ok: Vec<ModelReview> = Vec::new();
+            for h in handles {
+                match h.await {
+                    Ok(Ok(r)) => ok.push(r),
+                    Ok(Err(e)) => eprintln!("postil: consensus model failed: {e:#}"),
+                    Err(e) => eprintln!("postil: consensus task panicked: {e}"),
+                }
+            }
             match ok.len() {
                 0 => Err(anyhow!("all {n} consensus models failed")),
                 1 => Ok(ok.into_iter().next().unwrap()),
@@ -104,6 +126,23 @@ impl LlmClient {
             }
             Err(last_err.unwrap_or_else(|| anyhow!("empty model chain")))
         }
+    }
+
+    /// Free-form answer (no JSON contract). Used by the interactive bot to reply
+    /// to a maintainer's question or mention. Tries the model chain in order.
+    pub async fn answer(&self, cfg: &Config, system: &str, user: &str) -> Result<(String, String)> {
+        let mut usage = Usage::default();
+        let mut last_err = None;
+        for model in cfg.model_chain() {
+            match self.chat(&model, system, user, &mut usage).await {
+                Ok(content) => return Ok((content.trim().to_string(), model)),
+                Err(e) => {
+                    eprintln!("postil: model {model} failed: {e:#}");
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("empty model chain")))
     }
 
     async fn review_with_model(
@@ -154,22 +193,48 @@ impl LlmClient {
                 {"role": "user", "content": user},
             ],
         });
-        let resp = self
-            .http
-            .post(format!("{}/chat/completions", self.api_base))
-            .bearer_auth(&self.api_key)
-            .header("HTTP-Referer", "https://postil.dev")
-            .header("X-Title", "Postil")
-            .json(&body)
-            .send()
-            .await
-            .context("request to model endpoint failed")?;
-        let status = resp.status();
-        let text = resp.text().await.context("reading model response")?;
-        if !status.is_success() {
-            let snippet: String = text.chars().take(300).collect();
-            return Err(anyhow!("model endpoint returned {status}: {snippet}"));
-        }
+        let mut attempt = 0u32;
+        let text = loop {
+            attempt += 1;
+            let sent = self
+                .http
+                .post(format!("{}/chat/completions", self.api_base))
+                .bearer_auth(&self.api_key)
+                .header("HTTP-Referer", "https://postil.dev")
+                .header("X-Title", "Postil")
+                .json(&body)
+                .send()
+                .await;
+            match sent {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let text = resp.text().await.context("reading model response")?;
+                    if status.is_success() {
+                        break text;
+                    }
+                    let snippet: String = text.chars().take(300).collect();
+                    if retryable_status(status.as_u16()) && attempt <= TRANSIENT_RETRIES {
+                        let wait = std::time::Duration::from_secs(2 * attempt as u64);
+                        eprintln!(
+                            "postil: {model} returned {status}, retrying in {}s \
+                             (attempt {attempt}/{TRANSIENT_RETRIES})",
+                            wait.as_secs()
+                        );
+                        tokio::time::sleep(wait).await;
+                        continue;
+                    }
+                    return Err(anyhow!("model endpoint returned {status}: {snippet}"));
+                }
+                // Connection-level failures retry too; timeouts do not (the
+                // request already waited the full budget).
+                Err(e) if e.is_connect() && attempt <= TRANSIENT_RETRIES => {
+                    tokio::time::sleep(std::time::Duration::from_secs(2 * attempt as u64)).await;
+                }
+                Err(e) => {
+                    return Err(anyhow::Error::from(e).context("request to model endpoint failed"));
+                }
+            }
+        };
         let parsed: ChatResponse =
             serde_json::from_str(&text).context("model endpoint returned non-JSON body")?;
         if let Some(u) = parsed.usage {
@@ -319,18 +384,6 @@ fn consensus_merge(mut runs: Vec<ModelReview>) -> ModelReview {
         model_used: format!("consensus({})", models.join(", ")),
         usage: total_usage,
     }
-}
-
-/// Sequential await; consensus N is small so we avoid the futures crate.
-async fn futures_join_all<F, T>(futs: impl IntoIterator<Item = F>) -> Vec<Option<T>>
-where
-    F: std::future::Future<Output = Result<T>>,
-{
-    let mut out = Vec::new();
-    for f in futs {
-        out.push(f.await.ok());
-    }
-    out
 }
 
 #[cfg(test)]

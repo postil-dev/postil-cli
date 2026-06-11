@@ -27,8 +27,11 @@ platform at [postil.dev](https://postil.dev).
 ## Install
 
 ```sh
+# Verified prebuilt binary (checks the published SHA-256), installs to ~/.local/bin:
+curl -fsSL https://postil.dev/install.sh | sh
+
+# Or build from source:
 cargo install --git https://github.com/postil-dev/postil-cli --locked
-# or download a prebuilt binary from the releases page
 ```
 
 ## Quick start
@@ -48,18 +51,54 @@ run the binary directly:
 postil review --repo owner/name --pr 123   # posts inline comments + both check-runs
 ```
 
-GitLab (including self-managed):
+Other forges (each covering its self-managed/server variant via a base-URL env var):
 
 ```sh
+# GitLab (gitlab.com or self-managed)
 export GITLAB_TOKEN=... GITLAB_API_URL=https://gitlab.example.com/api/v4
 postil review --forge gitlab --repo group/project --pr 42
+
+# Bitbucket (Cloud, or Data Center via BITBUCKET_API_URL)
+export BITBUCKET_TOKEN=...            # set BITBUCKET_USER too to use an app password
+postil review --forge bitbucket --repo workspace/repo --pr 7
+
+# Azure DevOps Services (or Server via AZURE_DEVOPS_API_URL)
+export AZURE_DEVOPS_TOKEN=...         # a PAT
+postil review --forge azure --repo organization/project/repository --pr 7
 ```
+
+## SARIF output
+
+`--sarif <path>` writes SARIF 2.1.0 alongside the review for code-scanning ingestion
+(GitHub code scanning, GitLab SAST, any SARIF viewer):
+
+```sh
+postil review --repo owner/name --pr 123 --sarif postil.sarif
+```
+
+## Interactive bot
+
+Mention `@postil` in a pull-request or issue comment, reply to one of its review
+comments, or open an issue that mentions it, and the hosted bot replies. Postil reviews
+and answers only — it never opens PRs or pushes commits. The same engine is a CLI
+command:
+
+```sh
+postil respond --repo owner/name --pr 123 --comment "@postil is this safe?"
+postil respond --repo owner/name --issue 45 --comment "@postil what's the likely cause?"
+```
+
+## Repo guardrails
+
+Drop repo-specific merge rules in `.postil/guardrails.md` and Postil injects them into
+the prompt; a change that violates one is reported as a `guardrail` finding that quotes
+the rule it breaks.
 
 ## Configuration
 
 `postil init` writes a starter `.postil.yaml`. Precedence: flags > environment >
-`.postil.{yaml,yml,json}` > `.coderabbit.yaml` (translated) > `.kodo.yaml` (translated)
-> defaults. Unknown keys are rejected so typos fail loudly.
+`.postil.{yaml,yml,json}` > `.coderabbit.yaml` (translated) > defaults. Unknown keys are
+rejected so typos fail loudly.
 
 ```yaml
 ignore:
@@ -74,6 +113,7 @@ review:
   onClean: skip           # stay silent on clean PRs (default)
 gate:
   failOn: error           # info | warn | error | never
+  onError: block          # block (fail closed, default) | advisory (fail open on outage)
 model:
   name: deepseek/deepseek-v4-pro
   cascade: [anthropic/claude-sonnet-4.6]
@@ -83,7 +123,8 @@ model:
 
 Environment: `POSTIL_API_KEY` (or `OPENROUTER_API_KEY`), `POSTIL_API_BASE`,
 `REVIEW_MODEL`, `REVIEW_MODEL_CASCADE`, `GITHUB_TOKEN`/`GITHUB_API_URL`,
-`GITLAB_TOKEN`/`GITLAB_API_URL`.
+`GITLAB_TOKEN`/`GITLAB_API_URL`, `BITBUCKET_TOKEN`/`BITBUCKET_USER`/`BITBUCKET_API_URL`,
+`AZURE_DEVOPS_TOKEN`/`AZURE_DEVOPS_API_URL`.
 
 ## Preview a config change before deploying it
 

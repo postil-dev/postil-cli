@@ -28,12 +28,28 @@ pub fn system_prompt(cfg: &Config) -> String {
          Silence is the correct and expected output for most diffs.\n\
          \n\
          Severity: error = merge is unsafe; warn = likely problem, human should look; \
-         info = material context the merger needs. Kind: risk = concrete defect; \
-         humanEscalation = needs an accountable human decision; guardrail = violates a \
-         stated repo rule; uncertainty = you cannot verify something critical from the diff.\n\
+         info = material context the merger needs. A correctness bug that silently loses \
+         or corrupts data, or makes a function return wrong results, is error — not warn — \
+         even when it is not a security issue; do not flinch on confident correctness \
+         findings. Reserve warn for genuinely conditional problems (impact depends on \
+         callers or context). Kind: risk = concrete defect; humanEscalation = needs an \
+         accountable human decision; guardrail = violates a stated repo rule; uncertainty \
+         = you cannot verify something critical from the diff.\n\
          \n\
          Confidence is your honest probability the finding is real and merge-relevant. \
          Do not inflate it; low-confidence findings are suppressed and that is correct.\n\
+         \n\
+         Every finding body MUST end with a concrete next step the author can act on \
+         without further questions: the fix, or the exact thing to check (which callers, \
+         which command, which test). Never end a finding by telling the reader that 'a \
+         human must decide' without saying what to inspect to decide. State impact \
+         precisely; do not overstate (e.g. a TypeScript-only return-type change is a \
+         compile-time concern for callers that use the value, not a runtime break).\n\
+         \n\
+         For exposed secrets/credentials: flag at error regardless of whether the values \
+         look like real or placeholder keys, and the body must say to (1) rotate the \
+         credential, (2) purge it from git history (the commit is permanent otherwise), \
+         and (3) move it to an environment variable or secrets store.\n\
          \n\
          Cite ONLY line numbers printed in the left margin of the diff (the new-file line \
          numbers). Findings citing other lines are discarded as ungrounded.\n",
@@ -44,6 +60,19 @@ pub fn system_prompt(cfg: &Config) -> String {
             cfg.focus.join(", ")
         ));
     }
+    if let Some(rules) = &cfg.guardrails {
+        // Guardrails are repo-specific merge rules. A violation is reportable
+        // even when it is not a generic bug, and must name the rule it breaks.
+        p.push_str(
+            "\nThis repository defines guardrails below. A change that violates one IS \
+             merge-relevant: report it with kind \"guardrail\" and quote the specific \
+             rule it breaks in the body. Do not invent rules beyond these.\n\
+             --- REPO GUARDRAILS ---\n",
+        );
+        let rules: String = rules.chars().take(4000).collect();
+        p.push_str(&rules);
+        p.push_str("\n--- END GUARDRAILS ---\n");
+    }
     p.push_str(&format!("\nTone for finding bodies: {}.\n", cfg.tone));
     p.push_str(
         "\nRespond with ONLY a JSON object, no markdown fences, no prose:\n\
@@ -53,6 +82,27 @@ pub fn system_prompt(cfg: &Config) -> String {
           \"kind\": \"risk|humanEscalation|guardrail|uncertainty\", \"confidence\": <0..1>,\n \
           \"title\": \"short imperative title\", \"body\": \"specific, evidence-based markdown\"}]}\n",
     );
+    p
+}
+
+/// System prompt for the interactive bot answering a maintainer's mention.
+/// Free-form prose (not the review JSON contract), but the same noise discipline.
+pub fn respond_system_prompt(cfg: &Config) -> String {
+    let mut p = String::from(
+        "You are Postil, replying to a maintainer who mentioned you on a pull request or \
+         issue. Answer their actual question directly and concisely in GitHub-flavored \
+         markdown. Ground every claim in the diff or thread you are given; cite file:line \
+         when you reference code. If they ask you to re-review, point to specific lines and \
+         the merge risk. If something cannot be determined from what you were given, say so \
+         plainly rather than guessing. No filler, no praise, no restating the question. You \
+         do not open pull requests or push commits; if asked to, explain that you review and \
+         answer only.",
+    );
+    if let Some(rules) = &cfg.guardrails {
+        p.push_str("\n\nRepository guardrails you may reference:\n");
+        let rules: String = rules.chars().take(2000).collect();
+        p.push_str(&rules);
+    }
     p
 }
 
@@ -99,6 +149,16 @@ mod tests {
         assert!(p.contains("security, concurrency"));
         assert!(p.contains("Silence is the correct"));
         assert!(p.contains("no praise"));
+    }
+
+    #[test]
+    fn system_prompt_injects_guardrails() {
+        let mut cfg = Config::default();
+        cfg.guardrails = Some("All HTTP handlers must validate the tenant id.".to_string());
+        let p = system_prompt(&cfg);
+        assert!(p.contains("REPO GUARDRAILS"));
+        assert!(p.contains("validate the tenant id"));
+        assert!(p.contains("kind \"guardrail\""));
     }
 
     #[test]
