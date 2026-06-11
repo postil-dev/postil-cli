@@ -27,7 +27,8 @@ platform at [postil.dev](https://postil.dev).
 ## Install
 
 ```sh
-# Verified prebuilt binary (checks the published SHA-256), installs to ~/.local/bin:
+# Verified prebuilt binary (SHA-256 checksum; Sigstore keyless signature when
+# cosign is installed), installs to ~/.local/bin:
 curl -fsSL https://postil.dev/install.sh | sh
 
 # Or build from source:
@@ -86,6 +87,8 @@ command:
 ```sh
 postil respond --repo owner/name --pr 123 --comment "@postil is this safe?"
 postil respond --repo owner/name --issue 45 --comment "@postil what's the likely cause?"
+# Automation should pass the text via env instead (argv is visible in `ps`):
+POSTIL_COMMENT="@postil is this safe?" postil respond --repo owner/name --pr 123
 ```
 
 ## Repo guardrails
@@ -113,7 +116,8 @@ review:
   onClean: skip           # stay silent on clean PRs (default)
 gate:
   failOn: error           # info | warn | error | never
-  onError: block          # block (fail closed, default) | advisory (fail open on outage)
+  onError: block          # block (fail closed, default) | advisory (fail open on
+                          # provider outage only; unusable model output still blocks)
 model:
   name: deepseek/deepseek-v4-pro
   cascade: [anthropic/claude-sonnet-4.6]
