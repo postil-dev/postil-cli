@@ -10,7 +10,28 @@ pub mod gitlab;
 
 use anyhow::Result;
 
-use crate::envelope::{Envelope, Finding};
+use crate::envelope::{Envelope, Finding, Severity};
+
+/// Base URL for the brand status icons rendered in PR comments and check
+/// summaries. The four icons (error, warn, info, pass) are served by the
+/// marketing site and mirror the product-page statusline.
+pub const STATUS_ICON_BASE: &str = "https://postil.dev/status";
+
+/// Markdown `<img>` for a named status icon, sized to sit inline with text.
+pub fn icon_md(name: &str) -> String {
+    format!(
+        "<img src=\"{STATUS_ICON_BASE}/{name}.svg\" width=\"14\" height=\"14\" \
+         alt=\"{name}\" align=\"text-bottom\">"
+    )
+}
+
+pub fn severity_icon(severity: Severity) -> String {
+    icon_md(match severity {
+        Severity::Error => "error",
+        Severity::Warn => "warn",
+        Severity::Info => "info",
+    })
+}
 
 #[derive(Debug, Clone)]
 pub struct PrMeta {
@@ -69,9 +90,11 @@ pub fn check_title(envelope: &Envelope) -> String {
 pub fn check_summary(envelope: &Envelope) -> String {
     let mut s = String::new();
     if envelope.silent {
-        s.push_str(
-            "Postil reviewed this change and found nothing that affects the merge decision.\n",
-        );
+        s.push_str(&format!(
+            "{} Postil reviewed this change and found nothing that affects the merge \
+             decision.\n",
+            icon_md("pass")
+        ));
     } else {
         if !envelope.summary.is_empty() {
             s.push_str(&envelope.summary);
@@ -79,19 +102,21 @@ pub fn check_summary(envelope: &Envelope) -> String {
         }
         for f in &envelope.findings {
             s.push_str(&format!(
-                "- **{}** `{}:{}` [{}/{}] {}\n",
+                "- {} **{}** `{}:{}` — {} · confidence {} · kind: {}\n",
+                severity_icon(f.severity),
                 f.severity.as_str(),
                 f.path,
                 f.line,
-                f.kind.as_str(),
+                f.title,
                 format_confidence(f.confidence),
-                f.title
+                f.kind.as_str(),
             ));
         }
     }
     if !envelope.resolved.is_empty() {
         s.push_str(&format!(
-            "\n{} finding(s) from the previous review resolved.\n",
+            "\n{} {} finding(s) from the previous review resolved.\n",
+            icon_md("pass"),
             envelope.resolved.len()
         ));
     }
@@ -105,6 +130,8 @@ pub fn check_summary(envelope: &Envelope) -> String {
     s
 }
 
+/// Confidence rendered as the product statusline shows it: a bare decimal
+/// probability ("0.91"), not a percentage.
 pub fn format_confidence(c: f64) -> String {
-    format!("{:.0}%", c * 100.0)
+    format!("{:.2}", c)
 }

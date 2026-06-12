@@ -162,10 +162,12 @@ impl Forge for GitHub {
                     "line": f.line,
                     "side": "RIGHT",
                     "body": format!(
-                        "**{}** ({} / {} confidence)\n\n{}",
+                        "{} **{}**\n`{}` · confidence {} · kind: {}\n\n{}",
+                        super::severity_icon(f.severity),
                         f.title,
                         f.severity.as_str(),
                         super::format_confidence(f.confidence),
+                        f.kind.as_str(),
                         f.body
                     ),
                 });
