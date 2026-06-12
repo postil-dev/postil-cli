@@ -19,7 +19,7 @@ pub fn print_pretty(envelope: &Envelope) {
     if envelope.silent {
         out.push_str(&paint(
             color,
-            "postil: no merge-relevant findings. Staying silent.\n",
+            "✓ postil: no merge-relevant findings. Staying silent.\n",
             Paint::Green,
         ));
     } else {
@@ -28,46 +28,55 @@ pub fn print_pretty(envelope: &Envelope) {
         }
         for f in &envelope.findings {
             let (glyph, p) = match f.severity {
-                Severity::Error => ("error", Paint::Red),
-                Severity::Warn => ("warn ", Paint::Yellow),
-                Severity::Info => ("info ", Paint::Blue),
+                Severity::Error => ("✕ error", Paint::Red),
+                Severity::Warn => ("▲ warn ", Paint::Yellow),
+                Severity::Info => ("ℹ info ", Paint::Blue),
             };
             out.push_str(&format!(
-                "{} {}:{} {}\n",
+                "{}  {}:{}\n",
                 paint(color, glyph, p),
                 f.path,
-                f.line,
-                f.title
+                f.line
             ));
+            out.push_str(&format!("  {}\n", f.title));
             for line in f.body.lines() {
-                out.push_str(&format!("      {line}\n"));
+                out.push_str(&format!("  {line}\n"));
             }
             out.push_str(&format!(
-                "      kind: {}  confidence: {:.0}%\n\n",
-                f.kind.as_str(),
-                f.confidence * 100.0
+                "  (confidence {:.2}, kind: {})\n\n",
+                f.confidence,
+                f.kind.as_str()
             ));
         }
+        let n = envelope.findings.len();
+        let mut tally = format!("{n} finding{}", if n == 1 { "" } else { "s" });
+        if envelope.counts.suppressed > 0 {
+            tally.push_str(&format!(
+                " · {} suppressed by policy",
+                envelope.counts.suppressed
+            ));
+        }
+        out.push_str(&format!("{tally}\n"));
     }
     if !envelope.resolved.is_empty() {
         out.push_str(&format!(
-            "{} finding(s) from the previous review resolved.\n",
+            "✓ {} finding(s) from the previous review resolved.\n",
             envelope.resolved.len()
         ));
     }
-    if envelope.counts.suppressed > 0 {
+    if envelope.silent && envelope.counts.suppressed > 0 {
         out.push_str(&format!(
             "{} finding(s) suppressed by policy.\n",
             envelope.counts.suppressed
         ));
     }
     let gate = if envelope.gate.failing {
-        paint(color, "gate: FAILING", Paint::Red)
+        paint(color, "gate: failing", Paint::Red)
     } else {
         paint(color, "gate: passing", Paint::Green)
     };
     out.push_str(&format!(
-        "{gate} (failOn: {})  model: {}\n",
+        "{gate} (fail-on: {})  model: {}\n",
         envelope.gate.fail_on, envelope.model_used
     ));
     eprint!("{out}");
