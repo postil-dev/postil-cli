@@ -234,6 +234,7 @@ async fn review_diff(
         None => Vec::new(),
     };
 
+    let review_started = std::time::Instant::now();
     let parsed = diff::parse(diff_text);
     let index = DiffIndex::build(&parsed);
     let incremental = args.since_sha.is_some();
@@ -242,6 +243,7 @@ async fn review_diff(
     let mut model_used = "none (empty diff)".to_string();
     let mut usage = Usage::default();
     let mut suppressed = 0u32;
+    let mut ungrounded = 0u32;
     let mut findings: Vec<Finding> = Vec::new();
 
     if !cfg.enabled {
@@ -265,15 +267,25 @@ async fn review_diff(
         let client = LlmClient::from_env(cfg)?;
         match client.review(cfg, &system, &user).await {
             Ok(model_review) => {
+                let raw_findings = model_review.findings.len();
                 let outcome = filter::apply(cfg, &index, model_review.findings)?;
                 model_used = model_review.model_used;
                 usage = model_review.usage;
                 suppressed = outcome.suppressed;
+                ungrounded = outcome.ungrounded;
                 if outcome.all_ungrounded {
                     findings = vec![fail_closed_finding(&format!(
                         "model reported {} finding(s), none grounded in the diff",
                         outcome.ungrounded
                     ))];
+                } else if raw_findings == 0 && !model_review.summary.trim().is_empty() {
+                    // Risk narrated in prose with zero structured findings
+                    // (post-retry). Passing this as clean is the predecessor
+                    // product's worst failure mode; fail closed instead and
+                    // carry the narration into the finding so it is not lost.
+                    findings = vec![crate::envelope::narrated_risk_finding(
+                        &model_review.summary,
+                    )];
                 } else {
                     summary = model_review.summary;
                     findings = outcome.kept;
@@ -329,7 +341,8 @@ async fn review_diff(
             && !(advisory_on_error && f.path == crate::envelope::PROVIDER_PATH)
     });
     let silent = findings.is_empty();
-    let counts = Envelope::counts_of(&findings, suppressed);
+    let mut counts = Envelope::counts_of(&findings, suppressed);
+    counts.ungrounded = ungrounded;
     let buckets = Envelope::buckets_of(&findings);
 
     Ok(Envelope {
@@ -346,6 +359,7 @@ async fn review_diff(
         },
         model_used,
         usage,
+        duration_ms: review_started.elapsed().as_millis() as u64,
         base_sha: meta.map(|m| m.base_sha.clone()),
         head_sha,
         since_sha: args.since_sha.clone(),
@@ -424,6 +438,7 @@ fn error_envelope(cfg: &Config, err: &anyhow::Error, head_sha: &str, meta: &PrMe
         },
         model_used: cfg.model_chain().join(" -> "),
         usage: Usage::default(),
+        duration_ms: 0,
         base_sha: Some(meta.base_sha.clone()),
         head_sha: Some(head_sha.to_string()),
         since_sha: None,

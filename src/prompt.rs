@@ -80,7 +80,12 @@ pub fn system_prompt(cfg: &Config) -> String {
           \"findings\": [{\"path\": \"file path from the diff\", \"line\": <new-file line>,\n \
           \"endLine\": <optional>, \"severity\": \"info|warn|error\",\n \
           \"kind\": \"risk|humanEscalation|guardrail|uncertainty\", \"confidence\": <0..1>,\n \
-          \"title\": \"short imperative title\", \"body\": \"specific, evidence-based markdown\"}]}\n",
+          \"title\": \"short imperative title\", \"body\": \"specific, evidence-based markdown\"}]}\n\
+         \n\
+         The summary and findings must agree. Every risk the summary mentions MUST appear as \
+         a structured finding with its diff line; if findings is empty, summary MUST be the \
+         empty string. A summary that narrates problems alongside an empty findings array is \
+         invalid output and will fail the review.\n",
     );
     p
 }
