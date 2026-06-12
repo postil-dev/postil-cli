@@ -40,3 +40,24 @@
   the source build.
 - An `/evidence` benchmark: Postil's own silence rate and confirmed-finding rate on
   public OSS PRs, with raw envelopes.
+
+## Benchmarking status (2026-06)
+
+A hermetic PR-review benchmark harness survives from the previous product line
+(branch `fix/benchmark-comment-usefulness` of the pre-rebuild postil repo):
+isolated run dirs, mock forge and model endpoints, prompt-leakage guardrails,
+30 fixtures (24 seeded defects across languages, 6 clean PRs). Its last run
+(2026-06-05) scored 29/30 with 24 TP / 0 FP / 0 FN. Two caveats gate any public
+use of those numbers:
+
+- The mock model echoes output generated from the same spec as the ground
+  truth, so the run measures pipeline fidelity (grounding, gating, statusline
+  correctness) — not detection ability.
+- No competitor has been run on the same fixtures, so comparative claims are
+  not defensible; site comparisons stay qualitative and sourced until peer
+  runs on identical fixtures exist.
+
+Port plan: bring the harness into this repo against the envelope v1 contract,
+keep mock mode as a regression suite, add a live-model mode (real inference,
+same fixtures) to measure detection and silence rate, then run peers on the
+identical fixture set before publishing any comparison.
