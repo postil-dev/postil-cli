@@ -17,10 +17,27 @@ diff --git a/src/auth.rs b/src/auth.rs
 ";
 
 fn llm_content(findings: Value) -> Value {
+    // The contract requires summary and findings to agree: an empty findings
+    // array must come with an empty summary.
+    let summary = if findings.as_array().is_none_or(|a| a.is_empty()) {
+        ""
+    } else {
+        "SQL injection risk in auth path."
+    };
+    json!({
+        "choices": [{"message": {"content": json!({
+            "summary": summary,
+            "findings": findings
+        }).to_string()}}],
+        "usage": {"prompt_tokens": 100, "completion_tokens": 50}
+    })
+}
+
+fn llm_contradictory() -> Value {
     json!({
         "choices": [{"message": {"content": json!({
             "summary": "SQL injection risk in auth path.",
-            "findings": findings
+            "findings": []
         }).to_string()}}],
         "usage": {"prompt_tokens": 100, "completion_tokens": 50}
     })
@@ -288,6 +305,84 @@ async fn clean_diff_is_silent_and_exits_zero() {
     assert_eq!(env["silent"], true);
     assert_eq!(env["summary"], "");
     assert_eq!(env["gate"]["failing"], false);
+}
+
+#[tokio::test]
+async fn narrated_risk_without_findings_fails_closed() {
+    // The predecessor product's worst failure mode: risk prose in the summary,
+    // zero structured findings, green status. The model gets one corrective
+    // retry; if the contradiction persists the review fails closed.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_contradictory()))
+        .expect(2) // initial call + one semantic retry
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .code(1);
+    let env: Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+    assert_eq!(env["silent"], false);
+    assert_eq!(env["gate"]["failing"], true);
+    assert_eq!(env["findings"][0]["path"], ".postil/model-output");
+    assert_eq!(
+        env["findings"][0]["title"],
+        "Model narrated risk without structured findings"
+    );
+    // The narrated concern is preserved, not silently dropped.
+    assert!(
+        env["findings"][0]["body"]
+            .as_str()
+            .unwrap()
+            .contains("SQL injection risk in auth path.")
+    );
+}
+
+#[tokio::test]
+async fn narrated_risk_retry_recovers_structured_finding() {
+    // First response contradicts itself; the corrective retry returns a
+    // properly structured finding, which is used as the review result.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_contradictory()))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(llm_content(json!([finding_at(41, "error", 0.92)]))),
+        )
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .code(1);
+    let env: Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+    assert_eq!(env["findings"][0]["path"], "src/auth.rs");
+    assert_eq!(env["findings"][0]["line"], 41);
+    assert_eq!(env["counts"]["error"], 1);
 }
 
 #[tokio::test]

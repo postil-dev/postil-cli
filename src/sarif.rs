@@ -126,6 +126,7 @@ mod tests {
             },
             model_used: "m".into(),
             usage: Usage::default(),
+            duration_ms: 0,
             base_sha: None,
             head_sha: None,
             since_sha: None,

@@ -180,8 +180,8 @@ impl LlmClient {
     ) -> Result<ModelReview> {
         let mut usage = Usage::default();
         let content = self.chat(model, system, user, &mut usage).await?;
-        match parse_review(&content) {
-            Ok(raw) => Ok(into_review(raw, model, usage)),
+        let raw = match parse_review(&content) {
+            Ok(raw) => raw,
             Err(parse_err) => {
                 // One repair attempt: ask the same model to fix its own JSON.
                 let repair_user = format!(
@@ -198,11 +198,42 @@ impl LlmClient {
                     )
                     .await
                     .context("JSON repair call failed")?;
-                let raw = parse_review(&repaired)
-                    .map_err(|e| anyhow!("model output invalid after repair: {e}"))?;
-                Ok(into_review(raw, model, usage))
+                parse_review(&repaired)
+                    .map_err(|e| anyhow!("model output invalid after repair: {e}"))?
+            }
+        };
+        let mut review = into_review(raw, model, usage);
+
+        // Semantic consistency retry: a summary that narrates risk next to an
+        // empty findings array is the contract violation behind "clean status,
+        // scary prose" reviews. Give the model one chance to either structure
+        // the risk or retract it; if the contradiction survives, the caller
+        // fails the review closed.
+        if review.findings.is_empty() && !review.summary.is_empty() {
+            let retry_user = format!(
+                "{user}\n\n[Your previous response]\n{content}\n\n[Correction] Your summary \
+                 describes merge-relevant risk but `findings` is empty, which is invalid. \
+                 Either report each risk as a structured finding citing its exact new-file \
+                 line from the diff above, or — if nothing is actually merge-relevant — \
+                 return exactly {{\"summary\": \"\", \"findings\": []}}."
+            );
+            let mut retry_usage = usage;
+            if let Ok(retried) = self
+                .chat(model, system, &retry_user, &mut retry_usage)
+                .await
+                && let Ok(retried_raw) = parse_review(&retried)
+            {
+                let candidate = into_review(retried_raw, model, retry_usage);
+                let still_contradictory =
+                    candidate.findings.is_empty() && !candidate.summary.is_empty();
+                if still_contradictory {
+                    review.usage = retry_usage;
+                } else {
+                    review = candidate;
+                }
             }
         }
+        Ok(review)
     }
 
     async fn chat(
