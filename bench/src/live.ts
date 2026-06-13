@@ -20,6 +20,10 @@
 // match is tracked among detections; clean cases should be silent; any finding
 // in a clean case and any non-matching finding in a defect case is a false
 // positive.
+//
+// Severity match is reported two ways: exact (strict equality) and within one
+// tier (info<->warn and warn<->error treated as a match). See the severity-tier
+// helpers below for the rationale.
 
 import { execFile as execFileCb } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -35,6 +39,31 @@ export const DEFAULT_LIVE_MODEL = "deepseek/deepseek-v4-pro";
 /** A defect is detected when a finding hits the right file and is within this
  * many lines of the ground-truth line. Matches the manual fixture run. */
 const LINE_TOLERANCE = 3;
+
+/** Severity tiers, ordered low to high (mirrors src/envelope.rs: info < warn <
+ * error). Used to compute the +/-1-tier adjacency tolerance below. */
+const SEVERITY_ORDER = ["info", "warn", "error"] as const;
+
+function severityRank(severity: string | null): number {
+  return severity === null
+    ? -1
+    : SEVERITY_ORDER.indexOf(severity as (typeof SEVERITY_ORDER)[number]);
+}
+
+/**
+ * True when found and truth severities are within one tier of each other on the
+ * info < warn < error scale. Adjacent pairs (info<->warn, warn<->error) count as
+ * a match; only the two-tier gap info<->error is a real mismatch. This reflects
+ * the severity-calibration finding that warn<->error is frequently a defensible
+ * judgment call rather than a model error (see .cache/severity-investigation.md).
+ * It is reported alongside the strict exact metric, never as a replacement.
+ * Unknown/missing severities never match. */
+function severityWithinOneTier(found: string | null, truth: string | null): boolean {
+  const f = severityRank(found);
+  const t = severityRank(truth);
+  if (f < 0 || t < 0) return false;
+  return Math.abs(f - t) <= 1;
+}
 
 export interface LiveOptions {
   /** Path to the postil binary (a release build). */
@@ -65,7 +94,10 @@ export interface LiveCaseResult {
   silent: boolean | null;
   truthSeverity: string | null;
   foundSeverity: string | null;
+  /** Strict equality of found vs truth severity (the original metric). */
   severityMatch: boolean | null;
+  /** Found and truth severity within one tier (info<->warn, warn<->error). */
+  severityMatchWithinOneTier: boolean | null;
   confidence: number | null;
   /** Findings beyond the matched true positive (false positives in this case). */
   falsePositives: number;
@@ -86,7 +118,10 @@ export interface LiveSummary {
   scoredCases: number;
   detected: number;
   detectionRate: string;
-  severityMatchAmongDetected: string;
+  /** Strict severity equality among detections (the original metric). */
+  severityMatchExact: string;
+  /** Severity within one tier among detections (warn<->error is defensible). */
+  severityMatchWithinOneTier: string;
   silentOnClean: string;
   falsePositives: number;
   confidenceOfDetections: {
@@ -162,6 +197,7 @@ async function runLiveCase(
     truthSeverity: truth.severity,
     foundSeverity: null,
     severityMatch: null,
+    severityMatchWithinOneTier: null,
     confidence: null,
     falsePositives: 0,
     durationMs: null,
@@ -240,7 +276,10 @@ function scoreCase(base: LiveCaseResult, truth: GroundTruth, env: Envelope): Liv
   base.detected = Boolean(match);
   if (match) {
     base.foundSeverity = match.severity;
+    // Exact: strict equality (the original, strict metric). Within-one-tier:
+    // adjacent severities count as a match (see severityWithinOneTier).
     base.severityMatch = match.severity === truth.severity;
+    base.severityMatchWithinOneTier = severityWithinOneTier(match.severity, truth.severity);
     base.confidence = match.confidence;
   }
   // Every finding that is not the matched true positive is a false positive.
@@ -268,7 +307,8 @@ function summarize(results: LiveCaseResult[], options: LiveOptions): LiveSummary
   const scored = results.filter((r) => r.scored);
 
   const detected = defects.filter((r) => r.detected === true);
-  const sevMatched = detected.filter((r) => r.severityMatch === true);
+  const sevMatchedExact = detected.filter((r) => r.severityMatch === true);
+  const sevMatchedWithinOneTier = detected.filter((r) => r.severityMatchWithinOneTier === true);
   const silentClean = cleans.filter((r) => r.silent === true);
   const falsePositives = results.reduce((sum, r) => sum + r.falsePositives, 0);
 
@@ -294,7 +334,8 @@ function summarize(results: LiveCaseResult[], options: LiveOptions): LiveSummary
     scoredCases: scored.length,
     detected: detected.length,
     detectionRate: `${detected.length}/${defects.length}`,
-    severityMatchAmongDetected: `${sevMatched.length}/${detected.length}`,
+    severityMatchExact: `${sevMatchedExact.length}/${detected.length}`,
+    severityMatchWithinOneTier: `${sevMatchedWithinOneTier.length}/${detected.length}`,
     silentOnClean: `${silentClean.length}/${cleans.length}`,
     falsePositives,
     confidenceOfDetections: {
@@ -331,7 +372,8 @@ export function formatLiveReport(report: LiveReport): string {
   const s = report.summary;
   const lines: string[] = [
     `postil bench (LIVE mode): model ${s.model}`,
-    `Detection ${s.detectionRate} defects | severity-match ${s.severityMatchAmongDetected} | ` +
+    `Detection ${s.detectionRate} defects | severity match (exact) ${s.severityMatchExact} | ` +
+      `severity match (+/-1 tier) ${s.severityMatchWithinOneTier} | ` +
       `silent-on-clean ${s.silentOnClean} | false-positives ${s.falsePositives}`,
   ];
   const c = s.confidenceOfDetections;
@@ -349,6 +391,9 @@ export function formatLiveReport(report: LiveReport): string {
     lines.push(`Cases without a valid envelope: ${s.errors} (excluded from scoring)`);
   }
   lines.push(
+    "Severity match (exact) is strict equality; (+/-1 tier) treats adjacent",
+    "info<->warn and warn<->error as a match, since warn<->error is often a",
+    "defensible judgment call. Neither is a peer-comparison claim.",
     "Note: single model, one run per case, diff-only (no repo context). A measured",
     "baseline for this CLI — NOT a peer comparison.",
     "",
@@ -363,13 +408,22 @@ export function formatLiveReport(report: LiveReport): string {
     } else {
       const tag = r.detected ? "HIT " : "MISS";
       const sev = r.detected
-        ? `${r.truthSeverity}->${r.foundSeverity}${r.severityMatch ? "" : " (mismatch)"} conf=${fmt(r.confidence)}`
+        ? `${r.truthSeverity}->${r.foundSeverity}${severityTag(r)} conf=${fmt(r.confidence)}`
         : `${r.truthSeverity}`;
       const fp = r.falsePositives > 0 ? ` +${r.falsePositives} FP` : "";
       lines.push(`${tag} ${r.id}: ${sev}${fp}`);
     }
   }
   return lines.join("\n");
+}
+
+/** Per-case severity annotation: exact match shows nothing; an adjacent-tier
+ * (defensible) call is flagged distinctly from a true two-tier mismatch so the
+ * per-case detail keeps truth-vs-found fully visible. */
+function severityTag(r: LiveCaseResult): string {
+  if (r.severityMatch) return "";
+  if (r.severityMatchWithinOneTier) return " (+/-1 tier)";
+  return " (mismatch)";
 }
 
 function fmt(v: number | null): string {
