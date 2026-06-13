@@ -4,7 +4,8 @@
   "type": "module",
   "description": "Hermetic PR-review regression suite for the postil CLI (mock forge + mock model).",
   "scripts": {
-    "bench": "bun run src/run.ts"
+    "bench": "bun run src/run.ts",
+    "bench:live": "bun run src/run.ts --live"
   },
   "dependencies": {
     "zod": "^4.4.3"
