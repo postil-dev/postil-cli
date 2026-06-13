@@ -388,8 +388,14 @@ fn into_review(raw: RawReview, model: &str, usage: Usage) -> ModelReview {
     let findings = raw
         .findings
         .into_iter()
-        .filter_map(|f| {
-            let severity = Severity::parse(&f.severity)?;
+        .map(|f| {
+            // Fail toward surfacing: an unrecognized severity label must never
+            // erase the whole finding (path/line/body), or a real high-severity
+            // issue the model called "major"/"P0"/"moderate" would vanish before
+            // grounding, the gate, and the user ever see it. Default unknown
+            // labels to Warn — conservative (non-silent, doesn't over-gate the
+            // way an Error default would).
+            let severity = Severity::parse(&f.severity).unwrap_or(Severity::Warn);
             let kind = match f.kind.as_deref() {
                 Some("humanEscalation") | Some("human_escalation") => Kind::HumanEscalation,
                 Some("guardrail") => Kind::Guardrail,
@@ -402,7 +408,7 @@ fn into_review(raw: RawReview, model: &str, usage: Usage) -> ModelReview {
             } else {
                 f.title
             };
-            Some(Finding {
+            Finding {
                 path: f.path.trim_start_matches("./").to_string(),
                 line: f.line,
                 end_line: f.end_line.filter(|e| *e >= f.line),
@@ -411,7 +417,7 @@ fn into_review(raw: RawReview, model: &str, usage: Usage) -> ModelReview {
                 confidence: f.confidence.clamp(0.0, 1.0),
                 title,
                 body: f.body,
-            })
+            }
         })
         .collect();
     ModelReview {
@@ -499,6 +505,33 @@ mod tests {
     #[test]
     fn rejects_non_json() {
         assert!(parse_review("I could not review this.").is_err());
+    }
+
+    #[test]
+    fn into_review_keeps_unknown_severity_as_warn() {
+        // Fail toward surfacing: a severity label outside the alias table
+        // ("major"/"P0"/"moderate") must NOT drop the finding. It is retained
+        // and defaulted to Warn so grounding and the gate still see it.
+        for label in ["major", "P0", "moderate"] {
+            let raw = RawReview {
+                summary: String::new(),
+                findings: vec![RawFinding {
+                    path: "src/a.rs".into(),
+                    line: 7,
+                    end_line: None,
+                    severity: label.into(),
+                    kind: None,
+                    confidence: 0.9,
+                    title: "real issue".into(),
+                    body: "still grounded".into(),
+                }],
+            };
+            let r = into_review(raw, "m", Usage::default());
+            assert_eq!(r.findings.len(), 1, "finding dropped for label {label:?}");
+            assert_eq!(r.findings[0].severity, Severity::Warn);
+            assert_eq!(r.findings[0].line, 7);
+            assert_eq!(r.findings[0].title, "real issue");
+        }
     }
 
     #[test]
