@@ -17,7 +17,8 @@
 - Model cascade + concurrent multi-model consensus over any OpenAI-compatible endpoint;
   bounded retry with backoff on transient provider errors.
 - Verified `curl | sh` install script with SHA-256 checksum verification; prebuilt
-  release binaries for four targets.
+  release binaries for five targets, including x86_64 musl (Alpine) for static-libc
+  systems.
 - Sigstore keyless signing of release artifacts (cosign, GitHub OIDC); the installer
   verifies the signature when cosign is present and refuses a stripped signature
   unless explicitly overridden.
@@ -36,8 +37,6 @@
 - `postil respond` parity on GitLab/Bitbucket/Azure (today it is GitHub-only), and a
   visible error reply when the hosted bot exhausts its retries (today a dead respond
   job is only logged).
-- musl (Alpine) prebuilt target; the installer currently refuses musl and points at
-  the source build.
 - An `/evidence` benchmark: Postil's own silence rate and confirmed-finding rate on
   public OSS PRs, with raw envelopes.
 

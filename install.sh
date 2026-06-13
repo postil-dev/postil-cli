@@ -47,9 +47,13 @@ case "$arch" in
     aarch64|arm64) arch_part="aarch64" ;;
     *) err "unsupported architecture: $arch ($FROM_SOURCE)" ;;
 esac
-# The prebuilt Linux binaries link glibc; a musl libc (Alpine) cannot run them.
-if [ "$os" = "Linux" ] && ldd --version 2>&1 | grep -qi musl; then
-    err "musl libc detected (Alpine?); no musl prebuilt yet ($FROM_SOURCE)"
+# glibc and musl binaries are not interchangeable, so pick the matching libc on
+# Linux. Alpine and other musl systems report "musl" in `ldd --version`; the
+# presence of the musl loader (/lib/ld-musl-*) is a fallback when ldd is absent.
+if [ "$os" = "Linux" ]; then
+    if { ldd --version 2>&1 | grep -qi musl; } || ls /lib/ld-musl-* >/dev/null 2>&1; then
+        os_part="unknown-linux-musl"
+    fi
 fi
 target="${arch_part}-${os_part}"
 
