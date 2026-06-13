@@ -65,15 +65,33 @@ external provider. Every live run writes a timestamped JSON report under
 
 - **Detection rate**: a defect counts as detected when a finding matches the
   ground-truth path with line within +/-3.
-- **Severity match** among detections.
+- **Severity match (exact)** among detections: strict equality between the found
+  severity and the fixture's ground-truth severity.
+- **Severity match (+/-1 tier)** among detections: a wider band that treats
+  adjacent tiers on the `info < warn < error` scale (i.e. `info`<->`warn` and
+  `warn`<->`error`) as a match, counting only the two-tier `info`<->`error` gap
+  as a real mismatch.
 - **Silence on clean PRs**: a clean case should produce no findings.
 - **False positives**: any finding in a clean case, and any non-matching finding
   in a defect case.
 - **Confidence distribution** of true detections, and per-case duration / token
   usage.
 
+Both severity numbers are reported, and the per-case detail always shows the
+truth-vs-found severity so nothing is hidden. The exact figure is the strict
+metric; the +/-1-tier figure exists because `warn`<->`error` is frequently a
+defensible judgment call rather than a model error — the severity-calibration
+investigation found the consistent "mismatches" are reasonable alternative
+calls on judgment-heavy fixture labels (in several cases the model is correctly
+applying the prompt's own severity rule while the fixture is the aggressive
+party), and the mismatch direction is bidirectional, so it is not a one-way
+miscalibration a prompt change could fix. The +/-1-tier band measures
+agreement-up-to-a-defensible-disagreement; it is a softer view of the same
+detections, not a different or better result.
+
 These numbers are a **measured baseline for this CLI** — a single model, one run
-per case, diff-only with no repository context or policy docs. They are **not a
-peer comparison**: no competitor has been run on the same fixtures, and LLM
-nondeterminism means the rate can move a few points run to run. Treat them as
-internal evidence, not a published benchmark.
+per case, diff-only with no repository context or policy docs. **Neither
+severity metric is a peer-comparison claim**: no competitor has been run on the
+same fixtures, and LLM nondeterminism means the rates (severity match most of
+all) can move a few points run to run. Treat them as internal evidence, not a
+published benchmark.
