@@ -21,3 +21,16 @@ jobs:
       - run: cargo clippy --quiet --all-targets -- -D warnings
       - run: cargo test --quiet
       - run: cargo build --quiet --release
+
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: oven-sh/setup-bun@v2
+      - run: cargo build --quiet --release
+      - run: bun install --frozen-lockfile
+        working-directory: bench
+      - run: bun run bench
+        working-directory: bench
