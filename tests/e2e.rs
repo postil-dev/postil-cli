@@ -1097,6 +1097,288 @@ async fn respond_to_issue_mention_uses_issue_body() {
     }));
 }
 
+#[tokio::test]
+async fn respond_gitlab_mr_mention_posts_note() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_text(
+            "Line 41 interpolates `user_input` into the query — parameterize it.",
+        )))
+        .mount(&server)
+        .await;
+    // MR metadata (title/description + diff refs) for grounding.
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/projects/.+/merge_requests/5$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "Add login",
+            "description": "MR body",
+            "diff_refs": {"base_sha": "b", "start_sha": "s", "head_sha": "h"}
+        })))
+        .mount(&server)
+        .await;
+    // MR file diffs (paginated; one short page ends iteration).
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/projects/.+/merge_requests/5/diffs$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "old_path": "src/auth.rs", "new_path": "src/auth.rs",
+            "diff": "@@ -40,6 +40,8 @@ fn login() {\n context line\n+let token = format!(\"{}\", user_input);\n+exec_query(&token);\n trailing context\n",
+            "new_file": false, "deleted_file": false
+        }])))
+        .mount(&server)
+        .await;
+    // The reply note endpoint.
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/projects/.+/merge_requests/5/notes$"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITLAB_API_URL", server.uri())
+        .env("GITLAB_TOKEN", "gl-test-token")
+        .args([
+            "respond",
+            "--forge",
+            "gitlab",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "5",
+            "--comment",
+            "@postil is this safe?",
+        ])
+        .assert()
+        .success();
+
+    let reqs = server.received_requests().await.unwrap();
+    let note = reqs
+        .iter()
+        .find(|r| {
+            r.method == wiremock::http::Method::POST
+                && r.url.path().ends_with("/merge_requests/5/notes")
+        })
+        .expect("reply note posted to the MR");
+    let body: Value = note.body_json().unwrap();
+    let text = body["body"].as_str().unwrap();
+    assert!(text.contains("parameterize"));
+    assert!(text.contains("Postil ·")); // footer with model attribution
+}
+
+#[tokio::test]
+async fn respond_gitlab_issue_mention_uses_issue_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_text(
+            "This looks like connection-pool exhaustion under load, not a logic bug.",
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/projects/.+/issues/9$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "Timeouts under load",
+            "description": "Requests hang after ~200 concurrent users."
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/projects/.+/issues/9/notes$"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITLAB_API_URL", server.uri())
+        .env("GITLAB_TOKEN", "gl-test-token")
+        .args([
+            "respond",
+            "--forge",
+            "gitlab",
+            "--repo",
+            "acme/api",
+            "--issue",
+            "9",
+            "--comment",
+            "@postil what is happening?",
+        ])
+        .assert()
+        .success();
+
+    let reqs = server.received_requests().await.unwrap();
+    // The model was grounded on the issue body.
+    let llm = reqs
+        .iter()
+        .find(|r| r.url.path() == "/chat/completions")
+        .unwrap();
+    let sent: Value = llm.body_json().unwrap();
+    let user_msg = sent["messages"][1]["content"].as_str().unwrap();
+    assert!(user_msg.contains("200 concurrent users"));
+    // The reply landed on the issue notes endpoint, not the MR one.
+    assert!(reqs.iter().any(|r| {
+        r.method == wiremock::http::Method::POST && r.url.path().ends_with("/issues/9/notes")
+    }));
+}
+
+#[tokio::test]
+async fn respond_bitbucket_pr_mention_posts_comment() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_text(
+            "Line 41 interpolates `user_input` — that is the injection risk.",
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repositories/acme/api/pullrequests/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "Add login",
+            "summary": {"raw": "PR body"},
+            "source": {"commit": {"hash": "headsha111"}},
+            "destination": {"commit": {"hash": "basesha222"}}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repositories/acme/api/pullrequests/7/diff"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(DIFF))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repositories/acme/api/pullrequests/7/comments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("BITBUCKET_API_URL", server.uri())
+        .env("BITBUCKET_TOKEN", "bb-test-token")
+        .env_remove("BITBUCKET_USER")
+        .args([
+            "respond",
+            "--forge",
+            "bitbucket",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--comment",
+            "@postil is this safe?",
+        ])
+        .assert()
+        .success();
+
+    let reqs = server.received_requests().await.unwrap();
+    let comment = reqs
+        .iter()
+        .find(|r| {
+            r.method == wiremock::http::Method::POST
+                && r.url.path() == "/repositories/acme/api/pullrequests/7/comments"
+        })
+        .expect("reply comment posted to the PR");
+    let body: Value = comment.body_json().unwrap();
+    let text = body["content"]["raw"].as_str().unwrap();
+    assert!(text.contains("injection risk"));
+    assert!(text.contains("Postil ·"));
+}
+
+#[tokio::test]
+async fn respond_azure_pr_mention_posts_thread() {
+    let server = MockServer::start().await;
+    let old_content = "fn login() {\n    let token = sanitize(user_input);\n}\n";
+    let new_content = "fn login() {\n    let token = user_input;\n}\n";
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_text(
+            "Line 2 drops the sanitize() call — that is the risk.",
+        )))
+        .mount(&server)
+        .await;
+    let pr_path = "/myorg/myproj/_apis/git/repositories/myrepo/pullRequests/7";
+    Mock::given(method("GET"))
+        .and(path(pr_path))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "Add login", "description": "PR body",
+            "lastMergeSourceCommit": {"commitId": "HEAD"},
+            "lastMergeTargetCommit": {"commitId": "BASE"}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/myorg/myproj/_apis/git/repositories/myrepo/diffs/commits",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "changes": [{"item": {"path": "/src/auth.rs"}, "changeType": "edit"}]
+        })))
+        .mount(&server)
+        .await;
+    let items_path = "/myorg/myproj/_apis/git/repositories/myrepo/items";
+    Mock::given(method("GET"))
+        .and(path(items_path))
+        .and(query_param("version", "BASE"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(old_content))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(items_path))
+        .and(query_param("version", "HEAD"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(new_content))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/myorg/myproj/_apis/git/repositories/myrepo/pullRequests/7/threads",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("AZURE_DEVOPS_API_URL", server.uri())
+        .env("AZURE_DEVOPS_TOKEN", "az-test-pat")
+        .args([
+            "respond",
+            "--forge",
+            "azure",
+            "--repo",
+            "myorg/myproj/myrepo",
+            "--pr",
+            "7",
+            "--comment",
+            "@postil is this safe?",
+        ])
+        .assert()
+        .success();
+
+    let reqs = server.received_requests().await.unwrap();
+    let thread = reqs
+        .iter()
+        .find(|r| {
+            r.method == wiremock::http::Method::POST
+                && r.url.path().ends_with("/pullRequests/7/threads")
+        })
+        .expect("reply thread posted to the PR");
+    let body: Value = thread.body_json().unwrap();
+    let text = body["comments"][0]["content"].as_str().unwrap();
+    assert!(text.contains("risk"));
+    assert!(text.contains("Postil ·"));
+}
+
 #[test]
 fn init_writes_starter_and_config_shows_provenance() {
     let dir = tempfile::tempdir().unwrap();
