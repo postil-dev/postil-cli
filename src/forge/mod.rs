@@ -54,6 +54,17 @@ pub enum CheckState {
     Neutral,
 }
 
+/// What a `respond` thread number points at. GitHub's issues API covers both,
+/// so it ignores this; GitLab/Bitbucket/Azure key issues and PRs on different
+/// endpoints, so they branch on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadKind {
+    /// A pull request / merge request.
+    Pull,
+    /// An issue / work item on the forge's issue tracker.
+    Issue,
+}
+
 #[allow(async_fn_in_trait)]
 pub trait Forge {
     /// True when the forge renders inline HTML `<img>` in markdown comments
@@ -81,6 +92,15 @@ pub trait Forge {
         gate: CheckState,
         envelope: &Envelope,
     ) -> Result<()>;
+
+    /// Title and body of the issue/PR/MR a maintainer mentioned Postil on, used
+    /// to ground the answer (`postil respond`). `kind` disambiguates the number
+    /// for forges whose issues and pulls live on different endpoints.
+    async fn fetch_thread(&self, number: u64, kind: ThreadKind) -> Result<(String, String)>;
+
+    /// Post a top-level comment (Postil's reply to a mention). `kind` selects the
+    /// issue- vs pull-level endpoint where the forge separates them.
+    async fn post_comment(&self, number: u64, kind: ThreadKind, body: &str) -> Result<()>;
 }
 
 pub fn check_title(envelope: &Envelope) -> String {

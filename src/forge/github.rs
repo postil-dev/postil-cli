@@ -4,7 +4,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{CheckState, Forge, PrMeta, check_summary, check_title};
+use super::{CheckState, Forge, PrMeta, ThreadKind, check_summary, check_title};
 use crate::envelope::{Envelope, Finding, Severity};
 
 pub struct GitHub {
@@ -57,34 +57,6 @@ impl GitHub {
         let body = resp.text().await.unwrap_or_default();
         let snippet: String = body.chars().take(300).collect();
         Err(anyhow!("GitHub {what} failed: {status}: {snippet}"))
-    }
-
-    /// Title and body of an issue or PR (the issues API covers both).
-    pub async fn fetch_issue(&self, number: u64) -> Result<(String, String)> {
-        let resp = self
-            .request(reqwest::Method::GET, self.url(&format!("/issues/{number}")))
-            .send()
-            .await
-            .context("fetching issue")?;
-        let v: serde_json::Value = Self::check_ok(resp, "issue fetch").await?.json().await?;
-        let title = v["title"].as_str().unwrap_or_default().to_string();
-        let body = v["body"].as_str().unwrap_or_default().to_string();
-        Ok((title, body))
-    }
-
-    /// Post a top-level comment on an issue or PR (the bot's reply to a mention).
-    pub async fn post_issue_comment(&self, number: u64, body: &str) -> Result<()> {
-        let resp = self
-            .request(
-                reqwest::Method::POST,
-                self.url(&format!("/issues/{number}/comments")),
-            )
-            .json(&json!({ "body": body }))
-            .send()
-            .await
-            .context("posting comment")?;
-        Self::check_ok(resp, "comment post").await?;
-        Ok(())
     }
 }
 
@@ -302,6 +274,35 @@ impl Forge for GitHub {
                 .with_context(|| format!("completing check-run {name}"))?;
             Self::check_ok(resp, "check-run complete").await?;
         }
+        Ok(())
+    }
+
+    /// Title and body of an issue or PR (the issues API covers both, so `kind`
+    /// is not needed here).
+    async fn fetch_thread(&self, number: u64, _kind: ThreadKind) -> Result<(String, String)> {
+        let resp = self
+            .request(reqwest::Method::GET, self.url(&format!("/issues/{number}")))
+            .send()
+            .await
+            .context("fetching issue")?;
+        let v: serde_json::Value = Self::check_ok(resp, "issue fetch").await?.json().await?;
+        let title = v["title"].as_str().unwrap_or_default().to_string();
+        let body = v["body"].as_str().unwrap_or_default().to_string();
+        Ok((title, body))
+    }
+
+    /// Post a top-level comment on an issue or PR (the bot's reply to a mention).
+    async fn post_comment(&self, number: u64, _kind: ThreadKind, body: &str) -> Result<()> {
+        let resp = self
+            .request(
+                reqwest::Method::POST,
+                self.url(&format!("/issues/{number}/comments")),
+            )
+            .json(&json!({ "body": body }))
+            .send()
+            .await
+            .context("posting comment")?;
+        Self::check_ok(resp, "comment post").await?;
         Ok(())
     }
 }
