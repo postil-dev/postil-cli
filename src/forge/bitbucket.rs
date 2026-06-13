@@ -113,13 +113,7 @@ impl Bitbucket {
     /// API refuses the inline position.
     async fn post_finding(&self, f: &Finding) -> Result<()> {
         let body = json!({
-            "content": { "raw": format!(
-                "**{}** ({} / {} confidence)\n\n{}",
-                f.title,
-                f.severity.as_str(),
-                super::format_confidence(f.confidence),
-                f.body
-            )},
+            "content": { "raw": super::finding_comment_body(f, false) },
             "inline": { "path": f.path, "to": f.line },
         });
         let resp = self
@@ -298,7 +292,7 @@ impl Forge for Bitbucket {
             &head,
             "postil/review",
             map(advisory),
-            &check_summary(envelope),
+            &check_summary(envelope, false),
         )
         .await?;
         let gate_desc = if envelope.gate.failing {
