@@ -69,14 +69,53 @@ pub fn apply(cfg: &Config, index: &DiffIndex, mut findings: Vec<Finding>) -> Res
     })
 }
 
-/// Incremental reconciliation. A baseline finding is RESOLVED when the new
-/// (incremental) diff touched the lines it pointed at — the author changed that
-/// code — and no new finding re-flags the same spot. Untouched baseline
-/// findings are still OPEN and are carried forward so the gate cannot be
-/// cleared by pushing an unrelated commit.
+/// Incremental reconciliation. This decides, for each finding from the previous
+/// review (the baseline), whether it is now RESOLVED (drop it), SUPERSEDED by a
+/// fresh finding for the same issue (drop the stale copy, the new one stands),
+/// or still OPEN (CARRY it forward so the gate cannot be cleared by pushing an
+/// unrelated commit).
+///
+/// The guiding principle is fail-closed: this is a merge gate, so when the
+/// signal is ambiguous we CARRY rather than resolve or silently drop. The two
+/// heuristics below are deliberately conservative because both the original
+/// "touched ⇒ resolved" and "nearby ⇒ superseded" rules could clear the gate
+/// over an unfixed Error.
 pub struct Reconciliation {
     pub resolved: Vec<Finding>,
     pub carried: Vec<Finding>,
+}
+
+/// How close (in lines) a new finding must be to a baseline finding to be
+/// considered "the same spot". Kept small; proximity alone is not enough to
+/// supersede (see `supersedes`).
+const REFLAG_PROXIMITY: u32 = 3;
+
+/// True when `new` plausibly re-reports the SAME issue as the baseline finding
+/// `base` (so the fresh copy supersedes the stale one). Proximity alone is not
+/// sufficient: an unrelated low-severity finding landing near an unfixed Error
+/// must not erase the Error from the gate. We require same path, same kind, and
+/// comparable-or-higher severity (`new.severity >= base.severity`). Anything
+/// weaker is treated as a different, coexisting issue and the baseline is
+/// carried.
+fn supersedes(base: &Finding, new: &Finding) -> bool {
+    new.path == base.path
+        && new.line.abs_diff(base.line) <= REFLAG_PROXIMITY
+        && new.kind == base.kind
+        && new.severity >= base.severity
+}
+
+/// Whether the incremental diff plausibly ADDRESSES the baseline finding (so it
+/// can be declared resolved). Interval overlap (`touches`) is too loose: a
+/// finding with a wide `end_line` span (e.g. 5..40) would be resolved by a
+/// single one-line edit anywhere inside it, even if the bug is untouched. We
+/// only resolve when the diff touches the finding's ANCHOR line itself (the
+/// `line`, where the model pinned the issue), not merely somewhere in its span.
+/// This still cannot prove the edit fixed the bug — the model staying silent the
+/// next run is the real confirmation we lack — but it removes the worst
+/// false-resolve (wide-span / distant-touch) and fails closed (carry) when the
+/// edit landed elsewhere in the span.
+fn touch_addresses(incremental_index: &DiffIndex, f: &Finding) -> bool {
+    incremental_index.contains(&f.path, f.line)
 }
 
 pub fn reconcile(
@@ -92,21 +131,29 @@ pub fn reconcile(
         if f.path.starts_with(".postil/") {
             continue;
         }
-        let end = f.end_line.unwrap_or(f.line);
-        let touched = incremental_index.touches(&f.path, f.line, end);
-        let reflagged = new_findings
-            .iter()
-            .any(|n| n.path == f.path && n.line.abs_diff(f.line) <= 3);
-        if touched && !reflagged {
+        let superseded = new_findings.iter().any(|n| supersedes(f, n));
+        if superseded {
+            // A fresh, same-issue finding stands in for the baseline; the new
+            // copy is already in `new_findings` and will reach the gate.
+            continue;
+        }
+        if touch_addresses(incremental_index, f) {
+            // The author edited the exact line the issue was pinned to and the
+            // model did not re-flag it this run: treat as resolved. (Imperfect —
+            // a non-fixing edit to that line will also resolve it — but the
+            // anchor-line requirement is far tighter than span overlap, and a
+            // full re-review would re-detect a still-broken issue.)
             resolved.push(f.clone());
-        } else if !reflagged {
+        } else {
+            // Not superseded and the anchor line was not touched: the issue
+            // persists. Carry it forward (fail-closed) so an unrelated nearby
+            // finding or a distant in-span edit cannot clear the gate.
             let mut carry = f.clone();
             if !carry.body.contains("[carried from previous review]") {
                 carry.body = format!("[carried from previous review]\n\n{}", carry.body);
             }
             carried.push(carry);
         }
-        // reflagged → the new finding supersedes the baseline one; drop the old copy.
     }
     Reconciliation { resolved, carried }
 }
@@ -230,5 +277,46 @@ mod tests {
         let rec = reconcile(&baseline, &idx, &new);
         assert!(rec.resolved.is_empty());
         assert!(rec.carried.is_empty());
+    }
+
+    // H1: an unrelated, lower-severity new finding near an unfixed baseline
+    // Error must NOT supersede it. The baseline line is not touched by the
+    // incremental diff, so the Error has to be carried (gate still fails).
+    #[test]
+    fn reconcile_unrelated_nearby_finding_does_not_drop_baseline_error() {
+        let idx = index_for("z.rs", 100, 1); // incremental diff is elsewhere
+        let baseline = vec![f("a.rs", 10, Severity::Error, 0.9)];
+        let new = vec![f("a.rs", 12, Severity::Info, 0.9)]; // unrelated, lower sev
+        let rec = reconcile(&baseline, &idx, &new);
+        assert_eq!(rec.resolved.len(), 0);
+        assert_eq!(rec.carried.len(), 1, "baseline Error was dropped");
+        assert_eq!(rec.carried[0].severity, Severity::Error);
+        assert!(rec.carried[0].body.starts_with("[carried"));
+    }
+
+    // H1 (companion): a comparable-or-higher severity, same-kind finding at the
+    // same spot DOES supersede — the original carry-forward design intent.
+    #[test]
+    fn reconcile_same_issue_higher_severity_supersedes() {
+        let idx = index_for("z.rs", 100, 1);
+        let baseline = vec![f("a.rs", 10, Severity::Warn, 0.9)];
+        let new = vec![f("a.rs", 11, Severity::Error, 0.9)];
+        let rec = reconcile(&baseline, &idx, &new);
+        assert!(rec.resolved.is_empty());
+        assert!(rec.carried.is_empty(), "same-issue reflag should supersede");
+    }
+
+    // H2: a wide-span baseline Error (5..40) whose ANCHOR line (5) is not in the
+    // incremental diff must not be auto-resolved by a single unrelated touch at
+    // line 30 inside its span. With no reflag, it is carried (fail-closed).
+    #[test]
+    fn reconcile_wide_span_distant_touch_is_not_resolved() {
+        let idx = index_for("a.rs", 30, 1); // touches only a.rs:30
+        let mut wide = f("a.rs", 5, Severity::Error, 0.9);
+        wide.end_line = Some(40);
+        let rec = reconcile(&[wide], &idx, &[]);
+        assert_eq!(rec.resolved.len(), 0, "wide-span finding falsely resolved");
+        assert_eq!(rec.carried.len(), 1);
+        assert_eq!(rec.carried[0].severity, Severity::Error);
     }
 }
