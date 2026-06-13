@@ -87,7 +87,8 @@ pub enum Command {
     },
     /// Reply to an @postil mention on a pull request or issue (interactive bot).
     Respond {
-        /// Code host. Only github is supported today.
+        /// Code host. GitHub and GitLab support PRs/MRs and issues; Bitbucket
+        /// and Azure DevOps support pull requests only.
         #[arg(long, value_enum, default_value = "github")]
         forge: ForgeArg,
         /// Repository as owner/name.

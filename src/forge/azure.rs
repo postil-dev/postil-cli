@@ -14,7 +14,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{CheckState, Forge, PrMeta, check_summary, check_title};
+use super::{CheckState, Forge, PrMeta, ThreadKind, check_summary, check_title};
 use crate::envelope::{Envelope, Finding};
 
 const API_VERSION: &str = "7.1";
@@ -433,6 +433,47 @@ impl Forge for Azure {
         };
         self.set_status(&head, "postil/gate", map(gate), &gate_desc)
             .await?;
+        Ok(())
+    }
+
+    /// Title and description of a PR. Work-item comments live under a different
+    /// `_apis/wit` base and api-version than the git endpoints this client uses,
+    /// so respond is scoped to pull requests.
+    async fn fetch_thread(&self, _number: u64, kind: ThreadKind) -> Result<(String, String)> {
+        // TODO(respond): Azure work-item comments
+        // (`_apis/wit/workItems/{id}/comments?api-version=7.0-preview.3`, body
+        // field `text`) use a different base/version; scope respond to PRs.
+        if kind == ThreadKind::Issue {
+            return Err(anyhow!(
+                "postil respond on Azure DevOps supports --pr only (work items not supported)"
+            ));
+        }
+        let pr = self.pr().await?;
+        Ok((pr.title, pr.description))
+    }
+
+    /// Post a top-level PR comment as a non-anchored thread (the bot's reply to
+    /// a mention) — the same threads endpoint the reviewer uses for its summary.
+    async fn post_comment(&self, number: u64, kind: ThreadKind, body: &str) -> Result<()> {
+        // TODO(respond): Azure work-item comments are unverified here; scope to PRs.
+        if kind == ThreadKind::Issue {
+            return Err(anyhow!(
+                "postil respond on Azure DevOps supports --pr only (work items not supported)"
+            ));
+        }
+        let resp = self
+            .request(
+                reqwest::Method::POST,
+                self.url(&format!("/pullRequests/{number}/threads"), ""),
+            )
+            .json(&json!({
+                "comments": [{ "parentCommentId": 0, "commentType": 1, "content": body }],
+                "status": 1,
+            }))
+            .send()
+            .await
+            .context("posting comment")?;
+        Self::check_ok(resp, "comment post").await?;
         Ok(())
     }
 }
