@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{CheckState, Forge, PrMeta, check_summary, check_title};
+use super::{CheckState, Forge, PrMeta, ThreadKind, check_summary, check_title};
 use crate::envelope::{Envelope, Finding};
 
 pub struct GitLab {
@@ -311,6 +311,48 @@ impl Forge for GitLab {
         };
         self.set_status(&head, "postil/gate", map(gate), &gate_desc)
             .await?;
+        Ok(())
+    }
+
+    /// Title and description of an issue or MR. GitLab's issue and merge-request
+    /// objects both expose `title` and `description`, so only the resource path
+    /// differs by `kind`.
+    async fn fetch_thread(&self, number: u64, kind: ThreadKind) -> Result<(String, String)> {
+        let resource = match kind {
+            ThreadKind::Pull => "merge_requests",
+            ThreadKind::Issue => "issues",
+        };
+        let resp = self
+            .request(
+                reqwest::Method::GET,
+                self.url(&format!("/{resource}/{number}")),
+            )
+            .send()
+            .await
+            .context("fetching thread")?;
+        let v: serde_json::Value = Self::check_ok(resp, "thread fetch").await?.json().await?;
+        let title = v["title"].as_str().unwrap_or_default().to_string();
+        let body = v["description"].as_str().unwrap_or_default().to_string();
+        Ok((title, body))
+    }
+
+    /// Post a top-level note on an issue or MR (the bot's reply to a mention).
+    /// Both resources expose `/{resource}/{number}/notes` with a `body` field.
+    async fn post_comment(&self, number: u64, kind: ThreadKind, body: &str) -> Result<()> {
+        let resource = match kind {
+            ThreadKind::Pull => "merge_requests",
+            ThreadKind::Issue => "issues",
+        };
+        let resp = self
+            .request(
+                reqwest::Method::POST,
+                self.url(&format!("/{resource}/{number}/notes")),
+            )
+            .json(&json!({ "body": body }))
+            .send()
+            .await
+            .context("posting note")?;
+        Self::check_ok(resp, "note post").await?;
         Ok(())
     }
 }
