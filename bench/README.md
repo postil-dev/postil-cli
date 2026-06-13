@@ -53,6 +53,7 @@ is written to any repo.
 export POSTIL_API_KEY=...        # required; never logged or printed
 bun run bench:live               # or: bun run bench --live
 # REVIEW_MODEL or --model <id> overrides the model (default deepseek/deepseek-v4-pro)
+# --concurrency <n> or BENCH_CONCURRENCY sets case parallelism (default 6)
 ```
 
 It refuses to run without `POSTIL_API_KEY` and never reads or prints the key
@@ -60,6 +61,24 @@ value. Live mode is **not run in CI**: it spends real tokens and depends on an
 external provider. Every live run writes a timestamped JSON report under
 `.runs/` (gitignored); `--json-out <path>` writes an additional copy and
 `--json` prints the report as JSON.
+
+### Concurrency and retries
+
+Cases run through a bounded worker pool, `--concurrency <n>` (or
+`BENCH_CONCURRENCY`, default 6) at a time, instead of strictly sequentially.
+Each case still gets its own isolated run directory, and results are sorted by
+case index before the report is written, so the output is byte-for-byte
+deterministic in ordering regardless of completion order. Set `--concurrency 1`
+to fall back to fully sequential execution.
+
+Each case is retried **once** (after a short backoff) when its first attempt
+fails with a transient provider error: a non-zero exit whose stderr carries an
+HTTP 5xx/429, rate-limit, timeout, or connection signature, or a run that
+produced no valid v1 envelope at all (empty/garbled output, typically a dropped
+response). A valid envelope is always treated as a normal result and is never
+retried — including a gate-failing exit (exit 1 with a scored envelope) or one
+that merely reports findings or false positives. A case that fails on both
+attempts is recorded as an error and excluded from scoring, exactly as before.
 
 ### What live mode scores
 
