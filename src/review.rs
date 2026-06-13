@@ -267,7 +267,6 @@ async fn review_diff(
         let client = LlmClient::from_env(cfg)?;
         match client.review(cfg, &system, &user).await {
             Ok(model_review) => {
-                let raw_findings = model_review.findings.len();
                 let outcome = filter::apply(cfg, &index, model_review.findings)?;
                 model_used = model_review.model_used;
                 usage = model_review.usage;
@@ -278,11 +277,20 @@ async fn review_diff(
                         "model reported {} finding(s), none grounded in the diff",
                         outcome.ungrounded
                     ))];
-                } else if raw_findings == 0 && !model_review.summary.trim().is_empty() {
-                    // Risk narrated in prose with zero structured findings
-                    // (post-retry). Passing this as clean is the predecessor
-                    // product's worst failure mode; fail closed instead and
-                    // carry the narration into the finding so it is not lost.
+                } else if outcome.kept.is_empty() && !model_review.summary.trim().is_empty() {
+                    // Risk narrated in prose while NO finding survives to the
+                    // gate. Passing this as clean is the predecessor product's
+                    // worst failure mode; fail closed instead and carry the
+                    // narration into the finding so it is not lost.
+                    //
+                    // Keyed on the POST-FILTER kept set, not raw_findings: the
+                    // hole this closes is a model that returns findings which are
+                    // all removed by min_confidence/severity/ignore suppression
+                    // (so raw_findings != 0) while the summary still narrates
+                    // risk — that previously slipped through silently. The
+                    // all_ungrounded case is handled above, so this branch only
+                    // fires for the genuinely-empty-after-policy case and does
+                    // not double-fire.
                     findings = vec![crate::envelope::narrated_risk_finding(
                         &model_review.summary,
                     )];
@@ -326,7 +334,18 @@ async fn review_diff(
     }
 
     // Reconcile against the previous review (incremental or full re-review).
-    let rec = filter::reconcile(&baseline, &index, &findings);
+    // Skip entirely when review is disabled: a repo that set `enabled: false`
+    // must not have a supplied baseline carry Errors that fail the gate. With
+    // review off there is no fresh signal to reconcile against, so honoring the
+    // disable means dropping the baseline carry-forward too.
+    let rec = if cfg.enabled {
+        filter::reconcile(&baseline, &index, &findings)
+    } else {
+        filter::Reconciliation {
+            resolved: vec![],
+            carried: vec![],
+        }
+    };
     findings.extend(rec.carried);
 
     // Operational findings (model unreachable/unusable) fail the gate by default

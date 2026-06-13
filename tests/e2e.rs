@@ -386,13 +386,23 @@ async fn narrated_risk_retry_recovers_structured_finding() {
 }
 
 #[tokio::test]
-async fn low_confidence_findings_are_suppressed() {
+async fn low_confidence_only_finding_with_risk_summary_fails_closed() {
+    // M1 regression: the model returns one grounded finding below minConfidence
+    // (suppressed) WHILE its summary narrates risk. Policy emptying the kept set
+    // must not let a risk-narrating run pass silently — the narrated-risk guard
+    // keys on the post-filter kept set, so this fails closed with the narration
+    // preserved (the same hole, reached through the suppression door instead of
+    // the empty-findings door).
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([
-            finding_at(41, "warn", 0.3) // below default minConfidence 0.6
+            finding_at(41, "warn", 0.3) // grounded but below default minConfidence 0.6
         ]))))
+        // The model returns one (non-empty) raw finding, so the LLM-client
+        // semantic retry (which fires only on empty raw findings) does not run;
+        // the kept set empties later, in the filter. One call.
+        .expect(1)
         .mount(&server)
         .await;
 
@@ -405,11 +415,25 @@ async fn low_confidence_findings_are_suppressed() {
         .arg(&diff)
         .arg("--output-json")
         .assert()
-        .code(0);
+        .code(1); // fails closed, not a silent pass
     let env: Value =
         serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
-    assert_eq!(env["silent"], true);
+    assert_eq!(env["silent"], false);
+    assert_eq!(env["gate"]["failing"], true);
+    assert_eq!(env["findings"][0]["path"], ".postil/model-output");
+    assert_eq!(
+        env["findings"][0]["title"],
+        "Model narrated risk without structured findings"
+    );
+    // The suppressed finding still counts as suppressed, and the narrated
+    // concern is preserved rather than blanked.
     assert_eq!(env["counts"]["suppressed"], 1);
+    assert!(
+        env["findings"][0]["body"]
+            .as_str()
+            .unwrap()
+            .contains("SQL injection risk in auth path.")
+    );
 }
 
 #[tokio::test]
@@ -782,6 +806,60 @@ async fn incremental_review_resolves_and_carries_baseline_findings() {
     );
     assert_eq!(env["gate"]["failing"], true);
     assert_eq!(env["sinceSha"], "abc123");
+}
+
+#[tokio::test]
+async fn disabled_review_does_not_carry_baseline_findings() {
+    // M2 regression: a repo with `enabled: false` plus a supplied baseline must
+    // not have baseline Errors reconciled and carried into the gate. With review
+    // off there is no fresh model run, so reconcile is skipped entirely and the
+    // gate stays clean. No LLM call should be made.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
+        .expect(0) // disabled: the model is never called
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    std::fs::write(dir.path().join(".postil.yaml"), "enabled: false\n").unwrap();
+
+    let baseline = json!({
+        "version": 1, "summary": "", "silent": false,
+        "findings": [
+            {"path": "src/db.rs", "line": 10, "severity": "error", "kind": "risk",
+             "confidence": 0.9, "title": "still broken", "body": "not addressed"}
+        ],
+        "resolved": [], "counts": {"info": 0, "warn": 0, "error": 1, "suppressed": 0},
+        "confidenceBuckets": [0,0,0,0,1],
+        "gate": {"failOn": "error", "failing": true},
+        "modelUsed": "m", "usage": {"promptTokens": 0, "completionTokens": 0},
+        "baseSha": null, "headSha": null, "sinceSha": null
+    });
+    let baseline_path = dir.path().join("baseline.json");
+    std::fs::write(&baseline_path, baseline.to_string()).unwrap();
+
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--since-sha", "abc123", "--baseline"])
+        .arg(&baseline_path)
+        .arg("--output-json")
+        .assert()
+        .code(0); // disabled + no carry => gate passes
+    let env: Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+    assert_eq!(env["gate"]["failing"], false);
+    assert_eq!(
+        env["findings"].as_array().map(|a| a.len()).unwrap_or(0),
+        0,
+        "disabled review carried a baseline finding into the gate"
+    );
+    assert_eq!(env["silent"], true);
 }
 
 #[tokio::test]
