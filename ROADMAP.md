@@ -61,3 +61,7 @@ Port plan: bring the harness into this repo against the envelope v1 contract,
 keep mock mode as a regression suite, add a live-model mode (real inference,
 same fixtures) to measure detection and silence rate, then run peers on the
 identical fixture set before publishing any comparison.
+
+Status: mock mode is ported and lives in `bench/` (all 30 fixtures, isolation
+and prompt-leakage guardrails kept), runs as the `bench` job in CI against a
+release build. Live-model mode and peer runs remain open.
