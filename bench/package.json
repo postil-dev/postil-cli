@@ -1,0 +1,15 @@
+{
+  "name": "postil-bench",
+  "private": true,
+  "type": "module",
+  "description": "Hermetic PR-review regression suite for the postil CLI (mock forge + mock model).",
+  "scripts": {
+    "bench": "bun run src/run.ts"
+  },
+  "dependencies": {
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14"
+  }
+}
