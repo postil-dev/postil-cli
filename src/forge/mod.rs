@@ -56,6 +56,11 @@ pub enum CheckState {
 
 #[allow(async_fn_in_trait)]
 pub trait Forge {
+    /// True when the forge renders inline HTML `<img>` in markdown comments
+    /// (GitHub, GitLab). Forges that show raw HTML get text-only statuslines.
+    fn rich_markdown(&self) -> bool {
+        false
+    }
     async fn fetch_pr_meta(&self) -> Result<PrMeta>;
     /// Unified diff of the full PR.
     async fn fetch_diff(&self) -> Result<String>;
@@ -87,23 +92,33 @@ pub fn check_title(envelope: &Envelope) -> String {
     }
 }
 
-pub fn check_summary(envelope: &Envelope) -> String {
+pub fn check_summary(envelope: &Envelope, rich: bool) -> String {
     let mut s = String::new();
+    let pass = |s: &mut String| {
+        if rich {
+            s.push_str(&icon_md("pass"));
+            s.push(' ');
+        }
+    };
     if envelope.silent {
-        s.push_str(&format!(
-            "{} Postil reviewed this change and found nothing that affects the merge \
-             decision.\n",
-            icon_md("pass")
-        ));
+        pass(&mut s);
+        s.push_str(
+            "Postil reviewed this change and found nothing that affects the merge decision.\n",
+        );
     } else {
         if !envelope.summary.is_empty() {
             s.push_str(&envelope.summary);
             s.push_str("\n\n");
         }
         for f in &envelope.findings {
+            let icon = if rich {
+                format!("{} ", severity_icon(f.severity))
+            } else {
+                String::new()
+            };
             s.push_str(&format!(
-                "- {} **{}** `{}:{}` — {} · confidence {} · kind: {}\n",
-                severity_icon(f.severity),
+                "- {}**{}** `{}:{}` — {} · confidence {} · kind: {}\n",
+                icon,
                 f.severity.as_str(),
                 f.path,
                 f.line,
@@ -114,9 +129,10 @@ pub fn check_summary(envelope: &Envelope) -> String {
         }
     }
     if !envelope.resolved.is_empty() {
+        s.push('\n');
+        pass(&mut s);
         s.push_str(&format!(
-            "\n{} {} finding(s) from the previous review resolved.\n",
-            icon_md("pass"),
+            "{} finding(s) from the previous review resolved.\n",
             envelope.resolved.len()
         ));
     }
@@ -130,8 +146,85 @@ pub fn check_summary(envelope: &Envelope) -> String {
     s
 }
 
+/// The body of one inline finding comment: icon (rich forges), bold title,
+/// severity / confidence / kind statusline, then the finding body.
+pub fn finding_comment_body(f: &Finding, rich: bool) -> String {
+    let icon = if rich {
+        format!("{} ", severity_icon(f.severity))
+    } else {
+        String::new()
+    };
+    format!(
+        "{}**{}**\n`{}` · confidence {} · kind: {}\n\n{}",
+        icon,
+        f.title,
+        f.severity.as_str(),
+        format_confidence(f.confidence),
+        f.kind.as_str(),
+        f.body
+    )
+}
+
 /// Confidence rendered as the product statusline shows it: a bare decimal
 /// probability ("0.91"), not a percentage.
 pub fn format_confidence(c: f64) -> String {
     format!("{:.2}", c)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::envelope::{Kind, Severity};
+
+    fn finding() -> Finding {
+        Finding {
+            path: "src/auth.rs".into(),
+            line: 41,
+            end_line: None,
+            severity: Severity::Error,
+            kind: Kind::Risk,
+            confidence: 0.91,
+            title: "Unsanitized input reaches query".into(),
+            body: "user_input flows into exec_query.".into(),
+        }
+    }
+
+    #[test]
+    fn rich_comment_carries_brand_icon_and_statusline() {
+        let body = finding_comment_body(&finding(), true);
+        assert!(body.contains("https://postil.dev/status/error.svg"));
+        assert!(body.contains("confidence 0.91 · kind: risk"));
+    }
+
+    #[test]
+    fn plain_comment_has_statusline_without_html() {
+        let body = finding_comment_body(&finding(), false);
+        assert!(!body.contains("<img"));
+        assert!(body.contains("`error` · confidence 0.91 · kind: risk"));
+    }
+
+    #[test]
+    fn silent_summary_icon_only_when_rich() {
+        let env = Envelope {
+            version: 1,
+            summary: String::new(),
+            silent: true,
+            findings: vec![],
+            resolved: vec![],
+            counts: Default::default(),
+            confidence_buckets: [0; 5],
+            gate: crate::envelope::Gate {
+                fail_on: "error".into(),
+                failing: false,
+            },
+            model_used: "m".into(),
+            usage: Default::default(),
+            duration_ms: 0,
+            base_sha: None,
+            head_sha: None,
+            since_sha: None,
+        };
+        assert!(check_summary(&env, true).contains("status/pass.svg"));
+        assert!(!check_summary(&env, false).contains("<img"));
+    }
 }

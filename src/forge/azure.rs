@@ -252,10 +252,7 @@ impl Azure {
             "comments": [{
                 "parentCommentId": 0,
                 "commentType": 1,
-                "content": format!(
-                    "**{}** ({} / {} confidence)\n\n{}",
-                    f.title, f.severity.as_str(), super::format_confidence(f.confidence), f.body
-                ),
+                "content": super::finding_comment_body(f, false),
             }],
             "status": 1,
             "threadContext": {
@@ -422,7 +419,7 @@ impl Forge for Azure {
             &head,
             "postil/review",
             map(advisory),
-            &check_summary(envelope),
+            &check_summary(envelope, false),
         )
         .await?;
         let gate_desc = if envelope.gate.failing {

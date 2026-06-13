@@ -107,6 +107,10 @@ struct CheckRun {
 }
 
 impl Forge for GitHub {
+    fn rich_markdown(&self) -> bool {
+        true
+    }
+
     async fn fetch_pr_meta(&self) -> Result<PrMeta> {
         let resp = self
             .request(
@@ -161,15 +165,7 @@ impl Forge for GitHub {
                     "path": f.path,
                     "line": f.line,
                     "side": "RIGHT",
-                    "body": format!(
-                        "{} **{}**\n`{}` · confidence {} · kind: {}\n\n{}",
-                        super::severity_icon(f.severity),
-                        f.title,
-                        f.severity.as_str(),
-                        super::format_confidence(f.confidence),
-                        f.kind.as_str(),
-                        f.body
-                    ),
+                    "body": super::finding_comment_body(f, true),
                 });
                 if let Some(end) = f.end_line
                     && end > f.line
@@ -282,7 +278,7 @@ impl Forge for GitHub {
                     format!("Gate (`failOn: {}`) passing.\n", envelope.gate.fail_on)
                 }
             } else {
-                check_summary(envelope)
+                check_summary(envelope, true)
             };
             let mut output = json!({
                 "title": check_title(envelope),

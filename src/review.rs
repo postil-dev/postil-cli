@@ -392,11 +392,19 @@ async fn finish<F: Forge>(
         let should_comment =
             !envelope.silent || matches!(cfg.on_clean, crate::config::OnClean::Comment);
         if should_comment {
+            let rich = forge.rich_markdown();
             let summary = if envelope.silent {
-                "Postil reviewed this change and found nothing that affects the merge decision."
-                    .to_string()
+                let icon = if rich {
+                    format!("{} ", crate::forge::icon_md("pass"))
+                } else {
+                    String::new()
+                };
+                format!(
+                    "{icon}Postil reviewed this change and found nothing that affects the \
+                     merge decision."
+                )
             } else {
-                check_summary(&envelope)
+                check_summary(&envelope, rich)
             };
             let head = envelope.head_sha.clone().unwrap_or_default();
             forge

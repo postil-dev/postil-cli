@@ -147,6 +147,10 @@ impl GitLab {
 }
 
 impl Forge for GitLab {
+    fn rich_markdown(&self) -> bool {
+        true
+    }
+
     async fn fetch_pr_meta(&self) -> Result<PrMeta> {
         let mr = self.mr().await?;
         Ok(PrMeta {
@@ -208,13 +212,7 @@ impl Forge for GitLab {
                 continue;
             }
             let body = json!({
-                "body": format!(
-                    "**{}** ({} / {} confidence)\n\n{}",
-                    f.title,
-                    f.severity.as_str(),
-                    super::format_confidence(f.confidence),
-                    f.body
-                ),
+                "body": super::finding_comment_body(f, true),
                 "position": {
                     "position_type": "text",
                     "base_sha": mr.diff_refs.base_sha,
@@ -299,7 +297,7 @@ impl Forge for GitLab {
             &head,
             "postil/review",
             map(advisory),
-            &check_summary(envelope),
+            &check_summary(envelope, true),
         )
         .await?;
         let gate_desc = if envelope.gate.failing {
