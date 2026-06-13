@@ -11,7 +11,7 @@
 // measures detection ability. Requires POSTIL_API_KEY in the environment.
 //
 //   bun run bench:live              # or: BENCH_LIVE=1 bun run src/run.ts
-//   bun run bench --live [--json] [--json-out <path>] [--model <id>]
+//   bun run bench --live [--json] [--json-out <path>] [--model <id>] [--concurrency <n>]
 //
 // Environment:
 //   POSTIL_BIN              path to the postil binary (default ../target/release/postil)
@@ -19,16 +19,26 @@
 //   POSTIL_API_KEY          required in live mode; never logged or printed
 //   REVIEW_MODEL            model id for live mode (else --model, else default)
 //   BENCH_LIVE              set to 1 to select live mode
+//   BENCH_CONCURRENCY       live-mode case parallelism (else --concurrency, else default 6)
 
 import { mkdir, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { cases } from "../fixtures/cases";
 import { formatReport, runBenchmark } from "./harness";
-import { DEFAULT_LIVE_MODEL, formatLiveReport, runLive } from "./live";
+import { DEFAULT_LIVE_CONCURRENCY, DEFAULT_LIVE_MODEL, formatLiveReport, runLive } from "./live";
 
 function flagValue(args: string[], flag: string): string | undefined {
   const index = args.indexOf(flag);
   return index === -1 ? undefined : args[index + 1];
+}
+
+/** Resolve live-mode concurrency from BENCH_CONCURRENCY, then --concurrency,
+ * then the default. Non-positive or non-numeric inputs fall back to the default. */
+function liveConcurrency(args: string[]): number {
+  const raw = process.env.BENCH_CONCURRENCY ?? flagValue(args, "--concurrency");
+  if (raw === undefined) return DEFAULT_LIVE_CONCURRENCY;
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_LIVE_CONCURRENCY;
 }
 
 async function main() {
@@ -42,7 +52,8 @@ async function main() {
 
   if (live) {
     const model = process.env.REVIEW_MODEL ?? flagValue(args, "--model") ?? DEFAULT_LIVE_MODEL;
-    const report = await runLive(cases, { binary, model });
+    const concurrency = liveConcurrency(args);
+    const report = await runLive(cases, { binary, model, concurrency });
     await writeReport(jsonOut, JSON.stringify(report, null, 2));
     console.log(json ? JSON.stringify(report, null, 2) : formatLiveReport(report));
     return;

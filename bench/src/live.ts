@@ -36,6 +36,18 @@ const execFile = promisify(execFileCb);
 
 export const DEFAULT_LIVE_MODEL = "deepseek/deepseek-v4-pro";
 
+/** Default number of cases run concurrently. Live inference is I/O-bound on the
+ * provider, so a small pool cuts wall-clock time without overloading the API.
+ * Override with --concurrency <n> or BENCH_CONCURRENCY. */
+export const DEFAULT_LIVE_CONCURRENCY = 6;
+
+/** Each case that fails with a transient/provider error is retried this many
+ * extra times (so one retry total). A second failure is recorded as an error. */
+const DEFAULT_LIVE_RETRIES = 1;
+
+/** Backoff before the single retry of a transiently-failed case. */
+const RETRY_BACKOFF_MS = 2_000;
+
 /** A defect is detected when a finding hits the right file and is within this
  * many lines of the ground-truth line. Matches the manual fixture run. */
 const LINE_TOLERANCE = 3;
@@ -74,6 +86,10 @@ export interface LiveOptions {
   rootDir?: string;
   /** Per-case timeout (default 180s; live inference is slow). */
   timeoutMs?: number;
+  /** Cases run concurrently (default DEFAULT_LIVE_CONCURRENCY). */
+  concurrency?: number;
+  /** Extra attempts on a transient/provider failure (default 1 = one retry). */
+  retries?: number;
 }
 
 interface GroundTruth {
@@ -106,6 +122,9 @@ export interface LiveCaseResult {
   completionTokens: number;
   exitCode: number | undefined;
   error?: string;
+  /** Captured stderr of the binary run. Used internally to classify transient
+   * provider failures for retry; not part of the persisted report schema. */
+  stderr?: string;
 }
 
 export interface LiveSummary {
@@ -158,11 +177,105 @@ export async function runLive(
   await assertBinary(options.binary);
 
   const rootDir = options.rootDir ?? resolve(import.meta.dir, "..", ".runs");
-  const results: LiveCaseResult[] = [];
-  for (const [index, c] of cases.entries()) {
-    results.push(await runLiveCase(c, index, rootDir, options));
+
+  // Bounded worker pool: a small fixed number of workers pull case indices off a
+  // shared cursor until the queue drains. Each case writes its result into the
+  // slot for its original index, so completion order never affects the report.
+  const results = new Array<LiveCaseResult>(cases.length);
+  const concurrency = Math.max(1, Math.min(options.concurrency ?? DEFAULT_LIVE_CONCURRENCY, cases.length || 1));
+  let cursor = 0;
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const index = cursor++;
+      if (index >= cases.length) return;
+      results[index] = await runLiveCaseWithRetry(cases[index]!, index, rootDir, options);
+    }
+  };
+  await Promise.all(Array.from({ length: concurrency }, () => worker()));
+
+  // Results are already index-aligned; sorting by case index is belt-and-braces
+  // so the written report is deterministically ordered regardless of the pool.
+  // Strip the internal `stderr` field so the persisted report schema is intact.
+  const ordered = results
+    .map((result, index) => ({ result, index }))
+    .sort((a, b) => a.index - b.index)
+    .map(({ result }) => {
+      const { stderr: _stderr, ...rest } = result;
+      return rest;
+    });
+  return { summary: summarize(ordered, options), results: ordered };
+}
+
+/**
+ * Runs a case, retrying once (by default) after a short backoff if the first
+ * attempt fails with a transient/provider error: a non-zero exit whose stderr
+ * carries an HTTP-5xx/429/timeout/connection signature, or no valid v1 envelope
+ * at all (empty/garbled output). A valid envelope with findings is a normal
+ * result and is never retried. A case that fails every attempt is returned as
+ * the last attempt's error result, which summarize() already counts as an error.
+ */
+async function runLiveCaseWithRetry(
+  c: ReturnType<typeof benchmarkCase.parse>,
+  index: number,
+  rootDir: string,
+  options: LiveOptions,
+): Promise<LiveCaseResult> {
+  const maxRetries = options.retries ?? DEFAULT_LIVE_RETRIES;
+  let last: LiveCaseResult | undefined;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    last = await runLiveCase(c, index, rootDir, options);
+    // Scored => a valid envelope was produced; that is a normal result (even if
+    // it has findings or false positives), so never retry it.
+    if (last.scored) return last;
+    if (attempt < maxRetries && isTransientFailure(last)) {
+      await sleep(RETRY_BACKOFF_MS);
+      continue;
+    }
+    return last;
   }
-  return { summary: summarize(results, options), results };
+  return last!;
+}
+
+/** Signatures of a transient provider/transport failure in stderr: HTTP 5xx and
+ * 429, rate-limit/timeout/connection wording. Used to decide whether a failed
+ * (unscored) case is worth one retry. */
+const TRANSIENT_STDERR = new RegExp(
+  [
+    "\\b(5\\d{2}|429)\\b", // HTTP 5xx / 429 status
+    "rate.?limit",
+    "too many requests",
+    "timed? ?out",
+    "timeout",
+    "temporarily unavailable",
+    "service unavailable",
+    "bad gateway",
+    "gateway time-?out",
+    "overloaded",
+    "connection (reset|refused|closed|error)",
+    "econnreset",
+    "econnrefused",
+    "etimedout",
+    "socket hang up",
+    "network",
+  ].join("|"),
+  "i",
+);
+
+/** True when an unscored case looks like a transient provider failure: either
+ * the binary emitted a recognizable transient signature on stderr, or it
+ * produced no valid envelope at all (empty/garbled output, e.g. a dropped
+ * response). Both are worth one retry; a deterministic parse-shaped failure that
+ * is not provider-side will just fail again and be recorded as an error. */
+function isTransientFailure(result: LiveCaseResult): boolean {
+  if (result.scored) return false;
+  if (result.stderr && TRANSIENT_STDERR.test(result.stderr)) return true;
+  // No valid envelope (empty/invalid output) — typically a dropped or truncated
+  // provider response; retry once.
+  return result.error?.startsWith("no valid v1 envelope") ?? false;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((res) => setTimeout(res, ms));
 }
 
 async function assertBinary(binary: string): Promise<void> {
@@ -212,6 +325,7 @@ async function runLiveCase(
   await writeFile(diffPath, c.diff, { mode: 0o600 });
 
   let stdout = "";
+  let stderr = "";
   let exitCode: number | undefined;
   try {
     const out = await execFile(
@@ -226,14 +340,18 @@ async function runLiveCase(
     );
     exitCode = 0;
     stdout = out.stdout;
+    stderr = out.stderr;
   } catch (err) {
     // Exit 1 with a valid envelope is the gate failing on an error-severity
-    // finding, not a transport failure — keep the stdout and score it.
-    const e = err as { code?: unknown; stdout?: string };
+    // finding, not a transport failure — keep the stdout and score it. The
+    // stderr is captured so a genuine transport failure can be retried.
+    const e = err as { code?: unknown; stdout?: string; stderr?: string; message?: string };
     exitCode = typeof e.code === "number" ? e.code : undefined;
     stdout = e.stdout ?? "";
+    stderr = e.stderr ?? e.message ?? "";
   }
   base.exitCode = exitCode;
+  base.stderr = stderr;
   await writeFile(join(runDir, "stdout.json"), stdout, { mode: 0o600 });
 
   const parsed = envelopeV1.safeParse(safeJson(stdout));
