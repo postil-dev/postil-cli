@@ -21,8 +21,8 @@ platform at [postil.dev](https://postil.dev).
   (advisory, never blocks) and `postil/gate` (fails at/above `gate.failOn`, default
   `error`) — mark only the gate as required in branch protection.
 - Bring your own key. Postil talks to any OpenAI-compatible endpoint (OpenRouter by
-  default; Ollama, vLLM, Azure OpenAI, LiteLLM all work) and never proxies or marks up
-  your inference.
+  default; Ollama, vLLM, SGLang, Azure OpenAI, LiteLLM all work) and never proxies or
+  marks up your inference.
 
 ## Install
 
@@ -129,6 +129,39 @@ Environment: `POSTIL_API_KEY` (or `OPENROUTER_API_KEY`), `POSTIL_API_BASE`,
 `REVIEW_MODEL`, `REVIEW_MODEL_CASCADE`, `GITHUB_TOKEN`/`GITHUB_API_URL`,
 `GITLAB_TOKEN`/`GITLAB_API_URL`, `BITBUCKET_TOKEN`/`BITBUCKET_USER`/`BITBUCKET_API_URL`,
 `AZURE_DEVOPS_TOKEN`/`AZURE_DEVOPS_API_URL`.
+
+## Models and local inference
+
+The hosted site keeps current recommendations at
+[postil.dev/docs/models](https://postil.dev/docs/models). For OpenRouter, start with
+`deepseek/deepseek-v4-pro` as the balanced default, `deepseek/deepseek-v4-flash` for
+low-cost volume, `qwen/qwen3.7-plus` for fast coding reviews, and
+`moonshotai/kimi-k2.7-code` or `z-ai/glm-5.2` for larger engineering diffs.
+
+Local endpoints use the same OpenAI-compatible contract:
+
+```sh
+# Ollama
+ollama pull qwen3-coder:30b
+POSTIL_API_BASE=http://localhost:11434/v1 \
+POSTIL_API_KEY=ollama \
+REVIEW_MODEL=qwen3-coder:30b \
+postil doctor
+
+# vLLM, SGLang, LiteLLM, or another local gateway
+POSTIL_API_BASE=http://localhost:8000/v1 \
+POSTIL_API_KEY=local \
+REVIEW_MODEL=<served-model-name> \
+postil review --staged --output-json
+```
+
+Use the live benchmark harness before standardizing on a model:
+
+```sh
+cargo build --quiet --release
+cd bench
+AGENT=1 POSTIL_API_KEY=... REVIEW_MODEL=deepseek/deepseek-v4-pro bun run bench:live -- --json
+```
 
 ## Preview a config change before deploying it
 
