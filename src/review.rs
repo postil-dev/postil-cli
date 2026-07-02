@@ -18,6 +18,12 @@ use crate::output;
 use crate::prompt::{self, PrContext};
 
 const MAX_DIFF_BYTES: usize = 400_000;
+/// Hard cap on the raw fetched diff text before parsing. A generous multiple of
+/// the render cap so ordinary changes are never affected, but bounds the work a
+/// pathologically large fetched diff can force. Over the cap, the raw text is
+/// truncated at a line boundary and the review is flagged truncated so the
+/// uncertainty finding fires (a truncated review must not read as a full pass).
+const MAX_RAW_DIFF_BYTES: usize = MAX_DIFF_BYTES * 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForgeKind {
@@ -235,6 +241,9 @@ async fn review_diff(
     };
 
     let review_started = std::time::Instant::now();
+    // Cap the raw diff before parsing so an oversized fetched diff cannot force
+    // unbounded parse work; a cut here forces the truncated path below.
+    let (diff_text, raw_truncated) = diff::cap_raw_diff(diff_text, MAX_RAW_DIFF_BYTES);
     let parsed = diff::parse(diff_text);
     let index = DiffIndex::build(&parsed);
     let incremental = args.since_sha.is_some();
@@ -249,7 +258,10 @@ async fn review_diff(
     if !cfg.enabled {
         model_used = "none (disabled by config)".to_string();
     } else if !parsed.is_empty() {
-        let (annotated, truncated) = diff::render_annotated(&parsed, MAX_DIFF_BYTES);
+        let (annotated, render_truncated) = diff::render_annotated(&parsed, MAX_DIFF_BYTES);
+        // Either the raw input was capped or the rendered output hit the limit;
+        // both mean the model did not see the full change.
+        let truncated = render_truncated || raw_truncated;
         let ctx = PrContext {
             repo,
             title: meta.map(|m| m.title.as_str()),
