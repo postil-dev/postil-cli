@@ -253,8 +253,10 @@ impl Forge for GitHub {
                 check_summary(envelope, true)
             };
             let mut output = json!({
-                "title": check_title(envelope),
-                "summary": gate_note,
+                // GitHub rejects title >255 and summary >65535 with HTTP 422,
+                // which would abort posting both checks. Cap both defensively.
+                "title": super::cap_check_title(&check_title(envelope)),
+                "summary": super::cap_check_summary(&gate_note),
             });
             if with_annotations && !annotations.is_empty() {
                 output["annotations"] = json!(annotations);

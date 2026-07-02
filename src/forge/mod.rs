@@ -103,6 +103,36 @@ pub trait Forge {
     async fn post_comment(&self, number: u64, kind: ThreadKind, body: &str) -> Result<()>;
 }
 
+/// GitHub rejects a check-run `output.summary` over 65535 chars and a `title`
+/// over 255 with HTTP 422, which would abort posting both checks. These caps
+/// keep composed strings safely under those limits. Shared so every forge that
+/// PATCHes check output can apply the same bound.
+pub const MAX_CHECK_SUMMARY: usize = 60_000;
+pub const MAX_CHECK_TITLE: usize = 255;
+
+/// Truncate `s` to at most `max` characters, appending an explicit marker when
+/// anything is cut so the reader knows the output is not complete. The marker is
+/// counted against the budget, so the result never exceeds `max` characters.
+pub fn cap_text(s: &str, max: usize, marker: &str) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let budget = max.saturating_sub(marker.chars().count());
+    let mut out: String = s.chars().take(budget).collect();
+    out.push_str(marker);
+    out
+}
+
+/// Cap a check-run summary to a size GitHub accepts, with a truncation marker.
+pub fn cap_check_summary(s: &str) -> String {
+    cap_text(s, MAX_CHECK_SUMMARY, "\n\n[output truncated at the check-run size limit]")
+}
+
+/// Cap a check-run title to a size GitHub accepts.
+pub fn cap_check_title(s: &str) -> String {
+    cap_text(s, MAX_CHECK_TITLE, "…")
+}
+
 pub fn check_title(envelope: &Envelope) -> String {
     if envelope.silent {
         "No merge-relevant findings".to_string()
@@ -221,6 +251,23 @@ mod tests {
         let body = finding_comment_body(&finding(), false);
         assert!(!body.contains("<img"));
         assert!(body.contains("`error` · confidence 0.91 · kind: risk"));
+    }
+
+    #[test]
+    fn check_output_caps_stay_within_github_limits() {
+        // A summary far over the limit is truncated below 65535 with a marker.
+        let long = "x".repeat(200_000);
+        let capped = cap_check_summary(&long);
+        assert!(capped.chars().count() <= MAX_CHECK_SUMMARY);
+        assert!(capped.contains("[output truncated"));
+        // A short summary is passed through unchanged.
+        assert_eq!(cap_check_summary("brief"), "brief");
+        // Titles cap at 255 with an ellipsis marker; short ones pass through.
+        let long_title = "t".repeat(1000);
+        let capped_title = cap_check_title(&long_title);
+        assert!(capped_title.chars().count() <= MAX_CHECK_TITLE);
+        assert!(capped_title.ends_with('…'));
+        assert_eq!(cap_check_title("2 error, 0 warn, 1 info"), "2 error, 0 warn, 1 info");
     }
 
     #[test]
