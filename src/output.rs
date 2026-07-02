@@ -24,7 +24,7 @@ pub fn print_pretty(envelope: &Envelope) {
         ));
     } else {
         if !envelope.summary.is_empty() {
-            out.push_str(&format!("{}\n\n", envelope.summary));
+            out.push_str(&format!("{}\n\n", sanitize(&envelope.summary)));
         }
         for f in &envelope.findings {
             let (glyph, p) = match f.severity {
@@ -35,11 +35,11 @@ pub fn print_pretty(envelope: &Envelope) {
             out.push_str(&format!(
                 "{}  {}:{}\n",
                 paint(color, glyph, p),
-                f.path,
+                sanitize(&f.path),
                 f.line
             ));
-            out.push_str(&format!("  {}\n", f.title));
-            for line in f.body.lines() {
+            out.push_str(&format!("  {}\n", sanitize(&f.title)));
+            for line in sanitize(&f.body).lines() {
                 out.push_str(&format!("  {line}\n"));
             }
             out.push_str(&format!(
@@ -82,6 +82,19 @@ pub fn print_pretty(envelope: &Envelope) {
     eprint!("{out}");
 }
 
+/// Neutralize control characters in model-authored text before it reaches the
+/// TTY. Titles, bodies, and the summary come from an LLM and can carry raw C0/C1
+/// controls — plausibly via prompt injection in a reviewed diff — including ESC,
+/// which would otherwise let the model smuggle live ANSI escape sequences into
+/// the terminal (color, cursor moves, screen clears). Every control character is
+/// dropped except newline and tab, so the renderer's own styling (applied around
+/// this content in `paint`) stays intact while the model's content renders inert.
+fn sanitize(s: &str) -> String {
+    s.chars()
+        .filter(|c| *c == '\n' || *c == '\t' || !c.is_control())
+        .collect()
+}
+
 enum Paint {
     Red,
     Yellow,
@@ -98,5 +111,74 @@ fn paint(enabled: bool, text: &str, p: Paint) -> String {
         Paint::Yellow => text.yellow().bold().to_string(),
         Paint::Blue => text.blue().to_string(),
         Paint::Green => text.green().to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_strips_esc_and_c0_c1_keeps_newline_tab() {
+        // ESC-based CSI (color), a C0 control, and a C1 control, around plain text.
+        let raw = "\x1b[31mred\x1b[0m\x07bell\u{0085}nel";
+        let clean = sanitize(raw);
+        assert_eq!(clean, "[31mred[0mbellnel");
+        assert!(!clean.contains('\x1b'), "ESC must be removed");
+        assert!(!clean.chars().any(|c| c.is_control()));
+        // Structure-bearing whitespace survives.
+        assert_eq!(sanitize("a\nb\tc"), "a\nb\tc");
+    }
+
+    #[test]
+    fn esc_containing_body_renders_inert() {
+        use crate::envelope::{Envelope, Finding, Gate, Kind, Severity};
+
+        // An LLM-authored body carrying an ANSI screen-clear + colored injection.
+        let finding = Finding {
+            path: "src/lib.rs".into(),
+            line: 1,
+            end_line: None,
+            severity: Severity::Warn,
+            kind: Kind::Risk,
+            confidence: 0.9,
+            title: "\x1b[2Jhijacked title".into(),
+            body: "line one\n\x1b[31mFAKE ALL CLEAR\x1b[0m\nline three".into(),
+        };
+        let env = Envelope {
+            version: 1,
+            summary: "\x1b[1msummary\x1b[0m".into(),
+            silent: false,
+            findings: vec![finding],
+            resolved: vec![],
+            counts: Envelope::counts_of(&[], 0),
+            confidence_buckets: [0; 5],
+            gate: Gate {
+                fail_on: "error".into(),
+                failing: false,
+            },
+            model_used: "m".into(),
+            usage: Default::default(),
+            duration_ms: 0,
+            base_sha: None,
+            head_sha: None,
+            since_sha: None,
+        };
+        // Render exactly as print_pretty would with color disabled, so any ESC in
+        // the output can only have come from model-authored content.
+        let mut out = String::new();
+        out.push_str(&format!("{}\n\n", sanitize(&env.summary)));
+        for f in &env.findings {
+            out.push_str(&format!("  {}\n", sanitize(&f.title)));
+            for line in sanitize(&f.body).lines() {
+                out.push_str(&format!("  {line}\n"));
+            }
+        }
+        assert!(
+            !out.contains('\x1b'),
+            "no raw ESC may reach the terminal from model content"
+        );
+        assert!(out.contains("hijacked title"));
+        assert!(out.contains("FAKE ALL CLEAR"));
     }
 }

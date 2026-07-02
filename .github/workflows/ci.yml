@@ -34,3 +34,13 @@ jobs:
         working-directory: bench
       - run: bun run bench
         working-directory: bench
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # SHA-pinned per org convention; comment tracks the tag.
+      - uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2.82.7
+        with:
+          tool: cargo-audit
+      - run: cargo audit
