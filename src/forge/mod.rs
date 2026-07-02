@@ -123,6 +123,75 @@ pub fn cap_text(s: &str, max: usize, marker: &str) -> String {
     out
 }
 
+pub(crate) fn wrap_plain_text(text: &str, width: usize) -> String {
+    if width == 0 {
+        return text.to_string();
+    }
+
+    let mut wrapped = Vec::new();
+    for line in text.split('\n') {
+        wrap_plain_line(line, width, &mut wrapped);
+    }
+    wrapped.join("\n")
+}
+
+fn wrap_plain_line(mut line: &str, width: usize, wrapped: &mut Vec<String>) {
+    if line.is_empty() {
+        wrapped.push(String::new());
+        return;
+    }
+
+    while line.chars().count() > width {
+        let (break_at, split_on_space) = wrap_break(line, width);
+        let chunk = &line[..break_at];
+        wrapped.push(if split_on_space {
+            chunk.trim_end_matches(' ').to_string()
+        } else {
+            chunk.to_string()
+        });
+        line = if split_on_space {
+            line[break_at..].trim_start_matches(' ')
+        } else {
+            &line[break_at..]
+        };
+
+        if line.is_empty() {
+            return;
+        }
+    }
+
+    wrapped.push(line.to_string());
+}
+
+fn wrap_break(line: &str, width: usize) -> (usize, bool) {
+    let mut hard_break = line.len();
+    let mut last_space = None;
+    // Only break on a space that follows a word: breaking inside leading
+    // indentation would select an all-space chunk, which trims to an empty
+    // line and drops the indentation from the remainder.
+    let mut seen_word = false;
+
+    for (column, (idx, ch)) in line.char_indices().enumerate() {
+        if ch == ' ' {
+            if seen_word {
+                last_space = Some(idx);
+            }
+        } else {
+            seen_word = true;
+        }
+        if column == width {
+            hard_break = idx;
+            break;
+        }
+    }
+
+    if let Some(idx) = last_space {
+        (idx, true)
+    } else {
+        (hard_break, false)
+    }
+}
+
 /// Cap a check-run summary to a size GitHub accepts, with a truncation marker.
 pub fn cap_check_summary(s: &str) -> String {
     cap_text(
@@ -308,5 +377,60 @@ mod tests {
         };
         assert!(check_summary(&env, true).contains("status/pass.svg"));
         assert!(!check_summary(&env, false).contains("<img"));
+    }
+
+    #[test]
+    fn wrap_plain_text_leaves_short_text_unchanged() {
+        assert_eq!(wrap_plain_text("short text", 100), "short text");
+    }
+
+    #[test]
+    fn wrap_plain_text_wraps_long_paragraph_without_splitting_words() {
+        let text = (0..40)
+            .map(|n| format!("word{n:02}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let wrapped = wrap_plain_text(&text, 100);
+
+        assert_ne!(wrapped, text);
+        assert!(wrapped.lines().all(|line| line.chars().count() <= 100));
+        assert_eq!(
+            wrapped.split_whitespace().collect::<Vec<_>>(),
+            text.split_whitespace().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn wrap_plain_text_preserves_existing_newlines_and_blank_lines() {
+        let text = "alpha\n\nsecond line needs wrapping here\nthird";
+
+        assert_eq!(
+            wrap_plain_text(text, 20),
+            "alpha\n\nsecond line needs\nwrapping here\nthird"
+        );
+    }
+
+    #[test]
+    fn wrap_plain_text_hard_breaks_single_word_longer_than_width() {
+        let text = "x".repeat(150);
+        let wrapped = wrap_plain_text(&text, 100);
+        let lines = wrapped.lines().collect::<Vec<_>>();
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].chars().count(), 100);
+        assert_eq!(lines[1].chars().count(), 50);
+    }
+
+    #[test]
+    fn wrap_plain_text_keeps_indented_overlong_lines_intact() {
+        // A code-snippet line: leading indentation, then content past the
+        // width. Must not emit an empty chunk or drop the indent.
+        let text = format!("    let value = {};", "y".repeat(120));
+        let wrapped = wrap_plain_text(&text, 100);
+
+        assert!(wrapped.lines().all(|l| !l.trim().is_empty()));
+        assert!(wrapped.starts_with("    let value"));
+        assert!(wrapped.lines().all(|l| l.chars().count() <= 100));
     }
 }
