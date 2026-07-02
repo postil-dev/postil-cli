@@ -132,6 +132,10 @@ impl Forge for GitHub {
             .iter()
             // Carried findings already have comments from the previous review.
             .filter(|f| !f.body.starts_with("[carried from previous review]"))
+            // Synthetic-path findings (PR description, fail-closed markers) have
+            // no real file line to anchor an inline comment; they surface only in
+            // the summary body.
+            .filter(|f| !super::is_synthetic_path(&f.path))
             .map(|f| {
                 let mut c = json!({
                     "path": f.path,
@@ -209,6 +213,9 @@ impl Forge for GitHub {
         let annotations: Vec<_> = envelope
             .findings
             .iter()
+            // Synthetic-path findings have no real file line to annotate; they
+            // are already carried in the check-run summary body.
+            .filter(|f| !super::is_synthetic_path(&f.path))
             .take(50) // GitHub caps annotations per request at 50.
             .map(|f| {
                 json!({
@@ -253,8 +260,10 @@ impl Forge for GitHub {
                 check_summary(envelope, true)
             };
             let mut output = json!({
-                "title": check_title(envelope),
-                "summary": gate_note,
+                // GitHub rejects title >255 and summary >65535 with HTTP 422,
+                // which would abort posting both checks. Cap both defensively.
+                "title": super::cap_check_title(&check_title(envelope)),
+                "summary": super::cap_check_summary(&gate_note),
             });
             if with_annotations && !annotations.is_empty() {
                 output["annotations"] = json!(annotations);

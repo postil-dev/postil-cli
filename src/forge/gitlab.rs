@@ -208,7 +208,12 @@ impl Forge for GitLab {
     ) -> Result<()> {
         let mr = self.mr().await?;
         for f in findings {
-            if f.body.starts_with("[carried from previous review]") {
+            if f.body.starts_with("[carried from previous review]")
+                || super::is_synthetic_path(&f.path)
+            {
+                // Carried findings already have comments; synthetic-path findings
+                // (PR description, fail-closed markers) have no MR line to anchor
+                // and surface in the summary body instead.
                 continue;
             }
             let body = json!({

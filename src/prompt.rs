@@ -7,6 +7,10 @@ pub struct PrContext<'a> {
     pub title: Option<&'a str>,
     pub body: Option<&'a str>,
     pub incremental: bool,
+    /// When true, the PR title/description are also rendered as a numbered,
+    /// groundable block (under the reserved content-policy path) so title/body
+    /// content-policy findings survive grounding.
+    pub content_policy: bool,
 }
 
 pub fn system_prompt(cfg: &Config) -> String {
@@ -87,9 +91,11 @@ pub fn system_prompt(cfg: &Config) -> String {
              docstrings, user-facing/log strings, PR title/description) — never to code \
              logic, identifiers, or structured data. Report a violation with kind \
              \"contentPolicy\", name the rule number it breaks, and quote or paraphrase the \
-             specific offending text in the body. Be conservative: this augments the rules \
-             above, it does not turn you into a style linter; when a line is borderline, do \
-             not flag it.\n\
+             specific offending text in the body. A violation in the PR title or description \
+             MUST cite the path `.postil/pr-description` and one of the numbered lines shown \
+             for it; a violation in a diff file cites that file and a new-file line as usual. \
+             Be conservative: this augments the rules above, it does not turn you into a style \
+             linter; when a line is borderline, do not flag it.\n\
              --- CONTENT POLICY ---\n",
         );
         let policy: String = policy.chars().take(6000).collect();
@@ -134,19 +140,73 @@ pub fn respond_system_prompt(cfg: &Config) -> String {
     p
 }
 
+/// Render the PR title and description as a numbered block under the reserved
+/// content-policy path, mirroring the diff's left-margin line numbering so the
+/// model can cite a real, groundable line. Returns the rendered text and the
+/// number of numbered lines (0 when there is nothing to render). Line 1 is the
+/// title; the body follows on subsequent lines. Used only when content policy is
+/// active; the title/body are otherwise passed as unnumbered context.
+pub fn render_pr_description(title: Option<&str>, body: Option<&str>) -> (String, u32) {
+    let title = title.unwrap_or("").trim();
+    // Truncation lives here, not in the callers: the grounding range in
+    // review.rs and the prompt block in user_prompt must count the same
+    // lines, or the index would accept line numbers the model never saw.
+    let body: String = body.unwrap_or("").trim().chars().take(2000).collect();
+    let body = body.trim_end();
+    if title.is_empty() && body.is_empty() {
+        return (String::new(), 0);
+    }
+    let mut out = format!("### {}\n", crate::envelope::PR_DESCRIPTION_PATH);
+    let mut line_no: u32 = 0;
+    // Title is always line 1 (even when empty, to keep a stable anchor) only if
+    // there is any content at all; here at least one of title/body is non-empty.
+    line_no += 1;
+    out.push_str(&format!("{line_no:>6}   {title}\n"));
+    for line in body.lines() {
+        line_no += 1;
+        out.push_str(&format!("{line_no:>6}   {line}\n"));
+    }
+    (out, line_no)
+}
+
 pub fn user_prompt(ctx: &PrContext, annotated_diff: &str, max_findings: usize) -> String {
     let mut p = String::new();
     if let Some(repo) = ctx.repo {
         p.push_str(&format!("Repository: {repo}\n"));
     }
-    if let Some(title) = ctx.title {
-        p.push_str(&format!("PR title: {title}\n"));
-    }
-    if let Some(body) = ctx.body
-        && !body.trim().is_empty()
-    {
-        let body: String = body.chars().take(2000).collect();
-        p.push_str(&format!("PR description:\n{body}\n"));
+    // When content policy is active and there is a title/body, render the
+    // title/description as a numbered, groundable block so the model can cite a
+    // real line for a title/body content-policy finding (the reserved path).
+    // Otherwise pass them as plain unnumbered context.
+    let pr_block = if ctx.content_policy {
+        // render_pr_description truncates the body itself, keeping the
+        // rendered block in lockstep with the grounding range registered
+        // in review.rs.
+        let (block, _count) = render_pr_description(ctx.title, ctx.body);
+        (!block.is_empty()).then_some(block)
+    } else {
+        None
+    };
+    if let Some(block) = &pr_block {
+        p.push_str(
+            "\nThe PR title and description below are numbered so you can cite them. A \
+             content-policy finding about the title/description MUST use the path \
+             `.postil/pr-description` and one of these line numbers; findings there \
+             cannot cite any other path.\n\n",
+        );
+        p.push_str(block);
+        p.push('\n');
+    } else {
+        if let Some(title) = ctx.title {
+            p.push_str(&format!("PR title: {title}\n"));
+        }
+        let truncated_body: Option<String> = ctx
+            .body
+            .filter(|b| !b.trim().is_empty())
+            .map(|b| b.chars().take(2000).collect());
+        if let Some(body) = &truncated_body {
+            p.push_str(&format!("PR description:\n{body}\n"));
+        }
     }
     if ctx.incremental {
         p.push_str(
@@ -207,12 +267,56 @@ mod tests {
     }
 
     #[test]
+    fn render_pr_description_numbers_title_and_body() {
+        let (block, count) = render_pr_description(Some("Fix login"), Some("line one\nline two"));
+        assert_eq!(count, 3);
+        assert!(block.contains(".postil/pr-description"));
+        assert!(block.contains("     1   Fix login"));
+        assert!(block.contains("     2   line one"));
+        assert!(block.contains("     3   line two"));
+        // Empty title and body render nothing groundable.
+        let (empty, n) = render_pr_description(Some("  "), Some(""));
+        assert!(empty.is_empty());
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn user_prompt_renders_numbered_pr_description_under_content_policy() {
+        let ctx = PrContext {
+            repo: Some("o/r"),
+            title: Some("Add feature"),
+            body: Some("Some body text"),
+            incremental: false,
+            content_policy: true,
+        };
+        let p = user_prompt(&ctx, "DIFF", 5);
+        assert!(p.contains(".postil/pr-description"));
+        assert!(p.contains("     1   Add feature"));
+        assert!(p.contains("MUST use the path `.postil/pr-description`"));
+    }
+
+    #[test]
+    fn user_prompt_leaves_pr_description_unnumbered_without_content_policy() {
+        let ctx = PrContext {
+            repo: None,
+            title: Some("Add feature"),
+            body: Some("Some body text"),
+            incremental: false,
+            content_policy: false,
+        };
+        let p = user_prompt(&ctx, "DIFF", 5);
+        assert!(!p.contains(".postil/pr-description"));
+        assert!(p.contains("PR title: Add feature"));
+    }
+
+    #[test]
     fn user_prompt_marks_incremental() {
         let ctx = PrContext {
             repo: Some("o/r"),
             title: Some("t"),
             body: None,
             incremental: true,
+            content_policy: false,
         };
         let p = user_prompt(&ctx, "DIFF", 5);
         assert!(p.contains("INCREMENTAL"));

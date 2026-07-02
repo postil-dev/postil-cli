@@ -2,6 +2,11 @@
 //!
 //! Precedence: CLI flags > environment > `.postil.{yaml,yml,json}` >
 //! `.coderabbit.yaml` (translated) > defaults.
+//!
+//! Exception: `model.apiBase` from a config file is repo-controlled, and the
+//! resolved base URL receives the deployment's bearer key. It is ignored by
+//! default and honored only when `POSTIL_ALLOW_CONFIG_API_BASE=1` (single-user
+//! local setups with a trusted repo). `POSTIL_API_BASE` (env) always applies.
 
 use std::path::{Path, PathBuf};
 
@@ -249,6 +254,14 @@ impl Config {
     }
 
     pub fn apply_file(&mut self, f: FileConfig) -> Result<()> {
+        self.apply_file_inner(f, allow_config_api_base())
+    }
+
+    /// Core of [`apply_file`]. `allow_api_base` decides whether a
+    /// repo-controlled `model.apiBase` is honored; the public wrapper derives it
+    /// from the environment. Split out so tests can drive it deterministically
+    /// without mutating global process environment.
+    fn apply_file_inner(&mut self, f: FileConfig, allow_api_base: bool) -> Result<()> {
         if let Some(v) = f.enabled {
             self.enabled = v;
         }
@@ -297,7 +310,22 @@ impl Config {
                 self.cascade = c;
             }
             if let Some(b) = m.api_base {
-                self.api_base = b;
+                // `model.apiBase` from `.postil.yaml` is repo-controlled, and the
+                // resolved base URL receives the deployment's bearer key. Honoring
+                // it by default would let a repo redirect the inference credential,
+                // so it is ignored unless explicitly opted in for a trusted
+                // single-user local setup. `POSTIL_API_BASE` (env) and `--config`
+                // discovery of the base are unaffected: apply_env still runs after
+                // this and takes precedence.
+                if allow_api_base {
+                    self.api_base = b;
+                } else {
+                    eprintln!(
+                        "postil: ignoring model.apiBase from config ({b:?}); set \
+                         POSTIL_ALLOW_CONFIG_API_BASE=1 to honor it, or use the \
+                         POSTIL_API_BASE environment variable"
+                    );
+                }
             }
             if let Some(n) = m.consensus {
                 anyhow::ensure!(n >= 1, "model.consensus must be >= 1");
@@ -386,6 +414,16 @@ impl Config {
     }
 }
 
+/// Whether a repo-controlled `model.apiBase` may be applied. Opt-in only:
+/// intended for single-user local setups where the checked-out repo is trusted.
+/// The deployment's inference credential is sent to the resolved base URL, so a
+/// repo redirecting it would capture that credential; the default is to ignore.
+fn allow_config_api_base() -> bool {
+    std::env::var("POSTIL_ALLOW_CONFIG_API_BASE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 fn find_first(root: &Path, names: &[&str]) -> Option<PathBuf> {
     names.iter().map(|n| root.join(n)).find(|p| p.is_file())
 }
@@ -426,7 +464,11 @@ model:
   name: deepseek/deepseek-v4-pro
   # cascade:
   #   - anthropic/claude-sonnet-4.6
-  # apiBase: https://openrouter.ai/api/v1   # any OpenAI-compatible endpoint (Ollama, vLLM, Azure)
+  # apiBase: https://openrouter.ai/api/v1   # any OpenAI-compatible endpoint (Ollama, vLLM, Azure).
+  #                                         # Ignored from config by default (a repo could redirect
+  #                                         # the inference credential). Prefer POSTIL_API_BASE; to
+  #                                         # honor this key set POSTIL_ALLOW_CONFIG_API_BASE=1 for a
+  #                                         # trusted local repo.
   # consensus: 1
 
 # contentPolicy:
@@ -620,6 +662,27 @@ mod tests {
         let policy = c.content_policy.as_deref().unwrap();
         assert!(policy.contains("Fabricated"));
         assert!(policy.contains("Never mention unreleased pricing"));
+    }
+
+    #[test]
+    fn config_api_base_is_ignored_by_default() {
+        // Repo-controlled model.apiBase must not redirect the inference
+        // credential unless explicitly opted in. Driven through the inner
+        // helper so the test is deterministic and touches no process env.
+        let f: FileConfig =
+            serde_yaml::from_str("model:\n  apiBase: https://untrusted.example/v1\n").unwrap();
+        let mut c = Config::default();
+        c.apply_file_inner(f, false).unwrap();
+        assert_eq!(c.api_base, DEFAULT_API_BASE);
+    }
+
+    #[test]
+    fn config_api_base_honored_when_opted_in() {
+        let f: FileConfig =
+            serde_yaml::from_str("model:\n  apiBase: https://trusted.local/v1\n").unwrap();
+        let mut c = Config::default();
+        c.apply_file_inner(f, true).unwrap();
+        assert_eq!(c.api_base, "https://trusted.local/v1");
     }
 
     #[test]

@@ -220,6 +220,106 @@ async fn advisory_on_error_lets_gate_stand_aside() {
     assert_eq!(conclusions, vec!["neutral", "success"]);
 }
 
+// Shared setup for the pre-review diff-fetch-failure tests: PR meta succeeds,
+// the diff fetch (v3.diff Accept) fails, check-runs create/complete, and the
+// error review comment posts. Parameterized by the .postil.yaml gate policy.
+async fn diff_fetch_failure_server() -> MockServer {
+    let server = MockServer::start().await;
+    // The diff fetch (v3.diff Accept) fails after meta already succeeded.
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .and(header("Accept", "application/vnd.github.v3.diff"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("upstream down"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "t", "body": "b",
+            "head": {"sha": "headsha111"}, "base": {"sha": "basesha222"}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/api/check-runs"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": 11})))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path_regex(r"^/repos/acme/api/check-runs/\d+$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/api/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    server
+}
+
+#[tokio::test]
+async fn diff_fetch_failure_advisory_emits_envelope_and_exits_zero() {
+    // A pre-review diff fetch failure under gate.onError: advisory must not exit
+    // 2 with no output. The error envelope is emitted (machine output preserved)
+    // and the gate stands aside (exit 0).
+    let server = diff_fetch_failure_server().await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".postil.yaml"),
+        "gate:\n  onError: advisory\n",
+    )
+    .unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .args(["review", "--repo", "acme/api", "--pr", "7", "--output-json"])
+        .assert()
+        .code(0);
+    let env: Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+    // The envelope survived: provider-class error, gate passing under advisory.
+    assert_eq!(env["findings"][0]["path"], ".postil/provider");
+    assert_eq!(env["gate"]["failing"], false);
+    assert_eq!(env["headSha"], "headsha111");
+
+    // The advisory check went neutral, the gate success.
+    let reqs = server.received_requests().await.unwrap();
+    let conclusions: Vec<String> = reqs
+        .iter()
+        .filter(|r| r.method == wiremock::http::Method::PATCH)
+        .map(|r| {
+            r.body_json::<Value>().unwrap()["conclusion"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(conclusions, vec!["neutral", "success"]);
+}
+
+#[tokio::test]
+async fn diff_fetch_failure_block_emits_envelope_and_exits_one() {
+    // Same pre-review failure with the default (block) policy fails closed:
+    // exit 1 with the envelope emitted, not exit 2 with no output.
+    let server = diff_fetch_failure_server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .args(["review", "--repo", "acme/api", "--pr", "7", "--output-json"])
+        .assert()
+        .code(1);
+    let env: Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+    assert_eq!(env["findings"][0]["path"], ".postil/provider");
+    assert_eq!(env["gate"]["failing"], true);
+}
+
 #[tokio::test]
 async fn advisory_does_not_bypass_unusable_output() {
     let server = MockServer::start().await;
@@ -692,6 +792,161 @@ async fn github_flow_posts_review_and_completes_both_checks() {
     let body: Value = review.body_json().unwrap();
     assert_eq!(body["comments"][0]["path"], "src/auth.rs");
     assert_eq!(body["comments"][0]["line"], 41);
+}
+
+// An LLM response with a caller-provided summary and findings (used for
+// content-policy scenarios where the finding is not the standard auth one).
+fn llm_with_summary(summary: &str, findings: Value) -> Value {
+    json!({
+        "choices": [{"message": {"content": json!({
+            "summary": summary,
+            "findings": findings
+        }).to_string()}}],
+        "usage": {"prompt_tokens": 100, "completion_tokens": 50}
+    })
+}
+
+// Shared GitHub remote setup for the content-policy PR-description tests. The PR
+// body carries prose the model flags; content policy is enabled via config.
+async fn content_policy_pr_server(llm: Value) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .and(header("Accept", "application/vnd.github.v3.diff"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(DIFF))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "Add login",
+            "body": "This file is untracked and was written by Claude.",
+            "head": {"sha": "headsha111"}, "base": {"sha": "basesha222"}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/api/check-runs"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": 11})))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path_regex(r"^/repos/acme/api/check-runs/\d+$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/api/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    server
+}
+
+#[tokio::test]
+async fn content_policy_pr_body_finding_survives_grounding() {
+    // A content-policy finding against the PR description grounds on the reserved
+    // `.postil/pr-description` path instead of being dropped as ungrounded (which
+    // would have spuriously fail-closed a run whose only finding was here).
+    let cp_finding = json!([{
+        "path": ".postil/pr-description", "line": 1, "severity": "warn",
+        "kind": "contentPolicy", "confidence": 0.9,
+        "title": "AI-authorship residue in PR description",
+        "body": "Rule 3: the description states it was written by Claude."
+    }]);
+    let server = content_policy_pr_server(llm_with_summary(
+        "PR description narrates AI authorship.",
+        cp_finding,
+    ))
+    .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".postil.yaml"),
+        "contentPolicy:\n  enabled: true\n",
+    )
+    .unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .args(["review", "--repo", "acme/api", "--pr", "7", "--output-json"])
+        .assert()
+        .code(0); // warn severity: kept, but gate passes at default failOn=error
+    let env: Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+    // The finding survived grounding: it is NOT a fail-closed model-output error.
+    assert_eq!(env["findings"][0]["path"], ".postil/pr-description");
+    assert_eq!(env["findings"][0]["kind"], "contentPolicy");
+    assert_eq!(env["counts"]["ungrounded"], 0);
+    assert_eq!(env["gate"]["failing"], false);
+
+    // The model was shown the numbered PR-description block.
+    let reqs = server.received_requests().await.unwrap();
+    let llm = reqs
+        .iter()
+        .find(|r| r.url.path() == "/chat/completions")
+        .unwrap();
+    let sent: Value = llm.body_json().unwrap();
+    let user_msg = sent["messages"][1]["content"].as_str().unwrap();
+    assert!(user_msg.contains(".postil/pr-description"));
+    assert!(user_msg.contains("     1   Add login"));
+
+    // The reserved-path finding is not posted as an inline comment (no real line)
+    // but is carried in the summary body.
+    let review = reqs
+        .iter()
+        .find(|r| r.url.path() == "/repos/acme/api/pulls/7/reviews")
+        .expect("review posted");
+    let body: Value = review.body_json().unwrap();
+    assert_eq!(
+        body["comments"].as_array().map(|a| a.len()).unwrap_or(0),
+        0,
+        "reserved-path finding was posted as an inline comment"
+    );
+    assert!(
+        body["body"]
+            .as_str()
+            .unwrap()
+            .contains(".postil/pr-description")
+    );
+}
+
+#[tokio::test]
+async fn content_policy_clean_run_does_not_fail_close() {
+    // With content policy on and no violations, the run stays clean: the numbered
+    // PR-description block must not induce a spurious ungrounded/fail-closed run.
+    let server = content_policy_pr_server(llm_with_summary("", json!([]))).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".postil.yaml"),
+        "contentPolicy:\n  enabled: true\n",
+    )
+    .unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .args(["review", "--repo", "acme/api", "--pr", "7", "--output-json"])
+        .assert()
+        .code(0);
+    let env: Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+    assert_eq!(env["silent"], true);
+    assert_eq!(env["gate"]["failing"], false);
+    assert_eq!(
+        env["findings"].as_array().map(|a| a.len()).unwrap_or(0),
+        0,
+        "a clean content-policy run produced a spurious finding"
+    );
 }
 
 #[tokio::test]

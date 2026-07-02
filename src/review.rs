@@ -18,6 +18,12 @@ use crate::output;
 use crate::prompt::{self, PrContext};
 
 const MAX_DIFF_BYTES: usize = 400_000;
+/// Hard cap on the raw fetched diff text before parsing. A generous multiple of
+/// the render cap so ordinary changes are never affected, but bounds the work a
+/// pathologically large fetched diff can force. Over the cap, the raw text is
+/// truncated at a line boundary and the review is flagged truncated so the
+/// uncertainty finding fires (a truncated review must not read as a full pass).
+const MAX_RAW_DIFF_BYTES: usize = MAX_DIFF_BYTES * 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForgeKind {
@@ -172,17 +178,36 @@ async fn run_remote<F: Forge>(
             // pass. `gate.onError: advisory` opts a repo out of blocking on
             // operational errors (provider outage) — the advisory check still
             // shows the error; only the gate stands aside.
+            //
+            // Build the error envelope and route it through the SAME output path
+            // (finish) as a successful run: emitting the envelope/SARIF and
+            // deriving the exit code from the gate. Propagating Err here instead
+            // would map to exit 2 with no machine output — contradicting advisory
+            // policy (which wants exit 0) and losing the envelope/SARIF.
+            let envelope = error_envelope(cfg, &e, &head_sha, &meta);
             if let Some((a, g)) = &checks {
-                let envelope = error_envelope(cfg, &e, &head_sha, &meta);
-                let gate_state = match cfg.gate_on_error {
-                    OnError::Block => CheckState::Failure,
-                    OnError::Advisory => CheckState::Success,
+                let gate_state = if envelope.gate.failing {
+                    CheckState::Failure
+                } else {
+                    CheckState::Success
                 };
                 let _ = forge
                     .complete_checks(a, g, CheckState::Neutral, gate_state, &envelope)
                     .await;
             }
-            Err(e)
+            // Emit envelope/SARIF and derive the exit code from the gate. The
+            // fetch that failed here is forge I/O, so a follow-up comment post
+            // may also fail; that must not mask the derived exit code, so
+            // posting failures on this already-errored path are downgraded to
+            // the gate-derived code rather than propagated as exit 2.
+            let code = if envelope.gate.failing { 1 } else { 0 };
+            match finish(args, cfg, envelope, Some(forge)).await {
+                Ok(c) => Ok(c),
+                Err(post_err) => {
+                    eprintln!("postil: could not post the error review ({post_err:#})");
+                    Ok(code)
+                }
+            }
         }
     }
 }
@@ -235,9 +260,30 @@ async fn review_diff(
     };
 
     let review_started = std::time::Instant::now();
+    // Cap the raw diff before parsing so an oversized fetched diff cannot force
+    // unbounded parse work; a cut here forces the truncated path below.
+    let (diff_text, raw_truncated) = diff::cap_raw_diff(diff_text, MAX_RAW_DIFF_BYTES);
     let parsed = diff::parse(diff_text);
-    let index = DiffIndex::build(&parsed);
+    let mut index = DiffIndex::build(&parsed);
     let incremental = args.since_sha.is_some();
+
+    // When content policy is active, render the PR title/description as a
+    // numbered, groundable block and register its line range so a title/body
+    // content-policy finding can ground against the reserved path. Only meaningful
+    // for full reviews with a body; incremental reviews scope to the pushed diff.
+    let content_policy_active = cfg.enabled && cfg.content_policy.is_some() && !incremental;
+    let pr_desc_lines = if content_policy_active {
+        let (_, count) = prompt::render_pr_description(
+            meta.map(|m| m.title.as_str()),
+            meta.map(|m| m.body.as_str()),
+        );
+        count
+    } else {
+        0
+    };
+    if pr_desc_lines > 0 {
+        index.add_content_policy_path(crate::envelope::PR_DESCRIPTION_PATH, pr_desc_lines);
+    }
 
     let mut summary = String::new();
     let mut model_used = "none (empty diff)".to_string();
@@ -246,15 +292,22 @@ async fn review_diff(
     let mut ungrounded = 0u32;
     let mut findings: Vec<Finding> = Vec::new();
 
+    // Run the model when there is a diff to review, or when content policy is
+    // active and there is a PR title/description to review (an empty diff should
+    // still get its prose checked).
     if !cfg.enabled {
         model_used = "none (disabled by config)".to_string();
-    } else if !parsed.is_empty() {
-        let (annotated, truncated) = diff::render_annotated(&parsed, MAX_DIFF_BYTES);
+    } else if !parsed.is_empty() || pr_desc_lines > 0 {
+        let (annotated, render_truncated) = diff::render_annotated(&parsed, MAX_DIFF_BYTES);
+        // Either the raw input was capped or the rendered output hit the limit;
+        // both mean the model did not see the full change.
+        let truncated = render_truncated || raw_truncated;
         let ctx = PrContext {
             repo,
             title: meta.map(|m| m.title.as_str()),
             body: meta.map(|m| m.body.as_str()),
             incremental,
+            content_policy: content_policy_active,
         };
         let system = prompt::system_prompt(cfg);
         let mut user = prompt::user_prompt(&ctx, &annotated, cfg.max_findings);

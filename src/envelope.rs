@@ -160,6 +160,15 @@ pub const OPERATIONAL_PATH: &str = ".postil/model-output";
 /// This is the only class `gate.onError: advisory` lets stand aside.
 pub const PROVIDER_PATH: &str = ".postil/provider";
 
+/// Reserved synthetic path for content-policy findings against the PR
+/// title/description. The title/body are not part of the diff, so they have no
+/// real (path, line) to ground against; when content policy is active they are
+/// rendered as a numbered block under this path and grounded against its line
+/// range. Only `kind: contentPolicy` findings may cite it. Findings here cannot
+/// be posted as inline code annotations (there is no file line); they are
+/// surfaced in the check-run summary and PR comment body instead.
+pub const PR_DESCRIPTION_PATH: &str = ".postil/pr-description";
+
 /// The synthetic finding emitted when the model produced unusable output.
 /// Postil fails closed: a review that could not be trusted is an error, not a pass.
 pub fn fail_closed_finding(detail: &str) -> Finding {
