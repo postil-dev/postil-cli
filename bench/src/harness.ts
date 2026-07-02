@@ -377,7 +377,7 @@ interface RecordedRequest {
   body: string;
 }
 
-async function startMockGithub(c: BenchmarkCase) {
+export async function startMockGithub(c: BenchmarkCase) {
   const requests: RecordedRequest[] = [];
   const checkRunNames = new Map<string, string>(); // id -> check name
   let nextCheckRunId = 1001;
@@ -593,7 +593,7 @@ function scanForForbidden(c: BenchmarkCase, where: string, content: string): str
 
 /** The default gate (failOn: error) should fail exactly when the ground truth
  * contains an error-severity finding. */
-function expectedGateFailing(c: BenchmarkCase): boolean {
+export function expectedGateFailing(c: BenchmarkCase): boolean {
   return c.groundTruth.findings.some((f) => f.severity === "error");
 }
 
@@ -626,6 +626,85 @@ function evaluateEnvelope(c: BenchmarkCase, env: Envelope, exitCode: number | un
   for (const f of env.findings) {
     if (f.path.startsWith(".postil/")) {
       failures.push(`synthetic finding ${f.path}: ${f.title}`);
+    }
+  }
+  return failures;
+}
+
+/** Model-independent grounding checks that hold regardless of what a live model
+ * emits: the pipeline must ground every finding (counts.ungrounded == 0), keep
+ * the silent flag consistent with the findings, echo the PR head sha, and never
+ * surface synthetic operational findings (a .postil/ path means the run was not
+ * trusted). Detection quality and gate/severity correctness are scored
+ * separately by the live-models scorer; this is only the fidelity floor. */
+export function evaluateGrounding(c: BenchmarkCase, env: Envelope): string[] {
+  const failures: string[] = [];
+  if (env.headSha !== c.headSha) {
+    failures.push(`envelope headSha ${env.headSha} != PR head ${c.headSha}`);
+  }
+  if (env.counts.ungrounded !== 0) {
+    failures.push(
+      `counts.ungrounded is ${env.counts.ungrounded}: the pipeline dropped grounded findings`,
+    );
+  }
+  if (env.silent !== (env.findings.length === 0)) {
+    failures.push(`silent=${env.silent} contradicts ${env.findings.length} finding(s)`);
+  }
+  for (const f of env.findings) {
+    if (f.path.startsWith(".postil/")) {
+      failures.push(`synthetic finding ${f.path}: ${f.title}`);
+    }
+  }
+  return failures;
+}
+
+/** Statusline correctness that holds independent of the model's findings: both
+ * check-runs are created and completed, postil/review concludes success, and
+ * postil/gate's conclusion matches the envelope's own gate verdict. The
+ * exact-finding anchoring checks in evaluateForgeInteractions are intentionally
+ * omitted here because a live model's findings are not known ahead of time. */
+export function evaluateStatusline(
+  env: Envelope,
+  github: Awaited<ReturnType<typeof startMockGithub>>,
+): string[] {
+  const failures: string[] = [];
+
+  const creates = github.requests.filter(
+    (r) => r.method === "POST" && r.path === github.checkRunsPath,
+  );
+  const names = new Set(
+    creates.map((r) => (safeJson(r.body) as { name?: string } | undefined)?.name ?? ""),
+  );
+  if (creates.length !== 2 || !names.has("postil/review") || !names.has("postil/gate")) {
+    failures.push(
+      `expected check-run creations for postil/review and postil/gate, got [${[...names].join(", ")}]`,
+    );
+  }
+
+  const patches = github.requests.filter(
+    (r) => r.method === "PATCH" && /\/check-runs\/\d+$/u.test(r.path),
+  );
+  if (patches.length !== 2) {
+    failures.push(`expected 2 check-run completions, got ${patches.length}`);
+  }
+  const conclusionByName = new Map<string, string>();
+  for (const patch of patches) {
+    const id = patch.path.split("/").pop() ?? "";
+    const name = github.checkRunNames.get(id) ?? `unknown-${id}`;
+    const conclusion = (safeJson(patch.body) as { conclusion?: string } | undefined)?.conclusion;
+    conclusionByName.set(name, conclusion ?? "missing");
+  }
+  const wantGate = env.gate.failing ? "failure" : "success";
+  if (conclusionByName.size > 0) {
+    if (conclusionByName.get("postil/gate") !== wantGate) {
+      failures.push(
+        `postil/gate concluded ${conclusionByName.get("postil/gate")}, expected ${wantGate}`,
+      );
+    }
+    if (conclusionByName.get("postil/review") !== "success") {
+      failures.push(
+        `postil/review concluded ${conclusionByName.get("postil/review")}, expected success`,
+      );
     }
   }
   return failures;
@@ -873,7 +952,7 @@ export function formatReport(report: BenchmarkReport): string {
 // ---------------------------------------------------------------------------
 // Small utilities
 
-function safeJson(raw: string): unknown {
+export function safeJson(raw: string): unknown {
   try {
     return JSON.parse(raw);
   } catch {
