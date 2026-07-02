@@ -38,6 +38,10 @@ acquire diff ──> parse + index ──> prompt ──> model (cascade/consens
 - `config.rs` — precedence (flags > env > .postil.* > .coderabbit.yaml > defaults),
   `deny_unknown_fields` so typos fail loudly. Also resolves `guardrails` and
   `content_policy`, the two prompt-injected repo policy sources (see below).
+  Exception to precedence: `model.apiBase` from a config file is ignored by
+  default (a repo could redirect the base URL that receives the inference
+  credential); honored only with `POSTIL_ALLOW_CONFIG_API_BASE=1`. The
+  `POSTIL_API_BASE` environment variable is always applied.
 
 ## Prompt-injected policy sources
 

@@ -138,9 +138,16 @@ contentPolicy:
 model:
   name: deepseek/deepseek-v4-pro
   cascade: [anthropic/claude-sonnet-4.6]
-  apiBase: https://openrouter.ai/api/v1
+  apiBase: https://openrouter.ai/api/v1    # ignored from config by default; see note below
   consensus: 1            # >1: only findings multiple models agree on survive
 ```
+
+`model.apiBase` in a config file is repo-controlled, and the resolved base URL
+receives the deployment's inference credential. To keep an untrusted repo from
+redirecting that credential, `apiBase` from `.postil.yaml` is ignored by default;
+set the base URL through the `POSTIL_API_BASE` environment variable instead. For a
+single-user local setup where the checked-out repo is trusted, set
+`POSTIL_ALLOW_CONFIG_API_BASE=1` to honor the config value.
 
 Environment: `POSTIL_API_KEY` (or `OPENROUTER_API_KEY`), `POSTIL_API_BASE`,
 `REVIEW_MODEL`, `REVIEW_MODEL_CASCADE`, `GITHUB_TOKEN`/`GITHUB_API_URL`,
