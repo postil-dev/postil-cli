@@ -178,17 +178,36 @@ async fn run_remote<F: Forge>(
             // pass. `gate.onError: advisory` opts a repo out of blocking on
             // operational errors (provider outage) — the advisory check still
             // shows the error; only the gate stands aside.
+            //
+            // Build the error envelope and route it through the SAME output path
+            // (finish) as a successful run: emitting the envelope/SARIF and
+            // deriving the exit code from the gate. Propagating Err here instead
+            // would map to exit 2 with no machine output — contradicting advisory
+            // policy (which wants exit 0) and losing the envelope/SARIF.
+            let envelope = error_envelope(cfg, &e, &head_sha, &meta);
             if let Some((a, g)) = &checks {
-                let envelope = error_envelope(cfg, &e, &head_sha, &meta);
-                let gate_state = match cfg.gate_on_error {
-                    OnError::Block => CheckState::Failure,
-                    OnError::Advisory => CheckState::Success,
+                let gate_state = if envelope.gate.failing {
+                    CheckState::Failure
+                } else {
+                    CheckState::Success
                 };
                 let _ = forge
                     .complete_checks(a, g, CheckState::Neutral, gate_state, &envelope)
                     .await;
             }
-            Err(e)
+            // Emit envelope/SARIF and derive the exit code from the gate. The
+            // fetch that failed here is forge I/O, so a follow-up comment post
+            // may also fail; that must not mask the derived exit code, so
+            // posting failures on this already-errored path are downgraded to
+            // the gate-derived code rather than propagated as exit 2.
+            let code = if envelope.gate.failing { 1 } else { 0 };
+            match finish(args, cfg, envelope, Some(forge)).await {
+                Ok(c) => Ok(c),
+                Err(post_err) => {
+                    eprintln!("postil: could not post the error review ({post_err:#})");
+                    Ok(code)
+                }
+            }
         }
     }
 }

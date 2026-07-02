@@ -220,6 +220,106 @@ async fn advisory_on_error_lets_gate_stand_aside() {
     assert_eq!(conclusions, vec!["neutral", "success"]);
 }
 
+// Shared setup for the pre-review diff-fetch-failure tests: PR meta succeeds,
+// the diff fetch (v3.diff Accept) fails, check-runs create/complete, and the
+// error review comment posts. Parameterized by the .postil.yaml gate policy.
+async fn diff_fetch_failure_server() -> MockServer {
+    let server = MockServer::start().await;
+    // The diff fetch (v3.diff Accept) fails after meta already succeeded.
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .and(header("Accept", "application/vnd.github.v3.diff"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("upstream down"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "t", "body": "b",
+            "head": {"sha": "headsha111"}, "base": {"sha": "basesha222"}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/api/check-runs"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": 11})))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path_regex(r"^/repos/acme/api/check-runs/\d+$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/api/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    server
+}
+
+#[tokio::test]
+async fn diff_fetch_failure_advisory_emits_envelope_and_exits_zero() {
+    // A pre-review diff fetch failure under gate.onError: advisory must not exit
+    // 2 with no output. The error envelope is emitted (machine output preserved)
+    // and the gate stands aside (exit 0).
+    let server = diff_fetch_failure_server().await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".postil.yaml"),
+        "gate:\n  onError: advisory\n",
+    )
+    .unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .args(["review", "--repo", "acme/api", "--pr", "7", "--output-json"])
+        .assert()
+        .code(0);
+    let env: Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+    // The envelope survived: provider-class error, gate passing under advisory.
+    assert_eq!(env["findings"][0]["path"], ".postil/provider");
+    assert_eq!(env["gate"]["failing"], false);
+    assert_eq!(env["headSha"], "headsha111");
+
+    // The advisory check went neutral, the gate success.
+    let reqs = server.received_requests().await.unwrap();
+    let conclusions: Vec<String> = reqs
+        .iter()
+        .filter(|r| r.method == wiremock::http::Method::PATCH)
+        .map(|r| {
+            r.body_json::<Value>().unwrap()["conclusion"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(conclusions, vec!["neutral", "success"]);
+}
+
+#[tokio::test]
+async fn diff_fetch_failure_block_emits_envelope_and_exits_one() {
+    // Same pre-review failure with the default (block) policy fails closed:
+    // exit 1 with the envelope emitted, not exit 2 with no output.
+    let server = diff_fetch_failure_server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .args(["review", "--repo", "acme/api", "--pr", "7", "--output-json"])
+        .assert()
+        .code(1);
+    let env: Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+    assert_eq!(env["findings"][0]["path"], ".postil/provider");
+    assert_eq!(env["gate"]["failing"], true);
+}
+
 #[tokio::test]
 async fn advisory_does_not_bypass_unusable_output() {
     let server = MockServer::start().await;
