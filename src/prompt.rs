@@ -148,7 +148,11 @@ pub fn respond_system_prompt(cfg: &Config) -> String {
 /// active; the title/body are otherwise passed as unnumbered context.
 pub fn render_pr_description(title: Option<&str>, body: Option<&str>) -> (String, u32) {
     let title = title.unwrap_or("").trim();
-    let body = body.unwrap_or("").trim();
+    // Truncation lives here, not in the callers: the grounding range in
+    // review.rs and the prompt block in user_prompt must count the same
+    // lines, or the index would accept line numbers the model never saw.
+    let body: String = body.unwrap_or("").trim().chars().take(2000).collect();
+    let body = body.trim_end();
     if title.is_empty() && body.is_empty() {
         return (String::new(), 0);
     }
@@ -174,12 +178,11 @@ pub fn user_prompt(ctx: &PrContext, annotated_diff: &str, max_findings: usize) -
     // title/description as a numbered, groundable block so the model can cite a
     // real line for a title/body content-policy finding (the reserved path).
     // Otherwise pass them as plain unnumbered context.
-    let truncated_body: Option<String> = ctx
-        .body
-        .filter(|b| !b.trim().is_empty())
-        .map(|b| b.chars().take(2000).collect());
     let pr_block = if ctx.content_policy {
-        let (block, _count) = render_pr_description(ctx.title, truncated_body.as_deref());
+        // render_pr_description truncates the body itself, keeping the
+        // rendered block in lockstep with the grounding range registered
+        // in review.rs.
+        let (block, _count) = render_pr_description(ctx.title, ctx.body);
         (!block.is_empty()).then_some(block)
     } else {
         None
@@ -197,6 +200,10 @@ pub fn user_prompt(ctx: &PrContext, annotated_diff: &str, max_findings: usize) -
         if let Some(title) = ctx.title {
             p.push_str(&format!("PR title: {title}\n"));
         }
+        let truncated_body: Option<String> = ctx
+            .body
+            .filter(|b| !b.trim().is_empty())
+            .map(|b| b.chars().take(2000).collect());
         if let Some(body) = &truncated_body {
             p.push_str(&format!("PR description:\n{body}\n"));
         }
