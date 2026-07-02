@@ -73,13 +73,36 @@ pub fn system_prompt(cfg: &Config) -> String {
         p.push_str(&rules);
         p.push_str("\n--- END GUARDRAILS ---\n");
     }
+    if let Some(policy) = &cfg.content_policy {
+        // Content policy reviews human-readable prose in the diff (docs,
+        // comments, docstrings, PR title/body) for a different class of
+        // problem than the core rules above: not "is this code correct" but
+        // "is this text honest, self-consistent, and free of authoring
+        // residue". Findings are reportable even though they are not a code
+        // bug, and must quote or paraphrase the offending prose and name the
+        // numbered rule it breaks.
+        p.push_str(
+            "\nThis repository has content-policy review enabled. Apply the numbered rules \
+             below ONLY to human-readable prose in the diff (Markdown, code comments, \
+             docstrings, user-facing/log strings, PR title/description) — never to code \
+             logic, identifiers, or structured data. Report a violation with kind \
+             \"contentPolicy\", name the rule number it breaks, and quote or paraphrase the \
+             specific offending text in the body. Be conservative: this augments the rules \
+             above, it does not turn you into a style linter; when a line is borderline, do \
+             not flag it.\n\
+             --- CONTENT POLICY ---\n",
+        );
+        let policy: String = policy.chars().take(6000).collect();
+        p.push_str(&policy);
+        p.push_str("\n--- END CONTENT POLICY ---\n");
+    }
     p.push_str(&format!("\nTone for finding bodies: {}.\n", cfg.tone));
     p.push_str(
         "\nRespond with ONLY a JSON object, no markdown fences, no prose:\n\
          {\"summary\": \"1-3 sentences on merge-relevant risk, or empty string if none\",\n \
           \"findings\": [{\"path\": \"file path from the diff\", \"line\": <new-file line>,\n \
           \"endLine\": <optional>, \"severity\": \"info|warn|error\",\n \
-          \"kind\": \"risk|humanEscalation|guardrail|uncertainty\", \"confidence\": <0..1>,\n \
+          \"kind\": \"risk|humanEscalation|guardrail|uncertainty|contentPolicy\", \"confidence\": <0..1>,\n \
           \"title\": \"short imperative title\", \"body\": \"specific, evidence-based markdown\"}]}\n\
          \n\
          The summary and findings must agree. Every risk the summary mentions MUST appear as \
@@ -164,6 +187,23 @@ mod tests {
         assert!(p.contains("REPO GUARDRAILS"));
         assert!(p.contains("validate the tenant id"));
         assert!(p.contains("kind \"guardrail\""));
+    }
+
+    #[test]
+    fn system_prompt_injects_content_policy_when_active() {
+        let mut cfg = Config::default();
+        cfg.content_policy = Some("1. Never fabricate a claim.".to_string());
+        let p = system_prompt(&cfg);
+        assert!(p.contains("CONTENT POLICY"));
+        assert!(p.contains("Never fabricate a claim"));
+        assert!(p.contains("kind \"contentPolicy\""));
+    }
+
+    #[test]
+    fn system_prompt_omits_content_policy_when_inactive() {
+        let cfg = Config::default();
+        let p = system_prompt(&cfg);
+        assert!(!p.contains("CONTENT POLICY"));
     }
 
     #[test]

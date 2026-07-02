@@ -39,6 +39,12 @@ pub enum Kind {
     HumanEscalation,
     Guardrail,
     Uncertainty,
+    /// Violates the content policy: a fabricated/contradicted doc claim, a
+    /// self-contradiction the same PR creates, authoring-process or AI
+    /// narration residue, leaked conversation/transcript text, or (low
+    /// severity, opt-in noise) stale temporal/TODO residue and house style.
+    /// Only emitted when `contentPolicy` is active for the repo.
+    ContentPolicy,
 }
 
 impl Kind {
@@ -48,6 +54,7 @@ impl Kind {
             Kind::HumanEscalation => "humanEscalation",
             Kind::Guardrail => "guardrail",
             Kind::Uncertainty => "uncertainty",
+            Kind::ContentPolicy => "contentPolicy",
         }
     }
 }
