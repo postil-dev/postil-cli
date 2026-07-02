@@ -36,7 +36,19 @@ acquire diff ──> parse + index ──> prompt ──> model (cascade/consens
   never opens PRs or pushes commits.
 - `sarif.rs` — envelope → SARIF 2.1.0 for code-scanning ingestion (`--sarif`).
 - `config.rs` — precedence (flags > env > .postil.* > .coderabbit.yaml > defaults),
-  `deny_unknown_fields` so typos fail loudly.
+  `deny_unknown_fields` so typos fail loudly. Also resolves `guardrails` and
+  `content_policy`, the two prompt-injected repo policy sources (see below).
+
+## Prompt-injected policy sources
+
+Both are prompt-section injections into the single system prompt (`prompt.rs`), not a
+second model call: guardrails are repo-specific merge rules from `.postil/guardrails.md`
+(violations are `kind: guardrail`); content policy reviews human-readable prose only
+(Markdown, comments, docstrings, user-facing strings, PR title/body — never code logic
+or identifiers) against a built-in baseline plus optional `.postil/content-policy.md`
+additions (violations are `kind: contentPolicy`). Content policy is off by default;
+either an explicit `contentPolicy.enabled: true` or the mere presence of
+`.postil/content-policy.md` turns it on, mirroring how guardrails activates.
 
 ## Invariants
 
@@ -45,3 +57,6 @@ acquire diff ──> parse + index ──> prompt ──> model (cascade/consens
 3. A clean review posts nothing (onClean: skip) — checks complete, no comments.
 4. Carried baseline findings keep the gate failing until their code changes.
 5. Exit codes: 0 clean/below gate, 1 gate failing, 2 operational error.
+6. Content-policy findings are scoped to prose; a model asserting `kind: contentPolicy`
+   against code logic, an identifier, or structured data is not itself validated, but
+   the prompt instructs against it and it is expected to be rare and low-confidence.

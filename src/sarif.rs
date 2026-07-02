@@ -23,6 +23,7 @@ fn rule_id(kind: Kind) -> &'static str {
         Kind::HumanEscalation => "postil/human-escalation",
         Kind::Guardrail => "postil/guardrail",
         Kind::Uncertainty => "postil/uncertainty",
+        Kind::ContentPolicy => "postil/content-policy",
     }
 }
 
@@ -43,6 +44,10 @@ fn rule_descriptions() -> Vec<Value> {
         (
             Kind::Uncertainty,
             "Something critical could not be verified from the diff.",
+        ),
+        (
+            Kind::ContentPolicy,
+            "Violation of the active content policy (fabricated claims, AI-authorship residue, leaked conversation text, or stale/style residue).",
         ),
     ]
     .into_iter()

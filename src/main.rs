@@ -140,6 +140,13 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
                     None => "none".to_string(),
                 }
             );
+            println!(
+                "contentPolicy: {}",
+                match &cfg.content_policy {
+                    Some(p) => format!("active ({} chars)", p.len()),
+                    None => "off".to_string(),
+                }
+            );
             println!("model.name: {}", cfg.model);
             println!("model.cascade: {:?}", cfg.cascade);
             println!("model.apiBase: {}", cfg.api_base);

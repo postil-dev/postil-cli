@@ -97,6 +97,20 @@ Drop repo-specific merge rules in `.postil/guardrails.md` and Postil injects the
 the prompt; a change that violates one is reported as a `guardrail` finding that quotes
 the rule it breaks.
 
+## Content policy
+
+Off by default. Reviews human-readable prose in the diff — Markdown, code comments,
+docstrings, user-facing/log strings, and the PR title/description, never code logic or
+identifiers — for fabricated or contradicted documentation claims, self-contradictions
+the same PR creates, authoring-process narration and AI-authorship residue, leaked
+conversation/transcript text, and (lower severity) stale temporal/TODO residue and house
+style. Violations are reported as `contentPolicy` findings that name the rule broken.
+
+Turn it on with `contentPolicy.enabled: true` in `.postil.yaml` for the built-in
+baseline, or drop repo-specific additions in `.postil/content-policy.md` (which also
+turns it on by itself, the same way `.postil/guardrails.md` does); the file's rules are
+appended to the baseline, not a replacement for it.
+
 ## Configuration
 
 `postil init` writes a starter `.postil.yaml`. Precedence: flags > environment >
@@ -118,6 +132,9 @@ gate:
   failOn: error           # info | warn | error | never
   onError: block          # block (fail closed, default) | advisory (fail open on
                           # provider outage only; unusable model output still blocks)
+contentPolicy:
+  enabled: false          # true reviews prose in the diff for fabricated claims, AI-
+                          # authorship residue, and stale/style residue (see above)
 model:
   name: deepseek/deepseek-v4-pro
   cascade: [anthropic/claude-sonnet-4.6]

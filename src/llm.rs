@@ -400,6 +400,7 @@ fn into_review(raw: RawReview, model: &str, usage: Usage) -> ModelReview {
                 Some("humanEscalation") | Some("human_escalation") => Kind::HumanEscalation,
                 Some("guardrail") => Kind::Guardrail,
                 Some("uncertainty") => Kind::Uncertainty,
+                Some("contentPolicy") | Some("content_policy") => Kind::ContentPolicy,
                 _ => Kind::Risk,
             };
             let title = if f.title.trim().is_empty() {
@@ -557,6 +558,25 @@ mod tests {
         assert_eq!(f.confidence, 1.0);
         assert_eq!(f.end_line, None);
         assert_eq!(f.title, "a body");
+    }
+
+    #[test]
+    fn into_review_parses_content_policy_kind() {
+        let raw = RawReview {
+            summary: String::new(),
+            findings: vec![RawFinding {
+                path: "README.md".into(),
+                line: 3,
+                end_line: None,
+                severity: "info".into(),
+                kind: Some("contentPolicy".into()),
+                confidence: 0.8,
+                title: "Stale temporal residue".into(),
+                body: "b".into(),
+            }],
+        };
+        let r = into_review(raw, "m", Usage::default());
+        assert_eq!(r.findings[0].kind, Kind::ContentPolicy);
     }
 
     fn mk(model: &str, path: &str, line: u32, conf: f64) -> ModelReview {
