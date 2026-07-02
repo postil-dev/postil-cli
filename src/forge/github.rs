@@ -4,7 +4,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{CheckState, Forge, PrMeta, ThreadKind, check_summary, check_title};
+use super::{CheckState, Forge, PrMeta, ThreadKind, check_summary, check_title, wrap_plain_text};
 use crate::envelope::{Envelope, Finding, Severity};
 
 pub struct GitHub {
@@ -218,6 +218,7 @@ impl Forge for GitHub {
             .filter(|f| !super::is_synthetic_path(&f.path))
             .take(50) // GitHub caps annotations per request at 50.
             .map(|f| {
+                let message: String = f.body.chars().take(800).collect();
                 json!({
                     "path": f.path,
                     "start_line": f.line,
@@ -228,7 +229,7 @@ impl Forge for GitHub {
                         Severity::Error => "failure",
                     },
                     "title": f.title,
-                    "message": f.body.chars().take(800).collect::<String>(),
+                    "message": wrap_plain_text(&message, 100),
                 })
             })
             .collect();
