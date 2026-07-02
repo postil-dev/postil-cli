@@ -1,0 +1,105 @@
+name: Bench (live models)
+
+# Manual only: this spends real OpenRouter tokens, so it never runs on push or
+# PR. It runs each fixture once per model against the real endpoint (mock
+# GitHub, real inference) and reports measured detection efficacy and cost.
+on:
+  workflow_dispatch:
+    inputs:
+      models:
+        description: Comma-separated OpenRouter model ids
+        required: true
+        default: >-
+          deepseek/deepseek-v4-pro,moonshotai/kimi-k2.6,qwen/qwen3-32b,mistralai/mistral-small-3.2-24b-instruct,google/gemma-3-27b-it
+      cases:
+        description: Case selection (currently informational; "all" runs the full set)
+        required: false
+        default: all
+      cost_cap_usd:
+        description: Abort if the projected upper-bound total cost exceeds this many USD
+        required: false
+        default: "15"
+
+concurrency:
+  group: bench-live
+  cancel-in-progress: false
+
+jobs:
+  bench-live:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      POSTIL_BENCH_MODELS: ${{ inputs.models }}
+      POSTIL_BENCH_COST_CAP_USD: ${{ inputs.cost_cap_usd }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Build release binary
+        run: cargo build --quiet --release
+
+      - name: Install bench deps
+        run: bun install --frozen-lockfile
+        working-directory: bench
+
+      # Cost guardrail: fetch live pricing and project an upper-bound total cost
+      # from fixture diff sizes. Aborts before spending anything if the matrix
+      # would exceed the cap, or if any model has unknown pricing.
+      - name: Cost guardrail
+        working-directory: bench
+        run: bun run cost-guard --cap "$POSTIL_BENCH_COST_CAP_USD"
+
+      - name: Run live-models bench
+        working-directory: bench
+        env:
+          POSTIL_BENCH_MODE: live
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: bun run src/run.ts --json-out "$GITHUB_WORKSPACE/bench-live-report.json"
+
+      - name: Write step summary
+        if: always()
+        working-directory: bench
+        run: |
+          report="$GITHUB_WORKSPACE/bench-live-report.json"
+          {
+            echo '## Live-models bench'
+            if [ -f "$report" ]; then
+              echo ''
+              echo '```'
+              bun -e '
+                const r = require(process.env.GITHUB_WORKSPACE + "/bench-live-report.json");
+                const pad = (s, w) => String(s).length >= w ? String(s) : String(s) + " ".repeat(w - String(s).length);
+                console.log([pad("model",40),pad("detect",8),pad("FP",5),pad("cases",6),pad("$/review",12),pad("total $",12),pad("mean ms",9)].join(" "));
+                for (const a of r.modelAggregates) {
+                  console.log([
+                    pad(a.id,40),
+                    pad((a.detectionRate*100).toFixed(1)+"%",8),
+                    pad(a.falsePositives,5),
+                    pad(a.casesRun,6),
+                    pad("$"+a.meanCostUsdPerReview.toFixed(6),12),
+                    pad("$"+a.totalCostUsd.toFixed(6),12),
+                    pad(a.meanDurationMs ? a.meanDurationMs.toFixed(0) : "n/a",9),
+                  ].join(" "));
+                }
+                console.log("");
+                console.log("CLI " + r.cliVersion + " | endpoint " + r.apiBase + " | generated " + r.generatedAt);
+              '
+              echo '```'
+              echo ''
+              echo 'Fixtures are ours; no competitor peer run exists. Costs are our measured OpenRouter spend on our fixtures, one run per case.'
+            else
+              echo ''
+              echo 'No report produced (the run failed before writing output).'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-live-report
+          path: bench-live-report.json
+          if-no-files-found: warn
