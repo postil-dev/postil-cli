@@ -60,3 +60,16 @@ either an explicit `contentPolicy.enabled: true` or the mere presence of
 6. Content-policy findings are scoped to prose; a model asserting `kind: contentPolicy`
    against code logic, an identifier, or structured data is not itself validated, but
    the prompt instructs against it and it is expected to be rare and low-confidence.
+
+## Residual prompt-injection surface
+
+The grounding and fail-closed checks catch two attacker shapes: a run where every
+finding is ungrounded (all-uncited = untrusted, invariant 2) and one where the summary
+narrates merge-relevant risk while the findings array is empty (`narrated_risk_finding`).
+A diff whose injected text instead convinces the model to emit a normal-looking,
+grounded, *empty* envelope — no narrated risk, nothing to contradict — is
+indistinguishable from an honest clean review, so the CLI cannot detect it. This is
+inherent to any LLM reviewer: the tool can verify that reported findings are grounded,
+not that unreported ones do not exist. A clean Postil review is therefore not a security
+guarantee, and downstream consumers (the gate check, the hosted worker, `postil plan`)
+must not treat it as one.
