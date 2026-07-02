@@ -166,13 +166,18 @@ fn wrap_plain_line(mut line: &str, width: usize, wrapped: &mut Vec<String>) {
 fn wrap_break(line: &str, width: usize) -> (usize, bool) {
     let mut hard_break = line.len();
     let mut last_space = None;
+    // Only break on a space that follows a word: breaking inside leading
+    // indentation would select an all-space chunk, which trims to an empty
+    // line and drops the indentation from the remainder.
+    let mut seen_word = false;
 
     for (column, (idx, ch)) in line.char_indices().enumerate() {
-        if column > width {
-            break;
-        }
-        if ch == ' ' && idx > 0 {
-            last_space = Some(idx);
+        if ch == ' ' {
+            if seen_word {
+                last_space = Some(idx);
+            }
+        } else {
+            seen_word = true;
         }
         if column == width {
             hard_break = idx;
@@ -415,5 +420,17 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].chars().count(), 100);
         assert_eq!(lines[1].chars().count(), 50);
+    }
+
+    #[test]
+    fn wrap_plain_text_keeps_indented_overlong_lines_intact() {
+        // A code-snippet line: leading indentation, then content past the
+        // width. Must not emit an empty chunk or drop the indent.
+        let text = format!("    let value = {};", "y".repeat(120));
+        let wrapped = wrap_plain_text(&text, 100);
+
+        assert!(wrapped.lines().all(|l| !l.trim().is_empty()));
+        assert!(wrapped.starts_with("    let value"));
+        assert!(wrapped.lines().all(|l| l.chars().count() <= 100));
     }
 }
