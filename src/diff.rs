@@ -122,18 +122,15 @@ pub fn cap_raw_diff(text: &str, max_bytes: usize) -> (&str, bool) {
     if text.len() <= max_bytes {
         return (text, false);
     }
+    // The cap can land inside a multi-byte character; back up to a char
+    // boundary before slicing, or the index below panics on non-ASCII input.
+    let mut b = max_bytes;
+    while b > 0 && !text.is_char_boundary(b) {
+        b -= 1;
+    }
     // Cut at the last newline at or before the cap so the final retained hunk
-    // line stays intact; if there is none, hard-cut at a char boundary.
-    let cut = text[..max_bytes]
-        .rfind('\n')
-        .map(|i| i + 1)
-        .unwrap_or_else(|| {
-            let mut b = max_bytes;
-            while b > 0 && !text.is_char_boundary(b) {
-                b -= 1;
-            }
-            b
-        });
+    // line stays intact; if there is none, hard-cut at the char boundary.
+    let cut = text[..b].rfind('\n').map(|i| i + 1).unwrap_or(b);
     (&text[..cut], true)
 }
 
@@ -455,6 +452,22 @@ Binary files a/img.png and b/img.png differ
         let (same, t) = cap_raw_diff("small\n", 100);
         assert!(!t);
         assert_eq!(same, "small\n");
+    }
+
+    #[test]
+    fn raw_diff_cap_handles_multibyte_at_the_boundary() {
+        // No newline anywhere, and the cap lands mid-character: the cut must
+        // back up to a char boundary instead of panicking.
+        let s = "é".repeat(100); // 2 bytes per char, 200 bytes total
+        let (capped, truncated) = cap_raw_diff(&s, 99);
+        assert!(truncated);
+        assert_eq!(capped.len(), 98);
+        assert!(capped.chars().all(|c| c == 'é'));
+        // Newline present before a mid-character cap: still cuts on the line.
+        let s2 = format!("line one\n{}", "é".repeat(100));
+        let (capped2, truncated2) = cap_raw_diff(&s2, 15);
+        assert!(truncated2);
+        assert_eq!(capped2, "line one\n");
     }
 
     #[test]
