@@ -125,12 +125,24 @@ pub fn cap_text(s: &str, max: usize, marker: &str) -> String {
 
 /// Cap a check-run summary to a size GitHub accepts, with a truncation marker.
 pub fn cap_check_summary(s: &str) -> String {
-    cap_text(s, MAX_CHECK_SUMMARY, "\n\n[output truncated at the check-run size limit]")
+    cap_text(
+        s,
+        MAX_CHECK_SUMMARY,
+        "\n\n[output truncated at the check-run size limit]",
+    )
 }
 
 /// Cap a check-run title to a size GitHub accepts.
 pub fn cap_check_title(s: &str) -> String {
     cap_text(s, MAX_CHECK_TITLE, "…")
+}
+
+/// True when a finding's path is a synthetic Postil anchor (e.g. the reserved
+/// PR-description path or the fail-closed/provider markers) rather than a real
+/// file line. These cannot be posted as inline code annotations or review
+/// comments; they are surfaced in the check-run summary and PR comment body.
+pub fn is_synthetic_path(path: &str) -> bool {
+    path.starts_with(".postil/")
 }
 
 pub fn check_title(envelope: &Envelope) -> String {
@@ -267,7 +279,10 @@ mod tests {
         let capped_title = cap_check_title(&long_title);
         assert!(capped_title.chars().count() <= MAX_CHECK_TITLE);
         assert!(capped_title.ends_with('…'));
-        assert_eq!(cap_check_title("2 error, 0 warn, 1 info"), "2 error, 0 warn, 1 info");
+        assert_eq!(
+            cap_check_title("2 error, 0 warn, 1 info"),
+            "2 error, 0 warn, 1 info"
+        );
     }
 
     #[test]

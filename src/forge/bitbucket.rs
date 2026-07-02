@@ -228,7 +228,11 @@ impl Forge for Bitbucket {
         // then report the failures together.
         let mut failures: Vec<String> = Vec::new();
         for f in findings {
-            if f.body.starts_with("[carried from previous review]") {
+            if f.body.starts_with("[carried from previous review]")
+                || super::is_synthetic_path(&f.path)
+            {
+                // Carried findings already have comments; synthetic-path findings
+                // have no file line to anchor and surface in the summary instead.
                 continue;
             }
             if let Err(e) = self.post_finding(f).await {

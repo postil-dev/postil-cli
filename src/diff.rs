@@ -47,6 +47,10 @@ impl Diff {
 #[derive(Debug, Default)]
 pub struct DiffIndex {
     ranges: HashMap<String, Vec<RangeInclusive<u32>>>,
+    /// Reserved synthetic-path line ranges that only content-policy findings may
+    /// ground against (e.g. the rendered PR title/description). Kept separate
+    /// from `ranges` so a non-content-policy finding cannot exploit them.
+    content_policy_ranges: HashMap<String, RangeInclusive<u32>>,
 }
 
 impl DiffIndex {
@@ -63,7 +67,29 @@ impl DiffIndex {
                 }
             }
         }
-        DiffIndex { ranges }
+        DiffIndex {
+            ranges,
+            content_policy_ranges: HashMap::new(),
+        }
+    }
+
+    /// Register `path` as groundable for content-policy findings over lines
+    /// `1..=count` (the numbered PR title/description block). No-op when
+    /// `count == 0`.
+    pub fn add_content_policy_path(&mut self, path: &str, count: u32) {
+        if count > 0 {
+            self.content_policy_ranges
+                .insert(path.to_string(), 1..=count);
+        }
+    }
+
+    /// True when `(path, line)` is a registered content-policy anchor. Used only
+    /// for `kind: contentPolicy` findings; the normal `contains` path never
+    /// consults these ranges.
+    pub fn contains_content_policy(&self, path: &str, line: u32) -> bool {
+        self.content_policy_ranges
+            .get(path)
+            .is_some_and(|r| r.contains(&line))
     }
 
     pub fn contains(&self, path: &str, line: u32) -> bool {
@@ -282,7 +308,10 @@ pub fn render_annotated(diff: &Diff, max_bytes: usize) -> (String, bool) {
             break 'files;
         }
         for hunk in &file.hunks {
-            if push(&mut out, &format!("@@ starting at line {} @@\n", hunk.new_start)) {
+            if push(
+                &mut out,
+                &format!("@@ starting at line {} @@\n", hunk.new_start),
+            ) {
                 truncated = true;
                 break 'files;
             }
@@ -426,6 +455,22 @@ Binary files a/img.png and b/img.png differ
         let (same, t) = cap_raw_diff("small\n", 100);
         assert!(!t);
         assert_eq!(same, "small\n");
+    }
+
+    #[test]
+    fn content_policy_ranges_are_separate_from_diff_ranges() {
+        let d = parse(SAMPLE);
+        let mut idx = DiffIndex::build(&d);
+        idx.add_content_policy_path(".postil/pr-description", 3);
+        // Registered content-policy anchor: lines 1..=3 groundable there.
+        assert!(idx.contains_content_policy(".postil/pr-description", 1));
+        assert!(idx.contains_content_policy(".postil/pr-description", 3));
+        assert!(!idx.contains_content_policy(".postil/pr-description", 4));
+        // The normal contains() never consults content-policy ranges.
+        assert!(!idx.contains(".postil/pr-description", 1));
+        // A zero-count registration is a no-op.
+        idx.add_content_policy_path(".postil/empty", 0);
+        assert!(!idx.contains_content_policy(".postil/empty", 1));
     }
 
     #[test]

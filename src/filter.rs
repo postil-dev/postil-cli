@@ -31,9 +31,16 @@ pub fn build_ignore_set(patterns: &[String]) -> Result<GlobSet> {
 pub fn apply(cfg: &Config, index: &DiffIndex, mut findings: Vec<Finding>) -> Result<FilterOutcome> {
     let had_any = !findings.is_empty();
 
-    // Grounding: a finding must cite a line on the new side of the diff.
+    // Grounding: a finding must cite a line on the new side of the diff. Content-
+    // policy findings may additionally cite a reserved synthetic anchor (the
+    // rendered PR title/description), which only they may use — a non-content-
+    // policy finding on that path is not accepted.
     let before = findings.len();
-    findings.retain(|f| index.contains(&f.path, f.line));
+    findings.retain(|f| {
+        index.contains(&f.path, f.line)
+            || (f.kind == crate::envelope::Kind::ContentPolicy
+                && index.contains_content_policy(&f.path, f.line))
+    });
     let ungrounded = (before - findings.len()) as u32;
     let all_ungrounded = had_any && findings.is_empty();
 
@@ -210,6 +217,53 @@ mod tests {
         let cfg = Config::default();
         let out = apply(&cfg, &idx, vec![f("other.rs", 1, Severity::Error, 0.9)]).unwrap();
         assert!(out.all_ungrounded);
+        assert!(out.kept.is_empty());
+    }
+
+    #[test]
+    fn content_policy_finding_grounds_on_reserved_path() {
+        // A contentPolicy finding on the reserved PR-description anchor survives
+        // grounding when the anchor range is registered; a non-contentPolicy
+        // finding on the same anchor does not.
+        let mut idx = index_for("a.rs", 1, 5);
+        idx.add_content_policy_path(crate::envelope::PR_DESCRIPTION_PATH, 3);
+        let cfg = Config::default();
+
+        let mut cp = f(
+            crate::envelope::PR_DESCRIPTION_PATH,
+            2,
+            Severity::Error,
+            0.9,
+        );
+        cp.kind = Kind::ContentPolicy;
+        let out = apply(&cfg, &idx, vec![cp]).unwrap();
+        assert_eq!(
+            out.kept.len(),
+            1,
+            "content-policy PR-body finding was dropped"
+        );
+        assert!(!out.all_ungrounded);
+
+        // A risk-kind finding on the reserved path is not groundable there.
+        let risk = f(
+            crate::envelope::PR_DESCRIPTION_PATH,
+            2,
+            Severity::Error,
+            0.9,
+        );
+        let out = apply(&cfg, &idx, vec![risk]).unwrap();
+        assert!(out.kept.is_empty());
+        assert!(out.all_ungrounded);
+
+        // Out-of-range content-policy line is still rejected.
+        let mut oob = f(
+            crate::envelope::PR_DESCRIPTION_PATH,
+            9,
+            Severity::Error,
+            0.9,
+        );
+        oob.kind = Kind::ContentPolicy;
+        let out = apply(&cfg, &idx, vec![oob]).unwrap();
         assert!(out.kept.is_empty());
     }
 

@@ -56,7 +56,12 @@ either an explicit `contentPolicy.enabled: true` or the mere presence of
 
 ## Invariants
 
-1. Every reported finding cites a line present in the reviewed diff.
+1. Every reported finding cites a line present in the reviewed diff. Exception:
+   when content policy is active, a `kind: contentPolicy` finding may instead cite
+   the reserved `.postil/pr-description` path, whose valid lines are the numbered
+   PR title/description block rendered into the prompt. Only content-policy
+   findings may ground there; these have no real file line, so they are surfaced
+   in the check-run summary and comment body, never as inline annotations.
 2. An invalid/untrusted model run produces `error` at `.postil/model-output:1`, exit 1.
 3. A clean review posts nothing (onClean: skip) — checks complete, no comments.
 4. Carried baseline findings keep the gate failing until their code changes.
