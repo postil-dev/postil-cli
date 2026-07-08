@@ -11,15 +11,15 @@
 //   postil review --diff-file <fixture.diff> --no-post --output-json
 //
 // Local diff-file mode does no forge I/O at all (see src/review.rs run_local),
-// so no GitHub server — mock or real — is needed. POSTIL_API_KEY is required
-// and is read from the caller's environment; it is never logged or printed.
+// so no GitHub server, mock or real, is needed. MODEL_API_KEY, LLM_API_KEY,
+// OPENROUTER_API_KEY, or POSTIL_API_KEY is required and is read from the
+// caller's environment; it is never logged or printed.
 // REVIEW_MODEL is configurable (default deepseek/deepseek-v4-pro).
 //
-// Scoring mirrors the earlier manual fixture run: a defect counts as detected
-// when a finding matches the ground-truth path with line within +/-3; severity
-// match is tracked among detections; clean cases should be silent; any finding
-// in a clean case and any non-matching finding in a defect case is a false
-// positive.
+// Scoring uses fixture ground truth: a defect counts as detected when a finding
+// matches the ground-truth path with line within +/-3; severity match is tracked
+// among detections; clean cases should be silent; any finding in a clean case
+// and any non-matching finding in a defect case is a false positive.
 //
 // Severity match is reported two ways: exact (strict equality) and within one
 // tier (info<->warn and warn<->error treated as a match). See the severity-tier
@@ -30,6 +30,7 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
+import { API_KEY_ENV_NAMES_TEXT, forwardApiKey, resolveApiKeyName } from "./api-key";
 import { benchmarkCase, type BenchmarkCaseInput, envelopeV1, type Envelope } from "./harness";
 
 const execFile = promisify(execFileCb);
@@ -49,7 +50,7 @@ const DEFAULT_LIVE_RETRIES = 1;
 const RETRY_BACKOFF_MS = 2_000;
 
 /** A defect is detected when a finding hits the right file and is within this
- * many lines of the ground-truth line. Matches the manual fixture run. */
+ * many lines of the ground-truth line. */
 const LINE_TOLERANCE = 3;
 
 /** Severity tiers, ordered low to high (mirrors src/envelope.rs: info < warn <
@@ -66,8 +67,8 @@ function severityRank(severity: string | null): number {
  * True when found and truth severities are within one tier of each other on the
  * info < warn < error scale. Adjacent pairs (info<->warn, warn<->error) count as
  * a match; only the two-tier gap info<->error is a real mismatch. This reflects
- * the severity-calibration finding that warn<->error is frequently a defensible
- * judgment call rather than a model error (see .cache/severity-investigation.md).
+ * the calibration rule that warn<->error is frequently a defensible judgment
+ * call rather than a model error.
  * It is reported alongside the strict exact metric, never as a replacement.
  * Unknown/missing severities never match. */
 function severityWithinOneTier(found: string | null, truth: string | null): boolean {
@@ -167,9 +168,10 @@ export async function runLive(
   inputs: BenchmarkCaseInput[],
   options: LiveOptions,
 ): Promise<LiveReport> {
-  if (!process.env.POSTIL_API_KEY) {
+  const apiKeyName = resolveApiKeyName();
+  if (!apiKeyName) {
     throw new Error(
-      "live mode needs a real model key: set POSTIL_API_KEY in the environment " +
+      `live mode needs a real model key: set ${API_KEY_ENV_NAMES_TEXT} in the environment ` +
         "(it is never logged or printed). Mock mode (bun run bench) needs no key.",
     );
   }
@@ -321,6 +323,10 @@ async function runLiveCase(
 
   const runDir = join(rootDir, "live", caseRunDirName(index, c.id));
   await mkdir(runDir, { recursive: true, mode: 0o700 });
+  const homeDir = join(runDir, "home");
+  const tmpDir = join(runDir, "tmp");
+  await mkdir(homeDir, { recursive: true, mode: 0o700 });
+  await mkdir(tmpDir, { recursive: true, mode: 0o700 });
   const diffPath = join(runDir, "pull.diff");
   await writeFile(diffPath, c.diff, { mode: 0o600 });
 
@@ -333,7 +339,7 @@ async function runLiveCase(
       ["review", "--diff-file", diffPath, "--no-post", "--output-json"],
       {
         cwd: runDir,
-        env: liveEnv(options.model),
+        env: liveEnv(options.model, homeDir, tmpDir),
         timeout: options.timeoutMs ?? 180_000,
         maxBuffer: 8 * 1024 * 1024,
       },
@@ -362,18 +368,27 @@ async function runLiveCase(
   return scoreCase(base, truth, parsed.data);
 }
 
-function liveEnv(model: string): NodeJS.ProcessEnv {
-  // Inherit the parent environment so POSTIL_API_KEY (and any POSTIL_API_BASE
-  // override) reach the binary. The key is never read or printed here.
-  return {
-    ...process.env,
+function liveEnv(model: string, homeDir: string, tmpDir: string): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    PATH: process.env.PATH,
+    CI: "true",
     NO_COLOR: "1",
+    HOME: homeDir,
+    TMPDIR: tmpDir,
+    XDG_CACHE_HOME: join(homeDir, ".cache"),
+    XDG_CONFIG_HOME: join(homeDir, ".config"),
+    XDG_DATA_HOME: join(homeDir, ".local", "share"),
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_TERMINAL_PROMPT: "0",
     REVIEW_MODEL: model,
   };
+  if (process.env.POSTIL_API_BASE) env.POSTIL_API_BASE = process.env.POSTIL_API_BASE;
+  forwardApiKey(env);
+  return env;
 }
 
 // ---------------------------------------------------------------------------
-// Scoring (mirrors .cache/measurements-fixtures/score.ts)
+// Scoring
 
 function scoreCase(base: LiveCaseResult, truth: GroundTruth, env: Envelope): LiveCaseResult {
   const findings = env.findings;

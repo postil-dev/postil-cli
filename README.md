@@ -38,7 +38,7 @@ cargo install --git https://github.com/postil-dev/postil-cli --locked
 ## Quick start
 
 ```sh
-export OPENROUTER_API_KEY=...   # or POSTIL_API_KEY with any OpenAI-compatible endpoint
+export MODEL_API_KEY=...        # or LLM_API_KEY / OPENROUTER_API_KEY
 
 postil doctor                   # validates endpoint, key, model, and repo setup
 postil review --staged          # review what you are about to commit
@@ -149,7 +149,8 @@ set the base URL through the `POSTIL_API_BASE` environment variable instead. For
 single-user local setup where the checked-out repo is trusted, set
 `POSTIL_ALLOW_CONFIG_API_BASE=1` to honor the config value.
 
-Environment: `POSTIL_API_KEY` (or `OPENROUTER_API_KEY`), `POSTIL_API_BASE`,
+Environment: `POSTIL_API_KEY`, `OPENROUTER_API_KEY`, `MODEL_API_KEY`, or
+`LLM_API_KEY`, `POSTIL_API_BASE`,
 `REVIEW_MODEL`, `REVIEW_MODEL_CASCADE`, `GITHUB_TOKEN`/`GITHUB_API_URL`,
 `GITLAB_TOKEN`/`GITLAB_API_URL`, `BITBUCKET_TOKEN`/`BITBUCKET_USER`/`BITBUCKET_API_URL`,
 `AZURE_DEVOPS_TOKEN`/`AZURE_DEVOPS_API_URL`.
@@ -168,13 +169,13 @@ Local endpoints use the same OpenAI-compatible contract:
 # Ollama
 ollama pull qwen3-coder:30b
 POSTIL_API_BASE=http://localhost:11434/v1 \
-POSTIL_API_KEY=ollama \
+MODEL_API_KEY=ollama \
 REVIEW_MODEL=qwen3-coder:30b \
 postil doctor
 
 # vLLM, SGLang, LiteLLM, or another local gateway
 POSTIL_API_BASE=http://localhost:8000/v1 \
-POSTIL_API_KEY=local \
+MODEL_API_KEY=local \
 REVIEW_MODEL=<served-model-name> \
 postil review --staged --output-json
 ```
@@ -184,7 +185,7 @@ Use the live benchmark harness before standardizing on a model:
 ```sh
 cargo build --quiet --release
 cd bench
-AGENT=1 POSTIL_API_KEY=... REVIEW_MODEL=deepseek/deepseek-v4-pro bun run bench:live -- --json
+MODEL_API_KEY=... REVIEW_MODEL=deepseek/deepseek-v4-pro bun run bench:live -- --json
 ```
 
 ## Preview a config change before deploying it

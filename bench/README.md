@@ -1,11 +1,11 @@
 # postil bench
 
-Hermetic PR-review regression suite for the `postil` CLI, ported from the
-previous product line's benchmark harness. Each of the 30 fixtures (seeded
-defects across languages and change classes, plus clean PRs where the correct
-review is silence) runs the release binary against a per-case mock GitHub API
-and a mock OpenAI-compatible model endpoint in an isolated run directory, then
-scores the v1 envelope and the forge interactions against ground truth.
+Hermetic PR-review regression suite for the `postil` CLI. Each of the 40
+fixtures (seeded defects across languages and change classes, plus clean PRs
+where the correct review is silence) runs the release binary against a per-case
+mock GitHub API and a mock OpenAI-compatible model endpoint in an isolated run
+directory, then scores the v1 envelope and the forge interactions against
+ground truth.
 
 ## What it measures
 
@@ -17,15 +17,10 @@ silence on clean PRs (no review comment posted), and prompt-leakage guardrails
 (fixture metadata such as policy phrasing must never appear in the prompt or
 any pipeline output).
 
-From the roadmap, verbatim — the caveats that gate any public use of these
-numbers:
-
-> - The mock model echoes output generated from the same spec as the ground
->   truth, so the run measures pipeline fidelity (grounding, gating, statusline
->   correctness) — not detection ability.
-> - No competitor has been run on the same fixtures, so comparative claims are
->   not defensible; site comparisons stay qualitative and sourced until peer
->   runs on identical fixtures exist.
+The mock model returns recorded findings generated from the fixture specs, so
+mock mode measures pipeline fidelity rather than detection ability. Comparative
+claims require peer runs on the identical fixture set; site comparisons stay
+qualitative and sourced until then.
 
 ## Running (mock mode — default, CI)
 
@@ -51,7 +46,7 @@ against the mock GitHub, so grounding and statusline correctness are still
 checked as a model-independent fidelity floor.
 
 ```sh
-export OPENROUTER_API_KEY=...     # or POSTIL_API_KEY; never logged or printed
+export MODEL_API_KEY=...          # or LLM_API_KEY / OPENROUTER_API_KEY; never logged or printed
 export POSTIL_BENCH_MODE=live
 export POSTIL_BENCH_MODELS=deepseek/deepseek-v4-pro,moonshotai/kimi-k2.6,qwen/qwen3-32b
 bun run bench --json-out report.json   # or: bun run bench:live-models
@@ -59,9 +54,10 @@ bun run bench --json-out report.json   # or: bun run bench:live-models
 # --concurrency <n> or BENCH_CONCURRENCY sets case parallelism (default 4)
 ```
 
-The inference key is read from `OPENROUTER_API_KEY` (fallback `POSTIL_API_KEY`),
-forwarded to the binary only through the environment, and never read, logged, or
-placed on argv. It refuses to run without a key and without at least one model.
+The inference key is read from `POSTIL_API_KEY`, `OPENROUTER_API_KEY`,
+`MODEL_API_KEY`, or `LLM_API_KEY`, forwarded to
+the binary only through the environment, and never logged or placed on argv. It
+refuses to run without a key and without at least one model.
 
 ### What live-models mode scores
 
@@ -120,27 +116,29 @@ them as internal evidence, not a published benchmark.
 
 `.github/workflows/bench-live.yml` runs this mode on `workflow_dispatch` only
 (it spends real tokens): it builds the release binary, runs the cost guardrail,
-runs the live bench with `secrets.OPENROUTER_API_KEY`, uploads the JSON report as
-an artifact, and prints the per-model table to the job step summary.
+runs the live bench with any configured `POSTIL_API_KEY`, `OPENROUTER_API_KEY`,
+`MODEL_API_KEY`, or `LLM_API_KEY` secret, uploads the JSON report as an artifact,
+and prints the per-model table to the job step summary.
 
 ## Diff-file live mode (opt-in, single model, no forge)
 
-This older live mode runs the real release binary against the same fixtures with
-a real model and **no mocked model server**, so it measures detection ability
+This live mode runs the real release binary against the same fixtures with a
+real model and **no mocked model server**, so it measures detection ability
 rather than pipeline fidelity. Each case runs in local diff-file mode
 (`postil review --diff-file <fixture.diff> --no-post --output-json`), which does
 no forge I/O at all — so no GitHub server, mock or real, is involved and nothing
 is written to any repo.
 
 ```sh
-export POSTIL_API_KEY=...        # required; never logged or printed
+export MODEL_API_KEY=...         # required; never logged or printed
 bun run bench:live               # or: bun run bench --live
 # REVIEW_MODEL or --model <id> overrides the model (default deepseek/deepseek-v4-pro)
 # --concurrency <n> or BENCH_CONCURRENCY sets case parallelism (default 6)
 ```
 
-It refuses to run without `POSTIL_API_KEY` and never reads or prints the key
-value. Live mode is **not run in CI**: it spends real tokens and depends on an
+It refuses to run without `POSTIL_API_KEY`, `OPENROUTER_API_KEY`, `MODEL_API_KEY`,
+or `LLM_API_KEY` and never logs or prints the key value. Live mode is
+**not run in CI**: it spends real tokens and depends on an
 external provider. Every live run writes a timestamped JSON report under
 `.runs/` (gitignored); `--json-out <path>` writes an additional copy and
 `--json` prints the report as JSON.

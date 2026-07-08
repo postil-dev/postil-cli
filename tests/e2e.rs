@@ -67,10 +67,12 @@ fn postil() -> Command {
     // Isolate from developer environment and repo config discovery.
     cmd.env_remove("REVIEW_MODEL")
         .env_remove("REVIEW_MODEL_CASCADE")
+        .env_remove("MODEL_API_KEY")
+        .env_remove("LLM_API_KEY")
         .env_remove("OPENROUTER_API_KEY")
         .env_remove("POSTIL_API_KEY")
         .env_remove("POSTIL_API_BASE")
-        .env("POSTIL_API_KEY", "test-key");
+        .env("MODEL_API_KEY", "test-key");
     cmd
 }
 

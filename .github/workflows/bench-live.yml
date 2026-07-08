@@ -56,7 +56,10 @@ jobs:
         working-directory: bench
         env:
           POSTIL_BENCH_MODE: live
+          POSTIL_API_KEY: ${{ secrets.POSTIL_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
         run: bun run src/run.ts --json-out "$GITHUB_WORKSPACE/bench-live-report.json"
 
       - name: Write step summary

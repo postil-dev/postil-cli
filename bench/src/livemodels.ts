@@ -9,16 +9,18 @@
 //
 //   POSTIL_BENCH_MODE=live \
 //   POSTIL_BENCH_MODELS=deepseek/deepseek-v4-pro,moonshotai/kimi-k2.6 \
-//   OPENROUTER_API_KEY=...  bun run bench --json-out report.json
+//   MODEL_API_KEY=...  bun run bench --json-out report.json
 //
-// The key is read from OPENROUTER_API_KEY (fallback POSTIL_API_KEY), passed to
-// the binary only through the environment, and never logged, printed, or placed
-// on argv. POSTIL_API_BASE defaults to https://openrouter.ai/api/v1.
+// The key is read from MODEL_API_KEY, LLM_API_KEY, OPENROUTER_API_KEY, or
+// POSTIL_API_KEY, passed to the binary only through the environment, and never
+// logged, printed, or placed on argv. POSTIL_API_BASE defaults to
+// https://openrouter.ai/api/v1.
 
 import { execFile as execFileCb } from "node:child_process";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
+import { API_KEY_ENV_NAMES_TEXT, forwardApiKey, resolveApiKeyName } from "./api-key";
 import {
   benchmarkCase,
   envelopeV1,
@@ -94,7 +96,7 @@ export async function runLiveModels(
 ): Promise<LiveModelsReport> {
   if (!resolveApiKeyName()) {
     throw new Error(
-      "live mode needs a real model key: set OPENROUTER_API_KEY (or POSTIL_API_KEY) in the " +
+      `live mode needs a real model key: set ${API_KEY_ENV_NAMES_TEXT} in the ` +
         "environment (it is never logged or printed). Mock mode (bun run bench) needs no key.",
     );
   }
@@ -236,8 +238,8 @@ async function runLiveModelCase(
 
 /** Environment for a live-models run: an isolated HOME/TMPDIR/XDG so the binary
  * discovers no developer config, the mock GitHub for forge I/O, and the real
- * OpenRouter endpoint. The API key is inherited from the parent process and is
- * never read, logged, or placed on argv here. */
+ * OpenRouter endpoint. The API key is forwarded from the parent process and is
+ * never logged or placed on argv here. */
 function liveEnv(
   homeDir: string,
   tmpDir: string,
@@ -261,10 +263,10 @@ function liveEnv(
     GITHUB_TOKEN: "benchmark-github-token",
     REVIEW_MODEL: model,
   };
-  // Forward exactly one inference-key variable, by name, without ever reading
-  // the value in this process beyond the pass-through.
-  const keyName = resolveApiKeyName();
-  if (keyName) env[keyName] = process.env[keyName];
+  // Forward the selected inference-key variable without logging or placing the
+  // value on argv. Neutral aliases are also mirrored into POSTIL_API_KEY so
+  // older binaries can run from the same benchmark harness.
+  forwardApiKey(env);
   return env;
 }
 
@@ -353,14 +355,6 @@ function pad(s: string, width: number): string {
 
 // ---------------------------------------------------------------------------
 // Small utilities
-
-function resolveApiKeyName(): "OPENROUTER_API_KEY" | "POSTIL_API_KEY" | undefined {
-  for (const name of ["OPENROUTER_API_KEY", "POSTIL_API_KEY"] as const) {
-    const v = process.env[name];
-    if (v !== undefined && v.trim() !== "") return name;
-  }
-  return undefined;
-}
 
 async function assertBinary(binary: string): Promise<void> {
   const ok = await readFile(binary)

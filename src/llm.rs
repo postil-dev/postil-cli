@@ -8,6 +8,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::api_key;
 use crate::config::Config;
 use crate::envelope::{Finding, Usage};
 
@@ -80,17 +81,12 @@ fn retryable_status(status: u16) -> bool {
 
 impl LlmClient {
     pub fn from_env(cfg: &Config) -> Result<Self> {
-        // Set-but-empty must not shadow the fallback: CI commonly exports
-        // POSTIL_API_KEY="" when the input was omitted.
-        let api_key = ["POSTIL_API_KEY", "OPENROUTER_API_KEY"]
-            .iter()
-            .find_map(|name| std::env::var(name).ok().filter(|v| !v.trim().is_empty()))
-            .ok_or_else(|| {
-                anyhow!(
-                    "no API key: set POSTIL_API_KEY (or OPENROUTER_API_KEY). \
-                     Postil never proxies your inference; bring your own key."
-                )
-            })?;
+        let api_key = api_key::resolve_from_process_env().ok_or_else(|| {
+            let key_names = api_key::names_text();
+            anyhow!(
+                "no API key: set {key_names}. Postil never proxies your inference; bring your own key."
+            )
+        })?;
         Ok(LlmClient {
             http: reqwest::Client::builder()
                 // Generation time scales with diff size; a thorough review of a
@@ -488,7 +484,6 @@ fn consensus_merge(runs: Vec<ModelReview>) -> ModelReview {
 mod tests {
     use super::*;
     use crate::envelope::{Kind, Severity};
-
     #[test]
     fn extracts_json_from_fenced_output() {
         let text = "Here you go:\n```json\n{\"summary\": \"s\", \"findings\": []}\n```";
