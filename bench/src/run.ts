@@ -2,20 +2,20 @@
 // CLI entry point.
 //
 // Mock mode (default, CI path): runs all cases against a release build with a
-// mock forge and a mock model — measures pipeline fidelity, not detection.
+// mock forge and a mock model; it measures pipeline fidelity, not detection.
 //
 //   bun run bench [--json] [--json-out <path>]
 //
 // Live-models mode (opt-in, NOT run in CI, spends real tokens): keeps the
 // per-case mock GitHub API but points the CLI at the real OpenRouter endpoint,
-// running each fixture once per model in POSTIL_BENCH_MODELS — measures
+// running each fixture once per model in POSTIL_BENCH_MODELS. It measures
 // detection efficacy and measured cost per real model. Requires an inference
-// key (OPENROUTER_API_KEY or POSTIL_API_KEY).
+// key (POSTIL_API_KEY, OPENROUTER_API_KEY, MODEL_API_KEY, or LLM_API_KEY).
 //
 //   POSTIL_BENCH_MODE=live POSTIL_BENCH_MODELS=id1,id2 \
-//     OPENROUTER_API_KEY=... bun run bench --json-out report.json
+//     MODEL_API_KEY=... bun run bench --json-out report.json
 //
-// Diff-file live mode (older, single model, no forge): measures detection with
+// Diff-file live mode (single model, no forge): measures detection with
 // no mock GitHub at all. Selected by --live / BENCH_LIVE.
 //
 //   bun run bench:live              # or: BENCH_LIVE=1 bun run src/run.ts
@@ -27,8 +27,10 @@
 //   POSTIL_BENCH_MODE       set to "live" to select live-models mode
 //   POSTIL_BENCH_MODELS     comma-separated OpenRouter model ids for live-models mode
 //   POSTIL_API_BASE         OpenRouter-compatible base (default https://openrouter.ai/api/v1)
-//   OPENROUTER_API_KEY      inference key for live-models mode (or POSTIL_API_KEY); never printed
-//   POSTIL_API_KEY          required in diff-file live mode; never logged or printed
+//   MODEL_API_KEY           inference key for live modes; never printed
+//   LLM_API_KEY             equivalent neutral inference-key alias
+//   OPENROUTER_API_KEY      provider-specific inference-key alias
+//   POSTIL_API_KEY          backward-compatible inference-key alias
 //   REVIEW_MODEL            model id for diff-file live mode (else --model, else default)
 //   BENCH_LIVE              set to 1 to select diff-file live mode
 //   BENCH_CONCURRENCY       live-mode case parallelism (else --concurrency, else default)

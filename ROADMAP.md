@@ -47,27 +47,23 @@
 - An `/evidence` benchmark: Postil's own silence rate and confirmed-finding rate on
   public OSS PRs, with raw envelopes.
 
-## Benchmarking status (2026-06)
+## Benchmarking status
 
-A hermetic PR-review benchmark harness survives from the previous product line
-(branch `fix/benchmark-comment-usefulness` of the pre-rebuild postil repo):
-isolated run dirs, mock forge and model endpoints, prompt-leakage guardrails,
-30 fixtures (24 seeded defects across languages, 6 clean PRs). Its last run
-(2026-06-05) scored 29/30 with 24 TP / 0 FP / 0 FN. Two caveats gate any public
-use of those numbers:
+The hermetic PR-review benchmark harness lives in `bench/`: isolated run dirs,
+mock forge and model endpoints, prompt-leakage guardrails, and 40 fixtures. The
+set contains 33 seeded defects across languages and change classes plus 7 clean
+PRs where correct behavior is silence.
 
-- The mock model echoes output generated from the same spec as the ground
-  truth, so the run measures pipeline fidelity (grounding, gating, statusline
-  correctness) — not detection ability.
-- No competitor has been run on the same fixtures, so comparative claims are
-  not defensible; site comparisons stay qualitative and sourced until peer
-  runs on identical fixtures exist.
+Mock mode runs in CI against a release build and measures pipeline fidelity:
+grounding, gating, statusline correctness, and prompt-leakage controls. It does
+not measure detection ability because the mock model returns recorded findings
+generated from fixture specs.
 
-Port plan: bring the harness into this repo against the envelope v1 contract,
-keep mock mode as a regression suite, add a live-model mode (real inference,
-same fixtures) to measure detection and silence rate, then run peers on the
-identical fixture set before publishing any comparison.
+Live-model mode is manual because it spends real model tokens. It runs the same
+40 fixtures against selected OpenRouter-compatible models while keeping forge I/O
+mocked, then reports detection rate, false positives, measured cost, and per-case
+detail. Diff-file live mode is available for single-model local checks with no
+mock forge.
 
-Status: mock mode is ported and lives in `bench/` (all 30 fixtures, isolation
-and prompt-leakage guardrails kept), runs as the `bench` job in CI against a
-release build. Live-model mode and peer runs remain open.
+Comparative claims require peer runs on the identical fixture set; site
+comparisons stay qualitative and sourced until then.

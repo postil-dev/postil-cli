@@ -8,6 +8,7 @@
 use anyhow::Result;
 use serde_json::json;
 
+use crate::api_key;
 use crate::config::Config;
 
 pub struct Check {
@@ -47,16 +48,14 @@ pub async fn run(cfg: &Config) -> Result<Vec<Check>> {
         },
     });
 
-    let key = std::env::var("POSTIL_API_KEY")
-        .or_else(|_| std::env::var("OPENROUTER_API_KEY"))
-        .ok();
+    let key = api_key::resolve_from_process_env();
+    let key_names = api_key::names_text();
     checks.push(Check {
         name: "api key",
         ok: key.is_some(),
         detail: match &key {
-            Some(_) => "POSTIL_API_KEY or OPENROUTER_API_KEY is set (value not shown)".to_string(),
-            None => "set POSTIL_API_KEY (or OPENROUTER_API_KEY); Postil never proxies inference"
-                .to_string(),
+            Some(_) => format!("{key_names} is set (value not shown)"),
+            None => format!("set {key_names}; Postil never proxies inference"),
         },
     });
 

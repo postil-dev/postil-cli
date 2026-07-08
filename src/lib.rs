@@ -1,5 +1,6 @@
 //! Postil review engine. See README for the product doctrine.
 
+pub(crate) mod api_key;
 pub mod cli;
 pub mod config;
 pub mod diff;
