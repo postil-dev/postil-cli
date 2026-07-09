@@ -630,6 +630,84 @@ async fn cascade_falls_back_to_next_model() {
 }
 
 #[tokio::test]
+async fn forge_post_failure_on_success_path_keeps_gate_derived_exit_code() {
+    // A completed review (gate failing on a real finding) whose forge comment
+    // post then fails (rate limit, transient 5xx) must not discard the
+    // already-computed envelope or exit 2: the exit code stays derived from
+    // the gate, the envelope is still emitted, and both check runs still
+    // complete — only the review comment itself is lost, and only a stderr
+    // warning marks that.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(llm_content(json!([finding_at(41, "error", 0.92)]))),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .and(header("Accept", "application/vnd.github.v3.diff"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(DIFF))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "t", "body": "b",
+            "head": {"sha": "headsha111"}, "base": {"sha": "basesha222"}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/api/check-runs"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": 11})))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path_regex(r"^/repos/acme/api/check-runs/\d+$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    // The review comment post itself fails — the fault this test is pinning.
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/api/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("secondary rate limit"))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .args(["review", "--repo", "acme/api", "--pr", "7", "--output-json"])
+        .assert()
+        .code(1); // gate-derived exit code, unaffected by the failed post
+
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let env: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(env["gate"]["failing"], true);
+    assert_eq!(env["findings"][0]["path"], "src/auth.rs");
+
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("could not post review comment"),
+        "expected a warning about the failed post, got: {stderr}"
+    );
+
+    // Both check runs still completed despite the review-comment failure.
+    let reqs = server.received_requests().await.unwrap();
+    let patches = reqs
+        .iter()
+        .filter(|r| r.method == wiremock::http::Method::PATCH)
+        .count();
+    assert_eq!(patches, 2);
+}
+
+#[tokio::test]
 async fn hosted_path_completes_provided_check_run_ids_without_creating_new_ones() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

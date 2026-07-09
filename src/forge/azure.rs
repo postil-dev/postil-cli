@@ -19,6 +19,15 @@ use crate::envelope::{Envelope, Finding};
 
 const API_VERSION: &str = "7.1";
 
+/// Per-file cap on fetched content before diffing. Azure's `/items` endpoint
+/// returns full file text with no size limit and no cheap way to learn the
+/// length up front, so without this a single huge file (a lockfile, a
+/// vendored bundle) is fetched in full and handed to `similar::TextDiff`
+/// before the assembled diff ever reaches `MAX_RAW_DIFF_BYTES` in review.rs.
+/// Generous for any ordinary source file; anything larger is marked skipped,
+/// the same way binary content is below.
+const MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
+
 pub struct Azure {
     http: reqwest::Client,
     base: String,
@@ -231,15 +240,7 @@ impl Azure {
             if old == new {
                 continue;
             }
-            // Binary content cannot be line-diffed; mark it like git does so
-            // the path is still visible in the review context.
-            if old.contains('\0') || new.contains('\0') {
-                out.push_str(&format!(
-                    "diff --git a/{path} b/{path}\nBinary files a/{path} and b/{path} differ\n"
-                ));
-                continue;
-            }
-            out.push_str(&unified_file_diff(path, &old, &new, is_add, is_delete));
+            out.push_str(&diff_section(path, &old, &new, is_add, is_delete));
         }
         Ok(out)
     }
@@ -496,6 +497,30 @@ fn merge_commits(
     }
 }
 
+/// One file's diff section, or a "differ" marker if the content is binary or
+/// exceeds the per-file size cap. Split out of `build_diff` so the
+/// classification is unit-testable without network access.
+fn diff_section(path: &str, old: &str, new: &str, is_add: bool, is_delete: bool) -> String {
+    // One oversized file must not be diffed in full before any size cap ever
+    // sees it; mark it skipped like a binary file so the path is still
+    // visible in the review context.
+    if old.len() > MAX_FILE_BYTES || new.len() > MAX_FILE_BYTES {
+        return format!(
+            "diff --git a/{path} b/{path}\nBinary files a/{path} and b/{path} differ \
+             (exceeds {}MiB per-file cap, not diffed)\n",
+            MAX_FILE_BYTES / (1024 * 1024)
+        );
+    }
+    // Binary content cannot be line-diffed; mark it like git does so the path
+    // is still visible in the review context.
+    if old.contains('\0') || new.contains('\0') {
+        return format!(
+            "diff --git a/{path} b/{path}\nBinary files a/{path} and b/{path} differ\n"
+        );
+    }
+    unified_file_diff(path, old, new, is_add, is_delete)
+}
+
 /// Build one file's unified-diff section in the format `diff.rs` expects:
 /// a `diff --git` header (so the parser seeds the path even for additions),
 /// the `---`/`+++` lines, and `similar`-generated hunks.
@@ -559,5 +584,30 @@ mod tests {
         assert!(section.contains("+++ b/new.rs"));
         let parsed = diff::parse(&section);
         assert_eq!(parsed.files.len(), 1);
+    }
+
+    #[test]
+    fn oversized_file_is_marked_skipped_not_diffed() {
+        // One side exceeds the per-file cap: the section must be marked
+        // skipped (parsed as binary, no hunks) rather than diffed in full.
+        let huge = "x".repeat(MAX_FILE_BYTES + 1);
+        let section = diff_section("big.bin", "", &huge, true, false);
+        assert!(section.contains("differ"));
+        assert!(section.contains("per-file cap"));
+        let parsed = diff::parse(&section);
+        assert_eq!(parsed.files.len(), 1);
+        assert!(parsed.files[0].binary);
+        assert!(parsed.files[0].hunks.is_empty());
+    }
+
+    #[test]
+    fn ordinary_file_under_cap_is_diffed_normally() {
+        let old = "fn a() {\n    let x = 1;\n}\n";
+        let new = "fn a() {\n    let x = 2;\n}\n";
+        let section = diff_section("src/a.rs", old, new, false, false);
+        assert!(!section.contains("differ"));
+        let parsed = diff::parse(&section);
+        assert!(!parsed.files[0].binary);
+        assert!(!parsed.files[0].hunks.is_empty());
     }
 }

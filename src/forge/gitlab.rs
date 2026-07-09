@@ -124,6 +124,52 @@ impl GitLab {
         out
     }
 
+    /// Post one finding as an anchored discussion, falling back to a plain
+    /// note when GitLab refuses the position (e.g. line outside the visible
+    /// diff).
+    async fn post_finding(&self, mr: &MrResponse, f: &Finding) -> Result<()> {
+        let body = json!({
+            "body": super::finding_comment_body(f, true),
+            "position": {
+                "position_type": "text",
+                "base_sha": mr.diff_refs.base_sha,
+                "start_sha": mr.diff_refs.start_sha,
+                "head_sha": mr.diff_refs.head_sha,
+                "new_path": f.path,
+                "new_line": f.line,
+            },
+        });
+        let resp = self
+            .request(
+                reqwest::Method::POST,
+                self.url(&format!("/merge_requests/{}/discussions", self.mr_iid)),
+            )
+            .json(&body)
+            .send()
+            .await
+            .context("posting discussion")?;
+        if resp.status().is_success() {
+            return Ok(());
+        }
+        let note = json!({
+            "body": format!(
+                "`{}:{}` **{}** ({})\n\n{}",
+                f.path, f.line, f.title, f.severity.as_str(), f.body
+            ),
+        });
+        let resp = self
+            .request(
+                reqwest::Method::POST,
+                self.url(&format!("/merge_requests/{}/notes", self.mr_iid)),
+            )
+            .json(&note)
+            .send()
+            .await
+            .context("posting fallback note")?;
+        Self::check_ok(resp, "note post").await?;
+        Ok(())
+    }
+
     async fn set_status(
         &self,
         sha: &str,
@@ -207,6 +253,9 @@ impl Forge for GitLab {
         _head_sha: &str,
     ) -> Result<()> {
         let mr = self.mr().await?;
+        // One failed comment must not drop the rest: post everything we can,
+        // then report the failures together.
+        let mut failures: Vec<String> = Vec::new();
         for f in findings {
             if f.body.starts_with("[carried from previous review]")
                 || super::is_synthetic_path(&f.path)
@@ -216,45 +265,8 @@ impl Forge for GitLab {
                 // and surface in the summary body instead.
                 continue;
             }
-            let body = json!({
-                "body": super::finding_comment_body(f, true),
-                "position": {
-                    "position_type": "text",
-                    "base_sha": mr.diff_refs.base_sha,
-                    "start_sha": mr.diff_refs.start_sha,
-                    "head_sha": mr.diff_refs.head_sha,
-                    "new_path": f.path,
-                    "new_line": f.line,
-                },
-            });
-            let resp = self
-                .request(
-                    reqwest::Method::POST,
-                    self.url(&format!("/merge_requests/{}/discussions", self.mr_iid)),
-                )
-                .json(&body)
-                .send()
-                .await
-                .context("posting discussion")?;
-            // A position the API refuses (e.g. line outside the visible diff)
-            // falls back to a plain note rather than dropping the finding.
-            if !resp.status().is_success() {
-                let note = json!({
-                    "body": format!(
-                        "`{}:{}` **{}** ({})\n\n{}",
-                        f.path, f.line, f.title, f.severity.as_str(), f.body
-                    ),
-                });
-                let resp = self
-                    .request(
-                        reqwest::Method::POST,
-                        self.url(&format!("/merge_requests/{}/notes", self.mr_iid)),
-                    )
-                    .json(&note)
-                    .send()
-                    .await
-                    .context("posting fallback note")?;
-                Self::check_ok(resp, "note post").await?;
+            if let Err(e) = self.post_finding(&mr, f).await {
+                failures.push(format!("{}:{}: {e:#}", f.path, f.line));
             }
         }
         if !summary.is_empty() {
@@ -269,7 +281,15 @@ impl Forge for GitLab {
                 .context("posting summary note")?;
             Self::check_ok(resp, "summary post").await?;
         }
-        Ok(())
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "{} finding comment(s) failed to post: {}",
+                failures.len(),
+                failures.join("; ")
+            ))
+        }
     }
 
     async fn start_checks(&self, head_sha: &str) -> Result<(String, String)> {

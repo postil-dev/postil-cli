@@ -167,9 +167,16 @@ async fn run_remote<F: Forge>(
                 } else {
                     CheckState::Success
                 };
-                forge
+                // A transient forge outage here (rate limit, timeout) must not
+                // discard the review this far along: log and keep going so the
+                // envelope/SARIF output and exit code below still land. Mirrors
+                // the Err(e) arm below, which best-effort's this same call.
+                if let Err(e) = forge
                     .complete_checks(a, g, advisory_state, gate_state, &envelope)
-                    .await?;
+                    .await
+                {
+                    eprintln!("postil: could not update check runs ({e:#})");
+                }
             }
             finish(args, cfg, envelope, Some(forge)).await
         }
@@ -195,11 +202,14 @@ async fn run_remote<F: Forge>(
                     .complete_checks(a, g, CheckState::Neutral, gate_state, &envelope)
                     .await;
             }
-            // Emit envelope/SARIF and derive the exit code from the gate. The
-            // fetch that failed here is forge I/O, so a follow-up comment post
-            // may also fail; that must not mask the derived exit code, so
-            // posting failures on this already-errored path are downgraded to
-            // the gate-derived code rather than propagated as exit 2.
+            // Emit envelope/SARIF and derive the exit code from the gate.
+            // `finish` itself already downgrades forge posting failures
+            // (complete_checks/post_review) to warnings on stderr without
+            // touching its return value, so this only remains as a fallback
+            // for a local I/O failure inside `finish` (e.g. writing SARIF) on
+            // this already-errored path; even that must not mask the derived
+            // exit code, so it is downgraded to the gate-derived code rather
+            // than propagated as exit 2.
             let code = if envelope.gate.failing { 1 } else { 0 };
             match finish(args, cfg, envelope, Some(forge)).await {
                 Ok(c) => Ok(c),
@@ -479,10 +489,14 @@ async fn finish<F: Forge>(
                 check_summary(&envelope, rich)
             };
             let head = envelope.head_sha.clone().unwrap_or_default();
-            forge
-                .post_review(&summary, &envelope.findings, &head)
-                .await
-                .context("posting review")?;
+            // A posting failure here (rate limit, transient 5xx, network blip)
+            // must not discard a review that already computed and persisted its
+            // envelope/SARIF/stdout output above. Log it and keep going — the
+            // exit code always derives from the gate below, never from whether
+            // the forge comment made it out.
+            if let Err(e) = forge.post_review(&summary, &envelope.findings, &head).await {
+                eprintln!("postil: could not post review comment ({e:#})");
+            }
         }
     }
     Ok(if envelope.gate.failing { 1 } else { 0 })

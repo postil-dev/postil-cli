@@ -484,6 +484,28 @@ fn consensus_merge(runs: Vec<ModelReview>) -> ModelReview {
 mod tests {
     use super::*;
     use crate::envelope::{Kind, Severity};
+
+    #[test]
+    fn provider_error_downcast_survives_additional_context() {
+        // review.rs's fail-open/fail-closed classifier does
+        // `e.downcast_ref::<ProviderError>().is_some()` on the error returned by
+        // the LLM client. That error picks up further `.context(...)` layers
+        // between here and there (e.g. review.rs wrapping client calls); this
+        // pins that anyhow's downcast_ref still finds the marker underneath any
+        // number of additional context layers, so the marker is never masked by
+        // later wrapping.
+        let base: anyhow::Error =
+            anyhow::Error::new(std::io::Error::other("boom")).context(ProviderError);
+        let wrapped = base
+            .context("fetching diff")
+            .context("running review")
+            .context("one more layer for good measure");
+        assert!(
+            wrapped.downcast_ref::<ProviderError>().is_some(),
+            "ProviderError marker must survive additional context wrapping"
+        );
+    }
+
     #[test]
     fn extracts_json_from_fenced_output() {
         let text = "Here you go:\n```json\n{\"summary\": \"s\", \"findings\": []}\n```";
