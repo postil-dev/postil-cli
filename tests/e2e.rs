@@ -83,17 +83,18 @@ fn write_diff(dir: &std::path::Path) -> std::path::PathBuf {
     p
 }
 
+async fn mock_review(server: &MockServer, findings: Value) {
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(findings)))
+        .mount(server)
+        .await;
+}
+
 #[tokio::test]
 async fn local_review_reports_grounded_finding_and_gates() {
     let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(llm_content(json!([finding_at(41, "error", 0.92)]))),
-        )
-        .mount(&server)
-        .await;
+    mock_review(&server, json!([finding_at(41, "error", 0.92)])).await;
 
     let dir = tempfile::tempdir().unwrap();
     let diff = write_diff(dir.path());
@@ -102,7 +103,7 @@ async fn local_review_reports_grounded_finding_and_gates() {
         .env("POSTIL_API_BASE", server.uri())
         .args(["review", "--diff-file"])
         .arg(&diff)
-        .arg("--output-json")
+        .args(["--output", "json"])
         .assert()
         .code(1); // gate fails on error severity
     let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
@@ -118,6 +119,127 @@ async fn local_review_reports_grounded_finding_and_gates() {
     let request: Value = requests[0].body_json().unwrap();
     assert_eq!(request["max_tokens"], 16384);
     assert_eq!(request["messages"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn local_review_prints_yaml_output() {
+    let server = MockServer::start().await;
+    mock_review(&server, json!([])).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "yaml"])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let env: serde_yaml::Value = serde_yaml::from_str(&stdout).unwrap();
+    assert_eq!(env["silent"], true);
+    assert_eq!(env["gate"]["failing"], false);
+}
+
+#[tokio::test]
+async fn local_review_prints_csv_output() {
+    let server = MockServer::start().await;
+    mock_review(&server, json!([finding_at(41, "warn", 0.88)])).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "csv"])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(stdout.starts_with("version,silent,summary,path,line,endLine,severity"));
+    assert!(stdout.contains("src/auth.rs,41,,warn,risk,0.88"));
+    assert!(stdout.contains("Unsanitized input reaches query"));
+}
+
+#[tokio::test]
+async fn local_review_writes_output_file_in_selected_format() {
+    let server = MockServer::start().await;
+    mock_review(&server, json!([])).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let output = dir.path().join("review.json");
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json", "--output-file"])
+        .arg(&output)
+        .assert()
+        .success();
+
+    assert!(out.get_output().stdout.is_empty());
+    let env: Value = serde_json::from_str(&std::fs::read_to_string(output).unwrap()).unwrap();
+    assert_eq!(env["silent"], true);
+    assert_eq!(env["gate"]["failing"], false);
+}
+
+#[tokio::test]
+async fn deprecated_output_json_alias_prints_json_with_warning() {
+    let server = MockServer::start().await;
+    mock_review(&server, json!([])).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    let env: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(env["silent"], true);
+    assert!(
+        stderr.contains("warning: --output-json is deprecated; use --output json instead"),
+        "expected deprecation warning, got: {stderr}"
+    );
+}
+
+#[test]
+fn review_help_documents_machine_output_flags() {
+    let out = Command::cargo_bin("postil")
+        .unwrap()
+        .args(["review", "--help"])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(stdout.contains("--output <OUTPUT>"));
+    assert!(stdout.contains("--output-file <OUTPUT_FILE>"));
+    assert!(stdout.contains("--output-json"));
+    assert!(stdout.contains("Deprecated: use --output json"));
+}
+
+#[test]
+fn review_rejects_unknown_output_format() {
+    Command::cargo_bin("postil")
+        .unwrap()
+        .args(["review", "--output", "xml"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "possible values: json, yaml, csv",
+        ));
 }
 
 #[tokio::test]
