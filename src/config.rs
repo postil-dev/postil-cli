@@ -93,7 +93,7 @@ pub struct Config {
     /// rules. Findings that violate one are emitted as `kind: guardrail`.
     pub guardrails: Option<String>,
     /// Active content-policy rules (built-in baseline, optionally extended by
-    /// `.postil/content-policy.md`), or `None` when the dimension is off.
+    /// `.postil/content-policy.md`), or `None` after an explicit opt-out.
     /// Findings are emitted as `kind: contentPolicy`. See [`load`](Self::load).
     pub content_policy: Option<String>,
     /// Set by an explicit `contentPolicy: { enabled: false }`, so a repo can
@@ -122,7 +122,7 @@ impl Default for Config {
             api_base: DEFAULT_API_BASE.to_string(),
             consensus: 1,
             guardrails: None,
-            content_policy: None,
+            content_policy: Some(BUILTIN_CONTENT_POLICY.to_string()),
             content_policy_disabled: false,
             source: "defaults".to_string(),
         }
@@ -180,8 +180,8 @@ pub struct ModelSection {
 /// documentation claims, self-contradictions the same PR creates, authoring-
 /// process narration and AI-authorship residue, leaked conversation/transcript
 /// text, and (low severity) stale temporal/TODO residue and house style.
-/// Off by default; enabling it or dropping a `.postil/content-policy.md` file
-/// turns it on. Findings are reported as `kind: contentPolicy`.
+/// On by default; `contentPolicy: { enabled: false }` fully disables it.
+/// Findings are reported as `kind: contentPolicy`.
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ContentPolicySection {
@@ -220,9 +220,8 @@ impl Config {
                 cfg.guardrails = Some(trimmed.to_string());
             }
         }
-        // A repo-specific content-policy file turns the dimension on (like
-        // guardrails.md) even without an explicit `contentPolicy.enabled:
-        // true`, unless that was explicitly set to false above.
+        // Repo-specific content-policy rules extend the built-in baseline,
+        // unless the repository explicitly opted out above.
         if !cfg.content_policy_disabled {
             let content_policy_path = root.join(".postil").join("content-policy.md");
             if let Ok(text) = std::fs::read_to_string(&content_policy_path) {
@@ -334,7 +333,10 @@ impl Config {
         }
         if let Some(cp) = f.content_policy {
             match cp.enabled {
-                Some(true) => self.content_policy = Some(BUILTIN_CONTENT_POLICY.to_string()),
+                Some(true) => {
+                    self.content_policy = Some(BUILTIN_CONTENT_POLICY.to_string());
+                    self.content_policy_disabled = false;
+                }
                 Some(false) => {
                     self.content_policy = None;
                     self.content_policy_disabled = true;
@@ -471,12 +473,10 @@ model:
   #                                         # trusted local repo.
   # consensus: 1
 
+# Content policy is on by default. Repo rules in .postil/content-policy.md extend
+# the built-in baseline. Uncomment this explicit opt-out to fully disable it.
 # contentPolicy:
-#   enabled: true           # review prose in the diff (docs, comments, PR body) for
-#                           # fabricated claims, AI-authorship residue, leaked
-#                           # conversation text, and stale/style nits. Off by default;
-#                           # also turns on automatically if .postil/content-policy.md
-#                           # exists. See https://postil.dev/docs/content-policy
+#   enabled: false          # See https://postil.dev/docs/content-policy
 "#;
 
 /// Built-in content-policy baseline, active whenever the dimension is on
@@ -631,10 +631,11 @@ mod tests {
     }
 
     #[test]
-    fn content_policy_off_by_default() {
+    fn content_policy_on_by_default() {
         let dir = tempfile::tempdir().unwrap();
         let c = Config::load(dir.path(), None).unwrap();
-        assert!(c.content_policy.is_none());
+        assert_eq!(c.content_policy.as_deref(), Some(BUILTIN_CONTENT_POLICY));
+        assert!(!c.content_policy_disabled);
     }
 
     #[test]
@@ -650,7 +651,19 @@ mod tests {
     }
 
     #[test]
-    fn content_policy_file_presence_turns_it_on_and_is_appended() {
+    fn builtin_content_policy_severity_profile_matches_default_gate() {
+        assert_eq!(BUILTIN_CONTENT_POLICY.matches("report at error").count(), 2);
+        assert_eq!(BUILTIN_CONTENT_POLICY.matches("report at warn").count(), 2);
+        assert_eq!(BUILTIN_CONTENT_POLICY.matches("report at info").count(), 2);
+
+        let c = Config::default();
+        assert!(c.gate_fail_on.fails(Severity::Error));
+        assert!(!c.gate_fail_on.fails(Severity::Warn));
+        assert!(!c.gate_fail_on.fails(Severity::Info));
+    }
+
+    #[test]
+    fn content_policy_file_is_appended_after_the_builtin_baseline() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join(".postil")).unwrap();
         write(
@@ -660,8 +673,10 @@ mod tests {
         );
         let c = Config::load(dir.path(), None).unwrap();
         let policy = c.content_policy.as_deref().unwrap();
-        assert!(policy.contains("Fabricated"));
-        assert!(policy.contains("Never mention unreleased pricing"));
+        assert!(policy.starts_with(BUILTIN_CONTENT_POLICY));
+        assert!(
+            policy.contains("--- REPO-SPECIFIC ADDITIONS ---\nNever mention unreleased pricing.")
+        );
     }
 
     #[test]
@@ -697,5 +712,19 @@ mod tests {
         );
         let c = Config::load(dir.path(), None).unwrap();
         assert!(c.content_policy.is_none());
+        assert!(c.content_policy_disabled);
+    }
+
+    #[test]
+    fn content_policy_explicit_false_disables_the_default_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            ".postil.yaml",
+            "contentPolicy:\n  enabled: false\n",
+        );
+        let c = Config::load(dir.path(), None).unwrap();
+        assert!(c.content_policy.is_none());
+        assert!(c.content_policy_disabled);
     }
 }

@@ -13,11 +13,11 @@
 - SARIF 2.1.0 output (`--sarif`) for code-scanning ingestion.
 - Repo guardrails file (`.postil/guardrails.md`) injected into the prompt; violations
   surface as `kind: guardrail` findings that quote the rule.
-- Content policy (`contentPolicy.enabled` or `.postil/content-policy.md`, off by
-  default): reviews prose in the diff for fabricated/contradicted doc claims,
-  same-PR self-contradictions, AI-authorship/process-narration residue, leaked
-  conversation text, and stale temporal/TODO/style residue; surfaces as
-  `kind: contentPolicy`.
+- Content policy (built-in baseline by default, optional
+  `.postil/content-policy.md` additions, `contentPolicy.enabled: false` opt-out):
+  reviews prose in the diff for fabricated/contradicted doc claims, same-PR
+  self-contradictions, AI-authorship/process-narration residue, leaked conversation
+  text, and stale temporal/TODO/style residue; surfaces as `kind: contentPolicy`.
 - `postil plan` deterministic config dry-run; `postil doctor`; pre-push hook.
 - `.coderabbit.yaml` translation for zero-cost migration.
 - Model cascade + concurrent multi-model consensus over any OpenAI-compatible endpoint;

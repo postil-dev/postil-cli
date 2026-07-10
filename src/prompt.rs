@@ -261,7 +261,8 @@ mod tests {
 
     #[test]
     fn system_prompt_omits_content_policy_when_inactive() {
-        let cfg = Config::default();
+        let mut cfg = Config::default();
+        cfg.content_policy = None;
         let p = system_prompt(&cfg);
         assert!(!p.contains("CONTENT POLICY"));
     }
