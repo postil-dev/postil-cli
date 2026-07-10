@@ -42,6 +42,14 @@ const allowedContext = z.object({
   docs: z.array(fixtureFile).default([]),
 });
 
+const disallowedSource = z.union([
+  z.string().min(1),
+  z.object({
+    text: z.string().min(1),
+    scope: z.enum(["anywhere", "output"]).default("anywhere"),
+  }),
+]);
+
 // The recorded response the mock model endpoint replays, shaped for the
 // rebuilt CLI contract: findings need kind/confidence/title to survive
 // filtering, and an empty findings array must come with an empty summary or
@@ -74,8 +82,10 @@ export const benchmarkCase = z.object({
   diff: z.string().min(1),
   allowedContext: allowedContext.default({ files: [], docs: [] }),
   /// Fixture metadata (policy phrasing, ground-truth labels) that must never
-  /// leak into the prompt or any pipeline output.
-  disallowedSources: z.array(z.string().min(1)).default([]),
+  /// leak into the prompt or any pipeline output. Prompt-injection fixtures may
+  /// mark intentionally present untrusted diff text as output-only so the suite
+  /// can assert the source was not adopted by the reviewer.
+  disallowedSources: z.array(disallowedSource).default([]),
   scoringLabels: z.array(z.string().min(1)).default([]),
   groundTruth: z.object({ findings: z.array(expectedFinding).default([]) }).default({
     findings: [],
@@ -246,7 +256,7 @@ async function runCase(
   // Authoring guardrails, before anything runs.
   const preFailures = [
     ...validateAllowedContext(c),
-    ...scanForForbidden(c, "fixture diff", c.diff),
+    ...scanForForbidden(c, "fixture diff", c.diff, "fixture"),
   ];
   if (preFailures.length > 0) {
     return failedCase(c, runDir, preFailures);
@@ -296,11 +306,13 @@ async function runCase(
   // Prompt-leakage guardrails: fixture metadata (policy phrasing, ground-truth
   // labels) must not appear in anything the pipeline sent or produced.
   const leakFailures = [
-    ...model.requestBodies.flatMap((body, i) => scanForForbidden(c, `model request #${i + 1}`, body)),
-    ...scanForForbidden(c, "envelope output", stdout),
+    ...model.requestBodies.flatMap((body, i) =>
+      scanForForbidden(c, `model request #${i + 1}`, body, "prompt"),
+    ),
+    ...scanForForbidden(c, "envelope output", stdout, "output"),
     ...github.requests
       .filter((r) => r.body.length > 0)
-      .flatMap((r) => scanForForbidden(c, `forge ${r.method} ${r.path}`, r.body)),
+      .flatMap((r) => scanForForbidden(c, `forge ${r.method} ${r.path}`, r.body, "output")),
   ];
 
   const metrics = scoreFindings(c.groundTruth.findings, envelope.findings);
@@ -577,8 +589,22 @@ function validateAllowedContext(c: BenchmarkCase): string[] {
     .map((path) => `diff references ${path}, which is not declared as allowed context`);
 }
 
-function scanForForbidden(c: BenchmarkCase, where: string, content: string): string[] {
-  const forbidden = [...c.disallowedSources, ...c.guardrails.forbiddenPromptSubstrings];
+type ForbiddenSurface = "fixture" | "prompt" | "output";
+
+export function scanForForbidden(
+  c: BenchmarkCase,
+  where: string,
+  content: string,
+  surface: ForbiddenSurface,
+): string[] {
+  const forbidden = [
+    ...c.disallowedSources.flatMap((source) => {
+      if (typeof source === "string") return [source];
+      if (source.scope === "output" && surface !== "output") return [];
+      return [source.text];
+    }),
+    ...c.guardrails.forbiddenPromptSubstrings,
+  ];
   const failures: string[] = [];
   for (const token of forbidden) {
     if (content.includes(token)) {
