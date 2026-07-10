@@ -36,6 +36,20 @@ describe("benchmark fixtures", () => {
       const hunkCount = c.diff.match(/^@@ /gm)?.length ?? 0;
       expect(hunkCount).toBeGreaterThan(1);
     }
+
+    const clean = hugeCases.find((c) => c.id === "huge-low-signal-clean");
+    expect(clean).toBeDefined();
+    const removed = clean!.diff
+      .split("\n")
+      .filter((line) => line.startsWith("- "))
+      .map((line) => line.slice(2));
+    const added = clean!.diff
+      .split("\n")
+      .filter((line) => line.startsWith("+ "))
+      .map((line) => line.slice(2));
+    expect(removed.length).toBeGreaterThan(1);
+    expect(added.length).toBe(removed.length);
+    expect(added.some((line, index) => line !== removed[index])).toBe(true);
   });
 });
 
