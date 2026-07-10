@@ -92,6 +92,22 @@ pub struct Reconciliation {
     pub carried: Vec<Finding>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileScope {
+    Incremental,
+    /// A complete full review replaces the previous review's signal. When the
+    /// model run is not trustworthy, baseline findings remain carried.
+    Full {
+        trustworthy: bool,
+    },
+}
+
+pub const CARRIED_MARKER: &str = "[carried from previous review]";
+
+pub fn is_carried(finding: &Finding) -> bool {
+    finding.body.starts_with(CARRIED_MARKER)
+}
+
 /// How close (in lines) a new finding must be to a baseline finding to be
 /// considered "the same spot". Kept small; proximity alone is not enough to
 /// supersede (see `supersedes`).
@@ -111,7 +127,7 @@ fn supersedes(base: &Finding, new: &Finding) -> bool {
         && new.severity >= base.severity
 }
 
-/// Whether the incremental diff plausibly ADDRESSES the baseline finding (so it
+/// Whether the reviewed diff plausibly ADDRESSES the baseline finding (so it
 /// can be declared resolved). Interval overlap (`touches`) is too loose: a
 /// finding with a wide `end_line` span (e.g. 5..40) would be resolved by a
 /// single one-line edit anywhere inside it, even if the bug is untouched. We
@@ -121,14 +137,23 @@ fn supersedes(base: &Finding, new: &Finding) -> bool {
 /// next run is the real confirmation we lack — but it removes the worst
 /// false-resolve (wide-span / distant-touch) and fails closed (carry) when the
 /// edit landed elsewhere in the span.
-fn touch_addresses(incremental_index: &DiffIndex, f: &Finding) -> bool {
-    incremental_index.contains(&f.path, f.line)
+///
+/// Incremental baselines cite the OLD head, so their anchors must be checked
+/// against old-side hunk coordinates. A trustworthy full review is
+/// authoritative over the complete PR and resolves any baseline issue the
+/// fresh model run did not reproduce.
+fn touch_addresses(index: &DiffIndex, f: &Finding, scope: ReconcileScope) -> bool {
+    match scope {
+        ReconcileScope::Incremental => index.contains_old(&f.path, f.line),
+        ReconcileScope::Full { trustworthy } => trustworthy,
+    }
 }
 
 pub fn reconcile(
     baseline: &[Finding],
-    incremental_index: &DiffIndex,
+    index: &DiffIndex,
     new_findings: &[Finding],
+    scope: ReconcileScope,
 ) -> Reconciliation {
     let mut resolved = Vec::new();
     let mut carried = Vec::new();
@@ -144,20 +169,19 @@ pub fn reconcile(
             // copy is already in `new_findings` and will reach the gate.
             continue;
         }
-        if touch_addresses(incremental_index, f) {
-            // The author edited the exact line the issue was pinned to and the
-            // model did not re-flag it this run: treat as resolved. (Imperfect —
-            // a non-fixing edit to that line will also resolve it — but the
-            // anchor-line requirement is far tighter than span overlap, and a
-            // full re-review would re-detect a still-broken issue.)
+        if touch_addresses(index, f, scope) {
+            // An incremental edit touched the old-head anchor, or a trustworthy
+            // full review did not reproduce the issue: treat it as resolved.
+            // Incremental touch is imperfect because a non-fixing edit can also
+            // resolve it, but a full re-review re-detects a still-broken issue.
             resolved.push(f.clone());
         } else {
             // Not superseded and the anchor line was not touched: the issue
             // persists. Carry it forward (fail-closed) so an unrelated nearby
             // finding or a distant in-span edit cannot clear the gate.
             let mut carry = f.clone();
-            if !carry.body.contains("[carried from previous review]") {
-                carry.body = format!("[carried from previous review]\n\n{}", carry.body);
+            if !is_carried(&carry) {
+                carry.body = format!("{CARRIED_MARKER}\n\n{}", carry.body);
             }
             carried.push(carry);
         }
@@ -187,7 +211,7 @@ mod tests {
 
     fn index_for(path: &str, start: u32, count: u32) -> DiffIndex {
         let text = format!(
-            "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1,{count} +{start},{count} @@\n{}",
+            "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -{start},{count} +{start},{count} @@\n{}",
             "+x\n".repeat(count as usize)
         );
         DiffIndex::build(&diff::parse(&text))
@@ -315,7 +339,7 @@ mod tests {
             f("b.rs", 5, Severity::Warn, 0.8),   // untouched → carried
             f(".postil/model-output", 1, Severity::Error, 1.0), // synthetic → dropped
         ];
-        let rec = reconcile(&baseline, &idx, &[]);
+        let rec = reconcile(&baseline, &idx, &[], ReconcileScope::Incremental);
         assert_eq!(rec.resolved.len(), 1);
         assert_eq!(rec.resolved[0].path, "a.rs");
         assert_eq!(rec.carried.len(), 1);
@@ -328,7 +352,7 @@ mod tests {
         let idx = index_for("a.rs", 10, 3);
         let baseline = vec![f("a.rs", 11, Severity::Error, 0.9)];
         let new = vec![f("a.rs", 12, Severity::Error, 0.95)];
-        let rec = reconcile(&baseline, &idx, &new);
+        let rec = reconcile(&baseline, &idx, &new, ReconcileScope::Incremental);
         assert!(rec.resolved.is_empty());
         assert!(rec.carried.is_empty());
     }
@@ -341,7 +365,7 @@ mod tests {
         let idx = index_for("z.rs", 100, 1); // incremental diff is elsewhere
         let baseline = vec![f("a.rs", 10, Severity::Error, 0.9)];
         let new = vec![f("a.rs", 12, Severity::Info, 0.9)]; // unrelated, lower sev
-        let rec = reconcile(&baseline, &idx, &new);
+        let rec = reconcile(&baseline, &idx, &new, ReconcileScope::Incremental);
         assert_eq!(rec.resolved.len(), 0);
         assert_eq!(rec.carried.len(), 1, "baseline Error was dropped");
         assert_eq!(rec.carried[0].severity, Severity::Error);
@@ -355,7 +379,7 @@ mod tests {
         let idx = index_for("z.rs", 100, 1);
         let baseline = vec![f("a.rs", 10, Severity::Warn, 0.9)];
         let new = vec![f("a.rs", 11, Severity::Error, 0.9)];
-        let rec = reconcile(&baseline, &idx, &new);
+        let rec = reconcile(&baseline, &idx, &new, ReconcileScope::Incremental);
         assert!(rec.resolved.is_empty());
         assert!(rec.carried.is_empty(), "same-issue reflag should supersede");
     }
@@ -368,9 +392,66 @@ mod tests {
         let idx = index_for("a.rs", 30, 1); // touches only a.rs:30
         let mut wide = f("a.rs", 5, Severity::Error, 0.9);
         wide.end_line = Some(40);
-        let rec = reconcile(&[wide], &idx, &[]);
+        let rec = reconcile(&[wide], &idx, &[], ReconcileScope::Incremental);
         assert_eq!(rec.resolved.len(), 0, "wide-span finding falsely resolved");
         assert_eq!(rec.carried.len(), 1);
         assert_eq!(rec.carried[0].severity, Severity::Error);
+    }
+
+    #[test]
+    fn reconcile_uses_old_head_coordinates_for_rewritten_anchor() {
+        // PR 314 regression: the baseline finding cited old-head line 99. The
+        // rewrite touched it in an old-side 93..109 hunk which moved to new-side
+        // 133..159. Looking for new-side line 99 misses the edit and carries a
+        // stale finding forever.
+        let text = format!(
+            "diff --git a/src/components/code-copy-enhancer.tsx b/src/components/code-copy-enhancer.tsx\n\
+             --- a/src/components/code-copy-enhancer.tsx\n\
+             +++ b/src/components/code-copy-enhancer.tsx\n\
+             @@ -93,17 +133,27 @@ export function CodeCopyEnhancer() {{\n{}{}",
+            "-old line\n".repeat(17),
+            "+new line\n".repeat(27)
+        );
+        let idx = DiffIndex::build(&diff::parse(&text));
+        assert!(idx.contains_old("src/components/code-copy-enhancer.tsx", 99));
+        assert!(!idx.contains("src/components/code-copy-enhancer.tsx", 99));
+
+        let baseline = f(
+            "src/components/code-copy-enhancer.tsx",
+            99,
+            Severity::Error,
+            0.9,
+        );
+        let rec = reconcile(&[baseline], &idx, &[], ReconcileScope::Incremental);
+        assert_eq!(rec.resolved.len(), 1);
+        assert!(rec.carried.is_empty());
+    }
+
+    #[test]
+    fn trustworthy_full_review_resolves_findings_it_does_not_reproduce() {
+        let idx = index_for("other.rs", 1, 1);
+        let baseline = vec![f("a.rs", 99, Severity::Error, 0.9)];
+        let rec = reconcile(
+            &baseline,
+            &idx,
+            &[],
+            ReconcileScope::Full { trustworthy: true },
+        );
+        assert_eq!(rec.resolved.len(), 1);
+        assert!(rec.carried.is_empty());
+    }
+
+    #[test]
+    fn failed_full_review_keeps_baseline_findings_open() {
+        let idx = index_for("a.rs", 1, 100);
+        let baseline = vec![f("a.rs", 99, Severity::Error, 0.9)];
+        let rec = reconcile(
+            &baseline,
+            &idx,
+            &[],
+            ReconcileScope::Full { trustworthy: false },
+        );
+        assert!(rec.resolved.is_empty());
+        assert_eq!(rec.carried.len(), 1);
     }
 }

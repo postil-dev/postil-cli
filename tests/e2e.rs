@@ -1249,6 +1249,316 @@ async fn incremental_review_resolves_and_carries_baseline_findings() {
 }
 
 #[tokio::test]
+async fn same_head_with_open_baseline_falls_back_to_full_review() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .and(header("Accept", "application/vnd.github.v3.diff"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(DIFF))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "t", "body": null,
+            "head": {"sha": "h1"}, "base": {"sha": "b1"}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path_regex(r"^/repos/acme/api/check-runs/\d+$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let baseline = json!({
+        "version": 1, "summary": "", "silent": false,
+        "findings": [
+            {"path": "src/auth.rs", "line": 41, "severity": "error", "kind": "risk",
+             "confidence": 0.9, "title": "old auth bug", "body": "fixed now"}
+        ],
+        "resolved": [], "counts": {"info": 0, "warn": 0, "error": 1, "suppressed": 0},
+        "confidenceBuckets": [0,0,0,0,1],
+        "gate": {"failOn": "error", "failing": true},
+        "modelUsed": "m", "usage": {"promptTokens": 0, "completionTokens": 0},
+        "baseSha": "b1", "headSha": "h1", "sinceSha": null
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let baseline_path = dir.path().join("baseline.json");
+    std::fs::write(&baseline_path, baseline.to_string()).unwrap();
+
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .args(["review", "--repo", "acme/api", "--pr", "7"])
+        .args(["--sha", "h1", "--since-sha", "h1", "--baseline"])
+        .arg(&baseline_path)
+        .args([
+            "--check-run-id",
+            "11",
+            "--gate-check-run-id",
+            "12",
+            "--output-json",
+        ])
+        .assert()
+        .code(0);
+    let env: Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+    assert_eq!(env["resolved"][0]["title"], "old auth bug");
+    assert_eq!(env["findings"], json!([]));
+    assert_ne!(env["modelUsed"], "none (empty diff)");
+    assert_eq!(env["gate"]["failing"], false);
+
+    let requests = server.received_requests().await.unwrap();
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.url.path().contains("/compare/"))
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.url.path().ends_with("/reviews"))
+    );
+    let llm_request = requests
+        .iter()
+        .find(|request| request.url.path() == "/chat/completions")
+        .unwrap();
+    let body: Value = llm_request.body_json().unwrap();
+    assert!(
+        !body["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("This is an INCREMENTAL review")
+    );
+}
+
+#[tokio::test]
+async fn same_head_without_open_baseline_keeps_empty_diff_noop() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "t", "body": null,
+            "head": {"sha": "h1"}, "base": {"sha": "b1"}
+        })))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .args([
+            "review",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--sha",
+            "h1",
+            "--since-sha",
+            "h1",
+            "--no-post",
+            "--output-json",
+        ])
+        .assert()
+        .code(0);
+    let env: Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+    assert_eq!(env["modelUsed"], "none (empty diff)");
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        1,
+        "empty no-op fetched more than PR metadata"
+    );
+}
+
+#[tokio::test]
+async fn carried_only_incremental_run_updates_checks_without_posting_review() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/compare/old...h1"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(DIFF))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "t", "body": null,
+            "head": {"sha": "h1"}, "base": {"sha": "b1"}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path_regex(r"^/repos/acme/api/check-runs/\d+$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+
+    let baseline = json!({
+        "version": 1, "summary": "", "silent": false,
+        "findings": [
+            {"path": "src/db.rs", "line": 10, "severity": "error", "kind": "risk",
+             "confidence": 0.9, "title": "still broken", "body": "not addressed"}
+        ],
+        "resolved": [], "counts": {"info": 0, "warn": 0, "error": 1, "suppressed": 0},
+        "confidenceBuckets": [0,0,0,0,1],
+        "gate": {"failOn": "error", "failing": true},
+        "modelUsed": "m", "usage": {"promptTokens": 0, "completionTokens": 0},
+        "baseSha": "b1", "headSha": "old", "sinceSha": null
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let baseline_path = dir.path().join("baseline.json");
+    std::fs::write(&baseline_path, baseline.to_string()).unwrap();
+
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .args(["review", "--repo", "acme/api", "--pr", "7"])
+        .args(["--sha", "h1", "--since-sha", "old", "--baseline"])
+        .arg(&baseline_path)
+        .args([
+            "--check-run-id",
+            "11",
+            "--gate-check-run-id",
+            "12",
+            "--output-json",
+        ])
+        .assert()
+        .code(1);
+    let env: Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+    assert!(
+        env["findings"][0]["body"]
+            .as_str()
+            .unwrap()
+            .starts_with("[carried from previous review]")
+    );
+    assert_eq!(env["gate"]["failing"], true);
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == wiremock::http::Method::PATCH)
+            .count(),
+        2
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.url.path().ends_with("/reviews"))
+    );
+}
+
+#[tokio::test]
+async fn identical_fresh_finding_set_does_not_post_duplicate_review() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(llm_content(json!([finding_at(41, "error", 0.95)]))),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/compare/old...h1"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(DIFF))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "t", "body": null,
+            "head": {"sha": "h1"}, "base": {"sha": "b1"}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path_regex(r"^/repos/acme/api/check-runs/\d+$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+
+    let baseline = json!({
+        "version": 1, "summary": "", "silent": false,
+        "findings": [{
+            "path": "src/auth.rs", "line": 41, "severity": "error", "kind": "risk",
+            "confidence": 0.95, "title": "Unsanitized input reaches query",
+            "body": "user_input flows into exec_query without sanitization."
+        }],
+        "resolved": [], "counts": {"info": 0, "warn": 0, "error": 1, "suppressed": 0},
+        "confidenceBuckets": [0,0,0,0,1],
+        "gate": {"failOn": "error", "failing": true},
+        "modelUsed": "m", "usage": {"promptTokens": 0, "completionTokens": 0},
+        "baseSha": "b1", "headSha": "old", "sinceSha": null
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let baseline_path = dir.path().join("baseline.json");
+    std::fs::write(&baseline_path, baseline.to_string()).unwrap();
+
+    postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .args(["review", "--repo", "acme/api", "--pr", "7"])
+        .args(["--sha", "h1", "--since-sha", "old", "--baseline"])
+        .arg(&baseline_path)
+        .args([
+            "--check-run-id",
+            "11",
+            "--gate-check-run-id",
+            "12",
+            "--output-json",
+        ])
+        .assert()
+        .code(1);
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == wiremock::http::Method::PATCH)
+            .count(),
+        2
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.url.path().ends_with("/reviews"))
+    );
+}
+
+#[tokio::test]
 async fn disabled_review_does_not_carry_baseline_findings() {
     // M2 regression: a repo with `enabled: false` plus a supplied baseline must
     // not have baseline Errors reconciled and carried into the gate. With review
