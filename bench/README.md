@@ -9,18 +9,18 @@ ground truth.
 
 ## What it measures
 
-Pipeline fidelity, not detection ability: grounding (no ungrounded findings,
-`counts.ungrounded == 0`), gating (gate fails exactly on error-severity
-findings, exit codes match), statusline correctness (`postil/review` and
-`postil/gate` check-runs created and completed with the right conclusions),
-silence on clean PRs (no review comment posted), and prompt-leakage guardrails
-(fixture metadata such as policy phrasing must never appear in the prompt or
-any pipeline output).
+Pipeline fidelity, not seeded-region finding hit rate: grounding (no
+ungrounded findings, `counts.ungrounded == 0`), gating (gate fails exactly on
+error-severity findings, exit codes match), statusline correctness
+(`postil/review` and `postil/gate` check-runs created and completed with the
+right conclusions), silence on clean PRs (no review comment posted), and
+prompt-leakage guardrails (fixture metadata such as policy phrasing must never
+appear in the prompt or any pipeline output).
 
 The mock model returns recorded findings generated from the fixture specs, so
-mock mode measures pipeline fidelity rather than detection ability. Comparative
-claims require peer runs on the identical fixture set; site comparisons stay
-qualitative and sourced until then.
+mock mode measures pipeline fidelity rather than seeded-region finding hit
+rate. Comparative claims require peer runs on the identical fixture set; site
+comparisons stay qualitative and sourced until then.
 
 ## Running (mock mode — default, CI)
 
@@ -35,15 +35,15 @@ bun run bench                   # add --json or --json-out report.json for machi
 `POSTIL_BENCH_KEEP_RUNS=1` keeps per-case run directories under `.runs/`
 (failing cases are always kept).
 
-## Live-models mode (opt-in, detection efficacy + cost per model)
+## Live-models mode (opt-in, seeded-region finding hit rate + cost per model)
 
 `POSTIL_BENCH_MODE=live` keeps the per-case **mock GitHub API** but points the
 CLI at the real OpenRouter endpoint, running each fixture **once per model** in
-`POSTIL_BENCH_MODELS`. It measures, per real model: detection efficacy on the
-seeded defects, the false-positive rate, gate-verdict correctness, and the
-**measured cost and latency** of each review. The full forge pipeline still runs
-against the mock GitHub, so grounding and statusline correctness are still
-checked as a model-independent fidelity floor.
+`POSTIL_BENCH_MODELS`. It measures, per real model: seeded-region finding hit
+rate on the seeded defects, non-seeded-region finding count, gate-verdict
+correctness, catalog-priced token-cost estimate, and measured latency. The full
+forge pipeline still runs against the mock GitHub, so grounding and statusline
+correctness are still checked as a model-independent fidelity floor.
 
 ```sh
 export MODEL_API_KEY=...          # or LLM_API_KEY / OPENROUTER_API_KEY; never logged or printed
@@ -61,12 +61,12 @@ refuses to run without a key and without at least one model.
 
 ### What live-models mode scores
 
-- **Detection**: a seeded defect is detected when at least one non-carried
+- **Seeded-region finding hit**: a seeded region is found when at least one non-carried
   finding (in `findings`, not the carried `resolved` set) matches the seeded
   file and whose line range overlaps the seeded region (±3 lines).
-- **False positives**: any finding on a clean fixture, and any finding on a
-  defect fixture that does not detect the seeded region (wrong file or off the
-  region).
+- **Non-seeded-region finding count**: any finding on a clean fixture, and any
+  finding on a defect fixture that does not overlap the seeded region (wrong
+  file or off the region).
 - **Gate verdict**: whether the envelope's own gate `failing` matches the ground
   truth (the default `failOn: error` gate should fail iff the seeded defect is
   error-severity).
@@ -108,9 +108,10 @@ before spending anything. It needs no key (the `/models` catalog is public).
 These are a **measured baseline for this CLI** on **our own fixtures**: a single
 run per case, diff plus mock repo context, no policy docs. The fixtures are ours
 and **no competitor has been run on them**, so the numbers are not a peer
-comparison — they are our measured detection and OpenRouter spend on our
-fixtures. LLM nondeterminism means the rates move a few points run to run. Treat
-them as internal evidence, not a published benchmark.
+comparison — they are our measured seeded-region finding hit rate and
+catalog-priced token-cost estimates on our fixtures. Results vary across runs
+because model inference is nondeterministic. Treat them as internal evidence,
+not a published benchmark.
 
 ### CI
 
@@ -123,8 +124,8 @@ and prints the per-model table to the job step summary.
 ## Diff-file live mode (opt-in, single model, no forge)
 
 This live mode runs the real release binary against the same fixtures with a
-real model and **no mocked model server**, so it measures detection ability
-rather than pipeline fidelity. Each case runs in local diff-file mode
+real model and **no mocked model server**, so it measures seeded-region finding
+hit rate rather than pipeline fidelity. Each case runs in local diff-file mode
 (`postil review --diff-file <fixture.diff> --no-post --output-json`), which does
 no forge I/O at all — so no GitHub server, mock or real, is involved and nothing
 is written to any repo.
@@ -158,40 +159,32 @@ HTTP 5xx/429, rate-limit, timeout, or connection signature, or a run that
 produced no valid v1 envelope at all (empty/garbled output, typically a dropped
 response). A valid envelope is always treated as a normal result and is never
 retried — including a gate-failing exit (exit 1 with a scored envelope) or one
-that merely reports findings or false positives. A case that fails on both
+that merely reports findings or non-seeded-region findings. A case that fails on both
 attempts is recorded as an error and excluded from scoring, exactly as before.
 
 ### What live mode scores
 
-- **Detection rate**: a defect counts as detected when a finding matches the
-  ground-truth path with line within +/-3.
-- **Severity match (exact)** among detections: strict equality between the found
+- **Seeded-region finding hit rate**: a seeded region counts as found when a
+  finding matches the ground-truth path with line within +/-3.
+- **Severity match (exact)** among seeded-region hits: strict equality between the found
   severity and the fixture's ground-truth severity.
-- **Severity match (+/-1 tier)** among detections: a wider band that treats
+- **Severity match (+/-1 tier)** among seeded-region hits: a wider band that treats
   adjacent tiers on the `info < warn < error` scale (i.e. `info`<->`warn` and
   `warn`<->`error`) as a match, counting only the two-tier `info`<->`error` gap
   as a real mismatch.
 - **Silence on clean PRs**: a clean case should produce no findings.
-- **False positives**: any finding in a clean case, and any non-matching finding
-  in a defect case.
-- **Confidence distribution** of true detections, and per-case duration / token
+- **Non-seeded-region finding count**: any finding in a clean case, and any
+  non-matching finding in a defect case.
+- **Confidence distribution** of seeded-region hits, and per-case duration / token
   usage.
 
 Both severity numbers are reported, and the per-case detail always shows the
-truth-vs-found severity so nothing is hidden. The exact figure is the strict
-metric; the +/-1-tier figure exists because `warn`<->`error` is frequently a
-defensible judgment call rather than a model error — the severity-calibration
-investigation found the consistent "mismatches" are reasonable alternative
-calls on judgment-heavy fixture labels (in several cases the model is correctly
-applying the prompt's own severity rule while the fixture is the aggressive
-party), and the mismatch direction is bidirectional, so it is not a one-way
-miscalibration a prompt change could fix. The +/-1-tier band measures
-agreement-up-to-a-defensible-disagreement; it is a softer view of the same
-detections, not a different or better result.
+truth-vs-found severity. The exact figure uses strict equality. The +/-1-tier
+figure is a deliberately softer matching rule that also accepts adjacent tiers
+on the `info < warn < error` scale.
 
 These numbers are a **measured baseline for this CLI** — a single model, one run
 per case, diff-only with no repository context or policy docs. **Neither
 severity metric is a peer-comparison claim**: no competitor has been run on the
-same fixtures, and LLM nondeterminism means the rates (severity match most of
-all) can move a few points run to run. Treat them as internal evidence, not a
-published benchmark.
+same fixtures. Results vary across runs because model inference is
+nondeterministic. Treat them as internal evidence, not a published benchmark.

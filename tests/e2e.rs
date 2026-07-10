@@ -231,7 +231,11 @@ async fn diff_fetch_failure_server() -> MockServer {
     Mock::given(method("GET"))
         .and(path("/repos/acme/api/pulls/7"))
         .and(header("Accept", "application/vnd.github.v3.diff"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("upstream down"))
+        .respond_with(
+            ResponseTemplate::new(500)
+                .set_body_string("upstream down")
+                .set_delay(std::time::Duration::from_millis(25)),
+        )
         .mount(&server)
         .await;
     Mock::given(method("GET"))
@@ -320,6 +324,7 @@ async fn diff_fetch_failure_block_emits_envelope_and_exits_one() {
         serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
     assert_eq!(env["findings"][0]["path"], ".postil/provider");
     assert_eq!(env["gate"]["failing"], true);
+    assert!(env["durationMs"].as_u64().unwrap() >= 20);
 }
 
 #[tokio::test]
@@ -573,9 +578,9 @@ async fn garbage_output_fails_closed_after_repair_attempt() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [{"message": {"content": "I cannot review this diff, sorry."}}]
-        })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(llm_text("I cannot review this diff, sorry.")),
+        )
         .mount(&server)
         .await;
 
@@ -592,6 +597,8 @@ async fn garbage_output_fails_closed_after_repair_attempt() {
     let env: Value =
         serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
     assert_eq!(env["findings"][0]["path"], ".postil/model-output");
+    assert_eq!(env["usage"]["promptTokens"], 160);
+    assert_eq!(env["usage"]["completionTokens"], 60);
     // Initial call + repair call.
     assert_eq!(server.received_requests().await.unwrap().len(), 2);
 }

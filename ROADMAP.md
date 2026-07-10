@@ -61,9 +61,9 @@ generated from fixture specs.
 
 Live-model mode is manual because it spends real model tokens. It runs the same
 40 fixtures against selected OpenRouter-compatible models while keeping forge I/O
-mocked, then reports detection rate, false positives, measured cost, and per-case
-detail. Diff-file live mode is available for single-model local checks with no
-mock forge.
+mocked, then reports detection rate, false positives, catalog-priced token-cost
+estimates, and per-case detail. Diff-file live mode is available for single-model
+local checks with no mock forge.
 
 Comparative claims require peer runs on the identical fixture set; site
 comparisons stay qualitative and sourced until then.

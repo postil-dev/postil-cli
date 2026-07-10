@@ -9,8 +9,8 @@ use crate::diff::{self, DiffIndex};
 use crate::envelope::{Envelope, Finding, Gate, Usage, fail_closed_finding};
 use crate::filter;
 use crate::forge::{
-    CheckState, Forge, PrMeta, azure::Azure, bitbucket::Bitbucket, check_summary, github::GitHub,
-    gitlab::GitLab,
+    CheckState, Forge, PrMeta, azure::Azure, bitbucket::Bitbucket, check_summary,
+    clean_review_message, github::GitHub, gitlab::GitLab,
 };
 use crate::llm::LlmClient;
 use crate::local::{self, LocalSource};
@@ -126,6 +126,7 @@ async fn run_remote<F: Forge>(
     forge: &F,
     repo: &str,
 ) -> Result<i32> {
+    let review_started = std::time::Instant::now();
     let meta = forge.fetch_pr_meta().await?;
     let head_sha = args.sha.clone().unwrap_or_else(|| meta.head_sha.clone());
 
@@ -191,7 +192,13 @@ async fn run_remote<F: Forge>(
             // deriving the exit code from the gate. Propagating Err here instead
             // would map to exit 2 with no machine output — contradicting advisory
             // policy (which wants exit 0) and losing the envelope/SARIF.
-            let envelope = error_envelope(cfg, &e, &head_sha, &meta);
+            let envelope = error_envelope(
+                cfg,
+                &e,
+                &head_sha,
+                &meta,
+                review_started.elapsed().as_millis() as u64,
+            );
             if let Some((a, g)) = &checks {
                 let gate_state = if envelope.gate.failing {
                     CheckState::Failure
@@ -364,11 +371,12 @@ async fn review_diff(
             }
             Err(e) => {
                 model_used = cfg.model_chain().join(" -> ");
+                usage = e.usage();
                 let detail = format!("{e:#}");
                 // Provider-class failures (outage, timeout) are the only ones
                 // `gate.onError: advisory` may stand aside for; unusable model
                 // content is attacker-influenceable and always fails closed.
-                findings = vec![if e.downcast_ref::<crate::llm::ProviderError>().is_some() {
+                findings = vec![if e.is_provider() {
                     crate::envelope::provider_error_finding(&detail)
                 } else {
                     fail_closed_finding(&detail)
@@ -481,10 +489,7 @@ async fn finish<F: Forge>(
                 } else {
                     String::new()
                 };
-                format!(
-                    "{icon}Postil reviewed this change and found nothing that affects the \
-                     merge decision."
-                )
+                format!("{icon}{}", clean_review_message(&envelope))
             } else {
                 check_summary(&envelope, rich)
             };
@@ -502,7 +507,13 @@ async fn finish<F: Forge>(
     Ok(if envelope.gate.failing { 1 } else { 0 })
 }
 
-fn error_envelope(cfg: &Config, err: &anyhow::Error, head_sha: &str, meta: &PrMeta) -> Envelope {
+fn error_envelope(
+    cfg: &Config,
+    err: &anyhow::Error,
+    head_sha: &str,
+    meta: &PrMeta,
+    duration_ms: u64,
+) -> Envelope {
     // Pre-review failures (PR meta or diff fetch) are forge transport errors,
     // not model content — provider class. A PR author can induce a subset
     // (merge-conflict PRs, >20k-file change lists), so advisory mode bypasses
@@ -532,7 +543,7 @@ fn error_envelope(cfg: &Config, err: &anyhow::Error, head_sha: &str, meta: &PrMe
         },
         model_used: cfg.model_chain().join(" -> "),
         usage: Usage::default(),
-        duration_ms: 0,
+        duration_ms,
         base_sha: Some(meta.base_sha.clone()),
         head_sha: Some(head_sha.to_string()),
         since_sha: None,

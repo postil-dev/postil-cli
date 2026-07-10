@@ -20,6 +20,47 @@ pub struct ModelReview {
     pub usage: Usage,
 }
 
+#[derive(Debug)]
+pub struct ModelError {
+    error: anyhow::Error,
+    usage: Usage,
+}
+
+impl ModelError {
+    fn new(error: anyhow::Error, usage: Usage) -> Self {
+        Self { error, usage }
+    }
+
+    pub fn usage(&self) -> Usage {
+        self.usage
+    }
+
+    pub fn is_provider(&self) -> bool {
+        self.error.downcast_ref::<ProviderError>().is_some()
+    }
+}
+
+impl std::fmt::Display for ModelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if f.alternate() {
+            write!(f, "{:#}", self.error)
+        } else {
+            write!(f, "{}", self.error)
+        }
+    }
+}
+
+impl std::error::Error for ModelError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.error.as_ref())
+    }
+}
+
+fn add_usage(total: &mut Usage, usage: Usage) {
+    total.prompt_tokens += usage.prompt_tokens;
+    total.completion_tokens += usage.completion_tokens;
+}
+
 /// Raw shape we ask the model for. Findings are validated leniently here and
 /// strictly (grounding, ranges) by the caller.
 #[derive(Debug, Deserialize)]
@@ -100,7 +141,12 @@ impl LlmClient {
 
     /// Run the review. With `consensus > 1`, the first N models of the chain are
     /// each consulted and only findings two or more models agree on are kept.
-    pub async fn review(&self, cfg: &Config, system: &str, user: &str) -> Result<ModelReview> {
+    pub async fn review(
+        &self,
+        cfg: &Config,
+        system: &str,
+        user: &str,
+    ) -> std::result::Result<ModelReview, ModelError> {
         let chain = cfg.model_chain();
         if cfg.consensus > 1 && chain.len() > 1 {
             let n = cfg.consensus.min(chain.len());
@@ -115,12 +161,15 @@ impl LlmClient {
                 })
                 .collect();
             let mut ok: Vec<ModelReview> = Vec::new();
-            let mut last_err: Option<anyhow::Error> = None;
+            let mut failed_usage = Usage::default();
+            let mut last_err: Option<ModelError> = None;
             for h in handles {
                 match h.await {
                     Ok(Ok(r)) => ok.push(r),
-                    Ok(Err(e)) => {
+                    Ok(Err(mut e)) => {
                         eprintln!("postil: consensus model failed: {e:#}");
+                        add_usage(&mut failed_usage, e.usage);
+                        e.usage = failed_usage;
                         last_err = Some(e);
                     }
                     Err(e) => eprintln!("postil: consensus task panicked: {e}"),
@@ -130,24 +179,44 @@ impl LlmClient {
                 // Wrap the last failure so its error class (provider vs
                 // content) survives for gate.onError classification.
                 0 => Err(match last_err {
-                    Some(e) => e.context(format!("all {n} consensus models failed")),
-                    None => anyhow!("all {n} consensus models failed"),
+                    Some(e) => ModelError::new(
+                        e.error.context(format!("all {n} consensus models failed")),
+                        failed_usage,
+                    ),
+                    None => {
+                        ModelError::new(anyhow!("all {n} consensus models failed"), failed_usage)
+                    }
                 }),
-                1 => Ok(ok.into_iter().next().unwrap()),
-                _ => Ok(consensus_merge(ok)),
+                1 => {
+                    let mut review = ok.into_iter().next().unwrap();
+                    add_usage(&mut review.usage, failed_usage);
+                    Ok(review)
+                }
+                _ => {
+                    let mut review = consensus_merge(ok);
+                    add_usage(&mut review.usage, failed_usage);
+                    Ok(review)
+                }
             }
         } else {
+            let mut failed_usage = Usage::default();
             let mut last_err = None;
             for model in &chain {
                 match self.review_with_model(model, system, user).await {
-                    Ok(r) => return Ok(r),
-                    Err(e) => {
+                    Ok(mut r) => {
+                        add_usage(&mut r.usage, failed_usage);
+                        return Ok(r);
+                    }
+                    Err(mut e) => {
                         eprintln!("postil: model {model} failed: {e:#}");
+                        add_usage(&mut failed_usage, e.usage);
+                        e.usage = failed_usage;
                         last_err = Some(e);
                     }
                 }
             }
-            Err(last_err.unwrap_or_else(|| anyhow!("empty model chain")))
+            Err(last_err
+                .unwrap_or_else(|| ModelError::new(anyhow!("empty model chain"), failed_usage)))
         }
     }
 
@@ -173,9 +242,12 @@ impl LlmClient {
         model: &str,
         system: &str,
         user: &str,
-    ) -> Result<ModelReview> {
+    ) -> std::result::Result<ModelReview, ModelError> {
         let mut usage = Usage::default();
-        let content = self.chat(model, system, user, &mut usage).await?;
+        let content = self
+            .chat(model, system, user, &mut usage)
+            .await
+            .map_err(|e| ModelError::new(e, usage))?;
         let raw = match parse_review(&content) {
             Ok(raw) => raw,
             Err(parse_err) => {
@@ -193,9 +265,10 @@ impl LlmClient {
                         &mut usage,
                     )
                     .await
-                    .context("JSON repair call failed")?;
-                parse_review(&repaired)
-                    .map_err(|e| anyhow!("model output invalid after repair: {e}"))?
+                    .map_err(|e| ModelError::new(e.context("JSON repair call failed"), usage))?;
+                parse_review(&repaired).map_err(|e| {
+                    ModelError::new(anyhow!("model output invalid after repair: {e}"), usage)
+                })?
             }
         };
         let mut review = into_review(raw, model, usage);
@@ -217,15 +290,15 @@ impl LlmClient {
             if let Ok(retried) = self
                 .chat(model, system, &retry_user, &mut retry_usage)
                 .await
-                && let Ok(retried_raw) = parse_review(&retried)
             {
-                let candidate = into_review(retried_raw, model, retry_usage);
-                let still_contradictory =
-                    candidate.findings.is_empty() && !candidate.summary.is_empty();
-                if still_contradictory {
-                    review.usage = retry_usage;
-                } else {
-                    review = candidate;
+                review.usage = retry_usage;
+                if let Ok(retried_raw) = parse_review(&retried) {
+                    let candidate = into_review(retried_raw, model, retry_usage);
+                    let still_contradictory =
+                        candidate.findings.is_empty() && !candidate.summary.is_empty();
+                    if !still_contradictory {
+                        review = candidate;
+                    }
                 }
             }
         }

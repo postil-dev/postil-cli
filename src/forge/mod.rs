@@ -223,6 +223,16 @@ pub fn check_title(envelope: &Envelope) -> String {
     }
 }
 
+/// Truthful clean-result wording for review comments and check summaries.
+/// Some silent runs intentionally make no model call.
+pub fn clean_review_message(envelope: &Envelope) -> &'static str {
+    match envelope.model_used.as_str() {
+        "none (disabled by config)" => "Review disabled by configuration.",
+        "none (empty diff)" => "No reviewable diff; no model call was made.",
+        _ => "Postil reviewed this change and found nothing that affects the merge decision.",
+    }
+}
+
 pub fn check_summary(envelope: &Envelope, rich: bool) -> String {
     let mut s = String::new();
     let pass = |s: &mut String| {
@@ -233,9 +243,8 @@ pub fn check_summary(envelope: &Envelope, rich: bool) -> String {
     };
     if envelope.silent {
         pass(&mut s);
-        s.push_str(
-            "Postil reviewed this change and found nothing that affects the merge decision.\n",
-        );
+        s.push_str(clean_review_message(envelope));
+        s.push('\n');
     } else {
         if !envelope.summary.is_empty() {
             s.push_str(&envelope.summary);
@@ -377,6 +386,39 @@ mod tests {
         };
         assert!(check_summary(&env, true).contains("status/pass.svg"));
         assert!(!check_summary(&env, false).contains("<img"));
+    }
+
+    #[test]
+    fn silent_summary_distinguishes_reviews_from_no_model_runs() {
+        let mut env = Envelope {
+            version: 1,
+            summary: String::new(),
+            silent: true,
+            findings: vec![],
+            resolved: vec![],
+            counts: Default::default(),
+            confidence_buckets: [0; 5],
+            gate: crate::envelope::Gate {
+                fail_on: "error".into(),
+                failing: false,
+            },
+            model_used: "none (disabled by config)".into(),
+            usage: Default::default(),
+            duration_ms: 0,
+            base_sha: None,
+            head_sha: None,
+            since_sha: None,
+        };
+
+        assert!(check_summary(&env, false).starts_with("Review disabled by configuration."));
+
+        env.model_used = "none (empty diff)".into();
+        assert!(
+            check_summary(&env, false).starts_with("No reviewable diff; no model call was made.")
+        );
+
+        env.model_used = "review-model".into();
+        assert!(check_summary(&env, false).starts_with("Postil reviewed this change"));
     }
 
     #[test]
