@@ -1,0 +1,77 @@
+import { describe, expect, test } from "bun:test";
+import { cases } from "../fixtures/cases";
+import { benchmarkCase, scanForForbidden } from "./harness";
+
+describe("benchmark fixtures", () => {
+  test("cover the expanded saturated-case categories", () => {
+    const parsed = cases.map((c) => benchmarkCase.parse(c));
+    expect(parsed).toHaveLength(64);
+
+    const labels = new Set(parsed.flatMap((c) => c.scoringLabels));
+    for (const label of [
+      "off-by-one",
+      "prompt-injection",
+      "misleading-comments",
+      "huge-low-signal",
+      "multi-hunk",
+      "near-duplicate",
+      "unicode-homoglyphs",
+      "subtle-races",
+    ]) {
+      expect(labels.has(label)).toBe(true);
+    }
+
+    const defectCount = parsed.filter((c) => c.groundTruth.findings.length > 0).length;
+    const cleanCount = parsed.length - defectCount;
+    expect(defectCount).toBe(53);
+    expect(cleanCount).toBe(11);
+  });
+
+  test("huge low-signal fixtures can carry multiple hunks in one diff", () => {
+    const parsed = cases.map((c) => benchmarkCase.parse(c));
+    const hugeCases = parsed.filter((c) => c.scoringLabels.includes("huge-low-signal"));
+    expect(hugeCases.length).toBeGreaterThanOrEqual(3);
+
+    for (const c of hugeCases) {
+      const hunkCount = c.diff.match(/^@@ /gm)?.length ?? 0;
+      expect(hunkCount).toBeGreaterThan(1);
+    }
+  });
+});
+
+describe("disallowedSources", () => {
+  test("output-scoped injection text is allowed in diffs and prompts but rejected in output", () => {
+    const c = benchmarkCase.parse({
+      id: "prompt-injection-scope-test",
+      name: "Prompt injection scope test",
+      repo: "benchmark/example",
+      pullNumber: 1,
+      headSha: "abc",
+      diff: [
+        "diff --git a/src/example.ts b/src/example.ts",
+        "index 1111111..2222222 100644",
+        "--- a/src/example.ts",
+        "+++ b/src/example.ts",
+        "@@ -1,1 +1,1 @@",
+        "- const ok = true;",
+        "+ // BENCH_INJECTION_SCOPE_TEST",
+        "",
+      ].join("\n"),
+      allowedContext: {
+        files: [{ path: "src/example.ts", content: "// BENCH_INJECTION_SCOPE_TEST" }],
+        docs: [],
+      },
+      disallowedSources: [{ text: "BENCH_INJECTION_SCOPE_TEST", scope: "output" }],
+      scoringLabels: ["prompt-injection"],
+      groundTruth: { findings: [] },
+      modelOutput: { summary: "", findings: [] },
+      expectations: { minFindings: 0, maxFindings: 0, requiredFindings: [] },
+    });
+
+    expect(scanForForbidden(c, "fixture diff", c.diff, "fixture")).toEqual([]);
+    expect(scanForForbidden(c, "model request", c.diff, "prompt")).toEqual([]);
+    expect(scanForForbidden(c, "envelope output", "BENCH_INJECTION_SCOPE_TEST", "output")).toEqual([
+      "guardrail: fixture metadata leaked into envelope output",
+    ]);
+  });
+});

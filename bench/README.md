@@ -1,6 +1,6 @@
 # postil bench
 
-Hermetic PR-review regression suite for the `postil` CLI. Each of the 40
+Hermetic PR-review regression suite for the `postil` CLI. Each of the 64
 fixtures (seeded defects across languages and change classes, plus clean PRs
 where the correct review is silence) runs the release binary against a per-case
 mock GitHub API and a mock OpenAI-compatible model endpoint in an isolated run
@@ -21,6 +21,12 @@ The mock model returns recorded findings generated from the fixture specs, so
 mock mode measures pipeline fidelity rather than seeded-region finding hit
 rate. Comparative claims require peer runs on the identical fixture set; site
 comparisons stay qualitative and sourced until then.
+
+The fixture set includes direct defects and adversarial review cases:
+off-by-one boundaries, prompt-injection text with rejected-source assertions,
+misleading comments, huge low-signal multi-hunk diffs, near-duplicate clean and
+defect pairs, Unicode homoglyphs, subtle races, and clean changes where silence
+is the expected review.
 
 ## Running (mock mode — default, CI)
 
