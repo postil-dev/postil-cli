@@ -102,6 +102,12 @@ pub struct LlmClient {
 /// Retries per model on transient provider errors before the cascade moves on.
 const TRANSIENT_RETRIES: u32 = 2;
 
+/// A review returns a compact JSON object, even at the configured maximum of
+/// 20 findings. Bound review generation so reasoning-capable models cannot
+/// spend minutes producing an oversized completion. Interactive answers use
+/// their provider default because they have a different output contract.
+const REVIEW_MAX_TOKENS: u32 = 4096;
+
 /// Marker context attached to transport/provider-level failures (endpoint
 /// unreachable, HTTP error status, timeout, malformed HTTP envelope) — the
 /// class a malicious diff cannot induce. `gate.onError: advisory` stands aside
@@ -226,7 +232,7 @@ impl LlmClient {
         let mut usage = Usage::default();
         let mut last_err = None;
         for model in cfg.model_chain() {
-            match self.chat(&model, system, user, &mut usage).await {
+            match self.chat(&model, system, user, &mut usage, None).await {
                 Ok(content) => return Ok((content.trim().to_string(), model)),
                 Err(e) => {
                     eprintln!("postil: model {model} failed: {e:#}");
@@ -245,7 +251,7 @@ impl LlmClient {
     ) -> std::result::Result<ModelReview, ModelError> {
         let mut usage = Usage::default();
         let content = self
-            .chat(model, system, user, &mut usage)
+            .chat(model, system, user, &mut usage, Some(REVIEW_MAX_TOKENS))
             .await
             .map_err(|e| ModelError::new(e, usage))?;
         let raw = match parse_review(&content) {
@@ -263,6 +269,7 @@ impl LlmClient {
                         "You repair malformed JSON. Output only valid JSON.",
                         &repair_user,
                         &mut usage,
+                        Some(REVIEW_MAX_TOKENS),
                     )
                     .await
                     .map_err(|e| ModelError::new(e.context("JSON repair call failed"), usage))?;
@@ -288,7 +295,13 @@ impl LlmClient {
             );
             let mut retry_usage = usage;
             if let Ok(retried) = self
-                .chat(model, system, &retry_user, &mut retry_usage)
+                .chat(
+                    model,
+                    system,
+                    &retry_user,
+                    &mut retry_usage,
+                    Some(REVIEW_MAX_TOKENS),
+                )
                 .await
             {
                 review.usage = retry_usage;
@@ -311,8 +324,9 @@ impl LlmClient {
         system: &str,
         user: &str,
         usage: &mut Usage,
+        max_tokens: Option<u32>,
     ) -> Result<String> {
-        self.chat_inner(model, system, user, usage)
+        self.chat_inner(model, system, user, usage, max_tokens)
             .await
             .map_err(|e| e.context(ProviderError))
     }
@@ -324,8 +338,9 @@ impl LlmClient {
         system: &str,
         user: &str,
         usage: &mut Usage,
+        max_tokens: Option<u32>,
     ) -> Result<String> {
-        let body = json!({
+        let mut body = json!({
             "model": model,
             "temperature": 0.1,
             "messages": [
@@ -333,6 +348,9 @@ impl LlmClient {
                 {"role": "user", "content": user},
             ],
         });
+        if let Some(max_tokens) = max_tokens {
+            body["max_tokens"] = json!(max_tokens);
+        }
         let mut attempt = 0u32;
         let text = loop {
             attempt += 1;

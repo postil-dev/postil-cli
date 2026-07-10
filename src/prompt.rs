@@ -1,6 +1,6 @@
 //! Prompt construction. The system prompt is the noise policy.
 
-use crate::config::Config;
+use crate::config::{BUILTIN_CONTENT_POLICY, Config};
 
 pub struct PrContext<'a> {
     pub repo: Option<&'a str>,
@@ -58,6 +58,61 @@ pub fn system_prompt(cfg: &Config) -> String {
          Cite ONLY line numbers printed in the left margin of the diff (the new-file line \
          numbers). Findings citing other lines are discarded as ungrounded.\n",
     );
+    // Keep the response contract ahead of every repository-specific section.
+    // Implicit prompt caches match byte-identical prefixes, so global review
+    // instructions and the built-in policy baseline must precede focus,
+    // guardrails, policy additions, and tone.
+    p.push_str(
+        "\nRespond with ONLY a JSON object, no markdown fences, no prose or reasoning:\n\
+         {\"summary\": \"empty when clean; otherwise one sentence of at most 40 words\",\n \
+          \"findings\": [{\"path\": \"file path from the diff\", \"line\": <new-file line>,\n \
+          \"endLine\": <optional>, \"severity\": \"info|warn|error\",\n \
+          \"kind\": \"risk|humanEscalation|guardrail|uncertainty|contentPolicy\", \"confidence\": <0..1>,\n \
+          \"title\": \"imperative title of at most 12 words\", \"body\": \"one concise paragraph of at most 60 words\"}]}\n\
+         \n\
+         Each body must state the evidence, impact, and concrete next step without \
+         restating the diff or these rules. The summary and findings must agree. Every \
+         risk the summary mentions MUST appear as a structured finding with its diff \
+         line; if findings is empty, summary MUST be the empty string. A summary that \
+         narrates problems alongside an empty findings array is invalid output and will \
+         fail the review.\n",
+    );
+
+    // Config loading keeps the built-in policy at the start and appends optional
+    // repository rules. Split them after applying the existing aggregate cap so
+    // the stable baseline remains cacheable across repositories while the exact
+    // effective policy text stays unchanged.
+    let content_policy: Option<String> = cfg
+        .content_policy
+        .as_deref()
+        .map(|policy| policy.chars().take(6000).collect());
+    let (builtin_policy, repo_policy) = match content_policy.as_deref() {
+        Some(policy) => match policy.strip_prefix(BUILTIN_CONTENT_POLICY) {
+            Some(additions) => (Some(BUILTIN_CONTENT_POLICY), additions.trim()),
+            None => (None, policy.trim()),
+        },
+        None => (None, ""),
+    };
+    if content_policy.is_some() {
+        p.push_str(
+            "\nThis repository has content-policy review enabled. Apply the numbered rules \
+             below ONLY to human-readable prose in the diff (Markdown, code comments, \
+             docstrings, user-facing/log strings, PR title/description) — never to code \
+             logic, identifiers, or structured data. Report a violation with kind \
+             \"contentPolicy\", name the rule number it breaks, and quote or paraphrase the \
+             specific offending text in the body. A violation in the PR title or description \
+             MUST cite the path `.postil/pr-description` and one of the numbered lines shown \
+             for it; a violation in a diff file cites that file and a new-file line as usual. \
+             Be conservative: this augments the rules above, it does not turn you into a style \
+             linter; when a line is borderline, do not flag it.\n",
+        );
+        if let Some(policy) = builtin_policy {
+            p.push_str("--- CONTENT POLICY BASELINE ---\n");
+            p.push_str(policy);
+            p.push_str("\n--- END CONTENT POLICY BASELINE ---\n");
+        }
+    }
+
     if !cfg.focus.is_empty() {
         p.push_str(&format!(
             "\nThis repository asks for extra attention to: {}.\n",
@@ -77,45 +132,12 @@ pub fn system_prompt(cfg: &Config) -> String {
         p.push_str(&rules);
         p.push_str("\n--- END GUARDRAILS ---\n");
     }
-    if let Some(policy) = &cfg.content_policy {
-        // Content policy reviews human-readable prose in the diff (docs,
-        // comments, docstrings, PR title/body) for a different class of
-        // problem than the core rules above: not "is this code correct" but
-        // "is this text honest, self-consistent, and free of authoring
-        // residue". Findings are reportable even though they are not a code
-        // bug, and must quote or paraphrase the offending prose and name the
-        // numbered rule it breaks.
-        p.push_str(
-            "\nThis repository has content-policy review enabled. Apply the numbered rules \
-             below ONLY to human-readable prose in the diff (Markdown, code comments, \
-             docstrings, user-facing/log strings, PR title/description) — never to code \
-             logic, identifiers, or structured data. Report a violation with kind \
-             \"contentPolicy\", name the rule number it breaks, and quote or paraphrase the \
-             specific offending text in the body. A violation in the PR title or description \
-             MUST cite the path `.postil/pr-description` and one of the numbered lines shown \
-             for it; a violation in a diff file cites that file and a new-file line as usual. \
-             Be conservative: this augments the rules above, it does not turn you into a style \
-             linter; when a line is borderline, do not flag it.\n\
-             --- CONTENT POLICY ---\n",
-        );
-        let policy: String = policy.chars().take(6000).collect();
-        p.push_str(&policy);
-        p.push_str("\n--- END CONTENT POLICY ---\n");
+    if !repo_policy.is_empty() {
+        p.push_str("\n--- REPOSITORY CONTENT POLICY ---\n");
+        p.push_str(repo_policy);
+        p.push_str("\n--- END REPOSITORY CONTENT POLICY ---\n");
     }
     p.push_str(&format!("\nTone for finding bodies: {}.\n", cfg.tone));
-    p.push_str(
-        "\nRespond with ONLY a JSON object, no markdown fences, no prose:\n\
-         {\"summary\": \"1-3 sentences on merge-relevant risk, or empty string if none\",\n \
-          \"findings\": [{\"path\": \"file path from the diff\", \"line\": <new-file line>,\n \
-          \"endLine\": <optional>, \"severity\": \"info|warn|error\",\n \
-          \"kind\": \"risk|humanEscalation|guardrail|uncertainty|contentPolicy\", \"confidence\": <0..1>,\n \
-          \"title\": \"short imperative title\", \"body\": \"specific, evidence-based markdown\"}]}\n\
-         \n\
-         The summary and findings must agree. Every risk the summary mentions MUST appear as \
-         a structured finding with its diff line; if findings is empty, summary MUST be the \
-         empty string. A summary that narrates problems alongside an empty findings array is \
-         invalid output and will fail the review.\n",
-    );
     p
 }
 
@@ -169,8 +191,36 @@ pub fn render_pr_description(title: Option<&str>, body: Option<&str>) -> (String
     (out, line_no)
 }
 
-pub fn user_prompt(ctx: &PrContext, annotated_diff: &str, max_findings: usize) -> String {
-    let mut p = String::new();
+pub fn user_prompt(
+    ctx: &PrContext,
+    annotated_diff: &str,
+    max_findings: usize,
+    truncated: bool,
+) -> String {
+    let mut p =
+        format!("Report at most {max_findings} findings; if more exist, keep the most severe.\n");
+    if ctx.content_policy {
+        p.push_str(
+            "The PR title and description below are numbered so you can cite them. A \
+             content-policy finding about the title/description MUST use the path \
+             `.postil/pr-description` and one of those line numbers; findings there \
+             cannot cite any other path.\n",
+        );
+    }
+    if ctx.incremental {
+        p.push_str(
+            "This is an INCREMENTAL review: the diff covers only commits pushed since the \
+             previous review. Earlier findings are tracked separately; review only what is \
+             shown.\n",
+        );
+    }
+    if truncated {
+        p.push_str(
+            "The diff is truncated at the size limit. Review only what is shown and do not \
+             imply that the omitted remainder was assessed.\n",
+        );
+    }
+    p.push_str("\n--- REVIEW CONTEXT ---\n");
     if let Some(repo) = ctx.repo {
         p.push_str(&format!("Repository: {repo}\n"));
     }
@@ -188,14 +238,8 @@ pub fn user_prompt(ctx: &PrContext, annotated_diff: &str, max_findings: usize) -
         None
     };
     if let Some(block) = &pr_block {
-        p.push_str(
-            "\nThe PR title and description below are numbered so you can cite them. A \
-             content-policy finding about the title/description MUST use the path \
-             `.postil/pr-description` and one of these line numbers; findings there \
-             cannot cite any other path.\n\n",
-        );
-        p.push_str(block);
         p.push('\n');
+        p.push_str(block);
     } else {
         if let Some(title) = ctx.title {
             p.push_str(&format!("PR title: {title}\n"));
@@ -208,17 +252,9 @@ pub fn user_prompt(ctx: &PrContext, annotated_diff: &str, max_findings: usize) -
             p.push_str(&format!("PR description:\n{body}\n"));
         }
     }
-    if ctx.incremental {
-        p.push_str(
-            "\nThis is an INCREMENTAL review: the diff below covers only commits pushed \
-             since the previous review. Earlier findings are tracked separately; review \
-             only what is shown.\n",
-        );
-    }
-    p.push_str(&format!(
-        "\nReport at most {max_findings} findings; if more exist, keep the most severe.\n\
-         \nDiff (left margin numbers are new-file line numbers — cite exactly these):\n\n"
-    ));
+    p.push_str(
+        "--- END REVIEW CONTEXT ---\n\nDiff (left margin numbers are new-file line numbers — cite exactly these):\n\n",
+    );
     p.push_str(annotated_diff);
     p
 }
@@ -268,6 +304,31 @@ mod tests {
     }
 
     #[test]
+    fn system_prompt_keeps_global_contract_and_baseline_before_repo_content() {
+        let mut cfg = Config::default();
+        cfg.focus = vec!["repository-specific focus".into()];
+        cfg.guardrails = Some("repository-specific guardrail".into());
+        cfg.content_policy = Some(format!(
+            "{BUILTIN_CONTENT_POLICY}\n\n--- REPO-SPECIFIC ADDITIONS ---\nrepository-specific policy"
+        ));
+        cfg.tone = "repository-specific tone".into();
+
+        let p = system_prompt(&cfg);
+        let contract = p.find("Respond with ONLY a JSON object").unwrap();
+        let baseline = p.find("CONTENT POLICY BASELINE").unwrap();
+        for marker in [
+            "repository-specific focus",
+            "repository-specific guardrail",
+            "repository-specific policy",
+            "repository-specific tone",
+        ] {
+            let variable = p.find(marker).unwrap();
+            assert!(contract < variable, "contract followed {marker}");
+            assert!(baseline < variable, "baseline followed {marker}");
+        }
+    }
+
+    #[test]
     fn render_pr_description_numbers_title_and_body() {
         let (block, count) = render_pr_description(Some("Fix login"), Some("line one\nline two"));
         assert_eq!(count, 3);
@@ -290,7 +351,7 @@ mod tests {
             incremental: false,
             content_policy: true,
         };
-        let p = user_prompt(&ctx, "DIFF", 5);
+        let p = user_prompt(&ctx, "DIFF", 5, false);
         assert!(p.contains(".postil/pr-description"));
         assert!(p.contains("     1   Add feature"));
         assert!(p.contains("MUST use the path `.postil/pr-description`"));
@@ -305,7 +366,7 @@ mod tests {
             incremental: false,
             content_policy: false,
         };
-        let p = user_prompt(&ctx, "DIFF", 5);
+        let p = user_prompt(&ctx, "DIFF", 5, false);
         assert!(!p.contains(".postil/pr-description"));
         assert!(p.contains("PR title: Add feature"));
     }
@@ -319,9 +380,29 @@ mod tests {
             incremental: true,
             content_policy: false,
         };
-        let p = user_prompt(&ctx, "DIFF", 5);
+        let p = user_prompt(&ctx, "DIFF", 5, false);
         assert!(p.contains("INCREMENTAL"));
         assert!(p.contains("at most 5 findings"));
         assert!(p.ends_with("DIFF"));
+    }
+
+    #[test]
+    fn user_prompt_places_instructions_before_metadata_and_diff_last() {
+        let ctx = PrContext {
+            repo: Some("variable/repository"),
+            title: Some("Variable title"),
+            body: Some("Variable body"),
+            incremental: false,
+            content_policy: true,
+        };
+        let p = user_prompt(&ctx, "VARIABLE DIFF", 7, true);
+        let instructions = p.find("Report at most 7 findings").unwrap();
+        let truncation = p.find("diff is truncated").unwrap();
+        let metadata = p.find("Repository: variable/repository").unwrap();
+        let diff = p.find("VARIABLE DIFF").unwrap();
+        assert!(instructions < metadata);
+        assert!(truncation < metadata);
+        assert!(metadata < diff);
+        assert!(p.ends_with("VARIABLE DIFF"));
     }
 }
