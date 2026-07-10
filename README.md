@@ -40,7 +40,7 @@ cargo install --git https://github.com/postil-dev/postil-cli --locked
 ```sh
 export MODEL_API_KEY=...        # or LLM_API_KEY / OPENROUTER_API_KEY
 
-postil doctor                   # validates endpoint, key, model, and repo setup
+postil doctor                   # checks endpoint reachability, key acceptance, and repo setup
 postil review --staged          # review what you are about to commit
 postil review --base origin/main
 ```
@@ -157,11 +157,9 @@ Environment: `POSTIL_API_KEY`, `OPENROUTER_API_KEY`, `MODEL_API_KEY`, or
 
 ## Models and local inference
 
-The hosted site keeps current recommendations at
-[postil.dev/docs/models](https://postil.dev/docs/models). For OpenRouter, start with
-`deepseek/deepseek-v4-pro` as the balanced default, `deepseek/deepseek-v4-flash` for
-low-cost volume, `qwen/qwen3.7-plus` for fast coding reviews, and
-`moonshotai/kimi-k2.7-code` or `z-ai/glm-5.2` for larger engineering diffs.
+See the measured benchmark results at [postil.dev/docs/models](https://postil.dev/docs/models),
+which are sourced from the published bench aggregate. Any model served through an
+OpenAI-compatible endpoint works.
 
 Local endpoints use the same OpenAI-compatible contract:
 

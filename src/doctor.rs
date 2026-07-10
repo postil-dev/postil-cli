@@ -112,7 +112,7 @@ pub async fn run(cfg: &Config) -> Result<Vec<Check>> {
         name: "forge tokens",
         ok: true,
         detail: format!(
-            "GITHUB_TOKEN {}, GITLAB_TOKEN {} (only needed for remote review)",
+            "presence only: GITHUB_TOKEN {}, GITLAB_TOKEN {} (only needed for remote review)",
             if gh { "set" } else { "unset" },
             if gl { "set" } else { "unset" }
         ),
