@@ -150,7 +150,8 @@ single-user local setup where the checked-out repo is trusted, set
 `POSTIL_ALLOW_CONFIG_API_BASE=1` to honor the config value.
 
 Environment: `POSTIL_API_KEY`, `OPENROUTER_API_KEY`, `MODEL_API_KEY`, or
-`LLM_API_KEY`, `POSTIL_API_BASE`,
+`LLM_API_KEY`, `POSTIL_API_BASE`, `POSTIL_DETAILS_URL` (optional HTTP(S) target
+for GitHub check-run details links),
 `REVIEW_MODEL`, `REVIEW_MODEL_CASCADE`, `GITHUB_TOKEN`/`GITHUB_API_URL`,
 `GITLAB_TOKEN`/`GITLAB_API_URL`, `BITBUCKET_TOKEN`/`BITBUCKET_USER`/`BITBUCKET_API_URL`,
 `AZURE_DEVOPS_TOKEN`/`AZURE_DEVOPS_API_URL`.

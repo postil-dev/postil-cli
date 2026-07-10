@@ -10,6 +10,7 @@ use crate::envelope::{Envelope, Finding, Severity};
 pub struct GitHub {
     http: reqwest::Client,
     api_base: String,
+    details_url: Option<String>,
     token: String,
     owner: String,
     repo: String,
@@ -25,11 +26,13 @@ impl GitHub {
             .map_err(|_| anyhow!("GITHUB_TOKEN is required for --forge github"))?;
         let api_base = std::env::var("GITHUB_API_URL")
             .unwrap_or_else(|_| "https://api.github.com".to_string());
+        let details_url = valid_details_url(std::env::var("POSTIL_DETAILS_URL").ok());
         Ok(GitHub {
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(60))
                 .build()?,
             api_base: api_base.trim_end_matches('/').to_string(),
+            details_url,
             token,
             owner: owner.to_string(),
             repo: repo.to_string(),
@@ -49,6 +52,12 @@ impl GitHub {
             .header("X-GitHub-Api-Version", "2022-11-28")
     }
 
+    fn add_details_url(&self, body: &mut serde_json::Value) {
+        if let Some(details_url) = &self.details_url {
+            body["details_url"] = json!(details_url);
+        }
+    }
+
     async fn check_ok(resp: reqwest::Response, what: &str) -> Result<reqwest::Response> {
         let status = resp.status();
         if status.is_success() {
@@ -58,6 +67,53 @@ impl GitHub {
         let snippet: String = body.chars().take(300).collect();
         Err(anyhow!("GitHub {what} failed: {status}: {snippet}"))
     }
+}
+
+fn valid_details_url(value: Option<String>) -> Option<String> {
+    value.filter(|value| {
+        reqwest::Url::parse(value)
+            .map(|url| matches!(url.scheme(), "http" | "https") && url.has_host())
+            .unwrap_or(false)
+    })
+}
+
+fn gate_title(envelope: &Envelope) -> &'static str {
+    if envelope.gate.failing {
+        "Merge gate failed"
+    } else {
+        "Merge gate passed"
+    }
+}
+
+fn gate_summary(envelope: &Envelope) -> String {
+    if !envelope.gate.failing {
+        return format!(
+            "Merge gate passed: no findings at or above the blocking threshold ({}).\n",
+            envelope.gate.fail_on
+        );
+    }
+
+    let failing: Vec<_> = envelope
+        .findings
+        .iter()
+        .filter(|f| {
+            crate::config::GateLevel::parse(&envelope.gate.fail_on)
+                .map(|g| g.fails(f.severity))
+                .unwrap_or(false)
+        })
+        .map(|f| format!("- `{}:{}` {}", f.path, f.line, f.title))
+        .collect();
+    let noun = if failing.len() == 1 {
+        "finding"
+    } else {
+        "findings"
+    };
+    format!(
+        "Merge gate failed: {} {noun} at or above the blocking threshold ({}).\n\n{}\n",
+        failing.len(),
+        envelope.gate.fail_on,
+        failing.join("\n")
+    )
 }
 
 #[derive(Deserialize)]
@@ -178,13 +234,15 @@ impl Forge for GitHub {
     async fn start_checks(&self, head_sha: &str) -> Result<(String, String)> {
         let mut ids = Vec::with_capacity(2);
         for name in ["postil/review", "postil/gate"] {
+            let mut body = json!({
+                "name": name,
+                "head_sha": head_sha,
+                "status": "in_progress",
+            });
+            self.add_details_url(&mut body);
             let resp = self
                 .request(reqwest::Method::POST, self.url("/check-runs"))
-                .json(&json!({
-                    "name": name,
-                    "head_sha": head_sha,
-                    "status": "in_progress",
-                }))
+                .json(&body)
                 .send()
                 .await
                 .with_context(|| format!("creating check-run {name}"))?;
@@ -238,47 +296,36 @@ impl Forge for GitHub {
             (gate_id, gate, "postil/gate", false),
         ] {
             let gate_note = if name == "postil/gate" {
-                let failing: Vec<_> = envelope
-                    .findings
-                    .iter()
-                    .filter(|f| {
-                        crate::config::GateLevel::parse(&envelope.gate.fail_on)
-                            .map(|g| g.fails(f.severity))
-                            .unwrap_or(false)
-                    })
-                    .map(|f| format!("- `{}:{}` {}", f.path, f.line, f.title))
-                    .collect();
-                if envelope.gate.failing {
-                    format!(
-                        "Gate failing at `{}` on:\n{}\n",
-                        envelope.gate.fail_on,
-                        failing.join("\n")
-                    )
-                } else {
-                    format!("Gate (`failOn: {}`) passing.\n", envelope.gate.fail_on)
-                }
+                gate_summary(envelope)
             } else {
                 check_summary(envelope, true)
+            };
+            let title = if name == "postil/gate" {
+                gate_title(envelope).to_string()
+            } else {
+                check_title(envelope)
             };
             let mut output = json!({
                 // GitHub rejects title >255 and summary >65535 with HTTP 422,
                 // which would abort posting both checks. Cap both defensively.
-                "title": super::cap_check_title(&check_title(envelope)),
+                "title": super::cap_check_title(&title),
                 "summary": super::cap_check_summary(&gate_note),
             });
             if with_annotations && !annotations.is_empty() {
                 output["annotations"] = json!(annotations);
             }
+            let mut body = json!({
+                "status": "completed",
+                "conclusion": conclusion(state),
+                "output": output,
+            });
+            self.add_details_url(&mut body);
             let resp = self
                 .request(
                     reqwest::Method::PATCH,
                     self.url(&format!("/check-runs/{id}")),
                 )
-                .json(&json!({
-                    "status": "completed",
-                    "conclusion": conclusion(state),
-                    "output": output,
-                }))
+                .json(&body)
                 .send()
                 .await
                 .with_context(|| format!("completing check-run {name}"))?;
@@ -314,5 +361,26 @@ impl Forge for GitHub {
             .context("posting comment")?;
         Self::check_ok(resp, "comment post").await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_details_url;
+
+    #[test]
+    fn details_url_accepts_only_http_and_https_urls() {
+        assert_eq!(
+            valid_details_url(Some("https://postil.dev/orgs/acme/runs/review-1".into())),
+            Some("https://postil.dev/orgs/acme/runs/review-1".into())
+        );
+        assert_eq!(
+            valid_details_url(Some("http://localhost:3000/runs/review-1".into())),
+            Some("http://localhost:3000/runs/review-1".into())
+        );
+        assert_eq!(valid_details_url(Some("ftp://postil.dev/run".into())), None);
+        assert_eq!(valid_details_url(Some("https://".into())), None);
+        assert_eq!(valid_details_url(Some("not a URL".into())), None);
+        assert_eq!(valid_details_url(None), None);
     }
 }

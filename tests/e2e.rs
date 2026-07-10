@@ -72,6 +72,7 @@ fn postil() -> Command {
         .env_remove("OPENROUTER_API_KEY")
         .env_remove("POSTIL_API_KEY")
         .env_remove("POSTIL_API_BASE")
+        .env_remove("POSTIL_DETAILS_URL")
         .env("MODEL_API_KEY", "test-key");
     cmd
 }
@@ -830,6 +831,10 @@ async fn github_flow_posts_review_and_completes_both_checks() {
         .env("POSTIL_API_BASE", server.uri())
         .env("GITHUB_API_URL", server.uri())
         .env("GITHUB_TOKEN", "gh-test-token")
+        .env(
+            "POSTIL_DETAILS_URL",
+            "https://postil.dev/orgs/acme/runs/review-7",
+        )
         .args(["review", "--repo", "acme/api", "--pr", "7", "--output-json"])
         .assert()
         .code(1);
@@ -847,6 +852,10 @@ async fn github_flow_posts_review_and_completes_both_checks() {
         })
         .collect();
     assert_eq!(creates.len(), 2);
+    assert!(creates.iter().all(|request| {
+        request.body_json::<Value>().unwrap()["details_url"]
+            == "https://postil.dev/orgs/acme/runs/review-7"
+    }));
     let names: Vec<String> = creates
         .iter()
         .map(|r| {
@@ -865,12 +874,26 @@ async fn github_flow_posts_review_and_completes_both_checks() {
         .map(|r| r.body_json().unwrap())
         .collect();
     assert_eq!(patches.len(), 2);
+    assert!(
+        patches
+            .iter()
+            .all(|patch| { patch["details_url"] == "https://postil.dev/orgs/acme/runs/review-7" })
+    );
     let conclusions: Vec<&str> = patches
         .iter()
         .map(|p| p["conclusion"].as_str().unwrap())
         .collect();
     assert!(conclusions.contains(&"success"));
     assert!(conclusions.contains(&"failure"));
+    let gate_patch = patches
+        .iter()
+        .find(|patch| patch["conclusion"] == "failure")
+        .unwrap();
+    assert_eq!(gate_patch["output"]["title"], "Merge gate failed");
+    assert_eq!(
+        gate_patch["output"]["summary"],
+        "Merge gate failed: 1 finding at or above the blocking threshold (error).\n\n- `src/auth.rs:41` Unsanitized input reaches query\n"
+    );
     // Inline review posted with the finding at the cited line.
     let review = reqs
         .iter()
@@ -1094,6 +1117,28 @@ async fn github_clean_pr_stays_silent_but_completes_checks() {
         })
         .collect();
     assert_eq!(conclusions, vec!["success", "success"]);
+    let check_requests: Vec<Value> = reqs
+        .iter()
+        .filter(|request| {
+            request.url.path().starts_with("/repos/acme/api/check-runs")
+                && matches!(
+                    request.method,
+                    wiremock::http::Method::POST | wiremock::http::Method::PATCH
+                )
+        })
+        .map(|request| request.body_json().unwrap())
+        .collect();
+    assert!(
+        check_requests
+            .iter()
+            .all(|request| request.get("details_url").is_none())
+    );
+    let gate_patch = &check_requests[3];
+    assert_eq!(gate_patch["output"]["title"], "Merge gate passed");
+    assert_eq!(
+        gate_patch["output"]["summary"],
+        "Merge gate passed: no findings at or above the blocking threshold (error).\n"
+    );
 }
 
 #[tokio::test]
