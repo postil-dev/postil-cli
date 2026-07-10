@@ -1019,12 +1019,12 @@ const fixtureSpecs: FixtureSpec[] = [
     after: "await applyBulkEdit(changeSet);",
     hunks: [
       { line: 6, before: "const title = 'Bulk edit';", after: "const title = 'Bulk edit ';"},
-      { line: 18, before: "const batchSize = 50;", after: "const batchSize = 50;"},
+      { line: 18, before: "const batchSize=50;", after: "const batchSize = 50;"},
       { line: 33, before: "logger.debug('bulk edit start');", after: "logger.debug('bulk edit started');"},
-      { line: 57, before: "const summary = buildSummary(changeSet);", after: "const summary = buildSummary(changeSet);"},
+      { line: 57, before: "const summary = buildSummary(changeSet);", after: "const editSummary = buildSummary(changeSet);"},
       { line: 88, before: "if (!actor.can('bulkEdit')) throw new Error('Forbidden');", after: "await applyBulkEdit(changeSet);"},
-      { line: 122, before: "return { ok: true, summary };", after: "return { ok: true, summary };"},
-      { line: 147, before: "metrics.increment('bulk_edit.done');", after: "metrics.increment('bulk_edit.done');"},
+      { line: 122, before: "return { ok: true, summary };", after: "return { ok: true, summary: editSummary };"},
+      { line: 147, before: "metrics.increment('bulk_edit.done');", after: "metrics.increment('bulk_edit.completed');"},
     ],
     allowedFileContent:
       "export async function bulkEdit(actor: Actor, changeSet: ChangeSet) { await applyBulkEdit(changeSet); }",
@@ -1047,11 +1047,11 @@ const fixtureSpecs: FixtureSpec[] = [
     after: "timeoutMs: 0,",
     hunks: [
       { line: 9, before: "const userAgent = 'postil/1';", after: "const userAgent = 'postil/1 ';"},
-      { line: 21, before: "headers.set('accept', 'application/json');", after: "headers.set('accept', 'application/json');"},
-      { line: 43, before: "const retry = retryPolicy.standard();", after: "const retry = retryPolicy.standard();"},
-      { line: 64, before: "metrics.increment('provider.request');", after: "metrics.increment('provider.request');"},
+      { line: 21, before: "headers.set('accept', 'application/json');", after: "headers.set('accept', 'application/vnd.api+json');"},
+      { line: 43, before: "const retry = retryPolicy.standard();", after: "const retryPolicyForProvider = retryPolicy.standard();"},
+      { line: 64, before: "metrics.increment('provider.request');", after: "metrics.increment('provider.requests');"},
       { line: 96, before: "timeoutMs: 5_000,", after: "timeoutMs: 0,"},
-      { line: 118, before: "return parseProviderResponse(response);", after: "return parseProviderResponse(response);"},
+      { line: 118, before: "return parseProviderResponse(response);", after: "return parseResponse(response);"},
     ],
     allowedFileContent:
       "export const providerClient = createClient({ timeoutMs: 0, retry: retryPolicy.standard() });",
