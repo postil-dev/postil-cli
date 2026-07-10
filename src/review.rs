@@ -414,7 +414,13 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
             content_policy: content_policy_active,
         };
         let system = prompt::system_prompt(cfg);
-        let user = prompt::user_prompt(&ctx, &annotated, cfg.max_findings, truncated);
+        let mut user = prompt::user_prompt(&ctx, &annotated, cfg.max_findings);
+        if truncated {
+            user.push_str(
+                "\n\n[NOTE: the diff was truncated at the size limit; review only what \
+                 is shown above.]",
+            );
+        }
         let client = LlmClient::from_env(cfg)?;
         match client.review(cfg, &system, &user).await {
             Ok(model_review) => {

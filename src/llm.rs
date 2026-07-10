@@ -102,11 +102,11 @@ pub struct LlmClient {
 /// Retries per model on transient provider errors before the cascade moves on.
 const TRANSIENT_RETRIES: u32 = 2;
 
-/// A review returns a compact JSON object, even at the configured maximum of
-/// 20 findings. Bound review generation so reasoning-capable models cannot
-/// spend minutes producing an oversized completion. Interactive answers use
-/// their provider default because they have a different output contract.
-const REVIEW_MAX_TOKENS: u32 = 4096;
+/// Runaway-generation bound only. It is sized so legitimate reviews (observed
+/// up to roughly 12k output tokens) do not truncate. A truncated response goes
+/// through JSON repair and can salvage low-quality findings. Interactive answers
+/// use their provider default.
+const REVIEW_MAX_TOKENS: u32 = 16384;
 
 /// Marker context attached to transport/provider-level failures (endpoint
 /// unreachable, HTTP error status, timeout, malformed HTTP envelope) — the
