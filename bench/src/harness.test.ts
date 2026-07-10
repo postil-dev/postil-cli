@@ -37,19 +37,19 @@ describe("benchmark fixtures", () => {
       expect(hunkCount).toBeGreaterThan(1);
     }
 
-    const clean = hugeCases.find((c) => c.id === "huge-low-signal-clean");
-    expect(clean).toBeDefined();
-    const removed = clean!.diff
-      .split("\n")
-      .filter((line) => line.startsWith("- "))
-      .map((line) => line.slice(2));
-    const added = clean!.diff
-      .split("\n")
-      .filter((line) => line.startsWith("+ "))
-      .map((line) => line.slice(2));
-    expect(removed.length).toBeGreaterThan(1);
-    expect(added.length).toBe(removed.length);
-    expect(added.some((line, index) => line !== removed[index])).toBe(true);
+    for (const c of hugeCases) {
+      const removed = c.diff
+        .split("\n")
+        .filter((line) => line.startsWith("- "))
+        .map((line) => line.slice(2));
+      const added = c.diff
+        .split("\n")
+        .filter((line) => line.startsWith("+ "))
+        .map((line) => line.slice(2));
+      expect(removed.length).toBeGreaterThan(1);
+      expect(added.length).toBe(removed.length);
+      expect(added.every((line, index) => line !== removed[index])).toBe(true);
+    }
   });
 });
 
