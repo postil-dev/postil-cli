@@ -127,26 +127,43 @@ async fn run_remote<F: Forge>(
     repo: &str,
 ) -> Result<i32> {
     let review_started = std::time::Instant::now();
-    let meta = forge.fetch_pr_meta().await?;
-    let head_sha = args.sha.clone().unwrap_or_else(|| meta.head_sha.clone());
+    // Full-review metadata and diff fetches are independent forge reads. Fetch
+    // the diff while metadata is loading and check ownership is established;
+    // hosted runs with pre-created check IDs save the metadata RTT, while CLI-
+    // created checks also overlap their startup writes. Incremental diffs still
+    // wait for metadata because they depend on the selected head SHA.
+    let setup = async {
+        let meta = forge.fetch_pr_meta().await?;
+        let head_sha = args.sha.clone().unwrap_or_else(|| meta.head_sha.clone());
 
-    // Own the check-runs early so a crash can still be reported against them.
-    let checks = if args.no_post {
-        None
-    } else if let (Some(a), Some(g)) = (&args.check_run_id, &args.gate_check_run_id) {
-        Some((a.clone(), g.clone()))
-    } else {
-        match forge.start_checks(&head_sha).await {
-            Ok(ids) => Some(ids),
-            Err(e) => {
-                // CI tokens without checks:write still get review + exit code.
-                eprintln!("postil: cannot create check runs ({e:#}); continuing without");
-                None
+        // Own the check-runs early so a crash can still be reported against them.
+        let checks = if args.no_post {
+            None
+        } else if let (Some(a), Some(g)) = (&args.check_run_id, &args.gate_check_run_id) {
+            Some((a.clone(), g.clone()))
+        } else {
+            match forge.start_checks(&head_sha).await {
+                Ok(ids) => Some(ids),
+                Err(e) => {
+                    // CI tokens without checks:write still get review + exit code.
+                    eprintln!("postil: cannot create check runs ({e:#}); continuing without");
+                    None
+                }
             }
+        };
+        Ok::<_, anyhow::Error>((meta, head_sha, checks))
+    };
+    let prefetch_diff = async {
+        if args.since_sha.is_none() {
+            Some(forge.fetch_diff().await)
+        } else {
+            None
         }
     };
+    let (setup, prefetched_diff) = tokio::join!(setup, prefetch_diff);
+    let (meta, head_sha, checks) = setup?;
 
-    let result = remote_review(args, cfg, forge, repo, &meta, &head_sha).await;
+    let result = remote_review(args, cfg, forge, repo, &meta, &head_sha, prefetched_diff).await;
     match result {
         Ok(envelope) => {
             if let Some((a, g)) = &checks {
@@ -236,6 +253,7 @@ async fn remote_review<F: Forge>(
     repo: &str,
     meta: &PrMeta,
     head_sha: &str,
+    prefetched_diff: Option<Result<String>>,
 ) -> Result<Envelope> {
     let incremental = args.since_sha.as_deref();
     let diff_text = match incremental {
@@ -244,7 +262,10 @@ async fn remote_review<F: Forge>(
             .await
             .context("incremental diff fetch")?,
         Some(_) => String::new(),
-        None => forge.fetch_diff().await.context("diff fetch")?,
+        None => match prefetched_diff {
+            Some(diff) => diff.context("diff fetch")?,
+            None => forge.fetch_diff().await.context("diff fetch")?,
+        },
     };
     review_diff(
         cfg,
@@ -327,13 +348,7 @@ async fn review_diff(
             content_policy: content_policy_active,
         };
         let system = prompt::system_prompt(cfg);
-        let mut user = prompt::user_prompt(&ctx, &annotated, cfg.max_findings);
-        if truncated {
-            user.push_str(
-                "\n\n[NOTE: the diff was truncated at the size limit; review only what \
-                 is shown above.]",
-            );
-        }
+        let user = prompt::user_prompt(&ctx, &annotated, cfg.max_findings, truncated);
         let client = LlmClient::from_env(cfg)?;
         match client.review(cfg, &system, &user).await {
             Ok(model_review) => {

@@ -113,6 +113,69 @@ async fn local_review_reports_grounded_finding_and_gates() {
     assert_eq!(env["gate"]["failing"], true);
     assert_eq!(env["counts"]["error"], 1);
     assert_eq!(env["usage"]["promptTokens"], 100);
+
+    let requests = server.received_requests().await.unwrap();
+    let request: Value = requests[0].body_json().unwrap();
+    assert_eq!(request["max_tokens"], 4096);
+    assert_eq!(request["messages"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn full_remote_review_fetches_metadata_and_diff_concurrently() {
+    let server = MockServer::start().await;
+    let forge_delay = std::time::Duration::from_millis(1000);
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .and(header("Accept", "application/vnd.github.v3.diff"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(forge_delay)
+                .set_body_string(DIFF),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(forge_delay)
+                .set_body_json(json!({
+                    "title": "t", "body": "b",
+                    "head": {"sha": "headsha111"}, "base": {"sha": "basesha222"}
+                })),
+        )
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let started = std::time::Instant::now();
+    postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .args([
+            "review",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--no-post",
+            "--output-json",
+        ])
+        .assert()
+        .code(0);
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(1800),
+        "two 1000ms forge reads did not overlap: {:?}",
+        started.elapsed()
+    );
 }
 
 #[tokio::test]
