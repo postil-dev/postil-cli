@@ -917,7 +917,7 @@ fn llm_with_summary(summary: &str, findings: Value) -> Value {
 }
 
 // Shared GitHub remote setup for the content-policy PR-description tests. The PR
-// body carries prose the model flags; content policy is enabled via config.
+// body carries prose the model flags; content policy is active by default.
 async fn content_policy_pr_server(llm: Value) -> MockServer {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -976,11 +976,6 @@ async fn content_policy_pr_body_finding_survives_grounding() {
     .await;
 
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join(".postil.yaml"),
-        "contentPolicy:\n  enabled: true\n",
-    )
-    .unwrap();
     let out = postil()
         .current_dir(dir.path())
         .env("POSTIL_API_BASE", server.uri())
@@ -1030,16 +1025,11 @@ async fn content_policy_pr_body_finding_survives_grounding() {
 
 #[tokio::test]
 async fn content_policy_clean_run_does_not_fail_close() {
-    // With content policy on and no violations, the run stays clean: the numbered
+    // With default content policy and no violations, the run stays clean: the numbered
     // PR-description block must not induce a spurious ungrounded/fail-closed run.
     let server = content_policy_pr_server(llm_with_summary("", json!([]))).await;
 
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join(".postil.yaml"),
-        "contentPolicy:\n  enabled: true\n",
-    )
-    .unwrap();
     let out = postil()
         .current_dir(dir.path())
         .env("POSTIL_API_BASE", server.uri())
@@ -1873,6 +1863,7 @@ fn init_writes_starter_and_config_shows_provenance() {
     let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
     assert!(stdout.contains("source: .postil.yaml"));
     assert!(stdout.contains("gate.failOn: error"));
+    assert!(stdout.contains("contentPolicy: active"));
 }
 
 #[test]

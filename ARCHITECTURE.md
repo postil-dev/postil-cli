@@ -50,9 +50,8 @@ second model call: guardrails are repo-specific merge rules from `.postil/guardr
 (violations are `kind: guardrail`); content policy reviews human-readable prose only
 (Markdown, comments, docstrings, user-facing strings, PR title/body — never code logic
 or identifiers) against a built-in baseline plus optional `.postil/content-policy.md`
-additions (violations are `kind: contentPolicy`). Content policy is off by default;
-either an explicit `contentPolicy.enabled: true` or the mere presence of
-`.postil/content-policy.md` turns it on, mirroring how guardrails activates.
+additions (violations are `kind: contentPolicy`). Content policy is on by default;
+`contentPolicy.enabled: false` fully disables the baseline and repo additions.
 
 ## Invariants
 

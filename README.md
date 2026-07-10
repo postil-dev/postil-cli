@@ -99,17 +99,20 @@ the rule it breaks.
 
 ## Content policy
 
-Off by default. Reviews human-readable prose in the diff — Markdown, code comments,
-docstrings, user-facing/log strings, and the PR title/description, never code logic or
-identifiers — for fabricated or contradicted documentation claims, self-contradictions
-the same PR creates, authoring-process narration and AI-authorship residue, leaked
-conversation/transcript text, and (lower severity) stale temporal/TODO residue and house
-style. Violations are reported as `contentPolicy` findings that name the rule broken.
+On by default. It reviews human-readable prose in the diff, including Markdown, code
+comments, docstrings, user-facing/log strings, and the PR title/description, never code
+logic or identifiers. It checks for fabricated or contradicted documentation claims,
+self-contradictions the same PR creates, authoring-process narration and AI-authorship
+residue, leaked conversation/transcript text, and (lower severity) stale temporal/TODO
+residue and house style. Violations are reported as `contentPolicy` findings that name
+the rule broken.
 
-Turn it on with `contentPolicy.enabled: true` in `.postil.yaml` for the built-in
-baseline, or drop repo-specific additions in `.postil/content-policy.md` (which also
-turns it on by itself, the same way `.postil/guardrails.md` does); the file's rules are
-appended to the baseline, not a replacement for it.
+The built-in baseline reports fabricated or contradicted claims and conversation leaks
+at `error`, self-contradictions and authorship residue at `warn`, and stale/style residue
+at `info`. With the default `gate.failOn: error`, genuine violations of either error rule
+fail the gate. Repo-specific rules in `.postil/content-policy.md` are appended to the
+baseline, not a replacement for it. Set `contentPolicy.enabled: false` in `.postil.yaml`
+to fully disable both the baseline and repo-specific additions.
 
 ## Configuration
 
@@ -132,9 +135,10 @@ gate:
   failOn: error           # info | warn | error | never
   onError: block          # block (fail closed, default) | advisory (fail open on
                           # provider outage only; unusable model output still blocks)
-contentPolicy:
-  enabled: false          # true reviews prose in the diff for fabricated claims, AI-
-                          # authorship residue, and stale/style residue (see above)
+# Content policy uses the built-in baseline by default and extends it with
+# .postil/content-policy.md. Uncomment to fully opt out:
+# contentPolicy:
+#   enabled: false
 model:
   name: deepseek/deepseek-v4-pro
   cascade: [anthropic/claude-sonnet-4.6]
