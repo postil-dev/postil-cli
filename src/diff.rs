@@ -10,6 +10,8 @@ use std::ops::RangeInclusive;
 
 #[derive(Debug, Clone)]
 pub struct Hunk {
+    pub old_start: u32,
+    pub old_count: u32,
     pub new_start: u32,
     pub new_count: u32,
     /// Raw hunk lines including leading ' ', '+', '-'.
@@ -17,6 +19,10 @@ pub struct Hunk {
 }
 
 impl Hunk {
+    pub fn old_range(&self) -> RangeInclusive<u32> {
+        self.old_start..=self.old_start + self.old_count.saturating_sub(1)
+    }
+
     pub fn new_range(&self) -> RangeInclusive<u32> {
         // A zero-count hunk (pure deletion) still anchors at new_start.
         self.new_start..=self.new_start + self.new_count.saturating_sub(1)
@@ -25,6 +31,9 @@ impl Hunk {
 
 #[derive(Debug, Clone)]
 pub struct FileDiff {
+    /// Old-side path ("a/" stripped). Used to reconcile findings anchored to
+    /// the previously reviewed head, including across renames and deletions.
+    pub old_path: String,
     /// New-side path ("b/" stripped). Deleted files keep the old path.
     pub path: String,
     pub deleted: bool,
@@ -47,6 +56,7 @@ impl Diff {
 #[derive(Debug, Default)]
 pub struct DiffIndex {
     ranges: HashMap<String, Vec<RangeInclusive<u32>>>,
+    old_ranges: HashMap<String, Vec<RangeInclusive<u32>>>,
     /// Reserved synthetic-path line ranges that only content-policy findings may
     /// ground against (e.g. the rendered PR title/description). Kept separate
     /// from `ranges` so a non-content-policy finding cannot exploit them.
@@ -56,8 +66,20 @@ pub struct DiffIndex {
 impl DiffIndex {
     pub fn build(diff: &Diff) -> Self {
         let mut ranges: HashMap<String, Vec<RangeInclusive<u32>>> = HashMap::new();
+        let mut old_ranges: HashMap<String, Vec<RangeInclusive<u32>>> = HashMap::new();
         for file in &diff.files {
-            if file.deleted || file.binary {
+            if file.binary {
+                continue;
+            }
+            for hunk in &file.hunks {
+                if hunk.old_count > 0 {
+                    old_ranges
+                        .entry(file.old_path.clone())
+                        .or_default()
+                        .push(hunk.old_range());
+                }
+            }
+            if file.deleted {
                 continue;
             }
             let entry = ranges.entry(file.path.clone()).or_default();
@@ -69,6 +91,7 @@ impl DiffIndex {
         }
         DiffIndex {
             ranges,
+            old_ranges,
             content_policy_ranges: HashMap::new(),
         }
     }
@@ -94,6 +117,16 @@ impl DiffIndex {
 
     pub fn contains(&self, path: &str, line: u32) -> bool {
         self.ranges
+            .get(path)
+            .is_some_and(|rs| rs.iter().any(|r| r.contains(&line)))
+    }
+
+    /// True when `(path, line)` falls on the old side of a changed hunk. A
+    /// baseline finding cites the previously reviewed head, so incremental
+    /// reconciliation must use this coordinate space rather than new-file
+    /// grounding ranges.
+    pub fn contains_old(&self, path: &str, line: u32) -> bool {
+        self.old_ranges
             .get(path)
             .is_some_and(|rs| rs.iter().any(|r| r.contains(&line)))
     }
@@ -161,12 +194,18 @@ pub fn parse(text: &str) -> Diff {
             }
             // Seed the path from the header (binary diffs have no +++/--- lines);
             // the +++/--- lines that follow refine it for renames.
-            let seeded = rest
+            let (old_path, path) = rest
                 .rsplit_once(" b/")
-                .map(|(_, b)| b.trim().to_string())
+                .map(|(a, b)| {
+                    (
+                        strip_prefix_ab(a).to_string(),
+                        strip_prefix_ab(b).to_string(),
+                    )
+                })
                 .unwrap_or_default();
             current = Some(FileDiff {
-                path: seeded,
+                old_path,
+                path,
                 deleted: false,
                 binary: false,
                 hunks: Vec::new(),
@@ -180,12 +219,14 @@ pub fn parse(text: &str) -> Diff {
                 }
             }
         } else if let Some(rest) = line.strip_prefix("--- ") {
-            // Keep the old path as a fallback for deletions (+++ /dev/null case).
             if let Some(f) = current.as_mut()
-                && f.path.is_empty()
                 && rest != "/dev/null"
             {
-                f.path = strip_prefix_ab(rest).to_string();
+                f.old_path = strip_prefix_ab(rest).to_string();
+                // Keep the old path as a fallback for deletions (+++ /dev/null).
+                if f.path.is_empty() {
+                    f.path = f.old_path.clone();
+                }
             }
         } else if line.starts_with("Binary files ") || line.starts_with("GIT binary patch") {
             if let Some(f) = current.as_mut() {
@@ -193,8 +234,10 @@ pub fn parse(text: &str) -> Diff {
             }
         } else if let Some(header) = line.strip_prefix("@@ ") {
             flush_hunk(&mut current, &mut current_hunk);
-            if let Some((new_start, new_count, old_count)) = parse_hunk_header(header) {
+            if let Some((old_start, old_count, new_start, new_count)) = parse_hunk_header(header) {
                 current_hunk = Some(Hunk {
+                    old_start,
+                    old_count,
                     new_start,
                     new_count,
                     lines: Vec::new(),
@@ -244,28 +287,26 @@ fn strip_prefix_ab(path: &str) -> &str {
 }
 
 /// "@@ -l,c +l,c @@ ctx" minus the leading "@@ ". Returns
-/// (new_start, new_count, old_count). old_count defaults to 1 when the header
-/// omits it (single-line hunk) and to 0 when the old side is absent.
-fn parse_hunk_header(header: &str) -> Option<(u32, u32, u32)> {
-    let count_of = |token: &str| -> Option<u32> {
+/// (old_start, old_count, new_start, new_count). Counts default to 1 when a
+/// header omits them (single-line hunk).
+fn parse_hunk_header(header: &str) -> Option<(u32, u32, u32, u32)> {
+    let range_of = |token: &str| -> Option<(u32, u32)> {
         let spec = &token[1..];
         match spec.split_once(',') {
-            Some((_, c)) => c.parse().ok(),
-            None => Some(1),
+            Some((start, count)) => Some((start.parse().ok()?, count.parse().ok()?)),
+            None => Some((spec.parse().ok()?, 1)),
         }
     };
-    let plus = header.split_whitespace().find(|t| t.starts_with('+'))?;
-    let spec = &plus[1..];
-    let (new_start, new_count) = match spec.split_once(',') {
-        Some((s, c)) => (s.parse().ok()?, c.parse().ok()?),
-        None => (spec.parse().ok()?, 1),
-    };
-    let old_count = header
+    let (old_start, old_count) = header
         .split_whitespace()
         .find(|t| t.starts_with('-'))
-        .and_then(count_of)
-        .unwrap_or(0);
-    Some((new_start, new_count, old_count))
+        .and_then(range_of)
+        .unwrap_or((0, 0));
+    let (new_start, new_count) = header
+        .split_whitespace()
+        .find(|t| t.starts_with('+'))
+        .and_then(range_of)?;
+    Some((old_start, old_count, new_start, new_count))
 }
 
 /// Render the diff for the model with new-file line numbers on every line that
@@ -376,7 +417,10 @@ Binary files a/img.png and b/img.png differ
         let d = parse(SAMPLE);
         assert_eq!(d.files.len(), 3);
         assert_eq!(d.files[0].path, "src/lib.rs");
+        assert_eq!(d.files[0].old_path, "src/lib.rs");
         assert_eq!(d.files[0].hunks.len(), 1);
+        assert_eq!(d.files[0].hunks[0].old_start, 10);
+        assert_eq!(d.files[0].hunks[0].old_count, 4);
         assert_eq!(d.files[0].hunks[0].new_start, 10);
         assert_eq!(d.files[0].hunks[0].new_count, 5);
         assert!(d.files[1].deleted);
@@ -394,6 +438,10 @@ Binary files a/img.png and b/img.png differ
         assert!(!idx.contains("src/lib.rs", 9));
         assert!(!idx.contains("gone.txt", 1));
         assert!(!idx.contains("img.png", 1));
+        assert!(idx.contains_old("src/lib.rs", 10));
+        assert!(idx.contains_old("src/lib.rs", 13));
+        assert!(!idx.contains_old("src/lib.rs", 14));
+        assert!(idx.contains_old("gone.txt", 1));
         assert!(idx.touches("src/lib.rs", 1, 10));
         assert!(!idx.touches("src/lib.rs", 1, 9));
     }
@@ -428,6 +476,7 @@ Binary files a/img.png and b/img.png differ
         let mut diff = Diff::default();
         for i in 0..5000 {
             diff.files.push(FileDiff {
+                old_path: format!("path/to/generated/file_{i:05}.bin"),
                 path: format!("path/to/generated/file_{i:05}.bin"),
                 deleted: false,
                 binary: true,
@@ -488,9 +537,30 @@ Binary files a/img.png and b/img.png differ
 
     #[test]
     fn hunk_header_without_count() {
-        assert_eq!(parse_hunk_header("-1 +5 @@"), Some((5, 1, 1)));
-        assert_eq!(parse_hunk_header("-1,2 +3,4 @@"), Some((3, 4, 2)));
-        assert_eq!(parse_hunk_header("-0,0 +1,3 @@"), Some((1, 3, 0)));
+        assert_eq!(parse_hunk_header("-1 +5 @@"), Some((1, 1, 5, 1)));
+        assert_eq!(parse_hunk_header("-1,2 +3,4 @@"), Some((1, 2, 3, 4)));
+        assert_eq!(parse_hunk_header("-0,0 +1,3 @@"), Some((0, 0, 1, 3)));
+    }
+
+    #[test]
+    fn old_side_index_uses_pre_change_path_for_renames() {
+        let text = "\
+diff --git a/old.rs b/new.rs
+similarity index 80%
+rename from old.rs
+rename to new.rs
+--- a/old.rs
++++ b/new.rs
+@@ -9,2 +9,2 @@
+-old
++new
+ context
+";
+        let idx = DiffIndex::build(&parse(text));
+        assert!(idx.contains_old("old.rs", 9));
+        assert!(!idx.contains_old("new.rs", 9));
+        assert!(idx.contains("new.rs", 9));
+        assert!(!idx.contains("old.rs", 9));
     }
 
     // A bare blank line separating two concatenated file diffs must not be

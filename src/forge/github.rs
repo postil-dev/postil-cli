@@ -6,6 +6,7 @@ use serde_json::json;
 
 use super::{CheckState, Forge, PrMeta, ThreadKind, check_summary, check_title, wrap_plain_text};
 use crate::envelope::{Envelope, Finding, Severity};
+use crate::filter;
 
 pub struct GitHub {
     http: reqwest::Client,
@@ -184,10 +185,16 @@ impl Forge for GitHub {
     }
 
     async fn post_review(&self, summary: &str, findings: &[Finding], head_sha: &str) -> Result<()> {
+        // Every carried finding is already visible in an earlier Postil review.
+        // Check-runs still receive the complete envelope, but posting the same
+        // visible set as another PR review is duplicate noise.
+        if !findings.is_empty() && findings.iter().all(filter::is_carried) {
+            return Ok(());
+        }
         let comments: Vec<_> = findings
             .iter()
             // Carried findings already have comments from the previous review.
-            .filter(|f| !f.body.starts_with("[carried from previous review]"))
+            .filter(|f| !filter::is_carried(f))
             // Synthetic-path findings (PR description, fail-closed markers) have
             // no real file line to anchor an inline comment; they surface only in
             // the summary body.

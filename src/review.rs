@@ -54,6 +54,16 @@ pub struct ReviewArgs {
     pub no_post: bool,
 }
 
+struct ReviewInput<'a> {
+    diff_text: &'a str,
+    meta: Option<&'a PrMeta>,
+    head_sha: Option<String>,
+    repo: Option<&'a str>,
+    baseline: Vec<Finding>,
+    scope: filter::ReconcileScope,
+    force_model: bool,
+}
+
 pub async fn run(args: ReviewArgs) -> Result<i32> {
     let cwd = std::env::current_dir()?;
     let mut cfg = Config::load(&cwd, args.config.as_deref())?;
@@ -116,7 +126,26 @@ async fn run_local(args: &ReviewArgs, cfg: &Config) -> Result<i32> {
     };
     let diff_text = local::acquire(&source).await?;
     let head_sha = local::head_sha().await;
-    let envelope = review_diff(cfg, &diff_text, None, args, head_sha, None).await?;
+    let baseline = load_baseline(args)?;
+    let scope = if args.since_sha.is_some() {
+        filter::ReconcileScope::Incremental
+    } else {
+        filter::ReconcileScope::Full { trustworthy: false }
+    };
+    let envelope = review_diff(
+        cfg,
+        args,
+        ReviewInput {
+            diff_text: &diff_text,
+            meta: None,
+            head_sha,
+            repo: None,
+            baseline,
+            scope,
+            force_model: false,
+        },
+    )
+    .await?;
     finish(args, cfg, envelope, None::<&GitHub>).await
 }
 
@@ -255,55 +284,91 @@ async fn remote_review<F: Forge>(
     head_sha: &str,
     prefetched_diff: Option<Result<String>>,
 ) -> Result<Envelope> {
+    let baseline = load_baseline(args)?;
+    let has_carryable_baseline = baseline.iter().any(|f| !f.path.starts_with(".postil/"));
     let incremental = args.since_sha.as_deref();
-    let diff_text = match incremental {
+    let (diff_text, scope, force_model) = match incremental {
         Some(since) if since != head_sha => forge
             .fetch_diff_since(since, head_sha)
             .await
-            .context("incremental diff fetch")?,
-        Some(_) => String::new(),
-        None => match prefetched_diff {
-            Some(diff) => diff.context("diff fetch")?,
-            None => forge.fetch_diff().await.context("diff fetch")?,
-        },
+            .context("incremental diff fetch")
+            .map(|diff| (diff, filter::ReconcileScope::Incremental, false))?,
+        Some(_) => (String::new(), filter::ReconcileScope::Incremental, false),
+        None => (
+            match prefetched_diff {
+                Some(diff) => diff.context("diff fetch")?,
+                None => forge.fetch_diff().await.context("diff fetch")?,
+            },
+            filter::ReconcileScope::Full { trustworthy: false },
+            false,
+        ),
+    };
+
+    // A same-head re-run has no incremental diff. If a real baseline finding
+    // remains open, an empty run can never clear it, so retry as a full review.
+    // Empty incremental runs without carryable findings remain model-free.
+    let (diff_text, scope, force_model) = if cfg.enabled
+        && has_carryable_baseline
+        && matches!(scope, filter::ReconcileScope::Incremental)
+        && diff_text.trim().is_empty()
+    {
+        (
+            forge
+                .fetch_diff()
+                .await
+                .context("full diff fallback fetch")?,
+            filter::ReconcileScope::Full { trustworthy: false },
+            true,
+        )
+    } else {
+        (diff_text, scope, force_model)
     };
     review_diff(
         cfg,
-        &diff_text,
-        Some(meta),
         args,
-        Some(head_sha.to_string()),
-        Some(repo),
+        ReviewInput {
+            diff_text: &diff_text,
+            meta: Some(meta),
+            head_sha: Some(head_sha.to_string()),
+            repo: Some(repo),
+            baseline,
+            scope,
+            force_model,
+        },
     )
     .await
 }
 
-/// Core engine: diff text in, envelope out. No forge I/O.
-async fn review_diff(
-    cfg: &Config,
-    diff_text: &str,
-    meta: Option<&PrMeta>,
-    args: &ReviewArgs,
-    head_sha: Option<String>,
-    repo: Option<&str>,
-) -> Result<Envelope> {
-    let baseline: Vec<Finding> = match &args.baseline {
+fn load_baseline(args: &ReviewArgs) -> Result<Vec<Finding>> {
+    match &args.baseline {
         Some(path) => {
             let raw = std::fs::read_to_string(path)
                 .with_context(|| format!("reading baseline {}", path.display()))?;
             let env: Envelope = serde_json::from_str(&raw).context("parsing baseline envelope")?;
-            env.findings
+            Ok(env.findings)
         }
-        None => Vec::new(),
-    };
+        None => Ok(Vec::new()),
+    }
+}
 
+/// Core engine: diff text in, envelope out. No forge I/O.
+async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) -> Result<Envelope> {
+    let ReviewInput {
+        diff_text,
+        meta,
+        head_sha,
+        repo,
+        baseline,
+        scope,
+        force_model,
+    } = input;
     let review_started = std::time::Instant::now();
     // Cap the raw diff before parsing so an oversized fetched diff cannot force
     // unbounded parse work; a cut here forces the truncated path below.
     let (diff_text, raw_truncated) = diff::cap_raw_diff(diff_text, MAX_RAW_DIFF_BYTES);
     let parsed = diff::parse(diff_text);
     let mut index = DiffIndex::build(&parsed);
-    let incremental = args.since_sha.is_some();
+    let incremental = matches!(scope, filter::ReconcileScope::Incremental);
 
     // When content policy is active, render the PR title/description as a
     // numbered, groundable block and register its line range so a title/body
@@ -329,13 +394,14 @@ async fn review_diff(
     let mut suppressed = 0u32;
     let mut ungrounded = 0u32;
     let mut findings: Vec<Finding> = Vec::new();
+    let mut full_review_trustworthy = false;
 
     // Run the model when there is a diff to review, or when content policy is
     // active and there is a PR title/description to review (an empty diff should
     // still get its prose checked).
     if !cfg.enabled {
         model_used = "none (disabled by config)".to_string();
-    } else if !parsed.is_empty() || pr_desc_lines > 0 {
+    } else if force_model || !parsed.is_empty() || pr_desc_lines > 0 {
         let (annotated, render_truncated) = diff::render_annotated(&parsed, MAX_DIFF_BYTES);
         // Either the raw input was capped or the rendered output hit the limit;
         // both mean the model did not see the full change.
@@ -380,6 +446,7 @@ async fn review_diff(
                         &model_review.summary,
                     )];
                 } else {
+                    full_review_trustworthy = true;
                     summary = model_review.summary;
                     findings = outcome.kept;
                 }
@@ -401,6 +468,7 @@ async fn review_diff(
         // A truncated review must never read as a full pass: the unreviewed
         // tail is surfaced as an explicit uncertainty finding.
         if truncated {
+            full_review_trustworthy = false;
             findings.push(Finding {
                 path: ".postil/diff".to_string(),
                 line: 1,
@@ -425,7 +493,13 @@ async fn review_diff(
     // review off there is no fresh signal to reconcile against, so honoring the
     // disable means dropping the baseline carry-forward too.
     let rec = if cfg.enabled {
-        filter::reconcile(&baseline, &index, &findings)
+        let scope = match scope {
+            filter::ReconcileScope::Incremental => filter::ReconcileScope::Incremental,
+            filter::ReconcileScope::Full { .. } => filter::ReconcileScope::Full {
+                trustworthy: full_review_trustworthy,
+            },
+        };
+        filter::reconcile(&baseline, &index, &findings, scope)
     } else {
         filter::Reconciliation {
             resolved: vec![],
@@ -494,8 +568,12 @@ async fn finish<F: Forge>(
     if let Some(forge) = forge
         && !args.no_post
     {
-        let should_comment =
-            !envelope.silent || matches!(cfg.on_clean, crate::config::OnClean::Comment);
+        let duplicate_of_baseline = load_baseline(args)
+            .ok()
+            .is_some_and(|baseline| visible_finding_sets_equal(&baseline, &envelope.findings));
+        let should_comment = (!envelope.silent
+            || matches!(cfg.on_clean, crate::config::OnClean::Comment))
+            && !duplicate_of_baseline;
         if should_comment {
             let rich = forge.rich_markdown();
             let summary = if envelope.silent {
@@ -520,6 +598,50 @@ async fn finish<F: Forge>(
         }
     }
     Ok(if envelope.gate.failing { 1 } else { 0 })
+}
+
+fn visible_finding_sets_equal(previous: &[Finding], current: &[Finding]) -> bool {
+    // Synthetic findings represent this run's operational state and must stay
+    // visible even if an earlier run failed in the same way.
+    if previous.is_empty()
+        || current.is_empty()
+        || previous.len() != current.len()
+        || previous
+            .iter()
+            .chain(current)
+            .any(|f| f.path.starts_with(".postil/"))
+    {
+        return false;
+    }
+
+    let mut matched = vec![false; current.len()];
+    previous.iter().all(|old| {
+        current
+            .iter()
+            .enumerate()
+            .find(|(i, new)| !matched[*i] && same_visible_finding(old, new))
+            .is_some_and(|(i, _)| {
+                matched[i] = true;
+                true
+            })
+    })
+}
+
+fn same_visible_finding(a: &Finding, b: &Finding) -> bool {
+    a.path == b.path
+        && a.line == b.line
+        && a.end_line == b.end_line
+        && a.severity == b.severity
+        && a.kind == b.kind
+        && a.confidence.to_bits() == b.confidence.to_bits()
+        && a.title == b.title
+        && visible_body(&a.body) == visible_body(&b.body)
+}
+
+fn visible_body(body: &str) -> &str {
+    body.strip_prefix(filter::CARRIED_MARKER)
+        .map(str::trim_start)
+        .unwrap_or(body)
 }
 
 fn error_envelope(
@@ -562,5 +684,47 @@ fn error_envelope(
         base_sha: Some(meta.base_sha.clone()),
         head_sha: Some(head_sha.to_string()),
         since_sha: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::envelope::{Kind, Severity};
+
+    fn finding(path: &str, line: u32, body: &str) -> Finding {
+        Finding {
+            path: path.to_string(),
+            line,
+            end_line: None,
+            severity: Severity::Error,
+            kind: Kind::Risk,
+            confidence: 0.9,
+            title: "Finding".to_string(),
+            body: body.to_string(),
+        }
+    }
+
+    #[test]
+    fn visible_finding_comparison_ignores_carry_marker_and_order() {
+        let previous = vec![finding("a.rs", 10, "first"), finding("b.rs", 20, "second")];
+        let current = vec![
+            finding("b.rs", 20, "[carried from previous review]\n\nsecond"),
+            finding("a.rs", 10, "[carried from previous review]\n\nfirst"),
+        ];
+        assert!(visible_finding_sets_equal(&previous, &current));
+    }
+
+    #[test]
+    fn visible_finding_comparison_detects_changes_and_fresh_synthetic_state() {
+        let previous = vec![finding("a.rs", 10, "first")];
+        assert!(!visible_finding_sets_equal(
+            &previous,
+            &[finding("a.rs", 11, "first")]
+        ));
+        assert!(!visible_finding_sets_equal(
+            &[crate::envelope::provider_error_finding("old")],
+            &[crate::envelope::provider_error_finding("old")]
+        ));
     }
 }
