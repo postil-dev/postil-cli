@@ -116,7 +116,7 @@ async fn local_review_reports_grounded_finding_and_gates() {
 
     let requests = server.received_requests().await.unwrap();
     let request: Value = requests[0].body_json().unwrap();
-    assert_eq!(request["max_tokens"], 4096);
+    assert_eq!(request["max_tokens"], 16384);
     assert_eq!(request["messages"].as_array().unwrap().len(), 2);
 }
 
