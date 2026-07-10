@@ -278,6 +278,12 @@ export function aggregateModel(model: string, results: LiveModelCaseResult[]): L
   };
 }
 
+/** Total measured spend for a run, summing only cases with known pricing.
+ * Cases with null cost are excluded because their provider price was unknown. */
+export function calculateTotalRunCostUsd(results: LiveModelCaseResult[]): number {
+  return results.reduce((sum, r) => sum + (r.costUsd ?? 0), 0);
+}
+
 // ---------------------------------------------------------------------------
 // Pricing catalog parsing and cost projection
 

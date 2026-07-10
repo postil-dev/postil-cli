@@ -33,6 +33,7 @@ import {
 } from "./harness";
 import {
   aggregateModel,
+  calculateTotalRunCostUsd,
   erroredLiveCase,
   pricingFromCatalog,
   scoreLiveCase,
@@ -83,6 +84,8 @@ export interface LiveModelsReport {
   /** Full per-model aggregates (superset of `models`) for the human table and
    * diagnostics. */
   modelAggregates: LiveModelAggregate[];
+  /** Total measured spend across all scored cases with known pricing. */
+  totalRunCostUsd: number;
   /** Per-case detail across every (model, case) pair. */
   cases: LiveModelCaseResult[];
 }
@@ -159,6 +162,7 @@ export async function runLiveModels(
     apiBase,
     models: aggregates.map(toSiteModelAggregate),
     modelAggregates: aggregates,
+    totalRunCostUsd: calculateTotalRunCostUsd(results),
     cases: results,
   };
 }
@@ -333,6 +337,8 @@ export function formatLiveModelsReport(report: LiveModelsReport): string {
     }
   }
   lines.push(
+    "",
+    `Total run cost: ${usd(report.totalRunCostUsd)}`,
     "",
     "detect = detection rate over defect fixtures; FP = findings that miss the seeded",
     "region (or any finding on a clean fixture). Fixtures are ours; no competitor peer",

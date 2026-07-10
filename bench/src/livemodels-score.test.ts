@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { benchmarkCase, type BenchmarkCase, type Envelope } from "./harness";
 import {
   aggregateModel,
+  calculateTotalRunCostUsd,
   erroredLiveCase,
   estimateCasePromptTokens,
   findingHitsSeededRegion,
@@ -286,6 +287,60 @@ describe("aggregateModel", () => {
   test("empty results produce zeroed aggregate", () => {
     const agg = aggregateModel("m", []);
     expect(agg).toMatchObject({ detectionRate: 0, casesRun: 0, meanCostUsdPerReview: 0, meanDurationMs: 0, totalCostUsd: 0 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Run cost total
+
+describe("calculateTotalRunCostUsd", () => {
+  test("sums included per-case costs and matches per-model totals", () => {
+    const c = defectCase({ line: 20 });
+    const modelA = [
+      scoreLiveCase({
+        case: c,
+        model: "a/model",
+        envelope: envelope({ usage: { promptTokens: 1000, completionTokens: 100 } }),
+        pricing,
+        exitCode: 0,
+        fidelityFailures: [],
+      }),
+      scoreLiveCase({
+        case: cleanCase(),
+        model: "a/model",
+        envelope: envelope({ usage: { promptTokens: 500, completionTokens: 50 } }),
+        pricing,
+        exitCode: 0,
+        fidelityFailures: [],
+      }),
+    ];
+    const modelB = [
+      scoreLiveCase({
+        case: c,
+        model: "b/model",
+        envelope: envelope({ usage: { promptTokens: 200, completionTokens: 20 } }),
+        pricing,
+        exitCode: 0,
+        fidelityFailures: [],
+      }),
+      scoreLiveCase({
+        case: cleanCase(),
+        model: "b/model",
+        envelope: envelope({ usage: { promptTokens: 999, completionTokens: 999 } }),
+        pricing: null,
+        exitCode: 0,
+        fidelityFailures: [],
+      }),
+      erroredLiveCase({ case: c, model: "b/model", exitCode: 2, error: "no valid v1 envelope (exit 2)" }),
+    ];
+
+    const results = [...modelA, ...modelB];
+    const perCaseTotal = results.reduce((sum, r) => sum + (r.costUsd ?? 0), 0);
+    const perModelTotal =
+      aggregateModel("a/model", modelA).totalCostUsd + aggregateModel("b/model", modelB).totalCostUsd;
+
+    expect(calculateTotalRunCostUsd(results)).toBeCloseTo(perCaseTotal, 12);
+    expect(calculateTotalRunCostUsd(results)).toBeCloseTo(perModelTotal, 12);
   });
 });
 

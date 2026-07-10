@@ -88,6 +88,7 @@ jobs:
                   ].join(" "));
                 }
                 console.log("");
+                console.log("Total run cost: $" + r.totalRunCostUsd.toFixed(6));
                 console.log("CLI " + r.cliVersion + " | endpoint " + r.apiBase + " | generated " + r.generatedAt);
               '
               echo '```'

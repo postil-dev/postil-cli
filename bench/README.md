@@ -83,15 +83,16 @@ refuses to run without a key and without at least one model.
 ### Report
 
 `--json-out <path>` writes `{ generatedAt, cliVersion, apiBase, models[],
-modelAggregates[], cases[] }`. The `models` array is the exact schema the site
-consumes, one object per model:
+modelAggregates[], totalRunCostUsd, cases[] }`. The `models` array is the exact
+schema the site consumes, one object per model:
 
 ```
 { id, detectionRate, falsePositives, casesRun, meanCostUsdPerReview, meanDurationMs }
 ```
 
 `modelAggregates` is a superset with `totalCostUsd`, gate tallies, and error
-counts for the human table; `cases` is the per-`(model, case)` detail. Every run
+counts for the human table; `totalRunCostUsd` is the sum of included per-case
+costs across the full run; `cases` is the per-`(model, case)` detail. Every run
 also writes a timestamped copy under `.runs/live-models/` (gitignored). `--json`
 prints the full report instead of the human table.
 
