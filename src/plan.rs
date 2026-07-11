@@ -148,6 +148,7 @@ mod tests {
             gate: Gate {
                 fail_on: "error".into(),
                 failing: gate_failing,
+            block_on_kinds: vec![],
             },
             model_used: "m".into(),
             usage: Usage::default(),
@@ -168,6 +169,7 @@ mod tests {
             confidence: conf,
             title: "t".into(),
             body: "b".into(),
+        id: None,
         }
     }
 

@@ -505,6 +505,7 @@ fn into_review(raw: RawReview, model: &str, usage: Usage) -> ModelReview {
                 confidence: f.confidence.clamp(0.0, 1.0),
                 title,
                 body: f.body,
+            id: None,
             }
         })
         .collect();
@@ -699,6 +700,7 @@ mod tests {
                 confidence: conf,
                 title: "t".into(),
                 body: "b".into(),
+            id: None,
             }],
             model_used: model.into(),
             usage: Usage {
@@ -721,6 +723,7 @@ mod tests {
             confidence: 0.99,
             title: "solo".into(),
             body: "b".into(),
+        id: None,
         });
         let merged = consensus_merge(vec![a, b]);
         assert_eq!(merged.findings.len(), 1);
@@ -757,6 +760,7 @@ mod tests {
             confidence: 0.9,
             title: "t2".into(),
             body: "b2".into(),
+        id: None,
         });
         let merged = consensus_merge(vec![a, b]);
         assert!(merged.findings.is_empty());

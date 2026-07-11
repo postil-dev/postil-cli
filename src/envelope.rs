@@ -48,6 +48,17 @@ pub enum Kind {
 }
 
 impl Kind {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "risk" => Some(Kind::Risk),
+            "humanescalation" => Some(Kind::HumanEscalation),
+            "guardrail" => Some(Kind::Guardrail),
+            "uncertainty" => Some(Kind::Uncertainty),
+            "contentpolicy" => Some(Kind::ContentPolicy),
+            _ => None,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Kind::Risk => "risk",
@@ -71,6 +82,10 @@ pub struct Finding {
     pub confidence: f64,
     pub title: String,
     pub body: String,
+    /// Stable, engine-generated finding ID for deduplication and approval tracking.
+    /// Hash of (head_sha, kind, normalized_path, normalized_line, normalized_title, duplicate_index).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -92,6 +107,9 @@ pub struct Gate {
     /// Severity at or above which the gate check fails. "never" disables the gate.
     pub fail_on: String,
     pub failing: bool,
+    /// Finding kinds that block the gate regardless of severity.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub block_on_kinds: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -184,6 +202,7 @@ pub fn fail_closed_finding(detail: &str) -> Finding {
             "Postil could not obtain a valid, diff-grounded review from the configured \
              model(s) and is failing closed rather than passing unreviewed code.\n\nDetail: {detail}"
         ),
+        id: None,
     }
 }
 
@@ -211,6 +230,7 @@ pub fn narrated_risk_finding(summary: &str) -> Finding {
              Re-run the review; if the contradiction persists, inspect the areas the \
              summary names and address them or record findings manually."
         ),
+        id: None,
     }
 }
 
@@ -228,6 +248,7 @@ pub fn provider_error_finding(detail: &str) -> Finding {
             "Postil could not complete the model request and is failing closed rather \
              than passing unreviewed code.\n\nDetail: {detail}"
         ),
+        id: None,
     }
 }
 
@@ -245,6 +266,7 @@ mod tests {
             confidence: conf,
             title: "t".into(),
             body: "b".into(),
+            id: None,
         }
     }
 
@@ -271,6 +293,16 @@ mod tests {
     }
 
     #[test]
+    fn kind_parse() {
+        assert_eq!(Kind::parse("risk"), Some(Kind::Risk));
+        assert_eq!(Kind::parse("humanescalation"), Some(Kind::HumanEscalation));
+        assert_eq!(Kind::parse("guardrail"), Some(Kind::Guardrail));
+        assert_eq!(Kind::parse("uncertainty"), Some(Kind::Uncertainty));
+        assert_eq!(Kind::parse("contentpolicy"), Some(Kind::ContentPolicy));
+        assert_eq!(Kind::parse("unknown"), None);
+    }
+
+    #[test]
     fn envelope_serializes_camel_case() {
         let env = Envelope {
             version: 1,
@@ -283,6 +315,7 @@ mod tests {
             gate: Gate {
                 fail_on: "error".into(),
                 failing: false,
+                block_on_kinds: vec![],
             },
             model_used: "m".into(),
             usage: Usage::default(),

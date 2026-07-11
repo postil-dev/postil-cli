@@ -249,6 +249,7 @@ mod tests {
             confidence: 0.9,
             title: "\x1b[2Jhijacked title".into(),
             body: "line one\n\x1b[31mFAKE ALL CLEAR\x1b[0m\nline three".into(),
+        id: None,
         };
         let env = Envelope {
             version: 1,
@@ -261,6 +262,7 @@ mod tests {
             gate: Gate {
                 fail_on: "error".into(),
                 failing: false,
+            block_on_kinds: vec![],
             },
             model_used: "m".into(),
             usage: Default::default(),
