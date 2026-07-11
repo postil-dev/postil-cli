@@ -662,10 +662,33 @@ async fn garbage_output_fails_closed_after_repair_attempt() {
     let env: Value =
         serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
     assert_eq!(env["findings"][0]["path"], ".postil/model-output");
-    assert_eq!(env["usage"]["promptTokens"], 160);
-    assert_eq!(env["usage"]["completionTokens"], 60);
-    // Initial call + repair call.
-    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    assert_eq!(env["usage"]["promptTokens"], 640);
+    assert_eq!(env["usage"]["completionTokens"], 240);
+    // Initial call + repair call for each default model in the retry roster.
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 8);
+    let models: Vec<String> = requests
+        .iter()
+        .map(|request| {
+            request.body_json::<Value>().unwrap()["model"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        models,
+        vec![
+            "deepseek/deepseek-v4-pro",
+            "deepseek/deepseek-v4-pro",
+            "mistralai/mistral-small-3.2-24b-instruct",
+            "mistralai/mistral-small-3.2-24b-instruct",
+            "google/gemma-3-27b-it",
+            "google/gemma-3-27b-it",
+            "qwen/qwen3-32b",
+            "qwen/qwen3-32b",
+        ]
+    );
 }
 
 #[tokio::test]

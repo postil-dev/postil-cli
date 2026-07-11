@@ -143,7 +143,10 @@ gate:
 #   enabled: false
 model:
   name: deepseek/deepseek-v4-pro
-  cascade: [anthropic/claude-sonnet-4.6]
+  cascade:
+    - mistralai/mistral-small-3.2-24b-instruct
+    - google/gemma-3-27b-it
+    - qwen/qwen3-32b
   apiBase: https://openrouter.ai/api/v1    # ignored from config by default; see note below
   consensus: 1            # >1: only findings multiple models agree on survive
 ```
