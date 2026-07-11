@@ -35,6 +35,8 @@ curl -fsSL https://postil.dev/install.sh | sh
 cargo install --git https://github.com/postil-dev/postil-cli --locked
 ```
 
+Prebuilt binaries are available for Linux (x86_64 and aarch64), macOS (Intel and Apple Silicon), and glibc and musl libc variants. The installer script automatically detects your system and platform and downloads the appropriate binary. For Alpine Linux and other musl-libc systems, the installer provides statically linked musl binaries.
+
 ## Quick start
 
 ```sh
@@ -141,7 +143,10 @@ gate:
 #   enabled: false
 model:
   name: deepseek/deepseek-v4-pro
-  cascade: [anthropic/claude-sonnet-4.6]
+  cascade:
+    - mistralai/mistral-small-3.2-24b-instruct
+    - google/gemma-3-27b-it
+    - qwen/qwen3-32b
   apiBase: https://openrouter.ai/api/v1    # ignored from config by default; see note below
   consensus: 1            # >1: only findings multiple models agree on survive
 ```
@@ -208,6 +213,10 @@ Pass `--since-sha <last-reviewed-head>` and `--baseline <previous-envelope.json>
 Postil reviews only the new commits, marks earlier findings whose code was changed as
 resolved, and carries still-open findings forward so the gate cannot be cleared by
 pushing an unrelated commit.
+
+Bitbucket incremental reviews are disabled unless
+`POSTIL_ENABLE_BITBUCKET_INCREMENTAL=1` is set. Set it only after validating the
+`/diff/{head}..{since}` compare path against the target Bitbucket deployment.
 
 ## The envelope
 

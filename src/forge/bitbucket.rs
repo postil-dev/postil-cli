@@ -7,6 +7,11 @@
 //!
 //! Checks map to commit build statuses. Bitbucket has no `neutral`, so an
 //! operational error marks the gate `FAILED` — fail closed, never grey.
+//!
+//! Incremental diffs are disabled unless `POSTIL_ENABLE_BITBUCKET_INCREMENTAL=1`
+//! is present. Bitbucket's compare endpoint uses the opposite two-dot order from
+//! `git diff`; keep the path available for verified deployments without making
+//! unverified hosted runs trust it by default.
 
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
@@ -14,6 +19,8 @@ use serde_json::json;
 
 use super::{CheckState, Forge, PrMeta, ThreadKind, check_summary, check_title};
 use crate::envelope::{Envelope, Finding};
+
+const ENABLE_INCREMENTAL_ENV: &str = "POSTIL_ENABLE_BITBUCKET_INCREMENTAL";
 
 pub struct Bitbucket {
     http: reqwest::Client,
@@ -202,11 +209,16 @@ impl Forge for Bitbucket {
     }
 
     async fn fetch_diff_since(&self, since_sha: &str, head_sha: &str) -> Result<String> {
-        // Bitbucket's `diff/{spec}` two-dot form is `{to}..{from}`: it renders the
-        // changes that take the repo from `from` to `to`. We want everything new
-        // between `since` and `head`, so `to` = head and `from` = since. Atlassian's
-        // docs are ambiguous on the order and we have no live instance in CI, so
-        // this ordering is best-evidence, not verified end to end — see ROADMAP.
+        if std::env::var(ENABLE_INCREMENTAL_ENV).as_deref() != Ok("1") {
+            return Err(anyhow!(
+                "Bitbucket incremental review is disabled because the compare-diff path has \
+                 not been verified for this deployment; set {ENABLE_INCREMENTAL_ENV}=1 only \
+                 after validating /diff/{{head}}..{{since}} against the target Bitbucket API"
+            ));
+        }
+        // Bitbucket's `diff/{spec}` two-dot form is `{to}..{from}`: it renders
+        // the changes that take the repo from `from` to `to`. We want everything
+        // new between `since` and `head`, so `to` = head and `from` = since.
         let resp = self
             .request(
                 reqwest::Method::GET,

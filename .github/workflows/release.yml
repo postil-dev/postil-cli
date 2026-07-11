@@ -17,6 +17,10 @@ jobs:
             musl: true
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            # musl support for ARM64 targets Alpine and other musl-libc systems on ARM.
+            musl: true
           - target: x86_64-apple-darwin
             # macos-13 (the last plain Intel image) was retired in Dec 2025;
             # macos-15-intel is the designated replacement.
@@ -75,7 +79,7 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # Single fan-in publisher: four matrix legs racing to create the same
+  # Single fan-in publisher: six matrix legs racing to create the same
   # release is a known 422 flake in action-gh-release.
   release:
     needs: build
