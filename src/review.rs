@@ -14,7 +14,7 @@ use crate::forge::{
 };
 use crate::llm::LlmClient;
 use crate::local::{self, LocalSource};
-use crate::output;
+use crate::output::{self, OutputFormat};
 use crate::prompt::{self, PrContext};
 
 const MAX_DIFF_BYTES: usize = 400_000;
@@ -46,12 +46,24 @@ pub struct ReviewArgs {
     pub gate_check_run_id: Option<String>,
     pub since_sha: Option<String>,
     pub baseline: Option<PathBuf>,
+    pub output: Option<OutputFormat>,
+    pub output_file: Option<PathBuf>,
     pub output_json: bool,
     pub sarif: Option<PathBuf>,
     pub fail_on: Option<String>,
     pub config: Option<PathBuf>,
     pub model: Option<String>,
     pub no_post: bool,
+}
+
+impl ReviewArgs {
+    fn resolved_output_format(&self) -> Option<OutputFormat> {
+        if self.output_json {
+            Some(OutputFormat::Json)
+        } else {
+            self.output
+        }
+    }
 }
 
 struct ReviewInput<'a> {
@@ -66,6 +78,12 @@ struct ReviewInput<'a> {
 
 pub async fn run(args: ReviewArgs) -> Result<i32> {
     let cwd = std::env::current_dir()?;
+    if args.output_json {
+        eprintln!("warning: --output-json is deprecated; use --output json instead");
+    }
+    if args.output_file.is_some() && args.resolved_output_format().is_none() {
+        return Err(anyhow!("--output-file requires --output or --output-json"));
+    }
     let mut cfg = Config::load(&cwd, args.config.as_deref())?;
     if let Some(m) = &args.model {
         cfg.model = m.clone();
@@ -565,9 +583,10 @@ async fn finish<F: Forge>(
             .with_context(|| format!("writing SARIF to {}", path.display()))?;
     }
 
-    if args.output_json {
-        output::print_envelope_json(&envelope)?;
-    } else {
+    if let Some(format) = args.resolved_output_format() {
+        output::write_envelope(&envelope, format, args.output_file.as_deref())?;
+    }
+    if args.resolved_output_format().is_none() || args.output_file.is_some() {
         output::print_pretty(&envelope);
     }
 

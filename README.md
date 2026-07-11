@@ -185,7 +185,7 @@ postil doctor
 POSTIL_API_BASE=http://localhost:8000/v1 \
 MODEL_API_KEY=local \
 REVIEW_MODEL=<served-model-name> \
-postil review --staged --output-json
+postil review --staged --output json
 ```
 
 Use the live benchmark harness before standardizing on a model:
@@ -203,7 +203,7 @@ would change — which findings would be suppressed and which gate outcomes woul
 Deterministic, no model calls.
 
 ```sh
-postil review --staged --output-json > .cache/envelopes/r1.json
+postil review --staged --output json > .cache/envelopes/r1.json
 postil plan --envelopes .cache/envelopes --config .postil.candidate.yaml
 ```
 
@@ -220,9 +220,12 @@ Bitbucket incremental reviews are disabled unless
 
 ## The envelope
 
-`--output-json` prints a stable versioned envelope (`summary`, `silent`, `findings`,
+`--output json` prints a stable versioned envelope (`summary`, `silent`, `findings`,
 `resolved`, `counts`, `confidenceBuckets`, `gate`, `modelUsed`, `usage`, SHAs) consumed
-by the hosted platform and `postil plan`. Schema: [postil.dev/docs/envelope](https://postil.dev/docs/envelope).
+by the hosted platform and `postil plan`. `--output yaml` and `--output csv` print the
+same review result in YAML or CSV. `--output-file <path>` writes the selected format to
+a file instead of stdout. `--output-json` is deprecated in v0.2.1 as an alias for
+`--output json` and emits a stderr warning. Schema: [postil.dev/docs/envelope](https://postil.dev/docs/envelope).
 
 Exit codes: `0` clean or below gate threshold, `1` gate-failing findings, `2`
 operational error.

@@ -352,7 +352,7 @@ function pct(v: number): string {
 }
 
 function usd(v: number): string {
-  return `$${v.toFixed(6)}`;
+  return `$${v.toFixed(4)}`;
 }
 
 function pad(s: string, width: number): string {

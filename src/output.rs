@@ -1,15 +1,120 @@
-//! Terminal rendering. JSON mode prints the envelope alone on stdout;
-//! human chatter goes to stderr so pipelines stay clean.
+//! Terminal rendering. Machine output prints the envelope alone on stdout or
+//! writes it to the requested file; human chatter goes to stderr so pipelines
+//! stay clean.
 
 use std::io::IsTerminal;
+use std::path::Path;
 
+use anyhow::Context;
+use clap::ValueEnum;
 use owo_colors::OwoColorize;
 
 use crate::envelope::{Envelope, Severity};
 
-pub fn print_envelope_json(envelope: &Envelope) -> anyhow::Result<()> {
-    println!("{}", serde_json::to_string_pretty(envelope)?);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OutputFormat {
+    Json,
+    Yaml,
+    Csv,
+}
+
+pub fn write_envelope(
+    envelope: &Envelope,
+    format: OutputFormat,
+    path: Option<&Path>,
+) -> anyhow::Result<()> {
+    let rendered = render_envelope(envelope, format)?;
+    if let Some(path) = path {
+        std::fs::write(path, rendered)
+            .with_context(|| format!("writing {} output to {}", format.as_str(), path.display()))?;
+    } else {
+        print!("{rendered}");
+    }
     Ok(())
+}
+
+impl OutputFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OutputFormat::Json => "json",
+            OutputFormat::Yaml => "yaml",
+            OutputFormat::Csv => "csv",
+        }
+    }
+}
+
+fn render_envelope(envelope: &Envelope, format: OutputFormat) -> anyhow::Result<String> {
+    Ok(match format {
+        OutputFormat::Json => format!("{}\n", serde_json::to_string_pretty(envelope)?),
+        OutputFormat::Yaml => serde_yaml::to_string(envelope)?,
+        OutputFormat::Csv => render_csv(envelope),
+    })
+}
+
+fn render_csv(envelope: &Envelope) -> String {
+    let mut out = String::from(
+        "version,silent,summary,path,line,endLine,severity,kind,confidence,title,body,\
+         gateFailOn,gateFailing,modelUsed,promptTokens,completionTokens,durationMs,baseSha,\
+         headSha,sinceSha\n",
+    );
+    if envelope.findings.is_empty() {
+        push_csv_row(&mut out, envelope, None);
+    } else {
+        for finding in &envelope.findings {
+            push_csv_row(&mut out, envelope, Some(finding));
+        }
+    }
+    out
+}
+
+fn push_csv_row(out: &mut String, envelope: &Envelope, finding: Option<&crate::envelope::Finding>) {
+    let mut fields = vec![
+        envelope.version.to_string(),
+        envelope.silent.to_string(),
+        envelope.summary.clone(),
+    ];
+    if let Some(finding) = finding {
+        fields.extend([
+            finding.path.clone(),
+            finding.line.to_string(),
+            finding.end_line.map(|l| l.to_string()).unwrap_or_default(),
+            finding.severity.as_str().to_string(),
+            finding.kind.as_str().to_string(),
+            finding.confidence.to_string(),
+            finding.title.clone(),
+            finding.body.clone(),
+        ]);
+    } else {
+        fields.extend(std::iter::repeat_n(String::new(), 8));
+    }
+    fields.extend([
+        envelope.gate.fail_on.clone(),
+        envelope.gate.failing.to_string(),
+        envelope.model_used.clone(),
+        envelope.usage.prompt_tokens.to_string(),
+        envelope.usage.completion_tokens.to_string(),
+        envelope.duration_ms.to_string(),
+        envelope.base_sha.clone().unwrap_or_default(),
+        envelope.head_sha.clone().unwrap_or_default(),
+        envelope.since_sha.clone().unwrap_or_default(),
+    ]);
+    out.push_str(
+        &fields
+            .into_iter()
+            .map(csv_field)
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    out.push('\n');
+}
+
+fn csv_field(field: String) -> String {
+    let field = sanitize(&field);
+    if field.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", field.replace('"', "\"\""))
+    } else {
+        field
+    }
 }
 
 pub fn print_pretty(envelope: &Envelope) {
@@ -180,5 +285,12 @@ mod tests {
         );
         assert!(out.contains("hijacked title"));
         assert!(out.contains("FAKE ALL CLEAR"));
+    }
+
+    #[test]
+    fn csv_field_strips_terminal_controls_before_quoting() {
+        let field = csv_field("\x1b[31mred\x1b[0m,\"quoted\"\nnext".into());
+        assert_eq!(field, "\"[31mred[0m,\"\"quoted\"\"\nnext\"");
+        assert!(!field.contains('\x1b'));
     }
 }

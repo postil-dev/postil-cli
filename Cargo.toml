@@ -28,6 +28,7 @@ tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "process"
 
 [dev-dependencies]
 assert_cmd = "2.2.2"
+csv = "1.4.0"
 predicates = "3.1.4"
 tempfile = "3.27.0"
 wiremock = "0.6.5"

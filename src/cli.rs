@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+use crate::output::OutputFormat;
+
 #[derive(Parser)]
 #[command(
     name = "postil",
@@ -66,8 +68,14 @@ pub enum Command {
         /// Previous review envelope for finding reconciliation.
         #[arg(long)]
         baseline: Option<PathBuf>,
-        /// Print the envelope JSON on stdout (machine consumers).
+        /// Print the review envelope in this format on stdout: json, yaml, or csv.
+        #[arg(long, value_enum)]
+        output: Option<OutputFormat>,
+        /// Write --output or --output-json data to this path instead of stdout.
         #[arg(long)]
+        output_file: Option<PathBuf>,
+        /// Deprecated in v0.2.1: use --output json. Prints the envelope JSON.
+        #[arg(long, conflicts_with = "output")]
         output_json: bool,
         /// Write SARIF 2.1.0 to this path for code-scanning ingestion.
         #[arg(long)]
