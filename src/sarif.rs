@@ -128,7 +128,7 @@ mod tests {
             gate: Gate {
                 fail_on: "error".into(),
                 failing: true,
-            block_on_kinds: vec![],
+                block_on_kinds: vec![],
             },
             model_used: "m".into(),
             usage: Usage::default(),
@@ -150,7 +150,7 @@ mod tests {
             confidence: 0.9,
             title: "Bug".into(),
             body: "details".into(),
-        id: None,
+            id: None,
         };
         let s = to_sarif(&env_with(vec![f]));
         let r = &s["runs"][0]["results"][0];

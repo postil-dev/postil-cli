@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::envelope::{Severity, Kind};
+use crate::envelope::{Kind, Severity};
 
 pub const DEFAULT_MODEL: &str = "deepseek/deepseek-v4-pro";
 pub const DEFAULT_CASCADE: [&str; 3] = [

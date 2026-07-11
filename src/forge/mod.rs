@@ -326,7 +326,7 @@ mod tests {
             confidence: 0.91,
             title: "Unsanitized input reaches query".into(),
             body: "user_input flows into exec_query.".into(),
-        id: None,
+            id: None,
         }
     }
 
@@ -377,7 +377,7 @@ mod tests {
             gate: crate::envelope::Gate {
                 fail_on: "error".into(),
                 failing: false,
-            block_on_kinds: vec![],
+                block_on_kinds: vec![],
             },
             model_used: "m".into(),
             usage: Default::default(),
@@ -403,7 +403,7 @@ mod tests {
             gate: crate::envelope::Gate {
                 fail_on: "error".into(),
                 failing: false,
-            block_on_kinds: vec![],
+                block_on_kinds: vec![],
             },
             model_used: "none (disabled by config)".into(),
             usage: Default::default(),
