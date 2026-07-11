@@ -7,6 +7,8 @@
 // `disallowedSources` assertions for fixture metadata or prompt-injection text
 // that the reviewer must not adopt.
 
+import crypto from "crypto";
+
 import type { BenchmarkCaseInput } from "../src/harness";
 
 type DisallowedSource =
@@ -46,7 +48,11 @@ type FixtureSpec = {
 const repoFullName = "benchmark/example-fixtures";
 
 function makeHeadSha(seed: number): string {
-  return seed.toString(16).padStart(2, "0").repeat(20).slice(0, 40);
+  return crypto
+    .createHash("sha1")
+    .update(seed.toString())
+    .digest("hex")
+    .slice(0, 40);
 }
 
 function makeDiff(path: string, hunks: FixtureHunk[]): string {
