@@ -19,6 +19,10 @@ on:
         description: Abort if the projected upper-bound total cost exceeds this many USD
         required: false
         default: "15"
+      scorer_model:
+        description: Optional REVIEW_SCORER_MODEL override for scorer validation
+        required: false
+        default: ""
 
 concurrency:
   group: bench-live
@@ -56,6 +60,7 @@ jobs:
         working-directory: bench
         env:
           POSTIL_BENCH_MODE: live
+          REVIEW_SCORER_MODEL: ${{ inputs.scorer_model }}
           POSTIL_API_KEY: ${{ secrets.POSTIL_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
@@ -106,4 +111,12 @@ jobs:
         with:
           name: bench-live-report
           path: bench-live-report.json
+          if-no-files-found: warn
+
+      - name: Upload raw run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-live-raw-runs
+          path: bench/.runs/live-models
           if-no-files-found: warn
