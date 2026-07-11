@@ -16,6 +16,11 @@ use serde::{Deserialize, Serialize};
 use crate::envelope::Severity;
 
 pub const DEFAULT_MODEL: &str = "deepseek/deepseek-v4-pro";
+pub const DEFAULT_CASCADE: [&str; 3] = [
+    "mistralai/mistral-small-3.2-24b-instruct",
+    "google/gemma-3-27b-it",
+    "qwen/qwen3-32b",
+];
 pub const DEFAULT_API_BASE: &str = "https://openrouter.ai/api/v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,7 +123,7 @@ impl Default for Config {
             gate_fail_on: GateLevel::Severity(Severity::Error),
             gate_on_error: OnError::Block,
             model: DEFAULT_MODEL.to_string(),
-            cascade: Vec::new(),
+            cascade: DEFAULT_CASCADE.iter().map(|m| (*m).to_string()).collect(),
             api_base: DEFAULT_API_BASE.to_string(),
             consensus: 1,
             guardrails: None,
@@ -464,8 +469,10 @@ gate:
 
 model:
   name: deepseek/deepseek-v4-pro
-  # cascade:
-  #   - anthropic/claude-sonnet-4.6
+  cascade:
+    - mistralai/mistral-small-3.2-24b-instruct
+    - google/gemma-3-27b-it
+    - qwen/qwen3-32b
   # apiBase: https://openrouter.ai/api/v1   # any OpenAI-compatible endpoint (Ollama, vLLM, Azure).
   #                                         # Ignored from config by default (a repo could redirect
   #                                         # the inference credential). Prefer POSTIL_API_BASE; to
@@ -546,6 +553,10 @@ mod tests {
         f.write_all(content.as_bytes()).unwrap();
     }
 
+    fn default_cascade() -> Vec<String> {
+        DEFAULT_CASCADE.iter().map(|m| (*m).to_string()).collect()
+    }
+
     #[test]
     fn defaults_are_low_noise() {
         let c = Config::default();
@@ -555,6 +566,22 @@ mod tests {
             c.gate_fail_on,
             GateLevel::Severity(Severity::Error)
         ));
+    }
+
+    #[test]
+    fn defaults_keep_primary_and_retry_roster_order() {
+        let c = Config::default();
+        assert_eq!(c.model, DEFAULT_MODEL);
+        assert_eq!(c.cascade, default_cascade());
+        assert_eq!(
+            c.model_chain(),
+            vec![
+                "deepseek/deepseek-v4-pro",
+                "mistralai/mistral-small-3.2-24b-instruct",
+                "google/gemma-3-27b-it",
+                "qwen/qwen3-32b",
+            ]
+        );
     }
 
     #[test]
@@ -598,6 +625,8 @@ mod tests {
         let mut c = Config::default();
         c.apply_file(f).unwrap();
         assert_eq!(c.max_findings, 20);
+        assert_eq!(c.model, DEFAULT_MODEL);
+        assert_eq!(c.cascade, default_cascade());
     }
 
     #[test]
