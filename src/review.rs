@@ -29,6 +29,10 @@ const MAX_DIFF_BYTES: usize = 400_000;
 const MAX_RAW_DIFF_BYTES: usize = MAX_DIFF_BYTES * 4;
 const HOSTED_WORKER_WATCHDOG_SECS: u64 = 600;
 pub(crate) const HOSTED_LLM_TOTAL_TIMEOUT_SECS: u64 = 540;
+/// 540s total minus a 120s scorer reserve, leaving the cascade room to try
+/// every roster model once (4 models * 120s = 480s) before the total budget
+/// itself would have expired anyway.
+pub(crate) const HOSTED_LLM_REQUEST_TIMEOUT_SECS: u64 = 420;
 const FORGE_READ_TIMEOUT_SECS: u64 = 60;
 const CHECK_START_TIMEOUT_SECS: u64 = 30;
 const CHECK_COMPLETION_TIMEOUT_SECS: u64 = 30;
@@ -641,6 +645,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
             Some(started_at) => LlmClient::from_env_for_remote_review(
                 cfg,
                 started_at,
+                Duration::from_secs(HOSTED_LLM_REQUEST_TIMEOUT_SECS),
                 Duration::from_secs(HOSTED_LLM_TOTAL_TIMEOUT_SECS),
             )?,
             None => LlmClient::from_env(cfg)?,
@@ -1081,7 +1086,7 @@ mod tests {
         // LLM/scorer time before the client is constructed.
         assert_eq!(
             HOSTED_LLM_TOTAL_TIMEOUT_SECS,
-            crate::llm::DEFAULT_REQUEST_TIMEOUT_SECS + SCORER_TIMEOUT_SECS
+            HOSTED_LLM_REQUEST_TIMEOUT_SECS + SCORER_TIMEOUT_SECS
         );
         assert_eq!(
             HOSTED_WORKER_WATCHDOG_SECS - HOSTED_LLM_TOTAL_TIMEOUT_SECS,

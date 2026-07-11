@@ -141,7 +141,7 @@ const TRANSIENT_RETRIES: u32 = 2;
 /// use their provider default.
 const REVIEW_MAX_TOKENS: u32 = 16384;
 const SCORER_MAX_TOKENS: u32 = 4096;
-pub(crate) const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 420;
+pub(crate) const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 480;
 const REQUEST_TIMEOUT_ENV: &str = "POSTIL_LLM_REQUEST_TIMEOUT_SECS";
 const TOTAL_TIMEOUT_ENV: &str = "POSTIL_LLM_TOTAL_TIMEOUT_SECS";
 
@@ -168,7 +168,7 @@ impl LlmClient {
     /// get one when POSTIL_LLM_TOTAL_TIMEOUT_SECS is explicitly set.
     pub fn from_env(cfg: &Config) -> Result<Self> {
         let api_key = resolve_api_key()?;
-        let timeouts = LlmTimeouts::from_env(None)?;
+        let timeouts = LlmTimeouts::from_env(DEFAULT_REQUEST_TIMEOUT_SECS, None)?;
         let total_deadline = timeouts.total.map(|duration| Instant::now() + duration);
         Self::build(cfg, api_key, timeouts.request, total_deadline)
     }
@@ -176,10 +176,14 @@ impl LlmClient {
     pub(crate) fn from_env_for_remote_review(
         cfg: &Config,
         total_budget_started_at: Instant,
+        default_request_timeout: Duration,
         default_total_timeout: Duration,
     ) -> Result<Self> {
         let api_key = resolve_api_key()?;
-        let timeouts = LlmTimeouts::from_env(Some(default_total_timeout.as_secs()))?;
+        let timeouts = LlmTimeouts::from_env(
+            default_request_timeout.as_secs(),
+            Some(default_total_timeout.as_secs()),
+        )?;
         let total_deadline = timeouts
             .total
             .map(|duration| total_budget_started_at + duration);
@@ -581,8 +585,8 @@ impl LlmClient {
 }
 
 impl LlmTimeouts {
-    fn from_env(total_default_secs: Option<u64>) -> Result<Self> {
-        let request = duration_from_env(REQUEST_TIMEOUT_ENV, Some(DEFAULT_REQUEST_TIMEOUT_SECS))?
+    fn from_env(request_default_secs: u64, total_default_secs: Option<u64>) -> Result<Self> {
+        let request = duration_from_env(REQUEST_TIMEOUT_ENV, Some(request_default_secs))?
             .expect("default request timeout is always set");
         let total = duration_from_env(TOTAL_TIMEOUT_ENV, total_default_secs)?;
         Ok(Self { request, total })
@@ -938,6 +942,7 @@ mod tests {
         let client = LlmClient::from_env_for_remote_review(
             &Config::default(),
             Instant::now(),
+            Duration::from_secs(crate::review::HOSTED_LLM_REQUEST_TIMEOUT_SECS),
             Duration::from_secs(crate::review::HOSTED_LLM_TOTAL_TIMEOUT_SECS),
         )
         .unwrap();
@@ -961,18 +966,41 @@ mod tests {
     }
 
     #[test]
+    fn local_from_env_keeps_the_original_480s_request_timeout() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvRestore::capture(&[REQUEST_TIMEOUT_ENV, TOTAL_TIMEOUT_ENV]);
+        EnvRestore::remove(REQUEST_TIMEOUT_ENV);
+        EnvRestore::remove(TOTAL_TIMEOUT_ENV);
+
+        // The hosted path uses a shorter per-request timeout (420s) to fit the
+        // scorer and margin inside its total budget. Local/interactive runs have
+        // no total budget by default and must keep the original, more generous
+        // request timeout rather than inherit the hosted-tuned value.
+        let timeouts = LlmTimeouts::from_env(DEFAULT_REQUEST_TIMEOUT_SECS, None).unwrap();
+
+        assert_eq!(timeouts.request, Duration::from_secs(480));
+        assert_ne!(
+            timeouts.request,
+            Duration::from_secs(crate::review::HOSTED_LLM_REQUEST_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
     fn default_timeout_profile_sets_no_setup_scorer_window_and_worker_margin() {
         let _lock = env_lock().lock().unwrap();
         let _env = EnvRestore::capture(&[REQUEST_TIMEOUT_ENV, TOTAL_TIMEOUT_ENV]);
         EnvRestore::remove(REQUEST_TIMEOUT_ENV);
         EnvRestore::remove(TOTAL_TIMEOUT_ENV);
 
-        let timeouts =
-            LlmTimeouts::from_env(Some(crate::review::HOSTED_LLM_TOTAL_TIMEOUT_SECS)).unwrap();
+        let timeouts = LlmTimeouts::from_env(
+            crate::review::HOSTED_LLM_REQUEST_TIMEOUT_SECS,
+            Some(crate::review::HOSTED_LLM_TOTAL_TIMEOUT_SECS),
+        )
+        .unwrap();
 
         assert_eq!(
             timeouts.request,
-            Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS)
+            Duration::from_secs(crate::review::HOSTED_LLM_REQUEST_TIMEOUT_SECS)
         );
         assert_eq!(
             timeouts.total,
@@ -1003,6 +1031,7 @@ mod tests {
         let client = LlmClient::from_env_for_remote_review(
             &Config::default(),
             started_at,
+            Duration::from_secs(crate::review::HOSTED_LLM_REQUEST_TIMEOUT_SECS),
             Duration::from_secs(crate::review::HOSTED_LLM_TOTAL_TIMEOUT_SECS),
         )
         .unwrap();
