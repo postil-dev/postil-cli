@@ -209,6 +209,10 @@ Postil reviews only the new commits, marks earlier findings whose code was chang
 resolved, and carries still-open findings forward so the gate cannot be cleared by
 pushing an unrelated commit.
 
+Bitbucket incremental reviews are disabled unless
+`POSTIL_ENABLE_BITBUCKET_INCREMENTAL=1` is set. Set it only after validating the
+`/diff/{head}..{since}` compare path against the target Bitbucket deployment.
+
 ## The envelope
 
 `--output-json` prints a stable versioned envelope (`summary`, `silent`, `findings`,
