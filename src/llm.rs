@@ -4,6 +4,8 @@
 //! Works against OpenRouter (default), Ollama, vLLM, LiteLLM, Azure OpenAI, or
 //! any other endpoint that speaks `POST {base}/chat/completions`.
 
+use std::time::{Duration, Instant};
+
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use serde_json::json;
@@ -121,6 +123,7 @@ pub struct LlmClient {
     http: reqwest::Client,
     api_base: String,
     api_key: String,
+    total_deadline: Option<Instant>,
 }
 
 /// Retries per model on transient provider errors before the cascade moves on.
@@ -132,6 +135,9 @@ const TRANSIENT_RETRIES: u32 = 2;
 /// use their provider default.
 const REVIEW_MAX_TOKENS: u32 = 16384;
 const SCORER_MAX_TOKENS: u32 = 4096;
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 600;
+const REQUEST_TIMEOUT_ENV: &str = "POSTIL_LLM_REQUEST_TIMEOUT_SECS";
+const TOTAL_TIMEOUT_ENV: &str = "POSTIL_LLM_TOTAL_TIMEOUT_SECS";
 
 /// Marker context attached to transport/provider-level failures (endpoint
 /// unreachable, HTTP error status, timeout, malformed HTTP envelope) — the
@@ -159,14 +165,19 @@ impl LlmClient {
                 "no API key: set {key_names}. Postil never proxies your inference; bring your own key."
             )
         })?;
+        let request_timeout =
+            duration_from_env(REQUEST_TIMEOUT_ENV, Some(DEFAULT_REQUEST_TIMEOUT_SECS))?
+                .expect("default request timeout is always set");
+        let total_timeout = duration_from_env(TOTAL_TIMEOUT_ENV, None)?;
         Ok(LlmClient {
             http: reqwest::Client::builder()
                 // Generation time scales with diff size; a thorough review of a
                 // truncation-limit diff can exceed 3 minutes of streaming.
-                .timeout(std::time::Duration::from_secs(600))
+                .timeout(request_timeout)
                 .build()?,
             api_base: cfg.api_base.trim_end_matches('/').to_string(),
             api_key,
+            total_deadline: total_timeout.map(|duration| Instant::now() + duration),
         })
     }
 
@@ -452,19 +463,33 @@ impl LlmClient {
         let mut attempt = 0u32;
         let text = loop {
             attempt += 1;
-            let sent = self
+            let request = self
                 .http
                 .post(format!("{}/chat/completions", self.api_base))
                 .bearer_auth(&self.api_key)
                 .header("HTTP-Referer", "https://postil.dev")
                 .header("X-Title", "Postil")
                 .json(&body)
-                .send()
-                .await;
+                .send();
+            let sent = match self.remaining_total_budget()? {
+                Some(remaining) => match tokio::time::timeout(remaining, request).await {
+                    Ok(result) => result,
+                    Err(_) => return Err(anyhow!("LLM total timeout exceeded")),
+                },
+                None => request.await,
+            };
             match sent {
                 Ok(resp) => {
                     let status = resp.status();
-                    let text = resp.text().await.context("reading model response")?;
+                    let body = resp.text();
+                    let text = match self.remaining_total_budget()? {
+                        Some(remaining) => match tokio::time::timeout(remaining, body).await {
+                            Ok(result) => result,
+                            Err(_) => return Err(anyhow!("LLM total timeout exceeded")),
+                        },
+                        None => body.await,
+                    }
+                    .context("reading model response")?;
                     if status.is_success() {
                         break text;
                     }
@@ -476,7 +501,7 @@ impl LlmClient {
                              (attempt {attempt}/{TRANSIENT_RETRIES})",
                             wait.as_secs()
                         );
-                        tokio::time::sleep(wait).await;
+                        self.sleep_with_total_budget(wait).await?;
                         continue;
                     }
                     return Err(anyhow!("model endpoint returned {status}: {snippet}"));
@@ -484,7 +509,10 @@ impl LlmClient {
                 // Connection-level failures retry too; timeouts do not (the
                 // request already waited the full budget).
                 Err(e) if e.is_connect() && attempt <= TRANSIENT_RETRIES => {
-                    tokio::time::sleep(std::time::Duration::from_secs(2 * attempt as u64)).await;
+                    self.sleep_with_total_budget(std::time::Duration::from_secs(
+                        2 * attempt as u64,
+                    ))
+                    .await?;
                 }
                 Err(e) => {
                     return Err(anyhow::Error::from(e).context("request to model endpoint failed"));
@@ -504,6 +532,45 @@ impl LlmClient {
             .and_then(|c| c.message.content)
             .ok_or_else(|| anyhow!("model response had no choices/content"))
     }
+
+    fn remaining_total_budget(&self) -> Result<Option<Duration>> {
+        let Some(deadline) = self.total_deadline else {
+            return Ok(None);
+        };
+        deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .map(Some)
+            .ok_or_else(|| anyhow!("LLM total timeout exceeded"))
+    }
+
+    async fn sleep_with_total_budget(&self, duration: Duration) -> Result<()> {
+        let Some(remaining) = self.remaining_total_budget()? else {
+            tokio::time::sleep(duration).await;
+            return Ok(());
+        };
+        if remaining <= duration {
+            return Err(anyhow!("LLM total timeout exceeded"));
+        }
+        tokio::time::sleep(duration).await;
+        Ok(())
+    }
+}
+
+fn duration_from_env(name: &str, default_secs: Option<u64>) -> Result<Option<Duration>> {
+    let Some(raw) = std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(default_secs.map(Duration::from_secs));
+    };
+    let seconds = raw
+        .parse::<u64>()
+        .with_context(|| format!("{name} must be a positive integer number of seconds"))?;
+    if seconds == 0 {
+        return Err(anyhow!("{name} must be greater than zero"));
+    }
+    Ok(Some(Duration::from_secs(seconds)))
 }
 
 #[derive(Debug, Deserialize)]

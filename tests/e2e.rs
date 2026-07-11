@@ -101,6 +101,8 @@ fn postil() -> Command {
     cmd.env_remove("REVIEW_MODEL")
         .env_remove("REVIEW_MODEL_CASCADE")
         .env_remove("REVIEW_SCORER_MODEL")
+        .env_remove("POSTIL_LLM_REQUEST_TIMEOUT_SECS")
+        .env_remove("POSTIL_LLM_TOTAL_TIMEOUT_SECS")
         .env_remove("MODEL_API_KEY")
         .env_remove("LLM_API_KEY")
         .env_remove("OPENROUTER_API_KEY")
@@ -1211,6 +1213,91 @@ async fn cascade_falls_back_to_next_model() {
     let env: Value =
         serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
     assert_eq!(env["modelUsed"], "backup-model");
+}
+
+#[tokio::test]
+async fn slow_model_request_times_out_and_falls_back() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(wiremock::matchers::body_string_contains("primary-model"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(1500))
+                .set_body_json(llm_content(json!([]))),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(wiremock::matchers::body_string_contains("backup-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_LLM_REQUEST_TIMEOUT_SECS", "1")
+        .env("REVIEW_MODEL", "primary-model")
+        .env("REVIEW_MODEL_CASCADE", "backup-model")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .code(0);
+    let env: Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+    assert_eq!(env["modelUsed"], "backup-model");
+}
+
+#[tokio::test]
+async fn total_llm_timeout_caps_the_cascade() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(wiremock::matchers::body_string_contains("primary-model"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(1500))
+                .set_body_json(llm_content(json!([]))),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(wiremock::matchers::body_string_contains("backup-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_LLM_REQUEST_TIMEOUT_SECS", "5")
+        .env("POSTIL_LLM_TOTAL_TIMEOUT_SECS", "1")
+        .env("REVIEW_MODEL", "primary-model")
+        .env("REVIEW_MODEL_CASCADE", "backup-model")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .code(1);
+    let env: Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+    assert_eq!(env["findings"][0]["path"], ".postil/provider");
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let model = requests[0].body_json::<Value>().unwrap()["model"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(model, "primary-model");
 }
 
 #[tokio::test]
