@@ -10,7 +10,7 @@ on:
         description: Comma-separated OpenRouter model ids
         required: true
         default: >-
-          deepseek/deepseek-v4-pro,moonshotai/kimi-k2.6,qwen/qwen3-32b,mistralai/mistral-small-3.2-24b-instruct,google/gemma-3-27b-it
+          deepseek/deepseek-v4-pro,google/gemini-3.1-flash-lite,moonshotai/kimi-k2.7-code,mistralai/mistral-large-2512
       cases:
         description: Case selection (currently informational; "all" runs the full set)
         required: false

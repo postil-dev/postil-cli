@@ -1172,12 +1172,12 @@ async fn garbage_output_fails_closed_after_repair_attempt() {
         vec![
             "deepseek/deepseek-v4-pro",
             "deepseek/deepseek-v4-pro",
-            "mistralai/mistral-small-3.2-24b-instruct",
-            "mistralai/mistral-small-3.2-24b-instruct",
-            "google/gemma-3-27b-it",
-            "google/gemma-3-27b-it",
-            "qwen/qwen3-32b",
-            "qwen/qwen3-32b",
+            "google/gemini-3.1-flash-lite",
+            "google/gemini-3.1-flash-lite",
+            "moonshotai/kimi-k2.7-code",
+            "moonshotai/kimi-k2.7-code",
+            "mistralai/mistral-large-2512",
+            "mistralai/mistral-large-2512",
         ]
     );
 }
