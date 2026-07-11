@@ -74,7 +74,7 @@ pub enum Command {
         /// Write --output or --output-json data to this path instead of stdout.
         #[arg(long)]
         output_file: Option<PathBuf>,
-        /// Deprecated: use --output json. Prints the envelope JSON for one release.
+        /// Deprecated in v0.2.1: use --output json. Prints the envelope JSON.
         #[arg(long, conflicts_with = "output")]
         output_json: bool,
         /// Write SARIF 2.1.0 to this path for code-scanning ingestion.

@@ -1,5 +1,7 @@
 //! End-to-end tests: the real binary against mocked LLM and forge endpoints.
 
+use std::collections::BTreeMap;
+
 use assert_cmd::Command;
 use serde_json::{Value, json};
 use wiremock::matchers::{header, method, path, path_regex, query_param};
@@ -62,6 +64,18 @@ fn finding_at(line: u32, severity: &str, confidence: f64) -> Value {
     })
 }
 
+fn finding_with_text(line: u32, severity: &str, confidence: f64, title: &str, body: &str) -> Value {
+    json!({
+        "path": "src/auth.rs",
+        "line": line,
+        "severity": severity,
+        "kind": "risk",
+        "confidence": confidence,
+        "title": title,
+        "body": body
+    })
+}
+
 fn postil() -> Command {
     let mut cmd = Command::cargo_bin("postil").unwrap();
     // Isolate from developer environment and repo config discovery.
@@ -82,6 +96,21 @@ fn write_diff(dir: &std::path::Path) -> std::path::PathBuf {
     let p = dir.join("change.diff");
     std::fs::write(&p, DIFF).unwrap();
     p
+}
+
+fn parse_csv_rows(csv: &str) -> Vec<BTreeMap<String, String>> {
+    let mut reader = csv::Reader::from_reader(csv.as_bytes());
+    let headers = reader.headers().unwrap().clone();
+    reader
+        .records()
+        .map(|record| {
+            headers
+                .iter()
+                .zip(record.unwrap().iter())
+                .map(|(header, value)| (header.to_string(), value.to_string()))
+                .collect()
+        })
+        .collect()
 }
 
 async fn mock_review(server: &MockServer, findings: Value) {
@@ -145,25 +174,70 @@ async fn local_review_prints_yaml_output() {
 }
 
 #[tokio::test]
-async fn local_review_prints_csv_output() {
+async fn local_review_writes_csv_output_file_with_multiple_escaped_findings() {
     let server = MockServer::start().await;
-    mock_review(&server, json!([finding_at(41, "warn", 0.88)])).await;
+    mock_review(
+        &server,
+        json!([
+            finding_with_text(
+                41,
+                "warn",
+                0.88,
+                "Comma, quote \"and\" newline\nin title",
+                "First body has a comma, a \"quote\", and a newline\nsecond line."
+            ),
+            finding_with_text(
+                42,
+                "info",
+                0.77,
+                "Second finding",
+                "Body without CSV punctuation"
+            )
+        ]),
+    )
+    .await;
 
     let dir = tempfile::tempdir().unwrap();
     let diff = write_diff(dir.path());
+    let output = dir.path().join("review.csv");
     let out = postil()
         .current_dir(dir.path())
         .env("POSTIL_API_BASE", server.uri())
         .args(["review", "--diff-file"])
         .arg(&diff)
-        .args(["--output", "csv"])
+        .args(["--output", "csv", "--output-file"])
+        .arg(&output)
         .assert()
         .success();
 
-    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
-    assert!(stdout.starts_with("version,silent,summary,path,line,endLine,severity"));
-    assert!(stdout.contains("src/auth.rs,41,,warn,risk,0.88"));
-    assert!(stdout.contains("Unsanitized input reaches query"));
+    assert!(out.get_output().stdout.is_empty());
+    let csv = std::fs::read_to_string(output).unwrap();
+    let rows = parse_csv_rows(&csv);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["version"], "1");
+    assert_eq!(rows[0]["silent"], "false");
+    assert_eq!(rows[0]["summary"], "SQL injection risk in auth path.");
+    assert_eq!(rows[0]["path"], "src/auth.rs");
+    assert_eq!(rows[0]["line"], "41");
+    assert_eq!(rows[0]["endLine"], "");
+    assert_eq!(rows[0]["severity"], "warn");
+    assert_eq!(rows[0]["kind"], "risk");
+    assert_eq!(rows[0]["confidence"], "0.88");
+    assert_eq!(rows[0]["title"], "Comma, quote \"and\" newline\nin title");
+    assert_eq!(
+        rows[0]["body"],
+        "First body has a comma, a \"quote\", and a newline\nsecond line."
+    );
+    assert_eq!(rows[0]["gateFailOn"], "error");
+    assert_eq!(rows[0]["gateFailing"], "false");
+    assert_eq!(rows[0]["promptTokens"], "100");
+    assert_eq!(rows[0]["completionTokens"], "50");
+
+    assert_eq!(rows[1]["path"], "src/auth.rs");
+    assert_eq!(rows[1]["line"], "42");
+    assert_eq!(rows[1]["severity"], "info");
+    assert_eq!(rows[1]["title"], "Second finding");
+    assert_eq!(rows[1]["body"], "Body without CSV punctuation");
 }
 
 #[tokio::test]
@@ -228,7 +302,7 @@ fn review_help_documents_machine_output_flags() {
     assert!(stdout.contains("--output <OUTPUT>"));
     assert!(stdout.contains("--output-file <OUTPUT_FILE>"));
     assert!(stdout.contains("--output-json"));
-    assert!(stdout.contains("Deprecated: use --output json"));
+    assert!(stdout.contains("Deprecated in v0.2.1: use --output json"));
 }
 
 #[test]

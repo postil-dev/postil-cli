@@ -109,6 +109,7 @@ fn push_csv_row(out: &mut String, envelope: &Envelope, finding: Option<&crate::e
 }
 
 fn csv_field(field: String) -> String {
+    let field = sanitize(&field);
     if field.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", field.replace('"', "\"\""))
     } else {
@@ -284,5 +285,12 @@ mod tests {
         );
         assert!(out.contains("hijacked title"));
         assert!(out.contains("FAKE ALL CLEAR"));
+    }
+
+    #[test]
+    fn csv_field_strips_terminal_controls_before_quoting() {
+        let field = csv_field("\x1b[31mred\x1b[0m,\"quoted\"\nnext".into());
+        assert_eq!(field, "\"[31mred[0m,\"\"quoted\"\"\nnext\"");
+        assert!(!field.contains('\x1b'));
     }
 }

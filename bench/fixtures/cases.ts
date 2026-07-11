@@ -49,17 +49,21 @@ function makeHeadSha(seed: number): string {
   return seed.toString(16).padStart(2, "0").repeat(20).slice(0, 40);
 }
 
-function makeDiff(path: string, hunks: FixtureHunk[]): string {
+export function makeDiff(path: string, hunks: FixtureHunk[]): string {
   return [
     `diff --git a/${path} b/${path}`,
     "index 1111111..2222222 100644",
     `--- a/${path}`,
     `+++ b/${path}`,
-    ...hunks.flatMap((hunk) => [
-      `@@ -${hunk.line},1 +${hunk.line},1 @@`,
-      `- ${hunk.before}`,
-      `+ ${hunk.after}`,
-    ]),
+    ...hunks.flatMap((hunk) => {
+      const beforeLines = hunk.before.split("\n");
+      const afterLines = hunk.after.split("\n");
+      return [
+        `@@ -${hunk.line},${beforeLines.length} +${hunk.line},${afterLines.length} @@`,
+        ...beforeLines.map((line) => `- ${line}`),
+        ...afterLines.map((line) => `+ ${line}`),
+      ];
+    }),
     "",
   ].join("\n");
 }

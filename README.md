@@ -224,8 +224,8 @@ Bitbucket incremental reviews are disabled unless
 `resolved`, `counts`, `confidenceBuckets`, `gate`, `modelUsed`, `usage`, SHAs) consumed
 by the hosted platform and `postil plan`. `--output yaml` and `--output csv` print the
 same review result in YAML or CSV. `--output-file <path>` writes the selected format to
-a file instead of stdout. `--output-json` remains a deprecated alias for `--output json`
-for one release and emits a stderr warning. Schema: [postil.dev/docs/envelope](https://postil.dev/docs/envelope).
+a file instead of stdout. `--output-json` is deprecated in v0.2.1 as an alias for
+`--output json` and emits a stderr warning. Schema: [postil.dev/docs/envelope](https://postil.dev/docs/envelope).
 
 Exit codes: `0` clean or below gate threshold, `1` gate-failing findings, `2`
 operational error.
