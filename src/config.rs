@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::envelope::Severity;
+use crate::envelope::{Kind, Severity};
 
 pub const DEFAULT_MODEL: &str = "deepseek/deepseek-v4-pro";
 pub const DEFAULT_CASCADE: [&str; 3] = [
@@ -89,6 +89,8 @@ pub struct Config {
     pub gate_fail_on: GateLevel,
     /// Gate behavior on operational error. Default: fail closed.
     pub gate_on_error: OnError,
+    /// Finding kinds that block the gate regardless of severity. Default: [HumanEscalation].
+    pub block_on_kinds: Vec<Kind>,
     pub model: String,
     pub cascade: Vec<String>,
     pub api_base: String,
@@ -122,6 +124,7 @@ impl Default for Config {
             on_clean: OnClean::Skip,
             gate_fail_on: GateLevel::Severity(Severity::Error),
             gate_on_error: OnError::Block,
+            block_on_kinds: vec![Kind::HumanEscalation],
             model: DEFAULT_MODEL.to_string(),
             cascade: DEFAULT_CASCADE.iter().map(|m| (*m).to_string()).collect(),
             api_base: DEFAULT_API_BASE.to_string(),
@@ -169,6 +172,7 @@ pub struct ReviewSection {
 pub struct GateSection {
     pub fail_on: Option<String>,
     pub on_error: Option<OnError>,
+    pub block_on_kinds: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -304,6 +308,15 @@ impl Config {
             }
             if let Some(oe) = g.on_error {
                 self.gate_on_error = oe;
+            }
+            if let Some(kinds) = g.block_on_kinds {
+                let mut parsed_kinds = Vec::new();
+                for kind_name in kinds {
+                    parsed_kinds.push(Kind::parse(&kind_name).with_context(|| {
+                        format!("invalid gate.blockOnKinds entry {kind_name:?} (risk|humanEscalation|guardrail|uncertainty|contentPolicy)")
+                    })?);
+                }
+                self.block_on_kinds = parsed_kinds;
             }
         }
         if let Some(m) = f.model {
@@ -463,6 +476,8 @@ review:
 
 gate:
   failOn: error           # the postil/gate check fails at/above: info | warn | error | never
+  # blockOnKinds:           # finding kinds that block regardless of severity (default: [humanEscalation])
+  #   - humanEscalation
   # onError: block          # block (default, fail closed) | advisory — gate outcome when
   #                         # the review itself errors (model outage). advisory keeps an
   #                         # outage from freezing merges; the review check goes neutral, not green.

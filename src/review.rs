@@ -16,6 +16,8 @@ use crate::llm::LlmClient;
 use crate::local::{self, LocalSource};
 use crate::output::{self, OutputFormat};
 use crate::prompt::{self, PrContext};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 
 const MAX_DIFF_BYTES: usize = 400_000;
 /// Hard cap on the raw fetched diff text before parsing. A generous multiple of
@@ -370,6 +372,58 @@ fn load_baseline(args: &ReviewArgs) -> Result<Vec<Finding>> {
 }
 
 /// Core engine: diff text in, envelope out. No forge I/O.
+/// Generate stable IDs for findings based on (head_sha, kind, normalized_path, normalized_line, normalized_title, duplicate_index).
+fn generate_finding_ids(findings: &mut [Finding], head_sha: Option<&str>) {
+    if head_sha.is_none() {
+        return;
+    }
+
+    let head_sha = head_sha.unwrap();
+    let mut id_map: HashMap<String, usize> = HashMap::new();
+
+    for finding in findings.iter_mut() {
+        // Normalize the finding data
+        let normalized_path = finding.path.to_lowercase();
+        let normalized_line = finding.line.to_string();
+        let normalized_title = finding.title.trim().to_lowercase();
+
+        // Create a pre-hash key to track duplicates
+        let prehash_key = format!(
+            "{}{}{}{}",
+            head_sha,
+            finding.kind.as_str(),
+            normalized_path,
+            normalized_line
+        );
+        let duplicate_index = id_map
+            .entry(prehash_key)
+            .and_modify(|count| *count += 1)
+            .or_insert(0);
+
+        // Build the hash input
+        let hash_input = format!(
+            "{}\x00{}\x00{}\x00{}\x00{}\x00{}",
+            head_sha,
+            finding.kind.as_str(),
+            normalized_path,
+            normalized_line,
+            normalized_title,
+            duplicate_index
+        );
+
+        // Generate SHA256 hash
+        let mut hasher = Sha256::new();
+        hasher.update(hash_input.as_bytes());
+        let result = hasher.finalize();
+        let hex_id = result
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>();
+
+        finding.id = Some(hex_id);
+    }
+}
+
 async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) -> Result<Envelope> {
     let ReviewInput {
         diff_text,
@@ -501,6 +555,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                 kind: crate::envelope::Kind::Uncertainty,
                 confidence: 1.0,
                 title: "Diff truncated at the review size limit".to_string(),
+                id: None,
                 body: format!(
                     "This change exceeds the {} KB review limit; only the first part was \
                      reviewed. Files beyond the cut were not assessed. Split the change \
@@ -540,13 +595,17 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
     // induce it via prompt injection.
     let advisory_on_error = cfg.gate_on_error == OnError::Advisory;
     let gate_failing = findings.iter().any(|f| {
-        cfg.gate_fail_on.fails(f.severity)
-            && !(advisory_on_error && f.path == crate::envelope::PROVIDER_PATH)
+        (cfg.gate_fail_on.fails(f.severity)
+            && !(advisory_on_error && f.path == crate::envelope::PROVIDER_PATH))
+            || cfg.block_on_kinds.contains(&f.kind)
     });
     let silent = findings.is_empty();
     let mut counts = Envelope::counts_of(&findings, suppressed);
     counts.ungrounded = ungrounded;
     let buckets = Envelope::buckets_of(&findings);
+
+    // Generate stable IDs for findings
+    generate_finding_ids(&mut findings, head_sha.as_deref());
 
     Ok(Envelope {
         version: 1,
@@ -559,6 +618,11 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
         gate: Gate {
             fail_on: cfg.gate_fail_on.as_str().to_string(),
             failing: gate_failing,
+            block_on_kinds: cfg
+                .block_on_kinds
+                .iter()
+                .map(|k| k.as_str().to_string())
+                .collect(),
         },
         model_used,
         usage,
@@ -702,6 +766,11 @@ fn error_envelope(
         gate: Gate {
             fail_on: cfg.gate_fail_on.as_str().to_string(),
             failing: blocking,
+            block_on_kinds: cfg
+                .block_on_kinds
+                .iter()
+                .map(|k| k.as_str().to_string())
+                .collect(),
         },
         model_used: cfg.model_chain().join(" -> "),
         usage: Usage::default(),
@@ -727,6 +796,7 @@ mod tests {
             confidence: 0.9,
             title: "Finding".to_string(),
             body: body.to_string(),
+            id: None,
         }
     }
 

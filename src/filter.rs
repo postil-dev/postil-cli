@@ -206,6 +206,7 @@ mod tests {
             confidence: conf,
             title: "t".into(),
             body: "b".into(),
+            id: None,
         }
     }
 
