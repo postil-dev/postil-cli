@@ -73,6 +73,7 @@ fn postil() -> Command {
         .env_remove("POSTIL_API_KEY")
         .env_remove("POSTIL_API_BASE")
         .env_remove("POSTIL_DETAILS_URL")
+        .env_remove("POSTIL_ENABLE_BITBUCKET_INCREMENTAL")
         .env("MODEL_API_KEY", "test-key");
     cmd
 }
@@ -1708,6 +1709,138 @@ async fn bitbucket_flow_posts_comment_and_sets_statuses() {
     let body: Value = comment.body_json().unwrap();
     assert_eq!(body["inline"]["path"], "src/auth.rs");
     assert_eq!(body["inline"]["to"], 41);
+}
+
+#[tokio::test]
+async fn bitbucket_incremental_is_disabled_without_verification_gate() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repositories/acme/api/pullrequests/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "Add login",
+            "summary": {"raw": "PR body"},
+            "source": {"commit": {"hash": "headsha111"}},
+            "destination": {"commit": {"hash": "basesha222"}}
+        })))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("BITBUCKET_API_URL", server.uri())
+        .env("BITBUCKET_TOKEN", "bb-test-token")
+        .env_remove("BITBUCKET_USER")
+        .args([
+            "review",
+            "--forge",
+            "bitbucket",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--sha",
+            "headsha111",
+            "--since-sha",
+            "oldsha000",
+            "--no-post",
+            "--output-json",
+        ])
+        .assert()
+        .code(1);
+    let env: Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+    assert_eq!(env["findings"][0]["path"], ".postil/provider");
+    assert!(
+        env["findings"][0]["body"]
+            .as_str()
+            .unwrap()
+            .contains("POSTIL_ENABLE_BITBUCKET_INCREMENTAL=1")
+    );
+
+    let reqs = server.received_requests().await.unwrap();
+    assert!(
+        !reqs
+            .iter()
+            .any(|request| request.url.path().contains("/diff/"))
+    );
+}
+
+#[tokio::test]
+async fn bitbucket_incremental_fetches_documented_compare_when_enabled() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repositories/acme/api/pullrequests/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "Add login",
+            "summary": {"raw": "PR body"},
+            "source": {"commit": {"hash": "headsha111"}},
+            "destination": {"commit": {"hash": "basesha222"}}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repositories/acme/api/diff/headsha111..oldsha000"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(DIFF))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("BITBUCKET_API_URL", server.uri())
+        .env("BITBUCKET_TOKEN", "bb-test-token")
+        .env("POSTIL_ENABLE_BITBUCKET_INCREMENTAL", "1")
+        .env("REVIEW_MODEL", "test-model")
+        .env_remove("BITBUCKET_USER")
+        .args([
+            "review",
+            "--forge",
+            "bitbucket",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--sha",
+            "headsha111",
+            "--since-sha",
+            "oldsha000",
+            "--no-post",
+            "--output-json",
+        ])
+        .assert()
+        .code(0);
+    let env: Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+    assert_eq!(env["sinceSha"], "oldsha000");
+    assert_eq!(env["modelUsed"], "test-model");
+
+    let reqs = server.received_requests().await.unwrap();
+    let llm_request = reqs
+        .iter()
+        .find(|request| request.url.path() == "/chat/completions")
+        .unwrap();
+    let body: Value = llm_request.body_json().unwrap();
+    assert!(
+        body["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("This is an INCREMENTAL review")
+    );
 }
 
 #[tokio::test]
