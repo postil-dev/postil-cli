@@ -387,13 +387,14 @@ fn generate_finding_ids(findings: &mut [Finding], head_sha: Option<&str>) {
         let normalized_line = finding.line.to_string();
         let normalized_title = finding.title.trim().to_lowercase();
 
-        // Create a pre-hash key to track duplicates
+        // Create a pre-hash key to track duplicates.
         let prehash_key = format!(
-            "{}{}{}{}",
+            "{}\x00{}\x00{}\x00{}\x00{}",
             head_sha,
             finding.kind.as_str(),
             normalized_path,
-            normalized_line
+            normalized_line,
+            normalized_title
         );
         let duplicate_index = id_map
             .entry(prehash_key)
@@ -787,6 +788,10 @@ mod tests {
     use crate::envelope::{Kind, Severity};
 
     fn finding(path: &str, line: u32, body: &str) -> Finding {
+        finding_with_title(path, line, "Finding", body)
+    }
+
+    fn finding_with_title(path: &str, line: u32, title: &str, body: &str) -> Finding {
         Finding {
             path: path.to_string(),
             line,
@@ -794,10 +799,99 @@ mod tests {
             severity: Severity::Error,
             kind: Kind::Risk,
             confidence: 0.9,
-            title: "Finding".to_string(),
+            title: title.to_string(),
             body: body.to_string(),
             id: None,
         }
+    }
+
+    fn expected_finding_id(finding: &Finding, head_sha: &str, duplicate_index: usize) -> String {
+        let hash_input = format!(
+            "{}\x00{}\x00{}\x00{}\x00{}\x00{}",
+            head_sha,
+            finding.kind.as_str(),
+            finding.path.to_lowercase(),
+            finding.line,
+            finding.title.trim().to_lowercase(),
+            duplicate_index
+        );
+        let mut hasher = Sha256::new();
+        hasher.update(hash_input.as_bytes());
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>()
+    }
+
+    fn assigned_id(findings: &[Finding], path: &str, line: u32, title: &str) -> String {
+        findings
+            .iter()
+            .find(|finding| finding.path == path && finding.line == line && finding.title == title)
+            .and_then(|finding| finding.id.clone())
+            .expect("finding should have an assigned ID")
+    }
+
+    #[test]
+    fn stable_ids_do_not_share_duplicate_buckets_across_path_line_boundaries() {
+        let head_sha = "0123456789abcdef0123456789abcdef01234567";
+        let abc_line_12 = finding_with_title("abc", 12, "Boundary collision", "first");
+        let abc1_line_2 = finding_with_title("abc1", 2, "Boundary collision", "second");
+        let expected_abc_line_12 = expected_finding_id(&abc_line_12, head_sha, 0);
+        let expected_abc1_line_2 = expected_finding_id(&abc1_line_2, head_sha, 0);
+
+        let mut findings = vec![abc_line_12.clone(), abc1_line_2.clone()];
+        generate_finding_ids(&mut findings, Some(head_sha));
+        assert_eq!(
+            assigned_id(&findings, "abc", 12, "Boundary collision"),
+            expected_abc_line_12
+        );
+        assert_eq!(
+            assigned_id(&findings, "abc1", 2, "Boundary collision"),
+            expected_abc1_line_2
+        );
+
+        let mut reversed = vec![abc1_line_2, abc_line_12];
+        generate_finding_ids(&mut reversed, Some(head_sha));
+        assert_eq!(
+            assigned_id(&reversed, "abc", 12, "Boundary collision"),
+            expected_abc_line_12
+        );
+        assert_eq!(
+            assigned_id(&reversed, "abc1", 2, "Boundary collision"),
+            expected_abc1_line_2
+        );
+    }
+
+    #[test]
+    fn stable_ids_do_not_share_duplicate_buckets_across_titles_on_same_line() {
+        let head_sha = "0123456789abcdef0123456789abcdef01234567";
+        let sql_finding = finding_with_title("src/service.rs", 42, "SQL injection risk", "first");
+        let auth_finding = finding_with_title("src/service.rs", 42, "Missing auth guard", "second");
+        let expected_sql_id = expected_finding_id(&sql_finding, head_sha, 0);
+        let expected_auth_id = expected_finding_id(&auth_finding, head_sha, 0);
+
+        let mut findings = vec![sql_finding.clone(), auth_finding.clone()];
+        generate_finding_ids(&mut findings, Some(head_sha));
+        assert_eq!(
+            assigned_id(&findings, "src/service.rs", 42, "SQL injection risk"),
+            expected_sql_id
+        );
+        assert_eq!(
+            assigned_id(&findings, "src/service.rs", 42, "Missing auth guard"),
+            expected_auth_id
+        );
+
+        let mut reversed = vec![auth_finding, sql_finding];
+        generate_finding_ids(&mut reversed, Some(head_sha));
+        assert_eq!(
+            assigned_id(&reversed, "src/service.rs", 42, "SQL injection risk"),
+            expected_sql_id
+        );
+        assert_eq!(
+            assigned_id(&reversed, "src/service.rs", 42, "Missing auth guard"),
+            expected_auth_id
+        );
     }
 
     #[test]
