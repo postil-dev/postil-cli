@@ -126,6 +126,12 @@ pub struct LlmClient {
     total_deadline: Option<Instant>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct LlmTimeouts {
+    request: Duration,
+    total: Option<Duration>,
+}
+
 /// Retries per model on transient provider errors before the cascade moves on.
 const TRANSIENT_RETRIES: u32 = 2;
 
@@ -135,7 +141,7 @@ const TRANSIENT_RETRIES: u32 = 2;
 /// use their provider default.
 const REVIEW_MAX_TOKENS: u32 = 16384;
 const SCORER_MAX_TOKENS: u32 = 4096;
-const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 480;
+pub(crate) const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 480;
 const REQUEST_TIMEOUT_ENV: &str = "POSTIL_LLM_REQUEST_TIMEOUT_SECS";
 const TOTAL_TIMEOUT_ENV: &str = "POSTIL_LLM_TOTAL_TIMEOUT_SECS";
 
@@ -158,17 +164,38 @@ fn retryable_status(status: u16) -> bool {
 }
 
 impl LlmClient {
+    /// Local and interactive clients have no built-in total deadline. They only
+    /// get one when POSTIL_LLM_TOTAL_TIMEOUT_SECS is explicitly set.
     pub fn from_env(cfg: &Config) -> Result<Self> {
-        let api_key = api_key::resolve_from_process_env().ok_or_else(|| {
-            let key_names = api_key::names_text();
-            anyhow!(
-                "no API key: set {key_names}. Postil never proxies your inference; bring your own key."
-            )
-        })?;
-        let request_timeout =
-            duration_from_env(REQUEST_TIMEOUT_ENV, Some(DEFAULT_REQUEST_TIMEOUT_SECS))?
-                .expect("default request timeout is always set");
-        let total_timeout = duration_from_env(TOTAL_TIMEOUT_ENV, None)?;
+        let api_key = resolve_api_key()?;
+        let timeouts = LlmTimeouts::from_env(DEFAULT_REQUEST_TIMEOUT_SECS, None)?;
+        let total_deadline = timeouts.total.map(|duration| Instant::now() + duration);
+        Self::build(cfg, api_key, timeouts.request, total_deadline)
+    }
+
+    pub(crate) fn from_env_for_remote_review(
+        cfg: &Config,
+        total_budget_started_at: Instant,
+        default_request_timeout: Duration,
+        default_total_timeout: Duration,
+    ) -> Result<Self> {
+        let api_key = resolve_api_key()?;
+        let timeouts = LlmTimeouts::from_env(
+            default_request_timeout.as_secs(),
+            Some(default_total_timeout.as_secs()),
+        )?;
+        let total_deadline = timeouts
+            .total
+            .map(|duration| total_budget_started_at + duration);
+        Self::build(cfg, api_key, timeouts.request, total_deadline)
+    }
+
+    fn build(
+        cfg: &Config,
+        api_key: String,
+        request_timeout: Duration,
+        total_deadline: Option<Instant>,
+    ) -> Result<Self> {
         Ok(LlmClient {
             http: reqwest::Client::builder()
                 // Generation time scales with diff size; a thorough review of a
@@ -177,7 +204,7 @@ impl LlmClient {
                 .build()?,
             api_base: cfg.api_base.trim_end_matches('/').to_string(),
             api_key,
-            total_deadline: total_timeout.map(|duration| Instant::now() + duration),
+            total_deadline,
         })
     }
 
@@ -557,6 +584,24 @@ impl LlmClient {
     }
 }
 
+impl LlmTimeouts {
+    fn from_env(request_default_secs: u64, total_default_secs: Option<u64>) -> Result<Self> {
+        let request = duration_from_env(REQUEST_TIMEOUT_ENV, Some(request_default_secs))?
+            .expect("default request timeout is always set");
+        let total = duration_from_env(TOTAL_TIMEOUT_ENV, total_default_secs)?;
+        Ok(Self { request, total })
+    }
+}
+
+fn resolve_api_key() -> Result<String> {
+    api_key::resolve_from_process_env().ok_or_else(|| {
+        let key_names = api_key::names_text();
+        anyhow!(
+            "no API key: set {key_names}. Postil never proxies your inference; bring your own key."
+        )
+    })
+}
+
 fn duration_from_env(name: &str, default_secs: Option<u64>) -> Result<Option<Duration>> {
     let Some(raw) = std::env::var(name)
         .ok()
@@ -814,7 +859,56 @@ fn consensus_merge(runs: Vec<ModelReview>) -> ModelReview {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
     use crate::envelope::{Kind, Severity};
+    use std::sync::{Mutex, OnceLock};
+
+    struct EnvRestore {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvRestore {
+        fn capture(names: &[&'static str]) -> Self {
+            Self {
+                saved: names
+                    .iter()
+                    .map(|name| (*name, std::env::var_os(name)))
+                    .collect(),
+            }
+        }
+
+        fn remove(name: &str) {
+            unsafe {
+                std::env::remove_var(name);
+            }
+        }
+
+        fn set(name: &str, value: &str) {
+            unsafe {
+                std::env::set_var(name, value);
+            }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (name, value) in &self.saved {
+                match value {
+                    Some(value) => unsafe {
+                        std::env::set_var(name, value);
+                    },
+                    None => unsafe {
+                        std::env::remove_var(name);
+                    },
+                }
+            }
+        }
+    }
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn provider_error_downcast_survives_additional_context() {
@@ -834,6 +928,124 @@ mod tests {
         assert!(
             wrapped.downcast_ref::<ProviderError>().is_some(),
             "ProviderError marker must survive additional context wrapping"
+        );
+    }
+
+    #[test]
+    fn remote_budget_start_sets_default_total_deadline_when_env_is_unset() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvRestore::capture(&[REQUEST_TIMEOUT_ENV, TOTAL_TIMEOUT_ENV, "POSTIL_API_KEY"]);
+        EnvRestore::remove(REQUEST_TIMEOUT_ENV);
+        EnvRestore::remove(TOTAL_TIMEOUT_ENV);
+        EnvRestore::set("POSTIL_API_KEY", "test-key");
+
+        let client = LlmClient::from_env_for_remote_review(
+            &Config::default(),
+            Instant::now(),
+            Duration::from_secs(crate::review::HOSTED_LLM_REQUEST_TIMEOUT_SECS),
+            Duration::from_secs(crate::review::HOSTED_LLM_TOTAL_TIMEOUT_SECS),
+        )
+        .unwrap();
+        let remaining = client.remaining_total_budget().unwrap().unwrap();
+
+        assert!(remaining <= Duration::from_secs(crate::review::HOSTED_LLM_TOTAL_TIMEOUT_SECS));
+        assert!(remaining > Duration::from_secs(crate::review::HOSTED_LLM_TOTAL_TIMEOUT_SECS - 5));
+    }
+
+    #[test]
+    fn local_from_env_has_no_total_deadline_without_env_override() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvRestore::capture(&[REQUEST_TIMEOUT_ENV, TOTAL_TIMEOUT_ENV, "POSTIL_API_KEY"]);
+        EnvRestore::remove(REQUEST_TIMEOUT_ENV);
+        EnvRestore::remove(TOTAL_TIMEOUT_ENV);
+        EnvRestore::set("POSTIL_API_KEY", "test-key");
+
+        let client = LlmClient::from_env(&Config::default()).unwrap();
+
+        assert!(client.remaining_total_budget().unwrap().is_none());
+    }
+
+    #[test]
+    fn local_from_env_keeps_the_original_480s_request_timeout() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvRestore::capture(&[REQUEST_TIMEOUT_ENV, TOTAL_TIMEOUT_ENV]);
+        EnvRestore::remove(REQUEST_TIMEOUT_ENV);
+        EnvRestore::remove(TOTAL_TIMEOUT_ENV);
+
+        // The hosted path uses a shorter per-request timeout (420s) to fit the
+        // scorer and margin inside its total budget. Local/interactive runs have
+        // no total budget by default and must keep the original, more generous
+        // request timeout rather than inherit the hosted-tuned value.
+        let timeouts = LlmTimeouts::from_env(DEFAULT_REQUEST_TIMEOUT_SECS, None).unwrap();
+
+        assert_eq!(timeouts.request, Duration::from_secs(480));
+        assert_ne!(
+            timeouts.request,
+            Duration::from_secs(crate::review::HOSTED_LLM_REQUEST_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn default_timeout_profile_sets_no_setup_scorer_window_and_worker_margin() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvRestore::capture(&[REQUEST_TIMEOUT_ENV, TOTAL_TIMEOUT_ENV]);
+        EnvRestore::remove(REQUEST_TIMEOUT_ENV);
+        EnvRestore::remove(TOTAL_TIMEOUT_ENV);
+
+        let timeouts = LlmTimeouts::from_env(
+            crate::review::HOSTED_LLM_REQUEST_TIMEOUT_SECS,
+            Some(crate::review::HOSTED_LLM_TOTAL_TIMEOUT_SECS),
+        )
+        .unwrap();
+
+        assert_eq!(
+            timeouts.request,
+            Duration::from_secs(crate::review::HOSTED_LLM_REQUEST_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            timeouts.total,
+            Some(Duration::from_secs(
+                crate::review::HOSTED_LLM_TOTAL_TIMEOUT_SECS
+            ))
+        );
+        assert_eq!(
+            timeouts.total.unwrap() - timeouts.request,
+            Duration::from_secs(crate::review::SCORER_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            Duration::from_secs(600) - timeouts.total.unwrap(),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn from_env_charges_elapsed_time_against_supplied_budget_start() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvRestore::capture(&[REQUEST_TIMEOUT_ENV, TOTAL_TIMEOUT_ENV, "POSTIL_API_KEY"]);
+        EnvRestore::remove(REQUEST_TIMEOUT_ENV);
+        EnvRestore::remove(TOTAL_TIMEOUT_ENV);
+        EnvRestore::set("POSTIL_API_KEY", "test-key");
+
+        let elapsed = Duration::from_secs(10);
+        let started_at = Instant::now() - elapsed;
+        let client = LlmClient::from_env_for_remote_review(
+            &Config::default(),
+            started_at,
+            Duration::from_secs(crate::review::HOSTED_LLM_REQUEST_TIMEOUT_SECS),
+            Duration::from_secs(crate::review::HOSTED_LLM_TOTAL_TIMEOUT_SECS),
+        )
+        .unwrap();
+        let remaining = client.remaining_total_budget().unwrap().unwrap();
+
+        assert!(
+            remaining
+                <= Duration::from_secs(crate::review::HOSTED_LLM_TOTAL_TIMEOUT_SECS) - elapsed
+        );
+        assert!(
+            remaining
+                > Duration::from_secs(crate::review::HOSTED_LLM_TOTAL_TIMEOUT_SECS)
+                    - elapsed
+                    - Duration::from_secs(5)
         );
     }
 
