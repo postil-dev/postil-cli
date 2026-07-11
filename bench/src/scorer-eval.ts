@@ -336,10 +336,9 @@ function falseFinding(c: BenchmarkCase) {
     severity: "warn",
     kind: "risk",
     confidence: 0.95,
-    title: "Clean change incorrectly flagged as behavior risk",
+    title: "Clean change breaks runtime behavior",
     body:
-      "This clean change is asserted to introduce a merge-blocking runtime bug, " +
-      "but the local diff context does not support that claim.",
+      "This change removes required runtime behavior and will break callers after merge.",
   };
 }
 
