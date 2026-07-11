@@ -27,10 +27,6 @@ on:
         description: Run scorer calibration eval instead of live-models bench
         required: false
         default: "false"
-      scorer_eval_models:
-        description: Comma-separated scorer model ids for scorer calibration eval
-        required: false
-        default: "anthropic/claude-haiku-4.5,openai/gpt-5-mini"
 
 concurrency:
   group: bench-live
@@ -81,7 +77,6 @@ jobs:
         if: ${{ inputs.run_scorer_eval == 'true' }}
         working-directory: bench
         env:
-          POSTIL_SCORER_EVAL_MODELS: ${{ inputs.scorer_eval_models }}
           POSTIL_API_KEY: ${{ secrets.POSTIL_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
@@ -100,7 +95,7 @@ jobs:
               echo ''
               echo '```'
               bun -e '
-                const r = require(process.env.GITHUB_WORKSPACE + "/scorer-eval-report.json");
+                const r = await Bun.file(process.env.GITHUB_WORKSPACE + "/scorer-eval-report.json").json();
                 const pad = (s, w) => String(s).length >= w ? String(s) : String(s) + " ".repeat(w - String(s).length);
                 console.log([pad("model",36),pad("structured",11),pad("true kept",10),pad("false down",11),pad("mean true",10),pad("mean false",11),pad("pass",5)].join(" "));
                 for (const a of r.models) {
@@ -123,7 +118,7 @@ jobs:
               echo ''
               echo '```'
               bun -e '
-                const r = require(process.env.GITHUB_WORKSPACE + "/bench-live-report.json");
+                const r = await Bun.file(process.env.GITHUB_WORKSPACE + "/bench-live-report.json").json();
                 const pad = (s, w) => String(s).length >= w ? String(s) : String(s) + " ".repeat(w - String(s).length);
                 console.log([pad("model",40),pad("detect",8),pad("FP",5),pad("cases",6),pad("$/review",12),pad("total $",12),pad("mean ms",9)].join(" "));
                 for (const a of r.modelAggregates) {
@@ -166,12 +161,18 @@ jobs:
           path: scorer-eval-report.json
           if-no-files-found: warn
 
-      - name: Upload raw run artifacts
-        if: always()
+      - name: Upload live-model raw run artifacts
+        if: always() && inputs.run_scorer_eval != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: bench-live-raw-runs
-          path: |
-            bench/.runs/live-models
-            bench/.runs/scorer-eval
+          path: bench/.runs/live-models
+          if-no-files-found: warn
+
+      - name: Upload scorer eval raw run artifacts
+        if: always() && inputs.run_scorer_eval == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: scorer-eval-raw-runs
+          path: bench/.runs/scorer-eval
           if-no-files-found: warn
