@@ -386,6 +386,46 @@ pub fn render_annotated(diff: &Diff, max_bytes: usize) -> (String, bool) {
     (out, truncated)
 }
 
+/// Render the hunk around a cited new-file line for the independent scorer.
+/// The scorer receives only a small local window, not the whole prompt-sized diff.
+pub fn render_hunk_context(diff: &Diff, path: &str, line: u32, radius: u32) -> Option<String> {
+    let file = diff
+        .files
+        .iter()
+        .find(|f| !f.binary && !f.deleted && f.path == path)?;
+    let hunk = file.hunks.iter().find(|h| h.new_range().contains(&line))?;
+    let start = line.saturating_sub(radius);
+    let end = line.saturating_add(radius);
+    let mut out = format!(
+        "### {}\n@@ starting at line {} @@\n",
+        file.path, hunk.new_start
+    );
+    let mut line_no = hunk.new_start;
+    for raw in &hunk.lines {
+        let (marker, content) = raw.split_at(if raw.is_empty() { 0 } else { 1 });
+        match marker {
+            "+" => {
+                if (start..=end).contains(&line_no) {
+                    out.push_str(&format!("{line_no:>6} + {content}\n"));
+                }
+                line_no += 1;
+            }
+            "-" => {
+                if (start..=end).contains(&line_no) {
+                    out.push_str(&format!("       - {content}\n"));
+                }
+            }
+            _ => {
+                if (start..=end).contains(&line_no) {
+                    out.push_str(&format!("{line_no:>6}   {content}\n"));
+                }
+                line_no += 1;
+            }
+        }
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,6 +497,15 @@ Binary files a/img.png and b/img.png differ
         assert!(text.contains("    13   line thirteen"));
         assert!(text.contains("(deleted)"));
         assert!(text.contains("(binary, not reviewable)"));
+    }
+
+    #[test]
+    fn hunk_context_renders_local_cited_window() {
+        let d = parse(SAMPLE);
+        let context = render_hunk_context(&d, "src/lib.rs", 11, 20).unwrap();
+        assert!(context.contains("### src/lib.rs"));
+        assert!(context.contains("    11 + added eleven"));
+        assert!(context.contains("       - removed"));
     }
 
     #[test]

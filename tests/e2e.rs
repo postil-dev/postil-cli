@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use assert_cmd::Command;
 use serde_json::{Value, json};
-use wiremock::matchers::{header, method, path, path_regex, query_param};
+use wiremock::matchers::{body_string_contains, header, method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const DIFF: &str = "\
@@ -32,6 +32,13 @@ fn llm_content(findings: Value) -> Value {
             "findings": findings
         }).to_string()}}],
         "usage": {"prompt_tokens": 100, "completion_tokens": 50}
+    })
+}
+
+fn scorer_content(scores: Value) -> Value {
+    json!({
+        "choices": [{"message": {"content": scores.to_string()}}],
+        "usage": {"prompt_tokens": 30, "completion_tokens": 10}
     })
 }
 
@@ -64,6 +71,18 @@ fn finding_at(line: u32, severity: &str, confidence: f64) -> Value {
     })
 }
 
+fn finding_at_with_kind(line: u32, severity: &str, kind: &str, confidence: f64) -> Value {
+    json!({
+        "path": "src/auth.rs",
+        "line": line,
+        "severity": severity,
+        "kind": kind,
+        "confidence": confidence,
+        "title": "Unsanitized input reaches query",
+        "body": "user_input flows into exec_query without sanitization."
+    })
+}
+
 fn finding_with_text(line: u32, severity: &str, confidence: f64, title: &str, body: &str) -> Value {
     json!({
         "path": "src/auth.rs",
@@ -81,6 +100,7 @@ fn postil() -> Command {
     // Isolate from developer environment and repo config discovery.
     cmd.env_remove("REVIEW_MODEL")
         .env_remove("REVIEW_MODEL_CASCADE")
+        .env_remove("REVIEW_SCORER_MODEL")
         .env_remove("MODEL_API_KEY")
         .env_remove("LLM_API_KEY")
         .env_remove("OPENROUTER_API_KEY")
@@ -121,6 +141,28 @@ async fn mock_review(server: &MockServer, findings: Value) {
         .await;
 }
 
+async fn mock_review_model(server: &MockServer, model: &str, findings: Value) {
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(wiremock::matchers::body_string_contains(format!(
+            "\"model\":\"{model}\""
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(findings)))
+        .mount(server)
+        .await;
+}
+
+async fn mock_scorer_model(server: &MockServer, model: &str, scores: Value) {
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(wiremock::matchers::body_string_contains(format!(
+            "\"model\":\"{model}\""
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(scorer_content(scores)))
+        .mount(server)
+        .await;
+}
+
 #[tokio::test]
 async fn local_review_reports_grounded_finding_and_gates() {
     let server = MockServer::start().await;
@@ -143,12 +185,263 @@ async fn local_review_reports_grounded_finding_and_gates() {
     assert_eq!(env["findings"][0]["line"], 41);
     assert_eq!(env["gate"]["failing"], true);
     assert_eq!(env["counts"]["error"], 1);
-    assert_eq!(env["usage"]["promptTokens"], 100);
+    assert_eq!(env["usage"]["promptTokens"], 300);
 
     let requests = server.received_requests().await.unwrap();
     let request: Value = requests[0].body_json().unwrap();
     assert_eq!(request["max_tokens"], 16384);
     assert_eq!(request["messages"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn scorer_lowers_confidence_and_stores_both_values() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("generator-model"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(llm_content(json!([finding_at(41, "warn", 0.92)]))),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("openai/gpt-5-mini"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(scorer_content(json!([{
+                "index": 0,
+                "confidence": 0.7,
+                "kind": "risk",
+                "reason": "finding is plausible but impact depends on query behavior"
+            }]))),
+        )
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "generator-model")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .code(0);
+
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let env: Value = serde_json::from_str(&stdout).unwrap();
+    let finding = &env["findings"][0];
+    assert_eq!(env["scorerModel"], "openai/gpt-5-mini");
+    assert_eq!(env["scorerDisagreements"], 0);
+    assert_eq!(finding["confidence"], 0.7);
+    assert_eq!(finding["generatorConfidence"], 0.92);
+    assert_eq!(finding["scorerConfidence"], 0.7);
+    assert_eq!(finding["kind"], "risk");
+    assert_eq!(finding["generatorKind"], "risk");
+    assert_eq!(finding["scorerKind"], "risk");
+    assert_eq!(env["usage"]["promptTokens"], 130);
+
+    let requests = server.received_requests().await.unwrap();
+    let scorer_request: Value = requests
+        .iter()
+        .map(|request| request.body_json::<Value>().unwrap())
+        .find(|body| body["model"] == "openai/gpt-5-mini")
+        .unwrap();
+    assert_eq!(scorer_request["temperature"], 0.0);
+    let scorer_user = scorer_request["messages"][1]["content"].as_str().unwrap();
+    assert!(!scorer_user.contains("0.92"));
+    assert!(!scorer_user.contains("\"kind\": \"risk\""));
+    assert!(scorer_user.contains("diffHunk"));
+}
+
+#[tokio::test]
+async fn scorer_kind_escalation_into_configured_blocking_kind_takes_effect() {
+    let server = MockServer::start().await;
+    mock_review_model(
+        &server,
+        "generator-model",
+        json!([finding_at(41, "warn", 0.9)]),
+    )
+    .await;
+    mock_scorer_model(
+        &server,
+        "openai/gpt-5-mini",
+        json!([{
+            "index": 0,
+            "confidence": 0.88,
+            "kind": "guardrail",
+            "reason": "violates configured rule"
+        }]),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".postil.yaml"),
+        "gate:\n  blockOnKinds:\n    - guardrail\n",
+    )
+    .unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "generator-model")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .code(1);
+
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let env: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(env["findings"][0]["kind"], "guardrail");
+    assert_eq!(env["findings"][0]["generatorKind"], "risk");
+    assert_eq!(env["findings"][0]["scorerKind"], "guardrail");
+    assert_eq!(env["gate"]["failing"], true);
+}
+
+#[tokio::test]
+async fn scorer_kind_deescalation_from_blocking_kind_is_ignored() {
+    let server = MockServer::start().await;
+    mock_review_model(
+        &server,
+        "generator-model",
+        json!([finding_at_with_kind(41, "warn", "guardrail", 0.9)]),
+    )
+    .await;
+    mock_scorer_model(
+        &server,
+        "openai/gpt-5-mini",
+        json!([{
+            "index": 0,
+            "confidence": 0.88,
+            "kind": "risk",
+            "reason": "not a guardrail"
+        }]),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".postil.yaml"),
+        "gate:\n  blockOnKinds:\n    - guardrail\n",
+    )
+    .unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "generator-model")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .code(1);
+
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let env: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(env["findings"][0]["kind"], "guardrail");
+    assert_eq!(env["findings"][0]["generatorKind"], "guardrail");
+    assert_eq!(env["findings"][0]["scorerKind"], "risk");
+    assert_eq!(env["gate"]["failing"], true);
+}
+
+#[tokio::test]
+async fn large_confidence_disagreement_escalates_to_uncertainty_with_default_gate() {
+    let server = MockServer::start().await;
+    mock_review_model(
+        &server,
+        "generator-model",
+        json!([finding_at(41, "warn", 0.95)]),
+    )
+    .await;
+    mock_scorer_model(
+        &server,
+        "openai/gpt-5-mini",
+        json!([{
+            "index": 0,
+            "confidence": 0.5,
+            "kind": "risk",
+            "reason": "weak evidence"
+        }]),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "generator-model")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let env: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(env["findings"][0]["confidence"], 0.5);
+    assert_eq!(env["findings"][0]["kind"], "uncertainty");
+    assert_eq!(env["findings"][0]["generatorKind"], "risk");
+    assert_eq!(env["findings"][0]["scorerKind"], "risk");
+    assert_eq!(env["scorerDisagreements"], 1);
+}
+
+#[tokio::test]
+async fn scorer_error_fails_open_and_preserves_generator_values() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("generator-model"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(llm_content(json!([finding_at(41, "warn", 0.92)]))),
+        )
+        .mount(&server)
+        .await;
+    for scorer_model in ["openai/gpt-5-mini", "anthropic/claude-haiku-4.5"] {
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains(scorer_model))
+            .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
+            .mount(&server)
+            .await;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "generator-model")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .code(0);
+
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let env: Value = serde_json::from_str(&stdout).unwrap();
+    let finding = &env["findings"][0];
+    assert_eq!(env["gate"]["failing"], false);
+    assert!(env.get("scorerModel").is_none());
+    assert!(
+        env["scorerError"]
+            .as_str()
+            .unwrap()
+            .contains("scorer output invalid")
+    );
+    assert!(env.get("scorerDisagreements").is_none());
+    assert_eq!(finding["confidence"], 0.92);
+    assert_eq!(finding["kind"], "risk");
+    assert!(finding.get("generatorConfidence").is_none());
+    assert!(finding.get("scorerConfidence").is_none());
+    assert!(finding.get("generatorKind").is_none());
+    assert!(finding.get("scorerKind").is_none());
 }
 
 #[tokio::test]
@@ -230,8 +523,8 @@ async fn local_review_writes_csv_output_file_with_multiple_escaped_findings() {
     );
     assert_eq!(rows[0]["gateFailOn"], "error");
     assert_eq!(rows[0]["gateFailing"], "false");
-    assert_eq!(rows[0]["promptTokens"], "100");
-    assert_eq!(rows[0]["completionTokens"], "50");
+    assert_eq!(rows[0]["promptTokens"], "300");
+    assert_eq!(rows[0]["completionTokens"], "150");
 
     assert_eq!(rows[1]["path"], "src/auth.rs");
     assert_eq!(rows[1]["line"], "42");

@@ -80,6 +80,22 @@ pub struct Finding {
     pub severity: Severity,
     pub kind: Kind,
     pub confidence: f64,
+    /// Original generator confidence before independent scorer calibration.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub generator_confidence: Option<f64>,
+    /// Independent scorer confidence. Final `confidence` is the lower value.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub scorer_confidence: Option<f64>,
+    /// Original generator kind before safe scorer escalation.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub generator_kind: Option<Kind>,
+    /// Independent scorer kind. It can only move final `kind` toward configured
+    /// blocking kinds; de-escalation is ignored.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub scorer_kind: Option<Kind>,
+    /// Short scorer rationale for confidence/kind calibration.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub scorer_reason: Option<String>,
     pub title: String,
     pub body: String,
     /// Stable, engine-generated finding ID for deduplication and approval tracking.
@@ -132,6 +148,15 @@ pub struct Envelope {
     pub confidence_buckets: [u32; 5],
     pub gate: Gate,
     pub model_used: String,
+    /// Independent second-model scorer used for kept findings.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub scorer_model: Option<String>,
+    /// Nonempty when scoring was attempted but all scorer models errored.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub scorer_error: Option<String>,
+    /// Findings where scorer confidence differed by >= 0.4 or kind disagreed.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub scorer_disagreements: Option<u32>,
     pub usage: Usage,
     /// Wall-clock duration of the review engine run in milliseconds.
     #[serde(default)]
@@ -203,6 +228,11 @@ pub fn fail_closed_finding(detail: &str) -> Finding {
              model(s) and is failing closed rather than passing unreviewed code.\n\nDetail: {detail}"
         ),
         id: None,
+        generator_confidence: None,
+        scorer_confidence: None,
+        generator_kind: None,
+        scorer_kind: None,
+        scorer_reason: None,
     }
 }
 
@@ -231,6 +261,11 @@ pub fn narrated_risk_finding(summary: &str) -> Finding {
              summary names and address them or record findings manually."
         ),
         id: None,
+        generator_confidence: None,
+        scorer_confidence: None,
+        generator_kind: None,
+        scorer_kind: None,
+        scorer_reason: None,
     }
 }
 
@@ -249,6 +284,11 @@ pub fn provider_error_finding(detail: &str) -> Finding {
              than passing unreviewed code.\n\nDetail: {detail}"
         ),
         id: None,
+        generator_confidence: None,
+        scorer_confidence: None,
+        generator_kind: None,
+        scorer_kind: None,
+        scorer_reason: None,
     }
 }
 
@@ -264,6 +304,11 @@ mod tests {
             severity: sev,
             kind: Kind::Risk,
             confidence: conf,
+            generator_confidence: None,
+            scorer_confidence: None,
+            generator_kind: None,
+            scorer_kind: None,
+            scorer_reason: None,
             title: "t".into(),
             body: "b".into(),
             id: None,
@@ -318,6 +363,9 @@ mod tests {
                 block_on_kinds: vec![],
             },
             model_used: "m".into(),
+            scorer_model: None,
+            scorer_error: None,
+            scorer_disagreements: None,
             usage: Usage::default(),
             duration_ms: 0,
             base_sha: None,

@@ -10,12 +10,27 @@ use serde_json::json;
 
 use crate::api_key;
 use crate::config::Config;
-use crate::envelope::{Finding, Usage};
+use crate::envelope::{Finding, Kind, Usage};
 
 #[derive(Debug, Clone)]
 pub struct ModelReview {
     pub summary: String,
     pub findings: Vec<Finding>,
+    pub model_used: String,
+    pub usage: Usage,
+}
+
+#[derive(Debug, Clone)]
+pub struct FindingScore {
+    pub index: usize,
+    pub confidence: f64,
+    pub kind: Kind,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScorerReview {
+    pub scores: Vec<FindingScore>,
     pub model_used: String,
     pub usage: Usage,
 }
@@ -88,6 +103,15 @@ struct RawFinding {
     body: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct RawScore {
+    index: usize,
+    confidence: f64,
+    kind: String,
+    #[serde(default)]
+    reason: String,
+}
+
 fn default_confidence() -> f64 {
     0.5
 }
@@ -107,6 +131,7 @@ const TRANSIENT_RETRIES: u32 = 2;
 /// through JSON repair and can salvage low-quality findings. Interactive answers
 /// use their provider default.
 const REVIEW_MAX_TOKENS: u32 = 16384;
+const SCORER_MAX_TOKENS: u32 = 4096;
 
 /// Marker context attached to transport/provider-level failures (endpoint
 /// unreachable, HTTP error status, timeout, malformed HTTP envelope) — the
@@ -243,6 +268,36 @@ impl LlmClient {
         Err(last_err.unwrap_or_else(|| anyhow!("empty model chain")))
     }
 
+    pub async fn score_findings(
+        &self,
+        cfg: &Config,
+        system: &str,
+        user: &str,
+        expected_len: usize,
+    ) -> std::result::Result<ScorerReview, ModelError> {
+        let mut failed_usage = Usage::default();
+        let mut last_err = None;
+        for model in cfg.scorer_chain() {
+            match self
+                .score_with_model(&model, system, user, expected_len)
+                .await
+            {
+                Ok(mut r) => {
+                    add_usage(&mut r.usage, failed_usage);
+                    return Ok(r);
+                }
+                Err(mut e) => {
+                    eprintln!("postil: scorer model {model} failed: {e:#}");
+                    add_usage(&mut failed_usage, e.usage);
+                    e.usage = failed_usage;
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| ModelError::new(anyhow!("empty scorer model chain"), failed_usage)))
+    }
+
     async fn review_with_model(
         &self,
         model: &str,
@@ -318,6 +373,34 @@ impl LlmClient {
         Ok(review)
     }
 
+    async fn score_with_model(
+        &self,
+        model: &str,
+        system: &str,
+        user: &str,
+        expected_len: usize,
+    ) -> std::result::Result<ScorerReview, ModelError> {
+        let mut usage = Usage::default();
+        let content = self
+            .chat_with_temperature(
+                model,
+                system,
+                user,
+                &mut usage,
+                Some(SCORER_MAX_TOKENS),
+                0.0,
+            )
+            .await
+            .map_err(|e| ModelError::new(e, usage))?;
+        let scores = parse_scores(&content, expected_len)
+            .map_err(|e| ModelError::new(anyhow!("scorer output invalid: {e}"), usage))?;
+        Ok(ScorerReview {
+            scores,
+            model_used: model.to_string(),
+            usage,
+        })
+    }
+
     async fn chat(
         &self,
         model: &str,
@@ -326,7 +409,21 @@ impl LlmClient {
         usage: &mut Usage,
         max_tokens: Option<u32>,
     ) -> Result<String> {
-        self.chat_inner(model, system, user, usage, max_tokens)
+        self.chat_with_temperature(model, system, user, usage, max_tokens, 0.1)
+            .await
+            .map_err(|e| e.context(ProviderError))
+    }
+
+    async fn chat_with_temperature(
+        &self,
+        model: &str,
+        system: &str,
+        user: &str,
+        usage: &mut Usage,
+        max_tokens: Option<u32>,
+        temperature: f64,
+    ) -> Result<String> {
+        self.chat_inner(model, system, user, usage, max_tokens, temperature)
             .await
             .map_err(|e| e.context(ProviderError))
     }
@@ -339,10 +436,11 @@ impl LlmClient {
         user: &str,
         usage: &mut Usage,
         max_tokens: Option<u32>,
+        temperature: f64,
     ) -> Result<String> {
         let mut body = json!({
             "model": model,
-            "temperature": 0.1,
+            "temperature": temperature,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
@@ -438,6 +536,43 @@ fn parse_review(content: &str) -> Result<RawReview, String> {
     serde_json::from_str::<RawReview>(json_str).map_err(|e| e.to_string())
 }
 
+fn parse_scores(content: &str, expected_len: usize) -> Result<Vec<FindingScore>, String> {
+    let json_str = extract_json_array(content).ok_or("no JSON array found")?;
+    let raw = serde_json::from_str::<Vec<RawScore>>(json_str).map_err(|e| e.to_string())?;
+    if raw.len() != expected_len {
+        return Err(format!(
+            "expected {expected_len} score(s), got {}",
+            raw.len()
+        ));
+    }
+    let mut seen = vec![false; expected_len];
+    let mut scores = raw
+        .into_iter()
+        .map(|score| {
+            if score.index >= expected_len {
+                return Err(format!("score index {} out of range", score.index));
+            }
+            if std::mem::replace(&mut seen[score.index], true) {
+                return Err(format!("duplicate score index {}", score.index));
+            }
+            let kind = Kind::parse(&score.kind).ok_or_else(|| {
+                format!(
+                    "invalid score kind {:?} (risk|humanEscalation|guardrail|uncertainty|contentPolicy)",
+                    score.kind
+                )
+            })?;
+            Ok(FindingScore {
+                index: score.index,
+                confidence: score.confidence.clamp(0.0, 1.0),
+                kind,
+                reason: score.reason.trim().chars().take(300).collect(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    scores.sort_by_key(|score| score.index);
+    Ok(scores)
+}
+
 fn extract_json_object(text: &str) -> Option<&str> {
     let start = text.find('{')?;
     let bytes = text.as_bytes();
@@ -459,6 +594,38 @@ fn extract_json_object(text: &str) -> Option<&str> {
             b'"' => in_str = true,
             b'{' => depth += 1,
             b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&text[start..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn extract_json_array(text: &str) -> Option<&str> {
+    let start = text.find('[')?;
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut escape = false;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_str {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'[' => depth += 1,
+            b']' => {
                 depth -= 1;
                 if depth == 0 {
                     return Some(&text[start..=i]);
@@ -503,6 +670,11 @@ fn into_review(raw: RawReview, model: &str, usage: Usage) -> ModelReview {
                 severity,
                 kind,
                 confidence: f.confidence.clamp(0.0, 1.0),
+                generator_confidence: None,
+                scorer_confidence: None,
+                generator_kind: None,
+                scorer_kind: None,
+                scorer_reason: None,
                 title,
                 body: f.body,
                 id: None,
@@ -618,6 +790,39 @@ mod tests {
     }
 
     #[test]
+    fn scorer_scores_parse_clamp_and_validate_kind() {
+        let scores = parse_scores(
+            r#"[{"index":0,"confidence":1.2,"kind":"humanEscalation","reason":"needs owner"}]"#,
+            1,
+        )
+        .unwrap();
+        assert_eq!(scores[0].index, 0);
+        assert_eq!(scores[0].confidence, 1.0);
+        assert_eq!(scores[0].kind, Kind::HumanEscalation);
+    }
+
+    #[test]
+    fn scorer_rejects_missing_entries() {
+        assert!(parse_scores(r#"[{"index":0,"confidence":0.5,"kind":"risk"}]"#, 2).is_err());
+    }
+
+    #[test]
+    fn scorer_prompt_omits_generator_kind_and_confidence_fields() {
+        let prompt = crate::prompt::scorer_user_prompt(&[crate::prompt::ScorerPromptFinding {
+            index: 0,
+            path: "src/a.rs".into(),
+            line: 1,
+            severity: "warn".into(),
+            title: "t".into(),
+            body: "b".into(),
+            diff_hunk: "h".into(),
+        }]);
+        assert!(prompt.contains("\"severity\": \"warn\""));
+        assert!(!prompt.contains("\"kind\":"));
+        assert!(!prompt.contains("\"confidence\":"));
+    }
+
+    #[test]
     fn into_review_keeps_unknown_severity_as_warn() {
         // Fail toward surfacing: a severity label outside the alias table
         // ("major"/"P0"/"moderate") must NOT drop the finding. It is retained
@@ -698,6 +903,11 @@ mod tests {
                 severity: Severity::Warn,
                 kind: Kind::Risk,
                 confidence: conf,
+                generator_confidence: None,
+                scorer_confidence: None,
+                generator_kind: None,
+                scorer_kind: None,
+                scorer_reason: None,
                 title: "t".into(),
                 body: "b".into(),
                 id: None,
@@ -721,6 +931,11 @@ mod tests {
             severity: Severity::Error,
             kind: Kind::Risk,
             confidence: 0.99,
+            generator_confidence: None,
+            scorer_confidence: None,
+            generator_kind: None,
+            scorer_kind: None,
+            scorer_reason: None,
             title: "solo".into(),
             body: "b".into(),
             id: None,
@@ -758,6 +973,11 @@ mod tests {
             severity: Severity::Warn,
             kind: Kind::Risk,
             confidence: 0.9,
+            generator_confidence: None,
+            scorer_confidence: None,
+            generator_kind: None,
+            scorer_kind: None,
+            scorer_reason: None,
             title: "t2".into(),
             body: "b2".into(),
             id: None,
