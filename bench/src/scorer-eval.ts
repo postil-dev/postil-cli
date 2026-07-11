@@ -87,7 +87,8 @@ function flagValue(args: string[], flag: string): string | undefined {
 }
 
 function parseModels(raw: string | undefined): string[] {
-  return (raw ?? DEFAULT_SCORER_MODELS.join(","))
+  const source = raw?.trim() ? raw : DEFAULT_SCORER_MODELS.join(",");
+  return source
     .split(",")
     .map((model) => model.trim())
     .filter((model) => model.length > 0);
@@ -106,6 +107,9 @@ async function main() {
     process.env.POSTIL_BIN ??
     resolve(import.meta.dir, "..", "..", "target", "release", "postil");
   const models = parseModels(process.env.POSTIL_SCORER_EVAL_MODELS ?? flagValue(args, "--models"));
+  if (models.length === 0) {
+    throw new Error("scorer eval needs at least one scorer model");
+  }
   const rootDir = resolve(import.meta.dir, "..", ".runs", "scorer-eval");
   await mkdir(rootDir, { recursive: true });
 

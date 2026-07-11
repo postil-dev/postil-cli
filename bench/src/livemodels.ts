@@ -267,6 +267,10 @@ function liveEnv(
     GITHUB_TOKEN: "benchmark-github-token",
     REVIEW_MODEL: model,
   };
+  const scorerModel = process.env.REVIEW_SCORER_MODEL?.trim();
+  if (scorerModel) {
+    env.REVIEW_SCORER_MODEL = scorerModel;
+  }
   // Forward the selected inference-key variable without logging or placing the
   // value on argv. Neutral aliases are also mirrored into POSTIL_API_KEY so
   // older binaries can run from the same benchmark harness.

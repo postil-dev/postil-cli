@@ -93,9 +93,33 @@ jobs:
         working-directory: bench
         run: |
           report="$GITHUB_WORKSPACE/bench-live-report.json"
+          scorer_report="$GITHUB_WORKSPACE/scorer-eval-report.json"
           {
-            echo '## Live-models bench'
-            if [ -f "$report" ]; then
+            if [ -f "$scorer_report" ]; then
+              echo '## Scorer calibration eval'
+              echo ''
+              echo '```'
+              bun -e '
+                const r = require(process.env.GITHUB_WORKSPACE + "/scorer-eval-report.json");
+                const pad = (s, w) => String(s).length >= w ? String(s) : String(s) + " ".repeat(w - String(s).length);
+                console.log([pad("model",36),pad("structured",11),pad("true kept",10),pad("false down",11),pad("mean true",10),pad("mean false",11),pad("pass",5)].join(" "));
+                for (const a of r.models) {
+                  console.log([
+                    pad(a.id,36),
+                    pad(String(a.structuredFailures),11),
+                    pad(`${a.trueFindingHighConfidence}/${a.trueFindingCases}`,10),
+                    pad(`${a.falseFindingDownscored}/${a.falseFindingCases}`,11),
+                    pad(a.meanTrueConfidence.toFixed(2),10),
+                    pad(a.meanFalseConfidence.toFixed(2),11),
+                    pad(a.passed ? "yes" : "no",5),
+                  ].join(" "));
+                }
+                console.log("");
+                console.log("Endpoint " + r.apiBase + " | generated " + r.generatedAt);
+              '
+              echo '```'
+            elif [ -f "$report" ]; then
+              echo '## Live-models bench'
               echo ''
               echo '```'
               bun -e '
@@ -127,7 +151,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload report artifact
-        if: always()
+        if: always() && inputs.run_scorer_eval != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: bench-live-report
@@ -135,7 +159,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Upload scorer eval artifact
-        if: always()
+        if: always() && inputs.run_scorer_eval == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: scorer-eval-report
@@ -147,5 +171,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: bench-live-raw-runs
-          path: bench/.runs/live-models
+          path: |
+            bench/.runs/live-models
+            bench/.runs/scorer-eval
           if-no-files-found: warn
