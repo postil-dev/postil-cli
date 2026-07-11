@@ -19,7 +19,7 @@ import { benchmarkCase, safeJson, startMockGithub, type BenchmarkCase } from "./
 const execFile = promisify(execFileCb);
 
 const GENERATOR_MODEL = "postil-scorer-eval/generator";
-const DEFAULT_SCORER_MODELS = ["openai/gpt-5-mini", "anthropic/claude-haiku-4.5"];
+const DEFAULT_SCORER_MODELS = ["anthropic/claude-haiku-4.5", "openai/gpt-5-mini"];
 const DEFAULT_API_BASE = "https://openrouter.ai/api/v1";
 
 const TRUE_FINDING_CASES = [

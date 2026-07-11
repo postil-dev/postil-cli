@@ -21,8 +21,8 @@ pub const DEFAULT_CASCADE: [&str; 3] = [
     "google/gemma-3-27b-it",
     "qwen/qwen3-32b",
 ];
-pub const DEFAULT_SCORER_MODEL: &str = "openai/gpt-5-mini";
-pub const DEFAULT_SCORER_FALLBACK: &str = "anthropic/claude-haiku-4.5";
+pub const DEFAULT_SCORER_MODEL: &str = "anthropic/claude-haiku-4.5";
+pub const DEFAULT_SCORER_FALLBACK: &str = "openai/gpt-5-mini";
 pub const DEFAULT_API_BASE: &str = "https://openrouter.ai/api/v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -511,7 +511,7 @@ model:
     - mistralai/mistral-small-3.2-24b-instruct
     - google/gemma-3-27b-it
     - qwen/qwen3-32b
-  scorer: openai/gpt-5-mini
+  scorer: anthropic/claude-haiku-4.5
   # apiBase: https://openrouter.ai/api/v1   # any OpenAI-compatible endpoint (Ollama, vLLM, Azure).
   #                                         # Ignored from config by default (a repo could redirect
   #                                         # the inference credential). Prefer POSTIL_API_BASE; to

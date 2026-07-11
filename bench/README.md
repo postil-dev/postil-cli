@@ -141,7 +141,7 @@ real OpenRouter endpoint.
 cargo build --quiet --release
 cd bench
 export MODEL_API_KEY=...          # or LLM_API_KEY / OPENROUTER_API_KEY
-POSTIL_SCORER_EVAL_MODELS=openai/gpt-5-mini,anthropic/claude-haiku-4.5 \
+POSTIL_SCORER_EVAL_MODELS=anthropic/claude-haiku-4.5,openai/gpt-5-mini \
   bun run scorer-eval --json-out scorer-eval-report.json
 ```
 

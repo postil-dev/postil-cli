@@ -209,7 +209,7 @@ async fn scorer_lowers_confidence_and_stores_both_values() {
         .await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .and(body_string_contains("openai/gpt-5-mini"))
+        .and(body_string_contains("anthropic/claude-haiku-4.5"))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(scorer_content(json!([{
                 "index": 0,
@@ -236,7 +236,7 @@ async fn scorer_lowers_confidence_and_stores_both_values() {
     let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
     let env: Value = serde_json::from_str(&stdout).unwrap();
     let finding = &env["findings"][0];
-    assert_eq!(env["scorerModel"], "openai/gpt-5-mini");
+    assert_eq!(env["scorerModel"], "anthropic/claude-haiku-4.5");
     assert_eq!(env["scorerDisagreements"], 0);
     assert_eq!(finding["confidence"], 0.7);
     assert_eq!(finding["generatorConfidence"], 0.92);
@@ -250,7 +250,7 @@ async fn scorer_lowers_confidence_and_stores_both_values() {
     let scorer_request: Value = requests
         .iter()
         .map(|request| request.body_json::<Value>().unwrap())
-        .find(|body| body["model"] == "openai/gpt-5-mini")
+        .find(|body| body["model"] == "anthropic/claude-haiku-4.5")
         .unwrap();
     assert_eq!(scorer_request["temperature"], 0.0);
     let scorer_user = scorer_request["messages"][1]["content"].as_str().unwrap();
@@ -270,7 +270,7 @@ async fn scorer_kind_escalation_into_configured_blocking_kind_takes_effect() {
     .await;
     mock_scorer_model(
         &server,
-        "openai/gpt-5-mini",
+        "anthropic/claude-haiku-4.5",
         json!([{
             "index": 0,
             "confidence": 0.88,
@@ -316,7 +316,7 @@ async fn scorer_kind_deescalation_from_blocking_kind_is_ignored() {
     .await;
     mock_scorer_model(
         &server,
-        "openai/gpt-5-mini",
+        "anthropic/claude-haiku-4.5",
         json!([{
             "index": 0,
             "confidence": 0.88,
@@ -362,7 +362,7 @@ async fn large_confidence_disagreement_escalates_to_uncertainty_with_default_gat
     .await;
     mock_scorer_model(
         &server,
-        "openai/gpt-5-mini",
+        "anthropic/claude-haiku-4.5",
         json!([{
             "index": 0,
             "confidence": 0.5,
@@ -405,7 +405,7 @@ async fn scorer_error_fails_open_and_preserves_generator_values() {
         )
         .mount(&server)
         .await;
-    for scorer_model in ["openai/gpt-5-mini", "anthropic/claude-haiku-4.5"] {
+    for scorer_model in ["anthropic/claude-haiku-4.5", "openai/gpt-5-mini"] {
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(body_string_contains(scorer_model))
