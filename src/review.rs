@@ -6,13 +6,13 @@ use anyhow::{Context, Result, anyhow};
 
 use crate::config::{Config, GateLevel, OnError};
 use crate::diff::{self, DiffIndex};
-use crate::envelope::{Envelope, Finding, Gate, Usage, fail_closed_finding};
+use crate::envelope::{Envelope, Finding, Gate, Kind, Usage, fail_closed_finding};
 use crate::filter;
 use crate::forge::{
     CheckState, Forge, PrMeta, azure::Azure, bitbucket::Bitbucket, check_summary,
     clean_review_message, github::GitHub, gitlab::GitLab,
 };
-use crate::llm::LlmClient;
+use crate::llm::{FindingScore, LlmClient};
 use crate::local::{self, LocalSource};
 use crate::output::{self, OutputFormat};
 use crate::prompt::{self, PrContext};
@@ -26,6 +26,7 @@ const MAX_DIFF_BYTES: usize = 400_000;
 /// truncated at a line boundary and the review is flagged truncated so the
 /// uncertainty finding fires (a truncated review must not read as a full pass).
 const MAX_RAW_DIFF_BYTES: usize = MAX_DIFF_BYTES * 4;
+const SCORER_TIMEOUT_SECS: u64 = 120;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForgeKind {
@@ -425,6 +426,67 @@ fn generate_finding_ids(findings: &mut [Finding], head_sha: Option<&str>) {
     }
 }
 
+fn scorer_inputs(parsed: &diff::Diff, findings: &[Finding]) -> Vec<prompt::ScorerPromptFinding> {
+    findings
+        .iter()
+        .enumerate()
+        .map(|(index, finding)| prompt::ScorerPromptFinding {
+            index,
+            path: finding.path.clone(),
+            line: finding.line,
+            severity: finding.severity.as_str().to_string(),
+            title: finding.title.clone(),
+            body: finding.body.clone(),
+            diff_hunk: diff::render_hunk_context(parsed, &finding.path, finding.line, 20)
+                .unwrap_or_else(|| "No diff hunk available for this cited location.".to_string()),
+        })
+        .collect()
+}
+
+fn apply_scorer_scores(cfg: &Config, findings: &mut [Finding], scores: Vec<FindingScore>) -> u32 {
+    let mut disagreements = 0u32;
+    for score in scores {
+        let Some(finding) = findings.get_mut(score.index) else {
+            continue;
+        };
+        let generator_confidence = finding.confidence;
+        let generator_kind = finding.kind;
+        let large_confidence_disagreement = (generator_confidence - score.confidence).abs() >= 0.4;
+        let kind_disagreement = generator_kind != score.kind;
+        if large_confidence_disagreement || kind_disagreement {
+            disagreements += 1;
+        }
+
+        finding.generator_confidence = Some(generator_confidence);
+        finding.scorer_confidence = Some(score.confidence);
+        finding.generator_kind = Some(generator_kind);
+        finding.scorer_kind = Some(score.kind);
+        if !score.reason.is_empty() {
+            finding.scorer_reason = Some(score.reason);
+        }
+        finding.confidence = generator_confidence.min(score.confidence);
+
+        let generator_blocks = cfg.block_on_kinds.contains(&generator_kind);
+        let scorer_blocks = cfg.block_on_kinds.contains(&score.kind);
+        if scorer_blocks && !generator_blocks {
+            finding.kind = score.kind;
+        }
+
+        if large_confidence_disagreement && !cfg.block_on_kinds.contains(&finding.kind) {
+            finding.kind = Kind::Uncertainty;
+        }
+    }
+    disagreements
+}
+
+fn sort_findings_for_display(findings: &mut [Finding]) {
+    findings.sort_by(|a, b| {
+        b.severity
+            .cmp(&a.severity)
+            .then(b.confidence.total_cmp(&a.confidence))
+    });
+}
+
 async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) -> Result<Envelope> {
     let ReviewInput {
         diff_text,
@@ -468,6 +530,9 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
     let mut ungrounded = 0u32;
     let mut findings: Vec<Finding> = Vec::new();
     let mut full_review_trustworthy = false;
+    let mut scorer_model: Option<String> = None;
+    let mut scorer_error: Option<String> = None;
+    let mut scorer_disagreements: Option<u32> = None;
 
     // Run the model when there is a diff to review, or when content policy is
     // active and there is a PR title/description to review (an empty diff should
@@ -527,7 +592,43 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                 } else {
                     full_review_trustworthy = true;
                     summary = model_review.summary;
-                    findings = outcome.kept;
+                    let mut kept = outcome.kept;
+                    if !kept.is_empty() {
+                        let inputs = scorer_inputs(&parsed, &kept);
+                        let scorer_system = prompt::scorer_system_prompt(cfg);
+                        let scorer_user = prompt::scorer_user_prompt(&inputs);
+                        let scored = tokio::time::timeout(
+                            std::time::Duration::from_secs(SCORER_TIMEOUT_SECS),
+                            client.score_findings(cfg, &scorer_system, &scorer_user, inputs.len()),
+                        )
+                        .await;
+                        match scored {
+                            Ok(Ok(scored)) => {
+                                let disagreements =
+                                    apply_scorer_scores(cfg, &mut kept, scored.scores);
+                                scorer_model = Some(scored.model_used);
+                                usage.prompt_tokens += scored.usage.prompt_tokens;
+                                usage.completion_tokens += scored.usage.completion_tokens;
+                                scorer_disagreements = Some(disagreements);
+                                sort_findings_for_display(&mut kept);
+                            }
+                            Ok(Err(e)) => {
+                                let detail = format!("{e:#}");
+                                eprintln!("postil: scorer failed open: {detail}");
+                                let scorer_usage = e.usage();
+                                usage.prompt_tokens += scorer_usage.prompt_tokens;
+                                usage.completion_tokens += scorer_usage.completion_tokens;
+                                scorer_error = Some(detail);
+                            }
+                            Err(_) => {
+                                let detail =
+                                    format!("scorer timed out after {SCORER_TIMEOUT_SECS}s");
+                                eprintln!("postil: scorer failed open: {detail}");
+                                scorer_error = Some(detail);
+                            }
+                        }
+                    }
+                    findings = kept;
                 }
             }
             Err(e) => {
@@ -555,6 +656,11 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                 severity: crate::envelope::Severity::Info,
                 kind: crate::envelope::Kind::Uncertainty,
                 confidence: 1.0,
+                generator_confidence: None,
+                scorer_confidence: None,
+                generator_kind: None,
+                scorer_kind: None,
+                scorer_reason: None,
                 title: "Diff truncated at the review size limit".to_string(),
                 id: None,
                 body: format!(
@@ -626,6 +732,9 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                 .collect(),
         },
         model_used,
+        scorer_model,
+        scorer_error,
+        scorer_disagreements,
         usage,
         duration_ms: review_started.elapsed().as_millis() as u64,
         base_sha: meta.map(|m| m.base_sha.clone()),
@@ -774,6 +883,9 @@ fn error_envelope(
                 .collect(),
         },
         model_used: cfg.model_chain().join(" -> "),
+        scorer_model: None,
+        scorer_error: None,
+        scorer_disagreements: None,
         usage: Usage::default(),
         duration_ms,
         base_sha: Some(meta.base_sha.clone()),
@@ -799,6 +911,11 @@ mod tests {
             severity: Severity::Error,
             kind: Kind::Risk,
             confidence: 0.9,
+            generator_confidence: None,
+            scorer_confidence: None,
+            generator_kind: None,
+            scorer_kind: None,
+            scorer_reason: None,
             title: title.to_string(),
             body: body.to_string(),
             id: None,
@@ -915,5 +1032,77 @@ mod tests {
             &[crate::envelope::provider_error_finding("old")],
             &[crate::envelope::provider_error_finding("old")]
         ));
+    }
+
+    fn score(index: usize, confidence: f64, kind: Kind) -> FindingScore {
+        FindingScore {
+            index,
+            confidence,
+            kind,
+            reason: "scored independently".to_string(),
+        }
+    }
+
+    #[test]
+    fn scorer_lower_confidence_becomes_final_and_both_values_are_stored() {
+        let cfg = Config::default();
+        let mut findings = vec![finding("a.rs", 10, "body")];
+
+        let disagreements =
+            apply_scorer_scores(&cfg, &mut findings, vec![score(0, 0.7, Kind::Risk)]);
+
+        assert_eq!(disagreements, 0);
+        assert_eq!(findings[0].confidence, 0.7);
+        assert_eq!(findings[0].generator_confidence, Some(0.9));
+        assert_eq!(findings[0].scorer_confidence, Some(0.7));
+        assert_eq!(findings[0].kind, Kind::Risk);
+        assert_eq!(findings[0].generator_kind, Some(Kind::Risk));
+        assert_eq!(findings[0].scorer_kind, Some(Kind::Risk));
+    }
+
+    #[test]
+    fn scorer_kind_can_escalate_into_a_blocking_kind() {
+        let cfg = Config::default();
+        let mut findings = vec![finding("a.rs", 10, "body")];
+
+        let disagreements = apply_scorer_scores(
+            &cfg,
+            &mut findings,
+            vec![score(0, 0.9, Kind::HumanEscalation)],
+        );
+
+        assert_eq!(disagreements, 1);
+        assert_eq!(findings[0].kind, Kind::HumanEscalation);
+        assert_eq!(findings[0].generator_kind, Some(Kind::Risk));
+        assert_eq!(findings[0].scorer_kind, Some(Kind::HumanEscalation));
+    }
+
+    #[test]
+    fn scorer_kind_deescalation_out_of_blocking_kind_is_ignored() {
+        let cfg = Config::default();
+        let mut finding = finding("a.rs", 10, "body");
+        finding.kind = Kind::HumanEscalation;
+        let mut findings = vec![finding];
+
+        let disagreements =
+            apply_scorer_scores(&cfg, &mut findings, vec![score(0, 0.9, Kind::Risk)]);
+
+        assert_eq!(disagreements, 1);
+        assert_eq!(findings[0].kind, Kind::HumanEscalation);
+        assert_eq!(findings[0].generator_kind, Some(Kind::HumanEscalation));
+        assert_eq!(findings[0].scorer_kind, Some(Kind::Risk));
+    }
+
+    #[test]
+    fn large_confidence_disagreement_escalates_to_uncertainty_when_not_blocking() {
+        let cfg = Config::default();
+        let mut findings = vec![finding("a.rs", 10, "body")];
+
+        let disagreements =
+            apply_scorer_scores(&cfg, &mut findings, vec![score(0, 0.49, Kind::Risk)]);
+
+        assert_eq!(disagreements, 1);
+        assert_eq!(findings[0].confidence, 0.49);
+        assert_eq!(findings[0].kind, Kind::Uncertainty);
     }
 }

@@ -21,6 +21,8 @@ pub const DEFAULT_CASCADE: [&str; 3] = [
     "google/gemma-3-27b-it",
     "qwen/qwen3-32b",
 ];
+pub const DEFAULT_SCORER_MODEL: &str = "openai/gpt-5-mini";
+pub const DEFAULT_SCORER_FALLBACK: &str = "anthropic/claude-haiku-4.5";
 pub const DEFAULT_API_BASE: &str = "https://openrouter.ai/api/v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,6 +95,7 @@ pub struct Config {
     pub block_on_kinds: Vec<Kind>,
     pub model: String,
     pub cascade: Vec<String>,
+    pub scorer: String,
     pub api_base: String,
     /// Run the first N models of [model + cascade] and keep agreeing findings.
     pub consensus: usize,
@@ -127,6 +130,7 @@ impl Default for Config {
             block_on_kinds: vec![Kind::HumanEscalation],
             model: DEFAULT_MODEL.to_string(),
             cascade: DEFAULT_CASCADE.iter().map(|m| (*m).to_string()).collect(),
+            scorer: DEFAULT_SCORER_MODEL.to_string(),
             api_base: DEFAULT_API_BASE.to_string(),
             consensus: 1,
             guardrails: None,
@@ -180,6 +184,7 @@ pub struct GateSection {
 pub struct ModelSection {
     pub name: Option<String>,
     pub cascade: Option<Vec<String>>,
+    pub scorer: Option<String>,
     pub api_base: Option<String>,
     pub consensus: Option<usize>,
 }
@@ -326,6 +331,9 @@ impl Config {
             if let Some(c) = m.cascade {
                 self.cascade = c;
             }
+            if let Some(s) = m.scorer {
+                self.scorer = s;
+            }
             if let Some(b) = m.api_base {
                 // `model.apiBase` from `.postil.yaml` is repo-controlled, and the
                 // resolved base URL receives the deployment's bearer key. Honoring
@@ -415,6 +423,11 @@ impl Config {
         {
             self.cascade = c.split(',').map(|s| s.trim().to_string()).collect();
         }
+        if let Ok(s) = std::env::var("REVIEW_SCORER_MODEL")
+            && !s.is_empty()
+        {
+            self.scorer = s;
+        }
         if let Ok(b) = std::env::var("POSTIL_API_BASE")
             && !b.is_empty()
         {
@@ -429,6 +442,16 @@ impl Config {
             if !chain.contains(m) {
                 chain.push(m.clone());
             }
+        }
+        chain
+    }
+
+    /// Scorer models to try, in order, deduplicated.
+    pub fn scorer_chain(&self) -> Vec<String> {
+        let mut chain = vec![self.scorer.clone()];
+        let fallback = DEFAULT_SCORER_FALLBACK.to_string();
+        if !chain.contains(&fallback) {
+            chain.push(fallback);
         }
         chain
     }
@@ -488,6 +511,7 @@ model:
     - mistralai/mistral-small-3.2-24b-instruct
     - google/gemma-3-27b-it
     - qwen/qwen3-32b
+  scorer: openai/gpt-5-mini
   # apiBase: https://openrouter.ai/api/v1   # any OpenAI-compatible endpoint (Ollama, vLLM, Azure).
   #                                         # Ignored from config by default (a repo could redirect
   #                                         # the inference credential). Prefer POSTIL_API_BASE; to
@@ -588,6 +612,11 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.model, DEFAULT_MODEL);
         assert_eq!(c.cascade, default_cascade());
+        assert_eq!(c.scorer, DEFAULT_SCORER_MODEL);
+        assert_eq!(
+            c.scorer_chain(),
+            vec![DEFAULT_SCORER_MODEL, DEFAULT_SCORER_FALLBACK]
+        );
         assert_eq!(
             c.model_chain(),
             vec![
@@ -642,6 +671,19 @@ mod tests {
         assert_eq!(c.max_findings, 20);
         assert_eq!(c.model, DEFAULT_MODEL);
         assert_eq!(c.cascade, default_cascade());
+        assert_eq!(c.scorer, DEFAULT_SCORER_MODEL);
+    }
+
+    #[test]
+    fn model_scorer_parses_from_postil_config() {
+        let f: FileConfig = serde_yaml::from_str("model:\n  scorer: custom/scorer\n").unwrap();
+        let mut c = Config::default();
+        c.apply_file(f).unwrap();
+        assert_eq!(c.scorer, "custom/scorer");
+        assert_eq!(
+            c.scorer_chain(),
+            vec!["custom/scorer", DEFAULT_SCORER_FALLBACK]
+        );
     }
 
     #[test]

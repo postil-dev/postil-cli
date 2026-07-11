@@ -147,6 +147,7 @@ model:
     - mistralai/mistral-small-3.2-24b-instruct
     - google/gemma-3-27b-it
     - qwen/qwen3-32b
+  scorer: openai/gpt-5-mini
   apiBase: https://openrouter.ai/api/v1    # ignored from config by default; see note below
   consensus: 1            # >1: only findings multiple models agree on survive
 ```
@@ -161,7 +162,8 @@ single-user local setup where the checked-out repo is trusted, set
 Environment: `POSTIL_API_KEY`, `OPENROUTER_API_KEY`, `MODEL_API_KEY`, or
 `LLM_API_KEY`, `POSTIL_API_BASE`, `POSTIL_DETAILS_URL` (optional HTTP(S) target
 for GitHub check-run details links),
-`REVIEW_MODEL`, `REVIEW_MODEL_CASCADE`, `GITHUB_TOKEN`/`GITHUB_API_URL`,
+`REVIEW_MODEL`, `REVIEW_MODEL_CASCADE`, `REVIEW_SCORER_MODEL`,
+`GITHUB_TOKEN`/`GITHUB_API_URL`,
 `GITLAB_TOKEN`/`GITLAB_API_URL`, `BITBUCKET_TOKEN`/`BITBUCKET_USER`/`BITBUCKET_API_URL`,
 `AZURE_DEVOPS_TOKEN`/`AZURE_DEVOPS_API_URL`.
 
@@ -221,11 +223,12 @@ Bitbucket incremental reviews are disabled unless
 ## The envelope
 
 `--output json` prints a stable versioned envelope (`summary`, `silent`, `findings`,
-`resolved`, `counts`, `confidenceBuckets`, `gate`, `modelUsed`, `usage`, SHAs) consumed
-by the hosted platform and `postil plan`. `--output yaml` and `--output csv` print the
-same review result in YAML or CSV. `--output-file <path>` writes the selected format to
-a file instead of stdout. `--output-json` is deprecated in v0.2.1 as an alias for
-`--output json` and emits a stderr warning. Schema: [postil.dev/docs/envelope](https://postil.dev/docs/envelope).
+`resolved`, `counts`, `confidenceBuckets`, `gate`, `modelUsed`, scorer metadata,
+`usage`, SHAs) consumed by the hosted platform and `postil plan`. `--output yaml` and
+`--output csv` print the same review result in YAML or CSV. `--output-file <path>`
+writes the selected format to a file instead of stdout. `--output-json` is deprecated
+in v0.2.1 as an alias for `--output json` and emits a stderr warning. Schema:
+[postil.dev/docs/envelope](https://postil.dev/docs/envelope).
 
 Exit codes: `0` clean or below gate threshold, `1` gate-failing findings, `2`
 operational error.

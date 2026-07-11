@@ -153,6 +153,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
             );
             println!("model.name: {}", cfg.model);
             println!("model.cascade: {:?}", cfg.cascade);
+            println!("model.scorer: {}", cfg.scorer);
             println!("model.apiBase: {}", cfg.api_base);
             println!("model.consensus: {}", cfg.consensus);
             Ok(0)
