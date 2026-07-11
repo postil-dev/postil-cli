@@ -1,6 +1,7 @@
 //! Review orchestration: one engine for local, CI, and hosted runs.
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 
@@ -26,7 +27,13 @@ const MAX_DIFF_BYTES: usize = 400_000;
 /// truncated at a line boundary and the review is flagged truncated so the
 /// uncertainty finding fires (a truncated review must not read as a full pass).
 const MAX_RAW_DIFF_BYTES: usize = MAX_DIFF_BYTES * 4;
-const SCORER_TIMEOUT_SECS: u64 = 120;
+const HOSTED_WORKER_WATCHDOG_SECS: u64 = 600;
+pub(crate) const HOSTED_LLM_TOTAL_TIMEOUT_SECS: u64 = 540;
+const FORGE_READ_TIMEOUT_SECS: u64 = 60;
+const CHECK_START_TIMEOUT_SECS: u64 = 30;
+const CHECK_COMPLETION_TIMEOUT_SECS: u64 = 30;
+const REVIEW_POST_TIMEOUT_SECS: u64 = 20;
+pub(crate) const SCORER_TIMEOUT_SECS: u64 = 120;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForgeKind {
@@ -77,6 +84,14 @@ struct ReviewInput<'a> {
     baseline: Vec<Finding>,
     scope: filter::ReconcileScope,
     force_model: bool,
+    llm_budget_started_at: Option<Instant>,
+}
+
+struct RemoteReviewInput<'a> {
+    meta: &'a PrMeta,
+    head_sha: &'a str,
+    prefetched_diff: Option<Result<String>>,
+    review_started: Instant,
 }
 
 pub async fn run(args: ReviewArgs) -> Result<i32> {
@@ -164,10 +179,11 @@ async fn run_local(args: &ReviewArgs, cfg: &Config) -> Result<i32> {
             baseline,
             scope,
             force_model: false,
+            llm_budget_started_at: None,
         },
     )
     .await?;
-    finish(args, cfg, envelope, None::<&GitHub>).await
+    finish(args, cfg, envelope, None::<&GitHub>, None).await
 }
 
 async fn run_remote<F: Forge>(
@@ -183,7 +199,13 @@ async fn run_remote<F: Forge>(
     // created checks also overlap their startup writes. Incremental diffs still
     // wait for metadata because they depend on the selected head SHA.
     let setup = async {
-        let meta = forge.fetch_pr_meta().await?;
+        let meta = run_with_hosted_budget(
+            Some(review_started),
+            FORGE_READ_TIMEOUT_SECS,
+            forge.fetch_pr_meta(),
+            "fetching PR metadata",
+        )
+        .await?;
         let head_sha = args.sha.clone().unwrap_or_else(|| meta.head_sha.clone());
 
         // Own the check-runs early so a crash can still be reported against them.
@@ -192,7 +214,14 @@ async fn run_remote<F: Forge>(
         } else if let (Some(a), Some(g)) = (&args.check_run_id, &args.gate_check_run_id) {
             Some((a.clone(), g.clone()))
         } else {
-            match forge.start_checks(&head_sha).await {
+            match run_with_hosted_budget(
+                Some(review_started),
+                CHECK_START_TIMEOUT_SECS,
+                forge.start_checks(&head_sha),
+                "creating check runs",
+            )
+            .await
+            {
                 Ok(ids) => Some(ids),
                 Err(e) => {
                     // CI tokens without checks:write still get review + exit code.
@@ -205,7 +234,15 @@ async fn run_remote<F: Forge>(
     };
     let prefetch_diff = async {
         if args.since_sha.is_none() {
-            Some(forge.fetch_diff().await)
+            Some(
+                run_with_hosted_budget(
+                    Some(review_started),
+                    FORGE_READ_TIMEOUT_SECS,
+                    forge.fetch_diff(),
+                    "fetching diff",
+                )
+                .await,
+            )
         } else {
             None
         }
@@ -213,7 +250,19 @@ async fn run_remote<F: Forge>(
     let (setup, prefetched_diff) = tokio::join!(setup, prefetch_diff);
     let (meta, head_sha, checks) = setup?;
 
-    let result = remote_review(args, cfg, forge, repo, &meta, &head_sha, prefetched_diff).await;
+    let result = remote_review(
+        args,
+        cfg,
+        forge,
+        repo,
+        RemoteReviewInput {
+            meta: &meta,
+            head_sha: &head_sha,
+            prefetched_diff,
+            review_started,
+        },
+    )
+    .await;
     match result {
         Ok(envelope) => {
             if let Some((a, g)) = &checks {
@@ -239,14 +288,18 @@ async fn run_remote<F: Forge>(
                 // discard the review this far along: log and keep going so the
                 // envelope/SARIF output and exit code below still land. Mirrors
                 // the Err(e) arm below, which best-effort's this same call.
-                if let Err(e) = forge
-                    .complete_checks(a, g, advisory_state, gate_state, &envelope)
-                    .await
-                {
+                let completed = run_with_hosted_budget(
+                    Some(review_started),
+                    CHECK_COMPLETION_TIMEOUT_SECS,
+                    forge.complete_checks(a, g, advisory_state, gate_state, &envelope),
+                    "completing check runs",
+                )
+                .await;
+                if let Err(e) = completed {
                     eprintln!("postil: could not update check runs ({e:#})");
                 }
             }
-            finish(args, cfg, envelope, Some(forge)).await
+            finish(args, cfg, envelope, Some(forge), Some(review_started)).await
         }
         Err(e) => {
             // Fail closed by default: an errored run must never read as a silent
@@ -272,9 +325,13 @@ async fn run_remote<F: Forge>(
                 } else {
                     CheckState::Success
                 };
-                let _ = forge
-                    .complete_checks(a, g, CheckState::Neutral, gate_state, &envelope)
-                    .await;
+                let _ = run_with_hosted_budget(
+                    Some(review_started),
+                    CHECK_COMPLETION_TIMEOUT_SECS,
+                    forge.complete_checks(a, g, CheckState::Neutral, gate_state, &envelope),
+                    "completing check runs",
+                )
+                .await;
             }
             // Emit envelope/SARIF and derive the exit code from the gate.
             // `finish` itself already downgrades forge posting failures
@@ -285,7 +342,7 @@ async fn run_remote<F: Forge>(
             // exit code, so it is downgraded to the gate-derived code rather
             // than propagated as exit 2.
             let code = if envelope.gate.failing { 1 } else { 0 };
-            match finish(args, cfg, envelope, Some(forge)).await {
+            match finish(args, cfg, envelope, Some(forge), Some(review_started)).await {
                 Ok(c) => Ok(c),
                 Err(post_err) => {
                     eprintln!("postil: could not post the error review ({post_err:#})");
@@ -301,24 +358,39 @@ async fn remote_review<F: Forge>(
     cfg: &Config,
     forge: &F,
     repo: &str,
-    meta: &PrMeta,
-    head_sha: &str,
-    prefetched_diff: Option<Result<String>>,
+    input: RemoteReviewInput<'_>,
 ) -> Result<Envelope> {
+    let RemoteReviewInput {
+        meta,
+        head_sha,
+        prefetched_diff,
+        review_started,
+    } = input;
     let baseline = load_baseline(args)?;
     let has_carryable_baseline = baseline.iter().any(|f| !f.path.starts_with(".postil/"));
     let incremental = args.since_sha.as_deref();
     let (diff_text, scope, force_model) = match incremental {
-        Some(since) if since != head_sha => forge
-            .fetch_diff_since(since, head_sha)
-            .await
-            .context("incremental diff fetch")
-            .map(|diff| (diff, filter::ReconcileScope::Incremental, false))?,
+        Some(since) if since != head_sha => run_with_hosted_budget(
+            Some(review_started),
+            FORGE_READ_TIMEOUT_SECS,
+            forge.fetch_diff_since(since, head_sha),
+            "fetching incremental diff",
+        )
+        .await
+        .context("incremental diff fetch")
+        .map(|diff| (diff, filter::ReconcileScope::Incremental, false))?,
         Some(_) => (String::new(), filter::ReconcileScope::Incremental, false),
         None => (
             match prefetched_diff {
                 Some(diff) => diff.context("diff fetch")?,
-                None => forge.fetch_diff().await.context("diff fetch")?,
+                None => run_with_hosted_budget(
+                    Some(review_started),
+                    FORGE_READ_TIMEOUT_SECS,
+                    forge.fetch_diff(),
+                    "fetching diff",
+                )
+                .await
+                .context("diff fetch")?,
             },
             filter::ReconcileScope::Full { trustworthy: false },
             false,
@@ -334,10 +406,14 @@ async fn remote_review<F: Forge>(
         && diff_text.trim().is_empty()
     {
         (
-            forge
-                .fetch_diff()
-                .await
-                .context("full diff fallback fetch")?,
+            run_with_hosted_budget(
+                Some(review_started),
+                FORGE_READ_TIMEOUT_SECS,
+                forge.fetch_diff(),
+                "fetching full fallback diff",
+            )
+            .await
+            .context("full diff fallback fetch")?,
             filter::ReconcileScope::Full { trustworthy: false },
             true,
         )
@@ -355,6 +431,7 @@ async fn remote_review<F: Forge>(
             baseline,
             scope,
             force_model,
+            llm_budget_started_at: Some(review_started),
         },
     )
     .await
@@ -496,6 +573,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
         baseline,
         scope,
         force_model,
+        llm_budget_started_at,
     } = input;
     let review_started = std::time::Instant::now();
     // Cap the raw diff before parsing so an oversized fetched diff cannot force
@@ -559,7 +637,14 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                  is shown above.]",
             );
         }
-        let client = LlmClient::from_env(cfg)?;
+        let client = match llm_budget_started_at {
+            Some(started_at) => LlmClient::from_env_for_remote_review(
+                cfg,
+                started_at,
+                Duration::from_secs(HOSTED_LLM_TOTAL_TIMEOUT_SECS),
+            )?,
+            None => LlmClient::from_env(cfg)?,
+        };
         match client.review(cfg, &system, &user).await {
             Ok(model_review) => {
                 let outcome = filter::apply(cfg, &index, model_review.findings)?;
@@ -748,6 +833,7 @@ async fn finish<F: Forge>(
     cfg: &Config,
     envelope: Envelope,
     forge: Option<&F>,
+    hosted_budget_started_at: Option<Instant>,
 ) -> Result<i32> {
     // Persist artifacts before any forge I/O: a posting hiccup must not
     // discard the completed review's SARIF or envelope output.
@@ -791,12 +877,49 @@ async fn finish<F: Forge>(
             // envelope/SARIF/stdout output above. Log it and keep going — the
             // exit code always derives from the gate below, never from whether
             // the forge comment made it out.
-            if let Err(e) = forge.post_review(&summary, &envelope.findings, &head).await {
+            let posted = run_with_hosted_budget(
+                hosted_budget_started_at,
+                REVIEW_POST_TIMEOUT_SECS,
+                forge.post_review(&summary, &envelope.findings, &head),
+                "posting review comment",
+            )
+            .await;
+            if let Err(e) = posted {
                 eprintln!("postil: could not post review comment ({e:#})");
             }
         }
     }
     Ok(if envelope.gate.failing { 1 } else { 0 })
+}
+
+async fn run_with_hosted_budget<T>(
+    hosted_budget_started_at: Option<Instant>,
+    cap_secs: u64,
+    future: impl std::future::Future<Output = Result<T>>,
+    operation: &str,
+) -> Result<T> {
+    let Some(started_at) = hosted_budget_started_at else {
+        return future.await;
+    };
+    let Some(remaining) = hosted_worker_remaining(started_at) else {
+        return Err(anyhow!(
+            "hosted watchdog budget exhausted before {operation}"
+        ));
+    };
+    let timeout = remaining.min(Duration::from_secs(cap_secs));
+    match tokio::time::timeout(timeout, future).await {
+        Ok(result) => result,
+        Err(_) => Err(anyhow!(
+            "{operation} timed out after {}s of hosted budget",
+            timeout.as_secs()
+        )),
+    }
+}
+
+fn hosted_worker_remaining(started_at: Instant) -> Option<Duration> {
+    (started_at + Duration::from_secs(HOSTED_WORKER_WATCHDOG_SECS))
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
 }
 
 fn visible_finding_sets_equal(previous: &[Finding], current: &[Finding]) -> bool {
@@ -947,6 +1070,23 @@ mod tests {
             .find(|finding| finding.path == path && finding.line == line && finding.title == title)
             .and_then(|finding| finding.id.clone())
             .expect("finding should have an assigned ID")
+    }
+
+    #[test]
+    fn default_llm_timeouts_fit_inside_hosted_worker_watchdog() {
+        const PROCESS_OVERHEAD_SECS: u64 = 10;
+
+        // The request plus scorer equation is the no-setup upper bound. Remote
+        // setup is anchored to the same total budget and reduces the remaining
+        // LLM/scorer time before the client is constructed.
+        assert_eq!(
+            HOSTED_LLM_TOTAL_TIMEOUT_SECS,
+            crate::llm::DEFAULT_REQUEST_TIMEOUT_SECS + SCORER_TIMEOUT_SECS
+        );
+        assert_eq!(
+            HOSTED_WORKER_WATCHDOG_SECS - HOSTED_LLM_TOTAL_TIMEOUT_SECS,
+            CHECK_COMPLETION_TIMEOUT_SECS + REVIEW_POST_TIMEOUT_SECS + PROCESS_OVERHEAD_SECS
+        );
     }
 
     #[test]
