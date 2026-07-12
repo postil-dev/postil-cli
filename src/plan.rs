@@ -75,12 +75,10 @@ fn replay(path: &Path, env: &Envelope, cfg: &Config) -> Result<PlanRow> {
         .map(|kind| kind.as_str().to_string())
         .collect();
     let gate_after = kept.iter().any(|finding| {
-        if finding.path == crate::envelope::PROVIDER_PATH {
-            // Provider-only pre-review failures encode their onError outcome
-            // only in gate.failing. Envelope v1 does not carry enough detail
-            // to reconstruct that decision from failOn, so preserve it rather
-            // than reporting a fabricated candidate-policy result.
-            env.gate.failing
+        if finding.path == crate::envelope::OPERATIONAL_PATH {
+            true
+        } else if finding.path == crate::envelope::PROVIDER_PATH {
+            cfg.gate_on_error == crate::config::OnError::Block
         } else {
             crate::envelope::finding_blocks_gate(
                 finding,
@@ -248,5 +246,42 @@ mod tests {
 
         assert_eq!(rows[0].findings_after, 1);
         assert!(!rows[0].gate_after);
+    }
+
+    #[test]
+    fn replay_applies_candidate_error_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut provider = f(crate::envelope::PROVIDER_PATH, Severity::Error, 1.0);
+        provider.kind = Kind::Uncertainty;
+        let env = envelope_with(vec![provider], true);
+        std::fs::write(
+            dir.path().join("provider.json"),
+            serde_json::to_string(&env).unwrap(),
+        )
+        .unwrap();
+
+        let mut cfg = Config::default();
+        cfg.gate_fail_on = crate::config::GateLevel::Never;
+        cfg.gate_on_error = crate::config::OnError::Advisory;
+        assert!(!run(dir.path(), &cfg).unwrap()[0].gate_after);
+
+        cfg.gate_on_error = crate::config::OnError::Block;
+        assert!(run(dir.path(), &cfg).unwrap()[0].gate_after);
+    }
+
+    #[test]
+    fn replay_always_blocks_unusable_model_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = envelope_with(vec![crate::envelope::fail_closed_finding("invalid")], true);
+        std::fs::write(
+            dir.path().join("invalid.json"),
+            serde_json::to_string(&env).unwrap(),
+        )
+        .unwrap();
+
+        let mut cfg = Config::default();
+        cfg.gate_fail_on = crate::config::GateLevel::Never;
+        cfg.gate_on_error = crate::config::OnError::Advisory;
+        assert!(run(dir.path(), &cfg).unwrap()[0].gate_after);
     }
 }

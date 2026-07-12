@@ -798,12 +798,13 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
         .map(|kind| kind.as_str().to_string())
         .collect();
     let gate_failing = findings.iter().any(|f| {
-        crate::envelope::finding_blocks_gate(
-            f,
-            gate_fail_on,
-            &gate_block_on_kinds,
-            advisory_on_error && f.path == crate::envelope::PROVIDER_PATH,
-        )
+        if f.path == crate::envelope::OPERATIONAL_PATH {
+            true
+        } else if f.path == crate::envelope::PROVIDER_PATH {
+            !advisory_on_error
+        } else {
+            crate::envelope::finding_blocks_gate(f, gate_fail_on, &gate_block_on_kinds, false)
+        }
     });
     let silent = findings.is_empty();
     let mut counts = Envelope::counts_of(&findings, suppressed);
