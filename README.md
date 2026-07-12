@@ -142,13 +142,13 @@ gate:
 # contentPolicy:
 #   enabled: false
 model:
-  name: deepseek/deepseek-v4-pro
+  name: z-ai/glm-5.2
   cascade:
-    - google/gemini-3.1-flash-lite
     - moonshotai/kimi-k2.7-code
-    - mistralai/mistral-large-2512
+    - deepseek/deepseek-v4-flash
   scorer: anthropic/claude-haiku-4.5
   apiBase: https://openrouter.ai/api/v1    # ignored from config by default; see note below
+  apiFormat: openai-compatible             # or anthropic for the native Messages API
   consensus: 1            # >1: only findings multiple models agree on survive
 ```
 
@@ -160,7 +160,10 @@ single-user local setup where the checked-out repo is trusted, set
 `POSTIL_ALLOW_CONFIG_API_BASE=1` to honor the config value.
 
 Environment: `POSTIL_API_KEY`, `OPENROUTER_API_KEY`, `MODEL_API_KEY`, or
-`LLM_API_KEY`, `POSTIL_API_BASE`, `POSTIL_DETAILS_URL` (optional HTTP(S) target
+`LLM_API_KEY`, `POSTIL_API_BASE`, `POSTIL_API_FORMAT` (`openai-compatible` by
+default, or `anthropic`), `POSTIL_ENDPOINT_AUTH_HEADER` and
+`POSTIL_ENDPOINT_AUTH_VALUE` (optional additional authentication for a private
+endpoint), `POSTIL_DETAILS_URL` (optional HTTP(S) target
 for GitHub check-run details links),
 `REVIEW_MODEL`, `REVIEW_MODEL_CASCADE`, `REVIEW_SCORER_MODEL`,
 `GITHUB_TOKEN`/`GITHUB_API_URL`,
@@ -171,7 +174,24 @@ for GitHub check-run details links),
 
 See the measured benchmark results at [postil.dev/docs/models](https://postil.dev/docs/models),
 which are sourced from the published bench aggregate. Any model served through an
-OpenAI-compatible endpoint works.
+OpenAI-compatible endpoint works. Native Anthropic Messages API endpoints also work:
+
+```sh
+POSTIL_API_BASE=https://api.anthropic.com/v1 \
+POSTIL_API_FORMAT=anthropic \
+MODEL_API_KEY=... \
+REVIEW_MODEL=claude-sonnet-4-6 \
+postil doctor
+```
+
+OpenAI-compatible requests use `Authorization: Bearer`; Anthropic requests use
+`x-api-key` and `anthropic-version`. A private gateway can require an additional
+header through `POSTIL_ENDPOINT_AUTH_HEADER` and `POSTIL_ENDPOINT_AUTH_VALUE`.
+Postil rejects additional-header names that collide with `x-api-key`,
+`anthropic-version`, or `content-type`. OpenAI-compatible endpoints also reserve
+`Authorization` for the provider key; Anthropic endpoints may use an additional
+`Authorization` value alongside their provider-owned `x-api-key`. Postil never
+prints credential values.
 
 Local endpoints use the same OpenAI-compatible contract:
 
@@ -190,14 +210,14 @@ REVIEW_MODEL=<served-model-name> \
 postil review --staged --output json
 ```
 
-Hosted remote reviews use a 240-second request timeout with a single timeout retry capped at 90 seconds, reducing unnecessary fallback to weaker models when the primary model is slow but working. The entire review model phase is capped at 420 seconds, with the remaining 120 seconds of the 540-second total LLM budget reserved for scoring inside the worker watchdog. A timeout triggers one automatic retry at the same model level before cascading to the next model. Local reviews default to a 480-second request timeout and do not use a total deadline unless `POSTIL_LLM_TOTAL_TIMEOUT_SECS` is set. Exhausting a review or total deadline is terminal.
+Hosted remote reviews use a 240-second initial request timeout with a single timeout retry capped at 90 seconds, reducing unnecessary fallback to weaker models when the primary model is slow but working. The entire review model phase is capped at 420 seconds, with the remaining 120 seconds of the 540-second total LLM budget reserved for scoring inside the worker watchdog. A timeout triggers one automatic retry at the same model level before cascading to the next model. Local reviews use a 480-second initial request timeout and the same timeout-retry rule, so a timed-out model can receive one additional attempt of up to 90 seconds. Local reviews do not have a total deadline unless `POSTIL_LLM_TOTAL_TIMEOUT_SECS` is set. Exhausting a review or total deadline is terminal.
 
 Use the live benchmark harness before standardizing on a model:
 
 ```sh
 cargo build --quiet --release
 cd bench
-MODEL_API_KEY=... REVIEW_MODEL=deepseek/deepseek-v4-pro bun run bench:live -- --json
+MODEL_API_KEY=... REVIEW_MODEL=z-ai/glm-5.2 bun run bench:live -- --json
 ```
 
 ## Preview a config change before deploying it

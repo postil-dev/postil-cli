@@ -1,17 +1,18 @@
-//! OpenAI-compatible chat client with model cascade, one JSON-repair retry,
+//! OpenAI-compatible and native Anthropic chat client with model cascade, one JSON-repair retry,
 //! optional multi-model consensus, and fail-closed semantics.
 //!
-//! Works against OpenRouter (default), Ollama, vLLM, LiteLLM, Azure OpenAI, or
-//! any other endpoint that speaks `POST {base}/chat/completions`.
+//! OpenAI-compatible endpoints use `POST {base}/chat/completions` by default.
+//! Native Anthropic endpoints use `POST {base}/messages` when explicitly selected.
 
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
+use reqwest::header::{HeaderName, HeaderValue};
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::api_key;
-use crate::config::Config;
+use crate::config::{ApiFormat, Config};
 use crate::envelope::{Finding, Kind, Usage};
 
 #[derive(Debug, Clone)]
@@ -157,10 +158,19 @@ pub struct LlmClient {
     http: reqwest::Client,
     api_base: String,
     api_key: String,
+    api_format: ApiFormat,
+    endpoint_auth: Option<EndpointAuth>,
     request_timeout: Duration,
     timeout_retry_timeout: Duration,
     review_deadline: Option<Instant>,
     total_deadline: Option<Instant>,
+}
+
+#[derive(Clone)]
+struct EndpointAuth {
+    name: HeaderName,
+    value: HeaderValue,
+    secret: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -184,9 +194,14 @@ const TIMEOUT_RETRY_CAP_SECS: u64 = 90;
 /// use their provider default.
 const REVIEW_MAX_TOKENS: u32 = 16384;
 const SCORER_MAX_TOKENS: u32 = 4096;
+const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 4096;
+const ANTHROPIC_VERSION: &str = "2023-06-01";
 pub(crate) const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 480;
 const REQUEST_TIMEOUT_ENV: &str = "POSTIL_LLM_REQUEST_TIMEOUT_SECS";
 const TOTAL_TIMEOUT_ENV: &str = "POSTIL_LLM_TOTAL_TIMEOUT_SECS";
+const ENDPOINT_AUTH_HEADER_ENV: &str = "POSTIL_ENDPOINT_AUTH_HEADER";
+const ENDPOINT_AUTH_VALUE_ENV: &str = "POSTIL_ENDPOINT_AUTH_VALUE";
+const ALWAYS_MANAGED_HEADERS: &[&str] = &["x-api-key", "anthropic-version", "content-type"];
 
 /// Marker context attached to transport/provider-level failures (endpoint
 /// unreachable, HTTP error status, timeout, malformed HTTP envelope) — the
@@ -242,6 +257,23 @@ impl std::fmt::Display for RequestTimedOut {
 impl std::error::Error for RequestTimedOut {}
 
 impl LlmClient {
+    pub(crate) async fn doctor_probe(cfg: &Config, api_key: String) -> Result<()> {
+        let client = Self::build(cfg, api_key, Duration::from_secs(30), None, None)?;
+        let body = client.request_body(&cfg.model, "", "ping", Some(1), 0.0);
+        let (status, text) =
+            tokio::time::timeout(Duration::from_secs(30), client.request_once(&body))
+                .await
+                .map_err(|_| RequestTimedOut)??;
+        if !status.is_success() {
+            return Err(anyhow!(
+                "model endpoint returned {status}: {}",
+                client.safe_error_snippet(&text)
+            ));
+        }
+        client.parse_response(&text, &mut Usage::default())?;
+        Ok(())
+    }
+
     /// Local and interactive clients have no built-in total deadline. They only
     /// get one when POSTIL_LLM_TOTAL_TIMEOUT_SECS is explicitly set.
     pub fn from_env(cfg: &Config) -> Result<Self> {
@@ -290,6 +322,7 @@ impl LlmClient {
         review_deadline: Option<Instant>,
         total_deadline: Option<Instant>,
     ) -> Result<Self> {
+        let endpoint_auth = endpoint_auth_from_env(cfg.api_format)?;
         Ok(LlmClient {
             // The attempt timeout wraps both sending the request and consuming
             // the complete response body, so header and body stalls take the
@@ -297,6 +330,8 @@ impl LlmClient {
             http: reqwest::Client::builder().build()?,
             api_base: cfg.api_base.trim_end_matches('/').to_string(),
             api_key,
+            api_format: cfg.api_format,
+            endpoint_auth,
             request_timeout,
             timeout_retry_timeout: request_timeout.min(Duration::from_secs(TIMEOUT_RETRY_CAP_SECS)),
             review_deadline,
@@ -689,17 +724,7 @@ impl LlmClient {
         temperature: f64,
         phase: LlmPhase,
     ) -> Result<String> {
-        let mut body = json!({
-            "model": model,
-            "temperature": temperature,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-        });
-        if let Some(max_tokens) = max_tokens {
-            body["max_tokens"] = json!(max_tokens);
-        }
+        let body = self.request_body(model, system, user, max_tokens, temperature);
         let mut retries = 0u32;
         let mut timeout_retries = 0u32;
         let mut attempt_timeout = self.request_timeout;
@@ -735,7 +760,7 @@ impl LlmClient {
                     if status.is_success() {
                         break text;
                     }
-                    let snippet: String = text.chars().take(300).collect();
+                    let snippet = self.safe_error_snippet(&text);
                     if timeout_status(status.as_u16())
                         && timeout_retries < TIMEOUT_RETRIES
                         && retries < TRANSIENT_RETRIES
@@ -812,33 +837,114 @@ impl LlmClient {
                 }
             }
         };
-        let parsed: ChatResponse =
-            serde_json::from_str(&text).context("model endpoint returned non-JSON body")?;
-        if let Some(u) = parsed.usage {
-            usage.prompt_tokens += u.prompt_tokens.unwrap_or(0);
-            usage.completion_tokens += u.completion_tokens.unwrap_or(0);
+        self.parse_response(&text, usage)
+    }
+
+    fn request_body(
+        &self,
+        model: &str,
+        system: &str,
+        user: &str,
+        max_tokens: Option<u32>,
+        temperature: f64,
+    ) -> serde_json::Value {
+        match self.api_format {
+            ApiFormat::OpenaiCompatible => {
+                let mut body = json!({
+                    "model": model,
+                    "temperature": temperature,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                });
+                if let Some(max_tokens) = max_tokens {
+                    body["max_tokens"] = json!(max_tokens);
+                }
+                body
+            }
+            ApiFormat::Anthropic => json!({
+                "model": model,
+                "system": system,
+                "messages": [{"role": "user", "content": user}],
+                "max_tokens": max_tokens.unwrap_or(ANTHROPIC_DEFAULT_MAX_TOKENS),
+                "temperature": temperature,
+            }),
         }
-        parsed
-            .choices
-            .into_iter()
-            .next()
-            .and_then(|c| c.message.content)
-            .ok_or_else(|| anyhow!("model response had no choices/content"))
+    }
+
+    fn parse_response(&self, text: &str, usage: &mut Usage) -> Result<String> {
+        match self.api_format {
+            ApiFormat::OpenaiCompatible => {
+                let parsed: ChatResponse = serde_json::from_str(text)
+                    .context("model endpoint returned non-JSON OpenAI-compatible body")?;
+                if let Some(u) = parsed.usage {
+                    usage.prompt_tokens += u.prompt_tokens.unwrap_or(0);
+                    usage.completion_tokens += u.completion_tokens.unwrap_or(0);
+                }
+                parsed
+                    .choices
+                    .into_iter()
+                    .next()
+                    .and_then(|choice| choice.message.content)
+                    .ok_or_else(|| anyhow!("model response had no choices/content"))
+            }
+            ApiFormat::Anthropic => {
+                let parsed: AnthropicResponse = serde_json::from_str(text)
+                    .context("model endpoint returned non-JSON Anthropic body")?;
+                if let Some(u) = parsed.usage {
+                    usage.prompt_tokens += u.input_tokens.unwrap_or(0);
+                    usage.completion_tokens += u.output_tokens.unwrap_or(0);
+                }
+                let content = parsed
+                    .content
+                    .into_iter()
+                    .filter(|block| block.kind == "text")
+                    .filter_map(|block| block.text)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if content.is_empty() {
+                    Err(anyhow!("model response had no text content blocks"))
+                } else {
+                    Ok(content)
+                }
+            }
+        }
+    }
+
+    fn safe_error_snippet(&self, text: &str) -> String {
+        let mut redacted = text.replace(&self.api_key, "[REDACTED]");
+        if let Some(auth) = &self.endpoint_auth {
+            redacted = redacted.replace(&auth.secret, "[REDACTED]");
+        }
+        redacted.chars().take(300).collect()
     }
 
     async fn request_once(
         &self,
         body: &serde_json::Value,
     ) -> std::result::Result<(reqwest::StatusCode, String), reqwest::Error> {
-        let response = self
-            .http
-            .post(format!("{}/chat/completions", self.api_base))
-            .bearer_auth(&self.api_key)
-            .header("HTTP-Referer", "https://postil.dev")
-            .header("X-Title", "Postil")
-            .json(body)
-            .send()
-            .await?;
+        let mut request = match self.api_format {
+            ApiFormat::OpenaiCompatible => {
+                let url = format!("{}/chat/completions", self.api_base);
+                self.http
+                    .post(&url)
+                    .bearer_auth(&self.api_key)
+                    .header("HTTP-Referer", "https://postil.dev")
+                    .header("X-Title", "Postil")
+            }
+            ApiFormat::Anthropic => {
+                let url = format!("{}/messages", self.api_base);
+                self.http
+                    .post(&url)
+                    .header("x-api-key", &self.api_key)
+                    .header("anthropic-version", ANTHROPIC_VERSION)
+            }
+        };
+        if let Some(auth) = &self.endpoint_auth {
+            request = request.header(auth.name.clone(), auth.value.clone());
+        }
+        let response = request.json(body).send().await?;
         let status = response.status();
         let text = response.text().await?;
         Ok((status, text))
@@ -927,6 +1033,65 @@ struct Message {
 struct ChatUsage {
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicResponse {
+    #[serde(default)]
+    content: Vec<AnthropicContentBlock>,
+    usage: Option<AnthropicUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicContentBlock {
+    #[serde(rename = "type")]
+    kind: String,
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicUsage {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+}
+
+fn endpoint_auth_from_env(api_format: ApiFormat) -> Result<Option<EndpointAuth>> {
+    let header = std::env::var(ENDPOINT_AUTH_HEADER_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let value = std::env::var(ENDPOINT_AUTH_VALUE_ENV)
+        .ok()
+        .filter(|value| !value.is_empty());
+    match (header, value) {
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(anyhow!(
+            "{ENDPOINT_AUTH_VALUE_ENV} must be set when {ENDPOINT_AUTH_HEADER_ENV} is set"
+        )),
+        (None, Some(_)) => Err(anyhow!(
+            "{ENDPOINT_AUTH_HEADER_ENV} must be set when {ENDPOINT_AUTH_VALUE_ENV} is set"
+        )),
+        (Some(header), Some(secret)) => {
+            let normalized = header.trim().to_ascii_lowercase();
+            anyhow::ensure!(
+                !(ALWAYS_MANAGED_HEADERS.contains(&normalized.as_str())
+                    || (api_format == ApiFormat::OpenaiCompatible
+                        && normalized == "authorization")),
+                "{ENDPOINT_AUTH_HEADER_ENV} cannot override provider-managed header {header:?}"
+            );
+            let name = HeaderName::from_bytes(header.trim().as_bytes()).with_context(|| {
+                format!("{ENDPOINT_AUTH_HEADER_ENV} is not a valid HTTP header name")
+            })?;
+            let mut value = HeaderValue::from_bytes(secret.as_bytes()).with_context(|| {
+                format!("{ENDPOINT_AUTH_VALUE_ENV} is not a valid HTTP header value")
+            })?;
+            value.set_sensitive(true);
+            Ok(Some(EndpointAuth {
+                name,
+                value,
+                secret,
+            }))
+        }
+    }
 }
 
 /// Extract and validate the review JSON from model text. Tolerates code fences
@@ -1184,6 +1349,36 @@ mod tests {
             log_text("model\nnext\r\t\u{1b}[31m"),
             r"model\nnext\r\t\u{1b}[31m"
         );
+    }
+
+    #[test]
+    fn endpoint_auth_rejects_headers_managed_by_each_api_format() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvRestore::capture(&[ENDPOINT_AUTH_HEADER_ENV, ENDPOINT_AUTH_VALUE_ENV]);
+        EnvRestore::set(ENDPOINT_AUTH_VALUE_ENV, "secret-value");
+        for name in ["X-API-Key", "Anthropic-Version", "Content-Type"] {
+            EnvRestore::set(ENDPOINT_AUTH_HEADER_ENV, name);
+            for format in [ApiFormat::OpenaiCompatible, ApiFormat::Anthropic] {
+                let error = endpoint_auth_from_env(format)
+                    .err()
+                    .expect("collision rejected");
+                assert!(error.to_string().contains("provider-managed header"));
+                assert!(!error.to_string().contains("secret-value"));
+            }
+        }
+
+        EnvRestore::set(ENDPOINT_AUTH_HEADER_ENV, "Authorization");
+        let openai_error = endpoint_auth_from_env(ApiFormat::OpenaiCompatible)
+            .err()
+            .expect("OpenAI-compatible Authorization collision rejected");
+        assert!(openai_error.to_string().contains("provider-managed header"));
+        assert!(!openai_error.to_string().contains("secret-value"));
+
+        let anthropic = endpoint_auth_from_env(ApiFormat::Anthropic)
+            .unwrap()
+            .expect("Anthropic additional Authorization accepted");
+        assert_eq!(anthropic.name, reqwest::header::AUTHORIZATION);
+        assert_eq!(anthropic.value, "secret-value");
     }
 
     impl Drop for EnvRestore {

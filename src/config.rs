@@ -20,6 +20,31 @@ use crate::envelope::{Kind, Severity};
 const MODEL_DEFAULTS_TOML: &str = include_str!("../config.toml");
 pub const DEFAULT_API_BASE: &str = "https://openrouter.ai/api/v1";
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApiFormat {
+    #[default]
+    OpenaiCompatible,
+    Anthropic,
+}
+
+impl ApiFormat {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "openai-compatible" => Ok(Self::OpenaiCompatible),
+            "anthropic" => Ok(Self::Anthropic),
+            _ => anyhow::bail!("invalid API format {value:?} (openai-compatible|anthropic)"),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenaiCompatible => "openai-compatible",
+            Self::Anthropic => "anthropic",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelDefaults {
     pub version: u64,
@@ -193,6 +218,7 @@ pub struct Config {
     pub cascade: Vec<String>,
     pub scorer: String,
     pub api_base: String,
+    pub api_format: ApiFormat,
     /// Run the first N models of [model + cascade] and keep agreeing findings.
     pub consensus: usize,
     /// Contents of `.postil/guardrails.md`, injected into the prompt as repo
@@ -229,6 +255,7 @@ impl Default for Config {
             cascade: defaults.cascade.clone(),
             scorer: defaults.scorer_model.clone(),
             api_base: DEFAULT_API_BASE.to_string(),
+            api_format: ApiFormat::default(),
             consensus: 1,
             guardrails: None,
             content_policy: Some(BUILTIN_CONTENT_POLICY.to_string()),
@@ -283,6 +310,7 @@ pub struct ModelSection {
     pub cascade: Option<Vec<String>>,
     pub scorer: Option<String>,
     pub api_base: Option<String>,
+    pub api_format: Option<ApiFormat>,
     pub consensus: Option<usize>,
 }
 
@@ -322,7 +350,7 @@ impl Config {
         } else {
             Config::default()
         };
-        cfg.apply_env();
+        cfg.apply_env()?;
         // Repo guardrails are a separate file so they can be long-form prose.
         let guardrails_path = root.join(".postil").join("guardrails.md");
         if let Ok(text) = std::fs::read_to_string(&guardrails_path) {
@@ -449,6 +477,9 @@ impl Config {
                     );
                 }
             }
+            if let Some(format) = m.api_format {
+                self.api_format = format;
+            }
             if let Some(n) = m.consensus {
                 anyhow::ensure!(n >= 1, "model.consensus must be >= 1");
                 self.consensus = n;
@@ -509,7 +540,7 @@ impl Config {
         Ok(cfg)
     }
 
-    fn apply_env(&mut self) {
+    fn apply_env(&mut self) -> Result<()> {
         if let Ok(m) = std::env::var("REVIEW_MODEL")
             && !m.is_empty()
         {
@@ -530,6 +561,12 @@ impl Config {
         {
             self.api_base = b;
         }
+        if let Ok(format) = std::env::var("POSTIL_API_FORMAT")
+            && !format.trim().is_empty()
+        {
+            self.api_format = ApiFormat::parse(&format)?;
+        }
+        Ok(())
     }
 
     /// All models to try, in order, deduplicated.
@@ -606,7 +643,8 @@ model:
   name: __DEFAULT_MODEL__
   cascade:
 __DEFAULT_CASCADE__  scorer: __DEFAULT_SCORER_MODEL__
-  # apiBase: https://openrouter.ai/api/v1   # any OpenAI-compatible endpoint (Ollama, vLLM, Azure).
+  # apiBase: https://openrouter.ai/api/v1   # OpenAI-compatible or Anthropic endpoint base URL.
+  # apiFormat: openai-compatible             # openai-compatible (default) or anthropic.
   #                                         # Ignored from config by default (a repo could redirect
   #                                         # the inference credential). Prefer POSTIL_API_BASE; to
   #                                         # honor this key set POSTIL_ALLOW_CONFIG_API_BASE=1 for a
@@ -868,10 +906,9 @@ fallback = "example/scorer-fallback"
         assert_eq!(
             c.model_chain(),
             vec![
-                "deepseek/deepseek-v4-pro",
-                "google/gemini-3.1-flash-lite",
+                "z-ai/glm-5.2",
                 "moonshotai/kimi-k2.7-code",
-                "mistralai/mistral-large-2512",
+                "deepseek/deepseek-v4-flash",
             ]
         );
     }
@@ -933,6 +970,19 @@ fallback = "example/scorer-fallback"
             c.scorer_chain(),
             vec!["custom/scorer", &model_defaults().scorer_fallback]
         );
+    }
+
+    #[test]
+    fn anthropic_api_format_parses_from_postil_config() {
+        let f: FileConfig = serde_yaml::from_str("model:\n  apiFormat: anthropic\n").unwrap();
+        let mut config = Config::default();
+        config.apply_file(f).unwrap();
+        assert_eq!(config.api_format, ApiFormat::Anthropic);
+    }
+
+    #[test]
+    fn openai_compatible_is_the_default_api_format() {
+        assert_eq!(Config::default().api_format, ApiFormat::OpenaiCompatible);
     }
 
     #[test]

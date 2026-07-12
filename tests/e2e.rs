@@ -59,6 +59,24 @@ fn llm_text(text: &str) -> Value {
     })
 }
 
+fn anthropic_content(findings: Value, input_tokens: u64, output_tokens: u64) -> Value {
+    let summary = if findings.as_array().is_none_or(|items| items.is_empty()) {
+        ""
+    } else {
+        "SQL injection risk in auth path."
+    };
+    json!({
+        "content": [
+            {"type": "thinking", "thinking": "omitted"},
+            {"type": "text", "text": json!({
+                "summary": summary,
+                "findings": findings
+            }).to_string()}
+        ],
+        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
+    })
+}
+
 fn finding_at(line: u32, severity: &str, confidence: f64) -> Value {
     json!({
         "path": "src/auth.rs",
@@ -108,11 +126,214 @@ fn postil() -> Command {
         .env_remove("OPENROUTER_API_KEY")
         .env_remove("POSTIL_API_KEY")
         .env_remove("POSTIL_API_BASE")
+        .env_remove("POSTIL_API_FORMAT")
+        .env_remove("POSTIL_ENDPOINT_AUTH_HEADER")
+        .env_remove("POSTIL_ENDPOINT_AUTH_VALUE")
         .env_remove("POSTIL_DETAILS_URL")
         .env_remove("GITHUB_SERVER_URL")
         .env_remove("POSTIL_ENABLE_BITBUCKET_INCREMENTAL")
         .env("MODEL_API_KEY", "test-key");
     cmd
+}
+
+#[tokio::test]
+async fn native_anthropic_review_uses_messages_shape_auth_and_usage() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .and(header("x-api-key", "anthropic-provider-key"))
+        .and(header("anthropic-version", "2023-06-01"))
+        .and(header("authorization", "Bearer private-endpoint-secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_content(json!([]), 11, 7)))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("MODEL_API_KEY", "anthropic-provider-key")
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_API_FORMAT", "anthropic")
+        .env("POSTIL_ENDPOINT_AUTH_HEADER", "Authorization")
+        .env(
+            "POSTIL_ENDPOINT_AUTH_VALUE",
+            "Bearer private-endpoint-secret",
+        )
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .success();
+
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["usage"]["promptTokens"], 11);
+    assert_eq!(envelope["usage"]["completionTokens"], 7);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let body: Value = requests[0].body_json().unwrap();
+    assert!(body["system"].as_str().is_some());
+    assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(body["messages"][0]["role"], "user");
+    assert_eq!(body["max_tokens"], 16384);
+    assert!(body.get("choices").is_none());
+}
+
+#[tokio::test]
+async fn openai_compatible_rejects_additional_authorization_without_leaking() {
+    let server = MockServer::start().await;
+    let endpoint_secret = "Bearer endpoint-secret-never-print";
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_ENDPOINT_AUTH_HEADER", "Authorization")
+        .env("POSTIL_ENDPOINT_AUTH_VALUE", endpoint_secret)
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .code(2);
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout);
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(!stdout.contains(endpoint_secret));
+    assert!(!stderr.contains(endpoint_secret));
+    assert!(stderr.contains("cannot override provider-managed header"));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn native_anthropic_retries_transient_status_with_the_same_shape() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .respond_with(ResponseTemplate::new(529).set_body_string("overloaded"))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_content(json!([]), 3, 2)))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_API_FORMAT", "anthropic")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(stderr.contains("retryable HTTP 529"));
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.url.path() == "/messages")
+    );
+}
+
+#[tokio::test]
+async fn provider_errors_redact_provider_and_endpoint_auth_secrets() {
+    let server = MockServer::start().await;
+    let provider_secret = "provider-secret-never-print";
+    let endpoint_secret = "endpoint-secret-never-print";
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+            "bad credentials: {provider_secret} and {endpoint_secret}"
+        )))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("MODEL_API_KEY", provider_secret)
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_API_FORMAT", "anthropic")
+        .env("POSTIL_ENDPOINT_AUTH_HEADER", "X-Private-Endpoint-Token")
+        .env("POSTIL_ENDPOINT_AUTH_VALUE", endpoint_secret)
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .code(1);
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout);
+    assert!(!stderr.contains(provider_secret));
+    assert!(!stderr.contains(endpoint_secret));
+    assert!(!stdout.contains(provider_secret));
+    assert!(!stdout.contains(endpoint_secret));
+    assert!(stderr.contains("[REDACTED]"));
+    assert!(stdout.contains("[REDACTED]"));
+}
+
+#[tokio::test]
+async fn doctor_probes_native_anthropic_format() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "content": [{"type": "text", "text": "p"}],
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        })))
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_API_FORMAT", "anthropic")
+        .arg("doctor")
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(stderr.contains("using anthropic"));
+}
+
+#[tokio::test]
+async fn doctor_probes_openai_compatible_format_by_default() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(header("authorization", "Bearer test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_text("p")))
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .arg("doctor")
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(stderr.contains("using openai-compatible"));
 }
 
 fn write_diff(dir: &std::path::Path) -> std::path::PathBuf {
@@ -1373,11 +1594,11 @@ async fn garbage_output_fails_closed_after_repair_attempt() {
     let env: Value =
         serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
     assert_eq!(env["findings"][0]["path"], ".postil/model-output");
-    assert_eq!(env["usage"]["promptTokens"], 640);
-    assert_eq!(env["usage"]["completionTokens"], 240);
+    assert_eq!(env["usage"]["promptTokens"], 480);
+    assert_eq!(env["usage"]["completionTokens"], 180);
     // Initial call + repair call for each default model in the retry roster.
     let requests = server.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 8);
+    assert_eq!(requests.len(), 6);
     let models: Vec<String> = requests
         .iter()
         .map(|request| {
@@ -1390,14 +1611,12 @@ async fn garbage_output_fails_closed_after_repair_attempt() {
     assert_eq!(
         models,
         vec![
-            "deepseek/deepseek-v4-pro",
-            "deepseek/deepseek-v4-pro",
-            "google/gemini-3.1-flash-lite",
-            "google/gemini-3.1-flash-lite",
+            "z-ai/glm-5.2",
+            "z-ai/glm-5.2",
             "moonshotai/kimi-k2.7-code",
             "moonshotai/kimi-k2.7-code",
-            "mistralai/mistral-large-2512",
-            "mistralai/mistral-large-2512",
+            "deepseek/deepseek-v4-flash",
+            "deepseek/deepseek-v4-flash",
         ]
     );
 }
