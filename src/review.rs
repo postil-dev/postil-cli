@@ -703,7 +703,9 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                             }
                             Ok(Err(e)) => {
                                 let detail = format!("{e:#}");
-                                eprintln!("postil: scorer failed open: {detail}");
+                                eprintln!(
+                                    "postil: scorer failed open after all scorer models failed"
+                                );
                                 let scorer_usage = e.usage();
                                 usage.prompt_tokens += scorer_usage.prompt_tokens;
                                 usage.completion_tokens += scorer_usage.completion_tokens;
