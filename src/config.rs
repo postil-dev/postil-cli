@@ -217,6 +217,9 @@ pub struct Config {
     pub model: String,
     pub cascade: Vec<String>,
     pub scorer: String,
+    /// True when the scorer was selected by config or environment rather than
+    /// inherited from the OpenRouter-oriented built-in defaults.
+    pub scorer_explicit: bool,
     pub api_base: String,
     pub api_format: ApiFormat,
     /// Run the first N models of [model + cascade] and keep agreeing findings.
@@ -254,6 +257,7 @@ impl Default for Config {
             model: defaults.default_model.clone(),
             cascade: defaults.cascade.clone(),
             scorer: defaults.scorer_model.clone(),
+            scorer_explicit: false,
             api_base: DEFAULT_API_BASE.to_string(),
             api_format: ApiFormat::default(),
             consensus: 1,
@@ -458,6 +462,7 @@ impl Config {
             }
             if let Some(s) = m.scorer {
                 self.scorer = s;
+                self.scorer_explicit = true;
             }
             if let Some(b) = m.api_base {
                 // `model.apiBase` from `.postil.yaml` is repo-controlled, and the
@@ -555,6 +560,7 @@ impl Config {
             && !s.is_empty()
         {
             self.scorer = s;
+            self.scorer_explicit = true;
         }
         if let Ok(b) = std::env::var("POSTIL_API_BASE")
             && !b.is_empty()
@@ -582,12 +588,28 @@ impl Config {
 
     /// Scorer models to try, in order, deduplicated.
     pub fn scorer_chain(&self) -> Vec<String> {
+        if self.api_format == ApiFormat::Anthropic {
+            let defaults = model_defaults();
+            return if self.scorer.starts_with("claude-")
+                || (self.scorer_explicit
+                    && self.scorer != defaults.scorer_model
+                    && self.scorer != defaults.scorer_fallback)
+            {
+                vec![self.scorer.clone()]
+            } else {
+                Vec::new()
+            };
+        }
         let mut chain = vec![self.scorer.clone()];
         let fallback = model_defaults().scorer_fallback.clone();
         if !chain.contains(&fallback) {
             chain.push(fallback);
         }
         chain
+    }
+
+    pub fn scorer_enabled(&self) -> bool {
+        !self.scorer_chain().is_empty()
     }
 }
 
@@ -970,6 +992,30 @@ fallback = "example/scorer-fallback"
             c.scorer_chain(),
             vec!["custom/scorer", &model_defaults().scorer_fallback]
         );
+    }
+
+    #[test]
+    fn native_anthropic_skips_implicit_openrouter_scorers() {
+        let mut config = Config {
+            api_format: ApiFormat::Anthropic,
+            ..Config::default()
+        };
+        assert!(!config.scorer_enabled());
+        assert!(config.scorer_chain().is_empty());
+
+        let generated_default: FileConfig = serde_yaml::from_str(&format!(
+            "model:\n  scorer: {}\n",
+            model_defaults().scorer_model
+        ))
+        .unwrap();
+        config.apply_file(generated_default).unwrap();
+        assert!(config.scorer_chain().is_empty());
+
+        let file: FileConfig =
+            serde_yaml::from_str("model:\n  scorer: claude-haiku-4-5\n").unwrap();
+        config.apply_file(file).unwrap();
+        assert!(config.scorer_enabled());
+        assert_eq!(config.scorer_chain(), vec!["claude-haiku-4-5"]);
     }
 
     #[test]

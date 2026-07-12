@@ -163,7 +163,8 @@ Environment: `POSTIL_API_KEY`, `OPENROUTER_API_KEY`, `MODEL_API_KEY`, or
 `LLM_API_KEY`, `POSTIL_API_BASE`, `POSTIL_API_FORMAT` (`openai-compatible` by
 default, or `anthropic`), `POSTIL_ENDPOINT_AUTH_HEADER` and
 `POSTIL_ENDPOINT_AUTH_VALUE` (optional additional authentication for a private
-endpoint), `POSTIL_DETAILS_URL` (optional HTTP(S) target
+endpoint), `POSTIL_ALLOW_PRIVATE_API_BASE=1` (explicit opt-in for a local or
+private-network endpoint), `POSTIL_DETAILS_URL` (optional HTTP(S) target
 for GitHub check-run details links),
 `REVIEW_MODEL`, `REVIEW_MODEL_CASCADE`, `REVIEW_SCORER_MODEL`,
 `GITHUB_TOKEN`/`GITHUB_API_URL`,
@@ -191,7 +192,13 @@ Postil rejects additional-header names that collide with `x-api-key`,
 `anthropic-version`, or `content-type`. OpenAI-compatible endpoints also reserve
 `Authorization` for the provider key; Anthropic endpoints may use an additional
 `Authorization` value alongside their provider-owned `x-api-key`. Postil never
-prints credential values.
+prints credential values. Provider requests do not follow redirects. Postil
+resolves the API hostname once, rejects non-public addresses, and pins the HTTP
+client to the accepted addresses while retaining hostname-based TLS checks.
+
+The built-in scorer roster uses OpenRouter model identifiers, so native Anthropic
+skips implicit scoring. Set `model.scorer` or `REVIEW_SCORER_MODEL` to an
+Anthropic model identifier to enable scoring through a native Anthropic endpoint.
 
 Local endpoints use the same OpenAI-compatible contract:
 
@@ -199,12 +206,14 @@ Local endpoints use the same OpenAI-compatible contract:
 # Ollama
 ollama pull qwen3-coder:30b
 POSTIL_API_BASE=http://localhost:11434/v1 \
+POSTIL_ALLOW_PRIVATE_API_BASE=1 \
 MODEL_API_KEY=ollama \
 REVIEW_MODEL=qwen3-coder:30b \
 postil doctor
 
 # vLLM, SGLang, LiteLLM, or another local gateway
 POSTIL_API_BASE=http://localhost:8000/v1 \
+POSTIL_ALLOW_PRIVATE_API_BASE=1 \
 MODEL_API_KEY=local \
 REVIEW_MODEL=<served-model-name> \
 postil review --staged --output json

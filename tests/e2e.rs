@@ -77,6 +77,13 @@ fn anthropic_content(findings: Value, input_tokens: u64, output_tokens: u64) -> 
     })
 }
 
+fn anthropic_text(text: &str, input_tokens: u64, output_tokens: u64) -> Value {
+    json!({
+        "content": [{"type": "text", "text": text}],
+        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
+    })
+}
+
 fn finding_at(line: u32, severity: &str, confidence: f64) -> Value {
     json!({
         "path": "src/auth.rs",
@@ -129,10 +136,15 @@ fn postil() -> Command {
         .env_remove("POSTIL_API_FORMAT")
         .env_remove("POSTIL_ENDPOINT_AUTH_HEADER")
         .env_remove("POSTIL_ENDPOINT_AUTH_VALUE")
+        .env_remove("POSTIL_ALLOW_PRIVATE_API_BASE")
         .env_remove("POSTIL_DETAILS_URL")
         .env_remove("GITHUB_SERVER_URL")
         .env_remove("POSTIL_ENABLE_BITBUCKET_INCREMENTAL")
-        .env("MODEL_API_KEY", "test-key");
+        .env("MODEL_API_KEY", "test-key")
+        // Mock providers bind loopback. Production and normal CLI invocations
+        // reject private API endpoints unless this explicit local-only escape
+        // hatch is set by the caller.
+        .env("POSTIL_ALLOW_PRIVATE_API_BASE", "1");
     cmd
 }
 
@@ -177,6 +189,98 @@ async fn native_anthropic_review_uses_messages_shape_auth_and_usage() {
     assert_eq!(body["messages"][0]["role"], "user");
     assert_eq!(body["max_tokens"], 16384);
     assert!(body.get("choices").is_none());
+}
+
+#[tokio::test]
+async fn native_anthropic_findings_skip_incompatible_default_scorer() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .and(header("x-api-key", "anthropic-provider-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_content(
+            json!([finding_at(42, "warn", 0.9)]),
+            17,
+            9,
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("MODEL_API_KEY", "anthropic-provider-key")
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_API_FORMAT", "anthropic")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .success();
+
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["findings"].as_array().unwrap().len(), 1);
+    assert!(envelope["scorerModel"].is_null());
+    assert!(envelope["scorerError"].is_null());
+    assert_eq!(envelope["usage"]["promptTokens"], 17);
+    assert_eq!(envelope["usage"]["completionTokens"], 9);
+}
+
+#[tokio::test]
+async fn native_anthropic_findings_use_explicit_native_scorer() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .and(body_string_contains("\"model\":\"claude-sonnet-4-6\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_content(
+            json!([finding_at(42, "warn", 0.9)]),
+            17,
+            9,
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .and(body_string_contains("\"model\":\"claude-haiku-4-5\""))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(anthropic_text(
+                &json!([{
+                    "index": 0,
+                    "confidence": 0.82,
+                    "kind": "risk",
+                    "reason": "The changed line contains the reported flow."
+                }])
+                .to_string(),
+                5,
+                3,
+            )),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("MODEL_API_KEY", "anthropic-provider-key")
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_API_FORMAT", "anthropic")
+        .env("REVIEW_MODEL", "claude-sonnet-4-6")
+        .env("REVIEW_SCORER_MODEL", "claude-haiku-4-5")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .success();
+
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["scorerModel"], "claude-haiku-4-5");
+    assert_eq!(envelope["findings"][0]["scorerConfidence"], 0.82);
+    assert_eq!(envelope["usage"]["promptTokens"], 22);
+    assert_eq!(envelope["usage"]["completionTokens"], 12);
 }
 
 #[tokio::test]
@@ -334,6 +438,53 @@ async fn doctor_probes_openai_compatible_format_by_default() {
         .success();
     let stderr = String::from_utf8_lossy(&out.get_output().stderr);
     assert!(stderr.contains("using openai-compatible"));
+}
+
+#[tokio::test]
+async fn doctor_does_not_follow_provider_redirect_or_forward_auth() {
+    let redirect_target = MockServer::start().await;
+    let provider = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(header("authorization", "Bearer provider-secret"))
+        .and(header("x-private-endpoint-token", "endpoint-secret"))
+        .respond_with(
+            ResponseTemplate::new(307)
+                .insert_header("Location", format!("{}/captured", redirect_target.uri())),
+        )
+        .expect(1)
+        .mount(&provider)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let out = postil()
+        .current_dir(dir.path())
+        .env("MODEL_API_KEY", "provider-secret")
+        .env("POSTIL_API_BASE", provider.uri())
+        .env("POSTIL_ENDPOINT_AUTH_HEADER", "X-Private-Endpoint-Token")
+        .env("POSTIL_ENDPOINT_AUTH_VALUE", "endpoint-secret")
+        .arg("doctor")
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(stderr.contains("307"));
+    assert!(!stderr.contains("provider-secret"));
+    assert!(!stderr.contains("endpoint-secret"));
+    assert!(
+        redirect_target
+            .received_requests()
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 fn write_diff(dir: &std::path::Path) -> std::path::PathBuf {

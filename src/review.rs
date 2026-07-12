@@ -684,7 +684,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                     full_review_trustworthy = true;
                     summary = model_review.summary;
                     let mut kept = outcome.kept;
-                    if !kept.is_empty() {
+                    if !kept.is_empty() && cfg.scorer_enabled() {
                         let inputs = scorer_inputs(&parsed, &kept);
                         let scorer_system = prompt::scorer_system_prompt(cfg);
                         let scorer_user = prompt::scorer_user_prompt(&inputs);

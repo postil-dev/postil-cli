@@ -4,6 +4,8 @@
 //! OpenAI-compatible endpoints use `POST {base}/chat/completions` by default.
 //! Native Anthropic endpoints use `POST {base}/messages` when explicitly selected.
 
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
@@ -155,7 +157,7 @@ fn default_confidence() -> f64 {
 
 #[derive(Clone)]
 pub struct LlmClient {
-    http: reqwest::Client,
+    http: Arc<Mutex<Option<reqwest::Client>>>,
     api_base: String,
     api_key: String,
     api_format: ApiFormat,
@@ -201,6 +203,7 @@ const REQUEST_TIMEOUT_ENV: &str = "POSTIL_LLM_REQUEST_TIMEOUT_SECS";
 const TOTAL_TIMEOUT_ENV: &str = "POSTIL_LLM_TOTAL_TIMEOUT_SECS";
 const ENDPOINT_AUTH_HEADER_ENV: &str = "POSTIL_ENDPOINT_AUTH_HEADER";
 const ENDPOINT_AUTH_VALUE_ENV: &str = "POSTIL_ENDPOINT_AUTH_VALUE";
+const ALLOW_PRIVATE_API_BASE_ENV: &str = "POSTIL_ALLOW_PRIVATE_API_BASE";
 const ALWAYS_MANAGED_HEADERS: &[&str] = &["x-api-key", "anthropic-version", "content-type"];
 
 /// Marker context attached to transport/provider-level failures (endpoint
@@ -223,6 +226,12 @@ fn retryable_status(status: u16) -> bool {
 
 fn timeout_status(status: u16) -> bool {
     matches!(status, 408 | 504)
+}
+
+fn reqwest_error(error: &anyhow::Error) -> Option<&reqwest::Error> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<reqwest::Error>())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -327,7 +336,7 @@ impl LlmClient {
             // The attempt timeout wraps both sending the request and consuming
             // the complete response body, so header and body stalls take the
             // same retry path.
-            http: reqwest::Client::builder().build()?,
+            http: Arc::new(Mutex::new(None)),
             api_base: cfg.api_base.trim_end_matches('/').to_string(),
             api_key,
             api_format: cfg.api_format,
@@ -800,7 +809,7 @@ impl LlmClient {
                     return Err(anyhow!("model endpoint returned {status}: {snippet}"));
                 }
                 Err(error)
-                    if error.is_timeout()
+                    if reqwest_error(&error).is_some_and(reqwest::Error::is_timeout)
                         && timeout_retries < TIMEOUT_RETRIES
                         && retries < TRANSIENT_RETRIES =>
                 {
@@ -817,7 +826,10 @@ impl LlmClient {
                     self.sleep_with_budget(phase, wait).await?;
                     attempt_timeout = self.timeout_retry_timeout;
                 }
-                Err(error) if error.is_connect() && retries < TRANSIENT_RETRIES => {
+                Err(error)
+                    if reqwest_error(&error).is_some_and(reqwest::Error::is_connect)
+                        && retries < TRANSIENT_RETRIES =>
+                {
                     retries += 1;
                     let wait = Duration::from_secs(2 * retries as u64);
                     eprintln!(
@@ -831,9 +843,7 @@ impl LlmClient {
                     attempt_timeout = self.request_timeout;
                 }
                 Err(error) => {
-                    return Err(
-                        anyhow::Error::from(error).context("request to model endpoint failed")
-                    );
+                    return Err(error.context("request to model endpoint failed"));
                 }
             }
         };
@@ -923,20 +933,19 @@ impl LlmClient {
     async fn request_once(
         &self,
         body: &serde_json::Value,
-    ) -> std::result::Result<(reqwest::StatusCode, String), reqwest::Error> {
+    ) -> Result<(reqwest::StatusCode, String)> {
+        let http = self.http_client()?;
         let mut request = match self.api_format {
             ApiFormat::OpenaiCompatible => {
                 let url = format!("{}/chat/completions", self.api_base);
-                self.http
-                    .post(&url)
+                http.post(&url)
                     .bearer_auth(&self.api_key)
                     .header("HTTP-Referer", "https://postil.dev")
                     .header("X-Title", "Postil")
             }
             ApiFormat::Anthropic => {
                 let url = format!("{}/messages", self.api_base);
-                self.http
-                    .post(&url)
+                http.post(&url)
                     .header("x-api-key", &self.api_key)
                     .header("anthropic-version", ANTHROPIC_VERSION)
             }
@@ -948,6 +957,19 @@ impl LlmClient {
         let status = response.status();
         let text = response.text().await?;
         Ok((status, text))
+    }
+
+    fn http_client(&self) -> Result<reqwest::Client> {
+        let mut client = self
+            .http
+            .lock()
+            .map_err(|_| anyhow!("model provider HTTP client lock is poisoned"))?;
+        if let Some(client) = client.as_ref() {
+            return Ok(client.clone());
+        }
+        let built = secure_http_client(&self.api_base)?;
+        *client = Some(built.clone());
+        Ok(built)
     }
 
     fn remaining_budget(&self, phase: LlmPhase) -> Result<Option<Duration>> {
@@ -1053,6 +1075,122 @@ struct AnthropicContentBlock {
 struct AnthropicUsage {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
+}
+
+fn secure_http_client(api_base: &str) -> Result<reqwest::Client> {
+    let (hostname, addresses) = resolve_api_endpoint(api_base)?;
+    reqwest::Client::builder()
+        // Provider credentials and prompts must never follow an endpoint's
+        // redirect to another origin or into an internal network.
+        .redirect(reqwest::redirect::Policy::none())
+        // Connect only to the addresses approved by the single resolution
+        // above. Reqwest retains the URL hostname for TLS SNI/certificate
+        // verification while replacing DNS lookup results with this set.
+        .resolve_to_addrs(&hostname, &addresses)
+        .build()
+        .context("build model provider HTTP client")
+}
+
+fn resolve_api_endpoint(api_base: &str) -> Result<(String, Vec<SocketAddr>)> {
+    resolve_api_endpoint_with(api_base, |hostname, port| {
+        (hostname, port)
+            .to_socket_addrs()
+            .map(|items| items.collect())
+    })
+}
+
+fn resolve_api_endpoint_with<F>(api_base: &str, resolver: F) -> Result<(String, Vec<SocketAddr>)>
+where
+    F: FnOnce(&str, u16) -> std::io::Result<Vec<SocketAddr>>,
+{
+    let url = reqwest::Url::parse(api_base).context("model API base must be an absolute URL")?;
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https"),
+        "model API base must use HTTP or HTTPS"
+    );
+    anyhow::ensure!(
+        url.username().is_empty() && url.password().is_none(),
+        "model API base must not contain credentials"
+    );
+    let hostname = url
+        .host_str()
+        .filter(|hostname| !hostname.is_empty())
+        .context("model API base must include a hostname")?
+        .to_string();
+    let port = url
+        .port_or_known_default()
+        .context("model API base must include a port for its URL scheme")?;
+    let addresses = resolver(&hostname, port)
+        .with_context(|| format!("model API hostname {hostname:?} could not be resolved"))?;
+    anyhow::ensure!(
+        !addresses.is_empty(),
+        "model API hostname {hostname:?} did not resolve to any addresses"
+    );
+    let allow_private = std::env::var(ALLOW_PRIVATE_API_BASE_ENV)
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !allow_private {
+        for address in &addresses {
+            anyhow::ensure!(
+                is_public_ip(address.ip()),
+                "model API hostname {hostname:?} resolved to a private, loopback, link-local, or non-public address"
+            );
+        }
+    }
+    Ok((hostname, addresses))
+}
+
+fn is_public_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => is_public_ipv4(address),
+        IpAddr::V6(address) => is_public_ipv6(address),
+    }
+}
+
+fn is_public_ipv4(address: Ipv4Addr) -> bool {
+    let [a, b, c, _] = address.octets();
+    !(a == 0
+        || a == 10
+        || a == 127
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 169 && b == 254)
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && b == 0 && c == 0)
+        || (a == 192 && b == 0 && c == 2)
+        || (a == 192 && b == 168)
+        || (a == 198 && (b == 18 || b == 19))
+        || (a == 198 && b == 51 && c == 100)
+        || (a == 203 && b == 0 && c == 113)
+        || a >= 224)
+}
+
+fn is_public_ipv6(address: Ipv6Addr) -> bool {
+    if let Some(mapped) = address.to_ipv4_mapped() {
+        return is_public_ipv4(mapped);
+    }
+    let segments = address.segments();
+    // Deprecated IPv4-compatible addresses retain the embedded IPv4's
+    // reachability semantics even though they are not `::ffff:` mapped.
+    if segments[..6].iter().all(|segment| *segment == 0) {
+        return false;
+    }
+    // The well-known NAT64 prefix embeds the destination IPv4 in the final
+    // 32 bits. Reject it when it would translate to a non-public destination.
+    if segments[..6] == [0x0064, 0xff9b, 0, 0, 0, 0] {
+        return is_public_ipv4(Ipv4Addr::new(
+            (segments[6] >> 8) as u8,
+            segments[6] as u8,
+            (segments[7] >> 8) as u8,
+            segments[7] as u8,
+        ));
+    }
+    !(address.is_unspecified()
+        || address.is_loopback()
+        || address.is_multicast()
+        || (segments[0] & 0xfe00) == 0xfc00
+        || (segments[0] & 0xffc0) == 0xfe80
+        || (segments[0] & 0xffc0) == 0xfec0
+        || (segments[0] == 0x2001 && segments[1] == 0x0db8))
 }
 
 fn endpoint_auth_from_env(api_format: ApiFormat) -> Result<Option<EndpointAuth>> {
@@ -1379,6 +1517,57 @@ mod tests {
             .expect("Anthropic additional Authorization accepted");
         assert_eq!(anthropic.name, reqwest::header::AUTHORIZATION);
         assert_eq!(anthropic.value, "secret-value");
+    }
+
+    #[test]
+    fn api_endpoint_resolution_rejects_any_non_public_result() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvRestore::capture(&[ALLOW_PRIVATE_API_BASE_ENV]);
+        EnvRestore::remove(ALLOW_PRIVATE_API_BASE_ENV);
+        let error = resolve_api_endpoint_with("https://models.example/v1", |hostname, port| {
+            assert_eq!(hostname, "models.example");
+            assert_eq!(port, 443);
+            Ok(vec![
+                "8.8.8.8:443".parse().unwrap(),
+                "169.254.169.254:443".parse().unwrap(),
+            ])
+        })
+        .expect_err("a mixed public/private DNS answer must fail closed");
+        assert!(error.to_string().contains("non-public address"));
+    }
+
+    #[test]
+    fn api_endpoint_resolution_preserves_public_addresses_for_pinning() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvRestore::capture(&[ALLOW_PRIVATE_API_BASE_ENV]);
+        EnvRestore::remove(ALLOW_PRIVATE_API_BASE_ENV);
+        let expected = vec![
+            "8.8.8.8:8443".parse().unwrap(),
+            "[2606:4700:4700::1111]:8443".parse().unwrap(),
+        ];
+        let (hostname, addresses) = resolve_api_endpoint_with(
+            "https://models.example:8443/v1",
+            |_, _| Ok(expected.clone()),
+        )
+        .unwrap();
+        assert_eq!(hostname, "models.example");
+        assert_eq!(addresses, expected);
+    }
+
+    #[test]
+    fn api_endpoint_rejects_ipv4_mapped_compatible_and_nat64_private_targets() {
+        for address in [
+            "::ffff:127.0.0.1",
+            "::a00:1",
+            "64:ff9b::a9fe:a9fe",
+            "fec0::1",
+        ] {
+            assert!(
+                !is_public_ip(address.parse().unwrap()),
+                "accepted {address}"
+            );
+        }
+        assert!(is_public_ip("64:ff9b::808:808".parse().unwrap()));
     }
 
     impl Drop for EnvRestore {
