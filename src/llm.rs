@@ -413,7 +413,16 @@ impl LlmClient {
                 }
                 Err(mut e) => {
                     let elapsed = elapsed_text(started_at.elapsed());
-                    if index + 1 < chain.len() {
+                    let has_fallback = index + 1 < chain.len();
+                    if e.is_timeout() && has_fallback {
+                        eprintln!(
+                            "postil: scorer {model_log} timed out after {elapsed}, falling back to next scorer"
+                        );
+                    } else if e.is_timeout() {
+                        eprintln!(
+                            "postil: scorer {model_log} timed out after {elapsed}; no fallback scorers remain"
+                        );
+                    } else if has_fallback {
                         eprintln!(
                             "postil: scorer {model_log} failed after {elapsed}, falling back to next scorer: {}",
                             log_text(&format!("{e:#}"))
