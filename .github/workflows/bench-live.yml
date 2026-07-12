@@ -20,7 +20,7 @@ on:
         required: false
         default: "15"
       scorer_model:
-        description: Optional REVIEW_SCORER_MODEL override for scorer validation
+        description: REVIEW_SCORER_MODEL override for live-models bench (scorer-eval uses hardcoded defaults)
         required: false
         default: ""
       run_scorer_eval:
