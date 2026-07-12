@@ -193,7 +193,8 @@ postil review --staged --output json
 Hosted remote reviews use a 540-second total LLM budget so model cascades and
 scoring finish inside the worker watchdog. Local reviews do not use a total
 budget unless `POSTIL_LLM_TOTAL_TIMEOUT_SECS` is set. Each model request still
-uses `POSTIL_LLM_REQUEST_TIMEOUT_SECS`, which defaults to 420 seconds.
+uses `POSTIL_LLM_REQUEST_TIMEOUT_SECS`, which defaults to 480 seconds locally
+and 420 seconds for hosted remote reviews.
 
 Use the live benchmark harness before standardizing on a model:
 

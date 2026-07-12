@@ -1,7 +1,7 @@
 use clap::Parser;
 
 use postil_cli::cli::{Cli, Command, ForgeArg, HookAction};
-use postil_cli::config::{Config, STARTER_CONFIG};
+use postil_cli::config::{Config, starter_config};
 use postil_cli::review::{ForgeKind, ReviewArgs};
 use postil_cli::{doctor, hook, plan, respond, review};
 
@@ -166,7 +166,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
                     path.display()
                 );
             }
-            std::fs::write(&path, STARTER_CONFIG)?;
+            std::fs::write(&path, starter_config())?;
             eprintln!("postil: wrote {}", path.display());
             Ok(0)
         }
