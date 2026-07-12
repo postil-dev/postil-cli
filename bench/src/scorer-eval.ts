@@ -18,11 +18,11 @@ import { benchmarkCase, safeJson, startMockGithub, type BenchmarkCase } from "./
 
 const execFile = promisify(execFileCb);
 
-const GENERATOR_MODEL = "postil-scorer-eval/generator";
+export const GENERATOR_MODEL = "postil-scorer-eval/generator";
 const DEFAULT_SCORER_MODELS = ["anthropic/claude-haiku-4.5", "openai/gpt-5-mini"];
 const DEFAULT_API_BASE = "https://openrouter.ai/api/v1";
 
-const TRUE_FINDING_CASES = [
+export const TRUE_FINDING_CASES = [
   "billing-double-charge",
   "prompt-injection-sql-bypass",
   "misleading-comment-tenant-cache",
@@ -31,7 +31,7 @@ const TRUE_FINDING_CASES = [
   "huge-low-signal-permission-bypass",
 ];
 
-const FALSE_FINDING_CASES = [
+export const FALSE_FINDING_CASES = [
   "clean-docs-only",
   "clean-refactor-no-behavior-change",
   "clean-comment-only",
@@ -114,10 +114,7 @@ async function main() {
   await mkdir(rootDir, { recursive: true });
 
   const fixtures = fixtureInputs.map((input) => benchmarkCase.parse(input));
-  const selected = [
-    ...TRUE_FINDING_CASES.map((id) => evalCase(fixtures, id, "trueFinding")),
-    ...FALSE_FINDING_CASES.map((id) => evalCase(fixtures, id, "falseFinding")),
-  ];
+  const selected = selectEvalCases(fixtures);
 
   const results: ScorerEvalCase[] = [];
   for (const model of models) {
@@ -137,6 +134,13 @@ async function main() {
     await writeFile(jsonOut, `${json}\n`);
   }
   console.log(formatReport(report));
+}
+
+export function selectEvalCases(fixtures: BenchmarkCase[]): Array<{ case: BenchmarkCase; scenario: Scenario }> {
+  return [
+    ...TRUE_FINDING_CASES.map((id) => evalCase(fixtures, id, "trueFinding")),
+    ...FALSE_FINDING_CASES.map((id) => evalCase(fixtures, id, "falseFinding")),
+  ];
 }
 
 function evalCase(
@@ -266,7 +270,7 @@ function baseResult(
   };
 }
 
-async function startScorerProxy(
+export async function startScorerProxy(
   c: BenchmarkCase,
   scenario: Scenario,
   apiBase: string,
@@ -324,6 +328,7 @@ function generatorOutput(c: BenchmarkCase, scenario: Scenario) {
 export function trueFinding(c: BenchmarkCase) {
   const finding = c.modelOutput.findings[0];
   if (!finding) throw new Error(`fixture ${c.id} has no recorded finding`);
+  // The scorer should preserve real, grounded defects as confident risks.
   return {
     ...finding,
     kind: "risk",
@@ -334,6 +339,8 @@ export function trueFinding(c: BenchmarkCase) {
 export function falseFinding(c: BenchmarkCase) {
   const path = c.allowedContext.files[0]?.path ?? c.modelOutput.findings[0]?.path;
   const line = firstAddedLine(c.diff) ?? c.modelOutput.findings[0]?.line ?? 1;
+  // The injected false positive is intentionally plausible and overconfident:
+  // calibration succeeds only when the scorer pushes it below gate relevance.
   return {
     path,
     line,
@@ -351,7 +358,7 @@ export function firstAddedLine(diff: string): number | null {
   return match ? Number.parseInt(match[1]!, 10) : null;
 }
 
-function isolatedEnv(
+export function isolatedEnv(
   homeDir: string,
   tmpDir: string,
   githubBaseUrl: string,
