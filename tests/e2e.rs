@@ -265,6 +265,60 @@ async fn scorer_lowers_confidence_and_stores_both_values() {
 }
 
 #[tokio::test]
+async fn slow_scorer_request_times_out_and_falls_back() {
+    let server = MockServer::start().await;
+    mock_review_model(
+        &server,
+        "generator-model",
+        json!([finding_at(41, "warn", 0.92)]),
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("anthropic/claude-haiku-4.5"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(1500))
+                .set_body_json(scorer_content(json!([]))),
+        )
+        .mount(&server)
+        .await;
+    mock_scorer_model(
+        &server,
+        "openai/gpt-5-mini",
+        json!([{
+            "index": 0,
+            "confidence": 0.82,
+            "kind": "risk",
+            "reason": "finding is well grounded"
+        }]),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_LLM_REQUEST_TIMEOUT_SECS", "1")
+        .env("REVIEW_MODEL", "generator-model")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .code(0);
+
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    let env: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(env["scorerModel"], "openai/gpt-5-mini");
+    assert!(stderr.contains("postil: scorer anthropic/claude-haiku-4.5 timed out after"));
+    assert!(stderr.contains("falling back to next scorer"));
+    assert!(stderr.contains("postil: running scorer with openai/gpt-5-mini"));
+    assert!(stderr.contains("postil: scorer openai/gpt-5-mini completed successfully in"));
+}
+
+#[tokio::test]
 async fn scorer_kind_escalation_into_configured_blocking_kind_takes_effect() {
     let server = MockServer::start().await;
     mock_review_model(
