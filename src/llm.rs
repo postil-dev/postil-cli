@@ -661,6 +661,7 @@ impl LlmClient {
             .map_err(|e| e.context(ProviderError))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn chat_with_temperature(
         &self,
         model: &str,
@@ -677,6 +678,7 @@ impl LlmClient {
     }
 
     /// Transport + HTTP envelope handling; every error here is provider-class.
+    #[allow(clippy::too_many_arguments)]
     async fn chat_inner(
         &self,
         model: &str,
