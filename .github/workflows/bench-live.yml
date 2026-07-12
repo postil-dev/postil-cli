@@ -10,7 +10,7 @@ on:
         description: Comma-separated OpenRouter model ids
         required: true
         default: >-
-          deepseek/deepseek-v4-pro,moonshotai/kimi-k2.6,qwen/qwen3-32b,mistralai/mistral-small-3.2-24b-instruct,google/gemma-3-27b-it
+          deepseek/deepseek-v4-pro,google/gemini-3.1-flash-lite,moonshotai/kimi-k2.7-code,mistralai/mistral-large-2512
       cases:
         description: Case selection (currently informational; "all" runs the full set)
         required: false
@@ -19,6 +19,14 @@ on:
         description: Abort if the projected upper-bound total cost exceeds this many USD
         required: false
         default: "15"
+      scorer_model:
+        description: REVIEW_SCORER_MODEL override for live-models bench (scorer-eval uses hardcoded defaults)
+        required: false
+        default: ""
+      run_scorer_eval:
+        description: Run scorer calibration eval instead of live-models bench
+        required: false
+        default: "false"
 
 concurrency:
   group: bench-live
@@ -49,31 +57,65 @@ jobs:
       # from fixture diff sizes. Aborts before spending anything if the matrix
       # would exceed the cap, or if any model has unknown pricing.
       - name: Cost guardrail
+        if: ${{ inputs.run_scorer_eval != 'true' }}
         working-directory: bench
         run: bun run cost-guard --cap "$POSTIL_BENCH_COST_CAP_USD"
 
       - name: Run live-models bench
+        if: ${{ inputs.run_scorer_eval != 'true' }}
         working-directory: bench
         env:
           POSTIL_BENCH_MODE: live
+          REVIEW_SCORER_MODEL: ${{ inputs.scorer_model }}
           POSTIL_API_KEY: ${{ secrets.POSTIL_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
         run: bun run src/run.ts --json-out "$GITHUB_WORKSPACE/bench-live-report.json"
 
+      - name: Run scorer calibration eval
+        if: ${{ inputs.run_scorer_eval == 'true' }}
+        working-directory: bench
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: bun run scorer-eval --json-out "$GITHUB_WORKSPACE/scorer-eval-report.json"
+
       - name: Write step summary
         if: always()
         working-directory: bench
         run: |
           report="$GITHUB_WORKSPACE/bench-live-report.json"
+          scorer_report="$GITHUB_WORKSPACE/scorer-eval-report.json"
           {
-            echo '## Live-models bench'
-            if [ -f "$report" ]; then
+            if [ -f "$scorer_report" ]; then
+              echo '## Scorer calibration eval'
               echo ''
               echo '```'
               bun -e '
-                const r = require(process.env.GITHUB_WORKSPACE + "/bench-live-report.json");
+                const r = await Bun.file(process.env.GITHUB_WORKSPACE + "/scorer-eval-report.json").json();
+                const pad = (s, w) => String(s).length >= w ? String(s) : String(s) + " ".repeat(w - String(s).length);
+                console.log([pad("model",36),pad("structured",11),pad("true kept",10),pad("false down",11),pad("mean true",10),pad("mean false",11),pad("pass",5)].join(" "));
+                for (const a of r.models) {
+                  console.log([
+                    pad(a.id,36),
+                    pad(String(a.structuredFailures),11),
+                    pad(`${a.trueFindingHighConfidence}/${a.trueFindingCases}`,10),
+                    pad(`${a.falseFindingDownscored}/${a.falseFindingCases}`,11),
+                    pad(a.meanTrueConfidence.toFixed(2),10),
+                    pad(a.meanFalseConfidence.toFixed(2),11),
+                    pad(a.passed ? "yes" : "no",5),
+                  ].join(" "));
+                }
+                console.log("");
+                console.log("Endpoint " + r.apiBase + " | generated " + r.generatedAt);
+              '
+              echo '```'
+            elif [ -f "$report" ]; then
+              echo '## Live-models bench'
+              echo ''
+              echo '```'
+              bun -e '
+                const r = await Bun.file(process.env.GITHUB_WORKSPACE + "/bench-live-report.json").json();
                 const pad = (s, w) => String(s).length >= w ? String(s) : String(s) + " ".repeat(w - String(s).length);
                 console.log([pad("model",40),pad("detect",8),pad("FP",5),pad("cases",6),pad("$/review",12),pad("total $",12),pad("mean ms",9)].join(" "));
                 for (const a of r.modelAggregates) {
@@ -101,9 +143,33 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload report artifact
-        if: always()
+        if: always() && inputs.run_scorer_eval != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: bench-live-report
           path: bench-live-report.json
+          if-no-files-found: warn
+
+      - name: Upload scorer eval artifact
+        if: always() && inputs.run_scorer_eval == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: scorer-eval-report
+          path: scorer-eval-report.json
+          if-no-files-found: warn
+
+      - name: Upload live-model raw run artifacts
+        if: always() && inputs.run_scorer_eval != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-live-raw-runs
+          path: bench/.runs/live-models
+          if-no-files-found: warn
+
+      - name: Upload scorer eval raw run artifacts
+        if: always() && inputs.run_scorer_eval == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: scorer-eval-raw-runs
+          path: bench/.runs/scorer-eval
           if-no-files-found: warn

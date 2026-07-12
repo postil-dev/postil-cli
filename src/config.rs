@@ -17,12 +17,12 @@ use crate::envelope::{Kind, Severity};
 
 pub const DEFAULT_MODEL: &str = "deepseek/deepseek-v4-pro";
 pub const DEFAULT_CASCADE: [&str; 3] = [
-    "mistralai/mistral-small-3.2-24b-instruct",
-    "google/gemma-3-27b-it",
-    "qwen/qwen3-32b",
+    "google/gemini-3.1-flash-lite",
+    "moonshotai/kimi-k2.7-code",
+    "mistralai/mistral-large-2512",
 ];
-pub const DEFAULT_SCORER_MODEL: &str = "openai/gpt-5-mini";
-pub const DEFAULT_SCORER_FALLBACK: &str = "anthropic/claude-haiku-4.5";
+pub const DEFAULT_SCORER_MODEL: &str = "anthropic/claude-haiku-4.5";
+pub const DEFAULT_SCORER_FALLBACK: &str = "openai/gpt-5-mini";
 pub const DEFAULT_API_BASE: &str = "https://openrouter.ai/api/v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -508,10 +508,10 @@ gate:
 model:
   name: deepseek/deepseek-v4-pro
   cascade:
-    - mistralai/mistral-small-3.2-24b-instruct
-    - google/gemma-3-27b-it
-    - qwen/qwen3-32b
-  scorer: openai/gpt-5-mini
+    - google/gemini-3.1-flash-lite
+    - moonshotai/kimi-k2.7-code
+    - mistralai/mistral-large-2512
+  scorer: anthropic/claude-haiku-4.5
   # apiBase: https://openrouter.ai/api/v1   # any OpenAI-compatible endpoint (Ollama, vLLM, Azure).
   #                                         # Ignored from config by default (a repo could redirect
   #                                         # the inference credential). Prefer POSTIL_API_BASE; to
@@ -621,9 +621,9 @@ mod tests {
             c.model_chain(),
             vec![
                 "deepseek/deepseek-v4-pro",
-                "mistralai/mistral-small-3.2-24b-instruct",
-                "google/gemma-3-27b-it",
-                "qwen/qwen3-32b",
+                "google/gemini-3.1-flash-lite",
+                "moonshotai/kimi-k2.7-code",
+                "mistralai/mistral-large-2512",
             ]
         );
     }

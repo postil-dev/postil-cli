@@ -128,6 +128,32 @@ runs the live bench with any configured `POSTIL_API_KEY`, `OPENROUTER_API_KEY`,
 `MODEL_API_KEY`, or `LLM_API_KEY` secret, uploads the JSON report as an artifact,
 and prints the per-model table to the job step summary.
 
+## Scorer calibration live eval (opt-in, mocked generator + real scorer)
+
+The independent scorer has a different job from the primary review generator:
+it receives already-generated findings, without the generator's confidence or
+kind, and calibrates each finding's confidence and kind against local diff
+context. `bun run scorer-eval` evaluates that role directly by mocking the
+primary generator with fixed findings and proxying only scorer requests to the
+real OpenRouter endpoint.
+
+```sh
+cargo build --quiet --release
+cd bench
+export MODEL_API_KEY=...          # or LLM_API_KEY / OPENROUTER_API_KEY
+POSTIL_SCORER_EVAL_MODELS=anthropic/claude-haiku-4.5,openai/gpt-5-mini \
+  bun run scorer-eval --json-out scorer-eval-report.json
+```
+
+The eval uses 12 existing fixtures: six seeded defect findings copied from
+mock-mode ground truth, and six deliberately injected false findings on clean
+fixtures. A scorer passes the structured-output floor when every case records
+the requested `scorerModel` and no `scorerError`; it passes calibration when all
+true findings remain confident `risk` findings and at least half of injected
+false findings are down-scored below 0.6 confidence or retyped as
+`uncertainty`. The manual `Bench (live models)` workflow can run this path with
+`run_scorer_eval=true` and uploads `scorer-eval-report.json`.
+
 ## Diff-file live mode (opt-in, single model, no forge)
 
 This live mode runs the real release binary against the same fixtures with a

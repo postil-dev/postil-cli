@@ -144,10 +144,10 @@ gate:
 model:
   name: deepseek/deepseek-v4-pro
   cascade:
-    - mistralai/mistral-small-3.2-24b-instruct
-    - google/gemma-3-27b-it
-    - qwen/qwen3-32b
-  scorer: openai/gpt-5-mini
+    - google/gemini-3.1-flash-lite
+    - moonshotai/kimi-k2.7-code
+    - mistralai/mistral-large-2512
+  scorer: anthropic/claude-haiku-4.5
   apiBase: https://openrouter.ai/api/v1    # ignored from config by default; see note below
   consensus: 1            # >1: only findings multiple models agree on survive
 ```
