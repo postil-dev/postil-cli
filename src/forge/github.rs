@@ -32,8 +32,7 @@ impl GitHub {
         let api_base = std::env::var("GITHUB_API_URL")
             .unwrap_or_else(|_| "https://api.github.com".to_string());
         let details_url = valid_details_url(std::env::var("POSTIL_DETAILS_URL").ok());
-        let web_base = valid_details_url(std::env::var("GITHUB_SERVER_URL").ok())
-            .unwrap_or_else(|| "https://github.com".to_string());
+        let web_base = github_web_base(std::env::var("GITHUB_SERVER_URL").ok(), &api_base);
         Ok(GitHub {
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(60))
@@ -85,6 +84,20 @@ fn valid_details_url(value: Option<String>) -> Option<String> {
     })
 }
 
+fn github_web_base(server_url: Option<String>, api_base: &str) -> String {
+    if let Some(server_url) = valid_details_url(server_url) {
+        return server_url.trim_end_matches('/').to_string();
+    }
+    let normalized_api_base = api_base.trim_end_matches('/');
+    if normalized_api_base != "https://api.github.com"
+        && let Some(web_url) = normalized_api_base.strip_suffix("/api/v3")
+        && valid_details_url(Some(web_url.to_string())).is_some()
+    {
+        return web_url.trim_end_matches('/').to_string();
+    }
+    "https://github.com".to_string()
+}
+
 fn gate_title(envelope: &Envelope) -> &'static str {
     if envelope.gate.failing {
         "Merge gate failed"
@@ -105,12 +118,14 @@ fn gate_summary(envelope: &Envelope) -> String {
         .findings
         .iter()
         .filter(|f| {
-            crate::envelope::finding_blocks_gate(
-                f,
-                &envelope.gate.fail_on,
-                &envelope.gate.block_on_kinds,
-                false,
-            )
+            f.path == crate::envelope::OPERATIONAL_PATH
+                || (f.path == crate::envelope::PROVIDER_PATH && envelope.gate.failing)
+                || crate::envelope::finding_blocks_gate(
+                    f,
+                    &envelope.gate.fail_on,
+                    &envelope.gate.block_on_kinds,
+                    false,
+                )
         })
         .map(|f| format!("- `{}:{}` {}", f.path, f.line, f.title))
         .collect();
@@ -405,7 +420,7 @@ impl Forge for GitHub {
 
 #[cfg(test)]
 mod tests {
-    use super::{gate_summary, valid_details_url};
+    use super::{gate_summary, github_web_base, valid_details_url};
     use crate::envelope::{Envelope, Finding, Gate, Kind, Severity, Usage};
 
     #[test]
@@ -422,6 +437,22 @@ mod tests {
         assert_eq!(valid_details_url(Some("https://".into())), None);
         assert_eq!(valid_details_url(Some("not a URL".into())), None);
         assert_eq!(valid_details_url(None), None);
+    }
+
+    #[test]
+    fn web_base_uses_documented_github_enterprise_api_url() {
+        assert_eq!(
+            github_web_base(None, "https://github.example.com/api/v3"),
+            "https://github.example.com"
+        );
+        assert_eq!(
+            github_web_base(None, "https://github.example.com/api/v3/"),
+            "https://github.example.com"
+        );
+        assert_eq!(
+            github_web_base(Some("https://code.example.com/".into()), "ignored"),
+            "https://code.example.com"
+        );
     }
 
     #[test]
@@ -472,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    fn gate_summary_reports_operational_failure_without_inventing_blockers() {
+    fn gate_summary_reports_provider_failure_from_serialized_gate_outcome() {
         let mut env = Envelope {
             version: 1,
             summary: String::new(),
@@ -499,9 +530,8 @@ mod tests {
         env.findings
             .push(crate::envelope::provider_error_finding("timeout"));
 
-        assert_eq!(
-            gate_summary(&env),
-            "Merge gate failed under the configured operational error policy (failOn: never).\n"
-        );
+        let summary = gate_summary(&env);
+        assert!(summary.contains("1 finding blocks under the configured policy"));
+        assert!(summary.contains(".postil/provider:1"));
     }
 }
