@@ -295,6 +295,7 @@ export async function startScorerProxy(
       return;
     }
 
+    const signal = AbortSignal.timeout(180_000);
     const upstream = await fetch(`${apiBase.replace(/\/$/, "")}/chat/completions`, {
       method: "POST",
       headers: {
@@ -304,6 +305,7 @@ export async function startScorerProxy(
         "x-title": "Postil scorer eval",
       },
       body: bodyText,
+      signal,
     });
     const text = await upstream.text();
     res.writeHead(upstream.status, { "content-type": upstream.headers.get("content-type") ?? "application/json" });
