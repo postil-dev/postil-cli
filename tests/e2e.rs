@@ -1472,7 +1472,117 @@ async fn consensus_logs_each_model_outcome() {
 }
 
 #[tokio::test]
-async fn slow_model_request_times_out_and_falls_back() {
+async fn slow_model_request_retries_same_model_then_succeeds() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(wiremock::matchers::body_string_contains("primary-model"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(1500))
+                .set_body_json(llm_content(json!([]))),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(wiremock::matchers::body_string_contains("primary-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(wiremock::matchers::body_string_contains("backup-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_LLM_REQUEST_TIMEOUT_SECS", "1")
+        .env("POSTIL_LLM_TOTAL_TIMEOUT_SECS", "10")
+        .env("REVIEW_MODEL", "primary-model")
+        .env("REVIEW_MODEL_CASCADE", "backup-model")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .code(0);
+    let env: Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+    assert_eq!(env["modelUsed"], "primary-model");
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("postil: model primary-model hit a request timeout after"));
+    assert!(stderr.contains("timeout retry 1/1"));
+    assert!(stderr.contains("postil: model primary-model responded in"));
+    assert!(!stderr.contains("postil: attempting model: backup-model"));
+
+    let requests = server.received_requests().await.unwrap();
+    let models = requests
+        .iter()
+        .map(|request| {
+            request.body_json::<Value>().unwrap()["model"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(models, vec!["primary-model", "primary-model"]);
+}
+
+#[tokio::test]
+async fn timeout_http_status_retries_same_model_then_succeeds() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(wiremock::matchers::body_string_contains("primary-model"))
+        .respond_with(ResponseTemplate::new(408).set_body_string("request timed out"))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(wiremock::matchers::body_string_contains("primary-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_LLM_REQUEST_TIMEOUT_SECS", "5")
+        .env("POSTIL_LLM_TOTAL_TIMEOUT_SECS", "10")
+        .env("REVIEW_MODEL", "primary-model")
+        .env("REVIEW_MODEL_CASCADE", "backup-model")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .code(0);
+    let envelope: Value =
+        serde_json::from_slice(&out.get_output().stdout).expect("review output should be JSON");
+    assert_eq!(envelope["modelUsed"], "primary-model");
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("returned timeout HTTP 408 Request Timeout"));
+    assert!(stderr.contains("timeout retry 1/1"));
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests
+            .iter()
+            .all(|request| { request.body_json::<Value>().unwrap()["model"] == "primary-model" })
+    );
+}
+
+#[tokio::test]
+async fn exhausted_timeout_retry_falls_back_to_next_model() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
@@ -1505,14 +1615,97 @@ async fn slow_model_request_times_out_and_falls_back() {
         .arg("--output-json")
         .assert()
         .code(0);
-    let env: Value =
-        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
-    assert_eq!(env["modelUsed"], "backup-model");
-    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
-    assert!(stderr.contains("postil: model primary-model timed out after"));
-    assert!(stderr.contains("falling back to next model"));
-    assert!(stderr.contains("postil: attempting model: backup-model"));
-    assert!(stderr.contains("postil: model backup-model responded in"));
+    let envelope: Value =
+        serde_json::from_slice(&out.get_output().stdout).expect("review output should be JSON");
+    assert_eq!(envelope["modelUsed"], "backup-model");
+
+    let requests = server.received_requests().await.unwrap();
+    let models = requests
+        .iter()
+        .map(|request| {
+            request.body_json::<Value>().unwrap()["model"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        models,
+        vec!["primary-model", "primary-model", "backup-model"]
+    );
+}
+
+#[tokio::test]
+async fn mixed_failures_share_the_existing_two_retry_cap() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(wiremock::matchers::body_string_contains("primary-model"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("upstream down"))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(wiremock::matchers::body_string_contains("primary-model"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(1500))
+                .set_body_json(llm_content(json!([]))),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(wiremock::matchers::body_string_contains("primary-model"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("upstream still down"))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(wiremock::matchers::body_string_contains("backup-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_LLM_REQUEST_TIMEOUT_SECS", "1")
+        .env("POSTIL_LLM_TOTAL_TIMEOUT_SECS", "15")
+        .env("REVIEW_MODEL", "primary-model")
+        .env("REVIEW_MODEL_CASCADE", "backup-model")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .code(0);
+    let envelope: Value =
+        serde_json::from_slice(&out.get_output().stdout).expect("review output should be JSON");
+    assert_eq!(envelope["modelUsed"], "backup-model");
+
+    let requests = server.received_requests().await.unwrap();
+    let models = requests
+        .iter()
+        .map(|request| {
+            request.body_json::<Value>().unwrap()["model"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        models,
+        vec![
+            "primary-model",
+            "primary-model",
+            "primary-model",
+            "backup-model"
+        ]
+    );
 }
 
 #[tokio::test]

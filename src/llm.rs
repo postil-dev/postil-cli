@@ -61,8 +61,13 @@ impl ModelError {
             cause
                 .downcast_ref::<reqwest::Error>()
                 .is_some_and(reqwest::Error::is_timeout)
-                || cause.to_string() == "LLM total timeout exceeded"
+                || cause.downcast_ref::<RequestTimedOut>().is_some()
+                || cause.downcast_ref::<DeadlineExceeded>().is_some()
         })
+    }
+
+    fn is_deadline_exceeded(&self) -> bool {
+        self.error.downcast_ref::<DeadlineExceeded>().is_some()
     }
 }
 
@@ -152,6 +157,9 @@ pub struct LlmClient {
     http: reqwest::Client,
     api_base: String,
     api_key: String,
+    request_timeout: Duration,
+    timeout_retry_timeout: Duration,
+    review_deadline: Option<Instant>,
     total_deadline: Option<Instant>,
 }
 
@@ -163,6 +171,12 @@ struct LlmTimeouts {
 
 /// Retries per model on transient provider errors before the cascade moves on.
 const TRANSIENT_RETRIES: u32 = 2;
+/// A fresh request can recover when the caller's request timeout, rather than
+/// the provider's response, ended an otherwise viable routed completion. The
+/// shared total deadline remains authoritative, so this cannot extend a hosted
+/// review beyond its worker budget.
+const TIMEOUT_RETRIES: u32 = 1;
+const TIMEOUT_RETRY_CAP_SECS: u64 = 90;
 
 /// Runaway-generation bound only. It is sized so legitimate reviews (observed
 /// up to roughly 12k output tokens) do not truncate. A truncated response goes
@@ -192,6 +206,41 @@ fn retryable_status(status: u16) -> bool {
     matches!(status, 429 | 500 | 502 | 503 | 529)
 }
 
+fn timeout_status(status: u16) -> bool {
+    matches!(status, 408 | 504)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LlmPhase {
+    Review,
+    Total,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DeadlineExceeded(LlmPhase);
+
+impl std::fmt::Display for DeadlineExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            LlmPhase::Review => f.write_str("LLM review deadline exceeded"),
+            LlmPhase::Total => f.write_str("LLM total deadline exceeded"),
+        }
+    }
+}
+
+impl std::error::Error for DeadlineExceeded {}
+
+#[derive(Debug, Clone, Copy)]
+struct RequestTimedOut;
+
+impl std::fmt::Display for RequestTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LLM request timed out")
+    }
+}
+
+impl std::error::Error for RequestTimedOut {}
+
 impl LlmClient {
     /// Local and interactive clients have no built-in total deadline. They only
     /// get one when POSTIL_LLM_TOTAL_TIMEOUT_SECS is explicitly set.
@@ -199,13 +248,20 @@ impl LlmClient {
         let api_key = resolve_api_key()?;
         let timeouts = LlmTimeouts::from_env(DEFAULT_REQUEST_TIMEOUT_SECS, None)?;
         let total_deadline = timeouts.total.map(|duration| Instant::now() + duration);
-        Self::build(cfg, api_key, timeouts.request, total_deadline)
+        Self::build(
+            cfg,
+            api_key,
+            timeouts.request,
+            total_deadline,
+            total_deadline,
+        )
     }
 
     pub(crate) fn from_env_for_remote_review(
         cfg: &Config,
         total_budget_started_at: Instant,
         default_request_timeout: Duration,
+        default_review_timeout: Duration,
         default_total_timeout: Duration,
     ) -> Result<Self> {
         let api_key = resolve_api_key()?;
@@ -216,23 +272,34 @@ impl LlmClient {
         let total_deadline = timeouts
             .total
             .map(|duration| total_budget_started_at + duration);
-        Self::build(cfg, api_key, timeouts.request, total_deadline)
+        let review_deadline = Some(total_budget_started_at + default_review_timeout)
+            .map(|deadline| total_deadline.map_or(deadline, |total| deadline.min(total)));
+        Self::build(
+            cfg,
+            api_key,
+            timeouts.request,
+            review_deadline,
+            total_deadline,
+        )
     }
 
     fn build(
         cfg: &Config,
         api_key: String,
         request_timeout: Duration,
+        review_deadline: Option<Instant>,
         total_deadline: Option<Instant>,
     ) -> Result<Self> {
         Ok(LlmClient {
-            http: reqwest::Client::builder()
-                // Generation time scales with diff size; a thorough review of a
-                // truncation-limit diff can exceed 3 minutes of streaming.
-                .timeout(request_timeout)
-                .build()?,
+            // The attempt timeout wraps both sending the request and consuming
+            // the complete response body, so header and body stalls take the
+            // same retry path.
+            http: reqwest::Client::builder().build()?,
             api_base: cfg.api_base.trim_end_matches('/').to_string(),
             api_key,
+            request_timeout,
+            timeout_retry_timeout: request_timeout.min(Duration::from_secs(TIMEOUT_RETRY_CAP_SECS)),
+            review_deadline,
             total_deadline,
         })
     }
@@ -335,6 +402,14 @@ impl LlmClient {
                     }
                     Err(mut e) => {
                         let elapsed = elapsed_text(started_at.elapsed());
+                        if e.is_deadline_exceeded() {
+                            add_usage(&mut failed_usage, e.usage);
+                            e.usage = failed_usage;
+                            eprintln!(
+                                "postil: model {model_log} stopped after {elapsed}: {e}; cascade fallback is disabled after deadline exhaustion"
+                            );
+                            return Err(e);
+                        }
                         let has_fallback = index + 1 < chain.len();
                         if e.is_timeout() {
                             if has_fallback {
@@ -374,10 +449,16 @@ impl LlmClient {
         let mut usage = Usage::default();
         let mut last_err = None;
         for model in cfg.model_chain() {
-            match self.chat(&model, system, user, &mut usage, None).await {
+            match self
+                .chat(&model, system, user, &mut usage, None, LlmPhase::Total)
+                .await
+            {
                 Ok(content) => return Ok((content.trim().to_string(), model)),
                 Err(e) => {
                     eprintln!("postil: model {model} failed: {e:#}");
+                    if e.downcast_ref::<DeadlineExceeded>().is_some() {
+                        return Err(e);
+                    }
                     last_err = Some(e);
                 }
             }
@@ -413,6 +494,14 @@ impl LlmClient {
                 }
                 Err(mut e) => {
                     let elapsed = elapsed_text(started_at.elapsed());
+                    if e.is_deadline_exceeded() {
+                        add_usage(&mut failed_usage, e.usage);
+                        e.usage = failed_usage;
+                        eprintln!(
+                            "postil: scorer {model_log} stopped after {elapsed}: {e}; scorer fallback is disabled after deadline exhaustion"
+                        );
+                        return Err(e);
+                    }
                     let has_fallback = index + 1 < chain.len();
                     if e.is_timeout() && has_fallback {
                         eprintln!(
@@ -451,7 +540,14 @@ impl LlmClient {
     ) -> std::result::Result<ModelReview, ModelError> {
         let mut usage = Usage::default();
         let content = self
-            .chat(model, system, user, &mut usage, Some(REVIEW_MAX_TOKENS))
+            .chat(
+                model,
+                system,
+                user,
+                &mut usage,
+                Some(REVIEW_MAX_TOKENS),
+                LlmPhase::Review,
+            )
             .await
             .map_err(|e| ModelError::new(e, usage))?;
         let raw = match parse_review(&content) {
@@ -470,6 +566,7 @@ impl LlmClient {
                         &repair_user,
                         &mut usage,
                         Some(REVIEW_MAX_TOKENS),
+                        LlmPhase::Review,
                     )
                     .await
                     .map_err(|e| ModelError::new(e.context("JSON repair call failed"), usage))?;
@@ -501,6 +598,7 @@ impl LlmClient {
                     &retry_user,
                     &mut retry_usage,
                     Some(REVIEW_MAX_TOKENS),
+                    LlmPhase::Review,
                 )
                 .await
             {
@@ -513,6 +611,8 @@ impl LlmClient {
                         review = candidate;
                     }
                 }
+            } else if let Err(error) = self.remaining_budget(LlmPhase::Review) {
+                return Err(ModelError::new(error.context(ProviderError), retry_usage));
             }
         }
         Ok(review)
@@ -534,6 +634,7 @@ impl LlmClient {
                 &mut usage,
                 Some(SCORER_MAX_TOKENS),
                 0.0,
+                LlmPhase::Total,
             )
             .await
             .map_err(|e| ModelError::new(e, usage))?;
@@ -553,8 +654,9 @@ impl LlmClient {
         user: &str,
         usage: &mut Usage,
         max_tokens: Option<u32>,
+        phase: LlmPhase,
     ) -> Result<String> {
-        self.chat_with_temperature(model, system, user, usage, max_tokens, 0.1)
+        self.chat_with_temperature(model, system, user, usage, max_tokens, 0.1, phase)
             .await
             .map_err(|e| e.context(ProviderError))
     }
@@ -567,8 +669,9 @@ impl LlmClient {
         usage: &mut Usage,
         max_tokens: Option<u32>,
         temperature: f64,
+        phase: LlmPhase,
     ) -> Result<String> {
-        self.chat_inner(model, system, user, usage, max_tokens, temperature)
+        self.chat_inner(model, system, user, usage, max_tokens, temperature, phase)
             .await
             .map_err(|e| e.context(ProviderError))
     }
@@ -582,6 +685,7 @@ impl LlmClient {
         usage: &mut Usage,
         max_tokens: Option<u32>,
         temperature: f64,
+        phase: LlmPhase,
     ) -> Result<String> {
         let mut body = json!({
             "model": model,
@@ -594,70 +698,115 @@ impl LlmClient {
         if let Some(max_tokens) = max_tokens {
             body["max_tokens"] = json!(max_tokens);
         }
-        let mut attempt = 0u32;
+        let mut retries = 0u32;
+        let mut timeout_retries = 0u32;
+        let mut attempt_timeout = self.request_timeout;
         let text = loop {
-            attempt += 1;
             let attempt_started_at = Instant::now();
-            let request = self
-                .http
-                .post(format!("{}/chat/completions", self.api_base))
-                .bearer_auth(&self.api_key)
-                .header("HTTP-Referer", "https://postil.dev")
-                .header("X-Title", "Postil")
-                .json(&body)
-                .send();
-            let sent = match self.remaining_total_budget()? {
-                Some(remaining) => match tokio::time::timeout(remaining, request).await {
-                    Ok(result) => result,
-                    Err(_) => return Err(anyhow!("LLM total timeout exceeded")),
-                },
-                None => request.await,
-            };
-            match sent {
-                Ok(resp) => {
-                    let status = resp.status();
-                    let body = resp.text();
-                    let text = match self.remaining_total_budget()? {
-                        Some(remaining) => match tokio::time::timeout(remaining, body).await {
-                            Ok(result) => result,
-                            Err(_) => return Err(anyhow!("LLM total timeout exceeded")),
-                        },
-                        None => body.await,
-                    }
-                    .context("reading model response")?;
-                    if status.is_success() {
-                        break text;
-                    }
-                    let snippet: String = text.chars().take(300).collect();
-                    if retryable_status(status.as_u16()) && attempt <= TRANSIENT_RETRIES {
-                        let wait = std::time::Duration::from_secs(2 * attempt as u64);
+            let remaining = self.remaining_budget(phase)?;
+            let deadline_limited = remaining.is_some_and(|value| value <= attempt_timeout);
+            let timeout = remaining.map_or(attempt_timeout, |value| value.min(attempt_timeout));
+            let response = match tokio::time::timeout(timeout, self.request_once(&body)).await {
+                Ok(result) => result,
+                Err(_) if deadline_limited => return Err(DeadlineExceeded(phase).into()),
+                Err(_) => {
+                    if timeout_retries < TIMEOUT_RETRIES && retries < TRANSIENT_RETRIES {
+                        retries += 1;
+                        timeout_retries += 1;
+                        let wait = Duration::from_secs(2 * retries as u64);
                         eprintln!(
-                            "postil: model {} returned retryable HTTP {status} after {}, retrying in {}s \
-                             (retry {attempt}/{TRANSIENT_RETRIES})",
+                            "postil: model {} hit a request timeout after {}, retrying in {}s \
+                             (timeout retry {timeout_retries}/{TIMEOUT_RETRIES}; retry {retries}/{TRANSIENT_RETRIES})",
                             log_text(model),
                             elapsed_text(attempt_started_at.elapsed()),
                             wait.as_secs()
                         );
-                        self.sleep_with_total_budget(wait).await?;
+                        self.sleep_with_budget(phase, wait).await?;
+                        attempt_timeout = self.timeout_retry_timeout;
+                        continue;
+                    }
+                    return Err(RequestTimedOut.into());
+                }
+            };
+            match response {
+                Ok((status, text)) => {
+                    if status.is_success() {
+                        break text;
+                    }
+                    let snippet: String = text.chars().take(300).collect();
+                    if timeout_status(status.as_u16())
+                        && timeout_retries < TIMEOUT_RETRIES
+                        && retries < TRANSIENT_RETRIES
+                    {
+                        retries += 1;
+                        timeout_retries += 1;
+                        let wait = Duration::from_secs(2 * retries as u64);
+                        eprintln!(
+                            "postil: model {} returned timeout HTTP {status} after {}, retrying in {}s \
+                             (timeout retry {timeout_retries}/{TIMEOUT_RETRIES}; retry {retries}/{TRANSIENT_RETRIES})",
+                            log_text(model),
+                            elapsed_text(attempt_started_at.elapsed()),
+                            wait.as_secs()
+                        );
+                        self.sleep_with_budget(phase, wait).await?;
+                        attempt_timeout = self.timeout_retry_timeout;
+                        continue;
+                    }
+                    if timeout_status(status.as_u16()) {
+                        return Err(anyhow::Error::new(RequestTimedOut)
+                            .context(format!("model endpoint returned {status}: {snippet}")));
+                    }
+                    if retryable_status(status.as_u16()) && retries < TRANSIENT_RETRIES {
+                        retries += 1;
+                        let wait = Duration::from_secs(2 * retries as u64);
+                        eprintln!(
+                            "postil: model {} returned retryable HTTP {status} after {}, retrying in {}s \
+                             (retry {retries}/{TRANSIENT_RETRIES})",
+                            log_text(model),
+                            elapsed_text(attempt_started_at.elapsed()),
+                            wait.as_secs()
+                        );
+                        self.sleep_with_budget(phase, wait).await?;
+                        attempt_timeout = self.request_timeout;
                         continue;
                     }
                     return Err(anyhow!("model endpoint returned {status}: {snippet}"));
                 }
-                // Connection-level failures retry too; timeouts do not (the
-                // request already waited the full budget).
-                Err(e) if e.is_connect() && attempt <= TRANSIENT_RETRIES => {
-                    let wait = std::time::Duration::from_secs(2 * attempt as u64);
+                Err(error)
+                    if error.is_timeout()
+                        && timeout_retries < TIMEOUT_RETRIES
+                        && retries < TRANSIENT_RETRIES =>
+                {
+                    retries += 1;
+                    timeout_retries += 1;
+                    let wait = Duration::from_secs(2 * retries as u64);
                     eprintln!(
-                        "postil: model {} hit a retryable connection error after {}, retrying in {}s \
-                         (retry {attempt}/{TRANSIENT_RETRIES})",
+                        "postil: model {} hit a request timeout after {}, retrying in {}s \
+                         (timeout retry {timeout_retries}/{TIMEOUT_RETRIES}; retry {retries}/{TRANSIENT_RETRIES})",
                         log_text(model),
                         elapsed_text(attempt_started_at.elapsed()),
                         wait.as_secs()
                     );
-                    self.sleep_with_total_budget(wait).await?;
+                    self.sleep_with_budget(phase, wait).await?;
+                    attempt_timeout = self.timeout_retry_timeout;
                 }
-                Err(e) => {
-                    return Err(anyhow::Error::from(e).context("request to model endpoint failed"));
+                Err(error) if error.is_connect() && retries < TRANSIENT_RETRIES => {
+                    retries += 1;
+                    let wait = Duration::from_secs(2 * retries as u64);
+                    eprintln!(
+                        "postil: model {} hit a retryable connection error after {}, retrying in {}s \
+                         (retry {retries}/{TRANSIENT_RETRIES})",
+                        log_text(model),
+                        elapsed_text(attempt_started_at.elapsed()),
+                        wait.as_secs()
+                    );
+                    self.sleep_with_budget(phase, wait).await?;
+                    attempt_timeout = self.request_timeout;
+                }
+                Err(error) => {
+                    return Err(
+                        anyhow::Error::from(error).context("request to model endpoint failed")
+                    );
                 }
             }
         };
@@ -675,24 +824,46 @@ impl LlmClient {
             .ok_or_else(|| anyhow!("model response had no choices/content"))
     }
 
-    fn remaining_total_budget(&self) -> Result<Option<Duration>> {
-        let Some(deadline) = self.total_deadline else {
+    async fn request_once(
+        &self,
+        body: &serde_json::Value,
+    ) -> std::result::Result<(reqwest::StatusCode, String), reqwest::Error> {
+        let response = self
+            .http
+            .post(format!("{}/chat/completions", self.api_base))
+            .bearer_auth(&self.api_key)
+            .header("HTTP-Referer", "https://postil.dev")
+            .header("X-Title", "Postil")
+            .json(body)
+            .send()
+            .await?;
+        let status = response.status();
+        let text = response.text().await?;
+        Ok((status, text))
+    }
+
+    fn remaining_budget(&self, phase: LlmPhase) -> Result<Option<Duration>> {
+        let deadline = match phase {
+            LlmPhase::Review => self.review_deadline,
+            LlmPhase::Total => self.total_deadline,
+        };
+        let Some(deadline) = deadline else {
             return Ok(None);
         };
         deadline
             .checked_duration_since(Instant::now())
             .filter(|remaining| !remaining.is_zero())
             .map(Some)
-            .ok_or_else(|| anyhow!("LLM total timeout exceeded"))
+            .ok_or_else(|| DeadlineExceeded(phase).into())
     }
 
-    async fn sleep_with_total_budget(&self, duration: Duration) -> Result<()> {
-        let Some(remaining) = self.remaining_total_budget()? else {
+    async fn sleep_with_budget(&self, phase: LlmPhase, duration: Duration) -> Result<()> {
+        let Some(remaining) = self.remaining_budget(phase)? else {
             tokio::time::sleep(duration).await;
             return Ok(());
         };
         if remaining <= duration {
-            return Err(anyhow!("LLM total timeout exceeded"));
+            return Err(DeadlineExceeded(phase).into());
         }
         tokio::time::sleep(duration).await;
         Ok(())
@@ -1066,10 +1237,11 @@ mod tests {
             &Config::default(),
             Instant::now(),
             Duration::from_secs(crate::review::HOSTED_LLM_REQUEST_TIMEOUT_SECS),
+            Duration::from_secs(crate::review::HOSTED_LLM_REVIEW_TIMEOUT_SECS),
             Duration::from_secs(crate::review::HOSTED_LLM_TOTAL_TIMEOUT_SECS),
         )
         .unwrap();
-        let remaining = client.remaining_total_budget().unwrap().unwrap();
+        let remaining = client.remaining_budget(LlmPhase::Total).unwrap().unwrap();
 
         assert!(remaining <= Duration::from_secs(crate::review::HOSTED_LLM_TOTAL_TIMEOUT_SECS));
         assert!(remaining > Duration::from_secs(crate::review::HOSTED_LLM_TOTAL_TIMEOUT_SECS - 5));
@@ -1085,7 +1257,8 @@ mod tests {
 
         let client = LlmClient::from_env(&Config::default()).unwrap();
 
-        assert!(client.remaining_total_budget().unwrap().is_none());
+        assert!(client.remaining_budget(LlmPhase::Review).unwrap().is_none());
+        assert!(client.remaining_budget(LlmPhase::Total).unwrap().is_none());
     }
 
     #[test]
@@ -1095,8 +1268,8 @@ mod tests {
         EnvRestore::remove(REQUEST_TIMEOUT_ENV);
         EnvRestore::remove(TOTAL_TIMEOUT_ENV);
 
-        // The hosted path uses a shorter per-request timeout (420s) to fit the
-        // scorer and margin inside its total budget. Local/interactive runs have
+        // The hosted path uses a shorter per-request timeout (240s) so a timeout
+        // retry and fallback fit before its review deadline. Local runs have
         // no total budget by default and must keep the original, more generous
         // request timeout rather than inherit the hosted-tuned value.
         let timeouts = LlmTimeouts::from_env(DEFAULT_REQUEST_TIMEOUT_SECS, None).unwrap();
@@ -1131,9 +1304,17 @@ mod tests {
                 crate::review::HOSTED_LLM_TOTAL_TIMEOUT_SECS
             ))
         );
+        assert_eq!(crate::review::HOSTED_LLM_REVIEW_TIMEOUT_SECS, 420);
         assert_eq!(
-            timeouts.total.unwrap() - timeouts.request,
-            Duration::from_secs(crate::review::SCORER_TIMEOUT_SECS)
+            crate::review::HOSTED_LLM_REVIEW_TIMEOUT_SECS
+                - crate::review::HOSTED_LLM_REQUEST_TIMEOUT_SECS
+                - TIMEOUT_RETRY_CAP_SECS,
+            90
+        );
+        assert_eq!(
+            crate::review::HOSTED_LLM_TOTAL_TIMEOUT_SECS
+                - crate::review::HOSTED_LLM_REVIEW_TIMEOUT_SECS,
+            crate::review::SCORER_TIMEOUT_SECS
         );
         assert_eq!(
             Duration::from_secs(600) - timeouts.total.unwrap(),
@@ -1155,10 +1336,11 @@ mod tests {
             &Config::default(),
             started_at,
             Duration::from_secs(crate::review::HOSTED_LLM_REQUEST_TIMEOUT_SECS),
+            Duration::from_secs(crate::review::HOSTED_LLM_REVIEW_TIMEOUT_SECS),
             Duration::from_secs(crate::review::HOSTED_LLM_TOTAL_TIMEOUT_SECS),
         )
         .unwrap();
-        let remaining = client.remaining_total_budget().unwrap().unwrap();
+        let remaining = client.remaining_budget(LlmPhase::Total).unwrap().unwrap();
 
         assert!(
             remaining
