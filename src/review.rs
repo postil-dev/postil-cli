@@ -28,9 +28,11 @@ const MAX_DIFF_BYTES: usize = 400_000;
 const MAX_RAW_DIFF_BYTES: usize = MAX_DIFF_BYTES * 4;
 const HOSTED_WORKER_WATCHDOG_SECS: u64 = 600;
 pub(crate) const HOSTED_LLM_TOTAL_TIMEOUT_SECS: u64 = 540;
-/// 540s total minus a 120s scorer reserve: the cascade's own request budget
-/// stops with enough of the total left for the scorer call that follows it.
-pub(crate) const HOSTED_LLM_REQUEST_TIMEOUT_SECS: u64 = 420;
+/// Hosted reviews get a 240s primary attempt plus one timeout retry capped at
+/// 90s. The entire review-model phase stops at 420s, leaving 120s of the total
+/// LLM budget for scoring.
+pub(crate) const HOSTED_LLM_REQUEST_TIMEOUT_SECS: u64 = 240;
+pub(crate) const HOSTED_LLM_REVIEW_TIMEOUT_SECS: u64 = 420;
 const FORGE_READ_TIMEOUT_SECS: u64 = 60;
 const CHECK_START_TIMEOUT_SECS: u64 = 30;
 const CHECK_COMPLETION_TIMEOUT_SECS: u64 = 30;
@@ -644,6 +646,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                 cfg,
                 started_at,
                 Duration::from_secs(HOSTED_LLM_REQUEST_TIMEOUT_SECS),
+                Duration::from_secs(HOSTED_LLM_REVIEW_TIMEOUT_SECS),
                 Duration::from_secs(HOSTED_LLM_TOTAL_TIMEOUT_SECS),
             )?,
             None => LlmClient::from_env(cfg)?,
@@ -1077,12 +1080,11 @@ mod tests {
     fn default_llm_timeouts_fit_inside_hosted_worker_watchdog() {
         const PROCESS_OVERHEAD_SECS: u64 = 10;
 
-        // The request plus scorer equation is the no-setup upper bound. Remote
-        // setup is anchored to the same total budget and reduces the remaining
-        // LLM/scorer time before the client is constructed.
+        assert_eq!(HOSTED_LLM_REQUEST_TIMEOUT_SECS, 240);
+        assert_eq!(HOSTED_LLM_REVIEW_TIMEOUT_SECS, 420);
         assert_eq!(
             HOSTED_LLM_TOTAL_TIMEOUT_SECS,
-            HOSTED_LLM_REQUEST_TIMEOUT_SECS + SCORER_TIMEOUT_SECS
+            HOSTED_LLM_REVIEW_TIMEOUT_SECS + SCORER_TIMEOUT_SECS
         );
         assert_eq!(
             HOSTED_WORKER_WATCHDOG_SECS - HOSTED_LLM_TOTAL_TIMEOUT_SECS,
