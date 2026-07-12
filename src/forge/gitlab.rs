@@ -322,7 +322,7 @@ impl Forge for GitLab {
             &head,
             "postil/review",
             map(advisory),
-            &check_summary(envelope, true),
+            &check_summary(envelope, true, Default::default()),
         )
         .await?;
         let gate_desc = if envelope.gate.failing {

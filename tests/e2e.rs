@@ -109,6 +109,7 @@ fn postil() -> Command {
         .env_remove("POSTIL_API_KEY")
         .env_remove("POSTIL_API_BASE")
         .env_remove("POSTIL_DETAILS_URL")
+        .env_remove("GITHUB_SERVER_URL")
         .env_remove("POSTIL_ENABLE_BITBUCKET_INCREMENTAL")
         .env("MODEL_API_KEY", "test-key");
     cmd
@@ -193,6 +194,59 @@ async fn local_review_reports_grounded_finding_and_gates() {
     let request: Value = requests[0].body_json().unwrap();
     assert_eq!(request["max_tokens"], 16384);
     assert_eq!(request["messages"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn weak_human_escalation_remains_visible_without_blocking_gate() {
+    let server = MockServer::start().await;
+    mock_review(
+        &server,
+        json!([finding_at_with_kind(41, "error", "humanEscalation", 0.05)]),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".postil.yaml"), "minConfidence: 0\n").unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .code(0);
+    let env: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+
+    assert_eq!(env["findings"][0]["kind"], "humanEscalation");
+    assert_eq!(env["findings"][0]["confidence"], 0.05);
+    assert_eq!(env["gate"]["failing"], false);
+}
+
+#[tokio::test]
+async fn human_escalation_at_floor_blocks_even_at_warn_severity() {
+    let server = MockServer::start().await;
+    mock_review(
+        &server,
+        json!([finding_at_with_kind(41, "warn", "humanEscalation", 0.30)]),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".postil.yaml"), "minConfidence: 0\n").unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .code(1);
+    let env: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+
+    assert_eq!(env["findings"][0]["severity"], "warn");
+    assert_eq!(env["gate"]["failing"], true);
 }
 
 #[tokio::test]
@@ -1675,7 +1729,7 @@ async fn github_flow_posts_review_and_completes_both_checks() {
     assert_eq!(gate_patch["output"]["title"], "Merge gate failed");
     assert_eq!(
         gate_patch["output"]["summary"],
-        "Merge gate failed: 1 finding at or above the blocking threshold (error).\n\n- `src/auth.rs:41` Unsanitized input reaches query\n"
+        "Merge gate failed: 1 finding blocks under the configured policy (failOn: error).\n\n- `src/auth.rs:41` Unsanitized input reaches query\n"
     );
     // Inline review posted with the finding at the cited line.
     let review = reqs
@@ -1685,6 +1739,20 @@ async fn github_flow_posts_review_and_completes_both_checks() {
     let body: Value = review.body_json().unwrap();
     assert_eq!(body["comments"][0]["path"], "src/auth.rs");
     assert_eq!(body["comments"][0]["line"], 41);
+    let summary = body["body"].as_str().unwrap();
+    assert!(summary.starts_with("Gate: failed\n\n"));
+    assert!(summary.contains("**Unsanitized input reaches query** · severity: `error`"));
+    assert!(!summary.contains("`src/auth.rs:41`"));
+    assert!(summary.contains("<details><summary>Review metadata</summary>"));
+    assert!(
+        summary.contains("- Commit: [`headsha`](https://github.com/acme/api/commit/headsha111)")
+    );
+    assert!(
+        summary.contains(
+            "- Dashboard run: [View in Postil](https://postil.dev/orgs/acme/runs/review-7)"
+        )
+    );
+    assert!(summary.contains("- Tokens: 300 prompt, 150 completion"));
 }
 
 // An LLM response with a caller-provided summary and findings (used for
@@ -1802,7 +1870,7 @@ async fn content_policy_pr_body_finding_survives_grounding() {
         body["body"]
             .as_str()
             .unwrap()
-            .contains(".postil/pr-description")
+            .contains("AI-authorship residue in PR description")
     );
 }
 
@@ -1910,8 +1978,45 @@ async fn github_clean_pr_stays_silent_but_completes_checks() {
     assert_eq!(gate_patch["output"]["title"], "Merge gate passed");
     assert_eq!(
         gate_patch["output"]["summary"],
-        "Merge gate passed: no findings at or above the blocking threshold (error).\n"
+        "Merge gate passed: no findings block under the configured policy (failOn: error).\n"
     );
+
+    // The explicit onClean mode uses the same unified summary as finding-bearing
+    // reviews instead of falling back to the former one-line clean message.
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/api/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    std::fs::write(
+        dir.path().join(".postil.yaml"),
+        "review:\n  onClean: comment\n",
+    )
+    .unwrap();
+    postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .env(
+            "POSTIL_DETAILS_URL",
+            "https://postil.dev/orgs/acme/runs/clean-7",
+        )
+        .args(["review", "--repo", "acme/api", "--pr", "7"])
+        .assert()
+        .code(0);
+    let reqs = server.received_requests().await.unwrap();
+    let clean_review = reqs
+        .iter()
+        .rev()
+        .find(|request| request.url.path().ends_with("/reviews"))
+        .expect("onClean review posted");
+    let clean_body: Value = clean_review.body_json().unwrap();
+    let clean_summary = clean_body["body"].as_str().unwrap();
+    assert!(clean_summary.starts_with("Gate: passed\n\n"));
+    assert!(clean_summary.contains("Postil reviewed this change and found nothing"));
+    assert!(clean_summary.contains("<details><summary>Review metadata</summary>"));
+    assert!(clean_summary.contains("[View in Postil](https://postil.dev/orgs/acme/runs/clean-7)"));
 }
 
 #[tokio::test]

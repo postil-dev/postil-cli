@@ -91,7 +91,8 @@ pub struct Config {
     pub gate_fail_on: GateLevel,
     /// Gate behavior on operational error. Default: fail closed.
     pub gate_on_error: OnError,
-    /// Finding kinds that block the gate regardless of severity. Default: [HumanEscalation].
+    /// Finding kinds that block regardless of severity. Human escalations must
+    /// also meet the calibrated 0.30 gate confidence floor. Default: [HumanEscalation].
     pub block_on_kinds: Vec<Kind>,
     pub model: String,
     pub cascade: Vec<String>,
@@ -499,7 +500,7 @@ review:
 
 gate:
   failOn: error           # the postil/gate check fails at/above: info | warn | error | never
-  # blockOnKinds:           # finding kinds that block regardless of severity (default: [humanEscalation])
+  # blockOnKinds:           # kinds that block regardless of severity; humanEscalation also requires confidence >= 0.30
   #   - humanEscalation
   # onError: block          # block (default, fail closed) | advisory — gate outcome when
   #                         # the review itself errors (model outage). advisory keeps an

@@ -47,6 +47,15 @@ pub enum Kind {
     ContentPolicy,
 }
 
+/// Minimum confidence at which a human-escalation finding can block a merge.
+///
+/// Escalations are intentionally kept visible below this floor so reviewers can
+/// inspect weak signals, but a very weak escalation must not turn into a hard
+/// gate merely because of its kind or severity. A 0.30 floor is conservative:
+/// it filters the near-zero boilerplate observed in production while retaining
+/// uncertain but concrete concerns for human attention.
+pub const HUMAN_ESCALATION_GATE_MIN_CONFIDENCE: f64 = 0.30;
+
 impl Kind {
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
@@ -190,6 +199,33 @@ impl Envelope {
         }
         b
     }
+}
+
+/// Apply the serialized gate contract to one finding.
+///
+/// Keeping this beside the envelope makes live reviews, stored-envelope replay,
+/// and forge summaries share exactly the same blocking semantics.
+pub fn finding_blocks_gate(
+    finding: &Finding,
+    fail_on: &str,
+    block_on_kinds: &[String],
+    provider_error_is_advisory: bool,
+) -> bool {
+    if finding.kind == Kind::HumanEscalation
+        && finding.confidence < HUMAN_ESCALATION_GATE_MIN_CONFIDENCE
+    {
+        return false;
+    }
+
+    let severity_blocks = if provider_error_is_advisory || fail_on.eq_ignore_ascii_case("never") {
+        false
+    } else {
+        Severity::parse(fail_on).is_some_and(|threshold| finding.severity >= threshold)
+    };
+    let kind_blocks = block_on_kinds
+        .iter()
+        .any(|kind| Kind::parse(kind).is_some_and(|kind| kind == finding.kind));
+    severity_blocks || kind_blocks
 }
 
 /// Path marker for synthetic unusable-output findings (the model answered but
@@ -345,6 +381,29 @@ mod tests {
         assert_eq!(Kind::parse("uncertainty"), Some(Kind::Uncertainty));
         assert_eq!(Kind::parse("contentpolicy"), Some(Kind::ContentPolicy));
         assert_eq!(Kind::parse("unknown"), None);
+    }
+
+    #[test]
+    fn weak_human_escalation_never_blocks_but_floor_does() {
+        let mut escalation = finding(Severity::Error, 0.05);
+        escalation.kind = Kind::HumanEscalation;
+        let block_on_kinds = vec!["humanEscalation".to_string()];
+
+        assert!(!finding_blocks_gate(
+            &escalation,
+            "error",
+            &block_on_kinds,
+            false
+        ));
+
+        escalation.severity = Severity::Warn;
+        escalation.confidence = HUMAN_ESCALATION_GATE_MIN_CONFIDENCE;
+        assert!(finding_blocks_gate(
+            &escalation,
+            "error",
+            &block_on_kinds,
+            false
+        ));
     }
 
     #[test]

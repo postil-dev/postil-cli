@@ -4,7 +4,10 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{CheckState, Forge, PrMeta, ThreadKind, check_summary, check_title, wrap_plain_text};
+use super::{
+    CheckState, Forge, PrMeta, SummaryContext, ThreadKind, check_summary, check_title,
+    wrap_plain_text,
+};
 use crate::envelope::{Envelope, Finding, Severity};
 use crate::filter;
 
@@ -16,6 +19,7 @@ pub struct GitHub {
     owner: String,
     repo: String,
     pr: u64,
+    web_base: String,
 }
 
 impl GitHub {
@@ -28,6 +32,8 @@ impl GitHub {
         let api_base = std::env::var("GITHUB_API_URL")
             .unwrap_or_else(|_| "https://api.github.com".to_string());
         let details_url = valid_details_url(std::env::var("POSTIL_DETAILS_URL").ok());
+        let web_base = valid_details_url(std::env::var("GITHUB_SERVER_URL").ok())
+            .unwrap_or_else(|| "https://github.com".to_string());
         Ok(GitHub {
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(60))
@@ -38,6 +44,7 @@ impl GitHub {
             owner: owner.to_string(),
             repo: repo.to_string(),
             pr,
+            web_base: web_base.trim_end_matches('/').to_string(),
         })
     }
 
@@ -89,7 +96,7 @@ fn gate_title(envelope: &Envelope) -> &'static str {
 fn gate_summary(envelope: &Envelope) -> String {
     if !envelope.gate.failing {
         return format!(
-            "Merge gate passed: no findings at or above the blocking threshold ({}).\n",
+            "Merge gate passed: no findings block under the configured policy (failOn: {}).\n",
             envelope.gate.fail_on
         );
     }
@@ -98,20 +105,28 @@ fn gate_summary(envelope: &Envelope) -> String {
         .findings
         .iter()
         .filter(|f| {
-            crate::config::GateLevel::parse(&envelope.gate.fail_on)
-                .map(|g| g.fails(f.severity))
-                .unwrap_or(false)
+            crate::envelope::finding_blocks_gate(
+                f,
+                &envelope.gate.fail_on,
+                &envelope.gate.block_on_kinds,
+                false,
+            )
         })
         .map(|f| format!("- `{}:{}` {}", f.path, f.line, f.title))
         .collect();
-    let noun = if failing.len() == 1 {
-        "finding"
+    if failing.is_empty() {
+        return format!(
+            "Merge gate failed under the configured operational error policy (failOn: {}).\n",
+            envelope.gate.fail_on
+        );
+    }
+    let subject = if failing.len() == 1 {
+        "1 finding blocks".to_string()
     } else {
-        "findings"
+        format!("{} findings block", failing.len())
     };
     format!(
-        "Merge gate failed: {} {noun} at or above the blocking threshold ({}).\n\n{}\n",
-        failing.len(),
+        "Merge gate failed: {subject} under the configured policy (failOn: {}).\n\n{}\n",
         envelope.gate.fail_on,
         failing.join("\n")
     )
@@ -138,6 +153,23 @@ struct CheckRun {
 impl Forge for GitHub {
     fn rich_markdown(&self) -> bool {
         true
+    }
+
+    fn review_summary(&self, envelope: &Envelope) -> String {
+        let commit_url = envelope.head_sha.as_deref().map(|sha| {
+            format!(
+                "{}/{}/{}/commit/{sha}",
+                self.web_base, self.owner, self.repo
+            )
+        });
+        check_summary(
+            envelope,
+            true,
+            SummaryContext {
+                commit_url: commit_url.as_deref(),
+                details_url: self.details_url.as_deref(),
+            },
+        )
     }
 
     async fn fetch_pr_meta(&self) -> Result<PrMeta> {
@@ -305,7 +337,7 @@ impl Forge for GitHub {
             let gate_note = if name == "postil/gate" {
                 gate_summary(envelope)
             } else {
-                check_summary(envelope, true)
+                self.review_summary(envelope)
             };
             let title = if name == "postil/gate" {
                 gate_title(envelope).to_string()
@@ -373,7 +405,8 @@ impl Forge for GitHub {
 
 #[cfg(test)]
 mod tests {
-    use super::valid_details_url;
+    use super::{gate_summary, valid_details_url};
+    use crate::envelope::{Envelope, Finding, Gate, Kind, Severity, Usage};
 
     #[test]
     fn details_url_accepts_only_http_and_https_urls() {
@@ -389,5 +422,86 @@ mod tests {
         assert_eq!(valid_details_url(Some("https://".into())), None);
         assert_eq!(valid_details_url(Some("not a URL".into())), None);
         assert_eq!(valid_details_url(None), None);
+    }
+
+    #[test]
+    fn gate_summary_counts_qualified_kind_blocks_from_stored_envelope() {
+        let finding = Finding {
+            path: "src/auth.rs".into(),
+            line: 41,
+            end_line: None,
+            severity: Severity::Warn,
+            kind: Kind::HumanEscalation,
+            confidence: 0.30,
+            generator_confidence: None,
+            scorer_confidence: None,
+            generator_kind: None,
+            scorer_kind: None,
+            scorer_reason: None,
+            title: "Human judgment required".into(),
+            body: "Concrete compatibility concern.".into(),
+            id: None,
+        };
+        let env = Envelope {
+            version: 1,
+            summary: String::new(),
+            silent: false,
+            findings: vec![finding],
+            resolved: vec![],
+            counts: Default::default(),
+            confidence_buckets: [0; 5],
+            gate: Gate {
+                fail_on: "error".into(),
+                failing: true,
+                block_on_kinds: vec!["humanEscalation".into()],
+            },
+            model_used: "m".into(),
+            scorer_model: None,
+            scorer_error: None,
+            scorer_disagreements: None,
+            usage: Usage::default(),
+            duration_ms: 0,
+            base_sha: None,
+            head_sha: None,
+            since_sha: None,
+        };
+
+        let summary = gate_summary(&env);
+        assert!(summary.contains("1 finding blocks under the configured policy"));
+        assert!(summary.contains("src/auth.rs:41"));
+    }
+
+    #[test]
+    fn gate_summary_reports_operational_failure_without_inventing_blockers() {
+        let mut env = Envelope {
+            version: 1,
+            summary: String::new(),
+            silent: false,
+            findings: vec![],
+            resolved: vec![],
+            counts: Default::default(),
+            confidence_buckets: [0; 5],
+            gate: Gate {
+                fail_on: "never".into(),
+                failing: true,
+                block_on_kinds: vec![],
+            },
+            model_used: "m".into(),
+            scorer_model: None,
+            scorer_error: None,
+            scorer_disagreements: None,
+            usage: Usage::default(),
+            duration_ms: 0,
+            base_sha: None,
+            head_sha: None,
+            since_sha: None,
+        };
+        env.findings
+            .push(crate::envelope::provider_error_finding("timeout"));
+
+        assert_eq!(
+            gate_summary(&env),
+            "Merge gate failed under the configured operational error policy (failOn: never).\n"
+        );
     }
 }
