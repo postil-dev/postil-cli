@@ -234,6 +234,7 @@ async fn scorer_lowers_confidence_and_stores_both_values() {
         .code(0);
 
     let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
     let env: Value = serde_json::from_str(&stdout).unwrap();
     let finding = &env["findings"][0];
     assert_eq!(env["scorerModel"], "anthropic/claude-haiku-4.5");
@@ -245,6 +246,10 @@ async fn scorer_lowers_confidence_and_stores_both_values() {
     assert_eq!(finding["generatorKind"], "risk");
     assert_eq!(finding["scorerKind"], "risk");
     assert_eq!(env["usage"]["promptTokens"], 130);
+    assert!(stderr.contains("postil: attempting model: generator-model"));
+    assert!(stderr.contains("postil: model generator-model responded in"));
+    assert!(stderr.contains("postil: running scorer with anthropic/claude-haiku-4.5"));
+    assert!(stderr.contains("postil: scorer anthropic/claude-haiku-4.5 completed successfully in"));
 
     let requests = server.received_requests().await.unwrap();
     let scorer_request: Value = requests
@@ -427,6 +432,7 @@ async fn scorer_error_fails_open_and_preserves_generator_values() {
         .code(0);
 
     let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
     let env: Value = serde_json::from_str(&stdout).unwrap();
     let finding = &env["findings"][0];
     assert_eq!(env["gate"]["failing"], false);
@@ -444,6 +450,49 @@ async fn scorer_error_fails_open_and_preserves_generator_values() {
     assert!(finding.get("scorerConfidence").is_none());
     assert!(finding.get("generatorKind").is_none());
     assert!(finding.get("scorerKind").is_none());
+    assert!(stderr.contains("postil: scorer anthropic/claude-haiku-4.5 failed after"));
+    assert!(stderr.contains("falling back to next scorer"));
+    assert!(stderr.contains("postil: running scorer with openai/gpt-5-mini"));
+    assert!(stderr.contains("no fallback scorers remain"));
+}
+
+#[tokio::test]
+async fn scorer_provider_error_cannot_inject_stderr_lines() {
+    let server = MockServer::start().await;
+    mock_review_model(
+        &server,
+        "generator-model",
+        json!([finding_at(41, "warn", 0.92)]),
+    )
+    .await;
+    for scorer_model in ["anthropic/claude-haiku-4.5", "openai/gpt-5-mini"] {
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains(scorer_model))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_string("bad\n[stderr] forged\u{1b}[31m"),
+            )
+            .mount(&server)
+            .await;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "generator-model")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .code(0);
+
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(!stderr.contains("\n[stderr] forged"));
+    assert!(!stderr.contains('\u{1b}'));
+    assert!(stderr.contains(r"bad\n[stderr] forged\u{1b}[31m"));
+    assert!(stderr.contains("postil: scorer failed open after all scorer models failed"));
 }
 
 #[tokio::test]
@@ -1276,6 +1325,42 @@ async fn cascade_falls_back_to_next_model() {
     let env: Value =
         serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
     assert_eq!(env["modelUsed"], "backup-model");
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("postil: attempting model: primary-model"));
+    assert!(stderr.contains("postil: model primary-model returned retryable HTTP 500"));
+    assert!(stderr.contains("retrying in 2s"));
+    assert!(stderr.contains("postil: model primary-model failed after"));
+    assert!(stderr.contains("falling back to next model"));
+    assert!(stderr.contains("postil: attempting model: backup-model"));
+    assert!(stderr.contains("postil: model backup-model responded in"));
+}
+
+#[tokio::test]
+async fn consensus_logs_each_model_outcome() {
+    let server = MockServer::start().await;
+    for model in ["consensus-a", "consensus-b"] {
+        mock_review_model(&server, model, json!([])).await;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".postil.yaml"), "model:\n  consensus: 2\n").unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "consensus-a")
+        .env("REVIEW_MODEL_CASCADE", "consensus-b")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .code(0);
+
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    for model in ["consensus-a", "consensus-b"] {
+        assert!(stderr.contains(&format!("postil: attempting consensus model: {model}")));
+        assert!(stderr.contains(&format!("postil: consensus model {model} responded in")));
+    }
 }
 
 #[tokio::test]
@@ -1315,6 +1400,11 @@ async fn slow_model_request_times_out_and_falls_back() {
     let env: Value =
         serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
     assert_eq!(env["modelUsed"], "backup-model");
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("postil: model primary-model timed out after"));
+    assert!(stderr.contains("falling back to next model"));
+    assert!(stderr.contains("postil: attempting model: backup-model"));
+    assert!(stderr.contains("postil: model backup-model responded in"));
 }
 
 #[tokio::test]

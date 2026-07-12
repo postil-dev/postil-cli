@@ -55,6 +55,15 @@ impl ModelError {
     pub fn is_provider(&self) -> bool {
         self.error.downcast_ref::<ProviderError>().is_some()
     }
+
+    fn is_timeout(&self) -> bool {
+        self.error.chain().any(|cause| {
+            cause
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(reqwest::Error::is_timeout)
+                || cause.to_string() == "LLM total timeout exceeded"
+        })
+    }
 }
 
 impl std::fmt::Display for ModelError {
@@ -76,6 +85,26 @@ impl std::error::Error for ModelError {
 fn add_usage(total: &mut Usage, usage: Usage) {
     total.prompt_tokens += usage.prompt_tokens;
     total.completion_tokens += usage.completion_tokens;
+}
+
+fn elapsed_text(elapsed: Duration) -> String {
+    if elapsed < Duration::from_secs(1) {
+        format!("{}ms", elapsed.as_millis())
+    } else {
+        format!("{:.1}s", elapsed.as_secs_f64())
+    }
+}
+
+fn log_text(value: &str) -> String {
+    let mut sanitized = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character.is_control() {
+            sanitized.extend(character.escape_default());
+        } else {
+            sanitized.push(character);
+        }
+    }
+    sanitized
 }
 
 /// Raw shape we ask the model for. Findings are validated leniently here and
@@ -224,24 +253,45 @@ impl LlmClient {
                 .map(|m| {
                     let client = self.clone();
                     let (model, system, user) = (m.clone(), system.to_string(), user.to_string());
-                    tokio::spawn(
-                        async move { client.review_with_model(&model, &system, &user).await },
-                    )
+                    let task_model = model.clone();
+                    let handle = tokio::spawn(async move {
+                        let model_log = log_text(&task_model);
+                        eprintln!("postil: attempting consensus model: {model_log}");
+                        let started_at = Instant::now();
+                        let result = client.review_with_model(&task_model, &system, &user).await;
+                        let elapsed = elapsed_text(started_at.elapsed());
+                        match &result {
+                            Ok(_) => eprintln!(
+                                "postil: consensus model {model_log} responded in {elapsed}"
+                            ),
+                            Err(error) if error.is_timeout() => eprintln!(
+                                "postil: consensus model {model_log} timed out after {elapsed}"
+                            ),
+                            Err(error) => eprintln!(
+                                "postil: consensus model {model_log} failed after {elapsed}: {}",
+                                log_text(&format!("{error:#}"))
+                            ),
+                        }
+                        result
+                    });
+                    (model, handle)
                 })
                 .collect();
             let mut ok: Vec<ModelReview> = Vec::new();
             let mut failed_usage = Usage::default();
             let mut last_err: Option<ModelError> = None;
-            for h in handles {
-                match h.await {
+            for (model, handle) in handles {
+                let model_log = log_text(&model);
+                match handle.await {
                     Ok(Ok(r)) => ok.push(r),
                     Ok(Err(mut e)) => {
-                        eprintln!("postil: consensus model failed: {e:#}");
                         add_usage(&mut failed_usage, e.usage);
                         e.usage = failed_usage;
                         last_err = Some(e);
                     }
-                    Err(e) => eprintln!("postil: consensus task panicked: {e}"),
+                    Err(e) => {
+                        eprintln!("postil: consensus model {model_log} task panicked: {e}")
+                    }
                 }
             }
             match ok.len() {
@@ -270,14 +320,43 @@ impl LlmClient {
         } else {
             let mut failed_usage = Usage::default();
             let mut last_err = None;
-            for model in &chain {
+            for (index, model) in chain.iter().enumerate() {
+                let model_log = log_text(model);
+                eprintln!("postil: attempting model: {model_log}");
+                let started_at = Instant::now();
                 match self.review_with_model(model, system, user).await {
                     Ok(mut r) => {
+                        eprintln!(
+                            "postil: model {model_log} responded in {}",
+                            elapsed_text(started_at.elapsed())
+                        );
                         add_usage(&mut r.usage, failed_usage);
                         return Ok(r);
                     }
                     Err(mut e) => {
-                        eprintln!("postil: model {model} failed: {e:#}");
+                        let elapsed = elapsed_text(started_at.elapsed());
+                        let has_fallback = index + 1 < chain.len();
+                        if e.is_timeout() {
+                            if has_fallback {
+                                eprintln!(
+                                    "postil: model {model_log} timed out after {elapsed}, falling back to next model"
+                                );
+                            } else {
+                                eprintln!(
+                                    "postil: model {model_log} timed out after {elapsed}; no fallback models remain"
+                                );
+                            }
+                        } else if has_fallback {
+                            eprintln!(
+                                "postil: model {model_log} failed after {elapsed}, falling back to next model: {}",
+                                log_text(&format!("{e:#}"))
+                            );
+                        } else {
+                            eprintln!(
+                                "postil: model {model_log} failed after {elapsed}; no fallback models remain: {}",
+                                log_text(&format!("{e:#}"))
+                            );
+                        }
                         add_usage(&mut failed_usage, e.usage);
                         e.usage = failed_usage;
                         last_err = Some(e);
@@ -315,17 +394,36 @@ impl LlmClient {
     ) -> std::result::Result<ScorerReview, ModelError> {
         let mut failed_usage = Usage::default();
         let mut last_err = None;
-        for model in cfg.scorer_chain() {
+        let chain = cfg.scorer_chain();
+        for (index, model) in chain.iter().enumerate() {
+            let model_log = log_text(model);
+            eprintln!("postil: running scorer with {model_log}");
+            let started_at = Instant::now();
             match self
-                .score_with_model(&model, system, user, expected_len)
+                .score_with_model(model, system, user, expected_len)
                 .await
             {
                 Ok(mut r) => {
+                    eprintln!(
+                        "postil: scorer {model_log} completed successfully in {}",
+                        elapsed_text(started_at.elapsed())
+                    );
                     add_usage(&mut r.usage, failed_usage);
                     return Ok(r);
                 }
                 Err(mut e) => {
-                    eprintln!("postil: scorer model {model} failed: {e:#}");
+                    let elapsed = elapsed_text(started_at.elapsed());
+                    if index + 1 < chain.len() {
+                        eprintln!(
+                            "postil: scorer {model_log} failed after {elapsed}, falling back to next scorer: {}",
+                            log_text(&format!("{e:#}"))
+                        );
+                    } else {
+                        eprintln!(
+                            "postil: scorer {model_log} failed after {elapsed}; no fallback scorers remain: {}",
+                            log_text(&format!("{e:#}"))
+                        );
+                    }
                     add_usage(&mut failed_usage, e.usage);
                     e.usage = failed_usage;
                     last_err = Some(e);
@@ -490,6 +588,7 @@ impl LlmClient {
         let mut attempt = 0u32;
         let text = loop {
             attempt += 1;
+            let attempt_started_at = Instant::now();
             let request = self
                 .http
                 .post(format!("{}/chat/completions", self.api_base))
@@ -524,8 +623,10 @@ impl LlmClient {
                     if retryable_status(status.as_u16()) && attempt <= TRANSIENT_RETRIES {
                         let wait = std::time::Duration::from_secs(2 * attempt as u64);
                         eprintln!(
-                            "postil: {model} returned {status}, retrying in {}s \
-                             (attempt {attempt}/{TRANSIENT_RETRIES})",
+                            "postil: model {} returned retryable HTTP {status} after {}, retrying in {}s \
+                             (retry {attempt}/{TRANSIENT_RETRIES})",
+                            log_text(model),
+                            elapsed_text(attempt_started_at.elapsed()),
                             wait.as_secs()
                         );
                         self.sleep_with_total_budget(wait).await?;
@@ -536,10 +637,15 @@ impl LlmClient {
                 // Connection-level failures retry too; timeouts do not (the
                 // request already waited the full budget).
                 Err(e) if e.is_connect() && attempt <= TRANSIENT_RETRIES => {
-                    self.sleep_with_total_budget(std::time::Duration::from_secs(
-                        2 * attempt as u64,
-                    ))
-                    .await?;
+                    let wait = std::time::Duration::from_secs(2 * attempt as u64);
+                    eprintln!(
+                        "postil: model {} hit a retryable connection error after {}, retrying in {}s \
+                         (retry {attempt}/{TRANSIENT_RETRIES})",
+                        log_text(model),
+                        elapsed_text(attempt_started_at.elapsed()),
+                        wait.as_secs()
+                    );
+                    self.sleep_with_total_budget(wait).await?;
                 }
                 Err(e) => {
                     return Err(anyhow::Error::from(e).context("request to model endpoint failed"));
@@ -888,6 +994,14 @@ mod tests {
                 std::env::set_var(name, value);
             }
         }
+    }
+
+    #[test]
+    fn log_text_escapes_line_and_terminal_controls() {
+        assert_eq!(
+            log_text("model\nnext\r\t\u{1b}[31m"),
+            r"model\nnext\r\t\u{1b}[31m"
+        );
     }
 
     impl Drop for EnvRestore {
