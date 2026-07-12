@@ -1,0 +1,11 @@
+version = 1
+default_model = "deepseek/deepseek-v4-pro"
+cascade = [
+  "google/gemini-3.1-flash-lite",
+  "moonshotai/kimi-k2.7-code",
+  "mistralai/mistral-large-2512",
+]
+
+[scorer]
+default_model = "anthropic/claude-haiku-4.5"
+fallback = "openai/gpt-5-mini"

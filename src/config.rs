@@ -9,21 +9,116 @@
 //! local setups with a trusted repo). `POSTIL_API_BASE` (env) always applies.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::envelope::{Kind, Severity};
 
-pub const DEFAULT_MODEL: &str = "deepseek/deepseek-v4-pro";
-pub const DEFAULT_CASCADE: [&str; 3] = [
-    "google/gemini-3.1-flash-lite",
-    "moonshotai/kimi-k2.7-code",
-    "mistralai/mistral-large-2512",
-];
-pub const DEFAULT_SCORER_MODEL: &str = "anthropic/claude-haiku-4.5";
-pub const DEFAULT_SCORER_FALLBACK: &str = "openai/gpt-5-mini";
+const MODEL_DEFAULTS_TOML: &str = include_str!("../config.toml");
 pub const DEFAULT_API_BASE: &str = "https://openrouter.ai/api/v1";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelDefaults {
+    pub version: u64,
+    pub source_sha256: String,
+    pub default_model: String,
+    pub cascade: Vec<String>,
+    pub scorer_model: String,
+    pub scorer_fallback: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelDefaultsFile {
+    version: u64,
+    default_model: String,
+    cascade: Vec<String>,
+    scorer: ScorerDefaultsFile,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScorerDefaultsFile {
+    default_model: String,
+    fallback: String,
+}
+
+pub fn model_defaults() -> &'static ModelDefaults {
+    static MODEL_DEFAULTS: OnceLock<ModelDefaults> = OnceLock::new();
+    MODEL_DEFAULTS.get_or_init(|| {
+        parse_model_defaults(MODEL_DEFAULTS_TOML).expect("embedded model defaults must parse")
+    })
+}
+
+pub fn default_model() -> &'static str {
+    model_defaults().default_model.as_str()
+}
+
+pub fn default_cascade() -> &'static [String] {
+    model_defaults().cascade.as_slice()
+}
+
+pub fn default_scorer_model() -> &'static str {
+    model_defaults().scorer_model.as_str()
+}
+
+pub fn default_scorer_fallback() -> &'static str {
+    model_defaults().scorer_fallback.as_str()
+}
+
+fn parse_model_defaults(raw: &str) -> Result<ModelDefaults> {
+    let file: ModelDefaultsFile = toml::from_str(raw)?;
+    anyhow::ensure!(
+        file.version > 0,
+        "model defaults version must be greater than zero"
+    );
+    validate_model_id("defaultModel", &file.default_model)?;
+    anyhow::ensure!(!file.cascade.is_empty(), "cascade must not be empty");
+    for model in &file.cascade {
+        validate_model_id("cascade entries", model)?;
+    }
+    validate_model_id("scorer.defaultModel", &file.scorer.default_model)?;
+    validate_model_id("scorer.fallback", &file.scorer.fallback)?;
+    Ok(ModelDefaults {
+        version: file.version,
+        source_sha256: sha256_hex(raw),
+        default_model: file.default_model,
+        cascade: file.cascade,
+        scorer_model: file.scorer.default_model,
+        scorer_fallback: file.scorer.fallback,
+    })
+}
+
+fn validate_model_id(field: &str, value: &str) -> Result<()> {
+    anyhow::ensure!(!value.trim().is_empty(), "{field} must not be empty");
+    anyhow::ensure!(
+        !value.contains(['\n', '\r']),
+        "{field} must not contain line breaks"
+    );
+    Ok(())
+}
+
+fn sha256_hex(raw: &str) -> String {
+    let digest = Sha256::digest(raw.as_bytes());
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut hex, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    hex
+}
+
+fn yaml_scalar(value: &str) -> String {
+    serde_yaml::to_string(value)
+        .expect("model default scalar must serialize")
+        .lines()
+        .filter(|line| *line != "...")
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -116,6 +211,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
+        let defaults = model_defaults();
         Config {
             enabled: true,
             ignore: Vec::new(),
@@ -128,9 +224,9 @@ impl Default for Config {
             gate_fail_on: GateLevel::Severity(Severity::Error),
             gate_on_error: OnError::Block,
             block_on_kinds: vec![Kind::HumanEscalation],
-            model: DEFAULT_MODEL.to_string(),
-            cascade: DEFAULT_CASCADE.iter().map(|m| (*m).to_string()).collect(),
-            scorer: DEFAULT_SCORER_MODEL.to_string(),
+            model: defaults.default_model.clone(),
+            cascade: defaults.cascade.clone(),
+            scorer: defaults.scorer_model.clone(),
             api_base: DEFAULT_API_BASE.to_string(),
             consensus: 1,
             guardrails: None,
@@ -449,7 +545,7 @@ impl Config {
     /// Scorer models to try, in order, deduplicated.
     pub fn scorer_chain(&self) -> Vec<String> {
         let mut chain = vec![self.scorer.clone()];
-        let fallback = DEFAULT_SCORER_FALLBACK.to_string();
+        let fallback = model_defaults().scorer_fallback.clone();
         if !chain.contains(&fallback) {
             chain.push(fallback);
         }
@@ -477,7 +573,7 @@ fn rel_name(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
-pub const STARTER_CONFIG: &str = r#"# Postil review configuration. Docs: https://postil.dev/docs/config
+const STARTER_CONFIG_TEMPLATE: &str = r#"# Postil review configuration. Docs: https://postil.dev/docs/config
 # Every key is optional; unknown keys are rejected so typos fail loudly.
 
 # ignore:
@@ -506,12 +602,9 @@ gate:
   #                         # outage from freezing merges; the review check goes neutral, not green.
 
 model:
-  name: deepseek/deepseek-v4-pro
+  name: __DEFAULT_MODEL__
   cascade:
-    - google/gemini-3.1-flash-lite
-    - moonshotai/kimi-k2.7-code
-    - mistralai/mistral-large-2512
-  scorer: anthropic/claude-haiku-4.5
+__DEFAULT_CASCADE__  scorer: __DEFAULT_SCORER_MODEL__
   # apiBase: https://openrouter.ai/api/v1   # any OpenAI-compatible endpoint (Ollama, vLLM, Azure).
   #                                         # Ignored from config by default (a repo could redirect
   #                                         # the inference credential). Prefer POSTIL_API_BASE; to
@@ -524,6 +617,25 @@ model:
 # contentPolicy:
 #   enabled: false          # See https://postil.dev/docs/content-policy
 "#;
+
+pub fn starter_config() -> &'static str {
+    static STARTER_CONFIG: OnceLock<String> = OnceLock::new();
+    STARTER_CONFIG.get_or_init(|| {
+        let defaults = model_defaults();
+        let cascade = defaults
+            .cascade
+            .iter()
+            .map(|model| format!("    - {}\n", yaml_scalar(model)))
+            .collect::<String>();
+        STARTER_CONFIG_TEMPLATE
+            .replace("__DEFAULT_MODEL__", &yaml_scalar(&defaults.default_model))
+            .replace("__DEFAULT_CASCADE__", &cascade)
+            .replace(
+                "__DEFAULT_SCORER_MODEL__",
+                &yaml_scalar(&defaults.scorer_model),
+            )
+    })
+}
 
 /// Built-in content-policy baseline, active whenever the dimension is on
 /// (see [`Config::content_policy`]). Scoped to human-readable prose only:
@@ -593,7 +705,138 @@ mod tests {
     }
 
     fn default_cascade() -> Vec<String> {
-        DEFAULT_CASCADE.iter().map(|m| (*m).to_string()).collect()
+        model_defaults().cascade.clone()
+    }
+
+    #[test]
+    fn embedded_model_defaults_match_root_config_file() {
+        let parsed = parse_model_defaults(MODEL_DEFAULTS_TOML).unwrap();
+        let raw: toml::Value = toml::from_str(MODEL_DEFAULTS_TOML).unwrap();
+        assert_eq!(parsed.version, raw["version"].as_integer().unwrap() as u64);
+        assert_eq!(parsed.source_sha256, sha256_hex(MODEL_DEFAULTS_TOML));
+        assert_eq!(parsed.source_sha256.len(), 64);
+        assert_eq!(parsed.default_model, raw["default_model"].as_str().unwrap());
+        assert_eq!(
+            parsed.cascade,
+            raw["cascade"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            parsed.scorer_model,
+            raw["scorer"]["default_model"].as_str().unwrap()
+        );
+        assert_eq!(
+            parsed.scorer_fallback,
+            raw["scorer"]["fallback"].as_str().unwrap()
+        );
+        assert_eq!(&parsed, model_defaults());
+    }
+
+    #[test]
+    fn model_default_accessors_expose_embedded_values() {
+        let defaults = model_defaults();
+        assert_eq!(default_model(), defaults.default_model);
+        assert_eq!(super::default_cascade(), defaults.cascade);
+        assert_eq!(default_scorer_model(), defaults.scorer_model);
+        assert_eq!(default_scorer_fallback(), defaults.scorer_fallback);
+    }
+
+    #[test]
+    fn malformed_model_defaults_fail_loudly() {
+        let err = parse_model_defaults(
+            r#"version = 1
+default_model = "example/model"
+cascade = ["example/fallback"]
+unexpected_key = "typo"
+
+[scorer]
+default_model = "example/scorer"
+fallback = "example/scorer-fallback"
+"#,
+        )
+        .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("unknown field"));
+        assert!(message.contains("unexpected_key"));
+    }
+
+    #[test]
+    fn malformed_model_defaults_reject_invalid_values() {
+        let cases = [
+            (
+                "version = 0\n\
+                 default_model = \"example/model\"\n\
+                 cascade = [\"example/fallback\"]\n\
+                 scorer = { default_model = \"example/scorer\", fallback = \"example/scorer-fallback\" }\n",
+                "version must be greater than zero",
+            ),
+            (
+                "version = 1\n\
+                 default_model = \"\"\n\
+                 cascade = [\"example/fallback\"]\n\
+                 scorer = { default_model = \"example/scorer\", fallback = \"example/scorer-fallback\" }\n",
+                "defaultModel must not be empty",
+            ),
+            (
+                "version = 1\n\
+                 default_model = \"example/model\"\n\
+                 cascade = []\n\
+                 scorer = { default_model = \"example/scorer\", fallback = \"example/scorer-fallback\" }\n",
+                "cascade must not be empty",
+            ),
+            (
+                "version = 1\n\
+                 default_model = \"example/model\"\n\
+                 cascade = [\"\"]\n\
+                 scorer = { default_model = \"example/scorer\", fallback = \"example/scorer-fallback\" }\n",
+                "cascade entries must not be empty",
+            ),
+            (
+                "version = 1\n\
+                 default_model = \"example/model\"\n\
+                 cascade = [\"example/fallback\"]\n\
+                 scorer = { default_model = \"\", fallback = \"example/scorer-fallback\" }\n",
+                "scorer.defaultModel must not be empty",
+            ),
+            (
+                "version = 1\n\
+                 default_model = \"example/model\"\n\
+                 cascade = [\"example/fallback\"]\n\
+                 scorer = { default_model = \"example/scorer\", fallback = \"\" }\n",
+                "scorer.fallback must not be empty",
+            ),
+        ];
+        for (raw, expected) in cases {
+            let err = parse_model_defaults(raw).unwrap_err();
+            assert!(
+                format!("{err:#}").contains(expected),
+                "expected {expected:?} in {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn starter_config_yaml_quotes_model_defaults_when_needed() {
+        assert_eq!(yaml_scalar("plain/model"), "plain/model");
+        assert_eq!(
+            serde_yaml::from_str::<String>(&yaml_scalar("model: with # yaml")).unwrap(),
+            "model: with # yaml"
+        );
+    }
+
+    #[test]
+    fn readme_model_example_mentions_embedded_defaults() {
+        let readme = include_str!("../README.md");
+        let defaults = model_defaults();
+        assert!(readme.contains(&defaults.default_model));
+        for model in &defaults.cascade {
+            assert!(readme.contains(model));
+        }
+        assert!(readme.contains(&defaults.scorer_model));
     }
 
     #[test]
@@ -610,12 +853,16 @@ mod tests {
     #[test]
     fn defaults_keep_primary_and_retry_roster_order() {
         let c = Config::default();
-        assert_eq!(c.model, DEFAULT_MODEL);
+        let defaults = model_defaults();
+        assert_eq!(c.model, defaults.default_model);
         assert_eq!(c.cascade, default_cascade());
-        assert_eq!(c.scorer, DEFAULT_SCORER_MODEL);
+        assert_eq!(c.scorer, defaults.scorer_model);
         assert_eq!(
             c.scorer_chain(),
-            vec![DEFAULT_SCORER_MODEL, DEFAULT_SCORER_FALLBACK]
+            vec![
+                defaults.scorer_model.clone(),
+                defaults.scorer_fallback.clone()
+            ]
         );
         assert_eq!(
             c.model_chain(),
@@ -665,13 +912,14 @@ mod tests {
 
     #[test]
     fn starter_config_parses() {
-        let f: FileConfig = serde_yaml::from_str(STARTER_CONFIG).unwrap();
+        let f: FileConfig = serde_yaml::from_str(starter_config()).unwrap();
         let mut c = Config::default();
         c.apply_file(f).unwrap();
+        let defaults = model_defaults();
         assert_eq!(c.max_findings, 20);
-        assert_eq!(c.model, DEFAULT_MODEL);
+        assert_eq!(c.model, defaults.default_model);
         assert_eq!(c.cascade, default_cascade());
-        assert_eq!(c.scorer, DEFAULT_SCORER_MODEL);
+        assert_eq!(c.scorer, defaults.scorer_model);
     }
 
     #[test]
@@ -682,7 +930,7 @@ mod tests {
         assert_eq!(c.scorer, "custom/scorer");
         assert_eq!(
             c.scorer_chain(),
-            vec!["custom/scorer", DEFAULT_SCORER_FALLBACK]
+            vec!["custom/scorer", &model_defaults().scorer_fallback]
         );
     }
 
