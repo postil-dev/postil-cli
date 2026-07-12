@@ -40,9 +40,9 @@ const FALSE_FINDING_CASES = [
   "near-duplicate-auth-clean",
 ];
 
-type Scenario = "trueFinding" | "falseFinding";
+export type Scenario = "trueFinding" | "falseFinding";
 
-interface ScorerEvalCase {
+export interface ScorerEvalCase {
   id: string;
   name: string;
   scenario: Scenario;
@@ -61,7 +61,7 @@ interface ScorerEvalCase {
   completionTokens: number;
 }
 
-interface ScorerEvalAggregate {
+export interface ScorerEvalAggregate {
   id: string;
   casesRun: number;
   structuredFailures: number;
@@ -74,7 +74,7 @@ interface ScorerEvalAggregate {
   passed: boolean;
 }
 
-interface ScorerEvalReport {
+export interface ScorerEvalReport {
   generatedAt: string;
   apiBase: string;
   models: ScorerEvalAggregate[];
@@ -86,7 +86,7 @@ function flagValue(args: string[], flag: string): string | undefined {
   return index === -1 ? undefined : args[index + 1];
 }
 
-function parseModels(raw: string | undefined): string[] {
+export function parseModels(raw: string | undefined): string[] {
   const source = raw?.trim() ? raw : DEFAULT_SCORER_MODELS.join(",");
   return source
     .split(",")
@@ -321,7 +321,7 @@ function generatorOutput(c: BenchmarkCase, scenario: Scenario) {
   };
 }
 
-function trueFinding(c: BenchmarkCase) {
+export function trueFinding(c: BenchmarkCase) {
   const finding = c.modelOutput.findings[0];
   if (!finding) throw new Error(`fixture ${c.id} has no recorded finding`);
   return {
@@ -331,7 +331,7 @@ function trueFinding(c: BenchmarkCase) {
   };
 }
 
-function falseFinding(c: BenchmarkCase) {
+export function falseFinding(c: BenchmarkCase) {
   const path = c.allowedContext.files[0]?.path ?? c.modelOutput.findings[0]?.path;
   const line = firstAddedLine(c.diff) ?? c.modelOutput.findings[0]?.line ?? 1;
   return {
@@ -346,7 +346,7 @@ function falseFinding(c: BenchmarkCase) {
   };
 }
 
-function firstAddedLine(diff: string): number | null {
+export function firstAddedLine(diff: string): number | null {
   const match = diff.match(/@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/u);
   return match ? Number.parseInt(match[1]!, 10) : null;
 }
@@ -378,7 +378,7 @@ function isolatedEnv(
   };
 }
 
-function aggregate(model: string, cases: ScorerEvalCase[]): ScorerEvalAggregate {
+export function aggregate(model: string, cases: ScorerEvalCase[]): ScorerEvalAggregate {
   const structuredFailures = cases.filter(
     (c) => !c.envelopeProduced || c.scorerError !== null || c.scorerModel !== model || c.scorerConfidence === null,
   ).length;
@@ -409,7 +409,7 @@ function aggregate(model: string, cases: ScorerEvalCase[]): ScorerEvalAggregate 
   };
 }
 
-function formatReport(report: ScorerEvalReport): string {
+export function formatReport(report: ScorerEvalReport): string {
   const lines = ["postil scorer eval (LIVE scorer, mocked generator)", ""];
   lines.push("model                                  structured  true kept  false down  mean true  mean false  pass");
   lines.push("--------------------------------------------------------------------------------------------------");
@@ -429,15 +429,15 @@ function formatReport(report: ScorerEvalReport): string {
   return lines.join("\n");
 }
 
-function mean(values: number[]): number {
+export function mean(values: number[]): number {
   return values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0;
 }
 
-function pad(value: string, width: number): string {
+export function pad(value: string, width: number): string {
   return value.length >= width ? value : value + " ".repeat(width - value.length);
 }
 
-function safeSegment(value: string): string {
+export function safeSegment(value: string): string {
   return value.replace(/[^a-z0-9._-]+/giu, "_");
 }
 
@@ -471,7 +471,9 @@ function readRequestBody(req: IncomingMessage): Promise<string> {
   });
 }
 
-main().catch((err) => {
-  console.error(err instanceof Error ? err.message : String(err));
-  process.exitCode = 1;
-});
+if (import.meta.main) {
+  main().catch((err) => {
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exitCode = 1;
+  });
+}
