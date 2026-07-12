@@ -69,7 +69,27 @@ fn replay(path: &Path, env: &Envelope, cfg: &Config) -> Result<PlanRow> {
     if kept.len() > cfg.max_findings {
         suppressed.extend(kept.split_off(cfg.max_findings));
     }
-    let gate_after = kept.iter().any(|f| cfg.gate_fail_on.fails(f.severity));
+    let block_on_kinds: Vec<String> = cfg
+        .block_on_kinds
+        .iter()
+        .map(|kind| kind.as_str().to_string())
+        .collect();
+    let gate_after = kept.iter().any(|finding| {
+        if finding.path == crate::envelope::PROVIDER_PATH {
+            // Provider-only pre-review failures encode their onError outcome
+            // only in gate.failing. Envelope v1 does not carry enough detail
+            // to reconstruct that decision from failOn, so preserve it rather
+            // than reporting a fabricated candidate-policy result.
+            env.gate.failing
+        } else {
+            crate::envelope::finding_blocks_gate(
+                finding,
+                cfg.gate_fail_on.as_str(),
+                &block_on_kinds,
+                false,
+            )
+        }
+    });
     Ok(PlanRow {
         name: path
             .file_name()
@@ -208,5 +228,25 @@ mod tests {
         assert!(!rows[0].gate_after);
         assert_eq!(rows[0].newly_suppressed.len(), 2);
         let _ = Counts::default();
+    }
+
+    #[test]
+    fn replay_uses_human_escalation_confidence_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut weak = f("a.rs", Severity::Error, 0.05);
+        weak.kind = Kind::HumanEscalation;
+        let env = envelope_with(vec![weak], true);
+        std::fs::write(
+            dir.path().join("r1.json"),
+            serde_json::to_string(&env).unwrap(),
+        )
+        .unwrap();
+
+        let mut cfg = Config::default();
+        cfg.min_confidence = 0.0;
+        let rows = run(dir.path(), &cfg).unwrap();
+
+        assert_eq!(rows[0].findings_after, 1);
+        assert!(!rows[0].gate_after);
     }
 }

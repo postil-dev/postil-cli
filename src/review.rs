@@ -10,8 +10,7 @@ use crate::diff::{self, DiffIndex};
 use crate::envelope::{Envelope, Finding, Gate, Kind, Usage, fail_closed_finding};
 use crate::filter;
 use crate::forge::{
-    CheckState, Forge, PrMeta, azure::Azure, bitbucket::Bitbucket, check_summary,
-    clean_review_message, github::GitHub, gitlab::GitLab,
+    CheckState, Forge, PrMeta, azure::Azure, bitbucket::Bitbucket, github::GitHub, gitlab::GitLab,
 };
 use crate::llm::{FindingScore, LlmClient};
 use crate::local::{self, LocalSource};
@@ -792,10 +791,19 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
     // output (OPERATIONAL_PATH) never bypasses the gate: a malicious diff can
     // induce it via prompt injection.
     let advisory_on_error = cfg.gate_on_error == OnError::Advisory;
+    let gate_fail_on = cfg.gate_fail_on.as_str();
+    let gate_block_on_kinds: Vec<String> = cfg
+        .block_on_kinds
+        .iter()
+        .map(|kind| kind.as_str().to_string())
+        .collect();
     let gate_failing = findings.iter().any(|f| {
-        (cfg.gate_fail_on.fails(f.severity)
-            && !(advisory_on_error && f.path == crate::envelope::PROVIDER_PATH))
-            || cfg.block_on_kinds.contains(&f.kind)
+        crate::envelope::finding_blocks_gate(
+            f,
+            gate_fail_on,
+            &gate_block_on_kinds,
+            advisory_on_error && f.path == crate::envelope::PROVIDER_PATH,
+        )
     });
     let silent = findings.is_empty();
     let mut counts = Envelope::counts_of(&findings, suppressed);
@@ -816,11 +824,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
         gate: Gate {
             fail_on: cfg.gate_fail_on.as_str().to_string(),
             failing: gate_failing,
-            block_on_kinds: cfg
-                .block_on_kinds
-                .iter()
-                .map(|k| k.as_str().to_string())
-                .collect(),
+            block_on_kinds: gate_block_on_kinds,
         },
         model_used,
         scorer_model,
@@ -866,17 +870,7 @@ async fn finish<F: Forge>(
             || matches!(cfg.on_clean, crate::config::OnClean::Comment))
             && !duplicate_of_baseline;
         if should_comment {
-            let rich = forge.rich_markdown();
-            let summary = if envelope.silent {
-                let icon = if rich {
-                    format!("{} ", crate::forge::icon_md("pass"))
-                } else {
-                    String::new()
-                };
-                format!("{icon}{}", clean_review_message(&envelope))
-            } else {
-                check_summary(&envelope, rich)
-            };
+            let summary = forge.review_summary(&envelope);
             let head = envelope.head_sha.clone().unwrap_or_default();
             // A posting failure here (rate limit, transient 5xx, network blip)
             // must not discard a review that already computed and persisted its

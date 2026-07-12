@@ -308,7 +308,7 @@ impl Forge for Bitbucket {
             &head,
             "postil/review",
             map(advisory),
-            &check_summary(envelope, false),
+            &check_summary(envelope, false, Default::default()),
         )
         .await?;
         let gate_desc = if envelope.gate.failing {

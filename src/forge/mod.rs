@@ -72,6 +72,11 @@ pub trait Forge {
     fn rich_markdown(&self) -> bool {
         false
     }
+    /// Compose the top-level review body. Forges can add validated links to the
+    /// otherwise forge-neutral envelope metadata.
+    fn review_summary(&self, envelope: &Envelope) -> String {
+        check_summary(envelope, self.rich_markdown(), SummaryContext::default())
+    }
     async fn fetch_pr_meta(&self) -> Result<PrMeta>;
     /// Unified diff of the full PR.
     async fn fetch_diff(&self) -> Result<String>;
@@ -233,8 +238,19 @@ pub fn clean_review_message(envelope: &Envelope) -> &'static str {
     }
 }
 
-pub fn check_summary(envelope: &Envelope, rich: bool) -> String {
+#[derive(Default)]
+pub struct SummaryContext<'a> {
+    pub commit_url: Option<&'a str>,
+    pub details_url: Option<&'a str>,
+}
+
+pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext<'_>) -> String {
     let mut s = String::new();
+    s.push_str(if envelope.gate.failing {
+        "Gate: failed\n\n"
+    } else {
+        "Gate: passed\n\n"
+    });
     let pass = |s: &mut String| {
         if rich {
             s.push_str(&icon_md("pass"));
@@ -256,15 +272,24 @@ pub fn check_summary(envelope: &Envelope, rich: bool) -> String {
             } else {
                 String::new()
             };
+            let escalation_note = if f.kind == crate::envelope::Kind::HumanEscalation
+                && f.confidence < crate::envelope::HUMAN_ESCALATION_GATE_MIN_CONFIDENCE
+            {
+                format!(
+                    " · non-blocking below {:.2} escalation floor",
+                    crate::envelope::HUMAN_ESCALATION_GATE_MIN_CONFIDENCE
+                )
+            } else {
+                String::new()
+            };
             s.push_str(&format!(
-                "- {}**{}** `{}:{}` — {} · confidence {} · kind: {}\n",
+                "- {}**{}** · severity: `{}` · confidence {} · kind: {}{}\n",
                 icon,
-                f.severity.as_str(),
-                f.path,
-                f.line,
                 f.title,
+                f.severity.as_str(),
                 format_confidence(f.confidence),
                 f.kind.as_str(),
+                escalation_note,
             ));
         }
     }
@@ -282,8 +307,57 @@ pub fn check_summary(envelope: &Envelope, rich: bool) -> String {
             envelope.counts.suppressed
         ));
     }
-    s.push_str(&format!("\nModel: {}\n", envelope.model_used));
+    if rich {
+        s.push_str("\n<details><summary>Review metadata</summary>\n\n");
+    } else {
+        s.push_str("\nReview metadata:\n");
+    }
+    s.push_str(&format!("- Model: `{}`\n", envelope.model_used));
+    s.push_str(&format!(
+        "- Review duration: {}\n",
+        format_duration(envelope.duration_ms)
+    ));
+    if let Some(head_sha) = envelope.head_sha.as_deref() {
+        let short_sha: String = head_sha.chars().take(7).collect();
+        if let Some(commit_url) = context.commit_url {
+            s.push_str(&format!("- Commit: [`{short_sha}`]({commit_url})\n"));
+        } else {
+            s.push_str(&format!("- Commit: `{short_sha}`\n"));
+        }
+    }
+    if let Some(details_url) = context.details_url {
+        s.push_str(&format!(
+            "- Dashboard run: [View in Postil]({details_url})\n"
+        ));
+    }
+    s.push_str(&format!(
+        "- Tokens: {} prompt, {} completion\n",
+        envelope.usage.prompt_tokens, envelope.usage.completion_tokens
+    ));
+    if let Some(scorer_model) = envelope.scorer_model.as_deref() {
+        s.push_str(&format!("- Scorer: `{scorer_model}`"));
+        if let Some(disagreements) = envelope.scorer_disagreements {
+            s.push_str(&format!(" ({disagreements} disagreement(s))"));
+        }
+        s.push('\n');
+    }
+    if envelope.scorer_error.is_some() {
+        // Provider response bodies can contain arbitrary text. Keep the public
+        // metadata useful without copying raw upstream errors into Markdown.
+        s.push_str("- Scorer status: unavailable\n");
+    }
+    if rich {
+        s.push_str("\n</details>\n");
+    }
     s
+}
+
+fn format_duration(duration_ms: u64) -> String {
+    if duration_ms < 1_000 {
+        format!("{duration_ms} ms")
+    } else {
+        format!("{:.2} s", duration_ms as f64 / 1_000.0)
+    }
 }
 
 /// The body of one inline finding comment: icon (rich forges), bold title,
@@ -343,6 +417,92 @@ mod tests {
     }
 
     #[test]
+    fn summary_is_explicit_path_free_and_marks_weak_escalations_non_blocking() {
+        let mut escalation = finding();
+        escalation.kind = Kind::HumanEscalation;
+        escalation.confidence = 0.05;
+        let env = Envelope {
+            version: 1,
+            summary: "A weak signal needs review.".into(),
+            silent: false,
+            findings: vec![escalation],
+            resolved: vec![],
+            counts: Default::default(),
+            confidence_buckets: [1, 0, 0, 0, 0],
+            gate: crate::envelope::Gate {
+                fail_on: "error".into(),
+                failing: false,
+                block_on_kinds: vec!["humanEscalation".into()],
+            },
+            model_used: "review-model".into(),
+            scorer_model: Some("scorer-model".into()),
+            scorer_error: None,
+            scorer_disagreements: Some(1),
+            usage: crate::envelope::Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+            },
+            duration_ms: 1_250,
+            base_sha: None,
+            head_sha: Some("abcdef123456".into()),
+            since_sha: None,
+        };
+
+        let summary = check_summary(
+            &env,
+            true,
+            SummaryContext {
+                commit_url: Some("https://github.com/acme/api/commit/abcdef123456"),
+                details_url: Some("https://postil.dev/orgs/acme/runs/run-1"),
+            },
+        );
+
+        assert!(summary.starts_with("Gate: passed\n\n"));
+        assert!(summary.contains("**Unsanitized input reaches query** · severity: `error`"));
+        assert!(!summary.contains("src/auth.rs:41"));
+        assert!(summary.contains("non-blocking below 0.30 escalation floor"));
+        assert!(summary.contains("<details><summary>Review metadata</summary>"));
+        assert!(summary.contains("[`abcdef1`](https://github.com/acme/api/commit/abcdef123456)"));
+        assert!(summary.contains("[View in Postil](https://postil.dev/orgs/acme/runs/run-1)"));
+        assert!(summary.contains("- Review duration: 1.25 s"));
+        assert!(summary.contains("- Tokens: 10 prompt, 5 completion"));
+        assert!(summary.contains("- Scorer: `scorer-model` (1 disagreement(s))"));
+    }
+
+    #[test]
+    fn plain_summary_uses_plain_metadata_and_hides_raw_scorer_errors() {
+        let env = Envelope {
+            version: 1,
+            summary: String::new(),
+            silent: true,
+            findings: vec![],
+            resolved: vec![],
+            counts: Default::default(),
+            confidence_buckets: [0; 5],
+            gate: crate::envelope::Gate {
+                fail_on: "error".into(),
+                failing: false,
+                block_on_kinds: vec![],
+            },
+            model_used: "review-model".into(),
+            scorer_model: None,
+            scorer_error: Some("[click me](https://attacker.invalid)".into()),
+            scorer_disagreements: None,
+            usage: Default::default(),
+            duration_ms: 0,
+            base_sha: None,
+            head_sha: None,
+            since_sha: None,
+        };
+        let summary = check_summary(&env, false, Default::default());
+
+        assert!(summary.contains("\nReview metadata:\n"));
+        assert!(!summary.contains("<details>"));
+        assert!(summary.contains("- Scorer status: unavailable"));
+        assert!(!summary.contains("attacker.invalid"));
+    }
+
+    #[test]
     fn plain_comment_has_statusline_without_html() {
         let body = finding_comment_body(&finding(), false);
         assert!(!body.contains("<img"));
@@ -394,8 +554,8 @@ mod tests {
             head_sha: None,
             since_sha: None,
         };
-        assert!(check_summary(&env, true).contains("status/pass.svg"));
-        assert!(!check_summary(&env, false).contains("<img"));
+        assert!(check_summary(&env, true, Default::default()).contains("status/pass.svg"));
+        assert!(!check_summary(&env, false, Default::default()).contains("<img"));
     }
 
     #[test]
@@ -424,15 +584,22 @@ mod tests {
             since_sha: None,
         };
 
-        assert!(check_summary(&env, false).starts_with("Review disabled by configuration."));
+        assert!(
+            check_summary(&env, false, Default::default())
+                .starts_with("Gate: passed\n\nReview disabled by configuration.")
+        );
 
         env.model_used = "none (empty diff)".into();
         assert!(
-            check_summary(&env, false).starts_with("No reviewable diff; no model call was made.")
+            check_summary(&env, false, Default::default())
+                .starts_with("Gate: passed\n\nNo reviewable diff; no model call was made.")
         );
 
         env.model_used = "review-model".into();
-        assert!(check_summary(&env, false).starts_with("Postil reviewed this change"));
+        assert!(
+            check_summary(&env, false, Default::default())
+                .starts_with("Gate: passed\n\nPostil reviewed this change")
+        );
     }
 
     #[test]
