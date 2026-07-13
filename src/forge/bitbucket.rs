@@ -136,8 +136,10 @@ impl Bitbucket {
             return Ok(());
         }
         let note = json!({ "content": { "raw": format!(
-            "`{}:{}` **{}** ({})\n\n{}",
-            f.path, f.line, f.title, f.severity.as_str(), f.body
+            "`{}:{}`\n\n{}",
+            super::safe_code_text(&f.path),
+            f.line,
+            super::finding_comment_body(f, false),
         )}});
         let resp = self
             .request(

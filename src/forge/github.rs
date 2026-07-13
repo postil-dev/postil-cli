@@ -294,7 +294,15 @@ fn gate_summary(envelope: &Envelope) -> String {
                 false,
             )
         })
-        .map(|f| format!("- `{}:{}` {}", f.path, f.line, f.title))
+        .map(|f| {
+            let publication = crate::envelope::finding_publication_text(&f.title, &f.body);
+            format!(
+                "- `{}:{}` {}",
+                super::safe_code_text(&f.path),
+                f.line,
+                publication.title,
+            )
+        })
         .collect();
     if failing.is_empty() {
         return format!(
@@ -541,7 +549,8 @@ impl Forge for GitHub {
             .filter(|f| !super::is_synthetic_path(&f.path))
             .take(50) // GitHub caps annotations per request at 50.
             .map(|f| {
-                let message: String = f.body.chars().take(800).collect();
+                let publication = crate::envelope::finding_publication_text(&f.title, &f.body);
+                let message: String = publication.body.chars().take(800).collect();
                 json!({
                     "path": f.path,
                     "start_line": f.line,
@@ -551,7 +560,7 @@ impl Forge for GitHub {
                         Severity::Warn => "warning",
                         Severity::Error => "failure",
                     },
-                    "title": f.title,
+                    "title": publication.title,
                     "message": wrap_plain_text(&message, 100),
                 })
             })
@@ -646,7 +655,7 @@ mod tests {
         github_transport_retry_delay, only_operational_findings, valid_details_url,
     };
     use crate::envelope::{Envelope, Finding, Gate, Kind, Severity, Usage};
-    use crate::forge::Forge;
+    use crate::forge::{CheckState, Forge};
     use reqwest::header::{HeaderMap, HeaderValue};
     use std::time::Duration;
     use wiremock::matchers::{method, path};
@@ -750,6 +759,139 @@ mod tests {
             .post_review("Summary", &[finding], "aaaaaaaaaaaa")
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn github_review_and_check_annotations_revalidate_model_prose() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "title": "t", "body": "b",
+                "head": {"sha": "aaaaaaaaaaaa"}, "base": {"sha": "base"}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        for id in ["11", "12"] {
+            Mock::given(method("PATCH"))
+                .and(path(format!("/repos/owner/repo/check-runs/{id}")))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+        }
+        let github = GitHub {
+            http: reqwest::Client::new(),
+            api_base: server.uri(),
+            details_url: None,
+            token: "test-token".into(),
+            owner: "owner".into(),
+            repo: "repo".into(),
+            pr: 1,
+        };
+        let finding = Finding {
+            path: "src/lib.rs".into(),
+            line: 1,
+            end_line: None,
+            severity: Severity::Error,
+            kind: Kind::Risk,
+            confidence: 0.9,
+            generator_confidence: None,
+            scorer_confidence: None,
+            generator_kind: None,
+            scorer_kind: None,
+            scorer_reason: None,
+            title: format!("@octocat <img> {}", "oversized ".repeat(100)),
+            body: format!(
+                "# Summary\n@octocat <details>hidden</details> ![pixel](https://attacker.invalid/x)\n{}",
+                "article line\n".repeat(100),
+            ),
+            id: None,
+        };
+        let envelope = Envelope {
+            version: 1,
+            summary: String::new(),
+            silent: false,
+            findings: vec![finding.clone()],
+            suppressed_findings: vec![],
+            resolved: vec![],
+            counts: Envelope::counts_of(std::slice::from_ref(&finding), 0),
+            confidence_buckets: Envelope::buckets_of(std::slice::from_ref(&finding)),
+            gate: Gate {
+                fail_on: "error".into(),
+                failing: true,
+                block_on_kinds: vec![],
+            },
+            model_used: "model".into(),
+            scorer_model: None,
+            scorer_error: None,
+            scorer_disagreements: None,
+            usage: Usage::default(),
+            model_usage: vec![],
+            model_incidents: vec![],
+            usage_accounting_complete: true,
+            duration_ms: 0,
+            base_sha: Some("base".into()),
+            head_sha: Some("aaaaaaaaaaaa".into()),
+            since_sha: None,
+        };
+
+        github
+            .post_review(
+                "One finding needs attention.",
+                std::slice::from_ref(&finding),
+                "aaaaaaaaaaaa",
+            )
+            .await
+            .unwrap();
+        github
+            .complete_checks(
+                "11",
+                "12",
+                CheckState::Failure,
+                CheckState::Failure,
+                &envelope,
+            )
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let review = requests
+            .iter()
+            .find(|request| {
+                request.method == reqwest::Method::POST
+                    && request.url.path().ends_with("/pulls/1/reviews")
+            })
+            .unwrap();
+        let review_body: serde_json::Value = serde_json::from_slice(&review.body).unwrap();
+        let inline = review_body["comments"][0]["body"].as_str().unwrap();
+        assert!(inline.chars().count() < 1_600);
+        assert!(!inline.contains("@octocat"));
+        assert!(!inline.contains("<details>"));
+        assert!(
+            !inline
+                .lines()
+                .any(|line| line.trim_start().starts_with("!["))
+        );
+        assert!(!inline.contains("# Summary"));
+
+        let advisory = requests
+            .iter()
+            .find(|request| request.url.path().ends_with("/check-runs/11"))
+            .unwrap();
+        let check_body: serde_json::Value = serde_json::from_slice(&advisory.body).unwrap();
+        let annotation = &check_body["output"]["annotations"][0];
+        let title = annotation["title"].as_str().unwrap();
+        let message = annotation["message"].as_str().unwrap();
+        assert!(title.chars().count() <= crate::envelope::FINDING_PUBLIC_TITLE_MAX_CHARS);
+        assert!(message.chars().count() <= 800);
+        assert!(!title.contains('@'));
+        assert!(!message.contains("@octocat"));
+        assert!(!message.contains("<details>"));
     }
 
     #[test]

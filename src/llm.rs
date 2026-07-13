@@ -2175,7 +2175,7 @@ fn into_review(raw: RawReview, model: &str, usage: Usage) -> ModelReview {
             } else {
                 f.title
             };
-            Finding {
+            let mut finding = Finding {
                 path: f.path.trim_start_matches("./").to_string(),
                 line: f.line,
                 end_line: f.end_line.filter(|e| *e >= f.line),
@@ -2190,7 +2190,9 @@ fn into_review(raw: RawReview, model: &str, usage: Usage) -> ModelReview {
                 title,
                 body: f.body,
                 id: None,
-            }
+            };
+            crate::envelope::normalize_finding_publication(&mut finding);
+            finding
         })
         .collect();
     ModelReview {
@@ -2898,6 +2900,41 @@ mod tests {
         };
         let r = into_review(raw, "m", Usage::default());
         assert_eq!(r.findings[0].kind, Kind::ContentPolicy);
+    }
+
+    #[test]
+    fn into_review_normalizes_finding_prose_before_storage() {
+        let raw = RawReview {
+            summary: String::new(),
+            findings: vec![RawFinding {
+                path: "src/a.rs".into(),
+                line: 3,
+                end_line: None,
+                severity: "warn".into(),
+                kind: Some("risk".into()),
+                confidence: 0.8,
+                title: "@octocat <img> **unsafe**".into(),
+                body: format!(
+                    "# Summary\n@octocat <details>hidden</details> ![pixel](https://bad.test/x)\n{}",
+                    "line\n".repeat(30),
+                ),
+            }],
+        };
+
+        let review = into_review(raw, "m", Usage::default());
+        let finding = &review.findings[0];
+        assert!(!finding.title.contains('@'));
+        assert!(!finding.title.contains('<'));
+        assert!(!finding.body.contains("@octocat"));
+        assert!(!finding.body.contains("<details>"));
+        assert!(
+            !finding
+                .body
+                .lines()
+                .any(|line| line.trim_start().starts_with("!["))
+        );
+        assert!(finding.body.chars().count() <= crate::envelope::FINDING_PUBLIC_BODY_MAX_CHARS);
+        assert!(finding.body.lines().count() <= crate::envelope::FINDING_PUBLIC_BODY_MAX_LINES);
     }
 
     fn mk(model: &str, path: &str, line: u32, conf: f64) -> ModelReview {

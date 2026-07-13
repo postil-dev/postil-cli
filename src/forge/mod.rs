@@ -530,6 +530,7 @@ fn safe_code_text(value: &str) -> String {
 /// The body of one inline finding comment: icon (rich forges), bold title,
 /// severity / confidence / kind statusline, then the finding body.
 pub fn finding_comment_body(f: &Finding, rich: bool) -> String {
+    let publication = crate::envelope::finding_publication_text(&f.title, &f.body);
     let icon = if rich {
         format!("{} ", severity_icon(f.severity))
     } else {
@@ -538,11 +539,11 @@ pub fn finding_comment_body(f: &Finding, rich: bool) -> String {
     format!(
         "{}**{}**\n`{}` · confidence {} · kind: {}\n\n{}",
         icon,
-        f.title,
+        publication.title,
         f.severity.as_str(),
         format_confidence(f.confidence),
         f.kind.as_str(),
-        f.body
+        publication.body
     )
 }
 
@@ -611,6 +612,20 @@ mod tests {
         let body = finding_comment_body(&finding(), true);
         assert!(body.contains("https://postil.dev/status/error.svg"));
         assert!(body.contains("confidence 0.91 · kind: risk"));
+    }
+
+    #[test]
+    fn empty_finding_title_cannot_break_the_comment_wrapper() {
+        let mut unsafe_finding = finding();
+        unsafe_finding.title.clear();
+        unsafe_finding.body = "**@octocat <img> [`code`]**\n\nKeep `useful()` formatting.".into();
+
+        let body = finding_comment_body(&unsafe_finding, true);
+
+        assert!(!body.contains("@octocat"));
+        assert!(!body.contains("<img>"));
+        assert!(!body.contains("****"));
+        assert!(body.contains("`useful()`"));
     }
 
     #[test]
