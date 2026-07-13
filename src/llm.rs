@@ -1241,7 +1241,19 @@ impl LlmClient {
                     if response.status.is_success() {
                         let usage_before_parse = *usage;
                         match self.parse_response(&response.text, usage) {
-                            Ok(content) => return Ok(content),
+                            Ok(content) => {
+                                if let Some(reason) = successful_response_usage_issue(summary.usage)
+                                {
+                                    *usage_accounting_complete = false;
+                                    eprintln!(
+                                        "postil: llm usage accounting incomplete phase={} model={} attempt={} reason={reason}",
+                                        phase.as_str(),
+                                        log_text(model),
+                                        retries + 1,
+                                    );
+                                }
+                                return Ok(content);
+                            }
                             Err(error) => {
                                 let parse_added_usage = usage.prompt_tokens
                                     != usage_before_parse.prompt_tokens
@@ -1659,6 +1671,16 @@ fn safe_response_summary(
             .and_then(serde_json::Value::as_array)
             .map(Vec::len),
         usage,
+    }
+}
+
+fn successful_response_usage_issue(usage: Option<Usage>) -> Option<&'static str> {
+    match usage {
+        None => Some("missing"),
+        Some(usage) if usage.prompt_tokens == 0 || usage.completion_tokens == 0 => {
+            Some("nonpositive")
+        }
+        Some(_) => None,
     }
 }
 
@@ -2659,6 +2681,34 @@ mod tests {
         assert_eq!(
             safe_request_id(&headers, true).as_deref(),
             Some("token-shaped-secret")
+        );
+    }
+
+    #[test]
+    fn successful_response_requires_positive_input_and_output_usage() {
+        assert_eq!(successful_response_usage_issue(None), Some("missing"));
+        for usage in [
+            Usage::default(),
+            Usage {
+                prompt_tokens: 1,
+                completion_tokens: 0,
+            },
+            Usage {
+                prompt_tokens: 0,
+                completion_tokens: 1,
+            },
+        ] {
+            assert_eq!(
+                successful_response_usage_issue(Some(usage)),
+                Some("nonpositive")
+            );
+        }
+        assert_eq!(
+            successful_response_usage_issue(Some(Usage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+            })),
+            None
         );
     }
 

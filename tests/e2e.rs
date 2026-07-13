@@ -288,6 +288,180 @@ async fn native_anthropic_findings_use_explicit_native_scorer() {
 }
 
 #[tokio::test]
+async fn openai_successful_generator_without_usage_marks_accounting_incomplete() {
+    let server = MockServer::start().await;
+    let mut response = llm_content(json!([]));
+    response.as_object_mut().unwrap().remove("usage");
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("\"model\":\"generator-model\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(response))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "generator-model")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .success();
+
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["usageAccountingComplete"], false);
+    assert_eq!(envelope["usage"]["promptTokens"], 0);
+    assert_eq!(envelope["usage"]["completionTokens"], 0);
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(stderr.contains(
+        "llm usage accounting incomplete phase=review model=generator-model attempt=1 reason=missing"
+    ));
+}
+
+#[tokio::test]
+async fn openai_successful_scorer_with_zero_usage_marks_accounting_incomplete() {
+    let server = MockServer::start().await;
+    mock_review_model(
+        &server,
+        "generator-model",
+        json!([finding_at(41, "warn", 0.9)]),
+    )
+    .await;
+    let scorer_response = json!({
+        "choices": [{"message": {"content": json!([{
+            "index": 0,
+            "confidence": 0.82,
+            "kind": "risk",
+            "reason": "The changed line contains the reported flow."
+        }]).to_string()}}],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0}
+    });
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("\"model\":\"scorer-model\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(scorer_response))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "generator-model")
+        .env("REVIEW_SCORER_MODEL", "scorer-model")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .success();
+
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["scorerModel"], "scorer-model");
+    assert_eq!(envelope["usageAccountingComplete"], false);
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(stderr.contains(
+        "llm usage accounting incomplete phase=scorer model=scorer-model attempt=1 reason=nonpositive"
+    ));
+}
+
+#[tokio::test]
+async fn anthropic_successful_generator_without_usage_marks_accounting_incomplete() {
+    let server = MockServer::start().await;
+    let mut response = anthropic_content(json!([]), 11, 7);
+    response.as_object_mut().unwrap().remove("usage");
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .and(body_string_contains("\"model\":\"generator-model\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(response))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_API_FORMAT", "anthropic")
+        .env("REVIEW_MODEL", "generator-model")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .success();
+
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["usageAccountingComplete"], false);
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(stderr.contains(
+        "llm usage accounting incomplete phase=review model=generator-model attempt=1 reason=missing"
+    ));
+}
+
+#[tokio::test]
+async fn anthropic_successful_scorer_with_zero_usage_marks_accounting_incomplete() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .and(body_string_contains("\"model\":\"generator-model\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_content(
+            json!([finding_at(41, "warn", 0.9)]),
+            17,
+            9,
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .and(body_string_contains("\"model\":\"scorer-model\""))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(anthropic_text(
+                &json!([{
+                    "index": 0,
+                    "confidence": 0.82,
+                    "kind": "risk",
+                    "reason": "The changed line contains the reported flow."
+                }])
+                .to_string(),
+                0,
+                0,
+            )),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_API_FORMAT", "anthropic")
+        .env("REVIEW_MODEL", "generator-model")
+        .env("REVIEW_SCORER_MODEL", "scorer-model")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .success();
+
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["scorerModel"], "scorer-model");
+    assert_eq!(envelope["usageAccountingComplete"], false);
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(stderr.contains(
+        "llm usage accounting incomplete phase=scorer model=scorer-model attempt=1 reason=nonpositive"
+    ));
+}
+
+#[tokio::test]
 async fn openai_compatible_rejects_additional_authorization_without_leaking() {
     let server = MockServer::start().await;
     let endpoint_secret = "Bearer endpoint-secret-never-print";
