@@ -62,6 +62,8 @@ struct RespondModelUsage<'a> {
     completion_tokens: u64,
 }
 
+// PID separates concurrent processes; this sequence separates writers within
+// one process. create_new below also fails closed if a path already exists.
 static RECEIPT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 struct UsageReceiptWriter {
@@ -94,6 +96,7 @@ impl UsageReceiptWriter {
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
+            // Usage receipts contain private provider-accounting metadata.
             .mode(0o600)
             .open(&temp_path)
             .context("creating private usage receipt temporary file")?;
@@ -124,6 +127,8 @@ impl UsageReceiptWriter {
         let file = self.file.as_mut().expect("usage receipt file is present");
         serde_json::to_writer(&mut *file, &receipt).context("serializing usage receipt")?;
         file.write_all(b"\n").context("writing usage receipt")?;
+        // Publish only after file contents are durable. The directory sync
+        // below makes the rename durable before stdout or forge delivery.
         file.sync_all().context("syncing usage receipt")?;
         drop(self.file.take());
         std::fs::rename(&self.temp_path, &self.final_path)
@@ -139,6 +144,9 @@ impl UsageReceiptWriter {
 
 impl Drop for UsageReceiptWriter {
     fn drop(&mut self) {
+        // Drop cannot return cleanup errors. Best-effort removal is safe: an
+        // unpublished temp file is never treated as a committed receipt, and
+        // create_new prevents a later writer from clobbering it.
         let _ = std::fs::remove_file(&self.temp_path);
     }
 }

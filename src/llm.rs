@@ -946,6 +946,9 @@ impl LlmClient {
         temperature: f64,
         phase: LlmPhase,
     ) -> Result<String> {
+        // This mutable flag is stack-local state held through one exclusively
+        // borrowed async call. Request retries run sequentially in this loop,
+        // so updating it before continuing or returning needs no atomic type.
         let body = self.request_body(model, system, user, max_tokens, temperature);
         let mut retries = 0u32;
         let mut timeout_retries = 0u32;
