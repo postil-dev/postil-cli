@@ -44,25 +44,7 @@ const MAX_DIFF_BYTES: usize = 200_000;
 const USAGE_RECEIPT_PATH_ENV: &str = "POSTIL_USAGE_RECEIPT_PATH";
 const RESPOND_MAX_CHARS: usize = 2_400;
 const RESPOND_MAX_NONBLANK_LINES: usize = 24;
-const RESPOND_MAX_HEADINGS: usize = 2;
-const RESPOND_MAX_LIST_ITEMS: usize = 5;
-const REPORT_HEADINGS: [&str; 15] = [
-    "what this pr does",
-    "what this pull request does",
-    "summary",
-    "correctness",
-    "issue",
-    "issues",
-    "issue and risk",
-    "issue and risks",
-    "issues and risk",
-    "issues and risks",
-    "risk",
-    "risks",
-    "verdict",
-    "assessment",
-    "review metadata",
-];
+const RESPOND_MAX_LIST_ITEMS: usize = 3;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -338,10 +320,9 @@ fn validate_respond_output(raw: &str) -> Result<String> {
     {
         return Err(anyhow!("Mermaid must use the diagram field"));
     }
-    let headings = markdown_heading_count(&publication_text);
-    if headings > RESPOND_MAX_HEADINGS {
+    if markdown_heading_count(&publication_text) > 0 {
         return Err(anyhow!(
-            "reply contains {headings} headings; at most {RESPOND_MAX_HEADINGS} are allowed"
+            "reply contains a Markdown heading; conversational replies do not allow headings"
         ));
     }
     let list_items = markdown_list_item_count(&publication_text);
@@ -394,12 +375,6 @@ fn validate_answer_publication(publication_text: &str) -> Result<()> {
     }
     if contains_markdown_table(publication_text) {
         return Err(anyhow!("reply contains a Markdown table"));
-    }
-    if markdown_heading_names(publication_text)
-        .iter()
-        .any(|heading| REPORT_HEADINGS.contains(&heading.as_str()))
-    {
-        return Err(anyhow!("reply contains a report-shaped heading"));
     }
     Ok(())
 }
@@ -621,35 +596,6 @@ fn markdown_table_delimiter(line: &str) -> bool {
         })
 }
 
-fn markdown_heading_names(text: &str) -> Vec<String> {
-    let lines: Vec<&str> = text.lines().collect();
-    let mut names = Vec::new();
-    for (index, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        let hashes = trimmed.chars().take_while(|ch| *ch == '#').count();
-        if (1..=6).contains(&hashes) && trimmed.chars().nth(hashes).is_some_and(char::is_whitespace)
-        {
-            names.push(normalize_heading_name(&trimmed[hashes..]));
-        } else if index > 0
-            && !lines[index - 1].trim().is_empty()
-            && !trimmed.is_empty()
-            && (trimmed.chars().all(|ch| ch == '=') || trimmed.chars().all(|ch| ch == '-'))
-        {
-            names.push(normalize_heading_name(lines[index - 1].trim()));
-        }
-    }
-    names
-}
-
-fn normalize_heading_name(heading: &str) -> String {
-    heading
-        .trim()
-        .trim_end_matches('#')
-        .trim()
-        .trim_end_matches(|ch: char| !ch.is_alphanumeric())
-        .to_ascii_lowercase()
-}
-
 fn nonblank_line_count(text: &str) -> usize {
     text.lines().filter(|line| !line.trim().is_empty()).count()
 }
@@ -821,7 +767,7 @@ mod tests {
     }
 
     #[test]
-    fn enforces_line_heading_and_list_limits() {
+    fn enforces_line_and_list_limits_and_rejects_headings() {
         let too_many_lines = structured(&vec!["line"; 25].join("\n"), None);
         assert!(
             validate_respond_output(&too_many_lines)
@@ -830,28 +776,28 @@ mod tests {
                 .contains("24-line")
         );
 
-        let headings = structured("# One\n## Two\n### Three", None);
+        let headings = structured("# One", None);
         assert!(
             validate_respond_output(&headings)
                 .unwrap_err()
                 .to_string()
-                .contains("3 headings")
+                .contains("do not allow headings")
         );
 
-        let items = structured("1. One\n2. Two\n3. Three\n4. Four\n5. Five\n6. Six", None);
+        let items = structured("1. One\n2. Two\n3. Three\n4. Four", None);
         assert!(
             validate_respond_output(&items)
                 .unwrap_err()
                 .to_string()
-                .contains("6 list items")
+                .contains("4 list items")
         );
 
-        let parenthesized = structured("1) One\n2) Two\n3) Three\n4) Four\n5) Five\n6) Six", None);
+        let parenthesized = structured("1) One\n2) Two\n3) Three\n4) Four", None);
         assert!(
             validate_respond_output(&parenthesized)
                 .unwrap_err()
                 .to_string()
-                .contains("6 list items")
+                .contains("4 list items")
         );
     }
 
@@ -907,6 +853,9 @@ mod tests {
     #[test]
     fn rejects_report_shaped_headings() {
         for answer in [
+            "# Analysis\nLong-form report prose.",
+            "# Recommendations\nLong-form report prose.",
+            "# Overview\nLong-form report prose.",
             "# Summary\nLong-form report prose.",
             "# What this pull request does\nLong-form report prose.",
             "# Issue and risk\nLong-form report prose.",

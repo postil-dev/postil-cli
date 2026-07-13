@@ -208,17 +208,18 @@ pub fn respond_system_prompt(cfg: &Config) -> String {
          review, not an article: report only actionable merge risks, give each risk in one \
          concise item with its file:line evidence and next action, and say briefly when no such \
          risk is present. Do not add an overview, implementation tour, correctness section, \
-         generic risk inventory, or verdict. Use no more than two headings and five list items.\n\
+         generic risk inventory, or verdict. Do not use Markdown headings. Use no more than three \
+         list items.\n\
          Do not emit active @mentions, raw HTML or HTML comments, details blocks, Markdown \
-         tables, or images. Never use report headings such as \"Summary\", \"What this PR does\", \
-         \"Correctness\", \"Issues and risks\", \"Assessment\", or \"Verdict\".\n\
+         tables, or images.\n\
          \n\
          Return ONLY one JSON object with exactly this shape and no markdown fence or surrounding \
          prose:\n\
          {\"answer\":\"concise GitHub-flavored Markdown\",\"diagram\":null}\n\
          The answer must be non-empty and diagram must always be null. Generated diagrams and \
          Mermaid are not accepted. The publication validator rejects output over 2,400 characters \
-         or 24 nonblank lines, extra fields, excess headings or list items, and unsafe Markdown.",
+         or 24 nonblank lines, extra fields, Markdown headings, more than three list items, and \
+         unsafe Markdown.",
     );
     if let Some(rules) = &cfg.guardrails {
         p.push_str("\n\nRepository guardrails you may reference:\n");
@@ -358,8 +359,9 @@ mod tests {
         assert!(!p.contains("When justified"));
         assert!(!p.contains("materially clarifies"));
         assert!(p.contains("Do not add an overview"));
+        assert!(p.contains("Do not use Markdown headings"));
+        assert!(p.contains("no more than three list items"));
         assert!(p.contains("Do not emit active @mentions"));
-        assert!(p.contains("What this PR does"));
     }
 
     #[test]
