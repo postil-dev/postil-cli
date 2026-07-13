@@ -7,6 +7,8 @@ import {
   estimateCasePromptTokens,
   findingHitsSeededRegion,
   GUARDRAIL_COMPLETION_TOKENS,
+  GUARDRAIL_MAX_PROVIDER_REQUESTS_PER_CASE,
+  GUARDRAIL_REPAIR_INPUT_TOKENS,
   GUARDRAIL_SYSTEM_PROMPT_TOKENS,
   groundTruthOf,
   LINE_TOLERANCE,
@@ -61,6 +63,8 @@ function cleanCase(): BenchmarkCase {
 }
 
 function envelope(overrides: Partial<Envelope> = {}): Envelope {
+  const usage = overrides.usage ?? { promptTokens: 1000, completionTokens: 200 };
+  const modelUsed = overrides.modelUsed ?? "m";
   return {
     version: 1,
     summary: "",
@@ -70,8 +74,10 @@ function envelope(overrides: Partial<Envelope> = {}): Envelope {
     counts: { info: 0, warn: 0, error: 0, suppressed: 0, ungrounded: 0 },
     confidenceBuckets: [0, 0, 0, 0, 0],
     gate: { failOn: "error", failing: false },
-    modelUsed: "m",
-    usage: { promptTokens: 1000, completionTokens: 200 },
+    modelUsed,
+    usage,
+    modelUsage: overrides.modelUsage ?? [{ model: modelUsed, ...usage }],
+    usageAccountingComplete: overrides.usageAccountingComplete ?? true,
     durationMs: 1234,
     baseSha: null,
     headSha: null,
@@ -241,6 +247,72 @@ describe("cost", () => {
 // aggregateModel
 
 describe("aggregateModel", () => {
+  test("admits only a complete isolated generator result that meets quality, cost, and latency thresholds", () => {
+    const admitted = scoreLiveCase({
+      case: defectCase({ line: 20 }),
+      model: "m",
+      envelope: envelope({
+        findings: [mkFinding("src/x.ts", 20, "error")],
+        gate: { failOn: "error", failing: true },
+        durationMs: 1000,
+      }),
+      pricing,
+      exitCode: 1,
+      fidelityFailures: [],
+    });
+    expect(aggregateModel("m", [admitted])).toMatchObject({ passed: true, admissionFailures: [] });
+
+    const fidelityFailure = { ...admitted, fidelityFailures: ["wrong generator"] };
+    expect(aggregateModel("m", [fidelityFailure])).toMatchObject({ passed: false, fidelityFailures: 1 });
+  });
+
+  test("rejects incomplete or missing generator provider usage instead of pricing it as zero", () => {
+    const c = defectCase({ line: 20 });
+    const incomplete = scoreLiveCase({
+      case: c,
+      model: "m",
+      envelope: envelope({
+        findings: [mkFinding("src/x.ts", 20, "error")],
+        gate: { failOn: "error", failing: true },
+        usageAccountingComplete: false,
+      }),
+      pricing,
+      exitCode: 1,
+      fidelityFailures: [],
+    });
+    expect(incomplete).toMatchObject({ costUsd: null, usageAccountingComplete: false, usageValid: true });
+    expect(aggregateModel("m", [incomplete]).admissionFailures.join("\n")).toContain("usage accounting");
+
+    const missing = scoreLiveCase({
+      case: c,
+      model: "m",
+      envelope: envelope({
+        findings: [mkFinding("src/x.ts", 20, "error")],
+        gate: { failOn: "error", failing: true },
+        modelUsage: [],
+      }),
+      pricing,
+      exitCode: 1,
+      fidelityFailures: [],
+    });
+    expect(missing).toMatchObject({ costUsd: null, usageValid: false });
+    expect(aggregateModel("m", [missing]).passed).toBe(false);
+
+    const zero = scoreLiveCase({
+      case: c,
+      model: "m",
+      envelope: envelope({
+        findings: [mkFinding("src/x.ts", 20, "error")],
+        gate: { failOn: "error", failing: true },
+        usage: { promptTokens: 0, completionTokens: 0 },
+      }),
+      pricing,
+      exitCode: 1,
+      fidelityFailures: [],
+    });
+    expect(zero).toMatchObject({ costUsd: null, usageValid: false });
+  });
+
   test("detection rate, FP sum, mean cost/duration, gate tally, total cost", () => {
     const c = defectCase({ line: 20 });
     const hit = scoreLiveCase({
@@ -403,8 +475,9 @@ describe("projectTotalCostUsd", () => {
       const price = p.get(model)!;
       for (const diff of diffs) {
         expected +=
-          estimateCasePromptTokens(diff) * price.promptUsdPerToken +
-          GUARDRAIL_COMPLETION_TOKENS * price.completionUsdPerToken;
+          GUARDRAIL_MAX_PROVIDER_REQUESTS_PER_CASE *
+          ((estimateCasePromptTokens(diff) + GUARDRAIL_REPAIR_INPUT_TOKENS) * price.promptUsdPerToken +
+            GUARDRAIL_COMPLETION_TOKENS * price.completionUsdPerToken);
       }
     }
     expect(total).toBeCloseTo(expected, 12);

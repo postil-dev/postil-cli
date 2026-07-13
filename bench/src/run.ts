@@ -43,6 +43,7 @@ import { DEFAULT_LIVE_CONCURRENCY, DEFAULT_LIVE_MODEL, formatLiveReport, runLive
 import {
   DEFAULT_LIVE_CONCURRENCY as DEFAULT_LIVE_MODELS_CONCURRENCY,
   formatLiveModelsReport,
+  liveModelsQualificationExitCode,
   runLiveModels,
 } from "./livemodels";
 
@@ -81,6 +82,7 @@ async function main() {
     });
     await writeLiveModelsReport(jsonOut, JSON.stringify(report, null, 2));
     console.log(json ? JSON.stringify(report, null, 2) : formatLiveModelsReport(report));
+    process.exitCode = liveModelsQualificationExitCode(report);
     return;
   }
 

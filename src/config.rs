@@ -51,8 +51,10 @@ pub struct ModelDefaults {
     pub source_sha256: String,
     pub default_model: String,
     pub cascade: Vec<String>,
+    pub scorer_enabled: bool,
     pub scorer_model: String,
     pub scorer_fallback: String,
+    pub scorer_qualification_candidates: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,8 +69,10 @@ struct ModelDefaultsFile {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ScorerDefaultsFile {
+    enabled: bool,
     default_model: String,
     fallback: String,
+    qualification_candidates: Vec<String>,
 }
 
 pub fn model_defaults() -> &'static ModelDefaults {
@@ -94,6 +98,10 @@ pub fn default_scorer_fallback() -> &'static str {
     model_defaults().scorer_fallback.as_str()
 }
 
+pub fn scorer_qualification_candidates() -> &'static [String] {
+    model_defaults().scorer_qualification_candidates.as_slice()
+}
+
 fn parse_model_defaults(raw: &str) -> Result<ModelDefaults> {
     let file: ModelDefaultsFile = toml::from_str(raw)?;
     anyhow::ensure!(
@@ -107,13 +115,22 @@ fn parse_model_defaults(raw: &str) -> Result<ModelDefaults> {
     }
     validate_model_id("scorer.defaultModel", &file.scorer.default_model)?;
     validate_model_id("scorer.fallback", &file.scorer.fallback)?;
+    anyhow::ensure!(
+        !file.scorer.qualification_candidates.is_empty(),
+        "scorer.qualificationCandidates must not be empty"
+    );
+    for model in &file.scorer.qualification_candidates {
+        validate_model_id("scorer.qualificationCandidates entries", model)?;
+    }
     Ok(ModelDefaults {
         version: file.version,
         source_sha256: sha256_hex(raw),
         default_model: file.default_model,
         cascade: file.cascade,
+        scorer_enabled: file.scorer.enabled,
         scorer_model: file.scorer.default_model,
         scorer_fallback: file.scorer.fallback,
+        scorer_qualification_candidates: file.scorer.qualification_candidates,
     })
 }
 
@@ -217,6 +234,9 @@ pub struct Config {
     pub model: String,
     pub cascade: Vec<String>,
     pub scorer: String,
+    /// Embedded scoring remains disabled until a candidate passes the repeated
+    /// qualification gate. An explicit BYOK scorer enables only that model.
+    pub scorer_enabled: bool,
     /// True when the scorer was selected by config or environment rather than
     /// inherited from the OpenRouter-oriented built-in defaults.
     pub scorer_explicit: bool,
@@ -257,6 +277,7 @@ impl Default for Config {
             model: defaults.default_model.clone(),
             cascade: defaults.cascade.clone(),
             scorer: defaults.scorer_model.clone(),
+            scorer_enabled: defaults.scorer_enabled,
             scorer_explicit: false,
             api_base: DEFAULT_API_BASE.to_string(),
             api_format: ApiFormat::default(),
@@ -396,14 +417,19 @@ impl Config {
     }
 
     pub fn apply_file(&mut self, f: FileConfig) -> Result<()> {
-        self.apply_file_inner(f, allow_config_api_base())
+        self.apply_file_inner(f, allow_config_api_base(), hosted_mode())
     }
 
     /// Core of [`apply_file`]. `allow_api_base` decides whether a
     /// repo-controlled `model.apiBase` is honored; the public wrapper derives it
     /// from the environment. Split out so tests can drive it deterministically
     /// without mutating global process environment.
-    fn apply_file_inner(&mut self, f: FileConfig, allow_api_base: bool) -> Result<()> {
+    fn apply_file_inner(
+        &mut self,
+        f: FileConfig,
+        allow_api_base: bool,
+        hosted_mode: bool,
+    ) -> Result<()> {
         if let Some(v) = f.enabled {
             self.enabled = v;
         }
@@ -454,40 +480,47 @@ impl Config {
             }
         }
         if let Some(m) = f.model {
-            if let Some(n) = m.name {
-                self.model = n;
-            }
-            if let Some(c) = m.cascade {
-                self.cascade = c;
-            }
-            if let Some(s) = m.scorer {
-                self.scorer = s;
-                self.scorer_explicit = true;
-            }
-            if let Some(b) = m.api_base {
-                // `model.apiBase` from `.postil.yaml` is repo-controlled, and the
-                // resolved base URL receives the deployment's bearer key. Honoring
-                // it by default would let a repo redirect the inference credential,
-                // so it is ignored unless explicitly opted in for a trusted
-                // single-user local setup. `POSTIL_API_BASE` (env) and `--config`
-                // discovery of the base are unaffected: apply_env still runs after
-                // this and takes precedence.
-                if allow_api_base {
-                    self.api_base = b;
-                } else {
-                    eprintln!(
-                        "postil: ignoring model.apiBase from config ({b:?}); set \
-                         POSTIL_ALLOW_CONFIG_API_BASE=1 to honor it, or use the \
-                         POSTIL_API_BASE environment variable"
-                    );
+            if hosted_mode {
+                eprintln!(
+                    "postil: ignoring repository model configuration in hosted mode; hosted inference selects the provider and model roster"
+                );
+            } else {
+                if let Some(n) = m.name {
+                    self.model = n;
                 }
-            }
-            if let Some(format) = m.api_format {
-                self.api_format = format;
-            }
-            if let Some(n) = m.consensus {
-                anyhow::ensure!(n >= 1, "model.consensus must be >= 1");
-                self.consensus = n;
+                if let Some(c) = m.cascade {
+                    self.cascade = c;
+                }
+                if let Some(s) = m.scorer {
+                    self.scorer = s;
+                    self.scorer_enabled = true;
+                    self.scorer_explicit = true;
+                }
+                if let Some(b) = m.api_base {
+                    // `model.apiBase` from `.postil.yaml` is repo-controlled, and the
+                    // resolved base URL receives the deployment's bearer key. Honoring
+                    // it by default would let a repo redirect the inference credential,
+                    // so it is ignored unless explicitly opted in for a trusted
+                    // single-user local setup. `POSTIL_API_BASE` (env) and `--config`
+                    // discovery of the base are unaffected: apply_env still runs after
+                    // this and takes precedence.
+                    if allow_api_base {
+                        self.api_base = b;
+                    } else {
+                        eprintln!(
+                            "postil: ignoring model.apiBase from config ({b:?}); set \
+                             POSTIL_ALLOW_CONFIG_API_BASE=1 to honor it, or use the \
+                             POSTIL_API_BASE environment variable"
+                        );
+                    }
+                }
+                if let Some(format) = m.api_format {
+                    self.api_format = format;
+                }
+                if let Some(n) = m.consensus {
+                    anyhow::ensure!(n >= 1, "model.consensus must be >= 1");
+                    self.consensus = n;
+                }
             }
         }
         if let Some(cp) = f.content_policy {
@@ -560,7 +593,14 @@ impl Config {
             && !s.is_empty()
         {
             self.scorer = s;
+            self.scorer_enabled = true;
             self.scorer_explicit = true;
+        }
+        if std::env::var("POSTIL_DISABLE_SCORER")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+        {
+            self.scorer_enabled = false;
         }
         if let Ok(b) = std::env::var("POSTIL_API_BASE")
             && !b.is_empty()
@@ -588,6 +628,9 @@ impl Config {
 
     /// Scorer models to try, in order, deduplicated.
     pub fn scorer_chain(&self) -> Vec<String> {
+        if !self.scorer_enabled {
+            return Vec::new();
+        }
         if self.api_format == ApiFormat::Anthropic {
             let defaults = model_defaults();
             return if self.scorer.starts_with("claude-")
@@ -601,9 +644,9 @@ impl Config {
             };
         }
         let mut chain = vec![self.scorer.clone()];
-        let fallback = model_defaults().scorer_fallback.clone();
-        if !chain.contains(&fallback) {
-            chain.push(fallback);
+        let defaults = model_defaults();
+        if defaults.scorer_enabled && !chain.contains(&defaults.scorer_fallback) {
+            chain.push(defaults.scorer_fallback.clone());
         }
         chain
     }
@@ -619,6 +662,16 @@ impl Config {
 /// repo redirecting it would capture that credential; the default is to ignore.
 fn allow_config_api_base() -> bool {
     std::env::var("POSTIL_ALLOW_CONFIG_API_BASE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Hosted deployments own inference credentials and the complete model roster.
+/// Repository configuration is untrusted input, so it cannot select a model,
+/// scorer, provider interface, or credential destination in this mode. Trusted
+/// deployment environment overrides are applied after repository config.
+fn hosted_mode() -> bool {
+    std::env::var("POSTIL_HOSTED_MODE")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
@@ -664,7 +717,7 @@ gate:
 model:
   name: __DEFAULT_MODEL__
   cascade:
-__DEFAULT_CASCADE__  scorer: __DEFAULT_SCORER_MODEL__
+__DEFAULT_CASCADE__  # scorer: provider/model  # explicit BYOK opt-in; embedded scoring is disabled
   # apiBase: https://openrouter.ai/api/v1   # OpenAI-compatible or Anthropic endpoint base URL.
   # apiFormat: openai-compatible             # openai-compatible (default) or anthropic.
   #                                         # Ignored from config by default (a repo could redirect
@@ -691,10 +744,6 @@ pub fn starter_config() -> &'static str {
         STARTER_CONFIG_TEMPLATE
             .replace("__DEFAULT_MODEL__", &yaml_scalar(&defaults.default_model))
             .replace("__DEFAULT_CASCADE__", &cascade)
-            .replace(
-                "__DEFAULT_SCORER_MODEL__",
-                &yaml_scalar(&defaults.scorer_model),
-            )
     })
 }
 
@@ -794,6 +843,19 @@ mod tests {
             parsed.scorer_fallback,
             raw["scorer"]["fallback"].as_str().unwrap()
         );
+        assert_eq!(
+            parsed.scorer_enabled,
+            raw["scorer"]["enabled"].as_bool().unwrap()
+        );
+        assert_eq!(
+            parsed.scorer_qualification_candidates,
+            raw["scorer"]["qualification_candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        );
         assert_eq!(&parsed, model_defaults());
     }
 
@@ -804,6 +866,10 @@ mod tests {
         assert_eq!(super::default_cascade(), defaults.cascade);
         assert_eq!(default_scorer_model(), defaults.scorer_model);
         assert_eq!(default_scorer_fallback(), defaults.scorer_fallback);
+        assert_eq!(
+            scorer_qualification_candidates(),
+            defaults.scorer_qualification_candidates
+        );
     }
 
     #[test]
@@ -815,8 +881,10 @@ cascade = ["example/fallback"]
 unexpected_key = "typo"
 
 [scorer]
+enabled = false
 default_model = "example/scorer"
 fallback = "example/scorer-fallback"
+qualification_candidates = ["example/scorer"]
 "#,
         )
         .unwrap_err();
@@ -832,42 +900,42 @@ fallback = "example/scorer-fallback"
                 "version = 0\n\
                  default_model = \"example/model\"\n\
                  cascade = [\"example/fallback\"]\n\
-                 scorer = { default_model = \"example/scorer\", fallback = \"example/scorer-fallback\" }\n",
+                 scorer = { enabled = false, default_model = \"example/scorer\", fallback = \"example/scorer-fallback\", qualification_candidates = [\"example/scorer\"] }\n",
                 "version must be greater than zero",
             ),
             (
                 "version = 1\n\
                  default_model = \"\"\n\
                  cascade = [\"example/fallback\"]\n\
-                 scorer = { default_model = \"example/scorer\", fallback = \"example/scorer-fallback\" }\n",
+                 scorer = { enabled = false, default_model = \"example/scorer\", fallback = \"example/scorer-fallback\", qualification_candidates = [\"example/scorer\"] }\n",
                 "defaultModel must not be empty",
             ),
             (
                 "version = 1\n\
                  default_model = \"example/model\"\n\
                  cascade = []\n\
-                 scorer = { default_model = \"example/scorer\", fallback = \"example/scorer-fallback\" }\n",
+                 scorer = { enabled = false, default_model = \"example/scorer\", fallback = \"example/scorer-fallback\", qualification_candidates = [\"example/scorer\"] }\n",
                 "cascade must not be empty",
             ),
             (
                 "version = 1\n\
                  default_model = \"example/model\"\n\
                  cascade = [\"\"]\n\
-                 scorer = { default_model = \"example/scorer\", fallback = \"example/scorer-fallback\" }\n",
+                 scorer = { enabled = false, default_model = \"example/scorer\", fallback = \"example/scorer-fallback\", qualification_candidates = [\"example/scorer\"] }\n",
                 "cascade entries must not be empty",
             ),
             (
                 "version = 1\n\
                  default_model = \"example/model\"\n\
                  cascade = [\"example/fallback\"]\n\
-                 scorer = { default_model = \"\", fallback = \"example/scorer-fallback\" }\n",
+                 scorer = { enabled = false, default_model = \"\", fallback = \"example/scorer-fallback\", qualification_candidates = [\"example/scorer\"] }\n",
                 "scorer.defaultModel must not be empty",
             ),
             (
                 "version = 1\n\
                  default_model = \"example/model\"\n\
                  cascade = [\"example/fallback\"]\n\
-                 scorer = { default_model = \"example/scorer\", fallback = \"\" }\n",
+                 scorer = { enabled = false, default_model = \"example/scorer\", fallback = \"\", qualification_candidates = [\"example/scorer\"] }\n",
                 "scorer.fallback must not be empty",
             ),
         ];
@@ -897,7 +965,9 @@ fallback = "example/scorer-fallback"
         for model in &defaults.cascade {
             assert!(readme.contains(model));
         }
-        assert!(readme.contains(&defaults.scorer_model));
+        for model in &defaults.scorer_qualification_candidates {
+            assert!(readme.contains(model));
+        }
     }
 
     #[test]
@@ -918,19 +988,14 @@ fallback = "example/scorer-fallback"
         assert_eq!(c.model, defaults.default_model);
         assert_eq!(c.cascade, default_cascade());
         assert_eq!(c.scorer, defaults.scorer_model);
-        assert_eq!(
-            c.scorer_chain(),
-            vec![
-                defaults.scorer_model.clone(),
-                defaults.scorer_fallback.clone()
-            ]
-        );
+        assert!(!c.scorer_enabled);
+        assert!(c.scorer_chain().is_empty());
         assert_eq!(
             c.model_chain(),
             vec![
-                "z-ai/glm-5.2",
-                "moonshotai/kimi-k2.7-code",
-                "deepseek/deepseek-v4-flash",
+                "mistralai/mistral-small-3.2-24b-instruct",
+                "google/gemma-3-27b-it",
+                "qwen/qwen3-32b",
             ]
         );
     }
@@ -988,10 +1053,27 @@ fallback = "example/scorer-fallback"
         let mut c = Config::default();
         c.apply_file(f).unwrap();
         assert_eq!(c.scorer, "custom/scorer");
-        assert_eq!(
-            c.scorer_chain(),
-            vec!["custom/scorer", &model_defaults().scorer_fallback]
-        );
+        assert!(c.scorer_enabled);
+        assert_eq!(c.scorer_chain(), vec!["custom/scorer"]);
+    }
+
+    #[test]
+    fn hosted_mode_ignores_the_complete_repository_model_section() {
+        let f: FileConfig = serde_yaml::from_str(
+            "model:\n  name: anthropic/claude-opus-4.1\n  cascade:\n    - attacker/fallback\n  scorer: anthropic/claude-haiku-4.5\n  apiBase: https://attacker.invalid/v1\n  apiFormat: anthropic\n  consensus: 3\n",
+        )
+        .unwrap();
+        let mut config = Config::default();
+        let expected = Config::default();
+
+        config.apply_file_inner(f, true, true).unwrap();
+
+        assert_eq!(config.model_chain(), expected.model_chain());
+        assert_eq!(config.scorer, expected.scorer);
+        assert!(!config.scorer_enabled());
+        assert_eq!(config.api_base, DEFAULT_API_BASE);
+        assert_eq!(config.api_format, ApiFormat::OpenaiCompatible);
+        assert_eq!(config.consensus, 1);
     }
 
     #[test]
@@ -1016,6 +1098,22 @@ fallback = "example/scorer-fallback"
         config.apply_file(file).unwrap();
         assert!(config.scorer_enabled());
         assert_eq!(config.scorer_chain(), vec!["claude-haiku-4-5"]);
+    }
+
+    #[test]
+    fn hosted_roster_contains_no_anthropic_models() {
+        let defaults = model_defaults();
+        let hosted_models = std::iter::once(&defaults.default_model)
+            .chain(defaults.cascade.iter())
+            .chain(std::iter::once(&defaults.scorer_model))
+            .chain(std::iter::once(&defaults.scorer_fallback))
+            .chain(defaults.scorer_qualification_candidates.iter());
+        for model in hosted_models {
+            assert!(
+                !model.to_ascii_lowercase().starts_with("anthropic/"),
+                "hosted model roster contains Anthropic model {model}"
+            );
+        }
     }
 
     #[test]
@@ -1118,7 +1216,7 @@ fallback = "example/scorer-fallback"
         let f: FileConfig =
             serde_yaml::from_str("model:\n  apiBase: https://untrusted.example/v1\n").unwrap();
         let mut c = Config::default();
-        c.apply_file_inner(f, false).unwrap();
+        c.apply_file_inner(f, false, false).unwrap();
         assert_eq!(c.api_base, DEFAULT_API_BASE);
     }
 
@@ -1127,7 +1225,7 @@ fallback = "example/scorer-fallback"
         let f: FileConfig =
             serde_yaml::from_str("model:\n  apiBase: https://trusted.local/v1\n").unwrap();
         let mut c = Config::default();
-        c.apply_file_inner(f, true).unwrap();
+        c.apply_file_inner(f, true, false).unwrap();
         assert_eq!(c.api_base, "https://trusted.local/v1");
     }
 

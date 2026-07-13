@@ -59,7 +59,8 @@ export const DEFAULT_TIMEOUT_MS = 300_000;
 export interface LiveModelsOptions {
   /** Path to the postil binary (a release build). */
   binary: string;
-  /** OpenRouter model ids; each fixture runs once per model. */
+  /** OpenRouter model ids; each fixture runs once per model with scoring and
+   * the embedded generator cascade disabled. */
   models: string[];
   /** OpenRouter-compatible base URL (default DEFAULT_API_BASE). */
   apiBase?: string;
@@ -79,6 +80,7 @@ export interface LiveModelsReport {
   generatedAt: string;
   cliVersion: string;
   apiBase: string;
+  passed: boolean;
   /** The exact per-model schema the site consumes. */
   models: SiteModelAggregate[];
   /** Full per-model aggregates (superset of `models`) for the human table and
@@ -160,6 +162,7 @@ export async function runLiveModels(
     generatedAt: new Date().toISOString(),
     cliVersion,
     apiBase,
+    passed: aggregates.length > 0 && aggregates.every((aggregate) => aggregate.passed),
     models: aggregates.map(toSiteModelAggregate),
     modelAggregates: aggregates,
     totalRunCostUsd: calculateTotalRunCostUsd(results),
@@ -236,6 +239,12 @@ async function runLiveModelCase(
     ...evaluateGrounding(c, envelope),
     ...evaluateStatusline(envelope, github),
   ];
+  if (envelope.modelUsed !== model) {
+    fidelityFailures.push(`generator qualification used ${envelope.modelUsed} instead of ${model}`);
+  }
+  if (envelope.scorerModel !== undefined) {
+    fidelityFailures.push(`generator qualification unexpectedly used scorer ${envelope.scorerModel}`);
+  }
 
   return scoreLiveCase({ case: c, model, envelope, pricing, exitCode, fidelityFailures });
 }
@@ -244,7 +253,7 @@ async function runLiveModelCase(
  * discovers no developer config, the mock GitHub for forge I/O, and the real
  * OpenRouter endpoint. The API key is forwarded from the parent process and is
  * never logged or placed on argv here. */
-function liveEnv(
+export function liveEnv(
   homeDir: string,
   tmpDir: string,
   githubBaseUrl: string,
@@ -266,11 +275,11 @@ function liveEnv(
     GITHUB_API_URL: githubBaseUrl,
     GITHUB_TOKEN: "benchmark-github-token",
     REVIEW_MODEL: model,
+    // Repeating the primary in the cascade deduplicates to a one-model chain,
+    // so a candidate cannot pass using an embedded fallback.
+    REVIEW_MODEL_CASCADE: model,
+    POSTIL_DISABLE_SCORER: "1",
   };
-  const scorerModel = process.env.REVIEW_SCORER_MODEL?.trim();
-  if (scorerModel) {
-    env.REVIEW_SCORER_MODEL = scorerModel;
-  }
   // Forward the selected inference-key variable without logging or placing the
   // value on argv. Neutral aliases are also mirrored into POSTIL_API_KEY so
   // older binaries can run from the same benchmark harness.
@@ -339,6 +348,7 @@ export function formatLiveModelsReport(report: LiveModelsReport): string {
     if (!a.pricingKnown) {
       lines.push("  pricing unknown for this model: cost columns are 0");
     }
+    for (const failure of a.admissionFailures) lines.push(`  FAIL: ${failure}`);
   }
   lines.push(
     "",
@@ -349,6 +359,10 @@ export function formatLiveModelsReport(report: LiveModelsReport): string {
     "run exists. Costs are our measured OpenRouter spend on our fixtures, one run per case.",
   );
   return lines.join("\n");
+}
+
+export function liveModelsQualificationExitCode(report: LiveModelsReport): number {
+  return report.passed && report.modelAggregates.length > 0 ? 0 : 1;
 }
 
 function pct(v: number): string {

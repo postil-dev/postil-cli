@@ -126,6 +126,8 @@ fn postil() -> Command {
     cmd.env_remove("REVIEW_MODEL")
         .env_remove("REVIEW_MODEL_CASCADE")
         .env_remove("REVIEW_SCORER_MODEL")
+        .env_remove("POSTIL_DISABLE_SCORER")
+        .env_remove("POSTIL_HOSTED_MODE")
         .env_remove("POSTIL_LLM_REQUEST_TIMEOUT_SECS")
         .env_remove("POSTIL_LLM_TOTAL_TIMEOUT_SECS")
         .env_remove("MODEL_API_KEY")
@@ -540,6 +542,36 @@ async fn mock_scorer_model(server: &MockServer, model: &str, scores: Value) {
         .await;
 }
 
+#[test]
+fn hosted_config_ignores_repository_model_provider_and_scorer() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".postil.yaml"),
+        "model:\n  name: anthropic/claude-opus-4.1\n  cascade: [attacker/fallback]\n  scorer: anthropic/claude-haiku-4.5\n  apiBase: https://attacker.invalid/v1\n  apiFormat: anthropic\n  consensus: 3\n",
+    )
+    .unwrap();
+
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_HOSTED_MODE", "1")
+        .env("REVIEW_MODEL", "hosted/primary")
+        .env("REVIEW_MODEL_CASCADE", "hosted/fallback")
+        .env("REVIEW_SCORER_MODEL", "hosted/scorer")
+        .args(["config"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+
+    assert!(stdout.contains("model.name: hosted/primary"));
+    assert!(stdout.contains("model.cascade: [\"hosted/fallback\"]"));
+    assert!(stdout.contains("model.scorer: hosted/scorer"));
+    assert!(stdout.contains("model.apiBase: https://openrouter.ai/api/v1"));
+    assert!(stdout.contains("model.apiFormat: openai-compatible"));
+    assert!(stdout.contains("model.consensus: 1"));
+    assert!(!stdout.contains("anthropic/"));
+    assert!(!stdout.contains("attacker"));
+}
+
 #[tokio::test]
 async fn local_review_reports_grounded_finding_and_gates() {
     let server = MockServer::start().await;
@@ -667,6 +699,7 @@ async fn scorer_lowers_confidence_and_stores_both_values() {
         .current_dir(dir.path())
         .env("POSTIL_API_BASE", server.uri())
         .env("REVIEW_MODEL", "generator-model")
+        .env("REVIEW_SCORER_MODEL", "anthropic/claude-haiku-4.5")
         .args(["review", "--diff-file"])
         .arg(&diff)
         .args(["--output", "json"])
@@ -737,6 +770,7 @@ async fn scorer_confidence_below_minimum_is_suppressed_and_nonblocking() {
         .current_dir(dir.path())
         .env("POSTIL_API_BASE", server.uri())
         .env("REVIEW_MODEL", "generator-model")
+        .env("REVIEW_SCORER_MODEL", "anthropic/claude-haiku-4.5")
         .args(["review", "--diff-file"])
         .arg(&diff)
         .args(["--output", "json"])
@@ -808,6 +842,7 @@ async fn malformed_scorer_reason_gets_one_same_model_schema_repair() {
         .current_dir(dir.path())
         .env("POSTIL_API_BASE", server.uri())
         .env("REVIEW_MODEL", "generator-model")
+        .env("REVIEW_SCORER_MODEL", "anthropic/claude-haiku-4.5")
         .args(["review", "--diff-file"])
         .arg(&diff)
         .args(["--output", "json"])
@@ -828,7 +863,7 @@ async fn malformed_scorer_reason_gets_one_same_model_schema_repair() {
 }
 
 #[tokio::test]
-async fn slow_scorer_request_times_out_and_falls_back() {
+async fn slow_explicit_scorer_times_out_without_unqualified_fallback() {
     let server = MockServer::start().await;
     mock_review_model(
         &server,
@@ -846,18 +881,6 @@ async fn slow_scorer_request_times_out_and_falls_back() {
         )
         .mount(&server)
         .await;
-    mock_scorer_model(
-        &server,
-        "openai/gpt-5-mini",
-        json!([{
-            "index": 0,
-            "confidence": 0.82,
-            "kind": "risk",
-            "reason": "The finding is well grounded."
-        }]),
-    )
-    .await;
-
     let dir = tempfile::tempdir().unwrap();
     let diff = write_diff(dir.path());
     let out = postil()
@@ -865,6 +888,7 @@ async fn slow_scorer_request_times_out_and_falls_back() {
         .env("POSTIL_API_BASE", server.uri())
         .env("POSTIL_LLM_REQUEST_TIMEOUT_SECS", "1")
         .env("REVIEW_MODEL", "generator-model")
+        .env("REVIEW_SCORER_MODEL", "anthropic/claude-haiku-4.5")
         .args(["review", "--diff-file"])
         .arg(&diff)
         .args(["--output", "json"])
@@ -874,12 +898,13 @@ async fn slow_scorer_request_times_out_and_falls_back() {
     let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
     let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
     let env: Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(env["scorerModel"], "openai/gpt-5-mini");
+    assert!(env.get("scorerModel").is_none());
+    assert!(env["scorerError"].as_str().unwrap().contains("timed out"));
     assert_eq!(env["usageAccountingComplete"], false);
     assert_eq!(env["modelIncidents"][0]["phase"], "scorer");
     assert_eq!(env["modelIncidents"][0]["category"], "timeout");
-    assert_eq!(env["modelIncidents"][0]["recovered"], true);
-    assert_eq!(env["modelIncidents"][0]["recovery"], "fallback");
+    assert_eq!(env["modelIncidents"][0]["recovered"], false);
+    assert!(env["modelIncidents"][0].get("recovery").is_none());
     let models: Vec<_> = env["modelUsage"]
         .as_array()
         .unwrap()
@@ -887,15 +912,13 @@ async fn slow_scorer_request_times_out_and_falls_back() {
         .map(|entry| entry["model"].as_str().unwrap())
         .collect();
     assert!(models.contains(&"generator-model"));
-    assert!(models.contains(&"openai/gpt-5-mini"));
     // The timed-out request has no validated token count. It is not invented
     // as a per-model entry; the explicit incomplete flag makes hosted billing
     // consume the conservative reservation instead.
     assert!(!models.contains(&"anthropic/claude-haiku-4.5"));
     assert!(stderr.contains("postil: scorer anthropic/claude-haiku-4.5 timed out after"));
-    assert!(stderr.contains("falling back to next scorer"));
-    assert!(stderr.contains("postil: running scorer with openai/gpt-5-mini"));
-    assert!(stderr.contains("postil: scorer openai/gpt-5-mini completed successfully in"));
+    assert!(stderr.contains("no fallback scorers remain"));
+    assert!(!stderr.contains("openai/gpt-5-mini"));
 }
 
 #[tokio::test]
@@ -930,6 +953,7 @@ async fn scorer_kind_escalation_into_configured_blocking_kind_takes_effect() {
         .current_dir(dir.path())
         .env("POSTIL_API_BASE", server.uri())
         .env("REVIEW_MODEL", "generator-model")
+        .env("REVIEW_SCORER_MODEL", "anthropic/claude-haiku-4.5")
         .args(["review", "--diff-file"])
         .arg(&diff)
         .args(["--output", "json"])
@@ -976,6 +1000,7 @@ async fn scorer_kind_deescalation_from_blocking_kind_is_ignored() {
         .current_dir(dir.path())
         .env("POSTIL_API_BASE", server.uri())
         .env("REVIEW_MODEL", "generator-model")
+        .env("REVIEW_SCORER_MODEL", "anthropic/claude-haiku-4.5")
         .args(["review", "--diff-file"])
         .arg(&diff)
         .args(["--output", "json"])
@@ -1017,6 +1042,7 @@ async fn large_confidence_disagreement_escalates_to_uncertainty_with_default_gat
         .current_dir(dir.path())
         .env("POSTIL_API_BASE", server.uri())
         .env("REVIEW_MODEL", "generator-model")
+        .env("REVIEW_SCORER_MODEL", "anthropic/claude-haiku-4.5")
         .args(["review", "--diff-file"])
         .arg(&diff)
         .args(["--output", "json"])
@@ -1044,14 +1070,12 @@ async fn scorer_error_fails_open_and_preserves_generator_values() {
         )
         .mount(&server)
         .await;
-    for scorer_model in ["anthropic/claude-haiku-4.5", "openai/gpt-5-mini"] {
-        Mock::given(method("POST"))
-            .and(path("/chat/completions"))
-            .and(body_string_contains(scorer_model))
-            .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
-            .mount(&server)
-            .await;
-    }
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("anthropic/claude-haiku-4.5"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
+        .mount(&server)
+        .await;
 
     let dir = tempfile::tempdir().unwrap();
     let diff = write_diff(dir.path());
@@ -1059,6 +1083,7 @@ async fn scorer_error_fails_open_and_preserves_generator_values() {
         .current_dir(dir.path())
         .env("POSTIL_API_BASE", server.uri())
         .env("REVIEW_MODEL", "generator-model")
+        .env("REVIEW_SCORER_MODEL", "anthropic/claude-haiku-4.5")
         .args(["review", "--diff-file"])
         .arg(&diff)
         .args(["--output", "json"])
@@ -1080,7 +1105,7 @@ async fn scorer_error_fails_open_and_preserves_generator_values() {
     assert!(env.get("scorerDisagreements").is_none());
     assert_eq!(env["modelUsage"][0]["model"], "generator-model");
     assert_eq!(env["modelUsage"][1]["model"], "anthropic/claude-haiku-4.5");
-    assert_eq!(env["modelUsage"][2]["model"], "openai/gpt-5-mini");
+    assert_eq!(env["modelUsage"].as_array().unwrap().len(), 2);
     assert_eq!(
         env["modelUsage"]
             .as_array()
@@ -1097,9 +1122,8 @@ async fn scorer_error_fails_open_and_preserves_generator_values() {
     assert!(finding.get("generatorKind").is_none());
     assert!(finding.get("scorerKind").is_none());
     assert!(stderr.contains("postil: scorer anthropic/claude-haiku-4.5 failed after"));
-    assert!(stderr.contains("falling back to next scorer"));
-    assert!(stderr.contains("postil: running scorer with openai/gpt-5-mini"));
     assert!(stderr.contains("no fallback scorers remain"));
+    assert!(!stderr.contains("openai/gpt-5-mini"));
 }
 
 #[tokio::test]
@@ -1111,16 +1135,12 @@ async fn scorer_provider_error_cannot_inject_stderr_lines() {
         json!([finding_at(41, "warn", 0.92)]),
     )
     .await;
-    for scorer_model in ["anthropic/claude-haiku-4.5", "openai/gpt-5-mini"] {
-        Mock::given(method("POST"))
-            .and(path("/chat/completions"))
-            .and(body_string_contains(scorer_model))
-            .respond_with(
-                ResponseTemplate::new(400).set_body_string("bad\n[stderr] forged\u{1b}[31m"),
-            )
-            .mount(&server)
-            .await;
-    }
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("anthropic/claude-haiku-4.5"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("bad\n[stderr] forged\u{1b}[31m"))
+        .mount(&server)
+        .await;
 
     let dir = tempfile::tempdir().unwrap();
     let diff = write_diff(dir.path());
@@ -1128,6 +1148,7 @@ async fn scorer_provider_error_cannot_inject_stderr_lines() {
         .current_dir(dir.path())
         .env("POSTIL_API_BASE", server.uri())
         .env("REVIEW_MODEL", "generator-model")
+        .env("REVIEW_SCORER_MODEL", "anthropic/claude-haiku-4.5")
         .args(["review", "--diff-file"])
         .arg(&diff)
         .args(["--output", "json"])

@@ -144,11 +144,10 @@ gate:
 # contentPolicy:
 #   enabled: false
 model:
-  name: z-ai/glm-5.2
+  name: mistralai/mistral-small-3.2-24b-instruct
   cascade:
-    - moonshotai/kimi-k2.7-code
-    - deepseek/deepseek-v4-flash
-  scorer: anthropic/claude-haiku-4.5
+    - google/gemma-3-27b-it
+    - qwen/qwen3-32b
   apiBase: https://openrouter.ai/api/v1    # ignored from config by default; see note below
   apiFormat: openai-compatible             # or anthropic for the native Messages API
   consensus: 1            # >1: only findings multiple models agree on survive
@@ -165,6 +164,13 @@ redirecting that credential, `apiBase` from `.postil.yaml` is ignored by default
 set the base URL through the `POSTIL_API_BASE` environment variable instead. For a
 single-user local setup where the checked-out repo is trusted, set
 `POSTIL_ALLOW_CONFIG_API_BASE=1` to honor the config value.
+
+Hosted workers set `POSTIL_HOSTED_MODE=1`. In that mode Postil ignores the
+repository's complete `model` section, including primary, cascade, scorer, API
+base, API format, and consensus. Trusted deployment environment values select
+the hosted roster after repository configuration is resolved. BYOK and local
+execution leave hosted mode unset, so explicit OpenAI-compatible and native
+Anthropic configuration remains available.
 
 Environment: `POSTIL_API_KEY`, `OPENROUTER_API_KEY`, `MODEL_API_KEY`, or
 `LLM_API_KEY`, `POSTIL_API_BASE`, `POSTIL_API_FORMAT` (`openai-compatible` by
@@ -198,6 +204,12 @@ See the measured benchmark results at [postil.dev/docs/models](https://postil.de
 which are sourced from the published bench aggregate. Any model served through an
 OpenAI-compatible endpoint works. Native Anthropic Messages API endpoints also work:
 
+The embedded hosted chain remains `mistralai/mistral-small-3.2-24b-instruct` →
+`google/gemma-3-27b-it` → `qwen/qwen3-32b`. Generator candidates in the live
+benchmark workflow are evaluation inputs only; listing one does not change the
+embedded chain. The live generator command exits nonzero unless every candidate
+passes its isolated admission thresholds.
+
 ```sh
 POSTIL_API_BASE=https://api.anthropic.com/v1 \
 POSTIL_API_FORMAT=anthropic \
@@ -217,9 +229,12 @@ prints credential values. Provider requests do not follow redirects. Postil
 resolves the API hostname once, rejects non-public addresses, and pins the HTTP
 client to the accepted addresses while retaining hostname-based TLS checks.
 
-The built-in scorer roster uses OpenRouter model identifiers, so native Anthropic
-skips implicit scoring. Set `model.scorer` or `REVIEW_SCORER_MODEL` to an
-Anthropic model identifier to enable scoring through a native Anthropic endpoint.
+The embedded scorer is disabled until a non-Anthropic candidate passes the
+repeated qualification gate. The candidates are `openai/gpt-5.4-nano`,
+`google/gemini-3.5-flash`, and `stepfun/step-3.7-flash`; being listed does not
+enable or promote them. Set `model.scorer` or `REVIEW_SCORER_MODEL` explicitly
+to enable BYOK scoring. A native Anthropic endpoint accepts an explicit native
+Anthropic model while implicit OpenRouter scoring remains disabled.
 
 Local endpoints use the same OpenAI-compatible contract:
 
@@ -247,7 +262,7 @@ Use the live benchmark harness before standardizing on a model:
 ```sh
 cargo build --quiet --release
 cd bench
-MODEL_API_KEY=... REVIEW_MODEL=z-ai/glm-5.2 bun run bench:live -- --json
+MODEL_API_KEY=... REVIEW_MODEL=mistralai/mistral-small-3.2-24b-instruct bun run bench:live -- --json
 ```
 
 ## Review before pushing

@@ -20,6 +20,22 @@ import {
 } from "./livemodels-score";
 
 const DEFAULT_CAP_USD = 15;
+export const MAX_GENERATOR_COST_CAP_USD = 25;
+export const MAX_GENERATOR_CANDIDATES = 6;
+
+export function validateGeneratorPreflight(models: string[], cap: number): void {
+  if (models.length === 0) {
+    throw new Error("no models: set POSTIL_BENCH_MODELS or pass --models id1,id2");
+  }
+  if (models.length > MAX_GENERATOR_CANDIDATES) {
+    throw new Error(`generator qualification allows at most ${MAX_GENERATOR_CANDIDATES} candidates`);
+  }
+  if (!Number.isFinite(cap) || cap <= 0 || cap > MAX_GENERATOR_COST_CAP_USD) {
+    throw new Error(
+      `generator qualification cost cap must be greater than zero and at most $${MAX_GENERATOR_COST_CAP_USD}`,
+    );
+  }
+}
 
 function flagValue(args: string[], flag: string): string | undefined {
   const i = args.indexOf(flag);
@@ -28,15 +44,13 @@ function flagValue(args: string[], flag: string): string | undefined {
 
 async function main() {
   const args = process.argv.slice(2);
-  const models = (process.env.POSTIL_BENCH_MODELS ?? flagValue(args, "--models") ?? "")
+  const models = [...new Set((process.env.POSTIL_BENCH_MODELS ?? flagValue(args, "--models") ?? "")
     .split(",")
     .map((m) => m.trim())
-    .filter(Boolean);
-  if (models.length === 0) {
-    throw new Error("no models: set POSTIL_BENCH_MODELS or pass --models id1,id2");
-  }
+    .filter(Boolean))];
   const capRaw = flagValue(args, "--cap") ?? process.env.POSTIL_BENCH_COST_CAP_USD;
   const cap = capRaw ? Number.parseFloat(capRaw) : DEFAULT_CAP_USD;
+  validateGeneratorPreflight(models, cap);
 
   const apiBase = process.env.POSTIL_API_BASE ?? DEFAULT_API_BASE;
   const url = `${apiBase.replace(/\/$/, "")}/models`;
@@ -80,7 +94,9 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  console.error(err instanceof Error ? err.message : String(err));
-  process.exitCode = 1;
-});
+if (import.meta.main) {
+  main().catch((err) => {
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exitCode = 1;
+  });
+}
