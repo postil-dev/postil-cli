@@ -248,7 +248,7 @@ impl Default for Config {
             severity_threshold: Severity::Info,
             min_confidence: 0.6,
             max_findings: 20,
-            tone: "direct, specific, no praise, no filler".to_string(),
+            tone: "concise, dry, lightly sardonic, never hostile; no praise or filler".to_string(),
             focus: Vec::new(),
             on_clean: OnClean::Skip,
             gate_fail_on: GateLevel::Severity(Severity::Error),
@@ -645,7 +645,7 @@ minConfidence: 0.6        # suppress findings the model is not confident about
 maxFindings: 20
 
 reviewer:
-  tone: "direct, specific, no praise, no filler"
+  tone: "concise, dry, lightly sardonic, never hostile; no praise or filler"
   # focus:
   #   - security
   #   - concurrency
@@ -655,8 +655,8 @@ review:
 
 gate:
   failOn: error           # the postil/gate check fails at/above: info | warn | error | never
-  # blockOnKinds:           # kinds that block regardless of severity; humanEscalation also requires confidence >= 0.30
-  #   - humanEscalation
+  blockOnKinds:           # kinds that block regardless of severity; humanEscalation requires confidence >= 0.30
+    - humanEscalation     # genuine owner/product decisions only; concrete bugs remain risk
   # onError: block          # block (default, fail closed) | advisory — gate outcome when
   #                         # the review itself errors (model outage). advisory keeps an
   #                         # outage from freezing merges; the review check goes neutral, not green.

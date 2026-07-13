@@ -32,9 +32,14 @@ pub fn review_contract(cfg: &Config) -> String {
          or corrupts data, or makes a function return wrong results, is error — not warn — \
          even when it is not a security issue; do not flinch on confident correctness \
          findings. Reserve warn for genuinely conditional problems (impact depends on \
-         callers or context). Kind: risk = concrete defect; humanEscalation = needs an \
-         accountable human decision; guardrail = violates a stated repo rule; uncertainty \
-         = you cannot verify something critical from the diff.\n\
+         callers or context). Kind is a category, never a severity label: `info`, `warn`, \
+         and `error` are invalid kinds. Kind: risk = any concrete code defect with an \
+         actionable fix, including a defect that needs a focused test to confirm; \
+         humanEscalation = multiple valid product or policy outcomes remain and only an \
+         accountable owner can choose among them; guardrail = violates a stated repo rule; \
+         uncertainty = you cannot verify something critical from the diff. Never classify \
+         an ordinary bug as humanEscalation merely because it is uncertain or needs \
+         confirmation.\n\
          \n\
          Confidence is your honest probability the finding is real and merge-relevant. \
          Do not inflate it; low-confidence findings are suppressed and that is correct.\n\
@@ -98,7 +103,11 @@ pub fn review_contract(cfg: &Config) -> String {
         p.push_str(&policy);
         p.push_str("\n--- END CONTENT POLICY ---\n");
     }
-    p.push_str(&format!("\nTone for finding bodies: {}.\n", cfg.tone));
+    p.push_str(&format!(
+        "\nTone for finding bodies: {}. For security, data loss, safety, privacy, or other \
+         severe topics, use plain professional language with no jokes or snark.\n",
+        cfg.tone
+    ));
     p
 }
 
@@ -147,6 +156,12 @@ pub fn scorer_system_prompt(cfg: &Config) -> String {
          [{\"index\": <number>, \"confidence\": <0..1>, \
          \"kind\": \"risk|humanEscalation|guardrail|uncertainty|contentPolicy\", \
          \"reason\": \"short reason\"}]\n\
+         \n\
+         The `kind` value is a finding category. `info`, `warn`, and `error` are \
+         severities and are NEVER valid kind values. An ordinary concrete defect is \
+         `risk`, even when a focused test is needed to confirm it. Use \
+         `humanEscalation` only when multiple valid outcomes remain and an accountable \
+         owner must choose among them.\n\
          \n\
          The input intentionally omits the generator's original confidence and kind. Do \
          not infer them from absence; score independently from the finding text and local \

@@ -129,12 +129,14 @@ severityThreshold: info   # suppress below: info | warn | error
 minConfidence: 0.6        # suppress findings the model is not confident about
 maxFindings: 20
 reviewer:
-  tone: "direct, specific, no praise, no filler"
+  tone: "concise, dry, lightly sardonic, never hostile; no praise or filler"
   focus: [security, concurrency]
 review:
   onClean: skip           # stay silent on clean PRs (default)
 gate:
   failOn: error           # info | warn | error | never
+  blockOnKinds:           # kind blocks regardless of severity at confidence >= 0.30
+    - humanEscalation     # default: only irreducible owner/product decisions
   onError: block          # block (fail closed, default) | advisory (fail open on
                           # provider outage only; unusable model output still blocks)
 # Content policy uses the built-in baseline by default and extends it with
@@ -152,6 +154,11 @@ model:
   consensus: 1            # >1: only findings multiple models agree on survive
 ```
 
+`humanEscalation` is kind-blocking by default. It is reserved for a genuine choice
+between multiple valid product or policy outcomes. Concrete defects remain `risk`
+findings and should be fixed. An admin override is appropriate only for the genuine
+kind-only decision, not as a way to dismiss an ordinary bug.
+
 `model.apiBase` in a config file is repo-controlled, and the resolved base URL
 receives the deployment's inference credential. To keep an untrusted repo from
 redirecting that credential, `apiBase` from `.postil.yaml` is ignored by default;
@@ -166,7 +173,9 @@ default, or `anthropic`), `POSTIL_ENDPOINT_AUTH_HEADER` and
 endpoint), `POSTIL_ALLOW_PRIVATE_API_BASE=1` (explicit opt-in for a local or
 private-network endpoint), `POSTIL_USAGE_RECEIPT_PATH` (optional worker-owned
 path for a successful `respond` usage receipt), `POSTIL_DETAILS_URL` (optional
-HTTP(S) target for GitHub check-run details links),
+validated HTTP(S) run link for forge summaries and checks),
+`POSTIL_PREVENTION_HINT=1` and `POSTIL_PREVENTION_COMMANDS_JSON` (hosted coaching
+with a bounded JSON array of verified repository commands),
 `REVIEW_MODEL`, `REVIEW_MODEL_CASCADE`, `REVIEW_SCORER_MODEL`,
 `GITHUB_TOKEN`/`GITHUB_API_URL`,
 `GITLAB_TOKEN`/`GITLAB_API_URL`, `BITBUCKET_TOKEN`/`BITBUCKET_USER`/`BITBUCKET_API_URL`,
@@ -241,6 +250,19 @@ cd bench
 MODEL_API_KEY=... REVIEW_MODEL=z-ai/glm-5.2 bun run bench:live -- --json
 ```
 
+## Review before pushing
+
+Run the repository's focused tests and static checks, then review staged changes:
+
+```sh
+postil review --staged
+```
+
+`postil hook install` installs a pre-push hook in Git's resolved hooks directory. The
+hook reads the exact refs Git is about to push, skips deletions and tags, and reviews
+each outgoing branch diff. Installation declines repositories with a managed
+`core.hooksPath`; add the command to that existing hook chain instead.
+
 ## Preview a config change before deploying it
 
 `postil plan` re-applies a candidate config to stored review envelopes and reports what
@@ -266,13 +288,19 @@ Bitbucket incremental reviews are disabled unless
 ## The envelope
 
 `--output json` prints a stable versioned envelope (`summary`, `silent`, `findings`,
-`resolved`, `counts`, `confidenceBuckets`, `gate`, `modelUsed`, scorer metadata,
-aggregate `usage`, per-model `modelUsage`, SHAs) consumed by the hosted platform
-and `postil plan`. `modelUsage` includes the successful generator, scorers, and
+`suppressedFindings`, `resolved`, `counts`, `confidenceBuckets`, `gate`, `modelUsed`,
+scorer metadata, aggregate `usage`, per-model `modelUsage`, `modelIncidents`, SHAs)
+consumed by the hosted platform
+and `postil plan`. `suppressedFindings` retains grounded findings hidden by ignore,
+severity, confidence, or finding-cap policy with a structured reason. It is omitted
+when empty so older v1 readers remain compatible. `modelUsage` includes the successful
+generator, scorers, and
 token-bearing failed fallbacks; its totals equal aggregate `usage`. Older v1
 envelopes omit this additive field. Failed attempts that report zero tokens are
-omitted because they carry no billable usage. The envelope's
-`usageAccountingComplete` has the same conservative semantics. `--output yaml` and
+omitted because they carry no billable usage. `modelIncidents` records safe structured
+review/scorer failures and recovery by repair
+or fallback without provider detail or model output. Older v1 envelopes treat it as empty.
+The envelope's `usageAccountingComplete` has the same conservative semantics. `--output yaml` and
 `--output csv` print the same review result in YAML or CSV. `--output-file <path>`
 writes the selected format to a file instead of stdout. `--output-json` is deprecated
 in v0.2.1 as an alias for `--output json` and emits a stderr warning. Schema:

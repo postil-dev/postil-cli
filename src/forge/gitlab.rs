@@ -252,6 +252,9 @@ impl Forge for GitLab {
         findings: &[Finding],
         _head_sha: &str,
     ) -> Result<()> {
+        if super::only_operational_findings(findings) {
+            return Ok(());
+        }
         let mr = self.mr().await?;
         // One failed comment must not drop the rest: post everything we can,
         // then report the failures together.
@@ -322,7 +325,7 @@ impl Forge for GitLab {
             &head,
             "postil/review",
             map(advisory),
-            &check_summary(envelope, true, Default::default()),
+            &check_summary(envelope, true, super::SummaryContext::from_env()),
         )
         .await?;
         let gate_desc = if envelope.gate.failing {

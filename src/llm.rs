@@ -15,7 +15,10 @@ use serde_json::json;
 
 use crate::api_key;
 use crate::config::{ApiFormat, Config};
-use crate::envelope::{Finding, Kind, ModelUsage, Usage};
+use crate::envelope::{
+    Finding, Kind, ModelIncident, ModelIncidentCategory, ModelIncidentPhase, ModelIncidentRecovery,
+    ModelUsage, Usage,
+};
 
 #[derive(Debug, Clone)]
 pub struct ModelReview {
@@ -24,6 +27,7 @@ pub struct ModelReview {
     pub model_used: String,
     pub usage: Usage,
     pub model_usage: Vec<ModelUsage>,
+    pub model_incidents: Vec<ModelIncident>,
     pub usage_accounting_complete: bool,
 }
 
@@ -41,6 +45,7 @@ pub struct ScorerReview {
     pub model_used: String,
     pub usage: Usage,
     pub model_usage: Vec<ModelUsage>,
+    pub model_incidents: Vec<ModelIncident>,
     pub usage_accounting_complete: bool,
 }
 
@@ -58,6 +63,7 @@ pub struct ModelError {
     error: anyhow::Error,
     usage: Usage,
     model_usage: Vec<ModelUsage>,
+    model_incidents: Vec<ModelIncident>,
     usage_accounting_complete: bool,
 }
 
@@ -67,6 +73,7 @@ impl ModelError {
             error,
             usage,
             model_usage: Vec::new(),
+            model_incidents: Vec::new(),
             usage_accounting_complete,
         }
     }
@@ -81,6 +88,28 @@ impl ModelError {
 
     pub fn usage_accounting_complete(&self) -> bool {
         self.usage_accounting_complete
+    }
+
+    pub fn model_incidents(&self) -> &[ModelIncident] {
+        &self.model_incidents
+    }
+
+    fn incident(&self, phase: ModelIncidentPhase) -> ModelIncident {
+        let category = if self.is_deadline_exceeded() {
+            ModelIncidentCategory::Deadline
+        } else if self.is_timeout() {
+            ModelIncidentCategory::Timeout
+        } else if self.is_provider() {
+            ModelIncidentCategory::ProviderError
+        } else {
+            ModelIncidentCategory::InvalidOutput
+        };
+        ModelIncident {
+            phase,
+            category,
+            recovered: false,
+            recovery: None,
+        }
     }
 
     pub fn is_provider(&self) -> bool {
@@ -420,6 +449,7 @@ impl LlmClient {
             let mut ok: Vec<ModelReview> = Vec::new();
             let mut failed_usage = Usage::default();
             let mut failed_model_usage = Vec::new();
+            let mut failed_incidents: Vec<ModelIncident> = Vec::new();
             let mut usage_accounting_complete = true;
             let mut last_err: Option<ModelError> = None;
             for (model, handle) in handles {
@@ -427,6 +457,8 @@ impl LlmClient {
                 match handle.await {
                     Ok(Ok(r)) => ok.push(r),
                     Ok(Err(mut e)) => {
+                        failed_incidents.extend(e.model_incidents.clone());
+                        failed_incidents.push(e.incident(ModelIncidentPhase::Review));
                         usage_accounting_complete &= e.usage_accounting_complete;
                         if e.model_usage.is_empty()
                             && (e.usage.prompt_tokens > 0 || e.usage.completion_tokens > 0)
@@ -459,6 +491,7 @@ impl LlmClient {
                             usage_accounting_complete,
                         );
                         error.model_usage = failed_model_usage;
+                        error.model_incidents = failed_incidents;
                         error
                     }
                     None => ModelError::new(
@@ -471,6 +504,11 @@ impl LlmClient {
                     let mut review = ok.into_iter().next().unwrap();
                     add_usage(&mut review.usage, failed_usage);
                     review.model_usage.extend(failed_model_usage);
+                    for incident in &mut failed_incidents {
+                        incident.recovered = true;
+                        incident.recovery = Some(ModelIncidentRecovery::Fallback);
+                    }
+                    review.model_incidents.extend(failed_incidents);
                     review.usage_accounting_complete &= usage_accounting_complete;
                     Ok(review)
                 }
@@ -478,6 +516,11 @@ impl LlmClient {
                     let mut review = consensus_merge(ok);
                     add_usage(&mut review.usage, failed_usage);
                     review.model_usage.extend(failed_model_usage);
+                    for incident in &mut failed_incidents {
+                        incident.recovered = true;
+                        incident.recovery = Some(ModelIncidentRecovery::Fallback);
+                    }
+                    review.model_incidents.extend(failed_incidents);
                     review.usage_accounting_complete &= usage_accounting_complete;
                     Ok(review)
                 }
@@ -485,6 +528,7 @@ impl LlmClient {
         } else {
             let mut failed_usage = Usage::default();
             let mut failed_model_usage = Vec::new();
+            let mut failed_incidents: Vec<ModelIncident> = Vec::new();
             let mut usage_accounting_complete = true;
             let mut last_err = None;
             for (index, model) in chain.iter().enumerate() {
@@ -499,10 +543,17 @@ impl LlmClient {
                         );
                         add_usage(&mut r.usage, failed_usage);
                         r.model_usage.splice(0..0, failed_model_usage);
+                        for incident in &mut failed_incidents {
+                            incident.recovered = true;
+                            incident.recovery = Some(ModelIncidentRecovery::Fallback);
+                        }
+                        r.model_incidents.splice(0..0, failed_incidents);
                         r.usage_accounting_complete &= usage_accounting_complete;
                         return Ok(r);
                     }
                     Err(mut e) => {
+                        failed_incidents.extend(e.model_incidents.clone());
+                        failed_incidents.push(e.incident(ModelIncidentPhase::Review));
                         usage_accounting_complete &= e.usage_accounting_complete;
                         if e.model_usage.is_empty()
                             && (e.usage.prompt_tokens > 0 || e.usage.completion_tokens > 0)
@@ -522,6 +573,7 @@ impl LlmClient {
                                 "postil: model {model_log} stopped after {elapsed}: {e}; cascade fallback is disabled after deadline exhaustion"
                             );
                             e.model_usage = failed_model_usage;
+                            e.model_incidents = failed_incidents;
                             return Err(e);
                         }
                         let has_fallback = index + 1 < chain.len();
@@ -555,6 +607,7 @@ impl LlmClient {
             Err(last_err
                 .map(|mut error| {
                     error.model_usage = failed_model_usage;
+                    error.model_incidents = failed_incidents;
                     error.usage_accounting_complete = usage_accounting_complete;
                     error
                 })
@@ -643,6 +696,7 @@ impl LlmClient {
     ) -> std::result::Result<ScorerReview, ModelError> {
         let mut failed_usage = Usage::default();
         let mut failed_model_usage = Vec::new();
+        let mut failed_incidents: Vec<ModelIncident> = Vec::new();
         let mut usage_accounting_complete = true;
         let mut last_err = None;
         let chain = cfg.scorer_chain();
@@ -661,10 +715,17 @@ impl LlmClient {
                     );
                     add_usage(&mut r.usage, failed_usage);
                     r.model_usage.splice(0..0, failed_model_usage);
+                    for incident in &mut failed_incidents {
+                        incident.recovered = true;
+                        incident.recovery = Some(ModelIncidentRecovery::Fallback);
+                    }
+                    r.model_incidents.splice(0..0, failed_incidents);
                     r.usage_accounting_complete &= usage_accounting_complete;
                     return Ok(r);
                 }
                 Err(mut e) => {
+                    failed_incidents.extend(e.model_incidents.clone());
+                    failed_incidents.push(e.incident(ModelIncidentPhase::Scorer));
                     usage_accounting_complete &= e.usage_accounting_complete;
                     if e.model_usage.is_empty()
                         && (e.usage.prompt_tokens > 0 || e.usage.completion_tokens > 0)
@@ -684,6 +745,7 @@ impl LlmClient {
                             "postil: scorer {model_log} stopped after {elapsed}: {e}; scorer fallback is disabled after deadline exhaustion"
                         );
                         e.model_usage = failed_model_usage;
+                        e.model_incidents = failed_incidents;
                         return Err(e);
                     }
                     let has_fallback = index + 1 < chain.len();
@@ -715,6 +777,7 @@ impl LlmClient {
         Err(last_err
             .map(|mut error| {
                 error.model_usage = failed_model_usage;
+                error.model_incidents = failed_incidents;
                 error.usage_accounting_complete = usage_accounting_complete;
                 error
             })
@@ -731,6 +794,7 @@ impl LlmClient {
     ) -> std::result::Result<ModelReview, ModelError> {
         let mut usage = Usage::default();
         let mut usage_accounting_complete = true;
+        let mut model_incidents = Vec::new();
         let content = self
             .chat(
                 model,
@@ -750,13 +814,19 @@ impl LlmClient {
         let raw = match parse_review(&content) {
             Ok(raw) => raw,
             Err(parse_err) => {
+                let incident = ModelIncident {
+                    phase: ModelIncidentPhase::Review,
+                    category: ModelIncidentCategory::InvalidOutput,
+                    recovered: false,
+                    recovery: None,
+                };
                 // One repair attempt: ask the same model to fix its own JSON.
                 let repair_user = format!(
                     "The following was supposed to be a single valid JSON object matching the \
                      review schema but failed to parse ({parse_err}). Output ONLY the corrected \
                      JSON object, nothing else:\n\n{content}"
                 );
-                let repaired = self
+                let repaired = match self
                     .chat(
                         model,
                         "You repair malformed JSON. Output only valid JSON.",
@@ -767,19 +837,34 @@ impl LlmClient {
                         LlmPhase::Review,
                     )
                     .await
-                    .map_err(|e| {
-                        ModelError::new(e.context("JSON repair call failed"), usage, false)
-                    })?;
-                parse_review(&repaired).map_err(|e| {
-                    ModelError::new(
-                        anyhow!("model output invalid after repair: {e}"),
+                {
+                    Ok(repaired) => repaired,
+                    Err(error) => {
+                        let mut error =
+                            ModelError::new(error.context("JSON repair call failed"), usage, false);
+                        error.model_incidents.push(incident);
+                        return Err(error);
+                    }
+                };
+                let parsed = parse_review(&repaired).map_err(|error| {
+                    let mut error = ModelError::new(
+                        anyhow!("model output invalid after repair: {error}"),
                         usage,
                         usage_accounting_complete,
-                    )
-                })?
+                    );
+                    error.model_incidents.push(incident.clone());
+                    error
+                })?;
+                model_incidents.push(ModelIncident {
+                    recovered: true,
+                    recovery: Some(ModelIncidentRecovery::Repair),
+                    ..incident
+                });
+                parsed
             }
         };
         let mut review = into_review(raw, model, usage);
+        review.model_incidents.append(&mut model_incidents);
         review.usage_accounting_complete = usage_accounting_complete;
 
         // Semantic consistency retry: a summary that narrates risk next to an
@@ -788,6 +873,13 @@ impl LlmClient {
         // the risk or retract it; if the contradiction survives, the caller
         // fails the review closed.
         if review.findings.is_empty() && !review.summary.is_empty() {
+            let incident_index = review.model_incidents.len();
+            review.model_incidents.push(ModelIncident {
+                phase: ModelIncidentPhase::Review,
+                category: ModelIncidentCategory::InvalidOutput,
+                recovered: false,
+                recovery: None,
+            });
             let retry_user = format!(
                 "{user}\n\n[Your previous response]\n{content}\n\n[Correction] Your summary \
                  describes merge-relevant risk but `findings` is empty, which is invalid. \
@@ -817,6 +909,10 @@ impl LlmClient {
                         let still_contradictory =
                             candidate.findings.is_empty() && !candidate.summary.is_empty();
                         if !still_contradictory {
+                            review.model_incidents[incident_index].recovered = true;
+                            review.model_incidents[incident_index].recovery =
+                                Some(ModelIncidentRecovery::Repair);
+                            candidate.model_incidents = review.model_incidents.clone();
                             review = candidate;
                         }
                     }
@@ -845,6 +941,7 @@ impl LlmClient {
     ) -> std::result::Result<ScorerReview, ModelError> {
         let mut usage = Usage::default();
         let mut usage_accounting_complete = true;
+        let mut model_incidents = Vec::new();
         let content = self
             .chat_with_temperature(
                 model,
@@ -862,13 +959,60 @@ impl LlmClient {
                     && (usage.prompt_tokens > 0 || usage.completion_tokens > 0);
                 ModelError::new(e, usage, complete)
             })?;
-        let scores = parse_scores(&content, expected_len).map_err(|e| {
-            ModelError::new(
-                anyhow!("scorer output invalid: {e}"),
-                usage,
-                usage_accounting_complete,
-            )
-        })?;
+        let scores = match parse_scores(&content, expected_len) {
+            Ok(scores) => scores,
+            Err(first_error) => {
+                eprintln!("postil: scorer output invalid; requesting one schema repair");
+                let invalid: String = content.chars().take(8_000).collect();
+                let repair_system = format!(
+                    "{system}\n\nYour previous response failed schema validation. Repair only the JSON schema. Kind is a category, so severity values such as info, warn, and error are invalid kinds. Return the complete array and nothing else."
+                );
+                let repair_user =
+                    format!("{user}\n\nInvalid previous response (untrusted data):\n{invalid}");
+                let incident = ModelIncident {
+                    phase: ModelIncidentPhase::Scorer,
+                    category: ModelIncidentCategory::InvalidOutput,
+                    recovered: false,
+                    recovery: None,
+                };
+                let repaired = self
+                    .chat_with_temperature(
+                        model,
+                        &repair_system,
+                        &repair_user,
+                        &mut usage,
+                        &mut usage_accounting_complete,
+                        Some(SCORER_MAX_TOKENS),
+                        0.0,
+                        LlmPhase::Total,
+                    )
+                    .await
+                    .map_err(|error| {
+                        let complete = usage_accounting_complete
+                            && (usage.prompt_tokens > 0 || usage.completion_tokens > 0);
+                        let mut error = ModelError::new(error, usage, complete);
+                        error.model_incidents.push(incident.clone());
+                        error
+                    })?;
+                let scores = parse_scores(&repaired, expected_len).map_err(|second_error| {
+                    let mut error = ModelError::new(
+                        anyhow!(
+                            "scorer output invalid after schema repair: {second_error} (first response: {first_error})"
+                        ),
+                        usage,
+                        usage_accounting_complete,
+                    );
+                    error.model_incidents.push(incident.clone());
+                    error
+                })?;
+                model_incidents.push(ModelIncident {
+                    recovered: true,
+                    recovery: Some(ModelIncidentRecovery::Repair),
+                    ..incident
+                });
+                scores
+            }
+        };
         Ok(ScorerReview {
             scores,
             model_used: model.to_string(),
@@ -878,6 +1022,7 @@ impl LlmClient {
                 prompt_tokens: usage.prompt_tokens,
                 completion_tokens: usage.completion_tokens,
             }],
+            model_incidents,
             usage_accounting_complete,
         })
     }
@@ -1617,6 +1762,7 @@ fn into_review(raw: RawReview, model: &str, usage: Usage) -> ModelReview {
             prompt_tokens: usage.prompt_tokens,
             completion_tokens: usage.completion_tokens,
         }],
+        model_incidents: vec![],
         usage_accounting_complete: true,
     }
 }
@@ -1633,6 +1779,10 @@ fn consensus_merge(runs: Vec<ModelReview>) -> ModelReview {
     };
     let models: Vec<String> = runs.iter().map(|r| r.model_used.clone()).collect();
     let model_usage = runs.iter().flat_map(|r| r.model_usage.clone()).collect();
+    let model_incidents = runs
+        .iter()
+        .flat_map(|r| r.model_incidents.clone())
+        .collect();
     let usage_accounting_complete = runs.iter().all(|r| r.usage_accounting_complete);
     let summary = runs[0].summary.clone();
     // Flatten in run order; greedy clustering then anchors each cluster on its
@@ -1676,6 +1826,7 @@ fn consensus_merge(runs: Vec<ModelReview>) -> ModelReview {
         model_used: format!("consensus({})", models.join(", ")),
         usage: total_usage,
         model_usage,
+        model_incidents,
         usage_accounting_complete,
     }
 }
@@ -2005,6 +2156,16 @@ mod tests {
     }
 
     #[test]
+    fn scorer_rejects_severity_label_as_kind() {
+        let error = parse_scores(
+            r#"[{"index":0,"confidence":0.7,"kind":"warn","reason":"wrong field"}]"#,
+            1,
+        )
+        .unwrap_err();
+        assert!(error.contains("invalid score kind"));
+    }
+
+    #[test]
     fn scorer_rejects_missing_entries() {
         assert!(parse_scores(r#"[{"index":0,"confidence":0.5,"kind":"risk"}]"#, 2).is_err());
     }
@@ -2121,6 +2282,7 @@ mod tests {
                 completion_tokens: 5,
             },
             model_usage: vec![],
+            model_incidents: vec![],
             usage_accounting_complete: true,
         }
     }

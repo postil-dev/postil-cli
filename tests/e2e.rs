@@ -138,6 +138,8 @@ fn postil() -> Command {
         .env_remove("POSTIL_ENDPOINT_AUTH_VALUE")
         .env_remove("POSTIL_ALLOW_PRIVATE_API_BASE")
         .env_remove("POSTIL_DETAILS_URL")
+        .env_remove("POSTIL_PREVENTION_HINT")
+        .env_remove("POSTIL_PREVENTION_COMMANDS_JSON")
         .env_remove("GITHUB_SERVER_URL")
         .env_remove("POSTIL_ENABLE_BITBUCKET_INCREMENTAL")
         .env("MODEL_API_KEY", "test-key")
@@ -560,7 +562,9 @@ async fn local_review_reports_grounded_finding_and_gates() {
     assert_eq!(env["findings"][0]["line"], 41);
     assert_eq!(env["gate"]["failing"], true);
     assert_eq!(env["counts"]["error"], 1);
-    assert_eq!(env["usage"]["promptTokens"], 300);
+    // The generic mock is invalid scorer JSON. Each scorer gets one repair
+    // attempt before the cascade advances, and every attempt remains billable.
+    assert_eq!(env["usage"]["promptTokens"], 500);
     assert_eq!(env["usageAccountingComplete"], true);
     let model_usage = env["modelUsage"].as_array().unwrap();
     assert!(!model_usage.is_empty());
@@ -745,7 +749,82 @@ async fn scorer_confidence_below_minimum_is_suppressed_and_nonblocking() {
     assert_eq!(envelope["gate"]["failing"], false);
     assert_eq!(envelope["counts"]["error"], 0);
     assert_eq!(envelope["counts"]["suppressed"], 1);
+    assert_eq!(envelope["suppressedFindings"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        envelope["suppressedFindings"][0]["reason"],
+        "belowConfidence"
+    );
+    assert_eq!(
+        envelope["suppressedFindings"][0]["finding"]["path"],
+        "src/auth.rs"
+    );
     assert_eq!(envelope["scorerModel"], "anthropic/claude-haiku-4.5");
+}
+
+#[tokio::test]
+async fn malformed_scorer_kind_gets_one_same_model_schema_repair() {
+    let server = MockServer::start().await;
+    mock_review_model(
+        &server,
+        "generator-model",
+        json!([finding_at(41, "warn", 0.92)]),
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("anthropic/claude-haiku-4.5"))
+        .and(body_string_contains("failed schema validation"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(scorer_content(json!([{
+                "index": 0,
+                "confidence": 0.75,
+                "kind": "risk",
+                "reason": "concrete defect"
+            }]))),
+        )
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("anthropic/claude-haiku-4.5"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(scorer_content(json!([{
+                "index": 0,
+                "confidence": 0.75,
+                "kind": "warn",
+                "reason": "used severity as kind"
+            }]))),
+        )
+        .with_priority(2)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "generator-model")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .code(0);
+
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert_eq!(envelope["scorerModel"], "anthropic/claude-haiku-4.5");
+    assert_eq!(envelope["findings"][0]["scorerKind"], "risk");
+    assert_eq!(envelope["modelIncidents"][0]["phase"], "scorer");
+    assert_eq!(envelope["modelIncidents"][0]["category"], "invalidOutput");
+    assert_eq!(envelope["modelIncidents"][0]["recovered"], true);
+    assert_eq!(envelope["modelIncidents"][0]["recovery"], "repair");
+    assert_eq!(envelope["usage"]["promptTokens"], 160);
+    assert_eq!(envelope["usage"]["completionTokens"], 70);
+    assert!(stderr.contains("requesting one schema repair"));
 }
 
 #[tokio::test]
@@ -797,6 +876,10 @@ async fn slow_scorer_request_times_out_and_falls_back() {
     let env: Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(env["scorerModel"], "openai/gpt-5-mini");
     assert_eq!(env["usageAccountingComplete"], false);
+    assert_eq!(env["modelIncidents"][0]["phase"], "scorer");
+    assert_eq!(env["modelIncidents"][0]["category"], "timeout");
+    assert_eq!(env["modelIncidents"][0]["recovered"], true);
+    assert_eq!(env["modelIncidents"][0]["recovery"], "fallback");
     let models: Vec<_> = env["modelUsage"]
         .as_array()
         .unwrap()
@@ -1137,8 +1220,8 @@ async fn local_review_writes_csv_output_file_with_multiple_escaped_findings() {
     );
     assert_eq!(rows[0]["gateFailOn"], "error");
     assert_eq!(rows[0]["gateFailing"], "false");
-    assert_eq!(rows[0]["promptTokens"], "300");
-    assert_eq!(rows[0]["completionTokens"], "150");
+    assert_eq!(rows[0]["promptTokens"], "500");
+    assert_eq!(rows[0]["completionTokens"], "250");
 
     assert_eq!(rows[1]["path"], "src/auth.rs");
     assert_eq!(rows[1]["line"], "42");
@@ -1886,6 +1969,10 @@ async fn cascade_falls_back_to_next_model() {
     let env: Value =
         serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
     assert_eq!(env["modelUsed"], "backup-model");
+    assert_eq!(env["modelIncidents"][0]["phase"], "review");
+    assert_eq!(env["modelIncidents"][0]["category"], "providerError");
+    assert_eq!(env["modelIncidents"][0]["recovered"], true);
+    assert_eq!(env["modelIncidents"][0]["recovery"], "fallback");
     let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
     assert!(stderr.contains("postil: attempting model: primary-model"));
     assert!(stderr.contains("postil: model primary-model returned retryable HTTP 500"));
@@ -2532,19 +2619,13 @@ async fn github_flow_posts_review_and_completes_both_checks() {
     assert_eq!(body["comments"][0]["path"], "src/auth.rs");
     assert_eq!(body["comments"][0]["line"], 41);
     let summary = body["body"].as_str().unwrap();
-    assert!(summary.starts_with("Gate: failed\n\n"));
-    assert!(summary.contains("**Unsanitized input reaches query** · severity: `error`"));
+    assert!(summary.starts_with("**1 finding has applied the brakes.** Fix it, then push again."));
+    assert!(!summary.contains("Unsanitized input reaches query"));
     assert!(!summary.contains("`src/auth.rs:41`"));
-    assert!(summary.contains("<details><summary>Review metadata</summary>"));
-    assert!(
-        summary.contains("- Commit: [`headsha`](https://github.com/acme/api/commit/headsha111)")
-    );
-    assert!(
-        summary.contains(
-            "- Dashboard run: [View in Postil](https://postil.dev/orgs/acme/runs/review-7)"
-        )
-    );
-    assert!(summary.contains("- Tokens: 300 prompt, 150 completion"));
+    assert!(!summary.contains("Review metadata"));
+    assert!(!summary.contains("headsha"));
+    assert!(!summary.contains("Tokens"));
+    assert!(summary.contains("[Review details](https://postil.dev/orgs/acme/runs/review-7)"));
 }
 
 // An LLM response with a caller-provided summary and findings (used for
@@ -2646,8 +2727,8 @@ async fn content_policy_pr_body_finding_survives_grounding() {
     assert!(user_msg.contains(".postil/pr-description"));
     assert!(user_msg.contains("     1   Add login"));
 
-    // The reserved-path finding is not posted as an inline comment (no real line)
-    // but is carried in the summary body.
+    // The reserved-path finding has no real line, so its bounded detail appears
+    // in the PR summary instead of an inline comment.
     let review = reqs
         .iter()
         .find(|r| r.url.path() == "/repos/acme/api/pulls/7/reviews")
@@ -2658,12 +2739,11 @@ async fn content_policy_pr_body_finding_survives_grounding() {
         0,
         "reserved-path finding was posted as an inline comment"
     );
-    assert!(
-        body["body"]
-            .as_str()
-            .unwrap()
-            .contains("AI-authorship residue in PR description")
-    );
+    let summary = body["body"].as_str().unwrap();
+    assert!(summary.contains("1 finding worth a look"));
+    assert!(summary.contains("AI-authorship residue in PR description"));
+    assert!(summary.contains("in pull request description"));
+    assert!(summary.contains("Rule 3: the description states it was written by Claude."));
 }
 
 #[tokio::test]
@@ -2805,10 +2885,10 @@ async fn github_clean_pr_stays_silent_but_completes_checks() {
         .expect("onClean review posted");
     let clean_body: Value = clean_review.body_json().unwrap();
     let clean_summary = clean_body["body"].as_str().unwrap();
-    assert!(clean_summary.starts_with("Gate: passed\n\n"));
+    assert!(clean_summary.starts_with("Postil reviewed this change"));
     assert!(clean_summary.contains("Postil reviewed this change and found nothing"));
-    assert!(clean_summary.contains("<details><summary>Review metadata</summary>"));
-    assert!(clean_summary.contains("[View in Postil](https://postil.dev/orgs/acme/runs/clean-7)"));
+    assert!(!clean_summary.contains("Review metadata"));
+    assert!(clean_summary.contains("[Review details](https://postil.dev/orgs/acme/runs/clean-7)"));
 }
 
 #[tokio::test]

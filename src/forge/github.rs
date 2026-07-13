@@ -6,7 +6,7 @@ use serde_json::json;
 
 use super::{
     CheckState, Forge, PrMeta, SummaryContext, ThreadKind, check_summary, check_title,
-    wrap_plain_text,
+    only_operational_findings, valid_details_url, wrap_plain_text,
 };
 use crate::envelope::{Envelope, Finding, Severity};
 use crate::filter;
@@ -19,7 +19,6 @@ pub struct GitHub {
     owner: String,
     repo: String,
     pr: u64,
-    web_base: String,
 }
 
 impl GitHub {
@@ -32,7 +31,6 @@ impl GitHub {
         let api_base = std::env::var("GITHUB_API_URL")
             .unwrap_or_else(|_| "https://api.github.com".to_string());
         let details_url = valid_details_url(std::env::var("POSTIL_DETAILS_URL").ok());
-        let web_base = github_web_base(std::env::var("GITHUB_SERVER_URL").ok(), &api_base);
         Ok(GitHub {
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(60))
@@ -43,7 +41,6 @@ impl GitHub {
             owner: owner.to_string(),
             repo: repo.to_string(),
             pr,
-            web_base: web_base.trim_end_matches('/').to_string(),
         })
     }
 
@@ -76,28 +73,6 @@ impl GitHub {
     }
 }
 
-fn valid_details_url(value: Option<String>) -> Option<String> {
-    value.filter(|value| {
-        reqwest::Url::parse(value)
-            .map(|url| matches!(url.scheme(), "http" | "https") && url.has_host())
-            .unwrap_or(false)
-    })
-}
-
-fn github_web_base(server_url: Option<String>, api_base: &str) -> String {
-    if let Some(server_url) = valid_details_url(server_url) {
-        return server_url.trim_end_matches('/').to_string();
-    }
-    let normalized_api_base = api_base.trim_end_matches('/');
-    if normalized_api_base != "https://api.github.com"
-        && let Some(web_url) = normalized_api_base.strip_suffix("/api/v3")
-        && valid_details_url(Some(web_url.to_string())).is_some()
-    {
-        return web_url.trim_end_matches('/').to_string();
-    }
-    "https://github.com".to_string()
-}
-
 fn gate_title(envelope: &Envelope) -> &'static str {
     if envelope.gate.failing {
         "Merge gate failed"
@@ -107,6 +82,20 @@ fn gate_title(envelope: &Envelope) -> &'static str {
 }
 
 fn gate_summary(envelope: &Envelope) -> String {
+    if !envelope.findings.is_empty()
+        && envelope.findings.iter().all(|finding| {
+            matches!(
+                finding.path.as_str(),
+                crate::envelope::OPERATIONAL_PATH | crate::envelope::PROVIDER_PATH
+            )
+        })
+    {
+        return if envelope.gate.failing {
+            "Postil could not complete this review, so no review verdict exists. The merge check remains blocked.\n".to_string()
+        } else {
+            "Postil could not complete this review, so no review verdict exists. This repository treats review outages as advisory.\n".to_string()
+        };
+    }
     if !envelope.gate.failing {
         return format!(
             "Merge gate passed: no findings block under the configured policy (failOn: {}).\n",
@@ -118,14 +107,15 @@ fn gate_summary(envelope: &Envelope) -> String {
         .findings
         .iter()
         .filter(|f| {
-            f.path == crate::envelope::OPERATIONAL_PATH
-                || (f.path == crate::envelope::PROVIDER_PATH && envelope.gate.failing)
-                || crate::envelope::finding_blocks_gate(
-                    f,
-                    &envelope.gate.fail_on,
-                    &envelope.gate.block_on_kinds,
-                    false,
-                )
+            !matches!(
+                f.path.as_str(),
+                crate::envelope::OPERATIONAL_PATH | crate::envelope::PROVIDER_PATH
+            ) && crate::envelope::finding_blocks_gate(
+                f,
+                &envelope.gate.fail_on,
+                &envelope.gate.block_on_kinds,
+                false,
+            )
         })
         .map(|f| format!("- `{}:{}` {}", f.path, f.line, f.title))
         .collect();
@@ -171,18 +161,13 @@ impl Forge for GitHub {
     }
 
     fn review_summary(&self, envelope: &Envelope) -> String {
-        let commit_url = envelope.head_sha.as_deref().map(|sha| {
-            format!(
-                "{}/{}/{}/commit/{sha}",
-                self.web_base, self.owner, self.repo
-            )
-        });
         check_summary(
             envelope,
             true,
             SummaryContext {
-                commit_url: commit_url.as_deref(),
-                details_url: self.details_url.as_deref(),
+                details_url: self.details_url.clone(),
+                prevention_hint: std::env::var("POSTIL_PREVENTION_HINT").as_deref() == Ok("1"),
+                prevention_commands: SummaryContext::from_env().prevention_commands,
             },
         )
     }
@@ -232,6 +217,9 @@ impl Forge for GitHub {
     }
 
     async fn post_review(&self, summary: &str, findings: &[Finding], head_sha: &str) -> Result<()> {
+        if only_operational_findings(findings) {
+            return Ok(());
+        }
         // Every carried finding is already visible in an earlier Postil review.
         // Check-runs still receive the complete envelope, but posting the same
         // visible set as another PR review is duplicate noise.
@@ -352,7 +340,15 @@ impl Forge for GitHub {
             let gate_note = if name == "postil/gate" {
                 gate_summary(envelope)
             } else {
-                self.review_summary(envelope)
+                check_summary(
+                    envelope,
+                    true,
+                    SummaryContext {
+                        details_url: self.details_url.clone(),
+                        prevention_hint: false,
+                        prevention_commands: vec![],
+                    },
+                )
             };
             let title = if name == "postil/gate" {
                 gate_title(envelope).to_string()
@@ -420,7 +416,7 @@ impl Forge for GitHub {
 
 #[cfg(test)]
 mod tests {
-    use super::{gate_summary, github_web_base, valid_details_url};
+    use super::{gate_summary, only_operational_findings, valid_details_url};
     use crate::envelope::{Envelope, Finding, Gate, Kind, Severity, Usage};
 
     #[test]
@@ -440,19 +436,14 @@ mod tests {
     }
 
     #[test]
-    fn web_base_uses_documented_github_enterprise_api_url() {
-        assert_eq!(
-            github_web_base(None, "https://github.example.com/api/v3"),
-            "https://github.example.com"
-        );
-        assert_eq!(
-            github_web_base(None, "https://github.example.com/api/v3/"),
-            "https://github.example.com"
-        );
-        assert_eq!(
-            github_web_base(Some("https://code.example.com/".into()), "ignored"),
-            "https://code.example.com"
-        );
+    fn only_operational_failures_skip_the_pr_review() {
+        let provider = crate::envelope::provider_error_finding("private provider detail");
+        assert!(only_operational_findings(std::slice::from_ref(&provider)));
+
+        let mut real = provider;
+        real.path = "src/lib.rs".into();
+        assert!(!only_operational_findings(&[real]));
+        assert!(!only_operational_findings(&[]));
     }
 
     #[test]
@@ -478,6 +469,7 @@ mod tests {
             summary: String::new(),
             silent: false,
             findings: vec![finding],
+            suppressed_findings: vec![],
             resolved: vec![],
             counts: Default::default(),
             confidence_buckets: [0; 5],
@@ -492,6 +484,7 @@ mod tests {
             scorer_disagreements: None,
             usage: Usage::default(),
             model_usage: vec![],
+            model_incidents: vec![],
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
@@ -511,6 +504,7 @@ mod tests {
             summary: String::new(),
             silent: false,
             findings: vec![],
+            suppressed_findings: vec![],
             resolved: vec![],
             counts: Default::default(),
             confidence_buckets: [0; 5],
@@ -525,6 +519,7 @@ mod tests {
             scorer_disagreements: None,
             usage: Usage::default(),
             model_usage: vec![],
+            model_incidents: vec![],
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
@@ -535,7 +530,9 @@ mod tests {
             .push(crate::envelope::provider_error_finding("timeout"));
 
         let summary = gate_summary(&env);
-        assert!(summary.contains("1 finding blocks under the configured policy"));
-        assert!(summary.contains(".postil/provider:1"));
+        assert!(summary.contains("no review verdict exists"));
+        assert!(summary.contains("merge check remains blocked"));
+        assert!(!summary.contains("provider"));
+        assert!(!summary.contains("timeout"));
     }
 }

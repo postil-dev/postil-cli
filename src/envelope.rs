@@ -113,6 +113,26 @@ pub struct Finding {
     pub id: Option<String>,
 }
 
+/// Why an otherwise grounded finding did not reach the public review.
+///
+/// This additive v1 field lets trusted dashboards and compact forge summaries
+/// explain policy decisions without reconstructing them from mutable config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SuppressionReason {
+    Ignored,
+    BelowSeverity,
+    BelowConfidence,
+    MaxFindings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuppressedFinding {
+    pub finding: Finding,
+    pub reason: SuppressionReason,
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Counts {
@@ -155,6 +175,39 @@ pub struct ModelUsage {
     pub completion_tokens: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ModelIncidentPhase {
+    Review,
+    Scorer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ModelIncidentCategory {
+    ProviderError,
+    InvalidOutput,
+    Timeout,
+    Deadline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ModelIncidentRecovery {
+    Repair,
+    Fallback,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelIncident {
+    pub phase: ModelIncidentPhase,
+    pub category: ModelIncidentCategory,
+    pub recovered: bool,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub recovery: Option<ModelIncidentRecovery>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Envelope {
@@ -162,6 +215,10 @@ pub struct Envelope {
     pub summary: String,
     pub silent: bool,
     pub findings: Vec<Finding>,
+    /// Grounded findings hidden by review policy. Older v1 envelopes omit this
+    /// field, so readers must treat an absent value as an empty list.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub suppressed_findings: Vec<SuppressedFinding>,
     pub resolved: Vec<Finding>,
     pub counts: Counts,
     /// Counts of finding confidences in [0-.2, .2-.4, .4-.6, .6-.8, .8-1].
@@ -182,6 +239,10 @@ pub struct Envelope {
     /// this additive field and are handled conservatively by the control plane.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub model_usage: Vec<ModelUsage>,
+    /// Safe operational model signals for monitoring. No raw provider detail
+    /// or model-generated content is stored here.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub model_incidents: Vec<ModelIncident>,
     /// False when any sent provider request can have unknown billed usage,
     /// including timeouts and ambiguous transport failures.
     #[serde(default)]
@@ -266,6 +327,17 @@ pub const PROVIDER_PATH: &str = ".postil/provider";
 /// be posted as inline code annotations (there is no file line); they are
 /// surfaced in the check-run summary and PR comment body instead.
 pub const PR_DESCRIPTION_PATH: &str = ".postil/pr-description";
+pub const DIFF_PATH: &str = ".postil/diff";
+
+/// Exact virtual anchors emitted by Postil itself. Repository files under the
+/// `.postil/` directory are ordinary reviewable files and must never be swept
+/// into this classification by prefix.
+pub fn is_reserved_anchor(path: &str) -> bool {
+    matches!(
+        path,
+        OPERATIONAL_PATH | PROVIDER_PATH | PR_DESCRIPTION_PATH | DIFF_PATH
+    )
+}
 
 /// The synthetic finding emitted when the model produced unusable output.
 /// Postil fails closed: a review that could not be trusted is an error, not a pass.
@@ -427,11 +499,12 @@ mod tests {
 
     #[test]
     fn envelope_serializes_camel_case() {
-        let env = Envelope {
+        let mut env = Envelope {
             version: 1,
             summary: String::new(),
             silent: true,
             findings: vec![],
+            suppressed_findings: vec![],
             resolved: vec![],
             counts: Counts::default(),
             confidence_buckets: [0; 5],
@@ -446,15 +519,31 @@ mod tests {
             scorer_disagreements: None,
             usage: Usage::default(),
             model_usage: vec![],
+            model_incidents: vec![],
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
             head_sha: None,
             since_sha: None,
         };
-        let v = serde_json::to_value(&env).unwrap();
+        env.model_incidents.push(ModelIncident {
+            phase: ModelIncidentPhase::Scorer,
+            category: ModelIncidentCategory::InvalidOutput,
+            recovered: true,
+            recovery: Some(ModelIncidentRecovery::Repair),
+        });
+        let mut v = serde_json::to_value(&env).unwrap();
         assert!(v.get("confidenceBuckets").is_some());
         assert!(v.get("modelUsed").is_some());
         assert_eq!(v["gate"]["failOn"], "error");
+        assert!(v.get("suppressedFindings").is_none());
+        assert_eq!(v["modelIncidents"][0]["phase"], "scorer");
+        assert_eq!(v["modelIncidents"][0]["category"], "invalidOutput");
+        assert_eq!(v["modelIncidents"][0]["recovery"], "repair");
+
+        v.as_object_mut().unwrap().remove("modelIncidents");
+        let decoded: Envelope = serde_json::from_value(v).unwrap();
+        assert!(decoded.suppressed_findings.is_empty());
+        assert!(decoded.model_incidents.is_empty());
     }
 }

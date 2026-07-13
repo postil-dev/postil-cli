@@ -6,12 +6,13 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 
 use crate::config::Config;
 use crate::diff::DiffIndex;
-use crate::envelope::Finding;
+use crate::envelope::{Finding, SuppressedFinding, SuppressionReason};
 
 #[derive(Debug, Default)]
 pub struct FilterOutcome {
     pub kept: Vec<Finding>,
     pub suppressed: u32,
+    pub suppressed_findings: Vec<SuppressedFinding>,
     pub ungrounded: u32,
     /// True when the model reported findings but every one was ungrounded —
     /// the output cannot be trusted at all.
@@ -46,15 +47,26 @@ pub fn apply(cfg: &Config, index: &DiffIndex, mut findings: Vec<Finding>) -> Res
 
     // Policy suppression.
     let ignore = build_ignore_set(&cfg.ignore)?;
-    let mut suppressed = 0u32;
+    let mut suppressed_findings = Vec::new();
     findings.retain(|f| {
-        let keep = !ignore.is_match(&f.path)
-            && f.severity >= cfg.severity_threshold
-            && f.confidence >= cfg.min_confidence;
-        if !keep {
-            suppressed += 1;
+        let reason = if ignore.is_match(&f.path) {
+            Some(SuppressionReason::Ignored)
+        } else if f.severity < cfg.severity_threshold {
+            Some(SuppressionReason::BelowSeverity)
+        } else if f.confidence < cfg.min_confidence {
+            Some(SuppressionReason::BelowConfidence)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            suppressed_findings.push(SuppressedFinding {
+                finding: f.clone(),
+                reason,
+            });
+            false
+        } else {
+            true
         }
-        keep
     });
 
     // Highest severity first, then confidence; cap to maxFindings.
@@ -64,13 +76,21 @@ pub fn apply(cfg: &Config, index: &DiffIndex, mut findings: Vec<Finding>) -> Res
             .then(b.confidence.total_cmp(&a.confidence))
     });
     if findings.len() > cfg.max_findings {
-        suppressed += (findings.len() - cfg.max_findings) as u32;
+        suppressed_findings.extend(findings[cfg.max_findings..].iter().cloned().map(|finding| {
+            SuppressedFinding {
+                finding,
+                reason: SuppressionReason::MaxFindings,
+            }
+        }));
         findings.truncate(cfg.max_findings);
     }
+
+    let suppressed = suppressed_findings.len() as u32;
 
     Ok(FilterOutcome {
         kept: findings,
         suppressed,
+        suppressed_findings,
         ungrounded,
         all_ungrounded,
     })
@@ -158,9 +178,10 @@ pub fn reconcile(
     let mut resolved = Vec::new();
     let mut carried = Vec::new();
     for f in baseline {
-        // Synthetic findings (fail-closed, provider, truncation) never carry
+        // Reserved virtual findings (fail-closed, provider, PR description,
+        // truncation) never carry
         // forward; each run re-earns trust and re-detects its own limits.
-        if f.path.starts_with(".postil/") {
+        if crate::envelope::is_reserved_anchor(&f.path) {
             continue;
         }
         let superseded = new_findings.iter().any(|n| supersedes(f, n));
@@ -316,6 +337,14 @@ mod tests {
         .unwrap();
         assert_eq!(out.kept.len(), 1);
         assert_eq!(out.suppressed, 2);
+        assert_eq!(
+            out.suppressed_findings[0].reason,
+            SuppressionReason::BelowSeverity
+        );
+        assert_eq!(
+            out.suppressed_findings[1].reason,
+            SuppressionReason::BelowConfidence
+        );
     }
 
     #[test]
@@ -333,6 +362,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.kept.len(), 1);
+        assert_eq!(out.suppressed_findings.len(), 1);
+        assert_eq!(
+            out.suppressed_findings[0].reason,
+            SuppressionReason::MaxFindings
+        );
         assert_eq!(out.kept[0].severity, Severity::Error);
         assert_eq!(out.suppressed, 1);
     }
@@ -343,14 +377,17 @@ mod tests {
         let baseline = vec![
             f("a.rs", 11, Severity::Error, 0.9), // touched → resolved
             f("b.rs", 5, Severity::Warn, 0.8),   // untouched → carried
+            f(".postil/content-policy.md", 7, Severity::Warn, 0.8),
             f(".postil/model-output", 1, Severity::Error, 1.0), // synthetic → dropped
         ];
         let rec = reconcile(&baseline, &idx, &[], ReconcileScope::Incremental);
         assert_eq!(rec.resolved.len(), 1);
         assert_eq!(rec.resolved[0].path, "a.rs");
-        assert_eq!(rec.carried.len(), 1);
+        assert_eq!(rec.carried.len(), 2);
         assert_eq!(rec.carried[0].path, "b.rs");
         assert!(rec.carried[0].body.starts_with("[carried"));
+        assert_eq!(rec.carried[1].path, ".postil/content-policy.md");
+        assert!(rec.carried[1].body.starts_with("[carried"));
     }
 
     #[test]

@@ -357,6 +357,9 @@ impl Forge for Azure {
         findings: &[Finding],
         _head_sha: &str,
     ) -> Result<()> {
+        if super::only_operational_findings(findings) {
+            return Ok(());
+        }
         // One failed comment must not drop the rest: post everything we can,
         // then report the failures together.
         let mut failures: Vec<String> = Vec::new();
@@ -424,7 +427,7 @@ impl Forge for Azure {
             &head,
             "postil/review",
             map(advisory),
-            &check_summary(envelope, false, Default::default()),
+            &check_summary(envelope, false, super::SummaryContext::from_env()),
         )
         .await?;
         let gate_desc = if envelope.gate.failing {

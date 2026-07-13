@@ -124,6 +124,7 @@ mod tests {
             counts: Envelope::counts_of(&findings, 0),
             confidence_buckets: Envelope::buckets_of(&findings),
             findings,
+            suppressed_findings: vec![],
             resolved: vec![],
             gate: Gate {
                 fail_on: "error".into(),
@@ -136,6 +137,7 @@ mod tests {
             scorer_disagreements: None,
             usage: Usage::default(),
             model_usage: vec![],
+            model_incidents: vec![],
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,

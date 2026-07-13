@@ -18,7 +18,9 @@
   reviews prose in the diff for fabricated/contradicted doc claims, same-PR
   self-contradictions, AI-authorship/process-narration residue, leaked conversation
   text, and stale temporal/TODO/style residue; surfaces as `kind: contentPolicy`.
-- `postil plan` deterministic config dry-run; `postil doctor`; pre-push hook.
+- `postil plan` deterministic config dry-run; `postil doctor`; exact-ref pre-push hook.
+- Compact PR summaries with run links, retained policy-suppressed findings, and
+  provider-safe operational check text.
 - `.coderabbit.yaml` translation for zero-cost migration.
 - Model cascade + concurrent multi-model consensus over any OpenAI-compatible endpoint;
   bounded retry with backoff on transient provider errors.
