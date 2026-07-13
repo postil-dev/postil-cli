@@ -257,7 +257,10 @@ const REVIEW_MAX_TOKENS: u32 = 16384;
 const SCORER_MAX_TOKENS: u32 = 4096;
 const SCORER_REASON_MAX_CHARS: usize = 240;
 const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 4096;
-const RESPOND_MAX_TOKENS: u32 = 4096;
+// The publication contract targets 1,200 characters and hard-stops at 2,400.
+// Keep generation bounded too, so an invalid model cannot spend an article's
+// worth of output tokens before the validator rejects it.
+const RESPOND_MAX_TOKENS: u32 = 1024;
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 pub(crate) const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 480;
 const REQUEST_TIMEOUT_ENV: &str = "POSTIL_LLM_REQUEST_TIMEOUT_SECS";
