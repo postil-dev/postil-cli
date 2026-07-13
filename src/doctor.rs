@@ -5,11 +5,10 @@
 //! silently does nothing. Doctor checks each link in the chain and says
 //! exactly what to fix. Secret values are never printed.
 
-use anyhow::Result;
-use serde_json::json;
-
 use crate::api_key;
 use crate::config::Config;
+use crate::llm::LlmClient;
+use anyhow::Result;
 
 pub struct Check {
     pub name: &'static str,
@@ -59,43 +58,26 @@ pub async fn run(cfg: &Config) -> Result<Vec<Check>> {
         },
     });
 
-    // Live probe: a 1-token completion proves base URL + key + model in one shot.
+    // Live probe: a 1-token response proves base URL + key + model + selected
+    // API format in one shot. LlmClient also applies optional endpoint auth and
+    // redacts both secrets from any provider error body.
     if let Some(key) = key {
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()?;
-        let url = format!("{}/chat/completions", cfg.api_base.trim_end_matches('/'));
-        let resp = http
-            .post(&url)
-            .bearer_auth(&key)
-            .json(&json!({
-                "model": cfg.model,
-                "max_tokens": 1,
-                "messages": [{"role": "user", "content": "ping"}],
-            }))
-            .send()
-            .await;
-        let (ok, detail) = match resp {
-            Ok(r) if r.status().is_success() => (
+        let (ok, detail) = match LlmClient::doctor_probe(cfg, key).await {
+            Ok(()) => (
                 true,
-                format!("{} answered for model {}", cfg.api_base, cfg.model),
+                format!(
+                    "{} answered for model {} using {}",
+                    cfg.api_base,
+                    cfg.model,
+                    cfg.api_format.as_str()
+                ),
             ),
-            Ok(r) => {
-                let status = r.status();
-                let body = r.text().await.unwrap_or_default();
-                let snippet: String = body.chars().take(200).collect();
-                let hint = match status.as_u16() {
-                    401 | 403 => " (key rejected: wrong key for this endpoint?)",
-                    404 => " (404: wrong apiBase path or unknown model name?)",
-                    _ => "",
-                };
-                (false, format!("{status}{hint}: {snippet}"))
-            }
-            Err(e) => (
+            Err(error) => (
                 false,
                 format!(
-                    "cannot reach {} ({e}); check model.apiBase — for Ollama use http://localhost:11434/v1",
-                    cfg.api_base
+                    "cannot use {} as {} ({error:#}); check model.apiBase, model.apiFormat, credentials, and model name",
+                    cfg.api_base,
+                    cfg.api_format.as_str()
                 ),
             ),
         };

@@ -144,6 +144,17 @@ pub struct Usage {
     pub completion_tokens: u64,
 }
 
+/// Token usage attributed to one provider model attempt. Entries include
+/// successful generation/scoring calls and failed attempts that returned
+/// provider usage, so hosted accounting can price the complete review.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelUsage {
+    pub model: String,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Envelope {
@@ -167,6 +178,14 @@ pub struct Envelope {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub scorer_disagreements: Option<u32>,
     pub usage: Usage,
+    /// Per-model usage for exact provider pricing. Older v1 envelopes omit
+    /// this additive field and are handled conservatively by the control plane.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub model_usage: Vec<ModelUsage>,
+    /// False when any sent provider request can have unknown billed usage,
+    /// including timeouts and ambiguous transport failures.
+    #[serde(default)]
+    pub usage_accounting_complete: bool,
     /// Wall-clock duration of the review engine run in milliseconds.
     #[serde(default)]
     pub duration_ms: u64,
@@ -426,6 +445,8 @@ mod tests {
             scorer_error: None,
             scorer_disagreements: None,
             usage: Usage::default(),
+            model_usage: vec![],
+            usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
             head_sha: None,

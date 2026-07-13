@@ -6,16 +6,21 @@
 //! issues and pulls; Bitbucket and Azure DevOps are scoped to PRs (their issue
 //! trackers / work items use endpoints we cannot verify against a live host).
 
-use std::path::PathBuf;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, anyhow};
+use serde::Serialize;
 
 use crate::config::Config;
 use crate::diff;
 use crate::forge::{
     Forge, ThreadKind, azure::Azure, bitbucket::Bitbucket, github::GitHub, gitlab::GitLab,
 };
-use crate::llm::LlmClient;
+use crate::llm::{Answer, LlmClient};
 use crate::prompt;
 use crate::review::ForgeKind;
 
@@ -36,6 +41,115 @@ pub struct RespondArgs {
 }
 
 const MAX_DIFF_BYTES: usize = 200_000;
+const USAGE_RECEIPT_PATH_ENV: &str = "POSTIL_USAGE_RECEIPT_PATH";
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RespondUsageReceipt<'a> {
+    version: u32,
+    operation: &'static str,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    models: Vec<RespondModelUsage<'a>>,
+    usage_accounting_complete: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RespondModelUsage<'a> {
+    model: &'a str,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+}
+
+// PID separates concurrent processes; this sequence separates writers within
+// one process. create_new below also fails closed if a path already exists.
+static RECEIPT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct UsageReceiptWriter {
+    file: Option<File>,
+    temp_path: PathBuf,
+    final_path: PathBuf,
+}
+
+impl UsageReceiptWriter {
+    fn from_env() -> Result<Option<Self>> {
+        let Some(path) = std::env::var_os(USAGE_RECEIPT_PATH_ENV) else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            !path.is_empty(),
+            "{USAGE_RECEIPT_PATH_ENV} must not be empty"
+        );
+        let final_path = PathBuf::from(path);
+        let parent = final_path.parent().unwrap_or_else(|| Path::new("."));
+        let file_name = final_path
+            .file_name()
+            .ok_or_else(|| anyhow!("{USAGE_RECEIPT_PATH_ENV} must name a file"))?
+            .to_string_lossy();
+        let sequence = RECEIPT_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temp_path = parent.join(format!(
+            ".{file_name}.{}.{}.tmp",
+            std::process::id(),
+            sequence
+        ));
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            // Usage receipts contain private provider-accounting metadata.
+            .mode(0o600)
+            .open(&temp_path)
+            .context("creating private usage receipt temporary file")?;
+        Ok(Some(Self {
+            file: Some(file),
+            temp_path,
+            final_path,
+        }))
+    }
+
+    fn commit(mut self, answer: &Answer) -> Result<()> {
+        let receipt = RespondUsageReceipt {
+            version: 1,
+            operation: "respond",
+            prompt_tokens: answer.usage.prompt_tokens,
+            completion_tokens: answer.usage.completion_tokens,
+            models: answer
+                .models
+                .iter()
+                .map(|model| RespondModelUsage {
+                    model: &model.model,
+                    prompt_tokens: model.prompt_tokens,
+                    completion_tokens: model.completion_tokens,
+                })
+                .collect(),
+            usage_accounting_complete: answer.usage_accounting_complete,
+        };
+        let file = self.file.as_mut().expect("usage receipt file is present");
+        serde_json::to_writer(&mut *file, &receipt).context("serializing usage receipt")?;
+        file.write_all(b"\n").context("writing usage receipt")?;
+        // Publish only after file contents are durable. The directory sync
+        // below makes the rename durable before stdout or forge delivery.
+        file.sync_all().context("syncing usage receipt")?;
+        drop(self.file.take());
+        std::fs::rename(&self.temp_path, &self.final_path)
+            .context("atomically publishing usage receipt")?;
+        if let Some(parent) = self.final_path.parent() {
+            File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .context("syncing usage receipt directory")?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for UsageReceiptWriter {
+    fn drop(&mut self) {
+        // Drop cannot return cleanup errors. Best-effort removal is safe: an
+        // unpublished temp file is never treated as a committed receipt, and
+        // create_new prevents a later writer from clobbering it.
+        let _ = std::fs::remove_file(&self.temp_path);
+    }
+}
 
 pub async fn run(args: RespondArgs) -> Result<i32> {
     let cwd = std::env::current_dir()?;
@@ -54,6 +168,7 @@ pub async fn run(args: RespondArgs) -> Result<i32> {
         .or_else(|| std::env::var("POSTIL_COMMENT").ok())
         .filter(|c| !c.trim().is_empty())
         .ok_or_else(|| anyhow!("the mention text is required: --comment or POSTIL_COMMENT"))?;
+    let usage_receipt = UsageReceiptWriter::from_env()?;
 
     // The number the mention is on, and whether it is a PR/MR or an issue.
     let (number, kind) = match (args.pr, args.issue) {
@@ -75,6 +190,7 @@ pub async fn run(args: RespondArgs) -> Result<i32> {
                 kind,
                 &comment,
                 args.no_post,
+                usage_receipt,
             )
             .await
         }
@@ -87,6 +203,7 @@ pub async fn run(args: RespondArgs) -> Result<i32> {
                 kind,
                 &comment,
                 args.no_post,
+                usage_receipt,
             )
             .await
         }
@@ -99,6 +216,7 @@ pub async fn run(args: RespondArgs) -> Result<i32> {
                 kind,
                 &comment,
                 args.no_post,
+                usage_receipt,
             )
             .await
         }
@@ -111,6 +229,7 @@ pub async fn run(args: RespondArgs) -> Result<i32> {
                 kind,
                 &comment,
                 args.no_post,
+                usage_receipt,
             )
             .await
         }
@@ -127,6 +246,7 @@ async fn respond_with<F: Forge>(
     kind: ThreadKind,
     comment: &str,
     no_post: bool,
+    usage_receipt: Option<UsageReceiptWriter>,
 ) -> Result<i32> {
     let context = build_context(&forge, repo, number, kind).await?;
 
@@ -136,10 +256,19 @@ async fn respond_with<F: Forge>(
         comment.trim()
     );
     let client = LlmClient::from_env(cfg)?;
-    let (answer, model_used) = client.answer(cfg, &system, &user).await?;
+    let answer = client.answer(cfg, &system, &user).await?;
 
-    let reply = format!("{answer}\n\n<sub>Postil · {model_used}</sub>");
+    let reply = format!(
+        "{}\n\n<sub>Postil · {}</sub>",
+        answer.content, answer.model_used
+    );
 
+    // Hosted execution requires the durable usage receipt before any external
+    // delivery. Commit it before stdout or forge posting so the control plane
+    // can reconcile spend and own idempotent delivery.
+    if let Some(writer) = usage_receipt {
+        writer.commit(&answer)?;
+    }
     if no_post {
         println!("{reply}");
     } else {

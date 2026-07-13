@@ -142,13 +142,13 @@ gate:
 # contentPolicy:
 #   enabled: false
 model:
-  name: deepseek/deepseek-v4-pro
+  name: z-ai/glm-5.2
   cascade:
-    - google/gemini-3.1-flash-lite
     - moonshotai/kimi-k2.7-code
-    - mistralai/mistral-large-2512
+    - deepseek/deepseek-v4-flash
   scorer: anthropic/claude-haiku-4.5
   apiBase: https://openrouter.ai/api/v1    # ignored from config by default; see note below
+  apiFormat: openai-compatible             # or anthropic for the native Messages API
   consensus: 1            # >1: only findings multiple models agree on survive
 ```
 
@@ -160,18 +160,57 @@ single-user local setup where the checked-out repo is trusted, set
 `POSTIL_ALLOW_CONFIG_API_BASE=1` to honor the config value.
 
 Environment: `POSTIL_API_KEY`, `OPENROUTER_API_KEY`, `MODEL_API_KEY`, or
-`LLM_API_KEY`, `POSTIL_API_BASE`, `POSTIL_DETAILS_URL` (optional HTTP(S) target
-for GitHub check-run details links),
+`LLM_API_KEY`, `POSTIL_API_BASE`, `POSTIL_API_FORMAT` (`openai-compatible` by
+default, or `anthropic`), `POSTIL_ENDPOINT_AUTH_HEADER` and
+`POSTIL_ENDPOINT_AUTH_VALUE` (optional additional authentication for a private
+endpoint), `POSTIL_ALLOW_PRIVATE_API_BASE=1` (explicit opt-in for a local or
+private-network endpoint), `POSTIL_USAGE_RECEIPT_PATH` (optional worker-owned
+path for a successful `respond` usage receipt), `POSTIL_DETAILS_URL` (optional
+HTTP(S) target for GitHub check-run details links),
 `REVIEW_MODEL`, `REVIEW_MODEL_CASCADE`, `REVIEW_SCORER_MODEL`,
 `GITHUB_TOKEN`/`GITHUB_API_URL`,
 `GITLAB_TOKEN`/`GITLAB_API_URL`, `BITBUCKET_TOKEN`/`BITBUCKET_USER`/`BITBUCKET_API_URL`,
 `AZURE_DEVOPS_TOKEN`/`AZURE_DEVOPS_API_URL`.
 
+When `POSTIL_USAGE_RECEIPT_PATH` is set, `postil respond` creates that path with
+mode `0600` before provider access and writes JSON only after the reply succeeds.
+The version 1 receipt contains `operation: "respond"`, aggregate
+`promptTokens`/`completionTokens`, and a `models` array with token usage for each
+model that returned cost-relevant usage during cascade attempts. The receipt is
+synced before stdout or forge delivery, so a hosted worker can persist accounting
+before it posts an answer. `usageAccountingComplete` is false when a sent request
+can have unknown provider-billed usage, such as a timeout or ambiguous transport
+failure. The receipt is
+never written to stdout, stderr, or command arguments. The caller owns deletion.
+
 ## Models and local inference
 
 See the measured benchmark results at [postil.dev/docs/models](https://postil.dev/docs/models),
 which are sourced from the published bench aggregate. Any model served through an
-OpenAI-compatible endpoint works.
+OpenAI-compatible endpoint works. Native Anthropic Messages API endpoints also work:
+
+```sh
+POSTIL_API_BASE=https://api.anthropic.com/v1 \
+POSTIL_API_FORMAT=anthropic \
+MODEL_API_KEY=... \
+REVIEW_MODEL=claude-sonnet-4-6 \
+postil doctor
+```
+
+OpenAI-compatible requests use `Authorization: Bearer`; Anthropic requests use
+`x-api-key` and `anthropic-version`. A private gateway can require an additional
+header through `POSTIL_ENDPOINT_AUTH_HEADER` and `POSTIL_ENDPOINT_AUTH_VALUE`.
+Postil rejects additional-header names that collide with `x-api-key`,
+`anthropic-version`, or `content-type`. OpenAI-compatible endpoints also reserve
+`Authorization` for the provider key; Anthropic endpoints may use an additional
+`Authorization` value alongside their provider-owned `x-api-key`. Postil never
+prints credential values. Provider requests do not follow redirects. Postil
+resolves the API hostname once, rejects non-public addresses, and pins the HTTP
+client to the accepted addresses while retaining hostname-based TLS checks.
+
+The built-in scorer roster uses OpenRouter model identifiers, so native Anthropic
+skips implicit scoring. Set `model.scorer` or `REVIEW_SCORER_MODEL` to an
+Anthropic model identifier to enable scoring through a native Anthropic endpoint.
 
 Local endpoints use the same OpenAI-compatible contract:
 
@@ -179,25 +218,27 @@ Local endpoints use the same OpenAI-compatible contract:
 # Ollama
 ollama pull qwen3-coder:30b
 POSTIL_API_BASE=http://localhost:11434/v1 \
+POSTIL_ALLOW_PRIVATE_API_BASE=1 \
 MODEL_API_KEY=ollama \
 REVIEW_MODEL=qwen3-coder:30b \
 postil doctor
 
 # vLLM, SGLang, LiteLLM, or another local gateway
 POSTIL_API_BASE=http://localhost:8000/v1 \
+POSTIL_ALLOW_PRIVATE_API_BASE=1 \
 MODEL_API_KEY=local \
 REVIEW_MODEL=<served-model-name> \
 postil review --staged --output json
 ```
 
-Hosted remote reviews use a 240-second request timeout with a single timeout retry capped at 90 seconds, reducing unnecessary fallback to weaker models when the primary model is slow but working. The entire review model phase is capped at 420 seconds, with the remaining 120 seconds of the 540-second total LLM budget reserved for scoring inside the worker watchdog. A timeout triggers one automatic retry at the same model level before cascading to the next model. Local reviews default to a 480-second request timeout and do not use a total deadline unless `POSTIL_LLM_TOTAL_TIMEOUT_SECS` is set. Exhausting a review or total deadline is terminal.
+Hosted remote reviews use a 240-second initial request timeout with a single timeout retry capped at 90 seconds, reducing unnecessary fallback to weaker models when the primary model is slow but working. The entire review model phase is capped at 420 seconds, with the remaining 120 seconds of the 540-second total LLM budget reserved for scoring inside the worker watchdog. A timeout triggers one automatic retry at the same model level before cascading to the next model. Local reviews use a 480-second initial request timeout and the same timeout-retry rule, so a timed-out model can receive one additional attempt of up to 90 seconds. Local reviews do not have a total deadline unless `POSTIL_LLM_TOTAL_TIMEOUT_SECS` is set. Exhausting a review or total deadline is terminal.
 
 Use the live benchmark harness before standardizing on a model:
 
 ```sh
 cargo build --quiet --release
 cd bench
-MODEL_API_KEY=... REVIEW_MODEL=deepseek/deepseek-v4-pro bun run bench:live -- --json
+MODEL_API_KEY=... REVIEW_MODEL=z-ai/glm-5.2 bun run bench:live -- --json
 ```
 
 ## Preview a config change before deploying it
@@ -226,7 +267,12 @@ Bitbucket incremental reviews are disabled unless
 
 `--output json` prints a stable versioned envelope (`summary`, `silent`, `findings`,
 `resolved`, `counts`, `confidenceBuckets`, `gate`, `modelUsed`, scorer metadata,
-`usage`, SHAs) consumed by the hosted platform and `postil plan`. `--output yaml` and
+aggregate `usage`, per-model `modelUsage`, SHAs) consumed by the hosted platform
+and `postil plan`. `modelUsage` includes the successful generator, scorers, and
+token-bearing failed fallbacks; its totals equal aggregate `usage`. Older v1
+envelopes omit this additive field. Failed attempts that report zero tokens are
+omitted because they carry no billable usage. The envelope's
+`usageAccountingComplete` has the same conservative semantics. `--output yaml` and
 `--output csv` print the same review result in YAML or CSV. `--output-file <path>`
 writes the selected format to a file instead of stdout. `--output-json` is deprecated
 in v0.2.1 as an alias for `--output json` and emits a stderr warning. Schema:

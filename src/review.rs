@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow};
 
 use crate::config::{Config, GateLevel, OnError};
 use crate::diff::{self, DiffIndex};
-use crate::envelope::{Envelope, Finding, Gate, Kind, Usage, fail_closed_finding};
+use crate::envelope::{Envelope, Finding, Gate, Kind, ModelUsage, Usage, fail_closed_finding};
 use crate::filter;
 use crate::forge::{
     CheckState, Forge, PrMeta, azure::Azure, bitbucket::Bitbucket, github::GitHub, gitlab::GitLab,
@@ -560,6 +560,12 @@ fn apply_scorer_scores(cfg: &Config, findings: &mut [Finding], scores: Vec<Findi
     disagreements
 }
 
+fn suppress_below_min_confidence(cfg: &Config, findings: &mut Vec<Finding>) -> u32 {
+    let before = findings.len();
+    findings.retain(|finding| finding.confidence >= cfg.min_confidence);
+    (before - findings.len()) as u32
+}
+
 fn sort_findings_for_display(findings: &mut [Finding]) {
     findings.sort_by(|a, b| {
         b.severity
@@ -608,6 +614,8 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
     let mut summary = String::new();
     let mut model_used = "none (empty diff)".to_string();
     let mut usage = Usage::default();
+    let mut model_usage: Vec<ModelUsage> = Vec::new();
+    let mut usage_accounting_complete = true;
     let mut suppressed = 0u32;
     let mut ungrounded = 0u32;
     let mut findings: Vec<Finding> = Vec::new();
@@ -656,6 +664,8 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                 let outcome = filter::apply(cfg, &index, model_review.findings)?;
                 model_used = model_review.model_used;
                 usage = model_review.usage;
+                model_usage = model_review.model_usage;
+                usage_accounting_complete = model_review.usage_accounting_complete;
                 suppressed = outcome.suppressed;
                 ungrounded = outcome.ungrounded;
                 if outcome.all_ungrounded {
@@ -684,7 +694,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                     full_review_trustworthy = true;
                     summary = model_review.summary;
                     let mut kept = outcome.kept;
-                    if !kept.is_empty() {
+                    if !kept.is_empty() && cfg.scorer_enabled() {
                         let inputs = scorer_inputs(&parsed, &kept);
                         let scorer_system = prompt::scorer_system_prompt(cfg);
                         let scorer_user = prompt::scorer_user_prompt(&inputs);
@@ -697,9 +707,12 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                             Ok(Ok(scored)) => {
                                 let disagreements =
                                     apply_scorer_scores(cfg, &mut kept, scored.scores);
+                                suppressed += suppress_below_min_confidence(cfg, &mut kept);
                                 scorer_model = Some(scored.model_used);
                                 usage.prompt_tokens += scored.usage.prompt_tokens;
                                 usage.completion_tokens += scored.usage.completion_tokens;
+                                model_usage.extend(scored.model_usage);
+                                usage_accounting_complete &= scored.usage_accounting_complete;
                                 scorer_disagreements = Some(disagreements);
                                 sort_findings_for_display(&mut kept);
                             }
@@ -711,9 +724,12 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                                 let scorer_usage = e.usage();
                                 usage.prompt_tokens += scorer_usage.prompt_tokens;
                                 usage.completion_tokens += scorer_usage.completion_tokens;
+                                model_usage.extend_from_slice(e.model_usage());
+                                usage_accounting_complete &= e.usage_accounting_complete();
                                 scorer_error = Some(detail);
                             }
                             Err(_) => {
+                                usage_accounting_complete = false;
                                 let detail =
                                     format!("scorer timed out after {SCORER_TIMEOUT_SECS}s");
                                 eprintln!("postil: scorer failed open: {detail}");
@@ -727,6 +743,8 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
             Err(e) => {
                 model_used = cfg.model_chain().join(" -> ");
                 usage = e.usage();
+                model_usage = e.model_usage().to_vec();
+                usage_accounting_complete = e.usage_accounting_complete();
                 let detail = format!("{e:#}");
                 // Provider-class failures (outage, timeout) are the only ones
                 // `gate.onError: advisory` may stand aside for; unusable model
@@ -835,6 +853,8 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
         scorer_error,
         scorer_disagreements,
         usage,
+        model_usage,
+        usage_accounting_complete,
         duration_ms: review_started.elapsed().as_millis() as u64,
         base_sha: meta.map(|m| m.base_sha.clone()),
         head_sha,
@@ -1014,6 +1034,8 @@ fn error_envelope(
         scorer_error: None,
         scorer_disagreements: None,
         usage: Usage::default(),
+        model_usage: vec![],
+        usage_accounting_complete: true,
         duration_ms,
         base_sha: Some(meta.base_sha.clone()),
         head_sha: Some(head_sha.to_string()),
@@ -1201,6 +1223,28 @@ mod tests {
         assert_eq!(findings[0].kind, Kind::Risk);
         assert_eq!(findings[0].generator_kind, Some(Kind::Risk));
         assert_eq!(findings[0].scorer_kind, Some(Kind::Risk));
+    }
+
+    #[test]
+    fn scorer_confidence_below_policy_is_suppressed_after_calibration() {
+        let cfg = Config {
+            min_confidence: 0.6,
+            ..Config::default()
+        };
+        let mut findings = vec![finding("low.rs", 10, "low"), finding("kept.rs", 20, "kept")];
+
+        apply_scorer_scores(
+            &cfg,
+            &mut findings,
+            vec![score(0, 0.1, Kind::Risk), score(1, 0.8, Kind::Risk)],
+        );
+        let suppressed = suppress_below_min_confidence(&cfg, &mut findings);
+
+        assert_eq!(suppressed, 1);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].path, "kept.rs");
+        assert_eq!(findings[0].generator_confidence, Some(0.9));
+        assert_eq!(findings[0].scorer_confidence, Some(0.8));
     }
 
     #[test]

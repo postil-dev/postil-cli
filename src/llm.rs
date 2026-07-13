@@ -1,18 +1,21 @@
-//! OpenAI-compatible chat client with model cascade, one JSON-repair retry,
+//! OpenAI-compatible and native Anthropic chat client with model cascade, one JSON-repair retry,
 //! optional multi-model consensus, and fail-closed semantics.
 //!
-//! Works against OpenRouter (default), Ollama, vLLM, LiteLLM, Azure OpenAI, or
-//! any other endpoint that speaks `POST {base}/chat/completions`.
+//! OpenAI-compatible endpoints use `POST {base}/chat/completions` by default.
+//! Native Anthropic endpoints use `POST {base}/messages` when explicitly selected.
 
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
+use reqwest::header::{HeaderName, HeaderValue};
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::api_key;
-use crate::config::Config;
-use crate::envelope::{Finding, Kind, Usage};
+use crate::config::{ApiFormat, Config};
+use crate::envelope::{Finding, Kind, ModelUsage, Usage};
 
 #[derive(Debug, Clone)]
 pub struct ModelReview {
@@ -20,6 +23,8 @@ pub struct ModelReview {
     pub findings: Vec<Finding>,
     pub model_used: String,
     pub usage: Usage,
+    pub model_usage: Vec<ModelUsage>,
+    pub usage_accounting_complete: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -35,21 +40,47 @@ pub struct ScorerReview {
     pub scores: Vec<FindingScore>,
     pub model_used: String,
     pub usage: Usage,
+    pub model_usage: Vec<ModelUsage>,
+    pub usage_accounting_complete: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct Answer {
+    pub content: String,
+    pub model_used: String,
+    pub usage: Usage,
+    pub models: Vec<ModelUsage>,
+    pub usage_accounting_complete: bool,
 }
 
 #[derive(Debug)]
 pub struct ModelError {
     error: anyhow::Error,
     usage: Usage,
+    model_usage: Vec<ModelUsage>,
+    usage_accounting_complete: bool,
 }
 
 impl ModelError {
-    fn new(error: anyhow::Error, usage: Usage) -> Self {
-        Self { error, usage }
+    fn new(error: anyhow::Error, usage: Usage, usage_accounting_complete: bool) -> Self {
+        Self {
+            error,
+            usage,
+            model_usage: Vec::new(),
+            usage_accounting_complete,
+        }
     }
 
     pub fn usage(&self) -> Usage {
         self.usage
+    }
+
+    pub fn model_usage(&self) -> &[ModelUsage] {
+        &self.model_usage
+    }
+
+    pub fn usage_accounting_complete(&self) -> bool {
+        self.usage_accounting_complete
     }
 
     pub fn is_provider(&self) -> bool {
@@ -154,13 +185,22 @@ fn default_confidence() -> f64 {
 
 #[derive(Clone)]
 pub struct LlmClient {
-    http: reqwest::Client,
+    http: Arc<Mutex<Option<reqwest::Client>>>,
     api_base: String,
     api_key: String,
+    api_format: ApiFormat,
+    endpoint_auth: Option<EndpointAuth>,
     request_timeout: Duration,
     timeout_retry_timeout: Duration,
     review_deadline: Option<Instant>,
     total_deadline: Option<Instant>,
+}
+
+#[derive(Clone)]
+struct EndpointAuth {
+    name: HeaderName,
+    value: HeaderValue,
+    secret: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -184,9 +224,16 @@ const TIMEOUT_RETRY_CAP_SECS: u64 = 90;
 /// use their provider default.
 const REVIEW_MAX_TOKENS: u32 = 16384;
 const SCORER_MAX_TOKENS: u32 = 4096;
+const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 4096;
+const RESPOND_MAX_TOKENS: u32 = 4096;
+const ANTHROPIC_VERSION: &str = "2023-06-01";
 pub(crate) const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 480;
 const REQUEST_TIMEOUT_ENV: &str = "POSTIL_LLM_REQUEST_TIMEOUT_SECS";
 const TOTAL_TIMEOUT_ENV: &str = "POSTIL_LLM_TOTAL_TIMEOUT_SECS";
+const ENDPOINT_AUTH_HEADER_ENV: &str = "POSTIL_ENDPOINT_AUTH_HEADER";
+const ENDPOINT_AUTH_VALUE_ENV: &str = "POSTIL_ENDPOINT_AUTH_VALUE";
+const ALLOW_PRIVATE_API_BASE_ENV: &str = "POSTIL_ALLOW_PRIVATE_API_BASE";
+const ALWAYS_MANAGED_HEADERS: &[&str] = &["x-api-key", "anthropic-version", "content-type"];
 
 /// Marker context attached to transport/provider-level failures (endpoint
 /// unreachable, HTTP error status, timeout, malformed HTTP envelope) — the
@@ -208,6 +255,12 @@ fn retryable_status(status: u16) -> bool {
 
 fn timeout_status(status: u16) -> bool {
     matches!(status, 408 | 504)
+}
+
+fn reqwest_error(error: &anyhow::Error) -> Option<&reqwest::Error> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<reqwest::Error>())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -242,6 +295,23 @@ impl std::fmt::Display for RequestTimedOut {
 impl std::error::Error for RequestTimedOut {}
 
 impl LlmClient {
+    pub(crate) async fn doctor_probe(cfg: &Config, api_key: String) -> Result<()> {
+        let client = Self::build(cfg, api_key, Duration::from_secs(30), None, None)?;
+        let body = client.request_body(&cfg.model, "", "ping", Some(1), 0.0);
+        let (status, text) =
+            tokio::time::timeout(Duration::from_secs(30), client.request_once(&body))
+                .await
+                .map_err(|_| RequestTimedOut)??;
+        if !status.is_success() {
+            return Err(anyhow!(
+                "model endpoint returned {status}: {}",
+                client.safe_error_snippet(&text)
+            ));
+        }
+        client.parse_response(&text, &mut Usage::default())?;
+        Ok(())
+    }
+
     /// Local and interactive clients have no built-in total deadline. They only
     /// get one when POSTIL_LLM_TOTAL_TIMEOUT_SECS is explicitly set.
     pub fn from_env(cfg: &Config) -> Result<Self> {
@@ -290,13 +360,16 @@ impl LlmClient {
         review_deadline: Option<Instant>,
         total_deadline: Option<Instant>,
     ) -> Result<Self> {
+        let endpoint_auth = endpoint_auth_from_env(cfg.api_format)?;
         Ok(LlmClient {
             // The attempt timeout wraps both sending the request and consuming
             // the complete response body, so header and body stalls take the
             // same retry path.
-            http: reqwest::Client::builder().build()?,
+            http: Arc::new(Mutex::new(None)),
             api_base: cfg.api_base.trim_end_matches('/').to_string(),
             api_key,
+            api_format: cfg.api_format,
+            endpoint_auth,
             request_timeout,
             timeout_retry_timeout: request_timeout.min(Duration::from_secs(TIMEOUT_RETRY_CAP_SECS)),
             review_deadline,
@@ -346,17 +419,31 @@ impl LlmClient {
                 .collect();
             let mut ok: Vec<ModelReview> = Vec::new();
             let mut failed_usage = Usage::default();
+            let mut failed_model_usage = Vec::new();
+            let mut usage_accounting_complete = true;
             let mut last_err: Option<ModelError> = None;
             for (model, handle) in handles {
                 let model_log = log_text(&model);
                 match handle.await {
                     Ok(Ok(r)) => ok.push(r),
                     Ok(Err(mut e)) => {
+                        usage_accounting_complete &= e.usage_accounting_complete;
+                        if e.model_usage.is_empty()
+                            && (e.usage.prompt_tokens > 0 || e.usage.completion_tokens > 0)
+                        {
+                            e.model_usage.push(ModelUsage {
+                                model: model.clone(),
+                                prompt_tokens: e.usage.prompt_tokens,
+                                completion_tokens: e.usage.completion_tokens,
+                            });
+                        }
+                        failed_model_usage.extend(e.model_usage.clone());
                         add_usage(&mut failed_usage, e.usage);
                         e.usage = failed_usage;
                         last_err = Some(e);
                     }
                     Err(e) => {
+                        usage_accounting_complete = false;
                         eprintln!("postil: consensus model {model_log} task panicked: {e}")
                     }
                 }
@@ -365,27 +452,40 @@ impl LlmClient {
                 // Wrap the last failure so its error class (provider vs
                 // content) survives for gate.onError classification.
                 0 => Err(match last_err {
-                    Some(e) => ModelError::new(
-                        e.error.context(format!("all {n} consensus models failed")),
-                        failed_usage,
-                    ),
-                    None => {
-                        ModelError::new(anyhow!("all {n} consensus models failed"), failed_usage)
+                    Some(e) => {
+                        let mut error = ModelError::new(
+                            e.error.context(format!("all {n} consensus models failed")),
+                            failed_usage,
+                            usage_accounting_complete,
+                        );
+                        error.model_usage = failed_model_usage;
+                        error
                     }
+                    None => ModelError::new(
+                        anyhow!("all {n} consensus models failed"),
+                        failed_usage,
+                        usage_accounting_complete,
+                    ),
                 }),
                 1 => {
                     let mut review = ok.into_iter().next().unwrap();
                     add_usage(&mut review.usage, failed_usage);
+                    review.model_usage.extend(failed_model_usage);
+                    review.usage_accounting_complete &= usage_accounting_complete;
                     Ok(review)
                 }
                 _ => {
                     let mut review = consensus_merge(ok);
                     add_usage(&mut review.usage, failed_usage);
+                    review.model_usage.extend(failed_model_usage);
+                    review.usage_accounting_complete &= usage_accounting_complete;
                     Ok(review)
                 }
             }
         } else {
             let mut failed_usage = Usage::default();
+            let mut failed_model_usage = Vec::new();
+            let mut usage_accounting_complete = true;
             let mut last_err = None;
             for (index, model) in chain.iter().enumerate() {
                 let model_log = log_text(model);
@@ -398,9 +498,22 @@ impl LlmClient {
                             elapsed_text(started_at.elapsed())
                         );
                         add_usage(&mut r.usage, failed_usage);
+                        r.model_usage.splice(0..0, failed_model_usage);
+                        r.usage_accounting_complete &= usage_accounting_complete;
                         return Ok(r);
                     }
                     Err(mut e) => {
+                        usage_accounting_complete &= e.usage_accounting_complete;
+                        if e.model_usage.is_empty()
+                            && (e.usage.prompt_tokens > 0 || e.usage.completion_tokens > 0)
+                        {
+                            e.model_usage.push(ModelUsage {
+                                model: model.clone(),
+                                prompt_tokens: e.usage.prompt_tokens,
+                                completion_tokens: e.usage.completion_tokens,
+                            });
+                        }
+                        failed_model_usage.extend(e.model_usage.clone());
                         let elapsed = elapsed_text(started_at.elapsed());
                         if e.is_deadline_exceeded() {
                             add_usage(&mut failed_usage, e.usage);
@@ -408,6 +521,7 @@ impl LlmClient {
                             eprintln!(
                                 "postil: model {model_log} stopped after {elapsed}: {e}; cascade fallback is disabled after deadline exhaustion"
                             );
+                            e.model_usage = failed_model_usage;
                             return Err(e);
                         }
                         let has_fallback = index + 1 < chain.len();
@@ -439,23 +553,77 @@ impl LlmClient {
                 }
             }
             Err(last_err
-                .unwrap_or_else(|| ModelError::new(anyhow!("empty model chain"), failed_usage)))
+                .map(|mut error| {
+                    error.model_usage = failed_model_usage;
+                    error.usage_accounting_complete = usage_accounting_complete;
+                    error
+                })
+                .unwrap_or_else(|| {
+                    ModelError::new(anyhow!("empty model chain"), failed_usage, true)
+                }))
         }
     }
 
     /// Free-form answer (no JSON contract). Used by the interactive bot to reply
     /// to a maintainer's question or mention. Tries the model chain in order.
-    pub async fn answer(&self, cfg: &Config, system: &str, user: &str) -> Result<(String, String)> {
+    pub async fn answer(&self, cfg: &Config, system: &str, user: &str) -> Result<Answer> {
         let mut usage = Usage::default();
+        let mut models = Vec::new();
         let mut last_err = None;
+        let mut usage_accounting_complete = true;
         for model in cfg.model_chain() {
+            let mut model_usage = Usage::default();
+            let mut model_accounting_complete = true;
             match self
-                .chat(&model, system, user, &mut usage, None, LlmPhase::Total)
+                .chat(
+                    &model,
+                    system,
+                    user,
+                    &mut model_usage,
+                    &mut model_accounting_complete,
+                    Some(RESPOND_MAX_TOKENS),
+                    LlmPhase::Total,
+                )
                 .await
             {
-                Ok(content) => return Ok((content.trim().to_string(), model)),
+                Ok(content) => {
+                    usage_accounting_complete &= model_accounting_complete;
+                    add_usage(&mut usage, model_usage);
+                    models.push(ModelUsage {
+                        model: model.clone(),
+                        prompt_tokens: model_usage.prompt_tokens,
+                        completion_tokens: model_usage.completion_tokens,
+                    });
+                    return Ok(Answer {
+                        content: content.trim().to_string(),
+                        model_used: model,
+                        usage,
+                        models,
+                        usage_accounting_complete,
+                    });
+                }
                 Err(e) => {
+                    // Usage parsed from a provider response is complete even
+                    // when the response has no usable answer. A transport
+                    // failure with no response usage is ambiguous.
+                    if !model_accounting_complete
+                        || (model_usage.prompt_tokens == 0 && model_usage.completion_tokens == 0)
+                    {
+                        usage_accounting_complete = false;
+                    }
                     eprintln!("postil: model {model} failed: {e:#}");
+                    // Provider failures that report no tokens have no billable
+                    // usage to attribute. Omit them rather than emitting a
+                    // misleading accounting entry; token-bearing failures are
+                    // retained and priced by the hosted control plane.
+                    if model_usage.prompt_tokens > 0 || model_usage.completion_tokens > 0 {
+                        add_usage(&mut usage, model_usage);
+                        models.push(ModelUsage {
+                            model: model.clone(),
+                            prompt_tokens: model_usage.prompt_tokens,
+                            completion_tokens: model_usage.completion_tokens,
+                        });
+                    }
                     if e.downcast_ref::<DeadlineExceeded>().is_some() {
                         return Err(e);
                     }
@@ -474,6 +642,8 @@ impl LlmClient {
         expected_len: usize,
     ) -> std::result::Result<ScorerReview, ModelError> {
         let mut failed_usage = Usage::default();
+        let mut failed_model_usage = Vec::new();
+        let mut usage_accounting_complete = true;
         let mut last_err = None;
         let chain = cfg.scorer_chain();
         for (index, model) in chain.iter().enumerate() {
@@ -490,9 +660,22 @@ impl LlmClient {
                         elapsed_text(started_at.elapsed())
                     );
                     add_usage(&mut r.usage, failed_usage);
+                    r.model_usage.splice(0..0, failed_model_usage);
+                    r.usage_accounting_complete &= usage_accounting_complete;
                     return Ok(r);
                 }
                 Err(mut e) => {
+                    usage_accounting_complete &= e.usage_accounting_complete;
+                    if e.model_usage.is_empty()
+                        && (e.usage.prompt_tokens > 0 || e.usage.completion_tokens > 0)
+                    {
+                        e.model_usage.push(ModelUsage {
+                            model: model.clone(),
+                            prompt_tokens: e.usage.prompt_tokens,
+                            completion_tokens: e.usage.completion_tokens,
+                        });
+                    }
+                    failed_model_usage.extend(e.model_usage.clone());
                     let elapsed = elapsed_text(started_at.elapsed());
                     if e.is_deadline_exceeded() {
                         add_usage(&mut failed_usage, e.usage);
@@ -500,6 +683,7 @@ impl LlmClient {
                         eprintln!(
                             "postil: scorer {model_log} stopped after {elapsed}: {e}; scorer fallback is disabled after deadline exhaustion"
                         );
+                        e.model_usage = failed_model_usage;
                         return Err(e);
                     }
                     let has_fallback = index + 1 < chain.len();
@@ -529,7 +713,14 @@ impl LlmClient {
             }
         }
         Err(last_err
-            .unwrap_or_else(|| ModelError::new(anyhow!("empty scorer model chain"), failed_usage)))
+            .map(|mut error| {
+                error.model_usage = failed_model_usage;
+                error.usage_accounting_complete = usage_accounting_complete;
+                error
+            })
+            .unwrap_or_else(|| {
+                ModelError::new(anyhow!("empty scorer model chain"), failed_usage, true)
+            }))
     }
 
     async fn review_with_model(
@@ -539,17 +730,23 @@ impl LlmClient {
         user: &str,
     ) -> std::result::Result<ModelReview, ModelError> {
         let mut usage = Usage::default();
+        let mut usage_accounting_complete = true;
         let content = self
             .chat(
                 model,
                 system,
                 user,
                 &mut usage,
+                &mut usage_accounting_complete,
                 Some(REVIEW_MAX_TOKENS),
                 LlmPhase::Review,
             )
             .await
-            .map_err(|e| ModelError::new(e, usage))?;
+            .map_err(|e| {
+                let complete = usage_accounting_complete
+                    && (usage.prompt_tokens > 0 || usage.completion_tokens > 0);
+                ModelError::new(e, usage, complete)
+            })?;
         let raw = match parse_review(&content) {
             Ok(raw) => raw,
             Err(parse_err) => {
@@ -565,17 +762,25 @@ impl LlmClient {
                         "You repair malformed JSON. Output only valid JSON.",
                         &repair_user,
                         &mut usage,
+                        &mut usage_accounting_complete,
                         Some(REVIEW_MAX_TOKENS),
                         LlmPhase::Review,
                     )
                     .await
-                    .map_err(|e| ModelError::new(e.context("JSON repair call failed"), usage))?;
+                    .map_err(|e| {
+                        ModelError::new(e.context("JSON repair call failed"), usage, false)
+                    })?;
                 parse_review(&repaired).map_err(|e| {
-                    ModelError::new(anyhow!("model output invalid after repair: {e}"), usage)
+                    ModelError::new(
+                        anyhow!("model output invalid after repair: {e}"),
+                        usage,
+                        usage_accounting_complete,
+                    )
                 })?
             }
         };
         let mut review = into_review(raw, model, usage);
+        review.usage_accounting_complete = usage_accounting_complete;
 
         // Semantic consistency retry: a summary that narrates risk next to an
         // empty findings array is the contract violation behind "clean status,
@@ -591,28 +796,41 @@ impl LlmClient {
                  return exactly {{\"summary\": \"\", \"findings\": []}}."
             );
             let mut retry_usage = usage;
-            if let Ok(retried) = self
+            match self
                 .chat(
                     model,
                     system,
                     &retry_user,
                     &mut retry_usage,
+                    &mut usage_accounting_complete,
                     Some(REVIEW_MAX_TOKENS),
                     LlmPhase::Review,
                 )
                 .await
             {
-                review.usage = retry_usage;
-                if let Ok(retried_raw) = parse_review(&retried) {
-                    let candidate = into_review(retried_raw, model, retry_usage);
-                    let still_contradictory =
-                        candidate.findings.is_empty() && !candidate.summary.is_empty();
-                    if !still_contradictory {
-                        review = candidate;
+                Ok(retried) => {
+                    review.usage = retry_usage;
+                    review.usage_accounting_complete = usage_accounting_complete;
+                    if let Ok(retried_raw) = parse_review(&retried) {
+                        let mut candidate = into_review(retried_raw, model, retry_usage);
+                        candidate.usage_accounting_complete = usage_accounting_complete;
+                        let still_contradictory =
+                            candidate.findings.is_empty() && !candidate.summary.is_empty();
+                        if !still_contradictory {
+                            review = candidate;
+                        }
                     }
                 }
-            } else if let Err(error) = self.remaining_budget(LlmPhase::Review) {
-                return Err(ModelError::new(error.context(ProviderError), retry_usage));
+                Err(_) => {
+                    review.usage_accounting_complete = false;
+                    if let Err(error) = self.remaining_budget(LlmPhase::Review) {
+                        return Err(ModelError::new(
+                            error.context(ProviderError),
+                            retry_usage,
+                            false,
+                        ));
+                    }
+                }
             }
         }
         Ok(review)
@@ -626,39 +844,67 @@ impl LlmClient {
         expected_len: usize,
     ) -> std::result::Result<ScorerReview, ModelError> {
         let mut usage = Usage::default();
+        let mut usage_accounting_complete = true;
         let content = self
             .chat_with_temperature(
                 model,
                 system,
                 user,
                 &mut usage,
+                &mut usage_accounting_complete,
                 Some(SCORER_MAX_TOKENS),
                 0.0,
                 LlmPhase::Total,
             )
             .await
-            .map_err(|e| ModelError::new(e, usage))?;
-        let scores = parse_scores(&content, expected_len)
-            .map_err(|e| ModelError::new(anyhow!("scorer output invalid: {e}"), usage))?;
+            .map_err(|e| {
+                let complete = usage_accounting_complete
+                    && (usage.prompt_tokens > 0 || usage.completion_tokens > 0);
+                ModelError::new(e, usage, complete)
+            })?;
+        let scores = parse_scores(&content, expected_len).map_err(|e| {
+            ModelError::new(
+                anyhow!("scorer output invalid: {e}"),
+                usage,
+                usage_accounting_complete,
+            )
+        })?;
         Ok(ScorerReview {
             scores,
             model_used: model.to_string(),
             usage,
+            model_usage: vec![ModelUsage {
+                model: model.to_string(),
+                prompt_tokens: usage.prompt_tokens,
+                completion_tokens: usage.completion_tokens,
+            }],
+            usage_accounting_complete,
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn chat(
         &self,
         model: &str,
         system: &str,
         user: &str,
         usage: &mut Usage,
+        usage_accounting_complete: &mut bool,
         max_tokens: Option<u32>,
         phase: LlmPhase,
     ) -> Result<String> {
-        self.chat_with_temperature(model, system, user, usage, max_tokens, 0.1, phase)
-            .await
-            .map_err(|e| e.context(ProviderError))
+        self.chat_with_temperature(
+            model,
+            system,
+            user,
+            usage,
+            usage_accounting_complete,
+            max_tokens,
+            0.1,
+            phase,
+        )
+        .await
+        .map_err(|e| e.context(ProviderError))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -668,13 +914,23 @@ impl LlmClient {
         system: &str,
         user: &str,
         usage: &mut Usage,
+        usage_accounting_complete: &mut bool,
         max_tokens: Option<u32>,
         temperature: f64,
         phase: LlmPhase,
     ) -> Result<String> {
-        self.chat_inner(model, system, user, usage, max_tokens, temperature, phase)
-            .await
-            .map_err(|e| e.context(ProviderError))
+        self.chat_inner(
+            model,
+            system,
+            user,
+            usage,
+            usage_accounting_complete,
+            max_tokens,
+            temperature,
+            phase,
+        )
+        .await
+        .map_err(|e| e.context(ProviderError))
     }
 
     /// Transport + HTTP envelope handling; every error here is provider-class.
@@ -685,21 +941,15 @@ impl LlmClient {
         system: &str,
         user: &str,
         usage: &mut Usage,
+        usage_accounting_complete: &mut bool,
         max_tokens: Option<u32>,
         temperature: f64,
         phase: LlmPhase,
     ) -> Result<String> {
-        let mut body = json!({
-            "model": model,
-            "temperature": temperature,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-        });
-        if let Some(max_tokens) = max_tokens {
-            body["max_tokens"] = json!(max_tokens);
-        }
+        // This mutable flag is stack-local state held through one exclusively
+        // borrowed async call. Request retries run sequentially in this loop,
+        // so updating it before continuing or returning needs no atomic type.
+        let body = self.request_body(model, system, user, max_tokens, temperature);
         let mut retries = 0u32;
         let mut timeout_retries = 0u32;
         let mut attempt_timeout = self.request_timeout;
@@ -710,8 +960,12 @@ impl LlmClient {
             let timeout = remaining.map_or(attempt_timeout, |value| value.min(attempt_timeout));
             let response = match tokio::time::timeout(timeout, self.request_once(&body)).await {
                 Ok(result) => result,
-                Err(_) if deadline_limited => return Err(DeadlineExceeded(phase).into()),
+                Err(_) if deadline_limited => {
+                    *usage_accounting_complete = false;
+                    return Err(DeadlineExceeded(phase).into());
+                }
                 Err(_) => {
+                    *usage_accounting_complete = false;
                     if timeout_retries < TIMEOUT_RETRIES && retries < TRANSIENT_RETRIES {
                         retries += 1;
                         timeout_retries += 1;
@@ -735,11 +989,12 @@ impl LlmClient {
                     if status.is_success() {
                         break text;
                     }
-                    let snippet: String = text.chars().take(300).collect();
+                    let snippet = self.safe_error_snippet(&text);
                     if timeout_status(status.as_u16())
                         && timeout_retries < TIMEOUT_RETRIES
                         && retries < TRANSIENT_RETRIES
                     {
+                        *usage_accounting_complete = false;
                         retries += 1;
                         timeout_retries += 1;
                         let wait = Duration::from_secs(2 * retries as u64);
@@ -775,10 +1030,11 @@ impl LlmClient {
                     return Err(anyhow!("model endpoint returned {status}: {snippet}"));
                 }
                 Err(error)
-                    if error.is_timeout()
+                    if reqwest_error(&error).is_some_and(reqwest::Error::is_timeout)
                         && timeout_retries < TIMEOUT_RETRIES
                         && retries < TRANSIENT_RETRIES =>
                 {
+                    *usage_accounting_complete = false;
                     retries += 1;
                     timeout_retries += 1;
                     let wait = Duration::from_secs(2 * retries as u64);
@@ -792,7 +1048,11 @@ impl LlmClient {
                     self.sleep_with_budget(phase, wait).await?;
                     attempt_timeout = self.timeout_retry_timeout;
                 }
-                Err(error) if error.is_connect() && retries < TRANSIENT_RETRIES => {
+                Err(error)
+                    if reqwest_error(&error).is_some_and(reqwest::Error::is_connect)
+                        && retries < TRANSIENT_RETRIES =>
+                {
+                    *usage_accounting_complete = false;
                     retries += 1;
                     let wait = Duration::from_secs(2 * retries as u64);
                     eprintln!(
@@ -806,42 +1066,133 @@ impl LlmClient {
                     attempt_timeout = self.request_timeout;
                 }
                 Err(error) => {
-                    return Err(
-                        anyhow::Error::from(error).context("request to model endpoint failed")
-                    );
+                    return Err(error.context("request to model endpoint failed"));
                 }
             }
         };
-        let parsed: ChatResponse =
-            serde_json::from_str(&text).context("model endpoint returned non-JSON body")?;
-        if let Some(u) = parsed.usage {
-            usage.prompt_tokens += u.prompt_tokens.unwrap_or(0);
-            usage.completion_tokens += u.completion_tokens.unwrap_or(0);
+        self.parse_response(&text, usage)
+    }
+
+    fn request_body(
+        &self,
+        model: &str,
+        system: &str,
+        user: &str,
+        max_tokens: Option<u32>,
+        temperature: f64,
+    ) -> serde_json::Value {
+        match self.api_format {
+            ApiFormat::OpenaiCompatible => {
+                let mut body = json!({
+                    "model": model,
+                    "temperature": temperature,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                });
+                if let Some(max_tokens) = max_tokens {
+                    body["max_tokens"] = json!(max_tokens);
+                }
+                body
+            }
+            ApiFormat::Anthropic => json!({
+                "model": model,
+                "system": system,
+                "messages": [{"role": "user", "content": user}],
+                "max_tokens": max_tokens.unwrap_or(ANTHROPIC_DEFAULT_MAX_TOKENS),
+                "temperature": temperature,
+            }),
         }
-        parsed
-            .choices
-            .into_iter()
-            .next()
-            .and_then(|c| c.message.content)
-            .ok_or_else(|| anyhow!("model response had no choices/content"))
+    }
+
+    fn parse_response(&self, text: &str, usage: &mut Usage) -> Result<String> {
+        match self.api_format {
+            ApiFormat::OpenaiCompatible => {
+                let parsed: ChatResponse = serde_json::from_str(text)
+                    .context("model endpoint returned non-JSON OpenAI-compatible body")?;
+                if let Some(u) = parsed.usage {
+                    usage.prompt_tokens += u.prompt_tokens.unwrap_or(0);
+                    usage.completion_tokens += u.completion_tokens.unwrap_or(0);
+                }
+                parsed
+                    .choices
+                    .into_iter()
+                    .next()
+                    .and_then(|choice| choice.message.content)
+                    .ok_or_else(|| anyhow!("model response had no choices/content"))
+            }
+            ApiFormat::Anthropic => {
+                let parsed: AnthropicResponse = serde_json::from_str(text)
+                    .context("model endpoint returned non-JSON Anthropic body")?;
+                if let Some(u) = parsed.usage {
+                    usage.prompt_tokens += u.input_tokens.unwrap_or(0);
+                    usage.completion_tokens += u.output_tokens.unwrap_or(0);
+                }
+                let content = parsed
+                    .content
+                    .into_iter()
+                    .filter(|block| block.kind == "text")
+                    .filter_map(|block| block.text)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if content.is_empty() {
+                    Err(anyhow!("model response had no text content blocks"))
+                } else {
+                    Ok(content)
+                }
+            }
+        }
+    }
+
+    fn safe_error_snippet(&self, text: &str) -> String {
+        let mut redacted = text.replace(&self.api_key, "[REDACTED]");
+        if let Some(auth) = &self.endpoint_auth {
+            redacted = redacted.replace(&auth.secret, "[REDACTED]");
+        }
+        redacted.chars().take(300).collect()
     }
 
     async fn request_once(
         &self,
         body: &serde_json::Value,
-    ) -> std::result::Result<(reqwest::StatusCode, String), reqwest::Error> {
-        let response = self
-            .http
-            .post(format!("{}/chat/completions", self.api_base))
-            .bearer_auth(&self.api_key)
-            .header("HTTP-Referer", "https://postil.dev")
-            .header("X-Title", "Postil")
-            .json(body)
-            .send()
-            .await?;
+    ) -> Result<(reqwest::StatusCode, String)> {
+        let http = self.http_client()?;
+        let mut request = match self.api_format {
+            ApiFormat::OpenaiCompatible => {
+                let url = format!("{}/chat/completions", self.api_base);
+                http.post(&url)
+                    .bearer_auth(&self.api_key)
+                    .header("HTTP-Referer", "https://postil.dev")
+                    .header("X-Title", "Postil")
+            }
+            ApiFormat::Anthropic => {
+                let url = format!("{}/messages", self.api_base);
+                http.post(&url)
+                    .header("x-api-key", &self.api_key)
+                    .header("anthropic-version", ANTHROPIC_VERSION)
+            }
+        };
+        if let Some(auth) = &self.endpoint_auth {
+            request = request.header(auth.name.clone(), auth.value.clone());
+        }
+        let response = request.json(body).send().await?;
         let status = response.status();
         let text = response.text().await?;
         Ok((status, text))
+    }
+
+    fn http_client(&self) -> Result<reqwest::Client> {
+        let mut client = self
+            .http
+            .lock()
+            .map_err(|_| anyhow!("model provider HTTP client lock is poisoned"))?;
+        if let Some(client) = client.as_ref() {
+            return Ok(client.clone());
+        }
+        let built = secure_http_client(&self.api_base)?;
+        *client = Some(built.clone());
+        Ok(built)
     }
 
     fn remaining_budget(&self, phase: LlmPhase) -> Result<Option<Duration>> {
@@ -927,6 +1278,181 @@ struct Message {
 struct ChatUsage {
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicResponse {
+    #[serde(default)]
+    content: Vec<AnthropicContentBlock>,
+    usage: Option<AnthropicUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicContentBlock {
+    #[serde(rename = "type")]
+    kind: String,
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicUsage {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+}
+
+fn secure_http_client(api_base: &str) -> Result<reqwest::Client> {
+    let (hostname, addresses) = resolve_api_endpoint(api_base)?;
+    reqwest::Client::builder()
+        // Provider credentials and prompts must never follow an endpoint's
+        // redirect to another origin or into an internal network.
+        .redirect(reqwest::redirect::Policy::none())
+        // Connect only to the addresses approved by the single resolution
+        // above. Reqwest retains the URL hostname for TLS SNI/certificate
+        // verification while replacing DNS lookup results with this set.
+        .resolve_to_addrs(&hostname, &addresses)
+        .build()
+        .context("build model provider HTTP client")
+}
+
+fn resolve_api_endpoint(api_base: &str) -> Result<(String, Vec<SocketAddr>)> {
+    resolve_api_endpoint_with(api_base, |hostname, port| {
+        (hostname, port)
+            .to_socket_addrs()
+            .map(|items| items.collect())
+    })
+}
+
+fn resolve_api_endpoint_with<F>(api_base: &str, resolver: F) -> Result<(String, Vec<SocketAddr>)>
+where
+    F: FnOnce(&str, u16) -> std::io::Result<Vec<SocketAddr>>,
+{
+    let url = reqwest::Url::parse(api_base).context("model API base must be an absolute URL")?;
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https"),
+        "model API base must use HTTP or HTTPS"
+    );
+    anyhow::ensure!(
+        url.username().is_empty() && url.password().is_none(),
+        "model API base must not contain credentials"
+    );
+    let hostname = url
+        .host_str()
+        .filter(|hostname| !hostname.is_empty())
+        .context("model API base must include a hostname")?
+        .to_string();
+    let port = url
+        .port_or_known_default()
+        .context("model API base must include a port for its URL scheme")?;
+    let addresses = resolver(&hostname, port)
+        .with_context(|| format!("model API hostname {hostname:?} could not be resolved"))?;
+    anyhow::ensure!(
+        !addresses.is_empty(),
+        "model API hostname {hostname:?} did not resolve to any addresses"
+    );
+    let allow_private = std::env::var(ALLOW_PRIVATE_API_BASE_ENV)
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !allow_private {
+        for address in &addresses {
+            anyhow::ensure!(
+                is_public_ip(address.ip()),
+                "model API hostname {hostname:?} resolved to a private, loopback, link-local, or non-public address"
+            );
+        }
+    }
+    Ok((hostname, addresses))
+}
+
+fn is_public_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => is_public_ipv4(address),
+        IpAddr::V6(address) => is_public_ipv6(address),
+    }
+}
+
+fn is_public_ipv4(address: Ipv4Addr) -> bool {
+    let [a, b, c, _] = address.octets();
+    !(a == 0
+        || a == 10
+        || a == 127
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 169 && b == 254)
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && b == 0 && c == 0)
+        || (a == 192 && b == 0 && c == 2)
+        || (a == 192 && b == 168)
+        || (a == 198 && (b == 18 || b == 19))
+        || (a == 198 && b == 51 && c == 100)
+        || (a == 203 && b == 0 && c == 113)
+        || a >= 224)
+}
+
+fn is_public_ipv6(address: Ipv6Addr) -> bool {
+    if let Some(mapped) = address.to_ipv4_mapped() {
+        return is_public_ipv4(mapped);
+    }
+    let segments = address.segments();
+    // Deprecated IPv4-compatible addresses retain the embedded IPv4's
+    // reachability semantics even though they are not `::ffff:` mapped.
+    if segments[..6].iter().all(|segment| *segment == 0) {
+        return false;
+    }
+    // The well-known NAT64 prefix embeds the destination IPv4 in the final
+    // 32 bits. Reject it when it would translate to a non-public destination.
+    if segments[..6] == [0x0064, 0xff9b, 0, 0, 0, 0] {
+        return is_public_ipv4(Ipv4Addr::new(
+            (segments[6] >> 8) as u8,
+            segments[6] as u8,
+            (segments[7] >> 8) as u8,
+            segments[7] as u8,
+        ));
+    }
+    !(address.is_unspecified()
+        || address.is_loopback()
+        || address.is_multicast()
+        || (segments[0] & 0xfe00) == 0xfc00
+        || (segments[0] & 0xffc0) == 0xfe80
+        || (segments[0] & 0xffc0) == 0xfec0
+        || (segments[0] == 0x2001 && segments[1] == 0x0db8))
+}
+
+fn endpoint_auth_from_env(api_format: ApiFormat) -> Result<Option<EndpointAuth>> {
+    let header = std::env::var(ENDPOINT_AUTH_HEADER_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let value = std::env::var(ENDPOINT_AUTH_VALUE_ENV)
+        .ok()
+        .filter(|value| !value.is_empty());
+    match (header, value) {
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(anyhow!(
+            "{ENDPOINT_AUTH_VALUE_ENV} must be set when {ENDPOINT_AUTH_HEADER_ENV} is set"
+        )),
+        (None, Some(_)) => Err(anyhow!(
+            "{ENDPOINT_AUTH_HEADER_ENV} must be set when {ENDPOINT_AUTH_VALUE_ENV} is set"
+        )),
+        (Some(header), Some(secret)) => {
+            let normalized = header.trim().to_ascii_lowercase();
+            anyhow::ensure!(
+                !(ALWAYS_MANAGED_HEADERS.contains(&normalized.as_str())
+                    || (api_format == ApiFormat::OpenaiCompatible
+                        && normalized == "authorization")),
+                "{ENDPOINT_AUTH_HEADER_ENV} cannot override provider-managed header {header:?}"
+            );
+            let name = HeaderName::from_bytes(header.trim().as_bytes()).with_context(|| {
+                format!("{ENDPOINT_AUTH_HEADER_ENV} is not a valid HTTP header name")
+            })?;
+            let mut value = HeaderValue::from_bytes(secret.as_bytes()).with_context(|| {
+                format!("{ENDPOINT_AUTH_VALUE_ENV} is not a valid HTTP header value")
+            })?;
+            value.set_sensitive(true);
+            Ok(Some(EndpointAuth {
+                name,
+                value,
+                secret,
+            }))
+        }
+    }
 }
 
 /// Extract and validate the review JSON from model text. Tolerates code fences
@@ -1086,6 +1612,12 @@ fn into_review(raw: RawReview, model: &str, usage: Usage) -> ModelReview {
         findings,
         model_used: model.to_string(),
         usage,
+        model_usage: vec![ModelUsage {
+            model: model.to_string(),
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+        }],
+        usage_accounting_complete: true,
     }
 }
 
@@ -1100,6 +1632,8 @@ fn consensus_merge(runs: Vec<ModelReview>) -> ModelReview {
         completion_tokens: runs.iter().map(|r| r.usage.completion_tokens).sum(),
     };
     let models: Vec<String> = runs.iter().map(|r| r.model_used.clone()).collect();
+    let model_usage = runs.iter().flat_map(|r| r.model_usage.clone()).collect();
+    let usage_accounting_complete = runs.iter().all(|r| r.usage_accounting_complete);
     let summary = runs[0].summary.clone();
     // Flatten in run order; greedy clustering then anchors each cluster on its
     // earliest report.
@@ -1141,6 +1675,8 @@ fn consensus_merge(runs: Vec<ModelReview>) -> ModelReview {
         findings: kept,
         model_used: format!("consensus({})", models.join(", ")),
         usage: total_usage,
+        model_usage,
+        usage_accounting_complete,
     }
 }
 
@@ -1184,6 +1720,87 @@ mod tests {
             log_text("model\nnext\r\t\u{1b}[31m"),
             r"model\nnext\r\t\u{1b}[31m"
         );
+    }
+
+    #[test]
+    fn endpoint_auth_rejects_headers_managed_by_each_api_format() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvRestore::capture(&[ENDPOINT_AUTH_HEADER_ENV, ENDPOINT_AUTH_VALUE_ENV]);
+        EnvRestore::set(ENDPOINT_AUTH_VALUE_ENV, "secret-value");
+        for name in ["X-API-Key", "Anthropic-Version", "Content-Type"] {
+            EnvRestore::set(ENDPOINT_AUTH_HEADER_ENV, name);
+            for format in [ApiFormat::OpenaiCompatible, ApiFormat::Anthropic] {
+                let error = endpoint_auth_from_env(format)
+                    .err()
+                    .expect("collision rejected");
+                assert!(error.to_string().contains("provider-managed header"));
+                assert!(!error.to_string().contains("secret-value"));
+            }
+        }
+
+        EnvRestore::set(ENDPOINT_AUTH_HEADER_ENV, "Authorization");
+        let openai_error = endpoint_auth_from_env(ApiFormat::OpenaiCompatible)
+            .err()
+            .expect("OpenAI-compatible Authorization collision rejected");
+        assert!(openai_error.to_string().contains("provider-managed header"));
+        assert!(!openai_error.to_string().contains("secret-value"));
+
+        let anthropic = endpoint_auth_from_env(ApiFormat::Anthropic)
+            .unwrap()
+            .expect("Anthropic additional Authorization accepted");
+        assert_eq!(anthropic.name, reqwest::header::AUTHORIZATION);
+        assert_eq!(anthropic.value, "secret-value");
+    }
+
+    #[test]
+    fn api_endpoint_resolution_rejects_any_non_public_result() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvRestore::capture(&[ALLOW_PRIVATE_API_BASE_ENV]);
+        EnvRestore::remove(ALLOW_PRIVATE_API_BASE_ENV);
+        let error = resolve_api_endpoint_with("https://models.example/v1", |hostname, port| {
+            assert_eq!(hostname, "models.example");
+            assert_eq!(port, 443);
+            Ok(vec![
+                "8.8.8.8:443".parse().unwrap(),
+                "169.254.169.254:443".parse().unwrap(),
+            ])
+        })
+        .expect_err("a mixed public/private DNS answer must fail closed");
+        assert!(error.to_string().contains("non-public address"));
+    }
+
+    #[test]
+    fn api_endpoint_resolution_preserves_public_addresses_for_pinning() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvRestore::capture(&[ALLOW_PRIVATE_API_BASE_ENV]);
+        EnvRestore::remove(ALLOW_PRIVATE_API_BASE_ENV);
+        let expected = vec![
+            "8.8.8.8:8443".parse().unwrap(),
+            "[2606:4700:4700::1111]:8443".parse().unwrap(),
+        ];
+        let (hostname, addresses) = resolve_api_endpoint_with(
+            "https://models.example:8443/v1",
+            |_, _| Ok(expected.clone()),
+        )
+        .unwrap();
+        assert_eq!(hostname, "models.example");
+        assert_eq!(addresses, expected);
+    }
+
+    #[test]
+    fn api_endpoint_rejects_ipv4_mapped_compatible_and_nat64_private_targets() {
+        for address in [
+            "::ffff:127.0.0.1",
+            "::a00:1",
+            "64:ff9b::a9fe:a9fe",
+            "fec0::1",
+        ] {
+            assert!(
+                !is_public_ip(address.parse().unwrap()),
+                "accepted {address}"
+            );
+        }
+        assert!(is_public_ip("64:ff9b::808:808".parse().unwrap()));
     }
 
     impl Drop for EnvRestore {
@@ -1503,6 +2120,8 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 5,
             },
+            model_usage: vec![],
+            usage_accounting_complete: true,
         }
     }
 

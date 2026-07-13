@@ -22,8 +22,12 @@ acquire diff ──> parse + index ──> prompt ──> model (cascade/consens
 - `filter.rs` — grounding (uncited findings dropped; all-uncited = untrusted run),
   policy suppression (ignore globs, severityThreshold, minConfidence, maxFindings), and
   baseline reconciliation (resolved / carried) for incremental reviews.
-- `llm.rs` — OpenAI-compatible client; model cascade on failure, one JSON-repair retry,
-  optional N-model consensus (agreement by path + line proximity).
+- `llm.rs` — shared model transport for OpenAI-compatible chat completions and the
+  native Anthropic Messages API; model cascade on failure, one JSON-repair retry,
+  optional N-model consensus (agreement by path + line proximity). Request construction
+  and response decoding vary by API format while retry, timeout, deadline, cascade, and
+  secret-redaction semantics remain shared. Optional private-endpoint authentication is
+  a separate header whose name cannot collide with provider-managed headers.
 - `review.rs` — orchestration; owns fail-closed semantics (`fail_closed_finding`) and
   check-run lifecycle ordering (checks are created before the model runs so a crash can
   still be reported against them).
@@ -41,7 +45,8 @@ acquire diff ──> parse + index ──> prompt ──> model (cascade/consens
   Exception to precedence: `model.apiBase` from a config file is ignored by
   default (a repo could redirect the base URL that receives the inference
   credential); honored only with `POSTIL_ALLOW_CONFIG_API_BASE=1`. The
-  `POSTIL_API_BASE` environment variable is always applied.
+  `POSTIL_API_BASE` environment variable is always applied. `model.apiFormat` and
+  `POSTIL_API_FORMAT` select `openai-compatible` (default) or `anthropic`.
 
 ## Prompt-injected policy sources
 

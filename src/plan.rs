@@ -173,6 +173,8 @@ mod tests {
             scorer_error: None,
             scorer_disagreements: None,
             usage: Usage::default(),
+            model_usage: vec![],
+            usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
             head_sha: None,

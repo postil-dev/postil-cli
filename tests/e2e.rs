@@ -59,6 +59,31 @@ fn llm_text(text: &str) -> Value {
     })
 }
 
+fn anthropic_content(findings: Value, input_tokens: u64, output_tokens: u64) -> Value {
+    let summary = if findings.as_array().is_none_or(|items| items.is_empty()) {
+        ""
+    } else {
+        "SQL injection risk in auth path."
+    };
+    json!({
+        "content": [
+            {"type": "thinking", "thinking": "omitted"},
+            {"type": "text", "text": json!({
+                "summary": summary,
+                "findings": findings
+            }).to_string()}
+        ],
+        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
+    })
+}
+
+fn anthropic_text(text: &str, input_tokens: u64, output_tokens: u64) -> Value {
+    json!({
+        "content": [{"type": "text", "text": text}],
+        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
+    })
+}
+
 fn finding_at(line: u32, severity: &str, confidence: f64) -> Value {
     json!({
         "path": "src/auth.rs",
@@ -108,11 +133,358 @@ fn postil() -> Command {
         .env_remove("OPENROUTER_API_KEY")
         .env_remove("POSTIL_API_KEY")
         .env_remove("POSTIL_API_BASE")
+        .env_remove("POSTIL_API_FORMAT")
+        .env_remove("POSTIL_ENDPOINT_AUTH_HEADER")
+        .env_remove("POSTIL_ENDPOINT_AUTH_VALUE")
+        .env_remove("POSTIL_ALLOW_PRIVATE_API_BASE")
         .env_remove("POSTIL_DETAILS_URL")
         .env_remove("GITHUB_SERVER_URL")
         .env_remove("POSTIL_ENABLE_BITBUCKET_INCREMENTAL")
-        .env("MODEL_API_KEY", "test-key");
+        .env("MODEL_API_KEY", "test-key")
+        // Mock providers bind loopback. Production and normal CLI invocations
+        // reject private API endpoints unless this explicit local-only escape
+        // hatch is set by the caller.
+        .env("POSTIL_ALLOW_PRIVATE_API_BASE", "1");
     cmd
+}
+
+#[tokio::test]
+async fn native_anthropic_review_uses_messages_shape_auth_and_usage() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .and(header("x-api-key", "anthropic-provider-key"))
+        .and(header("anthropic-version", "2023-06-01"))
+        .and(header("authorization", "Bearer private-endpoint-secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_content(json!([]), 11, 7)))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("MODEL_API_KEY", "anthropic-provider-key")
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_API_FORMAT", "anthropic")
+        .env("POSTIL_ENDPOINT_AUTH_HEADER", "Authorization")
+        .env(
+            "POSTIL_ENDPOINT_AUTH_VALUE",
+            "Bearer private-endpoint-secret",
+        )
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .success();
+
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["usage"]["promptTokens"], 11);
+    assert_eq!(envelope["usage"]["completionTokens"], 7);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let body: Value = requests[0].body_json().unwrap();
+    assert!(body["system"].as_str().is_some());
+    assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(body["messages"][0]["role"], "user");
+    assert_eq!(body["max_tokens"], 16384);
+    assert!(body.get("choices").is_none());
+}
+
+#[tokio::test]
+async fn native_anthropic_findings_skip_incompatible_default_scorer() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .and(header("x-api-key", "anthropic-provider-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_content(
+            json!([finding_at(42, "warn", 0.9)]),
+            17,
+            9,
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("MODEL_API_KEY", "anthropic-provider-key")
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_API_FORMAT", "anthropic")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .success();
+
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["findings"].as_array().unwrap().len(), 1);
+    assert!(envelope["scorerModel"].is_null());
+    assert!(envelope["scorerError"].is_null());
+    assert_eq!(envelope["usage"]["promptTokens"], 17);
+    assert_eq!(envelope["usage"]["completionTokens"], 9);
+}
+
+#[tokio::test]
+async fn native_anthropic_findings_use_explicit_native_scorer() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .and(body_string_contains("\"model\":\"claude-sonnet-4-6\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_content(
+            json!([finding_at(42, "warn", 0.9)]),
+            17,
+            9,
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .and(body_string_contains("\"model\":\"claude-haiku-4-5\""))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(anthropic_text(
+                &json!([{
+                    "index": 0,
+                    "confidence": 0.82,
+                    "kind": "risk",
+                    "reason": "The changed line contains the reported flow."
+                }])
+                .to_string(),
+                5,
+                3,
+            )),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("MODEL_API_KEY", "anthropic-provider-key")
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_API_FORMAT", "anthropic")
+        .env("REVIEW_MODEL", "claude-sonnet-4-6")
+        .env("REVIEW_SCORER_MODEL", "claude-haiku-4-5")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .success();
+
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["scorerModel"], "claude-haiku-4-5");
+    assert_eq!(envelope["findings"][0]["scorerConfidence"], 0.82);
+    assert_eq!(envelope["usage"]["promptTokens"], 22);
+    assert_eq!(envelope["usage"]["completionTokens"], 12);
+}
+
+#[tokio::test]
+async fn openai_compatible_rejects_additional_authorization_without_leaking() {
+    let server = MockServer::start().await;
+    let endpoint_secret = "Bearer endpoint-secret-never-print";
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_ENDPOINT_AUTH_HEADER", "Authorization")
+        .env("POSTIL_ENDPOINT_AUTH_VALUE", endpoint_secret)
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .code(2);
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout);
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(!stdout.contains(endpoint_secret));
+    assert!(!stderr.contains(endpoint_secret));
+    assert!(stderr.contains("cannot override provider-managed header"));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn native_anthropic_retries_transient_status_with_the_same_shape() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .respond_with(ResponseTemplate::new(529).set_body_string("overloaded"))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_content(json!([]), 3, 2)))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_API_FORMAT", "anthropic")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(stderr.contains("retryable HTTP 529"));
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.url.path() == "/messages")
+    );
+}
+
+#[tokio::test]
+async fn provider_errors_redact_provider_and_endpoint_auth_secrets() {
+    let server = MockServer::start().await;
+    let provider_secret = "provider-secret-never-print";
+    let endpoint_secret = "endpoint-secret-never-print";
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .respond_with(ResponseTemplate::new(401).set_body_string(format!(
+            "bad credentials: {provider_secret} and {endpoint_secret}"
+        )))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("MODEL_API_KEY", provider_secret)
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_API_FORMAT", "anthropic")
+        .env("POSTIL_ENDPOINT_AUTH_HEADER", "X-Private-Endpoint-Token")
+        .env("POSTIL_ENDPOINT_AUTH_VALUE", endpoint_secret)
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .code(1);
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout);
+    assert!(!stderr.contains(provider_secret));
+    assert!(!stderr.contains(endpoint_secret));
+    assert!(!stdout.contains(provider_secret));
+    assert!(!stdout.contains(endpoint_secret));
+    assert!(stderr.contains("[REDACTED]"));
+    assert!(stdout.contains("[REDACTED]"));
+}
+
+#[tokio::test]
+async fn doctor_probes_native_anthropic_format() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "content": [{"type": "text", "text": "p"}],
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        })))
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_API_FORMAT", "anthropic")
+        .arg("doctor")
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(stderr.contains("using anthropic"));
+}
+
+#[tokio::test]
+async fn doctor_probes_openai_compatible_format_by_default() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(header("authorization", "Bearer test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_text("p")))
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .arg("doctor")
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(stderr.contains("using openai-compatible"));
+}
+
+#[tokio::test]
+async fn doctor_does_not_follow_provider_redirect_or_forward_auth() {
+    let redirect_target = MockServer::start().await;
+    let provider = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(header("authorization", "Bearer provider-secret"))
+        .and(header("x-private-endpoint-token", "endpoint-secret"))
+        .respond_with(
+            ResponseTemplate::new(307)
+                .insert_header("Location", format!("{}/captured", redirect_target.uri())),
+        )
+        .expect(1)
+        .mount(&provider)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let out = postil()
+        .current_dir(dir.path())
+        .env("MODEL_API_KEY", "provider-secret")
+        .env("POSTIL_API_BASE", provider.uri())
+        .env("POSTIL_ENDPOINT_AUTH_HEADER", "X-Private-Endpoint-Token")
+        .env("POSTIL_ENDPOINT_AUTH_VALUE", "endpoint-secret")
+        .arg("doctor")
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(stderr.contains("307"));
+    assert!(!stderr.contains("provider-secret"));
+    assert!(!stderr.contains("endpoint-secret"));
+    assert!(
+        redirect_target
+            .received_requests()
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 fn write_diff(dir: &std::path::Path) -> std::path::PathBuf {
@@ -189,6 +561,16 @@ async fn local_review_reports_grounded_finding_and_gates() {
     assert_eq!(env["gate"]["failing"], true);
     assert_eq!(env["counts"]["error"], 1);
     assert_eq!(env["usage"]["promptTokens"], 300);
+    assert_eq!(env["usageAccountingComplete"], true);
+    let model_usage = env["modelUsage"].as_array().unwrap();
+    assert!(!model_usage.is_empty());
+    assert_eq!(
+        model_usage
+            .iter()
+            .map(|entry| entry["promptTokens"].as_u64().unwrap())
+            .sum::<u64>(),
+        env["usage"]["promptTokens"].as_u64().unwrap()
+    );
 
     let requests = server.received_requests().await.unwrap();
     let request: Value = requests[0].body_json().unwrap();
@@ -319,6 +701,54 @@ async fn scorer_lowers_confidence_and_stores_both_values() {
 }
 
 #[tokio::test]
+async fn scorer_confidence_below_minimum_is_suppressed_and_nonblocking() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("generator-model"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(llm_content(json!([finding_at(41, "error", 0.92)]))),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("anthropic/claude-haiku-4.5"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(scorer_content(json!([{
+                "index": 0,
+                "confidence": 0.1,
+                "kind": "risk",
+                "reason": "independent evidence does not support the generator claim"
+            }]))),
+        )
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".postil.yaml"), "minConfidence: 0.6\n").unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "generator-model")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .code(0);
+
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["findings"].as_array().unwrap().len(), 0);
+    assert_eq!(envelope["silent"], true);
+    assert_eq!(envelope["gate"]["failing"], false);
+    assert_eq!(envelope["counts"]["error"], 0);
+    assert_eq!(envelope["counts"]["suppressed"], 1);
+    assert_eq!(envelope["scorerModel"], "anthropic/claude-haiku-4.5");
+}
+
+#[tokio::test]
 async fn slow_scorer_request_times_out_and_falls_back() {
     let server = MockServer::start().await;
     mock_review_model(
@@ -366,6 +796,19 @@ async fn slow_scorer_request_times_out_and_falls_back() {
     let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
     let env: Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(env["scorerModel"], "openai/gpt-5-mini");
+    assert_eq!(env["usageAccountingComplete"], false);
+    let models: Vec<_> = env["modelUsage"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["model"].as_str().unwrap())
+        .collect();
+    assert!(models.contains(&"generator-model"));
+    assert!(models.contains(&"openai/gpt-5-mini"));
+    // The timed-out request has no validated token count. It is not invented
+    // as a per-model entry; the explicit incomplete flag makes hosted billing
+    // consume the conservative reservation instead.
+    assert!(!models.contains(&"anthropic/claude-haiku-4.5"));
     assert!(stderr.contains("postil: scorer anthropic/claude-haiku-4.5 timed out after"));
     assert!(stderr.contains("falling back to next scorer"));
     assert!(stderr.contains("postil: running scorer with openai/gpt-5-mini"));
@@ -470,7 +913,7 @@ async fn large_confidence_disagreement_escalates_to_uncertainty_with_default_gat
     mock_review_model(
         &server,
         "generator-model",
-        json!([finding_at(41, "warn", 0.95)]),
+        json!([finding_at(41, "warn", 1.0)]),
     )
     .await;
     mock_scorer_model(
@@ -478,7 +921,7 @@ async fn large_confidence_disagreement_escalates_to_uncertainty_with_default_gat
         "anthropic/claude-haiku-4.5",
         json!([{
             "index": 0,
-            "confidence": 0.5,
+            "confidence": 0.6,
             "kind": "risk",
             "reason": "weak evidence"
         }]),
@@ -499,7 +942,7 @@ async fn large_confidence_disagreement_escalates_to_uncertainty_with_default_gat
 
     let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
     let env: Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(env["findings"][0]["confidence"], 0.5);
+    assert_eq!(env["findings"][0]["confidence"], 0.6);
     assert_eq!(env["findings"][0]["kind"], "uncertainty");
     assert_eq!(env["findings"][0]["generatorKind"], "risk");
     assert_eq!(env["findings"][0]["scorerKind"], "risk");
@@ -552,6 +995,18 @@ async fn scorer_error_fails_open_and_preserves_generator_values() {
             .contains("scorer output invalid")
     );
     assert!(env.get("scorerDisagreements").is_none());
+    assert_eq!(env["modelUsage"][0]["model"], "generator-model");
+    assert_eq!(env["modelUsage"][1]["model"], "anthropic/claude-haiku-4.5");
+    assert_eq!(env["modelUsage"][2]["model"], "openai/gpt-5-mini");
+    assert_eq!(
+        env["modelUsage"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["promptTokens"].as_u64().unwrap())
+            .sum::<u64>(),
+        env["usage"]["promptTokens"].as_u64().unwrap()
+    );
     assert_eq!(finding["confidence"], 0.92);
     assert_eq!(finding["kind"], "risk");
     assert!(finding.get("generatorConfidence").is_none());
@@ -1373,11 +1828,11 @@ async fn garbage_output_fails_closed_after_repair_attempt() {
     let env: Value =
         serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
     assert_eq!(env["findings"][0]["path"], ".postil/model-output");
-    assert_eq!(env["usage"]["promptTokens"], 640);
-    assert_eq!(env["usage"]["completionTokens"], 240);
+    assert_eq!(env["usage"]["promptTokens"], 480);
+    assert_eq!(env["usage"]["completionTokens"], 180);
     // Initial call + repair call for each default model in the retry roster.
     let requests = server.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 8);
+    assert_eq!(requests.len(), 6);
     let models: Vec<String> = requests
         .iter()
         .map(|request| {
@@ -1390,14 +1845,12 @@ async fn garbage_output_fails_closed_after_repair_attempt() {
     assert_eq!(
         models,
         vec![
-            "deepseek/deepseek-v4-pro",
-            "deepseek/deepseek-v4-pro",
-            "google/gemini-3.1-flash-lite",
-            "google/gemini-3.1-flash-lite",
+            "z-ai/glm-5.2",
+            "z-ai/glm-5.2",
             "moonshotai/kimi-k2.7-code",
             "moonshotai/kimi-k2.7-code",
-            "mistralai/mistral-large-2512",
-            "mistralai/mistral-large-2512",
+            "deepseek/deepseek-v4-flash",
+            "deepseek/deepseek-v4-flash",
         ]
     );
 }
@@ -1515,6 +1968,7 @@ async fn slow_model_request_retries_same_model_then_succeeds() {
     let env: Value =
         serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
     assert_eq!(env["modelUsed"], "primary-model");
+    assert_eq!(env["usageAccountingComplete"], false);
     let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
     assert!(stderr.contains("postil: model primary-model hit a request timeout after"));
     assert!(stderr.contains("timeout retry 1/1"));
@@ -1568,6 +2022,7 @@ async fn timeout_http_status_retries_same_model_then_succeeds() {
     let envelope: Value =
         serde_json::from_slice(&out.get_output().stdout).expect("review output should be JSON");
     assert_eq!(envelope["modelUsed"], "primary-model");
+    assert_eq!(envelope["usageAccountingComplete"], false);
     let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
     assert!(stderr.contains("returned timeout HTTP 408 Request Timeout"));
     assert!(stderr.contains("timeout retry 1/1"));
@@ -3160,6 +3615,209 @@ async fn respond_to_pr_mention_posts_grounded_reply() {
     let text = body["body"].as_str().unwrap();
     assert!(text.contains("injection risk"));
     assert!(text.contains("Postil ·")); // footer with model attribution
+}
+
+#[tokio::test]
+async fn respond_writes_private_usage_receipt_across_model_fallback() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("primary-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("backup-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "Use a bounded worker pool."}}],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 3}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/issues/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "Timeouts", "body": "Requests hang under load."
+        })))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let receipt_path = dir.path().join("respond-usage.json");
+    std::fs::write(
+        &receipt_path,
+        b"stale receipt from an interrupted attempt\n",
+    )
+    .unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .env("REVIEW_MODEL", "primary-model")
+        .env("REVIEW_MODEL_CASCADE", "backup-model")
+        .env("POSTIL_USAGE_RECEIPT_PATH", &receipt_path)
+        .args([
+            "respond",
+            "--repo",
+            "acme/api",
+            "--issue",
+            "9",
+            "--comment",
+            "@postil how should this be bounded?",
+            "--no-post",
+        ])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout);
+    assert!(stdout.contains("Use a bounded worker pool."));
+    assert!(!stdout.contains("promptTokens"));
+    let receipt: Value = serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+    assert_eq!(receipt["version"], 1);
+    assert_eq!(receipt["operation"], "respond");
+    assert_eq!(receipt["usageAccountingComplete"], true);
+    assert_eq!(receipt["promptTokens"], 30);
+    assert_eq!(receipt["completionTokens"], 5);
+    assert_eq!(receipt["models"][0]["model"], "primary-model");
+    assert_eq!(receipt["models"][1]["model"], "backup-model");
+    assert_eq!(
+        std::fs::metadata(&receipt_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600,
+    );
+}
+
+#[tokio::test]
+async fn respond_marks_receipt_incomplete_after_ambiguous_fallback() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("primary-model"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("backup-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "Retry with a bounded backoff."}}],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 3}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/issues/10"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "Retries", "body": "Requests fail intermittently."
+        })))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let receipt_path = dir.path().join("respond-usage.json");
+    postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .env("REVIEW_MODEL", "primary-model")
+        .env("REVIEW_MODEL_CASCADE", "backup-model")
+        .env("POSTIL_USAGE_RECEIPT_PATH", &receipt_path)
+        .args([
+            "respond",
+            "--repo",
+            "acme/api",
+            "--issue",
+            "10",
+            "--comment",
+            "@postil how should this retry?",
+            "--no-post",
+        ])
+        .assert()
+        .success();
+
+    let receipt: Value = serde_json::from_slice(&std::fs::read(receipt_path).unwrap()).unwrap();
+    assert_eq!(receipt["usageAccountingComplete"], false);
+    assert_eq!(receipt["models"].as_array().unwrap().len(), 1);
+    assert_eq!(receipt["models"][0]["model"], "backup-model");
+}
+
+#[tokio::test]
+async fn respond_marks_receipt_incomplete_after_internal_retry_succeeds() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("primary-model"))
+        .respond_with(ResponseTemplate::new(408).set_body_string("request timed out"))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("primary-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "Use a bounded retry."}}],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 3}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/issues/11"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "Retries", "body": "Requests fail intermittently."
+        })))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let receipt_path = dir.path().join("respond-usage.json");
+    postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .env("REVIEW_MODEL", "primary-model")
+        .env("REVIEW_MODEL_CASCADE", "")
+        .env("POSTIL_USAGE_RECEIPT_PATH", &receipt_path)
+        .args([
+            "respond",
+            "--repo",
+            "acme/api",
+            "--issue",
+            "11",
+            "--comment",
+            "@postil how should this retry?",
+            "--no-post",
+        ])
+        .assert()
+        .success();
+
+    let receipt: Value = serde_json::from_slice(&std::fs::read(receipt_path).unwrap()).unwrap();
+    assert_eq!(receipt["usageAccountingComplete"], false);
+    assert_eq!(receipt["models"].as_array().unwrap().len(), 1);
+    assert_eq!(receipt["models"][0]["model"], "primary-model");
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| { request.url.path() == "/chat/completions" })
+            .count(),
+        2
+    );
 }
 
 #[tokio::test]

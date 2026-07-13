@@ -372,6 +372,7 @@ function isolatedEnv(
     GIT_CONFIG_NOSYSTEM: "1",
     GIT_TERMINAL_PROMPT: "0",
     POSTIL_API_BASE: modelBaseUrl,
+    POSTIL_ALLOW_PRIVATE_API_BASE: "1",
     POSTIL_API_KEY: "benchmark-api-key",
     GITHUB_API_URL: githubBaseUrl,
     GITHUB_TOKEN: "benchmark-github-token",
