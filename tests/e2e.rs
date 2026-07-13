@@ -381,8 +381,10 @@ async fn provider_errors_redact_provider_and_endpoint_auth_secrets() {
     assert!(!stderr.contains(endpoint_secret));
     assert!(!stdout.contains(provider_secret));
     assert!(!stdout.contains(endpoint_secret));
-    assert!(stderr.contains("[REDACTED]"));
-    assert!(stdout.contains("[REDACTED]"));
+    assert!(!stderr.contains("bad credentials"));
+    assert!(!stdout.contains("bad credentials"));
+    assert!(stderr.contains("status=401"));
+    assert!(stderr.contains("category=none"));
 }
 
 #[tokio::test]
@@ -594,9 +596,8 @@ async fn local_review_reports_grounded_finding_and_gates() {
     assert_eq!(env["findings"][0]["line"], 41);
     assert_eq!(env["gate"]["failing"], true);
     assert_eq!(env["counts"]["error"], 1);
-    // The generic mock is invalid scorer JSON. Each scorer gets one repair
-    // attempt before the cascade advances, and every attempt remains billable.
-    assert_eq!(env["usage"]["promptTokens"], 500);
+    // Embedded scoring is disabled unless the user explicitly configures it.
+    assert_eq!(env["usage"]["promptTokens"], 100);
     assert_eq!(env["usageAccountingComplete"], true);
     let model_usage = env["modelUsage"].as_array().unwrap();
     assert!(!model_usage.is_empty());
@@ -1243,8 +1244,8 @@ async fn local_review_writes_csv_output_file_with_multiple_escaped_findings() {
     );
     assert_eq!(rows[0]["gateFailOn"], "error");
     assert_eq!(rows[0]["gateFailing"], "false");
-    assert_eq!(rows[0]["promptTokens"], "500");
-    assert_eq!(rows[0]["completionTokens"], "250");
+    assert_eq!(rows[0]["promptTokens"], "100");
+    assert_eq!(rows[0]["completionTokens"], "50");
 
     assert_eq!(rows[1]["path"], "src/auth.rs");
     assert_eq!(rows[1]["line"], "42");
@@ -1951,12 +1952,12 @@ async fn garbage_output_fails_closed_after_repair_attempt() {
     assert_eq!(
         models,
         vec![
-            "z-ai/glm-5.2",
-            "z-ai/glm-5.2",
-            "moonshotai/kimi-k2.7-code",
-            "moonshotai/kimi-k2.7-code",
-            "deepseek/deepseek-v4-flash",
-            "deepseek/deepseek-v4-flash",
+            "mistralai/mistral-small-3.2-24b-instruct",
+            "mistralai/mistral-small-3.2-24b-instruct",
+            "google/gemma-3-27b-it",
+            "google/gemma-3-27b-it",
+            "qwen/qwen3-32b",
+            "qwen/qwen3-32b",
         ]
     );
 }
@@ -2349,7 +2350,7 @@ async fn empty_response_retry_http_failure_falls_back_without_a_third_primary_re
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .and(body_string_contains("primary-model"))
-        .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({
             "error": {"metadata": {"error_type": "provider_unavailable"}}
         })))
         .mount(&server)
@@ -2392,6 +2393,52 @@ async fn empty_response_retry_http_failure_falls_back_without_a_third_primary_re
         models,
         vec!["primary-model", "primary-model", "backup-model"]
     );
+}
+
+#[test]
+fn empty_response_retry_connection_failure_stops_without_a_third_request() {
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 16_384];
+        let _ = stream.read(&mut request).unwrap();
+        let body = r#"{"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":0}}"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+        stream.flush().unwrap();
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".postil.yaml"),
+        "model:\n  name: primary-model\n  cascade: []\n",
+    )
+    .unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", format!("http://{address}"))
+        .env("POSTIL_LLM_REQUEST_TIMEOUT_SECS", "5")
+        .env("POSTIL_LLM_TOTAL_TIMEOUT_SECS", "10")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .code(1);
+    server.join().unwrap();
+
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(stderr.contains("model=primary-model attempt=2/3"));
+    assert!(!stderr.contains("model=primary-model attempt=3/3"));
+    assert!(stderr.contains("connection failed after empty-response retry"));
 }
 
 #[tokio::test]
@@ -4118,7 +4165,7 @@ async fn respond_writes_private_usage_receipt_across_model_fallback() {
             "choices": [],
             "usage": {"prompt_tokens": 10, "completion_tokens": 2}
         })))
-        .expect(1)
+        .expect(2)
         .mount(&server)
         .await;
     Mock::given(method("POST"))
@@ -4174,10 +4221,14 @@ async fn respond_writes_private_usage_receipt_across_model_fallback() {
     assert_eq!(receipt["version"], 1);
     assert_eq!(receipt["operation"], "respond");
     assert_eq!(receipt["usageAccountingComplete"], true);
-    assert_eq!(receipt["promptTokens"], 30);
-    assert_eq!(receipt["completionTokens"], 5);
+    assert_eq!(receipt["promptTokens"], 40);
+    assert_eq!(receipt["completionTokens"], 7);
     assert_eq!(receipt["models"][0]["model"], "primary-model");
+    assert_eq!(receipt["models"][0]["promptTokens"], 20);
+    assert_eq!(receipt["models"][0]["completionTokens"], 4);
     assert_eq!(receipt["models"][1]["model"], "backup-model");
+    assert_eq!(receipt["models"][1]["promptTokens"], 20);
+    assert_eq!(receipt["models"][1]["completionTokens"], 3);
     assert_eq!(
         std::fs::metadata(&receipt_path)
             .unwrap()
