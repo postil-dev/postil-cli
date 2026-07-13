@@ -32,6 +32,18 @@ pub fn build_ignore_set(patterns: &[String]) -> Result<GlobSet> {
 pub fn apply(cfg: &Config, index: &DiffIndex, mut findings: Vec<Finding>) -> Result<FilterOutcome> {
     let had_any = !findings.is_empty();
 
+    // Keep the grounded anchor while collapsing ranges that a forge cannot
+    // resolve. A model may cite a valid start line with an end line outside the
+    // hunk or in a later hunk; sending that range makes GitHub reject the whole
+    // batched review.
+    for finding in &mut findings {
+        if finding.end_line.is_some_and(|end| {
+            end > finding.line && !index.contains_range(&finding.path, finding.line, end)
+        }) {
+            finding.end_line = None;
+        }
+    }
+
     // Grounding: a finding must cite a line on the new side of the diff. Content-
     // policy findings may additionally cite a reserved synthetic anchor (the
     // rendered PR title/description), which only they may use — a non-content-
@@ -260,6 +272,26 @@ mod tests {
         assert_eq!(out.kept.len(), 1);
         assert_eq!(out.ungrounded, 1);
         assert!(!out.all_ungrounded);
+    }
+
+    #[test]
+    fn grounding_collapses_invalid_and_cross_hunk_ranges() {
+        let parsed = diff::parse(
+            "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -10,3 +10,3 @@\n+x\n+y\n+z\n@@ -30,2 +30,2 @@\n+a\n+b\n",
+        );
+        let idx = DiffIndex::build(&parsed);
+        let cfg = Config::default();
+        let mut valid = f("a.rs", 10, Severity::Error, 0.9);
+        valid.end_line = Some(12);
+        let mut cross_hunk = f("a.rs", 11, Severity::Error, 0.9);
+        cross_hunk.end_line = Some(30);
+        let mut outside = f("a.rs", 30, Severity::Error, 0.9);
+        outside.end_line = Some(99);
+
+        let out = apply(&cfg, &idx, vec![valid, cross_hunk, outside]).unwrap();
+        assert_eq!(out.kept[0].end_line, Some(12));
+        assert!(out.kept[1].end_line.is_none());
+        assert!(out.kept[2].end_line.is_none());
     }
 
     #[test]

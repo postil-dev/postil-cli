@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use reqwest::header::{HeaderName, HeaderValue};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -229,7 +229,6 @@ pub struct LlmClient {
 struct EndpointAuth {
     name: HeaderName,
     value: HeaderValue,
-    secret: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -245,7 +244,10 @@ const TRANSIENT_RETRIES: u32 = 2;
 /// shared total deadline remains authoritative, so this cannot extend a hosted
 /// review beyond its worker budget.
 const TIMEOUT_RETRIES: u32 = 1;
+const EMPTY_RESPONSE_RETRIES: u32 = 1;
 const TIMEOUT_RETRY_CAP_SECS: u64 = 90;
+const EMPTY_RESPONSE_RETRY_TIMEOUT_SECS: u64 = 30;
+const PROVIDER_RETRY_DELAY_CAP_SECS: u64 = 30;
 
 /// Runaway-generation bound only. It is sized so legitimate reviews (observed
 /// up to roughly 12k output tokens) do not truncate. A truncated response goes
@@ -253,6 +255,7 @@ const TIMEOUT_RETRY_CAP_SECS: u64 = 90;
 /// use their provider default.
 const REVIEW_MAX_TOKENS: u32 = 16384;
 const SCORER_MAX_TOKENS: u32 = 4096;
+const SCORER_REASON_MAX_CHARS: usize = 240;
 const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 4096;
 const RESPOND_MAX_TOKENS: u32 = 4096;
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -295,8 +298,51 @@ fn reqwest_error(error: &anyhow::Error) -> Option<&reqwest::Error> {
 #[derive(Debug, Clone, Copy)]
 enum LlmPhase {
     Review,
+    Scorer,
+    Respond,
+    #[cfg_attr(not(test), allow(dead_code))]
     Total,
 }
+
+impl LlmPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Review => "review",
+            Self::Scorer => "scorer",
+            Self::Respond => "respond",
+            Self::Total => "total",
+        }
+    }
+}
+
+struct ModelHttpResponse {
+    status: reqwest::StatusCode,
+    text: String,
+    retry_after: Option<Duration>,
+    request_id: Option<String>,
+}
+
+#[derive(Default)]
+struct SafeResponseSummary {
+    response_id: Option<String>,
+    returned_model: Option<String>,
+    provider: Option<String>,
+    finish_reason: Option<String>,
+    error_type: Option<String>,
+    choices: Option<usize>,
+    usage: Option<Usage>,
+}
+
+#[derive(Debug)]
+struct EmptyModelResponse;
+
+impl std::fmt::Display for EmptyModelResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("model response had no choices/content")
+    }
+}
+
+impl std::error::Error for EmptyModelResponse {}
 
 #[derive(Debug, Clone, Copy)]
 struct DeadlineExceeded(LlmPhase);
@@ -305,7 +351,9 @@ impl std::fmt::Display for DeadlineExceeded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.0 {
             LlmPhase::Review => f.write_str("LLM review deadline exceeded"),
-            LlmPhase::Total => f.write_str("LLM total deadline exceeded"),
+            LlmPhase::Scorer | LlmPhase::Respond | LlmPhase::Total => {
+                f.write_str("LLM total deadline exceeded")
+            }
         }
     }
 }
@@ -327,17 +375,22 @@ impl LlmClient {
     pub(crate) async fn doctor_probe(cfg: &Config, api_key: String) -> Result<()> {
         let client = Self::build(cfg, api_key, Duration::from_secs(30), None, None)?;
         let body = client.request_body(&cfg.model, "", "ping", Some(1), 0.0);
-        let (status, text) =
-            tokio::time::timeout(Duration::from_secs(30), client.request_once(&body))
-                .await
-                .map_err(|_| RequestTimedOut)??;
-        if !status.is_success() {
+        let response = tokio::time::timeout(Duration::from_secs(30), client.request_once(&body))
+            .await
+            .map_err(|_| RequestTimedOut)??;
+        if !response.status.is_success() {
+            let summary = safe_response_summary(
+                &response.text,
+                client.api_format,
+                is_canonical_openrouter_base(&client.api_base),
+            );
             return Err(anyhow!(
-                "model endpoint returned {status}: {}",
-                client.safe_error_snippet(&text)
+                "model endpoint returned {} (category {})",
+                response.status,
+                summary.error_type.as_deref().unwrap_or("unclassified")
             ));
         }
-        client.parse_response(&text, &mut Usage::default())?;
+        client.parse_response(&response.text, &mut Usage::default())?;
         Ok(())
     }
 
@@ -533,7 +586,11 @@ impl LlmClient {
             let mut last_err = None;
             for (index, model) in chain.iter().enumerate() {
                 let model_log = log_text(model);
-                eprintln!("postil: attempting model: {model_log}");
+                eprintln!(
+                    "postil: attempting model: {model_log} (cascade {}/{})",
+                    index + 1,
+                    chain.len()
+                );
                 let started_at = Instant::now();
                 match self.review_with_model(model, system, user).await {
                     Ok(mut r) => {
@@ -635,7 +692,7 @@ impl LlmClient {
                     &mut model_usage,
                     &mut model_accounting_complete,
                     Some(RESPOND_MAX_TOKENS),
-                    LlmPhase::Total,
+                    LlmPhase::Respond,
                 )
                 .await
             {
@@ -702,7 +759,11 @@ impl LlmClient {
         let chain = cfg.scorer_chain();
         for (index, model) in chain.iter().enumerate() {
             let model_log = log_text(model);
-            eprintln!("postil: running scorer with {model_log}");
+            eprintln!(
+                "postil: running scorer with {model_log} (cascade {}/{})",
+                index + 1,
+                chain.len()
+            );
             let started_at = Instant::now();
             match self
                 .score_with_model(model, system, user, expected_len)
@@ -951,7 +1012,7 @@ impl LlmClient {
                 &mut usage_accounting_complete,
                 Some(SCORER_MAX_TOKENS),
                 0.0,
-                LlmPhase::Total,
+                LlmPhase::Scorer,
             )
             .await
             .map_err(|e| {
@@ -965,7 +1026,7 @@ impl LlmClient {
                 eprintln!("postil: scorer output invalid; requesting one schema repair");
                 let invalid: String = content.chars().take(8_000).collect();
                 let repair_system = format!(
-                    "{system}\n\nYour previous response failed schema validation. Repair only the JSON schema. Kind is a category, so severity values such as info, warn, and error are invalid kinds. Return the complete array and nothing else."
+                    "{system}\n\nYour previous response failed schema validation. Repair only the JSON schema. Kind is a category, so severity values such as info, warn, and error are invalid kinds. Every reason must be exactly one complete sentence of at most 240 Unicode characters. Return the complete array and nothing else."
                 );
                 let repair_user =
                     format!("{user}\n\nInvalid previous response (untrusted data):\n{invalid}");
@@ -984,7 +1045,7 @@ impl LlmClient {
                         &mut usage_accounting_complete,
                         Some(SCORER_MAX_TOKENS),
                         0.0,
-                        LlmPhase::Total,
+                        LlmPhase::Scorer,
                     )
                     .await
                     .map_err(|error| {
@@ -1097,12 +1158,24 @@ impl LlmClient {
         let body = self.request_body(model, system, user, max_tokens, temperature);
         let mut retries = 0u32;
         let mut timeout_retries = 0u32;
+        let mut empty_response_retries = 0u32;
         let mut attempt_timeout = self.request_timeout;
-        let text = loop {
+        loop {
             let attempt_started_at = Instant::now();
             let remaining = self.remaining_budget(phase)?;
             let deadline_limited = remaining.is_some_and(|value| value <= attempt_timeout);
             let timeout = remaining.map_or(attempt_timeout, |value| value.min(attempt_timeout));
+            eprintln!(
+                "postil: llm attempt phase={} model={} attempt={}/{} timeout={} budget_remaining={}",
+                phase.as_str(),
+                log_text(model),
+                retries + 1,
+                TRANSIENT_RETRIES + 1,
+                elapsed_text(timeout),
+                remaining
+                    .map(elapsed_text)
+                    .unwrap_or_else(|| "unbounded".to_string()),
+            );
             let response = match tokio::time::timeout(timeout, self.request_once(&body)).await {
                 Ok(result) => result,
                 Err(_) if deadline_limited => {
@@ -1111,6 +1184,9 @@ impl LlmClient {
                 }
                 Err(_) => {
                     *usage_accounting_complete = false;
+                    if empty_response_retries > 0 {
+                        return Err(RequestTimedOut.into());
+                    }
                     if timeout_retries < TIMEOUT_RETRIES && retries < TRANSIENT_RETRIES {
                         retries += 1;
                         timeout_retries += 1;
@@ -1130,19 +1206,100 @@ impl LlmClient {
                 }
             };
             match response {
-                Ok((status, text)) => {
-                    if status.is_success() {
-                        break text;
+                Ok(response) => {
+                    let summary = safe_response_summary(
+                        &response.text,
+                        self.api_format,
+                        is_canonical_openrouter_base(&self.api_base),
+                    );
+                    let elapsed = elapsed_text(attempt_started_at.elapsed());
+                    eprintln!(
+                        "postil: llm response phase={} model={} attempt={} status={} elapsed={} bytes={} request_id={} response_id={} returned_model={} provider={} choices={} finish={} usage={} prompt_tokens={} completion_tokens={} category={}",
+                        phase.as_str(),
+                        log_text(model),
+                        retries + 1,
+                        response.status.as_u16(),
+                        elapsed,
+                        response.text.len(),
+                        response.request_id.as_deref().unwrap_or("none"),
+                        summary.response_id.as_deref().unwrap_or("none"),
+                        summary.returned_model.as_deref().unwrap_or("none"),
+                        summary.provider.as_deref().unwrap_or("none"),
+                        summary
+                            .choices
+                            .map_or_else(|| "unknown".to_string(), |count| count.to_string()),
+                        summary.finish_reason.as_deref().unwrap_or("none"),
+                        if summary.usage.is_some() {
+                            "present"
+                        } else {
+                            "missing"
+                        },
+                        summary.usage.map_or(0, |value| value.prompt_tokens),
+                        summary.usage.map_or(0, |value| value.completion_tokens),
+                        summary.error_type.as_deref().unwrap_or("none"),
+                    );
+                    if response.status.is_success() {
+                        let usage_before_parse = *usage;
+                        match self.parse_response(&response.text, usage) {
+                            Ok(content) => return Ok(content),
+                            Err(error) => {
+                                let parse_added_usage = usage.prompt_tokens
+                                    != usage_before_parse.prompt_tokens
+                                    || usage.completion_tokens
+                                        != usage_before_parse.completion_tokens;
+                                if !parse_added_usage && let Some(response_usage) = summary.usage {
+                                    add_usage(usage, response_usage);
+                                }
+                                if summary.usage.is_none() {
+                                    *usage_accounting_complete = false;
+                                }
+                                if error.downcast_ref::<EmptyModelResponse>().is_some()
+                                    && empty_response_retries < EMPTY_RESPONSE_RETRIES
+                                    && retries < TRANSIENT_RETRIES
+                                {
+                                    retries += 1;
+                                    empty_response_retries += 1;
+                                    let wait = Duration::from_secs(2 * retries as u64);
+                                    eprintln!(
+                                        "postil: model {} returned empty content after {elapsed}, retrying in {}s (empty retry {empty_response_retries}/{EMPTY_RESPONSE_RETRIES}; retry {retries}/{TRANSIENT_RETRIES})",
+                                        log_text(model),
+                                        wait.as_secs(),
+                                    );
+                                    self.sleep_with_budget(phase, wait).await?;
+                                    attempt_timeout = self.request_timeout.min(
+                                        Duration::from_secs(EMPTY_RESPONSE_RETRY_TIMEOUT_SECS),
+                                    );
+                                    continue;
+                                }
+                                return Err(error);
+                            }
+                        }
                     }
-                    let snippet = self.safe_error_snippet(&text);
+                    if let Some(response_usage) = summary.usage {
+                        add_usage(usage, response_usage);
+                    }
+                    *usage_accounting_complete = false;
+                    let status = response.status;
+                    if empty_response_retries > 0 {
+                        if timeout_status(status.as_u16()) {
+                            return Err(anyhow::Error::new(RequestTimedOut).context(format!(
+                                "model endpoint returned {status} after empty-response retry"
+                            )));
+                        }
+                        return Err(anyhow!(
+                            "model endpoint returned {status} after empty-response retry (category {})",
+                            summary.error_type.as_deref().unwrap_or("unclassified")
+                        ));
+                    }
                     if timeout_status(status.as_u16())
                         && timeout_retries < TIMEOUT_RETRIES
                         && retries < TRANSIENT_RETRIES
                     {
-                        *usage_accounting_complete = false;
                         retries += 1;
                         timeout_retries += 1;
-                        let wait = Duration::from_secs(2 * retries as u64);
+                        let wait = response
+                            .retry_after
+                            .unwrap_or_else(|| Duration::from_secs(2 * retries as u64));
                         eprintln!(
                             "postil: model {} returned timeout HTTP {status} after {}, retrying in {}s \
                              (timeout retry {timeout_retries}/{TIMEOUT_RETRIES}; retry {retries}/{TRANSIENT_RETRIES})",
@@ -1155,12 +1312,16 @@ impl LlmClient {
                         continue;
                     }
                     if timeout_status(status.as_u16()) {
-                        return Err(anyhow::Error::new(RequestTimedOut)
-                            .context(format!("model endpoint returned {status}: {snippet}")));
+                        return Err(anyhow::Error::new(RequestTimedOut).context(format!(
+                            "model endpoint returned {status} (category {})",
+                            summary.error_type.as_deref().unwrap_or("timeout")
+                        )));
                     }
                     if retryable_status(status.as_u16()) && retries < TRANSIENT_RETRIES {
                         retries += 1;
-                        let wait = Duration::from_secs(2 * retries as u64);
+                        let wait = response
+                            .retry_after
+                            .unwrap_or_else(|| Duration::from_secs(2 * retries as u64));
                         eprintln!(
                             "postil: model {} returned retryable HTTP {status} after {}, retrying in {}s \
                              (retry {retries}/{TRANSIENT_RETRIES})",
@@ -1172,7 +1333,24 @@ impl LlmClient {
                         attempt_timeout = self.request_timeout;
                         continue;
                     }
-                    return Err(anyhow!("model endpoint returned {status}: {snippet}"));
+                    return Err(anyhow!(
+                        "model endpoint returned {status} (category {})",
+                        summary.error_type.as_deref().unwrap_or("unclassified")
+                    ));
+                }
+                Err(error)
+                    if reqwest_error(&error).is_some_and(reqwest::Error::is_timeout)
+                        && empty_response_retries > 0 =>
+                {
+                    *usage_accounting_complete = false;
+                    return Err(RequestTimedOut.into());
+                }
+                Err(error)
+                    if reqwest_error(&error).is_some_and(reqwest::Error::is_connect)
+                        && empty_response_retries > 0 =>
+                {
+                    *usage_accounting_complete = false;
+                    return Err(error.context("connection failed after empty-response retry"));
                 }
                 Err(error)
                     if reqwest_error(&error).is_some_and(reqwest::Error::is_timeout)
@@ -1214,8 +1392,7 @@ impl LlmClient {
                     return Err(error.context("request to model endpoint failed"));
                 }
             }
-        };
-        self.parse_response(&text, usage)
+        }
     }
 
     fn request_body(
@@ -1265,7 +1442,8 @@ impl LlmClient {
                     .into_iter()
                     .next()
                     .and_then(|choice| choice.message.content)
-                    .ok_or_else(|| anyhow!("model response had no choices/content"))
+                    .filter(|content| !content.trim().is_empty())
+                    .ok_or_else(|| anyhow::Error::new(EmptyModelResponse))
             }
             ApiFormat::Anthropic => {
                 let parsed: AnthropicResponse = serde_json::from_str(text)
@@ -1282,7 +1460,7 @@ impl LlmClient {
                     .collect::<Vec<_>>()
                     .join("\n");
                 if content.is_empty() {
-                    Err(anyhow!("model response had no text content blocks"))
+                    Err(anyhow::Error::new(EmptyModelResponse))
                 } else {
                     Ok(content)
                 }
@@ -1290,18 +1468,7 @@ impl LlmClient {
         }
     }
 
-    fn safe_error_snippet(&self, text: &str) -> String {
-        let mut redacted = text.replace(&self.api_key, "[REDACTED]");
-        if let Some(auth) = &self.endpoint_auth {
-            redacted = redacted.replace(&auth.secret, "[REDACTED]");
-        }
-        redacted.chars().take(300).collect()
-    }
-
-    async fn request_once(
-        &self,
-        body: &serde_json::Value,
-    ) -> Result<(reqwest::StatusCode, String)> {
+    async fn request_once(&self, body: &serde_json::Value) -> Result<ModelHttpResponse> {
         let http = self.http_client()?;
         let mut request = match self.api_format {
             ApiFormat::OpenaiCompatible => {
@@ -1321,10 +1488,21 @@ impl LlmClient {
         if let Some(auth) = &self.endpoint_auth {
             request = request.header(auth.name.clone(), auth.value.clone());
         }
+        let canonical_openrouter = is_canonical_openrouter_base(&self.api_base);
+        if canonical_openrouter {
+            request = request.header("X-OpenRouter-Experimental-Metadata", "enabled");
+        }
         let response = request.json(body).send().await?;
         let status = response.status();
+        let retry_after = retry_after_duration(response.headers());
+        let request_id = safe_request_id(response.headers(), canonical_openrouter);
         let text = response.text().await?;
-        Ok((status, text))
+        Ok(ModelHttpResponse {
+            status,
+            text,
+            retry_after,
+            request_id,
+        })
     }
 
     fn http_client(&self) -> Result<reqwest::Client> {
@@ -1343,7 +1521,7 @@ impl LlmClient {
     fn remaining_budget(&self, phase: LlmPhase) -> Result<Option<Duration>> {
         let deadline = match phase {
             LlmPhase::Review => self.review_deadline,
-            LlmPhase::Total => self.total_deadline,
+            LlmPhase::Scorer | LlmPhase::Respond | LlmPhase::Total => self.total_deadline,
         };
         let Some(deadline) = deadline else {
             return Ok(None);
@@ -1365,6 +1543,122 @@ impl LlmClient {
         }
         tokio::time::sleep(duration).await;
         Ok(())
+    }
+}
+
+fn is_canonical_openrouter_base(api_base: &str) -> bool {
+    reqwest::Url::parse(api_base).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.host_str() == Some("openrouter.ai")
+            && url.port().is_none()
+            && url.path().trim_end_matches('/') == "/api/v1"
+            && url.query().is_none()
+            && url.fragment().is_none()
+    })
+}
+
+fn retry_after_duration(headers: &HeaderMap) -> Option<Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(|seconds| Duration::from_secs(seconds.min(PROVIDER_RETRY_DELAY_CAP_SECS)))
+}
+
+fn safe_header_value(value: Option<&HeaderValue>) -> Option<String> {
+    value
+        .and_then(|value| value.to_str().ok())
+        .and_then(safe_response_identifier)
+}
+
+fn safe_request_id(headers: &HeaderMap, expose_identifier: bool) -> Option<String> {
+    let value = headers
+        .get("x-request-id")
+        .or_else(|| headers.get("x-openrouter-request-id"))
+        .or_else(|| headers.get("x-generation-id"));
+    if expose_identifier {
+        safe_header_value(value)
+    } else {
+        value.map(|_| "present".to_string())
+    }
+}
+
+fn safe_response_identifier(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value.chars().all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-' | ':' | '/')
+    }) {
+        Some(value.chars().take(96).collect())
+    } else {
+        Some("present".to_string())
+    }
+}
+
+fn safe_response_summary(
+    text: &str,
+    api_format: ApiFormat,
+    expose_identifiers: bool,
+) -> SafeResponseSummary {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return SafeResponseSummary::default();
+    };
+    let string_at = |path: &[&str]| -> Option<String> {
+        path.iter()
+            .try_fold(&value, |current, key| {
+                key.parse::<usize>()
+                    .ok()
+                    .and_then(|index| current.get(index))
+                    .or_else(|| current.get(*key))
+            })?
+            .as_str()
+            .and_then(|value| {
+                if expose_identifiers {
+                    safe_response_identifier(value)
+                } else {
+                    Some("present".to_string())
+                }
+            })
+    };
+    let usage_value = value.get("usage").filter(|usage| usage.is_object());
+    let usage = match api_format {
+        ApiFormat::OpenaiCompatible => usage_value.map(|usage| Usage {
+            prompt_tokens: usage
+                .get("prompt_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            completion_tokens: usage
+                .get("completion_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        }),
+        ApiFormat::Anthropic => usage_value.map(|usage| Usage {
+            prompt_tokens: usage
+                .get("input_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            completion_tokens: usage
+                .get("output_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        }),
+    };
+    SafeResponseSummary {
+        response_id: string_at(&["id"]),
+        returned_model: string_at(&["model"]),
+        provider: string_at(&["provider"]),
+        finish_reason: string_at(&["choices", "0", "finish_reason"])
+            .or_else(|| string_at(&["stop_reason"])),
+        error_type: string_at(&["error", "metadata", "error_type"])
+            .or_else(|| string_at(&["error", "error_type"])),
+        choices: value
+            .get("choices")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len),
+        usage,
     }
 }
 
@@ -1591,11 +1885,7 @@ fn endpoint_auth_from_env(api_format: ApiFormat) -> Result<Option<EndpointAuth>>
                 format!("{ENDPOINT_AUTH_VALUE_ENV} is not a valid HTTP header value")
             })?;
             value.set_sensitive(true);
-            Ok(Some(EndpointAuth {
-                name,
-                value,
-                secret,
-            }))
+            Ok(Some(EndpointAuth { name, value }))
         }
     }
 }
@@ -1632,16 +1922,101 @@ fn parse_scores(content: &str, expected_len: usize) -> Result<Vec<FindingScore>,
                     score.kind
                 )
             })?;
+            let reason = validate_scorer_reason(&score.reason)?;
             Ok(FindingScore {
                 index: score.index,
                 confidence: score.confidence.clamp(0.0, 1.0),
                 kind,
-                reason: score.reason.trim().chars().take(300).collect(),
+                reason,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
     scores.sort_by_key(|score| score.index);
     Ok(scores)
+}
+
+fn validate_scorer_reason(value: &str) -> Result<String, String> {
+    let reason = value.trim();
+    if reason.is_empty() {
+        return Err("score reason must be one complete sentence".to_string());
+    }
+    if reason.contains(['\n', '\r']) {
+        return Err("score reason must not contain line breaks".to_string());
+    }
+    let character_count = reason.chars().count();
+    if character_count > SCORER_REASON_MAX_CHARS {
+        return Err(format!(
+            "score reason exceeds {SCORER_REASON_MAX_CHARS} Unicode characters (got {character_count})"
+        ));
+    }
+    let is_terminator = |character: char| {
+        matches!(
+            character,
+            '.' | '!' | '?' | '\u{3002}' | '\u{ff01}' | '\u{ff1f}'
+        )
+    };
+    if !reason.chars().last().is_some_and(is_terminator) {
+        return Err("score reason must end with sentence punctuation".to_string());
+    }
+    let characters = reason.chars().collect::<Vec<_>>();
+    for (index, character) in characters.iter().enumerate() {
+        if !is_terminator(*character) || index + 1 == characters.len() {
+            continue;
+        }
+        if is_common_sentence_abbreviation(&characters, index) {
+            continue;
+        }
+        // Dots inside tokens such as `src/lib.rs` and `4.2` are not sentence
+        // boundaries. A no-space transition to an uppercase letter is treated
+        // as a malformed second sentence.
+        if *character == '.'
+            && characters.get(index + 1).is_some_and(|next| {
+                !next.is_whitespace() && (next.is_lowercase() || next.is_numeric())
+            })
+        {
+            continue;
+        }
+        return Err("score reason must contain exactly one sentence".to_string());
+    }
+    Ok(reason.to_string())
+}
+
+fn is_common_sentence_abbreviation(characters: &[char], period_index: usize) -> bool {
+    if characters.get(period_index) != Some(&'.') {
+        return false;
+    }
+    if period_index
+        .checked_sub(1)
+        .and_then(|index| characters.get(index))
+        .is_some_and(|character| character.is_ascii_uppercase())
+        && characters
+            .get(period_index + 1)
+            .is_some_and(|character| character.is_ascii_uppercase())
+        && characters.get(period_index + 2) == Some(&'.')
+    {
+        return true;
+    }
+    let prefix = characters[..=period_index]
+        .iter()
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if prefix.ends_with("e.g.") || prefix.ends_with("i.e.") {
+        return true;
+    }
+
+    let mut index = period_index;
+    let mut initials = 0;
+    loop {
+        if index < 1 || characters[index] != '.' || !characters[index - 1].is_ascii_uppercase() {
+            break;
+        }
+        initials += 1;
+        if index < 2 || characters[index - 2] != '.' {
+            break;
+        }
+        index -= 2;
+    }
+    initials >= 2
 }
 
 fn extract_json_object(text: &str) -> Option<&str> {
@@ -2146,7 +2521,7 @@ mod tests {
     #[test]
     fn scorer_scores_parse_clamp_and_validate_kind() {
         let scores = parse_scores(
-            r#"[{"index":0,"confidence":1.2,"kind":"humanEscalation","reason":"needs owner"}]"#,
+            r#"[{"index":0,"confidence":1.2,"kind":"humanEscalation","reason":"This needs an owner decision."}]"#,
             1,
         )
         .unwrap();
@@ -2158,7 +2533,7 @@ mod tests {
     #[test]
     fn scorer_rejects_severity_label_as_kind() {
         let error = parse_scores(
-            r#"[{"index":0,"confidence":0.7,"kind":"warn","reason":"wrong field"}]"#,
+            r#"[{"index":0,"confidence":0.7,"kind":"warn","reason":"The response used the wrong field."}]"#,
             1,
         )
         .unwrap_err();
@@ -2168,6 +2543,123 @@ mod tests {
     #[test]
     fn scorer_rejects_missing_entries() {
         assert!(parse_scores(r#"[{"index":0,"confidence":0.5,"kind":"risk"}]"#, 2).is_err());
+    }
+
+    #[test]
+    fn scorer_rejects_incomplete_and_overlength_reasons() {
+        let incomplete = parse_scores(
+            r#"[{"index":0,"confidence":0.7,"kind":"risk","reason":"This has no sentence terminator"}]"#,
+            1,
+        )
+        .unwrap_err();
+        assert!(incomplete.contains("sentence punctuation"));
+
+        let overlength = format!(
+            r#"[{{"index":0,"confidence":0.7,"kind":"risk","reason":"{}."}}]"#,
+            "x".repeat(SCORER_REASON_MAX_CHARS)
+        );
+        let error = parse_scores(&overlength, 1).unwrap_err();
+        assert!(error.contains("exceeds 240 Unicode characters"));
+    }
+
+    #[test]
+    fn scorer_reason_limit_counts_unicode_scalars() {
+        let reason = format!("{}.", "界".repeat(SCORER_REASON_MAX_CHARS - 1));
+        let input = serde_json::json!([{
+            "index": 0,
+            "confidence": 0.7,
+            "kind": "risk",
+            "reason": reason,
+        }]);
+        let scores = parse_scores(&input.to_string(), 1).unwrap();
+        assert_eq!(scores[0].reason.chars().count(), SCORER_REASON_MAX_CHARS);
+    }
+
+    #[test]
+    fn scorer_reason_accepts_common_abbreviations() {
+        let scores = parse_scores(
+            r#"[{"index":0,"confidence":0.7,"kind":"risk","reason":"The U.S. service affects retries, e.g. this call, i.e. the idempotent path."}]"#,
+            1,
+        )
+        .unwrap();
+        assert_eq!(scores.len(), 1);
+
+        let error = parse_scores(
+            r#"[{"index":0,"confidence":0.7,"kind":"risk","reason":"The first condition fails. The second condition also fails."}]"#,
+            1,
+        )
+        .unwrap_err();
+        assert!(error.contains("exactly one sentence"));
+
+        let lowercase = parse_scores(
+            r#"[{"index":0,"confidence":0.7,"kind":"risk","reason":"The first condition fails. the second condition also fails."}]"#,
+            1,
+        )
+        .unwrap_err();
+        assert!(lowercase.contains("exactly one sentence"));
+
+        let no_space = parse_scores(
+            r#"[{"index":0,"confidence":0.7,"kind":"risk","reason":"The first condition fails.The second condition also fails."}]"#,
+            1,
+        )
+        .unwrap_err();
+        assert!(no_space.contains("exactly one sentence"));
+
+        let file_and_version = parse_scores(
+            r#"[{"index":0,"confidence":0.7,"kind":"risk","reason":"The src/lib.rs behavior changed in version 4.2."}]"#,
+            1,
+        )
+        .unwrap();
+        assert_eq!(file_and_version.len(), 1);
+    }
+
+    #[test]
+    fn provider_retry_after_is_capped_for_local_reviews() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            HeaderValue::from_static("999"),
+        );
+        assert_eq!(
+            retry_after_duration(&headers),
+            Some(Duration::from_secs(PROVIDER_RETRY_DELAY_CAP_SECS))
+        );
+    }
+
+    #[test]
+    fn response_metadata_logs_only_safe_identifiers_or_presence() {
+        let summary = safe_response_summary(
+            r#"{"id":"secret\nvalue","model":"safe/model-v1","provider":"private key=value","choices":[{"finish_reason":"stop\tsecret"}],"error":{"metadata":{"error_type":"bad bearer token"}}}"#,
+            ApiFormat::OpenaiCompatible,
+            false,
+        );
+        assert_eq!(summary.response_id.as_deref(), Some("present"));
+        assert_eq!(summary.returned_model.as_deref(), Some("present"));
+        assert_eq!(summary.provider.as_deref(), Some("present"));
+        assert_eq!(summary.finish_reason.as_deref(), Some("present"));
+        assert_eq!(summary.error_type.as_deref(), Some("present"));
+
+        let public_summary = safe_response_summary(
+            r#"{"id":"response-1","model":"safe/model-v1","provider":"provider-1"}"#,
+            ApiFormat::OpenaiCompatible,
+            true,
+        );
+        assert_eq!(public_summary.response_id.as_deref(), Some("response-1"));
+        assert_eq!(
+            public_summary.returned_model.as_deref(),
+            Some("safe/model-v1")
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-request-id",
+            HeaderValue::from_static("token-shaped-secret"),
+        );
+        assert_eq!(safe_request_id(&headers, false).as_deref(), Some("present"));
+        assert_eq!(
+            safe_request_id(&headers, true).as_deref(),
+            Some("token-shaped-secret")
+        );
     }
 
     #[test]

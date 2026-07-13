@@ -655,7 +655,7 @@ async fn scorer_lowers_confidence_and_stores_both_values() {
                 "index": 0,
                 "confidence": 0.7,
                 "kind": "risk",
-                "reason": "finding is plausible but impact depends on query behavior"
+                "reason": "The finding is plausible, but its impact depends on query behavior."
             }]))),
         )
         .mount(&server)
@@ -724,7 +724,7 @@ async fn scorer_confidence_below_minimum_is_suppressed_and_nonblocking() {
                 "index": 0,
                 "confidence": 0.1,
                 "kind": "risk",
-                "reason": "independent evidence does not support the generator claim"
+                "reason": "Independent evidence does not support the generator claim."
             }]))),
         )
         .mount(&server)
@@ -762,7 +762,7 @@ async fn scorer_confidence_below_minimum_is_suppressed_and_nonblocking() {
 }
 
 #[tokio::test]
-async fn malformed_scorer_kind_gets_one_same_model_schema_repair() {
+async fn malformed_scorer_reason_gets_one_same_model_schema_repair() {
     let server = MockServer::start().await;
     mock_review_model(
         &server,
@@ -779,7 +779,7 @@ async fn malformed_scorer_kind_gets_one_same_model_schema_repair() {
                 "index": 0,
                 "confidence": 0.75,
                 "kind": "risk",
-                "reason": "concrete defect"
+                "reason": "This is a concrete defect."
             }]))),
         )
         .with_priority(1)
@@ -793,8 +793,8 @@ async fn malformed_scorer_kind_gets_one_same_model_schema_repair() {
             ResponseTemplate::new(200).set_body_json(scorer_content(json!([{
                 "index": 0,
                 "confidence": 0.75,
-                "kind": "warn",
-                "reason": "used severity as kind"
+                "kind": "risk",
+                "reason": "This reason is incomplete"
             }]))),
         )
         .with_priority(2)
@@ -853,7 +853,7 @@ async fn slow_scorer_request_times_out_and_falls_back() {
             "index": 0,
             "confidence": 0.82,
             "kind": "risk",
-            "reason": "finding is well grounded"
+            "reason": "The finding is well grounded."
         }]),
     )
     .await;
@@ -914,7 +914,7 @@ async fn scorer_kind_escalation_into_configured_blocking_kind_takes_effect() {
             "index": 0,
             "confidence": 0.88,
             "kind": "guardrail",
-            "reason": "violates configured rule"
+            "reason": "The finding violates the configured rule."
         }]),
     )
     .await;
@@ -960,7 +960,7 @@ async fn scorer_kind_deescalation_from_blocking_kind_is_ignored() {
             "index": 0,
             "confidence": 0.88,
             "kind": "risk",
-            "reason": "not a guardrail"
+            "reason": "The finding is not a guardrail violation."
         }]),
     )
     .await;
@@ -1006,7 +1006,7 @@ async fn large_confidence_disagreement_escalates_to_uncertainty_with_default_gat
             "index": 0,
             "confidence": 0.6,
             "kind": "risk",
-            "reason": "weak evidence"
+            "reason": "The finding has weak supporting evidence."
         }]),
     )
     .await;
@@ -1137,7 +1137,9 @@ async fn scorer_provider_error_cannot_inject_stderr_lines() {
     let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
     assert!(!stderr.contains("\n[stderr] forged"));
     assert!(!stderr.contains('\u{1b}'));
-    assert!(stderr.contains(r"bad\n[stderr] forged\u{1b}[31m"));
+    assert!(!stderr.contains("forged"));
+    assert!(!stderr.contains("bad"));
+    assert!(stderr.contains("status=400"));
     assert!(stderr.contains("postil: scorer failed open after all scorer models failed"));
 }
 
@@ -1944,7 +1946,10 @@ async fn cascade_falls_back_to_next_model() {
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .and(wiremock::matchers::body_string_contains("primary-model"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("upstream down"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+            "error": {"metadata": {"error_type": "provider_unavailable"}},
+            "usage": {"prompt_tokens": 12, "completion_tokens": 0}
+        })))
         .mount(&server)
         .await;
     Mock::given(method("POST"))
@@ -1973,6 +1978,11 @@ async fn cascade_falls_back_to_next_model() {
     assert_eq!(env["modelIncidents"][0]["category"], "providerError");
     assert_eq!(env["modelIncidents"][0]["recovered"], true);
     assert_eq!(env["modelIncidents"][0]["recovery"], "fallback");
+    assert_eq!(env["usage"]["promptTokens"], 136);
+    assert_eq!(env["usage"]["completionTokens"], 50);
+    assert_eq!(env["modelUsage"][0]["model"], "primary-model");
+    assert_eq!(env["modelUsage"][0]["promptTokens"], 36);
+    assert_eq!(env["usageAccountingComplete"], false);
     let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
     assert!(stderr.contains("postil: attempting model: primary-model"));
     assert!(stderr.contains("postil: model primary-model returned retryable HTTP 500"));
@@ -2073,6 +2083,294 @@ async fn slow_model_request_retries_same_model_then_succeeds() {
         })
         .collect::<Vec<_>>();
     assert_eq!(models, vec!["primary-model", "primary-model"]);
+}
+
+#[tokio::test]
+async fn empty_success_response_retries_same_model_and_accumulates_usage() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("primary-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "empty-attempt",
+            "model": "primary-model",
+            "provider": "test-provider",
+            "choices": [],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 0}
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("primary-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "primary-model")
+        .env("REVIEW_MODEL_CASCADE", "backup-model")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .code(0);
+
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["modelUsed"], "primary-model");
+    assert_eq!(envelope["usage"]["promptTokens"], 112);
+    assert_eq!(envelope["usage"]["completionTokens"], 50);
+    assert_eq!(envelope["modelUsage"][0]["promptTokens"], 112);
+    assert_eq!(envelope["usageAccountingComplete"], true);
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(stderr.contains("returned empty content"));
+    assert!(stderr.contains("phase=review"));
+    assert!(stderr.contains("provider=present"));
+    assert!(stderr.contains("usage=present"));
+    assert!(stderr.contains("response_id=present"));
+    assert!(!stderr.contains("empty-attempt"));
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+}
+
+#[tokio::test]
+async fn empty_success_without_usage_marks_accounting_incomplete() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("primary-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"choices": []})))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("primary-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "primary-model")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .code(0);
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["usageAccountingComplete"], false);
+}
+
+#[tokio::test]
+async fn malformed_success_without_usage_marks_accounting_incomplete_before_fallback() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("primary-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("not-json"))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("backup-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "primary-model")
+        .env("REVIEW_MODEL_CASCADE", "backup-model")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .code(0);
+
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["modelUsed"], "backup-model");
+    assert_eq!(envelope["usageAccountingComplete"], false);
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(stderr.contains("usage=missing"));
+    assert!(!stderr.contains("not-json"));
+}
+
+#[tokio::test]
+async fn malformed_success_with_usage_records_the_attempt_exactly_once() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("primary-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": "invalid-shape",
+            "usage": {"prompt_tokens": 12, "completion_tokens": 3}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("backup-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "primary-model")
+        .env("REVIEW_MODEL_CASCADE", "backup-model")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .code(0);
+
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["modelUsed"], "backup-model");
+    assert_eq!(envelope["usage"]["promptTokens"], 112);
+    assert_eq!(envelope["usage"]["completionTokens"], 53);
+    assert_eq!(envelope["modelUsage"][0]["promptTokens"], 12);
+    assert_eq!(envelope["modelUsage"][0]["completionTokens"], 3);
+    assert_eq!(envelope["usageAccountingComplete"], true);
+}
+
+#[tokio::test]
+async fn slow_empty_response_retry_times_out_then_preserves_the_cascade() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("primary-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 0}
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("primary-model"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(1500))
+                .set_body_json(llm_content(json!([]))),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("backup-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_LLM_REQUEST_TIMEOUT_SECS", "1")
+        .env("POSTIL_LLM_TOTAL_TIMEOUT_SECS", "10")
+        .env("REVIEW_MODEL", "primary-model")
+        .env("REVIEW_MODEL_CASCADE", "backup-model")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .code(0);
+
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["modelUsed"], "backup-model");
+    let requests = server.received_requests().await.unwrap();
+    let models = requests
+        .iter()
+        .map(|request| {
+            request.body_json::<Value>().unwrap()["model"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        models,
+        vec!["primary-model", "primary-model", "backup-model"]
+    );
+}
+
+#[tokio::test]
+async fn empty_response_retry_http_failure_falls_back_without_a_third_primary_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("primary-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 0}
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("primary-model"))
+        .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+            "error": {"metadata": {"error_type": "provider_unavailable"}}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("backup-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_LLM_REQUEST_TIMEOUT_SECS", "2")
+        .env("POSTIL_LLM_TOTAL_TIMEOUT_SECS", "10")
+        .env("REVIEW_MODEL", "primary-model")
+        .env("REVIEW_MODEL_CASCADE", "backup-model")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .code(0);
+
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["modelUsed"], "backup-model");
+    let requests = server.received_requests().await.unwrap();
+    let models = requests
+        .iter()
+        .map(|request| {
+            request.body_json::<Value>().unwrap()["model"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        models,
+        vec!["primary-model", "primary-model", "backup-model"]
+    );
 }
 
 #[tokio::test]
@@ -2429,6 +2727,96 @@ async fn forge_post_failure_on_success_path_keeps_gate_derived_exit_code() {
         .filter(|r| r.method == wiremock::http::Method::PATCH)
         .count();
     assert_eq!(patches, 2);
+    let review_posts = reqs
+        .iter()
+        .filter(|request| {
+            request.method == wiremock::http::Method::POST
+                && request.url.path() == "/repos/acme/api/pulls/7/reviews"
+        })
+        .count();
+    assert_eq!(
+        review_posts, 1,
+        "ambiguous review POST must not be replayed"
+    );
+}
+
+#[tokio::test]
+async fn github_unresolved_inline_line_falls_back_once_to_summary_only() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(llm_content(json!([finding_at(41, "error", 0.92)]))),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .and(header("Accept", "application/vnd.github.v3.diff"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(DIFF))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "t", "body": "b",
+            "head": {"sha": "headsha111"}, "base": {"sha": "basesha222"}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/api/check-runs"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": 11})))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path_regex(r"^/repos/acme/api/check-runs/\d+$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/api/pulls/7/reviews"))
+        .respond_with(
+            ResponseTemplate::new(422)
+                .set_body_string(r#"{"message":"Line could not be resolved"}"#),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/api/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .args(["review", "--repo", "acme/api", "--pr", "7", "--output-json"])
+        .assert()
+        .code(1);
+
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(stderr.contains("category=unresolved-line"));
+    assert!(stderr.contains("recovery=summary-only"));
+    let requests = server.received_requests().await.unwrap();
+    let review_bodies = requests
+        .iter()
+        .filter(|request| {
+            request.method == wiremock::http::Method::POST
+                && request.url.path() == "/repos/acme/api/pulls/7/reviews"
+        })
+        .map(|request| request.body_json::<Value>().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(review_bodies.len(), 2);
+    assert!(review_bodies[0].get("comments").is_some());
+    assert!(review_bodies[1].get("comments").is_none());
 }
 
 #[tokio::test]
