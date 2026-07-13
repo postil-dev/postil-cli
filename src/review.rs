@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow};
 
 use crate::config::{Config, GateLevel, OnError};
 use crate::diff::{self, DiffIndex};
-use crate::envelope::{Envelope, Finding, Gate, Kind, Usage, fail_closed_finding};
+use crate::envelope::{Envelope, Finding, Gate, Kind, ModelUsage, Usage, fail_closed_finding};
 use crate::filter;
 use crate::forge::{
     CheckState, Forge, PrMeta, azure::Azure, bitbucket::Bitbucket, github::GitHub, gitlab::GitLab,
@@ -608,6 +608,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
     let mut summary = String::new();
     let mut model_used = "none (empty diff)".to_string();
     let mut usage = Usage::default();
+    let mut model_usage: Vec<ModelUsage> = Vec::new();
     let mut suppressed = 0u32;
     let mut ungrounded = 0u32;
     let mut findings: Vec<Finding> = Vec::new();
@@ -656,6 +657,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                 let outcome = filter::apply(cfg, &index, model_review.findings)?;
                 model_used = model_review.model_used;
                 usage = model_review.usage;
+                model_usage = model_review.model_usage;
                 suppressed = outcome.suppressed;
                 ungrounded = outcome.ungrounded;
                 if outcome.all_ungrounded {
@@ -700,6 +702,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                                 scorer_model = Some(scored.model_used);
                                 usage.prompt_tokens += scored.usage.prompt_tokens;
                                 usage.completion_tokens += scored.usage.completion_tokens;
+                                model_usage.extend(scored.model_usage);
                                 scorer_disagreements = Some(disagreements);
                                 sort_findings_for_display(&mut kept);
                             }
@@ -711,6 +714,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                                 let scorer_usage = e.usage();
                                 usage.prompt_tokens += scorer_usage.prompt_tokens;
                                 usage.completion_tokens += scorer_usage.completion_tokens;
+                                model_usage.extend_from_slice(e.model_usage());
                                 scorer_error = Some(detail);
                             }
                             Err(_) => {
@@ -727,6 +731,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
             Err(e) => {
                 model_used = cfg.model_chain().join(" -> ");
                 usage = e.usage();
+                model_usage = e.model_usage().to_vec();
                 let detail = format!("{e:#}");
                 // Provider-class failures (outage, timeout) are the only ones
                 // `gate.onError: advisory` may stand aside for; unusable model
@@ -835,6 +840,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
         scorer_error,
         scorer_disagreements,
         usage,
+        model_usage,
         duration_ms: review_started.elapsed().as_millis() as u64,
         base_sha: meta.map(|m| m.base_sha.clone()),
         head_sha,
@@ -1014,6 +1020,7 @@ fn error_envelope(
         scorer_error: None,
         scorer_disagreements: None,
         usage: Usage::default(),
+        model_usage: vec![],
         duration_ms,
         base_sha: Some(meta.base_sha.clone()),
         head_sha: Some(head_sha.to_string()),

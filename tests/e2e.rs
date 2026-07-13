@@ -561,6 +561,15 @@ async fn local_review_reports_grounded_finding_and_gates() {
     assert_eq!(env["gate"]["failing"], true);
     assert_eq!(env["counts"]["error"], 1);
     assert_eq!(env["usage"]["promptTokens"], 300);
+    let model_usage = env["modelUsage"].as_array().unwrap();
+    assert!(!model_usage.is_empty());
+    assert_eq!(
+        model_usage
+            .iter()
+            .map(|entry| entry["promptTokens"].as_u64().unwrap())
+            .sum::<u64>(),
+        env["usage"]["promptTokens"].as_u64().unwrap()
+    );
 
     let requests = server.received_requests().await.unwrap();
     let request: Value = requests[0].body_json().unwrap();
@@ -738,6 +747,15 @@ async fn slow_scorer_request_times_out_and_falls_back() {
     let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
     let env: Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(env["scorerModel"], "openai/gpt-5-mini");
+    let models: Vec<_> = env["modelUsage"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["model"].as_str().unwrap())
+        .collect();
+    assert!(models.contains(&"generator-model"));
+    assert!(models.contains(&"openai/gpt-5-mini"));
+    assert!(!models.contains(&"anthropic/claude-haiku-4.5"));
     assert!(stderr.contains("postil: scorer anthropic/claude-haiku-4.5 timed out after"));
     assert!(stderr.contains("falling back to next scorer"));
     assert!(stderr.contains("postil: running scorer with openai/gpt-5-mini"));
@@ -924,6 +942,18 @@ async fn scorer_error_fails_open_and_preserves_generator_values() {
             .contains("scorer output invalid")
     );
     assert!(env.get("scorerDisagreements").is_none());
+    assert_eq!(env["modelUsage"][0]["model"], "generator-model");
+    assert_eq!(env["modelUsage"][1]["model"], "anthropic/claude-haiku-4.5");
+    assert_eq!(env["modelUsage"][2]["model"], "openai/gpt-5-mini");
+    assert_eq!(
+        env["modelUsage"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["promptTokens"].as_u64().unwrap())
+            .sum::<u64>(),
+        env["usage"]["promptTokens"].as_u64().unwrap()
+    );
     assert_eq!(finding["confidence"], 0.92);
     assert_eq!(finding["kind"], "risk");
     assert!(finding.get("generatorConfidence").is_none());
@@ -3567,6 +3597,11 @@ async fn respond_writes_private_usage_receipt_across_model_fallback() {
 
     let dir = tempfile::tempdir().unwrap();
     let receipt_path = dir.path().join("respond-usage.json");
+    std::fs::write(
+        &receipt_path,
+        b"stale receipt from an interrupted attempt\n",
+    )
+    .unwrap();
     let out = postil()
         .current_dir(dir.path())
         .env("POSTIL_API_BASE", server.uri())

@@ -177,6 +177,8 @@ mode `0600` before provider access and writes JSON only after the reply succeeds
 The version 1 receipt contains `operation: "respond"`, aggregate
 `promptTokens`/`completionTokens`, and a `models` array with token usage for each
 model that returned cost-relevant usage during cascade attempts. The receipt is
+synced before stdout or forge delivery, so a hosted worker can persist accounting
+before it posts an answer. The receipt is
 never written to stdout, stderr, or command arguments. The caller owns deletion.
 
 ## Models and local inference
@@ -263,7 +265,11 @@ Bitbucket incremental reviews are disabled unless
 
 `--output json` prints a stable versioned envelope (`summary`, `silent`, `findings`,
 `resolved`, `counts`, `confidenceBuckets`, `gate`, `modelUsed`, scorer metadata,
-`usage`, SHAs) consumed by the hosted platform and `postil plan`. `--output yaml` and
+aggregate `usage`, per-model `modelUsage`, SHAs) consumed by the hosted platform
+and `postil plan`. `modelUsage` includes the successful generator, scorers, and
+token-bearing failed fallbacks; its totals equal aggregate `usage`. Older v1
+envelopes omit this additive field. Failed attempts that report zero tokens are
+omitted because they carry no billable usage. `--output yaml` and
 `--output csv` print the same review result in YAML or CSV. `--output-file <path>`
 writes the selected format to a file instead of stdout. `--output-json` is deprecated
 in v0.2.1 as an alias for `--output json` and emits a stderr warning. Schema:

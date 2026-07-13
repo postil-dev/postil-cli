@@ -9,7 +9,8 @@
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
@@ -60,7 +61,13 @@ struct RespondModelUsage<'a> {
     completion_tokens: u64,
 }
 
-struct UsageReceiptWriter(File);
+static RECEIPT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct UsageReceiptWriter {
+    file: Option<File>,
+    temp_path: PathBuf,
+    final_path: PathBuf,
+}
 
 impl UsageReceiptWriter {
     fn from_env() -> Result<Option<Self>> {
@@ -71,13 +78,29 @@ impl UsageReceiptWriter {
             !path.is_empty(),
             "{USAGE_RECEIPT_PATH_ENV} must not be empty"
         );
+        let final_path = PathBuf::from(path);
+        let parent = final_path.parent().unwrap_or_else(|| Path::new("."));
+        let file_name = final_path
+            .file_name()
+            .ok_or_else(|| anyhow!("{USAGE_RECEIPT_PATH_ENV} must name a file"))?
+            .to_string_lossy();
+        let sequence = RECEIPT_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temp_path = parent.join(format!(
+            ".{file_name}.{}.{}.tmp",
+            std::process::id(),
+            sequence
+        ));
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(PathBuf::from(path))
-            .context("creating usage receipt")?;
-        Ok(Some(Self(file)))
+            .open(&temp_path)
+            .context("creating private usage receipt temporary file")?;
+        Ok(Some(Self {
+            file: Some(file),
+            temp_path,
+            final_path,
+        }))
     }
 
     fn commit(mut self, answer: &Answer) -> Result<()> {
@@ -91,15 +114,30 @@ impl UsageReceiptWriter {
                 .iter()
                 .map(|model| RespondModelUsage {
                     model: &model.model,
-                    prompt_tokens: model.usage.prompt_tokens,
-                    completion_tokens: model.usage.completion_tokens,
+                    prompt_tokens: model.prompt_tokens,
+                    completion_tokens: model.completion_tokens,
                 })
                 .collect(),
         };
-        serde_json::to_writer(&mut self.0, &receipt).context("serializing usage receipt")?;
-        self.0.write_all(b"\n").context("writing usage receipt")?;
-        self.0.sync_all().context("syncing usage receipt")?;
+        let file = self.file.as_mut().expect("usage receipt file is present");
+        serde_json::to_writer(&mut *file, &receipt).context("serializing usage receipt")?;
+        file.write_all(b"\n").context("writing usage receipt")?;
+        file.sync_all().context("syncing usage receipt")?;
+        drop(self.file.take());
+        std::fs::rename(&self.temp_path, &self.final_path)
+            .context("atomically publishing usage receipt")?;
+        if let Some(parent) = self.final_path.parent() {
+            File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .context("syncing usage receipt directory")?;
+        }
         Ok(())
+    }
+}
+
+impl Drop for UsageReceiptWriter {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.temp_path);
     }
 }
 
@@ -215,6 +253,12 @@ async fn respond_with<F: Forge>(
         answer.content, answer.model_used
     );
 
+    // Hosted execution requires the durable usage receipt before any external
+    // delivery. Commit it before stdout or forge posting so the control plane
+    // can reconcile spend and own idempotent delivery.
+    if let Some(writer) = usage_receipt {
+        writer.commit(&answer)?;
+    }
     if no_post {
         println!("{reply}");
     } else {
@@ -223,9 +267,6 @@ async fn respond_with<F: Forge>(
             .await
             .context("posting reply")?;
         eprintln!("postil: replied on {repo}#{number}");
-    }
-    if let Some(writer) = usage_receipt {
-        writer.commit(&answer)?;
     }
     Ok(0)
 }

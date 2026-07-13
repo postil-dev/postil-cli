@@ -274,6 +274,7 @@ mod tests {
             scorer_error: None,
             scorer_disagreements: None,
             usage: Default::default(),
+            model_usage: vec![],
             duration_ms: 0,
             base_sha: None,
             head_sha: None,
