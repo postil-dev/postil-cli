@@ -3707,6 +3707,72 @@ async fn respond_marks_receipt_incomplete_after_ambiguous_fallback() {
 }
 
 #[tokio::test]
+async fn respond_marks_receipt_incomplete_after_internal_retry_succeeds() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("primary-model"))
+        .respond_with(ResponseTemplate::new(408).set_body_string("request timed out"))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("primary-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "Use a bounded retry."}}],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 3}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/issues/11"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "Retries", "body": "Requests fail intermittently."
+        })))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let receipt_path = dir.path().join("respond-usage.json");
+    postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .env("REVIEW_MODEL", "primary-model")
+        .env("REVIEW_MODEL_CASCADE", "")
+        .env("POSTIL_USAGE_RECEIPT_PATH", &receipt_path)
+        .args([
+            "respond",
+            "--repo",
+            "acme/api",
+            "--issue",
+            "11",
+            "--comment",
+            "@postil how should this retry?",
+            "--no-post",
+        ])
+        .assert()
+        .success();
+
+    let receipt: Value = serde_json::from_slice(&std::fs::read(receipt_path).unwrap()).unwrap();
+    assert_eq!(receipt["usageAccountingComplete"], false);
+    assert_eq!(receipt["models"].as_array().unwrap().len(), 1);
+    assert_eq!(receipt["models"][0]["model"], "primary-model");
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| { request.url.path() == "/chat/completions" })
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
 async fn respond_to_issue_mention_uses_issue_body() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

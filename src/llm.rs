@@ -587,6 +587,7 @@ impl LlmClient {
                 .await
             {
                 Ok(content) => {
+                    usage_accounting_complete &= model_accounting_complete;
                     add_usage(&mut usage, model_usage);
                     models.push(ModelUsage {
                         model: model.clone(),
