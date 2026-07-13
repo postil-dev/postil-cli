@@ -164,12 +164,20 @@ Environment: `POSTIL_API_KEY`, `OPENROUTER_API_KEY`, `MODEL_API_KEY`, or
 default, or `anthropic`), `POSTIL_ENDPOINT_AUTH_HEADER` and
 `POSTIL_ENDPOINT_AUTH_VALUE` (optional additional authentication for a private
 endpoint), `POSTIL_ALLOW_PRIVATE_API_BASE=1` (explicit opt-in for a local or
-private-network endpoint), `POSTIL_DETAILS_URL` (optional HTTP(S) target
-for GitHub check-run details links),
+private-network endpoint), `POSTIL_USAGE_RECEIPT_PATH` (optional worker-owned
+path for a successful `respond` usage receipt), `POSTIL_DETAILS_URL` (optional
+HTTP(S) target for GitHub check-run details links),
 `REVIEW_MODEL`, `REVIEW_MODEL_CASCADE`, `REVIEW_SCORER_MODEL`,
 `GITHUB_TOKEN`/`GITHUB_API_URL`,
 `GITLAB_TOKEN`/`GITLAB_API_URL`, `BITBUCKET_TOKEN`/`BITBUCKET_USER`/`BITBUCKET_API_URL`,
 `AZURE_DEVOPS_TOKEN`/`AZURE_DEVOPS_API_URL`.
+
+When `POSTIL_USAGE_RECEIPT_PATH` is set, `postil respond` creates that path with
+mode `0600` before provider access and writes JSON only after the reply succeeds.
+The version 1 receipt contains `operation: "respond"`, aggregate
+`promptTokens`/`completionTokens`, and a `models` array with token usage for each
+model that returned cost-relevant usage during cascade attempts. The receipt is
+never written to stdout, stderr, or command arguments. The caller owns deletion.
 
 ## Models and local inference
 

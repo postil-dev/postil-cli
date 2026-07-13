@@ -3533,6 +3533,82 @@ async fn respond_to_pr_mention_posts_grounded_reply() {
 }
 
 #[tokio::test]
+async fn respond_writes_private_usage_receipt_across_model_fallback() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("primary-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("backup-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "Use a bounded worker pool."}}],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 3}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/issues/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "Timeouts", "body": "Requests hang under load."
+        })))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let receipt_path = dir.path().join("respond-usage.json");
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .env("REVIEW_MODEL", "primary-model")
+        .env("REVIEW_MODEL_CASCADE", "backup-model")
+        .env("POSTIL_USAGE_RECEIPT_PATH", &receipt_path)
+        .args([
+            "respond",
+            "--repo",
+            "acme/api",
+            "--issue",
+            "9",
+            "--comment",
+            "@postil how should this be bounded?",
+            "--no-post",
+        ])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout);
+    assert!(stdout.contains("Use a bounded worker pool."));
+    assert!(!stdout.contains("promptTokens"));
+    let receipt: Value = serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+    assert_eq!(receipt["version"], 1);
+    assert_eq!(receipt["operation"], "respond");
+    assert_eq!(receipt["promptTokens"], 30);
+    assert_eq!(receipt["completionTokens"], 5);
+    assert_eq!(receipt["models"][0]["model"], "primary-model");
+    assert_eq!(receipt["models"][1]["model"], "backup-model");
+    assert_eq!(
+        std::fs::metadata(&receipt_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600,
+    );
+}
+
+#[tokio::test]
 async fn respond_to_issue_mention_uses_issue_body() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

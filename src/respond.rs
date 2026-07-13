@@ -6,16 +6,20 @@
 //! issues and pulls; Bitbucket and Azure DevOps are scoped to PRs (their issue
 //! trackers / work items use endpoints we cannot verify against a live host).
 
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
+use serde::Serialize;
 
 use crate::config::Config;
 use crate::diff;
 use crate::forge::{
     Forge, ThreadKind, azure::Azure, bitbucket::Bitbucket, github::GitHub, gitlab::GitLab,
 };
-use crate::llm::LlmClient;
+use crate::llm::{Answer, LlmClient};
 use crate::prompt;
 use crate::review::ForgeKind;
 
@@ -36,6 +40,68 @@ pub struct RespondArgs {
 }
 
 const MAX_DIFF_BYTES: usize = 200_000;
+const USAGE_RECEIPT_PATH_ENV: &str = "POSTIL_USAGE_RECEIPT_PATH";
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RespondUsageReceipt<'a> {
+    version: u32,
+    operation: &'static str,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    models: Vec<RespondModelUsage<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RespondModelUsage<'a> {
+    model: &'a str,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+}
+
+struct UsageReceiptWriter(File);
+
+impl UsageReceiptWriter {
+    fn from_env() -> Result<Option<Self>> {
+        let Some(path) = std::env::var_os(USAGE_RECEIPT_PATH_ENV) else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            !path.is_empty(),
+            "{USAGE_RECEIPT_PATH_ENV} must not be empty"
+        );
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(PathBuf::from(path))
+            .context("creating usage receipt")?;
+        Ok(Some(Self(file)))
+    }
+
+    fn commit(mut self, answer: &Answer) -> Result<()> {
+        let receipt = RespondUsageReceipt {
+            version: 1,
+            operation: "respond",
+            prompt_tokens: answer.usage.prompt_tokens,
+            completion_tokens: answer.usage.completion_tokens,
+            models: answer
+                .models
+                .iter()
+                .map(|model| RespondModelUsage {
+                    model: &model.model,
+                    prompt_tokens: model.usage.prompt_tokens,
+                    completion_tokens: model.usage.completion_tokens,
+                })
+                .collect(),
+        };
+        serde_json::to_writer(&mut self.0, &receipt).context("serializing usage receipt")?;
+        self.0.write_all(b"\n").context("writing usage receipt")?;
+        self.0.sync_all().context("syncing usage receipt")?;
+        Ok(())
+    }
+}
 
 pub async fn run(args: RespondArgs) -> Result<i32> {
     let cwd = std::env::current_dir()?;
@@ -54,6 +120,7 @@ pub async fn run(args: RespondArgs) -> Result<i32> {
         .or_else(|| std::env::var("POSTIL_COMMENT").ok())
         .filter(|c| !c.trim().is_empty())
         .ok_or_else(|| anyhow!("the mention text is required: --comment or POSTIL_COMMENT"))?;
+    let usage_receipt = UsageReceiptWriter::from_env()?;
 
     // The number the mention is on, and whether it is a PR/MR or an issue.
     let (number, kind) = match (args.pr, args.issue) {
@@ -75,6 +142,7 @@ pub async fn run(args: RespondArgs) -> Result<i32> {
                 kind,
                 &comment,
                 args.no_post,
+                usage_receipt,
             )
             .await
         }
@@ -87,6 +155,7 @@ pub async fn run(args: RespondArgs) -> Result<i32> {
                 kind,
                 &comment,
                 args.no_post,
+                usage_receipt,
             )
             .await
         }
@@ -99,6 +168,7 @@ pub async fn run(args: RespondArgs) -> Result<i32> {
                 kind,
                 &comment,
                 args.no_post,
+                usage_receipt,
             )
             .await
         }
@@ -111,6 +181,7 @@ pub async fn run(args: RespondArgs) -> Result<i32> {
                 kind,
                 &comment,
                 args.no_post,
+                usage_receipt,
             )
             .await
         }
@@ -127,6 +198,7 @@ async fn respond_with<F: Forge>(
     kind: ThreadKind,
     comment: &str,
     no_post: bool,
+    usage_receipt: Option<UsageReceiptWriter>,
 ) -> Result<i32> {
     let context = build_context(&forge, repo, number, kind).await?;
 
@@ -136,9 +208,12 @@ async fn respond_with<F: Forge>(
         comment.trim()
     );
     let client = LlmClient::from_env(cfg)?;
-    let (answer, model_used) = client.answer(cfg, &system, &user).await?;
+    let answer = client.answer(cfg, &system, &user).await?;
 
-    let reply = format!("{answer}\n\n<sub>Postil · {model_used}</sub>");
+    let reply = format!(
+        "{}\n\n<sub>Postil · {}</sub>",
+        answer.content, answer.model_used
+    );
 
     if no_post {
         println!("{reply}");
@@ -148,6 +223,9 @@ async fn respond_with<F: Forge>(
             .await
             .context("posting reply")?;
         eprintln!("postil: replied on {repo}#{number}");
+    }
+    if let Some(writer) = usage_receipt {
+        writer.commit(&answer)?;
     }
     Ok(0)
 }

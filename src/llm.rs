@@ -40,6 +40,20 @@ pub struct ScorerReview {
     pub usage: Usage,
 }
 
+#[derive(Debug, Clone)]
+pub struct ModelUsage {
+    pub model: String,
+    pub usage: Usage,
+}
+
+#[derive(Debug, Clone)]
+pub struct Answer {
+    pub content: String,
+    pub model_used: String,
+    pub usage: Usage,
+    pub models: Vec<ModelUsage>,
+}
+
 #[derive(Debug)]
 pub struct ModelError {
     error: anyhow::Error,
@@ -197,6 +211,7 @@ const TIMEOUT_RETRY_CAP_SECS: u64 = 90;
 const REVIEW_MAX_TOKENS: u32 = 16384;
 const SCORER_MAX_TOKENS: u32 = 4096;
 const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 4096;
+const RESPOND_MAX_TOKENS: u32 = 4096;
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 pub(crate) const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 480;
 const REQUEST_TIMEOUT_ENV: &str = "POSTIL_LLM_REQUEST_TIMEOUT_SECS";
@@ -489,17 +504,45 @@ impl LlmClient {
 
     /// Free-form answer (no JSON contract). Used by the interactive bot to reply
     /// to a maintainer's question or mention. Tries the model chain in order.
-    pub async fn answer(&self, cfg: &Config, system: &str, user: &str) -> Result<(String, String)> {
+    pub async fn answer(&self, cfg: &Config, system: &str, user: &str) -> Result<Answer> {
         let mut usage = Usage::default();
+        let mut models = Vec::new();
         let mut last_err = None;
         for model in cfg.model_chain() {
+            let mut model_usage = Usage::default();
             match self
-                .chat(&model, system, user, &mut usage, None, LlmPhase::Total)
+                .chat(
+                    &model,
+                    system,
+                    user,
+                    &mut model_usage,
+                    Some(RESPOND_MAX_TOKENS),
+                    LlmPhase::Total,
+                )
                 .await
             {
-                Ok(content) => return Ok((content.trim().to_string(), model)),
+                Ok(content) => {
+                    add_usage(&mut usage, model_usage);
+                    models.push(ModelUsage {
+                        model: model.clone(),
+                        usage: model_usage,
+                    });
+                    return Ok(Answer {
+                        content: content.trim().to_string(),
+                        model_used: model,
+                        usage,
+                        models,
+                    });
+                }
                 Err(e) => {
                     eprintln!("postil: model {model} failed: {e:#}");
+                    if model_usage.prompt_tokens > 0 || model_usage.completion_tokens > 0 {
+                        add_usage(&mut usage, model_usage);
+                        models.push(ModelUsage {
+                            model: model.clone(),
+                            usage: model_usage,
+                        });
+                    }
                     if e.downcast_ref::<DeadlineExceeded>().is_some() {
                         return Err(e);
                     }
