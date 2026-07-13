@@ -210,8 +210,8 @@ pub fn respond_system_prompt(cfg: &Config) -> String {
          risk is present. Do not add an overview, implementation tour, correctness section, \
          generic risk inventory, or verdict. Use no more than two headings and five list items.\n\
          Do not emit active @mentions, raw HTML or HTML comments, details blocks, Markdown \
-         tables, or images. Never use the report headings \"What this PR does\", \"Correctness\", \
-         \"Issues and risks\", or \"Verdict\".\n\
+         tables, or images. Never use report headings such as \"Summary\", \"What this PR does\", \
+         \"Correctness\", \"Issues and risks\", \"Assessment\", or \"Verdict\".\n\
          \n\
          Return ONLY one JSON object with exactly this shape and no markdown fence or surrounding \
          prose:\n\

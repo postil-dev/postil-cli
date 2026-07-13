@@ -46,11 +46,22 @@ const RESPOND_MAX_CHARS: usize = 2_400;
 const RESPOND_MAX_NONBLANK_LINES: usize = 24;
 const RESPOND_MAX_HEADINGS: usize = 2;
 const RESPOND_MAX_LIST_ITEMS: usize = 5;
-const REPORT_HEADINGS: [&str; 4] = [
+const REPORT_HEADINGS: [&str; 15] = [
     "what this pr does",
+    "what this pull request does",
+    "summary",
     "correctness",
+    "issue",
+    "issues",
+    "issue and risk",
+    "issue and risks",
+    "issues and risk",
     "issues and risks",
+    "risk",
+    "risks",
     "verdict",
+    "assessment",
+    "review metadata",
 ];
 
 #[derive(Deserialize)]
@@ -835,6 +846,24 @@ mod tests {
             "classDiagram\n  class A",
         ] {
             assert!(validate_respond_output(&structured(answer, None)).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_report_shaped_headings() {
+        for heading in [
+            "Summary",
+            "What this pull request does",
+            "Issue and risk",
+            "Risks",
+            "Assessment",
+            "Review metadata",
+        ] {
+            let reply = structured(&format!("# {heading}\nLong-form report prose."), None);
+            assert!(
+                validate_respond_output(&reply).is_err(),
+                "report heading was accepted: {heading}",
+            );
         }
     }
 
