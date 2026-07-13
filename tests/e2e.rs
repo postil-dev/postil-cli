@@ -913,7 +913,7 @@ async fn large_confidence_disagreement_escalates_to_uncertainty_with_default_gat
     mock_review_model(
         &server,
         "generator-model",
-        json!([finding_at(41, "warn", 0.95)]),
+        json!([finding_at(41, "warn", 1.0)]),
     )
     .await;
     mock_scorer_model(
@@ -921,7 +921,7 @@ async fn large_confidence_disagreement_escalates_to_uncertainty_with_default_gat
         "anthropic/claude-haiku-4.5",
         json!([{
             "index": 0,
-            "confidence": 0.5,
+            "confidence": 0.6,
             "kind": "risk",
             "reason": "weak evidence"
         }]),
@@ -942,7 +942,7 @@ async fn large_confidence_disagreement_escalates_to_uncertainty_with_default_gat
 
     let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
     let env: Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(env["findings"][0]["confidence"], 0.5);
+    assert_eq!(env["findings"][0]["confidence"], 0.6);
     assert_eq!(env["findings"][0]["kind"], "uncertainty");
     assert_eq!(env["findings"][0]["generatorKind"], "risk");
     assert_eq!(env["findings"][0]["scorerKind"], "risk");
