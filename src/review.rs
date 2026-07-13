@@ -609,6 +609,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
     let mut model_used = "none (empty diff)".to_string();
     let mut usage = Usage::default();
     let mut model_usage: Vec<ModelUsage> = Vec::new();
+    let mut usage_accounting_complete = true;
     let mut suppressed = 0u32;
     let mut ungrounded = 0u32;
     let mut findings: Vec<Finding> = Vec::new();
@@ -658,6 +659,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                 model_used = model_review.model_used;
                 usage = model_review.usage;
                 model_usage = model_review.model_usage;
+                usage_accounting_complete = model_review.usage_accounting_complete;
                 suppressed = outcome.suppressed;
                 ungrounded = outcome.ungrounded;
                 if outcome.all_ungrounded {
@@ -703,6 +705,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                                 usage.prompt_tokens += scored.usage.prompt_tokens;
                                 usage.completion_tokens += scored.usage.completion_tokens;
                                 model_usage.extend(scored.model_usage);
+                                usage_accounting_complete &= scored.usage_accounting_complete;
                                 scorer_disagreements = Some(disagreements);
                                 sort_findings_for_display(&mut kept);
                             }
@@ -715,9 +718,11 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                                 usage.prompt_tokens += scorer_usage.prompt_tokens;
                                 usage.completion_tokens += scorer_usage.completion_tokens;
                                 model_usage.extend_from_slice(e.model_usage());
+                                usage_accounting_complete &= e.usage_accounting_complete();
                                 scorer_error = Some(detail);
                             }
                             Err(_) => {
+                                usage_accounting_complete = false;
                                 let detail =
                                     format!("scorer timed out after {SCORER_TIMEOUT_SECS}s");
                                 eprintln!("postil: scorer failed open: {detail}");
@@ -732,6 +737,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                 model_used = cfg.model_chain().join(" -> ");
                 usage = e.usage();
                 model_usage = e.model_usage().to_vec();
+                usage_accounting_complete = e.usage_accounting_complete();
                 let detail = format!("{e:#}");
                 // Provider-class failures (outage, timeout) are the only ones
                 // `gate.onError: advisory` may stand aside for; unusable model
@@ -841,6 +847,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
         scorer_disagreements,
         usage,
         model_usage,
+        usage_accounting_complete,
         duration_ms: review_started.elapsed().as_millis() as u64,
         base_sha: meta.map(|m| m.base_sha.clone()),
         head_sha,
@@ -1021,6 +1028,7 @@ fn error_envelope(
         scorer_disagreements: None,
         usage: Usage::default(),
         model_usage: vec![],
+        usage_accounting_complete: true,
         duration_ms,
         base_sha: Some(meta.base_sha.clone()),
         head_sha: Some(head_sha.to_string()),

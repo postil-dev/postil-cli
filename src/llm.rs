@@ -24,6 +24,7 @@ pub struct ModelReview {
     pub model_used: String,
     pub usage: Usage,
     pub model_usage: Vec<ModelUsage>,
+    pub usage_accounting_complete: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +41,7 @@ pub struct ScorerReview {
     pub model_used: String,
     pub usage: Usage,
     pub model_usage: Vec<ModelUsage>,
+    pub usage_accounting_complete: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +50,7 @@ pub struct Answer {
     pub model_used: String,
     pub usage: Usage,
     pub models: Vec<ModelUsage>,
+    pub usage_accounting_complete: bool,
 }
 
 #[derive(Debug)]
@@ -55,14 +58,16 @@ pub struct ModelError {
     error: anyhow::Error,
     usage: Usage,
     model_usage: Vec<ModelUsage>,
+    usage_accounting_complete: bool,
 }
 
 impl ModelError {
-    fn new(error: anyhow::Error, usage: Usage) -> Self {
+    fn new(error: anyhow::Error, usage: Usage, usage_accounting_complete: bool) -> Self {
         Self {
             error,
             usage,
             model_usage: Vec::new(),
+            usage_accounting_complete,
         }
     }
 
@@ -72,6 +77,10 @@ impl ModelError {
 
     pub fn model_usage(&self) -> &[ModelUsage] {
         &self.model_usage
+    }
+
+    pub fn usage_accounting_complete(&self) -> bool {
+        self.usage_accounting_complete
     }
 
     pub fn is_provider(&self) -> bool {
@@ -411,12 +420,14 @@ impl LlmClient {
             let mut ok: Vec<ModelReview> = Vec::new();
             let mut failed_usage = Usage::default();
             let mut failed_model_usage = Vec::new();
+            let mut usage_accounting_complete = true;
             let mut last_err: Option<ModelError> = None;
             for (model, handle) in handles {
                 let model_log = log_text(&model);
                 match handle.await {
                     Ok(Ok(r)) => ok.push(r),
                     Ok(Err(mut e)) => {
+                        usage_accounting_complete &= e.usage_accounting_complete;
                         if e.model_usage.is_empty()
                             && (e.usage.prompt_tokens > 0 || e.usage.completion_tokens > 0)
                         {
@@ -432,6 +443,7 @@ impl LlmClient {
                         last_err = Some(e);
                     }
                     Err(e) => {
+                        usage_accounting_complete = false;
                         eprintln!("postil: consensus model {model_log} task panicked: {e}")
                     }
                 }
@@ -444,30 +456,36 @@ impl LlmClient {
                         let mut error = ModelError::new(
                             e.error.context(format!("all {n} consensus models failed")),
                             failed_usage,
+                            usage_accounting_complete,
                         );
                         error.model_usage = failed_model_usage;
                         error
                     }
-                    None => {
-                        ModelError::new(anyhow!("all {n} consensus models failed"), failed_usage)
-                    }
+                    None => ModelError::new(
+                        anyhow!("all {n} consensus models failed"),
+                        failed_usage,
+                        usage_accounting_complete,
+                    ),
                 }),
                 1 => {
                     let mut review = ok.into_iter().next().unwrap();
                     add_usage(&mut review.usage, failed_usage);
                     review.model_usage.extend(failed_model_usage);
+                    review.usage_accounting_complete &= usage_accounting_complete;
                     Ok(review)
                 }
                 _ => {
                     let mut review = consensus_merge(ok);
                     add_usage(&mut review.usage, failed_usage);
                     review.model_usage.extend(failed_model_usage);
+                    review.usage_accounting_complete &= usage_accounting_complete;
                     Ok(review)
                 }
             }
         } else {
             let mut failed_usage = Usage::default();
             let mut failed_model_usage = Vec::new();
+            let mut usage_accounting_complete = true;
             let mut last_err = None;
             for (index, model) in chain.iter().enumerate() {
                 let model_log = log_text(model);
@@ -481,9 +499,11 @@ impl LlmClient {
                         );
                         add_usage(&mut r.usage, failed_usage);
                         r.model_usage.splice(0..0, failed_model_usage);
+                        r.usage_accounting_complete &= usage_accounting_complete;
                         return Ok(r);
                     }
                     Err(mut e) => {
+                        usage_accounting_complete &= e.usage_accounting_complete;
                         if e.model_usage.is_empty()
                             && (e.usage.prompt_tokens > 0 || e.usage.completion_tokens > 0)
                         {
@@ -535,9 +555,12 @@ impl LlmClient {
             Err(last_err
                 .map(|mut error| {
                     error.model_usage = failed_model_usage;
+                    error.usage_accounting_complete = usage_accounting_complete;
                     error
                 })
-                .unwrap_or_else(|| ModelError::new(anyhow!("empty model chain"), failed_usage)))
+                .unwrap_or_else(|| {
+                    ModelError::new(anyhow!("empty model chain"), failed_usage, true)
+                }))
         }
     }
 
@@ -547,6 +570,7 @@ impl LlmClient {
         let mut usage = Usage::default();
         let mut models = Vec::new();
         let mut last_err = None;
+        let mut usage_accounting_complete = true;
         for model in cfg.model_chain() {
             let mut model_usage = Usage::default();
             match self
@@ -572,9 +596,16 @@ impl LlmClient {
                         model_used: model,
                         usage,
                         models,
+                        usage_accounting_complete,
                     });
                 }
                 Err(e) => {
+                    // Usage parsed from a provider response is complete even
+                    // when the response has no usable answer. A transport
+                    // failure with no response usage is ambiguous.
+                    if model_usage.prompt_tokens == 0 && model_usage.completion_tokens == 0 {
+                        usage_accounting_complete = false;
+                    }
                     eprintln!("postil: model {model} failed: {e:#}");
                     // Provider failures that report no tokens have no billable
                     // usage to attribute. Omit them rather than emitting a
@@ -607,6 +638,7 @@ impl LlmClient {
     ) -> std::result::Result<ScorerReview, ModelError> {
         let mut failed_usage = Usage::default();
         let mut failed_model_usage = Vec::new();
+        let mut usage_accounting_complete = true;
         let mut last_err = None;
         let chain = cfg.scorer_chain();
         for (index, model) in chain.iter().enumerate() {
@@ -624,9 +656,11 @@ impl LlmClient {
                     );
                     add_usage(&mut r.usage, failed_usage);
                     r.model_usage.splice(0..0, failed_model_usage);
+                    r.usage_accounting_complete &= usage_accounting_complete;
                     return Ok(r);
                 }
                 Err(mut e) => {
+                    usage_accounting_complete &= e.usage_accounting_complete;
                     if e.model_usage.is_empty()
                         && (e.usage.prompt_tokens > 0 || e.usage.completion_tokens > 0)
                     {
@@ -676,9 +710,12 @@ impl LlmClient {
         Err(last_err
             .map(|mut error| {
                 error.model_usage = failed_model_usage;
+                error.usage_accounting_complete = usage_accounting_complete;
                 error
             })
-            .unwrap_or_else(|| ModelError::new(anyhow!("empty scorer model chain"), failed_usage)))
+            .unwrap_or_else(|| {
+                ModelError::new(anyhow!("empty scorer model chain"), failed_usage, true)
+            }))
     }
 
     async fn review_with_model(
@@ -698,7 +735,10 @@ impl LlmClient {
                 LlmPhase::Review,
             )
             .await
-            .map_err(|e| ModelError::new(e, usage))?;
+            .map_err(|e| {
+                let complete = usage.prompt_tokens > 0 || usage.completion_tokens > 0;
+                ModelError::new(e, usage, complete)
+            })?;
         let raw = match parse_review(&content) {
             Ok(raw) => raw,
             Err(parse_err) => {
@@ -718,9 +758,15 @@ impl LlmClient {
                         LlmPhase::Review,
                     )
                     .await
-                    .map_err(|e| ModelError::new(e.context("JSON repair call failed"), usage))?;
+                    .map_err(|e| {
+                        ModelError::new(e.context("JSON repair call failed"), usage, false)
+                    })?;
                 parse_review(&repaired).map_err(|e| {
-                    ModelError::new(anyhow!("model output invalid after repair: {e}"), usage)
+                    ModelError::new(
+                        anyhow!("model output invalid after repair: {e}"),
+                        usage,
+                        true,
+                    )
                 })?
             }
         };
@@ -740,7 +786,7 @@ impl LlmClient {
                  return exactly {{\"summary\": \"\", \"findings\": []}}."
             );
             let mut retry_usage = usage;
-            if let Ok(retried) = self
+            match self
                 .chat(
                     model,
                     system,
@@ -751,17 +797,27 @@ impl LlmClient {
                 )
                 .await
             {
-                review.usage = retry_usage;
-                if let Ok(retried_raw) = parse_review(&retried) {
-                    let candidate = into_review(retried_raw, model, retry_usage);
-                    let still_contradictory =
-                        candidate.findings.is_empty() && !candidate.summary.is_empty();
-                    if !still_contradictory {
-                        review = candidate;
+                Ok(retried) => {
+                    review.usage = retry_usage;
+                    if let Ok(retried_raw) = parse_review(&retried) {
+                        let candidate = into_review(retried_raw, model, retry_usage);
+                        let still_contradictory =
+                            candidate.findings.is_empty() && !candidate.summary.is_empty();
+                        if !still_contradictory {
+                            review = candidate;
+                        }
                     }
                 }
-            } else if let Err(error) = self.remaining_budget(LlmPhase::Review) {
-                return Err(ModelError::new(error.context(ProviderError), retry_usage));
+                Err(_) => {
+                    review.usage_accounting_complete = false;
+                    if let Err(error) = self.remaining_budget(LlmPhase::Review) {
+                        return Err(ModelError::new(
+                            error.context(ProviderError),
+                            retry_usage,
+                            false,
+                        ));
+                    }
+                }
             }
         }
         Ok(review)
@@ -786,9 +842,12 @@ impl LlmClient {
                 LlmPhase::Total,
             )
             .await
-            .map_err(|e| ModelError::new(e, usage))?;
+            .map_err(|e| {
+                let complete = usage.prompt_tokens > 0 || usage.completion_tokens > 0;
+                ModelError::new(e, usage, complete)
+            })?;
         let scores = parse_scores(&content, expected_len)
-            .map_err(|e| ModelError::new(anyhow!("scorer output invalid: {e}"), usage))?;
+            .map_err(|e| ModelError::new(anyhow!("scorer output invalid: {e}"), usage, true))?;
         Ok(ScorerReview {
             scores,
             model_used: model.to_string(),
@@ -798,6 +857,7 @@ impl LlmClient {
                 prompt_tokens: usage.prompt_tokens,
                 completion_tokens: usage.completion_tokens,
             }],
+            usage_accounting_complete: true,
         })
     }
 
@@ -1504,6 +1564,7 @@ fn into_review(raw: RawReview, model: &str, usage: Usage) -> ModelReview {
             prompt_tokens: usage.prompt_tokens,
             completion_tokens: usage.completion_tokens,
         }],
+        usage_accounting_complete: true,
     }
 }
 
@@ -1519,6 +1580,7 @@ fn consensus_merge(runs: Vec<ModelReview>) -> ModelReview {
     };
     let models: Vec<String> = runs.iter().map(|r| r.model_used.clone()).collect();
     let model_usage = runs.iter().flat_map(|r| r.model_usage.clone()).collect();
+    let usage_accounting_complete = runs.iter().all(|r| r.usage_accounting_complete);
     let summary = runs[0].summary.clone();
     // Flatten in run order; greedy clustering then anchors each cluster on its
     // earliest report.
@@ -1561,6 +1623,7 @@ fn consensus_merge(runs: Vec<ModelReview>) -> ModelReview {
         model_used: format!("consensus({})", models.join(", ")),
         usage: total_usage,
         model_usage,
+        usage_accounting_complete,
     }
 }
 
@@ -2005,6 +2068,7 @@ mod tests {
                 completion_tokens: 5,
             },
             model_usage: vec![],
+            usage_accounting_complete: true,
         }
     }
 

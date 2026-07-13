@@ -178,7 +178,9 @@ The version 1 receipt contains `operation: "respond"`, aggregate
 `promptTokens`/`completionTokens`, and a `models` array with token usage for each
 model that returned cost-relevant usage during cascade attempts. The receipt is
 synced before stdout or forge delivery, so a hosted worker can persist accounting
-before it posts an answer. The receipt is
+before it posts an answer. `usageAccountingComplete` is false when a sent request
+can have unknown provider-billed usage, such as a timeout or ambiguous transport
+failure. The receipt is
 never written to stdout, stderr, or command arguments. The caller owns deletion.
 
 ## Models and local inference
@@ -269,7 +271,8 @@ aggregate `usage`, per-model `modelUsage`, SHAs) consumed by the hosted platform
 and `postil plan`. `modelUsage` includes the successful generator, scorers, and
 token-bearing failed fallbacks; its totals equal aggregate `usage`. Older v1
 envelopes omit this additive field. Failed attempts that report zero tokens are
-omitted because they carry no billable usage. `--output yaml` and
+omitted because they carry no billable usage. The envelope's
+`usageAccountingComplete` has the same conservative semantics. `--output yaml` and
 `--output csv` print the same review result in YAML or CSV. `--output-file <path>`
 writes the selected format to a file instead of stdout. `--output-json` is deprecated
 in v0.2.1 as an alias for `--output json` and emits a stderr warning. Schema:

@@ -561,6 +561,7 @@ async fn local_review_reports_grounded_finding_and_gates() {
     assert_eq!(env["gate"]["failing"], true);
     assert_eq!(env["counts"]["error"], 1);
     assert_eq!(env["usage"]["promptTokens"], 300);
+    assert_eq!(env["usageAccountingComplete"], true);
     let model_usage = env["modelUsage"].as_array().unwrap();
     assert!(!model_usage.is_empty());
     assert_eq!(
@@ -747,6 +748,7 @@ async fn slow_scorer_request_times_out_and_falls_back() {
     let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
     let env: Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(env["scorerModel"], "openai/gpt-5-mini");
+    assert_eq!(env["usageAccountingComplete"], false);
     let models: Vec<_> = env["modelUsage"]
         .as_array()
         .unwrap()
@@ -755,6 +757,9 @@ async fn slow_scorer_request_times_out_and_falls_back() {
         .collect();
     assert!(models.contains(&"generator-model"));
     assert!(models.contains(&"openai/gpt-5-mini"));
+    // The timed-out request has no validated token count. It is not invented
+    // as a per-model entry; the explicit incomplete flag makes hosted billing
+    // consume the conservative reservation instead.
     assert!(!models.contains(&"anthropic/claude-haiku-4.5"));
     assert!(stderr.contains("postil: scorer anthropic/claude-haiku-4.5 timed out after"));
     assert!(stderr.contains("falling back to next scorer"));
@@ -3629,6 +3634,7 @@ async fn respond_writes_private_usage_receipt_across_model_fallback() {
     let receipt: Value = serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
     assert_eq!(receipt["version"], 1);
     assert_eq!(receipt["operation"], "respond");
+    assert_eq!(receipt["usageAccountingComplete"], true);
     assert_eq!(receipt["promptTokens"], 30);
     assert_eq!(receipt["completionTokens"], 5);
     assert_eq!(receipt["models"][0]["model"], "primary-model");
@@ -3641,6 +3647,61 @@ async fn respond_writes_private_usage_receipt_across_model_fallback() {
             & 0o777,
         0o600,
     );
+}
+
+#[tokio::test]
+async fn respond_marks_receipt_incomplete_after_ambiguous_fallback() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("primary-model"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("backup-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "Retry with a bounded backoff."}}],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 3}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/issues/10"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "Retries", "body": "Requests fail intermittently."
+        })))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let receipt_path = dir.path().join("respond-usage.json");
+    postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .env("REVIEW_MODEL", "primary-model")
+        .env("REVIEW_MODEL_CASCADE", "backup-model")
+        .env("POSTIL_USAGE_RECEIPT_PATH", &receipt_path)
+        .args([
+            "respond",
+            "--repo",
+            "acme/api",
+            "--issue",
+            "10",
+            "--comment",
+            "@postil how should this retry?",
+            "--no-post",
+        ])
+        .assert()
+        .success();
+
+    let receipt: Value = serde_json::from_slice(&std::fs::read(receipt_path).unwrap()).unwrap();
+    assert_eq!(receipt["usageAccountingComplete"], false);
+    assert_eq!(receipt["models"].as_array().unwrap().len(), 1);
+    assert_eq!(receipt["models"][0]["model"], "backup-model");
 }
 
 #[tokio::test]

@@ -51,6 +51,7 @@ struct RespondUsageReceipt<'a> {
     prompt_tokens: u64,
     completion_tokens: u64,
     models: Vec<RespondModelUsage<'a>>,
+    usage_accounting_complete: bool,
 }
 
 #[derive(Serialize)]
@@ -118,6 +119,7 @@ impl UsageReceiptWriter {
                     completion_tokens: model.completion_tokens,
                 })
                 .collect(),
+            usage_accounting_complete: answer.usage_accounting_complete,
         };
         let file = self.file.as_mut().expect("usage receipt file is present");
         serde_json::to_writer(&mut *file, &receipt).context("serializing usage receipt")?;

@@ -182,6 +182,10 @@ pub struct Envelope {
     /// this additive field and are handled conservatively by the control plane.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub model_usage: Vec<ModelUsage>,
+    /// False when any sent provider request can have unknown billed usage,
+    /// including timeouts and ambiguous transport failures.
+    #[serde(default)]
+    pub usage_accounting_complete: bool,
     /// Wall-clock duration of the review engine run in milliseconds.
     #[serde(default)]
     pub duration_ms: u64,
@@ -442,6 +446,7 @@ mod tests {
             scorer_disagreements: None,
             usage: Usage::default(),
             model_usage: vec![],
+            usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
             head_sha: None,
