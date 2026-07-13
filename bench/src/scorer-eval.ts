@@ -15,12 +15,29 @@ import { promisify } from "node:util";
 import { cases as fixtureInputs } from "../fixtures/cases";
 import { API_KEY_ENV_NAMES_TEXT, resolveApiKeyName } from "./api-key";
 import { benchmarkCase, safeJson, startMockGithub, type BenchmarkCase } from "./harness";
+import {
+  pricingFromCatalog,
+  type ModelPricing,
+  type OpenRouterModelsResponse,
+} from "./livemodels-score";
 
 const execFile = promisify(execFileCb);
 
 export const GENERATOR_MODEL = "postil-scorer-eval/generator";
-const DEFAULT_SCORER_MODELS = ["anthropic/claude-haiku-4.5", "openai/gpt-5-mini"];
 const DEFAULT_API_BASE = "https://openrouter.ai/api/v1";
+export const DEFAULT_QUALIFICATION_REPEATS = 5;
+export const SCORER_REASON_MAX_CHARS = 240;
+export const SCORER_MAX_P50_MS = 5_000;
+export const SCORER_MAX_P95_MS = 10_000;
+export const SCORER_MAX_CASE_MS = 20_000;
+export const SCORER_MAX_MEAN_COST_USD = 0.005;
+export const SCORER_MIN_FALSE_DOWNSCORE_RATE = 0.8;
+export const SCORER_MAX_CANDIDATES = 6;
+export const SCORER_MAX_PROJECTED_SPEND_USD = 10;
+export const SCORER_PREFLIGHT_PROMPT_TOKENS_PER_CASE = 20_000;
+export const SCORER_PREFLIGHT_COMPLETION_TOKENS_PER_ATTEMPT = 4_096;
+export const SCORER_PREFLIGHT_REPAIR_INPUT_TOKENS_PER_ATTEMPT = 4_096;
+export const SCORER_PREFLIGHT_MAX_REQUESTS_PER_CASE = 6;
 
 export const TRUE_FINDING_CASES = [
   "billing-double-charge",
@@ -43,6 +60,7 @@ export const FALSE_FINDING_CASES = [
 export type Scenario = "trueFinding" | "falseFinding";
 
 export interface ScorerEvalCase {
+  repeat: number;
   id: string;
   name: string;
   scenario: Scenario;
@@ -56,9 +74,14 @@ export interface ScorerEvalCase {
   finalKind: string | null;
   passed: boolean;
   reason: string;
+  reasonContractValid: boolean;
+  usageAccountingComplete: boolean | null;
+  usageValid: boolean;
+  upstreamRequests: number;
   durationMs: number | null;
   promptTokens: number;
   completionTokens: number;
+  costUsd: number | null;
 }
 
 export interface ScorerEvalAggregate {
@@ -71,14 +94,35 @@ export interface ScorerEvalAggregate {
   falseFindingCases: number;
   meanTrueConfidence: number;
   meanFalseConfidence: number;
+  reasonContractFailures: number;
+  pricingKnown: boolean;
+  meanCostUsd: number;
+  p50DurationMs: number;
+  p95DurationMs: number;
+  maxDurationMs: number;
+  admissionFailures: string[];
   passed: boolean;
 }
 
 export interface ScorerEvalReport {
   generatedAt: string;
   apiBase: string;
+  repeats: number;
+  passed: boolean;
   models: ScorerEvalAggregate[];
   cases: ScorerEvalCase[];
+}
+
+interface ScorerAttempt {
+  durationMs: number;
+  promptTokens: number;
+  completionTokens: number;
+  usageValid: boolean;
+}
+
+interface EmbeddedScorerDefaults {
+  enabled: boolean;
+  qualification_candidates: string[];
 }
 
 function flagValue(args: string[], flag: string): string | undefined {
@@ -86,12 +130,43 @@ function flagValue(args: string[], flag: string): string | undefined {
   return index === -1 ? undefined : args[index + 1];
 }
 
-export function parseModels(raw: string | undefined): string[] {
-  const source = raw?.trim() ? raw : DEFAULT_SCORER_MODELS.join(",");
-  return source
+export function parseModels(raw: string | undefined, defaults: string[]): string[] {
+  const source = raw?.trim() ? raw : defaults.join(",");
+  return [...new Set(source
     .split(",")
     .map((model) => model.trim())
-    .filter((model) => model.length > 0);
+    .filter((model) => model.length > 0))];
+}
+
+export function parseRepeatCount(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") return DEFAULT_QUALIFICATION_REPEATS;
+  const repeats = Number.parseInt(raw, 10);
+  if (!Number.isSafeInteger(repeats) || repeats < 1 || repeats > 10) {
+    throw new Error("scorer qualification repeats must be an integer in 1..10");
+  }
+  return repeats;
+}
+
+export async function loadEmbeddedScorerDefaults(
+  path = resolve(import.meta.dir, "..", "..", "config.toml"),
+): Promise<EmbeddedScorerDefaults> {
+  const parsed = Bun.TOML.parse(await Bun.file(path).text()) as {
+    scorer?: Partial<EmbeddedScorerDefaults>;
+  };
+  const scorer = parsed.scorer;
+  if (!scorer || typeof scorer.enabled !== "boolean") {
+    throw new Error("config.toml scorer.enabled is missing");
+  }
+  if (!Array.isArray(scorer.qualification_candidates) || scorer.qualification_candidates.length === 0) {
+    throw new Error("config.toml scorer.qualification_candidates must not be empty");
+  }
+  const candidates = scorer.qualification_candidates.filter(
+    (model): model is string => typeof model === "string" && model.trim().length > 0,
+  );
+  if (candidates.length !== scorer.qualification_candidates.length) {
+    throw new Error("config.toml scorer.qualification_candidates contains an invalid model id");
+  }
+  return { enabled: scorer.enabled, qualification_candidates: candidates };
 }
 
 async function main() {
@@ -106,10 +181,19 @@ async function main() {
   const binary =
     process.env.POSTIL_BIN ??
     resolve(import.meta.dir, "..", "..", "target", "release", "postil");
-  const models = parseModels(process.env.POSTIL_SCORER_EVAL_MODELS ?? flagValue(args, "--models"));
+  const embedded = await loadEmbeddedScorerDefaults();
+  const models = parseModels(
+    process.env.POSTIL_SCORER_EVAL_MODELS ?? flagValue(args, "--models"),
+    embedded.qualification_candidates,
+  );
   if (models.length === 0) {
     throw new Error("scorer eval needs at least one scorer model");
   }
+  const repeats = parseRepeatCount(
+    process.env.POSTIL_SCORER_EVAL_REPEATS ?? flagValue(args, "--repeats"),
+  );
+  const pricing = await fetchPricing(apiBase, models);
+  assertQualificationPreflight(models, repeats, pricing);
   const rootDir = resolve(import.meta.dir, "..", ".runs", "scorer-eval");
   await mkdir(rootDir, { recursive: true });
 
@@ -118,15 +202,34 @@ async function main() {
 
   const results: ScorerEvalCase[] = [];
   for (const model of models) {
-    for (const c of selected) {
-      results.push(await runScorerEvalCase(c.case, c.scenario, model, binary, rootDir, apiBase, keyName));
+    for (let repeat = 1; repeat <= repeats; repeat += 1) {
+      for (const c of selected) {
+        results.push(
+          await runScorerEvalCase(
+            c.case,
+            c.scenario,
+            model,
+            repeat,
+            binary,
+            rootDir,
+            apiBase,
+            keyName,
+            pricing.get(model) ?? null,
+          ),
+        );
+      }
     }
   }
 
+  const aggregates = models.map((model) =>
+    aggregate(model, results.filter((result) => result.model === model), repeats),
+  );
   const report: ScorerEvalReport = {
     generatedAt: new Date().toISOString(),
     apiBase,
-    models: models.map((model) => aggregate(model, results.filter((r) => r.model === model))),
+    repeats,
+    passed: aggregates.every((model) => model.passed),
+    models: aggregates,
     cases: results,
   };
   const json = JSON.stringify(report, null, 2);
@@ -134,6 +237,7 @@ async function main() {
     await writeFile(jsonOut, `${json}\n`);
   }
   console.log(formatReport(report));
+  process.exitCode = qualificationExitCode(report);
 }
 
 export function selectEvalCases(fixtures: BenchmarkCase[]): Array<{ case: BenchmarkCase; scenario: Scenario }> {
@@ -157,12 +261,14 @@ async function runScorerEvalCase(
   c: BenchmarkCase,
   scenario: Scenario,
   scorerModel: string,
+  repeat: number,
   binary: string,
   rootDir: string,
   apiBase: string,
   keyName: string,
+  pricing: ModelPricing | null,
 ): Promise<ScorerEvalCase> {
-  const runDir = join(rootDir, safeSegment(scorerModel), c.id);
+  const runDir = join(rootDir, safeSegment(scorerModel), `repeat-${repeat}`, c.id);
   await rm(runDir, { recursive: true, force: true });
   const homeDir = join(runDir, "home");
   const tmpDir = join(runDir, "tmp");
@@ -200,17 +306,43 @@ async function runScorerEvalCase(
 
   const envelope = safeJson(stdout) as Record<string, any> | undefined;
   if (!envelope || envelope.version !== 1) {
-    return baseResult(c, scenario, scorerModel, false, `no valid v1 envelope (exit ${exitCode ?? "unknown"})`);
+    return baseResult(
+      c,
+      scenario,
+      scorerModel,
+      repeat,
+      false,
+      `no valid v1 envelope (exit ${exitCode ?? "unknown"})`,
+    );
   }
-  const finding = Array.isArray(envelope.findings) ? envelope.findings[0] : undefined;
+  const finding = scoredFinding(envelope);
   const scorerError = typeof envelope.scorerError === "string" ? envelope.scorerError : null;
   const actualScorer = typeof envelope.scorerModel === "string" ? envelope.scorerModel : null;
   const scorerConfidence = typeof finding?.scorerConfidence === "number" ? finding.scorerConfidence : null;
   const scorerKind = typeof finding?.scorerKind === "string" ? finding.scorerKind : null;
   const finalConfidence = typeof finding?.confidence === "number" ? finding.confidence : null;
   const finalKind = typeof finding?.kind === "string" ? finding.kind : null;
+  const scorerReason = typeof finding?.scorerReason === "string" ? finding.scorerReason : null;
+  const reasonContractValid = isValidReason(scorerReason);
+  const usageAccountingComplete =
+    typeof envelope.usageAccountingComplete === "boolean" ? envelope.usageAccountingComplete : null;
+  const usageValid = proxy.attempts.length === 1 && proxy.attempts[0]!.usageValid;
+  const durationMs = proxy.attempts.reduce((sum, attempt) => sum + attempt.durationMs, 0);
+  const promptTokens = proxy.attempts.reduce((sum, attempt) => sum + attempt.promptTokens, 0);
+  const completionTokens = proxy.attempts.reduce((sum, attempt) => sum + attempt.completionTokens, 0);
+  const costUsd = pricing
+    ? promptTokens * pricing.promptUsdPerToken + completionTokens * pricing.completionUsdPerToken
+    : null;
 
-  const structuredOk = actualScorer === scorerModel && scorerError === null && scorerConfidence !== null && scorerKind !== null;
+  const structuredOk =
+    actualScorer === scorerModel &&
+    scorerError === null &&
+    scorerConfidence !== null &&
+    scorerKind !== null &&
+    reasonContractValid &&
+    usageAccountingComplete === true &&
+    usageValid &&
+    proxy.attempts.length === 1;
   let passed = false;
   let reason = "";
   if (!structuredOk) {
@@ -224,6 +356,7 @@ async function runScorerEvalCase(
   }
 
   return {
+    repeat,
     id: c.id,
     name: c.name,
     scenario,
@@ -237,9 +370,14 @@ async function runScorerEvalCase(
     finalKind,
     passed,
     reason,
-    durationMs: typeof envelope.durationMs === "number" ? envelope.durationMs : null,
-    promptTokens: Number(envelope.usage?.promptTokens ?? 0),
-    completionTokens: Number(envelope.usage?.completionTokens ?? 0),
+    reasonContractValid,
+    usageAccountingComplete,
+    usageValid,
+    upstreamRequests: proxy.attempts.length,
+    durationMs: proxy.attempts.length > 0 ? durationMs : null,
+    promptTokens,
+    completionTokens,
+    costUsd,
   };
 }
 
@@ -247,10 +385,12 @@ function baseResult(
   c: BenchmarkCase,
   scenario: Scenario,
   model: string,
+  repeat: number,
   envelopeProduced: boolean,
   reason: string,
 ): ScorerEvalCase {
   return {
+    repeat,
     id: c.id,
     name: c.name,
     scenario,
@@ -264,9 +404,14 @@ function baseResult(
     finalKind: null,
     passed: false,
     reason,
+    reasonContractValid: false,
+    usageAccountingComplete: null,
+    usageValid: false,
+    upstreamRequests: 0,
     durationMs: null,
     promptTokens: 0,
     completionTokens: 0,
+    costUsd: null,
   };
 }
 
@@ -276,6 +421,7 @@ export async function startScorerProxy(
   apiBase: string,
   apiKey: string,
 ) {
+  const attempts: ScorerAttempt[] = [];
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     if (req.method !== "POST" || req.url !== "/chat/completions") {
       res.writeHead(404, { "content-type": "application/json" });
@@ -296,6 +442,7 @@ export async function startScorerProxy(
     }
 
     const signal = AbortSignal.timeout(180_000);
+    const startedAt = performance.now();
     const upstream = await fetch(`${apiBase.replace(/\/$/, "")}/chat/completions`, {
       method: "POST",
       headers: {
@@ -308,6 +455,16 @@ export async function startScorerProxy(
       signal,
     });
     const text = await upstream.text();
+    const response = safeJson(text) as {
+      usage?: { prompt_tokens?: number; completion_tokens?: number };
+    } | undefined;
+    const usageValid = isValidUsage(response?.usage);
+    attempts.push({
+      durationMs: performance.now() - startedAt,
+      promptTokens: Number(response?.usage?.prompt_tokens ?? 0),
+      completionTokens: Number(response?.usage?.completion_tokens ?? 0),
+      usageValid,
+    });
     res.writeHead(upstream.status, { "content-type": upstream.headers.get("content-type") ?? "application/json" });
     res.end(text);
   });
@@ -315,8 +472,83 @@ export async function startScorerProxy(
   await listen(server);
   return {
     baseUrl: serverBaseUrl(server),
+    attempts,
     close: () => closeServer(server),
   };
+}
+
+function scoredFinding(envelope: Record<string, any>): Record<string, any> | undefined {
+  if (Array.isArray(envelope.findings) && envelope.findings[0]) return envelope.findings[0];
+  const suppressed = Array.isArray(envelope.suppressedFindings) ? envelope.suppressedFindings[0] : undefined;
+  return suppressed?.finding;
+}
+
+export function isValidReason(reason: string | null): boolean {
+  if (reason === null || reason !== reason.trim() || reason.length === 0) return false;
+  const withoutAbbreviations = reason
+    .replace(
+      /\b(?:e\.g\.|i\.e\.|etc\.|vs\.|Dr\.|Mr\.|Mrs\.|Ms\.|Prof\.|Sr\.|Jr\.|No\.|Fig\.|St\.)/giu,
+      (value) => value.replaceAll(".", "∯"),
+    )
+    .replace(/(?:\b\p{L}\.){2,}/gu, (value) => value.replaceAll(".", "∯"))
+    .replace(/\b\p{Lu}\.(?=\s+\p{Lu})/gu, (value) => value.replace(".", "∯"));
+  return (
+    !reason.includes("\n") &&
+    !reason.includes("\r") &&
+    [...reason].length <= SCORER_REASON_MAX_CHARS &&
+    /[.!?…]$/u.test(reason) &&
+    !/[.!?…]\s+\S/u.test(withoutAbbreviations)
+  );
+}
+
+function isValidUsage(usage: { prompt_tokens?: number; completion_tokens?: number } | undefined): boolean {
+  return (
+    usage !== undefined &&
+    Number.isSafeInteger(usage.prompt_tokens) &&
+    (usage.prompt_tokens ?? 0) > 0 &&
+    Number.isSafeInteger(usage.completion_tokens) &&
+    (usage.completion_tokens ?? 0) > 0
+  );
+}
+
+export function projectedQualificationSpendUsd(
+  models: string[],
+  repeats: number,
+  pricing: Map<string, ModelPricing>,
+): number {
+  const callsPerModel = repeats * (TRUE_FINDING_CASES.length + FALSE_FINDING_CASES.length);
+  return models.reduce((total, model) => {
+    const price = pricing.get(model);
+    if (!price) return Number.POSITIVE_INFINITY;
+    return (
+      total +
+      callsPerModel * SCORER_PREFLIGHT_MAX_REQUESTS_PER_CASE *
+        ((SCORER_PREFLIGHT_PROMPT_TOKENS_PER_CASE + SCORER_PREFLIGHT_REPAIR_INPUT_TOKENS_PER_ATTEMPT) *
+          price.promptUsdPerToken +
+          SCORER_PREFLIGHT_COMPLETION_TOKENS_PER_ATTEMPT * price.completionUsdPerToken)
+    );
+  }, 0);
+}
+
+export function assertQualificationPreflight(
+  models: string[],
+  repeats: number,
+  pricing: Map<string, ModelPricing>,
+): number {
+  if (models.length > SCORER_MAX_CANDIDATES) {
+    throw new Error(`scorer qualification allows at most ${SCORER_MAX_CANDIDATES} candidates`);
+  }
+  const missing = models.filter((model) => !pricing.has(model));
+  if (missing.length > 0) {
+    throw new Error(`cannot project scorer qualification spend; pricing missing for ${missing.join(", ")}`);
+  }
+  const projected = projectedQualificationSpendUsd(models, repeats, pricing);
+  if (!Number.isFinite(projected) || projected > SCORER_MAX_PROJECTED_SPEND_USD) {
+    throw new Error(
+      `projected scorer qualification spend $${projected.toFixed(2)} exceeds $${SCORER_MAX_PROJECTED_SPEND_USD.toFixed(2)}`,
+    );
+  }
+  return projected;
 }
 
 function generatorOutput(c: BenchmarkCase, scenario: Scenario) {
@@ -384,13 +616,36 @@ export function isolatedEnv(
     GITHUB_API_URL: githubBaseUrl,
     GITHUB_TOKEN: "benchmark-github-token",
     REVIEW_MODEL: GENERATOR_MODEL,
+    REVIEW_MODEL_CASCADE: GENERATOR_MODEL,
     REVIEW_SCORER_MODEL: scorerModel,
   };
 }
 
-export function aggregate(model: string, cases: ScorerEvalCase[]): ScorerEvalAggregate {
+async function fetchPricing(apiBase: string, models: string[]): Promise<Map<string, ModelPricing>> {
+  const url = `${apiBase.replace(/\/$/, "")}/models`;
+  const response = await fetch(url, { headers: { accept: "application/json" } });
+  if (!response.ok) {
+    throw new Error(`failed to fetch scorer pricing (${response.status}) from ${url}`);
+  }
+  return pricingFromCatalog((await response.json()) as OpenRouterModelsResponse, models);
+}
+
+export function aggregate(
+  model: string,
+  cases: ScorerEvalCase[],
+  repeats = DEFAULT_QUALIFICATION_REPEATS,
+): ScorerEvalAggregate {
   const structuredFailures = cases.filter(
-    (c) => !c.envelopeProduced || c.scorerError !== null || c.scorerModel !== model || c.scorerConfidence === null,
+    (c) =>
+      !c.envelopeProduced ||
+      c.scorerError !== null ||
+      c.scorerModel !== model ||
+      c.scorerConfidence === null ||
+      c.scorerKind === null ||
+      !c.reasonContractValid ||
+      c.usageAccountingComplete !== true ||
+      !c.usageValid ||
+      c.upstreamRequests !== 1,
   ).length;
   const trueCases = cases.filter((c) => c.scenario === "trueFinding");
   const falseCases = cases.filter((c) => c.scenario === "falseFinding");
@@ -402,6 +657,58 @@ export function aggregate(model: string, cases: ScorerEvalCase[]): ScorerEvalAgg
   const falseFindingDownscored = falseCases.filter(
     (c) => c.scorerConfidence !== null && (c.scorerConfidence < 0.6 || c.scorerKind === "uncertainty"),
   ).length;
+  const durations = cases.map((c) => c.durationMs).filter((value): value is number => value !== null);
+  const costs = cases.map((c) => c.costUsd).filter((value): value is number => value !== null);
+  const reasonContractFailures = cases.filter((c) => !c.reasonContractValid).length;
+  const p50DurationMs = percentile(durations, 0.5);
+  const p95DurationMs = percentile(durations, 0.95);
+  const maxDurationMs = durations.length > 0 ? Math.max(...durations) : 0;
+  const meanCostUsd = mean(costs);
+  const admissionFailures: string[] = [];
+  const expectedPerScenario = repeats * TRUE_FINDING_CASES.length;
+  if (trueCases.length !== expectedPerScenario || falseCases.length !== repeats * FALSE_FINDING_CASES.length) {
+    admissionFailures.push(
+      `incomplete matrix: got ${trueCases.length} true/${falseCases.length} false cases for ${repeats} repeats`,
+    );
+  }
+  if (structuredFailures > 0) admissionFailures.push(`${structuredFailures} structured-output failure(s)`);
+  if (trueFindingHighConfidence !== trueCases.length) {
+    admissionFailures.push(
+      `${trueCases.length - trueFindingHighConfidence} true finding(s) were not kept as confident risks`,
+    );
+  }
+  const requiredFalseDownscores = Math.ceil(falseCases.length * SCORER_MIN_FALSE_DOWNSCORE_RATE);
+  if (falseFindingDownscored < requiredFalseDownscores) {
+    admissionFailures.push(
+      `only ${falseFindingDownscored}/${falseCases.length} false findings were down-scored; need ${requiredFalseDownscores}`,
+    );
+  }
+  const perFixtureRequired = Math.ceil(repeats * SCORER_MIN_FALSE_DOWNSCORE_RATE);
+  for (const id of FALSE_FINDING_CASES) {
+    const fixtureCases = falseCases.filter((c) => c.id === id);
+    const downscored = fixtureCases.filter(
+      (c) => c.scorerConfidence !== null && (c.scorerConfidence < 0.6 || c.scorerKind === "uncertainty"),
+    ).length;
+    if (fixtureCases.length !== repeats || downscored < perFixtureRequired) {
+      admissionFailures.push(`${id} down-scored ${downscored}/${fixtureCases.length}; need ${perFixtureRequired}/${repeats}`);
+    }
+  }
+  const pricingKnown = costs.length === cases.length && cases.length > 0;
+  if (!pricingKnown) admissionFailures.push("pricing missing for one or more cases");
+  if (p50DurationMs > SCORER_MAX_P50_MS) {
+    admissionFailures.push(`p50 latency ${p50DurationMs.toFixed(0)}ms exceeds ${SCORER_MAX_P50_MS}ms`);
+  }
+  if (p95DurationMs > SCORER_MAX_P95_MS) {
+    admissionFailures.push(`p95 latency ${p95DurationMs.toFixed(0)}ms exceeds ${SCORER_MAX_P95_MS}ms`);
+  }
+  if (maxDurationMs > SCORER_MAX_CASE_MS) {
+    admissionFailures.push(`max latency ${maxDurationMs.toFixed(0)}ms exceeds ${SCORER_MAX_CASE_MS}ms`);
+  }
+  if (pricingKnown && meanCostUsd > SCORER_MAX_MEAN_COST_USD) {
+    admissionFailures.push(
+      `mean cost $${meanCostUsd.toFixed(6)} exceeds $${SCORER_MAX_MEAN_COST_USD.toFixed(3)}`,
+    );
+  }
   return {
     id: model,
     casesRun: cases.length,
@@ -412,31 +719,52 @@ export function aggregate(model: string, cases: ScorerEvalCase[]): ScorerEvalAgg
     falseFindingCases: falseCases.length,
     meanTrueConfidence: mean(trueConf),
     meanFalseConfidence: mean(falseConf),
-    passed:
-      structuredFailures === 0 &&
-      trueFindingHighConfidence === trueCases.length &&
-      falseFindingDownscored >= Math.ceil(falseCases.length * 0.5),
+    reasonContractFailures,
+    pricingKnown,
+    meanCostUsd,
+    p50DurationMs,
+    p95DurationMs,
+    maxDurationMs,
+    admissionFailures,
+    passed: admissionFailures.length === 0,
   };
 }
 
 export function formatReport(report: ScorerEvalReport): string {
-  const lines = ["postil scorer eval (LIVE scorer, mocked generator)", ""];
-  lines.push("model                                  structured  true kept  false down  mean true  mean false  pass");
-  lines.push("--------------------------------------------------------------------------------------------------");
+  const lines = [
+    `postil scorer qualification (LIVE scorer, mocked generator, ${report.repeats} repeats)`,
+    "",
+  ];
+  lines.push("model                                  struct  true kept  false down  p50 ms  p95 ms  max ms   $/case    pass");
+  lines.push("-----------------------------------------------------------------------------------------------------------");
   for (const a of report.models) {
     lines.push(
       [
         pad(a.id, 38),
-        pad(String(a.structuredFailures), 10),
+        pad(String(a.structuredFailures), 7),
         pad(`${a.trueFindingHighConfidence}/${a.trueFindingCases}`, 10),
         pad(`${a.falseFindingDownscored}/${a.falseFindingCases}`, 11),
-        pad(a.meanTrueConfidence.toFixed(2), 10),
-        pad(a.meanFalseConfidence.toFixed(2), 11),
+        pad(a.p50DurationMs.toFixed(0), 7),
+        pad(a.p95DurationMs.toFixed(0), 7),
+        pad(a.maxDurationMs.toFixed(0), 8),
+        pad(a.pricingKnown ? `$${a.meanCostUsd.toFixed(6)}` : "unknown", 10),
         a.passed ? "yes" : "no",
       ].join(" "),
     );
+    for (const failure of a.admissionFailures) lines.push(`  FAIL: ${failure}`);
   }
   return lines.join("\n");
+}
+
+export function qualificationExitCode(report: ScorerEvalReport): number {
+  return report.passed && report.models.length > 0 ? 0 : 1;
+}
+
+export function percentile(values: number[], quantile: number): number {
+  if (values.length === 0) return 0;
+  const ordered = [...values].sort((a, b) => a - b);
+  const index = Math.ceil(quantile * ordered.length) - 1;
+  return ordered[Math.max(0, Math.min(index, ordered.length - 1))]!;
 }
 
 export function mean(values: number[]): number {

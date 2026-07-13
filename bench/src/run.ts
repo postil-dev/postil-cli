@@ -43,6 +43,7 @@ import { DEFAULT_LIVE_CONCURRENCY, DEFAULT_LIVE_MODEL, formatLiveReport, runLive
 import {
   DEFAULT_LIVE_CONCURRENCY as DEFAULT_LIVE_MODELS_CONCURRENCY,
   formatLiveModelsReport,
+  liveModelsQualificationExitCode,
   runLiveModels,
 } from "./livemodels";
 
@@ -71,16 +72,19 @@ async function main() {
     process.env.POSTIL_BENCH_MODE === "live" || args.includes("--live-models");
 
   if (liveModels) {
-    const models = parseModels(process.env.POSTIL_BENCH_MODELS ?? flagValue(args, "--models"));
+    const models = (process.env.POSTIL_BENCH_MODELS ?? flagValue(args, "--models") ?? "").split(",");
     const concurrency = liveModelsConcurrency(args);
+    const costCapRaw = process.env.POSTIL_BENCH_COST_CAP_USD ?? flagValue(args, "--cost-cap");
     const report = await runLiveModels(cases, {
       binary,
       models,
       apiBase: process.env.POSTIL_API_BASE,
       concurrency,
+      costCapUsd: costCapRaw === undefined ? undefined : Number.parseFloat(costCapRaw),
     });
     await writeLiveModelsReport(jsonOut, JSON.stringify(report, null, 2));
     console.log(json ? JSON.stringify(report, null, 2) : formatLiveModelsReport(report));
+    process.exitCode = liveModelsQualificationExitCode(report);
     return;
   }
 
@@ -109,14 +113,6 @@ async function main() {
   if (!report.ok) {
     process.exitCode = 1;
   }
-}
-
-/** Parse a comma-separated model list, trimming blanks. */
-function parseModels(raw: string | undefined): string[] {
-  return (raw ?? "")
-    .split(",")
-    .map((m) => m.trim())
-    .filter((m) => m.length > 0);
 }
 
 /** Resolve live-models concurrency from BENCH_CONCURRENCY, then --concurrency,

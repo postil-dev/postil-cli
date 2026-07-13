@@ -113,6 +113,253 @@ pub struct Finding {
     pub id: Option<String>,
 }
 
+pub const FINDING_PUBLIC_TITLE_MAX_CHARS: usize = 160;
+pub const FINDING_PUBLIC_BODY_MAX_CHARS: usize = 1_200;
+pub const FINDING_PUBLIC_BODY_MAX_LINES: usize = 12;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FindingPublicationText {
+    pub title: String,
+    pub body: String,
+}
+
+/// Deterministic publication boundary for model-authored finding prose.
+///
+/// Findings keep useful inline-code, lists, and links, but cannot turn a code
+/// review into an article, ping GitHub users, inject HTML/images, or open a
+/// Markdown block that consumes the rest of the review. Callers normalize at
+/// ingestion and again at forge sinks so imported/baseline envelopes receive
+/// the same protection.
+pub fn finding_publication_text(title: &str, body: &str) -> FindingPublicationText {
+    let normalized_body = body.replace("\r\n", "\n").replace('\r', "\n");
+    let source_lines: Vec<&str> = normalized_body.lines().collect();
+    let mut lines = Vec::new();
+    let mut omitted = source_lines.len() > FINDING_PUBLIC_BODY_MAX_LINES;
+    for (index, source) in source_lines
+        .iter()
+        .take(FINDING_PUBLIC_BODY_MAX_LINES)
+        .enumerate()
+    {
+        let mut line = sanitize_publication_line(source);
+        let trimmed = line.trim();
+        if markdown_fence_line(trimmed) {
+            if let Some(position) = line.find(['`', '~']) {
+                line.insert(position, '\\');
+            }
+        } else if markdown_atx_heading(trimmed) {
+            line = trimmed
+                .trim_start_matches('#')
+                .trim_start()
+                .trim_end_matches('#')
+                .trim_end()
+                .to_string();
+        } else if index > 0 && markdown_setext_delimiter(trimmed) {
+            line = "…".to_string();
+        } else if markdown_table_delimiter(trimmed) {
+            line = line.replace('|', "\\|");
+        }
+        lines.push(neutralize_unmatched_backticks(&line));
+    }
+    if lines.is_empty() {
+        lines.push("Inspect the cited line and verify this finding before merging.".to_string());
+    } else if omitted {
+        if lines.len() == FINDING_PUBLIC_BODY_MAX_LINES {
+            lines.pop();
+        }
+        lines.push("…".to_string());
+    }
+
+    let joined = lines.join("\n");
+    let (body, body_truncated) = cap_publication_text(&joined, FINDING_PUBLIC_BODY_MAX_CHARS);
+    omitted |= body_truncated;
+    let body = if omitted && !body.ends_with('…') {
+        let reserve = FINDING_PUBLIC_BODY_MAX_CHARS.saturating_sub(1);
+        format!(
+            "{}…",
+            body.chars().take(reserve).collect::<String>().trim_end()
+        )
+    } else {
+        body
+    };
+    let body = neutralize_unmatched_backticks(body.trim());
+    let body = if body.is_empty() {
+        "Inspect the cited line and verify this finding before merging.".to_string()
+    } else {
+        body
+    };
+
+    let requested_title = sanitize_publication_title(title);
+    let title = if requested_title.is_empty() {
+        sanitize_publication_title(body.lines().next().unwrap_or("Finding"))
+    } else {
+        requested_title
+    };
+    let (title, _) = cap_publication_text(&title, FINDING_PUBLIC_TITLE_MAX_CHARS);
+
+    FindingPublicationText { title, body }
+}
+
+pub fn normalize_finding_publication(finding: &mut Finding) {
+    let publication = finding_publication_text(&finding.title, &finding.body);
+    finding.title = publication.title;
+    finding.body = publication.body;
+}
+
+fn sanitize_publication_title(value: &str) -> String {
+    let single_line = value
+        .chars()
+        .map(|character| {
+            if character.is_whitespace() || character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let line = sanitize_publication_line(&single_line).replace(['`', '*', '_', '[', ']', '#'], " ");
+    line.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn sanitize_publication_line(value: &str) -> String {
+    let text = value
+        .chars()
+        .filter(|character| !character.is_control() || *character == '\t')
+        .collect::<String>()
+        .replace('@', "＠")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    neutralize_markdown_images(&text)
+}
+
+fn neutralize_markdown_images(value: &str) -> String {
+    let characters: Vec<char> = value.chars().collect();
+    let mut output = String::with_capacity(value.len());
+    for (index, character) in characters.iter().enumerate() {
+        if *character == '!' && characters.get(index + 1) == Some(&'[') {
+            let preceding_backslashes = characters[..index]
+                .iter()
+                .rev()
+                .take_while(|candidate| **candidate == '\\')
+                .count();
+            if preceding_backslashes % 2 == 0 {
+                output.push('\\');
+            }
+        }
+        output.push(*character);
+    }
+    output
+}
+
+fn cap_publication_text(value: &str, max: usize) -> (String, bool) {
+    if value.chars().count() <= max {
+        return (value.to_string(), false);
+    }
+    let prefix: String = value.chars().take(max.saturating_sub(1)).collect();
+    (format!("{}…", prefix.trim_end()), true)
+}
+
+fn markdown_fence_line(value: &str) -> bool {
+    let value = value.trim_start();
+    value.starts_with("```") || value.starts_with("~~~")
+}
+
+fn markdown_atx_heading(value: &str) -> bool {
+    let hashes = value
+        .chars()
+        .take_while(|character| *character == '#')
+        .count();
+    (1..=6).contains(&hashes) && value.chars().nth(hashes).is_some_and(char::is_whitespace)
+}
+
+fn markdown_setext_delimiter(value: &str) -> bool {
+    value.len() >= 3
+        && (value.chars().all(|character| character == '=')
+            || value.chars().all(|character| character == '-'))
+}
+
+fn markdown_table_delimiter(value: &str) -> bool {
+    let value = value.strip_prefix('|').unwrap_or(value);
+    let value = value.strip_suffix('|').unwrap_or(value);
+    let cells: Vec<&str> = value.split('|').collect();
+    cells.len() >= 2
+        && cells.iter().all(|cell| {
+            let cell = cell.trim();
+            let cell = cell.strip_prefix(':').unwrap_or(cell);
+            let cell = cell.strip_suffix(':').unwrap_or(cell);
+            cell.len() >= 3 && cell.chars().all(|character| character == '-')
+        })
+}
+
+fn neutralize_unmatched_backticks(value: &str) -> String {
+    let characters: Vec<char> = value.chars().collect();
+    let mut output = String::with_capacity(value.len());
+    let mut cursor = 0;
+    while cursor < characters.len() {
+        if characters[cursor] != '`' {
+            output.push(characters[cursor]);
+            cursor += 1;
+            continue;
+        }
+        let width = characters[cursor..]
+            .iter()
+            .take_while(|character| **character == '`')
+            .count();
+        let mut candidate = cursor + width;
+        let mut closing = None;
+        while candidate < characters.len() {
+            if characters[candidate] != '`' {
+                candidate += 1;
+                continue;
+            }
+            let candidate_width = characters[candidate..]
+                .iter()
+                .take_while(|character| **character == '`')
+                .count();
+            if candidate_width == width {
+                closing = Some(candidate + width);
+                break;
+            }
+            candidate += candidate_width;
+        }
+        if let Some(end) = closing {
+            output.extend(characters[cursor..end].iter());
+            cursor = end;
+        } else {
+            let preceding_backslashes = characters[..cursor]
+                .iter()
+                .rev()
+                .take_while(|character| **character == '\\')
+                .count();
+            if preceding_backslashes % 2 == 0 {
+                output.push('\\');
+            }
+            output.extend(characters[cursor..cursor + width].iter());
+            cursor += width;
+        }
+    }
+    output
+}
+
+/// Why an otherwise grounded finding did not reach the public review.
+///
+/// This additive v1 field lets trusted dashboards and compact forge summaries
+/// explain policy decisions without reconstructing them from mutable config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SuppressionReason {
+    Ignored,
+    BelowSeverity,
+    BelowConfidence,
+    MaxFindings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuppressedFinding {
+    pub finding: Finding,
+    pub reason: SuppressionReason,
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Counts {
@@ -155,6 +402,39 @@ pub struct ModelUsage {
     pub completion_tokens: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ModelIncidentPhase {
+    Review,
+    Scorer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ModelIncidentCategory {
+    ProviderError,
+    InvalidOutput,
+    Timeout,
+    Deadline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ModelIncidentRecovery {
+    Repair,
+    Fallback,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelIncident {
+    pub phase: ModelIncidentPhase,
+    pub category: ModelIncidentCategory,
+    pub recovered: bool,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub recovery: Option<ModelIncidentRecovery>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Envelope {
@@ -162,6 +442,10 @@ pub struct Envelope {
     pub summary: String,
     pub silent: bool,
     pub findings: Vec<Finding>,
+    /// Grounded findings hidden by review policy. Older v1 envelopes omit this
+    /// field, so readers must treat an absent value as an empty list.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub suppressed_findings: Vec<SuppressedFinding>,
     pub resolved: Vec<Finding>,
     pub counts: Counts,
     /// Counts of finding confidences in [0-.2, .2-.4, .4-.6, .6-.8, .8-1].
@@ -182,6 +466,10 @@ pub struct Envelope {
     /// this additive field and are handled conservatively by the control plane.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub model_usage: Vec<ModelUsage>,
+    /// Safe operational model signals for monitoring. No raw provider detail
+    /// or model-generated content is stored here.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub model_incidents: Vec<ModelIncident>,
     /// False when any sent provider request can have unknown billed usage,
     /// including timeouts and ambiguous transport failures.
     #[serde(default)]
@@ -266,6 +554,17 @@ pub const PROVIDER_PATH: &str = ".postil/provider";
 /// be posted as inline code annotations (there is no file line); they are
 /// surfaced in the check-run summary and PR comment body instead.
 pub const PR_DESCRIPTION_PATH: &str = ".postil/pr-description";
+pub const DIFF_PATH: &str = ".postil/diff";
+
+/// Exact virtual anchors emitted by Postil itself. Repository files under the
+/// `.postil/` directory are ordinary reviewable files and must never be swept
+/// into this classification by prefix.
+pub fn is_reserved_anchor(path: &str) -> bool {
+    matches!(
+        path,
+        OPERATIONAL_PATH | PROVIDER_PATH | PR_DESCRIPTION_PATH | DIFF_PATH
+    )
+}
 
 /// The synthetic finding emitted when the model produced unusable output.
 /// Postil fails closed: a review that could not be trusted is an error, not a pass.
@@ -403,6 +702,72 @@ mod tests {
     }
 
     #[test]
+    fn finding_publication_is_bounded_and_neutralizes_unsafe_markdown() {
+        let body = [
+            "# Summary",
+            "Ping @octocat and open <details>hidden</details>.",
+            "![remote](https://attacker.invalid/pixel.png)",
+            "```mermaid",
+            "flowchart LR",
+            "```",
+            "A | B",
+            "--- | ---",
+            "Keep `useful_code()` and [the docs](https://example.test).",
+        ]
+        .into_iter()
+        .chain(std::iter::repeat_n("extra line", 20))
+        .collect::<Vec<_>>()
+        .join("\n");
+        let publication = finding_publication_text(
+            "**Huge** @octocat <img> title that must remain plain",
+            &body,
+        );
+
+        assert!(publication.title.chars().count() <= FINDING_PUBLIC_TITLE_MAX_CHARS);
+        assert!(publication.body.chars().count() <= FINDING_PUBLIC_BODY_MAX_CHARS);
+        assert!(publication.body.lines().count() <= FINDING_PUBLIC_BODY_MAX_LINES);
+        assert!(!publication.title.contains('@'));
+        assert!(!publication.title.contains('<'));
+        assert!(!publication.body.contains("@octocat"));
+        assert!(!publication.body.contains("<details>"));
+        assert!(
+            !publication
+                .body
+                .lines()
+                .any(|line| line.trim_start().starts_with("!["))
+        );
+        assert!(!publication.body.lines().any(|line| line.starts_with('#')));
+        assert!(!publication.body.lines().any(|line| line.starts_with("```")));
+        assert!(!publication.body.contains("--- | ---"));
+        assert!(publication.body.contains("`useful_code()`"));
+        assert!(
+            publication
+                .body
+                .contains("[the docs](https://example.test)")
+        );
+        assert!(publication.body.ends_with('…'));
+        assert_eq!(
+            finding_publication_text(&publication.title, &publication.body),
+            publication,
+        );
+        assert!(!finding_publication_text("", "\n\n").body.is_empty());
+    }
+
+    #[test]
+    fn finding_publication_title_replaces_line_breaks_and_control_whitespace() {
+        let publication = finding_publication_text(
+            "First\r\nsecond\rthird\nfourth\tfifth\u{000B}sixth\0seventh",
+            "Body",
+        );
+
+        assert_eq!(
+            publication.title,
+            "First second third fourth fifth sixth seventh"
+        );
+        assert!(!publication.title.chars().any(char::is_control));
+    }
+
+    #[test]
     fn weak_human_escalation_never_blocks_but_floor_does() {
         let mut escalation = finding(Severity::Error, 0.05);
         escalation.kind = Kind::HumanEscalation;
@@ -427,11 +792,12 @@ mod tests {
 
     #[test]
     fn envelope_serializes_camel_case() {
-        let env = Envelope {
+        let mut env = Envelope {
             version: 1,
             summary: String::new(),
             silent: true,
             findings: vec![],
+            suppressed_findings: vec![],
             resolved: vec![],
             counts: Counts::default(),
             confidence_buckets: [0; 5],
@@ -446,15 +812,31 @@ mod tests {
             scorer_disagreements: None,
             usage: Usage::default(),
             model_usage: vec![],
+            model_incidents: vec![],
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
             head_sha: None,
             since_sha: None,
         };
-        let v = serde_json::to_value(&env).unwrap();
+        env.model_incidents.push(ModelIncident {
+            phase: ModelIncidentPhase::Scorer,
+            category: ModelIncidentCategory::InvalidOutput,
+            recovered: true,
+            recovery: Some(ModelIncidentRecovery::Repair),
+        });
+        let mut v = serde_json::to_value(&env).unwrap();
         assert!(v.get("confidenceBuckets").is_some());
         assert!(v.get("modelUsed").is_some());
         assert_eq!(v["gate"]["failOn"], "error");
+        assert!(v.get("suppressedFindings").is_none());
+        assert_eq!(v["modelIncidents"][0]["phase"], "scorer");
+        assert_eq!(v["modelIncidents"][0]["category"], "invalidOutput");
+        assert_eq!(v["modelIncidents"][0]["recovery"], "repair");
+
+        v.as_object_mut().unwrap().remove("modelIncidents");
+        let decoded: Envelope = serde_json::from_value(v).unwrap();
+        assert!(decoded.suppressed_findings.is_empty());
+        assert!(decoded.model_incidents.is_empty());
     }
 }

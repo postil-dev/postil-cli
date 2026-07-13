@@ -371,7 +371,9 @@ async fn remote_review<F: Forge>(
         review_started,
     } = input;
     let baseline = load_baseline(args)?;
-    let has_carryable_baseline = baseline.iter().any(|f| !f.path.starts_with(".postil/"));
+    let has_carryable_baseline = baseline
+        .iter()
+        .any(|f| !crate::envelope::is_reserved_anchor(&f.path));
     let incremental = args.since_sha.as_deref();
     let (diff_text, scope, force_model) = match incremental {
         Some(since) if since != head_sha => run_with_hosted_budget(
@@ -560,10 +562,23 @@ fn apply_scorer_scores(cfg: &Config, findings: &mut [Finding], scores: Vec<Findi
     disagreements
 }
 
-fn suppress_below_min_confidence(cfg: &Config, findings: &mut Vec<Finding>) -> u32 {
-    let before = findings.len();
-    findings.retain(|finding| finding.confidence >= cfg.min_confidence);
-    (before - findings.len()) as u32
+fn suppress_below_min_confidence(
+    cfg: &Config,
+    findings: &mut Vec<Finding>,
+) -> Vec<crate::envelope::SuppressedFinding> {
+    let mut suppressed = Vec::new();
+    findings.retain(|finding| {
+        if finding.confidence >= cfg.min_confidence {
+            true
+        } else {
+            suppressed.push(crate::envelope::SuppressedFinding {
+                finding: finding.clone(),
+                reason: crate::envelope::SuppressionReason::BelowConfidence,
+            });
+            false
+        }
+    });
+    suppressed
 }
 
 fn sort_findings_for_display(findings: &mut [Finding]) {
@@ -615,10 +630,12 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
     let mut model_used = "none (empty diff)".to_string();
     let mut usage = Usage::default();
     let mut model_usage: Vec<ModelUsage> = Vec::new();
+    let mut model_incidents = Vec::new();
     let mut usage_accounting_complete = true;
     let mut suppressed = 0u32;
     let mut ungrounded = 0u32;
     let mut findings: Vec<Finding> = Vec::new();
+    let mut suppressed_findings = Vec::new();
     let mut full_review_trustworthy = false;
     let mut scorer_model: Option<String> = None;
     let mut scorer_error: Option<String> = None;
@@ -665,8 +682,10 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                 model_used = model_review.model_used;
                 usage = model_review.usage;
                 model_usage = model_review.model_usage;
+                model_incidents = model_review.model_incidents;
                 usage_accounting_complete = model_review.usage_accounting_complete;
                 suppressed = outcome.suppressed;
+                suppressed_findings = outcome.suppressed_findings;
                 ungrounded = outcome.ungrounded;
                 if outcome.all_ungrounded {
                     findings = vec![fail_closed_finding(&format!(
@@ -707,11 +726,15 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                             Ok(Ok(scored)) => {
                                 let disagreements =
                                     apply_scorer_scores(cfg, &mut kept, scored.scores);
-                                suppressed += suppress_below_min_confidence(cfg, &mut kept);
+                                let scorer_suppressed =
+                                    suppress_below_min_confidence(cfg, &mut kept);
+                                suppressed += scorer_suppressed.len() as u32;
+                                suppressed_findings.extend(scorer_suppressed);
                                 scorer_model = Some(scored.model_used);
                                 usage.prompt_tokens += scored.usage.prompt_tokens;
                                 usage.completion_tokens += scored.usage.completion_tokens;
                                 model_usage.extend(scored.model_usage);
+                                model_incidents.extend(scored.model_incidents);
                                 usage_accounting_complete &= scored.usage_accounting_complete;
                                 scorer_disagreements = Some(disagreements);
                                 sort_findings_for_display(&mut kept);
@@ -725,6 +748,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                                 usage.prompt_tokens += scorer_usage.prompt_tokens;
                                 usage.completion_tokens += scorer_usage.completion_tokens;
                                 model_usage.extend_from_slice(e.model_usage());
+                                model_incidents.extend_from_slice(e.model_incidents());
                                 usage_accounting_complete &= e.usage_accounting_complete();
                                 scorer_error = Some(detail);
                             }
@@ -734,6 +758,12 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                                     format!("scorer timed out after {SCORER_TIMEOUT_SECS}s");
                                 eprintln!("postil: scorer failed open: {detail}");
                                 scorer_error = Some(detail);
+                                model_incidents.push(crate::envelope::ModelIncident {
+                                    phase: crate::envelope::ModelIncidentPhase::Scorer,
+                                    category: crate::envelope::ModelIncidentCategory::Timeout,
+                                    recovered: false,
+                                    recovery: None,
+                                });
                             }
                         }
                     }
@@ -744,6 +774,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                 model_used = cfg.model_chain().join(" -> ");
                 usage = e.usage();
                 model_usage = e.model_usage().to_vec();
+                model_incidents = e.model_incidents().to_vec();
                 usage_accounting_complete = e.usage_accounting_complete();
                 let detail = format!("{e:#}");
                 // Provider-class failures (outage, timeout) are the only ones
@@ -761,7 +792,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
         if truncated {
             full_review_trustworthy = false;
             findings.push(Finding {
-                path: ".postil/diff".to_string(),
+                path: crate::envelope::DIFF_PATH.to_string(),
                 line: 1,
                 end_line: None,
                 severity: crate::envelope::Severity::Info,
@@ -840,6 +871,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
         summary: if silent { String::new() } else { summary },
         silent,
         findings,
+        suppressed_findings,
         resolved: rec.resolved,
         counts,
         confidence_buckets: buckets,
@@ -854,6 +886,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
         scorer_disagreements,
         usage,
         model_usage,
+        model_incidents,
         usage_accounting_complete,
         duration_ms: review_started.elapsed().as_millis() as u64,
         base_sha: meta.map(|m| m.base_sha.clone()),
@@ -947,15 +980,15 @@ fn hosted_worker_remaining(started_at: Instant) -> Option<Duration> {
 }
 
 fn visible_finding_sets_equal(previous: &[Finding], current: &[Finding]) -> bool {
-    // Synthetic findings represent this run's operational state and must stay
-    // visible even if an earlier run failed in the same way.
+    // Reserved findings represent this run's virtual review state and must
+    // stay visible even if an earlier run produced the same marker.
     if previous.is_empty()
         || current.is_empty()
         || previous.len() != current.len()
         || previous
             .iter()
             .chain(current)
-            .any(|f| f.path.starts_with(".postil/"))
+            .any(|f| crate::envelope::is_reserved_anchor(&f.path))
     {
         return false;
     }
@@ -1017,6 +1050,7 @@ fn error_envelope(
         },
         silent: false,
         findings,
+        suppressed_findings: vec![],
         resolved: vec![],
         counts,
         confidence_buckets: buckets,
@@ -1035,6 +1069,7 @@ fn error_envelope(
         scorer_disagreements: None,
         usage: Usage::default(),
         model_usage: vec![],
+        model_incidents: vec![],
         usage_accounting_complete: true,
         duration_ms,
         base_sha: Some(meta.base_sha.clone()),
@@ -1240,7 +1275,11 @@ mod tests {
         );
         let suppressed = suppress_below_min_confidence(&cfg, &mut findings);
 
-        assert_eq!(suppressed, 1);
+        assert_eq!(suppressed.len(), 1);
+        assert_eq!(
+            suppressed[0].reason,
+            crate::envelope::SuppressionReason::BelowConfidence
+        );
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].path, "kept.rs");
         assert_eq!(findings[0].generator_confidence, Some(0.9));

@@ -13,24 +13,27 @@ acquire diff ──> parse + index ──> prompt ──> model (cascade/consens
       │                  (baseline)   (ground, policy)
       ├─ stdout JSON (--output-json)
       ├─ terminal (stderr)
-      └─ forge: inline review + postil/review (advisory) + postil/gate (blocking)
+      └─ forge: compact summary + inline findings + review and gate checks
 ```
 
 - `diff.rs` — unified-diff parser, `DiffIndex` (which (path, line) pairs exist on the
   new side), and the annotated rendering whose margin line numbers are the only numbers
   the model is allowed to cite.
 - `filter.rs` — grounding (uncited findings dropped; all-uncited = untrusted run),
-  policy suppression (ignore globs, severityThreshold, minConfidence, maxFindings), and
+  policy suppression (ignore globs, severityThreshold, minConfidence, maxFindings),
+  structured retention of suppressed grounded findings, and
   baseline reconciliation (resolved / carried) for incremental reviews.
 - `llm.rs` — shared model transport for OpenAI-compatible chat completions and the
-  native Anthropic Messages API; model cascade on failure, one JSON-repair retry,
+  native Anthropic Messages API; model cascade on failure, one JSON-repair retry for
+  generator output and one schema-repair retry for scorer output,
   optional N-model consensus (agreement by path + line proximity). Request construction
   and response decoding vary by API format while retry, timeout, deadline, cascade, and
   secret-redaction semantics remain shared. Optional private-endpoint authentication is
   a separate header whose name cannot collide with provider-managed headers.
 - `review.rs` — orchestration; owns fail-closed semantics (`fail_closed_finding`) and
   check-run lifecycle ordering (checks are created before the model runs so a crash can
-  still be reported against them).
+  still be reported against them). It persists safe structured model incidents for
+  monitoring without raw provider or model text.
 - `forge/` — trait + GitHub, GitLab, Bitbucket, and Azure DevOps implementations (each
   with a self-managed/server base-URL override). Azure has no PR-diff endpoint, so it
   reconstructs a unified diff from changed-file content with `similar`. The gate check is
@@ -64,8 +67,9 @@ additions (violations are `kind: contentPolicy`). Content policy is on by defaul
    when content policy is active, a `kind: contentPolicy` finding may instead cite
    the reserved `.postil/pr-description` path, whose valid lines are the numbered
    PR title/description block rendered into the prompt. Only content-policy
-   findings may ground there; these have no real file line, so they are surfaced
-   in the check-run summary and comment body, never as inline annotations.
+   findings may ground there. They have no real file line, so bounded sanitized
+   detail appears in the compact PR summary and the linked run instead of an inline
+   annotation.
 2. An invalid/untrusted model run produces `error` at `.postil/model-output:1`, exit 1.
 3. A clean review posts nothing (onClean: skip) — checks complete, no comments.
 4. Carried baseline findings keep the gate failing until their code changes.
@@ -73,6 +77,11 @@ additions (violations are `kind: contentPolicy`). Content policy is on by defaul
 6. Content-policy findings are scoped to prose; a model asserting `kind: contentPolicy`
    against code logic, an identifier, or structured data is not itself validated, but
    the prompt instructs against it and it is expected to be rare and low-confidence.
+7. Forge summaries do not duplicate inline findings or expose model/provider details.
+   Operational-only failures skip the PR review and use generic linked check text.
+8. `humanEscalation` blocks by kind at confidence 0.30 or above. It represents an
+   irreducible owner decision, not uncertainty about a concrete defect. Admin overrides
+   apply to that kind-only decision rather than ordinary risk findings.
 
 ## Residual prompt-injection surface
 

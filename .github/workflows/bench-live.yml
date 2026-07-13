@@ -1,16 +1,16 @@
 name: Bench (live models)
 
 # Manual only: this spends real OpenRouter tokens, so it never runs on push or
-# PR. It runs each fixture once per model against the real endpoint (mock
-# GitHub, real inference) and reports measured detection efficacy and cost.
+# PR. Generator qualification forces one model with scoring disabled. Scorer
+# qualification uses a deterministic generator and repeats its calibration set.
 on:
   workflow_dispatch:
     inputs:
       models:
-        description: Comma-separated OpenRouter model ids
+        description: Comma-separated generator candidate model ids
         required: true
         default: >-
-          deepseek/deepseek-v4-pro,google/gemini-3.1-flash-lite,moonshotai/kimi-k2.7-code,mistralai/mistral-large-2512
+          z-ai/glm-5.2,moonshotai/kimi-k2.7-code,deepseek/deepseek-v4-flash,google/gemini-3.5-flash,stepfun/step-3.7-flash
       cases:
         description: Case selection (currently informational; "all" runs the full set)
         required: false
@@ -19,10 +19,15 @@ on:
         description: Abort if the projected upper-bound total cost exceeds this many USD
         required: false
         default: "15"
-      scorer_model:
-        description: REVIEW_SCORER_MODEL override for live-models bench (scorer-eval uses hardcoded defaults)
-        required: false
-        default: ""
+      scorer_models:
+        description: Comma-separated scorer candidates; must match config.toml unless intentionally overridden
+        required: true
+        default: >-
+          openai/gpt-5.4-nano,google/gemini-3.5-flash,stepfun/step-3.7-flash
+      scorer_repeats:
+        description: Complete scorer qualification repetitions (1-10)
+        required: true
+        default: "5"
       run_scorer_eval:
         description: Run scorer calibration eval instead of live-models bench
         required: false
@@ -40,6 +45,8 @@ jobs:
     env:
       POSTIL_BENCH_MODELS: ${{ inputs.models }}
       POSTIL_BENCH_COST_CAP_USD: ${{ inputs.cost_cap_usd }}
+      POSTIL_SCORER_EVAL_MODELS: ${{ inputs.scorer_models }}
+      POSTIL_SCORER_EVAL_REPEATS: ${{ inputs.scorer_repeats }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -66,14 +73,13 @@ jobs:
         working-directory: bench
         env:
           POSTIL_BENCH_MODE: live
-          REVIEW_SCORER_MODEL: ${{ inputs.scorer_model }}
           POSTIL_API_KEY: ${{ secrets.POSTIL_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
         run: bun run src/run.ts --json-out "$GITHUB_WORKSPACE/bench-live-report.json"
 
-      - name: Run scorer calibration eval
+      - name: Run scorer qualification
         if: ${{ inputs.run_scorer_eval == 'true' }}
         working-directory: bench
         env:
@@ -88,26 +94,28 @@ jobs:
           scorer_report="$GITHUB_WORKSPACE/scorer-eval-report.json"
           {
             if [ -f "$scorer_report" ]; then
-              echo '## Scorer calibration eval'
+              echo '## Scorer qualification'
               echo ''
               echo '```'
               bun -e '
                 const r = await Bun.file(process.env.GITHUB_WORKSPACE + "/scorer-eval-report.json").json();
                 const pad = (s, w) => String(s).length >= w ? String(s) : String(s) + " ".repeat(w - String(s).length);
-                console.log([pad("model",36),pad("structured",11),pad("true kept",10),pad("false down",11),pad("mean true",10),pad("mean false",11),pad("pass",5)].join(" "));
+                console.log([pad("model",36),pad("structured",11),pad("true kept",10),pad("false down",11),pad("p50 ms",8),pad("p95 ms",8),pad("$/case",11),pad("pass",5)].join(" "));
                 for (const a of r.models) {
                   console.log([
                     pad(a.id,36),
                     pad(String(a.structuredFailures),11),
                     pad(`${a.trueFindingHighConfidence}/${a.trueFindingCases}`,10),
                     pad(`${a.falseFindingDownscored}/${a.falseFindingCases}`,11),
-                    pad(a.meanTrueConfidence.toFixed(2),10),
-                    pad(a.meanFalseConfidence.toFixed(2),11),
+                    pad(a.p50DurationMs.toFixed(0),8),
+                    pad(a.p95DurationMs.toFixed(0),8),
+                    pad(a.pricingKnown ? "$"+a.meanCostUsd.toFixed(6) : "unknown",11),
                     pad(a.passed ? "yes" : "no",5),
                   ].join(" "));
+                  for (const failure of a.admissionFailures) console.log("  FAIL: " + failure);
                 }
                 console.log("");
-                console.log("Endpoint " + r.apiBase + " | generated " + r.generatedAt);
+                console.log("Repeats " + r.repeats + " | endpoint " + r.apiBase + " | generated " + r.generatedAt);
               '
               echo '```'
             elif [ -f "$report" ]; then
@@ -135,7 +143,7 @@ jobs:
               '
               echo '```'
               echo ''
-              echo 'Fixtures are ours; no competitor peer run exists. Costs are our measured OpenRouter spend on our fixtures, one run per case.'
+              echo 'Fixtures are ours; no competitor peer run exists. Generator costs and latency exclude the independent scorer.'
             else
               echo ''
               echo 'No report produced (the run failed before writing output).'

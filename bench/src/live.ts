@@ -35,7 +35,7 @@ import { benchmarkCase, type BenchmarkCaseInput, envelopeV1, type Envelope } fro
 
 const execFile = promisify(execFileCb);
 
-export const DEFAULT_LIVE_MODEL = "deepseek/deepseek-v4-pro";
+export const DEFAULT_LIVE_MODEL = "mistralai/mistral-small-3.2-24b-instruct";
 
 /** Default number of cases run concurrently. Live inference is I/O-bound on the
  * provider, so a small pool cuts wall-clock time without overloading the API.

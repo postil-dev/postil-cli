@@ -49,9 +49,19 @@ pub fn run(envelopes_dir: &Path, candidate: &Config) -> Result<Vec<PlanRow>> {
 
 fn replay(path: &Path, env: &Envelope, cfg: &Config) -> Result<PlanRow> {
     let ignore = build_ignore_set(&cfg.ignore)?;
+    let all_findings = env
+        .findings
+        .iter()
+        .cloned()
+        .chain(
+            env.suppressed_findings
+                .iter()
+                .map(|suppressed| suppressed.finding.clone()),
+        )
+        .collect::<Vec<_>>();
     let mut kept: Vec<Finding> = Vec::new();
     let mut suppressed: Vec<Finding> = Vec::new();
-    for f in &env.findings {
+    for f in &all_findings {
         let keep = !ignore.is_match(&f.path)
             && f.severity >= cfg.severity_threshold
             && f.confidence >= cfg.min_confidence;
@@ -93,7 +103,7 @@ fn replay(path: &Path, env: &Envelope, cfg: &Config) -> Result<PlanRow> {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default(),
-        findings_before: env.findings.len(),
+        findings_before: all_findings.len(),
         findings_after: kept.len(),
         gate_before: env.gate.failing,
         gate_after,
@@ -160,6 +170,7 @@ mod tests {
             summary: String::new(),
             silent: findings.is_empty(),
             findings,
+            suppressed_findings: vec![],
             resolved: vec![],
             counts,
             confidence_buckets: buckets,
@@ -174,6 +185,7 @@ mod tests {
             scorer_disagreements: None,
             usage: Usage::default(),
             model_usage: vec![],
+            model_incidents: vec![],
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
@@ -285,5 +297,27 @@ mod tests {
         cfg.gate_fail_on = crate::config::GateLevel::Never;
         cfg.gate_on_error = crate::config::OnError::Advisory;
         assert!(run(dir.path(), &cfg).unwrap()[0].gate_after);
+    }
+
+    #[test]
+    fn replay_can_restore_a_retained_suppressed_finding() {
+        let path = Path::new("r1.json");
+        let hidden = f("src/lib.rs", Severity::Warn, 0.55);
+        let mut env = envelope_with(vec![], false);
+        env.suppressed_findings = vec![crate::envelope::SuppressedFinding {
+            finding: hidden,
+            reason: crate::envelope::SuppressionReason::BelowConfidence,
+        }];
+        env.counts.suppressed = 1;
+
+        let cfg = Config {
+            min_confidence: 0.5,
+            ..Config::default()
+        };
+        let row = replay(path, &env, &cfg).unwrap();
+
+        assert_eq!(row.findings_before, 1);
+        assert_eq!(row.findings_after, 1);
+        assert!(row.newly_suppressed.is_empty());
     }
 }

@@ -15,6 +15,10 @@ import type { BenchmarkCase, Envelope } from "./harness";
  * The tolerance absorbs the off-by-a-few line drift between where a model
  * anchors a comment and the exact seeded line. */
 export const LINE_TOLERANCE = 3;
+export const GENERATOR_MIN_DETECTION_RATE = 0.9;
+export const GENERATOR_MAX_FALSE_POSITIVE_RATE = 0.05;
+export const GENERATOR_MAX_MEAN_COST_USD = 0.01;
+export const GENERATOR_MAX_MEAN_DURATION_MS = 15_000;
 
 /** OpenRouter per-token prices for one model (USD per token, as returned by
  * GET /api/v1/models under `pricing`). */
@@ -60,6 +64,8 @@ export interface LiveModelCaseResult {
   gateFailingExpected: boolean;
   promptTokens: number;
   completionTokens: number;
+  usageAccountingComplete: boolean | null;
+  usageValid: boolean;
   costUsd: number | null;
   durationMs: number | null;
   exitCode: number | undefined;
@@ -88,6 +94,9 @@ export interface LiveModelAggregate {
   gateScored: number;
   errors: number;
   pricingKnown: boolean;
+  fidelityFailures: number;
+  admissionFailures: string[];
+  passed: boolean;
 }
 
 /** The exact per-model object the site consumes. Keep this in lockstep with the
@@ -167,7 +176,17 @@ export function scoreLiveCase(args: {
   const truth = groundTruthOf(c);
   const findings = env.findings;
 
-  const cost = pricing
+  const usageAccountingComplete = env.usageAccountingComplete ?? null;
+  const modelUsage = env.modelUsage ?? [];
+  const usageValid =
+    modelUsage.length > 0 &&
+    modelUsage.every((entry) => entry.model === model) &&
+    env.usage.promptTokens > 0 &&
+    env.usage.completionTokens > 0 &&
+    modelUsage.reduce((sum, entry) => sum + entry.promptTokens, 0) === env.usage.promptTokens &&
+    modelUsage.reduce((sum, entry) => sum + entry.completionTokens, 0) === env.usage.completionTokens;
+
+  const cost = pricing && usageAccountingComplete === true && usageValid
     ? env.usage.promptTokens * pricing.promptUsdPerToken +
       env.usage.completionTokens * pricing.completionUsdPerToken
     : null;
@@ -185,6 +204,8 @@ export function scoreLiveCase(args: {
     gateFailingExpected: truth.gateShouldFail,
     promptTokens: env.usage.promptTokens,
     completionTokens: env.usage.completionTokens,
+    usageAccountingComplete,
+    usageValid,
     costUsd: cost,
     durationMs: env.durationMs,
     exitCode,
@@ -233,6 +254,8 @@ export function erroredLiveCase(args: {
     gateFailingExpected: truth.gateShouldFail,
     promptTokens: 0,
     completionTokens: 0,
+    usageAccountingComplete: null,
+    usageValid: false,
     costUsd: null,
     durationMs: null,
     exitCode: args.exitCode,
@@ -260,10 +283,50 @@ export function aggregateModel(model: string, results: LiveModelCaseResult[]): L
     ? durations.reduce((a, b) => a + b, 0) / durations.length
     : 0;
 
+  const falsePositives = results.reduce((sum, r) => sum + r.falsePositives, 0);
+  const errors = results.filter((r) => r.error !== undefined).length;
+  const pricingKnown = scored.length > 0 && costs.length === scored.length;
+  const fidelityFailures = results.reduce((sum, result) => sum + result.fidelityFailures.length, 0);
+  const usageFailures = scored.filter(
+    (result) => result.usageAccountingComplete !== true || !result.usageValid,
+  ).length;
+  const detectionRate = defects.length ? detected / defects.length : 0;
+  const gateCorrect = gateScored.filter((r) => r.gateCorrect === true).length;
+  const maxFalsePositives = Math.floor(scored.length * GENERATOR_MAX_FALSE_POSITIVE_RATE);
+  const admissionFailures: string[] = [];
+  if (results.length === 0 || scored.length !== results.length) {
+    admissionFailures.push(`incomplete matrix: ${scored.length}/${results.length} cases produced valid envelopes`);
+  }
+  if (errors > 0) admissionFailures.push(`${errors} execution error(s)`);
+  if (fidelityFailures > 0) admissionFailures.push(`${fidelityFailures} pipeline fidelity failure(s)`);
+  if (usageFailures > 0) admissionFailures.push(`${usageFailures} provider usage accounting failure(s)`);
+  if (defects.length === 0 || detectionRate < GENERATOR_MIN_DETECTION_RATE) {
+    admissionFailures.push(
+      `detection ${(detectionRate * 100).toFixed(1)}% is below ${(GENERATOR_MIN_DETECTION_RATE * 100).toFixed(0)}%`,
+    );
+  }
+  if (falsePositives > maxFalsePositives) {
+    admissionFailures.push(`false positives ${falsePositives} exceed ${maxFalsePositives}`);
+  }
+  if (gateScored.length !== scored.length || gateCorrect !== gateScored.length) {
+    admissionFailures.push(`gate verdict correct for ${gateCorrect}/${scored.length} cases`);
+  }
+  if (!pricingKnown) admissionFailures.push("pricing or usage missing for one or more cases");
+  if (meanCostUsdPerReview > GENERATOR_MAX_MEAN_COST_USD) {
+    admissionFailures.push(
+      `mean cost $${meanCostUsdPerReview.toFixed(6)} exceeds $${GENERATOR_MAX_MEAN_COST_USD.toFixed(3)}`,
+    );
+  }
+  if (meanDurationMs > GENERATOR_MAX_MEAN_DURATION_MS) {
+    admissionFailures.push(
+      `mean latency ${meanDurationMs.toFixed(0)}ms exceeds ${GENERATOR_MAX_MEAN_DURATION_MS}ms`,
+    );
+  }
+
   return {
     id: model,
-    detectionRate: defects.length ? detected / defects.length : 0,
-    falsePositives: results.reduce((sum, r) => sum + r.falsePositives, 0),
+    detectionRate,
+    falsePositives,
     casesRun: scored.length,
     meanCostUsdPerReview,
     meanDurationMs,
@@ -271,10 +334,13 @@ export function aggregateModel(model: string, results: LiveModelCaseResult[]): L
     defectCases: defects.length,
     detected,
     cleanCases: cleans.length,
-    gateCorrect: gateScored.filter((r) => r.gateCorrect === true).length,
+    gateCorrect,
     gateScored: gateScored.length,
-    errors: results.filter((r) => r.error !== undefined).length,
-    pricingKnown: costs.length > 0 || scored.length === 0,
+    errors,
+    pricingKnown,
+    fidelityFailures,
+    admissionFailures,
+    passed: admissionFailures.length === 0,
   };
 }
 
@@ -318,7 +384,14 @@ export function pricingFromCatalog(
  * completion is bounded by a conservative cap. Deliberately an over-estimate so
  * the projected cost is an upper bound, never an under-count. */
 export const GUARDRAIL_SYSTEM_PROMPT_TOKENS = 1500;
-export const GUARDRAIL_COMPLETION_TOKENS = 1200;
+export const GUARDRAIL_COMPLETION_TOKENS = 16_384;
+export const GUARDRAIL_REPAIR_INPUT_TOKENS = 16_384;
+export const GUARDRAIL_PROVIDER_ATTEMPTS_PER_PHASE = 3;
+export const GUARDRAIL_GENERATION_PHASES_PER_CASE = 3;
+export const GUARDRAIL_MAX_PROVIDER_REQUESTS_PER_CASE =
+  GUARDRAIL_PROVIDER_ATTEMPTS_PER_PHASE * GUARDRAIL_GENERATION_PHASES_PER_CASE;
+export const MAX_GENERATOR_COST_CAP_USD = 25;
+export const MAX_GENERATOR_CANDIDATES = 6;
 
 /** Chars-per-token divisor for the crude diff-size estimate (English/code text
  * averages ~4 chars/token; 3 is used to over-estimate). */
@@ -346,9 +419,57 @@ export function projectTotalCostUsd(args: {
     for (const diff of args.diffs) {
       const promptTokens = estimateCasePromptTokens(diff);
       total +=
-        promptTokens * price.promptUsdPerToken +
-        GUARDRAIL_COMPLETION_TOKENS * price.completionUsdPerToken;
+        GUARDRAIL_MAX_PROVIDER_REQUESTS_PER_CASE *
+        ((promptTokens + GUARDRAIL_REPAIR_INPUT_TOKENS) * price.promptUsdPerToken +
+          GUARDRAIL_COMPLETION_TOKENS * price.completionUsdPerToken);
     }
   }
   return total;
+}
+
+/** Normalize candidate ids once before pricing, job creation, or aggregation. */
+export function normalizeGeneratorModels(models: string[]): string[] {
+  return [...new Set(models.map((model) => model.trim()).filter((model) => model.length > 0))];
+}
+
+/** Enforce model-count and cap bounds before pricing lookup or provider calls. */
+export function validateGeneratorQualificationBounds(models: string[], costCapUsd: number): void {
+  if (models.length === 0) {
+    throw new Error("no models: set POSTIL_BENCH_MODELS or pass --models id1,id2");
+  }
+  if (models.length > MAX_GENERATOR_CANDIDATES) {
+    throw new Error(`generator qualification allows at most ${MAX_GENERATOR_CANDIDATES} candidates`);
+  }
+  if (
+    !Number.isFinite(costCapUsd) ||
+    costCapUsd <= 0 ||
+    costCapUsd > MAX_GENERATOR_COST_CAP_USD
+  ) {
+    throw new Error(
+      `generator qualification cost cap must be greater than zero and at most $${MAX_GENERATOR_COST_CAP_USD}`,
+    );
+  }
+}
+
+/** Enforce the projected-spend bound before inference jobs are created. */
+export function assertGeneratorQualificationPreflight(args: {
+  diffs: string[];
+  models: string[];
+  pricing: Map<string, ModelPricing>;
+  costCapUsd: number;
+}): number {
+  validateGeneratorQualificationBounds(args.models, args.costCapUsd);
+  const missing = args.models.filter((model) => !args.pricing.has(model));
+  if (missing.length > 0) {
+    throw new Error(
+      `cannot project generator qualification spend; pricing missing for ${missing.join(", ")}`,
+    );
+  }
+  const projected = projectTotalCostUsd(args);
+  if (!Number.isFinite(projected) || projected > args.costCapUsd) {
+    throw new Error(
+      `projected generator qualification spend $${projected.toFixed(4)} exceeds the $${args.costCapUsd.toFixed(2)} cap`,
+    );
+  }
+  return projected;
 }

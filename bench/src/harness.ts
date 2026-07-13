@@ -116,6 +116,9 @@ const envelopeFinding = z.object({
   confidence: z.number(),
   title: z.string(),
   body: z.string(),
+  scorerConfidence: z.number().optional(),
+  scorerKind: z.string().optional(),
+  scorerReason: z.string().optional(),
 });
 
 export const envelopeV1 = z.object({
@@ -134,10 +137,21 @@ export const envelopeV1 = z.object({
   confidenceBuckets: z.array(z.number().int().nonnegative()).length(5),
   gate: z.object({ failOn: z.string(), failing: z.boolean() }),
   modelUsed: z.string(),
+  scorerModel: z.string().optional(),
   usage: z.object({
     promptTokens: z.number().int().nonnegative(),
     completionTokens: z.number().int().nonnegative(),
   }),
+  modelUsage: z
+    .array(
+      z.object({
+        model: z.string().min(1),
+        promptTokens: z.number().int().nonnegative(),
+        completionTokens: z.number().int().nonnegative(),
+      }),
+    )
+    .optional(),
+  usageAccountingComplete: z.boolean().optional(),
   durationMs: z.number().int().nonnegative(),
   baseSha: z.string().nullable(),
   headSha: z.string().nullable(),

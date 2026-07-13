@@ -45,16 +45,31 @@ bun run bench                   # add --json or --json-out report.json for machi
 
 `POSTIL_BENCH_MODE=live` keeps the per-case **mock GitHub API** but points the
 CLI at the real OpenRouter endpoint, running each fixture **once per model** in
-`POSTIL_BENCH_MODELS`. It measures, per real model: seeded-region finding hit
+`POSTIL_BENCH_MODELS`. Each run forces a one-model generator chain and disables
+the independent scorer, so fallback and scorer behavior cannot inflate quality,
+latency, or cost. It measures, per real model: seeded-region finding hit
 rate on the seeded defects, non-seeded-region finding count, gate-verdict
 correctness, catalog-priced token-cost estimate, and measured latency. The full
 forge pipeline still runs against the mock GitHub, so grounding and statusline
 correctness are still checked as a model-independent fidelity floor.
 
+This command is an admission gate, not a roster promotion mechanism. It exits
+nonzero unless every candidate completes the full isolated matrix with no
+execution or pipeline-fidelity failures, at least 90% seeded-defect detection,
+no more than 5% false findings per completed case, correct gate verdicts, known
+pricing, mean cost at or below $0.01, and mean latency at or below 15 seconds.
+The embedded roster remains the last qualified production chain until an
+isolated candidate report passes and the roster is updated separately.
+The generator cost guard rejects more than six candidates or a configured cap
+above $25. Its projection prices nine provider requests per fixture, covering
+three transport attempts each for initial generation, JSON repair, and
+semantic-consistency repair. Every request includes the 16,384-token review
+completion ceiling plus another 16,384 input tokens for repair context.
+
 ```sh
 export MODEL_API_KEY=...          # or LLM_API_KEY / OPENROUTER_API_KEY; never logged or printed
 export POSTIL_BENCH_MODE=live
-export POSTIL_BENCH_MODELS=deepseek/deepseek-v4-pro,moonshotai/kimi-k2.6,qwen/qwen3-32b
+export POSTIL_BENCH_MODELS=z-ai/glm-5.2,moonshotai/kimi-k2.7-code,deepseek/deepseek-v4-flash,google/gemini-3.5-flash,stepfun/step-3.7-flash
 bun run bench --json-out report.json   # or: bun run bench:live-models
 # POSTIL_API_BASE overrides the endpoint (default https://openrouter.ai/api/v1)
 # --concurrency <n> or BENCH_CONCURRENCY sets case parallelism (default 4)
@@ -128,12 +143,12 @@ runs the live bench with any configured `POSTIL_API_KEY`, `OPENROUTER_API_KEY`,
 `MODEL_API_KEY`, or `LLM_API_KEY` secret, uploads the JSON report as an artifact,
 and prints the per-model table to the job step summary.
 
-## Scorer calibration live eval (opt-in, mocked generator + real scorer)
+## Scorer qualification (opt-in, mocked generator + real scorer)
 
 The independent scorer has a different job from the primary review generator:
 it receives already-generated findings, without the generator's confidence or
 kind, and calibrates each finding's confidence and kind against local diff
-context. `bun run scorer-eval` evaluates that role directly by mocking the
+context. `bun run scorer-eval` qualifies that role directly by mocking the
 primary generator with fixed findings and proxying only scorer requests to the
 real OpenRouter endpoint.
 
@@ -141,18 +156,28 @@ real OpenRouter endpoint.
 cargo build --quiet --release
 cd bench
 export MODEL_API_KEY=...          # or LLM_API_KEY / OPENROUTER_API_KEY
-POSTIL_SCORER_EVAL_MODELS=anthropic/claude-haiku-4.5,openai/gpt-5-mini \
+POSTIL_SCORER_EVAL_MODELS=openai/gpt-5.4-nano,google/gemini-3.5-flash,stepfun/step-3.7-flash \
+POSTIL_SCORER_EVAL_REPEATS=5 \
   bun run scorer-eval --json-out scorer-eval-report.json
 ```
 
-The eval uses 12 existing fixtures: six seeded defect findings copied from
-mock-mode ground truth, and six deliberately injected false findings on clean
-fixtures. A scorer passes the structured-output floor when every case records
-the requested `scorerModel` and no `scorerError`; it passes calibration when all
-true findings remain confident `risk` findings and at least half of injected
-false findings are down-scored below 0.6 confidence or retyped as
-`uncertainty`. The manual `Bench (live models)` workflow can run this path with
-`run_scorer_eval=true` and uploads `scorer-eval-report.json`.
+The default candidates come from `config.toml`; the workflow input may override
+them explicitly. Qualification repeats 12 fixtures five times: six seeded true
+findings and six injected false findings. Admission requires a complete matrix,
+no malformed, repaired, fallback, or reason-contract failures, all true findings
+kept as confident risks, at least 80% of false findings down-scored overall and
+per fixture, p50/p95/max scorer latency at or below 5/10/20 seconds, known live
+catalog pricing, and mean scorer cost at or below $0.005 per case. A failed
+candidate makes the command exit nonzero after writing its report. Candidate
+listing alone never enables the embedded scorer. Before any model call, the
+evaluator rejects more than six candidates, more than ten repeats, missing
+prices, or a conservative projected total above $10. The projection prices six
+provider requests per case, covering three transport attempts plus schema
+repair, with 20,000 base input tokens, another 4,096 repair-context input
+tokens, and the 4,096-token output ceiling on every request. Scorer responses also fail
+admission when provider usage is missing or malformed, runtime accounting is
+incomplete, or the assessment is not a trimmed, single-line sentence of at most
+240 Unicode characters ending in sentence punctuation.
 
 ## Diff-file live mode (opt-in, single model, no forge)
 
@@ -166,7 +191,7 @@ is written to any repo.
 ```sh
 export MODEL_API_KEY=...         # required; never logged or printed
 bun run bench:live               # or: bun run bench --live
-# REVIEW_MODEL or --model <id> overrides the model (default deepseek/deepseek-v4-pro)
+# REVIEW_MODEL or --model <id> overrides the model (default mistralai/mistral-small-3.2-24b-instruct)
 # --concurrency <n> or BENCH_CONCURRENCY sets case parallelism (default 6)
 ```
 

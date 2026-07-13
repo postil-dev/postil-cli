@@ -10,7 +10,7 @@ pub mod gitlab;
 
 use anyhow::Result;
 
-use crate::envelope::{Envelope, Finding, Severity};
+use crate::envelope::{Envelope, Finding, Severity, SuppressionReason};
 
 /// Base URL for the brand status icons rendered in PR comments and check
 /// summaries. The four icons (error, warn, info, pass) are served by the
@@ -75,7 +75,7 @@ pub trait Forge {
     /// Compose the top-level review body. Forges can add validated links to the
     /// otherwise forge-neutral envelope metadata.
     fn review_summary(&self, envelope: &Envelope) -> String {
-        check_summary(envelope, self.rich_markdown(), SummaryContext::default())
+        check_summary(envelope, self.rich_markdown(), SummaryContext::from_env())
     }
     async fn fetch_pr_meta(&self) -> Result<PrMeta>;
     /// Unified diff of the full PR.
@@ -216,7 +216,29 @@ pub fn cap_check_title(s: &str) -> String {
 /// file line. These cannot be posted as inline code annotations or review
 /// comments; they are surfaced in the check-run summary and PR comment body.
 pub fn is_synthetic_path(path: &str) -> bool {
-    path.starts_with(".postil/")
+    crate::envelope::is_reserved_anchor(path)
+}
+
+pub fn is_operational_path(path: &str) -> bool {
+    matches!(
+        path,
+        crate::envelope::OPERATIONAL_PATH | crate::envelope::PROVIDER_PATH
+    )
+}
+
+pub fn only_operational_findings(findings: &[Finding]) -> bool {
+    !findings.is_empty()
+        && findings
+            .iter()
+            .all(|finding| is_operational_path(&finding.path))
+}
+
+pub fn valid_details_url(value: Option<String>) -> Option<String> {
+    value.filter(|value| {
+        reqwest::Url::parse(value)
+            .map(|url| matches!(url.scheme(), "http" | "https") && url.has_host())
+            .unwrap_or(false)
+    })
 }
 
 pub fn check_title(envelope: &Envelope) -> String {
@@ -239,130 +261,276 @@ pub fn clean_review_message(envelope: &Envelope) -> &'static str {
 }
 
 #[derive(Default)]
-pub struct SummaryContext<'a> {
-    pub commit_url: Option<&'a str>,
-    pub details_url: Option<&'a str>,
+pub struct SummaryContext {
+    pub details_url: Option<String>,
+    pub prevention_hint: bool,
+    pub prevention_commands: Vec<String>,
 }
 
-pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext<'_>) -> String {
-    let mut s = String::new();
-    s.push_str(if envelope.gate.failing {
-        "Gate: failed\n\n"
-    } else {
-        "Gate: passed\n\n"
-    });
-    let pass = |s: &mut String| {
-        if rich {
-            s.push_str(&icon_md("pass"));
-            s.push(' ');
+impl SummaryContext {
+    pub fn from_env() -> Self {
+        Self {
+            details_url: valid_details_url(std::env::var("POSTIL_DETAILS_URL").ok()),
+            prevention_hint: std::env::var("POSTIL_PREVENTION_HINT").as_deref() == Ok("1"),
+            prevention_commands: prevention_commands_from_env(),
         }
+    }
+}
+
+fn prevention_commands_from_env() -> Vec<String> {
+    let Ok(raw) = std::env::var("POSTIL_PREVENTION_COMMANDS_JSON") else {
+        return Vec::new();
     };
-    if envelope.silent {
-        pass(&mut s);
+    parse_prevention_commands(&raw)
+}
+
+fn parse_prevention_commands(raw: &str) -> Vec<String> {
+    if raw.len() > 4_096 {
+        return Vec::new();
+    }
+    let Ok(commands) = serde_json::from_str::<Vec<String>>(raw) else {
+        return Vec::new();
+    };
+    commands
+        .into_iter()
+        .take(5)
+        .filter_map(|command| {
+            let command = command.trim();
+            (!command.is_empty()
+                && command.chars().count() <= 200
+                && !command.chars().any(|ch| ch.is_control() || ch == '`'))
+            .then(|| command.to_string())
+        })
+        .collect()
+}
+
+pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -> String {
+    let mut s = String::new();
+    let operational = only_operational_findings(&envelope.findings);
+    let has_operational = envelope
+        .findings
+        .iter()
+        .any(|finding| is_operational_path(&finding.path));
+
+    if operational {
+        if envelope.gate.failing {
+            s.push_str(
+                "Postil could not complete this review, so no review verdict exists. The merge check remains blocked.",
+            );
+        } else {
+            s.push_str(
+                "Postil could not complete this review, so no review verdict exists. This repository treats review outages as advisory.",
+            );
+        }
+        s.push('\n');
+    } else if envelope.silent {
         s.push_str(clean_review_message(envelope));
         s.push('\n');
     } else {
-        if !envelope.summary.is_empty() {
-            s.push_str(&envelope.summary);
-            s.push_str("\n\n");
-        }
-        for f in &envelope.findings {
-            let icon = if rich {
-                format!("{} ", severity_icon(f.severity))
-            } else {
-                String::new()
-            };
-            let escalation_note = if f.kind == crate::envelope::Kind::HumanEscalation
-                && f.confidence < crate::envelope::HUMAN_ESCALATION_GATE_MIN_CONFIDENCE
-            {
-                format!(
-                    " · non-blocking below {:.2} escalation floor",
-                    crate::envelope::HUMAN_ESCALATION_GATE_MIN_CONFIDENCE
+        let visible = envelope
+            .findings
+            .iter()
+            .filter(|finding| !is_operational_path(&finding.path))
+            .count();
+        let blocking = envelope
+            .findings
+            .iter()
+            .filter(|finding| !is_operational_path(&finding.path))
+            .filter(|finding| {
+                crate::envelope::finding_blocks_gate(
+                    finding,
+                    &envelope.gate.fail_on,
+                    &envelope.gate.block_on_kinds,
+                    false,
                 )
+            })
+            .count();
+        if has_operational && visible > 0 {
+            s.push_str(&format!(
+                "**{} {} posted inline.** Review {}, then follow the merge check.\n",
+                visible,
+                plural(visible, "finding is", "findings are"),
+                plural(visible, "it", "them"),
+            ));
+        } else if blocking > 0 {
+            s.push_str(&format!(
+                "**{} {} applied the brakes.** Fix {}, then push again.\n",
+                blocking,
+                plural(blocking, "finding has", "findings have"),
+                plural(blocking, "it", "them"),
+            ));
+        } else if visible > 0 {
+            s.push_str(&format!(
+                "**{} {} worth a look.** {} {} not block this merge.\n",
+                visible,
+                plural(visible, "finding", "findings"),
+                plural(visible, "It", "They"),
+                plural(visible, "does", "do"),
+            ));
+        } else {
+            s.push_str("**A finding needs attention in the review details.**\n");
+        }
+    }
+
+    // PR-level policy findings use a synthetic anchor because no changed file
+    // line exists for an inline comment. Unlike operational sentinels, these
+    // are actionable review results, so keep their bounded detail visible in
+    // the review summary instead of reducing them to a count and dashboard
+    // link.
+    let synthetic_findings: Vec<_> = envelope
+        .findings
+        .iter()
+        .filter(|finding| is_synthetic_path(&finding.path))
+        .filter(|finding| !is_operational_path(&finding.path))
+        .take(3)
+        .collect();
+    if !synthetic_findings.is_empty() {
+        s.push('\n');
+        for finding in &synthetic_findings {
+            let location = if finding.path == crate::envelope::PR_DESCRIPTION_PATH {
+                "pull request description".to_string()
             } else {
-                String::new()
+                format!("`{}`", safe_code_text(&finding.path))
             };
             s.push_str(&format!(
-                "- {}**{}** · severity: `{}` · confidence {} · kind: {}{}\n",
-                icon,
-                f.title,
-                f.severity.as_str(),
-                format_confidence(f.confidence),
-                f.kind.as_str(),
-                escalation_note,
+                "- **{}** in {}: {}\n",
+                safe_markdown_text(&finding.title),
+                location,
+                safe_evidence_text(&finding.body),
+            ));
+        }
+        let undisclosed = envelope
+            .findings
+            .iter()
+            .filter(|finding| is_synthetic_path(&finding.path))
+            .filter(|finding| !is_operational_path(&finding.path))
+            .count()
+            .saturating_sub(synthetic_findings.len());
+        if undisclosed > 0 {
+            s.push_str(&format!(
+                "- {} more PR-level {} in the review details.\n",
+                undisclosed,
+                plural(undisclosed, "finding is", "findings are"),
             ));
         }
     }
     if !envelope.resolved.is_empty() {
-        s.push('\n');
-        pass(&mut s);
         s.push_str(&format!(
-            "{} finding(s) from the previous review resolved.\n",
-            envelope.resolved.len()
+            "{} earlier {} resolved.\n",
+            envelope.resolved.len(),
+            plural(envelope.resolved.len(), "finding", "findings"),
         ));
     }
-    if envelope.counts.suppressed > 0 {
-        s.push_str(&format!(
-            "\n{} finding(s) suppressed by policy (confidence/severity/ignore).\n",
-            envelope.counts.suppressed
-        ));
-    }
-    if rich {
-        s.push_str("\n<details><summary>Review metadata</summary>\n\n");
-    } else {
-        s.push_str("\nReview metadata:\n");
-    }
-    s.push_str(&format!("- Model: `{}`\n", envelope.model_used));
-    s.push_str(&format!(
-        "- Review duration: {}\n",
-        format_duration(envelope.duration_ms)
-    ));
-    if let Some(head_sha) = envelope.head_sha.as_deref() {
-        let short_sha: String = head_sha.chars().take(7).collect();
-        if let Some(commit_url) = context.commit_url {
-            s.push_str(&format!("- Commit: [`{short_sha}`]({commit_url})\n"));
+
+    let eligible: Vec<_> = envelope
+        .suppressed_findings
+        .iter()
+        .filter(|suppressed| suppressed.reason != SuppressionReason::Ignored)
+        .collect();
+    let disclosed: Vec<_> = eligible.iter().take(5).copied().collect();
+    if !disclosed.is_empty() {
+        if rich {
+            s.push_str(&format!(
+                "\n<details><summary>{} lower-priority {}, not posted inline{}</summary>\n\n",
+                eligible.len(),
+                plural(eligible.len(), "finding", "findings"),
+                if eligible.len() > disclosed.len() {
+                    format!("; showing {} of {}", disclosed.len(), eligible.len())
+                } else {
+                    String::new()
+                },
+            ));
         } else {
-            s.push_str(&format!("- Commit: `{short_sha}`\n"));
+            s.push_str(&format!(
+                "\nLower-priority findings not posted inline{}:\n",
+                if eligible.len() > disclosed.len() {
+                    format!(" (showing {} of {})", disclosed.len(), eligible.len())
+                } else {
+                    String::new()
+                },
+            ));
+        }
+        for suppressed in disclosed {
+            s.push_str(&format!(
+                "- **{}** at `{}`:{}: {}; severity {}, confidence {}. {}\n",
+                safe_markdown_text(&suppressed.finding.title),
+                safe_code_text(&suppressed.finding.path),
+                suppressed.finding.line,
+                suppression_reason(suppressed.reason),
+                suppressed.finding.severity.as_str(),
+                format_confidence(suppressed.finding.confidence),
+                safe_evidence_text(&suppressed.finding.body),
+            ));
+        }
+        if rich {
+            s.push_str("\n</details>\n");
         }
     }
+
+    if context.prevention_hint && !operational && !envelope.silent {
+        if rich {
+            s.push_str("\n<details><summary>Before the next push</summary>\n\n");
+        } else {
+            s.push_str("\nBefore the next push:\n");
+        }
+        s.push_str("Install committed-change review with `postil hook install`.\n");
+        if !context.prevention_commands.is_empty() {
+            s.push_str("Run the repository's verified checks:\n");
+            for command in &context.prevention_commands {
+                s.push_str(&format!("- `{command}`\n"));
+            }
+        }
+        s.push_str("After staging and before committing, run `postil review --staged`.\n");
+        if rich {
+            s.push_str("\n</details>\n");
+        }
+    }
+
     if let Some(details_url) = context.details_url {
-        s.push_str(&format!(
-            "- Dashboard run: [View in Postil]({details_url})\n"
-        ));
-    }
-    s.push_str(&format!(
-        "- Tokens: {} prompt, {} completion\n",
-        envelope.usage.prompt_tokens, envelope.usage.completion_tokens
-    ));
-    if let Some(scorer_model) = envelope.scorer_model.as_deref() {
-        s.push_str(&format!("- Scorer: `{scorer_model}`"));
-        if let Some(disagreements) = envelope.scorer_disagreements {
-            s.push_str(&format!(" ({disagreements} disagreement(s))"));
-        }
-        s.push('\n');
-    }
-    if envelope.scorer_error.is_some() {
-        // Provider response bodies can contain arbitrary text. Keep the public
-        // metadata useful without copying raw upstream errors into Markdown.
-        s.push_str("- Scorer status: unavailable\n");
-    }
-    if rich {
-        s.push_str("\n</details>\n");
+        s.push_str(&format!("\n[Review details]({details_url})\n"));
     }
     s
 }
 
-fn format_duration(duration_ms: u64) -> String {
-    if duration_ms < 1_000 {
-        format!("{duration_ms} ms")
-    } else {
-        format!("{:.2} s", duration_ms as f64 / 1_000.0)
+fn safe_evidence_text(value: &str) -> String {
+    safe_markdown_text(value).chars().take(240).collect()
+}
+
+fn plural<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
+    if count == 1 { singular } else { plural }
+}
+
+fn suppression_reason(reason: SuppressionReason) -> &'static str {
+    match reason {
+        SuppressionReason::Ignored => "ignored by repository policy",
+        SuppressionReason::BelowSeverity => "below the configured severity threshold",
+        SuppressionReason::BelowConfidence => "below the configured confidence threshold",
+        SuppressionReason::MaxFindings => "outside the configured finding cap",
     }
+}
+
+fn safe_markdown_text(value: &str) -> String {
+    value
+        .replace(['\r', '\n'], " ")
+        .replace('@', "＠")
+        .replace(['[', ']', '*', '_', '<', '>'], "")
+        .chars()
+        .take(160)
+        .collect()
+}
+
+fn safe_code_text(value: &str) -> String {
+    value
+        .replace(['\r', '\n', '`'], "")
+        .chars()
+        .take(300)
+        .collect()
 }
 
 /// The body of one inline finding comment: icon (rich forges), bold title,
 /// severity / confidence / kind statusline, then the finding body.
 pub fn finding_comment_body(f: &Finding, rich: bool) -> String {
+    let publication = crate::envelope::finding_publication_text(&f.title, &f.body);
     let icon = if rich {
         format!("{} ", severity_icon(f.severity))
     } else {
@@ -371,11 +539,11 @@ pub fn finding_comment_body(f: &Finding, rich: bool) -> String {
     format!(
         "{}**{}**\n`{}` · confidence {} · kind: {}\n\n{}",
         icon,
-        f.title,
+        publication.title,
         f.severity.as_str(),
         format_confidence(f.confidence),
         f.kind.as_str(),
-        f.body
+        publication.body
     )
 }
 
@@ -409,6 +577,36 @@ mod tests {
         }
     }
 
+    fn envelope_with_findings(findings: Vec<Finding>) -> Envelope {
+        Envelope {
+            version: 1,
+            summary: String::new(),
+            silent: findings.is_empty(),
+            counts: Envelope::counts_of(&findings, 0),
+            confidence_buckets: Envelope::buckets_of(&findings),
+            findings,
+            suppressed_findings: vec![],
+            resolved: vec![],
+            gate: crate::envelope::Gate {
+                fail_on: "error".into(),
+                failing: true,
+                block_on_kinds: vec!["humanEscalation".into()],
+            },
+            model_used: "review-model".into(),
+            scorer_model: None,
+            scorer_error: None,
+            scorer_disagreements: None,
+            usage: Default::default(),
+            model_usage: vec![],
+            model_incidents: vec![],
+            usage_accounting_complete: true,
+            duration_ms: 0,
+            base_sha: None,
+            head_sha: None,
+            since_sha: None,
+        }
+    }
+
     #[test]
     fn rich_comment_carries_brand_icon_and_statusline() {
         let body = finding_comment_body(&finding(), true);
@@ -417,15 +615,57 @@ mod tests {
     }
 
     #[test]
+    fn empty_finding_title_cannot_break_the_comment_wrapper() {
+        let mut unsafe_finding = finding();
+        unsafe_finding.title.clear();
+        unsafe_finding.body = "**@octocat <img> [`code`]**\n\nKeep `useful()` formatting.".into();
+
+        let body = finding_comment_body(&unsafe_finding, true);
+
+        assert!(!body.contains("@octocat"));
+        assert!(!body.contains("<img>"));
+        assert!(!body.contains("****"));
+        assert!(body.contains("`useful()`"));
+    }
+
+    #[test]
+    fn only_exact_virtual_anchors_are_synthetic() {
+        assert!(is_synthetic_path(crate::envelope::PROVIDER_PATH));
+        assert!(is_synthetic_path(crate::envelope::OPERATIONAL_PATH));
+        assert!(is_synthetic_path(crate::envelope::PR_DESCRIPTION_PATH));
+        assert!(is_synthetic_path(crate::envelope::DIFF_PATH));
+        assert!(!is_synthetic_path(".postil/content-policy.md"));
+        assert!(!is_synthetic_path(".postil/guardrails.md"));
+    }
+
+    #[test]
     fn summary_is_explicit_path_free_and_marks_weak_escalations_non_blocking() {
         let mut escalation = finding();
         escalation.kind = Kind::HumanEscalation;
         escalation.confidence = 0.05;
+        let mut suppressed_findings = (0..6)
+            .map(|index| crate::envelope::SuppressedFinding {
+                finding: Finding {
+                    title: format!("Lower confidence concern {index}"),
+                    body: "Evidence from the changed branch shows the value can be lost.".into(),
+                    ..finding()
+                },
+                reason: crate::envelope::SuppressionReason::BelowConfidence,
+            })
+            .collect::<Vec<_>>();
+        suppressed_findings.push(crate::envelope::SuppressedFinding {
+            finding: Finding {
+                title: "Ignored generated file".into(),
+                ..finding()
+            },
+            reason: crate::envelope::SuppressionReason::Ignored,
+        });
         let env = Envelope {
             version: 1,
             summary: "A weak signal needs review.".into(),
             silent: false,
             findings: vec![escalation],
+            suppressed_findings,
             resolved: vec![],
             counts: Default::default(),
             confidence_buckets: [1, 0, 0, 0, 0],
@@ -443,6 +683,7 @@ mod tests {
                 completion_tokens: 5,
             },
             model_usage: vec![],
+            model_incidents: vec![],
             usage_accounting_complete: true,
             duration_ms: 1_250,
             base_sha: None,
@@ -454,30 +695,72 @@ mod tests {
             &env,
             true,
             SummaryContext {
-                commit_url: Some("https://github.com/acme/api/commit/abcdef123456"),
-                details_url: Some("https://postil.dev/orgs/acme/runs/run-1"),
+                details_url: Some("https://postil.dev/orgs/acme/runs/run-1".into()),
+                prevention_hint: true,
+                prevention_commands: vec!["cargo test --lib".into()],
             },
         );
 
-        assert!(summary.starts_with("Gate: passed\n\n"));
-        assert!(summary.contains("**Unsanitized input reaches query** · severity: `error`"));
+        assert!(summary.starts_with("**1 finding worth a look.**"));
+        assert!(!summary.contains("Unsanitized input reaches query"));
         assert!(!summary.contains("src/auth.rs:41"));
-        assert!(summary.contains("non-blocking below 0.30 escalation floor"));
-        assert!(summary.contains("<details><summary>Review metadata</summary>"));
-        assert!(summary.contains("[`abcdef1`](https://github.com/acme/api/commit/abcdef123456)"));
-        assert!(summary.contains("[View in Postil](https://postil.dev/orgs/acme/runs/run-1)"));
-        assert!(summary.contains("- Review duration: 1.25 s"));
-        assert!(summary.contains("- Tokens: 10 prompt, 5 completion"));
-        assert!(summary.contains("- Scorer: `scorer-model` (1 disagreement(s))"));
+        assert!(!summary.contains("Review metadata"));
+        assert!(!summary.contains("abcdef1"));
+        assert!(summary.contains("6 lower-priority findings, not posted inline; showing 5 of 6"));
+        assert!(summary.contains("Lower confidence concern 0"));
+        assert!(summary.contains("severity error, confidence 0.91"));
+        assert!(summary.contains("Evidence from the changed branch"));
+        assert!(!summary.contains("Ignored generated file"));
+        assert!(summary.contains("postil review --staged"));
+        assert!(summary.contains("postil hook install"));
+        assert!(summary.contains("cargo test --lib"));
+        assert!(summary.contains("[Review details](https://postil.dev/orgs/acme/runs/run-1)"));
+
+        let plain = check_summary(&env, false, Default::default());
+        assert!(plain.contains("Lower-priority findings not posted inline (showing 5 of 6):"));
+        assert!(!plain.contains("<details>"));
     }
 
     #[test]
-    fn plain_summary_uses_plain_metadata_and_hides_raw_scorer_errors() {
+    fn pr_description_finding_is_visible_without_exposing_operational_detail() {
+        let mut pr_description = finding();
+        pr_description.path = crate::envelope::PR_DESCRIPTION_PATH.into();
+        pr_description.title = "Required disclosure is missing".into();
+        pr_description.body =
+            "Add the compatibility impact to the pull request description.".into();
+        let mut provider = finding();
+        provider.path = crate::envelope::PROVIDER_PATH.into();
+        provider.title = "private provider title".into();
+        provider.body = "private provider body".into();
+        let mut env = envelope_with_findings(vec![pr_description, provider]);
+        env.silent = false;
+
+        let summary = check_summary(&env, true, Default::default());
+
+        assert!(summary.contains("Required disclosure is missing"));
+        assert!(summary.contains("in pull request description"));
+        assert!(summary.contains("Add the compatibility impact"));
+        assert!(!summary.contains("private provider title"));
+        assert!(!summary.contains("private provider body"));
+    }
+
+    #[test]
+    fn prevention_commands_are_bounded_and_markdown_safe() {
+        let parsed = parse_prevention_commands(
+            r#"["cargo test --lib","bun test","bad`command","line\nbreak","","one","two","three","four"]"#,
+        );
+        assert_eq!(parsed, vec!["cargo test --lib", "bun test"]);
+        assert!(parse_prevention_commands(&"x".repeat(4_097)).is_empty());
+    }
+
+    #[test]
+    fn compact_summary_hides_model_metadata_and_raw_scorer_errors() {
         let env = Envelope {
             version: 1,
             summary: String::new(),
             silent: true,
             findings: vec![],
+            suppressed_findings: vec![],
             resolved: vec![],
             counts: Default::default(),
             confidence_buckets: [0; 5],
@@ -492,6 +775,7 @@ mod tests {
             scorer_disagreements: None,
             usage: Default::default(),
             model_usage: vec![],
+            model_incidents: vec![],
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
@@ -500,9 +784,9 @@ mod tests {
         };
         let summary = check_summary(&env, false, Default::default());
 
-        assert!(summary.contains("\nReview metadata:\n"));
+        assert!(summary.contains("Postil reviewed this change"));
         assert!(!summary.contains("<details>"));
-        assert!(summary.contains("- Scorer status: unavailable"));
+        assert!(!summary.contains("Scorer"));
         assert!(!summary.contains("attacker.invalid"));
     }
 
@@ -534,12 +818,13 @@ mod tests {
     }
 
     #[test]
-    fn silent_summary_icon_only_when_rich() {
+    fn silent_summary_is_plain_and_compact_for_all_forges() {
         let env = Envelope {
             version: 1,
             summary: String::new(),
             silent: true,
             findings: vec![],
+            suppressed_findings: vec![],
             resolved: vec![],
             counts: Default::default(),
             confidence_buckets: [0; 5],
@@ -554,13 +839,14 @@ mod tests {
             scorer_disagreements: None,
             usage: Default::default(),
             model_usage: vec![],
+            model_incidents: vec![],
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
             head_sha: None,
             since_sha: None,
         };
-        assert!(check_summary(&env, true, Default::default()).contains("status/pass.svg"));
+        assert!(!check_summary(&env, true, Default::default()).contains("status/pass.svg"));
         assert!(!check_summary(&env, false, Default::default()).contains("<img"));
     }
 
@@ -571,6 +857,7 @@ mod tests {
             summary: String::new(),
             silent: true,
             findings: vec![],
+            suppressed_findings: vec![],
             resolved: vec![],
             counts: Default::default(),
             confidence_buckets: [0; 5],
@@ -585,6 +872,7 @@ mod tests {
             scorer_disagreements: None,
             usage: Default::default(),
             model_usage: vec![],
+            model_incidents: vec![],
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
@@ -594,19 +882,19 @@ mod tests {
 
         assert!(
             check_summary(&env, false, Default::default())
-                .starts_with("Gate: passed\n\nReview disabled by configuration.")
+                .starts_with("Review disabled by configuration.")
         );
 
         env.model_used = "none (empty diff)".into();
         assert!(
             check_summary(&env, false, Default::default())
-                .starts_with("Gate: passed\n\nNo reviewable diff; no model call was made.")
+                .starts_with("No reviewable diff; no model call was made.")
         );
 
         env.model_used = "review-model".into();
         assert!(
             check_summary(&env, false, Default::default())
-                .starts_with("Gate: passed\n\nPostil reviewed this change")
+                .starts_with("Postil reviewed this change")
         );
     }
 

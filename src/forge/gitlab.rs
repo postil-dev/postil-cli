@@ -153,8 +153,10 @@ impl GitLab {
         }
         let note = json!({
             "body": format!(
-                "`{}:{}` **{}** ({})\n\n{}",
-                f.path, f.line, f.title, f.severity.as_str(), f.body
+                "`{}:{}`\n\n{}",
+                super::safe_code_text(&f.path),
+                f.line,
+                super::finding_comment_body(f, true),
             ),
         });
         let resp = self
@@ -252,6 +254,9 @@ impl Forge for GitLab {
         findings: &[Finding],
         _head_sha: &str,
     ) -> Result<()> {
+        if super::only_operational_findings(findings) {
+            return Ok(());
+        }
         let mr = self.mr().await?;
         // One failed comment must not drop the rest: post everything we can,
         // then report the failures together.
@@ -322,7 +327,7 @@ impl Forge for GitLab {
             &head,
             "postil/review",
             map(advisory),
-            &check_summary(envelope, true, Default::default()),
+            &check_summary(envelope, true, super::SummaryContext::from_env()),
         )
         .await?;
         let gate_desc = if envelope.gate.failing {

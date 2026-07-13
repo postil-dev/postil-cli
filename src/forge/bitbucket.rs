@@ -136,8 +136,10 @@ impl Bitbucket {
             return Ok(());
         }
         let note = json!({ "content": { "raw": format!(
-            "`{}:{}` **{}** ({})\n\n{}",
-            f.path, f.line, f.title, f.severity.as_str(), f.body
+            "`{}:{}`\n\n{}",
+            super::safe_code_text(&f.path),
+            f.line,
+            super::finding_comment_body(f, false),
         )}});
         let resp = self
             .request(
@@ -236,6 +238,9 @@ impl Forge for Bitbucket {
         findings: &[Finding],
         _head_sha: &str,
     ) -> Result<()> {
+        if super::only_operational_findings(findings) {
+            return Ok(());
+        }
         // One failed comment must not drop the rest: post everything we can,
         // then report the failures together.
         let mut failures: Vec<String> = Vec::new();
@@ -308,7 +313,7 @@ impl Forge for Bitbucket {
             &head,
             "postil/review",
             map(advisory),
-            &check_summary(envelope, false, Default::default()),
+            &check_summary(envelope, false, super::SummaryContext::from_env()),
         )
         .await?;
         let gate_desc = if envelope.gate.failing {

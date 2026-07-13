@@ -33,8 +33,11 @@ import {
 } from "./harness";
 import {
   aggregateModel,
+  assertGeneratorQualificationPreflight,
   calculateTotalRunCostUsd,
   erroredLiveCase,
+  MAX_GENERATOR_COST_CAP_USD,
+  normalizeGeneratorModels,
   pricingFromCatalog,
   scoreLiveCase,
   toSiteModelAggregate,
@@ -43,6 +46,7 @@ import {
   type ModelPricing,
   type OpenRouterModelsResponse,
   type SiteModelAggregate,
+  validateGeneratorQualificationBounds,
 } from "./livemodels-score";
 
 const execFile = promisify(execFileCb);
@@ -59,7 +63,8 @@ export const DEFAULT_TIMEOUT_MS = 300_000;
 export interface LiveModelsOptions {
   /** Path to the postil binary (a release build). */
   binary: string;
-  /** OpenRouter model ids; each fixture runs once per model. */
+  /** OpenRouter model ids; each fixture runs once per model with scoring and
+   * the embedded generator cascade disabled. */
   models: string[];
   /** OpenRouter-compatible base URL (default DEFAULT_API_BASE). */
   apiBase?: string;
@@ -73,12 +78,15 @@ export interface LiveModelsOptions {
   cliVersion?: string;
   /** Injected pricing (per-model). When omitted, the catalog is fetched once. */
   pricing?: Map<string, ModelPricing>;
+  /** Projected-spend cap. It cannot exceed MAX_GENERATOR_COST_CAP_USD. */
+  costCapUsd?: number;
 }
 
 export interface LiveModelsReport {
   generatedAt: string;
   cliVersion: string;
   apiBase: string;
+  passed: boolean;
   /** The exact per-model schema the site consumes. */
   models: SiteModelAggregate[];
   /** Full per-model aggregates (superset of `models`) for the human table and
@@ -97,24 +105,26 @@ export async function runLiveModels(
   inputs: BenchmarkCaseInput[],
   options: LiveModelsOptions,
 ): Promise<LiveModelsReport> {
+  const models = normalizeGeneratorModels(options.models);
+  const costCapUsd = options.costCapUsd ?? MAX_GENERATOR_COST_CAP_USD;
+  validateGeneratorQualificationBounds(models, costCapUsd);
   if (!resolveApiKeyName()) {
     throw new Error(
       `live mode needs a real model key: set ${API_KEY_ENV_NAMES_TEXT} in the ` +
         "environment (it is never logged or printed). Mock mode (bun run bench) needs no key.",
     );
   }
-  if (options.models.length === 0) {
-    throw new Error(
-      "live mode needs at least one model: set POSTIL_BENCH_MODELS to a comma-separated list of " +
-        "OpenRouter model ids.",
-    );
-  }
   const cases = inputs.map((input) => benchmarkCase.parse(input));
-  await assertBinary(options.binary);
-
   const apiBase = options.apiBase ?? DEFAULT_API_BASE;
   const rootDir = options.rootDir ?? resolve(import.meta.dir, "..", ".runs", "live-models");
-  const pricing = options.pricing ?? (await fetchPricing(apiBase, options.models));
+  const pricing = options.pricing ?? (await fetchPricing(apiBase, models));
+  assertGeneratorQualificationPreflight({
+    diffs: cases.map((candidate) => candidate.diff),
+    models,
+    pricing,
+    costCapUsd,
+  });
+  await assertBinary(options.binary);
 
   // Task queue: one job per (model, case). A bounded worker pool drains it so at
   // most `concurrency` binary runs are in flight regardless of model count.
@@ -124,7 +134,7 @@ export async function runLiveModels(
     caseIndex: number;
   }
   const jobs: Job[] = [];
-  for (const model of options.models) {
+  for (const model of models) {
     cases.forEach((c, caseIndex) => jobs.push({ model, case: c, caseIndex }));
   }
 
@@ -149,7 +159,7 @@ export async function runLiveModels(
   await Promise.all(Array.from({ length: concurrency }, () => worker()));
 
   const cliVersion = options.cliVersion ?? (await resolveCliVersion(options.binary));
-  const aggregates = options.models.map((model) =>
+  const aggregates = models.map((model) =>
     aggregateModel(
       model,
       results.filter((r) => r.model === model),
@@ -160,6 +170,7 @@ export async function runLiveModels(
     generatedAt: new Date().toISOString(),
     cliVersion,
     apiBase,
+    passed: aggregates.length > 0 && aggregates.every((aggregate) => aggregate.passed),
     models: aggregates.map(toSiteModelAggregate),
     modelAggregates: aggregates,
     totalRunCostUsd: calculateTotalRunCostUsd(results),
@@ -236,6 +247,12 @@ async function runLiveModelCase(
     ...evaluateGrounding(c, envelope),
     ...evaluateStatusline(envelope, github),
   ];
+  if (envelope.modelUsed !== model) {
+    fidelityFailures.push(`generator qualification used ${envelope.modelUsed} instead of ${model}`);
+  }
+  if (envelope.scorerModel !== undefined) {
+    fidelityFailures.push(`generator qualification unexpectedly used scorer ${envelope.scorerModel}`);
+  }
 
   return scoreLiveCase({ case: c, model, envelope, pricing, exitCode, fidelityFailures });
 }
@@ -244,7 +261,7 @@ async function runLiveModelCase(
  * discovers no developer config, the mock GitHub for forge I/O, and the real
  * OpenRouter endpoint. The API key is forwarded from the parent process and is
  * never logged or placed on argv here. */
-function liveEnv(
+export function liveEnv(
   homeDir: string,
   tmpDir: string,
   githubBaseUrl: string,
@@ -266,11 +283,11 @@ function liveEnv(
     GITHUB_API_URL: githubBaseUrl,
     GITHUB_TOKEN: "benchmark-github-token",
     REVIEW_MODEL: model,
+    // Repeating the primary in the cascade deduplicates to a one-model chain,
+    // so a candidate cannot pass using an embedded fallback.
+    REVIEW_MODEL_CASCADE: model,
+    POSTIL_DISABLE_SCORER: "1",
   };
-  const scorerModel = process.env.REVIEW_SCORER_MODEL?.trim();
-  if (scorerModel) {
-    env.REVIEW_SCORER_MODEL = scorerModel;
-  }
   // Forward the selected inference-key variable without logging or placing the
   // value on argv. Neutral aliases are also mirrored into POSTIL_API_KEY so
   // older binaries can run from the same benchmark harness.
@@ -292,14 +309,6 @@ async function fetchPricing(
   }
   const catalog = (await res.json()) as OpenRouterModelsResponse;
   const pricing = pricingFromCatalog(catalog, models);
-  const missing = models.filter((m) => !pricing.has(m));
-  if (missing.length > 0) {
-    // A missing price is non-fatal (cost stays null for that model) but worth a
-    // warning so the run is not silently under-priced.
-    console.error(
-      `warning: no OpenRouter pricing for ${missing.join(", ")}; cost will be null for these models`,
-    );
-  }
   return pricing;
 }
 
@@ -339,6 +348,7 @@ export function formatLiveModelsReport(report: LiveModelsReport): string {
     if (!a.pricingKnown) {
       lines.push("  pricing unknown for this model: cost columns are 0");
     }
+    for (const failure of a.admissionFailures) lines.push(`  FAIL: ${failure}`);
   }
   lines.push(
     "",
@@ -349,6 +359,10 @@ export function formatLiveModelsReport(report: LiveModelsReport): string {
     "run exists. Costs are our measured OpenRouter spend on our fixtures, one run per case.",
   );
   return lines.join("\n");
+}
+
+export function liveModelsQualificationExitCode(report: LiveModelsReport): number {
+  return report.passed && report.modelAggregates.length > 0 ? 0 : 1;
 }
 
 function pct(v: number): string {

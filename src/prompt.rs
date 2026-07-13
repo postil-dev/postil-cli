@@ -32,9 +32,14 @@ pub fn review_contract(cfg: &Config) -> String {
          or corrupts data, or makes a function return wrong results, is error — not warn — \
          even when it is not a security issue; do not flinch on confident correctness \
          findings. Reserve warn for genuinely conditional problems (impact depends on \
-         callers or context). Kind: risk = concrete defect; humanEscalation = needs an \
-         accountable human decision; guardrail = violates a stated repo rule; uncertainty \
-         = you cannot verify something critical from the diff.\n\
+         callers or context). Kind is a category, never a severity label: `info`, `warn`, \
+         and `error` are invalid kinds. Kind: risk = any concrete code defect with an \
+         actionable fix, including a defect that needs a focused test to confirm; \
+         humanEscalation = multiple valid product or policy outcomes remain and only an \
+         accountable owner can choose among them; guardrail = violates a stated repo rule; \
+         uncertainty = you cannot verify something critical from the diff. Never classify \
+         an ordinary bug as humanEscalation merely because it is uncertain or needs \
+         confirmation.\n\
          \n\
          Confidence is your honest probability the finding is real and merge-relevant. \
          Do not inflate it; low-confidence findings are suppressed and that is correct.\n\
@@ -98,7 +103,11 @@ pub fn review_contract(cfg: &Config) -> String {
         p.push_str(&policy);
         p.push_str("\n--- END CONTENT POLICY ---\n");
     }
-    p.push_str(&format!("\nTone for finding bodies: {}.\n", cfg.tone));
+    p.push_str(&format!(
+        "\nTone for finding bodies: {}. For security, data loss, safety, privacy, or other \
+         severe topics, use plain professional language with no jokes or snark.\n",
+        cfg.tone
+    ));
     p
 }
 
@@ -146,7 +155,15 @@ pub fn scorer_system_prompt(cfg: &Config) -> String {
          exactly one object per supplied finding:\n\
          [{\"index\": <number>, \"confidence\": <0..1>, \
          \"kind\": \"risk|humanEscalation|guardrail|uncertainty|contentPolicy\", \
-         \"reason\": \"short reason\"}]\n\
+         \"reason\": \"one complete sentence of at most 240 Unicode characters\"}]\n\
+         \n\
+         The `kind` value is a finding category. `info`, `warn`, and `error` are \
+         severities and are NEVER valid kind values. An ordinary concrete defect is \
+         `risk`, even when a focused test is needed to confirm it. Use \
+         `humanEscalation` only when multiple valid outcomes remain and an accountable \
+         owner must choose among them. Every `reason` must be exactly one complete \
+         sentence, end with sentence punctuation, contain no line breaks, and contain \
+         at most 240 Unicode characters.\n\
          \n\
          The input intentionally omits the generator's original confidence and kind. Do \
          not infer them from absence; score independently from the finding text and local \
@@ -176,17 +193,33 @@ pub fn scorer_user_prompt(findings: &[ScorerPromptFinding]) -> String {
 }
 
 /// System prompt for the interactive bot answering a maintainer's mention.
-/// Free-form prose (not the review JSON contract), but the same noise discipline.
+/// The small JSON envelope keeps generated prose behind a deterministic
+/// publication check before it can reach a forge.
 pub fn respond_system_prompt(cfg: &Config) -> String {
     let mut p = String::from(
         "You are Postil, replying to a maintainer who mentioned you on a pull request or \
-         issue. Answer their actual question directly and concisely in GitHub-flavored \
-         markdown. Ground every claim in the diff or thread you are given; cite file:line \
-         when you reference code. If they ask you to re-review, point to specific lines and \
-         the merge risk. If something cannot be determined from what you were given, say so \
-         plainly rather than guessing. No filler, no praise, no restating the question. You \
-         do not open pull requests or push commits; if asked to, explain that you review and \
-         answer only.",
+         issue. Answer the actual question directly. Ground every claim in the diff or thread \
+         you are given, and cite file:line when you reference code. If something cannot be \
+         determined from the supplied context, say so plainly rather than guessing. No filler, \
+         praise, preamble, or restatement of the question. You do not open pull requests or push \
+         commits; if asked to, explain that you review and answer only.\n\
+         \n\
+         Keep an ordinary reply at or below 1,200 characters. A re-review reply is a compact \
+         review, not an article: report only actionable merge risks, give each risk in one \
+         concise item with its file:line evidence and next action, and say briefly when no such \
+         risk is present. Do not add an overview, implementation tour, correctness section, \
+         generic risk inventory, or verdict. Do not use Markdown headings. Use no more than three \
+         list items.\n\
+         Do not emit active @mentions, raw HTML or HTML comments, details blocks, Markdown \
+         tables, or images.\n\
+         \n\
+         Return ONLY one JSON object with exactly this shape and no markdown fence or surrounding \
+         prose:\n\
+         {\"answer\":\"concise GitHub-flavored Markdown\",\"diagram\":null}\n\
+         The answer must be non-empty and diagram must always be null. Generated diagrams and \
+         Mermaid are not accepted. The publication validator rejects output over 2,400 characters \
+         or 24 nonblank lines, extra fields, Markdown headings, more than three list items, and \
+         unsafe Markdown.",
     );
     if let Some(rules) = &cfg.guardrails {
         p.push_str("\n\nRepository guardrails you may reference:\n");
@@ -313,6 +346,22 @@ mod tests {
         assert!(p.contains("CONTENT POLICY"));
         assert!(p.contains("Never fabricate a claim"));
         assert!(p.contains("kind \"contentPolicy\""));
+    }
+
+    #[test]
+    fn respond_prompt_requires_a_compact_structured_reply() {
+        let p = respond_system_prompt(&Config::default());
+        assert!(p.contains("at or below 1,200 characters"));
+        assert!(p.contains("not an article"));
+        assert!(p.contains("{\"answer\":\"concise GitHub-flavored Markdown\",\"diagram\":null}"));
+        assert!(p.contains("diagram must always be null"));
+        assert!(p.contains("Mermaid are not accepted"));
+        assert!(!p.contains("When justified"));
+        assert!(!p.contains("materially clarifies"));
+        assert!(p.contains("Do not add an overview"));
+        assert!(p.contains("Do not use Markdown headings"));
+        assert!(p.contains("no more than three list items"));
+        assert!(p.contains("Do not emit active @mentions"));
     }
 
     #[test]

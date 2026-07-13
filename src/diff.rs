@@ -121,6 +121,18 @@ impl DiffIndex {
             .is_some_and(|rs| rs.iter().any(|r| r.contains(&line)))
     }
 
+    /// True when both endpoints are on the new side of one diff hunk. Forge
+    /// APIs reject multiline comments that cross hunk boundaries even when the
+    /// individual line numbers both appear elsewhere in the file diff.
+    pub fn contains_range(&self, path: &str, start: u32, end: u32) -> bool {
+        start <= end
+            && self.ranges.get(path).is_some_and(|ranges| {
+                ranges
+                    .iter()
+                    .any(|range| range.contains(&start) && range.contains(&end))
+            })
+    }
+
     /// True when `(path, line)` falls on the old side of a changed hunk. A
     /// baseline finding cites the previously reviewed head, so incremental
     /// reconciliation must use this coordinate space rather than new-file

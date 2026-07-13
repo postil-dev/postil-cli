@@ -14,12 +14,17 @@ import { cases } from "../fixtures/cases";
 import { benchmarkCase } from "./harness";
 import { DEFAULT_API_BASE } from "./livemodels";
 import {
+  assertGeneratorQualificationPreflight,
+  normalizeGeneratorModels,
   pricingFromCatalog,
-  projectTotalCostUsd,
   type OpenRouterModelsResponse,
+  validateGeneratorQualificationBounds,
 } from "./livemodels-score";
 
 const DEFAULT_CAP_USD = 15;
+export function validateGeneratorPreflight(models: string[], cap: number): void {
+  validateGeneratorQualificationBounds(models, cap);
+}
 
 function flagValue(args: string[], flag: string): string | undefined {
   const i = args.indexOf(flag);
@@ -28,15 +33,12 @@ function flagValue(args: string[], flag: string): string | undefined {
 
 async function main() {
   const args = process.argv.slice(2);
-  const models = (process.env.POSTIL_BENCH_MODELS ?? flagValue(args, "--models") ?? "")
-    .split(",")
-    .map((m) => m.trim())
-    .filter(Boolean);
-  if (models.length === 0) {
-    throw new Error("no models: set POSTIL_BENCH_MODELS or pass --models id1,id2");
-  }
+  const models = normalizeGeneratorModels(
+    (process.env.POSTIL_BENCH_MODELS ?? flagValue(args, "--models") ?? "").split(","),
+  );
   const capRaw = flagValue(args, "--cap") ?? process.env.POSTIL_BENCH_COST_CAP_USD;
   const cap = capRaw ? Number.parseFloat(capRaw) : DEFAULT_CAP_USD;
+  validateGeneratorPreflight(models, cap);
 
   const apiBase = process.env.POSTIL_API_BASE ?? DEFAULT_API_BASE;
   const url = `${apiBase.replace(/\/$/, "")}/models`;
@@ -48,39 +50,18 @@ async function main() {
   const pricing = pricingFromCatalog(catalog, models);
 
   const diffs = cases.map((c) => benchmarkCase.parse(c).diff);
-  const projected = projectTotalCostUsd({ diffs, models, pricing });
-
-  const missing = models.filter((m) => !pricing.has(m));
+  const projected = assertGeneratorQualificationPreflight({ diffs, models, pricing, costCapUsd: cap });
   const lines = [
     `Cost guardrail: ${cases.length} fixtures x ${models.length} model(s)`,
     `Models: ${models.join(", ")}`,
     `Projected upper-bound total cost: $${projected.toFixed(4)} (cap $${cap.toFixed(2)})`,
   ];
-  if (missing.length > 0) {
-    lines.push(
-      `WARNING: no pricing for ${missing.join(", ")} — their spend is NOT in the projection.`,
-    );
-  }
   console.log(lines.join("\n"));
-
-  if (missing.length > 0) {
-    console.error(
-      "Refusing to proceed: at least one model has unknown pricing, so the projection is not an " +
-        "upper bound. Remove the unpriced model(s) or verify their ids.",
-    );
-    process.exitCode = 1;
-    return;
-  }
-  if (projected > cap) {
-    console.error(
-      `Refusing to proceed: projected $${projected.toFixed(4)} exceeds the $${cap.toFixed(2)} cap. ` +
-        "Reduce the model list or the case set.",
-    );
-    process.exitCode = 1;
-  }
 }
 
-main().catch((err) => {
-  console.error(err instanceof Error ? err.message : String(err));
-  process.exitCode = 1;
-});
+if (import.meta.main) {
+  main().catch((err) => {
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exitCode = 1;
+  });
+}
