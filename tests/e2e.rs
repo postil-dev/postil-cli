@@ -1920,6 +1920,7 @@ async fn slow_model_request_retries_same_model_then_succeeds() {
     let env: Value =
         serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
     assert_eq!(env["modelUsed"], "primary-model");
+    assert_eq!(env["usageAccountingComplete"], false);
     let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
     assert!(stderr.contains("postil: model primary-model hit a request timeout after"));
     assert!(stderr.contains("timeout retry 1/1"));
@@ -1973,6 +1974,7 @@ async fn timeout_http_status_retries_same_model_then_succeeds() {
     let envelope: Value =
         serde_json::from_slice(&out.get_output().stdout).expect("review output should be JSON");
     assert_eq!(envelope["modelUsed"], "primary-model");
+    assert_eq!(envelope["usageAccountingComplete"], false);
     let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
     assert!(stderr.contains("returned timeout HTTP 408 Request Timeout"));
     assert!(stderr.contains("timeout retry 1/1"));

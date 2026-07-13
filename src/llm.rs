@@ -573,12 +573,14 @@ impl LlmClient {
         let mut usage_accounting_complete = true;
         for model in cfg.model_chain() {
             let mut model_usage = Usage::default();
+            let mut model_accounting_complete = true;
             match self
                 .chat(
                     &model,
                     system,
                     user,
                     &mut model_usage,
+                    &mut model_accounting_complete,
                     Some(RESPOND_MAX_TOKENS),
                     LlmPhase::Total,
                 )
@@ -603,7 +605,9 @@ impl LlmClient {
                     // Usage parsed from a provider response is complete even
                     // when the response has no usable answer. A transport
                     // failure with no response usage is ambiguous.
-                    if model_usage.prompt_tokens == 0 && model_usage.completion_tokens == 0 {
+                    if !model_accounting_complete
+                        || (model_usage.prompt_tokens == 0 && model_usage.completion_tokens == 0)
+                    {
                         usage_accounting_complete = false;
                     }
                     eprintln!("postil: model {model} failed: {e:#}");
@@ -725,18 +729,21 @@ impl LlmClient {
         user: &str,
     ) -> std::result::Result<ModelReview, ModelError> {
         let mut usage = Usage::default();
+        let mut usage_accounting_complete = true;
         let content = self
             .chat(
                 model,
                 system,
                 user,
                 &mut usage,
+                &mut usage_accounting_complete,
                 Some(REVIEW_MAX_TOKENS),
                 LlmPhase::Review,
             )
             .await
             .map_err(|e| {
-                let complete = usage.prompt_tokens > 0 || usage.completion_tokens > 0;
+                let complete = usage_accounting_complete
+                    && (usage.prompt_tokens > 0 || usage.completion_tokens > 0);
                 ModelError::new(e, usage, complete)
             })?;
         let raw = match parse_review(&content) {
@@ -754,6 +761,7 @@ impl LlmClient {
                         "You repair malformed JSON. Output only valid JSON.",
                         &repair_user,
                         &mut usage,
+                        &mut usage_accounting_complete,
                         Some(REVIEW_MAX_TOKENS),
                         LlmPhase::Review,
                     )
@@ -765,12 +773,13 @@ impl LlmClient {
                     ModelError::new(
                         anyhow!("model output invalid after repair: {e}"),
                         usage,
-                        true,
+                        usage_accounting_complete,
                     )
                 })?
             }
         };
         let mut review = into_review(raw, model, usage);
+        review.usage_accounting_complete = usage_accounting_complete;
 
         // Semantic consistency retry: a summary that narrates risk next to an
         // empty findings array is the contract violation behind "clean status,
@@ -792,6 +801,7 @@ impl LlmClient {
                     system,
                     &retry_user,
                     &mut retry_usage,
+                    &mut usage_accounting_complete,
                     Some(REVIEW_MAX_TOKENS),
                     LlmPhase::Review,
                 )
@@ -799,8 +809,10 @@ impl LlmClient {
             {
                 Ok(retried) => {
                     review.usage = retry_usage;
+                    review.usage_accounting_complete = usage_accounting_complete;
                     if let Ok(retried_raw) = parse_review(&retried) {
-                        let candidate = into_review(retried_raw, model, retry_usage);
+                        let mut candidate = into_review(retried_raw, model, retry_usage);
+                        candidate.usage_accounting_complete = usage_accounting_complete;
                         let still_contradictory =
                             candidate.findings.is_empty() && !candidate.summary.is_empty();
                         if !still_contradictory {
@@ -831,23 +843,31 @@ impl LlmClient {
         expected_len: usize,
     ) -> std::result::Result<ScorerReview, ModelError> {
         let mut usage = Usage::default();
+        let mut usage_accounting_complete = true;
         let content = self
             .chat_with_temperature(
                 model,
                 system,
                 user,
                 &mut usage,
+                &mut usage_accounting_complete,
                 Some(SCORER_MAX_TOKENS),
                 0.0,
                 LlmPhase::Total,
             )
             .await
             .map_err(|e| {
-                let complete = usage.prompt_tokens > 0 || usage.completion_tokens > 0;
+                let complete = usage_accounting_complete
+                    && (usage.prompt_tokens > 0 || usage.completion_tokens > 0);
                 ModelError::new(e, usage, complete)
             })?;
-        let scores = parse_scores(&content, expected_len)
-            .map_err(|e| ModelError::new(anyhow!("scorer output invalid: {e}"), usage, true))?;
+        let scores = parse_scores(&content, expected_len).map_err(|e| {
+            ModelError::new(
+                anyhow!("scorer output invalid: {e}"),
+                usage,
+                usage_accounting_complete,
+            )
+        })?;
         Ok(ScorerReview {
             scores,
             model_used: model.to_string(),
@@ -857,22 +877,33 @@ impl LlmClient {
                 prompt_tokens: usage.prompt_tokens,
                 completion_tokens: usage.completion_tokens,
             }],
-            usage_accounting_complete: true,
+            usage_accounting_complete,
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn chat(
         &self,
         model: &str,
         system: &str,
         user: &str,
         usage: &mut Usage,
+        usage_accounting_complete: &mut bool,
         max_tokens: Option<u32>,
         phase: LlmPhase,
     ) -> Result<String> {
-        self.chat_with_temperature(model, system, user, usage, max_tokens, 0.1, phase)
-            .await
-            .map_err(|e| e.context(ProviderError))
+        self.chat_with_temperature(
+            model,
+            system,
+            user,
+            usage,
+            usage_accounting_complete,
+            max_tokens,
+            0.1,
+            phase,
+        )
+        .await
+        .map_err(|e| e.context(ProviderError))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -882,13 +913,23 @@ impl LlmClient {
         system: &str,
         user: &str,
         usage: &mut Usage,
+        usage_accounting_complete: &mut bool,
         max_tokens: Option<u32>,
         temperature: f64,
         phase: LlmPhase,
     ) -> Result<String> {
-        self.chat_inner(model, system, user, usage, max_tokens, temperature, phase)
-            .await
-            .map_err(|e| e.context(ProviderError))
+        self.chat_inner(
+            model,
+            system,
+            user,
+            usage,
+            usage_accounting_complete,
+            max_tokens,
+            temperature,
+            phase,
+        )
+        .await
+        .map_err(|e| e.context(ProviderError))
     }
 
     /// Transport + HTTP envelope handling; every error here is provider-class.
@@ -899,6 +940,7 @@ impl LlmClient {
         system: &str,
         user: &str,
         usage: &mut Usage,
+        usage_accounting_complete: &mut bool,
         max_tokens: Option<u32>,
         temperature: f64,
         phase: LlmPhase,
@@ -914,8 +956,12 @@ impl LlmClient {
             let timeout = remaining.map_or(attempt_timeout, |value| value.min(attempt_timeout));
             let response = match tokio::time::timeout(timeout, self.request_once(&body)).await {
                 Ok(result) => result,
-                Err(_) if deadline_limited => return Err(DeadlineExceeded(phase).into()),
+                Err(_) if deadline_limited => {
+                    *usage_accounting_complete = false;
+                    return Err(DeadlineExceeded(phase).into());
+                }
                 Err(_) => {
+                    *usage_accounting_complete = false;
                     if timeout_retries < TIMEOUT_RETRIES && retries < TRANSIENT_RETRIES {
                         retries += 1;
                         timeout_retries += 1;
@@ -944,6 +990,7 @@ impl LlmClient {
                         && timeout_retries < TIMEOUT_RETRIES
                         && retries < TRANSIENT_RETRIES
                     {
+                        *usage_accounting_complete = false;
                         retries += 1;
                         timeout_retries += 1;
                         let wait = Duration::from_secs(2 * retries as u64);
@@ -983,6 +1030,7 @@ impl LlmClient {
                         && timeout_retries < TIMEOUT_RETRIES
                         && retries < TRANSIENT_RETRIES =>
                 {
+                    *usage_accounting_complete = false;
                     retries += 1;
                     timeout_retries += 1;
                     let wait = Duration::from_secs(2 * retries as u64);
@@ -1000,6 +1048,7 @@ impl LlmClient {
                     if reqwest_error(&error).is_some_and(reqwest::Error::is_connect)
                         && retries < TRANSIENT_RETRIES =>
                 {
+                    *usage_accounting_complete = false;
                     retries += 1;
                     let wait = Duration::from_secs(2 * retries as u64);
                     eprintln!(
