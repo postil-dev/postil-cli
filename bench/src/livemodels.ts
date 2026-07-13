@@ -33,8 +33,11 @@ import {
 } from "./harness";
 import {
   aggregateModel,
+  assertGeneratorQualificationPreflight,
   calculateTotalRunCostUsd,
   erroredLiveCase,
+  MAX_GENERATOR_COST_CAP_USD,
+  normalizeGeneratorModels,
   pricingFromCatalog,
   scoreLiveCase,
   toSiteModelAggregate,
@@ -43,6 +46,7 @@ import {
   type ModelPricing,
   type OpenRouterModelsResponse,
   type SiteModelAggregate,
+  validateGeneratorQualificationBounds,
 } from "./livemodels-score";
 
 const execFile = promisify(execFileCb);
@@ -74,6 +78,8 @@ export interface LiveModelsOptions {
   cliVersion?: string;
   /** Injected pricing (per-model). When omitted, the catalog is fetched once. */
   pricing?: Map<string, ModelPricing>;
+  /** Projected-spend cap. It cannot exceed MAX_GENERATOR_COST_CAP_USD. */
+  costCapUsd?: number;
 }
 
 export interface LiveModelsReport {
@@ -99,24 +105,26 @@ export async function runLiveModels(
   inputs: BenchmarkCaseInput[],
   options: LiveModelsOptions,
 ): Promise<LiveModelsReport> {
+  const models = normalizeGeneratorModels(options.models);
+  const costCapUsd = options.costCapUsd ?? MAX_GENERATOR_COST_CAP_USD;
+  validateGeneratorQualificationBounds(models, costCapUsd);
   if (!resolveApiKeyName()) {
     throw new Error(
       `live mode needs a real model key: set ${API_KEY_ENV_NAMES_TEXT} in the ` +
         "environment (it is never logged or printed). Mock mode (bun run bench) needs no key.",
     );
   }
-  if (options.models.length === 0) {
-    throw new Error(
-      "live mode needs at least one model: set POSTIL_BENCH_MODELS to a comma-separated list of " +
-        "OpenRouter model ids.",
-    );
-  }
   const cases = inputs.map((input) => benchmarkCase.parse(input));
-  await assertBinary(options.binary);
-
   const apiBase = options.apiBase ?? DEFAULT_API_BASE;
   const rootDir = options.rootDir ?? resolve(import.meta.dir, "..", ".runs", "live-models");
-  const pricing = options.pricing ?? (await fetchPricing(apiBase, options.models));
+  const pricing = options.pricing ?? (await fetchPricing(apiBase, models));
+  assertGeneratorQualificationPreflight({
+    diffs: cases.map((candidate) => candidate.diff),
+    models,
+    pricing,
+    costCapUsd,
+  });
+  await assertBinary(options.binary);
 
   // Task queue: one job per (model, case). A bounded worker pool drains it so at
   // most `concurrency` binary runs are in flight regardless of model count.
@@ -126,7 +134,7 @@ export async function runLiveModels(
     caseIndex: number;
   }
   const jobs: Job[] = [];
-  for (const model of options.models) {
+  for (const model of models) {
     cases.forEach((c, caseIndex) => jobs.push({ model, case: c, caseIndex }));
   }
 
@@ -151,7 +159,7 @@ export async function runLiveModels(
   await Promise.all(Array.from({ length: concurrency }, () => worker()));
 
   const cliVersion = options.cliVersion ?? (await resolveCliVersion(options.binary));
-  const aggregates = options.models.map((model) =>
+  const aggregates = models.map((model) =>
     aggregateModel(
       model,
       results.filter((r) => r.model === model),
@@ -301,14 +309,6 @@ async function fetchPricing(
   }
   const catalog = (await res.json()) as OpenRouterModelsResponse;
   const pricing = pricingFromCatalog(catalog, models);
-  const missing = models.filter((m) => !pricing.has(m));
-  if (missing.length > 0) {
-    // A missing price is non-fatal (cost stays null for that model) but worth a
-    // warning so the run is not silently under-priced.
-    console.error(
-      `warning: no OpenRouter pricing for ${missing.join(", ")}; cost will be null for these models`,
-    );
-  }
   return pricing;
 }
 

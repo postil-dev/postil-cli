@@ -616,6 +616,7 @@ export function isolatedEnv(
     GITHUB_API_URL: githubBaseUrl,
     GITHUB_TOKEN: "benchmark-github-token",
     REVIEW_MODEL: GENERATOR_MODEL,
+    REVIEW_MODEL_CASCADE: GENERATOR_MODEL,
     REVIEW_SCORER_MODEL: scorerModel,
   };
 }

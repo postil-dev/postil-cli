@@ -387,6 +387,8 @@ export const GUARDRAIL_SYSTEM_PROMPT_TOKENS = 1500;
 export const GUARDRAIL_COMPLETION_TOKENS = 16_384;
 export const GUARDRAIL_REPAIR_INPUT_TOKENS = 16_384;
 export const GUARDRAIL_MAX_PROVIDER_REQUESTS_PER_CASE = 6;
+export const MAX_GENERATOR_COST_CAP_USD = 25;
+export const MAX_GENERATOR_CANDIDATES = 6;
 
 /** Chars-per-token divisor for the crude diff-size estimate (English/code text
  * averages ~4 chars/token; 3 is used to over-estimate). */
@@ -420,4 +422,51 @@ export function projectTotalCostUsd(args: {
     }
   }
   return total;
+}
+
+/** Normalize candidate ids once before pricing, job creation, or aggregation. */
+export function normalizeGeneratorModels(models: string[]): string[] {
+  return [...new Set(models.map((model) => model.trim()).filter((model) => model.length > 0))];
+}
+
+/** Enforce model-count and cap bounds before pricing lookup or provider calls. */
+export function validateGeneratorQualificationBounds(models: string[], costCapUsd: number): void {
+  if (models.length === 0) {
+    throw new Error("no models: set POSTIL_BENCH_MODELS or pass --models id1,id2");
+  }
+  if (models.length > MAX_GENERATOR_CANDIDATES) {
+    throw new Error(`generator qualification allows at most ${MAX_GENERATOR_CANDIDATES} candidates`);
+  }
+  if (
+    !Number.isFinite(costCapUsd) ||
+    costCapUsd <= 0 ||
+    costCapUsd > MAX_GENERATOR_COST_CAP_USD
+  ) {
+    throw new Error(
+      `generator qualification cost cap must be greater than zero and at most $${MAX_GENERATOR_COST_CAP_USD}`,
+    );
+  }
+}
+
+/** Enforce the projected-spend bound before inference jobs are created. */
+export function assertGeneratorQualificationPreflight(args: {
+  diffs: string[];
+  models: string[];
+  pricing: Map<string, ModelPricing>;
+  costCapUsd: number;
+}): number {
+  validateGeneratorQualificationBounds(args.models, args.costCapUsd);
+  const missing = args.models.filter((model) => !args.pricing.has(model));
+  if (missing.length > 0) {
+    throw new Error(
+      `cannot project generator qualification spend; pricing missing for ${missing.join(", ")}`,
+    );
+  }
+  const projected = projectTotalCostUsd(args);
+  if (!Number.isFinite(projected) || projected > args.costCapUsd) {
+    throw new Error(
+      `projected generator qualification spend $${projected.toFixed(4)} exceeds the $${args.costCapUsd.toFixed(2)} cap`,
+    );
+  }
+  return projected;
 }

@@ -220,7 +220,15 @@ describe("scorer proxy and isolated runtime", () => {
   });
 
   test("isolates review execution from the caller environment", () => {
-    const env = isolatedEnv("/tmp/postil-home", "/tmp/postil-tmp", "http://github.test", "http://model.test", "scorer/model");
+    const inheritedCascade = process.env.REVIEW_MODEL_CASCADE;
+    process.env.REVIEW_MODEL_CASCADE = "embedded/fallback,another/fallback";
+    let env: NodeJS.ProcessEnv;
+    try {
+      env = isolatedEnv("/tmp/postil-home", "/tmp/postil-tmp", "http://github.test", "http://model.test", "scorer/model");
+    } finally {
+      if (inheritedCascade === undefined) delete process.env.REVIEW_MODEL_CASCADE;
+      else process.env.REVIEW_MODEL_CASCADE = inheritedCascade;
+    }
     expect(env).toMatchObject({
       CI: "true",
       NO_COLOR: "1",
@@ -231,6 +239,7 @@ describe("scorer proxy and isolated runtime", () => {
       GITHUB_API_URL: "http://github.test",
       GITHUB_TOKEN: "benchmark-github-token",
       REVIEW_MODEL: GENERATOR_MODEL,
+      REVIEW_MODEL_CASCADE: GENERATOR_MODEL,
       REVIEW_SCORER_MODEL: "scorer/model",
     });
     expect(env.OPENROUTER_API_KEY).toBeUndefined();

@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test";
+import { cases as fixtureInputs } from "../fixtures/cases";
 import {
   formatLiveModelsReport,
   liveEnv,
   liveModelsQualificationExitCode,
+  runLiveModels,
   type LiveModelsReport,
 } from "./livemodels";
 
@@ -66,5 +68,43 @@ describe("generator qualification isolation", () => {
       POSTIL_DISABLE_SCORER: "1",
     });
     expect(env.REVIEW_SCORER_MODEL).toBeUndefined();
+  });
+
+  test("normalizes duplicate candidates and enforces direct-run bounds before execution", async () => {
+    const sixModels = ["a/one", "b/two", "c/three", "d/four", "e/five", "f/six"];
+    await expect(
+      runLiveModels([], {
+        binary: "/missing/postil",
+        models: [...sixModels, ...sixModels.map((model) => ` ${model} `)],
+        pricing: new Map(),
+        costCapUsd: 26,
+      }),
+    ).rejects.toThrow("cost cap must be greater than zero and at most $25");
+
+    await expect(
+      runLiveModels([], {
+        binary: "/missing/postil",
+        models: [...sixModels, "g/seven", "a/one"],
+        pricing: new Map(),
+      }),
+    ).rejects.toThrow("at most 6 candidates");
+
+    const inheritedKey = process.env.POSTIL_API_KEY;
+    process.env.POSTIL_API_KEY = "test-only-key";
+    try {
+      await expect(
+        runLiveModels([fixtureInputs[0]!], {
+          binary: "/missing/postil",
+          models: [" costly/model ", "costly/model"],
+          pricing: new Map([
+            ["costly/model", { promptUsdPerToken: 0.001, completionUsdPerToken: 0.001 }],
+          ]),
+          costCapUsd: 1,
+        }),
+      ).rejects.toThrow("projected generator qualification spend");
+    } finally {
+      if (inheritedKey === undefined) delete process.env.POSTIL_API_KEY;
+      else process.env.POSTIL_API_KEY = inheritedKey;
+    }
   });
 });
