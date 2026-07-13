@@ -1048,6 +1048,7 @@ dependencies = [
  "clap",
  "csv",
  "globset",
+ "httpdate",
  "owo-colors",
  "predicates",
  "reqwest",

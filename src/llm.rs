@@ -1570,12 +1570,21 @@ fn is_canonical_openrouter_base(api_base: &str) -> bool {
 }
 
 fn retry_after_duration(headers: &HeaderMap) -> Option<Duration> {
-    headers
+    let value = headers
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|seconds| *seconds > 0)
-        .map(|seconds| Duration::from_secs(seconds.min(PROVIDER_RETRY_DELAY_CAP_SECS)))
+        .map(str::trim)?;
+
+    let duration = if let Ok(seconds) = value.parse::<u64>() {
+        Duration::from_secs(seconds)
+    } else {
+        httpdate::parse_http_date(value)
+            .ok()?
+            .duration_since(std::time::SystemTime::now())
+            .ok()?
+    };
+
+    (!duration.is_zero()).then(|| duration.min(Duration::from_secs(PROVIDER_RETRY_DELAY_CAP_SECS)))
 }
 
 fn safe_header_value(value: Option<&HeaderValue>) -> Option<String> {
@@ -2646,6 +2655,28 @@ mod tests {
             retry_after_duration(&headers),
             Some(Duration::from_secs(PROVIDER_RETRY_DELAY_CAP_SECS))
         );
+    }
+
+    #[test]
+    fn provider_retry_after_accepts_http_dates_and_ignores_past_dates() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            HeaderValue::from_str(&httpdate::fmt_http_date(
+                std::time::SystemTime::now() + Duration::from_secs(120),
+            ))
+            .unwrap(),
+        );
+        assert_eq!(
+            retry_after_duration(&headers),
+            Some(Duration::from_secs(PROVIDER_RETRY_DELAY_CAP_SECS))
+        );
+
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            HeaderValue::from_static("Thu, 01 Jan 1970 00:00:00 GMT"),
+        );
+        assert_eq!(retry_after_duration(&headers), None);
     }
 
     #[test]
