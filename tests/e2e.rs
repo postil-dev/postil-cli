@@ -4428,16 +4428,27 @@ async fn respond_rejects_article_shape_and_preserves_usage_across_fallback() {
 }
 
 #[tokio::test]
-async fn respond_allows_one_explicitly_requested_mermaid_diagram() {
+async fn respond_rejects_generated_mermaid_even_when_requested() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
+        .and(body_string_contains("diagram-model"))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(llm_text(&respond_payload(
                 "The request is queued before a worker handles it.",
                 Some("flowchart LR\n  API --> Queue\n  Queue --> Worker"),
             ))),
         )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("compact-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(respond_text(
+            "The API writes the job to the queue before a worker claims it.",
+        )))
+        .expect(1)
         .mount(&server)
         .await;
     Mock::given(method("GET"))
@@ -4454,6 +4465,8 @@ async fn respond_allows_one_explicitly_requested_mermaid_diagram() {
         .env("POSTIL_API_BASE", server.uri())
         .env("GITHUB_API_URL", server.uri())
         .env("GITHUB_TOKEN", "gh-test-token")
+        .env("REVIEW_MODEL", "diagram-model")
+        .env("REVIEW_MODEL_CASCADE", "compact-model")
         .args([
             "respond",
             "--repo",
@@ -4468,8 +4481,9 @@ async fn respond_allows_one_explicitly_requested_mermaid_diagram() {
         .success();
 
     let stdout = String::from_utf8_lossy(&out.get_output().stdout);
-    assert_eq!(stdout.matches("```mermaid").count(), 1);
-    assert!(stdout.contains("API --> Queue"));
+    assert!(stdout.contains("worker claims it"));
+    assert!(!stdout.contains("```mermaid"));
+    assert!(!stdout.contains("API --> Queue"));
 }
 
 #[tokio::test]

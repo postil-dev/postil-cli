@@ -216,14 +216,9 @@ pub fn respond_system_prompt(cfg: &Config) -> String {
          Return ONLY one JSON object with exactly this shape and no markdown fence or surrounding \
          prose:\n\
          {\"answer\":\"concise GitHub-flavored Markdown\",\"diagram\":null}\n\
-         The answer must be non-empty. Set diagram to null unless the maintainer explicitly asks \
-         for a diagram and one materially clarifies a flow or architecture. When justified, set \
-         diagram to the raw source for exactly one Mermaid flowchart or sequence diagram, without \
-         markdown fences; keep the explanation in answer. A diagram is limited to 1,200 characters \
-         and 16 nonblank lines. It must not contain interactive or styling directives, links, HTML, \
-         or initialization directives. The publication validator rejects output over 2,400 \
-         characters or 24 nonblank lines, extra fields, excess headings or list items, unsafe \
-         Markdown, and unrequested or malformed Mermaid.",
+         The answer must be non-empty and diagram must always be null. Generated diagrams and \
+         Mermaid are not accepted. The publication validator rejects output over 2,400 characters \
+         or 24 nonblank lines, extra fields, excess headings or list items, and unsafe Markdown.",
     );
     if let Some(rules) = &cfg.guardrails {
         p.push_str("\n\nRepository guardrails you may reference:\n");
@@ -358,12 +353,13 @@ mod tests {
         assert!(p.contains("at or below 1,200 characters"));
         assert!(p.contains("not an article"));
         assert!(p.contains("{\"answer\":\"concise GitHub-flavored Markdown\",\"diagram\":null}"));
-        assert!(p.contains("explicitly asks for a diagram"));
+        assert!(p.contains("diagram must always be null"));
+        assert!(p.contains("Mermaid are not accepted"));
+        assert!(!p.contains("When justified"));
+        assert!(!p.contains("materially clarifies"));
         assert!(p.contains("Do not add an overview"));
         assert!(p.contains("Do not emit active @mentions"));
         assert!(p.contains("What this PR does"));
-        assert!(p.contains("1,200 characters"));
-        assert!(p.contains("16 nonblank lines"));
     }
 
     #[test]
