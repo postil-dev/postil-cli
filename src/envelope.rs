@@ -206,7 +206,17 @@ pub fn normalize_finding_publication(finding: &mut Finding) {
 }
 
 fn sanitize_publication_title(value: &str) -> String {
-    let line = sanitize_publication_line(value).replace(['`', '*', '_', '[', ']', '#'], " ");
+    let single_line = value
+        .chars()
+        .map(|character| {
+            if character.is_whitespace() || character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let line = sanitize_publication_line(&single_line).replace(['`', '*', '_', '[', ']', '#'], " ");
     line.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -741,6 +751,20 @@ mod tests {
             publication,
         );
         assert!(!finding_publication_text("", "\n\n").body.is_empty());
+    }
+
+    #[test]
+    fn finding_publication_title_replaces_line_breaks_and_control_whitespace() {
+        let publication = finding_publication_text(
+            "First\r\nsecond\rthird\nfourth\tfifth\u{000B}sixth\0seventh",
+            "Body",
+        );
+
+        assert_eq!(
+            publication.title,
+            "First second third fourth fifth sixth seventh"
+        );
+        assert!(!publication.title.chars().any(char::is_control));
     }
 
     #[test]

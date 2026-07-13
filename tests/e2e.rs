@@ -1510,7 +1510,7 @@ async fn local_review_writes_csv_output_file_with_multiple_escaped_findings() {
     assert_eq!(rows[0]["severity"], "warn");
     assert_eq!(rows[0]["kind"], "risk");
     assert_eq!(rows[0]["confidence"], "0.88");
-    assert_eq!(rows[0]["title"], "Comma, quote \"and\" newline\nin title");
+    assert_eq!(rows[0]["title"], "Comma, quote \"and\" newline in title");
     assert_eq!(
         rows[0]["body"],
         "First body has a comma, a \"quote\", and a newline\nsecond line."
