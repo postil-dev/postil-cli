@@ -7,7 +7,9 @@ import {
   estimateCasePromptTokens,
   findingHitsSeededRegion,
   GUARDRAIL_COMPLETION_TOKENS,
+  GUARDRAIL_GENERATION_PHASES_PER_CASE,
   GUARDRAIL_MAX_PROVIDER_REQUESTS_PER_CASE,
+  GUARDRAIL_PROVIDER_ATTEMPTS_PER_PHASE,
   GUARDRAIL_REPAIR_INPUT_TOKENS,
   GUARDRAIL_SYSTEM_PROMPT_TOKENS,
   groundTruthOf,
@@ -457,6 +459,12 @@ describe("pricingFromCatalog", () => {
 // Cost guardrail projection
 
 describe("projectTotalCostUsd", () => {
+  test("covers initial generation, JSON repair, and semantic repair with three attempts each", () => {
+    expect(GUARDRAIL_GENERATION_PHASES_PER_CASE).toBe(3);
+    expect(GUARDRAIL_PROVIDER_ATTEMPTS_PER_PHASE).toBe(3);
+    expect(GUARDRAIL_MAX_PROVIDER_REQUESTS_PER_CASE).toBe(9);
+  });
+
   test("estimate is a fixed overhead plus diff length over the divisor", () => {
     expect(estimateCasePromptTokens("")).toBe(GUARDRAIL_SYSTEM_PROMPT_TOKENS);
     expect(estimateCasePromptTokens("a".repeat(30))).toBe(GUARDRAIL_SYSTEM_PROMPT_TOKENS + 10);

@@ -61,9 +61,10 @@ pricing, mean cost at or below $0.01, and mean latency at or below 15 seconds.
 The embedded roster remains the last qualified production chain until an
 isolated candidate report passes and the roster is updated separately.
 The generator cost guard rejects more than six candidates or a configured cap
-above $25. Its projection prices six provider requests per fixture, covering
-transport attempts and schema repair, with the 16,384-token review completion
-ceiling plus another 16,384 input tokens for repair context on every request.
+above $25. Its projection prices nine provider requests per fixture, covering
+three transport attempts each for initial generation, JSON repair, and
+semantic-consistency repair. Every request includes the 16,384-token review
+completion ceiling plus another 16,384 input tokens for repair context.
 
 ```sh
 export MODEL_API_KEY=...          # or LLM_API_KEY / OPENROUTER_API_KEY; never logged or printed
