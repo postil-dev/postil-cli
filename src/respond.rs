@@ -329,7 +329,8 @@ fn validate_respond_output(raw: &str) -> Result<String> {
     if answer.is_empty() {
         return Err(anyhow!("reply answer is empty"));
     }
-    validate_answer_publication(&answer)?;
+    let publication_text = mask_markdown_code(&answer);
+    validate_answer_publication(&publication_text)?;
     if contains_mermaid_fence(&answer)
         || answer
             .lines()
@@ -337,13 +338,13 @@ fn validate_respond_output(raw: &str) -> Result<String> {
     {
         return Err(anyhow!("Mermaid must use the diagram field"));
     }
-    let headings = markdown_heading_count(&answer);
+    let headings = markdown_heading_count(&publication_text);
     if headings > RESPOND_MAX_HEADINGS {
         return Err(anyhow!(
             "reply contains {headings} headings; at most {RESPOND_MAX_HEADINGS} are allowed"
         ));
     }
-    let list_items = markdown_list_item_count(&answer);
+    let list_items = markdown_list_item_count(&publication_text);
     if list_items > RESPOND_MAX_LIST_ITEMS {
         return Err(anyhow!(
             "reply contains {list_items} list items; at most {RESPOND_MAX_LIST_ITEMS} are allowed"
@@ -381,21 +382,20 @@ fn trim_outer_blank_lines(text: &str) -> String {
     lines[first..=last].join("\n")
 }
 
-fn validate_answer_publication(answer: &str) -> Result<()> {
-    let prose = mask_markdown_code(answer);
-    if contains_active_mention(&prose) {
+fn validate_answer_publication(publication_text: &str) -> Result<()> {
+    if contains_active_mention(publication_text) {
         return Err(anyhow!("reply contains an active mention"));
     }
-    if contains_raw_html(&prose) {
+    if contains_raw_html(publication_text) {
         return Err(anyhow!("reply contains raw HTML"));
     }
-    if contains_markdown_image(&prose) {
+    if contains_markdown_image(publication_text) {
         return Err(anyhow!("reply contains a Markdown image"));
     }
-    if contains_markdown_table(&prose) {
+    if contains_markdown_table(publication_text) {
         return Err(anyhow!("reply contains a Markdown table"));
     }
-    if markdown_heading_names(&prose)
+    if markdown_heading_names(publication_text)
         .iter()
         .any(|heading| REPORT_HEADINGS.contains(&heading.as_str()))
     {
@@ -646,7 +646,7 @@ fn normalize_heading_name(heading: &str) -> String {
         .trim()
         .trim_end_matches('#')
         .trim()
-        .trim_end_matches([':', '.', '!', '?'])
+        .trim_end_matches(|ch: char| !ch.is_alphanumeric())
         .to_ascii_lowercase()
 }
 
@@ -913,6 +913,7 @@ mod tests {
             "# Risks\nLong-form report prose.",
             "# Assessment\nLong-form report prose.",
             "# Review metadata\nLong-form report prose.",
+            "# Summary)\nLong-form report prose.",
             "## Verdict: ###\nLong-form report prose.",
             "Correctness!\n------------\nLong-form report prose.",
         ] {
@@ -984,5 +985,19 @@ mod tests {
             validate_respond_output(&structured("\n \n    @maintainer\n\t\n", None)).unwrap(),
             answer
         );
+    }
+
+    #[test]
+    fn shape_limits_ignore_markers_inside_code() {
+        for answer in [
+            "    1) One\n    2) Two\n    3) Three\n    4) Four\n    5) Five\n    6) Six",
+            "    # One\n    ## Two\n    ### Three",
+            "`# One`\n`## Two`\n`### Three`\n`1) One`\n`2) Two`\n`3) Three`\n`4) Four`\n`5) Five`\n`6) Six`",
+        ] {
+            assert_eq!(
+                validate_respond_output(&structured(answer, None)).unwrap(),
+                answer
+            );
+        }
     }
 }
