@@ -995,6 +995,7 @@ impl LlmClient {
             {
                 Ok(retried) => {
                     review.usage = retry_usage;
+                    review.model_usage = single_model_usage(model, retry_usage);
                     review.usage_accounting_complete = usage_accounting_complete;
                     if let Ok(retried_raw) = parse_review(&retried) {
                         let mut candidate = into_review(retried_raw, model, retry_usage);
@@ -1011,6 +1012,8 @@ impl LlmClient {
                     }
                 }
                 Err(_) => {
+                    review.usage = retry_usage;
+                    review.model_usage = single_model_usage(model, retry_usage);
                     review.usage_accounting_complete = false;
                     if let Err(error) = self.remaining_budget(LlmPhase::Review) {
                         return Err(ModelError::new(
@@ -1110,11 +1113,7 @@ impl LlmClient {
             scores,
             model_used: model.to_string(),
             usage,
-            model_usage: vec![ModelUsage {
-                model: model.to_string(),
-                prompt_tokens: usage.prompt_tokens,
-                completion_tokens: usage.completion_tokens,
-            }],
+            model_usage: single_model_usage(model, usage),
             model_incidents,
             usage_accounting_complete,
         })
@@ -2199,14 +2198,18 @@ fn into_review(raw: RawReview, model: &str, usage: Usage) -> ModelReview {
         findings,
         model_used: model.to_string(),
         usage,
-        model_usage: vec![ModelUsage {
-            model: model.to_string(),
-            prompt_tokens: usage.prompt_tokens,
-            completion_tokens: usage.completion_tokens,
-        }],
+        model_usage: single_model_usage(model, usage),
         model_incidents: vec![],
         usage_accounting_complete: true,
     }
+}
+
+fn single_model_usage(model: &str, usage: Usage) -> Vec<ModelUsage> {
+    vec![ModelUsage {
+        model: model.to_string(),
+        prompt_tokens: usage.prompt_tokens,
+        completion_tokens: usage.completion_tokens,
+    }]
 }
 
 /// Keep findings at least two models agree on (same path, lines within 5).

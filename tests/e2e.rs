@@ -172,6 +172,26 @@ fn postil() -> Command {
     cmd
 }
 
+fn assert_model_usage_matches_aggregate(envelope: &Value) {
+    let model_usage = envelope["modelUsage"].as_array().unwrap();
+    let prompt_tokens: u64 = model_usage
+        .iter()
+        .map(|entry| entry["promptTokens"].as_u64().unwrap())
+        .sum();
+    let completion_tokens: u64 = model_usage
+        .iter()
+        .map(|entry| entry["completionTokens"].as_u64().unwrap())
+        .sum();
+    assert_eq!(
+        prompt_tokens,
+        envelope["usage"]["promptTokens"].as_u64().unwrap()
+    );
+    assert_eq!(
+        completion_tokens,
+        envelope["usage"]["completionTokens"].as_u64().unwrap()
+    );
+}
+
 #[tokio::test]
 async fn native_anthropic_review_uses_messages_shape_auth_and_usage() {
     let server = MockServer::start().await;
@@ -914,6 +934,9 @@ async fn scorer_lowers_confidence_and_stores_both_values() {
     assert_eq!(finding["generatorKind"], "risk");
     assert_eq!(finding["scorerKind"], "risk");
     assert_eq!(env["usage"]["promptTokens"], 130);
+    assert_eq!(env["usage"]["completionTokens"], 60);
+    assert_eq!(env["modelUsage"].as_array().unwrap().len(), 2);
+    assert_model_usage_matches_aggregate(&env);
     assert!(stderr.contains("postil: attempting model: generator-model"));
     assert!(stderr.contains("postil: model generator-model responded in"));
     assert!(stderr.contains("postil: running scorer with anthropic/claude-haiku-4.5"));
@@ -930,6 +953,66 @@ async fn scorer_lowers_confidence_and_stores_both_values() {
     assert!(!scorer_user.contains("0.92"));
     assert!(!scorer_user.contains("\"kind\": \"risk\""));
     assert!(scorer_user.contains("diffHunk"));
+}
+
+#[tokio::test]
+async fn same_model_generator_and_scorer_emit_separate_balanced_usage_rows() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("same-model"))
+        .and(body_string_contains(
+            "Postil's independent second-model scorer",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(scorer_content(json!([{
+                "index": 0,
+                "confidence": 0.8,
+                "kind": "risk",
+                "reason": "The changed line contains the reported unsafe data flow."
+            }]))),
+        )
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("same-model"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(llm_content(json!([finding_at(41, "warn", 0.92)]))),
+        )
+        .with_priority(2)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "same-model")
+        .env("REVIEW_SCORER_MODEL", "same-model")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .code(0);
+
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["usage"]["promptTokens"], 130);
+    assert_eq!(envelope["usage"]["completionTokens"], 60);
+    assert_eq!(envelope["modelUsage"].as_array().unwrap().len(), 2);
+    assert!(
+        envelope["modelUsage"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["model"] == "same-model")
+    );
+    assert_model_usage_matches_aggregate(&envelope);
 }
 
 #[tokio::test]
@@ -1054,6 +1137,10 @@ async fn malformed_scorer_reason_gets_one_same_model_schema_repair() {
     assert_eq!(envelope["modelIncidents"][0]["recovery"], "repair");
     assert_eq!(envelope["usage"]["promptTokens"], 160);
     assert_eq!(envelope["usage"]["completionTokens"], 70);
+    assert_eq!(envelope["modelUsage"].as_array().unwrap().len(), 2);
+    assert_eq!(envelope["modelUsage"][1]["promptTokens"], 60);
+    assert_eq!(envelope["modelUsage"][1]["completionTokens"], 20);
+    assert_model_usage_matches_aggregate(&envelope);
     assert!(stderr.contains("requesting one schema repair"));
 }
 
@@ -1301,15 +1388,7 @@ async fn scorer_error_fails_open_and_preserves_generator_values() {
     assert_eq!(env["modelUsage"][0]["model"], "generator-model");
     assert_eq!(env["modelUsage"][1]["model"], "anthropic/claude-haiku-4.5");
     assert_eq!(env["modelUsage"].as_array().unwrap().len(), 2);
-    assert_eq!(
-        env["modelUsage"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|entry| entry["promptTokens"].as_u64().unwrap())
-            .sum::<u64>(),
-        env["usage"]["promptTokens"].as_u64().unwrap()
-    );
+    assert_model_usage_matches_aggregate(&env);
     assert_eq!(finding["confidence"], 0.92);
     assert_eq!(finding["kind"], "risk");
     assert!(finding.get("generatorConfidence").is_none());
@@ -1978,6 +2057,12 @@ async fn narrated_risk_without_findings_fails_closed() {
         env["findings"][0]["title"],
         "Model narrated risk without structured findings"
     );
+    assert_eq!(env["usage"]["promptTokens"], 200);
+    assert_eq!(env["usage"]["completionTokens"], 100);
+    assert_eq!(env["modelUsage"].as_array().unwrap().len(), 1);
+    assert_eq!(env["modelUsage"][0]["promptTokens"], 200);
+    assert_eq!(env["modelUsage"][0]["completionTokens"], 100);
+    assert_model_usage_matches_aggregate(&env);
     // The narrated concern is preserved, not silently dropped.
     assert!(
         env["findings"][0]["body"]
@@ -2022,6 +2107,9 @@ async fn narrated_risk_retry_recovers_structured_finding() {
     assert_eq!(env["findings"][0]["path"], "src/auth.rs");
     assert_eq!(env["findings"][0]["line"], 41);
     assert_eq!(env["counts"]["error"], 1);
+    assert_eq!(env["usage"]["promptTokens"], 200);
+    assert_eq!(env["usage"]["completionTokens"], 100);
+    assert_model_usage_matches_aggregate(&env);
 }
 
 #[tokio::test]
@@ -2198,11 +2286,12 @@ async fn cascade_falls_back_to_next_model() {
     assert_eq!(env["usage"]["completionTokens"], 50);
     assert_eq!(env["modelUsage"][0]["model"], "primary-model");
     assert_eq!(env["modelUsage"][0]["promptTokens"], 36);
+    assert_model_usage_matches_aggregate(&env);
     assert_eq!(env["usageAccountingComplete"], false);
     let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
     assert!(stderr.contains("postil: attempting model: primary-model"));
     assert!(stderr.contains("postil: model primary-model returned retryable HTTP 500"));
-    assert!(stderr.contains("retrying in 2s"));
+    assert!(stderr.contains("retrying in 2.0s"));
     assert!(stderr.contains("postil: model primary-model failed after"));
     assert!(stderr.contains("falling back to next model"));
     assert!(stderr.contains("postil: attempting model: backup-model"));
