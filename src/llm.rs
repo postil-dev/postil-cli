@@ -252,7 +252,7 @@ const PROVIDER_RETRY_DELAY_CAP_SECS: u64 = 30;
 /// Runaway-generation bound only. It is sized so legitimate reviews (observed
 /// up to roughly 12k output tokens) do not truncate. A truncated response goes
 /// through JSON repair and can salvage low-quality findings. Interactive answers
-/// use their provider default.
+/// use the separate bounded response limit below.
 const REVIEW_MAX_TOKENS: u32 = 16384;
 const SCORER_MAX_TOKENS: u32 = 4096;
 const SCORER_REASON_MAX_CHARS: usize = 240;

@@ -324,14 +324,13 @@ fn validate_respond_output(raw: &str) -> Result<String> {
     if !output.diagram.is_null() {
         return Err(anyhow!("reply diagram must be null"));
     }
-    let answer = normalize_newlines(output.answer.trim());
+    let normalized_answer = normalize_newlines(&output.answer);
+    let answer = trim_outer_blank_lines(&normalized_answer);
     if answer.is_empty() {
         return Err(anyhow!("reply answer is empty"));
     }
     validate_answer_publication(&answer)?;
-    let lower_answer = answer.to_ascii_lowercase();
-    if lower_answer.contains("```mermaid")
-        || lower_answer.contains("~~~mermaid")
+    if contains_mermaid_fence(&answer)
         || answer
             .lines()
             .any(|line| is_mermaid_declaration(line.trim()))
@@ -370,6 +369,18 @@ fn normalize_newlines(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
+fn trim_outer_blank_lines(text: &str) -> String {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let Some(first) = lines.iter().position(|line| !line.trim().is_empty()) else {
+        return String::new();
+    };
+    let last = lines
+        .iter()
+        .rposition(|line| !line.trim().is_empty())
+        .expect("a first nonblank line has a matching last line");
+    lines[first..=last].join("\n")
+}
+
 fn validate_answer_publication(answer: &str) -> Result<()> {
     let prose = mask_markdown_code(answer);
     if contains_active_mention(&prose) {
@@ -396,12 +407,14 @@ fn validate_answer_publication(answer: &str) -> Result<()> {
 fn mask_markdown_code(text: &str) -> String {
     let mut masked = String::with_capacity(text.len());
     let mut fence: Option<(char, usize)> = None;
+    let mut in_indented_block = false;
+    let mut previous_line_was_blank = true;
     for line_with_newline in text.split_inclusive('\n') {
         let (line, newline) = line_with_newline
             .strip_suffix('\n')
             .map_or((line_with_newline, ""), |line| (line, "\n"));
         if let Some((marker, width)) = fence {
-            let closes = markdown_fence(line).is_some_and(|(candidate, candidate_width)| {
+            let closes = markdown_fence_marker(line).is_some_and(|(candidate, candidate_width)| {
                 candidate == marker
                     && candidate_width >= width
                     && fence_remainder(line, candidate, candidate_width)
@@ -412,22 +425,39 @@ fn mask_markdown_code(text: &str) -> String {
             masked.push_str(newline);
             if closes {
                 fence = None;
+                previous_line_was_blank = true;
             }
             continue;
         }
-        if let Some(opening) = markdown_fence(line) {
+        if let Some(opening) = markdown_fence_opening(line) {
             fence = Some(opening);
+            in_indented_block = false;
             masked.extend(std::iter::repeat_n(' ', line.chars().count()));
             masked.push_str(newline);
             continue;
         }
+        if is_indented_code_line(line) && (in_indented_block || previous_line_was_blank) {
+            in_indented_block = true;
+            previous_line_was_blank = false;
+            masked.extend(std::iter::repeat_n(' ', line.chars().count()));
+            masked.push_str(newline);
+            continue;
+        }
+        if line.trim().is_empty() {
+            previous_line_was_blank = true;
+            masked.push_str(line);
+            masked.push_str(newline);
+            continue;
+        }
+        in_indented_block = false;
+        previous_line_was_blank = false;
         masked.push_str(&mask_inline_code(line));
         masked.push_str(newline);
     }
     masked
 }
 
-fn markdown_fence(line: &str) -> Option<(char, usize)> {
+fn markdown_fence_marker(line: &str) -> Option<(char, usize)> {
     let indentation = line.chars().take_while(|ch| *ch == ' ').count();
     if indentation > 3 {
         return None;
@@ -441,10 +471,33 @@ fn markdown_fence(line: &str) -> Option<(char, usize)> {
     (width >= 3).then_some((marker, width))
 }
 
+fn markdown_fence_opening(line: &str) -> Option<(char, usize)> {
+    let (marker, width) = markdown_fence_marker(line)?;
+    if marker == '`' && fence_remainder(line, marker, width).contains('`') {
+        return None;
+    }
+    Some((marker, width))
+}
+
+fn is_indented_code_line(line: &str) -> bool {
+    line.starts_with("    ") || line.starts_with('\t')
+}
+
 fn fence_remainder(line: &str, marker: char, width: usize) -> &str {
     let indentation = line.chars().take_while(|ch| *ch == ' ').count();
     let offset = indentation + marker.len_utf8() * width;
     &line[offset..]
+}
+
+fn contains_mermaid_fence(text: &str) -> bool {
+    text.lines().any(|line| {
+        markdown_fence_opening(line).is_some_and(|(marker, width)| {
+            fence_remainder(line, marker, width)
+                .split_whitespace()
+                .next()
+                .is_some_and(|language| language.eq_ignore_ascii_case("mermaid"))
+        })
+    })
 }
 
 fn mask_inline_code(line: &str) -> String {
@@ -841,7 +894,9 @@ mod tests {
         );
         for answer in [
             "```mermaid\nflowchart TD\n  A --> B\n```",
+            "``` mermaid\nA --> B\n```",
             "~~~mermaid\nsequenceDiagram\n  A->>B: hello\n~~~",
+            "   ~~~ MERMAID\nA --> B\n   ~~~",
             "flowchart LR\n  A --> B",
             "classDiagram\n  class A",
         ] {
@@ -851,18 +906,20 @@ mod tests {
 
     #[test]
     fn rejects_report_shaped_headings() {
-        for heading in [
-            "Summary",
-            "What this pull request does",
-            "Issue and risk",
-            "Risks",
-            "Assessment",
-            "Review metadata",
+        for answer in [
+            "# Summary\nLong-form report prose.",
+            "# What this pull request does\nLong-form report prose.",
+            "# Issue and risk\nLong-form report prose.",
+            "# Risks\nLong-form report prose.",
+            "# Assessment\nLong-form report prose.",
+            "# Review metadata\nLong-form report prose.",
+            "## Verdict: ###\nLong-form report prose.",
+            "Correctness!\n------------\nLong-form report prose.",
         ] {
-            let reply = structured(&format!("# {heading}\nLong-form report prose."), None);
+            let reply = structured(answer, None);
             assert!(
                 validate_respond_output(&reply).is_err(),
-                "report heading was accepted: {heading}",
+                "report heading was accepted: {answer}",
             );
         }
     }
@@ -871,8 +928,11 @@ mod tests {
     fn contract_vectors_mask_code_and_reject_image_forms() {
         for answer in [
             "Use `@maintainer` as the literal test fixture.",
+            "Unicode before code: é `@maintainer`.",
             "`<details>not HTML here</details>` is sample text.",
             "```markdown\n@maintainer\n<details>sample</details>\n![image][ref]\n## Verdict\nA | B\n--- | ---\n```",
+            "    @maintainer",
+            "\t@maintainer",
         ] {
             assert_eq!(
                 validate_respond_output(&structured(answer, None)).unwrap(),
@@ -885,6 +945,7 @@ mod tests {
             "![reference][image-ref]",
             "![collapsed][]",
             "![shortcut]",
+            "![multi\nline](image.png)",
         ] {
             assert!(validate_respond_output(&structured(image, None)).is_err());
         }
@@ -897,5 +958,31 @@ mod tests {
         ] {
             assert!(validate_respond_output(invalid).is_err());
         }
+    }
+
+    #[test]
+    fn commonmark_masking_does_not_hide_active_mentions_in_live_prose() {
+        for answer in [
+            "Ask @maintainer to approve this.",
+            "`unterminated @maintainer",
+            "Unicode before unmatched code: é `unterminated @maintainer",
+            "```rust`invalid info string\n@maintainer\n```",
+            "This is a paragraph.\n    @maintainer remains live prose.",
+        ] {
+            let error = validate_respond_output(&structured(answer, None)).unwrap_err();
+            assert!(
+                error.to_string().contains("active mention"),
+                "active mention was hidden by invalid code markup: {answer}"
+            );
+        }
+    }
+
+    #[test]
+    fn outer_blank_line_trimming_preserves_indented_code() {
+        let answer = "    @maintainer";
+        assert_eq!(
+            validate_respond_output(&structured("\n \n    @maintainer\n\t\n", None)).unwrap(),
+            answer
+        );
     }
 }
