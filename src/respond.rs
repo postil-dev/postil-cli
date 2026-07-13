@@ -656,34 +656,29 @@ fn markdown_list_item_count(text: &str) -> usize {
 }
 
 fn is_mermaid_declaration(line: &str) -> bool {
-    let declaration = line
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    [
-        "flowchart",
-        "graph",
-        "sequencediagram",
-        "statediagram",
-        "statediagram-v2",
-        "classdiagram",
-        "erdiagram",
-        "journey",
-        "gantt",
-        "pie",
-        "mindmap",
-        "timeline",
-        "gitgraph",
-        "quadrantchart",
-        "xychart-beta",
-        "block-beta",
-        "packet-beta",
-        "architecture-beta",
-        "kanban",
-        "sankey-beta",
-    ]
-    .contains(&declaration.as_str())
+    let line = line.trim();
+    let Some(declaration) = line.split_whitespace().next() else {
+        return false;
+    };
+    let rest = line[declaration.len()..].trim();
+    match declaration.to_ascii_lowercase().as_str() {
+        "flowchart" | "graph" => rest.split_whitespace().next().is_some_and(|direction| {
+            matches!(
+                direction.to_ascii_uppercase().as_str(),
+                "TB" | "TD" | "BT" | "RL" | "LR"
+            )
+        }),
+        "pie" => {
+            let rest = rest.to_ascii_lowercase();
+            rest.is_empty() || rest == "showdata" || rest.starts_with("title ")
+        }
+        "block-beta" => rest.is_empty() || rest.to_ascii_lowercase().starts_with("columns "),
+        "gitgraph" => rest.is_empty() || rest.starts_with('{'),
+        "sequencediagram" | "statediagram" | "statediagram-v2" | "classdiagram" | "erdiagram"
+        | "journey" | "gantt" | "mindmap" | "timeline" | "quadrantchart" | "xychart-beta"
+        | "packet-beta" | "architecture-beta" | "kanban" | "sankey-beta" => rest.is_empty(),
+        _ => false,
+    }
 }
 
 /// Build the grounding context for the model: a PR/MR mention gets the annotated
@@ -844,9 +839,43 @@ mod tests {
             "~~~mermaid\nsequenceDiagram\n  A->>B: hello\n~~~",
             "   ~~~ MERMAID\nA --> B\n   ~~~",
             "flowchart LR\n  A --> B",
+            "graph TD\n  A --> B",
+            "sequenceDiagram",
+            "stateDiagram",
+            "stateDiagram-v2",
             "classDiagram\n  class A",
+            "erDiagram",
+            "journey",
+            "gantt",
+            "pie showData",
+            "mindmap",
+            "timeline",
+            "gitGraph {\"showBranches\": true}",
+            "quadrantChart",
+            "xychart-beta",
+            "block-beta columns 3",
+            "packet-beta",
+            "architecture-beta",
+            "kanban",
+            "sankey-beta",
         ] {
             assert!(validate_respond_output(&structured(answer, None)).is_err());
+        }
+    }
+
+    #[test]
+    fn mermaid_detection_does_not_reject_ordinary_prose() {
+        for answer in [
+            "Graph construction is linear in the number of edges.",
+            "A timeline helps explain the retry sequence.",
+            "Pie is not relevant to this handler.",
+            "The journey continues through the queue.",
+            "Kanban boards are outside this change.",
+        ] {
+            assert_eq!(
+                validate_respond_output(&structured(answer, None)).unwrap(),
+                answer
+            );
         }
     }
 
