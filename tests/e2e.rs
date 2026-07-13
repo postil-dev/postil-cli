@@ -701,6 +701,54 @@ async fn scorer_lowers_confidence_and_stores_both_values() {
 }
 
 #[tokio::test]
+async fn scorer_confidence_below_minimum_is_suppressed_and_nonblocking() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("generator-model"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(llm_content(json!([finding_at(41, "error", 0.92)]))),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("anthropic/claude-haiku-4.5"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(scorer_content(json!([{
+                "index": 0,
+                "confidence": 0.1,
+                "kind": "risk",
+                "reason": "independent evidence does not support the generator claim"
+            }]))),
+        )
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".postil.yaml"), "minConfidence: 0.6\n").unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "generator-model")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .code(0);
+
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["findings"].as_array().unwrap().len(), 0);
+    assert_eq!(envelope["silent"], true);
+    assert_eq!(envelope["gate"]["failing"], false);
+    assert_eq!(envelope["counts"]["error"], 0);
+    assert_eq!(envelope["counts"]["suppressed"], 1);
+    assert_eq!(envelope["scorerModel"], "anthropic/claude-haiku-4.5");
+}
+
+#[tokio::test]
 async fn slow_scorer_request_times_out_and_falls_back() {
     let server = MockServer::start().await;
     mock_review_model(

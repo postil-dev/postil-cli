@@ -560,6 +560,12 @@ fn apply_scorer_scores(cfg: &Config, findings: &mut [Finding], scores: Vec<Findi
     disagreements
 }
 
+fn suppress_below_min_confidence(cfg: &Config, findings: &mut Vec<Finding>) -> u32 {
+    let before = findings.len();
+    findings.retain(|finding| finding.confidence >= cfg.min_confidence);
+    (before - findings.len()) as u32
+}
+
 fn sort_findings_for_display(findings: &mut [Finding]) {
     findings.sort_by(|a, b| {
         b.severity
@@ -701,6 +707,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                             Ok(Ok(scored)) => {
                                 let disagreements =
                                     apply_scorer_scores(cfg, &mut kept, scored.scores);
+                                suppressed += suppress_below_min_confidence(cfg, &mut kept);
                                 scorer_model = Some(scored.model_used);
                                 usage.prompt_tokens += scored.usage.prompt_tokens;
                                 usage.completion_tokens += scored.usage.completion_tokens;
@@ -1216,6 +1223,28 @@ mod tests {
         assert_eq!(findings[0].kind, Kind::Risk);
         assert_eq!(findings[0].generator_kind, Some(Kind::Risk));
         assert_eq!(findings[0].scorer_kind, Some(Kind::Risk));
+    }
+
+    #[test]
+    fn scorer_confidence_below_policy_is_suppressed_after_calibration() {
+        let cfg = Config {
+            min_confidence: 0.6,
+            ..Config::default()
+        };
+        let mut findings = vec![finding("low.rs", 10, "low"), finding("kept.rs", 20, "kept")];
+
+        apply_scorer_scores(
+            &cfg,
+            &mut findings,
+            vec![score(0, 0.1, Kind::Risk), score(1, 0.8, Kind::Risk)],
+        );
+        let suppressed = suppress_below_min_confidence(&cfg, &mut findings);
+
+        assert_eq!(suppressed, 1);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].path, "kept.rs");
+        assert_eq!(findings[0].generator_confidence, Some(0.9));
+        assert_eq!(findings[0].scorer_confidence, Some(0.8));
     }
 
     #[test]
