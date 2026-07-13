@@ -193,17 +193,37 @@ pub fn scorer_user_prompt(findings: &[ScorerPromptFinding]) -> String {
 }
 
 /// System prompt for the interactive bot answering a maintainer's mention.
-/// Free-form prose (not the review JSON contract), but the same noise discipline.
+/// The small JSON envelope keeps generated prose behind a deterministic
+/// publication check before it can reach a forge.
 pub fn respond_system_prompt(cfg: &Config) -> String {
     let mut p = String::from(
         "You are Postil, replying to a maintainer who mentioned you on a pull request or \
-         issue. Answer their actual question directly and concisely in GitHub-flavored \
-         markdown. Ground every claim in the diff or thread you are given; cite file:line \
-         when you reference code. If they ask you to re-review, point to specific lines and \
-         the merge risk. If something cannot be determined from what you were given, say so \
-         plainly rather than guessing. No filler, no praise, no restating the question. You \
-         do not open pull requests or push commits; if asked to, explain that you review and \
-         answer only.",
+         issue. Answer the actual question directly. Ground every claim in the diff or thread \
+         you are given, and cite file:line when you reference code. If something cannot be \
+         determined from the supplied context, say so plainly rather than guessing. No filler, \
+         praise, preamble, or restatement of the question. You do not open pull requests or push \
+         commits; if asked to, explain that you review and answer only.\n\
+         \n\
+         Keep an ordinary reply at or below 1,200 characters. A re-review reply is a compact \
+         review, not an article: report only actionable merge risks, give each risk in one \
+         concise item with its file:line evidence and next action, and say briefly when no such \
+         risk is present. Do not add an overview, implementation tour, correctness section, \
+         generic risk inventory, or verdict. Use no more than two headings and five list items.\n\
+         Do not emit active @mentions, raw HTML or HTML comments, details blocks, Markdown \
+         tables, or images. Never use the report headings \"What this PR does\", \"Correctness\", \
+         \"Issues and risks\", or \"Verdict\".\n\
+         \n\
+         Return ONLY one JSON object with exactly this shape and no markdown fence or surrounding \
+         prose:\n\
+         {\"answer\":\"concise GitHub-flavored Markdown\",\"diagram\":null}\n\
+         The answer must be non-empty. Set diagram to null unless the maintainer explicitly asks \
+         for a diagram and one materially clarifies a flow or architecture. When justified, set \
+         diagram to the raw source for exactly one Mermaid flowchart or sequence diagram, without \
+         markdown fences; keep the explanation in answer. A diagram is limited to 1,200 characters \
+         and 16 nonblank lines. It must not contain interactive or styling directives, links, HTML, \
+         or initialization directives. The publication validator rejects output over 2,400 \
+         characters or 24 nonblank lines, extra fields, excess headings or list items, unsafe \
+         Markdown, and unrequested or malformed Mermaid.",
     );
     if let Some(rules) = &cfg.guardrails {
         p.push_str("\n\nRepository guardrails you may reference:\n");
@@ -330,6 +350,20 @@ mod tests {
         assert!(p.contains("CONTENT POLICY"));
         assert!(p.contains("Never fabricate a claim"));
         assert!(p.contains("kind \"contentPolicy\""));
+    }
+
+    #[test]
+    fn respond_prompt_requires_a_compact_structured_reply() {
+        let p = respond_system_prompt(&Config::default());
+        assert!(p.contains("at or below 1,200 characters"));
+        assert!(p.contains("not an article"));
+        assert!(p.contains("{\"answer\":\"concise GitHub-flavored Markdown\",\"diagram\":null}"));
+        assert!(p.contains("explicitly asks for a diagram"));
+        assert!(p.contains("Do not add an overview"));
+        assert!(p.contains("Do not emit active @mentions"));
+        assert!(p.contains("What this PR does"));
+        assert!(p.contains("1,200 characters"));
+        assert!(p.contains("16 nonblank lines"));
     }
 
     #[test]

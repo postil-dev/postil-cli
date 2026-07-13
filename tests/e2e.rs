@@ -59,6 +59,26 @@ fn llm_text(text: &str) -> Value {
     })
 }
 
+fn respond_payload(answer: &str, diagram: Option<&str>) -> String {
+    json!({"answer": answer, "diagram": diagram}).to_string()
+}
+
+fn respond_text(answer: &str) -> Value {
+    llm_text(&respond_payload(answer, None))
+}
+
+fn respond_article_slop() -> String {
+    let prefix = "I reviewed the full diff. Here's my assessment.\n\n\
+## What this PR does\n\nA broad implementation tour.\n\n\
+## Correctness\n\nSeveral paragraphs of non-actionable narration.\n\n\
+## Issues and risks\n\n\
+1. First item.\n2. Second item.\n3. Third item.\n\
+4. Fourth item.\n5. Fifth item.\n6. Sixth item.\n\n\
+## Verdict\n\nA long conclusion.\n\n";
+    let padding = 7_186 - prefix.chars().count();
+    format!("{prefix}{}", "x".repeat(padding))
+}
+
 fn anthropic_content(findings: Value, input_tokens: u64, output_tokens: u64) -> Value {
     let summary = if findings.as_array().is_none_or(|items| items.is_empty()) {
         ""
@@ -4272,8 +4292,8 @@ async fn respond_to_pr_mention_posts_grounded_reply() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(llm_text(
-            "Line 41 interpolates `user_input` straight into the query — that is the \
+        .respond_with(ResponseTemplate::new(200).set_body_json(respond_text(
+            "Line 41 interpolates `user_input` straight into the query; that is the \
              injection risk. Parameterize it.",
         )))
         .mount(&server)
@@ -4324,7 +4344,257 @@ async fn respond_to_pr_mention_posts_grounded_reply() {
     let body: Value = comment.body_json().unwrap();
     let text = body["body"].as_str().unwrap();
     assert!(text.contains("injection risk"));
-    assert!(text.contains("Postil ·")); // footer with model attribution
+    assert!(!text.contains("Postil ·"));
+}
+
+#[tokio::test]
+async fn respond_rejects_article_shape_and_preserves_usage_across_fallback() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let server = MockServer::start().await;
+    let slop = respond_article_slop();
+    assert_eq!(slop.chars().count(), 7_186);
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("article-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": slop}}],
+            "usage": {"prompt_tokens": 30, "completion_tokens": 900}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("compact-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": respond_payload(
+                "`src/queue.rs:18` retries forever. Add a terminal state before merge.",
+                None,
+            )}}],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 15}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/issues/9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "Queue retry", "body": "Review the retry behavior."
+        })))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let receipt_path = dir.path().join("respond-usage.json");
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .env("REVIEW_MODEL", "article-model")
+        .env("REVIEW_MODEL_CASCADE", "compact-model")
+        .env("POSTIL_USAGE_RECEIPT_PATH", &receipt_path)
+        .args([
+            "respond",
+            "--repo",
+            "acme/api",
+            "--issue",
+            "9",
+            "--comment",
+            "@postil review this",
+            "--no-post",
+        ])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout);
+    assert!(stdout.contains("Add a terminal state"));
+    assert!(!stdout.contains("What this PR does"));
+    assert!(!stdout.contains("Postil ·"));
+    let receipt: Value = serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+    assert_eq!(receipt["promptTokens"], 50);
+    assert_eq!(receipt["completionTokens"], 915);
+    assert_eq!(receipt["models"][0]["model"], "article-model");
+    assert_eq!(receipt["models"][1]["model"], "compact-model");
+    assert_eq!(
+        std::fs::metadata(&receipt_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600,
+    );
+}
+
+#[tokio::test]
+async fn respond_allows_one_explicitly_requested_mermaid_diagram() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(llm_text(&respond_payload(
+                "The request is queued before a worker handles it.",
+                Some("flowchart LR\n  API --> Queue\n  Queue --> Worker"),
+            ))),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/issues/10"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "Queue flow", "body": "How does work reach a worker?"
+        })))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .args([
+            "respond",
+            "--repo",
+            "acme/api",
+            "--issue",
+            "10",
+            "--comment",
+            "@postil please include a Mermaid diagram of this flow",
+            "--no-post",
+        ])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout);
+    assert_eq!(stdout.matches("```mermaid").count(), 1);
+    assert!(stdout.contains("API --> Queue"));
+}
+
+#[tokio::test]
+async fn respond_rejects_unrequested_mermaid_and_uses_compact_fallback() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("diagram-model"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(llm_text(&respond_payload(
+                "The request enters a queue.",
+                Some("flowchart LR\n  API --> Queue"),
+            ))),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("compact-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(respond_text(
+            "The API writes the job to the queue before a worker claims it.",
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/issues/11"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "Queue flow", "body": "Explain the worker handoff."
+        })))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .env("REVIEW_MODEL", "diagram-model")
+        .env("REVIEW_MODEL_CASCADE", "compact-model")
+        .args([
+            "respond",
+            "--repo",
+            "acme/api",
+            "--issue",
+            "11",
+            "--comment",
+            "@postil explain the worker handoff",
+            "--no-post",
+        ])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout);
+    assert!(stdout.contains("worker claims it"));
+    assert!(!stdout.contains("```mermaid"));
+}
+
+#[tokio::test]
+async fn respond_rejects_unsafe_reply_before_direct_forge_posting() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("unsafe-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(respond_text(
+            "Ask @maintainer to approve this.\n\n## Verdict\nLooks good.",
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("compact-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(respond_text(
+            "`src/queue.rs:18` can retry forever. Add a terminal state before merge.",
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/issues/12"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "Queue retry", "body": "Review the retry behavior."
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/api/issues/12/comments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .env("REVIEW_MODEL", "unsafe-model")
+        .env("REVIEW_MODEL_CASCADE", "compact-model")
+        .args([
+            "respond",
+            "--repo",
+            "acme/api",
+            "--issue",
+            "12",
+            "--comment",
+            "@postil review the retry behavior",
+        ])
+        .assert()
+        .success();
+
+    let requests = server.received_requests().await.unwrap();
+    let post = requests
+        .iter()
+        .find(|request| request.url.path() == "/repos/acme/api/issues/12/comments")
+        .expect("validated fallback posted");
+    let body: Value = post.body_json().unwrap();
+    let reply = body["body"].as_str().unwrap();
+    assert!(reply.contains("Add a terminal state"));
+    assert!(!reply.contains("@maintainer"));
+    assert!(!reply.contains("Verdict"));
 }
 
 #[tokio::test]
@@ -4346,7 +4616,7 @@ async fn respond_writes_private_usage_receipt_across_model_fallback() {
         .and(path("/chat/completions"))
         .and(body_string_contains("backup-model"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [{"message": {"content": "Use a bounded worker pool."}}],
+            "choices": [{"message": {"content": respond_payload("Use a bounded worker pool.", None)}}],
             "usage": {"prompt_tokens": 20, "completion_tokens": 3}
         })))
         .expect(1)
@@ -4426,7 +4696,7 @@ async fn respond_marks_receipt_incomplete_after_ambiguous_fallback() {
         .and(path("/chat/completions"))
         .and(body_string_contains("backup-model"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [{"message": {"content": "Retry with a bounded backoff."}}],
+            "choices": [{"message": {"content": respond_payload("Retry with a bounded backoff.", None)}}],
             "usage": {"prompt_tokens": 20, "completion_tokens": 3}
         })))
         .mount(&server)
@@ -4482,7 +4752,7 @@ async fn respond_marks_receipt_incomplete_after_internal_retry_succeeds() {
         .and(path("/chat/completions"))
         .and(body_string_contains("primary-model"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [{"message": {"content": "Use a bounded retry."}}],
+            "choices": [{"message": {"content": respond_payload("Use a bounded retry.", None)}}],
             "usage": {"prompt_tokens": 20, "completion_tokens": 3}
         })))
         .mount(&server)
@@ -4539,7 +4809,7 @@ async fn respond_to_issue_mention_uses_issue_body() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(llm_text(
+        .respond_with(ResponseTemplate::new(200).set_body_json(respond_text(
             "This looks like a connection-pool exhaustion under load, not a logic bug.",
         )))
         .mount(&server)
@@ -4596,8 +4866,8 @@ async fn respond_gitlab_mr_mention_posts_note() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(llm_text(
-            "Line 41 interpolates `user_input` into the query — parameterize it.",
+        .respond_with(ResponseTemplate::new(200).set_body_json(respond_text(
+            "Line 41 interpolates `user_input` into the query; parameterize it.",
         )))
         .mount(&server)
         .await;
@@ -4659,7 +4929,7 @@ async fn respond_gitlab_mr_mention_posts_note() {
     let body: Value = note.body_json().unwrap();
     let text = body["body"].as_str().unwrap();
     assert!(text.contains("parameterize"));
-    assert!(text.contains("Postil ·")); // footer with model attribution
+    assert!(!text.contains("Postil ·"));
 }
 
 #[tokio::test]
@@ -4667,7 +4937,7 @@ async fn respond_gitlab_issue_mention_uses_issue_body() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(llm_text(
+        .respond_with(ResponseTemplate::new(200).set_body_json(respond_text(
             "This looks like connection-pool exhaustion under load, not a logic bug.",
         )))
         .mount(&server)
@@ -4726,8 +4996,8 @@ async fn respond_bitbucket_pr_mention_posts_comment() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(llm_text(
-            "Line 41 interpolates `user_input` — that is the injection risk.",
+        .respond_with(ResponseTemplate::new(200).set_body_json(respond_text(
+            "Line 41 interpolates `user_input`; that is the injection risk.",
         )))
         .mount(&server)
         .await;
@@ -4784,7 +5054,7 @@ async fn respond_bitbucket_pr_mention_posts_comment() {
     let body: Value = comment.body_json().unwrap();
     let text = body["content"]["raw"].as_str().unwrap();
     assert!(text.contains("injection risk"));
-    assert!(text.contains("Postil ·"));
+    assert!(!text.contains("Postil ·"));
 }
 
 #[tokio::test]
@@ -4794,8 +5064,8 @@ async fn respond_azure_pr_mention_posts_thread() {
     let new_content = "fn login() {\n    let token = user_input;\n}\n";
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(llm_text(
-            "Line 2 drops the sanitize() call — that is the risk.",
+        .respond_with(ResponseTemplate::new(200).set_body_json(respond_text(
+            "Line 2 drops the sanitize() call; that is the risk.",
         )))
         .mount(&server)
         .await;
@@ -4870,7 +5140,7 @@ async fn respond_azure_pr_mention_posts_thread() {
     let body: Value = thread.body_json().unwrap();
     let text = body["comments"][0]["content"].as_str().unwrap();
     assert!(text.contains("risk"));
-    assert!(text.contains("Postil ·"));
+    assert!(!text.contains("Postil ·"));
 }
 
 #[test]

@@ -674,14 +674,26 @@ impl LlmClient {
         }
     }
 
-    /// Free-form answer (no JSON contract). Used by the interactive bot to reply
-    /// to a maintainer's question or mention. Tries the model chain in order.
-    pub async fn answer(&self, cfg: &Config, system: &str, user: &str) -> Result<Answer> {
+    /// Interactive answer validated by the caller's publication contract.
+    /// Invalid model content consumes and preserves its usage before the next
+    /// configured model is tried.
+    pub async fn answer<F>(
+        &self,
+        cfg: &Config,
+        system: &str,
+        user: &str,
+        validate: F,
+    ) -> Result<Answer>
+    where
+        F: Fn(&str) -> Result<String>,
+    {
         let mut usage = Usage::default();
         let mut models = Vec::new();
         let mut last_err = None;
         let mut usage_accounting_complete = true;
-        for model in cfg.model_chain() {
+        let chain = cfg.model_chain();
+        let chain_len = chain.len();
+        for (index, model) in chain.into_iter().enumerate() {
             let mut model_usage = Usage::default();
             let mut model_accounting_complete = true;
             match self
@@ -704,13 +716,30 @@ impl LlmClient {
                         prompt_tokens: model_usage.prompt_tokens,
                         completion_tokens: model_usage.completion_tokens,
                     });
-                    return Ok(Answer {
-                        content: content.trim().to_string(),
-                        model_used: model,
-                        usage,
-                        models,
-                        usage_accounting_complete,
-                    });
+                    match validate(&content) {
+                        Ok(content) => {
+                            return Ok(Answer {
+                                content,
+                                model_used: model,
+                                usage,
+                                models,
+                                usage_accounting_complete,
+                            });
+                        }
+                        Err(error) => {
+                            let disposition = if index + 1 < chain_len {
+                                "trying the next model"
+                            } else {
+                                "no fallback models remain"
+                            };
+                            eprintln!(
+                                "postil: model {} produced an invalid reply; {disposition}: {}",
+                                log_text(&model),
+                                log_text(&format!("{error:#}")),
+                            );
+                            last_err = Some(error.context("model reply failed publication checks"));
+                        }
+                    }
                 }
                 Err(e) => {
                     // Usage parsed from a provider response is complete even

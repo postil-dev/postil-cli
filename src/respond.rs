@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, anyhow};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::diff;
@@ -42,6 +42,25 @@ pub struct RespondArgs {
 
 const MAX_DIFF_BYTES: usize = 200_000;
 const USAGE_RECEIPT_PATH_ENV: &str = "POSTIL_USAGE_RECEIPT_PATH";
+const RESPOND_MAX_CHARS: usize = 2_400;
+const RESPOND_MAX_NONBLANK_LINES: usize = 24;
+const RESPOND_MAX_HEADINGS: usize = 2;
+const RESPOND_MAX_LIST_ITEMS: usize = 5;
+const MERMAID_MAX_CHARS: usize = 1_200;
+const MERMAID_MAX_NONBLANK_LINES: usize = 16;
+const REPORT_HEADINGS: [&str; 4] = [
+    "what this pr does",
+    "correctness",
+    "issues and risks",
+    "verdict",
+];
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RespondOutput {
+    answer: String,
+    diagram: Option<String>,
+}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -256,12 +275,13 @@ async fn respond_with<F: Forge>(
         comment.trim()
     );
     let client = LlmClient::from_env(cfg)?;
-    let answer = client.answer(cfg, &system, &user).await?;
-
-    let reply = format!(
-        "{}\n\n<sub>Postil · {}</sub>",
-        answer.content, answer.model_used
-    );
+    let diagram_requested = explicitly_requests_diagram(comment);
+    let answer = client
+        .answer(cfg, &system, &user, |raw| {
+            validate_respond_output(raw, diagram_requested)
+        })
+        .await?;
+    let reply = answer.content.clone();
 
     // Hosted execution requires the durable usage receipt before any external
     // delivery. Commit it before stdout or forge posting so the control plane
@@ -279,6 +299,415 @@ async fn respond_with<F: Forge>(
         eprintln!("postil: replied on {repo}#{number}");
     }
     Ok(0)
+}
+
+fn validate_respond_output(raw: &str, diagram_requested: bool) -> Result<String> {
+    if raw.chars().count() > RESPOND_MAX_CHARS {
+        return Err(anyhow!(
+            "reply exceeds the 2,400-character publication limit"
+        ));
+    }
+    if nonblank_line_count(raw) > RESPOND_MAX_NONBLANK_LINES {
+        return Err(anyhow!(
+            "reply exceeds the {RESPOND_MAX_NONBLANK_LINES}-line publication limit"
+        ));
+    }
+
+    let output: RespondOutput = serde_json::from_str(raw.trim())
+        .context("reply must be the exact {answer, diagram} JSON object")?;
+    let answer = normalize_newlines(output.answer.trim());
+    if answer.is_empty() {
+        return Err(anyhow!("reply answer is empty"));
+    }
+    validate_answer_publication(&answer)?;
+    let lower_answer = answer.to_ascii_lowercase();
+    if lower_answer.contains("```mermaid")
+        || lower_answer.contains("~~~mermaid")
+        || answer
+            .lines()
+            .any(|line| is_mermaid_declaration(line.trim()))
+    {
+        return Err(anyhow!("Mermaid must use the diagram field"));
+    }
+    let headings = markdown_heading_count(&answer);
+    if headings > RESPOND_MAX_HEADINGS {
+        return Err(anyhow!(
+            "reply contains {headings} headings; at most {RESPOND_MAX_HEADINGS} are allowed"
+        ));
+    }
+    let list_items = markdown_list_item_count(&answer);
+    if list_items > RESPOND_MAX_LIST_ITEMS {
+        return Err(anyhow!(
+            "reply contains {list_items} list items; at most {RESPOND_MAX_LIST_ITEMS} are allowed"
+        ));
+    }
+
+    let rendered = match output.diagram {
+        None => answer,
+        Some(diagram) => {
+            if !diagram_requested {
+                return Err(anyhow!("reply contains an unrequested Mermaid diagram"));
+            }
+            let diagram = normalize_newlines(diagram.trim());
+            if diagram.is_empty() {
+                return Err(anyhow!("reply diagram is empty"));
+            }
+            validate_mermaid_source(&diagram)?;
+            format!("{answer}\n\n```mermaid\n{diagram}\n```")
+        }
+    };
+
+    if rendered.chars().count() > RESPOND_MAX_CHARS {
+        return Err(anyhow!(
+            "rendered reply exceeds the 2,400-character publication limit"
+        ));
+    }
+    if nonblank_line_count(&rendered) > RESPOND_MAX_NONBLANK_LINES {
+        return Err(anyhow!(
+            "rendered reply exceeds the {RESPOND_MAX_NONBLANK_LINES}-line publication limit"
+        ));
+    }
+    Ok(rendered)
+}
+
+fn normalize_newlines(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn validate_answer_publication(answer: &str) -> Result<()> {
+    if contains_active_mention(answer) {
+        return Err(anyhow!("reply contains an active mention"));
+    }
+    if contains_raw_html(answer) {
+        return Err(anyhow!("reply contains raw HTML"));
+    }
+    if contains_markdown_image(answer) {
+        return Err(anyhow!("reply contains a Markdown image"));
+    }
+    if contains_markdown_table(answer) {
+        return Err(anyhow!("reply contains a Markdown table"));
+    }
+    if markdown_heading_names(answer)
+        .iter()
+        .any(|heading| REPORT_HEADINGS.contains(&heading.as_str()))
+    {
+        return Err(anyhow!("reply contains a report-shaped heading"));
+    }
+    Ok(())
+}
+
+fn contains_active_mention(text: &str) -> bool {
+    let chars: Vec<char> = text.chars().collect();
+    for (index, ch) in chars.iter().enumerate() {
+        if *ch != '@'
+            || index
+                .checked_sub(1)
+                .and_then(|previous| chars.get(previous))
+                .is_some_and(|previous| {
+                    previous.is_ascii_alphanumeric() || matches!(previous, '_' | '-')
+                })
+        {
+            continue;
+        }
+        let mut cursor = index + 1;
+        let mut name_len = 0;
+        while chars
+            .get(cursor)
+            .is_some_and(|next| next.is_ascii_alphanumeric() || *next == '-')
+            && name_len < 39
+        {
+            cursor += 1;
+            name_len += 1;
+        }
+        if name_len > 0
+            && chars.get(cursor).is_none_or(|boundary| {
+                !boundary.is_ascii_alphanumeric() && !matches!(boundary, '_' | '-')
+            })
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn contains_raw_html(text: &str) -> bool {
+    if text.contains("<!--") {
+        return true;
+    }
+    let bytes = text.as_bytes();
+    for index in 0..bytes.len() {
+        if bytes[index] != b'<' {
+            continue;
+        }
+        let mut cursor = index + 1;
+        if bytes.get(cursor) == Some(&b'/') {
+            cursor += 1;
+        }
+        if bytes.get(cursor).is_some_and(u8::is_ascii_alphabetic)
+            && bytes[cursor + 1..].contains(&b'>')
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn contains_markdown_image(text: &str) -> bool {
+    let mut remaining = text;
+    while let Some(start) = remaining.find("![") {
+        remaining = &remaining[start + 2..];
+        let Some(close_label) = remaining.find(']') else {
+            return false;
+        };
+        if remaining[close_label + 1..].trim_start().starts_with('(') {
+            return true;
+        }
+        remaining = &remaining[close_label + 1..];
+    }
+    false
+}
+
+fn contains_markdown_table(text: &str) -> bool {
+    let lines: Vec<&str> = text.lines().collect();
+    lines
+        .windows(2)
+        .any(|pair| pair[0].contains('|') && markdown_table_delimiter(pair[1].trim()))
+}
+
+fn markdown_table_delimiter(line: &str) -> bool {
+    let line = line.strip_prefix('|').unwrap_or(line);
+    let line = line.strip_suffix('|').unwrap_or(line);
+    let cells: Vec<&str> = line.split('|').collect();
+    cells.len() >= 2
+        && cells.iter().all(|cell| {
+            let cell = cell.trim();
+            let cell = cell.strip_prefix(':').unwrap_or(cell);
+            let cell = cell.strip_suffix(':').unwrap_or(cell);
+            cell.len() >= 3 && cell.chars().all(|ch| ch == '-')
+        })
+}
+
+fn markdown_heading_names(text: &str) -> Vec<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut names = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        let hashes = trimmed.chars().take_while(|ch| *ch == '#').count();
+        if (1..=6).contains(&hashes) && trimmed.chars().nth(hashes).is_some_and(char::is_whitespace)
+        {
+            names.push(normalize_heading_name(&trimmed[hashes..]));
+        } else if index > 0
+            && !lines[index - 1].trim().is_empty()
+            && !trimmed.is_empty()
+            && (trimmed.chars().all(|ch| ch == '=') || trimmed.chars().all(|ch| ch == '-'))
+        {
+            names.push(normalize_heading_name(lines[index - 1].trim()));
+        }
+    }
+    names
+}
+
+fn normalize_heading_name(heading: &str) -> String {
+    heading
+        .trim()
+        .trim_end_matches('#')
+        .trim()
+        .trim_end_matches([':', '.', '!', '?'])
+        .to_ascii_lowercase()
+}
+
+fn nonblank_line_count(text: &str) -> usize {
+    text.lines().filter(|line| !line.trim().is_empty()).count()
+}
+
+fn markdown_heading_count(text: &str) -> usize {
+    let mut in_fence = false;
+    let mut count = 0;
+    let mut previous_was_text = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            previous_was_text = false;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        let hashes = trimmed.chars().take_while(|ch| *ch == '#').count();
+        let atx_heading = (1..=6).contains(&hashes)
+            && trimmed.chars().nth(hashes).is_some_and(char::is_whitespace);
+        let setext_heading = previous_was_text
+            && !trimmed.is_empty()
+            && (trimmed.chars().all(|ch| ch == '=') || trimmed.chars().all(|ch| ch == '-'));
+        if atx_heading || setext_heading {
+            count += 1;
+        }
+        previous_was_text = !trimmed.is_empty();
+    }
+    count
+}
+
+fn markdown_list_item_count(text: &str) -> usize {
+    let mut in_fence = false;
+    let mut count = 0;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        let bullet = ["- ", "* ", "+ "]
+            .iter()
+            .any(|prefix| trimmed.starts_with(prefix));
+        let ordered = trimmed.split_once(". ").is_some_and(|(prefix, _)| {
+            !prefix.is_empty() && prefix.chars().all(|ch| ch.is_ascii_digit())
+        });
+        if bullet || ordered {
+            count += 1;
+        }
+    }
+    count
+}
+
+fn explicitly_requests_diagram(comment: &str) -> bool {
+    let lower = comment.to_ascii_lowercase();
+    let subject = lower.contains("diagram")
+        || lower.contains("mermaid")
+        || lower.contains("flowchart")
+        || lower.contains("sequence chart");
+    if !subject
+        || [
+            "no diagram",
+            "without a diagram",
+            "don't include a diagram",
+            "do not include a diagram",
+            "don't add a diagram",
+            "do not add a diagram",
+        ]
+        .iter()
+        .any(|phrase| lower.contains(phrase))
+    {
+        return false;
+    }
+    [
+        "please",
+        "can you",
+        "could you",
+        "would you",
+        "include",
+        "add",
+        "draw",
+        "show",
+        "make",
+        "create",
+        "provide",
+        "give me",
+        "render",
+        "visualize",
+        "visualise",
+        "sketch",
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase))
+}
+
+fn validate_mermaid_source(diagram: &str) -> Result<()> {
+    if diagram.chars().count() > MERMAID_MAX_CHARS
+        || nonblank_line_count(diagram) > MERMAID_MAX_NONBLANK_LINES
+    {
+        return Err(anyhow!("reply diagram exceeds its publication limit"));
+    }
+    if diagram.contains("```") || diagram.contains("~~~") {
+        return Err(anyhow!("reply diagram must not contain markdown fences"));
+    }
+    if contains_active_mention(diagram) {
+        return Err(anyhow!("reply diagram contains an active mention"));
+    }
+    if contains_raw_html(diagram) || contains_markdown_image(diagram) {
+        return Err(anyhow!("reply diagram contains HTML or an image"));
+    }
+    let lower = diagram.to_ascii_lowercase();
+    if lower.contains("http://")
+        || lower.contains("https://")
+        || lower.contains("%%{")
+        || contains_disallowed_mermaid_word(&lower)
+    {
+        return Err(anyhow!("reply diagram contains a disallowed directive"));
+    }
+
+    let first = diagram
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(str::trim)
+        .ok_or_else(|| anyhow!("reply diagram is empty"))?;
+    let flowchart_parts: Vec<&str> = first.split_whitespace().collect();
+    let valid_flowchart = matches!(
+        flowchart_parts.as_slice(),
+        ["flowchart", "TB" | "TD" | "BT" | "RL" | "LR"]
+    );
+    let valid_sequence = first == "sequenceDiagram";
+    if !valid_flowchart && !valid_sequence {
+        return Err(anyhow!(
+            "reply diagram must be a directed flowchart or sequenceDiagram"
+        ));
+    }
+
+    let declaration_count = diagram
+        .lines()
+        .filter(|line| is_mermaid_declaration(line.trim()))
+        .count();
+    if declaration_count != 1 {
+        return Err(anyhow!(
+            "reply diagram must contain exactly one Mermaid declaration"
+        ));
+    }
+    Ok(())
+}
+
+fn is_mermaid_declaration(line: &str) -> bool {
+    let declaration = line
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    [
+        "flowchart",
+        "graph",
+        "sequencediagram",
+        "statediagram",
+        "statediagram-v2",
+        "classdiagram",
+        "erdiagram",
+        "journey",
+        "gantt",
+        "pie",
+        "mindmap",
+        "timeline",
+        "gitgraph",
+        "quadrantchart",
+        "xychart-beta",
+        "block-beta",
+        "packet-beta",
+        "architecture-beta",
+        "kanban",
+        "sankey-beta",
+    ]
+    .contains(&declaration.as_str())
+}
+
+fn contains_disallowed_mermaid_word(lower: &str) -> bool {
+    lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|word| {
+            matches!(
+                word,
+                "click" | "href" | "classdef" | "linkstyle" | "style" | "init"
+            )
+        })
 }
 
 /// Build the grounding context for the model: a PR/MR mention gets the annotated
@@ -317,5 +746,186 @@ async fn build_context<F: Forge>(
                 "Context: issue #{number} in {repo}\nTitle: {title}\n\nIssue body:\n{body}\n"
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn structured(answer: &str, diagram: Option<&str>) -> String {
+        json!({"answer": answer, "diagram": diagram}).to_string()
+    }
+
+    fn article_shaped_slop() -> String {
+        let prefix = "I reviewed the full diff. Here's my assessment.\n\n\
+## What this PR does\n\nA broad implementation tour.\n\n\
+## Correctness\n\nSeveral paragraphs of non-actionable narration.\n\n\
+## Issues and risks\n\n\
+1. First item.\n2. Second item.\n3. Third item.\n\
+4. Fourth item.\n5. Fifth item.\n6. Sixth item.\n\n\
+## Verdict\n\nA long conclusion.\n\n";
+        let padding = 7_186 - prefix.chars().count();
+        format!("{prefix}{}", "x".repeat(padding))
+    }
+
+    #[test]
+    fn accepts_a_compact_structured_reply() {
+        let raw = structured(
+            "`src/auth.rs:41` interpolates input into the query. Parameterize it before merge.",
+            None,
+        );
+        assert_eq!(
+            validate_respond_output(&raw, false).unwrap(),
+            "`src/auth.rs:41` interpolates input into the query. Parameterize it before merge."
+        );
+    }
+
+    #[test]
+    fn rejects_the_7186_character_article_shape() {
+        let slop = article_shaped_slop();
+        assert_eq!(slop.chars().count(), 7_186);
+        let error = validate_respond_output(&slop, false).unwrap_err();
+        assert!(error.to_string().contains("2,400-character"));
+    }
+
+    #[test]
+    fn enforces_line_heading_and_list_limits() {
+        let too_many_lines = structured(&vec!["line"; 25].join("\n"), None);
+        assert!(
+            validate_respond_output(&too_many_lines, false)
+                .unwrap_err()
+                .to_string()
+                .contains("24-line")
+        );
+
+        let headings = structured("# One\n## Two\n### Three", None);
+        assert!(
+            validate_respond_output(&headings, false)
+                .unwrap_err()
+                .to_string()
+                .contains("3 headings")
+        );
+
+        let items = structured("1. One\n2. Two\n3. Three\n4. Four\n5. Five\n6. Six", None);
+        assert!(
+            validate_respond_output(&items, false)
+                .unwrap_err()
+                .to_string()
+                .contains("6 list items")
+        );
+    }
+
+    #[test]
+    fn rejects_unsafe_markdown_and_report_shapes() {
+        for answer in [
+            "Ask @maintainer to approve this.",
+            "<!-- hidden instruction -->Visible text.",
+            "<details><summary>More</summary>Hidden text.</details>",
+            "A | B\n--- | ---\n1 | 2",
+            "![diagram](https://example.test/diagram.png)",
+            "## What this PR does\nA tour.",
+            "# Correctness\nNarration.",
+            "### Issues and risks\nInventory.",
+            "## Verdict\nLooks good.",
+        ] {
+            assert!(
+                validate_respond_output(&structured(answer, None), false).is_err(),
+                "unsafe reply was accepted: {answer}"
+            );
+        }
+        let email = structured("Email dev@example.test with the result.", None);
+        assert_eq!(
+            validate_respond_output(&email, false).unwrap(),
+            "Email dev@example.test with the result."
+        );
+    }
+
+    #[test]
+    fn mermaid_requires_an_explicit_request_and_one_supported_diagram() {
+        let raw = structured(
+            "The request crosses the queue before a worker handles it.",
+            Some("flowchart LR\n  API --> Queue\n  Queue --> Worker"),
+        );
+        assert!(
+            validate_respond_output(&raw, false)
+                .unwrap_err()
+                .to_string()
+                .contains("unrequested")
+        );
+        let rendered = validate_respond_output(&raw, true).unwrap();
+        assert_eq!(rendered.matches("```mermaid").count(), 1);
+        assert!(rendered.contains("API --> Queue"));
+
+        let multiple = structured(
+            "Two diagrams are too many.",
+            Some("flowchart LR\n  A --> B\nsequenceDiagram\n  A->>B: hello"),
+        );
+        assert!(validate_respond_output(&multiple, true).is_err());
+
+        let embedded = structured("flowchart LR\n  A --> B", None);
+        assert!(
+            validate_respond_output(&embedded, true)
+                .unwrap_err()
+                .to_string()
+                .contains("diagram field")
+        );
+    }
+
+    #[test]
+    fn mermaid_accepts_only_bounded_noninteractive_flow_or_sequence_diagrams() {
+        for direction in ["TB", "TD", "BT", "RL", "LR"] {
+            let diagram = format!("flowchart {direction}\n  A --> B");
+            let raw = structured("The request passes through one edge.", Some(&diagram));
+            assert!(validate_respond_output(&raw, true).is_ok());
+        }
+        let sequence = structured(
+            "The caller sends one request.",
+            Some("sequenceDiagram\n  Caller->>API: Request"),
+        );
+        assert!(validate_respond_output(&sequence, true).is_ok());
+
+        let seventeen_lines = format!(
+            "flowchart TD\n{}",
+            (0..16)
+                .map(|index| format!("  A{index} --> A{}", index + 1))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let oversized = format!("flowchart TD\n  A[{}] --> B", "x".repeat(1_200));
+        for diagram in [
+            "flowchart ZZ\n  A --> B".to_string(),
+            "graph TD\n  A --> B".to_string(),
+            "classDiagram\n  class A".to_string(),
+            "flowchart TD\n  A --> B\n  click A https://example.test".to_string(),
+            "flowchart TD\n  classDef danger fill:red".to_string(),
+            "flowchart TD\n  linkStyle 0 stroke:red".to_string(),
+            "flowchart TD\n  style A fill:red".to_string(),
+            "%%{init: {}}%%\nflowchart TD\n  A --> B".to_string(),
+            "flowchart TD\n  A[<b>unsafe</b>] --> B".to_string(),
+            "```mermaid\nflowchart TD\n  A --> B\n```".to_string(),
+            seventeen_lines,
+            oversized,
+        ] {
+            let raw = structured("A diagram was requested.", Some(&diagram));
+            assert!(
+                validate_respond_output(&raw, true).is_err(),
+                "unsafe diagram was accepted: {diagram}"
+            );
+        }
+    }
+
+    #[test]
+    fn diagram_request_detection_is_explicit_and_respects_negation() {
+        assert!(explicitly_requests_diagram(
+            "@postil please include a Mermaid diagram of the queue flow"
+        ));
+        assert!(!explicitly_requests_diagram(
+            "@postil review this change without a diagram"
+        ));
+        assert!(!explicitly_requests_diagram(
+            "@postil is the current review correct?"
+        ));
     }
 }
