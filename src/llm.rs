@@ -1313,11 +1313,11 @@ impl LlmClient {
                             .retry_after
                             .unwrap_or_else(|| Duration::from_secs(2 * retries as u64));
                         eprintln!(
-                            "postil: model {} returned timeout HTTP {status} after {}, retrying in {}s \
+                            "postil: model {} returned timeout HTTP {status} after {}, retrying in {} \
                              (timeout retry {timeout_retries}/{TIMEOUT_RETRIES}; retry {retries}/{TRANSIENT_RETRIES})",
                             log_text(model),
                             elapsed_text(attempt_started_at.elapsed()),
-                            wait.as_secs()
+                            elapsed_text(wait)
                         );
                         self.sleep_with_budget(phase, wait).await?;
                         attempt_timeout = self.timeout_retry_timeout;
@@ -1335,11 +1335,11 @@ impl LlmClient {
                             .retry_after
                             .unwrap_or_else(|| Duration::from_secs(2 * retries as u64));
                         eprintln!(
-                            "postil: model {} returned retryable HTTP {status} after {}, retrying in {}s \
+                            "postil: model {} returned retryable HTTP {status} after {}, retrying in {} \
                              (retry {retries}/{TRANSIENT_RETRIES})",
                             log_text(model),
                             elapsed_text(attempt_started_at.elapsed()),
-                            wait.as_secs()
+                            elapsed_text(wait)
                         );
                         self.sleep_with_budget(phase, wait).await?;
                         attempt_timeout = self.request_timeout;
@@ -1570,6 +1570,10 @@ fn is_canonical_openrouter_base(api_base: &str) -> bool {
 }
 
 fn retry_after_duration(headers: &HeaderMap) -> Option<Duration> {
+    retry_after_duration_at(headers, std::time::SystemTime::now())
+}
+
+fn retry_after_duration_at(headers: &HeaderMap, now: std::time::SystemTime) -> Option<Duration> {
     let value = headers
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
@@ -1580,11 +1584,11 @@ fn retry_after_duration(headers: &HeaderMap) -> Option<Duration> {
     } else {
         httpdate::parse_http_date(value)
             .ok()?
-            .duration_since(std::time::SystemTime::now())
-            .ok()?
+            .duration_since(now)
+            .unwrap_or_default()
     };
 
-    (!duration.is_zero()).then(|| duration.min(Duration::from_secs(PROVIDER_RETRY_DELAY_CAP_SECS)))
+    Some(duration.min(Duration::from_secs(PROVIDER_RETRY_DELAY_CAP_SECS)))
 }
 
 fn safe_header_value(value: Option<&HeaderValue>) -> Option<String> {
@@ -2645,8 +2649,17 @@ mod tests {
     }
 
     #[test]
-    fn provider_retry_after_is_capped_for_local_reviews() {
+    fn provider_retry_after_parses_delta_seconds_and_caps_local_waits() {
         let mut headers = HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, HeaderValue::from_static("0"));
+        assert_eq!(retry_after_duration(&headers), Some(Duration::ZERO));
+
+        headers.insert(reqwest::header::RETRY_AFTER, HeaderValue::from_static("12"));
+        assert_eq!(
+            retry_after_duration(&headers),
+            Some(Duration::from_secs(12))
+        );
+
         headers.insert(
             reqwest::header::RETRY_AFTER,
             HeaderValue::from_static("999"),
@@ -2658,25 +2671,47 @@ mod tests {
     }
 
     #[test]
-    fn provider_retry_after_accepts_http_dates_and_ignores_past_dates() {
+    fn provider_retry_after_parses_http_dates_relative_to_the_client_clock() {
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let mut headers = HeaderMap::new();
         headers.insert(
             reqwest::header::RETRY_AFTER,
+            HeaderValue::from_str(&httpdate::fmt_http_date(now + Duration::from_secs(12))).unwrap(),
+        );
+        assert_eq!(
+            retry_after_duration_at(&headers, now),
+            Some(Duration::from_secs(12))
+        );
+
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            HeaderValue::from_str(&httpdate::fmt_http_date(now)).unwrap(),
+        );
+        assert_eq!(retry_after_duration_at(&headers, now), Some(Duration::ZERO));
+
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            HeaderValue::from_str(&httpdate::fmt_http_date(now - Duration::from_secs(1))).unwrap(),
+        );
+        assert_eq!(retry_after_duration_at(&headers, now), Some(Duration::ZERO));
+
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
             HeaderValue::from_str(&httpdate::fmt_http_date(
-                std::time::SystemTime::now() + Duration::from_secs(120),
+                now + Duration::from_secs(PROVIDER_RETRY_DELAY_CAP_SECS),
             ))
             .unwrap(),
         );
         assert_eq!(
-            retry_after_duration(&headers),
+            retry_after_duration_at(&headers, now),
             Some(Duration::from_secs(PROVIDER_RETRY_DELAY_CAP_SECS))
         );
 
         headers.insert(
             reqwest::header::RETRY_AFTER,
-            HeaderValue::from_static("Thu, 01 Jan 1970 00:00:00 GMT"),
+            HeaderValue::from_static("not a delay or HTTP date"),
         );
-        assert_eq!(retry_after_duration(&headers), None);
+        assert_eq!(retry_after_duration_at(&headers, now), None);
     }
 
     #[test]
