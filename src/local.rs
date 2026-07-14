@@ -6,7 +6,7 @@ use std::process::Stdio;
 use anyhow::{Context, Result, anyhow, ensure};
 use tokio::process::Command;
 
-use crate::diff::MAX_RAW_DIFF_INPUT_BYTES;
+use crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES;
 
 pub enum LocalSource {
     /// `git diff --cached`
@@ -24,20 +24,20 @@ pub async fn acquire(source: &LocalSource) -> Result<String> {
                 .with_context(|| format!("reading diff file metadata {}", path.display()))?
                 .len();
             ensure!(
-                size <= MAX_RAW_DIFF_INPUT_BYTES as u64,
+                size <= MAX_RAW_DIFF_ACQUISITION_BYTES as u64,
                 "diff input exceeds the {} byte acquisition limit",
-                MAX_RAW_DIFF_INPUT_BYTES
+                MAX_RAW_DIFF_ACQUISITION_BYTES
             );
             let file = std::fs::File::open(path)
                 .with_context(|| format!("opening diff file {}", path.display()))?;
             let mut bytes = Vec::with_capacity(size as usize);
-            file.take((MAX_RAW_DIFF_INPUT_BYTES + 1) as u64)
+            file.take((MAX_RAW_DIFF_ACQUISITION_BYTES + 1) as u64)
                 .read_to_end(&mut bytes)
                 .with_context(|| format!("reading diff file {}", path.display()))?;
             ensure!(
-                bytes.len() <= MAX_RAW_DIFF_INPUT_BYTES,
+                bytes.len() <= MAX_RAW_DIFF_ACQUISITION_BYTES,
                 "diff input exceeds the {} byte acquisition limit",
-                MAX_RAW_DIFF_INPUT_BYTES
+                MAX_RAW_DIFF_ACQUISITION_BYTES
             );
             String::from_utf8(bytes).context("diff file is not valid UTF-8")
         }
@@ -77,13 +77,13 @@ async fn git_diff(args: &[&str]) -> Result<String> {
             if count == 0 {
                 break;
             }
-            if bytes.len().saturating_add(count) > MAX_RAW_DIFF_INPUT_BYTES {
+            if bytes.len().saturating_add(count) > MAX_RAW_DIFF_ACQUISITION_BYTES {
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = stderr_reader.join();
                 return Err(anyhow!(
                     "git diff exceeds the {} byte acquisition limit",
-                    MAX_RAW_DIFF_INPUT_BYTES
+                    MAX_RAW_DIFF_ACQUISITION_BYTES
                 ));
             }
             bytes.extend_from_slice(&chunk[..count]);

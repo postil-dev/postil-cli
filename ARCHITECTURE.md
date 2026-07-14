@@ -19,7 +19,8 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
 
 - `diff.rs`: unified-diff parser, `DiffIndex` (which (path, line) pairs exist on the
   new side), and annotated evidence whose margin line numbers are the only numbers
-  the model is allowed to cite. Supported known lockfiles become bounded,
+  the model is allowed to cite. Cargo, npm package-lock/shrinkwrap, Yarn v1/Berry,
+  pnpm, and Go checksum lockfiles become bounded,
   format-specific added-package-version and removed-package-version metadata;
   malformed, unsupported, or over-budget lockfile sections fail closed. Every other
   path remains untrusted reviewable source, including generated,
@@ -27,7 +28,8 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   splits at file and hunk boundaries with overlap, repeats a bounded changed-file
   manifest, segments oversized lines without hiding the tail, and records deletion,
   binary, rename, mode, and dependency evidence under `.postil/change-metadata`.
-  Git C-quoted paths are decoded before classification and grounding.
+  Git C-quoted paths are decoded to canonical identities, then reversibly C-quoted
+  for prompt display; model citations decode back to the same forge path.
 - `filter.rs`: grounding (uncited findings dropped; all-uncited = untrusted run),
   policy suppression (ignore globs, severityThreshold, minConfidence, maxFindings),
   structured retention of suppressed grounded findings, and
@@ -39,11 +41,14 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   and response decoding vary by API format while retry, timeout, deadline, cascade, and
   secret-redaction semantics remain shared. Optional private-endpoint authentication is
   a separate header whose name cannot collide with provider-managed headers.
-- `review.rs`: orchestration; enforces acquisition, batch, request, projected-input
-  byte, and projected-input token budgets before provider calls; runs every evidence
+- `review.rs`: orchestration; enforces acquisition, model-aware context, request,
+  provider-attempt, output-token, and worst-case token-exposure budgets before calls;
+  one UTF-8 byte counts as one projected token rather than using an optimistic ratio;
+  runs every evidence
   batch plus one bounded cross-batch synthesis built from deterministic heuristic
   semantic categories (contracts, sources, sinks, validation, lifecycle, and
-  dependencies); aggregates findings before grounding and scoring; owns
+  dependencies) with at least one bounded representative for every rendered
+  file region; aggregates findings before grounding and scoring; owns
   fail-closed semantics (`fail_closed_finding`); and owns
   check-run lifecycle ordering (checks are created before the model runs so a crash can
   still be reported against them). It persists safe structured model incidents for
@@ -52,6 +57,8 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   with a self-managed/server base-URL override). Azure has no PR-diff endpoint, so it
   reconstructs a unified diff from changed-file content with `similar`. The gate check is
   never `neutral`: an errored run is a failed gate unless `gate.onError: advisory`.
+  GitLab full reviews require a collected diff version whose `real_size` matches the
+  exhausted paginated file count; incremental compares reject `compare_timeout`.
 - `respond.rs`: interactive bot (`postil respond`): answers an @postil mention on a PR
   or issue, grounded in the diff/issue, and posts one reply. Review-and-answer only; it
   never opens PRs or pushes commits.
@@ -103,16 +110,19 @@ additions (violations are `kind: contentPolicy`). Content policy is on by defaul
    emits the generic internal `Review incomplete` operational finding before any model
    call, preserves the hosted global deadline, and keeps full-review reconciliation
    untrustworthy.
-10. Diff acquisition stops before buffering more than the aggregate raw-input cap for
-    local files, Git stdout, remote response streams, and reconstructed forge diffs.
-    This cap includes lockfile-only changes.
-11. Projected-input token accounting is an input-planning guard, not a total provider
-    spend bound. Model output, cascade, consensus, and retry usage remain bounded by
-    model transport limits, request deadlines, and the hosted global deadline and are
-    recorded from provider receipts.
+10. Diff acquisition streams into a 32 MiB hard cap for local files, Git stdout,
+    remote response bodies, and reconstructed forge diffs. The reviewable non-lockfile
+    source cap is 8 MiB. Supported lockfile sections compact before that source cap and
+    have a separate 16 MiB per-section cap.
+11. Every configured chain is planned against the smallest conservative model context.
+    A review admits at most three models per logical request and hard-caps logical
+    requests, HTTP attempts including repair/retry paths, per-response output tokens,
+    scorer input, and worst-case token exposure across cascade or consensus.
 12. Operational and provider virtual anchors expire after each run. Reviewable
     PR-description and change-metadata anchors carry across unrelated incremental
     reviews, and a same-head rerun with either anchor falls back to a full review.
+    Change-metadata supersession requires an exact stable semantic ID; synthetic line
+    reuse alone cannot clear a baseline finding.
 
 ## Residual prompt-injection surface
 

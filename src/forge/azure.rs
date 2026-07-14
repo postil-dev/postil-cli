@@ -146,7 +146,7 @@ impl Azure {
             .send()
             .await
             .context("fetching PR")?;
-        Ok(Self::check_ok(resp, "PR fetch").await?.json().await?)
+        super::bounded_response_json(Self::check_ok(resp, "PR fetch").await?, "Azure PR").await
     }
 
     /// File content at a commit, or empty string if the file does not exist
@@ -165,7 +165,7 @@ impl Azure {
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(String::new());
         }
-        let response = Self::check_ok(resp, "item fetch").await?;
+        let mut response = Self::check_ok(resp, "item fetch").await?;
         if response
             .content_length()
             .is_some_and(|length| length > MAX_FILE_BYTES as u64)
@@ -174,7 +174,12 @@ impl Azure {
                 "Azure item {path} exceeds the {MAX_FILE_BYTES} byte limit"
             ));
         }
-        let text = super::bounded_response_text(response, "Azure item content").await?;
+        let text = super::bounded_response_text_with_limit(
+            &mut response,
+            "Azure item content",
+            MAX_FILE_BYTES,
+        )
+        .await?;
         if text.len() > MAX_FILE_BYTES {
             return Err(anyhow!(
                 "Azure item {path} exceeds the {MAX_FILE_BYTES} byte limit"
@@ -191,6 +196,7 @@ impl Azure {
         const PAGE: usize = 100;
         const MAX_CHANGES: usize = 20_000;
         let mut changes: Vec<Change> = Vec::new();
+        let mut retained_bytes = 0usize;
         loop {
             let q = format!(
                 "baseVersion={base_sha}&baseVersionType=commit&\
@@ -203,11 +209,28 @@ impl Azure {
                 .send()
                 .await
                 .context("fetching change list")?;
-            let page: DiffResponse = Self::check_ok(resp, "change list fetch")
-                .await?
-                .json()
-                .await?;
+            let page: DiffResponse = super::bounded_response_json(
+                Self::check_ok(resp, "change list fetch").await?,
+                "Azure change-list page",
+            )
+            .await?;
             let n = page.changes.len();
+            let page_bytes = page
+                .changes
+                .iter()
+                .map(|change| {
+                    change.change_type.len()
+                        + change.item.as_ref().map_or(0, |item| item.path.len())
+                        + change.source_server_item.as_ref().map_or(0, String::len)
+                })
+                .sum::<usize>();
+            retained_bytes = retained_bytes.saturating_add(page_bytes);
+            if retained_bytes > crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES {
+                return Err(anyhow!(
+                    "Azure change-list metadata exceeds the {} byte acquisition limit",
+                    crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES
+                ));
+            }
             changes.extend(page.changes);
             // A short page with no explicit "more" marker means exhaustion.
             if n == 0 || (n < PAGE && page.all_changes_included != Some(false)) {
@@ -255,10 +278,11 @@ impl Azure {
                 continue;
             }
             let section = diff_section(path, &old, &new, is_add, is_delete);
-            if out.len().saturating_add(section.len()) > crate::diff::MAX_RAW_DIFF_INPUT_BYTES {
+            if out.len().saturating_add(section.len()) > crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES
+            {
                 return Err(anyhow!(
                     "Azure reconstructed diff exceeds the {} byte acquisition limit",
-                    crate::diff::MAX_RAW_DIFF_INPUT_BYTES
+                    crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES
                 ));
             }
             out.push_str(&section);
@@ -527,12 +551,14 @@ fn merge_commits(
 /// exceeds the per-file size cap. Split out of `build_diff` so the
 /// classification is unit-testable without network access.
 fn diff_section(path: &str, old: &str, new: &str, is_add: bool, is_delete: bool) -> String {
+    let old_marker = crate::diff::display_path(&format!("a/{path}"));
+    let new_marker = crate::diff::display_path(&format!("b/{path}"));
     // One oversized file must not be diffed in full before any size cap ever
     // sees it; mark it skipped like a binary file so the path is still
     // visible in the review context.
     if old.len() > MAX_FILE_BYTES || new.len() > MAX_FILE_BYTES {
         return format!(
-            "diff --git a/{path} b/{path}\nBinary files a/{path} and b/{path} differ \
+            "diff --git {old_marker} {new_marker}\nBinary files {old_marker} and {new_marker} differ \
              (exceeds {}MiB per-file cap, not diffed)\n",
             MAX_FILE_BYTES / (1024 * 1024)
         );
@@ -541,7 +567,7 @@ fn diff_section(path: &str, old: &str, new: &str, is_add: bool, is_delete: bool)
     // is still visible in the review context.
     if old.contains('\0') || new.contains('\0') {
         return format!(
-            "diff --git a/{path} b/{path}\nBinary files a/{path} and b/{path} differ\n"
+            "diff --git {old_marker} {new_marker}\nBinary files {old_marker} and {new_marker} differ\n"
         );
     }
     unified_file_diff(path, old, new, is_add, is_delete)
@@ -552,13 +578,15 @@ fn diff_section(path: &str, old: &str, new: &str, is_add: bool, is_delete: bool)
 /// the `---`/`+++` lines, and `similar`-generated hunks.
 fn unified_file_diff(path: &str, old: &str, new: &str, is_add: bool, is_delete: bool) -> String {
     use similar::TextDiff;
-    let mut out = format!("diff --git a/{path} b/{path}\n");
+    let old_marker = crate::diff::display_path(&format!("a/{path}"));
+    let new_marker = crate::diff::display_path(&format!("b/{path}"));
+    let mut out = format!("diff --git {old_marker} {new_marker}\n");
     if is_add {
-        out.push_str(&format!("--- /dev/null\n+++ b/{path}\n"));
+        out.push_str(&format!("--- /dev/null\n+++ {new_marker}\n"));
     } else if is_delete {
-        out.push_str(&format!("--- a/{path}\n+++ /dev/null\n"));
+        out.push_str(&format!("--- {old_marker}\n+++ /dev/null\n"));
     } else {
-        out.push_str(&format!("--- a/{path}\n+++ b/{path}\n"));
+        out.push_str(&format!("--- {old_marker}\n+++ {new_marker}\n"));
     }
     let diff = TextDiff::from_lines(old, new);
     let hunks = diff.unified_diff().context_radius(3).to_string();

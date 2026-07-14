@@ -50,7 +50,15 @@ struct FileDiffItem {
 
 #[derive(Deserialize)]
 struct CompareResponse {
+    #[serde(default)]
+    compare_timeout: bool,
     diffs: Vec<FileDiffItem>,
+}
+
+#[derive(Deserialize)]
+struct DiffVersion {
+    state: String,
+    real_size: String,
 }
 
 impl GitLab {
@@ -99,11 +107,10 @@ impl GitLab {
             .send()
             .await
             .context("fetching MR")?;
-        Ok(Self::check_ok(resp, "MR fetch").await?.json().await?)
+        super::bounded_response_json(Self::check_ok(resp, "MR fetch").await?, "GitLab MR").await
     }
 
-    fn assemble_unified(items: &[FileDiffItem]) -> Result<String> {
-        let mut out = String::new();
+    fn append_unified(out: &mut String, items: &[FileDiffItem]) -> Result<()> {
         for item in items {
             if item.collapsed || item.too_large {
                 return Err(anyhow!(
@@ -111,29 +118,83 @@ impl GitLab {
                     item.new_path
                 ));
             }
-            let mut section = format!("diff --git a/{} b/{}\n", item.old_path, item.new_path);
+            let old_marker = crate::diff::display_path(&format!("a/{}", item.old_path));
+            let new_marker = crate::diff::display_path(&format!("b/{}", item.new_path));
+            let mut section = format!("diff --git {old_marker} {new_marker}\n");
             if item.new_file {
-                section.push_str(&format!("--- /dev/null\n+++ b/{}\n", item.new_path));
+                section.push_str(&format!("--- /dev/null\n+++ {new_marker}\n"));
             } else if item.deleted_file {
-                section.push_str(&format!("--- a/{}\n+++ /dev/null\n", item.old_path));
+                section.push_str(&format!("--- {old_marker}\n+++ /dev/null\n"));
             } else {
-                section.push_str(&format!(
-                    "--- a/{}\n+++ b/{}\n",
-                    item.old_path, item.new_path
-                ));
+                section.push_str(&format!("--- {old_marker}\n+++ {new_marker}\n"));
             }
             section.push_str(&item.diff);
             if !item.diff.ends_with('\n') {
                 section.push('\n');
             }
             ensure!(
-                out.len().saturating_add(section.len()) <= crate::diff::MAX_RAW_DIFF_INPUT_BYTES,
+                out.len().saturating_add(section.len())
+                    <= crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES,
                 "GitLab assembled diff exceeds the {} byte acquisition limit",
-                crate::diff::MAX_RAW_DIFF_INPUT_BYTES
+                crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES
             );
             out.push_str(&section);
         }
+        Ok(())
+    }
+
+    fn assemble_unified(items: &[FileDiffItem]) -> Result<String> {
+        let mut out = String::new();
+        Self::append_unified(&mut out, items)?;
         Ok(out)
+    }
+
+    fn assemble_compare(compare: CompareResponse) -> Result<String> {
+        ensure!(
+            !compare.compare_timeout,
+            "GitLab compare timed out or exceeded provider limits"
+        );
+        Self::assemble_unified(&compare.diffs)
+    }
+
+    fn validate_diff_version(version: &DiffVersion, item_count: usize) -> Result<()> {
+        ensure!(
+            version.state == "collected",
+            "GitLab diff version is not complete (state {})",
+            version.state
+        );
+        let expected_items: usize = version
+            .real_size
+            .parse()
+            .context("GitLab diff version real_size is not numeric")?;
+        ensure!(
+            item_count == expected_items,
+            "GitLab returned {item_count} diff files but the collected version reports {expected_items}"
+        );
+        Ok(())
+    }
+
+    async fn latest_diff_version(&self) -> Result<DiffVersion> {
+        let resp = self
+            .request(
+                reqwest::Method::GET,
+                self.url(&format!(
+                    "/merge_requests/{}/versions?per_page=1&page=1",
+                    self.mr_iid
+                )),
+            )
+            .send()
+            .await
+            .context("fetching MR diff version")?;
+        let versions: Vec<DiffVersion> = super::bounded_response_json(
+            Self::check_ok(resp, "diff version fetch").await?,
+            "GitLab diff version",
+        )
+        .await?;
+        versions
+            .into_iter()
+            .next()
+            .context("GitLab returned no merge-request diff version")
     }
 
     /// Post one finding as an anchored discussion, falling back to a plain
@@ -225,7 +286,17 @@ impl Forge for GitLab {
         const PER_PAGE: usize = 100;
         const MAX_PAGES: usize = 100;
         const MAX_ITEMS: usize = 10_000;
-        let mut items: Vec<FileDiffItem> = Vec::new();
+        let version = self.latest_diff_version().await?;
+        let expected_items: usize = version
+            .real_size
+            .parse()
+            .context("GitLab diff version real_size is not numeric")?;
+        ensure!(
+            expected_items <= MAX_ITEMS,
+            "GitLab diff version exceeds {MAX_ITEMS} files"
+        );
+        let mut out = String::new();
+        let mut item_count = 0usize;
         let mut page = 1usize;
         loop {
             ensure!(
@@ -249,14 +320,23 @@ impl Forge for GitLab {
                 .get("x-next-page")
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_string);
-            let batch: Vec<FileDiffItem> =
-                super::bounded_response_json(checked, "GitLab diff page").await?;
+            let page_text = super::bounded_response_text(checked, "GitLab diff page").await?;
             ensure!(
-                items.len().saturating_add(batch.len()) <= MAX_ITEMS,
+                out.len().saturating_add(page_text.len())
+                    <= crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES,
+                "GitLab diff pages exceed the {} byte aggregate acquisition limit",
+                crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES
+            );
+            let batch: Vec<FileDiffItem> =
+                serde_json::from_str(&page_text).context("decoding GitLab diff page")?;
+            drop(page_text);
+            ensure!(
+                item_count.saturating_add(batch.len()) <= MAX_ITEMS,
                 "GitLab diff pagination exceeds {MAX_ITEMS} files"
             );
             let batch_len = batch.len();
-            items.extend(batch);
+            item_count = item_count.saturating_add(batch_len);
+            Self::append_unified(&mut out, &batch)?;
             match next_page.as_deref() {
                 Some("") => break,
                 Some(next) => {
@@ -273,7 +353,8 @@ impl Forge for GitLab {
                 }
             }
         }
-        Self::assemble_unified(&items)
+        Self::validate_diff_version(&version, item_count)?;
+        Ok(out)
     }
 
     async fn fetch_diff_since(&self, since_sha: &str, head_sha: &str) -> Result<String> {
@@ -292,7 +373,7 @@ impl Forge for GitLab {
             "GitLab compare diff",
         )
         .await?;
-        Self::assemble_unified(&cmp.diffs)
+        Self::assemble_compare(cmp)
     }
 
     async fn post_review(
@@ -407,7 +488,11 @@ impl Forge for GitLab {
             .send()
             .await
             .context("fetching thread")?;
-        let v: serde_json::Value = Self::check_ok(resp, "thread fetch").await?.json().await?;
+        let v: serde_json::Value = super::bounded_response_json(
+            Self::check_ok(resp, "thread fetch").await?,
+            "GitLab thread",
+        )
+        .await?;
         let title = v["title"].as_str().unwrap_or_default().to_string();
         let body = v["description"].as_str().unwrap_or_default().to_string();
         Ok((title, body))
@@ -455,5 +540,36 @@ mod tests {
         assert!(GitLab::assemble_unified(&[item(true, false)]).is_err());
         assert!(GitLab::assemble_unified(&[item(false, true)]).is_err());
         assert!(GitLab::assemble_unified(&[item(false, false)]).is_ok());
+    }
+
+    #[test]
+    fn compare_timeout_and_incomplete_versions_fail_closed() {
+        assert!(
+            GitLab::assemble_compare(CompareResponse {
+                compare_timeout: true,
+                diffs: vec![item(false, false)],
+            })
+            .is_err()
+        );
+        assert!(
+            GitLab::validate_diff_version(
+                &DiffVersion {
+                    state: "collecting".into(),
+                    real_size: "1".into(),
+                },
+                1,
+            )
+            .is_err()
+        );
+        assert!(
+            GitLab::validate_diff_version(
+                &DiffVersion {
+                    state: "collected".into(),
+                    real_size: "2".into(),
+                },
+                1,
+            )
+            .is_err()
+        );
     }
 }

@@ -153,6 +153,11 @@ const REFLAG_PROXIMITY: u32 = 3;
 /// weaker is treated as a different, coexisting issue and the baseline is
 /// carried.
 fn supersedes(base: &Finding, new: &Finding) -> bool {
+    if base.path == crate::envelope::CHANGE_METADATA_PATH
+        || new.path == crate::envelope::CHANGE_METADATA_PATH
+    {
+        return base.path == new.path && base.id.is_some() && base.id == new.id;
+    }
     new.path == base.path
         && new.line.abs_diff(base.line) <= REFLAG_PROXIMITY
         && new.kind == base.kind
@@ -442,6 +447,28 @@ mod tests {
         assert_eq!(rec.carried.len(), 2);
         assert_eq!(rec.carried[0].path, crate::envelope::CHANGE_METADATA_PATH);
         assert_eq!(rec.carried[1].path, crate::envelope::PR_DESCRIPTION_PATH);
+    }
+
+    #[test]
+    fn unrelated_change_metadata_at_same_line_never_supersedes() {
+        let idx = index_for("unrelated.rs", 1, 1);
+        let mut baseline = f(
+            crate::envelope::CHANGE_METADATA_PATH,
+            1,
+            Severity::Error,
+            0.9,
+        );
+        baseline.id = Some("dependency-a".into());
+        let mut fresh = f(
+            crate::envelope::CHANGE_METADATA_PATH,
+            1,
+            Severity::Error,
+            0.9,
+        );
+        fresh.id = Some("dependency-b".into());
+        let rec = reconcile(&[baseline], &idx, &[fresh], ReconcileScope::Incremental);
+        assert_eq!(rec.carried.len(), 1);
+        assert!(rec.resolved.is_empty());
     }
 
     #[test]

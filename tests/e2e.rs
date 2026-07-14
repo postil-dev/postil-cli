@@ -231,7 +231,7 @@ async fn native_anthropic_review_uses_messages_shape_auth_and_usage() {
     assert!(body["system"].as_str().is_some());
     assert_eq!(body["messages"].as_array().unwrap().len(), 1);
     assert_eq!(body["messages"][0]["role"], "user");
-    assert_eq!(body["max_tokens"], 16384);
+    assert_eq!(body["max_tokens"], 4096);
     assert!(body.get("choices").is_none());
 }
 
@@ -644,6 +644,63 @@ async fn provider_403_redacts_key_management_url_from_cli_and_finding() {
 }
 
 #[tokio::test]
+async fn provider_reported_spend_above_hard_cap_fails_closed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "{\"summary\":\"\",\"findings\":[]}"}}],
+            "usage": {"prompt_tokens": 20_000_001_u64, "completion_tokens": 1}
+        })))
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .code(1);
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(
+        envelope["findings"][0]["title"],
+        "Model provider unavailable"
+    );
+    assert!(String::from_utf8_lossy(&out.get_output().stderr).contains("token hard cap"));
+}
+
+#[tokio::test]
+async fn provider_response_body_above_hard_cap_fails_closed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 512 * 1024 + 1]))
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .code(1);
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(
+        envelope["findings"][0]["title"],
+        "Model provider unavailable"
+    );
+    assert!(String::from_utf8_lossy(&out.get_output().stderr).contains("byte hard cap"));
+}
+
+#[tokio::test]
 async fn doctor_probes_native_anthropic_format() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -806,7 +863,7 @@ async fn remote_diff_reader_rejects_declared_oversized_bodies_before_buffering()
         .and(path("/oversized.diff"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![
             b'x';
-            postil_cli::diff::MAX_RAW_DIFF_INPUT_BYTES
+            postil_cli::diff::MAX_RAW_DIFF_ACQUISITION_BYTES
                 + 1
         ]))
         .mount(&server)
@@ -820,7 +877,7 @@ async fn remote_diff_reader_rejects_declared_oversized_bodies_before_buffering()
     assert!(
         error
             .to_string()
-            .contains("exceeds the 8388608 byte acquisition limit")
+            .contains("exceeds the 33554432 byte acquisition limit")
     );
 }
 
@@ -1161,13 +1218,39 @@ fn review_budget_exhaustion_fails_closed_without_calling_a_provider() {
     assert_eq!(envelope["usage"]["promptTokens"], 0);
 }
 
-#[test]
-fn lockfile_only_input_is_rejected_at_the_acquisition_limit() {
+#[tokio::test]
+async fn model_chain_above_hard_cap_fails_before_provider_calls() {
+    let server = MockServer::start().await;
     let dir = tempfile::tempdir().unwrap();
-    let diff = dir.path().join("huge-lockfile.diff");
+    let diff = write_diff(dir.path());
+    let config = dir.path().join("postil.yml");
+    std::fs::write(
+        &config,
+        "model:\n  name: model/one\n  cascade:\n    - model/two\n    - model/three\n    - model/four\n",
+    )
+    .unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--config")
+        .arg(&config)
+        .args(["--output", "json"])
+        .assert()
+        .code(1);
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["findings"][0]["title"], "Review incomplete");
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[test]
+fn local_diff_file_is_stopped_at_the_acquisition_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let diff = dir.path().join("huge.diff");
     let source = format!(
-        "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -0,0 +1 @@\n+{}\n",
-        "x".repeat(8 * 1024 * 1024)
+        "diff --git a/huge.rs b/huge.rs\n--- a/huge.rs\n+++ b/huge.rs\n@@ -0,0 +1 @@\n+{}\n",
+        "x".repeat(postil_cli::diff::MAX_RAW_DIFF_ACQUISITION_BYTES)
     );
     std::fs::write(&diff, source).unwrap();
     let out = postil()
@@ -1192,7 +1275,11 @@ fn staged_git_diff_is_stopped_at_the_acquisition_limit() {
             .unwrap()
             .success()
     );
-    std::fs::write(dir.path().join("huge.rs"), "x".repeat(8 * 1024 * 1024)).unwrap();
+    std::fs::write(
+        dir.path().join("huge.rs"),
+        "x".repeat(postil_cli::diff::MAX_RAW_DIFF_ACQUISITION_BYTES),
+    )
+    .unwrap();
     assert!(
         std::process::Command::new("git")
             .args(["add", "huge.rs"])
@@ -1270,6 +1357,48 @@ async fn quoted_lockfile_path_is_decoded_and_raw_content_never_reaches_provider(
     assert!(body.contains("removed package-one@1.0.0"));
     assert!(body.contains("added package-one@2.0.0"));
     assert!(!body.contains("RAW_LOCKFILE_SENTINEL"));
+}
+
+#[tokio::test]
+async fn c_quoted_prompt_path_round_trips_into_canonical_finding_path() {
+    let server = MockServer::start().await;
+    let canonical = "src/tab\tline\rbreak\nquote\"slash\\日.rs";
+    let displayed = postil_cli::diff::display_path(canonical);
+    mock_review(
+        &server,
+        json!([{
+            "path": displayed,
+            "line": 1,
+            "severity": "warn",
+            "kind": "risk",
+            "confidence": 0.9,
+            "title": "Hostile path remains grounded",
+            "body": "The changed call is unsafe. Replace it with a checked operation."
+        }]),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let diff = dir.path().join("quoted-path.diff");
+    let old = postil_cli::diff::display_path(&format!("a/{canonical}"));
+    let new = postil_cli::diff::display_path(&format!("b/{canonical}"));
+    std::fs::write(
+        &diff,
+        format!(
+            "diff --git {old} {new}\n--- {old}\n+++ {new}\n@@ -0,0 +1 @@\n+dangerous_call();\n"
+        ),
+    )
+    .unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["findings"][0]["path"], canonical);
 }
 
 #[test]
@@ -1383,7 +1512,7 @@ async fn local_review_reports_grounded_finding_and_gates() {
 
     let requests = server.received_requests().await.unwrap();
     let request: Value = requests[0].body_json().unwrap();
-    assert_eq!(request["max_tokens"], 16384);
+    assert_eq!(request["max_tokens"], 4096);
     assert_eq!(request["messages"].as_array().unwrap().len(), 2);
 }
 
@@ -5553,6 +5682,13 @@ async fn respond_gitlab_mr_mention_posts_note() {
         })))
         .mount(&server)
         .await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/projects/.+/merge_requests/5/versions$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "state": "collected", "real_size": "1"
+        }])))
+        .mount(&server)
+        .await;
     // MR file diffs (paginated; one short page ends iteration).
     Mock::given(method("GET"))
         .and(path_regex(r"^/projects/.+/merge_requests/5/diffs$"))
@@ -5621,6 +5757,13 @@ async fn gitlab_diff_pagination_follows_authoritative_next_page_to_exhaustion() 
             "description": "",
             "diff_refs": {"base_sha": "b", "start_sha": "s", "head_sha": "h"}
         })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/projects/.+/merge_requests/6/versions$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "state": "collected", "real_size": "101"
+        }])))
         .mount(&server)
         .await;
     let first_page: Vec<Value> = (0..100)

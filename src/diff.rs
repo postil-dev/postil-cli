@@ -10,9 +10,10 @@ use std::collections::{BTreeSet, HashMap};
 use std::ops::RangeInclusive;
 
 const MAX_LOCKFILE_EVIDENCE_SECTIONS: usize = 1024;
-const MAX_LOCKFILE_SECTION_BYTES: usize = 256 * 1024;
+const MAX_LOCKFILE_SECTION_BYTES: usize = 16 * 1024 * 1024;
 const MAX_LOCKFILE_DIRECTIONAL_CHANGES: usize = 256;
 pub const MAX_RAW_DIFF_INPUT_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_RAW_DIFF_ACQUISITION_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Default)]
 pub struct ReviewBatchPlan {
@@ -393,6 +394,51 @@ fn parse_git_marker_path(value: &str) -> Option<String> {
     Some(strip_prefix_ab(&decoded).to_string())
 }
 
+/// Reversible path spelling used in model prompts. Control characters,
+/// quotes, backslashes, and non-ASCII bytes use Git's C-quoted convention so
+/// a path can never create a prompt header or line of its own.
+pub fn display_path(path: &str) -> String {
+    let boundary_whitespace = path
+        .as_bytes()
+        .first()
+        .into_iter()
+        .chain(path.as_bytes().last())
+        .any(u8::is_ascii_whitespace);
+    if !boundary_whitespace
+        && path.bytes().all(|byte| {
+            byte.is_ascii() && !byte.is_ascii_control() && !matches!(byte, b'"' | b'\\')
+        })
+    {
+        return path.to_string();
+    }
+    let mut out = String::from("\"");
+    for byte in path.as_bytes() {
+        match byte {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            b'\t' => out.push_str("\\t"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            0x20..=0x7e => out.push(char::from(*byte)),
+            _ => out.push_str(&format!("\\{byte:03o}")),
+        }
+    }
+    out.push('"');
+    out
+}
+
+pub fn canonical_prompt_path(path: &str) -> Option<String> {
+    if !path.starts_with('"') {
+        return Some(path.to_string());
+    }
+    let (decoded, trailing) = parse_git_path_token(path)?;
+    trailing.trim().is_empty().then_some(decoded)
+}
+
+fn prompt_header_path(header: &str) -> &str {
+    header
+}
+
 fn lockfile_evidence(path: &str, section: &str) -> Option<LockfileEvidence> {
     if section.len() > MAX_LOCKFILE_SECTION_BYTES {
         return None;
@@ -499,6 +545,15 @@ fn parse_package_lock_records(lines: &[&str]) -> Option<BTreeSet<String>> {
             .and_then(safe_package_atom)
         {
             package = Some(path);
+        } else if let Some(name) = trimmed
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix("\": {"))
+            .filter(|name| !matches!(*name, "dependencies" | "packages" | "requires"))
+            .and_then(safe_package_atom)
+        {
+            // npm lockfileVersion 1 stores package records under the
+            // dependency name rather than a node_modules path.
+            package = Some(name);
         } else if let Some(version) = json_string_field(trimmed, "version")
             && let Some(name) = package.take()
         {
@@ -525,14 +580,18 @@ fn parse_yarn_records(lines: &[&str]) -> Option<BTreeSet<String>> {
             && line.trim_end().ends_with(':')
         {
             let header = line.trim().trim_end_matches(':').trim_matches('"');
-            let name = header
+            let selector = header.split(',').next()?.trim();
+            let name = selector
                 .rsplit_once('@')
                 .map(|(name, _)| name)
-                .unwrap_or(header);
+                .unwrap_or(selector);
             package = safe_package_atom(name);
-        } else if let Some(version) = line.trim().strip_prefix("version ")
+        } else if let Some(version) = line
+            .trim()
+            .strip_prefix("version ")
+            .or_else(|| line.trim().strip_prefix("version:"))
             && let Some(name) = package.take()
-            && let Some(version) = safe_package_atom(version.trim_matches('"'))
+            && let Some(version) = safe_package_atom(version.trim().trim_matches('"'))
         {
             packages.insert(format!("{name}@{version}"));
         }
@@ -728,7 +787,6 @@ fn strip_prefix_ab(path: &str) -> &str {
     path.strip_prefix("a/")
         .or_else(|| path.strip_prefix("b/"))
         .unwrap_or(path)
-        .trim_end()
 }
 
 /// "@@ -l,c +l,c @@ ctx" minus the leading "@@ ". Returns
@@ -772,7 +830,10 @@ pub fn render_annotated(diff: &Diff, max_bytes: usize) -> (String, bool) {
         if file.binary {
             if push(
                 &mut out,
-                &format!("### {} (binary, not reviewable)\n", file.path),
+                &format!(
+                    "### {}\n@@ binary, not reviewable @@\n",
+                    display_path(&file.path)
+                ),
             ) {
                 truncated = true;
                 break 'files;
@@ -780,13 +841,16 @@ pub fn render_annotated(diff: &Diff, max_bytes: usize) -> (String, bool) {
             continue;
         }
         if file.deleted {
-            if push(&mut out, &format!("### {} (deleted)\n", file.path)) {
+            if push(
+                &mut out,
+                &format!("### {}\n@@ deleted @@\n", display_path(&file.path)),
+            ) {
                 truncated = true;
                 break 'files;
             }
             continue;
         }
-        if push(&mut out, &format!("### {}\n", file.path)) {
+        if push(&mut out, &format!("### {}\n", display_path(&file.path))) {
             truncated = true;
             break 'files;
         }
@@ -1030,7 +1094,7 @@ fn build_manifest(diff: &Diff, lockfiles: &[LockfileEvidence], max_bytes: usize)
 }
 
 fn manifest_path(path: &str) -> String {
-    path.replace(['\r', '\n'], " ").chars().take(240).collect()
+    display_path(path)
 }
 
 fn render_hunk_units(
@@ -1041,12 +1105,12 @@ fn render_hunk_units(
 ) -> Option<Vec<String>> {
     let file_header = if file.deleted {
         format!(
-            "### {} (deleted; cite {} metadata line)\n",
-            file.path,
+            "### {}\n@@ deleted; cite {} metadata line @@\n",
+            display_path(&file.path),
             crate::envelope::CHANGE_METADATA_PATH
         )
     } else {
-        format!("### {}\n", file.path)
+        format!("### {}\n", display_path(&file.path))
     };
     let header_reserve = file_header.len() + 80;
     let segment_budget = budget.saturating_sub(header_reserve).max(1024);
@@ -1226,19 +1290,43 @@ fn semantic_digest(batch: &str) -> String {
             &["import", "require", "package", "dependency", " use "],
         ),
     ];
-    let mut current_path = None;
-    let mut entries: Vec<Vec<(String, String)>> = vec![Vec::new(); CATEGORIES.len()];
-    let mut fallback = None;
+    struct Region {
+        path: String,
+        label: String,
+        categories: Vec<Option<String>>,
+        fallback: Option<String>,
+    }
+
+    fn flush_region(regions: &mut Vec<Region>, current: &mut Option<Region>) {
+        if current
+            .as_ref()
+            .is_some_and(|region| region.fallback.is_some())
+        {
+            regions.push(current.take().expect("checked above"));
+        } else {
+            *current = None;
+        }
+    }
+
+    let mut current_path = None::<String>;
+    let mut current_region = None::<Region>;
+    let mut regions = Vec::new();
     for rendered in batch.lines() {
         if let Some(header) = rendered.strip_prefix("### ") {
-            current_path = Some(
-                header
-                    .split(" (")
-                    .next()
-                    .unwrap_or(header)
-                    .trim()
-                    .to_string(),
-            );
+            flush_region(&mut regions, &mut current_region);
+            current_path = Some(prompt_header_path(header).to_string());
+            continue;
+        }
+        if let Some(label) = rendered.strip_prefix("@@ ") {
+            flush_region(&mut regions, &mut current_region);
+            if let Some(path) = current_path.as_ref() {
+                current_region = Some(Region {
+                    path: path.clone(),
+                    label: label.trim_end_matches(" @@").to_string(),
+                    categories: vec![None; CATEGORIES.len()],
+                    fallback: None,
+                });
+            }
             continue;
         }
         let Some(path) = current_path.as_ref() else {
@@ -1251,36 +1339,46 @@ fn semantic_digest(batch: &str) -> String {
         if number.parse::<u32>().is_err() {
             continue;
         }
-        fallback
-            .get_or_insert_with(|| (path.clone(), rendered.chars().take(360).collect::<String>()));
+        let region = current_region.get_or_insert_with(|| Region {
+            path: path.clone(),
+            label: "source region".to_string(),
+            categories: vec![None; CATEGORIES.len()],
+            fallback: None,
+        });
+        let bounded: String = rendered.chars().take(360).collect();
+        region.fallback.get_or_insert_with(|| bounded.clone());
         let lower = content.to_ascii_lowercase();
         for (category_index, (_, markers)) in CATEGORIES.iter().enumerate() {
-            if entries[category_index].len() < 6
+            if region.categories[category_index].is_none()
                 && markers.iter().any(|marker| lower.contains(marker))
             {
-                let bounded: String = rendered.chars().take(360).collect();
-                entries[category_index].push((path.clone(), bounded));
+                region.categories[category_index] = Some(bounded.clone());
             }
         }
     }
+    flush_region(&mut regions, &mut current_region);
+
     let mut out = String::new();
-    for ((category, _), category_entries) in CATEGORIES.iter().zip(entries) {
-        let mut previous_path = None;
-        for (path, rendered) in category_entries {
-            if previous_path.as_deref() != Some(path.as_str()) {
-                out.push_str(&format!("### {path}\n@@ semantic {category} @@\n"));
-                previous_path = Some(path);
-            }
-            out.push_str(&rendered);
-            out.push('\n');
-        }
-    }
-    if out.is_empty()
-        && let Some((path, rendered)) = fallback
-    {
+    for region in regions {
         out.push_str(&format!(
-            "### {path}\n@@ semantic uncategorized @@\n{rendered}\n"
+            "### {}\n@@ semantic region: {} @@\n",
+            region.path, region.label
         ));
+        let mut emitted = BTreeSet::new();
+        for ((category, _), rendered) in CATEGORIES.iter().zip(region.categories) {
+            if let Some(rendered) = rendered
+                && emitted.insert(rendered.clone())
+            {
+                out.push_str(&format!("@@ semantic category={category} @@\n{rendered}\n"));
+            }
+        }
+        if emitted.is_empty()
+            && let Some(rendered) = region.fallback
+        {
+            out.push_str(&format!(
+                "@@ semantic category=uncategorized @@\n{rendered}\n"
+            ));
+        }
     }
     out
 }
@@ -1292,7 +1390,7 @@ fn review_batch_segments(annotated: &str, path: &str, line: u32) -> Vec<usize> {
     let mut matches = Vec::new();
     for rendered in annotated.lines() {
         if let Some(header) = rendered.strip_prefix("### ") {
-            current_path = Some(header.split(" (").next().unwrap_or(header).trim());
+            current_path = Some(prompt_header_path(header));
             segment = segment.saturating_add(1);
             continue;
         }
@@ -1378,7 +1476,8 @@ pub fn render_hunk_context(diff: &Diff, path: &str, line: u32, radius: u32) -> O
     let end = line.saturating_add(radius);
     let mut out = format!(
         "### {}\n@@ starting at line {} @@\n",
-        file.path, hunk.new_start
+        display_path(&file.path),
+        hunk.new_start
     );
     let mut line_no = hunk.new_start;
     for raw in &hunk.lines {
@@ -1475,8 +1574,8 @@ Binary files a/img.png and b/img.png differ
         assert!(text.contains("    12 + added twelve"));
         assert!(text.contains("       - removed"));
         assert!(text.contains("    13   line thirteen"));
-        assert!(text.contains("(deleted)"));
-        assert!(text.contains("(binary, not reviewable)"));
+        assert!(text.contains("@@ deleted @@"));
+        assert!(text.contains("@@ binary, not reviewable @@"));
     }
 
     #[test]
@@ -1523,6 +1622,41 @@ Binary files a/img.png and b/img.png differ
     }
 
     #[test]
+    fn prompt_path_spelling_is_reversible_and_groundable() {
+        let canonical = " src/tab\tline\rbreak\nquote\"slash\\日.rs ";
+        let displayed = display_path(canonical);
+        assert!(!displayed.contains('\t'));
+        assert!(!displayed.contains('\r'));
+        assert!(!displayed.contains('\n'));
+        assert_eq!(
+            canonical_prompt_path(&displayed).as_deref(),
+            Some(canonical)
+        );
+
+        let batch = format!("### {displayed}\n@@ region @@\n     7 + dangerous_sink(input);\n");
+        assert!(review_batch_contains_range(&batch, &displayed, 7, 7));
+    }
+
+    #[test]
+    fn semantic_digest_covers_every_region_not_only_early_keyword_hits() {
+        let mut batch = String::new();
+        for region in 1..=8 {
+            batch.push_str(&format!(
+                "### src/file_{region}.rs\n@@ region {region} @@\n{region:>6} + {}\n",
+                if region == 8 {
+                    "dangerous_sink(untrusted_input);"
+                } else {
+                    "validate_early_value();"
+                }
+            ));
+        }
+        let digest = semantic_digest(&batch);
+        assert!(digest.contains("src/file_8.rs"));
+        assert!(digest.contains("dangerous_sink(untrusted_input)"));
+        assert_eq!(digest.matches("@@ semantic region:").count(), 8);
+    }
+
+    #[test]
     fn unquoted_paths_with_spaces_and_renames_parse_both_operands() {
         let source = "diff --git a/old name.rs b/new name.rs\nsimilarity index 90%\n--- a/old name.rs\n+++ b/new name.rs\n@@ -1 +1 @@\n-old();\n+new();\n";
         let parsed = parse(source);
@@ -1560,6 +1694,35 @@ Binary files a/img.png and b/img.png differ
         assert!(prepare_diff(malformed, 4096).incomplete);
         let unsupported = "diff --git a/composer.lock b/composer.lock\n--- a/composer.lock\n+++ b/composer.lock\n@@ -1 +1 @@\n-old\n+new\n";
         assert!(prepare_diff(unsupported, 4096).incomplete);
+    }
+
+    #[test]
+    fn supported_lockfile_larger_than_source_budget_is_compacted_first() {
+        let padding = "x".repeat(MAX_RAW_DIFF_INPUT_BYTES + 1);
+        let source = format!(
+            "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1,3 +1,3 @@\n name = \"package-one\"\n-version = \"1.0.0\"\n+version = \"2.0.0\"\n checksum = \"{padding}\"\n"
+        );
+        let prepared = prepare_diff(&source, MAX_RAW_DIFF_INPUT_BYTES);
+        assert!(!prepared.incomplete);
+        assert_eq!(prepared.source.as_deref(), Some(""));
+        assert_eq!(prepared.lockfiles[0].changes.len(), 2);
+    }
+
+    #[test]
+    fn yarn_berry_and_package_lock_v1_have_directional_evidence() {
+        let yarn = "diff --git a/yarn.lock b/yarn.lock\n--- a/yarn.lock\n+++ b/yarn.lock\n@@ -1,2 +1,2 @@\n \"@scope/pkg@npm:^1.0.0\":\n-  version: 1.0.0\n+  version: 1.1.0\n";
+        let yarn = prepare_diff(yarn, 4096);
+        assert_eq!(
+            yarn.lockfiles[0].changes,
+            ["removed @scope/pkg@1.0.0", "added @scope/pkg@1.1.0"]
+        );
+
+        let npm = "diff --git a/package-lock.json b/package-lock.json\n--- a/package-lock.json\n+++ b/package-lock.json\n@@ -1,3 +1,3 @@\n \"left-pad\": {\n-  \"version\": \"1.0.0\"\n+  \"version\": \"1.1.0\"\n";
+        let npm = prepare_diff(npm, 4096);
+        assert_eq!(
+            npm.lockfiles[0].changes,
+            ["removed left-pad@1.0.0", "added left-pad@1.1.0"]
+        );
     }
 
     #[test]

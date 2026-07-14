@@ -24,9 +24,10 @@ use std::collections::HashMap;
 const MAX_REVIEW_BATCH_BYTES: usize = 120_000;
 const MAX_SOURCE_BATCHES: usize = 8;
 const MAX_REVIEW_REQUESTS: usize = MAX_SOURCE_BATCHES + 1;
-const MAX_REVIEW_PROJECTED_INPUT_BYTES: usize = 1_100_000;
-const MAX_REVIEW_PROJECTED_INPUT_TOKENS: usize = 300_000;
+const MAX_REVIEW_PROJECTED_INPUT_TOKENS: usize = 1_000_000;
 const MAX_REVIEW_MANIFEST_BYTES: usize = 24_000;
+const MAX_MODELS_PER_REQUEST: usize = 3;
+const MAX_SCORER_INPUT_TOKENS: usize = 64_000;
 const HOSTED_WORKER_WATCHDOG_SECS: u64 = 600;
 pub(crate) const HOSTED_LLM_TOTAL_TIMEOUT_SECS: u64 = 540;
 /// Hosted reviews get a 240s primary attempt plus one timeout retry capped at
@@ -39,6 +40,20 @@ const CHECK_START_TIMEOUT_SECS: u64 = 30;
 const CHECK_COMPLETION_TIMEOUT_SECS: u64 = 30;
 const REVIEW_POST_TIMEOUT_SECS: u64 = 20;
 pub(crate) const SCORER_TIMEOUT_SECS: u64 = 120;
+
+fn conservative_context_tokens(model: &str) -> usize {
+    let model = model.to_ascii_lowercase();
+    if ["gpt-5", "gemma-3", "qwen3", "deepseek-v4", "mistral-small"]
+        .iter()
+        .any(|known| model.contains(known))
+    {
+        128_000
+    } else {
+        // Unknown BYOK endpoints get a conservative floor rather than an
+        // optimistic provider-specific assumption.
+        32_000
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForgeKind {
@@ -457,45 +472,48 @@ fn load_baseline(args: &ReviewArgs) -> Result<Vec<Finding>> {
 }
 
 /// Core engine: diff text in, envelope out. No forge I/O.
-/// Generate stable IDs for findings based on (head_sha, kind, normalized_path, normalized_line, normalized_title, duplicate_index).
+/// Generate stable IDs. Source findings are scoped to the reviewed head;
+/// change-metadata findings use their exact semantic content so an unrelated
+/// metadata entry reusing the same synthetic line cannot supersede them.
 fn generate_finding_ids(findings: &mut [Finding], head_sha: Option<&str>) {
-    if head_sha.is_none() {
-        return;
-    }
-
-    let head_sha = head_sha.unwrap();
     let mut id_map: HashMap<String, usize> = HashMap::new();
 
     for finding in findings.iter_mut() {
+        if finding.id.is_some() {
+            continue;
+        }
         // Normalize the finding data
         let normalized_path = finding.path.to_lowercase();
         let normalized_line = finding.line.to_string();
         let normalized_title = finding.title.trim().to_lowercase();
+        let identity = if finding.path == crate::envelope::CHANGE_METADATA_PATH {
+            format!(
+                "change-metadata\x00{}\x00{}\x00{}\x00{}",
+                finding.kind.as_str(),
+                finding.severity.as_str(),
+                normalized_title,
+                visible_body(&finding.body).trim()
+            )
+        } else {
+            let Some(head_sha) = head_sha else { continue };
+            format!(
+                "{head_sha}\x00{}\x00{}\x00{}\x00{}",
+                finding.kind.as_str(),
+                normalized_path,
+                normalized_line,
+                normalized_title
+            )
+        };
 
         // Create a pre-hash key to track duplicates.
-        let prehash_key = format!(
-            "{}\x00{}\x00{}\x00{}\x00{}",
-            head_sha,
-            finding.kind.as_str(),
-            normalized_path,
-            normalized_line,
-            normalized_title
-        );
+        let prehash_key = identity.clone();
         let duplicate_index = id_map
             .entry(prehash_key)
             .and_modify(|count| *count += 1)
             .or_insert(0);
 
         // Build the hash input
-        let hash_input = format!(
-            "{}\x00{}\x00{}\x00{}\x00{}\x00{}",
-            head_sha,
-            finding.kind.as_str(),
-            normalized_path,
-            normalized_line,
-            normalized_title,
-            duplicate_index
-        );
+        let hash_input = format!("{identity}\x00{duplicate_index}");
 
         // Generate SHA256 hash
         let mut hasher = Sha256::new();
@@ -668,7 +686,26 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
         || !prepared.lockfiles.is_empty()
         || pr_desc_lines > 0
     {
-        let mut plan = if prepared.incomplete {
+        let system = prompt::system_prompt(cfg);
+        let chain = cfg.model_chain();
+        let active_model_count = if cfg.consensus > 1 {
+            cfg.consensus.min(chain.len())
+        } else {
+            chain.len()
+        };
+        let context_tokens = chain
+            .iter()
+            .take(active_model_count)
+            .map(|model| conservative_context_tokens(model))
+            .min()
+            .unwrap_or(32_000);
+        let shared_context_tokens =
+            system.len() + meta.map_or(0, |value| value.title.len() + value.body.len()) + 4096;
+        let batch_budget = context_tokens
+            .saturating_sub(crate::llm::REVIEW_MAX_TOKENS as usize)
+            .saturating_sub(shared_context_tokens)
+            .min(MAX_REVIEW_BATCH_BYTES);
+        let mut plan = if prepared.incomplete || batch_budget < 4_096 {
             diff::ReviewBatchPlan {
                 incomplete: true,
                 ..Default::default()
@@ -677,31 +714,49 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
             diff::render_review_batches(
                 &parsed,
                 &prepared.lockfiles,
-                MAX_REVIEW_BATCH_BYTES,
+                batch_budget,
                 MAX_SOURCE_BATCHES,
-                MAX_REVIEW_MANIFEST_BYTES,
+                MAX_REVIEW_MANIFEST_BYTES.min(batch_budget / 3),
             )
         };
         index.add_change_metadata(plan.metadata_count);
         if plan.batches.is_empty() && (force_model || pr_desc_lines > 0) {
             plan.batches.push(String::new());
         }
-        let system = prompt::system_prompt(cfg);
         let request_count = plan.batches.len() + usize::from(plan.synthesis.is_some());
-        let shared_context_bytes =
-            system.len() + meta.map_or(0, |value| value.title.len() + value.body.len()) + 4096;
         let projected_input_bytes = plan
             .projected_input_bytes
-            .saturating_add(shared_context_bytes.saturating_mul(request_count));
-        let projected_input_tokens = projected_input_bytes.saturating_add(3) / 4;
+            .saturating_add(shared_context_tokens.saturating_mul(request_count));
+        // One UTF-8 byte per token is deliberately pessimistic across BPE
+        // tokenizers and avoids the unsafe bytes/4 approximation.
+        let projected_input_tokens = projected_input_bytes;
+        let attempts_per_request =
+            active_model_count.saturating_mul((crate::llm::TRANSIENT_RETRIES as usize + 1) * 2);
+        let scorer_attempts = usize::from(cfg.scorer_enabled())
+            .saturating_mul(MAX_MODELS_PER_REQUEST)
+            .saturating_mul((crate::llm::TRANSIENT_RETRIES as usize + 1) * 2);
+        let projected_attempts = request_count
+            .saturating_mul(attempts_per_request)
+            .saturating_add(scorer_attempts);
+        let review_exposure = projected_input_tokens
+            .saturating_add(request_count.saturating_mul(crate::llm::REVIEW_MAX_TOKENS as usize))
+            .saturating_mul(attempts_per_request);
+        let scorer_exposure =
+            scorer_attempts.saturating_mul(MAX_SCORER_INPUT_TOKENS.saturating_add(4_096));
+        let projected_token_exposure = review_exposure.saturating_add(scorer_exposure);
         let budget_exhausted = plan.incomplete
             || request_count > MAX_REVIEW_REQUESTS
-            || projected_input_bytes > MAX_REVIEW_PROJECTED_INPUT_BYTES
-            || projected_input_tokens > MAX_REVIEW_PROJECTED_INPUT_TOKENS;
+            || active_model_count == 0
+            || active_model_count > MAX_MODELS_PER_REQUEST
+            || projected_input_tokens > MAX_REVIEW_PROJECTED_INPUT_TOKENS
+            || projected_attempts > crate::llm::MAX_PROVIDER_ATTEMPTS
+            || projected_token_exposure > crate::llm::MAX_REPORTED_TOKEN_SPEND;
 
         if budget_exhausted {
             eprintln!(
-                "postil: review incomplete before model calls (requests {request_count}/{MAX_REVIEW_REQUESTS}, projected input {projected_input_bytes} bytes and {projected_input_tokens} tokens)"
+                "postil: review incomplete before model calls (requests {request_count}/{MAX_REVIEW_REQUESTS}, models {active_model_count}/{MAX_MODELS_PER_REQUEST}, projected input <= {projected_input_tokens} tokens, attempts {projected_attempts}/{}, token exposure {projected_token_exposure}/{})",
+                crate::llm::MAX_PROVIDER_ATTEMPTS,
+                crate::llm::MAX_REPORTED_TOKEN_SPEND,
             );
             model_used = "none (review budget exhausted)".to_string();
             findings = vec![crate::envelope::incomplete_review_finding()];
@@ -803,6 +858,10 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                                 && finding.kind == crate::envelope::Kind::ContentPolicy
                                 && index.contains_content_policy(&finding.path, finding.line))
                         });
+                        for finding in &mut model_review.findings {
+                            finding.path = diff::canonical_prompt_path(&finding.path)
+                                .expect("grounded prompt paths are reversible");
+                        }
                         batch_ungrounded += (before - model_review.findings.len()) as u32;
                         raw_findings.extend(model_review.findings);
                     }
@@ -889,53 +948,67 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                         let inputs = scorer_inputs(&parsed, &plan.batches, &kept);
                         let scorer_system = prompt::scorer_system_prompt(cfg);
                         let scorer_user = prompt::scorer_user_prompt(&inputs);
-                        let scored = tokio::time::timeout(
-                            std::time::Duration::from_secs(SCORER_TIMEOUT_SECS),
-                            client.score_findings(cfg, &scorer_system, &scorer_user, inputs.len()),
-                        )
-                        .await;
-                        match scored {
-                            Ok(Ok(scored)) => {
-                                let disagreements =
-                                    apply_scorer_scores(cfg, &mut kept, scored.scores);
-                                let scorer_suppressed =
-                                    suppress_below_min_confidence(cfg, &mut kept);
-                                suppressed += scorer_suppressed.len() as u32;
-                                suppressed_findings.extend(scorer_suppressed);
-                                scorer_model = Some(scored.model_used);
-                                usage.prompt_tokens += scored.usage.prompt_tokens;
-                                usage.completion_tokens += scored.usage.completion_tokens;
-                                model_usage.extend(scored.model_usage);
-                                model_incidents.extend(scored.model_incidents);
-                                usage_accounting_complete &= scored.usage_accounting_complete;
-                                scorer_disagreements = Some(disagreements);
-                                sort_findings_for_display(&mut kept);
-                            }
-                            Ok(Err(e)) => {
-                                let detail = format!("{e:#}");
-                                eprintln!(
-                                    "postil: scorer failed open after all scorer models failed"
-                                );
-                                let scorer_usage = e.usage();
-                                usage.prompt_tokens += scorer_usage.prompt_tokens;
-                                usage.completion_tokens += scorer_usage.completion_tokens;
-                                model_usage.extend_from_slice(e.model_usage());
-                                model_incidents.extend_from_slice(e.model_incidents());
-                                usage_accounting_complete &= e.usage_accounting_complete();
-                                scorer_error = Some(detail);
-                            }
-                            Err(_) => {
-                                usage_accounting_complete = false;
-                                let detail =
-                                    format!("scorer timed out after {SCORER_TIMEOUT_SECS}s");
-                                eprintln!("postil: scorer failed open: {detail}");
-                                scorer_error = Some(detail);
-                                model_incidents.push(crate::envelope::ModelIncident {
-                                    phase: crate::envelope::ModelIncidentPhase::Scorer,
-                                    category: crate::envelope::ModelIncidentCategory::Timeout,
-                                    recovered: false,
-                                    recovery: None,
-                                });
+                        if scorer_system.len().saturating_add(scorer_user.len())
+                            > MAX_SCORER_INPUT_TOKENS
+                        {
+                            scorer_error = Some(
+                                "scorer skipped because its bounded input budget was exceeded"
+                                    .to_string(),
+                            );
+                        } else {
+                            let scored = tokio::time::timeout(
+                                std::time::Duration::from_secs(SCORER_TIMEOUT_SECS),
+                                client.score_findings(
+                                    cfg,
+                                    &scorer_system,
+                                    &scorer_user,
+                                    inputs.len(),
+                                ),
+                            )
+                            .await;
+                            match scored {
+                                Ok(Ok(scored)) => {
+                                    let disagreements =
+                                        apply_scorer_scores(cfg, &mut kept, scored.scores);
+                                    let scorer_suppressed =
+                                        suppress_below_min_confidence(cfg, &mut kept);
+                                    suppressed += scorer_suppressed.len() as u32;
+                                    suppressed_findings.extend(scorer_suppressed);
+                                    scorer_model = Some(scored.model_used);
+                                    usage.prompt_tokens += scored.usage.prompt_tokens;
+                                    usage.completion_tokens += scored.usage.completion_tokens;
+                                    model_usage.extend(scored.model_usage);
+                                    model_incidents.extend(scored.model_incidents);
+                                    usage_accounting_complete &= scored.usage_accounting_complete;
+                                    scorer_disagreements = Some(disagreements);
+                                    sort_findings_for_display(&mut kept);
+                                }
+                                Ok(Err(e)) => {
+                                    let detail = format!("{e:#}");
+                                    eprintln!(
+                                        "postil: scorer failed open after all scorer models failed"
+                                    );
+                                    let scorer_usage = e.usage();
+                                    usage.prompt_tokens += scorer_usage.prompt_tokens;
+                                    usage.completion_tokens += scorer_usage.completion_tokens;
+                                    model_usage.extend_from_slice(e.model_usage());
+                                    model_incidents.extend_from_slice(e.model_incidents());
+                                    usage_accounting_complete &= e.usage_accounting_complete();
+                                    scorer_error = Some(detail);
+                                }
+                                Err(_) => {
+                                    usage_accounting_complete = false;
+                                    let detail =
+                                        format!("scorer timed out after {SCORER_TIMEOUT_SECS}s");
+                                    eprintln!("postil: scorer failed open: {detail}");
+                                    scorer_error = Some(detail);
+                                    model_incidents.push(crate::envelope::ModelIncident {
+                                        phase: crate::envelope::ModelIncidentPhase::Scorer,
+                                        category: crate::envelope::ModelIncidentCategory::Timeout,
+                                        recovered: false,
+                                        recovery: None,
+                                    });
+                                }
                             }
                         }
                     }
@@ -944,6 +1017,10 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
             }
         }
     }
+
+    // Fresh metadata IDs must exist before reconciliation: synthetic line
+    // numbers are presentation positions, not issue identity.
+    generate_finding_ids(&mut findings, head_sha.as_deref());
 
     // Reconcile against the previous review (incremental or full re-review).
     // Skip entirely when review is disabled: a repo that set `enabled: false`

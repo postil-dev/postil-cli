@@ -5,10 +5,11 @@
 //! Native Anthropic endpoints use `POST {base}/messages` when explicitly selected.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use serde_json::json;
@@ -223,6 +224,8 @@ pub struct LlmClient {
     timeout_retry_timeout: Duration,
     review_deadline: Option<Instant>,
     total_deadline: Option<Instant>,
+    provider_attempts: Arc<AtomicUsize>,
+    reported_token_spend: Arc<AtomicUsize>,
 }
 
 #[derive(Clone)]
@@ -238,7 +241,7 @@ struct LlmTimeouts {
 }
 
 /// Retries per model on transient provider errors before the cascade moves on.
-const TRANSIENT_RETRIES: u32 = 2;
+pub(crate) const TRANSIENT_RETRIES: u32 = 2;
 /// A fresh request can recover when the caller's request timeout, rather than
 /// the provider's response, ended an otherwise viable routed completion. The
 /// shared total deadline remains authoritative, so this cannot extend a hosted
@@ -253,7 +256,10 @@ const PROVIDER_RETRY_DELAY_CAP_SECS: u64 = 30;
 /// up to roughly 12k output tokens) do not truncate. A truncated response goes
 /// through JSON repair and can salvage low-quality findings. Interactive answers
 /// use the separate bounded response limit below.
-const REVIEW_MAX_TOKENS: u32 = 16384;
+pub(crate) const REVIEW_MAX_TOKENS: u32 = 4096;
+pub(crate) const MAX_PROVIDER_ATTEMPTS: usize = 216;
+pub(crate) const MAX_REPORTED_TOKEN_SPEND: usize = 20_000_000;
+const MAX_MODEL_RESPONSE_BYTES: usize = 512 * 1024;
 const SCORER_MAX_TOKENS: u32 = 4096;
 const SCORER_REASON_MAX_CHARS: usize = 240;
 const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 4096;
@@ -459,6 +465,8 @@ impl LlmClient {
             timeout_retry_timeout: request_timeout.min(Duration::from_secs(TIMEOUT_RETRY_CAP_SECS)),
             review_deadline,
             total_deadline,
+            provider_attempts: Arc::new(AtomicUsize::new(0)),
+            reported_token_spend: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -1244,6 +1252,20 @@ impl LlmClient {
                         is_canonical_openrouter_base(&self.api_base),
                     );
                     let elapsed = elapsed_text(attempt_started_at.elapsed());
+                    if let Some(response_usage) = summary.usage {
+                        let response_tokens = response_usage
+                            .prompt_tokens
+                            .saturating_add(response_usage.completion_tokens)
+                            as usize;
+                        let previous = self
+                            .reported_token_spend
+                            .fetch_add(response_tokens, Ordering::Relaxed);
+                        if previous.saturating_add(response_tokens) > MAX_REPORTED_TOKEN_SPEND {
+                            return Err(anyhow!(
+                                "model token spend exceeded the {MAX_REPORTED_TOKEN_SPEND} token hard cap"
+                            ));
+                        }
+                    }
                     if response.status.is_success() {
                         eprintln!(
                             "postil: llm response phase={} model={} attempt={} status={} elapsed={} bytes={} request_id={} response_id={} returned_model={} provider={} choices={} finish={} usage={} prompt_tokens={} completion_tokens={} category={}",
@@ -1526,6 +1548,11 @@ impl LlmClient {
     }
 
     async fn request_once(&self, body: &serde_json::Value) -> Result<ModelHttpResponse> {
+        let attempt = self.provider_attempts.fetch_add(1, Ordering::Relaxed);
+        ensure!(
+            attempt < MAX_PROVIDER_ATTEMPTS,
+            "model provider attempt hard cap ({MAX_PROVIDER_ATTEMPTS}) exceeded"
+        );
         let http = self.http_client()?;
         let mut request = match self.api_format {
             ApiFormat::OpenaiCompatible => {
@@ -1549,11 +1576,19 @@ impl LlmClient {
         if canonical_openrouter {
             request = request.header("X-OpenRouter-Experimental-Metadata", "enabled");
         }
-        let response = request.json(body).send().await?;
+        let mut response = request.json(body).send().await?;
         let status = response.status();
         let retry_after = retry_after_duration(response.headers());
         let request_id = safe_request_id(response.headers(), canonical_openrouter);
-        let text = response.text().await?;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            ensure!(
+                bytes.len().saturating_add(chunk.len()) <= MAX_MODEL_RESPONSE_BYTES,
+                "model response exceeded the {MAX_MODEL_RESPONSE_BYTES} byte hard cap"
+            );
+            bytes.extend_from_slice(&chunk);
+        }
+        let text = String::from_utf8(bytes).context("model endpoint returned non-UTF-8 body")?;
         Ok(ModelHttpResponse {
             status,
             text,

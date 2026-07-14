@@ -17,6 +17,19 @@ pub async fn bounded_response_text(
     mut response: reqwest::Response,
     context: &str,
 ) -> Result<String> {
+    bounded_response_text_with_limit(
+        &mut response,
+        context,
+        crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES,
+    )
+    .await
+}
+
+pub async fn bounded_response_text_with_limit(
+    response: &mut reqwest::Response,
+    context: &str,
+    limit: usize,
+) -> Result<String> {
     ensure!(
         response.status() != reqwest::StatusCode::PARTIAL_CONTENT,
         "{context} returned partial content"
@@ -33,9 +46,9 @@ pub async fn bounded_response_text(
     }
     if let Some(length) = response.content_length() {
         ensure!(
-            length <= crate::diff::MAX_RAW_DIFF_INPUT_BYTES as u64,
+            length <= limit as u64,
             "{context} exceeds the {} byte acquisition limit",
-            crate::diff::MAX_RAW_DIFF_INPUT_BYTES
+            limit
         );
     }
     let mut bytes = Vec::new();
@@ -45,9 +58,9 @@ pub async fn bounded_response_text(
         .with_context(|| format!("reading {context}"))?
     {
         ensure!(
-            bytes.len().saturating_add(chunk.len()) <= crate::diff::MAX_RAW_DIFF_INPUT_BYTES,
+            bytes.len().saturating_add(chunk.len()) <= limit,
             "{context} exceeds the {} byte acquisition limit",
-            crate::diff::MAX_RAW_DIFF_INPUT_BYTES
+            limit
         );
         bytes.extend_from_slice(&chunk);
     }
