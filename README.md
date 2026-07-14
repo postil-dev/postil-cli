@@ -1,328 +1,81 @@
-# postil
+# Postil CLI
 
-Low-noise AI review gate. Silent on clean changes, hard gate on real risk.
+Postil is a quiet AI code review gate. It reports merge-relevant bugs, security issues, breaking changes, concurrency hazards, and explicit policy violations. Clean changes produce no review comment.
 
-Postil reviews diffs for merge-relevant findings only: bugs, security issues, breaking
-changes, concurrency hazards, and decisions that need an accountable human. It does not
-comment on style, naming, formatting, or anything a linter would catch. On a clean PR it
-posts nothing at all — the check-run completes and that is the whole interaction.
-
-One binary runs everywhere: locally before you push, in CI, and behind the hosted
-platform at [postil.dev](https://postil.dev).
-
-## Doctrine
-
-- Review by default, trust by evidence. Every finding must cite a line in the diff;
-  uncited findings are discarded as ungrounded.
-- Silence is a feature. Comment only when the comment can affect the merge decision.
-- Fail closed. If the model's output cannot be validated, that is an `error` finding at
-  `.postil/model-output:1`, not a pass.
-- Block on what matters, advise on the rest. Two separate checks: `postil/review`
-  (advisory, never blocks) and `postil/gate` (fails at/above `gate.failOn`, default
-  `error`) — mark only the gate as required in branch protection.
-- Bring your own key. Postil talks to any OpenAI-compatible endpoint (OpenRouter by
-  default; Ollama, vLLM, SGLang, Azure OpenAI, LiteLLM all work) and never proxies or
-  marks up your inference.
+One binary reviews local changes, pull requests, and merge requests. It supports OpenAI-compatible model endpoints and the native Anthropic Messages API.
 
 ## Install
 
 ```sh
-# Verified prebuilt binary (SHA-256 checksum; Sigstore keyless signature when
-# cosign is installed), installs to ~/.local/bin:
 curl -fsSL https://postil.dev/install.sh | sh
+```
 
-# Or build from source:
+The installer verifies the release checksum and, when `cosign` is available, its Sigstore signature. You can also build from source:
+
+```sh
 cargo install --git https://github.com/postil-dev/postil-cli --locked
 ```
 
-Prebuilt binaries are available for Linux (x86_64 and aarch64), macOS (Intel and Apple Silicon), and glibc and musl libc variants. The installer script automatically detects your system and platform and downloads the appropriate binary. For Alpine Linux and other musl-libc systems, the installer provides statically linked musl binaries.
+Release binaries cover Linux x86_64 and ARM64 with glibc or musl, plus macOS on Intel and Apple Silicon.
 
-## Quick start
-
-```sh
-export MODEL_API_KEY=...        # or LLM_API_KEY / OPENROUTER_API_KEY
-
-postil doctor                   # checks endpoint reachability, key acceptance, and repo setup
-postil review --staged          # review what you are about to commit
-postil review --base origin/main
-```
-
-In GitHub Actions, use [postil-action](https://github.com/postil-dev/postil-action), or
-run the binary directly:
+## Review before pushing
 
 ```sh
-postil review --repo owner/name --pr 123   # posts inline comments + both check-runs
+export MODEL_API_KEY=...                 # OpenRouter is the default endpoint
+export REVIEW_MODEL=provider/qualified-model
+postil doctor                            # validate the endpoint and repository
+postil review --staged                   # review the staged change
+postil review --base origin/main         # review the branch
+postil review --bounded --base origin/main # cap large reviews at five source batches
+postil hook install                      # add a pre-push review
 ```
 
-Other forges (each covering its self-managed/server variant via a base-URL env var):
+`postil review` exits `0` when the gate passes, `1` when it fails, and `2` when it cannot produce a review envelope.
+
+## Review a pull request
 
 ```sh
-# GitLab (gitlab.com or self-managed)
-export GITLAB_TOKEN=... GITLAB_API_URL=https://gitlab.example.com/api/v4
-postil review --forge gitlab --repo group/project --pr 42
-
-# Bitbucket (Cloud, or Data Center via BITBUCKET_API_URL)
-export BITBUCKET_TOKEN=...            # set BITBUCKET_USER too to use an app password
-postil review --forge bitbucket --repo workspace/repo --pr 7
-
-# Azure DevOps Services (or Server via AZURE_DEVOPS_API_URL)
-export AZURE_DEVOPS_TOKEN=...         # a PAT
-postil review --forge azure --repo organization/project/repository --pr 7
+export GITHUB_TOKEN=...
+postil review --repo owner/repository --pr 123
 ```
 
-## SARIF output
+The CLI publishes inline findings and separate `postil/review` and `postil/gate` checks. Mark only `postil/gate` as required in branch protection.
 
-`--sarif <path>` writes SARIF 2.1.0 alongside the review for code-scanning ingestion
-(GitHub code scanning, GitLab SAST, any SARIF viewer):
-
-```sh
-postil review --repo owner/name --pr 123 --sarif postil.sarif
-```
-
-## Interactive bot
-
-Mention `@postil` in a pull-request or issue comment, reply to one of its review
-comments, or open an issue that mentions it, and the hosted bot replies. Postil reviews
-and answers only — it never opens PRs or pushes commits. The same engine is a CLI
-command:
-
-```sh
-postil respond --repo owner/name --pr 123 --comment "@postil is this safe?"
-postil respond --repo owner/name --issue 45 --comment "@postil what's the likely cause?"
-# Automation should pass the text via env instead (argv is visible in `ps`):
-POSTIL_COMMENT="@postil is this safe?" postil respond --repo owner/name --pr 123
-```
-
-## Repo guardrails
-
-Drop repo-specific merge rules in `.postil/guardrails.md` and Postil injects them into
-the prompt; a change that violates one is reported as a `guardrail` finding that quotes
-the rule it breaks.
-
-## Content policy
-
-On by default. It reviews human-readable prose in the diff, including Markdown, code
-comments, docstrings, user-facing/log strings, and the PR title/description, never code
-logic or identifiers. It checks for fabricated or contradicted documentation claims,
-self-contradictions the same PR creates, authoring-process narration and AI-authorship
-residue, leaked conversation/transcript text, and (lower severity) stale temporal/TODO
-residue and house style. Violations are reported as `contentPolicy` findings that name
-the rule broken.
-
-The built-in baseline reports fabricated or contradicted claims and conversation leaks
-at `error`, self-contradictions and authorship residue at `warn`, and stale/style residue
-at `info`. With the default `gate.failOn: error`, genuine violations of either error rule
-fail the gate. Repo-specific rules in `.postil/content-policy.md` are appended to the
-baseline, not a replacement for it. Set `contentPolicy.enabled: false` in `.postil.yaml`
-to fully disable both the baseline and repo-specific additions.
+For GitHub Actions, use [`postil-action`](https://github.com/postil-dev/postil-action). Hosted GitHub reviews are available at [postil.dev/install](https://postil.dev/install).
 
 ## Configuration
 
-`postil init` writes a starter `.postil.yaml`. Precedence: flags > environment >
-`.postil.{yaml,yml,json}` > `.coderabbit.yaml` (translated) > defaults. Unknown keys are
-rejected so typos fail loudly.
+`postil init` writes `.postil.yaml`. Flags override environment variables, which override repository configuration and defaults.
 
 ```yaml
 ignore:
   - "**/dist/**"
-severityThreshold: info   # suppress below: info | warn | error
-minConfidence: 0.6        # suppress findings the model is not confident about
+severityThreshold: info
+minConfidence: 0.6
 maxFindings: 20
 reviewer:
-  tone: "concise, dry, lightly sardonic, never hostile; no praise or filler"
+  tone: "direct, specific, no praise, no filler"
   focus: [security, concurrency]
-review:
-  onClean: skip           # stay silent on clean PRs (default)
 gate:
-  failOn: error           # info | warn | error | never
-  blockOnKinds:           # kind blocks regardless of severity at confidence >= 0.30
-    - humanEscalation     # default: only irreducible owner/product decisions
-  onError: block          # block (fail closed, default) | advisory (fail open on
-                          # provider outage only; unusable model output still blocks)
-# Content policy uses the built-in baseline by default and extends it with
-# .postil/content-policy.md. Uncomment to fully opt out:
-# contentPolicy:
-#   enabled: false
-model:
-  name: mistralai/mistral-small-3.2-24b-instruct
-  cascade:
-    - google/gemma-3-27b-it
-    - qwen/qwen3-32b
-  apiBase: https://openrouter.ai/api/v1    # ignored from config by default; see note below
-  apiFormat: openai-compatible             # or anthropic for the native Messages API
-  consensus: 1            # >1: only findings multiple models agree on survive
+  failOn: error
+  onError: block
 ```
 
-`humanEscalation` is kind-blocking by default. It is reserved for a genuine choice
-between multiple valid product or policy outcomes. Concrete defects remain `risk`
-findings and should be fixed. An admin override is appropriate only for the genuine
-kind-only decision, not as a way to dismiss an ordinary bug.
+Unknown keys are rejected. Repository configuration cannot redirect a deployment credential to another API host unless the operator explicitly permits that behavior.
+The CLI has no implicit model roster. Review and scorer models must be selected explicitly from models qualified by the benchmark.
 
-`model.apiBase` in a config file is repo-controlled, and the resolved base URL
-receives the deployment's inference credential. To keep an untrusted repo from
-redirecting that credential, `apiBase` from `.postil.yaml` is ignored by default;
-set the base URL through the `POSTIL_API_BASE` environment variable instead. For a
-single-user local setup where the checked-out repo is trusted, set
-`POSTIL_ALLOW_CONFIG_API_BASE=1` to honor the config value.
+## Documentation
 
-Hosted workers set `POSTIL_HOSTED_MODE=1`. In that mode Postil ignores the
-repository's complete `model` section, including primary, cascade, scorer, API
-base, API format, and consensus. Trusted deployment environment values select
-the hosted roster after repository configuration is resolved. BYOK and local
-execution leave hosted mode unset, so explicit OpenAI-compatible and native
-Anthropic configuration remains available.
+| Guide | Covers |
+| --- | --- |
+| [Configuration](docs/configuration.md) | Policy, precedence, model selection, and environment variables |
+| [Model providers](docs/model-providers.md) | OpenAI-compatible, Anthropic, and local endpoints |
+| [Code forges](docs/forges.md) | GitHub, GitLab, Bitbucket, and Azure DevOps |
+| [Automation](docs/automation.md) | SARIF, incremental review, envelopes, planning, and interactive replies |
+| [Architecture](ARCHITECTURE.md) | Trust boundaries and review pipeline |
+| [Benchmarks](bench/README.md) | Model evaluation harness |
 
-Environment: `POSTIL_API_KEY`, `OPENROUTER_API_KEY`, `MODEL_API_KEY`, or
-`LLM_API_KEY`, `POSTIL_API_BASE`, `POSTIL_API_FORMAT` (`openai-compatible` by
-default, or `anthropic`), `POSTIL_ENDPOINT_AUTH_HEADER` and
-`POSTIL_ENDPOINT_AUTH_VALUE` (optional additional authentication for a private
-endpoint), `POSTIL_ALLOW_PRIVATE_API_BASE=1` (explicit opt-in for a local or
-private-network endpoint), `POSTIL_USAGE_RECEIPT_PATH` (optional worker-owned
-path for a successful `respond` usage receipt), `POSTIL_DETAILS_URL` (optional
-validated HTTP(S) run link for forge summaries and checks),
-`POSTIL_PREVENTION_HINT=1` and `POSTIL_PREVENTION_COMMANDS_JSON` (hosted coaching
-with a bounded JSON array of verified repository commands),
-`REVIEW_MODEL`, `REVIEW_MODEL_CASCADE`, `REVIEW_SCORER_MODEL`,
-`GITHUB_TOKEN`/`GITHUB_API_URL`,
-`GITLAB_TOKEN`/`GITLAB_API_URL`, `BITBUCKET_TOKEN`/`BITBUCKET_USER`/`BITBUCKET_API_URL`,
-`AZURE_DEVOPS_TOKEN`/`AZURE_DEVOPS_API_URL`.
-
-When `POSTIL_USAGE_RECEIPT_PATH` is set, `postil respond` creates that path with
-mode `0600` before provider access and writes JSON only after the reply succeeds.
-The version 1 receipt contains `operation: "respond"`, aggregate
-`promptTokens`/`completionTokens`, and a `models` array with token usage for each
-model that returned cost-relevant usage during cascade attempts. The receipt is
-synced before stdout or forge delivery, so a hosted worker can persist accounting
-before it posts an answer. `usageAccountingComplete` is false when a sent request
-can have unknown provider-billed usage, such as a timeout or ambiguous transport
-failure. The receipt is
-never written to stdout, stderr, or command arguments. The caller owns deletion.
-
-## Models and local inference
-
-See the measured benchmark results at [postil.dev/docs/models](https://postil.dev/docs/models),
-which are sourced from the published bench aggregate. Any model served through an
-OpenAI-compatible endpoint works. Native Anthropic Messages API endpoints also work:
-
-The embedded hosted chain remains `mistralai/mistral-small-3.2-24b-instruct` →
-`google/gemma-3-27b-it` → `qwen/qwen3-32b`. Generator candidates in the live
-benchmark workflow are evaluation inputs only; listing one does not change the
-embedded chain. The live generator command exits nonzero unless every candidate
-passes its isolated admission thresholds.
-
-```sh
-POSTIL_API_BASE=https://api.anthropic.com/v1 \
-POSTIL_API_FORMAT=anthropic \
-MODEL_API_KEY=... \
-REVIEW_MODEL=claude-sonnet-4-6 \
-postil doctor
-```
-
-OpenAI-compatible requests use `Authorization: Bearer`; Anthropic requests use
-`x-api-key` and `anthropic-version`. A private gateway can require an additional
-header through `POSTIL_ENDPOINT_AUTH_HEADER` and `POSTIL_ENDPOINT_AUTH_VALUE`.
-Postil rejects additional-header names that collide with `x-api-key`,
-`anthropic-version`, or `content-type`. OpenAI-compatible endpoints also reserve
-`Authorization` for the provider key; Anthropic endpoints may use an additional
-`Authorization` value alongside their provider-owned `x-api-key`. Postil never
-prints credential values. Provider requests do not follow redirects. Postil
-resolves the API hostname once, rejects non-public addresses, and pins the HTTP
-client to the accepted addresses while retaining hostname-based TLS checks.
-
-The embedded scorer is disabled until a non-Anthropic candidate passes the
-repeated qualification gate. The candidates are `openai/gpt-5.4-nano`,
-`google/gemini-3.5-flash`, and `stepfun/step-3.7-flash`; being listed does not
-enable or promote them. Set `model.scorer` or `REVIEW_SCORER_MODEL` explicitly
-to enable BYOK scoring. A native Anthropic endpoint accepts an explicit native
-Anthropic model while implicit OpenRouter scoring remains disabled.
-
-Local endpoints use the same OpenAI-compatible contract:
-
-```sh
-# Ollama
-ollama pull qwen3-coder:30b
-POSTIL_API_BASE=http://localhost:11434/v1 \
-POSTIL_ALLOW_PRIVATE_API_BASE=1 \
-MODEL_API_KEY=ollama \
-REVIEW_MODEL=qwen3-coder:30b \
-postil doctor
-
-# vLLM, SGLang, LiteLLM, or another local gateway
-POSTIL_API_BASE=http://localhost:8000/v1 \
-POSTIL_ALLOW_PRIVATE_API_BASE=1 \
-MODEL_API_KEY=local \
-REVIEW_MODEL=<served-model-name> \
-postil review --staged --output json
-```
-
-Hosted remote reviews use a 240-second initial request timeout with a single timeout retry capped at 90 seconds, reducing unnecessary fallback to weaker models when the primary model is slow but working. The entire review model phase is capped at 420 seconds, with the remaining 120 seconds of the 540-second total LLM budget reserved for scoring inside the worker watchdog. A timeout triggers one automatic retry at the same model level before cascading to the next model. Local reviews use a 480-second initial request timeout and the same timeout-retry rule, so a timed-out model can receive one additional attempt of up to 90 seconds. Local reviews do not have a total deadline unless `POSTIL_LLM_TOTAL_TIMEOUT_SECS` is set. Exhausting a review or total deadline is terminal.
-
-Use the live benchmark harness before standardizing on a model:
-
-```sh
-cargo build --quiet --release
-cd bench
-MODEL_API_KEY=... REVIEW_MODEL=mistralai/mistral-small-3.2-24b-instruct bun run bench:live -- --json
-```
-
-## Review before pushing
-
-Run the repository's focused tests and static checks, then review staged changes:
-
-```sh
-postil review --staged
-```
-
-`postil hook install` installs a pre-push hook in Git's resolved hooks directory. The
-hook reads the exact refs Git is about to push, skips deletions and tags, and reviews
-each outgoing branch diff. Installation declines repositories with a managed
-`core.hooksPath`; add the command to that existing hook chain instead.
-
-## Preview a config change before deploying it
-
-`postil plan` re-applies a candidate config to stored review envelopes and reports what
-would change — which findings would be suppressed and which gate outcomes would flip.
-Deterministic, no model calls.
-
-```sh
-postil review --staged --output json > .cache/envelopes/r1.json
-postil plan --envelopes .cache/envelopes --config .postil.candidate.yaml
-```
-
-## Incremental re-review
-
-Pass `--since-sha <last-reviewed-head>` and `--baseline <previous-envelope.json>` and
-Postil reviews only the new commits, marks earlier findings whose code was changed as
-resolved, and carries still-open findings forward so the gate cannot be cleared by
-pushing an unrelated commit.
-
-Bitbucket incremental reviews are disabled unless
-`POSTIL_ENABLE_BITBUCKET_INCREMENTAL=1` is set. Set it only after validating the
-`/diff/{head}..{since}` compare path against the target Bitbucket deployment.
-
-## The envelope
-
-`--output json` prints a stable versioned envelope (`summary`, `silent`, `findings`,
-`suppressedFindings`, `resolved`, `counts`, `confidenceBuckets`, `gate`, `modelUsed`,
-scorer metadata, aggregate `usage`, per-model `modelUsage`, `modelIncidents`, SHAs)
-consumed by the hosted platform
-and `postil plan`. `suppressedFindings` retains grounded findings hidden by ignore,
-severity, confidence, or finding-cap policy with a structured reason. It is omitted
-when empty so older v1 readers remain compatible. `modelUsage` includes the successful
-generator, scorers, and
-token-bearing failed fallbacks; its totals equal aggregate `usage`. Older v1
-envelopes omit this additive field. Failed attempts that report zero tokens are
-omitted because they carry no billable usage. `modelIncidents` records safe structured
-review/scorer failures and recovery by repair
-or fallback without provider detail or model output. Older v1 envelopes treat it as empty.
-The envelope's `usageAccountingComplete` has the same conservative semantics. `--output yaml` and
-`--output csv` print the same review result in YAML or CSV. `--output-file <path>`
-writes the selected format to a file instead of stdout. `--output-json` is deprecated
-in v0.2.1 as an alias for `--output json` and emits a stderr warning. Schema:
-[postil.dev/docs/envelope](https://postil.dev/docs/envelope).
-
-Exit codes: `0` clean or below gate threshold, `1` gate-failing findings, `2`
-operational error.
+The rendered product documentation is at [postil.dev/docs](https://postil.dev/docs).
 
 ## License
 

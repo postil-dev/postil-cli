@@ -2,6 +2,12 @@
 
 use crate::config::Config;
 
+/// Hard validator boundary for scorer assessment text.
+pub(crate) const SCORER_REASON_MAX_BYTES: usize = 240;
+/// Lower prompt target that leaves room for modest model overshoot.
+pub(crate) const SCORER_REASON_PROMPT_MAX_BYTES: usize = 180;
+const _: () = assert!(SCORER_REASON_PROMPT_MAX_BYTES < SCORER_REASON_MAX_BYTES);
+
 pub struct PrContext<'a> {
     pub repo: Option<&'a str>,
     pub title: Option<&'a str>,
@@ -39,7 +45,10 @@ pub fn review_contract(cfg: &Config) -> String {
          accountable owner can choose among them; guardrail = violates a stated repo rule; \
          uncertainty = you cannot verify something critical from the diff. Never classify \
          an ordinary bug as humanEscalation merely because it is uncertain or needs \
-         confirmation.\n\
+         confirmation. Classify the primary merge reason: a concrete code or security \
+         defect is risk even when changed prose also contradicts that defect. Use \
+         contentPolicy only when the prose violation itself is merge-relevant and no \
+         concrete code defect is established. Do not duplicate one issue under both kinds.\n\
          \n\
          Confidence is your honest probability the finding is real and merge-relevant. \
          Do not inflate it; low-confidence findings are suppressed and that is correct.\n\
@@ -56,8 +65,11 @@ pub fn review_contract(cfg: &Config) -> String {
          credential, (2) purge it from git history (the commit is permanent otherwise), \
          and (3) move it to an environment variable or secrets store.\n\
          \n\
-         Cite ONLY line numbers printed in the left margin of the diff (the new-file line \
-         numbers). Findings citing other lines are discarded as ungrounded.\n",
+         Cite ONLY line numbers printed in the left margin of the supplied evidence. For \
+         ordinary source, cite the new-file line. For deletion, binary, rename, mode, or \
+         compact lockfile evidence, cite the matching numbered line under \
+         `.postil/change-metadata`. Findings citing other lines are discarded as \
+         ungrounded.\n",
     );
     if !cfg.focus.is_empty() {
         p.push_str(&format!(
@@ -148,27 +160,27 @@ pub fn scorer_system_prompt(cfg: &Config) -> String {
          --- POSTIL REVIEW CONTRACT ---\n",
     );
     p.push_str(&review_contract(cfg));
-    p.push_str(
+    p.push_str(&format!(
         "--- END POSTIL REVIEW CONTRACT ---\n\
          \n\
          Return ONLY a JSON array, no markdown fences, no prose. The array MUST contain \
          exactly one object per supplied finding:\n\
-         [{\"index\": <number>, \"confidence\": <0..1>, \
+         [{{\"index\": <number>, \"confidence\": <0..1>, \
          \"kind\": \"risk|humanEscalation|guardrail|uncertainty|contentPolicy\", \
-         \"reason\": \"one complete sentence of at most 240 Unicode characters\"}]\n\
+         \"reason\": \"concise single-line text of at most {SCORER_REASON_PROMPT_MAX_BYTES} UTF-8 bytes\"}}]\n\
          \n\
          The `kind` value is a finding category. `info`, `warn`, and `error` are \
          severities and are NEVER valid kind values. An ordinary concrete defect is \
          `risk`, even when a focused test is needed to confirm it. Use \
          `humanEscalation` only when multiple valid outcomes remain and an accountable \
-         owner must choose among them. Every `reason` must be exactly one complete \
-         sentence, end with sentence punctuation, contain no line breaks, and contain \
-         at most 240 Unicode characters.\n\
+         owner must choose among them. Every `reason` must be concise single-line text, \
+         end with sentence punctuation, contain no line breaks, and contain \
+         at most {SCORER_REASON_PROMPT_MAX_BYTES} UTF-8 bytes.\n\
          \n\
          The input intentionally omits the generator's original confidence and kind. Do \
          not infer them from absence; score independently from the finding text and local \
          diff hunk.",
-    );
+    ));
     p
 }
 
@@ -306,7 +318,7 @@ pub fn user_prompt(ctx: &PrContext, annotated_diff: &str, max_findings: usize) -
     }
     p.push_str(&format!(
         "\nReport at most {max_findings} findings; if more exist, keep the most severe.\n\
-         \nDiff (left margin numbers are new-file line numbers — cite exactly these):\n\n"
+         \nReview evidence (cite exactly the numbered new-file or change-metadata lines):\n\n"
     ));
     p.push_str(annotated_diff);
     p
@@ -346,6 +358,18 @@ mod tests {
         assert!(p.contains("CONTENT POLICY"));
         assert!(p.contains("Never fabricate a claim"));
         assert!(p.contains("kind \"contentPolicy\""));
+        assert!(p.contains("Classify the primary merge reason"));
+        assert!(p.contains("concrete code or security defect is risk"));
+        assert!(p.contains("Do not duplicate one issue under both kinds"));
+    }
+
+    #[test]
+    fn scorer_prompt_targets_headroom_below_the_hard_reason_limit() {
+        let prompt = scorer_system_prompt(&Config::default());
+        assert!(prompt.contains(&format!(
+            "at most {SCORER_REASON_PROMPT_MAX_BYTES} UTF-8 bytes"
+        )));
+        assert!(!prompt.contains(&format!("at most {SCORER_REASON_MAX_BYTES} UTF-8 bytes")));
     }
 
     #[test]

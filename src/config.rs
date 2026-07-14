@@ -18,7 +18,77 @@ use sha2::{Digest, Sha256};
 use crate::envelope::{Kind, Severity};
 
 const MODEL_DEFAULTS_TOML: &str = include_str!("../config.toml");
+const QUALIFIED_MODELS_JSON: &str = include_str!("../qualified-models.json");
+const REVIEW_CONTRACT_SOURCES: &[(&str, &str)] = &[
+    ("Cargo.toml", include_str!("../Cargo.toml")),
+    ("Cargo.lock", include_str!("../Cargo.lock")),
+    ("src/api_key.rs", include_str!("api_key.rs")),
+    ("src/cli.rs", include_str!("cli.rs")),
+    ("src/config.rs", include_str!("config.rs")),
+    ("src/doctor.rs", include_str!("doctor.rs")),
+    ("src/forge/azure.rs", include_str!("forge/azure.rs")),
+    ("src/forge/bitbucket.rs", include_str!("forge/bitbucket.rs")),
+    ("src/forge/github.rs", include_str!("forge/github.rs")),
+    ("src/forge/gitlab.rs", include_str!("forge/gitlab.rs")),
+    ("src/forge/mod.rs", include_str!("forge/mod.rs")),
+    ("src/hook.rs", include_str!("hook.rs")),
+    ("src/lib.rs", include_str!("lib.rs")),
+    ("src/local.rs", include_str!("local.rs")),
+    ("src/main.rs", include_str!("main.rs")),
+    ("src/output.rs", include_str!("output.rs")),
+    ("src/plan.rs", include_str!("plan.rs")),
+    ("src/prompt.rs", include_str!("prompt.rs")),
+    ("src/llm.rs", include_str!("llm.rs")),
+    ("src/envelope.rs", include_str!("envelope.rs")),
+    ("src/respond.rs", include_str!("respond.rs")),
+    ("src/review.rs", include_str!("review.rs")),
+    ("src/sarif.rs", include_str!("sarif.rs")),
+    ("src/diff.rs", include_str!("diff.rs")),
+    ("src/filter.rs", include_str!("filter.rs")),
+];
+const BENCH_FIXTURES_SOURCE: &str = include_str!("../bench/fixtures/cases.ts");
+const BENCH_PACKAGE_JSON: &str = include_str!("../bench/package.json");
+const BENCH_BUN_LOCK: &str = include_str!("../bench/bun.lock");
+const EVALUATOR_CONTRACT_PATHS_JSON: &str =
+    include_str!("../bench/evaluator-contract-sources.json");
+const EVALUATOR_CONTRACT_SOURCES: &[(&str, &str)] = &[
+    (
+        "bench/admission-manifest-candidate-vector.json",
+        include_str!("../bench/admission-manifest-candidate-vector.json"),
+    ),
+    (
+        "bench/evaluator-contract-sources.json",
+        EVALUATOR_CONTRACT_PATHS_JSON,
+    ),
+    ("bench/package.json", BENCH_PACKAGE_JSON),
+    ("bench/bun.lock", BENCH_BUN_LOCK),
+    ("bench/fixtures/cases.ts", BENCH_FIXTURES_SOURCE),
+    (
+        "bench/src/api-key.ts",
+        include_str!("../bench/src/api-key.ts"),
+    ),
+    (
+        "bench/src/harness.ts",
+        include_str!("../bench/src/harness.ts"),
+    ),
+    (
+        "bench/src/livemodels-score.ts",
+        include_str!("../bench/src/livemodels-score.ts"),
+    ),
+    (
+        "bench/src/livemodels.ts",
+        include_str!("../bench/src/livemodels.ts"),
+    ),
+    ("bench/src/run.ts", include_str!("../bench/src/run.ts")),
+    (
+        "bench/src/verify-admission.ts",
+        include_str!("../bench/src/verify-admission.ts"),
+    ),
+];
 pub const DEFAULT_API_BASE: &str = "https://openrouter.ai/api/v1";
+pub const MANAGED_OPENROUTER_API_BASE: &str = "https://openrouter.ai:443/api/v1";
+pub const MANAGED_OPENROUTER_PROVIDER_IDENTITY: &str = "openrouter:managed-routing";
+pub const MAX_FINDINGS: usize = 20;
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -51,11 +121,95 @@ pub struct ModelDefaults {
     pub source_sha256: String,
     pub default_model: String,
     pub cascade: Vec<String>,
+    pub consensus: usize,
+    pub api_base: String,
+    pub api_format: ApiFormat,
     pub scorer_enabled: bool,
     pub scorer_model: String,
     pub scorer_fallback: String,
     pub scorer_qualification_candidates: Vec<String>,
 }
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct QualificationManifest {
+    pub version: u64,
+    pub qualification_source_sha: Option<String>,
+    pub qualification_issued_at_unix_seconds: Option<u64>,
+    pub qualification_expires_at_unix_seconds: Option<u64>,
+    pub qualification_max_age_days: Option<u32>,
+    pub model_defaults_sha256: String,
+    pub profiles: Vec<QualificationProfile>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct QualificationProfile {
+    pub id: String,
+    pub qualification_source_sha: String,
+    pub model_defaults_sha256: String,
+    pub api_format: ApiFormat,
+    pub api_base: String,
+    #[serde(default)]
+    pub benchmark_provider_identity: Option<String>,
+    pub generator_chain: Vec<String>,
+    pub consensus: usize,
+    pub scorer_chain: Vec<String>,
+    pub model_price_bounds: Vec<ModelPriceBound>,
+    pub review_contract_sha256: String,
+    pub fixture_set_sha256: String,
+    pub evaluator_contract_sha256: String,
+    pub evaluator_runtime_identity: String,
+    pub report_sha256: String,
+    pub repeated_runs: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ModelPriceBound {
+    pub model: String,
+    pub input_micros_per_million_tokens: u64,
+    pub output_micros_per_million_tokens: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct QualificationCandidateProfile {
+    pub benchmark_provider_identity: String,
+    pub api_base: String,
+    pub api_format: ApiFormat,
+    pub generator_chain: Vec<String>,
+    pub consensus: usize,
+    pub scorer_chain: Vec<String>,
+    pub model_price_bounds: Vec<ModelPriceBound>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QualificationProfileDigestMaterial<'a> {
+    qualification_source_sha: &'a str,
+    model_defaults_sha256: &'a str,
+    benchmark_provider_identity: &'a Option<String>,
+    api_base: &'a str,
+    api_format: ApiFormat,
+    generator_chain: &'a [String],
+    consensus: usize,
+    scorer_chain: &'a [String],
+    model_price_bounds: &'a [ModelPriceBound],
+    review_contract_sha256: &'a str,
+    fixture_set_sha256: &'a str,
+    evaluator_contract_sha256: &'a str,
+    evaluator_runtime_identity: &'a str,
+    report_sha256: &'a str,
+    repeated_runs: u32,
+}
+
+pub const HOSTED_OPERATION_COST_CAP_MICROS: u64 = 1_000_000;
+pub const QUALIFICATION_MAX_AGE_DAYS: u32 = 30;
+const QUALIFICATION_MAX_AGE_SECONDS: u64 = QUALIFICATION_MAX_AGE_DAYS as u64 * 24 * 60 * 60;
+const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
+const QUALIFICATION_CANDIDATE_PROFILE_ENV: &str = "POSTIL_QUALIFICATION_CANDIDATE_PROFILE";
+const BENCH_FORCE_BOUNDED_SELECTION_ENV: &str = "POSTIL_BENCH_FORCE_BOUNDED_SELECTION";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -63,6 +217,9 @@ struct ModelDefaultsFile {
     version: u64,
     default_model: String,
     cascade: Vec<String>,
+    consensus: usize,
+    api_base: String,
+    api_format: ApiFormat,
     scorer: ScorerDefaultsFile,
 }
 
@@ -102,23 +259,464 @@ pub fn scorer_qualification_candidates() -> &'static [String] {
     model_defaults().scorer_qualification_candidates.as_slice()
 }
 
+pub fn qualification_manifest() -> &'static QualificationManifest {
+    static MANIFEST: OnceLock<QualificationManifest> = OnceLock::new();
+    MANIFEST.get_or_init(|| {
+        parse_qualification_manifest(QUALIFIED_MODELS_JSON)
+            .expect("embedded qualification manifest must parse and match model defaults")
+    })
+}
+
+pub fn review_contract_sha256() -> String {
+    sha256_named_sources(REVIEW_CONTRACT_SOURCES)
+}
+
+pub fn fixture_set_sha256() -> String {
+    sha256_named_sources(&[("bench/fixtures/cases.ts", BENCH_FIXTURES_SOURCE)])
+}
+
+pub fn evaluator_contract_sha256() -> String {
+    sha256_named_sources(EVALUATOR_CONTRACT_SOURCES)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QualificationMetadata {
+    pub qualification_issued_at_unix_seconds: Option<u64>,
+    pub qualification_expires_at_unix_seconds: Option<u64>,
+    pub qualification_max_age_days: Option<u32>,
+    pub model_defaults_sha256: String,
+    pub review_contract_sha256: String,
+    pub fixture_set_sha256: String,
+    pub evaluator_contract_sha256: String,
+    pub evaluator_runtime_identity: String,
+    pub default_api_base: String,
+    pub default_api_format: ApiFormat,
+    pub generator_chain: Vec<String>,
+    pub consensus: usize,
+    pub scorer_chain: Vec<String>,
+    pub hosted_operation_cost_cap_micros: u64,
+    pub admitted_profile: Option<QualificationProfile>,
+}
+
+/// Immutable qualification inputs embedded in this exact binary.
+pub fn qualification_metadata() -> QualificationMetadata {
+    let defaults = model_defaults();
+    let manifest = qualification_manifest();
+    qualification_metadata_for(defaults, manifest)
+}
+
+fn qualification_metadata_for(
+    defaults: &ModelDefaults,
+    manifest: &QualificationManifest,
+) -> QualificationMetadata {
+    let admitted_profile = admitted_profile_for(defaults, manifest);
+    let (generator_chain, scorer_chain, api_base) = qualification_defaults(defaults);
+    QualificationMetadata {
+        qualification_issued_at_unix_seconds: manifest.qualification_issued_at_unix_seconds,
+        qualification_expires_at_unix_seconds: manifest.qualification_expires_at_unix_seconds,
+        qualification_max_age_days: manifest.qualification_max_age_days,
+        model_defaults_sha256: defaults.source_sha256.clone(),
+        review_contract_sha256: review_contract_sha256(),
+        fixture_set_sha256: fixture_set_sha256(),
+        evaluator_contract_sha256: evaluator_contract_sha256(),
+        evaluator_runtime_identity: evaluator_runtime_identity(),
+        default_api_base: api_base,
+        default_api_format: defaults.api_format,
+        generator_chain,
+        consensus: defaults.consensus,
+        scorer_chain,
+        hosted_operation_cost_cap_micros: HOSTED_OPERATION_COST_CAP_MICROS,
+        admitted_profile,
+    }
+}
+
+fn qualification_defaults(defaults: &ModelDefaults) -> (Vec<String>, Vec<String>, String) {
+    let mut generator_chain = Vec::new();
+    if !defaults.default_model.is_empty() {
+        generator_chain.push(defaults.default_model.clone());
+    }
+    generator_chain.extend(defaults.cascade.clone());
+    let mut scorer_chain = Vec::new();
+    if defaults.scorer_enabled && !defaults.scorer_model.is_empty() {
+        scorer_chain.push(defaults.scorer_model.clone());
+        if !defaults.scorer_fallback.is_empty() && defaults.scorer_fallback != defaults.scorer_model
+        {
+            scorer_chain.push(defaults.scorer_fallback.clone());
+        }
+    }
+    let api_base =
+        normalize_api_base(&defaults.api_base).expect("embedded API base must be canonicalizable");
+    (generator_chain, scorer_chain, api_base)
+}
+
+fn admitted_profile_for(
+    defaults: &ModelDefaults,
+    manifest: &QualificationManifest,
+) -> Option<QualificationProfile> {
+    let (generator_chain, scorer_chain, api_base) = qualification_defaults(defaults);
+    manifest
+        .profiles
+        .iter()
+        .find(|profile| {
+            profile.generator_chain == generator_chain
+                && profile.consensus == defaults.consensus
+                && profile.scorer_chain == scorer_chain
+                && profile.api_base == api_base
+                && profile.api_format == defaults.api_format
+        })
+        .cloned()
+}
+
+pub fn admitted_profile_for_config(config: &Config) -> Option<&'static QualificationProfile> {
+    let generator_chain = config.model_chain();
+    let scorer_chain = config.scorer_chain();
+    let api_base = normalize_api_base(&config.api_base).ok()?;
+    qualification_manifest().profiles.iter().find(|profile| {
+        profile.generator_chain == generator_chain
+            && profile.consensus == config.consensus
+            && profile.scorer_chain == scorer_chain
+            && profile.api_base == api_base
+            && profile.api_format == config.api_format
+    })
+}
+
+fn evaluator_runtime_identity() -> String {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct BenchPackage {
+        package_manager: String,
+    }
+    let package: BenchPackage =
+        serde_json::from_str(BENCH_PACKAGE_JSON).expect("bench package.json must parse");
+    let version = package
+        .package_manager
+        .strip_prefix("bun@")
+        .expect("bench packageManager must pin Bun");
+    let parts = version.split('.').collect::<Vec<_>>();
+    assert!(
+        parts.len() == 3
+            && parts
+                .iter()
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())),
+        "bench packageManager must pin an exact Bun runtime version"
+    );
+    package.package_manager
+}
+
+fn sha256_named_sources(sources: &[(&str, &str)]) -> String {
+    let mut hasher = Sha256::new();
+    for (path, contents) in sources {
+        hasher.update(path.as_bytes());
+        hasher.update([0]);
+        hasher.update(contents.as_bytes());
+        hasher.update([0]);
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut hex, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    hex
+}
+
+fn validate_profile_model_price_bounds(
+    label: &str,
+    generator_chain: &[String],
+    scorer_chain: &[String],
+    model_price_bounds: &[ModelPriceBound],
+) -> Result<()> {
+    for model in generator_chain {
+        validate_model_id(&format!("{label} generator chain"), model)?;
+    }
+    for model in scorer_chain {
+        validate_model_id(&format!("{label} scorer chain"), model)?;
+    }
+    let mut expected_models = generator_chain.to_vec();
+    expected_models.extend_from_slice(scorer_chain);
+    expected_models.sort();
+    expected_models.dedup();
+    let mut previous_model: Option<&str> = None;
+    for bound in model_price_bounds {
+        validate_model_id(&format!("{label} model price bound"), &bound.model)?;
+        anyhow::ensure!(
+            previous_model.is_none_or(|previous| previous < bound.model.as_str()),
+            "{label} model price bounds must be unique and sorted by model"
+        );
+        previous_model = Some(&bound.model);
+        anyhow::ensure!(
+            expected_models.binary_search(&bound.model).is_ok(),
+            "{label} model price bound references an unknown model"
+        );
+        anyhow::ensure!(
+            bound.input_micros_per_million_tokens > 0
+                && bound.output_micros_per_million_tokens > 0
+                && bound.input_micros_per_million_tokens <= MAX_SAFE_JSON_INTEGER
+                && bound.output_micros_per_million_tokens <= MAX_SAFE_JSON_INTEGER,
+            "{label} model price bounds must be positive safe integers"
+        );
+    }
+    let bounded_models = model_price_bounds
+        .iter()
+        .map(|bound| bound.model.clone())
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        bounded_models == expected_models,
+        "{label} model price bounds must exactly cover the generator and scorer models"
+    );
+    Ok(())
+}
+
+fn parse_qualification_manifest(raw: &str) -> Result<QualificationManifest> {
+    let manifest: QualificationManifest = serde_json::from_str(raw)?;
+    anyhow::ensure!(
+        manifest.version > 0,
+        "qualification manifest version must be greater than zero"
+    );
+    anyhow::ensure!(
+        manifest.model_defaults_sha256 == model_defaults().source_sha256,
+        "qualification manifest does not match the embedded model defaults"
+    );
+    let mut profile_ids = Vec::with_capacity(manifest.profiles.len());
+    validate_qualification_authority(&manifest, current_unix_seconds()?)?;
+    if manifest.profiles.is_empty() {
+        anyhow::ensure!(
+            manifest.qualification_source_sha.is_none()
+                && manifest.qualification_issued_at_unix_seconds.is_none()
+                && manifest.qualification_expires_at_unix_seconds.is_none()
+                && manifest.qualification_max_age_days.is_none(),
+            "empty qualification manifest must not claim qualification authority"
+        );
+    }
+    let current_review_contract = review_contract_sha256();
+    let current_fixture_set = fixture_set_sha256();
+    let current_evaluator_contract = evaluator_contract_sha256();
+    for profile in &manifest.profiles {
+        anyhow::ensure!(
+            !profile.id.trim().is_empty(),
+            "qualification profile id must not be empty"
+        );
+        anyhow::ensure!(
+            !profile.generator_chain.is_empty(),
+            "qualification profile generator chain must not be empty"
+        );
+        anyhow::ensure!(
+            !profile.scorer_chain.is_empty(),
+            "qualification profile scorer chain must not be empty"
+        );
+        anyhow::ensure!(
+            (1..=profile.generator_chain.len()).contains(&profile.consensus),
+            "qualification profile consensus must fit its generator chain"
+        );
+        anyhow::ensure!(
+            normalize_api_base(&profile.api_base)? == profile.api_base,
+            "qualification profile apiBase must use its canonical form"
+        );
+        let provider = profile
+            .benchmark_provider_identity
+            .as_deref()
+            .ok_or_else(|| {
+                anyhow::anyhow!("hosted qualification profile provider identity is required")
+            })?;
+        anyhow::ensure!(
+            provider == MANAGED_OPENROUTER_PROVIDER_IDENTITY,
+            "hosted qualification profile provider identity must be {MANAGED_OPENROUTER_PROVIDER_IDENTITY}"
+        );
+        anyhow::ensure!(
+            profile.api_base == MANAGED_OPENROUTER_API_BASE
+                && profile.api_format == ApiFormat::OpenaiCompatible,
+            "hosted qualification profile must use the canonical managed OpenRouter endpoint"
+        );
+        validate_profile_model_price_bounds(
+            "qualification profile",
+            &profile.generator_chain,
+            &profile.scorer_chain,
+            &profile.model_price_bounds,
+        )?;
+        anyhow::ensure!(
+            profile.repeated_runs >= 3,
+            "qualification profile must record at least three repeated runs"
+        );
+        for (field, digest) in [
+            ("id", &profile.id),
+            ("modelDefaultsSha256", &profile.model_defaults_sha256),
+            ("reviewContractSha256", &profile.review_contract_sha256),
+            ("fixtureSetSha256", &profile.fixture_set_sha256),
+            (
+                "evaluatorContractSha256",
+                &profile.evaluator_contract_sha256,
+            ),
+            ("reportSha256", &profile.report_sha256),
+        ] {
+            anyhow::ensure!(
+                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "qualification profile {field} must be a SHA-256 digest"
+            );
+        }
+        anyhow::ensure!(
+            profile.model_defaults_sha256 == manifest.model_defaults_sha256,
+            "qualification profile model defaults digest does not match its manifest"
+        );
+        anyhow::ensure!(
+            manifest.qualification_source_sha.as_deref()
+                == Some(profile.qualification_source_sha.as_str()),
+            "qualification profile source SHA does not match its manifest"
+        );
+        anyhow::ensure!(
+            profile.review_contract_sha256 == current_review_contract,
+            "qualification profile review contract is stale"
+        );
+        anyhow::ensure!(
+            profile.fixture_set_sha256 == current_fixture_set,
+            "qualification profile fixture set is stale"
+        );
+        anyhow::ensure!(
+            profile.evaluator_contract_sha256 == current_evaluator_contract,
+            "qualification profile evaluator contract is stale"
+        );
+        anyhow::ensure!(
+            profile.evaluator_runtime_identity == evaluator_runtime_identity(),
+            "qualification profile evaluator runtime is stale"
+        );
+        let mut generators = profile.generator_chain.clone();
+        generators.sort();
+        generators.dedup();
+        anyhow::ensure!(
+            generators.len() == profile.generator_chain.len(),
+            "qualification profile generator chain must not repeat models"
+        );
+        let mut scorers = profile.scorer_chain.clone();
+        scorers.sort();
+        scorers.dedup();
+        anyhow::ensure!(
+            scorers.len() == profile.scorer_chain.len(),
+            "qualification profile scorer chain must not repeat models"
+        );
+        anyhow::ensure!(
+            profile.id == qualification_profile_digest(profile),
+            "qualification profile id does not match its canonical digest material"
+        );
+        profile_ids.push(profile.id.clone());
+    }
+    profile_ids.sort();
+    profile_ids.dedup();
+    anyhow::ensure!(
+        profile_ids.len() == manifest.profiles.len(),
+        "qualification profile ids must be unique"
+    );
+    Ok(manifest)
+}
+
+fn current_unix_seconds() -> Result<u64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_secs())
+}
+
+fn validate_qualification_authority(manifest: &QualificationManifest, now: u64) -> Result<()> {
+    if manifest.profiles.is_empty() {
+        return Ok(());
+    }
+    let source_sha = manifest
+        .qualification_source_sha
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("qualification manifest source SHA is required"))?;
+    anyhow::ensure!(
+        matches!(source_sha.len(), 40 | 64)
+            && source_sha
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+        "qualification manifest source SHA must be a lowercase Git commit SHA"
+    );
+    let issued = manifest
+        .qualification_issued_at_unix_seconds
+        .ok_or_else(|| anyhow::anyhow!("qualification issue time is required"))?;
+    let expires = manifest
+        .qualification_expires_at_unix_seconds
+        .ok_or_else(|| anyhow::anyhow!("qualification expiry time is required"))?;
+    anyhow::ensure!(
+        (1..=MAX_SAFE_JSON_INTEGER).contains(&issued)
+            && (1..=MAX_SAFE_JSON_INTEGER).contains(&expires),
+        "qualification authority timestamps must be positive JSON-safe integers"
+    );
+    anyhow::ensure!(
+        manifest.qualification_max_age_days == Some(QUALIFICATION_MAX_AGE_DAYS),
+        "qualification maximum age must be {QUALIFICATION_MAX_AGE_DAYS} days"
+    );
+    anyhow::ensure!(
+        expires.checked_sub(issued) == Some(QUALIFICATION_MAX_AGE_SECONDS),
+        "qualification expiry window is invalid"
+    );
+    anyhow::ensure!(now < expires, "qualification evidence has expired");
+    anyhow::ensure!(
+        issued <= now.saturating_add(15 * 60),
+        "qualification issue time is in the future"
+    );
+    Ok(())
+}
+
 fn parse_model_defaults(raw: &str) -> Result<ModelDefaults> {
     let file: ModelDefaultsFile = toml::from_str(raw)?;
     anyhow::ensure!(
         file.version > 0,
         "model defaults version must be greater than zero"
     );
-    validate_model_id("defaultModel", &file.default_model)?;
-    anyhow::ensure!(!file.cascade.is_empty(), "cascade must not be empty");
+    if !file.default_model.is_empty() {
+        validate_model_id("defaultModel", &file.default_model)?;
+    } else {
+        anyhow::ensure!(
+            file.cascade.is_empty(),
+            "cascade must be empty when defaultModel is empty"
+        );
+    }
     for model in &file.cascade {
         validate_model_id("cascade entries", model)?;
     }
-    validate_model_id("scorer.defaultModel", &file.scorer.default_model)?;
-    validate_model_id("scorer.fallback", &file.scorer.fallback)?;
+    let mut generator_chain = Vec::new();
+    if !file.default_model.is_empty() {
+        generator_chain.push(file.default_model.as_str());
+    }
+    generator_chain.extend(file.cascade.iter().map(String::as_str));
+    let unique_generators = generator_chain
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
     anyhow::ensure!(
-        !file.scorer.qualification_candidates.is_empty(),
-        "scorer.qualificationCandidates must not be empty"
+        unique_generators.len() == generator_chain.len(),
+        "embedded generator chain must not repeat models"
     );
+    let generator_count = usize::from(!file.default_model.is_empty()) + file.cascade.len();
+    if generator_count == 0 {
+        anyhow::ensure!(
+            file.consensus == 1,
+            "empty model defaults require consensus = 1"
+        );
+    } else {
+        anyhow::ensure!(
+            (1..=generator_count).contains(&file.consensus),
+            "consensus must fit the embedded generator chain"
+        );
+    }
+    normalize_api_base(&file.api_base).context("invalid embedded model API base")?;
+    if !file.scorer.default_model.is_empty() {
+        validate_model_id("scorer.defaultModel", &file.scorer.default_model)?;
+    } else {
+        anyhow::ensure!(
+            !file.scorer.enabled
+                && file.scorer.fallback.is_empty()
+                && file.scorer.qualification_candidates.is_empty(),
+            "scorer configuration must be empty when scorer.defaultModel is empty"
+        );
+    }
+    if !file.scorer.fallback.is_empty() {
+        validate_model_id("scorer.fallback", &file.scorer.fallback)?;
+        anyhow::ensure!(
+            file.scorer.fallback != file.scorer.default_model,
+            "scorer fallback must differ from scorer.defaultModel"
+        );
+    }
     for model in &file.scorer.qualification_candidates {
         validate_model_id("scorer.qualificationCandidates entries", model)?;
     }
@@ -127,6 +725,9 @@ fn parse_model_defaults(raw: &str) -> Result<ModelDefaults> {
         source_sha256: sha256_hex(raw),
         default_model: file.default_model,
         cascade: file.cascade,
+        consensus: file.consensus,
+        api_base: file.api_base,
+        api_format: file.api_format,
         scorer_enabled: file.scorer.enabled,
         scorer_model: file.scorer.default_model,
         scorer_fallback: file.scorer.fallback,
@@ -151,6 +752,30 @@ fn sha256_hex(raw: &str) -> String {
         write!(&mut hex, "{byte:02x}").expect("writing to String cannot fail");
     }
     hex
+}
+
+fn qualification_profile_digest(profile: &QualificationProfile) -> String {
+    let material = QualificationProfileDigestMaterial {
+        qualification_source_sha: &profile.qualification_source_sha,
+        model_defaults_sha256: &profile.model_defaults_sha256,
+        benchmark_provider_identity: &profile.benchmark_provider_identity,
+        api_base: &profile.api_base,
+        api_format: profile.api_format,
+        generator_chain: &profile.generator_chain,
+        consensus: profile.consensus,
+        scorer_chain: &profile.scorer_chain,
+        model_price_bounds: &profile.model_price_bounds,
+        review_contract_sha256: &profile.review_contract_sha256,
+        fixture_set_sha256: &profile.fixture_set_sha256,
+        evaluator_contract_sha256: &profile.evaluator_contract_sha256,
+        evaluator_runtime_identity: &profile.evaluator_runtime_identity,
+        report_sha256: &profile.report_sha256,
+        repeated_runs: profile.repeated_runs,
+    };
+    sha256_hex(
+        &serde_json::to_string(&material)
+            .expect("qualification profile digest material must serialize"),
+    )
 }
 
 fn yaml_scalar(value: &str) -> String {
@@ -180,7 +805,7 @@ pub enum OnError {
     Block,
     /// Provider outage passes the gate (advisory only): an outage does not
     /// freeze every merge in the org; the review check goes neutral. Unusable
-    /// model output still blocks — that class is attacker-influenceable.
+    /// model output still blocks because that class is attacker-influenceable.
     Advisory,
 }
 
@@ -234,12 +859,10 @@ pub struct Config {
     pub model: String,
     pub cascade: Vec<String>,
     pub scorer: String,
+    pub scorer_fallback: String,
     /// Embedded scoring remains disabled until a candidate passes the repeated
-    /// qualification gate. An explicit BYOK scorer enables only that model.
+    /// qualification gate. BYOK can select a scorer and one fallback.
     pub scorer_enabled: bool,
-    /// True when the scorer was selected by config or environment rather than
-    /// inherited from the OpenRouter-oriented built-in defaults.
-    pub scorer_explicit: bool,
     pub api_base: String,
     pub api_format: ApiFormat,
     /// Run the first N models of [model + cascade] and keep agreeing findings.
@@ -277,11 +900,11 @@ impl Default for Config {
             model: defaults.default_model.clone(),
             cascade: defaults.cascade.clone(),
             scorer: defaults.scorer_model.clone(),
+            scorer_fallback: defaults.scorer_fallback.clone(),
             scorer_enabled: defaults.scorer_enabled,
-            scorer_explicit: false,
-            api_base: DEFAULT_API_BASE.to_string(),
-            api_format: ApiFormat::default(),
-            consensus: 1,
+            api_base: defaults.api_base.clone(),
+            api_format: defaults.api_format,
+            consensus: defaults.consensus,
             guardrails: None,
             content_policy: Some(BUILTIN_CONTENT_POLICY.to_string()),
             content_policy_disabled: false,
@@ -376,6 +999,7 @@ impl Config {
             Config::default()
         };
         cfg.apply_env()?;
+        validate_benchmark_bounded_selection(&cfg)?;
         // Repo guardrails are a separate file so they can be long-form prose.
         let guardrails_path = root.join(".postil").join("guardrails.md");
         if let Ok(text) = std::fs::read_to_string(&guardrails_path) {
@@ -417,7 +1041,7 @@ impl Config {
     }
 
     pub fn apply_file(&mut self, f: FileConfig) -> Result<()> {
-        self.apply_file_inner(f, allow_config_api_base(), hosted_mode())
+        self.apply_file_inner(f, allow_config_api_base(), repository_model_config_locked())
     }
 
     /// Core of [`apply_file`]. `allow_api_base` decides whether a
@@ -445,6 +1069,10 @@ impl Config {
             self.min_confidence = v;
         }
         if let Some(v) = f.max_findings {
+            anyhow::ensure!(
+                (1..=MAX_FINDINGS).contains(&v),
+                "maxFindings must be in 1..={MAX_FINDINGS}"
+            );
             self.max_findings = v;
         }
         if let Some(r) = f.reviewer {
@@ -493,8 +1121,8 @@ impl Config {
                 }
                 if let Some(s) = m.scorer {
                     self.scorer = s;
+                    self.scorer_fallback.clear();
                     self.scorer_enabled = true;
-                    self.scorer_explicit = true;
                 }
                 if let Some(b) = m.api_base {
                     // `model.apiBase` from `.postil.yaml` is repo-controlled, and the
@@ -579,6 +1207,22 @@ impl Config {
     }
 
     fn apply_env(&mut self) -> Result<()> {
+        if hosted_mode() {
+            return Ok(());
+        }
+        if qualification_candidate_mode() {
+            let profile = qualification_candidate_profile()?
+                .context("qualification candidate profile is required")?;
+            self.model = profile.generator_chain[0].clone();
+            self.cascade = profile.generator_chain[1..].to_vec();
+            self.consensus = profile.consensus;
+            self.scorer = profile.scorer_chain[0].clone();
+            self.scorer_fallback = profile.scorer_chain.get(1).cloned().unwrap_or_default();
+            self.scorer_enabled = true;
+            self.api_base = profile.api_base;
+            self.api_format = profile.api_format;
+            return Ok(());
+        }
         if let Ok(m) = std::env::var("REVIEW_MODEL")
             && !m.is_empty()
         {
@@ -589,12 +1233,38 @@ impl Config {
         {
             self.cascade = c.split(',').map(|s| s.trim().to_string()).collect();
         }
+        if let Ok(value) = std::env::var("REVIEW_MODEL_CONSENSUS")
+            && !value.trim().is_empty()
+        {
+            let consensus = value
+                .trim()
+                .parse::<usize>()
+                .context("REVIEW_MODEL_CONSENSUS must be a positive integer")?;
+            anyhow::ensure!(consensus >= 1, "REVIEW_MODEL_CONSENSUS must be >= 1");
+            self.consensus = consensus;
+        }
         if let Ok(s) = std::env::var("REVIEW_SCORER_MODEL")
             && !s.is_empty()
         {
             self.scorer = s;
+            self.scorer_fallback.clear();
             self.scorer_enabled = true;
-            self.scorer_explicit = true;
+        }
+        if let Ok(cascade) = std::env::var("REVIEW_SCORER_MODEL_CASCADE")
+            && !cascade.trim().is_empty()
+        {
+            let models = cascade
+                .split(',')
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .collect::<Vec<_>>();
+            anyhow::ensure!(
+                models.len() == 1,
+                "REVIEW_SCORER_MODEL_CASCADE supports exactly one embedded scorer fallback"
+            );
+            validate_model_id("REVIEW_SCORER_MODEL_CASCADE", models[0])?;
+            self.scorer_fallback = models[0].to_string();
+            self.scorer_enabled = true;
         }
         if std::env::var("POSTIL_DISABLE_SCORER")
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
@@ -617,36 +1287,65 @@ impl Config {
 
     /// All models to try, in order, deduplicated.
     pub fn model_chain(&self) -> Vec<String> {
-        let mut chain = vec![self.model.clone()];
+        let mut chain = Vec::new();
+        if !self.model.trim().is_empty() {
+            chain.push(self.model.clone());
+        }
         for m in &self.cascade {
-            if !chain.contains(m) {
+            if !m.trim().is_empty() && !chain.contains(m) {
                 chain.push(m.clone());
             }
         }
         chain
     }
 
+    pub fn require_model(&self) -> Result<()> {
+        self.require_model_for(hosted_mode())?;
+        if qualification_candidate_mode() {
+            let profile = qualification_candidate_profile_for_config(self)?;
+            anyhow::ensure!(
+                profile.is_some(),
+                "qualification candidate profile does not exactly match the resolved review configuration"
+            );
+        }
+        Ok(())
+    }
+
+    fn require_model_for(&self, hosted: bool) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let generator_chain = self.model_chain();
+        anyhow::ensure!(
+            !generator_chain.is_empty(),
+            "no review model is configured; pass --model, set REVIEW_MODEL, or set model.name in a trusted local config"
+        );
+        if hosted {
+            let manifest = qualification_manifest();
+            let scorer_chain = self.scorer_chain();
+            anyhow::ensure!(
+                manifest.profiles.iter().any(|profile| {
+                    profile.generator_chain == generator_chain
+                        && profile.consensus == self.consensus
+                        && profile.scorer_chain == scorer_chain
+                        && profile.api_format == self.api_format
+                        && normalize_api_base(&self.api_base).ok().as_deref()
+                            == Some(profile.api_base.as_str())
+                }),
+                "hosted inference configuration does not exactly match a deployed qualification profile"
+            );
+        }
+        Ok(())
+    }
+
     /// Scorer models to try, in order, deduplicated.
     pub fn scorer_chain(&self) -> Vec<String> {
-        if !self.scorer_enabled {
+        if !self.scorer_enabled || self.scorer.trim().is_empty() {
             return Vec::new();
         }
-        if self.api_format == ApiFormat::Anthropic {
-            let defaults = model_defaults();
-            return if self.scorer.starts_with("claude-")
-                || (self.scorer_explicit
-                    && self.scorer != defaults.scorer_model
-                    && self.scorer != defaults.scorer_fallback)
-            {
-                vec![self.scorer.clone()]
-            } else {
-                Vec::new()
-            };
-        }
         let mut chain = vec![self.scorer.clone()];
-        let defaults = model_defaults();
-        if defaults.scorer_enabled && !chain.contains(&defaults.scorer_fallback) {
-            chain.push(defaults.scorer_fallback.clone());
+        if !self.scorer_fallback.trim().is_empty() && !chain.contains(&self.scorer_fallback) {
+            chain.push(self.scorer_fallback.clone());
         }
         chain
     }
@@ -670,10 +1369,238 @@ fn allow_config_api_base() -> bool {
 /// Repository configuration is untrusted input, so it cannot select a model,
 /// scorer, provider interface, or credential destination in this mode. Trusted
 /// deployment environment overrides are applied after repository config.
-fn hosted_mode() -> bool {
+pub(crate) fn hosted_mode() -> bool {
     std::env::var("POSTIL_HOSTED_MODE")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
+}
+
+pub(crate) fn hosted_runtime_mode() -> bool {
+    hosted_mode() || qualification_candidate_mode()
+}
+
+pub(crate) fn bounded_review_selection_mode() -> bool {
+    hosted_runtime_mode() || benchmark_force_bounded_selection()
+}
+
+fn benchmark_force_bounded_selection_requested() -> bool {
+    std::env::var(BENCH_FORCE_BOUNDED_SELECTION_ENV)
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn benchmark_force_bounded_selection() -> bool {
+    cfg!(feature = "qualification-candidate") && benchmark_force_bounded_selection_requested()
+}
+
+fn validate_benchmark_bounded_selection(config: &Config) -> Result<()> {
+    if !benchmark_force_bounded_selection_requested() {
+        return Ok(());
+    }
+    let ci = std::env::var("CI").ok();
+    let private_api_opt_in = std::env::var("POSTIL_ALLOW_PRIVATE_API_BASE").ok();
+    let github_api = std::env::var("GITHUB_API_URL").ok();
+    validate_benchmark_bounded_selection_values(
+        cfg!(feature = "qualification-candidate"),
+        ci.as_deref(),
+        private_api_opt_in.as_deref(),
+        config.api_base.as_str(),
+        github_api.as_deref(),
+    )
+}
+
+fn validate_benchmark_bounded_selection_values(
+    feature_enabled: bool,
+    ci: Option<&str>,
+    private_api_opt_in: Option<&str>,
+    model_api: &str,
+    github_api: Option<&str>,
+) -> Result<()> {
+    anyhow::ensure!(
+        feature_enabled,
+        "benchmark bounded selection requires the non-default qualification-candidate feature"
+    );
+    anyhow::ensure!(
+        ci == Some("true"),
+        "benchmark bounded selection requires the hermetic CI harness"
+    );
+    anyhow::ensure!(
+        private_api_opt_in.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
+        "benchmark bounded selection requires explicit private API-base opt-in"
+    );
+    let github_api =
+        github_api.context("benchmark bounded selection requires a mock GitHub endpoint")?;
+    for (label, value) in [("model API", model_api), ("GitHub API", github_api)] {
+        let url = reqwest::Url::parse(value).with_context(|| {
+            format!("benchmark bounded selection {label} must be an absolute URL")
+        })?;
+        let loopback = url
+            .host_str()
+            .and_then(|host| {
+                host.trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .parse::<std::net::IpAddr>()
+                    .ok()
+            })
+            .is_some_and(|address| address.is_loopback());
+        anyhow::ensure!(
+            url.scheme() == "http" && loopback,
+            "benchmark bounded selection {label} must be an HTTP loopback endpoint"
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn qualification_candidate_mode() -> bool {
+    cfg!(feature = "qualification-candidate")
+        && std::env::var_os(QUALIFICATION_CANDIDATE_PROFILE_ENV).is_some()
+}
+
+pub(crate) fn qualification_plan_only() -> bool {
+    qualification_candidate_mode()
+        && std::env::var("POSTIL_QUALIFICATION_PLAN_ONLY")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+}
+
+#[cfg(feature = "qualification-candidate")]
+fn qualification_candidate_profile() -> Result<Option<QualificationCandidateProfile>> {
+    let Some(path) = std::env::var_os(QUALIFICATION_CANDIDATE_PROFILE_ENV) else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        !hosted_mode(),
+        "qualification candidate mode cannot run inside a hosted deployment"
+    );
+    anyhow::ensure!(
+        std::env::var("CI").as_deref() == Ok("true"),
+        "qualification candidate mode requires the hermetic CI harness"
+    );
+    anyhow::ensure!(
+        std::env::var("POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY").as_deref() == Ok("1"),
+        "qualification candidate mode requires managed provider privacy enforcement"
+    );
+    let github_api = std::env::var("GITHUB_API_URL")
+        .context("qualification candidate mode requires a mock GitHub endpoint")?;
+    let github_url = reqwest::Url::parse(&github_api)
+        .context("qualification candidate mock GitHub endpoint must be an absolute URL")?;
+    let loopback = github_url
+        .host_str()
+        .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+        .is_some_and(|address| address.is_loopback());
+    anyhow::ensure!(
+        github_url.scheme() == "http" && loopback,
+        "qualification candidate mode requires an HTTP loopback GitHub endpoint"
+    );
+    let raw = std::fs::read_to_string(&path).with_context(|| {
+        format!(
+            "reading qualification candidate profile {}",
+            Path::new(&path).display()
+        )
+    })?;
+    let profile: QualificationCandidateProfile =
+        serde_json::from_str(&raw).context("parsing qualification candidate profile")?;
+    anyhow::ensure!(
+        profile.benchmark_provider_identity == MANAGED_OPENROUTER_PROVIDER_IDENTITY,
+        "qualification candidate profile must use the managed provider identity"
+    );
+    anyhow::ensure!(
+        normalize_api_base(&profile.api_base)? == MANAGED_OPENROUTER_API_BASE
+            && profile.api_base == MANAGED_OPENROUTER_API_BASE
+            && profile.api_format == ApiFormat::OpenaiCompatible,
+        "qualification candidate profile must use the canonical managed OpenRouter endpoint"
+    );
+    anyhow::ensure!(
+        !profile.generator_chain.is_empty()
+            && (1..=profile.generator_chain.len()).contains(&profile.consensus),
+        "qualification candidate consensus must fit its generator chain"
+    );
+    anyhow::ensure!(
+        (1..=2).contains(&profile.scorer_chain.len()),
+        "qualification candidate scorer chain must contain a primary and at most one fallback"
+    );
+    validate_profile_model_price_bounds(
+        "qualification candidate profile",
+        &profile.generator_chain,
+        &profile.scorer_chain,
+        &profile.model_price_bounds,
+    )?;
+    Ok(Some(profile))
+}
+
+#[cfg(not(feature = "qualification-candidate"))]
+fn qualification_candidate_profile() -> Result<Option<QualificationCandidateProfile>> {
+    Ok(None)
+}
+
+pub(crate) fn qualification_candidate_profile_for_config(
+    config: &Config,
+) -> Result<Option<QualificationCandidateProfile>> {
+    let Some(profile) = qualification_candidate_profile()? else {
+        return Ok(None);
+    };
+    let api_base = normalize_api_base(&config.api_base)?;
+    anyhow::ensure!(
+        profile.generator_chain == config.model_chain()
+            && profile.consensus == config.consensus
+            && profile.scorer_chain == config.scorer_chain()
+            && profile.api_base == api_base
+            && profile.api_format == config.api_format,
+        "qualification candidate profile does not exactly match the resolved review configuration"
+    );
+    Ok(Some(profile))
+}
+
+pub(crate) fn hosted_price_bounds_for_config(
+    config: &Config,
+) -> Result<Option<Vec<ModelPriceBound>>> {
+    if hosted_mode() {
+        let profile = admitted_profile_for_config(config).ok_or_else(|| {
+            anyhow::anyhow!("hosted inference has no exact admitted qualification profile")
+        })?;
+        return Ok(Some(profile.model_price_bounds.clone()));
+    }
+    Ok(qualification_candidate_profile_for_config(config)?
+        .map(|profile| profile.model_price_bounds))
+}
+
+fn repository_model_config_locked() -> bool {
+    hosted_runtime_mode()
+        || benchmark_force_bounded_selection_requested()
+        || std::env::var("POSTIL_IGNORE_REPOSITORY_MODEL_CONFIG")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+}
+
+fn normalize_api_base(value: &str) -> Result<String> {
+    let url = reqwest::Url::parse(value).context("model API base must be an absolute URL")?;
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https"),
+        "model API base must use HTTP or HTTPS"
+    );
+    anyhow::ensure!(
+        url.username().is_empty() && url.password().is_none(),
+        "model API base must not contain credentials"
+    );
+    anyhow::ensure!(
+        url.query().is_none() && url.fragment().is_none(),
+        "model API base must not contain a query or fragment"
+    );
+    let hostname = url
+        .host_str()
+        .context("model API base must include a hostname")?
+        .to_ascii_lowercase();
+    let hostname = if hostname.contains(':') {
+        format!("[{hostname}]")
+    } else {
+        hostname
+    };
+    let port = url
+        .port_or_known_default()
+        .context("model API base must include an effective port")?;
+    let path = url.path().trim_end_matches('/');
+    let path = if path.is_empty() { "/" } else { path };
+    Ok(format!("{}://{hostname}:{port}{path}", url.scheme()))
 }
 
 fn find_first(root: &Path, names: &[&str]) -> Option<PathBuf> {
@@ -710,7 +1637,7 @@ gate:
   failOn: error           # the postil/gate check fails at/above: info | warn | error | never
   blockOnKinds:           # kinds that block regardless of severity; humanEscalation requires confidence >= 0.30
     - humanEscalation     # genuine owner/product decisions only; concrete bugs remain risk
-  # onError: block          # block (default, fail closed) | advisory — gate outcome when
+  # onError: block          # block (default, fail closed) | advisory: gate outcome when
   #                         # the review itself errors (model outage). advisory keeps an
   #                         # outage from freezing merges; the review check goes neutral, not green.
 
@@ -751,7 +1678,7 @@ pub fn starter_config() -> &'static str {
 /// (see [`Config::content_policy`]). Scoped to human-readable prose only:
 /// comments, docstrings, Markdown, and PR title/body, never code logic,
 /// identifiers, or structured data. Kept conservative and low-noise on
-/// purpose — this augments, it does not replace, Postil's core "silence is
+/// purpose. This augments, rather than replacing, Postil's core "silence is
 /// the correct output for most diffs" stance.
 pub const BUILTIN_CONTENT_POLICY: &str = "\
 1. Fabricated or contradicted claims (report at error). A changed comment, \
@@ -818,6 +1745,51 @@ mod tests {
         model_defaults().cascade.clone()
     }
 
+    fn valid_qualification_manifest_json() -> serde_json::Value {
+        let issued = current_unix_seconds().unwrap();
+        let mut manifest = serde_json::json!({
+            "version": 1,
+            "qualificationSourceSha": "9".repeat(40),
+            "qualificationIssuedAtUnixSeconds": issued,
+            "qualificationExpiresAtUnixSeconds": issued + QUALIFICATION_MAX_AGE_SECONDS,
+            "qualificationMaxAgeDays": QUALIFICATION_MAX_AGE_DAYS,
+            "modelDefaultsSha256": model_defaults().source_sha256,
+            "profiles": [{
+                "id": "0".repeat(64),
+                "qualificationSourceSha": "9".repeat(40),
+                "modelDefaultsSha256": model_defaults().source_sha256,
+                "apiFormat": "openai-compatible",
+                "apiBase": "https://openrouter.ai:443/api/v1",
+                "benchmarkProviderIdentity": MANAGED_OPENROUTER_PROVIDER_IDENTITY,
+                "generatorChain": ["provider/model"],
+                "consensus": 1,
+                "scorerChain": ["provider/scorer"],
+                "modelPriceBounds": [
+                    {
+                        "model": "provider/model",
+                        "inputMicrosPerMillionTokens": 1_000_000,
+                        "outputMicrosPerMillionTokens": 2_000_000
+                    },
+                    {
+                        "model": "provider/scorer",
+                        "inputMicrosPerMillionTokens": 3_000_000,
+                        "outputMicrosPerMillionTokens": 4_000_000
+                    }
+                ],
+                "reviewContractSha256": review_contract_sha256(),
+                "fixtureSetSha256": fixture_set_sha256(),
+                "evaluatorContractSha256": evaluator_contract_sha256(),
+                "evaluatorRuntimeIdentity": evaluator_runtime_identity(),
+                "reportSha256": "1".repeat(64),
+                "repeatedRuns": 3
+            }]
+        });
+        let profile: QualificationProfile =
+            serde_json::from_value(manifest["profiles"][0].clone()).unwrap();
+        manifest["profiles"][0]["id"] = serde_json::json!(qualification_profile_digest(&profile));
+        manifest
+    }
+
     #[test]
     fn embedded_model_defaults_match_root_config_file() {
         let parsed = parse_model_defaults(MODEL_DEFAULTS_TOML).unwrap();
@@ -878,6 +1850,9 @@ mod tests {
             r#"version = 1
 default_model = "example/model"
 cascade = ["example/fallback"]
+consensus = 1
+api_base = "https://openrouter.ai/api/v1"
+api_format = "openai-compatible"
 unexpected_key = "typo"
 
 [scorer]
@@ -900,6 +1875,9 @@ qualification_candidates = ["example/scorer"]
                 "version = 0\n\
                  default_model = \"example/model\"\n\
                  cascade = [\"example/fallback\"]\n\
+                 consensus = 1\n\
+                 api_base = \"https://openrouter.ai/api/v1\"\n\
+                 api_format = \"openai-compatible\"\n\
                  scorer = { enabled = false, default_model = \"example/scorer\", fallback = \"example/scorer-fallback\", qualification_candidates = [\"example/scorer\"] }\n",
                 "version must be greater than zero",
             ),
@@ -907,20 +1885,19 @@ qualification_candidates = ["example/scorer"]
                 "version = 1\n\
                  default_model = \"\"\n\
                  cascade = [\"example/fallback\"]\n\
+                 consensus = 1\n\
+                 api_base = \"https://openrouter.ai/api/v1\"\n\
+                 api_format = \"openai-compatible\"\n\
                  scorer = { enabled = false, default_model = \"example/scorer\", fallback = \"example/scorer-fallback\", qualification_candidates = [\"example/scorer\"] }\n",
-                "defaultModel must not be empty",
-            ),
-            (
-                "version = 1\n\
-                 default_model = \"example/model\"\n\
-                 cascade = []\n\
-                 scorer = { enabled = false, default_model = \"example/scorer\", fallback = \"example/scorer-fallback\", qualification_candidates = [\"example/scorer\"] }\n",
-                "cascade must not be empty",
+                "cascade must be empty when defaultModel is empty",
             ),
             (
                 "version = 1\n\
                  default_model = \"example/model\"\n\
                  cascade = [\"\"]\n\
+                 consensus = 1\n\
+                 api_base = \"https://openrouter.ai/api/v1\"\n\
+                 api_format = \"openai-compatible\"\n\
                  scorer = { enabled = false, default_model = \"example/scorer\", fallback = \"example/scorer-fallback\", qualification_candidates = [\"example/scorer\"] }\n",
                 "cascade entries must not be empty",
             ),
@@ -928,15 +1905,11 @@ qualification_candidates = ["example/scorer"]
                 "version = 1\n\
                  default_model = \"example/model\"\n\
                  cascade = [\"example/fallback\"]\n\
+                 consensus = 1\n\
+                 api_base = \"https://openrouter.ai/api/v1\"\n\
+                 api_format = \"openai-compatible\"\n\
                  scorer = { enabled = false, default_model = \"\", fallback = \"example/scorer-fallback\", qualification_candidates = [\"example/scorer\"] }\n",
-                "scorer.defaultModel must not be empty",
-            ),
-            (
-                "version = 1\n\
-                 default_model = \"example/model\"\n\
-                 cascade = [\"example/fallback\"]\n\
-                 scorer = { enabled = false, default_model = \"example/scorer\", fallback = \"\", qualification_candidates = [\"example/scorer\"] }\n",
-                "scorer.fallback must not be empty",
+                "scorer configuration must be empty when scorer.defaultModel is empty",
             ),
         ];
         for (raw, expected) in cases {
@@ -949,6 +1922,39 @@ qualification_candidates = ["example/scorer"]
     }
 
     #[test]
+    fn model_defaults_reject_duplicate_generator_and_scorer_entries() {
+        let duplicate_generator = r#"version = 1
+default_model = "provider/model"
+cascade = ["provider/model"]
+consensus = 2
+api_base = "https://openrouter.ai/api/v1"
+api_format = "openai-compatible"
+scorer = { enabled = true, default_model = "provider/scorer", fallback = "", qualification_candidates = [] }
+"#;
+        assert!(
+            parse_model_defaults(duplicate_generator)
+                .unwrap_err()
+                .to_string()
+                .contains("must not repeat")
+        );
+
+        let duplicate_scorer = r#"version = 1
+default_model = "provider/model"
+cascade = []
+consensus = 1
+api_base = "https://openrouter.ai/api/v1"
+api_format = "openai-compatible"
+scorer = { enabled = true, default_model = "provider/scorer", fallback = "provider/scorer", qualification_candidates = [] }
+"#;
+        assert!(
+            parse_model_defaults(duplicate_scorer)
+                .unwrap_err()
+                .to_string()
+                .contains("fallback must differ")
+        );
+    }
+
+    #[test]
     fn starter_config_yaml_quotes_model_defaults_when_needed() {
         assert_eq!(yaml_scalar("plain/model"), "plain/model");
         assert_eq!(
@@ -958,16 +1964,12 @@ qualification_candidates = ["example/scorer"]
     }
 
     #[test]
-    fn readme_model_example_mentions_embedded_defaults() {
+    fn provider_guide_requires_qualified_explicit_models() {
         let readme = include_str!("../README.md");
-        let defaults = model_defaults();
-        assert!(readme.contains(&defaults.default_model));
-        for model in &defaults.cascade {
-            assert!(readme.contains(model));
-        }
-        for model in &defaults.scorer_qualification_candidates {
-            assert!(readme.contains(model));
-        }
+        assert!(readme.contains("docs/model-providers.md"));
+        let provider_guide = include_str!("../docs/model-providers.md");
+        assert!(provider_guide.contains("no implicit model or fallback chain"));
+        assert!(provider_guide.contains("qualification manifest"));
     }
 
     #[test]
@@ -982,7 +1984,82 @@ qualification_candidates = ["example/scorer"]
     }
 
     #[test]
-    fn defaults_keep_primary_and_retry_roster_order() {
+    fn benchmark_bounded_selection_requires_the_hermetic_feature_and_loopback_endpoints() {
+        let valid = || {
+            validate_benchmark_bounded_selection_values(
+                true,
+                Some("true"),
+                Some("1"),
+                "http://127.0.0.1:4100/v1",
+                Some("http://[::1]:4200"),
+            )
+        };
+        valid().unwrap();
+
+        let invalid = [
+            validate_benchmark_bounded_selection_values(
+                false,
+                Some("true"),
+                Some("1"),
+                "http://127.0.0.1:4100/v1",
+                Some("http://127.0.0.1:4200"),
+            ),
+            validate_benchmark_bounded_selection_values(
+                true,
+                Some("false"),
+                Some("1"),
+                "http://127.0.0.1:4100/v1",
+                Some("http://127.0.0.1:4200"),
+            ),
+            validate_benchmark_bounded_selection_values(
+                true,
+                Some("true"),
+                None,
+                "http://127.0.0.1:4100/v1",
+                Some("http://127.0.0.1:4200"),
+            ),
+            validate_benchmark_bounded_selection_values(
+                true,
+                Some("true"),
+                Some("1"),
+                "https://openrouter.ai/api/v1",
+                Some("http://127.0.0.1:4200"),
+            ),
+            validate_benchmark_bounded_selection_values(
+                true,
+                Some("true"),
+                Some("1"),
+                "http://127.0.0.1:4100/v1",
+                Some("http://example.test"),
+            ),
+            validate_benchmark_bounded_selection_values(
+                true,
+                Some("true"),
+                Some("1"),
+                "http://127.0.0.1:4100/v1",
+                None,
+            ),
+        ];
+        assert!(invalid.iter().all(Result::is_err));
+    }
+
+    #[test]
+    fn max_findings_is_bounded_for_scorer_admission() {
+        let mut accepted = Config::default();
+        let file: FileConfig = serde_yaml::from_str("maxFindings: 20\n").unwrap();
+        accepted.apply_file(file).unwrap();
+        assert_eq!(accepted.max_findings, MAX_FINDINGS);
+
+        for value in [0, 21, usize::MAX] {
+            let mut rejected = Config::default();
+            let file: FileConfig =
+                serde_yaml::from_str(&format!("maxFindings: {value}\n")).unwrap();
+            assert!(rejected.apply_file(file).is_err());
+        }
+    }
+
+    #[test]
+    fn defaults_require_an_explicit_model_roster() {
         let c = Config::default();
         let defaults = model_defaults();
         assert_eq!(c.model, defaults.default_model);
@@ -990,14 +2067,7 @@ qualification_candidates = ["example/scorer"]
         assert_eq!(c.scorer, defaults.scorer_model);
         assert!(!c.scorer_enabled);
         assert!(c.scorer_chain().is_empty());
-        assert_eq!(
-            c.model_chain(),
-            vec![
-                "mistralai/mistral-small-3.2-24b-instruct",
-                "google/gemma-3-27b-it",
-                "qwen/qwen3-32b",
-            ]
-        );
+        assert!(c.model_chain().is_empty());
     }
 
     #[test]
@@ -1058,7 +2128,7 @@ qualification_candidates = ["example/scorer"]
     }
 
     #[test]
-    fn hosted_mode_ignores_the_complete_repository_model_section() {
+    fn trusted_runtime_can_ignore_the_complete_repository_model_section() {
         let f: FileConfig = serde_yaml::from_str(
             "model:\n  name: anthropic/claude-opus-4.1\n  cascade:\n    - attacker/fallback\n  scorer: anthropic/claude-haiku-4.5\n  apiBase: https://attacker.invalid/v1\n  apiFormat: anthropic\n  consensus: 3\n",
         )
@@ -1074,6 +2144,504 @@ qualification_candidates = ["example/scorer"]
         assert_eq!(config.api_base, DEFAULT_API_BASE);
         assert_eq!(config.api_format, ApiFormat::OpenaiCompatible);
         assert_eq!(config.consensus, 1);
+    }
+
+    #[test]
+    fn empty_and_hosted_model_admission_fail_closed() {
+        let empty = Config::default();
+        assert!(empty.require_model_for(false).is_err());
+
+        let explicit = Config {
+            model: "provider/qualified-model".to_string(),
+            ..Config::default()
+        };
+        explicit.require_model_for(false).unwrap();
+        assert!(explicit.require_model_for(true).is_err());
+
+        let disabled = Config {
+            enabled: false,
+            ..Config::default()
+        };
+        disabled.require_model_for(true).unwrap();
+        assert!(qualification_manifest().profiles.is_empty());
+    }
+
+    #[test]
+    fn scorer_chain_preserves_the_ordered_fallback() {
+        let config = Config {
+            scorer: "qualified/scorer".into(),
+            scorer_fallback: "qualified/fallback".into(),
+            scorer_enabled: true,
+            ..Config::default()
+        };
+        assert_eq!(
+            config.scorer_chain(),
+            vec!["qualified/scorer", "qualified/fallback"]
+        );
+    }
+
+    #[test]
+    fn qualification_profile_rejects_stale_embedded_contract_hashes() {
+        let mut raw = valid_qualification_manifest_json();
+        raw["profiles"][0]["reviewContractSha256"] = serde_json::json!("0".repeat(64));
+        let error = parse_qualification_manifest(&raw.to_string()).unwrap_err();
+        assert!(error.to_string().contains("review contract is stale"));
+    }
+
+    #[test]
+    fn qualification_manifest_requires_one_canonical_source_commit() {
+        let mut missing = valid_qualification_manifest_json();
+        missing["qualificationSourceSha"] = serde_json::Value::Null;
+        let error = parse_qualification_manifest(&missing.to_string()).unwrap_err();
+        assert!(error.to_string().contains("source SHA is required"));
+
+        let mut uppercase = valid_qualification_manifest_json();
+        uppercase["qualificationSourceSha"] = serde_json::json!("A".repeat(40));
+        let error = parse_qualification_manifest(&uppercase.to_string()).unwrap_err();
+        assert!(error.to_string().contains("lowercase Git commit SHA"));
+
+        let mut mismatch = valid_qualification_manifest_json();
+        mismatch["profiles"][0]["qualificationSourceSha"] = serde_json::json!("8".repeat(40));
+        let error = parse_qualification_manifest(&mismatch.to_string()).unwrap_err();
+        assert!(error.to_string().contains("source SHA does not match"));
+    }
+
+    #[test]
+    fn empty_qualification_manifest_carries_no_source_authority() {
+        let mut empty = valid_qualification_manifest_json();
+        empty["profiles"] = serde_json::json!([]);
+        empty["qualificationSourceSha"] = serde_json::Value::Null;
+        empty["qualificationIssuedAtUnixSeconds"] = serde_json::Value::Null;
+        empty["qualificationExpiresAtUnixSeconds"] = serde_json::Value::Null;
+        empty["qualificationMaxAgeDays"] = serde_json::Value::Null;
+        assert!(
+            parse_qualification_manifest(&empty.to_string())
+                .unwrap()
+                .profiles
+                .is_empty()
+        );
+
+        empty["qualificationSourceSha"] = serde_json::json!("9".repeat(40));
+        let error = parse_qualification_manifest(&empty.to_string()).unwrap_err();
+        assert!(error.to_string().contains("must not claim"));
+    }
+
+    #[test]
+    fn qualification_authority_expires_against_runtime_time() {
+        let mut raw = valid_qualification_manifest_json();
+        raw["qualificationIssuedAtUnixSeconds"] = serde_json::json!(1_000_000_u64);
+        raw["qualificationExpiresAtUnixSeconds"] =
+            serde_json::json!(1_000_000_u64 + QUALIFICATION_MAX_AGE_SECONDS);
+        let manifest: QualificationManifest = serde_json::from_value(raw).unwrap();
+        let error = validate_qualification_authority(
+            &manifest,
+            1_000_000_u64 + QUALIFICATION_MAX_AGE_SECONDS,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("expired"));
+
+        validate_qualification_authority(&manifest, 999_999_u64 + QUALIFICATION_MAX_AGE_SECONDS)
+            .unwrap();
+    }
+
+    #[test]
+    fn qualification_authority_timestamps_are_service_compatible_integers() {
+        let mut raw = valid_qualification_manifest_json();
+        raw["qualificationIssuedAtUnixSeconds"] = serde_json::json!(0);
+        raw["qualificationExpiresAtUnixSeconds"] = serde_json::json!(QUALIFICATION_MAX_AGE_SECONDS);
+        let manifest: QualificationManifest = serde_json::from_value(raw).unwrap();
+        let error = validate_qualification_authority(&manifest, 1).unwrap_err();
+        assert!(error.to_string().contains("positive JSON-safe integers"));
+
+        let mut raw = valid_qualification_manifest_json();
+        raw["qualificationIssuedAtUnixSeconds"] = serde_json::json!(MAX_SAFE_JSON_INTEGER);
+        raw["qualificationExpiresAtUnixSeconds"] =
+            serde_json::json!(MAX_SAFE_JSON_INTEGER + QUALIFICATION_MAX_AGE_SECONDS);
+        let manifest: QualificationManifest = serde_json::from_value(raw).unwrap();
+        let error = validate_qualification_authority(&manifest, MAX_SAFE_JSON_INTEGER).unwrap_err();
+        assert!(error.to_string().contains("positive JSON-safe integers"));
+    }
+
+    #[test]
+    fn qualification_profile_requires_three_complete_repeats() {
+        let mut raw = valid_qualification_manifest_json();
+        raw["profiles"][0]["repeatedRuns"] = serde_json::json!(2);
+        let error = parse_qualification_manifest(&raw.to_string()).unwrap_err();
+        assert!(error.to_string().contains("at least three repeated runs"));
+    }
+
+    #[test]
+    fn qualification_profile_rejects_a_stale_evaluator_runtime() {
+        let mut raw = valid_qualification_manifest_json();
+        raw["profiles"][0]["evaluatorRuntimeIdentity"] = serde_json::json!("bun@0.0.0");
+        let error = parse_qualification_manifest(&raw.to_string()).unwrap_err();
+        assert!(error.to_string().contains("evaluator runtime is stale"));
+    }
+
+    #[test]
+    fn qualification_profile_requires_exact_safe_sorted_model_price_bounds() {
+        let valid = valid_qualification_manifest_json();
+        parse_qualification_manifest(&valid.to_string()).unwrap();
+
+        let mut missing_field = valid.clone();
+        missing_field["profiles"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("modelPriceBounds");
+        assert!(
+            parse_qualification_manifest(&missing_field.to_string())
+                .unwrap_err()
+                .to_string()
+                .contains("missing field `modelPriceBounds`")
+        );
+
+        let mut duplicate = valid.clone();
+        duplicate["profiles"][0]["modelPriceBounds"] = serde_json::json!([
+            {
+                "model": "provider/model",
+                "inputMicrosPerMillionTokens": 1,
+                "outputMicrosPerMillionTokens": 1
+            },
+            {
+                "model": "provider/model",
+                "inputMicrosPerMillionTokens": 1,
+                "outputMicrosPerMillionTokens": 1
+            },
+            {
+                "model": "provider/scorer",
+                "inputMicrosPerMillionTokens": 1,
+                "outputMicrosPerMillionTokens": 1
+            }
+        ]);
+        assert!(
+            parse_qualification_manifest(&duplicate.to_string())
+                .unwrap_err()
+                .to_string()
+                .contains("unique and sorted")
+        );
+
+        let mut unknown = valid.clone();
+        unknown["profiles"][0]["modelPriceBounds"][1]["model"] =
+            serde_json::json!("provider/unknown");
+        assert!(
+            parse_qualification_manifest(&unknown.to_string())
+                .unwrap_err()
+                .to_string()
+                .contains("unknown model")
+        );
+
+        let mut missing_model = valid.clone();
+        missing_model["profiles"][0]["modelPriceBounds"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        assert!(
+            parse_qualification_manifest(&missing_model.to_string())
+                .unwrap_err()
+                .to_string()
+                .contains("exactly cover")
+        );
+
+        let mut out_of_order = valid.clone();
+        out_of_order["profiles"][0]["modelPriceBounds"]
+            .as_array_mut()
+            .unwrap()
+            .reverse();
+        assert!(
+            parse_qualification_manifest(&out_of_order.to_string())
+                .unwrap_err()
+                .to_string()
+                .contains("unique and sorted")
+        );
+
+        for invalid in [0_u64, MAX_SAFE_JSON_INTEGER + 1] {
+            let mut unsafe_bound = valid.clone();
+            unsafe_bound["profiles"][0]["modelPriceBounds"][0]["inputMicrosPerMillionTokens"] =
+                serde_json::json!(invalid);
+            assert!(
+                parse_qualification_manifest(&unsafe_bound.to_string())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("positive safe integers")
+            );
+        }
+    }
+
+    #[test]
+    fn qualification_metadata_exposes_the_hosted_cost_cap_at_top_level() {
+        let metadata = serde_json::to_value(qualification_metadata()).unwrap();
+        assert_eq!(
+            metadata["hostedOperationCostCapMicros"],
+            serde_json::json!(1_000_000)
+        );
+        assert_eq!(
+            metadata["qualificationIssuedAtUnixSeconds"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            metadata["qualificationExpiresAtUnixSeconds"],
+            serde_json::Value::Null
+        );
+        assert_eq!(metadata["qualificationMaxAgeDays"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn qualification_hash_framing_matches_cross_language_vector() {
+        assert_eq!(
+            sha256_named_sources(&[("a.txt", "alpha"), ("b/β.txt", "line\n")]),
+            "1969c5b03a79915d62106b91c742a28127afae455317dcb3a4670e50829eb9ba"
+        );
+        assert_eq!(
+            normalize_api_base("HTTPS://OpenRouter.AI/api/v1/").unwrap(),
+            "https://openrouter.ai:443/api/v1"
+        );
+        assert!(normalize_api_base("https://example.com/v1?route=x").is_err());
+    }
+
+    #[test]
+    fn evaluator_contract_manifest_matches_the_exact_runtime_source_set() {
+        let declared: Vec<String> = serde_json::from_str(EVALUATOR_CONTRACT_PATHS_JSON).unwrap();
+        let embedded = EVALUATOR_CONTRACT_SOURCES
+            .iter()
+            .map(|(path, _)| path.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(declared, embedded);
+        assert!(declared.contains(&"bench/src/verify-admission.ts".to_string()));
+    }
+
+    #[test]
+    fn emitted_candidate_vector_parses_in_the_runtime_admission_parser() {
+        let mut candidate: serde_json::Value = serde_json::from_str(include_str!(
+            "../bench/admission-manifest-candidate-vector.json"
+        ))
+        .unwrap();
+        let issued = current_unix_seconds().unwrap();
+        candidate["qualificationIssuedAtUnixSeconds"] = serde_json::json!(issued);
+        candidate["qualificationExpiresAtUnixSeconds"] =
+            serde_json::json!(issued + QUALIFICATION_MAX_AGE_SECONDS);
+        candidate["modelDefaultsSha256"] = serde_json::json!(model_defaults().source_sha256);
+        candidate["profiles"][0]["modelDefaultsSha256"] =
+            serde_json::json!(model_defaults().source_sha256);
+        candidate["profiles"][0]["reviewContractSha256"] =
+            serde_json::json!(review_contract_sha256());
+        candidate["profiles"][0]["fixtureSetSha256"] = serde_json::json!(fixture_set_sha256());
+        candidate["profiles"][0]["evaluatorContractSha256"] =
+            serde_json::json!(evaluator_contract_sha256());
+        let profile: QualificationProfile =
+            serde_json::from_value(candidate["profiles"][0].clone()).unwrap();
+        candidate["profiles"][0]["id"] = serde_json::json!(qualification_profile_digest(&profile));
+        let parsed = parse_qualification_manifest(&candidate.to_string()).unwrap();
+        assert_eq!(parsed.profiles.len(), 1);
+        assert_eq!(
+            parsed.qualification_max_age_days,
+            Some(QUALIFICATION_MAX_AGE_DAYS)
+        );
+        let metadata =
+            serde_json::to_value(qualification_metadata_for(model_defaults(), &parsed)).unwrap();
+        assert_eq!(
+            metadata["qualificationIssuedAtUnixSeconds"],
+            candidate["qualificationIssuedAtUnixSeconds"]
+        );
+        assert_eq!(
+            metadata["qualificationExpiresAtUnixSeconds"],
+            candidate["qualificationExpiresAtUnixSeconds"]
+        );
+        assert_eq!(
+            metadata["qualificationMaxAgeDays"],
+            candidate["qualificationMaxAgeDays"]
+        );
+    }
+
+    #[test]
+    fn qualification_profile_digest_matches_cross_language_vector() {
+        let profile = QualificationProfile {
+            id: String::new(),
+            qualification_source_sha: "9".repeat(40),
+            model_defaults_sha256: "c".repeat(64),
+            benchmark_provider_identity: Some(MANAGED_OPENROUTER_PROVIDER_IDENTITY.into()),
+            api_base: "https://openrouter.ai:443/api/v1".into(),
+            api_format: ApiFormat::OpenaiCompatible,
+            generator_chain: vec!["provider/one".into(), "provider/two".into()],
+            consensus: 2,
+            scorer_chain: vec!["provider/scorer".into()],
+            model_price_bounds: vec![
+                ModelPriceBound {
+                    model: "provider/one".into(),
+                    input_micros_per_million_tokens: 1_000_000,
+                    output_micros_per_million_tokens: 2_000_000,
+                },
+                ModelPriceBound {
+                    model: "provider/scorer".into(),
+                    input_micros_per_million_tokens: 3_000_000,
+                    output_micros_per_million_tokens: 4_000_000,
+                },
+                ModelPriceBound {
+                    model: "provider/two".into(),
+                    input_micros_per_million_tokens: 5_000_000,
+                    output_micros_per_million_tokens: 6_000_000,
+                },
+            ],
+            review_contract_sha256: "b".repeat(64),
+            fixture_set_sha256: "a".repeat(64),
+            evaluator_contract_sha256: "f".repeat(64),
+            evaluator_runtime_identity: "bun@1.3.14".into(),
+            report_sha256: "e".repeat(64),
+            repeated_runs: 3,
+        };
+        assert_eq!(
+            qualification_profile_digest(&profile),
+            "e050df18c0f82fe6758eafd91c0c8d5b9eaccfe4a6cd0d01ca2edb8fc0a91d09"
+        );
+    }
+
+    #[test]
+    fn qualification_profile_rejects_tampered_digest_material() {
+        for field in ["price", "report", "repeats"] {
+            let mut raw = valid_qualification_manifest_json();
+            match field {
+                "price" => {
+                    raw["profiles"][0]["modelPriceBounds"][0]["inputMicrosPerMillionTokens"] =
+                        serde_json::json!(1_000_001)
+                }
+                "report" => raw["profiles"][0]["reportSha256"] = serde_json::json!("2".repeat(64)),
+                "repeats" => raw["profiles"][0]["repeatedRuns"] = serde_json::json!(4),
+                _ => unreachable!(),
+            }
+            let error = parse_qualification_manifest(&raw.to_string()).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("id does not match its canonical digest material"),
+                "{field}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn qualification_profile_rejects_other_openrouter_identities() {
+        let mut raw = valid_qualification_manifest_json();
+        raw["profiles"][0]["benchmarkProviderIdentity"] =
+            serde_json::json!("openrouter:other-routing");
+        let error = parse_qualification_manifest(&raw.to_string()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(MANAGED_OPENROUTER_PROVIDER_IDENTITY),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn qualification_metadata_attests_only_an_exact_default_profile() {
+        let defaults = ModelDefaults {
+            version: 1,
+            source_sha256: "a".repeat(64),
+            default_model: "provider/generator".into(),
+            cascade: vec!["provider/fallback".into()],
+            consensus: 1,
+            api_base: "https://models.example/v1".into(),
+            api_format: ApiFormat::OpenaiCompatible,
+            scorer_enabled: true,
+            scorer_model: "provider/scorer".into(),
+            scorer_fallback: "provider/scorer-fallback".into(),
+            scorer_qualification_candidates: Vec::new(),
+        };
+        let profile = QualificationProfile {
+            id: "qualified-profile".into(),
+            qualification_source_sha: "9".repeat(40),
+            model_defaults_sha256: defaults.source_sha256.clone(),
+            api_format: ApiFormat::OpenaiCompatible,
+            api_base: "https://models.example:443/v1".into(),
+            benchmark_provider_identity: Some("provider-route".into()),
+            generator_chain: vec!["provider/generator".into(), "provider/fallback".into()],
+            consensus: 1,
+            scorer_chain: vec!["provider/scorer".into(), "provider/scorer-fallback".into()],
+            model_price_bounds: vec![
+                ModelPriceBound {
+                    model: "provider/fallback".into(),
+                    input_micros_per_million_tokens: 1_000_000,
+                    output_micros_per_million_tokens: 2_000_000,
+                },
+                ModelPriceBound {
+                    model: "provider/generator".into(),
+                    input_micros_per_million_tokens: 1_000_000,
+                    output_micros_per_million_tokens: 2_000_000,
+                },
+                ModelPriceBound {
+                    model: "provider/scorer".into(),
+                    input_micros_per_million_tokens: 1_000_000,
+                    output_micros_per_million_tokens: 2_000_000,
+                },
+                ModelPriceBound {
+                    model: "provider/scorer-fallback".into(),
+                    input_micros_per_million_tokens: 1_000_000,
+                    output_micros_per_million_tokens: 2_000_000,
+                },
+            ],
+            review_contract_sha256: "b".repeat(64),
+            fixture_set_sha256: "c".repeat(64),
+            evaluator_contract_sha256: "d".repeat(64),
+            evaluator_runtime_identity: "bun@1.3.14".into(),
+            report_sha256: "e".repeat(64),
+            repeated_runs: 3,
+        };
+        let issued = 1_800_000_000;
+        let manifest = QualificationManifest {
+            version: 1,
+            qualification_source_sha: Some("9".repeat(40)),
+            qualification_issued_at_unix_seconds: Some(issued),
+            qualification_expires_at_unix_seconds: Some(issued + QUALIFICATION_MAX_AGE_SECONDS),
+            qualification_max_age_days: Some(QUALIFICATION_MAX_AGE_DAYS),
+            model_defaults_sha256: defaults.source_sha256.clone(),
+            profiles: vec![profile.clone()],
+        };
+
+        assert_eq!(admitted_profile_for(&defaults, &manifest), Some(profile));
+        let metadata =
+            serde_json::to_value(qualification_metadata_for(&defaults, &manifest)).unwrap();
+        assert_eq!(metadata["qualificationIssuedAtUnixSeconds"], issued);
+        assert_eq!(
+            metadata["qualificationExpiresAtUnixSeconds"],
+            issued + QUALIFICATION_MAX_AGE_SECONDS
+        );
+        assert_eq!(
+            metadata["qualificationMaxAgeDays"],
+            QUALIFICATION_MAX_AGE_DAYS
+        );
+        assert!(metadata["admittedProfile"].is_object());
+
+        for tamper in ["generator", "consensus", "scorer", "apiBase", "apiFormat"] {
+            let mut altered = defaults.clone();
+            match tamper {
+                "generator" => altered.default_model = "provider/other".into(),
+                "consensus" => altered.consensus = 2,
+                "scorer" => altered.scorer_model = "provider/other-scorer".into(),
+                "apiBase" => altered.api_base = "https://other.example/v1".into(),
+                "apiFormat" => altered.api_format = ApiFormat::Anthropic,
+                _ => unreachable!(),
+            }
+            assert_eq!(admitted_profile_for(&altered, &manifest), None, "{tamper}");
+        }
+
+        let empty = QualificationManifest {
+            profiles: Vec::new(),
+            qualification_source_sha: None,
+            qualification_issued_at_unix_seconds: None,
+            qualification_expires_at_unix_seconds: None,
+            qualification_max_age_days: None,
+            ..manifest
+        };
+        assert_eq!(admitted_profile_for(&defaults, &empty), None);
+        let metadata = serde_json::to_value(qualification_metadata_for(&defaults, &empty)).unwrap();
+        assert_eq!(
+            metadata["qualificationIssuedAtUnixSeconds"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            metadata["qualificationExpiresAtUnixSeconds"],
+            serde_json::Value::Null
+        );
+        assert_eq!(metadata["qualificationMaxAgeDays"], serde_json::Value::Null);
     }
 
     #[test]
@@ -1101,19 +2669,13 @@ qualification_candidates = ["example/scorer"]
     }
 
     #[test]
-    fn hosted_roster_contains_no_anthropic_models() {
+    fn hosted_roster_is_empty_until_qualification_admits_models() {
         let defaults = model_defaults();
-        let hosted_models = std::iter::once(&defaults.default_model)
-            .chain(defaults.cascade.iter())
-            .chain(std::iter::once(&defaults.scorer_model))
-            .chain(std::iter::once(&defaults.scorer_fallback))
-            .chain(defaults.scorer_qualification_candidates.iter());
-        for model in hosted_models {
-            assert!(
-                !model.to_ascii_lowercase().starts_with("anthropic/"),
-                "hosted model roster contains Anthropic model {model}"
-            );
-        }
+        assert!(defaults.default_model.is_empty());
+        assert!(defaults.cascade.is_empty());
+        assert!(defaults.scorer_model.is_empty());
+        assert!(defaults.scorer_fallback.is_empty());
+        assert!(defaults.scorer_qualification_candidates.is_empty());
     }
 
     #[test]

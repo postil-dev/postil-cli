@@ -1,11 +1,146 @@
 import { describe, expect, test } from "bun:test";
-import { cases } from "../fixtures/cases";
-import { benchmarkCase, scanForForbidden } from "./harness";
+import {
+  cases,
+  negativePropositionsByFixtureId,
+  positiveParaphrasesByFixtureId,
+  semanticProbesByFixtureId,
+} from "../fixtures/cases";
+import {
+  benchmarkCase,
+  commentMatchesExpectation,
+  parseUnifiedDiffFiles,
+  scanForForbidden,
+  startMockGithub,
+} from "./harness";
+
+function minimalFixture(diff: string, primaryChange?: { path: string; line: number }) {
+  return {
+    id: "coordinate-contract",
+    name: "Coordinate contract",
+    repo: "benchmark/example",
+    pullNumber: 1,
+    headSha: "abc",
+    diff,
+    primaryChange,
+    allowedContext: { files: [], docs: [] },
+    admission: { classification: "clean" as const, contractRule: "no-merge-relevant-defect" },
+    modelOutput: { summary: "", findings: [] },
+    expectations: { minFindings: 0, maxFindings: 0, requiredFindings: [] },
+  };
+}
 
 describe("benchmark fixtures", () => {
+  test("every canonical fixture declares a real added coordinate", () => {
+    const parsed = cases.map((candidate) => benchmarkCase.parse(candidate));
+    expect(parsed).toHaveLength(61);
+    for (const candidate of parsed) {
+      expect(candidate.primaryChange).toBeDefined();
+      const changedFile = parseUnifiedDiffFiles(candidate.diff).find(
+        (file) => file.path === candidate.primaryChange?.path,
+      );
+      expect(changedFile?.addedLines).toContain(candidate.primaryChange?.line);
+    }
+  });
+
+  test("rejects primary paths and lines that are not added coordinates", () => {
+    const diff = [
+      "diff --git a/src/example.ts b/src/example.ts",
+      "--- a/src/example.ts",
+      "+++ b/src/example.ts",
+      "@@ -10,3 +10,3 @@",
+      " const context = true;",
+      "-const oldValue = 1;",
+      "+const newValue = 2;",
+      " const tail = true;",
+      "",
+    ].join("\n");
+
+    const missingPath = benchmarkCase.safeParse(
+      minimalFixture(diff, { path: "src/missing.ts", line: 11 }),
+    );
+    expect(missingPath.success).toBe(false);
+    expect(missingPath.error?.issues[0]?.message).toContain("does not name a file in the diff");
+    expect(missingPath.error?.issues[0]?.message.length).toBeLessThan(240);
+
+    const contextLine = benchmarkCase.safeParse(
+      minimalFixture(diff, { path: "src/example.ts", line: 10 }),
+    );
+    expect(contextLine.success).toBe(false);
+    expect(contextLine.error?.issues[0]?.message).toContain("is not an added line in the diff");
+
+    const deletionOnlyDiff = [
+      "diff --git a/src/removed.ts b/src/removed.ts",
+      "--- a/src/removed.ts",
+      "+++ b/src/removed.ts",
+      "@@ -7,1 +7,0 @@",
+      "-removedOnly();",
+      "",
+    ].join("\n");
+    const deletedOnlyLine = benchmarkCase.safeParse(
+      minimalFixture(deletionOnlyDiff, { path: "src/removed.ts", line: 7 }),
+    );
+    expect(deletedOnlyLine.success).toBe(false);
+    expect(deletedOnlyLine.error?.issues[0]?.path).toEqual(["primaryChange", "line"]);
+
+    const unknownPrimaryField = benchmarkCase.safeParse({
+      ...minimalFixture(diff),
+      primaryChange: { path: "src/example.ts", line: 11, note: "not part of the contract" },
+    });
+    expect(unknownPrimaryField.success).toBe(false);
+    expect(unknownPrimaryField.error?.issues[0]?.code).toBe("unrecognized_keys");
+  });
+
+  test("parses exact added coordinates across renames, multiple files, and multiple hunks", () => {
+    const diff = [
+      "diff --git a/src/old.ts b/src/new.ts",
+      "similarity index 80%",
+      "rename from src/old.ts",
+      "rename to src/new.ts",
+      "--- a/src/old.ts",
+      "+++ b/src/new.ts",
+      "@@ -4,2 +4,2 @@",
+      " keep();",
+      "+addedAtFive();",
+      "@@ -20,1 +20,2 @@",
+      "-removedAtTwenty();",
+      "+addedAtTwenty();",
+      "+++contentBeginningWithPluses();",
+      "diff --git a/src/other.ts b/src/other.ts",
+      "--- a/src/other.ts",
+      "+++ b/src/other.ts",
+      "@@ -1 +1,2 @@",
+      " existing();",
+      "+otherAddition();",
+      "",
+    ].join("\n");
+
+    const parsed = parseUnifiedDiffFiles(diff);
+    expect(parsed.map((file) => file.path)).toEqual(["src/new.ts", "src/other.ts"]);
+    expect(parsed[0]?.addedLines).toEqual([5, 20, 21]);
+    expect(parsed[1]?.addedLines).toEqual([2]);
+    expect(benchmarkCase.parse(minimalFixture(diff, { path: "src/new.ts", line: 20 })).primaryChange)
+      .toEqual({ path: "src/new.ts", line: 20 });
+
+    const headerlessRename = [
+      "diff --git a/src/before.ts b/src/after.ts",
+      "similarity index 100%",
+      "rename from src/before.ts",
+      "rename to src/after.ts",
+      "",
+    ].join("\n");
+    expect(parseUnifiedDiffFiles(headerlessRename)).toMatchObject([
+      { path: "src/after.ts", status: "modified", addedLines: [], changes: 0 },
+    ]);
+    expect(
+      benchmarkCase.safeParse(
+        minimalFixture(headerlessRename, { path: "src/after.ts", line: 1 }),
+      ).success,
+    ).toBe(false);
+  });
+
   test("cover the expanded saturated-case categories", () => {
     const parsed = cases.map((c) => benchmarkCase.parse(c));
-    expect(parsed).toHaveLength(64);
+    expect(parsed).toHaveLength(61);
 
     const labels = new Set(parsed.flatMap((c) => c.scoringLabels));
     for (const label of [
@@ -21,10 +156,176 @@ describe("benchmark fixtures", () => {
       expect(labels.has(label)).toBe(true);
     }
 
-    const defectCount = parsed.filter((c) => c.groundTruth.findings.length > 0).length;
-    const cleanCount = parsed.length - defectCount;
-    expect(defectCount).toBe(53);
-    expect(cleanCount).toBe(11);
+    const byClass = Object.groupBy(parsed, (candidate) => candidate.admission.classification);
+    expect(byClass.mustBlock).toHaveLength(34);
+    expect(byClass.advisory).toHaveLength(15);
+    expect(byClass.clean).toHaveLength(12);
+    expect(parsed.filter((candidate) => candidate.groundTruth.findings.length > 0)).toHaveLength(49);
+
+    expect(parsed.map((candidate) => candidate.id)).not.toContain("migration-drop-column");
+    expect(parsed.map((candidate) => candidate.id)).not.toContain("migration-nullability-tighten");
+    expect(parsed.map((candidate) => candidate.id)).not.toContain("dependency-vulnerable-pin");
+    expect(parsed.find((candidate) => candidate.id === "dependency-major-bump")?.admission).toEqual({
+      classification: "clean",
+      contractRule: "version-change-alone-is-not-a-defect-without-a-guardrail",
+    });
+
+    for (const candidate of parsed) {
+      const expectedSeverity = candidate.admission.classification === "mustBlock"
+        ? "error"
+        : candidate.admission.classification === "advisory"
+          ? "warn"
+          : undefined;
+      expect(candidate.groundTruth.findings[0]?.severity).toBe(expectedSeverity);
+      const finding = candidate.groundTruth.findings[0];
+      if (finding !== undefined) {
+        expect(finding.semantics?.positive.length).toBeGreaterThan(3);
+        expect(finding.semantics?.failedRemediation.length).toBe(6);
+        const explicitPositives = positiveParaphrasesByFixtureId[candidate.id];
+        expect(explicitPositives).toBeDefined();
+        for (const explicitPositive of explicitPositives!) {
+          expect({
+            id: candidate.id,
+            explicitPositive,
+            matches: commentMatchesExpectation(explicitPositive, finding.semantics),
+          }).toEqual({ id: candidate.id, explicitPositive, matches: true });
+        }
+        const inversePropositions = negativePropositionsByFixtureId[candidate.id];
+        expect(inversePropositions).toBeDefined();
+        for (const inverse of inversePropositions!) {
+          expect({
+            id: candidate.id,
+            inverse,
+            matches: commentMatchesExpectation(inverse, finding.semantics),
+          }).toEqual({ id: candidate.id, inverse, matches: false });
+        }
+        expect({
+          id: candidate.id,
+          recordedMatches: commentMatchesExpectation(candidate.modelOutput.findings[0]!.body, finding.semantics),
+        }).toEqual({ id: candidate.id, recordedMatches: true });
+        const probe = semanticProbesByFixtureId[candidate.id];
+        expect(probe).toBeDefined();
+        expect(probe).not.toBe(candidate.modelOutput.findings[0]!.body);
+        expect({
+          id: candidate.id,
+          matches: commentMatchesExpectation(probe!, finding.semantics),
+        }).toEqual({ id: candidate.id, matches: true });
+        for (const negated of [
+          `It is false that ${probe}`,
+          `It is not true that ${probe}`,
+          `It is never true that ${probe}`,
+          `It never happens that ${probe}`,
+          `There is no evidence that ${probe}`,
+          `Without ${probe}`,
+          `This prevents ${probe}`,
+          `This avoids ${probe}`,
+          `This eliminates ${probe}`,
+          `This fixes ${probe}`,
+          `This no longer causes ${probe}`,
+        ]) {
+          expect({
+            id: candidate.id,
+            negated,
+            matches: commentMatchesExpectation(negated, finding.semantics),
+          }).toEqual({ id: candidate.id, negated, matches: false });
+        }
+        for (const remediated of finding.semantics!.negative) {
+          expect({
+            id: candidate.id,
+            remediated,
+            matches: commentMatchesExpectation(remediated, finding.semantics),
+          }).toEqual({ id: candidate.id, remediated, matches: false });
+        }
+        for (const failedRemediation of finding.semantics!.failedRemediation) {
+          expect({
+            id: candidate.id,
+            failedRemediation,
+            matches: commentMatchesExpectation(failedRemediation, finding.semantics),
+          }).toEqual({ id: candidate.id, failedRemediation, matches: true });
+        }
+        for (const positive of finding.semantics!.positive) {
+          const sentenceCased = `${positive.at(0)?.toUpperCase() ?? ""}${positive.slice(1)}`;
+          expect(commentMatchesExpectation(sentenceCased, finding.semantics)).toBe(true);
+          for (const hostile of [
+            `It is not false that ${positive}`,
+            `This fixes an unrelated concern. ${positive}`,
+            `This makes the defect impossible. ${positive}`,
+            `The path is protected against this defect. ${positive}`,
+            `The condition cannot occur. ${positive}`,
+          ]) {
+            expect({
+              id: candidate.id,
+              hostile,
+              matches: commentMatchesExpectation(hostile, finding.semantics),
+            }).toEqual({ id: candidate.id, hostile, matches: false });
+          }
+        }
+      }
+    }
+    expect(Object.values(positiveParaphrasesByFixtureId).flat()).toHaveLength(100);
+    expect(Object.values(negativePropositionsByFixtureId).flat()).toHaveLength(49);
+    expect(Object.keys(semanticProbesByFixtureId).sort()).toEqual(
+      parsed.filter((candidate) => candidate.groundTruth.findings.length > 0).map((candidate) => candidate.id).sort(),
+    );
+  });
+
+  test("distinguishes billing defect paraphrases from their inversions", () => {
+    const candidate = benchmarkCase.parse(
+      cases.find((fixture) => fixture.id === "billing-double-charge"),
+    );
+    const semantics = candidate.groundTruth.findings[0]?.semantics;
+    expect(semantics).toBeDefined();
+    for (const defect of [
+      "A retry charges the buyer two times for one purchase.",
+      "The ledger records two debits for one purchase.",
+      "This duplicates the customer charge on retry.",
+    ]) {
+      expect(commentMatchesExpectation(defect, semantics)).toBe(true);
+    }
+    for (const inversion of [
+      "The customer is not charged twice.",
+      "The customer isn't charged twice.",
+      "A retry never produces two debits.",
+      "The retry doesn't produce two debits.",
+      "It is false that a retry charges the buyer two times.",
+    ]) {
+      expect(commentMatchesExpectation(inversion, semantics)).toBe(false);
+    }
+    expect(commentMatchesExpectation(
+      "The retry does not change tax. It charges the buyer two times.",
+      semantics,
+    )).toBe(false);
+    for (const unlisted of [
+      "The report alleges that a retry creates a duplicate charge for the customer, but that allegation is incorrect.",
+      "Supposedly a retry creates a duplicate charge for the customer; however, this assertion is wrong.",
+      "A reviewer claimed a retry creates a duplicate charge for the customer. The reviewer was mistaken.",
+      "Historically, a retry creates a duplicate charge for the customer; this patch corrects that behavior.",
+      "The old implementation meant a retry creates a duplicate charge for the customer. The new transaction removes that risk.",
+      "If the guard were absent, a retry creates a duplicate charge for the customer, but the guard is present.",
+      "A retry creates a duplicate charge for the customer. This is additional unlisted context.",
+    ]) {
+      expect(commentMatchesExpectation(unlisted, semantics)).toBe(false);
+    }
+  });
+
+  test("keeps authorization polarity while accepting useful paraphrases", () => {
+    const candidate = benchmarkCase.parse(
+      cases.find((fixture) => fixture.id === "security-admin-delete"),
+    );
+    const semantics = candidate.groundTruth.findings[0]?.semantics;
+    expect(semantics).toBeDefined();
+    expect(commentMatchesExpectation(
+      "This path checks authorization before deleting the user.",
+      semantics,
+    )).toBe(false);
+    expect(commentMatchesExpectation(
+      "The destructive action lacks an admin check before deleting the user.",
+      semantics,
+    )).toBe(true);
+    expect(commentMatchesExpectation(
+      "Deleting users now skips permission enforcement.",
+      semantics,
+    )).toBe(true);
   });
 
   test("huge low-signal fixtures can carry multiple hunks in one diff", () => {
@@ -38,17 +339,69 @@ describe("benchmark fixtures", () => {
     }
 
     for (const c of hugeCases) {
-      const removed = c.diff
+      const primaryPath = c.allowedContext.files[0]?.path;
+      const primaryDiff = parseUnifiedDiffFiles(c.diff).find((file) =>
+        file.path === primaryPath
+      )?.patch ?? "";
+      const removed = primaryDiff
         .split("\n")
         .filter((line) => line.startsWith("- "))
         .map((line) => line.slice(2));
-      const added = c.diff
+      const added = primaryDiff
         .split("\n")
         .filter((line) => line.startsWith("+ "))
         .map((line) => line.slice(2));
       expect(removed.length).toBeGreaterThan(1);
       expect(added.length).toBe(removed.length);
       expect(added.every((line, index) => line !== removed[index])).toBe(true);
+    }
+
+    const distant = hugeCases.find((fixture) =>
+      fixture.id === "huge-low-signal-permission-bypass"
+    );
+    expect(distant?.diff.length).toBeGreaterThan(600_000);
+    expect(distant?.diff).toContain("src/churn/prefix-0.ts");
+    expect(distant?.diff).toContain("src/admin/bulk-edit.ts");
+    expect(distant?.admission.expectedCoverage).toBe("bounded");
+    const distantFiles = parseUnifiedDiffFiles(distant!.diff);
+    const defectIndex = distantFiles.findIndex((file) => file.path === "src/admin/bulk-edit.ts");
+    expect(distantFiles.length).toBe(7);
+    expect(defectIndex).toBeGreaterThan(0);
+    expect(defectIndex).toBeLessThan(distantFiles.length - 1);
+
+    const generatedNoise = hugeCases.find((fixture) =>
+      fixture.id === "huge-low-signal-clean"
+    );
+    expect(generatedNoise?.diff.length).toBeGreaterThan(32 * 1024 * 1024);
+    expect(generatedNoise?.diff).toContain("generated-noise.js.map");
+    expect(generatedNoise?.diff.match(/^\+  \"x/gm)?.length).toBeGreaterThan(30_000);
+    expect(generatedNoise?.admission.expectedCoverage).toBe("bounded");
+  });
+
+  test("the GitHub mock reports and serves every changed file independently", async () => {
+    const c = benchmarkCase.parse(cases.find((candidate) =>
+      candidate.id === "huge-low-signal-permission-bypass"
+    ));
+    const github = await startMockGithub(c);
+    try {
+      const pull = await fetch(`${github.baseUrl}${github.pullPath}`, {
+        headers: { accept: "application/json" },
+      }).then((response) => response.json()) as { changed_files: number };
+      expect(pull.changed_files).toBe(7);
+
+      const files = await fetch(`${github.baseUrl}${github.pullPath}/files`).then((response) =>
+        response.json()
+      ) as Array<{ filename: string }>;
+      expect(files.map((file) => file.filename)).toContain("src/admin/bulk-edit.ts");
+      expect(files.map((file) => file.filename)).toContain("src/churn/suffix-2.ts");
+
+      const primary = await fetch(
+        `${github.baseUrl}/repos/${c.repo}/contents/src%2Fadmin%2Fbulk-edit.ts?ref=${c.headSha}`,
+      ).then((response) => response.text());
+      expect(primary).toContain("applyBulkEdit(changeSet)");
+      expect(primary).not.toContain("ordinary_prefix");
+    } finally {
+      await github.close();
     }
   });
 });
@@ -77,6 +430,7 @@ describe("disallowedSources", () => {
       },
       disallowedSources: [{ text: "BENCH_INJECTION_SCOPE_TEST", scope: "output" }],
       scoringLabels: ["prompt-injection"],
+      admission: { classification: "clean", contractRule: "no-merge-relevant-defect" },
       groundTruth: { findings: [] },
       modelOutput: { summary: "", findings: [] },
       expectations: { minFindings: 0, maxFindings: 0, requiredFindings: [] },

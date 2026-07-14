@@ -33,6 +33,9 @@ pub enum ForgeArg {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)] // Review carries the full flag set by design.
 pub enum Command {
+    /// Print immutable qualification metadata embedded in this binary.
+    #[command(hide = true)]
+    QualificationMetadata,
     /// Review a diff: a PR/MR on a forge, or local changes.
     Review {
         /// Code host for remote review. Inferred as github when --repo is set.
@@ -89,6 +92,9 @@ pub enum Command {
         /// Model override (else REVIEW_MODEL, else config, else default).
         #[arg(long)]
         model: Option<String>,
+        /// Use deterministic semantic synthesis and model-assisted risk selection to cap large reviews at five source batches; report bounded coverage.
+        #[arg(long)]
+        bounded: bool,
         /// Do not post comments or checks to the forge; report locally only.
         #[arg(long)]
         no_post: bool,
@@ -160,4 +166,30 @@ pub enum HookAction {
         #[arg(long)]
         force: bool,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::{CommandFactory, Parser};
+
+    use super::{Cli, Command};
+
+    #[test]
+    fn review_bounded_is_an_explicit_action_flag_with_concise_help() {
+        let parsed = Cli::try_parse_from(["postil", "review", "--staged", "--bounded"]).unwrap();
+        let Command::Review { bounded, .. } = parsed.command else {
+            panic!("review command was not parsed");
+        };
+        assert!(bounded);
+
+        let help = Cli::command()
+            .find_subcommand_mut("review")
+            .expect("review subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--bounded"));
+        assert!(help.contains(
+            "Use deterministic semantic synthesis and model-assisted risk selection to cap large reviews at five source batches; report bounded coverage"
+        ));
+    }
 }

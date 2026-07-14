@@ -1,13 +1,16 @@
 //! GitLab forge implementation (gitlab.com and self-managed via GITLAB_API_URL).
 //!
 //! Check semantics map to commit statuses: GitLab has no `neutral`, so an
-//! operational error marks both statuses `failed` — fail closed, never grey.
+//! operational error marks both statuses `failed`: fail closed, never grey.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
+use futures::{StreamExt, TryStreamExt, stream};
 use serde::Deserialize;
 use serde_json::json;
+use std::io::Write;
 
 use super::{CheckState, Forge, PrMeta, ThreadKind, check_summary, check_title};
+use crate::diff::{DiffSnapshot, DiffSpool, WorkspaceBudget};
 use crate::envelope::{Envelope, Finding};
 
 pub struct GitLab {
@@ -37,16 +40,20 @@ struct MrResponse {
 struct FileDiffItem {
     old_path: String,
     new_path: String,
-    diff: String,
-    #[serde(default)]
     new_file: bool,
-    #[serde(default)]
     deleted_file: bool,
 }
 
 #[derive(Deserialize)]
 struct CompareResponse {
+    compare_timeout: bool,
     diffs: Vec<FileDiffItem>,
+}
+
+#[derive(Deserialize)]
+struct DiffVersion {
+    state: String,
+    real_size: String,
 }
 
 impl GitLab {
@@ -82,9 +89,11 @@ impl GitLab {
         if status.is_success() {
             return Ok(resp);
         }
-        let body = resp.text().await.unwrap_or_default();
-        let snippet: String = body.chars().take(300).collect();
-        Err(anyhow!("GitLab {what} failed: {status}: {snippet}"))
+        let request_id = super::response_request_id(&resp).unwrap_or_else(|| "none".into());
+        Err(super::http_failure(
+            status,
+            format!("GitLab {what} failed: {status} (request id {request_id})"),
+        ))
     }
 
     async fn mr(&self) -> Result<MrResponse> {
@@ -96,32 +105,160 @@ impl GitLab {
             .send()
             .await
             .context("fetching MR")?;
-        Ok(Self::check_ok(resp, "MR fetch").await?.json().await?)
+        super::bounded_response_json(Self::check_ok(resp, "MR fetch").await?, "GitLab MR").await
     }
 
-    fn assemble_unified(items: &[FileDiffItem]) -> String {
-        let mut out = String::new();
-        for item in items {
-            out.push_str(&format!(
-                "diff --git a/{} b/{}\n",
-                item.old_path, item.new_path
-            ));
-            if item.new_file {
-                out.push_str(&format!("--- /dev/null\n+++ b/{}\n", item.new_path));
-            } else if item.deleted_file {
-                out.push_str(&format!("--- a/{}\n+++ /dev/null\n", item.old_path));
-            } else {
-                out.push_str(&format!(
-                    "--- a/{}\n+++ b/{}\n",
-                    item.old_path, item.new_path
-                ));
-            }
-            out.push_str(&item.diff);
-            if !item.diff.ends_with('\n') {
-                out.push('\n');
-            }
+    async fn source_file(
+        &self,
+        revision: &str,
+        path: &str,
+        workspace: WorkspaceBudget,
+    ) -> Result<(DiffSnapshot, usize)> {
+        ensure!(
+            super::valid_repository_path(path),
+            "GitLab returned an unsafe repository path"
+        );
+        let mut url = reqwest::Url::parse(
+            &self.url(&format!("/repository/files/{}/raw", encode_component(path))),
+        )
+        .context("building GitLab source URL")?;
+        url.query_pairs_mut().append_pair("ref", revision);
+        let response = self
+            .request(reqwest::Method::GET, url.to_string())
+            .send()
+            .await
+            .context("fetching GitLab source file")?;
+        let response = Self::check_ok(response, "source file fetch").await?;
+        let authoritative_size = response
+            .headers()
+            .get("x-gitlab-size")
+            .map(|value| {
+                value
+                    .to_str()
+                    .context("GitLab source size header is not text")?
+                    .parse::<u64>()
+                    .context("GitLab source size header is not numeric")
+            })
+            .transpose()?;
+        let authoritative_sha256 = response
+            .headers()
+            .get("x-gitlab-content-sha256")
+            .map(|value| {
+                let value = value
+                    .to_str()
+                    .context("GitLab source SHA-256 header is not text")?;
+                ensure!(
+                    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                    "GitLab source SHA-256 header is malformed"
+                );
+                Ok::<_, anyhow::Error>(value.to_string())
+            })
+            .transpose()?;
+        let authoritative = (authoritative_size.is_some() || authoritative_sha256.is_some())
+            .then_some(super::SourceExpectation {
+                size: authoritative_size,
+                sha256: authoritative_sha256,
+            });
+        let snapshot =
+            super::response_snapshot_in(response, "GitLab source file", workspace, authoritative)
+                .await?;
+        let byte_count = snapshot.as_bytes().len();
+        Ok((snapshot, byte_count))
+    }
+
+    async fn build_complete_diff(
+        &self,
+        items: Vec<FileDiffItem>,
+        base_sha: &str,
+        head_sha: &str,
+        workspace: WorkspaceBudget,
+    ) -> Result<DiffSnapshot> {
+        for item in &items {
+            ensure!(
+                super::valid_repository_path(&item.old_path)
+                    && super::valid_repository_path(&item.new_path),
+                "GitLab returned an unsafe repository path"
+            );
         }
-        out
+        let mut sections = stream::iter(items.into_iter().enumerate().map(|(index, item)| {
+            let workspace = workspace.clone();
+            async move {
+                let (old, old_bytes) = if item.new_file {
+                    (DiffSnapshot::from_bytes_in(b"", workspace.clone())?, 0)
+                } else {
+                    self.source_file(base_sha, &item.old_path, workspace.clone())
+                        .await?
+                };
+                let (new, new_bytes) = if item.deleted_file {
+                    (DiffSnapshot::from_bytes_in(b"", workspace.clone())?, 0)
+                } else {
+                    self.source_file(head_sha, &item.new_path, workspace.clone())
+                        .await?
+                };
+                let mut section = DiffSpool::new_in(workspace.clone())?;
+                super::azure::write_diff_section(
+                    &mut section,
+                    &item.old_path,
+                    &item.new_path,
+                    old.source_str(),
+                    new.source_str(),
+                    item.new_file,
+                    item.deleted_file,
+                )?;
+                Ok::<_, anyhow::Error>((index, old_bytes, new_bytes, section.finish()?))
+            }
+        }))
+        .buffered(4);
+        let mut output = DiffSpool::new_in(workspace.clone())?;
+        while let Some((_, old_bytes, new_bytes, section)) = sections.try_next().await? {
+            old_bytes
+                .checked_add(new_bytes)
+                .ok_or_else(|| anyhow!("GitLab source acquisition size overflowed"))?;
+            output
+                .write_all(section.as_bytes())
+                .context("spooling GitLab reconstructed diff")?;
+        }
+        output.finish()
+    }
+
+    fn validate_diff_version(version: &DiffVersion, item_count: usize) -> Result<()> {
+        ensure!(
+            version.state == "collected",
+            "GitLab diff version is not complete (state {})",
+            version.state
+        );
+        let expected_items: usize = version
+            .real_size
+            .parse()
+            .context("GitLab diff version real_size is not numeric")?;
+        ensure!(
+            item_count == expected_items,
+            "GitLab returned {item_count} diff files but the collected version reports {expected_items}"
+        );
+        Ok(())
+    }
+
+    async fn latest_diff_version(&self) -> Result<DiffVersion> {
+        let resp = self
+            .request(
+                reqwest::Method::GET,
+                self.url(&format!(
+                    "/merge_requests/{}/versions?per_page=1&page=1",
+                    self.mr_iid
+                )),
+            )
+            .send()
+            .await
+            .context("fetching MR diff version")?;
+        let versions: Vec<DiffVersion> = super::bounded_response_json(
+            Self::check_ok(resp, "diff version fetch").await?,
+            "GitLab diff version",
+        )
+        .await?;
+        versions
+            .into_iter()
+            .next()
+            .context("GitLab returned no merge-request diff version")
     }
 
     /// Post one finding as an anchored discussion, falling back to a plain
@@ -194,6 +331,18 @@ impl GitLab {
     }
 }
 
+fn encode_component(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (byte as char).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
+}
+
 impl Forge for GitLab {
     fn rich_markdown(&self) -> bool {
         true
@@ -206,34 +355,94 @@ impl Forge for GitLab {
             body: mr.description.unwrap_or_default(),
             head_sha: mr.diff_refs.head_sha,
             base_sha: mr.diff_refs.base_sha,
+            changed_files: None,
         })
     }
 
-    async fn fetch_diff(&self) -> Result<String> {
-        let mut items: Vec<FileDiffItem> = Vec::new();
-        for page in 1..=10 {
+    async fn fetch_diff(&self, snapshot: &PrMeta) -> Result<DiffSnapshot> {
+        let workspace = WorkspaceBudget::new();
+        const PER_PAGE: usize = 100;
+        const MAX_PAGES: usize = 100;
+        const MAX_ITEMS: usize = 10_000;
+        let version = self.latest_diff_version().await?;
+        let expected_items: usize = version
+            .real_size
+            .parse()
+            .context("GitLab diff version real_size is not numeric")?;
+        ensure!(
+            expected_items <= MAX_ITEMS,
+            "GitLab diff version exceeds {MAX_ITEMS} files"
+        );
+        let mut items = Vec::with_capacity(expected_items);
+        let mut retained_bytes = 0usize;
+        let mut item_count = 0usize;
+        let mut page = 1usize;
+        loop {
+            ensure!(
+                page <= MAX_PAGES,
+                "GitLab diff pagination exceeds {MAX_PAGES} pages"
+            );
             let resp = self
                 .request(
                     reqwest::Method::GET,
                     self.url(&format!(
-                        "/merge_requests/{}/diffs?per_page=100&page={page}",
+                        "/merge_requests/{}/diffs?per_page={PER_PAGE}&page={page}",
                         self.mr_iid
                     )),
                 )
                 .send()
                 .await
                 .context("fetching MR diffs")?;
-            let batch: Vec<FileDiffItem> = Self::check_ok(resp, "diff fetch").await?.json().await?;
-            let done = batch.len() < 100;
+            let checked = Self::check_ok(resp, "diff fetch").await?;
+            let next_page = checked
+                .headers()
+                .get("x-next-page")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let page_text = super::bounded_response_text(checked, "GitLab diff page").await?;
+            retained_bytes = super::checked_metadata_total(
+                retained_bytes,
+                page_text.len(),
+                "GitLab diff pages",
+            )?;
+            let batch: Vec<FileDiffItem> =
+                serde_json::from_str(&page_text).context("decoding GitLab diff page")?;
+            drop(page_text);
+            ensure!(
+                item_count.saturating_add(batch.len()) <= MAX_ITEMS,
+                "GitLab diff pagination exceeds {MAX_ITEMS} files"
+            );
+            let batch_len = batch.len();
+            item_count = item_count.saturating_add(batch_len);
             items.extend(batch);
-            if done {
-                break;
+            match next_page.as_deref() {
+                Some("") => break,
+                Some(next) => {
+                    let parsed: usize =
+                        next.parse().context("invalid GitLab x-next-page header")?;
+                    ensure!(parsed > page, "GitLab pagination did not advance");
+                    page = parsed;
+                }
+                None if batch_len < PER_PAGE => break,
+                None => {
+                    return Err(anyhow!(
+                        "GitLab returned a full diff page without authoritative pagination headers"
+                    ));
+                }
             }
         }
-        Ok(Self::assemble_unified(&items))
+        Self::validate_diff_version(&version, item_count)?;
+        let current = self.fetch_pr_meta().await?;
+        ensure!(
+            current.head_sha == snapshot.head_sha && current.base_sha == snapshot.base_sha,
+            "GitLab merge request changed while its diff was being acquired"
+        );
+        self.build_complete_diff(items, &snapshot.base_sha, &snapshot.head_sha, workspace)
+            .await
     }
 
-    async fn fetch_diff_since(&self, since_sha: &str, head_sha: &str) -> Result<String> {
+    async fn fetch_diff_since(&self, since_sha: &str, head_sha: &str) -> Result<DiffSnapshot> {
+        let workspace = WorkspaceBudget::new();
         let resp = self
             .request(
                 reqwest::Method::GET,
@@ -244,8 +453,17 @@ impl Forge for GitLab {
             .send()
             .await
             .context("fetching incremental compare")?;
-        let cmp: CompareResponse = Self::check_ok(resp, "compare fetch").await?.json().await?;
-        Ok(Self::assemble_unified(&cmp.diffs))
+        let cmp: CompareResponse = super::bounded_response_json(
+            Self::check_ok(resp, "compare fetch").await?,
+            "GitLab compare diff",
+        )
+        .await?;
+        ensure!(
+            !cmp.compare_timeout,
+            "GitLab compare timed out or exceeded provider limits"
+        );
+        self.build_complete_diff(cmp.diffs, since_sha, head_sha, workspace)
+            .await
     }
 
     async fn post_review(
@@ -360,7 +578,11 @@ impl Forge for GitLab {
             .send()
             .await
             .context("fetching thread")?;
-        let v: serde_json::Value = Self::check_ok(resp, "thread fetch").await?.json().await?;
+        let v: serde_json::Value = super::bounded_response_json(
+            Self::check_ok(resp, "thread fetch").await?,
+            "GitLab thread",
+        )
+        .await?;
         let title = v["title"].as_str().unwrap_or_default().to_string();
         let body = v["description"].as_str().unwrap_or_default().to_string();
         Ok((title, body))
@@ -384,5 +606,34 @@ impl Forge for GitLab {
             .context("posting note")?;
         Self::check_ok(resp, "note post").await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incomplete_versions_fail_closed() {
+        assert!(
+            GitLab::validate_diff_version(
+                &DiffVersion {
+                    state: "collecting".into(),
+                    real_size: "1".into(),
+                },
+                1,
+            )
+            .is_err()
+        );
+        assert!(
+            GitLab::validate_diff_version(
+                &DiffVersion {
+                    state: "collected".into(),
+                    real_size: "2".into(),
+                },
+                1,
+            )
+            .is_err()
+        );
     }
 }

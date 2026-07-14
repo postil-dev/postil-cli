@@ -1,6 +1,6 @@
 //! Interactive bot: reply to an @postil mention on a PR or issue.
 //!
-//! Scope is review and answer only — Postil never opens PRs or pushes commits.
+//! Scope is review and answer only. Postil never opens PRs or pushes commits.
 //! Works across every forge the reviewer supports. PR/MR mentions are grounded
 //! on the diff; issue mentions on the issue body. GitHub and GitLab cover both
 //! issues and pulls; Bitbucket and Azure DevOps are scoped to PRs (their issue
@@ -12,11 +12,12 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::diff;
+use crate::envelope::{ModelUsageCostSource, ModelUsagePhase, ModelUsageRole};
 use crate::forge::{
     Forge, ThreadKind, azure::Azure, bitbucket::Bitbucket, github::GitHub, gitlab::GitLab,
 };
@@ -32,7 +33,7 @@ pub struct RespondArgs {
     /// The issue number, when the mention is on an issue.
     pub issue: Option<u64>,
     /// The maintainer's comment text (the mention). When None, read from the
-    /// POSTIL_COMMENT environment variable — the safe path for automation.
+    /// POSTIL_COMMENT environment variable, the safe path for automation.
     pub comment: Option<String>,
     pub config: Option<PathBuf>,
     pub model: Option<String>,
@@ -40,7 +41,8 @@ pub struct RespondArgs {
     pub no_post: bool,
 }
 
-const MAX_DIFF_BYTES: usize = 200_000;
+const MAX_RESPOND_DIFF_CONTEXT_BYTES: usize = 120_000;
+const MAX_RESPOND_MANIFEST_BYTES: usize = 24_000;
 const USAGE_RECEIPT_PATH_ENV: &str = "POSTIL_USAGE_RECEIPT_PATH";
 const RESPOND_MAX_CHARS: usize = 2_400;
 const RESPOND_MAX_NONBLANK_LINES: usize = 24;
@@ -68,8 +70,23 @@ struct RespondUsageReceipt<'a> {
 #[serde(rename_all = "camelCase")]
 struct RespondModelUsage<'a> {
     model: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<ModelUsageRole>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<ModelUsagePhase>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    call_ordinal: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attempt: Option<u32>,
     prompt_tokens: u64,
     completion_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_micros: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_provider_decimal: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_source: Option<ModelUsageCostSource>,
+    accounting_complete: bool,
 }
 
 // PID separates concurrent processes; this sequence separates writers within
@@ -119,7 +136,7 @@ impl UsageReceiptWriter {
 
     fn commit(mut self, answer: &Answer) -> Result<()> {
         let receipt = RespondUsageReceipt {
-            version: 1,
+            version: 2,
             operation: "respond",
             prompt_tokens: answer.usage.prompt_tokens,
             completion_tokens: answer.usage.completion_tokens,
@@ -128,8 +145,16 @@ impl UsageReceiptWriter {
                 .iter()
                 .map(|model| RespondModelUsage {
                     model: &model.model,
+                    role: model.role,
+                    phase: model.phase,
+                    call_ordinal: model.call_ordinal,
+                    attempt: model.attempt,
                     prompt_tokens: model.prompt_tokens,
                     completion_tokens: model.completion_tokens,
+                    cost_micros: model.cost_micros,
+                    cost_provider_decimal: model.cost_provider_decimal.as_deref(),
+                    cost_source: model.cost_source,
+                    accounting_complete: model.accounting_complete,
                 })
                 .collect(),
             usage_accounting_complete: answer.usage_accounting_complete,
@@ -167,6 +192,7 @@ pub async fn run(args: RespondArgs) -> Result<i32> {
     if let Some(m) = &args.model {
         cfg.model = m.clone();
     }
+    cfg.require_model()?;
     let repo = args
         .repo
         .clone()
@@ -266,6 +292,7 @@ async fn respond_with<F: Forge>(
         comment.trim()
     );
     let client = LlmClient::from_env(cfg)?;
+    client.preflight_respond_plan(cfg, &system, &user)?;
     let answer = client
         .answer(cfg, &system, &user, validate_respond_output)
         .await?;
@@ -692,9 +719,16 @@ async fn build_context<F: Forge>(
     match kind {
         ThreadKind::Pull => {
             let meta = forge.fetch_pr_meta().await?;
-            let raw = forge.fetch_diff().await.context("fetching PR diff")?;
-            let parsed = diff::parse(&raw);
-            let (annotated, truncated) = diff::render_annotated(&parsed, MAX_DIFF_BYTES);
+            let raw = forge.fetch_diff(&meta).await.context("fetching PR diff")?;
+            let (annotated, reserved_anchor) = diff::bounded_respond_context(
+                &raw,
+                MAX_RESPOND_DIFF_CONTEXT_BYTES,
+                MAX_RESPOND_MANIFEST_BYTES,
+            )?;
+            ensure!(
+                !reserved_anchor,
+                "pull request contains a path reserved for Postil's virtual review evidence"
+            );
             let mut ctx = format!(
                 "Context: pull request #{number} in {repo}\nTitle: {}\n",
                 meta.title
@@ -705,9 +739,6 @@ async fn build_context<F: Forge>(
             }
             ctx.push_str("\nDiff (left-margin numbers are new-file lines):\n\n");
             ctx.push_str(&annotated);
-            if truncated {
-                ctx.push_str("\n[diff truncated at the size limit]\n");
-            }
             Ok(ctx)
         }
         ThreadKind::Issue => {

@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "qualificationSourceSha": null,
+  "qualificationIssuedAtUnixSeconds": null,
+  "qualificationExpiresAtUnixSeconds": null,
+  "qualificationMaxAgeDays": null,
+  "modelDefaultsSha256": "767f34d4dfeaf6e9622951c9e6567d8f3322c1340057e1cbd8fee22766631812",
+  "profiles": []
+}

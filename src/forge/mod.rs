@@ -1,16 +1,307 @@
 //! Forge abstraction: everything Postil needs from a code host.
 //!
-//! Ships GitHub, GitLab, Bitbucket, and Azure DevOps — each covering its
-//! self-managed/server variant through a custom base-URL environment variable.
+//! Ships GitHub, GitLab, Bitbucket Cloud, and Azure DevOps. GitHub, GitLab, and
+//! Azure cover self-managed variants through a custom base URL.
 
 pub mod azure;
 pub mod bitbucket;
 pub mod github;
 pub mod gitlab;
 
-use anyhow::Result;
+use anyhow::{Context, Result, ensure};
+use serde::de::DeserializeOwned;
+use sha2::{Digest, Sha256};
+use std::io::Write;
 
+use crate::diff::DiffSnapshot;
 use crate::envelope::{Envelope, Finding, Severity, SuppressionReason};
+
+pub const MAX_FORGE_METADATA_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_FORGE_CHANGED_FILES: usize = 20_000;
+
+pub fn checked_metadata_total(current: usize, additional: usize, context: &str) -> Result<usize> {
+    let total = current
+        .checked_add(additional)
+        .ok_or_else(|| anyhow::anyhow!("{context} metadata byte count overflowed"))?;
+    ensure!(
+        total <= MAX_FORGE_METADATA_BYTES,
+        "{context} metadata exceeds the {MAX_FORGE_METADATA_BYTES} byte aggregate limit"
+    );
+    Ok(total)
+}
+
+#[derive(Debug)]
+pub struct ForgeServiceFailure(pub String);
+
+impl std::fmt::Display for ForgeServiceFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ForgeServiceFailure {}
+
+#[derive(Debug)]
+pub struct IncompleteReviewInput;
+
+impl std::fmt::Display for IncompleteReviewInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("review input was incomplete or malformed")
+    }
+}
+
+impl std::error::Error for IncompleteReviewInput {}
+
+pub fn service_failure(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(ForgeServiceFailure(message.into()))
+}
+
+pub fn http_failure(status: reqwest::StatusCode, message: impl Into<String>) -> anyhow::Error {
+    let message = message.into();
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+        service_failure(message)
+    } else {
+        anyhow::anyhow!(message)
+    }
+}
+
+pub fn classify_review_input_error(error: anyhow::Error) -> anyhow::Error {
+    let service_failure = error.chain().any(|cause| {
+        cause.downcast_ref::<ForgeServiceFailure>().is_some()
+            || cause
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(|error| error.is_connect() || error.is_timeout())
+    });
+    if service_failure {
+        error
+    } else {
+        error.context(IncompleteReviewInput)
+    }
+}
+
+pub fn is_incomplete_review_input(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<IncompleteReviewInput>().is_some()
+        || error
+            .chain()
+            .any(|cause| cause.downcast_ref::<IncompleteReviewInput>().is_some())
+}
+
+pub fn valid_repository_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.starts_with('/')
+        && !path.contains('\0')
+        && path
+            .split('/')
+            .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
+}
+
+pub async fn bounded_response_text(
+    mut response: reqwest::Response,
+    context: &str,
+) -> Result<String> {
+    bounded_response_text_with_limit(
+        &mut response,
+        context,
+        crate::diff::MAX_FORGE_RESPONSE_BYTES,
+    )
+    .await
+}
+
+pub async fn bounded_response_text_with_limit(
+    response: &mut reqwest::Response,
+    context: &str,
+    limit: usize,
+) -> Result<String> {
+    ensure!(
+        response.status() != reqwest::StatusCode::PARTIAL_CONTENT,
+        "{context} returned partial content"
+    );
+    for header in ["x-diff-truncated", "x-content-truncated", "x-truncated"] {
+        if response
+            .headers()
+            .get(header)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.eq_ignore_ascii_case("true") || value == "1")
+        {
+            return Err(anyhow::anyhow!("{context} reported truncated content"));
+        }
+    }
+    if let Some(length) = response.content_length() {
+        ensure!(
+            length <= limit as u64,
+            "{context} exceeds the {} byte acquisition limit",
+            limit
+        );
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .with_context(|| format!("reading {context}"))?
+    {
+        ensure!(
+            bytes.len().saturating_add(chunk.len()) <= limit,
+            "{context} exceeds the {} byte acquisition limit",
+            limit
+        );
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes).with_context(|| format!("{context} is not valid UTF-8"))
+}
+
+pub async fn bounded_response_bytes_with_limit(
+    response: &mut reqwest::Response,
+    context: &str,
+    limit: usize,
+) -> Result<Vec<u8>> {
+    ensure!(
+        response.status() != reqwest::StatusCode::PARTIAL_CONTENT,
+        "{context} returned partial content"
+    );
+    if let Some(length) = response.content_length() {
+        ensure!(
+            length <= limit as u64,
+            "{context} exceeds the {limit} byte limit"
+        );
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .with_context(|| format!("reading {context}"))?
+    {
+        let next = bytes
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(|| anyhow::anyhow!("{context} byte count overflowed"))?;
+        ensure!(next <= limit, "{context} exceeds the {limit} byte limit");
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+/// Stream a complete UTF-8 forge response to a file-backed immutable snapshot.
+/// This is used for individual source files whose size is not a review-scope
+/// decision. Transport truncation remains fatal, while heap use stays bounded
+/// by the response chunk size.
+pub async fn response_snapshot(response: reqwest::Response, context: &str) -> Result<DiffSnapshot> {
+    response_snapshot_in(response, context, crate::diff::WorkspaceBudget::new(), None).await
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SourceExpectation {
+    pub size: Option<u64>,
+    pub sha256: Option<String>,
+}
+
+pub async fn response_snapshot_in(
+    mut response: reqwest::Response,
+    context: &str,
+    workspace: crate::diff::WorkspaceBudget,
+    authoritative: Option<SourceExpectation>,
+) -> Result<DiffSnapshot> {
+    ensure!(
+        response.status() != reqwest::StatusCode::PARTIAL_CONTENT,
+        "{context} returned partial content"
+    );
+    for header in ["x-diff-truncated", "x-content-truncated", "x-truncated"] {
+        if response
+            .headers()
+            .get(header)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.eq_ignore_ascii_case("true") || value == "1")
+        {
+            return Err(anyhow::anyhow!("{context} reported truncated content"));
+        }
+    }
+    let declared_size = response.content_length();
+    if let (Some(declared), Some(expected)) = (
+        declared_size,
+        authoritative.as_ref().and_then(|value| value.size),
+    ) {
+        ensure!(
+            declared == expected,
+            "{context} declared {declared} bytes but forge metadata requires {expected}"
+        );
+    }
+    let mut spool = crate::diff::DiffSpool::new_in(workspace)?;
+    let mut received = 0u64;
+    let mut digest = authoritative
+        .as_ref()
+        .and_then(|value| value.sha256.as_ref())
+        .map(|_| Sha256::new());
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .with_context(|| format!("reading {context}"))?
+    {
+        received = received
+            .checked_add(chunk.len() as u64)
+            .ok_or_else(|| anyhow::anyhow!("{context} byte count overflowed"))?;
+        if let Some(digest) = &mut digest {
+            digest.update(&chunk);
+        }
+        spool
+            .write_all(&chunk)
+            .with_context(|| format!("spooling {context}"))?;
+    }
+    if let Some(declared) = declared_size {
+        ensure!(
+            received == declared,
+            "{context} ended after {received} of {declared} declared bytes"
+        );
+    }
+    if let Some(expected) = authoritative.as_ref().and_then(|value| value.size) {
+        ensure!(
+            received == expected,
+            "{context} ended after {received} bytes but forge metadata requires {expected}"
+        );
+    }
+    if let (Some(expected), Some(actual)) = (
+        authoritative
+            .as_ref()
+            .and_then(|value| value.sha256.as_ref()),
+        digest.map(|value| {
+            value
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        }),
+    ) {
+        ensure!(
+            expected.eq_ignore_ascii_case(&actual),
+            "{context} content hash does not match forge metadata"
+        );
+    }
+    spool.finish_source()
+}
+
+pub async fn bounded_response_json<T: DeserializeOwned>(
+    response: reqwest::Response,
+    context: &str,
+) -> Result<T> {
+    let text = bounded_response_text(response, context).await?;
+    serde_json::from_str(&text).with_context(|| format!("decoding {context}"))
+}
+
+/// Stable, non-reversible diagnostic for an opaque provider request id.
+pub fn opaque_id(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    format!(
+        "sha256:{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        digest[0], digest[1], digest[2], digest[3], digest[4], digest[5]
+    )
+}
+
+pub fn response_request_id(response: &reqwest::Response) -> Option<String> {
+    ["x-request-id", "x-github-request-id", "x-trace-id"]
+        .iter()
+        .find_map(|name| response.headers().get(*name))
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .map(opaque_id)
+}
 
 /// Base URL for the brand status icons rendered in PR comments and check
 /// summaries. The four icons (error, warn, info, pass) are served by the
@@ -33,18 +324,23 @@ pub fn severity_icon(severity: Severity) -> String {
     })
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrMeta {
     pub title: String,
     pub body: String,
     pub head_sha: String,
+    /// Exact merge base selected for this review snapshot. This is never the
+    /// moving target-branch tip when the forge exposes a distinct merge base.
     pub base_sha: String,
+    /// Authoritative changed-file count when the forge exposes one cheaply.
+    /// It is used only to size a bounded acquisition deadline.
+    pub changed_files: Option<usize>,
 }
 
 /// Check conclusions, mapped per-forge. Postil semantics:
 /// - advisory check (`postil/review`): success unless the run itself failed.
 /// - gate check (`postil/gate`): failure iff gate-level findings exist (or the
-///   run failed — fail closed). Never `neutral` for the gate: a grey square
+///   run failed, so fail closed). Never `neutral` for the gate: a grey square
 ///   that reads as "didn't fail" is the GitHub Copilot mistake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckState {
@@ -78,12 +374,13 @@ pub trait Forge {
         check_summary(envelope, self.rich_markdown(), SummaryContext::from_env())
     }
     async fn fetch_pr_meta(&self) -> Result<PrMeta>;
-    /// Unified diff of the full PR.
-    async fn fetch_diff(&self) -> Result<String>;
+    /// Unified diff of the immutable snapshot returned by `fetch_pr_meta`.
+    /// Implementations must not re-read a moving PR head or target tip.
+    async fn fetch_diff(&self, snapshot: &PrMeta) -> Result<DiffSnapshot>;
     /// Unified diff covering `since_sha..head_sha` only (incremental reviews).
     /// `head_sha` is the SHA the caller is reviewing, not whatever the PR's
-    /// head happens to be at fetch time — a later push must not widen the diff.
-    async fn fetch_diff_since(&self, since_sha: &str, head_sha: &str) -> Result<String>;
+    /// head happens to be at fetch time. A later push must not widen the diff.
+    async fn fetch_diff_since(&self, since_sha: &str, head_sha: &str) -> Result<DiffSnapshot>;
     /// Post the batched review: one summary plus inline comments per finding.
     async fn post_review(&self, summary: &str, findings: &[Finding], head_sha: &str) -> Result<()>;
     /// Ensure both check runs exist (in_progress); returns (advisory_id, gate_id).
@@ -97,6 +394,12 @@ pub trait Forge {
         gate: CheckState,
         envelope: &Envelope,
     ) -> Result<()>;
+
+    /// Confirm that publication still targets the snapshot that was reviewed.
+    /// The caller checks this before publishing either comments or conclusions.
+    async fn head_is_current(&self, expected_head_sha: &str) -> Result<bool> {
+        Ok(self.fetch_pr_meta().await?.head_sha == expected_head_sha)
+    }
 
     /// Title and body of the issue/PR/MR a maintainer mentioned Postil on, used
     /// to ground the answer (`postil respond`). `kind` disambiguates the number
@@ -304,6 +607,21 @@ fn parse_prevention_commands(raw: &str) -> Vec<String> {
         .collect()
 }
 
+fn summary_count(
+    rich: bool,
+    status: &str,
+    count: usize,
+    singular: &str,
+    plural_label: &str,
+) -> String {
+    let label = plural(count, singular, plural_label);
+    if rich {
+        format!("{} **{count} {label}**", icon_md(status))
+    } else {
+        format!("{status}: **{count} {label}**")
+    }
+}
+
 pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -> String {
     let mut s = String::new();
     let operational = only_operational_findings(&envelope.findings);
@@ -346,29 +664,52 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
             })
             .count();
         if has_operational && visible > 0 {
-            s.push_str(&format!(
-                "**{} {} posted inline.** Review {}, then follow the merge check.\n",
+            s.push_str(&summary_count(
+                rich,
+                "warn",
                 visible,
-                plural(visible, "finding is", "findings are"),
-                plural(visible, "it", "them"),
+                "finding; review incomplete",
+                "findings; review incomplete",
             ));
+            s.push('\n');
         } else if blocking > 0 {
-            s.push_str(&format!(
-                "**{} {} applied the brakes.** Fix {}, then push again.\n",
+            s.push_str(&summary_count(
+                rich,
+                "error",
                 blocking,
-                plural(blocking, "finding has", "findings have"),
-                plural(blocking, "it", "them"),
+                "blocking finding",
+                "blocking findings",
             ));
+            let advisory = visible.saturating_sub(blocking);
+            if advisory > 0 {
+                s.push_str(" · ");
+                s.push_str(&summary_count(
+                    rich,
+                    "info",
+                    advisory,
+                    "advisory finding",
+                    "advisory findings",
+                ));
+            }
+            s.push('\n');
         } else if visible > 0 {
-            s.push_str(&format!(
-                "**{} {} worth a look.** {} {} not block this merge.\n",
+            s.push_str(&summary_count(
+                rich,
+                "info",
                 visible,
-                plural(visible, "finding", "findings"),
-                plural(visible, "It", "They"),
-                plural(visible, "does", "do"),
+                "advisory finding",
+                "advisory findings",
             ));
+            s.push('\n');
         } else {
-            s.push_str("**A finding needs attention in the review details.**\n");
+            s.push_str(&summary_count(
+                rich,
+                "info",
+                1,
+                "finding in review details",
+                "findings in review details",
+            ));
+            s.push('\n');
         }
     }
 
@@ -415,11 +756,14 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
         }
     }
     if !envelope.resolved.is_empty() {
-        s.push_str(&format!(
-            "{} earlier {} resolved.\n",
+        s.push_str(&summary_count(
+            rich,
+            "pass",
             envelope.resolved.len(),
-            plural(envelope.resolved.len(), "finding", "findings"),
+            "resolved finding",
+            "resolved findings",
         ));
+        s.push('\n');
     }
 
     let eligible: Vec<_> = envelope
@@ -431,20 +775,21 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
     if !disclosed.is_empty() {
         if rich {
             s.push_str(&format!(
-                "\n<details><summary>{} lower-priority {}, not posted inline{}</summary>\n\n",
+                "\n<details><summary>{} {} suppressed{}</summary>\n\n",
+                icon_md("info"),
                 eligible.len(),
-                plural(eligible.len(), "finding", "findings"),
                 if eligible.len() > disclosed.len() {
-                    format!("; showing {} of {}", disclosed.len(), eligible.len())
+                    format!(" (showing {})", disclosed.len())
                 } else {
                     String::new()
                 },
             ));
         } else {
             s.push_str(&format!(
-                "\nLower-priority findings not posted inline{}:\n",
+                "\ninfo: {} suppressed{}:\n",
+                eligible.len(),
                 if eligible.len() > disclosed.len() {
-                    format!(" (showing {} of {})", disclosed.len(), eligible.len())
+                    format!(" (showing {})", disclosed.len())
                 } else {
                     String::new()
                 },
@@ -464,6 +809,29 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
         }
         if rich {
             s.push_str("\n</details>\n");
+        }
+    }
+
+    if let Some(coverage) = &envelope.review_coverage {
+        let fallback = if coverage.planner_fallback {
+            "yes"
+        } else {
+            "no"
+        };
+        if rich {
+            s.push_str(&format!(
+                "\n<sub>{}/{} source batches · {} · planner fallback: {fallback}</sub>\n",
+                coverage.selected_batches,
+                coverage.total_batches,
+                coverage.mode.as_str(),
+            ));
+        } else {
+            s.push_str(&format!(
+                "\n{}/{} source batches ({}; planner fallback: {fallback}).\n",
+                coverage.selected_batches,
+                coverage.total_batches,
+                coverage.mode.as_str(),
+            ));
         }
     }
 
@@ -487,7 +855,11 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
     }
 
     if let Some(details_url) = context.details_url {
-        s.push_str(&format!("\n[Review details]({details_url})\n"));
+        if rich {
+            s.push_str(&format!("\n<sub>[Review details]({details_url})</sub>\n"));
+        } else {
+            s.push_str(&format!("\n[Review details]({details_url})\n"));
+        }
     }
     s
 }
@@ -557,6 +929,179 @@ pub fn format_confidence(c: f64) -> String {
 mod tests {
     use super::*;
     use crate::envelope::{Kind, Severity};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn raw_http_server(response: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4_096];
+            let _ = stream.read(&mut request);
+            stream.write_all(&response).unwrap();
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    #[test]
+    fn forge_metadata_limit_is_aggregate_and_overflow_safe() {
+        assert_eq!(
+            checked_metadata_total(MAX_FORGE_METADATA_BYTES - 7, 7, "pages").unwrap(),
+            MAX_FORGE_METADATA_BYTES
+        );
+        assert!(
+            checked_metadata_total(MAX_FORGE_METADATA_BYTES, 1, "pages")
+                .unwrap_err()
+                .to_string()
+                .contains("aggregate limit")
+        );
+        assert!(checked_metadata_total(usize::MAX, 1, "pages").is_err());
+    }
+
+    #[tokio::test]
+    async fn source_snapshot_streams_above_page_limit_with_complete_length() {
+        let server = MockServer::start().await;
+        let body = vec![b'x'; crate::diff::MAX_FORGE_RESPONSE_BYTES + 1];
+        Mock::given(method("GET"))
+            .and(path("/large-source"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let response = reqwest::get(format!("{}/large-source", server.uri()))
+            .await
+            .unwrap();
+        let snapshot = response_snapshot(response, "large forge source")
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.len(), body.len() as u64);
+        assert_eq!(snapshot.as_bytes().first(), Some(&b'x'));
+        assert_eq!(snapshot.as_bytes().last(), Some(&b'x'));
+    }
+
+    #[tokio::test]
+    async fn source_snapshot_accepts_complete_chunked_response_without_length() {
+        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\nsafe\r\n5\r\n body\r\n0\r\n\r\n".to_vec();
+        let (url, server) = raw_http_server(response);
+        let response = reqwest::get(url).await.unwrap();
+        assert_eq!(response.content_length(), None);
+
+        let snapshot = response_snapshot(response, "chunked forge source")
+            .await
+            .unwrap();
+
+        server.join().unwrap();
+        assert_eq!(snapshot.as_bytes(), b"safe body");
+    }
+
+    #[tokio::test]
+    async fn source_snapshot_enforces_workspace_quota_without_declared_length() {
+        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\nsafe\r\n5\r\n body\r\n0\r\n\r\n".to_vec();
+        let (url, server) = raw_http_server(response);
+        let response = reqwest::get(url).await.unwrap();
+
+        let error = match response_snapshot_in(
+            response,
+            "quota-bound chunked source",
+            crate::diff::WorkspaceBudget::with_limit(8),
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("chunked source must respect the shared workspace quota"),
+            Err(error) => error,
+        };
+
+        server.join().unwrap();
+        assert!(format!("{error:#}").contains("operation quota"));
+    }
+
+    #[tokio::test]
+    async fn source_snapshot_rejects_transport_truncation() {
+        let response =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nshort".to_vec();
+        let (url, server) = raw_http_server(response);
+        let response = reqwest::get(url).await.unwrap();
+
+        let error = match response_snapshot(response, "truncated forge source").await {
+            Ok(_) => panic!("truncated response must be rejected"),
+            Err(error) => error,
+        };
+
+        server.join().unwrap();
+        assert!(error.to_string().contains("reading truncated forge source"));
+    }
+
+    #[tokio::test]
+    async fn source_snapshot_verifies_authoritative_size_and_hash() {
+        let body = b"complete source";
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/source"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let expected_hash = Sha256::digest(body)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let valid = response_snapshot_in(
+            reqwest::get(format!("{}/source", server.uri()))
+                .await
+                .unwrap(),
+            "verified forge source",
+            crate::diff::WorkspaceBudget::new(),
+            Some(SourceExpectation {
+                size: Some(body.len() as u64),
+                sha256: Some(expected_hash),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(valid.as_bytes(), body);
+
+        let error = match response_snapshot_in(
+            reqwest::get(format!("{}/source", server.uri()))
+                .await
+                .unwrap(),
+            "mismatched forge source",
+            crate::diff::WorkspaceBudget::new(),
+            Some(SourceExpectation {
+                size: Some(body.len() as u64),
+                sha256: Some("0".repeat(64)),
+            }),
+        )
+        .await
+        {
+            Ok(_) => panic!("hash mismatch must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("content hash"));
+    }
+
+    #[test]
+    fn only_typed_service_failures_remain_advisory_eligible() {
+        let outage = classify_review_input_error(service_failure("upstream unavailable"));
+        assert!(!is_incomplete_review_input(&outage));
+
+        let malformed = classify_review_input_error(anyhow::anyhow!(
+            "forge returned truncated pagination metadata"
+        ));
+        assert!(is_incomplete_review_input(&malformed));
+
+        let unauthorized = classify_review_input_error(http_failure(
+            reqwest::StatusCode::UNAUTHORIZED,
+            "forge rejected credentials",
+        ));
+        assert!(is_incomplete_review_input(&unauthorized));
+    }
 
     fn finding() -> Finding {
         Finding {
@@ -599,6 +1144,8 @@ mod tests {
             usage: Default::default(),
             model_usage: vec![],
             model_incidents: vec![],
+            review_coverage: None,
+            review_admission: None,
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
@@ -633,6 +1180,7 @@ mod tests {
         assert!(is_synthetic_path(crate::envelope::PROVIDER_PATH));
         assert!(is_synthetic_path(crate::envelope::OPERATIONAL_PATH));
         assert!(is_synthetic_path(crate::envelope::PR_DESCRIPTION_PATH));
+        assert!(is_synthetic_path(crate::envelope::CHANGE_METADATA_PATH));
         assert!(is_synthetic_path(crate::envelope::DIFF_PATH));
         assert!(!is_synthetic_path(".postil/content-policy.md"));
         assert!(!is_synthetic_path(".postil/guardrails.md"));
@@ -681,9 +1229,12 @@ mod tests {
             usage: crate::envelope::Usage {
                 prompt_tokens: 10,
                 completion_tokens: 5,
+                ..Default::default()
             },
             model_usage: vec![],
             model_incidents: vec![],
+            review_coverage: None,
+            review_admission: None,
             usage_accounting_complete: true,
             duration_ms: 1_250,
             base_sha: None,
@@ -701,12 +1252,16 @@ mod tests {
             },
         );
 
-        assert!(summary.starts_with("**1 finding worth a look.**"));
+        assert!(summary.starts_with(&format!("{} **1 advisory finding**", icon_md("info"))));
+        assert!(!summary.contains("does not block"));
         assert!(!summary.contains("Unsanitized input reaches query"));
         assert!(!summary.contains("src/auth.rs:41"));
         assert!(!summary.contains("Review metadata"));
         assert!(!summary.contains("abcdef1"));
-        assert!(summary.contains("6 lower-priority findings, not posted inline; showing 5 of 6"));
+        assert!(summary.contains(&format!(
+            "<details><summary>{} 6 suppressed (showing 5)</summary>",
+            icon_md("info")
+        )));
         assert!(summary.contains("Lower confidence concern 0"));
         assert!(summary.contains("severity error, confidence 0.91"));
         assert!(summary.contains("Evidence from the changed branch"));
@@ -714,11 +1269,112 @@ mod tests {
         assert!(summary.contains("postil review --staged"));
         assert!(summary.contains("postil hook install"));
         assert!(summary.contains("cargo test --lib"));
-        assert!(summary.contains("[Review details](https://postil.dev/orgs/acme/runs/run-1)"));
+        assert!(
+            summary
+                .contains("<sub>[Review details](https://postil.dev/orgs/acme/runs/run-1)</sub>")
+        );
 
         let plain = check_summary(&env, false, Default::default());
-        assert!(plain.contains("Lower-priority findings not posted inline (showing 5 of 6):"));
+        assert!(plain.contains("info: 6 suppressed (showing 5):"));
         assert!(!plain.contains("<details>"));
+    }
+
+    #[test]
+    fn summary_counts_cover_blocking_advisory_resolved_and_suppressed() {
+        let blocking = envelope_with_findings(vec![finding()]);
+        let blocking_summary = check_summary(&blocking, true, Default::default());
+        assert!(
+            blocking_summary.starts_with(&format!("{} **1 blocking finding**\n", icon_md("error")))
+        );
+        let blocking_plural = envelope_with_findings(vec![finding(), finding()]);
+        assert!(
+            check_summary(&blocking_plural, true, Default::default())
+                .starts_with(&format!("{} **2 blocking findings**\n", icon_md("error")))
+        );
+
+        let mut advisory_one = finding();
+        advisory_one.severity = Severity::Warn;
+        let mut advisory_two = advisory_one.clone();
+        advisory_two.line = 42;
+        let mut advisory = envelope_with_findings(vec![advisory_one, advisory_two]);
+        advisory.gate.failing = false;
+        let advisory_summary = check_summary(&advisory, true, Default::default());
+        assert!(
+            advisory_summary.starts_with(&format!("{} **2 advisory findings**\n", icon_md("info")))
+        );
+
+        let mut resolved_singular = envelope_with_findings(vec![finding()]);
+        resolved_singular.resolved = vec![finding()];
+        assert!(
+            check_summary(&resolved_singular, true, Default::default())
+                .contains(&format!("{} **1 resolved finding**\n", icon_md("pass")))
+        );
+
+        let mut detail_counts = envelope_with_findings(vec![finding()]);
+        detail_counts.resolved = vec![finding(), finding()];
+        detail_counts.suppressed_findings = vec![crate::envelope::SuppressedFinding {
+            finding: finding(),
+            reason: SuppressionReason::BelowConfidence,
+        }];
+        let detail_summary = check_summary(&detail_counts, true, Default::default());
+        assert!(detail_summary.contains(&format!("{} **2 resolved findings**\n", icon_md("pass"))));
+        assert!(detail_summary.contains(&format!(
+            "<details><summary>{} 1 suppressed</summary>",
+            icon_md("info")
+        )));
+        assert!(!detail_summary.contains("earlier finding"));
+    }
+
+    #[test]
+    fn review_details_are_subordinate_when_present_and_absent_when_unset() {
+        let env = envelope_with_findings(vec![finding()]);
+        let with_details = check_summary(
+            &env,
+            true,
+            SummaryContext {
+                details_url: Some("https://postil.dev/orgs/acme/runs/run-1".into()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            with_details.ends_with(
+                "<sub>[Review details](https://postil.dev/orgs/acme/runs/run-1)</sub>\n"
+            )
+        );
+
+        let without_details = check_summary(&env, true, Default::default());
+        assert!(!without_details.contains("Review details"));
+        assert!(!without_details.contains("<sub>"));
+    }
+
+    #[test]
+    fn review_coverage_is_compact_and_auditable_in_every_mode() {
+        let mut env = envelope_with_findings(vec![finding()]);
+        env.review_coverage = Some(crate::envelope::ReviewCoverage {
+            mode: crate::envelope::ReviewCoverageMode::Bounded,
+            selected_batches: 5,
+            total_batches: 19,
+            planner_fallback: true,
+        });
+
+        let rich = check_summary(&env, true, Default::default());
+        assert!(rich.contains("<sub>5/19 source batches · bounded · planner fallback: yes</sub>"));
+
+        let plain = check_summary(&env, false, Default::default());
+        assert!(plain.contains("5/19 source batches (bounded; planner fallback: yes)."));
+
+        env.review_coverage = Some(crate::envelope::ReviewCoverage {
+            mode: crate::envelope::ReviewCoverageMode::Exhaustive,
+            selected_batches: 19,
+            total_batches: 19,
+            planner_fallback: false,
+        });
+        let rich = check_summary(&env, true, Default::default());
+        assert!(
+            rich.contains("<sub>19/19 source batches · exhaustive · planner fallback: no</sub>")
+        );
+        let plain = check_summary(&env, false, Default::default());
+        assert!(plain.contains("19/19 source batches (exhaustive; planner fallback: no)."));
     }
 
     #[test]
@@ -776,6 +1432,8 @@ mod tests {
             usage: Default::default(),
             model_usage: vec![],
             model_incidents: vec![],
+            review_coverage: None,
+            review_admission: None,
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
@@ -840,6 +1498,8 @@ mod tests {
             usage: Default::default(),
             model_usage: vec![],
             model_incidents: vec![],
+            review_coverage: None,
+            review_admission: None,
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
@@ -873,6 +1533,8 @@ mod tests {
             usage: Default::default(),
             model_usage: vec![],
             model_incidents: vec![],
+            review_coverage: None,
+            review_admission: None,
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,

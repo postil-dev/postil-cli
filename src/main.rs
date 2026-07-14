@@ -1,7 +1,7 @@
 use clap::Parser;
 
 use postil_cli::cli::{Cli, Command, ForgeArg, HookAction};
-use postil_cli::config::{Config, starter_config};
+use postil_cli::config::{Config, qualification_metadata, starter_config};
 use postil_cli::review::{ForgeKind, ReviewArgs};
 use postil_cli::{doctor, hook, plan, respond, review};
 
@@ -20,6 +20,10 @@ async fn main() {
 
 async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
     match cli.command {
+        Command::QualificationMetadata => {
+            println!("{}", serde_json::to_string(&qualification_metadata())?);
+            Ok(0)
+        }
         Command::Review {
             forge,
             repo,
@@ -39,6 +43,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
             fail_on,
             config,
             model,
+            bounded,
             no_post,
         } => {
             let local_mode = staged || base.is_some() || diff_file.is_some();
@@ -71,6 +76,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
                 fail_on,
                 config,
                 model,
+                bounded,
                 no_post,
             })
             .await
@@ -174,6 +180,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
         Command::Doctor { config } => {
             let cwd = std::env::current_dir()?;
             let cfg = Config::load(&cwd, config.as_deref())?;
+            cfg.require_model()?;
             let checks = doctor::run(&cfg).await?;
             Ok(if doctor::print_report(&checks) { 0 } else { 1 })
         }

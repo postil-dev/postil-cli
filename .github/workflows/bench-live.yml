@@ -1,40 +1,20 @@
-name: Bench (live models)
+name: Bench (managed OpenRouter admission)
 
-# Manual only: this spends real OpenRouter tokens, so it never runs on push or
-# PR. Generator qualification forces one model with scoring disabled. Scorer
-# qualification uses a deterministic generator and repeats its calibration set.
+# Manual only. This qualifies the managed hosted profile through OpenRouter.
+# Direct BYOK endpoints use the local benchmark command documented in bench/.
 on:
   workflow_dispatch:
     inputs:
-      models:
-        description: Comma-separated generator candidate model ids
+      pairs:
+        description: Exact generators::consensus::scorer+fallback profile
         required: true
-        default: >-
-          z-ai/glm-5.2,moonshotai/kimi-k2.7-code,deepseek/deepseek-v4-flash,google/gemini-3.5-flash,stepfun/step-3.7-flash
-      cases:
-        description: Case selection (currently informational; "all" runs the full set)
-        required: false
-        default: all
       cost_cap_usd:
-        description: Abort if the projected upper-bound total cost exceeds this many USD
-        required: false
+        description: Abort when projected qualification spend exceeds this amount
+        required: true
         default: "15"
-      scorer_models:
-        description: Comma-separated scorer candidates; must match config.toml unless intentionally overridden
-        required: true
-        default: >-
-          openai/gpt-5.4-nano,google/gemini-3.5-flash,stepfun/step-3.7-flash
-      scorer_repeats:
-        description: Complete scorer qualification repetitions (1-10)
-        required: true
-        default: "5"
-      run_scorer_eval:
-        description: Run scorer calibration eval instead of live-models bench
-        required: false
-        default: "false"
 
 concurrency:
-  group: bench-live
+  group: bench-live-admission
   cancel-in-progress: false
 
 jobs:
@@ -42,142 +22,134 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     env:
-      POSTIL_BENCH_MODELS: ${{ inputs.models }}
+      POSTIL_BENCH_MODE: live
+      POSTIL_BENCH_PAIRS: ${{ inputs.pairs }}
+      POSTIL_BENCH_REPEATS: "3"
       POSTIL_BENCH_COST_CAP_USD: ${{ inputs.cost_cap_usd }}
-      POSTIL_SCORER_EVAL_MODELS: ${{ inputs.scorer_models }}
-      POSTIL_SCORER_EVAL_REPEATS: ${{ inputs.scorer_repeats }}
+      POSTIL_API_BASE: https://openrouter.ai/api/v1
+      POSTIL_API_FORMAT: openai-compatible
+      POSTIL_QUALIFICATION_SOURCE_SHA: ${{ github.sha }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Require main branch qualification
+        run: test "$GITHUB_REF" = "refs/heads/main"
+
+      - name: Initialize unique evidence paths
+        run: |
+          suffix="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          {
+            echo "POSTIL_REPORT_OUT=${RUNNER_TEMP}/postil-live-report-${suffix}.json"
+            echo "POSTIL_MANIFEST_OUT=${RUNNER_TEMP}/postil-qualified-models-${suffix}.json"
+            echo "POSTIL_ATTESTATION_BUNDLE_OUT=${RUNNER_TEMP}/postil-qualified-models-${suffix}.attestation.json"
+          } >> "$GITHUB_ENV"
 
       - name: Build release binary
-        run: cargo build --quiet --release
+        run: cargo build --quiet --release --features qualification-candidate
 
-      - name: Install bench deps
+      - name: Install benchmark dependencies
+        working-directory: bench
         run: bun install --frozen-lockfile
-        working-directory: bench
 
-      # Cost guardrail: fetch live pricing and project an upper-bound total cost
-      # from fixture diff sizes. Aborts before spending anything if the matrix
-      # would exceed the cap, or if any model has unknown pricing.
-      - name: Cost guardrail
-        if: ${{ inputs.run_scorer_eval != 'true' }}
-        working-directory: bench
-        run: bun run cost-guard --cap "$POSTIL_BENCH_COST_CAP_USD"
+      - name: Prepare unique evidence paths
+        run: rm -f "$POSTIL_REPORT_OUT" "$POSTIL_MANIFEST_OUT" "$POSTIL_ATTESTATION_BUNDLE_OUT"
 
-      - name: Run live-models bench
-        if: ${{ inputs.run_scorer_eval != 'true' }}
-        working-directory: bench
-        env:
-          POSTIL_BENCH_MODE: live
-          POSTIL_API_KEY: ${{ secrets.POSTIL_API_KEY }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
-          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-        run: bun run src/run.ts --json-out "$GITHUB_WORKSPACE/bench-live-report.json"
-
-      - name: Run scorer qualification
-        if: ${{ inputs.run_scorer_eval == 'true' }}
+      - name: Run exact admission profile
         working-directory: bench
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-        run: bun run scorer-eval --json-out "$GITHUB_WORKSPACE/scorer-eval-report.json"
+        run: >-
+          bun run src/run.ts
+          --json-out "$POSTIL_REPORT_OUT"
+          --manifest-out "$POSTIL_MANIFEST_OUT"
 
-      - name: Write step summary
+      - name: Attest admitted candidate
+        id: attest-candidate
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4
+        with:
+          subject-path: ${{ env.POSTIL_MANIFEST_OUT }}
+
+      - name: Export attestation bundle
+        env:
+          GENERATED_BUNDLE: ${{ steps.attest-candidate.outputs.bundle-path }}
+        run: cp "$GENERATED_BUNDLE" "$POSTIL_ATTESTATION_BUNDLE_OUT"
+
+      - name: Write admission summary
         if: always()
         working-directory: bench
         run: |
-          report="$GITHUB_WORKSPACE/bench-live-report.json"
-          scorer_report="$GITHUB_WORKSPACE/scorer-eval-report.json"
+          report="$POSTIL_REPORT_OUT"
           {
-            if [ -f "$scorer_report" ]; then
-              echo '## Scorer qualification'
-              echo ''
-              echo '```'
-              bun -e '
-                const r = await Bun.file(process.env.GITHUB_WORKSPACE + "/scorer-eval-report.json").json();
-                const pad = (s, w) => String(s).length >= w ? String(s) : String(s) + " ".repeat(w - String(s).length);
-                console.log([pad("model",36),pad("structured",11),pad("true kept",10),pad("false down",11),pad("p50 ms",8),pad("p95 ms",8),pad("$/case",11),pad("pass",5)].join(" "));
-                for (const a of r.models) {
-                  console.log([
-                    pad(a.id,36),
-                    pad(String(a.structuredFailures),11),
-                    pad(`${a.trueFindingHighConfidence}/${a.trueFindingCases}`,10),
-                    pad(`${a.falseFindingDownscored}/${a.falseFindingCases}`,11),
-                    pad(a.p50DurationMs.toFixed(0),8),
-                    pad(a.p95DurationMs.toFixed(0),8),
-                    pad(a.pricingKnown ? "$"+a.meanCostUsd.toFixed(6) : "unknown",11),
-                    pad(a.passed ? "yes" : "no",5),
-                  ].join(" "));
-                  for (const failure of a.admissionFailures) console.log("  FAIL: " + failure);
-                }
-                console.log("");
-                console.log("Repeats " + r.repeats + " | endpoint " + r.apiBase + " | generated " + r.generatedAt);
-              '
-              echo '```'
-            elif [ -f "$report" ]; then
-              echo '## Live-models bench'
-              echo ''
-              echo '```'
-              bun -e '
-                const r = await Bun.file(process.env.GITHUB_WORKSPACE + "/bench-live-report.json").json();
-                const pad = (s, w) => String(s).length >= w ? String(s) : String(s) + " ".repeat(w - String(s).length);
-                console.log([pad("model",40),pad("detect",8),pad("FP",5),pad("cases",6),pad("$/review",12),pad("total $",12),pad("mean ms",9)].join(" "));
-                for (const a of r.modelAggregates) {
-                  console.log([
-                    pad(a.id,40),
-                    pad((a.detectionRate*100).toFixed(1)+"%",8),
-                    pad(a.falsePositives,5),
-                    pad(a.casesRun,6),
-                    pad("$"+a.meanCostUsdPerReview.toFixed(6),12),
-                    pad("$"+a.totalCostUsd.toFixed(6),12),
-                    pad(a.meanDurationMs ? a.meanDurationMs.toFixed(0) : "n/a",9),
-                  ].join(" "));
-                }
-                console.log("");
-                console.log("Total run cost: $" + r.totalRunCostUsd.toFixed(6));
-                console.log("CLI " + r.cliVersion + " | endpoint " + r.apiBase + " | generated " + r.generatedAt);
-              '
-              echo '```'
-              echo ''
-              echo 'Fixtures are ours; no competitor peer run exists. Generator costs and latency exclude the independent scorer.'
-            else
-              echo ''
-              echo 'No report produced (the run failed before writing output).'
+            echo '## Live admission'
+            echo ''
+            if [ ! -f "$report" ]; then
+              echo 'No report was produced.'
+              exit 0
             fi
+            echo '```'
+            bun -e '
+              const r = await Bun.file(process.env.POSTIL_REPORT_OUT).json();
+              const pct = (value) => (value * 100).toFixed(1) + "%";
+              const pad = (value, width) => String(value).length >= width
+                ? String(value)
+                : String(value) + " ".repeat(width - String(value).length);
+              console.log([
+                pad("profile", 52), pad("block", 8), pad("final", 8),
+                pad("advisory", 9), pad("overblock", 10), pad("clean FP", 9),
+                pad("$/review", 12), pad("p95 ms", 8), pad("pass", 5),
+              ].join(" "));
+              for (const a of r.modelAggregates) {
+                console.log([
+                  pad(a.id, 52), pad(pct(a.mustBlockRecall), 8),
+                  pad(pct(a.mustBlockFinalBlockingRate), 8),
+                  pad(pct(a.advisoryDetectionRate), 9),
+                  pad(pct(a.advisoryOverblockRate), 10),
+                  pad(pct(a.cleanFindingFalsePositiveRate), 9),
+                  pad(a.pricingKnown ? "$" + a.meanCostUsdPerReview.toFixed(6) : "unknown", 12),
+                  pad(a.p95DurationMs.toFixed(0), 8), pad(a.passed ? "yes" : "no", 5),
+                ].join(" "));
+                for (const failure of a.admissionFailures) console.log("  FAIL: " + failure);
+              }
+              console.log("");
+              console.log("Repeats " + r.repeats + " | total $" + r.totalRunCostUsd.toFixed(6));
+              console.log("CLI " + r.cliVersion + " | " + r.evaluatorRuntimeIdentity);
+              console.log("Endpoint " + r.providerEndpointIdentity + " | " + r.apiFormat);
+              console.log("Manifest " + (r.manifestCandidate ? "emitted" : "not admitted"));
+            '
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload report artifact
-        if: always() && inputs.run_scorer_eval != 'true'
-        uses: actions/upload-artifact@v4
+      - name: Upload admission report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: bench-live-report
-          path: bench-live-report.json
+          path: ${{ env.POSTIL_REPORT_OUT }}
           if-no-files-found: warn
 
-      - name: Upload scorer eval artifact
-        if: always() && inputs.run_scorer_eval == 'true'
-        uses: actions/upload-artifact@v4
+      - name: Upload admitted candidate
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: scorer-eval-report
-          path: scorer-eval-report.json
-          if-no-files-found: warn
+          name: qualified-models-candidate
+          path: |
+            ${{ env.POSTIL_MANIFEST_OUT }}
+            ${{ env.POSTIL_ATTESTATION_BUNDLE_OUT }}
+          if-no-files-found: error
 
-      - name: Upload live-model raw run artifacts
-        if: always() && inputs.run_scorer_eval != 'true'
-        uses: actions/upload-artifact@v4
+      - name: Upload raw runs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: bench-live-raw-runs
           path: bench/.runs/live-models
-          if-no-files-found: warn
-
-      - name: Upload scorer eval raw run artifacts
-        if: always() && inputs.run_scorer_eval == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: scorer-eval-raw-runs
-          path: bench/.runs/scorer-eval
           if-no-files-found: warn

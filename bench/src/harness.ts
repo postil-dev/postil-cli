@@ -25,11 +25,20 @@ const execFile = promisify(execFileCb);
 
 export const severity = z.enum(["info", "warn", "error"]);
 
+export const semanticPropositions = z.object({
+  // These fixture-owned phrases are part of the signed evaluator contract.
+  // Matching is intentionally conservative: unlisted wording may be rejected,
+  // while a known inverse or remediation always takes precedence.
+  positive: z.array(z.string().trim().min(2)).min(1),
+  negative: z.array(z.string().trim().min(2)).min(1),
+  failedRemediation: z.array(z.string().trim().min(2)).min(1),
+});
+
 const expectedFinding = z.object({
   path: z.string(),
   line: z.number().int().positive().optional(),
   severity: severity.optional(),
-  bodyIncludes: z.string().optional(),
+  semantics: semanticPropositions.optional(),
 });
 
 const fixtureFile = z.object({
@@ -73,13 +82,17 @@ const modelOutput = z
     message: "a clean recorded response must have an empty summary (CLI contract)",
   });
 
-export const benchmarkCase = z.object({
+const benchmarkCaseShape = z.object({
   id: z.string().min(1),
   name: z.string().min(1),
   repo: z.string().regex(/^[^/]+\/[^/]+$/u),
   pullNumber: z.number().int().positive(),
   headSha: z.string().min(1),
   diff: z.string().min(1),
+  primaryChange: z.object({
+    path: z.string().min(1),
+    line: z.number().int().positive(),
+  }).strict().optional(),
   allowedContext: allowedContext.default({ files: [], docs: [] }),
   /// Fixture metadata (policy phrasing, ground-truth labels) that must never
   /// leak into the prompt or any pipeline output. Prompt-injection fixtures may
@@ -87,6 +100,11 @@ export const benchmarkCase = z.object({
   /// can assert the source was not adopted by the reviewer.
   disallowedSources: z.array(disallowedSource).default([]),
   scoringLabels: z.array(z.string().min(1)).default([]),
+  admission: z.object({
+    classification: z.enum(["mustBlock", "advisory", "clean"]),
+    contractRule: z.string().min(1),
+    expectedCoverage: z.enum(["exhaustive", "bounded"]).optional(),
+  }),
   groundTruth: z.object({ findings: z.array(expectedFinding).default([]) }).default({
     findings: [],
   }),
@@ -99,6 +117,37 @@ export const benchmarkCase = z.object({
     maxFindings: z.number().int().nonnegative().optional(),
     requiredFindings: z.array(expectedFinding).default([]),
   }),
+});
+
+export const benchmarkCase = benchmarkCaseShape.superRefine((candidate, ctx) => {
+  if (candidate.primaryChange === undefined) return;
+  let changedFile: ParsedUnifiedDiffFile | undefined;
+  try {
+    changedFile = parseUnifiedDiffFiles(candidate.diff).find(
+      (file) => file.path === candidate.primaryChange?.path,
+    );
+  } catch (error) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["primaryChange"],
+      message: `primaryChange cannot be validated because the diff is invalid: ${boundedErrorMessage(error)}`,
+    });
+    return;
+  }
+  const coordinate = `${boundedText(candidate.primaryChange.path, 160)}:${candidate.primaryChange.line}`;
+  if (changedFile === undefined) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["primaryChange", "path"],
+      message: `primaryChange ${coordinate} does not name a file in the diff`,
+    });
+  } else if (!changedFile.addedLines.includes(candidate.primaryChange.line)) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["primaryChange", "line"],
+      message: `primaryChange ${coordinate} is not an added line in the diff`,
+    });
+  }
 });
 
 export type BenchmarkCase = z.infer<typeof benchmarkCase>;
@@ -121,11 +170,17 @@ const envelopeFinding = z.object({
   scorerReason: z.string().optional(),
 });
 
+const suppressedEnvelopeFinding = z.object({
+  finding: envelopeFinding,
+  reason: z.string(),
+});
+
 export const envelopeV1 = z.object({
   version: z.literal(1),
   summary: z.string(),
   silent: z.boolean(),
   findings: z.array(envelopeFinding),
+  suppressedFindings: z.array(suppressedEnvelopeFinding).default([]),
   resolved: z.array(envelopeFinding),
   counts: z.object({
     info: z.number().int().nonnegative(),
@@ -135,9 +190,14 @@ export const envelopeV1 = z.object({
     ungrounded: z.number().int().nonnegative(),
   }),
   confidenceBuckets: z.array(z.number().int().nonnegative()).length(5),
-  gate: z.object({ failOn: z.string(), failing: z.boolean() }),
+  gate: z.object({
+    failOn: z.string(),
+    failing: z.boolean(),
+    blockOnKinds: z.array(z.string()).default([]),
+  }),
   modelUsed: z.string(),
   scorerModel: z.string().optional(),
+  scorerError: z.string().optional(),
   usage: z.object({
     promptTokens: z.number().int().nonnegative(),
     completionTokens: z.number().int().nonnegative(),
@@ -146,11 +206,31 @@ export const envelopeV1 = z.object({
     .array(
       z.object({
         model: z.string().min(1),
+        role: z.enum(["reviewPlanner", "reviewGenerator", "findingScorer", "mentionResponder"]).optional(),
+        phase: z.enum(["initial", "schemaRepair", "semanticRetry"]).optional(),
+        callOrdinal: z.number().int().positive().optional(),
+        attempt: z.number().int().positive().optional(),
         promptTokens: z.number().int().nonnegative(),
         completionTokens: z.number().int().nonnegative(),
+        costMicros: z.number().int().nonnegative().optional(),
+        costProviderDecimal: z.string().regex(/^(?:0|[1-9][0-9]*|(?:0|[1-9][0-9]*)\.[0-9]*[1-9])$/u).optional(),
+        costSource: z.enum(["providerReported", "unavailable"]).optional(),
+        accountingComplete: z.boolean().default(false),
       }),
     )
     .optional(),
+  reviewCoverage: z.object({
+    mode: z.enum(["exhaustive", "bounded"]),
+    selectedBatches: z.number().int().nonnegative(),
+    totalBatches: z.number().int().nonnegative(),
+    plannerFallback: z.boolean().default(false),
+  }).optional(),
+  reviewAdmission: z.object({
+    providerAttempts: z.number().int().nonnegative(),
+    serializedInputBytes: z.number().int().nonnegative(),
+    outputTokens: z.number().int().nonnegative(),
+    projectedCostMicros: z.number().int().nonnegative().max(1_000_000),
+  }).optional(),
   usageAccountingComplete: z.boolean().optional(),
   durationMs: z.number().int().nonnegative(),
   baseSha: z.string().nullable(),
@@ -288,7 +368,13 @@ async function runCase(
       ["review", "--repo", c.repo, "--pr", String(c.pullNumber), "--output-json"],
       {
         cwd: runDir,
-        env: isolatedEnv(homeDir, tmpDir, github.baseUrl, model.baseUrl),
+        env: isolatedEnv(
+          homeDir,
+          tmpDir,
+          github.baseUrl,
+          model.baseUrl,
+          c.admission.expectedCoverage === "bounded",
+        ),
         timeout: options.timeoutMs ?? 120_000,
         maxBuffer: 4 * 1024 * 1024,
       },
@@ -371,6 +457,7 @@ function isolatedEnv(
   tmpDir: string,
   githubBaseUrl: string,
   modelBaseUrl: string,
+  forceBoundedSelection: boolean,
 ): NodeJS.ProcessEnv {
   // A fresh environment, never the parent's: no developer keys, no repo
   // config discovery beyond the run directory.
@@ -391,6 +478,7 @@ function isolatedEnv(
     GITHUB_API_URL: githubBaseUrl,
     GITHUB_TOKEN: "benchmark-github-token",
     REVIEW_MODEL: "postil-bench/recorded",
+    ...(forceBoundedSelection ? { POSTIL_BENCH_FORCE_BOUNDED_SELECTION: "1" } : {}),
   };
 }
 
@@ -409,10 +497,13 @@ export async function startMockGithub(c: BenchmarkCase) {
   const checkRunNames = new Map<string, string>(); // id -> check name
   let nextCheckRunId = 1001;
   const pullPath = `/repos/${c.repo}/pulls/${c.pullNumber}`;
+  const pullFilesPath = `${pullPath}/files`;
   const checkRunsPath = `/repos/${c.repo}/check-runs`;
   const contentsPrefix = `/repos/${c.repo}/contents/`;
   const allowedContent = allowedContextByPath(c);
   const baseSha = "0".repeat(40);
+  const comparePath = `/repos/${c.repo}/compare/${baseSha}...${c.headSha}`;
+  const changedFiles = parseUnifiedDiffFiles(c.diff);
 
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
@@ -432,15 +523,38 @@ export async function startMockGithub(c: BenchmarkCase) {
             body: "",
             head: { sha: c.headSha },
             base: { sha: baseSha },
+            changed_files: changedFiles.length,
           }),
         );
       }
       return;
     }
 
+    if (req.method === "GET" && url.pathname === pullFilesPath) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(changedFiles.map((file) => ({
+        filename: file.path,
+        status: file.status,
+        changes: file.changes,
+      }))));
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === comparePath) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ merge_base_commit: { sha: baseSha } }));
+      return;
+    }
+
     if (req.method === "GET" && url.pathname.startsWith(contentsPrefix)) {
       const requested = decodeURIComponent(url.pathname.slice(contentsPrefix.length));
-      const content = allowedContent.get(requested);
+      const ref = url.searchParams.get("ref");
+      const changed = changedFiles.find((file) => file.path === requested);
+      const content = changed !== undefined && ref === baseSha
+        ? changed.before
+        : changed !== undefined && ref === c.headSha
+          ? changed.after
+          : allowedContent.get(requested);
       if (content !== undefined) {
         res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
         res.end(content);
@@ -489,6 +603,102 @@ export async function startMockGithub(c: BenchmarkCase) {
   };
 }
 
+export interface ParsedUnifiedDiffFile {
+  path: string;
+  status: "added" | "modified" | "removed";
+  patch: string | undefined;
+  changes: number;
+  addedLines: number[];
+  before: string;
+  after: string;
+}
+
+export function parseUnifiedDiffFiles(diff: string): ParsedUnifiedDiffFile[] {
+  const lines = diff.split("\n");
+  const starts = lines
+    .map((line, index) => line.startsWith("diff --git ") ? index : -1)
+    .filter((index) => index >= 0);
+  return starts.map((start, position) => {
+    const section = lines.slice(start, starts[position + 1] ?? lines.length);
+    const oldHeader = section.find((line) => line.startsWith("--- "));
+    const newHeader = section.find((line) => line.startsWith("+++ "));
+    const renameFrom = section.find((line) => line.startsWith("rename from "))?.slice(12);
+    const renameTo = section.find((line) => line.startsWith("rename to "))?.slice(10);
+    const oldPath = oldHeader?.startsWith("--- a/") ? oldHeader.slice(6) : renameFrom;
+    const newPath = newHeader?.startsWith("+++ b/") ? newHeader.slice(6) : renameTo;
+    const path = newPath ?? oldPath;
+    if (path === undefined || path.length === 0) {
+      throw new Error("benchmark diff section has no canonical file path");
+    }
+    const patchStart = section.findIndex((line) => line.startsWith("@@ "));
+    const patch = patchStart >= 0 ? section.slice(patchStart).join("\n").trimEnd() : undefined;
+    const versions = sourceVersionsFromSection(section);
+    return {
+      path,
+      status: oldHeader === "--- /dev/null" ? "added" : newHeader === "+++ /dev/null" ? "removed" : "modified",
+      patch,
+      changes: versions.changes,
+      ...versions,
+    };
+  });
+}
+
+function sourceVersionsFromSection(lines: string[]): {
+  before: string;
+  after: string;
+  addedLines: number[];
+  changes: number;
+} {
+  const before: string[] = [];
+  const after: string[] = [];
+  const addedLines: number[] = [];
+  let oldLine = 0;
+  let newLine = 0;
+  let inHunk = false;
+  let changes = 0;
+  for (const line of lines) {
+    const header = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/u.exec(line);
+    if (header) {
+      oldLine = Number.parseInt(header[1]!, 10);
+      newLine = Number.parseInt(header[2]!, 10);
+      inHunk = true;
+      continue;
+    }
+    if (!inHunk || line.startsWith("\\ No newline")) continue;
+    if (line.startsWith("-")) {
+      before[oldLine - 1] = line.slice(1);
+      oldLine += 1;
+      changes += 1;
+    } else if (line.startsWith("+")) {
+      after[newLine - 1] = line.slice(1);
+      addedLines.push(newLine);
+      newLine += 1;
+      changes += 1;
+    } else if (line.startsWith(" ")) {
+      before[oldLine - 1] = line.slice(1);
+      after[newLine - 1] = line.slice(1);
+      oldLine += 1;
+      newLine += 1;
+    }
+  }
+  return {
+    before: Array.from({ length: before.length }, (_, index) => before[index] ?? "").join("\n"),
+    after: Array.from({ length: after.length }, (_, index) => after[index] ?? "").join("\n"),
+    addedLines,
+    changes,
+  };
+}
+
+function boundedText(value: string, maxBytes: number): string {
+  const bytes = Buffer.from(value, "utf8");
+  if (bytes.length <= maxBytes) return value;
+  return `${bytes.subarray(0, maxBytes).toString("utf8").replace(/\uFFFD$/u, "")}…`;
+}
+
+function boundedErrorMessage(error: unknown): string {
+  return boundedText(error instanceof Error ? error.message : String(error), 200);
+}
+
 async function startMockModel(c: BenchmarkCase, artifactsDir: string) {
   const requestBodies: string[] = [];
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
@@ -498,10 +708,36 @@ async function startMockModel(c: BenchmarkCase, artifactsDir: string) {
       await writeFile(join(artifactsDir, `model-request-${requestBodies.length}.json`), body, {
         mode: 0o600,
       });
+      const request = safeJson(body) as {
+        messages?: Array<{ role?: string; content?: string }>;
+      } | undefined;
+      const system = request?.messages?.find((message) => message.role === "system")?.content ?? "";
+      const user = request?.messages?.find((message) => message.role === "user")?.content ?? "";
+      if (system.includes("select bounded code-review batches")) {
+        const targetId = plannerBatchIdForPath(user, c.primaryChange?.path);
+        const mandatoryIds = plannerMandatoryIds(user);
+        const batchIds = targetId !== null && !mandatoryIds.has(targetId) ? [targetId] : [];
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            choices: [{ message: { content: JSON.stringify({ batchIds }) } }],
+            usage: { prompt_tokens: 20, completion_tokens: 4, total_tokens: 24 },
+          }),
+        );
+        return;
+      }
+      const targetPath = c.primaryChange?.path ?? c.modelOutput.findings[0]?.path;
+      const synthesis = user.includes("This bounded synthesis window joins semantic evidence");
+      const targetBatch = targetPath === undefined || user
+        .split("\n")
+        .some((line) => line.trim() === `### ${targetPath}`);
+      const output = !synthesis && targetBatch
+        ? c.modelOutput
+        : { summary: "", findings: [] };
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
         JSON.stringify({
-          choices: [{ message: { content: JSON.stringify(c.modelOutput) } }],
+          choices: [{ message: { content: JSON.stringify(output) } }],
           usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
         }),
       );
@@ -517,6 +753,27 @@ async function startMockModel(c: BenchmarkCase, artifactsDir: string) {
     requestBodies,
     close: () => closeServer(server),
   };
+}
+
+function plannerMandatoryIds(prompt: string): Set<number> {
+  const match = /Mandatory IDs: \[([^\]]*)\]/u.exec(prompt);
+  if (!match) return new Set();
+  return new Set(
+    match[1]!
+      .split(",")
+      .map((value) => Number.parseInt(value.trim(), 10))
+      .filter(Number.isSafeInteger),
+  );
+}
+
+function plannerBatchIdForPath(prompt: string, path: string | undefined): number | null {
+  if (path === undefined) return null;
+  for (const block of prompt.split("\nBatch ").slice(1)) {
+    if (!block.includes(path)) continue;
+    const id = Number.parseInt(block, 10);
+    if (Number.isSafeInteger(id) && id > 0) return id;
+  }
+  return null;
 }
 
 function listen(server: ReturnType<typeof createServer>): Promise<void> {
@@ -641,9 +898,27 @@ export function expectedGateFailing(c: BenchmarkCase): boolean {
 function evaluateEnvelope(c: BenchmarkCase, env: Envelope, exitCode: number | undefined): string[] {
   const failures: string[] = [];
   const clean = c.groundTruth.findings.length === 0;
+  const expectedCoverage = c.admission.expectedCoverage;
 
   if (env.headSha !== c.headSha) {
     failures.push(`envelope headSha ${env.headSha} != PR head ${c.headSha}`);
+  }
+  if (expectedCoverage !== undefined && env.reviewCoverage?.mode !== expectedCoverage) {
+    failures.push(
+      `reviewCoverage.mode=${env.reviewCoverage?.mode ?? "missing"}, expected ${expectedCoverage}`,
+    );
+  }
+  if (expectedCoverage === "bounded") {
+    if (env.reviewCoverage === undefined || env.reviewCoverage.selectedBatches >= env.reviewCoverage.totalBatches) {
+      failures.push("bounded review did not select fewer batches than the full source set");
+    }
+    if (env.reviewCoverage?.plannerFallback !== false) {
+      failures.push("bounded review did not complete a non-fallback planner selection");
+    }
+    const plannerUsage = env.modelUsage?.filter((usage) => usage.role === "reviewPlanner") ?? [];
+    if (plannerUsage.length !== 1) {
+      failures.push(`bounded review recorded ${plannerUsage.length} planner usage event(s), expected 1`);
+    }
   }
   if (env.counts.ungrounded !== 0) {
     failures.push(`counts.ungrounded is ${env.counts.ungrounded}: the pipeline dropped grounded findings`);
@@ -850,7 +1125,7 @@ function evaluateExpectations(
       if (finding.path !== required.path) return false;
       if (required.line !== undefined && finding.line !== required.line) return false;
       if (required.severity !== undefined && finding.severity !== required.severity) return false;
-      return commentMatchesExpectation(finding.body, required.bodyIncludes);
+      return commentMatchesExpectation(finding.body, required.semantics);
     });
     if (!match) {
       failures.push(`missing required finding in ${required.path}`);
@@ -893,7 +1168,7 @@ function scoreFindings(
     if (want.line !== undefined && finding.line === want.line) {
       fileLineMatches += 1;
     }
-    if (commentMatchesExpectation(finding.body, want.bodyIncludes)) {
+    if (commentMatchesExpectation(finding.body, want.semantics)) {
       commentUsefulness += 1;
     }
   }
@@ -908,29 +1183,29 @@ function scoreFindings(
   };
 }
 
-function commentMatchesExpectation(comment: string, bodyIncludes: string | undefined): boolean {
-  if (bodyIncludes === undefined) return true;
-  if (comment.includes(bodyIncludes)) return true;
+export type SemanticPropositions = z.infer<typeof semanticPropositions>;
 
-  const expectedTokens = tokenizeForUsefulness(bodyIncludes);
-  if (expectedTokens.length === 0) return true;
-
-  const commentTokens = new Set(tokenizeForUsefulness(comment));
-  return expectedTokens.every((token) => commentTokens.has(token));
+export function commentMatchesExpectation(
+  comment: string,
+  semantics: SemanticPropositions | undefined,
+): boolean {
+  if (semantics === undefined) return true;
+  const tokens = propositionTokens(comment);
+  return [...semantics.failedRemediation, ...semantics.positive].some((phrase) => {
+    const candidate = propositionTokens(phrase);
+    return candidate.length === tokens.length && candidate.every((token, index) => tokens[index] === token);
+  });
 }
 
-function tokenizeForUsefulness(value: string): string[] {
+function propositionTokens(value: string): string[] {
   return value
     .replace(/([a-z0-9])([A-Z])/gu, "$1 $2")
+    .replace(/(?<=[a-z0-9])\.(?=[a-z0-9])/giu, " ")
+    .replace(/\bwon['’]t\b/giu, "will not")
+    .replace(/\bcan['’]t\b/giu, "cannot")
+    .replace(/\b([a-z]+)n['’]t\b/giu, "$1 not")
     .toLowerCase()
-    .split(/[^a-z0-9]+/u)
-    .map(normalizeUsefulnessToken)
-    .filter((token) => token.length > 2);
-}
-
-function normalizeUsefulnessToken(token: string): string {
-  if (token.startsWith("remov")) return "remove";
-  return token;
+    .match(/[a-z0-9]+/gu) ?? [];
 }
 
 function sumMetrics(metrics: BenchmarkMetrics[]): BenchmarkMetrics {
@@ -958,7 +1233,7 @@ function emptyMetrics(): BenchmarkMetrics {
   };
 }
 
-function validateUniqueCaseIds(cases: BenchmarkCase[]) {
+export function validateUniqueCaseIds(cases: BenchmarkCase[]) {
   const ids = new Set<string>();
   for (const c of cases) {
     if (ids.has(c.id)) {

@@ -1,11 +1,11 @@
 # postil bench
 
-Hermetic PR-review regression suite for the `postil` CLI. Each of the 64
-fixtures (seeded defects across languages and change classes, plus clean PRs
-where the correct review is silence) runs the release binary against a per-case
-mock GitHub API and a mock OpenAI-compatible model endpoint in an isolated run
-directory, then scores the v1 envelope and the forge interactions against
-ground truth.
+Hermetic PR-review regression suite for the `postil` CLI. The 61-fixture
+admission matrix contains 34 must-block defects, 15 advisory defects, and 12
+clean PRs where the correct review is silence. Each fixture runs the release
+binary against a per-case mock GitHub API and a mock OpenAI-compatible model
+endpoint in an isolated run directory, then scores the v1 envelope and the
+forge interactions against ground truth.
 
 ## What it measures
 
@@ -28,10 +28,15 @@ misleading comments, huge low-signal multi-hunk diffs, near-duplicate clean and
 defect pairs, Unicode homoglyphs, subtle races, and clean changes where silence
 is the expected review.
 
-## Running (mock mode — default, CI)
+Seeded findings match a fixture-owned, signed proposition corpus. Detection
+credit requires full normalized equality with a listed positive or
+failed-remediation proposition. Signed negatives and all unlisted wording are
+rejected.
+
+## Running (mock mode: default, CI)
 
 ```sh
-cargo build --quiet --release   # from the repo root
+cargo build --quiet --release --features qualification-candidate   # from the repo root
 cd bench
 bun install
 bun run bench                   # add --json or --json-out report.json for machine output
@@ -41,107 +46,160 @@ bun run bench                   # add --json or --json-out report.json for machi
 `POSTIL_BENCH_KEEP_RUNS=1` keeps per-case run directories under `.runs/`
 (failing cases are always kept).
 
-## Live-models mode (opt-in, seeded-region finding hit rate + cost per model)
+## Pair qualification (opt-in, live inference)
 
-`POSTIL_BENCH_MODE=live` keeps the per-case **mock GitHub API** but points the
-CLI at the real OpenRouter endpoint, running each fixture **once per model** in
-`POSTIL_BENCH_MODELS`. Each run forces a one-model generator chain and disables
-the independent scorer, so fallback and scorer behavior cannot inflate quality,
-latency, or cost. It measures, per real model: seeded-region finding hit
-rate on the seeded defects, non-seeded-region finding count, gate-verdict
-correctness, catalog-priced token-cost estimate, and measured latency. The full
-forge pipeline still runs against the mock GitHub, so grounding and statusline
-correctness are still checked as a model-independent fidelity floor.
+Live qualification exercises the exact deployed generator and scorer together.
+There are no unlisted or implicit fallbacks: the ordered generator chain and
+consensus width are part of the qualified profile. The scorer runs through the production
+prompt, filtering, usage accounting, and gate path. Each pair must complete the
+entire matrix at least three times.
 
-This command is an admission gate, not a roster promotion mechanism. It exits
-nonzero unless every candidate completes the full isolated matrix with no
-execution or pipeline-fidelity failures, at least 90% seeded-defect detection,
-no more than 5% false findings per completed case, correct gate verdicts, known
-pricing, mean cost at or below $0.01, and mean latency at or below 15 seconds.
-The embedded roster remains the last qualified production chain until an
-isolated candidate report passes and the roster is updated separately.
-The generator cost guard rejects more than six candidates or a configured cap
-above $25. Its projection prices nine provider requests per fixture, covering
-three transport attempts each for initial generation, JSON repair, and
-semantic-consistency repair. Every request includes the 16,384-token review
-completion ceiling plus another 16,384 input tokens for repair context.
+The manual `Bench (managed OpenRouter admission)` workflow is fixed to the
+managed OpenRouter endpoint and its OpenAI-compatible interface. The local
+command below supports operator-owned OpenAI-compatible and Anthropic BYOK
+endpoints; those endpoints are not candidates for the managed workflow.
+
+The managed workflow runs only from the exact `refs/heads/main` ref, includes
+that immutable source SHA and a 30-day authority window in every candidate
+profile, and attests the exact candidate file with GitHub OIDC through
+Sigstore. Every hosted candidate binds the canonical endpoint to
+`openrouter:managed-routing`; custom and local evidence cannot produce a
+hosted manifest candidate. The workflow uploads the candidate and its
+attestation bundle together. To admit a profile, commit the downloaded candidate as
+`qualified-models.json` and its bundle as
+`qualified-models.attestation.json`. CI verifies both with:
 
 ```sh
-export MODEL_API_KEY=...          # or LLM_API_KEY / OPENROUTER_API_KEY; never logged or printed
+cd bench
+bun run verify-admission
+```
+
+Verification uses [`gh attestation verify`](https://cli.github.com/manual/gh_attestation_verify)
+to pin `postil-dev/postil-cli`, the exact admission workflow,
+the main source ref, source and signer commit, GitHub's OIDC issuer, the SLSA
+provenance predicate, public Sigstore trust, and a GitHub-hosted runner. The
+source commit must be an ancestor of the candidate commit, and the intervening
+diff may contain only the manifest and bundle. A cryptographically verified
+Sigstore timestamp must match the signed issue time within 15 minutes and fit
+inside the 30-day window. The expiry second is outside the authority window.
+CI, release validation, and the runtime reject expired authority. A
+missing, mismatched, stale, or invalid bundle rejects a nonempty manifest. The
+empty manifest is exempt because it admits no models. Report and profile
+checksums detect changes; they do not authenticate who produced a candidate.
+
+The workflow builds a qualification-only binary feature that accepts one exact
+candidate profile inside the hermetic benchmark. The feature requires CI,
+managed privacy enforcement, and a loopback mock forge. Release binaries omit
+the feature. Candidate runs therefore execute the production hosted planner,
+request preflight, price ceilings, consensus, and scorer behavior without
+granting unqualified profiles authority in a deployed service.
+
+```sh
+export MODEL_API_KEY=... # or POSTIL_API_KEY, OPENROUTER_API_KEY, or LLM_API_KEY
 export POSTIL_BENCH_MODE=live
-export POSTIL_BENCH_MODELS=z-ai/glm-5.2,moonshotai/kimi-k2.7-code,deepseek/deepseek-v4-flash,google/gemini-3.5-flash,stepfun/step-3.7-flash
-bun run bench --json-out report.json   # or: bun run bench:live-models
-# POSTIL_API_BASE overrides the endpoint (default https://openrouter.ai/api/v1)
-# --concurrency <n> or BENCH_CONCURRENCY sets case parallelism (default 4)
+export POSTIL_BENCH_PAIRS=provider/generator::provider/scorer+provider/scorer-fallback
+export POSTIL_BENCH_REPEATS=3
+export POSTIL_API_FORMAT=openai-compatible # or anthropic
+bun run bench --json-out report.json --manifest-out ../qualified-models.json
 ```
 
-The inference key is read from `POSTIL_API_KEY`, `OPENROUTER_API_KEY`,
-`MODEL_API_KEY`, or `LLM_API_KEY`, forwarded to
-the binary only through the environment, and never logged or placed on argv. It
-refuses to run without a key and without at least one model.
+The release binary must embed the exact profile under test. Set the intended
+generator, cascade, consensus width, scorer, API base, and interface in
+`config.toml`, leave the
+admission manifest empty, then build the binary. The benchmark compares the
+binary's embedded metadata with the worktree before inference. Environment
+model variables select that same profile for the isolated run; they do not
+define a different candidate.
 
-### What live-models mode scores
+Native Anthropic and authenticated private endpoints can use an operator-owned
+pricing file instead of a public model catalog:
 
-- **Seeded-region finding hit**: a seeded region is found when at least one non-carried
-  finding (in `findings`, not the carried `resolved` set) matches the seeded
-  file and whose line range overlaps the seeded region (±3 lines).
-- **Non-seeded-region finding count**: any finding on a clean fixture, and any
-  finding on a defect fixture that does not overlap the seeded region (wrong
-  file or off the region).
-- **Gate verdict**: whether the envelope's own gate `failing` matches the ground
-  truth (the default `failOn: error` gate should fail iff the seeded defect is
-  error-severity).
-- **Cost + timing**: the envelope's `usage` tokens and `durationMs` per case;
-  cost is `promptTokens × promptPrice + completionTokens × completionPrice`,
-  with prices fetched once per run from `GET /api/v1/models` and matched by id.
-- **Grounding / statusline**: still checked (they are model-independent): every
-  finding grounded (`counts.ungrounded == 0`), no synthetic `.postil/` findings,
-  both check-runs created and completed, `postil/gate` concluding consistently
-  with the envelope's gate. The mock-mode fidelity checks that depend on exact
-  model output (silence-on-clean, exact finding anchoring, min/max findings) are
-  **not** applied here — a real model's output is not known ahead of time.
-
-### Report
-
-`--json-out <path>` writes `{ generatedAt, cliVersion, apiBase, models[],
-modelAggregates[], totalRunCostUsd, cases[] }`. The `models` array is the exact
-schema the site consumes, one object per model:
-
-```
-{ id, detectionRate, falsePositives, casesRun, meanCostUsdPerReview, meanDurationMs }
+```json
+{
+  "provider/model": {
+    "promptUsdPerToken": "0.000001",
+    "completionUsdPerToken": "0.000005"
+  }
+}
 ```
 
-`modelAggregates` is a superset with `totalCostUsd`, gate tallies, and error
-counts for the human table; `totalRunCostUsd` is the sum of included per-case
-costs across the full run; `cases` is the per-`(model, case)` detail. Every run
-also writes a timestamped copy under `.runs/live-models/` (gitignored). `--json`
-prints the full report instead of the human table.
+Pass it with `--pricing-file prices.json` or
+`POSTIL_BENCH_PRICING_FILE=prices.json`. Prices are positive canonical decimal
+strings that must be exactly representable as integer micros per million
+tokens. Each admitted profile carries immutable input and output price bounds
+for its exact generator and scorer model set. The catalog request uses the
+inference credential when no file is supplied and fails closed when any model
+is unpriced. Catalog redirects are rejected so credentials remain bound to the
+configured endpoint origin.
 
-### Cost guardrail
+Private gateways may set `POSTIL_ENDPOINT_AUTH_HEADER` and
+`POSTIL_ENDPOINT_AUTH_VALUE`. The harness validates and forwards the pair to
+both catalog and inference requests. Provider-managed headers cannot be
+overridden.
 
-`bun run cost-guard` (or `src/cost-guard.ts`) fetches live pricing and projects
-an **upper-bound** total cost of the matrix from fixture diff sizes, exiting
-non-zero if the projection exceeds `--cap <usd>` (default 15) or if any model has
-unknown pricing. CI runs it before the live bench so an over-budget matrix aborts
-before spending anything. It needs no key (the `/models` catalog is public).
+Pair syntax is `generators::scorer+fallback` or
+`generators::consensus::scorer+fallback`. For example,
+`provider/one+provider/two+provider/three::2::provider/scorer` qualifies an
+ordered three-model generator chain with two-model consensus. Omitting the
+consensus field requires every listed generator. The optional scorer fallback
+is tried after the primary scorer.
 
-### Honesty caveats
+Admission requires all of these in every repeat:
 
-These are a **measured baseline for this CLI** on **our own fixtures**: a single
-run per case, diff plus mock repo context, no policy docs. The fixtures are ours
-and **no competitor has been run on them**, so the numbers are not a peer
-comparison — they are our measured seeded-region finding hit rate and
-catalog-priced token-cost estimates on our fixtures. Results vary across runs
-because model inference is nondeterministic. Treat them as internal evidence,
-not a published benchmark.
+- 100% must-block detection and final blocking by the seeded finding itself
+- at least 90% advisory detection and at most 10% advisory overblocking
+- no clean false blocks and at most 5% clean cases with any finding
+- no execution, structured-output, grounding, statusline, or usage-accounting failure
+- mean pair cost at most $0.04 and mean review latency at most 15 seconds
+- every review costs at most the $1 hosted operation cap
+- per-repeat p95 latency at most 30 seconds and maximum latency at most 60 seconds
 
-### CI
+Findings suppressed by the scorer count as detector evidence but cannot satisfy
+final blocking. An unrelated error cannot substitute for the seeded finding.
+The report stores only attributable finding coordinates and labels, never model
+finding titles or bodies. It records separate fixture, review-contract source,
+configuration, evaluator contract, and CLI binary SHA-256 hashes; the canonical API base and
+provider interface; the ordered generator chain and consensus width; the
+ordered scorer chain; repeat number; and provider-exact or catalog-estimate
+cost provenance. One checked-in source manifest defines the identical Rust and
+TypeScript evaluator source list, including the attestation verifier,
+`bench/package.json`, and `bench/bun.lock`; `packageManager` pins the Bun
+runtime identity.
+Source-bundle hashes use the runtime's ordered
+`path + NUL + exact bytes + NUL` framing. Each immutable profile and the
+complete sanitized evidence payload have their own SHA-256 identifier.
+The runtime recomputes the profile identifier from one canonical manifest
+material object: model defaults, provider identity, endpoint and interface,
+ordered model chains and consensus, sorted price bounds, review and evaluator
+contracts, evaluator runtime, report digest, and repeat count. The report
+records the evaluated binary hash, but the profile identifier excludes it
+because embedding the resulting manifest changes the binary bytes and would
+create a self-referential digest. Source-contract and report digests bind the
+profile to the evaluated binary without that cycle.
+`manifestCandidate` uses the runtime admission-manifest schema directly and is
+absent from a failed report. Only the process that performs the live run can
+write a candidate, using `--manifest-out` on that invocation. Saved JSON
+reports are evidence only and cannot be admitted later. Explicit report and
+candidate paths are invalidated before a run and replaced atomically; mock mode
+rejects `--manifest-out`. Output aliases are rejected by canonical parent path
+and existing file identity, including symlinked parents and hardlinks.
 
-`.github/workflows/bench-live.yml` runs this mode on `workflow_dispatch` only
-(it spends real tokens): it builds the release binary, runs the cost guardrail,
-runs the live bench with any configured `POSTIL_API_KEY`, `OPENROUTER_API_KEY`,
-`MODEL_API_KEY`, or `LLM_API_KEY` secret, uploads the JSON report as an artifact,
-and prints the per-model table to the job step summary.
+The managed preflight runs the CLI's exact normalized and compacted request
+plan for every fixture before inference. It includes bounded planner, selected
+source and synthesis requests, scoring, consensus, fallback, repair, and
+transport retries. It rejects missing prices, more than six models, a review
+above the $1 hosted operation cap, a total above the configured qualification
+cap, or a cap outside `(0, $25]`. A single model used for more than one role is
+priced for each planned invocation.
+The inference key stays in the child environment and is never printed or placed
+on an argument list.
+
+These fixtures are internal evidence, not a competitor comparison. Inference is
+nondeterministic, so one successful matrix is insufficient for admission.
+OpenRouter's endpoint identity is recorded, but its dynamic upstream route is
+not described as pinned. A pinned-provider claim requires request and response
+evidence for that exact route. Hosted OpenRouter qualification uses the same
+non-collection and ZDR request preferences as production.
 
 ## Scorer qualification (opt-in, mocked generator + real scorer)
 
@@ -151,33 +209,49 @@ kind, and calibrates each finding's confidence and kind against local diff
 context. `bun run scorer-eval` qualifies that role directly by mocking the
 primary generator with fixed findings and proxying only scorer requests to the
 real OpenRouter endpoint.
+This diagnostic can reject a scorer but cannot admit a production pair; pair
+qualification above is the admission authority.
 
 ```sh
-cargo build --quiet --release
+cargo build --quiet --release --features qualification-candidate
 cd bench
 export MODEL_API_KEY=...          # or LLM_API_KEY / OPENROUTER_API_KEY
-POSTIL_SCORER_EVAL_MODELS=openai/gpt-5.4-nano,google/gemini-3.5-flash,stepfun/step-3.7-flash \
+POSTIL_SCORER_EVAL_MODELS=provider/candidate-a,provider/candidate-b \
 POSTIL_SCORER_EVAL_REPEATS=5 \
   bun run scorer-eval --json-out scorer-eval-report.json
 ```
 
 The default candidates come from `config.toml`; the workflow input may override
-them explicitly. Qualification repeats 12 fixtures five times: six seeded true
-findings and six injected false findings. Admission requires a complete matrix,
-no malformed, repaired, fallback, or reason-contract failures, all true findings
-kept as confident risks, at least 80% of false findings down-scored overall and
-per fixture, p50/p95/max scorer latency at or below 5/10/20 seconds, known live
+them explicitly. Qualification repeats 12 fixtures five times: six unambiguous
+seeded risks and six injected false findings. Admission requires a complete
+matrix, no malformed, repaired, fallback, or reason-contract failures, all
+seeded risks preserved as published gate failures, at least 80% of false
+findings actually suppressed overall and per fixture, p50/p95/max scorer latency
+at or below 5/10/20 seconds, known live
 catalog pricing, and mean scorer cost at or below $0.005 per case. A failed
 candidate makes the command exit nonzero after writing its report. Candidate
 listing alone never enables the embedded scorer. Before any model call, the
 evaluator rejects more than six candidates, more than ten repeats, missing
-prices, or a conservative projected total above $10. The projection prices six
-provider requests per case, covering three transport attempts plus schema
-repair, with 20,000 base input tokens, another 4,096 repair-context input
-tokens, and the 4,096-token output ceiling on every request. Scorer responses also fail
+prices, or a conservative projected total above $10. The projection prices the
+runtime retry graph: three transport attempts for the initial request and three
+for at most one schema-repair request. A one-finding qualification request uses
+a 17,000-byte prompt bound, an 896-token output bound, and at most 3,584 bytes
+of repair context. Scorer responses also fail
 admission when provider usage is missing or malformed, runtime accounting is
-incomplete, or the assessment is not a trimmed, single-line sentence of at most
-240 Unicode characters ending in sentence punctuation.
+incomplete, or the assessment is not trimmed single-line text of at most
+240 UTF-8 bytes ending in sentence punctuation. Each case is killed one second
+after the 20-second admission limit, and teardown aborts outstanding provider
+requests. A timeout rejects that candidate immediately rather than running the
+rest of its matrix. Any other admission-fatal structural result, including an
+unroutable provider response, malformed envelope, scorer mismatch, invalid
+reason, incomplete usage, or repair attempt, also stops only that candidate.
+Ordinary true/false quality misses run the complete statistical matrix. Reports
+record completed and expected case counts explicitly. With `--json-out`,
+`<path>.partial` atomically records completed case metrics without prompts,
+responses, credentials, or error text; the final report replaces it after the
+run completes. Scorer output is bounded from the supplied finding count, up to
+the supported maximum of 20 findings, and schema-repair context is byte-bounded
+from the same output limit.
 
 ## Diff-file live mode (opt-in, single model, no forge)
 
@@ -185,13 +259,13 @@ This live mode runs the real release binary against the same fixtures with a
 real model and **no mocked model server**, so it measures seeded-region finding
 hit rate rather than pipeline fidelity. Each case runs in local diff-file mode
 (`postil review --diff-file <fixture.diff> --no-post --output-json`), which does
-no forge I/O at all — so no GitHub server, mock or real, is involved and nothing
+no forge I/O at all, so no GitHub server, mock or real, is involved and nothing
 is written to any repo.
 
 ```sh
 export MODEL_API_KEY=...         # required; never logged or printed
-bun run bench:live               # or: bun run bench --live
-# REVIEW_MODEL or --model <id> overrides the model (default mistralai/mistral-small-3.2-24b-instruct)
+REVIEW_MODEL=provider/qualified-model bun run bench:live
+# --model <id> is the equivalent command-line override
 # --concurrency <n> or BENCH_CONCURRENCY sets case parallelism (default 6)
 ```
 
@@ -216,7 +290,7 @@ fails with a transient provider error: a non-zero exit whose stderr carries an
 HTTP 5xx/429, rate-limit, timeout, or connection signature, or a run that
 produced no valid v1 envelope at all (empty/garbled output, typically a dropped
 response). A valid envelope is always treated as a normal result and is never
-retried — including a gate-failing exit (exit 1 with a scored envelope) or one
+retried, including a gate-failing exit (exit 1 with a scored envelope) or one
 that merely reports findings or non-seeded-region findings. A case that fails on both
 attempts is recorded as an error and excluded from scoring, exactly as before.
 
@@ -241,7 +315,7 @@ truth-vs-found severity. The exact figure uses strict equality. The +/-1-tier
 figure is a deliberately softer matching rule that also accepts adjacent tiers
 on the `info < warn < error` scale.
 
-These numbers are a **measured baseline for this CLI** — a single model, one run
+These numbers are a **measured baseline for this CLI**: a single model, one run
 per case, diff-only with no repository context or policy docs. **Neither
 severity metric is a peer-comparison claim**: no competitor has been run on the
 same fixtures. Results vary across runs because model inference is

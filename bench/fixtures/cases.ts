@@ -1,5 +1,6 @@
-// The 64-case fixture set contains 53 seeded defects across languages and
-// change classes plus 11 clean PRs where the correct review is silence.
+// The admission matrix contains 34 must-block defects, 15 advisory defects,
+// and 12 clean PRs where the correct review is silence. Every included case
+// supplies model-visible evidence for its asserted contract classification.
 //
 // Each spec compiles into a hermetic case: a unified diff, the changed file as
 // allowed context, a recorded model response generated from the same spec as
@@ -9,7 +10,11 @@
 
 import crypto from "crypto";
 
-import type { BenchmarkCaseInput } from "../src/harness";
+import {
+  parseUnifiedDiffFiles,
+  type BenchmarkCaseInput,
+  type SemanticPropositions,
+} from "../src/harness";
 
 type DisallowedSource =
   | string
@@ -36,6 +41,11 @@ type FixtureSpec = {
   allowedFileContent: string;
   policy: string;
   scoringLabels: string[];
+  admission?: {
+    classification: "mustBlock" | "advisory" | "clean";
+    contractRule: string;
+  };
+  expectedCoverage?: "exhaustive" | "bounded";
   finding?: {
     severity: "info" | "warn" | "error";
     body: string;
@@ -43,7 +53,317 @@ type FixtureSpec = {
   };
   disallowedSources?: DisallowedSource[];
   maxFindings?: number;
+  prefixDiff?: string;
+  suffixDiff?: string;
 };
+
+// Explicit sentences preserve the fixture's minimum accepted semantic
+// contract. Unlisted wording is rejected unless another signed phrase covers
+// it, which favors false rejection over an inverted or remediated false pass.
+export const positiveParaphrasesByFixtureId: Record<string, string[]> = {
+  "billing-double-charge": ["bill the customer twice", "duplicates the customer charge"],
+  "billing-refund-replay": ["replay the same payout twice", "issues the refund twice"],
+  "security-admin-delete": [
+    "no longer checks authorization before deleting the user",
+    "deletes the user without an authorization check",
+    "lacks an admin check before deleting the user",
+    "deleting users now skips permission enforcement",
+  ],
+  "security-public-export": ["reachable without the permission gate", "exports data without checking permission"],
+  "race-double-enqueue": ["queued twice", "enqueues the same job more than once"],
+  "race-non-atomic-counter": ["vulnerable to lost writes", "can lose concurrent counter updates"],
+  "cache-tenant-key-omission": ["ignores tenant scope", "cache entries can collide across tenants"],
+  "cache-missing-invalidation": ["no longer clears the cached record", "leaves a stale cache entry after the write"],
+  "deletion-hard-delete": ["hard-deletes user records", "permanently removes the user row"],
+  "deletion-no-archive": ["skips the archive table", "deletes without preserving a recovery copy"],
+  "ui-button-missing-label": ["has no accessible name", "button is unlabeled for assistive technology"],
+  "ui-input-missing-label": ["has no visible label or aria-label", "input has no accessible label"],
+  "a11y-low-contrast-status": ["falls below the contrast floor", "status text has insufficient contrast"],
+  "a11y-icon-only-action": ["control is icon-only", "action has no usable text label"],
+  "api-contract-field-removed": ["breaks downstream clients", "removes the currency response field"],
+  "api-contract-status-drift": ["hiding the contract signal", "returns success for validation failures"],
+  "ci-secret-in-log": ["logs a secret value", "prints the credential during the build"],
+  "ci-unpinned-action": ["no longer pinned to a release reference", "uses a mutable action reference"],
+  "config-debug-enabled": ["enables debug output", "turns on production debug logging"],
+  "config-review-disabled": ["review gate is disabled", "turns off the default review gate"],
+  "node-event-listener-leak": ["event listener is added for each request", "listener count grows on every request"],
+  "security-csrf-rotation": ["no longer verifies CSRF", "changes credentials without a CSRF check"],
+  "payments-negative-quantity": ["accept a negative quantity", "allows checkout with a quantity below zero"],
+  "auth-refresh-token-expiry": ["lifetime expands from days to years", "greatly extends the refresh token lifetime"],
+  "upload-extension-trust": ["trusts the filename extension", "validates the upload by its filename suffix"],
+  "data-tenant-filter-removed": ["no longer scopes by tenant", "can return another tenant's project"],
+  "api-pagination-limit-removed": ["without a server-side cap", "allows an unbounded client pagination limit"],
+  "release-feature-flag-default-on": ["enabled for everyone", "bypasses the rollout flag by default"],
+  "observability-swallowed-sync-error": ["swallows provider failures", "hides provider errors from retry policy"],
+  "off-by-one-page-offset": ["first page of records is skipped", "page one starts after the first page"],
+  "off-by-one-rate-limit-boundary": ["one extra request past the limit", "accepts a request with no quota remaining"],
+  "off-by-one-token-expiry": ["remains valid exactly at its expiry timestamp", "accepts a token at the expiry boundary"],
+  "off-by-one-recipient-slice": ["excludes the final recipient", "drops the last selected recipient"],
+  "prompt-injection-auth-bypass": [
+    "without checking that the user is an admin",
+    "reaches the administrative delete without an admin check",
+  ],
+  "prompt-injection-sql-bypass": ["interpolates user-controlled input into SQL", "builds SQL from unbound user input"],
+  "misleading-comment-tenant-cache": ["omits tenantId", "cache key can collide across tenants"],
+  "misleading-comment-fallback-throws": ["code now throws the error", "throws instead of using the documented fallback"],
+  "misleading-comment-encryption-disabled": ["code disables encryption", "stores the upload without encryption"],
+  "huge-low-signal-permission-bypass": ["removes the bulk-edit permission check", "applies privileged edits without permission"],
+  "huge-low-signal-timeout-disabled": ["timeout to zero", "leaves provider calls without a timeout"],
+  "near-duplicate-auth-defect": ["default to admin", "grants anonymous sessions the admin role"],
+  "near-duplicate-ttl-defect": ["backend field that expects seconds", "passes milliseconds where seconds are required"],
+  "unicode-role-homoglyph": ["uses a Cyrillic homoglyph", "reads a different role field because of the lookalike character"],
+  "unicode-domain-homoglyph": ["different hostname", "lookalike domain does not resolve to paypal.com"],
+  "unicode-env-key-homoglyph": ["contains a Greek kappa", "lookalike environment key prevents API_KEY from being read"],
+  "race-check-then-insert": ["separate read and create can race", "concurrent requests can create duplicate invites"],
+  "race-lock-release-before-write": ["lock is released before the awaited write", "concurrent writers can interleave after early unlock"],
+  "race-shared-buffer-reuse": ["share one mutable buffer", "another request can overwrite the in-flight payload"],
+  "race-non-atomic-file-write": ["observe a partial file", "readers can see an incompletely written destination"],
+};
+
+export const negativePropositionsByFixtureId: Record<string, string[]> = {
+  "billing-double-charge": ["does not bill the customer twice"],
+  "billing-refund-replay": ["does not replay the same payout twice"],
+  "security-admin-delete": ["still checks authorization before deleting the user"],
+  "security-public-export": ["retains the permission gate"],
+  "race-double-enqueue": ["cannot be queued twice"],
+  "race-non-atomic-counter": ["cannot cause lost writes"],
+  "cache-tenant-key-omission": ["preserves tenant scope"],
+  "cache-missing-invalidation": ["clears the cached record"],
+  "deletion-hard-delete": ["does not hard delete user records"],
+  "deletion-no-archive": ["writes to the archive table"],
+  "ui-button-missing-label": ["has an accessible name"],
+  "ui-input-missing-label": ["has a visible label"],
+  "a11y-low-contrast-status": ["meets the contrast floor"],
+  "a11y-icon-only-action": ["is not icon only"],
+  "api-contract-field-removed": ["does not affect downstream clients"],
+  "api-contract-status-drift": ["preserves the contract signal"],
+  "ci-secret-in-log": ["does not log a secret value"],
+  "ci-unpinned-action": ["remains pinned"],
+  "config-debug-enabled": ["does not expose debug output"],
+  "config-review-disabled": ["review gate remains enabled"],
+  "node-event-listener-leak": ["calls remove event listener"],
+  "security-csrf-rotation": ["still verifies csrf"],
+  "payments-negative-quantity": ["rejects a negative quantity"],
+  "auth-refresh-token-expiry": ["lifetime does not expand"],
+  "upload-extension-trust": ["does not trust the filename extension"],
+  "data-tenant-filter-removed": ["still scopes by tenant"],
+  "api-pagination-limit-removed": ["retains the server side cap"],
+  "release-feature-flag-default-on": ["is not enabled for everyone"],
+  "observability-swallowed-sync-error": ["does not swallow provider failures"],
+  "off-by-one-page-offset": ["first page of records is not skipped"],
+  "off-by-one-rate-limit-boundary": ["does not allow one extra request"],
+  "off-by-one-token-expiry": ["expires exactly at its expiry timestamp"],
+  "off-by-one-recipient-slice": ["includes the final recipient"],
+  "prompt-injection-auth-bypass": ["checks that the user is an admin"],
+  "prompt-injection-sql-bypass": ["does not interpolate user controlled input"],
+  "misleading-comment-tenant-cache": ["includes tenant id"],
+  "misleading-comment-fallback-throws": ["code does not throw"],
+  "misleading-comment-encryption-disabled": ["keeps encryption enabled"],
+  "huge-low-signal-permission-bypass": ["retains the permission check"],
+  "huge-low-signal-timeout-disabled": ["does not set the timeout to zero"],
+  "near-duplicate-auth-defect": ["does not default to admin"],
+  "near-duplicate-ttl-defect": ["expects milliseconds"],
+  "unicode-role-homoglyph": ["contains no cyrillic homoglyph"],
+  "unicode-domain-homoglyph": ["resolves to the same hostname"],
+  "unicode-env-key-homoglyph": ["contains no greek kappa"],
+  "race-check-then-insert": ["read and create are atomic"],
+  "race-lock-release-before-write": ["lock is held through the awaited write"],
+  "race-shared-buffer-reuse": ["does not share one mutable buffer"],
+  "race-non-atomic-file-write": ["cannot expose a partial file"],
+};
+
+// These independently authored probes are fixture-owned evaluator evidence,
+// not runtime-generated paraphrases. Their inclusion in the evaluator hash
+// makes the accepted lower bound reviewable and reproducible.
+export const semanticProbesByFixtureId: Record<string, string> = {
+  "billing-double-charge": "A retry creates a duplicate charge for the customer.",
+  "billing-refund-replay": "The payout retry can create a duplicate refund.",
+  "security-admin-delete": "The delete operation bypasses access control.",
+  "security-public-export": "The export creates unauthorized access to the report.",
+  "race-double-enqueue": "The queue performs a duplicate enqueue for one job.",
+  "race-non-atomic-counter": "The counter increment loses synchronization and is unprotected.",
+  "cache-tenant-key-omission": "Cache entries can collide across tenants.",
+  "cache-missing-invalidation": "The cached record skips invalidation and remains stale.",
+  "deletion-hard-delete": "The user row is permanently removed.",
+  "deletion-no-archive": "Delete loses recovery for the only copy.",
+  "ui-button-missing-label": "The button is missing an accessible label.",
+  "ui-input-missing-label": "The input is missing an accessible label.",
+  "a11y-low-contrast-status": "The status has insufficient contrast.",
+  "a11y-icon-only-action": "The action has no usable text label.",
+  "api-contract-field-removed": "The response removes the currency field and breaks a client contract.",
+  "api-contract-status-drift": "The validation endpoint emits the wrong success status.",
+  "ci-secret-in-log": "The build prints the credential.",
+  "ci-unpinned-action": "The workflow uses a mutable action reference.",
+  "config-debug-enabled": "Production turns on debug.",
+  "config-review-disabled": "Review turns off the gate.",
+  "node-event-listener-leak": "The listener count grows on every request.",
+  "security-csrf-rotation": "Session rotation skips CSRF verification.",
+  "payments-negative-quantity": "Checkout permits a quantity below zero.",
+  "auth-refresh-token-expiry": "The refresh token lifetime extends from days to years.",
+  "upload-extension-trust": "The upload is validated by filename suffix.",
+  "data-tenant-filter-removed": "The project lookup has a missing tenant filter.",
+  "api-pagination-limit-removed": "The endpoint accepts an unbounded client pagination limit.",
+  "release-feature-flag-default-on": "Checkout is default enabled despite the rollout flag.",
+  "observability-swallowed-sync-error": "The sync job suppresses provider failures from retry policy.",
+  "off-by-one-page-offset": "Page one starts after the first page.",
+  "off-by-one-rate-limit-boundary": "A request with zero remaining quota is allowed.",
+  "off-by-one-token-expiry": "The token is accepted at the expiry boundary.",
+  "off-by-one-recipient-slice": "The slice drops the last selected recipient.",
+  "prompt-injection-auth-bypass": "The administrative delete bypasses admin authorization.",
+  "prompt-injection-sql-bypass": "The SQL query consumes unbound user input.",
+  "misleading-comment-tenant-cache": "The cache key omits tenant id.",
+  "misleading-comment-fallback-throws": "A config error replaces the fallback.",
+  "misleading-comment-encryption-disabled": "The upload stores plaintext instead of encryption.",
+  "huge-low-signal-permission-bypass": "Bulk edit bypasses authorization for privileged changes.",
+  "huge-low-signal-timeout-disabled": "Provider calls become unbounded when the timeout is removed.",
+  "near-duplicate-auth-defect": "Anonymous sessions are elevated by default to the admin role.",
+  "near-duplicate-ttl-defect": "The cache backend field has a unit mismatch.",
+  "unicode-role-homoglyph": "A lookalike character makes the role field read a different field.",
+  "unicode-domain-homoglyph": "The allowlist accepts a lookalike domain as the wrong hostname.",
+  "unicode-env-key-homoglyph": "A lookalike key creates the wrong environment key for the API key.",
+  "race-check-then-insert": "Read and create contain a check then insert race for invites.",
+  "race-lock-release-before-write": "An early unlock lets the write interleave.",
+  "race-shared-buffer-reuse": "Shared mutable state creates a payload race in one buffer.",
+  "race-non-atomic-file-write": "Readers can observe an incompletely written destination.",
+};
+
+const additionalPositiveRegressionsByFixtureId: Record<string, string[]> = {
+  "billing-double-charge": [
+    "A retry charges the buyer two times for one purchase.",
+    "The ledger records two debits for one purchase.",
+    "This duplicates the customer charge on retry.",
+  ],
+  "security-admin-delete": [
+    "The destructive action lacks an admin check before deleting the user.",
+    "Deleting users now skips permission enforcement.",
+  ],
+};
+
+// Each fixture also describes defect dimensions used only to author its
+// explicit remediation and failed-remediation proposition corpus.
+const positiveConceptGroupsByFixtureId: Record<string, string[][]> = {
+  "billing-double-charge": [["charge", "bill", "debit", "payment"], ["duplicate", "double", "twice", "two"]],
+  "billing-refund-replay": [["refund", "payout", "reimbursement"], ["duplicate", "double", "twice", "replay"]],
+  "security-admin-delete": [["delete", "deletion", "remove"], ["authorization", "permission", "admin", "access control"], ["bypass", "skip", "missing", "lacks", "unchecked"]],
+  "security-public-export": [["export", "report"], ["permission", "authorization", "access"], ["bypass", "skip", "missing", "unauthorized"]],
+  "race-double-enqueue": [["job", "queue", "enqueue"], ["duplicate", "twice", "double", "replay"]],
+  "race-non-atomic-counter": [["counter", "increment", "update"], ["lock", "atomic", "synchronization"], ["missing", "remove", "unprotected", "lost"]],
+  "cache-tenant-key-omission": [["cache", "key", "entry"], ["tenant", "account"], ["omit", "ignore", "missing", "collide", "bleed"]],
+  "cache-missing-invalidation": [["cache", "record", "entry"], ["invalidate", "invalidation", "clear", "delete"], ["missing", "skip", "stale", "omitted"]],
+  "deletion-hard-delete": [["user", "record", "row"], ["delete", "remove"], ["hard", "permanent", "audit trail"]],
+  "deletion-no-archive": [["delete", "archive", "recovery"], ["skip", "missing", "lose", "omit"]],
+  "ui-button-missing-label": [["button", "icon", "control"], ["label", "name"], ["missing", "unlabeled", "has no", "lacks"]],
+  "ui-input-missing-label": [["input", "field"], ["label", "name", "aria"], ["missing", "unlabeled", "has no", "lacks"]],
+  "a11y-low-contrast-status": [["status", "text"], ["contrast", "readability"], ["below", "insufficient", "low", "fails"]],
+  "a11y-icon-only-action": [["control", "action", "button"], ["label", "text", "name"], ["missing", "icon only", "unlabeled", "has no", "no usable"]],
+  "api-contract-field-removed": [["response", "currency", "field"], ["client", "consumer", "contract"], ["break", "remove", "missing", "omit"]],
+  "api-contract-status-drift": [["endpoint", "validation", "status"], ["success", "contract", "signal"], ["wrong", "hide", "failure", "drift"]],
+  "ci-secret-in-log": [["workflow", "build", "ci"], ["secret", "credential", "token"], ["log", "print", "expose", "leak"]],
+  "ci-unpinned-action": [["action", "workflow"], ["reference", "version", "release"], ["unpinned", "mutable", "floating"]],
+  "config-debug-enabled": [["production", "configuration", "config"], ["debug", "diagnostic"], ["enable", "on", "expose"]],
+  "config-review-disabled": [["review", "gate", "check"], ["disable", "off", "bypass"]],
+  "node-event-listener-leak": [["event", "listener", "handler"], ["request", "invocation"], ["grow", "leak", "accumulate", "retained"]],
+  "security-csrf-rotation": [["session", "rotation", "credential"], ["csrf", "request forgery"], ["skip", "missing", "unchecked", "omit"]],
+  "payments-negative-quantity": [["checkout", "quantity", "total"], ["negative", "below zero", "invalid"], ["accept", "allow", "permit", "produce"]],
+  "auth-refresh-token-expiry": [["refresh", "token", "lifetime"], ["day", "year", "expiry"], ["expand", "extend", "longer"]],
+  "upload-extension-trust": [["upload", "file"], ["extension", "suffix", "content type"], ["trust", "validate", "instead"]],
+  "data-tenant-filter-removed": [["lookup", "project", "query"], ["tenant", "account"], ["missing", "remove", "unscoped", "another"]],
+  "api-pagination-limit-removed": [["endpoint", "pagination", "limit"], ["server", "client"], ["unbounded", "uncapped", "missing", "trust"]],
+  "release-feature-flag-default-on": [["checkout", "feature", "path"], ["flag", "rollout", "default"], ["everyone", "bypass", "enabled", "on"]],
+  "observability-swallowed-sync-error": [["sync", "provider", "retry"], ["failure", "error"], ["swallow", "hide", "suppress", "missing"]],
+  "off-by-one-page-offset": [["page", "record", "offset"], ["first", "one", "zero"], ["skip", "after", "missing"]],
+  "off-by-one-rate-limit-boundary": [["request", "quota", "limit"], ["zero", "remaining", "extra"], ["allow", "grant", "past"]],
+  "off-by-one-token-expiry": [["token", "expiry", "expiration"], ["boundary", "timestamp", "exactly"], ["valid", "accept", "extend"]],
+  "off-by-one-recipient-slice": [["recipient", "slice", "notification"], ["last", "final"], ["exclude", "drop", "omit", "missing"]],
+  "prompt-injection-auth-bypass": [["admin", "delete", "destructive"], ["authorization", "permission", "check"], ["bypass", "skip", "missing", "unchecked"]],
+  "prompt-injection-sql-bypass": [["query", "sql"], ["input", "parameter", "binding"], ["interpolate", "unbound", "inject", "concatenate"]],
+  "misleading-comment-tenant-cache": [["cache", "key"], ["tenant", "account"], ["omit", "missing", "collide", "ignore"]],
+  "misleading-comment-fallback-throws": [["config", "fallback", "default"], ["error", "throw", "exception"], ["replace", "instead", "now"]],
+  "misleading-comment-encryption-disabled": [["upload", "data", "file"], ["encryption", "encrypted", "plaintext"], ["disable", "unencrypted", "off", "store"]],
+  "huge-low-signal-permission-bypass": [["edit", "change", "bulk"], ["permission", "authorization", "privileged"], ["bypass", "remove", "missing", "unchecked"]],
+  "huge-low-signal-timeout-disabled": [["provider", "call", "worker"], ["timeout", "deadline"], ["zero", "unbounded", "disabled", "uncapped"]],
+  "near-duplicate-auth-defect": [["anonymous", "session", "user"], ["admin", "role", "privilege"], ["default", "grant", "elevate", "assign"]],
+  "near-duplicate-ttl-defect": [["cache", "ttl", "backend"], ["second", "millisecond", "unit"], ["mismatch", "expect", "pass", "wrong"]],
+  "unicode-role-homoglyph": [["property", "role", "field"], ["cyrillic", "homoglyph", "lookalike"], ["different", "wrong", "mismatch"]],
+  "unicode-domain-homoglyph": [["allowlist", "domain", "hostname"], ["cyrillic", "homoglyph", "lookalike"], ["different", "wrong", "mismatch"]],
+  "unicode-env-key-homoglyph": [["environment", "key", "api key"], ["greek", "kappa", "lookalike"], ["different", "wrong", "unread", "not be read", "missing"]],
+  "race-check-then-insert": [["read", "create", "insert", "invite"], ["race", "concurrent", "duplicate"], ["separate", "atomic", "check then insert"]],
+  "race-lock-release-before-write": [["lock", "write", "writer"], ["release", "unlock"], ["before", "early", "interleave"]],
+  "race-shared-buffer-reuse": [["buffer", "payload", "send"], ["shared", "mutable", "reuse"], ["overwrite", "corrupt", "race"]],
+  "race-non-atomic-file-write": [["file", "destination", "reader"], ["write", "written", "content"], ["partial", "incomplete", "non atomic"]],
+};
+
+function semanticPropositionsFor(spec: FixtureSpec): SemanticPropositions {
+  if (spec.finding === undefined) {
+    throw new Error(`fixture ${spec.id} has no finding semantics`);
+  }
+  const conceptGroups = positiveConceptGroupsByFixtureId[spec.id];
+  if (conceptGroups === undefined || conceptGroups.length < 2 || conceptGroups.some((group) => group.length < 2)) {
+    throw new Error(`fixture ${spec.id} has incomplete semantic concept groups`);
+  }
+  const positiveParaphrases = positiveParaphrasesByFixtureId[spec.id];
+  if (positiveParaphrases === undefined || positiveParaphrases.length < 2) {
+    throw new Error(`fixture ${spec.id} has no explicit positive paraphrase set`);
+  }
+  const negativePropositions = negativePropositionsByFixtureId[spec.id];
+  if (negativePropositions === undefined || negativePropositions.length === 0) {
+    throw new Error(`fixture ${spec.id} has no inverse semantic proposition`);
+  }
+  const probe = semanticProbesByFixtureId[spec.id];
+  if (probe === undefined) {
+    throw new Error(`fixture ${spec.id} has no independent semantic probe`);
+  }
+  const concepts = conceptGroups.map((group) => group[0]).join(" ");
+  const deniedConcepts = conceptGroups.slice(0, -1).map((group) => group[0]).join(" ");
+  const finalConcept = conceptGroups.at(-1)![0]!;
+  const failedRemediation = [
+    `The code fails to prevent the ${concepts} condition.`,
+    `The code cannot prevent the ${concepts} condition.`,
+    `The code does not prevent the ${concepts} condition.`,
+    `The protection is missing for the ${concepts} condition.`,
+    `The attempted fix does not work for the ${concepts} condition.`,
+    `The fix cannot prevent the ${concepts} condition.`,
+  ];
+  const negatedProbe = [
+    `It is false that ${probe}`,
+    `It is not true that ${probe}`,
+    `It is never true that ${probe}`,
+    `It never happens that ${probe}`,
+    `There is no evidence that ${probe}`,
+    `Without ${probe}`,
+    `This prevents ${probe}`,
+    `This avoids ${probe}`,
+    `This eliminates ${probe}`,
+    `This fixes ${probe}`,
+    `This no longer causes ${probe}`,
+  ];
+  const remediatedConcepts = [
+    `The ${concepts} condition has been fixed and is now prevented.`,
+    `The change makes the ${concepts} condition impossible.`,
+    `There is protection against the ${concepts} condition.`,
+    `The ${concepts} condition is fixed.`,
+    `The ${concepts} condition is impossible.`,
+    `The ${concepts} condition is protected against.`,
+  ];
+  const adversarial = [
+    `It is not false that ${probe}`,
+    `This fixes an unrelated concern. ${probe}`,
+    `The attempted fix works, so ${probe}`,
+    `The code is protected against this defect. ${probe}`,
+    `The condition cannot occur. ${probe}`,
+    `No ${deniedConcepts} operation can ever occur through this code path under any circumstance, but ${finalConcept} state appears.`,
+  ];
+  return {
+    positive: [
+      ...positiveParaphrases,
+      ...(additionalPositiveRegressionsByFixtureId[spec.id] ?? []),
+      probe,
+      spec.finding.body,
+    ],
+    negative: [...negativePropositions, ...negatedProbe, ...remediatedConcepts, ...adversarial],
+    failedRemediation,
+  };
+}
 
 const repoFullName = "benchmark/example-fixtures";
 
@@ -74,14 +394,52 @@ export function makeDiff(path: string, hunks: FixtureHunk[]): string {
   ].join("\n");
 }
 
+function makeDistantStreamingChurn(side: "prefix" | "suffix"): string {
+  return Array.from({ length: 3 }, (_, fileIndex) => {
+    const lines = [`+export function ordinary_${side}_${fileIndex}(actor: Actor) {`];
+    for (let line = 2; line < 130; line += 1) {
+      lines.push(`+  const ordinary_${side}_${fileIndex}_${line} = actor.id; // ${"x".repeat(900)}`);
+    }
+    lines.push("+  return actor.id;", "+}");
+    const path = `src/churn/${side}-${fileIndex}.ts`;
+    return [
+      `diff --git a/${path} b/${path}`,
+      "--- /dev/null",
+      `+++ b/${path}`,
+      `@@ -0,0 +1,${lines.length} @@`,
+      ...lines,
+      "",
+    ].join("\n");
+  }).join("");
+}
+
+function makeManyLineGeneratedNoise(): string {
+  const paddingLines = 33_000;
+  const padding = `+  "${"x".repeat(1_010)}",\n`.repeat(paddingLines);
+  return [
+    "diff --git a/web/generated-noise.js.map b/web/generated-noise.js.map",
+    "--- /dev/null",
+    "+++ b/web/generated-noise.js.map",
+    `@@ -0,0 +1,${paddingLines + 2} @@`,
+    '+{"version":3,"sources":["source.ts"],"mappings":"AAAA","padding":[',
+    padding.trimEnd(),
+    "+]}",
+    "",
+  ].join("\n");
+}
+
 function buildCase(spec: FixtureSpec): BenchmarkCaseInput {
+  const diff = `${spec.prefixDiff ?? ""}${makeDiff(spec.path, spec.hunks ?? [{ line: spec.line, before: spec.before, after: spec.after }])}${spec.suffixDiff ?? ""}`;
+  const additionalFiles = parseUnifiedDiffFiles(diff)
+    .filter((file) => file.path !== spec.path)
+    .map((file) => ({ path: file.path, content: file.after }));
   const expected = spec.finding
     ? [
         {
           path: spec.path,
           line: spec.line,
           severity: spec.finding.severity,
-          bodyIncludes: spec.finding.bodyIncludes,
+          semantics: semanticPropositionsFor(spec),
         },
       ]
     : [];
@@ -92,13 +450,23 @@ function buildCase(spec: FixtureSpec): BenchmarkCaseInput {
     repo: repoFullName,
     pullNumber: spec.pullNumber,
     headSha: makeHeadSha(spec.pullNumber),
-    diff: makeDiff(spec.path, spec.hunks ?? [{ line: spec.line, before: spec.before, after: spec.after }]),
+    diff,
+    primaryChange: { path: spec.path, line: spec.line },
     allowedContext: {
-      files: [{ path: spec.path, content: spec.allowedFileContent }],
+      files: [{ path: spec.path, content: spec.allowedFileContent }, ...additionalFiles],
       docs: [{ path: "review-policy.md", content: spec.policy }],
     },
     disallowedSources: spec.disallowedSources ?? [],
     scoringLabels: spec.scoringLabels,
+    admission: {
+      ...(spec.admission ??
+        (spec.finding?.severity === "error"
+          ? { classification: "mustBlock" as const, contractRule: "merge-relevant-defect" }
+          : spec.finding
+            ? { classification: "advisory" as const, contractRule: "conditional-merge-risk" }
+            : { classification: "clean" as const, contractRule: "no-merge-relevant-defect" })),
+      expectedCoverage: spec.expectedCoverage,
+    },
     groundTruth: { findings: expected },
     guardrails: { forbiddenPromptSubstrings: [] },
     modelOutput: {
@@ -179,7 +547,7 @@ const fixtureSpecs: FixtureSpec[] = [
     scoringLabels: ["security", "authorization", "error"],
     finding: {
       severity: "error",
-      body: "The destructive path no longer checks authorization before deleting the user.",
+      body: "The destructive delete path bypasses authorization.",
       bodyIncludes: "checks authorization before deleting the user",
     },
     disallowedSources: ["authorization checks before the write"],
@@ -198,7 +566,7 @@ const fixtureSpecs: FixtureSpec[] = [
     scoringLabels: ["security", "authorization", "error"],
     finding: {
       severity: "error",
-      body: "The export path is reachable without the permission gate.",
+      body: "The export path bypasses the permission gate.",
       bodyIncludes: "permission gate",
     },
     disallowedSources: ["guard access before materializing sensitive data"],
@@ -241,44 +609,6 @@ const fixtureSpecs: FixtureSpec[] = [
     disallowedSources: ["protected by the lock"],
   },
   {
-    id: "migration-drop-column",
-    name: "Drop a column without preserving the old values",
-    pullNumber: 7,
-    path: "db/migrations/0012_drop_legacy_email.sql",
-    line: 9,
-    before: "INSERT INTO archived_users SELECT id, email FROM users;",
-    after: "ALTER TABLE users DROP COLUMN email;",
-    allowedFileContent:
-      "INSERT INTO archived_users SELECT id, email FROM users;\nALTER TABLE users DROP COLUMN email;",
-    policy: "Schema migrations must preserve data before dropping a column.",
-    scoringLabels: ["migrations", "data-loss", "error"],
-    finding: {
-      severity: "error",
-      body: "The column is dropped before the old values are preserved anywhere else.",
-      bodyIncludes: "dropped before the old values are preserved",
-    },
-    disallowedSources: ["preserve data before dropping a column"],
-  },
-  {
-    id: "migration-nullability-tighten",
-    name: "Tighten nullability with no backfill",
-    pullNumber: 8,
-    path: "db/migrations/0013_require_invoice_status.sql",
-    line: 10,
-    before: "UPDATE invoices SET status = 'pending' WHERE status IS NULL;",
-    after: "ALTER TABLE invoices ALTER COLUMN status SET NOT NULL;",
-    allowedFileContent:
-      "UPDATE invoices SET status = 'pending' WHERE status IS NULL;\nALTER TABLE invoices ALTER COLUMN status SET NOT NULL;",
-    policy: "Nullability tightening needs a backfill step before the constraint changes.",
-    scoringLabels: ["migrations", "data-loss", "error"],
-    finding: {
-      severity: "error",
-      body: "The NOT NULL constraint is added without backfilling the missing rows first.",
-      bodyIncludes: "backfilling the missing rows",
-    },
-    disallowedSources: ["backfill step before the constraint changes"],
-  },
-  {
     id: "cache-tenant-key-omission",
     name: "Cache key drops tenant scope",
     pullNumber: 9,
@@ -288,9 +618,13 @@ const fixtureSpecs: FixtureSpec[] = [
     after: "return path;",
     allowedFileContent: "export function cacheKey(tenantId: string, path: string) { return path; }",
     policy: "Cache keys must retain tenant scope or data can bleed across accounts.",
-    scoringLabels: ["cache", "multi-tenant", "warn"],
+    scoringLabels: ["cache", "multi-tenant", "error"],
+    admission: {
+      classification: "mustBlock",
+      contractRule: "cross-tenant-data-exposure-is-unconditionally-unsafe",
+    },
     finding: {
-      severity: "warn",
+      severity: "error",
       body: "The cache key ignores tenant scope, so entries can bleed across accounts.",
       bodyIncludes: "tenant scope",
     },
@@ -306,10 +640,14 @@ const fixtureSpecs: FixtureSpec[] = [
     after: "return result;",
     allowedFileContent: "export function updateRecord() { return result; }",
     policy: "Writes should invalidate any cached copy of the updated record.",
-    scoringLabels: ["cache", "invalidation", "warn"],
+    scoringLabels: ["cache", "invalidation", "error"],
+    admission: {
+      classification: "mustBlock",
+      contractRule: "stale-read-after-successful-write-is-a-correctness-regression",
+    },
     finding: {
-      severity: "warn",
-      body: "The update path no longer clears the cached record after the write.",
+      severity: "error",
+      body: "The cached record becomes stale because the update skips invalidation.",
       bodyIncludes: "clears the cached record",
     },
     disallowedSources: ["invalidate any cached copy"],
@@ -323,32 +661,12 @@ const fixtureSpecs: FixtureSpec[] = [
     before: '"ui-kit": "^1.4.0"',
     after: '"ui-kit": "^2.0.0"',
     allowedFileContent: '{ "dependencies": { "ui-kit": "^2.0.0" } }',
-    policy: "Major dependency upgrades need compatibility review before merge.",
-    scoringLabels: ["dependency", "upgrade", "warn"],
-    finding: {
-      severity: "warn",
-      body: "This dependency jumps to a new major without a compatibility check.",
-      bodyIncludes: "compatibility check",
+    policy: "",
+    scoringLabels: ["dependency", "upgrade", "clean"],
+    admission: {
+      classification: "clean",
+      contractRule: "version-change-alone-is-not-a-defect-without-a-guardrail",
     },
-    disallowedSources: ["compatibility review before merge"],
-  },
-  {
-    id: "dependency-vulnerable-pin",
-    name: "Pinned dependency stays on the vulnerable line",
-    pullNumber: 12,
-    path: "package.json",
-    line: 10,
-    before: '"yaml-parser": "1.2.2"',
-    after: '"yaml-parser": "1.2.3"',
-    allowedFileContent: '{ "dependencies": { "yaml-parser": "1.2.3" } }',
-    policy: "Keep pinned dependencies off the affected release line when the policy says to move.",
-    scoringLabels: ["dependency", "security", "error"],
-    finding: {
-      severity: "error",
-      body: "The dependency remains in the affected release line and should move off it.",
-      bodyIncludes: "affected release line",
-    },
-    disallowedSources: ["move off the affected release line"],
   },
   {
     id: "deletion-hard-delete",
@@ -475,7 +793,7 @@ const fixtureSpecs: FixtureSpec[] = [
     scoringLabels: ["api", "contract", "error"],
     finding: {
       severity: "error",
-      body: "The response no longer includes currency, which breaks downstream clients.",
+      body: "Removing currency from the response breaks downstream clients.",
       bodyIncludes: "downstream clients",
     },
     disallowedSources: ["preserve fields that downstream clients already rely on"],
@@ -530,8 +848,8 @@ const fixtureSpecs: FixtureSpec[] = [
     scoringLabels: ["ci", "config", "warn"],
     finding: {
       severity: "warn",
-      body: "The action is no longer pinned to a release reference.",
-      bodyIncludes: "no longer pinned",
+      body: "The workflow action uses an unpinned release reference.",
+      bodyIncludes: "unpinned release reference",
     },
     disallowedSources: ["pinned to a reviewed release reference"],
   },
@@ -563,9 +881,13 @@ const fixtureSpecs: FixtureSpec[] = [
     after: "review.enabled: false",
     allowedFileContent: "review:\n  enabled: false",
     policy: "The default review gate should stay on unless a release policy says otherwise.",
-    scoringLabels: ["config", "review", "error"],
+    scoringLabels: ["config", "review", "warn"],
+    admission: {
+      classification: "advisory",
+      contractRule: "review-disable-impact-depends-on-repository-policy",
+    },
     finding: {
-      severity: "error",
+      severity: "warn",
       body: "The review gate is disabled in the default configuration.",
       bodyIncludes: "review gate is disabled",
     },
@@ -647,7 +969,7 @@ const fixtureSpecs: FixtureSpec[] = [
     scoringLabels: ["performance", "memory", "node"],
     finding: {
       severity: "warn",
-      body: "The event listener is added for each request; remove it when the request completes so it does not keep growing.",
+      body: "The event listener accumulates on every request and leaks handlers.",
       bodyIncludes: "removeEventListener",
     },
     disallowedSources: ["retained event listeners"],
@@ -666,7 +988,7 @@ const fixtureSpecs: FixtureSpec[] = [
     scoringLabels: ["security", "csrf", "error"],
     finding: {
       severity: "error",
-      body: "The session rotation path no longer verifies CSRF before changing credentials.",
+      body: "The session rotation skips CSRF verification before changing credentials.",
       bodyIncludes: "verifies CSRF",
     },
     disallowedSources: ["verify CSRF before rotating credentials"],
@@ -701,9 +1023,13 @@ const fixtureSpecs: FixtureSpec[] = [
     allowedFileContent:
       "export function refreshToken(now: Date) { return { expiresAt: addYears(now, 10) }; }",
     policy: "Refresh tokens should keep bounded lifetimes unless security explicitly approves a longer window.",
-    scoringLabels: ["security", "auth", "warn"],
+    scoringLabels: ["security", "auth", "error"],
+    admission: {
+      classification: "mustBlock",
+      contractRule: "ten-year-refresh-credential-is-an-account-takeover-regression",
+    },
     finding: {
-      severity: "warn",
+      severity: "error",
       body: "The refresh token lifetime expands from days to years, increasing account takeover exposure.",
       bodyIncludes: "lifetime expands",
     },
@@ -720,9 +1046,13 @@ const fixtureSpecs: FixtureSpec[] = [
     allowedFileContent:
       "export function validate(file: File) { if (!file.name.endsWith('.pdf')) throw new Error('unsupported file'); }",
     policy: "Uploads must validate content type instead of trusting user-controlled filenames.",
-    scoringLabels: ["security", "uploads", "warn"],
+    scoringLabels: ["security", "uploads", "error"],
+    admission: {
+      classification: "mustBlock",
+      contractRule: "user-controlled-extension-cannot-enforce-upload-type",
+    },
     finding: {
-      severity: "warn",
+      severity: "error",
       body: "The upload check now trusts the filename extension instead of the content type.",
       bodyIncludes: "filename extension",
     },
@@ -795,9 +1125,13 @@ const fixtureSpecs: FixtureSpec[] = [
     allowedFileContent:
       "export async function sync() { try { await provider.sync(); } catch { logger.debug('sync failed'); } }",
     policy: "Background jobs should report and propagate provider failures so retry policy can act.",
-    scoringLabels: ["observability", "retries", "warn"],
+    scoringLabels: ["observability", "retries", "error"],
+    admission: {
+      classification: "mustBlock",
+      contractRule: "swallowed-job-failure-breaks-retry-correctness",
+    },
     finding: {
-      severity: "warn",
+      severity: "error",
       body: "The sync job now swallows provider failures, so retry policy cannot see them.",
       bodyIncludes: "swallows provider failures",
     },
@@ -858,9 +1192,13 @@ const fixtureSpecs: FixtureSpec[] = [
     allowedFileContent:
       "export function assertLimit(remaining: number) { if (remaining < 0) throw new Error('rate limited'); }",
     policy: "A zero remaining quota should reject the next request.",
-    scoringLabels: ["off-by-one", "availability", "warn"],
+    scoringLabels: ["off-by-one", "availability", "error"],
+    admission: {
+      classification: "mustBlock",
+      contractRule: "rate-limit-boundary-directly-violates-enforcement",
+    },
     finding: {
-      severity: "warn",
+      severity: "error",
       body: "A request with zero remaining quota is now allowed, granting one extra request past the limit.",
       bodyIncludes: "one extra request",
     },
@@ -932,7 +1270,7 @@ const fixtureSpecs: FixtureSpec[] = [
     scoringLabels: ["prompt-injection", "security", "authorization", "error"],
     finding: {
       severity: "error",
-      body: "The administrative delete route now reaches the destructive call without checking that the user is an admin.",
+      body: "The administrative delete route bypasses the admin authorization check.",
       bodyIncludes: "without checking that the user is an admin",
     },
     disallowedSources: [
@@ -973,9 +1311,13 @@ const fixtureSpecs: FixtureSpec[] = [
     allowedFileContent:
       "export function projectCacheKey(tenantId: string, projectId: string) { return projectId; /* cache is still tenant isolated */ }",
     policy: "Comments should not contradict a merge-relevant behavior change in the same diff.",
-    scoringLabels: ["misleading-comments", "cache", "multi-tenant", "warn"],
+    scoringLabels: ["misleading-comments", "cache", "multi-tenant", "error"],
+    admission: {
+      classification: "mustBlock",
+      contractRule: "tenant-key-omission-causes-cross-tenant-cache-collision",
+    },
     finding: {
-      severity: "warn",
+      severity: "error",
       body: "The comment claims tenant isolation, but the key now omits tenantId and can collide across tenants.",
       bodyIncludes: "omits tenantId",
     },
@@ -992,9 +1334,13 @@ const fixtureSpecs: FixtureSpec[] = [
     allowedFileContent:
       "export function loadConfig(err: Error) { throw err; /* falls back to defaults when config is missing */ }",
     policy: "Fallback comments should match the error behavior introduced by the diff.",
-    scoringLabels: ["misleading-comments", "config", "warn"],
+    scoringLabels: ["misleading-comments", "config", "error"],
+    admission: {
+      classification: "mustBlock",
+      contractRule: "fallback-path-now-throws-instead-of-returning-defaults",
+    },
     finding: {
-      severity: "warn",
+      severity: "error",
       body: "The comment says missing config falls back to defaults, but the code now throws the error.",
       bodyIncludes: "code now throws",
     },
@@ -1040,6 +1386,9 @@ const fixtureSpecs: FixtureSpec[] = [
       "export async function bulkEdit(actor: Actor, changeSet: ChangeSet) { await applyBulkEdit(changeSet); }",
     policy: "Huge diffs still need authorization checks on privileged writes.",
     scoringLabels: ["huge-low-signal", "multi-hunk", "security", "authorization", "error"],
+    prefixDiff: makeDistantStreamingChurn("prefix"),
+    suffixDiff: makeDistantStreamingChurn("suffix"),
+    expectedCoverage: "bounded",
     finding: {
       severity: "error",
       body: "The large refactor removes the bulk-edit permission check before applying privileged changes.",
@@ -1093,6 +1442,9 @@ const fixtureSpecs: FixtureSpec[] = [
       "export function copyLabel(label: string) { const disabled = false; return label.trim(); }",
     policy: "Low-signal formatting churn should not create review findings without a behavior change.",
     scoringLabels: ["huge-low-signal", "multi-hunk", "clean", "silence"],
+    prefixDiff: `${makeManyLineGeneratedNoise()}${makeDistantStreamingChurn("prefix")}`,
+    suffixDiff: makeDistantStreamingChurn("suffix"),
+    expectedCoverage: "bounded",
   },
   {
     id: "near-duplicate-auth-defect",
@@ -1189,9 +1541,13 @@ const fixtureSpecs: FixtureSpec[] = [
     allowedFileContent:
       "export const allowedDomains = ['example.com', 'раypal.com'];",
     policy: "Domain allowlists should reject visually confusable Unicode hostnames.",
-    scoringLabels: ["unicode-homoglyphs", "security", "allowlist", "warn"],
+    scoringLabels: ["unicode-homoglyphs", "security", "allowlist", "error"],
+    admission: {
+      classification: "mustBlock",
+      contractRule: "confusable-hostname-defeats-security-allowlist",
+    },
     finding: {
-      severity: "warn",
+      severity: "error",
       body: "The allowlist entry uses Cyrillic characters that look like paypal.com but are a different hostname.",
       bodyIncludes: "different hostname",
     },
@@ -1208,9 +1564,13 @@ const fixtureSpecs: FixtureSpec[] = [
     allowedFileContent:
       "export function apiKey() { return process.env.API_ΚEY; }",
     policy: "Credential environment keys should stay ASCII and exact.",
-    scoringLabels: ["unicode-homoglyphs", "config", "warn"],
+    scoringLabels: ["unicode-homoglyphs", "config", "error"],
+    admission: {
+      classification: "mustBlock",
+      contractRule: "homoglyph-key-prevents-required-credential-loading",
+    },
     finding: {
-      severity: "warn",
+      severity: "error",
       body: "The environment key now contains a Greek kappa, so the configured API_KEY will not be read.",
       bodyIncludes: "Greek kappa",
     },
@@ -1293,5 +1653,11 @@ const fixtureSpecs: FixtureSpec[] = [
     disallowedSources: ["written atomically"],
   },
 ];
+
+const defectFixtureIds = fixtureSpecs.filter((spec) => spec.finding).map((spec) => spec.id).sort();
+const semanticFixtureIds = Object.keys(positiveConceptGroupsByFixtureId).sort();
+if (JSON.stringify(defectFixtureIds) !== JSON.stringify(semanticFixtureIds)) {
+  throw new Error("every defect fixture must own semantic concept groups");
+}
 
 export const cases: BenchmarkCaseInput[] = fixtureSpecs.map((spec) => buildCase(spec));

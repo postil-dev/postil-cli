@@ -389,24 +389,207 @@ pub struct Gate {
 pub struct Usage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// Exact provider-billed cost represented by this in-memory aggregate.
+    /// Durable attribution is emitted per model through `ModelUsage`.
+    #[serde(skip)]
+    pub cost_micros: Option<u64>,
+    /// Exact provider-reported decimal dollars. This remains in memory for
+    /// aggregation; durable call records serialize its canonical decimal text.
+    #[serde(skip)]
+    pub provider_cost: Option<ProviderCost>,
 }
 
-/// Token usage attributed to one provider model attempt. Entries include
-/// successful generation/scoring calls and failed attempts that returned
-/// provider usage, so hosted accounting can price the complete review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderCost {
+    coefficient: u128,
+    scale: u32,
+}
+
+impl ProviderCost {
+    pub fn parse(raw: &str) -> Option<Self> {
+        let raw = raw.trim();
+        if raw.is_empty() || raw.starts_with('-') || raw.starts_with('+') {
+            return None;
+        }
+        let (base, exponent) =
+            raw.split_once(['e', 'E'])
+                .map_or((raw, 0i32), |(base, exponent)| {
+                    exponent
+                        .parse::<i32>()
+                        .ok()
+                        .map(|value| (base, value))
+                        .unwrap_or(("", 0))
+                });
+        if base.is_empty() {
+            return None;
+        }
+        let mut digits = String::new();
+        let mut fractional = 0i32;
+        let mut seen_dot = false;
+        for character in base.chars() {
+            match character {
+                '0'..='9' => {
+                    digits.push(character);
+                    if seen_dot {
+                        fractional = fractional.checked_add(1)?;
+                    }
+                }
+                '.' if !seen_dot => seen_dot = true,
+                _ => return None,
+            }
+        }
+        if digits.is_empty() {
+            return None;
+        }
+        let mut coefficient = digits.parse::<u128>().ok()?;
+        let adjusted_scale = fractional.checked_sub(exponent)?;
+        let mut scale = if adjusted_scale < 0 {
+            let zeros = u32::try_from(-adjusted_scale).ok()?;
+            coefficient = coefficient.checked_mul(10u128.checked_pow(zeros)?)?;
+            0
+        } else {
+            u32::try_from(adjusted_scale).ok()?
+        };
+        while scale > 0 && coefficient % 10 == 0 {
+            coefficient /= 10;
+            scale -= 1;
+        }
+        Some(Self { coefficient, scale })
+    }
+
+    pub fn checked_add(self, other: Self) -> Option<Self> {
+        let scale = self.scale.max(other.scale);
+        let left = self
+            .coefficient
+            .checked_mul(10u128.checked_pow(scale - self.scale)?)?;
+        let right = other
+            .coefficient
+            .checked_mul(10u128.checked_pow(scale - other.scale)?)?;
+        let mut value = Self {
+            coefficient: left.checked_add(right)?,
+            scale,
+        };
+        while value.scale > 0 && value.coefficient.is_multiple_of(10) {
+            value.coefficient /= 10;
+            value.scale -= 1;
+        }
+        Some(value)
+    }
+
+    pub fn micros_rounded(self) -> Option<u64> {
+        let micros = if self.scale <= 6 {
+            self.coefficient
+                .checked_mul(10u128.checked_pow(6 - self.scale)?)?
+        } else {
+            let divisor = 10u128.checked_pow(self.scale - 6)?;
+            let quotient = self.coefficient / divisor;
+            let remainder = self.coefficient % divisor;
+            quotient.checked_add(u128::from(remainder.saturating_mul(2) >= divisor))?
+        };
+        u64::try_from(micros).ok()
+    }
+
+    pub fn micros_ceiling(self) -> Option<u64> {
+        let micros = if self.scale <= 6 {
+            self.coefficient
+                .checked_mul(10u128.checked_pow(6 - self.scale)?)?
+        } else {
+            let divisor = 10u128.checked_pow(self.scale - 6)?;
+            self.coefficient.div_ceil(divisor)
+        };
+        u64::try_from(micros).ok()
+    }
+}
+
+impl std::fmt::Display for ProviderCost {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.scale == 0 {
+            return write!(formatter, "{}", self.coefficient);
+        }
+        let digits = self.coefficient.to_string();
+        let scale = self.scale as usize;
+        if digits.len() <= scale {
+            write!(
+                formatter,
+                "0.{}{}",
+                "0".repeat(scale - digits.len()),
+                digits
+            )
+        } else {
+            let split = digits.len() - scale;
+            write!(formatter, "{}.{}", &digits[..split], &digits[split..])
+        }
+    }
+}
+
+/// Token usage attributed to one provider call. Entries include successful
+/// generation/scoring calls and failed calls, so audit and hosted accounting
+/// preserve the exact call boundary instead of folding repairs and retries
+/// into a model-level total.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelUsage {
     pub model: String,
+    /// Product role that caused this provider call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<ModelUsageRole>,
+    /// Logical stage within the role.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<ModelUsagePhase>,
+    /// One-based provider HTTP call across this role/model invocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_ordinal: Option<u32>,
+    /// One-based transport attempt within the logical phase call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// Exact provider-billed cost when supplied by the endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_micros: Option<u64>,
+    /// Canonical provider-reported decimal dollars, without binary floating-
+    /// point conversion. `costMicros` remains a rounded display/index value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_provider_decimal: Option<String>,
+    /// Explains whether cost came from the provider or is unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_source: Option<ModelUsageCostSource>,
+    /// False when the provider call returned no authoritative usage record.
+    #[serde(default)]
+    pub accounting_complete: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ModelUsageRole {
+    ReviewPlanner,
+    ReviewGenerator,
+    FindingScorer,
+    MentionResponder,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ModelUsagePhase {
+    Initial,
+    SchemaRepair,
+    SemanticRetry,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ModelUsageCostSource {
+    ProviderReported,
+    Unavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ModelIncidentPhase {
+    Planner,
     Review,
     Scorer,
+    Respond,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -433,6 +616,49 @@ pub struct ModelIncident {
     pub recovered: bool,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub recovery: Option<ModelIncidentRecovery>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ReviewCoverageMode {
+    Exhaustive,
+    Bounded,
+}
+
+impl ReviewCoverageMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Exhaustive => "exhaustive",
+            Self::Bounded => "bounded",
+        }
+    }
+}
+
+/// Audit record for the source-evidence batches sent to review models. Synthesis
+/// requests are excluded from both counts. This additive v1 field lets stored
+/// envelopes without coverage accounting deserialize with `review_coverage = None`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewCoverage {
+    pub mode: ReviewCoverageMode,
+    pub selected_batches: u32,
+    pub total_batches: u32,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub planner_fallback: bool,
+}
+
+/// Conservative hosted-provider exposure reserved before the first model call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewAdmission {
+    pub provider_attempts: u32,
+    pub serialized_input_bytes: u64,
+    pub output_tokens: u64,
+    pub projected_cost_micros: u64,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -470,6 +696,14 @@ pub struct Envelope {
     /// or model-generated content is stored here.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub model_incidents: Vec<ModelIncident>,
+    /// Source-evidence batch selection used for this review. An absent value
+    /// represents a v1 envelope without coverage accounting.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub review_coverage: Option<ReviewCoverage>,
+    /// Conservative hosted exposure computed from the exact serialized request
+    /// plan. It is absent for BYOK and historical envelopes.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub review_admission: Option<ReviewAdmission>,
     /// False when any sent provider request can have unknown billed usage,
     /// including timeouts and ambiguous transport failures.
     #[serde(default)]
@@ -537,7 +771,7 @@ pub fn finding_blocks_gate(
 
 /// Path marker for synthetic unusable-output findings (the model answered but
 /// the output could not be validated). A malicious diff can induce this class
-/// via prompt injection, so it always fails the gate — even under
+/// via prompt injection, so it always fails the gate, even under
 /// `gate.onError: advisory`.
 pub const OPERATIONAL_PATH: &str = ".postil/model-output";
 
@@ -554,6 +788,10 @@ pub const PROVIDER_PATH: &str = ".postil/provider";
 /// be posted as inline code annotations (there is no file line); they are
 /// surfaced in the check-run summary and PR comment body instead.
 pub const PR_DESCRIPTION_PATH: &str = ".postil/pr-description";
+/// Reserved path for numbered change metadata that has no valid new-side line,
+/// including deletions, binary changes, renames, mode changes, and compact
+/// lockfile evidence.
+pub const CHANGE_METADATA_PATH: &str = ".postil/change-metadata";
 pub const DIFF_PATH: &str = ".postil/diff";
 
 /// Exact virtual anchors emitted by Postil itself. Repository files under the
@@ -562,8 +800,37 @@ pub const DIFF_PATH: &str = ".postil/diff";
 pub fn is_reserved_anchor(path: &str) -> bool {
     matches!(
         path,
-        OPERATIONAL_PATH | PROVIDER_PATH | PR_DESCRIPTION_PATH | DIFF_PATH
+        OPERATIONAL_PATH | PROVIDER_PATH | PR_DESCRIPTION_PATH | CHANGE_METADATA_PATH | DIFF_PATH
     )
+}
+
+/// Virtual findings that describe only the current run's operational state.
+/// These never carry into a later review. Reviewable PR and change metadata
+/// anchors are reserved for forge publication but remain durable baselines.
+pub fn is_ephemeral_anchor(path: &str) -> bool {
+    matches!(path, OPERATIONAL_PATH | PROVIDER_PATH | DIFF_PATH)
+}
+
+/// A complete, trustworthy review could not fit inside Postil's bounded local
+/// resource and provider-request budget. This is an internal fail-closed state;
+/// forge adapters expose only generic check text for operational findings.
+pub fn incomplete_review_finding() -> Finding {
+    Finding {
+        path: OPERATIONAL_PATH.to_string(),
+        line: 1,
+        end_line: None,
+        severity: Severity::Error,
+        kind: Kind::Uncertainty,
+        confidence: 1.0,
+        title: "Review incomplete".to_string(),
+        body: "The complete change did not fit within Postil's bounded review budget. No clean verdict was issued. Split the change or run focused local reviews before retrying.".to_string(),
+        id: None,
+        generator_confidence: None,
+        scorer_confidence: None,
+        generator_kind: None,
+        scorer_kind: None,
+        scorer_reason: None,
+    }
 }
 
 /// The synthetic finding emitted when the model produced unusable output.
@@ -624,7 +891,7 @@ pub fn narrated_risk_finding(summary: &str) -> Finding {
 }
 
 /// The synthetic finding emitted when the provider could not be reached at all.
-pub fn provider_error_finding(detail: &str) -> Finding {
+pub fn provider_error_finding(_detail: &str) -> Finding {
     Finding {
         path: PROVIDER_PATH.to_string(),
         line: 1,
@@ -633,10 +900,9 @@ pub fn provider_error_finding(detail: &str) -> Finding {
         kind: Kind::Uncertainty,
         confidence: 1.0,
         title: "Model provider unavailable".to_string(),
-        body: format!(
-            "Postil could not complete the model request and is failing closed rather \
-             than passing unreviewed code.\n\nDetail: {detail}"
-        ),
+        body: "Postil could not complete the model request and is failing closed rather \
+             than passing unreviewed code. The failure is available to Postil operators."
+            .to_string(),
         id: None,
         generator_confidence: None,
         scorer_confidence: None,
@@ -813,6 +1079,8 @@ mod tests {
             usage: Usage::default(),
             model_usage: vec![],
             model_incidents: vec![],
+            review_coverage: None,
+            review_admission: None,
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
@@ -834,9 +1102,41 @@ mod tests {
         assert_eq!(v["modelIncidents"][0]["category"], "invalidOutput");
         assert_eq!(v["modelIncidents"][0]["recovery"], "repair");
 
+        env.review_coverage = Some(ReviewCoverage {
+            mode: ReviewCoverageMode::Bounded,
+            selected_batches: 5,
+            total_batches: 17,
+            planner_fallback: true,
+        });
+        let mut with_coverage = serde_json::to_value(&env).unwrap();
+        assert_eq!(with_coverage["reviewCoverage"]["mode"], "bounded");
+        assert_eq!(with_coverage["reviewCoverage"]["selectedBatches"], 5);
+        assert_eq!(with_coverage["reviewCoverage"]["totalBatches"], 17);
+        assert_eq!(with_coverage["reviewCoverage"]["plannerFallback"], true);
+
+        with_coverage
+            .as_object_mut()
+            .unwrap()
+            .remove("reviewCoverage");
+        let historical: Envelope = serde_json::from_value(with_coverage).unwrap();
+        assert!(historical.review_coverage.is_none());
+
         v.as_object_mut().unwrap().remove("modelIncidents");
         let decoded: Envelope = serde_json::from_value(v).unwrap();
         assert!(decoded.suppressed_findings.is_empty());
         assert!(decoded.model_incidents.is_empty());
+    }
+
+    #[test]
+    fn provider_cost_preserves_decimal_precision_and_derives_micros() {
+        let first = ProviderCost::parse("0.00000049").unwrap();
+        let second = ProviderCost::parse("1.2300e-6").unwrap();
+        assert_eq!(first.to_string(), "0.00000049");
+        assert_eq!(first.micros_rounded(), Some(0));
+        assert_eq!(first.micros_ceiling(), Some(1));
+        assert_eq!(second.to_string(), "0.00000123");
+        assert_eq!(first.checked_add(second).unwrap().to_string(), "0.00000172");
+        assert!(ProviderCost::parse("-0.1").is_none());
+        assert!(ProviderCost::parse("NaN").is_none());
     }
 }
