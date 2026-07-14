@@ -1,6 +1,6 @@
 //! Interactive bot: reply to an @postil mention on a PR or issue.
 //!
-//! Scope is review and answer only — Postil never opens PRs or pushes commits.
+//! Scope is review and answer only. Postil never opens PRs or pushes commits.
 //! Works across every forge the reviewer supports. PR/MR mentions are grounded
 //! on the diff; issue mentions on the issue body. GitHub and GitLab cover both
 //! issues and pulls; Bitbucket and Azure DevOps are scoped to PRs (their issue
@@ -12,7 +12,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
@@ -32,7 +32,7 @@ pub struct RespondArgs {
     /// The issue number, when the mention is on an issue.
     pub issue: Option<u64>,
     /// The maintainer's comment text (the mention). When None, read from the
-    /// POSTIL_COMMENT environment variable — the safe path for automation.
+    /// POSTIL_COMMENT environment variable, the safe path for automation.
     pub comment: Option<String>,
     pub config: Option<PathBuf>,
     pub model: Option<String>,
@@ -170,6 +170,7 @@ pub async fn run(args: RespondArgs) -> Result<i32> {
     if let Some(m) = &args.model {
         cfg.model = m.clone();
     }
+    cfg.require_model()?;
     let repo = args
         .repo
         .clone()
@@ -697,6 +698,17 @@ async fn build_context<F: Forge>(
             let meta = forge.fetch_pr_meta().await?;
             let raw = forge.fetch_diff().await.context("fetching PR diff")?;
             let parsed = diff::parse(&raw);
+            ensure!(
+                parsed.complete,
+                "pull request diff is structurally incomplete"
+            );
+            ensure!(
+                !parsed
+                    .files
+                    .iter()
+                    .any(|file| crate::envelope::is_reserved_anchor(&file.path)),
+                "pull request contains a path reserved for Postil's virtual review evidence"
+            );
             let (annotated, truncated) = diff::render_annotated(&parsed, MAX_DIFF_BYTES);
             let mut ctx = format!(
                 "Context: pull request #{number} in {repo}\nTitle: {}\n",

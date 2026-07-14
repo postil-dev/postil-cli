@@ -22,7 +22,7 @@ use std::collections::HashMap;
 /// Each model request and the aggregate review stay bounded. Exhausting any
 /// limit produces an internal fail-closed result rather than a partial pass.
 const MAX_REVIEW_BATCH_BYTES: usize = 120_000;
-const MAX_SOURCE_BATCHES: usize = 8;
+const MAX_SOURCE_BATCHES: usize = 23;
 const MAX_REVIEW_REQUESTS: usize = MAX_SOURCE_BATCHES + 1;
 const MAX_REVIEW_PROJECTED_INPUT_TOKENS: usize = 1_000_000;
 const MAX_REVIEW_MANIFEST_BYTES: usize = 24_000;
@@ -126,6 +126,7 @@ pub async fn run(args: ReviewArgs) -> Result<i32> {
     if let Some(m) = &args.model {
         cfg.model = m.clone();
     }
+    cfg.require_model()?;
     if let Some(fo) = &args.fail_on {
         cfg.gate_fail_on =
             GateLevel::parse(fo).ok_or_else(|| anyhow!("invalid --fail-on {fo:?}"))?;
@@ -292,7 +293,7 @@ async fn run_remote<F: Forge>(
                     CheckState::Success
                 };
                 // An operational failure inside the review (provider outage,
-                // unusable output) must stay visible on the advisory check —
+                // unusable output) must stay visible on the advisory check.
                 // green-on-green would make an outage look like a clean pass
                 // when the gate stands aside under `gate.onError: advisory`.
                 let operational = envelope.findings.iter().any(|f| {
@@ -324,13 +325,13 @@ async fn run_remote<F: Forge>(
         Err(e) => {
             // Fail closed by default: an errored run must never read as a silent
             // pass. `gate.onError: advisory` opts a repo out of blocking on
-            // operational errors (provider outage) — the advisory check still
+            // operational errors (provider outage). The advisory check still
             // shows the error; only the gate stands aside.
             //
             // Build the error envelope and route it through the SAME output path
             // (finish) as a successful run: emitting the envelope/SARIF and
             // deriving the exit code from the gate. Propagating Err here instead
-            // would map to exit 2 with no machine output — contradicting advisory
+            // would map to exit 2 with no machine output, contradicting advisory
             // policy (which wants exit 0) and losing the envelope/SARIF.
             let envelope = error_envelope(
                 cfg,
@@ -397,12 +398,15 @@ async fn remote_review<F: Forge>(
             "fetching incremental diff",
         )
         .await
+        .map_err(crate::forge::classify_review_input_error)
         .context("incremental diff fetch")
         .map(|diff| (diff, filter::ReconcileScope::Incremental, false))?,
         Some(_) => (String::new(), filter::ReconcileScope::Incremental, false),
         None => (
             match prefetched_diff {
-                Some(diff) => diff.context("diff fetch")?,
+                Some(diff) => diff
+                    .map_err(crate::forge::classify_review_input_error)
+                    .context("diff fetch")?,
                 None => run_with_hosted_budget(
                     Some(review_started),
                     FORGE_READ_TIMEOUT_SECS,
@@ -410,6 +414,7 @@ async fn remote_review<F: Forge>(
                     "fetching diff",
                 )
                 .await
+                .map_err(crate::forge::classify_review_input_error)
                 .context("diff fetch")?,
             },
             filter::ReconcileScope::Full { trustworthy: false },
@@ -433,6 +438,7 @@ async fn remote_review<F: Forge>(
                 "fetching full fallback diff",
             )
             .await
+            .map_err(crate::forge::classify_review_input_error)
             .context("full diff fallback fetch")?,
             filter::ReconcileScope::Full { trustworthy: false },
             true,
@@ -637,6 +643,12 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
     let review_started = std::time::Instant::now();
     let prepared = diff::prepare_diff(diff_text, diff::MAX_RAW_DIFF_INPUT_BYTES);
     let parsed = diff::parse(prepared.source.as_deref().unwrap_or_default());
+    let input_incomplete = prepared.incomplete
+        || !parsed.complete
+        || parsed
+            .files
+            .iter()
+            .any(|file| crate::envelope::is_reserved_anchor(&file.path));
     let mut index = DiffIndex::build(&parsed);
     let incremental = matches!(scope, filter::ReconcileScope::Incremental);
 
@@ -679,7 +691,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
     if !cfg.enabled {
         model_used = "none (disabled by config)".to_string();
     } else if force_model
-        || prepared.incomplete
+        || input_incomplete
         || parsed.has_review_evidence()
         || !prepared.lockfiles.is_empty()
         || pr_desc_lines > 0
@@ -697,16 +709,17 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
             .map(|model| conservative_context_tokens(model))
             .min()
             .unwrap_or(32_000);
+        let review_output_tokens = crate::llm::REVIEW_MAX_TOKENS as usize;
         // Serialized UTF-8 bytes conservatively upper-bound the corresponding
         // input token count. This intentionally under-fills the model context
         // rather than relying on a provider-specific tokenizer.
         let shared_context_token_upper_bound =
             system.len() + meta.map_or(0, |value| value.title.len() + value.body.len()) + 4096;
         let batch_budget = context_tokens
-            .saturating_sub(crate::llm::REVIEW_MAX_TOKENS as usize)
+            .saturating_sub(review_output_tokens)
             .saturating_sub(shared_context_token_upper_bound)
             .min(MAX_REVIEW_BATCH_BYTES);
-        let mut plan = if prepared.incomplete || batch_budget < 4_096 {
+        let mut plan = if input_incomplete || batch_budget < 4_096 {
             diff::ReviewBatchPlan {
                 incomplete: true,
                 ..Default::default()
@@ -733,7 +746,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
         // approximation. The byte projection remains separate for byte caps.
         let projected_input_token_upper_bound = projected_input_bytes;
         let attempts_per_request =
-            active_model_count.saturating_mul((crate::llm::TRANSIENT_RETRIES as usize + 1) * 2);
+            active_model_count.saturating_mul((crate::llm::TRANSIENT_RETRIES as usize + 1) * 3);
         let scorer_attempts = usize::from(cfg.scorer_enabled())
             .saturating_mul(MAX_MODELS_PER_REQUEST)
             .saturating_mul((crate::llm::TRANSIENT_RETRIES as usize + 1) * 2);
@@ -741,7 +754,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
             .saturating_mul(attempts_per_request)
             .saturating_add(scorer_attempts);
         let review_exposure = projected_input_token_upper_bound
-            .saturating_add(request_count.saturating_mul(crate::llm::REVIEW_MAX_TOKENS as usize))
+            .saturating_add(request_count.saturating_mul(review_output_tokens))
             .saturating_mul(attempts_per_request);
         let scorer_exposure =
             scorer_attempts.saturating_mul(MAX_SCORER_INPUT_TOKENS.saturating_add(4_096));
@@ -752,6 +765,10 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
             || active_model_count > MAX_MODELS_PER_REQUEST
             || projected_input_token_upper_bound > MAX_REVIEW_PROJECTED_INPUT_TOKENS
             || projected_attempts > crate::llm::MAX_PROVIDER_ATTEMPTS
+            || request_count
+                .saturating_mul(review_output_tokens)
+                .saturating_mul(attempts_per_request)
+                > crate::llm::MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE
             || projected_token_exposure > crate::llm::MAX_REPORTED_TOKEN_SPEND;
 
         if budget_exhausted {
@@ -1046,7 +1063,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
     findings.extend(rec.carried);
 
     // Operational findings (model unreachable/unusable) fail the gate by default
-    // — fail closed. `gate.onError: advisory` lets the gate stand aside on a
+    // and fail closed. `gate.onError: advisory` lets the gate stand aside on a
     // provider outage so a blip does not freeze every merge; the finding still
     // shows in the output and the advisory check goes neutral. Unusable model
     // output (OPERATIONAL_PATH) never bypasses the gate: a malicious diff can
@@ -1074,6 +1091,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
 
     // Generate stable IDs for findings
     generate_finding_ids(&mut findings, head_sha.as_deref());
+    model_usage.sort_by_key(|entry| entry.call_ordinal.unwrap_or(u32::MAX));
 
     Ok(Envelope {
         version: 1,
@@ -1140,7 +1158,7 @@ async fn finish<F: Forge>(
             let head = envelope.head_sha.clone().unwrap_or_default();
             // A posting failure here (rate limit, transient 5xx, network blip)
             // must not discard a review that already computed and persisted its
-            // envelope/SARIF/stdout output above. Log it and keep going — the
+            // envelope/SARIF/stdout output above. Log it and keep going because the
             // exit code always derives from the gate below, never from whether
             // the forge comment made it out.
             let posted = run_with_hosted_budget(
@@ -1246,15 +1264,15 @@ fn error_envelope(
     meta: &PrMeta,
     duration_ms: u64,
 ) -> Envelope {
-    // Pre-review failures (PR meta or diff fetch) are forge transport errors,
-    // not model content — provider class. A PR author can induce a subset
-    // (merge-conflict PRs, >20k-file change lists), so advisory mode bypasses
-    // those too; accepted because a conflicted PR cannot merge anyway and a
-    // 20k-file PR is conspicuous, but revisit if either proves abusable.
-    let findings = vec![crate::envelope::provider_error_finding(&format!("{err:#}"))];
+    let incomplete_input = crate::forge::is_incomplete_review_input(err);
+    let findings = vec![if incomplete_input {
+        crate::envelope::incomplete_review_finding()
+    } else {
+        crate::envelope::provider_error_finding(&format!("{err:#}"))
+    }];
     let counts = Envelope::counts_of(&findings, 0);
     let buckets = Envelope::buckets_of(&findings);
-    let blocking = cfg.gate_on_error == OnError::Block;
+    let blocking = incomplete_input || cfg.gate_on_error == OnError::Block;
     Envelope {
         version: 1,
         summary: if blocking {

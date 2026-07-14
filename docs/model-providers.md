@@ -2,9 +2,11 @@
 
 Postil speaks either an OpenAI-compatible chat-completions interface or the native Anthropic Messages API. Provider requests do not follow redirects, credentials are never written to logs, and private-network endpoints require an explicit opt-in.
 
-## Built-in model set
+## Model admission
 
-The default review chain is `mistralai/mistral-small-3.2-24b-instruct`, `google/gemma-3-27b-it`, then `qwen/qwen3-32b`. Scoring is disabled by default. Its configured qualification candidates are `openai/gpt-5.4-nano`, `google/gemini-3.5-flash`, and `stepfun/step-3.7-flash`; configuration alone does not admit a scorer for hosted traffic.
+The CLI has no implicit model or fallback chain. Set `REVIEW_MODEL` to a model that passes the repository benchmark for the intended review profile. Set `REVIEW_MODEL_CASCADE` only to other qualified models. Scoring is disabled unless `REVIEW_SCORER_MODEL` names a qualified scorer.
+
+Hosted deployments admit only models in their deployed qualification manifest. An empty manifest rejects hosted inference instead of selecting an untested model.
 
 ## OpenAI-compatible
 
@@ -13,7 +15,7 @@ OpenRouter is the default endpoint. Ollama, vLLM, SGLang, LiteLLM, and private g
 ```sh
 export MODEL_API_KEY=...
 export POSTIL_API_BASE=https://openrouter.ai/api/v1
-export REVIEW_MODEL=mistralai/mistral-small-3.2-24b-instruct
+export REVIEW_MODEL=provider/qualified-model
 postil doctor
 ```
 
@@ -25,7 +27,7 @@ These requests authenticate with `Authorization: Bearer`.
 export MODEL_API_KEY=...
 export POSTIL_API_BASE=https://api.anthropic.com/v1
 export POSTIL_API_FORMAT=anthropic
-export REVIEW_MODEL=claude-sonnet-4-6
+export REVIEW_MODEL=provider-qualified-anthropic-model
 postil doctor
 ```
 
@@ -36,12 +38,12 @@ Native Anthropic requests use `x-api-key` and `anthropic-version`. Set `REVIEW_S
 Private and loopback addresses are denied unless the operator permits them:
 
 ```sh
-ollama pull qwen3-coder:30b
+ollama pull your-qualified-local-model
 
 POSTIL_API_BASE=http://localhost:11434/v1 \
 POSTIL_ALLOW_PRIVATE_API_BASE=1 \
 MODEL_API_KEY=local \
-REVIEW_MODEL=qwen3-coder:30b \
+REVIEW_MODEL=your-qualified-local-model \
 postil review --staged
 ```
 

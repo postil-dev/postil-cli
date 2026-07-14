@@ -39,7 +39,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { cases } from "../fixtures/cases";
 import { formatReport, runBenchmark } from "./harness";
-import { DEFAULT_LIVE_CONCURRENCY, DEFAULT_LIVE_MODEL, formatLiveReport, runLive } from "./live";
+import { DEFAULT_LIVE_CONCURRENCY, formatLiveReport, runLive } from "./live";
 import {
   DEFAULT_LIVE_CONCURRENCY as DEFAULT_LIVE_MODELS_CONCURRENCY,
   formatLiveModelsReport,
@@ -91,7 +91,10 @@ async function main() {
   const live = args.includes("--live") || process.env.BENCH_LIVE === "1";
 
   if (live) {
-    const model = process.env.REVIEW_MODEL ?? flagValue(args, "--model") ?? DEFAULT_LIVE_MODEL;
+    const model = process.env.REVIEW_MODEL ?? flagValue(args, "--model");
+    if (!model?.trim()) {
+      throw new Error("live benchmark needs an explicitly qualified model: set REVIEW_MODEL or --model");
+    }
     const concurrency = liveConcurrency(args);
     const report = await runLive(cases, { binary, model, concurrency });
     await writeReport(jsonOut, JSON.stringify(report, null, 2));

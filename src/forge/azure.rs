@@ -10,7 +10,7 @@
 //! `--repo` is `organization/project/repository`. Checks map to PR statuses;
 //! Azure has no neutral, so an operational error marks the gate `failed`.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -26,7 +26,7 @@ const API_VERSION: &str = "7.1";
 /// before the assembled diff reaches the bounded review-source pipeline.
 /// Generous for any ordinary source file; anything larger is marked skipped,
 /// the same way binary content is below.
-const MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
 
 pub struct Azure {
     http: reqwest::Client,
@@ -58,18 +58,15 @@ struct PrResponse {
 
 #[derive(Deserialize)]
 struct ChangeItem {
-    #[serde(default)]
     path: String,
-    #[serde(rename = "isFolder", default)]
+    #[serde(rename = "isFolder")]
     is_folder: bool,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Change {
-    #[serde(default)]
-    item: Option<ChangeItem>,
-    #[serde(default)]
+    item: ChangeItem,
     change_type: String,
     /// Original path for renames; content lookups on the base side use it.
     #[serde(default)]
@@ -79,11 +76,9 @@ struct Change {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DiffResponse {
-    #[serde(default)]
     changes: Vec<Change>,
     /// False when the change list is paginated and this page is partial.
-    #[serde(default)]
-    all_changes_included: Option<bool>,
+    all_changes_included: bool,
 }
 
 impl Azure {
@@ -134,8 +129,9 @@ impl Azure {
             return Ok(resp);
         }
         let request_id = super::response_request_id(&resp).unwrap_or_else(|| "none".into());
-        Err(anyhow!(
-            "Azure DevOps {what} failed: {status} (request id {request_id})"
+        Err(super::http_failure(
+            status,
+            format!("Azure DevOps {what} failed: {status} (request id {request_id})"),
         ))
     }
 
@@ -189,7 +185,7 @@ impl Azure {
 
     /// The full change list across pages. `/diffs/commits` pages `changes`
     /// ($top defaults to 100); consuming one page would silently review only
-    /// part of a large PR and pass the rest unseen — so this paginates to
+    /// part of a large PR and pass the rest unseen, so this paginates to
     /// exhaustion and fails closed on a runaway list rather than truncating.
     async fn change_list(&self, base_sha: &str, head_sha: &str) -> Result<Vec<Change>> {
         const PAGE: usize = 100;
@@ -219,7 +215,7 @@ impl Azure {
                 .iter()
                 .map(|change| {
                     change.change_type.len()
-                        + change.item.as_ref().map_or(0, |item| item.path.len())
+                        + change.item.path.len()
                         + change.source_server_item.as_ref().map_or(0, String::len)
                 })
                 .sum::<usize>();
@@ -234,7 +230,7 @@ impl Azure {
             }
             let all_changes_included = page.all_changes_included;
             changes.extend(page.changes);
-            if azure_page_complete(n, PAGE, all_changes_included)? {
+            if azure_page_complete(n, all_changes_included)? {
                 return Ok(changes);
             }
             if changes.len() > MAX_CHANGES {
@@ -251,20 +247,41 @@ impl Azure {
 
         let mut out = String::new();
         for change in &changes {
-            let Some(item) = &change.item else { continue };
-            if item.is_folder || item.path.is_empty() {
+            let item = &change.item;
+            ensure!(!item.path.is_empty(), "Azure change item has an empty path");
+            if item.is_folder {
                 continue;
             }
             let path = item.path.trim_start_matches('/');
+            ensure!(
+                super::valid_repository_path(path),
+                "Azure change item has an unsafe repository path"
+            );
             let ct = change.change_type.to_ascii_lowercase();
-            let is_add = ct.contains("add");
-            let is_delete = ct.contains("delete");
+            let kinds = ct
+                .split(',')
+                .map(str::trim)
+                .filter(|kind| !kind.is_empty())
+                .collect::<Vec<_>>();
+            ensure!(
+                !kinds.is_empty()
+                    && kinds
+                        .iter()
+                        .all(|kind| matches!(*kind, "add" | "edit" | "delete" | "rename")),
+                "Azure change item has an unsupported change type"
+            );
+            let is_add = kinds.contains(&"add");
+            let is_delete = kinds.contains(&"delete");
             // Renames keep their history under the original path on the base side.
             let base_path = change
                 .source_server_item
                 .as_deref()
                 .map(|p| p.trim_start_matches('/'))
                 .unwrap_or(path);
+            ensure!(
+                super::valid_repository_path(base_path),
+                "Azure change item has an unsafe source repository path"
+            );
             let old = if is_add {
                 String::new()
             } else {
@@ -509,7 +526,7 @@ impl Forge for Azure {
     }
 
     /// Post a top-level PR comment as a non-anchored thread (the bot's reply to
-    /// a mention) — the same threads endpoint the reviewer uses for its summary.
+    /// a mention), using the same threads endpoint the reviewer uses for its summary.
     async fn post_comment(&self, number: u64, kind: ThreadKind, body: &str) -> Result<()> {
         // TODO(respond): Azure work-item comments are unverified here; scope to PRs.
         if kind == ThreadKind::Issue {
@@ -548,14 +565,13 @@ fn merge_commits(
     }
 }
 
-fn azure_page_complete(count: usize, page_size: usize, marker: Option<bool>) -> Result<bool> {
+fn azure_page_complete(count: usize, marker: bool) -> Result<bool> {
     match marker {
-        Some(true) => Ok(true),
-        Some(false) if count == 0 => Err(anyhow!(
+        true => Ok(true),
+        false if count == 0 => Err(anyhow!(
             "Azure change-list pagination reported more changes but made no progress"
         )),
-        Some(false) => Ok(false),
-        None => Ok(count == 0 || count < page_size),
+        false => Ok(false),
     }
 }
 
@@ -685,9 +701,8 @@ mod tests {
 
     #[test]
     fn pagination_marker_is_authoritative_and_no_progress_fails() {
-        assert!(!azure_page_complete(12, 100, Some(false)).unwrap());
-        assert!(azure_page_complete(100, 100, Some(true)).unwrap());
-        assert!(azure_page_complete(12, 100, None).unwrap());
-        assert!(azure_page_complete(0, 100, Some(false)).is_err());
+        assert!(!azure_page_complete(12, false).unwrap());
+        assert!(azure_page_complete(100, true).unwrap());
+        assert!(azure_page_complete(0, false).is_err());
     }
 }

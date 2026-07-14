@@ -158,8 +158,8 @@ export async function loadEmbeddedScorerDefaults(
   if (!scorer || typeof scorer.enabled !== "boolean") {
     throw new Error("config.toml scorer.enabled is missing");
   }
-  if (!Array.isArray(scorer.qualification_candidates) || scorer.qualification_candidates.length === 0) {
-    throw new Error("config.toml scorer.qualification_candidates must not be empty");
+  if (!Array.isArray(scorer.qualification_candidates)) {
+    throw new Error("config.toml scorer.qualification_candidates must be an array");
   }
   const candidates = scorer.qualification_candidates.filter(
     (model): model is string => typeof model === "string" && model.trim().length > 0,

@@ -74,9 +74,19 @@ pub struct FileDiff {
     pub hunks: Vec<Hunk>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Diff {
     pub files: Vec<FileDiff>,
+    pub complete: bool,
+}
+
+impl Default for Diff {
+    fn default() -> Self {
+        Self {
+            files: Vec::new(),
+            complete: true,
+        }
+    }
 }
 
 impl Diff {
@@ -678,22 +688,40 @@ pub fn parse(text: &str) -> Diff {
     // phantom line that would render an ungroundable numbered line.
     let mut old_left: u32 = 0;
     let mut new_left: u32 = 0;
+    let mut complete = true;
 
-    let flush_hunk = |file: &mut Option<FileDiff>, hunk: &mut Option<Hunk>| {
+    let flush_hunk = |file: &mut Option<FileDiff>,
+                      hunk: &mut Option<Hunk>,
+                      old_left: u32,
+                      new_left: u32,
+                      complete: &mut bool| {
         if let (Some(f), Some(h)) = (file.as_mut(), hunk.take()) {
+            if old_left != 0 || new_left != 0 {
+                *complete = false;
+            }
             f.hunks.push(h);
         }
     };
 
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("diff --git ") {
-            flush_hunk(&mut current, &mut current_hunk);
+            flush_hunk(
+                &mut current,
+                &mut current_hunk,
+                old_left,
+                new_left,
+                &mut complete,
+            );
             if let Some(f) = current.take() {
                 files.push(f);
             }
             // Seed the path from the header (binary diffs have no +++/--- lines);
             // the +++/--- lines that follow refine it for renames.
-            let (old_path, path) = parse_diff_header_paths(rest).unwrap_or_default();
+            let Some((old_path, path)) = parse_diff_header_paths(rest) else {
+                complete = false;
+                current = None;
+                continue;
+            };
             current = Some(FileDiff {
                 old_path,
                 path,
@@ -743,7 +771,13 @@ pub fn parse(text: &str) -> Diff {
                 f.binary = true;
             }
         } else if let Some(header) = line.strip_prefix("@@ ") {
-            flush_hunk(&mut current, &mut current_hunk);
+            flush_hunk(
+                &mut current,
+                &mut current_hunk,
+                old_left,
+                new_left,
+                &mut complete,
+            );
             if let Some((old_start, old_count, new_start, new_count)) = parse_hunk_header(header) {
                 current_hunk = Some(Hunk {
                     old_start,
@@ -754,39 +788,70 @@ pub fn parse(text: &str) -> Diff {
                 });
                 old_left = old_count;
                 new_left = new_count;
+            } else {
+                complete = false;
             }
         } else if let Some(h) = current_hunk.as_mut() {
             // The hunk is complete once every declared old- and new-side line has
             // been consumed. Anything after that (a blank separator, a stray
             // line) belongs to the next file, not this hunk.
-            let complete = old_left == 0 && new_left == 0;
-            if !complete && (line.starts_with(['+', '-', ' ']) || line.is_empty()) {
+            let hunk_complete = old_left == 0 && new_left == 0;
+            if !hunk_complete && (line.starts_with(['+', '-', ' ']) || line.is_empty()) {
                 // A bare blank line counts as an unchanged (context) line: it is
                 // present on both sides.
-                match line.chars().next() {
-                    Some('+') => new_left = new_left.saturating_sub(1),
-                    Some('-') => old_left = old_left.saturating_sub(1),
-                    _ => {
-                        old_left = old_left.saturating_sub(1);
-                        new_left = new_left.saturating_sub(1);
+                let consumed = match line.chars().next() {
+                    Some('+') if new_left > 0 => {
+                        new_left -= 1;
+                        true
                     }
+                    Some('-') if old_left > 0 => {
+                        old_left -= 1;
+                        true
+                    }
+                    _ => {
+                        if old_left == 0 || new_left == 0 {
+                            false
+                        } else {
+                            old_left -= 1;
+                            new_left -= 1;
+                            true
+                        }
+                    }
+                };
+                if !consumed {
+                    complete = false;
                 }
                 h.lines.push(line.to_string());
             } else if line.starts_with('\\') {
-                // "\ No newline at end of file" — not content.
+                // "\ No newline at end of file" is not content.
             } else {
                 // Hunk complete, or a trailer (e.g. next file's "index" line in
                 // odd diffs): close the hunk.
-                flush_hunk(&mut current, &mut current_hunk);
+                if hunk_complete && line.starts_with(['+', '-', ' ']) {
+                    complete = false;
+                }
+                flush_hunk(
+                    &mut current,
+                    &mut current_hunk,
+                    old_left,
+                    new_left,
+                    &mut complete,
+                );
             }
         }
     }
-    flush_hunk(&mut current, &mut current_hunk);
+    flush_hunk(
+        &mut current,
+        &mut current_hunk,
+        old_left,
+        new_left,
+        &mut complete,
+    );
     if let Some(f) = current.take() {
         files.push(f);
     }
     files.retain(|f| !f.path.is_empty());
-    Diff { files }
+    Diff { files, complete }
 }
 
 fn strip_prefix_ab(path: &str) -> &str {
@@ -824,7 +889,7 @@ fn parse_hunk_header(header: &str) -> Option<(u32, u32, u32, u32)> {
 pub fn render_annotated(diff: &Diff, max_bytes: usize) -> (String, bool) {
     let mut out = String::new();
     // Append `s`, returning true once the size cap is exceeded. Routing EVERY
-    // push through this enforces the cap after each append, headers included — a
+    // push through this enforces the cap after each append, headers included. A
     // diff with hundreds of thousands of header-only files must still trip the
     // truncation flag rather than render unbounded output that reads as a full
     // pass.
@@ -1535,6 +1600,7 @@ index 111..222 100644
 +added eleven
 +added twelve
  line thirteen
+ line fourteen
 diff --git a/gone.txt b/gone.txt
 deleted file mode 100644
 --- a/gone.txt
@@ -1549,6 +1615,7 @@ Binary files a/img.png and b/img.png differ
     #[test]
     fn parses_files_hunks_and_kinds() {
         let d = parse(SAMPLE);
+        assert!(d.complete);
         assert_eq!(d.files.len(), 3);
         assert_eq!(d.files[0].path, "src/lib.rs");
         assert_eq!(d.files[0].old_path, "src/lib.rs");
@@ -1560,6 +1627,23 @@ Binary files a/img.png and b/img.png differ
         assert!(d.files[1].deleted);
         assert_eq!(d.files[1].path, "gone.txt");
         assert!(d.files[2].binary);
+    }
+
+    #[test]
+    fn rejects_truncated_and_malformed_hunks() {
+        let truncated = parse(
+            "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n",
+        );
+        assert!(!truncated.complete);
+
+        let malformed =
+            parse("diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ not-a-range @@\n+new\n");
+        assert!(!malformed.complete);
+
+        let overfull = parse(
+            "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -0,0 +1,1 @@\n+one\n+two\n",
+        );
+        assert!(!overfull.complete);
     }
 
     #[test]

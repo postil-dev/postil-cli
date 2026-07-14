@@ -28,7 +28,7 @@ misleading comments, huge low-signal multi-hunk diffs, near-duplicate clean and
 defect pairs, Unicode homoglyphs, subtle races, and clean changes where silence
 is the expected review.
 
-## Running (mock mode — default, CI)
+## Running (mock mode: default, CI)
 
 ```sh
 cargo build --quiet --release   # from the repo root
@@ -99,7 +99,7 @@ refuses to run without a key and without at least one model.
   both check-runs created and completed, `postil/gate` concluding consistently
   with the envelope's gate. The mock-mode fidelity checks that depend on exact
   model output (silence-on-clean, exact finding anchoring, min/max findings) are
-  **not** applied here — a real model's output is not known ahead of time.
+  **not** applied here because a real model's output is not known ahead of time.
 
 ### Report
 
@@ -130,7 +130,7 @@ before spending anything. It needs no key (the `/models` catalog is public).
 These are a **measured baseline for this CLI** on **our own fixtures**: a single
 run per case, diff plus mock repo context, no policy docs. The fixtures are ours
 and **no competitor has been run on them**, so the numbers are not a peer
-comparison — they are our measured seeded-region finding hit rate and
+comparison. They are our measured seeded-region finding hit rate and
 catalog-priced token-cost estimates on our fixtures. Results vary across runs
 because model inference is nondeterministic. Treat them as internal evidence,
 not a published benchmark.
@@ -156,7 +156,7 @@ real OpenRouter endpoint.
 cargo build --quiet --release
 cd bench
 export MODEL_API_KEY=...          # or LLM_API_KEY / OPENROUTER_API_KEY
-POSTIL_SCORER_EVAL_MODELS=openai/gpt-5.4-nano,google/gemini-3.5-flash,stepfun/step-3.7-flash \
+POSTIL_SCORER_EVAL_MODELS=provider/candidate-a,provider/candidate-b \
 POSTIL_SCORER_EVAL_REPEATS=5 \
   bun run scorer-eval --json-out scorer-eval-report.json
 ```
@@ -188,13 +188,13 @@ This live mode runs the real release binary against the same fixtures with a
 real model and **no mocked model server**, so it measures seeded-region finding
 hit rate rather than pipeline fidelity. Each case runs in local diff-file mode
 (`postil review --diff-file <fixture.diff> --no-post --output-json`), which does
-no forge I/O at all — so no GitHub server, mock or real, is involved and nothing
+no forge I/O at all, so no GitHub server, mock or real, is involved and nothing
 is written to any repo.
 
 ```sh
 export MODEL_API_KEY=...         # required; never logged or printed
-bun run bench:live               # or: bun run bench --live
-# REVIEW_MODEL or --model <id> overrides the model (default mistralai/mistral-small-3.2-24b-instruct)
+REVIEW_MODEL=provider/qualified-model bun run bench:live
+# --model <id> is the equivalent command-line override
 # --concurrency <n> or BENCH_CONCURRENCY sets case parallelism (default 6)
 ```
 
@@ -219,7 +219,7 @@ fails with a transient provider error: a non-zero exit whose stderr carries an
 HTTP 5xx/429, rate-limit, timeout, or connection signature, or a run that
 produced no valid v1 envelope at all (empty/garbled output, typically a dropped
 response). A valid envelope is always treated as a normal result and is never
-retried — including a gate-failing exit (exit 1 with a scored envelope) or one
+retried, including a gate-failing exit (exit 1 with a scored envelope) or one
 that merely reports findings or non-seeded-region findings. A case that fails on both
 attempts is recorded as an error and excluded from scoring, exactly as before.
 
@@ -244,7 +244,7 @@ truth-vs-found severity. The exact figure uses strict equality. The +/-1-tier
 figure is a deliberately softer matching rule that also accepts adjacent tiers
 on the `info < warn < error` scale.
 
-These numbers are a **measured baseline for this CLI** — a single model, one run
+These numbers are a **measured baseline for this CLI**: a single model, one run
 per case, diff-only with no repository context or policy docs. **Neither
 severity metric is a peer-comparison claim**: no competitor has been run on the
 same fixtures. Results vary across runs because model inference is

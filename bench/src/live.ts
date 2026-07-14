@@ -14,7 +14,7 @@
 // so no GitHub server, mock or real, is needed. MODEL_API_KEY, LLM_API_KEY,
 // OPENROUTER_API_KEY, or POSTIL_API_KEY is required and is read from the
 // caller's environment; it is never logged or printed.
-// REVIEW_MODEL is configurable (default deepseek/deepseek-v4-pro).
+// REVIEW_MODEL or --model is required.
 //
 // Scoring uses fixture ground truth: a defect counts as detected when a finding
 // matches the ground-truth path with line within +/-3; severity match is tracked
@@ -34,8 +34,6 @@ import { API_KEY_ENV_NAMES_TEXT, forwardApiKey, resolveApiKeyName } from "./api-
 import { benchmarkCase, type BenchmarkCaseInput, envelopeV1, type Envelope } from "./harness";
 
 const execFile = promisify(execFileCb);
-
-export const DEFAULT_LIVE_MODEL = "mistralai/mistral-small-3.2-24b-instruct";
 
 /** Default number of cases run concurrently. Live inference is I/O-bound on the
  * provider, so a small pool cuts wall-clock time without overloading the API.
@@ -81,7 +79,7 @@ function severityWithinOneTier(found: string | null, truth: string | null): bool
 export interface LiveOptions {
   /** Path to the postil binary (a release build). */
   binary: string;
-  /** Model id passed via REVIEW_MODEL (default deepseek/deepseek-v4-pro). */
+  /** Explicit candidate model id passed via REVIEW_MODEL. */
   model: string;
   /** Root directory for per-case run dirs. Defaults to bench/.runs. */
   rootDir?: string;
@@ -271,7 +269,7 @@ const TRANSIENT_STDERR = new RegExp(
 function isTransientFailure(result: LiveCaseResult): boolean {
   if (result.scored) return false;
   if (result.stderr && TRANSIENT_STDERR.test(result.stderr)) return true;
-  // No valid envelope (empty/invalid output) — typically a dropped or truncated
+  // No valid envelope (empty/invalid output), typically a dropped or truncated
   // provider response; retry once.
   return result.error?.startsWith("no valid v1 envelope") ?? false;
 }
@@ -286,7 +284,7 @@ async function assertBinary(binary: string): Promise<void> {
     .catch(() => false);
   if (!ok) {
     throw new Error(
-      `postil binary not found at ${binary} — build it first: cargo build --quiet --release ` +
+      `postil binary not found at ${binary}. Build it first: cargo build --quiet --release ` +
         `(or point POSTIL_BIN at a binary)`,
     );
   }
@@ -349,7 +347,7 @@ async function runLiveCase(
     stderr = out.stderr;
   } catch (err) {
     // Exit 1 with a valid envelope is the gate failing on an error-severity
-    // finding, not a transport failure — keep the stdout and score it. The
+    // finding, not a transport failure. Keep the stdout and score it. The
     // stderr is captured so a genuine transport failure can be retried.
     const e = err as { code?: unknown; stdout?: string; stderr?: string; message?: string };
     exitCode = typeof e.code === "number" ? e.code : undefined;
@@ -528,7 +526,7 @@ export function formatLiveReport(report: LiveReport): string {
     "info<->warn and warn<->error as a match, since warn<->error is often a",
     "defensible judgment call. Neither is a peer-comparison claim.",
     "Note: single model, one run per case, diff-only (no repo context). A measured",
-    "baseline for this CLI — NOT a peer comparison.",
+    "baseline for this CLI, NOT a peer comparison.",
     "",
   );
   for (const r of report.results) {

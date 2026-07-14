@@ -28,7 +28,7 @@ export BITBUCKET_TOKEN=...
 postil review --forge bitbucket --repo workspace/repository --pr 7
 ```
 
-Set `BITBUCKET_USER` when the credential is an app password. `BITBUCKET_API_URL` selects Bitbucket Data Center.
+Set `BITBUCKET_USER` when the credential is an app password. `BITBUCKET_API_URL` selects the Bitbucket Cloud-compatible API origin. Bitbucket Data Center uses a different REST contract and is not supported by this adapter.
 
 Incremental Bitbucket reviews require `POSTIL_ENABLE_BITBUCKET_INCREMENTAL=1` because compare-path behavior varies by deployment. Enable it only after validating the target server.
 

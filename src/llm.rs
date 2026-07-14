@@ -5,6 +5,7 @@
 //! Native Anthropic endpoints use `POST {base}/messages` when explicitly selected.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -18,7 +19,7 @@ use crate::api_key;
 use crate::config::{ApiFormat, Config};
 use crate::envelope::{
     Finding, Kind, ModelIncident, ModelIncidentCategory, ModelIncidentPhase, ModelIncidentRecovery,
-    ModelUsage, Usage,
+    ModelUsage, ModelUsageCostSource, ModelUsagePhase, ModelUsageRole, Usage,
 };
 
 #[derive(Debug, Clone)]
@@ -286,6 +287,7 @@ pub struct LlmClient {
     review_deadline: Option<Instant>,
     total_deadline: Option<Instant>,
     admission: Arc<Mutex<ProviderAdmission>>,
+    call_ordinal: Arc<AtomicU32>,
 }
 
 #[derive(Debug, Default)]
@@ -328,7 +330,7 @@ pub(crate) const REVIEW_MAX_TOKENS: u32 = 8_000;
 pub(crate) const MAX_PROVIDER_ATTEMPTS: usize = 216;
 pub(crate) const MAX_REPORTED_TOKEN_SPEND: usize = 20_000_000;
 const MAX_PROVIDER_INPUT_BYTES: usize = 64 * 1024 * 1024;
-const MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE: usize = 2_000_000;
+pub(crate) const MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE: usize = 2_000_000;
 const MAX_PROVIDER_COST_MICROS: u64 = 25_000_000;
 const MAX_MODEL_RESPONSE_BYTES: usize = 512 * 1024;
 const SCORER_BASE_MAX_TOKENS: u32 = 256;
@@ -364,9 +366,8 @@ fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> &str {
     }
     &value[..end]
 }
-
 /// Marker context attached to transport/provider-level failures (endpoint
-/// unreachable, HTTP error status, timeout, malformed HTTP envelope) — the
+/// unreachable, HTTP error status, timeout, malformed HTTP envelope), the
 /// class a malicious diff cannot induce. `gate.onError: advisory` stands aside
 /// only for errors carrying this marker; unusable model *content* (which
 /// prompt injection can cause) always fails closed.
@@ -402,6 +403,13 @@ enum LlmPhase {
     Total,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum LlmCallPhase {
+    Initial,
+    SchemaRepair,
+    SemanticRetry,
+}
+
 impl LlmPhase {
     fn as_str(self) -> &'static str {
         match self {
@@ -409,6 +417,24 @@ impl LlmPhase {
             Self::Scorer => "scorer",
             Self::Respond => "respond",
             Self::Total => "total",
+        }
+    }
+
+    fn usage_role(self) -> ModelUsageRole {
+        match self {
+            Self::Review | Self::Total => ModelUsageRole::ReviewGenerator,
+            Self::Scorer => ModelUsageRole::FindingScorer,
+            Self::Respond => ModelUsageRole::MentionResponder,
+        }
+    }
+}
+
+impl LlmCallPhase {
+    fn usage_phase(self) -> ModelUsagePhase {
+        match self {
+            Self::Initial => ModelUsagePhase::Initial,
+            Self::SchemaRepair => ModelUsagePhase::SchemaRepair,
+            Self::SemanticRetry => ModelUsagePhase::SemanticRetry,
         }
     }
 }
@@ -555,7 +581,38 @@ impl LlmClient {
             review_deadline,
             total_deadline,
             admission: Arc::new(Mutex::new(ProviderAdmission::default())),
+            call_ordinal: Arc::new(AtomicU32::new(0)),
         })
+    }
+
+    fn model_usage_event(
+        &self,
+        model: &str,
+        role: LlmPhase,
+        phase: LlmCallPhase,
+        attempt: u32,
+        usage: Option<Usage>,
+    ) -> ModelUsage {
+        let reported = usage.is_some_and(|value| {
+            value.prompt_tokens > 0 || value.completion_tokens > 0 || value.cost_micros.is_some()
+        });
+        let usage = usage.unwrap_or_default();
+        ModelUsage {
+            model: model.to_string(),
+            role: Some(role.usage_role()),
+            phase: Some(phase.usage_phase()),
+            call_ordinal: Some(self.call_ordinal.fetch_add(1, Ordering::Relaxed) + 1),
+            attempt: Some(attempt),
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            cost_micros: usage.cost_micros,
+            cost_source: Some(if usage.cost_micros.is_some() {
+                ModelUsageCostSource::ProviderReported
+            } else {
+                ModelUsageCostSource::Unavailable
+            }),
+            accounting_complete: reported,
+        }
     }
 
     /// Run the review. With `consensus > 1`, the first N models of the chain are
@@ -612,14 +669,6 @@ impl LlmClient {
                         failed_incidents.extend(e.model_incidents.clone());
                         failed_incidents.push(e.incident(ModelIncidentPhase::Review));
                         usage_accounting_complete &= e.usage_accounting_complete;
-                        if e.model_usage.is_empty() && has_billable_usage(e.usage) {
-                            e.model_usage.push(ModelUsage {
-                                model: model.clone(),
-                                prompt_tokens: e.usage.prompt_tokens,
-                                completion_tokens: e.usage.completion_tokens,
-                                cost_micros: e.usage.cost_micros,
-                            });
-                        }
                         failed_model_usage.extend(e.model_usage.clone());
                         add_usage(&mut failed_usage, e.usage);
                         e.usage = failed_usage;
@@ -710,14 +759,6 @@ impl LlmClient {
                         failed_incidents.extend(e.model_incidents.clone());
                         failed_incidents.push(e.incident(ModelIncidentPhase::Review));
                         usage_accounting_complete &= e.usage_accounting_complete;
-                        if e.model_usage.is_empty() && has_billable_usage(e.usage) {
-                            e.model_usage.push(ModelUsage {
-                                model: model.clone(),
-                                prompt_tokens: e.usage.prompt_tokens,
-                                completion_tokens: e.usage.completion_tokens,
-                                cost_micros: e.usage.cost_micros,
-                            });
-                        }
                         failed_model_usage.extend(e.model_usage.clone());
                         let elapsed = elapsed_text(started_at.elapsed());
                         if e.is_deadline_exceeded() {
@@ -792,6 +833,7 @@ impl LlmClient {
         let chain_len = chain.len();
         for (index, model) in chain.into_iter().enumerate() {
             let mut model_usage = Usage::default();
+            let mut call_usage = Vec::new();
             let mut model_accounting_complete = true;
             match self
                 .chat(
@@ -799,21 +841,18 @@ impl LlmClient {
                     system,
                     user,
                     &mut model_usage,
+                    &mut call_usage,
                     &mut model_accounting_complete,
                     RESPOND_MAX_TOKENS,
                     LlmPhase::Respond,
+                    LlmCallPhase::Initial,
                 )
                 .await
             {
                 Ok(content) => {
                     usage_accounting_complete &= model_accounting_complete;
                     add_usage(&mut usage, model_usage);
-                    models.push(ModelUsage {
-                        model: model.clone(),
-                        prompt_tokens: model_usage.prompt_tokens,
-                        completion_tokens: model_usage.completion_tokens,
-                        cost_micros: model_usage.cost_micros,
-                    });
+                    models.append(&mut call_usage);
                     match validate(&content) {
                         Ok(content) => {
                             return Ok(Answer {
@@ -857,13 +896,8 @@ impl LlmClient {
                     // retained and priced by the hosted control plane.
                     if has_billable_usage(model_usage) {
                         add_usage(&mut usage, model_usage);
-                        models.push(ModelUsage {
-                            model: model.clone(),
-                            prompt_tokens: model_usage.prompt_tokens,
-                            completion_tokens: model_usage.completion_tokens,
-                            cost_micros: model_usage.cost_micros,
-                        });
                     }
+                    models.append(&mut call_usage);
                     if e.downcast_ref::<DeadlineExceeded>().is_some() {
                         return Err(e);
                     }
@@ -918,14 +952,6 @@ impl LlmClient {
                     failed_incidents.extend(e.model_incidents.clone());
                     failed_incidents.push(e.incident(ModelIncidentPhase::Scorer));
                     usage_accounting_complete &= e.usage_accounting_complete;
-                    if e.model_usage.is_empty() && has_billable_usage(e.usage) {
-                        e.model_usage.push(ModelUsage {
-                            model: model.clone(),
-                            prompt_tokens: e.usage.prompt_tokens,
-                            completion_tokens: e.usage.completion_tokens,
-                            cost_micros: e.usage.cost_micros,
-                        });
-                    }
                     failed_model_usage.extend(e.model_usage.clone());
                     let elapsed = elapsed_text(started_at.elapsed());
                     if e.is_deadline_exceeded() {
@@ -983,6 +1009,7 @@ impl LlmClient {
         user: &str,
     ) -> std::result::Result<ModelReview, ModelError> {
         let mut usage = Usage::default();
+        let mut call_usage = Vec::new();
         let mut usage_accounting_complete = true;
         let mut model_incidents = Vec::new();
         let content = self
@@ -991,15 +1018,19 @@ impl LlmClient {
                 system,
                 user,
                 &mut usage,
+                &mut call_usage,
                 &mut usage_accounting_complete,
                 REVIEW_MAX_TOKENS,
                 LlmPhase::Review,
+                LlmCallPhase::Initial,
             )
             .await
             .map_err(|e| {
                 let complete = usage_accounting_complete
                     && (usage.prompt_tokens > 0 || usage.completion_tokens > 0);
-                ModelError::new(e, usage, complete)
+                let mut error = ModelError::new(e, usage, complete);
+                error.model_usage = call_usage.clone();
+                error
             })?;
         let mut repaired_schema = false;
         let raw = match parse_review(&content) {
@@ -1024,9 +1055,11 @@ impl LlmClient {
                         "You repair malformed JSON. Output only valid JSON.",
                         &repair_user,
                         &mut usage,
+                        &mut call_usage,
                         &mut usage_accounting_complete,
                         REVIEW_MAX_TOKENS,
                         LlmPhase::Review,
+                        LlmCallPhase::SchemaRepair,
                     )
                     .await
                 {
@@ -1034,6 +1067,7 @@ impl LlmClient {
                     Err(error) => {
                         let mut error =
                             ModelError::new(error.context("JSON repair call failed"), usage, false);
+                        error.model_usage = call_usage.clone();
                         error.model_incidents.push(incident);
                         return Err(error);
                     }
@@ -1045,6 +1079,7 @@ impl LlmClient {
                         usage_accounting_complete,
                     );
                     error.model_incidents.push(incident.clone());
+                    error.model_usage = call_usage.clone();
                     error
                 })?;
                 model_incidents.push(ModelIncident {
@@ -1057,6 +1092,7 @@ impl LlmClient {
             }
         };
         let mut review = into_review(raw, model, usage);
+        review.model_usage = call_usage.clone();
         review.model_incidents.append(&mut model_incidents);
         review.usage_accounting_complete = usage_accounting_complete;
         if repaired_schema && review.findings.is_empty() && !review.summary.is_empty() {
@@ -1066,6 +1102,7 @@ impl LlmClient {
                 review.usage_accounting_complete,
             );
             error.model_incidents = review.model_incidents;
+            error.model_usage = review.model_usage;
             return Err(error);
         }
 
@@ -1087,7 +1124,7 @@ impl LlmClient {
                 "{user}\n\n[Your previous response]\n{previous}\n\n[Correction] Your summary \
                  describes merge-relevant risk but `findings` is empty, which is invalid. \
                  Either report each risk as a structured finding citing its exact new-file \
-                 line from the diff above, or — if nothing is actually merge-relevant — \
+                 line from the diff above, or, if nothing is actually merge-relevant, \
                  return exactly {{\"summary\": \"\", \"findings\": []}}."
             );
             let mut retry_usage = usage;
@@ -1097,18 +1134,21 @@ impl LlmClient {
                     system,
                     &retry_user,
                     &mut retry_usage,
+                    &mut call_usage,
                     &mut usage_accounting_complete,
                     REVIEW_MAX_TOKENS,
                     LlmPhase::Review,
+                    LlmCallPhase::SemanticRetry,
                 )
                 .await
             {
                 Ok(retried) => {
                     review.usage = retry_usage;
-                    review.model_usage = single_model_usage(model, retry_usage);
+                    review.model_usage = call_usage.clone();
                     review.usage_accounting_complete = usage_accounting_complete;
                     if let Ok(retried_raw) = parse_review(&retried) {
                         let mut candidate = into_review(retried_raw, model, retry_usage);
+                        candidate.model_usage = call_usage.clone();
                         candidate.usage_accounting_complete = usage_accounting_complete;
                         let still_contradictory =
                             candidate.findings.is_empty() && !candidate.summary.is_empty();
@@ -1123,14 +1163,14 @@ impl LlmClient {
                 }
                 Err(_) => {
                     review.usage = retry_usage;
-                    review.model_usage = single_model_usage(model, retry_usage);
+                    review.model_usage = call_usage.clone();
                     review.usage_accounting_complete = false;
                     if let Err(error) = self.remaining_budget(LlmPhase::Review) {
-                        return Err(ModelError::new(
-                            error.context(ProviderError),
-                            retry_usage,
-                            false,
-                        ));
+                        let mut error =
+                            ModelError::new(error.context(ProviderError), retry_usage, false);
+                        error.model_usage = call_usage.clone();
+                        error.model_incidents = review.model_incidents;
+                        return Err(error);
                     }
                 }
             }
@@ -1155,6 +1195,7 @@ impl LlmClient {
             )
         })?;
         let mut usage = Usage::default();
+        let mut call_usage = Vec::new();
         let mut usage_accounting_complete = true;
         let mut model_incidents = Vec::new();
         let content = self
@@ -1163,16 +1204,20 @@ impl LlmClient {
                 system,
                 user,
                 &mut usage,
+                &mut call_usage,
                 &mut usage_accounting_complete,
                 max_tokens,
                 0.0,
                 LlmPhase::Scorer,
+                LlmCallPhase::Initial,
             )
             .await
             .map_err(|e| {
                 let complete = usage_accounting_complete
                     && (usage.prompt_tokens > 0 || usage.completion_tokens > 0);
-                ModelError::new(e, usage, complete)
+                let mut error = ModelError::new(e, usage, complete);
+                error.model_usage = call_usage.clone();
+                error
             })?;
         let scores = match parse_scores(&content, expected_len) {
             Ok(scores) => scores,
@@ -1199,16 +1244,19 @@ impl LlmClient {
                         &repair_system,
                         &repair_user,
                         &mut usage,
+                        &mut call_usage,
                         &mut usage_accounting_complete,
                         max_tokens,
                         0.0,
                         LlmPhase::Scorer,
+                        LlmCallPhase::SchemaRepair,
                     )
                     .await
                     .map_err(|error| {
                         let complete = usage_accounting_complete
                             && (usage.prompt_tokens > 0 || usage.completion_tokens > 0);
                         let mut error = ModelError::new(error, usage, complete);
+                        error.model_usage = call_usage.clone();
                         error.model_incidents.push(incident.clone());
                         error
                     })?;
@@ -1221,6 +1269,7 @@ impl LlmClient {
                         usage_accounting_complete,
                     );
                     error.model_incidents.push(incident.clone());
+                    error.model_usage = call_usage.clone();
                     error
                 })?;
                 model_incidents.push(ModelIncident {
@@ -1235,7 +1284,7 @@ impl LlmClient {
             scores,
             model_used: model.to_string(),
             usage,
-            model_usage: single_model_usage(model, usage),
+            model_usage: call_usage,
             model_incidents,
             usage_accounting_complete,
         })
@@ -1248,19 +1297,23 @@ impl LlmClient {
         system: &str,
         user: &str,
         usage: &mut Usage,
+        call_usage: &mut Vec<ModelUsage>,
         usage_accounting_complete: &mut bool,
         max_tokens: u32,
         phase: LlmPhase,
+        call_phase: LlmCallPhase,
     ) -> Result<String> {
         self.chat_with_temperature(
             model,
             system,
             user,
             usage,
+            call_usage,
             usage_accounting_complete,
             max_tokens,
             0.1,
             phase,
+            call_phase,
         )
         .await
         .map_err(|e| e.context(ProviderError))
@@ -1273,20 +1326,24 @@ impl LlmClient {
         system: &str,
         user: &str,
         usage: &mut Usage,
+        call_usage: &mut Vec<ModelUsage>,
         usage_accounting_complete: &mut bool,
         max_tokens: u32,
         temperature: f64,
         phase: LlmPhase,
+        call_phase: LlmCallPhase,
     ) -> Result<String> {
         self.chat_inner(
             model,
             system,
             user,
             usage,
+            call_usage,
             usage_accounting_complete,
             max_tokens,
             temperature,
             phase,
+            call_phase,
         )
         .await
         .map_err(|e| e.context(ProviderError))
@@ -1300,10 +1357,12 @@ impl LlmClient {
         system: &str,
         user: &str,
         usage: &mut Usage,
+        call_usage: &mut Vec<ModelUsage>,
         usage_accounting_complete: &mut bool,
         max_tokens: u32,
         temperature: f64,
         phase: LlmPhase,
+        call_phase: LlmCallPhase,
     ) -> Result<String> {
         // This mutable flag is stack-local state held through one exclusively
         // borrowed async call. Request retries run sequentially in this loop,
@@ -1314,6 +1373,7 @@ impl LlmClient {
         let mut empty_response_retries = 0u32;
         let mut attempt_timeout = self.request_timeout;
         loop {
+            let attempt = retries.saturating_add(1);
             let attempt_started_at = Instant::now();
             let remaining = self.remaining_budget(phase)?;
             let deadline_limited = remaining.is_some_and(|value| value <= attempt_timeout);
@@ -1333,10 +1393,14 @@ impl LlmClient {
                 Ok(result) => result,
                 Err(_) if deadline_limited => {
                     *usage_accounting_complete = false;
+                    call_usage
+                        .push(self.model_usage_event(model, phase, call_phase, attempt, None));
                     return Err(DeadlineExceeded(phase).into());
                 }
                 Err(_) => {
                     *usage_accounting_complete = false;
+                    call_usage
+                        .push(self.model_usage_event(model, phase, call_phase, attempt, None));
                     if empty_response_retries > 0 {
                         return Err(RequestTimedOut.into());
                     }
@@ -1366,6 +1430,13 @@ impl LlmClient {
                         is_canonical_openrouter_base(&self.api_base),
                     );
                     let elapsed = elapsed_text(attempt_started_at.elapsed());
+                    call_usage.push(self.model_usage_event(
+                        model,
+                        phase,
+                        call_phase,
+                        attempt,
+                        summary.usage,
+                    ));
                     if let Some(response_usage) = summary.usage
                         && let Err(error) = self.record_reported_usage(response_usage)
                     {
@@ -1530,6 +1601,8 @@ impl LlmClient {
                         && empty_response_retries > 0 =>
                 {
                     *usage_accounting_complete = false;
+                    call_usage
+                        .push(self.model_usage_event(model, phase, call_phase, attempt, None));
                     return Err(RequestTimedOut.into());
                 }
                 Err(error)
@@ -1537,6 +1610,8 @@ impl LlmClient {
                         && empty_response_retries > 0 =>
                 {
                     *usage_accounting_complete = false;
+                    call_usage
+                        .push(self.model_usage_event(model, phase, call_phase, attempt, None));
                     return Err(error.context("connection failed after empty-response retry"));
                 }
                 Err(error)
@@ -1545,6 +1620,8 @@ impl LlmClient {
                         && retries < TRANSIENT_RETRIES =>
                 {
                     *usage_accounting_complete = false;
+                    call_usage
+                        .push(self.model_usage_event(model, phase, call_phase, attempt, None));
                     retries += 1;
                     timeout_retries += 1;
                     let wait = Duration::from_secs(2 * retries as u64);
@@ -1563,6 +1640,8 @@ impl LlmClient {
                         && retries < TRANSIENT_RETRIES =>
                 {
                     *usage_accounting_complete = false;
+                    call_usage
+                        .push(self.model_usage_event(model, phase, call_phase, attempt, None));
                     retries += 1;
                     let wait = Duration::from_secs(2 * retries as u64);
                     eprintln!(
@@ -1576,6 +1655,9 @@ impl LlmClient {
                     attempt_timeout = self.request_timeout;
                 }
                 Err(error) => {
+                    *usage_accounting_complete = false;
+                    call_usage
+                        .push(self.model_usage_event(model, phase, call_phase, attempt, None));
                     return Err(error.context("request to model endpoint failed"));
                 }
             }
@@ -2162,6 +2244,12 @@ where
     let allow_private = std::env::var(ALLOW_PRIVATE_API_BASE_ENV)
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    if url.scheme() == "http" {
+        anyhow::ensure!(
+            allow_private && addresses.iter().all(|address| !is_public_ip(address.ip())),
+            "plain HTTP model APIs are allowed only for explicitly opted-in private or loopback endpoints"
+        );
+    }
     if !allow_private {
         for address in &addresses {
             anyhow::ensure!(
@@ -2467,7 +2555,7 @@ fn into_review(raw: RawReview, model: &str, usage: Usage) -> ModelReview {
             // erase the whole finding (path/line/body), or a real high-severity
             // issue the model called "major"/"P0"/"moderate" would vanish before
             // grounding, the gate, and the user ever see it. Default unknown
-            // labels to Warn — conservative (non-silent, doesn't over-gate the
+            // labels to Warn. This is conservative (non-silent, without over-gating the
             // way an Error default would).
             let severity = Severity::parse(&f.severity).unwrap_or(Severity::Warn);
             let kind = match f.kind.as_deref() {
@@ -2508,19 +2596,10 @@ fn into_review(raw: RawReview, model: &str, usage: Usage) -> ModelReview {
         findings,
         model_used: model.to_string(),
         usage,
-        model_usage: single_model_usage(model, usage),
+        model_usage: vec![],
         model_incidents: vec![],
         usage_accounting_complete: true,
     }
-}
-
-fn single_model_usage(model: &str, usage: Usage) -> Vec<ModelUsage> {
-    vec![ModelUsage {
-        model: model.to_string(),
-        prompt_tokens: usage.prompt_tokens,
-        completion_tokens: usage.completion_tokens,
-        cost_micros: usage.cost_micros,
-    }]
 }
 
 /// Keep findings at least two models agree on (same path, lines within 5).

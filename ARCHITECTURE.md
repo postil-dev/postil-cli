@@ -1,8 +1,8 @@
 # Architecture
 
 Source of truth hierarchy: this document describes intent; `src/` is authoritative for
-behavior; the envelope schema (README "The envelope", `src/envelope.rs`) is a frozen
-contract shared with postil-dev/postil (hosted worker) and `postil plan`.
+behavior; `src/envelope.rs` is the envelope contract shared with the hosted worker and
+`postil plan`.
 
 ## Pipeline
 
@@ -43,8 +43,10 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   a separate header whose name cannot collide with provider-managed headers. A shared
   admission ledger reserves each HTTP attempt, serialized input bytes, maximum output,
   and worst-case token spend before sending any initial, retry, repair, or scorer call.
-  OpenRouter's response `usage.cost` is preserved as optional exact micro-dollar cost
-  on each model-usage record; endpoints that omit it retain token-only accounting.
+  Every provider HTTP call has a model-usage record with a product role, logical phase,
+  operation-wide call ordinal, phase-local attempt, token counts, and exact-cost source.
+  OpenRouter's response `usage.cost` is preserved as optional exact micro-dollar cost;
+  endpoints that omit it retain token-only accounting with unavailable cost provenance.
 - `review.rs`: orchestration; enforces acquisition, model-aware context, request,
   provider-attempt, output-token, and worst-case token-exposure budgets before calls;
   one UTF-8 byte counts as one projected token rather than using an optimistic ratio;
@@ -58,15 +60,16 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   still be reported against them). It persists safe structured model incidents for
   monitoring without raw provider or model text.
 - `forge/`: trait + GitHub, GitLab, Bitbucket, and Azure DevOps implementations (each
-  with a self-managed/server base-URL override). GitHub reconstructs full reviews from
-  the declared changed-file count and exhausted paginated file patches, and rejects
-  omitted text patches or an ambiguous 300-file incremental compare. Bitbucket exhausts
+  with a self-managed/server base-URL override where the forge API supports it). GitHub
+  reconstructs full reviews from base/head file content after exhausting the declared
+  changed-file count, and rejects an ambiguous 300-file incremental compare. Bitbucket exhausts
   paginated diffstat and reconstructs bounded source content from the compared commits.
   Azure has no PR-diff endpoint, so it exhausts the authoritative change marker and
   reconstructs a unified diff from changed-file content with `similar`. The gate check is
   never `neutral`: an errored run is a failed gate unless `gate.onError: advisory`.
   GitLab full reviews require a collected diff version whose `real_size` matches the
-  exhausted paginated file count; incremental compares reject `compare_timeout`.
+  exhausted paginated file count, then reconstruct source from base/head content;
+  incremental compares reject `compare_timeout`.
 - `respond.rs`: interactive bot (`postil respond`): answers an @postil mention on a PR
   or issue, grounded in the diff/issue, and posts one reply. Review-and-answer only; it
   never opens PRs or pushes commits.

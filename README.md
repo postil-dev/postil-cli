@@ -22,6 +22,7 @@ Release binaries cover Linux x86_64 and ARM64 with glibc or musl, plus macOS on 
 
 ```sh
 export MODEL_API_KEY=...                 # OpenRouter is the default endpoint
+export REVIEW_MODEL=provider/qualified-model
 postil doctor                            # validate the endpoint and repository
 postil review --staged                   # review the staged change
 postil review --base origin/main         # review the branch
@@ -60,6 +61,7 @@ gate:
 ```
 
 Unknown keys are rejected. Repository configuration cannot redirect a deployment credential to another API host unless the operator explicitly permits that behavior.
+The CLI has no implicit model roster. Review and scorer models must be selected explicitly from models qualified by the benchmark.
 
 ## Documentation
 

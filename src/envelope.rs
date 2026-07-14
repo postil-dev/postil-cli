@@ -395,18 +395,60 @@ pub struct Usage {
     pub cost_micros: Option<u64>,
 }
 
-/// Token usage attributed to one provider model attempt. Entries include
-/// successful generation/scoring calls and failed attempts that returned
-/// provider usage, so hosted accounting can price the complete review.
+/// Token usage attributed to one provider call. Entries include successful
+/// generation/scoring calls and failed calls, so audit and hosted accounting
+/// preserve the exact call boundary instead of folding repairs and retries
+/// into a model-level total.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelUsage {
     pub model: String,
+    /// Product role that caused this provider call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<ModelUsageRole>,
+    /// Logical stage within the role.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<ModelUsagePhase>,
+    /// One-based provider HTTP call across this role/model invocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_ordinal: Option<u32>,
+    /// One-based transport attempt within the logical phase call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     /// Exact provider-billed cost when supplied by the endpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_micros: Option<u64>,
+    /// Explains whether cost came from the provider or is unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_source: Option<ModelUsageCostSource>,
+    /// False when the provider call returned no authoritative usage record.
+    #[serde(default)]
+    pub accounting_complete: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ModelUsageRole {
+    ReviewGenerator,
+    FindingScorer,
+    MentionResponder,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ModelUsagePhase {
+    Initial,
+    SchemaRepair,
+    SemanticRetry,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ModelUsageCostSource {
+    ProviderReported,
+    Unavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -414,6 +456,7 @@ pub struct ModelUsage {
 pub enum ModelIncidentPhase {
     Review,
     Scorer,
+    Respond,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -544,7 +587,7 @@ pub fn finding_blocks_gate(
 
 /// Path marker for synthetic unusable-output findings (the model answered but
 /// the output could not be validated). A malicious diff can induce this class
-/// via prompt injection, so it always fails the gate — even under
+/// via prompt injection, so it always fails the gate, even under
 /// `gate.onError: advisory`.
 pub const OPERATIONAL_PATH: &str = ".postil/model-output";
 

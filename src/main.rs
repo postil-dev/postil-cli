@@ -174,6 +174,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
         Command::Doctor { config } => {
             let cwd = std::env::current_dir()?;
             let cfg = Config::load(&cwd, config.as_deref())?;
+            cfg.require_model()?;
             let checks = doctor::run(&cfg).await?;
             Ok(if doctor::print_report(&checks) { 0 } else { 1 })
         }

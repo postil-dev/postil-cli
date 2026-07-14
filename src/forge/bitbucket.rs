@@ -6,7 +6,7 @@
 //! access token sent as a Bearer credential.
 //!
 //! Checks map to commit build statuses. Bitbucket has no `neutral`, so an
-//! operational error marks the gate `FAILED` — fail closed, never grey.
+//! operational error marks the gate `FAILED`: fail closed, never grey.
 //!
 //! Incremental diffs are disabled unless `POSTIL_ENABLE_BITBUCKET_INCREMENTAL=1`
 //! is present. Bitbucket's compare endpoint uses the opposite two-dot order from
@@ -66,7 +66,6 @@ struct PrResponse {
 
 #[derive(Deserialize)]
 struct DiffStatPage {
-    #[serde(default)]
     values: Vec<DiffStat>,
     #[serde(default)]
     next: Option<String>,
@@ -74,7 +73,6 @@ struct DiffStatPage {
 
 #[derive(Deserialize)]
 struct DiffStat {
-    #[serde(default)]
     status: String,
     #[serde(default)]
     old: Option<DiffStatFile>,
@@ -136,8 +134,9 @@ impl Bitbucket {
             return Ok(resp);
         }
         let request_id = super::response_request_id(&resp).unwrap_or_else(|| "none".into());
-        Err(anyhow!(
-            "Bitbucket {what} failed: {status} (request id {request_id})"
+        Err(super::http_failure(
+            status,
+            format!("Bitbucket {what} failed: {status} (request id {request_id})"),
         ))
     }
 
@@ -213,11 +212,26 @@ impl Bitbucket {
 
     async fn diffstat_pages(&self, initial_url: String) -> Result<Vec<DiffStat>> {
         const MAX_FILES: usize = 20_000;
+        const MAX_PAGES: usize = 200;
         let expected_origin =
             reqwest::Url::parse(&self.api_base).context("invalid Bitbucket API URL")?;
         let mut next = Some(initial_url);
         let mut entries = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        let mut retained_bytes = 0usize;
+        let mut pages = 0usize;
         while let Some(url) = next.take() {
+            pages = pages
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("Bitbucket diffstat page count overflowed"))?;
+            ensure!(
+                pages <= MAX_PAGES,
+                "Bitbucket diffstat exceeds {MAX_PAGES} pages"
+            );
+            ensure!(
+                visited.insert(url.clone()),
+                "Bitbucket diffstat pagination repeated a page URL"
+            );
             let parsed =
                 reqwest::Url::parse(&url).context("invalid Bitbucket diffstat next URL")?;
             ensure!(
@@ -240,6 +254,17 @@ impl Bitbucket {
                 !page.values.is_empty() || page.next.is_none(),
                 "Bitbucket diffstat pagination reported a next page without progress"
             );
+            for entry in &page.values {
+                validate_diffstat(entry)?;
+                retained_bytes = retained_bytes
+                    .checked_add(diffstat_retained_bytes(entry))
+                    .ok_or_else(|| anyhow!("Bitbucket diffstat metadata size overflowed"))?;
+            }
+            ensure!(
+                retained_bytes <= crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES,
+                "Bitbucket diffstat metadata exceeds the {} byte acquisition limit",
+                crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES
+            );
             entries.extend(page.values);
             ensure!(
                 entries.len() <= MAX_FILES,
@@ -251,7 +276,7 @@ impl Bitbucket {
     }
 
     async fn source_file(&self, commit: &str, path: &str) -> Result<(String, usize)> {
-        const MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
+        const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
         validate_commit(commit)?;
         ensure!(
             !path.starts_with('/')
@@ -324,25 +349,33 @@ impl Bitbucket {
         }
         Ok(output)
     }
+}
 
-    #[cfg(debug_assertions)]
-    fn is_loopback_test_api(&self) -> bool {
-        reqwest::Url::parse(&self.api_base)
-            .ok()
-            .and_then(|url| url.host_str().map(str::to_string))
-            .and_then(|host| host.parse::<std::net::IpAddr>().ok())
-            .is_some_and(|address| address.is_loopback())
-    }
+fn diffstat_retained_bytes(entry: &DiffStat) -> usize {
+    entry.status.len()
+        + entry.old.as_ref().map_or(0, |file| file.path.len())
+        + entry.new.as_ref().map_or(0, |file| file.path.len())
+}
 
-    #[cfg(debug_assertions)]
-    async fn test_raw_diff(&self, path: &str, context: &str) -> Result<String> {
-        let response = self
-            .request(reqwest::Method::GET, self.url(path))
-            .send()
-            .await
-            .with_context(|| format!("fetching {context}"))?;
-        super::bounded_response_text(Self::check_ok(response, context).await?, context).await
+fn validate_diffstat(entry: &DiffStat) -> Result<()> {
+    ensure!(
+        matches!(
+            entry.status.to_ascii_lowercase().as_str(),
+            "added" | "removed" | "modified" | "renamed"
+        ),
+        "Bitbucket diffstat returned an unsupported status"
+    );
+    ensure!(
+        entry.old.is_some() || entry.new.is_some(),
+        "Bitbucket diffstat entry has no file"
+    );
+    for file in entry.old.iter().chain(entry.new.iter()) {
+        ensure!(
+            super::valid_repository_path(&file.path),
+            "Bitbucket diffstat returned an unsafe repository path"
+        );
     }
+    Ok(())
 }
 
 fn encode_path(path: &str) -> String {
@@ -396,12 +429,6 @@ impl Forge for Bitbucket {
     }
 
     async fn fetch_diff(&self) -> Result<String> {
-        #[cfg(debug_assertions)]
-        if self.is_loopback_test_api() {
-            return self
-                .test_raw_diff(&format!("/pullrequests/{}/diff", self.pr), "test PR diff")
-                .await;
-        }
         let pr = self.pr_meta().await?;
         self.build_complete_diff(
             &pr.destination.commit.hash,
@@ -418,15 +445,6 @@ impl Forge for Bitbucket {
                  not been verified for this deployment; set {ENABLE_INCREMENTAL_ENV}=1 only \
                  after validating /diff/{{head}}..{{since}} against the target Bitbucket API"
             ));
-        }
-        #[cfg(debug_assertions)]
-        if self.is_loopback_test_api() {
-            return self
-                .test_raw_diff(
-                    &format!("/diff/{head_sha}..{since_sha}"),
-                    "test compare diff",
-                )
-                .await;
         }
         validate_commit(since_sha)?;
         validate_commit(head_sha)?;

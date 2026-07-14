@@ -8,7 +8,7 @@
 // the full forge pipeline (diff fetch, check-runs, review posting).
 //
 //   POSTIL_BENCH_MODE=live \
-//   POSTIL_BENCH_MODELS=deepseek/deepseek-v4-pro,moonshotai/kimi-k2.6 \
+//   POSTIL_BENCH_MODELS=provider/candidate-a,provider/candidate-b \
 //   MODEL_API_KEY=...  bun run bench --json-out report.json
 //
 // The key is read from MODEL_API_KEY, LLM_API_KEY, OPENROUTER_API_KEY, or
@@ -218,7 +218,7 @@ async function runLiveModelCase(
     stderr = out.stderr;
   } catch (err) {
     // Exit 1 with a valid envelope is the gate failing on an error-severity
-    // finding, not a transport failure — keep stdout and score it.
+    // finding, not a transport failure; keep stdout and score it.
     const e = err as { code?: unknown; stdout?: string; stderr?: string; message?: string };
     exitCode = typeof e.code === "number" ? e.code : undefined;
     stdout = e.stdout ?? "";
@@ -317,7 +317,7 @@ async function fetchPricing(
 
 export function formatLiveModelsReport(report: LiveModelsReport): string {
   const lines: string[] = [
-    `postil bench (LIVE-MODELS mode) — CLI ${report.cliVersion}, endpoint ${report.apiBase}`,
+    `postil bench (LIVE-MODELS mode): CLI ${report.cliVersion}, endpoint ${report.apiBase}`,
     "",
   ];
   const header = [
@@ -386,7 +386,7 @@ async function assertBinary(binary: string): Promise<void> {
     .catch(() => false);
   if (!ok) {
     throw new Error(
-      `postil binary not found at ${binary} — build it first: cargo build --quiet --release ` +
+      `postil binary not found at ${binary}; build it first: cargo build --quiet --release ` +
         `(or point POSTIL_BIN at a binary)`,
     );
   }

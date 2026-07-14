@@ -19,6 +19,7 @@ use crate::envelope::{Kind, Severity};
 
 const MODEL_DEFAULTS_TOML: &str = include_str!("../config.toml");
 pub const DEFAULT_API_BASE: &str = "https://openrouter.ai/api/v1";
+pub const MAX_FINDINGS: usize = 20;
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -108,17 +109,30 @@ fn parse_model_defaults(raw: &str) -> Result<ModelDefaults> {
         file.version > 0,
         "model defaults version must be greater than zero"
     );
-    validate_model_id("defaultModel", &file.default_model)?;
-    anyhow::ensure!(!file.cascade.is_empty(), "cascade must not be empty");
+    if !file.default_model.is_empty() {
+        validate_model_id("defaultModel", &file.default_model)?;
+    } else {
+        anyhow::ensure!(
+            file.cascade.is_empty(),
+            "cascade must be empty when defaultModel is empty"
+        );
+    }
     for model in &file.cascade {
         validate_model_id("cascade entries", model)?;
     }
-    validate_model_id("scorer.defaultModel", &file.scorer.default_model)?;
-    validate_model_id("scorer.fallback", &file.scorer.fallback)?;
-    anyhow::ensure!(
-        !file.scorer.qualification_candidates.is_empty(),
-        "scorer.qualificationCandidates must not be empty"
-    );
+    if !file.scorer.default_model.is_empty() {
+        validate_model_id("scorer.defaultModel", &file.scorer.default_model)?;
+    } else {
+        anyhow::ensure!(
+            !file.scorer.enabled
+                && file.scorer.fallback.is_empty()
+                && file.scorer.qualification_candidates.is_empty(),
+            "scorer configuration must be empty when scorer.defaultModel is empty"
+        );
+    }
+    if !file.scorer.fallback.is_empty() {
+        validate_model_id("scorer.fallback", &file.scorer.fallback)?;
+    }
     for model in &file.scorer.qualification_candidates {
         validate_model_id("scorer.qualificationCandidates entries", model)?;
     }
@@ -180,7 +194,7 @@ pub enum OnError {
     Block,
     /// Provider outage passes the gate (advisory only): an outage does not
     /// freeze every merge in the org; the review check goes neutral. Unusable
-    /// model output still blocks — that class is attacker-influenceable.
+    /// model output still blocks because that class is attacker-influenceable.
     Advisory,
 }
 
@@ -417,7 +431,7 @@ impl Config {
     }
 
     pub fn apply_file(&mut self, f: FileConfig) -> Result<()> {
-        self.apply_file_inner(f, allow_config_api_base(), hosted_mode())
+        self.apply_file_inner(f, allow_config_api_base(), repository_model_config_locked())
     }
 
     /// Core of [`apply_file`]. `allow_api_base` decides whether a
@@ -445,6 +459,10 @@ impl Config {
             self.min_confidence = v;
         }
         if let Some(v) = f.max_findings {
+            anyhow::ensure!(
+                (1..=MAX_FINDINGS).contains(&v),
+                "maxFindings must be in 1..={MAX_FINDINGS}"
+            );
             self.max_findings = v;
         }
         if let Some(r) = f.reviewer {
@@ -617,38 +635,40 @@ impl Config {
 
     /// All models to try, in order, deduplicated.
     pub fn model_chain(&self) -> Vec<String> {
-        let mut chain = vec![self.model.clone()];
+        let mut chain = Vec::new();
+        if !self.model.trim().is_empty() {
+            chain.push(self.model.clone());
+        }
         for m in &self.cascade {
-            if !chain.contains(m) {
+            if !m.trim().is_empty() && !chain.contains(m) {
                 chain.push(m.clone());
             }
         }
         chain
     }
 
+    pub fn require_model(&self) -> Result<()> {
+        self.require_model_for(hosted_mode())
+    }
+
+    fn require_model_for(&self, hosted: bool) -> Result<()> {
+        anyhow::ensure!(
+            !hosted,
+            "hosted inference has no admitted model; configure BYOK or local inference instead"
+        );
+        anyhow::ensure!(
+            !self.model_chain().is_empty(),
+            "no review model is configured; pass --model, set REVIEW_MODEL, or set model.name in a trusted local config"
+        );
+        Ok(())
+    }
+
     /// Scorer models to try, in order, deduplicated.
     pub fn scorer_chain(&self) -> Vec<String> {
-        if !self.scorer_enabled {
+        if !self.scorer_enabled || !self.scorer_explicit || self.scorer.trim().is_empty() {
             return Vec::new();
         }
-        if self.api_format == ApiFormat::Anthropic {
-            let defaults = model_defaults();
-            return if self.scorer.starts_with("claude-")
-                || (self.scorer_explicit
-                    && self.scorer != defaults.scorer_model
-                    && self.scorer != defaults.scorer_fallback)
-            {
-                vec![self.scorer.clone()]
-            } else {
-                Vec::new()
-            };
-        }
-        let mut chain = vec![self.scorer.clone()];
-        let defaults = model_defaults();
-        if defaults.scorer_enabled && !chain.contains(&defaults.scorer_fallback) {
-            chain.push(defaults.scorer_fallback.clone());
-        }
-        chain
+        vec![self.scorer.clone()]
     }
 
     pub fn scorer_enabled(&self) -> bool {
@@ -674,6 +694,13 @@ fn hosted_mode() -> bool {
     std::env::var("POSTIL_HOSTED_MODE")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
+}
+
+fn repository_model_config_locked() -> bool {
+    hosted_mode()
+        || std::env::var("POSTIL_IGNORE_REPOSITORY_MODEL_CONFIG")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
 }
 
 fn find_first(root: &Path, names: &[&str]) -> Option<PathBuf> {
@@ -710,7 +737,7 @@ gate:
   failOn: error           # the postil/gate check fails at/above: info | warn | error | never
   blockOnKinds:           # kinds that block regardless of severity; humanEscalation requires confidence >= 0.30
     - humanEscalation     # genuine owner/product decisions only; concrete bugs remain risk
-  # onError: block          # block (default, fail closed) | advisory — gate outcome when
+  # onError: block          # block (default, fail closed) | advisory: gate outcome when
   #                         # the review itself errors (model outage). advisory keeps an
   #                         # outage from freezing merges; the review check goes neutral, not green.
 
@@ -751,7 +778,7 @@ pub fn starter_config() -> &'static str {
 /// (see [`Config::content_policy`]). Scoped to human-readable prose only:
 /// comments, docstrings, Markdown, and PR title/body, never code logic,
 /// identifiers, or structured data. Kept conservative and low-noise on
-/// purpose — this augments, it does not replace, Postil's core "silence is
+/// purpose. This augments, rather than replacing, Postil's core "silence is
 /// the correct output for most diffs" stance.
 pub const BUILTIN_CONTENT_POLICY: &str = "\
 1. Fabricated or contradicted claims (report at error). A changed comment, \
@@ -908,14 +935,7 @@ qualification_candidates = ["example/scorer"]
                  default_model = \"\"\n\
                  cascade = [\"example/fallback\"]\n\
                  scorer = { enabled = false, default_model = \"example/scorer\", fallback = \"example/scorer-fallback\", qualification_candidates = [\"example/scorer\"] }\n",
-                "defaultModel must not be empty",
-            ),
-            (
-                "version = 1\n\
-                 default_model = \"example/model\"\n\
-                 cascade = []\n\
-                 scorer = { enabled = false, default_model = \"example/scorer\", fallback = \"example/scorer-fallback\", qualification_candidates = [\"example/scorer\"] }\n",
-                "cascade must not be empty",
+                "cascade must be empty when defaultModel is empty",
             ),
             (
                 "version = 1\n\
@@ -929,14 +949,7 @@ qualification_candidates = ["example/scorer"]
                  default_model = \"example/model\"\n\
                  cascade = [\"example/fallback\"]\n\
                  scorer = { enabled = false, default_model = \"\", fallback = \"example/scorer-fallback\", qualification_candidates = [\"example/scorer\"] }\n",
-                "scorer.defaultModel must not be empty",
-            ),
-            (
-                "version = 1\n\
-                 default_model = \"example/model\"\n\
-                 cascade = [\"example/fallback\"]\n\
-                 scorer = { enabled = false, default_model = \"example/scorer\", fallback = \"\", qualification_candidates = [\"example/scorer\"] }\n",
-                "scorer.fallback must not be empty",
+                "scorer configuration must be empty when scorer.defaultModel is empty",
             ),
         ];
         for (raw, expected) in cases {
@@ -958,18 +971,12 @@ qualification_candidates = ["example/scorer"]
     }
 
     #[test]
-    fn provider_guide_mentions_embedded_defaults() {
+    fn provider_guide_requires_qualified_explicit_models() {
         let readme = include_str!("../README.md");
         assert!(readme.contains("docs/model-providers.md"));
         let provider_guide = include_str!("../docs/model-providers.md");
-        let defaults = model_defaults();
-        assert!(provider_guide.contains(&defaults.default_model));
-        for model in &defaults.cascade {
-            assert!(provider_guide.contains(model));
-        }
-        for model in &defaults.scorer_qualification_candidates {
-            assert!(provider_guide.contains(model));
-        }
+        assert!(provider_guide.contains("no implicit model or fallback chain"));
+        assert!(provider_guide.contains("qualification manifest"));
     }
 
     #[test]
@@ -984,7 +991,22 @@ qualification_candidates = ["example/scorer"]
     }
 
     #[test]
-    fn defaults_keep_primary_and_retry_roster_order() {
+    fn max_findings_is_bounded_for_scorer_admission() {
+        let mut accepted = Config::default();
+        let file: FileConfig = serde_yaml::from_str("maxFindings: 20\n").unwrap();
+        accepted.apply_file(file).unwrap();
+        assert_eq!(accepted.max_findings, MAX_FINDINGS);
+
+        for value in [0, 21, usize::MAX] {
+            let mut rejected = Config::default();
+            let file: FileConfig =
+                serde_yaml::from_str(&format!("maxFindings: {value}\n")).unwrap();
+            assert!(rejected.apply_file(file).is_err());
+        }
+    }
+
+    #[test]
+    fn defaults_require_an_explicit_model_roster() {
         let c = Config::default();
         let defaults = model_defaults();
         assert_eq!(c.model, defaults.default_model);
@@ -992,14 +1014,7 @@ qualification_candidates = ["example/scorer"]
         assert_eq!(c.scorer, defaults.scorer_model);
         assert!(!c.scorer_enabled);
         assert!(c.scorer_chain().is_empty());
-        assert_eq!(
-            c.model_chain(),
-            vec![
-                "mistralai/mistral-small-3.2-24b-instruct",
-                "google/gemma-3-27b-it",
-                "qwen/qwen3-32b",
-            ]
-        );
+        assert!(c.model_chain().is_empty());
     }
 
     #[test]
@@ -1060,7 +1075,7 @@ qualification_candidates = ["example/scorer"]
     }
 
     #[test]
-    fn hosted_mode_ignores_the_complete_repository_model_section() {
+    fn trusted_runtime_can_ignore_the_complete_repository_model_section() {
         let f: FileConfig = serde_yaml::from_str(
             "model:\n  name: anthropic/claude-opus-4.1\n  cascade:\n    - attacker/fallback\n  scorer: anthropic/claude-haiku-4.5\n  apiBase: https://attacker.invalid/v1\n  apiFormat: anthropic\n  consensus: 3\n",
         )
@@ -1076,6 +1091,19 @@ qualification_candidates = ["example/scorer"]
         assert_eq!(config.api_base, DEFAULT_API_BASE);
         assert_eq!(config.api_format, ApiFormat::OpenaiCompatible);
         assert_eq!(config.consensus, 1);
+    }
+
+    #[test]
+    fn empty_and_hosted_model_admission_fail_closed() {
+        let empty = Config::default();
+        assert!(empty.require_model_for(false).is_err());
+
+        let explicit = Config {
+            model: "provider/qualified-model".to_string(),
+            ..Config::default()
+        };
+        explicit.require_model_for(false).unwrap();
+        assert!(explicit.require_model_for(true).is_err());
     }
 
     #[test]
@@ -1103,19 +1131,13 @@ qualification_candidates = ["example/scorer"]
     }
 
     #[test]
-    fn hosted_roster_contains_no_anthropic_models() {
+    fn hosted_roster_is_empty_until_qualification_admits_models() {
         let defaults = model_defaults();
-        let hosted_models = std::iter::once(&defaults.default_model)
-            .chain(defaults.cascade.iter())
-            .chain(std::iter::once(&defaults.scorer_model))
-            .chain(std::iter::once(&defaults.scorer_fallback))
-            .chain(defaults.scorer_qualification_candidates.iter());
-        for model in hosted_models {
-            assert!(
-                !model.to_ascii_lowercase().starts_with("anthropic/"),
-                "hosted model roster contains Anthropic model {model}"
-            );
-        }
+        assert!(defaults.default_model.is_empty());
+        assert!(defaults.cascade.is_empty());
+        assert!(defaults.scorer_model.is_empty());
+        assert!(defaults.scorer_fallback.is_empty());
+        assert!(defaults.scorer_qualification_candidates.is_empty());
     }
 
     #[test]

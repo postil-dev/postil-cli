@@ -1,7 +1,7 @@
 //! GitLab forge implementation (gitlab.com and self-managed via GITLAB_API_URL).
 //!
 //! Check semantics map to commit statuses: GitLab has no `neutral`, so an
-//! operational error marks both statuses `failed` — fail closed, never grey.
+//! operational error marks both statuses `failed`: fail closed, never grey.
 
 use anyhow::{Context, Result, anyhow, ensure};
 use serde::Deserialize;
@@ -37,20 +37,18 @@ struct MrResponse {
 struct FileDiffItem {
     old_path: String,
     new_path: String,
+    #[cfg(test)]
     diff: String,
-    #[serde(default)]
     new_file: bool,
-    #[serde(default)]
     deleted_file: bool,
-    #[serde(default)]
+    #[cfg(test)]
     collapsed: bool,
-    #[serde(default)]
+    #[cfg(test)]
     too_large: bool,
 }
 
 #[derive(Deserialize)]
 struct CompareResponse {
-    #[serde(default)]
     compare_timeout: bool,
     diffs: Vec<FileDiffItem>,
 }
@@ -95,8 +93,9 @@ impl GitLab {
             return Ok(resp);
         }
         let request_id = super::response_request_id(&resp).unwrap_or_else(|| "none".into());
-        Err(anyhow!(
-            "GitLab {what} failed: {status} (request id {request_id})"
+        Err(super::http_failure(
+            status,
+            format!("GitLab {what} failed: {status} (request id {request_id})"),
         ))
     }
 
@@ -112,6 +111,7 @@ impl GitLab {
         super::bounded_response_json(Self::check_ok(resp, "MR fetch").await?, "GitLab MR").await
     }
 
+    #[cfg(test)]
     fn append_unified(out: &mut String, items: &[FileDiffItem]) -> Result<()> {
         for item in items {
             if item.collapsed || item.too_large {
@@ -145,18 +145,94 @@ impl GitLab {
         Ok(())
     }
 
+    #[cfg(test)]
     fn assemble_unified(items: &[FileDiffItem]) -> Result<String> {
         let mut out = String::new();
         Self::append_unified(&mut out, items)?;
         Ok(out)
     }
 
+    #[cfg(test)]
     fn assemble_compare(compare: CompareResponse) -> Result<String> {
         ensure!(
             !compare.compare_timeout,
             "GitLab compare timed out or exceeded provider limits"
         );
         Self::assemble_unified(&compare.diffs)
+    }
+
+    async fn source_file(&self, revision: &str, path: &str) -> Result<(String, usize)> {
+        const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
+        ensure!(
+            super::valid_repository_path(path),
+            "GitLab returned an unsafe repository path"
+        );
+        let mut url = reqwest::Url::parse(
+            &self.url(&format!("/repository/files/{}/raw", encode_component(path))),
+        )
+        .context("building GitLab source URL")?;
+        url.query_pairs_mut().append_pair("ref", revision);
+        let response = self
+            .request(reqwest::Method::GET, url.to_string())
+            .send()
+            .await
+            .context("fetching GitLab source file")?;
+        let mut response = Self::check_ok(response, "source file fetch").await?;
+        let bytes = super::bounded_response_bytes_with_limit(
+            &mut response,
+            "GitLab source file",
+            MAX_FILE_BYTES,
+        )
+        .await?;
+        let byte_count = bytes.len();
+        Ok((
+            String::from_utf8(bytes).unwrap_or_else(|_| "\0".to_string()),
+            byte_count,
+        ))
+    }
+
+    async fn build_complete_diff(
+        &self,
+        items: Vec<FileDiffItem>,
+        base_sha: &str,
+        head_sha: &str,
+    ) -> Result<String> {
+        let mut output = String::new();
+        let mut acquired = 0usize;
+        for item in items {
+            ensure!(
+                super::valid_repository_path(&item.old_path)
+                    && super::valid_repository_path(&item.new_path),
+                "GitLab returned an unsafe repository path"
+            );
+            let (old, old_bytes) = if item.new_file {
+                (String::new(), 0)
+            } else {
+                self.source_file(base_sha, &item.old_path).await?
+            };
+            acquired = checked_acquired_bytes(acquired, old_bytes)?;
+            let (new, new_bytes) = if item.deleted_file {
+                (String::new(), 0)
+            } else {
+                self.source_file(head_sha, &item.new_path).await?
+            };
+            acquired = checked_acquired_bytes(acquired, new_bytes)?;
+            let section = super::azure::diff_section(
+                &item.new_path,
+                &old,
+                &new,
+                item.new_file,
+                item.deleted_file,
+            );
+            ensure!(
+                output.len().saturating_add(section.len())
+                    <= crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES,
+                "GitLab reconstructed diff exceeds the {} byte acquisition limit",
+                crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES
+            );
+            output.push_str(&section);
+        }
+        Ok(output)
     }
 
     fn validate_diff_version(version: &DiffVersion, item_count: usize) -> Result<()> {
@@ -269,6 +345,30 @@ impl GitLab {
     }
 }
 
+fn encode_component(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (byte as char).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
+}
+
+fn checked_acquired_bytes(current: usize, additional: usize) -> Result<usize> {
+    let total = current
+        .checked_add(additional)
+        .ok_or_else(|| anyhow!("GitLab source acquisition size overflowed"))?;
+    ensure!(
+        total <= crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES,
+        "GitLab source acquisition exceeds the {} byte limit",
+        crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES
+    );
+    Ok(total)
+}
+
 impl Forge for GitLab {
     fn rich_markdown(&self) -> bool {
         true
@@ -289,6 +389,7 @@ impl Forge for GitLab {
         const MAX_PAGES: usize = 100;
         const MAX_ITEMS: usize = 10_000;
         let version = self.latest_diff_version().await?;
+        let mr = self.mr().await?;
         let expected_items: usize = version
             .real_size
             .parse()
@@ -297,7 +398,8 @@ impl Forge for GitLab {
             expected_items <= MAX_ITEMS,
             "GitLab diff version exceeds {MAX_ITEMS} files"
         );
-        let mut out = String::new();
+        let mut items = Vec::with_capacity(expected_items);
+        let mut retained_bytes = 0usize;
         let mut item_count = 0usize;
         let mut page = 1usize;
         loop {
@@ -323,11 +425,12 @@ impl Forge for GitLab {
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_string);
             let page_text = super::bounded_response_text(checked, "GitLab diff page").await?;
+            retained_bytes = retained_bytes
+                .checked_add(page_text.len())
+                .ok_or_else(|| anyhow!("GitLab diff page size overflowed"))?;
             ensure!(
-                out.len().saturating_add(page_text.len())
-                    <= crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES,
-                "GitLab diff pages exceed the {} byte aggregate acquisition limit",
-                crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES
+                retained_bytes <= crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES,
+                "GitLab diff pages exceed the aggregate acquisition limit"
             );
             let batch: Vec<FileDiffItem> =
                 serde_json::from_str(&page_text).context("decoding GitLab diff page")?;
@@ -338,7 +441,7 @@ impl Forge for GitLab {
             );
             let batch_len = batch.len();
             item_count = item_count.saturating_add(batch_len);
-            Self::append_unified(&mut out, &batch)?;
+            items.extend(batch);
             match next_page.as_deref() {
                 Some("") => break,
                 Some(next) => {
@@ -356,7 +459,8 @@ impl Forge for GitLab {
             }
         }
         Self::validate_diff_version(&version, item_count)?;
-        Ok(out)
+        self.build_complete_diff(items, &mr.diff_refs.base_sha, &mr.diff_refs.head_sha)
+            .await
     }
 
     async fn fetch_diff_since(&self, since_sha: &str, head_sha: &str) -> Result<String> {
@@ -375,7 +479,12 @@ impl Forge for GitLab {
             "GitLab compare diff",
         )
         .await?;
-        Self::assemble_compare(cmp)
+        ensure!(
+            !cmp.compare_timeout,
+            "GitLab compare timed out or exceeded provider limits"
+        );
+        self.build_complete_diff(cmp.diffs, since_sha, head_sha)
+            .await
     }
 
     async fn post_review(

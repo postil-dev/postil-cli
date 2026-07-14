@@ -1,6 +1,6 @@
 //! Forge abstraction: everything Postil needs from a code host.
 //!
-//! Ships GitHub, GitLab, Bitbucket, and Azure DevOps — each covering its
+//! Ships GitHub, GitLab, Bitbucket, and Azure DevOps. Each covers its
 //! self-managed/server variant through a custom base-URL environment variable.
 
 pub mod azure;
@@ -13,6 +13,71 @@ use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 
 use crate::envelope::{Envelope, Finding, Severity, SuppressionReason};
+
+#[derive(Debug)]
+pub struct ForgeServiceFailure(pub String);
+
+impl std::fmt::Display for ForgeServiceFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ForgeServiceFailure {}
+
+#[derive(Debug)]
+pub struct IncompleteReviewInput;
+
+impl std::fmt::Display for IncompleteReviewInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("review input was incomplete or malformed")
+    }
+}
+
+impl std::error::Error for IncompleteReviewInput {}
+
+pub fn service_failure(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(ForgeServiceFailure(message.into()))
+}
+
+pub fn http_failure(status: reqwest::StatusCode, message: impl Into<String>) -> anyhow::Error {
+    let message = message.into();
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+        service_failure(message)
+    } else {
+        anyhow::anyhow!(message)
+    }
+}
+
+pub fn classify_review_input_error(error: anyhow::Error) -> anyhow::Error {
+    let service_failure = error.chain().any(|cause| {
+        cause.downcast_ref::<ForgeServiceFailure>().is_some()
+            || cause
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(|error| error.is_connect() || error.is_timeout())
+    });
+    if service_failure {
+        error
+    } else {
+        error.context(IncompleteReviewInput)
+    }
+}
+
+pub fn is_incomplete_review_input(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<IncompleteReviewInput>().is_some()
+        || error
+            .chain()
+            .any(|cause| cause.downcast_ref::<IncompleteReviewInput>().is_some())
+}
+
+pub fn valid_repository_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.starts_with('/')
+        && !path.contains('\0')
+        && path
+            .split('/')
+            .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
+}
 
 pub async fn bounded_response_text(
     mut response: reqwest::Response,
@@ -157,7 +222,7 @@ pub struct PrMeta {
 /// Check conclusions, mapped per-forge. Postil semantics:
 /// - advisory check (`postil/review`): success unless the run itself failed.
 /// - gate check (`postil/gate`): failure iff gate-level findings exist (or the
-///   run failed — fail closed). Never `neutral` for the gate: a grey square
+///   run failed, so fail closed). Never `neutral` for the gate: a grey square
 ///   that reads as "didn't fail" is the GitHub Copilot mistake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckState {
@@ -195,7 +260,7 @@ pub trait Forge {
     async fn fetch_diff(&self) -> Result<String>;
     /// Unified diff covering `since_sha..head_sha` only (incremental reviews).
     /// `head_sha` is the SHA the caller is reviewing, not whatever the PR's
-    /// head happens to be at fetch time — a later push must not widen the diff.
+    /// head happens to be at fetch time. A later push must not widen the diff.
     async fn fetch_diff_since(&self, since_sha: &str, head_sha: &str) -> Result<String>;
     /// Post the batched review: one summary plus inline comments per finding.
     async fn post_review(&self, summary: &str, findings: &[Finding], head_sha: &str) -> Result<()>;
@@ -716,6 +781,23 @@ pub fn format_confidence(c: f64) -> String {
 mod tests {
     use super::*;
     use crate::envelope::{Kind, Severity};
+
+    #[test]
+    fn only_typed_service_failures_remain_advisory_eligible() {
+        let outage = classify_review_input_error(service_failure("upstream unavailable"));
+        assert!(!is_incomplete_review_input(&outage));
+
+        let malformed = classify_review_input_error(anyhow::anyhow!(
+            "forge returned truncated pagination metadata"
+        ));
+        assert!(is_incomplete_review_input(&malformed));
+
+        let unauthorized = classify_review_input_error(http_failure(
+            reqwest::StatusCode::UNAUTHORIZED,
+            "forge rejected credentials",
+        ));
+        assert!(is_incomplete_review_input(&unauthorized));
+    }
 
     fn finding() -> Finding {
         Finding {

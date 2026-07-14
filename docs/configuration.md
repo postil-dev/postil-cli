@@ -17,7 +17,7 @@ ignore:
   - "**/dist/**"
 severityThreshold: info       # info, warn, or error
 minConfidence: 0.6
-maxFindings: 20
+maxFindings: 20              # 1..20; bounds scorer and publication work
 reviewer:
   tone: "direct, specific, no praise, no filler"
   focus: [security, concurrency]
@@ -29,11 +29,9 @@ gate:
 contentPolicy:
   enabled: true
 model:
-  name: mistralai/mistral-small-3.2-24b-instruct
-  cascade:
-    - google/gemma-3-27b-it
-    - qwen/qwen3-32b
-  # scorer: provider/model       # explicit opt-in
+  name: provider/qualified-model
+  cascade: []                    # qualified fallbacks only
+  # scorer: provider/qualified-scorer
   consensus: 1
 ```
 
@@ -49,6 +47,7 @@ Place organization-specific merge rules in `.postil/guardrails.md`. Place additi
 | `POSTIL_ENDPOINT_AUTH_HEADER`, `POSTIL_ENDPOINT_AUTH_VALUE` | Additional private-gateway authentication |
 | `POSTIL_ALLOW_PRIVATE_API_BASE` | Explicitly permit a local or private-network endpoint |
 | `POSTIL_ALLOW_CONFIG_API_BASE` | Honor a repository-controlled `model.apiBase` |
+| `POSTIL_IGNORE_REPOSITORY_MODEL_CONFIG` | Keep trusted local/hosted model selection independent of repository model fields |
 | `REVIEW_MODEL` | Primary model override |
 | `REVIEW_MODEL_CASCADE` | Comma-separated fallback models |
 | `REVIEW_SCORER_MODEL` | Scorer model override |

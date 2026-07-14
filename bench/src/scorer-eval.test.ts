@@ -115,13 +115,11 @@ describe("parseModels", () => {
     expect(parseModels(" a/model, ,b/model,a/model ", [])).toEqual(["a/model", "b/model"]);
   });
 
-  test("loads disabled non-Anthropic candidates from the embedded config and matches workflow defaults", async () => {
+  test("keeps the embedded scorer roster empty until qualification admits a model", async () => {
     const defaults = await loadEmbeddedScorerDefaults();
     expect(defaults.enabled).toBe(false);
-    expect(defaults.qualification_candidates.length).toBeGreaterThan(0);
-    expect(defaults.qualification_candidates.every((model) => !model.startsWith("anthropic/"))).toBe(true);
-    const workflow = await Bun.file(new URL("../../.github/workflows/bench-live.yml", import.meta.url)).text();
-    expect(workflow).toContain(defaults.qualification_candidates.join(","));
+    expect(defaults.qualification_candidates).toEqual([]);
+    expect(parseModels(undefined, defaults.qualification_candidates)).toEqual([]);
   });
 });
 
