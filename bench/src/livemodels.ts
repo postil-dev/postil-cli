@@ -60,13 +60,23 @@ const execFile = promisify(execFileCb);
 export const DEFAULT_API_BASE = "https://openrouter.ai/api/v1";
 
 export const REVIEW_CONTRACT_SOURCE_PATHS = [
+  "Cargo.toml", "Cargo.lock",
+  "src/api_key.rs", "src/cli.rs", "src/config.rs", "src/doctor.rs",
+  "src/forge/azure.rs", "src/forge/bitbucket.rs", "src/forge/github.rs",
+  "src/forge/gitlab.rs", "src/forge/mod.rs", "src/hook.rs", "src/lib.rs", "src/local.rs", "src/main.rs",
+  "src/output.rs", "src/plan.rs",
   "src/prompt.rs",
   "src/llm.rs",
   "src/envelope.rs",
+  "src/respond.rs", "src/review.rs", "src/sarif.rs",
   "src/diff.rs",
   "src/filter.rs",
 ] as const;
 export const FIXTURE_SET_SOURCE_PATHS = ["bench/fixtures/cases.ts"] as const;
+export const EVALUATOR_CONTRACT_SOURCE_PATHS = [
+  "bench/fixtures/cases.ts", "bench/src/api-key.ts", "bench/src/harness.ts",
+  "bench/src/livemodels-score.ts", "bench/src/livemodels.ts", "bench/src/run.ts",
+] as const;
 
 /** Cases in flight at once. Live inference is provider-I/O-bound; a modest pool
  * cuts wall-clock time without hammering the API. */
@@ -106,14 +116,17 @@ export interface LiveModelsReport {
   apiBase: string;
   apiFormat: "openai-compatible" | "anthropic";
   providerEndpointIdentity: string;
+  upstreamProviderPinned: false;
+  upstreamProviderIdentity: null;
   fixtureHash: string;
   reviewContractHash: string;
+  evaluatorContractHash: string;
   configHash: string;
   cliBinaryHash: string;
   evidenceHash: string;
   repeats: number;
   profiles: QualificationProfile[];
-  manifestCandidate: AdmissionManifestCandidate;
+  manifestCandidate?: AdmissionManifestCandidate;
   passed: boolean;
   /** The exact per-model schema the site consumes. */
   models: SiteModelAggregate[];
@@ -126,6 +139,18 @@ export interface LiveModelsReport {
   cases: LiveModelCaseResult[];
 }
 
+export interface BinaryQualificationMetadata {
+  modelDefaultsSha256: string;
+  reviewContractSha256: string;
+  fixtureSetSha256: string;
+  evaluatorContractSha256: string;
+  defaultApiBase: string;
+  defaultApiFormat: "openai-compatible" | "anthropic";
+  generatorChain: string[];
+  consensus: number;
+  scorerChain: string[];
+}
+
 export interface QualificationProfile {
   id: string;
   apiBase: string;
@@ -135,6 +160,7 @@ export interface QualificationProfile {
   scorerModels: string[];
   fixtureHash: string;
   reviewContractHash: string;
+  evaluatorContractHash: string;
   configHash: string;
   cliBinaryHash: string;
   repeats: number;
@@ -152,6 +178,7 @@ export interface AdmissionManifestCandidate {
     apiFormat: "openai-compatible" | "anthropic";
     reviewContractSha256: string;
     fixtureSetSha256: string;
+    evaluatorContractSha256: string;
     reportSha256: string;
     repeatedRuns: number;
   }>;
@@ -173,7 +200,7 @@ export async function runLiveModels(
     throw new Error("qualification repeats must be an integer in 1..10");
   }
   const costCapUsd = options.costCapUsd ?? MAX_GENERATOR_COST_CAP_USD;
-  validateGeneratorQualificationBounds(pairs.map((pair) => pair.generatorModel), costCapUsd);
+  validateGeneratorQualificationBounds(models, costCapUsd);
   if (!resolveApiKeyName()) {
     throw new Error(
       `live mode needs a real model key: set ${API_KEY_ENV_NAMES_TEXT} in the ` +
@@ -184,21 +211,38 @@ export async function runLiveModels(
   const apiBase = normalizeApiBase(options.apiBase ?? DEFAULT_API_BASE);
   const apiFormat = options.apiFormat ?? "openai-compatible";
   const rootDir = options.rootDir ?? resolve(import.meta.dir, "..", ".runs", "live-models");
-  const pricing = options.pricing ?? (await fetchPricing(apiBase, models));
-  assertPairQualificationPreflight({
-    diffs: Array.from({ length: repeats }, () => cases.map((candidate) => candidate.diff)).flat(),
-    pairs,
-    pricing,
-    costCapUsd,
-  });
+  const suppliedPricing = options.pricing;
+  if (suppliedPricing !== undefined) {
+    assertPairQualificationPreflight({
+      diffs: Array.from({ length: repeats }, () => cases.map((candidate) => candidate.diff)).flat(),
+      pairs,
+      pricing: suppliedPricing,
+      costCapUsd,
+    });
+  }
   await assertBinary(options.binary);
   const repositoryRoot = resolve(import.meta.dir, "..", "..");
-  const [fixtureHash, reviewContractHash, configHash, cliBinaryHash] = await Promise.all([
+  const [fixtureHash, reviewContractHash, evaluatorContractHash, configHash, cliBinaryHash, binaryMetadata] = await Promise.all([
     hashRepositorySources(repositoryRoot, FIXTURE_SET_SOURCE_PATHS),
     hashRepositorySources(repositoryRoot, REVIEW_CONTRACT_SOURCE_PATHS),
+    hashRepositorySources(repositoryRoot, EVALUATOR_CONTRACT_SOURCE_PATHS),
     hashFile(resolve(import.meta.dir, "..", "..", "config.toml")),
     hashFile(options.binary),
+    resolveBinaryQualificationMetadata(options.binary),
   ]);
+  assertBinaryMatchesQualificationWorktree({
+    metadata: binaryMetadata, fixtureHash, reviewContractHash, evaluatorContractHash,
+    configHash, apiBase, apiFormat, pairs,
+  });
+  const pricing = suppliedPricing ?? (await fetchPricing(apiBase, models));
+  if (suppliedPricing === undefined) {
+    assertPairQualificationPreflight({
+      diffs: Array.from({ length: repeats }, () => cases.map((candidate) => candidate.diff)).flat(),
+      pairs,
+      pricing,
+      costCapUsd,
+    });
+  }
 
   // Task queue: one job per (profile, repeat, case). A bounded worker pool drains it so at
   // most `concurrency` binary runs are in flight regardless of model count.
@@ -251,45 +295,116 @@ export async function runLiveModels(
     apiFormat,
     fixtureHash,
     reviewContractHash,
+    evaluatorContractHash,
     configHash,
     cliBinaryHash,
     repeats,
   }));
-  const evidenceHash = hashText(JSON.stringify({
+  const evidence = {
     cliVersion,
     apiBase,
     apiFormat,
     providerEndpointIdentity: identity,
+    upstreamProviderPinned: false,
+    upstreamProviderIdentity: null,
     fixtureHash,
     reviewContractHash,
+    evaluatorContractHash,
     configHash,
     cliBinaryHash,
     repeats,
     profiles,
-    modelAggregates: aggregates,
     cases: results,
-  }));
-  const manifestCandidate = admissionManifestCandidate(configHash, evidenceHash, profiles);
-  return {
+  };
+  const evidenceHash = hashSanitizedEvidence(evidence);
+  const passed = repeats >= MIN_QUALIFICATION_REPEATS && aggregates.length > 0 &&
+    aggregates.every((aggregate) => aggregate.passed);
+  const report: LiveModelsReport = {
     generatedAt: new Date().toISOString(),
     cliVersion,
     apiBase,
     apiFormat,
     providerEndpointIdentity: identity,
+    upstreamProviderPinned: false,
+    upstreamProviderIdentity: null,
     fixtureHash,
     reviewContractHash,
+    evaluatorContractHash,
     configHash,
     cliBinaryHash,
     evidenceHash,
     repeats,
     profiles,
-    manifestCandidate,
-    passed: aggregates.length > 0 && aggregates.every((aggregate) => aggregate.passed),
+    passed,
     models: aggregates.map(toSiteModelAggregate),
     modelAggregates: aggregates,
     totalRunCostUsd: calculateTotalRunCostUsd(results),
     cases: results,
   };
+  if (passed) report.manifestCandidate = admissionManifestCandidate(configHash, evidenceHash, profiles);
+  return report;
+}
+
+export function hashSanitizedEvidence(value: object): string {
+  return hashText(JSON.stringify(value));
+}
+
+export function sanitizedEvidenceFromReport(report: LiveModelsReport): object {
+  return {
+    cliVersion: report.cliVersion,
+    apiBase: report.apiBase,
+    apiFormat: report.apiFormat,
+    providerEndpointIdentity: report.providerEndpointIdentity,
+    upstreamProviderPinned: report.upstreamProviderPinned,
+    upstreamProviderIdentity: report.upstreamProviderIdentity,
+    fixtureHash: report.fixtureHash,
+    reviewContractHash: report.reviewContractHash,
+    evaluatorContractHash: report.evaluatorContractHash,
+    configHash: report.configHash,
+    cliBinaryHash: report.cliBinaryHash,
+    repeats: report.repeats,
+    profiles: report.profiles,
+    cases: report.cases,
+  };
+}
+
+export function admitSavedLiveModelsReport(raw: string): AdmissionManifestCandidate {
+  const report = JSON.parse(raw) as LiveModelsReport;
+  if (!report || typeof report !== "object" || !Array.isArray(report.profiles) || !Array.isArray(report.cases)) {
+    throw new Error("qualification report has an invalid shape");
+  }
+  if (!Number.isSafeInteger(report.repeats) || report.repeats < MIN_QUALIFICATION_REPEATS) {
+    throw new Error(`qualification needs at least ${MIN_QUALIFICATION_REPEATS} complete repeats`);
+  }
+  if (report.upstreamProviderPinned !== false || report.upstreamProviderIdentity !== null) {
+    throw new Error("qualification report does not prove a pinned upstream provider route");
+  }
+  if (hashSanitizedEvidence(sanitizedEvidenceFromReport(report)) !== report.evidenceHash) {
+    throw new Error("qualification report evidence hash does not match");
+  }
+  if (report.profiles.length === 0) throw new Error("qualification report contains no profiles");
+  for (const profile of report.profiles) {
+    if (
+      profile.fixtureHash !== report.fixtureHash || profile.reviewContractHash !== report.reviewContractHash ||
+      profile.evaluatorContractHash !== report.evaluatorContractHash ||
+      profile.configHash !== report.configHash || profile.cliBinaryHash !== report.cliBinaryHash ||
+      profile.repeats !== report.repeats || profile.apiBase !== report.apiBase ||
+      profile.apiFormat !== report.apiFormat || profile.generatorModels.length === 0 ||
+      profile.scorerModels.length !== 1
+    ) throw new Error(`qualification profile ${profile.id || "(empty)"} does not match its report`);
+    const pair: QualificationPair = {
+      generatorModel: profile.generatorModels[0]!, generatorCascade: profile.generatorModels.slice(1),
+      consensus: profile.consensus, scorerModel: profile.scorerModels[0]!,
+    };
+    const aggregate = aggregateModel(
+      pair, report.cases.filter((candidate) => candidate.pairId === qualificationPairId(pair)), report.repeats,
+    );
+    if (!aggregate.passed) {
+      throw new Error(`qualification profile ${profile.id} failed: ${aggregate.admissionFailures.join("; ")}`);
+    }
+  }
+  if (!report.passed) throw new Error("qualification report is not passing");
+  return admissionManifestCandidate(report.configHash, report.evidenceHash, report.profiles);
 }
 
 export function admissionManifestCandidate(
@@ -309,6 +424,7 @@ export function admissionManifestCandidate(
       apiFormat: profile.apiFormat,
       reviewContractSha256: profile.reviewContractHash,
       fixtureSetSha256: profile.fixtureHash,
+      evaluatorContractSha256: profile.evaluatorContractHash,
       reportSha256,
       repeatedRuns: profile.repeats,
     })),
@@ -456,6 +572,8 @@ export function liveEnv(
     GIT_TERMINAL_PROMPT: "0",
     POSTIL_API_BASE: apiBase,
     POSTIL_API_FORMAT: apiFormat,
+    POSTIL_IGNORE_REPOSITORY_MODEL_CONFIG: "1",
+    POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY: "1",
     GITHUB_API_URL: githubBaseUrl,
     GITHUB_TOKEN: "benchmark-github-token",
     REVIEW_MODEL: pair.generatorModel,
@@ -584,6 +702,7 @@ function qualificationProfile(args: Omit<QualificationProfile, "id" | "generator
     scorerModels: [args.pair.scorerModel],
     fixtureHash: args.fixtureHash,
     reviewContractHash: args.reviewContractHash,
+    evaluatorContractHash: args.evaluatorContractHash,
     configHash: args.configHash,
     cliBinaryHash: args.cliBinaryHash,
     repeats: args.repeats,
@@ -599,13 +718,46 @@ async function fetchPricing(
   models: string[],
 ): Promise<Map<string, ModelPricing>> {
   const url = `${apiBase.replace(/\/$/, "")}/models`;
-  const res = await fetch(url, { headers: { accept: "application/json" } });
+  const keyName = resolveApiKeyName();
+  const key = keyName === undefined ? undefined : process.env[keyName];
+  const headers: Record<string, string> = { accept: "application/json" };
+  if (key) headers.authorization = `Bearer ${key}`;
+  const res = await fetch(url, { headers });
   if (!res.ok) {
     throw new Error(`failed to fetch OpenRouter pricing (${res.status}) from ${url}`);
   }
   const catalog = (await res.json()) as OpenRouterModelsResponse;
   const pricing = pricingFromCatalog(catalog, models);
   return pricing;
+}
+
+export async function pricingFromFile(path: string): Promise<Map<string, ModelPricing>> {
+  const parsed = JSON.parse(await readFile(path, "utf8")) as unknown;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("qualification pricing file must be a JSON object keyed by model id");
+  }
+  const out = new Map<string, ModelPricing>();
+  for (const [model, value] of Object.entries(parsed as Record<string, unknown>)) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error(`qualification pricing for ${model} must be an object`);
+    }
+    const record = value as Record<string, unknown>;
+    out.set(model, {
+      promptUsdPerToken: strictPrice(record.promptUsdPerToken, `${model}.promptUsdPerToken`),
+      completionUsdPerToken: strictPrice(record.completionUsdPerToken, `${model}.completionUsdPerToken`),
+    });
+  }
+  if (out.size === 0) throw new Error("qualification pricing file must contain at least one model");
+  return out;
+}
+
+function strictPrice(value: unknown, field: string): number {
+  if (typeof value !== "string" || !/^(?:0|[1-9][0-9]*|(?:0|[1-9][0-9]*)\.[0-9]*[1-9])$/u.test(value)) {
+    throw new Error(`${field} must be a canonical nonnegative decimal string`);
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) throw new Error(`${field} is outside the supported range`);
+  return parsed;
 }
 
 // ---------------------------------------------------------------------------
@@ -654,6 +806,7 @@ export function formatLiveModelsReport(report: LiveModelsReport): string {
     "",
     `Fixture ${report.fixtureHash}; review contract ${report.reviewContractHash}.`,
     `Provider endpoint ${report.providerEndpointIdentity}; ${report.repeats} complete repeats.`,
+    "Upstream provider route: dynamic and unpinned.",
     "block = must-block seeded-defect recall; adv = advisory seeded-defect recall;",
     "clean FP = clean cases with any final or suppressed finding. Costs retain provider-exact",
     "or catalog-estimate provenance in the per-case report.",
@@ -698,6 +851,48 @@ async function resolveCliVersion(binary: string): Promise<string> {
     return stdout.trim() || "unknown";
   } catch {
     return "unknown";
+  }
+}
+
+export async function resolveBinaryQualificationMetadata(binary: string): Promise<BinaryQualificationMetadata> {
+  const { stdout } = await execFile(binary, ["qualification-metadata"], { timeout: 15_000 });
+  const metadata = JSON.parse(stdout) as BinaryQualificationMetadata;
+  if (!metadata || typeof metadata !== "object") throw new Error("binary qualification metadata is invalid");
+  return metadata;
+}
+
+function assertBinaryMatchesQualificationWorktree(args: {
+  metadata: BinaryQualificationMetadata;
+  fixtureHash: string;
+  reviewContractHash: string;
+  evaluatorContractHash: string;
+  configHash: string;
+  apiBase: string;
+  apiFormat: "openai-compatible" | "anthropic";
+  pairs: QualificationPair[];
+}): void {
+  const metadata = args.metadata;
+  for (const [label, actual, expected] of [
+    ["model defaults", metadata.modelDefaultsSha256, args.configHash],
+    ["review contract", metadata.reviewContractSha256, args.reviewContractHash],
+    ["fixture set", metadata.fixtureSetSha256, args.fixtureHash],
+    ["evaluator contract", metadata.evaluatorContractSha256, args.evaluatorContractHash],
+  ] as const) {
+    if (actual !== expected) throw new Error(`supplied binary ${label} does not match this worktree`);
+  }
+  if (metadata.defaultApiBase !== args.apiBase || metadata.defaultApiFormat !== args.apiFormat) {
+    throw new Error("qualification endpoint does not match the supplied binary defaults");
+  }
+  if (args.pairs.length !== 1) {
+    throw new Error("one exact embedded profile may be admitted per qualification report");
+  }
+  const pair = args.pairs[0]!;
+  if (
+    JSON.stringify(qualificationGeneratorModels(pair)) !== JSON.stringify(metadata.generatorChain) ||
+    pair.consensus !== metadata.consensus ||
+    JSON.stringify([pair.scorerModel]) !== JSON.stringify(metadata.scorerChain)
+  ) {
+    throw new Error("qualification pair does not match the supplied binary's embedded default profile");
   }
 }
 

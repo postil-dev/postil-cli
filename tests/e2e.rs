@@ -1685,22 +1685,23 @@ fn hosted_config_ignores_repository_model_provider_and_scorer() {
     let out = postil()
         .current_dir(dir.path())
         .env("POSTIL_HOSTED_MODE", "1")
-        .env("REVIEW_MODEL", "hosted/primary")
-        .env("REVIEW_MODEL_CASCADE", "hosted/fallback")
-        .env("REVIEW_SCORER_MODEL", "hosted/scorer")
+        .env("REVIEW_MODEL", "stale/primary")
+        .env("REVIEW_MODEL_CASCADE", "stale/fallback")
+        .env("REVIEW_SCORER_MODEL", "stale/scorer")
         .args(["config"])
         .assert()
         .success();
     let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
 
-    assert!(stdout.contains("model.name: hosted/primary"));
-    assert!(stdout.contains("model.cascade: [\"hosted/fallback\"]"));
-    assert!(stdout.contains("model.scorer: hosted/scorer"));
+    assert!(stdout.contains("model.name: "));
+    assert!(stdout.contains("model.cascade: []"));
+    assert!(stdout.contains("model.scorer: "));
     assert!(stdout.contains("model.apiBase: https://openrouter.ai/api/v1"));
     assert!(stdout.contains("model.apiFormat: openai-compatible"));
     assert!(stdout.contains("model.consensus: 1"));
     assert!(!stdout.contains("anthropic/"));
     assert!(!stdout.contains("attacker"));
+    assert!(!stdout.contains("stale/"));
 }
 
 #[tokio::test]

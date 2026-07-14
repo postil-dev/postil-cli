@@ -58,6 +58,31 @@ export POSTIL_API_FORMAT=openai-compatible # or anthropic
 bun run bench --json-out report.json
 ```
 
+The release binary must embed the exact profile under test. Set the intended
+generator, cascade, consensus width, scorer, API base, and interface in
+`config.toml`, leave the
+admission manifest empty, then build the binary. The benchmark compares the
+binary's embedded metadata with the worktree before inference. Environment
+model variables select that same profile for the isolated run; they do not
+define a different candidate.
+
+Native Anthropic and authenticated private endpoints can use an operator-owned
+pricing file instead of a public model catalog:
+
+```json
+{
+  "provider/model": {
+    "promptUsdPerToken": "0.000001",
+    "completionUsdPerToken": "0.000005"
+  }
+}
+```
+
+Pass it with `--pricing-file prices.json` or
+`POSTIL_BENCH_PRICING_FILE=prices.json`. Prices are canonical decimal strings.
+The catalog request uses the inference credential when no file is supplied and
+fails closed when any model is unpriced.
+
 Use `provider/one+provider/two+provider/three::provider/scorer` to qualify a
 three-model consensus generator chain. Every listed generator is consulted;
 the CLI's production two-model agreement rule determines the merged findings.
@@ -68,28 +93,41 @@ Admission requires all of these in every repeat:
 - at least 90% advisory detection and at most 10% advisory overblocking
 - no clean false blocks and at most 5% clean cases with any finding
 - no execution, structured-output, grounding, statusline, or usage-accounting failure
-- mean pair cost at most $0.01 and mean review latency at most 15 seconds
+- mean pair cost at most $0.04 and mean review latency at most 15 seconds
+- per-repeat p95 latency at most 30 seconds and maximum latency at most 60 seconds
 
 Findings suppressed by the scorer count as detector evidence but cannot satisfy
 final blocking. An unrelated error cannot substitute for the seeded finding.
 The report stores only attributable finding coordinates and labels, never model
 finding titles or bodies. It records separate fixture, review-contract source,
-configuration, and CLI binary SHA-256 hashes; the canonical API base and
+configuration, evaluator contract, and CLI binary SHA-256 hashes; the canonical API base and
 provider interface; the ordered generator chain and consensus width; the
 ordered scorer chain; repeat number; and provider-exact or catalog-estimate
 cost provenance. Source-bundle hashes use the runtime's ordered
 `path + NUL + exact bytes + NUL` framing. Each immutable profile and the
 complete sanitized evidence payload have their own SHA-256 identifier.
-`manifestCandidate` uses the runtime admission-manifest schema directly. It
-contains no admission decision and can be copied only after the report passes.
+`manifestCandidate` uses the runtime admission-manifest schema directly and is
+absent from a failed report. Admit a saved passing report with:
 
-The preflight prices both roles across the configured repeats before inference.
-It rejects missing prices, more than six pairs, and a cap outside `(0, $25]`.
+```sh
+bun run bench --admit-report report.json --manifest-out ../qualified-models.json
+```
+
+This command recomputes the sanitized evidence hash and every admission gate.
+It emits no manifest when the report is incomplete, stale, altered, or failed.
+
+The preflight prices every unique generator and scorer across the configured
+repeats before inference. It rejects missing prices, more than six models, and
+a cap outside `(0, $25]`.
 The inference key stays in the child environment and is never printed or placed
 on an argument list.
 
 These fixtures are internal evidence, not a competitor comparison. Inference is
 nondeterministic, so one successful matrix is insufficient for admission.
+OpenRouter's endpoint identity is recorded, but its dynamic upstream route is
+not described as pinned. A pinned-provider claim requires request and response
+evidence for that exact route. Hosted OpenRouter qualification uses the same
+non-collection and ZDR request preferences as production.
 
 ## Scorer qualification (opt-in, mocked generator + real scorer)
 

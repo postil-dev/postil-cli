@@ -1,6 +1,9 @@
-version = 2
+version = 3
 default_model = ""
 cascade = []
+consensus = 1
+api_base = "https://openrouter.ai/api/v1"
+api_format = "openai-compatible"
 
 [scorer]
 enabled = false

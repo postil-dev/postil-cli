@@ -20,13 +20,53 @@ use crate::envelope::{Kind, Severity};
 const MODEL_DEFAULTS_TOML: &str = include_str!("../config.toml");
 const QUALIFIED_MODELS_JSON: &str = include_str!("../qualified-models.json");
 const REVIEW_CONTRACT_SOURCES: &[(&str, &str)] = &[
+    ("Cargo.toml", include_str!("../Cargo.toml")),
+    ("Cargo.lock", include_str!("../Cargo.lock")),
+    ("src/api_key.rs", include_str!("api_key.rs")),
+    ("src/cli.rs", include_str!("cli.rs")),
+    ("src/config.rs", include_str!("config.rs")),
+    ("src/doctor.rs", include_str!("doctor.rs")),
+    ("src/forge/azure.rs", include_str!("forge/azure.rs")),
+    ("src/forge/bitbucket.rs", include_str!("forge/bitbucket.rs")),
+    ("src/forge/github.rs", include_str!("forge/github.rs")),
+    ("src/forge/gitlab.rs", include_str!("forge/gitlab.rs")),
+    ("src/forge/mod.rs", include_str!("forge/mod.rs")),
+    ("src/hook.rs", include_str!("hook.rs")),
+    ("src/lib.rs", include_str!("lib.rs")),
+    ("src/local.rs", include_str!("local.rs")),
+    ("src/main.rs", include_str!("main.rs")),
+    ("src/output.rs", include_str!("output.rs")),
+    ("src/plan.rs", include_str!("plan.rs")),
     ("src/prompt.rs", include_str!("prompt.rs")),
     ("src/llm.rs", include_str!("llm.rs")),
     ("src/envelope.rs", include_str!("envelope.rs")),
+    ("src/respond.rs", include_str!("respond.rs")),
+    ("src/review.rs", include_str!("review.rs")),
+    ("src/sarif.rs", include_str!("sarif.rs")),
     ("src/diff.rs", include_str!("diff.rs")),
     ("src/filter.rs", include_str!("filter.rs")),
 ];
 const BENCH_FIXTURES_SOURCE: &str = include_str!("../bench/fixtures/cases.ts");
+const EVALUATOR_CONTRACT_SOURCES: &[(&str, &str)] = &[
+    ("bench/fixtures/cases.ts", BENCH_FIXTURES_SOURCE),
+    (
+        "bench/src/api-key.ts",
+        include_str!("../bench/src/api-key.ts"),
+    ),
+    (
+        "bench/src/harness.ts",
+        include_str!("../bench/src/harness.ts"),
+    ),
+    (
+        "bench/src/livemodels-score.ts",
+        include_str!("../bench/src/livemodels-score.ts"),
+    ),
+    (
+        "bench/src/livemodels.ts",
+        include_str!("../bench/src/livemodels.ts"),
+    ),
+    ("bench/src/run.ts", include_str!("../bench/src/run.ts")),
+];
 pub const DEFAULT_API_BASE: &str = "https://openrouter.ai/api/v1";
 pub const MAX_FINDINGS: usize = 20;
 
@@ -61,6 +101,9 @@ pub struct ModelDefaults {
     pub source_sha256: String,
     pub default_model: String,
     pub cascade: Vec<String>,
+    pub consensus: usize,
+    pub api_base: String,
+    pub api_format: ApiFormat,
     pub scorer_enabled: bool,
     pub scorer_model: String,
     pub scorer_fallback: String,
@@ -88,6 +131,7 @@ pub struct QualificationProfile {
     pub scorer_chain: Vec<String>,
     pub review_contract_sha256: String,
     pub fixture_set_sha256: String,
+    pub evaluator_contract_sha256: String,
     pub report_sha256: String,
     pub repeated_runs: u32,
 }
@@ -98,6 +142,9 @@ struct ModelDefaultsFile {
     version: u64,
     default_model: String,
     cascade: Vec<String>,
+    consensus: usize,
+    api_base: String,
+    api_format: ApiFormat,
     scorer: ScorerDefaultsFile,
 }
 
@@ -153,6 +200,54 @@ pub fn fixture_set_sha256() -> String {
     sha256_named_sources(&[("bench/fixtures/cases.ts", BENCH_FIXTURES_SOURCE)])
 }
 
+pub fn evaluator_contract_sha256() -> String {
+    sha256_named_sources(EVALUATOR_CONTRACT_SOURCES)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QualificationMetadata {
+    pub model_defaults_sha256: String,
+    pub review_contract_sha256: String,
+    pub fixture_set_sha256: String,
+    pub evaluator_contract_sha256: String,
+    pub default_api_base: String,
+    pub default_api_format: ApiFormat,
+    pub generator_chain: Vec<String>,
+    pub consensus: usize,
+    pub scorer_chain: Vec<String>,
+}
+
+/// Immutable qualification inputs embedded in this exact binary.
+pub fn qualification_metadata() -> QualificationMetadata {
+    let defaults = model_defaults();
+    let mut generator_chain = Vec::new();
+    if !defaults.default_model.is_empty() {
+        generator_chain.push(defaults.default_model.clone());
+    }
+    generator_chain.extend(defaults.cascade.clone());
+    let mut scorer_chain = Vec::new();
+    if defaults.scorer_enabled && !defaults.scorer_model.is_empty() {
+        scorer_chain.push(defaults.scorer_model.clone());
+        if !defaults.scorer_fallback.is_empty() && defaults.scorer_fallback != defaults.scorer_model
+        {
+            scorer_chain.push(defaults.scorer_fallback.clone());
+        }
+    }
+    QualificationMetadata {
+        model_defaults_sha256: defaults.source_sha256.clone(),
+        review_contract_sha256: review_contract_sha256(),
+        fixture_set_sha256: fixture_set_sha256(),
+        evaluator_contract_sha256: evaluator_contract_sha256(),
+        default_api_base: normalize_api_base(&defaults.api_base)
+            .expect("embedded API base must be canonicalizable"),
+        default_api_format: defaults.api_format,
+        generator_chain,
+        consensus: defaults.consensus,
+        scorer_chain,
+    }
+}
+
 fn sha256_named_sources(sources: &[(&str, &str)]) -> String {
     let mut hasher = Sha256::new();
     for (path, contents) in sources {
@@ -183,6 +278,7 @@ fn parse_qualification_manifest(raw: &str) -> Result<QualificationManifest> {
     let mut profile_ids = Vec::with_capacity(manifest.profiles.len());
     let current_review_contract = review_contract_sha256();
     let current_fixture_set = fixture_set_sha256();
+    let current_evaluator_contract = evaluator_contract_sha256();
     for profile in &manifest.profiles {
         anyhow::ensure!(
             !profile.id.trim().is_empty(),
@@ -191,6 +287,10 @@ fn parse_qualification_manifest(raw: &str) -> Result<QualificationManifest> {
         anyhow::ensure!(
             !profile.generator_chain.is_empty(),
             "qualification profile generator chain must not be empty"
+        );
+        anyhow::ensure!(
+            !profile.scorer_chain.is_empty(),
+            "qualification profile scorer chain must not be empty"
         );
         anyhow::ensure!(
             (1..=profile.generator_chain.len()).contains(&profile.consensus),
@@ -213,12 +313,16 @@ fn parse_qualification_manifest(raw: &str) -> Result<QualificationManifest> {
             validate_model_id("qualification profile scorer chain", model)?;
         }
         anyhow::ensure!(
-            profile.repeated_runs > 0,
-            "qualification profile must record repeated runs"
+            profile.repeated_runs >= 3,
+            "qualification profile must record at least three repeated runs"
         );
         for (field, digest) in [
             ("reviewContractSha256", &profile.review_contract_sha256),
             ("fixtureSetSha256", &profile.fixture_set_sha256),
+            (
+                "evaluatorContractSha256",
+                &profile.evaluator_contract_sha256,
+            ),
             ("reportSha256", &profile.report_sha256),
         ] {
             anyhow::ensure!(
@@ -233,6 +337,10 @@ fn parse_qualification_manifest(raw: &str) -> Result<QualificationManifest> {
         anyhow::ensure!(
             profile.fixture_set_sha256 == current_fixture_set,
             "qualification profile fixture set is stale"
+        );
+        anyhow::ensure!(
+            profile.evaluator_contract_sha256 == current_evaluator_contract,
+            "qualification profile evaluator contract is stale"
         );
         let mut generators = profile.generator_chain.clone();
         generators.sort();
@@ -276,6 +384,32 @@ fn parse_model_defaults(raw: &str) -> Result<ModelDefaults> {
     for model in &file.cascade {
         validate_model_id("cascade entries", model)?;
     }
+    let mut generator_chain = Vec::new();
+    if !file.default_model.is_empty() {
+        generator_chain.push(file.default_model.as_str());
+    }
+    generator_chain.extend(file.cascade.iter().map(String::as_str));
+    let unique_generators = generator_chain
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    anyhow::ensure!(
+        unique_generators.len() == generator_chain.len(),
+        "embedded generator chain must not repeat models"
+    );
+    let generator_count = usize::from(!file.default_model.is_empty()) + file.cascade.len();
+    if generator_count == 0 {
+        anyhow::ensure!(
+            file.consensus == 1,
+            "empty model defaults require consensus = 1"
+        );
+    } else {
+        anyhow::ensure!(
+            (1..=generator_count).contains(&file.consensus),
+            "consensus must fit the embedded generator chain"
+        );
+    }
+    normalize_api_base(&file.api_base).context("invalid embedded model API base")?;
     if !file.scorer.default_model.is_empty() {
         validate_model_id("scorer.defaultModel", &file.scorer.default_model)?;
     } else {
@@ -288,6 +422,10 @@ fn parse_model_defaults(raw: &str) -> Result<ModelDefaults> {
     }
     if !file.scorer.fallback.is_empty() {
         validate_model_id("scorer.fallback", &file.scorer.fallback)?;
+        anyhow::ensure!(
+            file.scorer.fallback != file.scorer.default_model,
+            "scorer fallback must differ from scorer.defaultModel"
+        );
     }
     for model in &file.scorer.qualification_candidates {
         validate_model_id("scorer.qualificationCandidates entries", model)?;
@@ -297,6 +435,9 @@ fn parse_model_defaults(raw: &str) -> Result<ModelDefaults> {
         source_sha256: sha256_hex(raw),
         default_model: file.default_model,
         cascade: file.cascade,
+        consensus: file.consensus,
+        api_base: file.api_base,
+        api_format: file.api_format,
         scorer_enabled: file.scorer.enabled,
         scorer_model: file.scorer.default_model,
         scorer_fallback: file.scorer.fallback,
@@ -451,9 +592,9 @@ impl Default for Config {
             scorer_fallback: defaults.scorer_fallback.clone(),
             scorer_enabled: defaults.scorer_enabled,
             scorer_explicit: false,
-            api_base: DEFAULT_API_BASE.to_string(),
-            api_format: ApiFormat::default(),
-            consensus: 1,
+            api_base: defaults.api_base.clone(),
+            api_format: defaults.api_format,
+            consensus: defaults.consensus,
             guardrails: None,
             content_policy: Some(BUILTIN_CONTENT_POLICY.to_string()),
             content_policy_disabled: false,
@@ -755,6 +896,9 @@ impl Config {
     }
 
     fn apply_env(&mut self) -> Result<()> {
+        if hosted_mode() {
+            return Ok(());
+        }
         if let Ok(m) = std::env::var("REVIEW_MODEL")
             && !m.is_empty()
         {
@@ -880,7 +1024,7 @@ fn allow_config_api_base() -> bool {
 /// Repository configuration is untrusted input, so it cannot select a model,
 /// scorer, provider interface, or credential destination in this mode. Trusted
 /// deployment environment overrides are applied after repository config.
-fn hosted_mode() -> bool {
+pub(crate) fn hosted_mode() -> bool {
     std::env::var("POSTIL_HOSTED_MODE")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
@@ -1126,6 +1270,9 @@ mod tests {
             r#"version = 1
 default_model = "example/model"
 cascade = ["example/fallback"]
+consensus = 1
+api_base = "https://openrouter.ai/api/v1"
+api_format = "openai-compatible"
 unexpected_key = "typo"
 
 [scorer]
@@ -1148,6 +1295,9 @@ qualification_candidates = ["example/scorer"]
                 "version = 0\n\
                  default_model = \"example/model\"\n\
                  cascade = [\"example/fallback\"]\n\
+                 consensus = 1\n\
+                 api_base = \"https://openrouter.ai/api/v1\"\n\
+                 api_format = \"openai-compatible\"\n\
                  scorer = { enabled = false, default_model = \"example/scorer\", fallback = \"example/scorer-fallback\", qualification_candidates = [\"example/scorer\"] }\n",
                 "version must be greater than zero",
             ),
@@ -1155,6 +1305,9 @@ qualification_candidates = ["example/scorer"]
                 "version = 1\n\
                  default_model = \"\"\n\
                  cascade = [\"example/fallback\"]\n\
+                 consensus = 1\n\
+                 api_base = \"https://openrouter.ai/api/v1\"\n\
+                 api_format = \"openai-compatible\"\n\
                  scorer = { enabled = false, default_model = \"example/scorer\", fallback = \"example/scorer-fallback\", qualification_candidates = [\"example/scorer\"] }\n",
                 "cascade must be empty when defaultModel is empty",
             ),
@@ -1162,6 +1315,9 @@ qualification_candidates = ["example/scorer"]
                 "version = 1\n\
                  default_model = \"example/model\"\n\
                  cascade = [\"\"]\n\
+                 consensus = 1\n\
+                 api_base = \"https://openrouter.ai/api/v1\"\n\
+                 api_format = \"openai-compatible\"\n\
                  scorer = { enabled = false, default_model = \"example/scorer\", fallback = \"example/scorer-fallback\", qualification_candidates = [\"example/scorer\"] }\n",
                 "cascade entries must not be empty",
             ),
@@ -1169,6 +1325,9 @@ qualification_candidates = ["example/scorer"]
                 "version = 1\n\
                  default_model = \"example/model\"\n\
                  cascade = [\"example/fallback\"]\n\
+                 consensus = 1\n\
+                 api_base = \"https://openrouter.ai/api/v1\"\n\
+                 api_format = \"openai-compatible\"\n\
                  scorer = { enabled = false, default_model = \"\", fallback = \"example/scorer-fallback\", qualification_candidates = [\"example/scorer\"] }\n",
                 "scorer configuration must be empty when scorer.defaultModel is empty",
             ),
@@ -1180,6 +1339,39 @@ qualification_candidates = ["example/scorer"]
                 "expected {expected:?} in {err:#}"
             );
         }
+    }
+
+    #[test]
+    fn model_defaults_reject_duplicate_generator_and_scorer_entries() {
+        let duplicate_generator = r#"version = 1
+default_model = "provider/model"
+cascade = ["provider/model"]
+consensus = 2
+api_base = "https://openrouter.ai/api/v1"
+api_format = "openai-compatible"
+scorer = { enabled = true, default_model = "provider/scorer", fallback = "", qualification_candidates = [] }
+"#;
+        assert!(
+            parse_model_defaults(duplicate_generator)
+                .unwrap_err()
+                .to_string()
+                .contains("must not repeat")
+        );
+
+        let duplicate_scorer = r#"version = 1
+default_model = "provider/model"
+cascade = []
+consensus = 1
+api_base = "https://openrouter.ai/api/v1"
+api_format = "openai-compatible"
+scorer = { enabled = true, default_model = "provider/scorer", fallback = "provider/scorer", qualification_candidates = [] }
+"#;
+        assert!(
+            parse_model_defaults(duplicate_scorer)
+                .unwrap_err()
+                .to_string()
+                .contains("fallback must differ")
+        );
     }
 
     #[test]
@@ -1367,15 +1559,39 @@ qualification_candidates = ["example/scorer"]
                 "benchmarkProviderIdentity": "openrouter:test-route",
                 "generatorChain": ["provider/model"],
                 "consensus": 1,
-                "scorerChain": [],
+                "scorerChain": ["provider/scorer"],
                 "reviewContractSha256": "0".repeat(64),
                 "fixtureSetSha256": fixture_set_sha256(),
+                "evaluatorContractSha256": evaluator_contract_sha256(),
                 "reportSha256": "1".repeat(64),
                 "repeatedRuns": 3
             }]
         });
         let error = parse_qualification_manifest(&raw.to_string()).unwrap_err();
         assert!(error.to_string().contains("review contract is stale"));
+    }
+
+    #[test]
+    fn qualification_profile_requires_three_complete_repeats() {
+        let raw = serde_json::json!({
+            "version": 1,
+            "modelDefaultsSha256": model_defaults().source_sha256,
+            "profiles": [{
+                "id": "candidate",
+                "apiFormat": "openai-compatible",
+                "apiBase": "https://openrouter.ai:443/api/v1",
+                "generatorChain": ["provider/model"],
+                "consensus": 1,
+                "scorerChain": ["provider/scorer"],
+                "reviewContractSha256": review_contract_sha256(),
+                "fixtureSetSha256": fixture_set_sha256(),
+                "evaluatorContractSha256": evaluator_contract_sha256(),
+                "reportSha256": "1".repeat(64),
+                "repeatedRuns": 2
+            }]
+        });
+        let error = parse_qualification_manifest(&raw.to_string()).unwrap_err();
+        assert!(error.to_string().contains("at least three repeated runs"));
     }
 
     #[test]

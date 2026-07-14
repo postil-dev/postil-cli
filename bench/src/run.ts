@@ -37,7 +37,7 @@
 //   BENCH_LIVE              set to 1 to select diff-file live mode
 //   BENCH_CONCURRENCY       live-mode case parallelism (else --concurrency, else default)
 
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { cases } from "../fixtures/cases";
 import { formatReport, runBenchmark } from "./harness";
@@ -45,9 +45,11 @@ import { DEFAULT_LIVE_CONCURRENCY, formatLiveReport, runLive } from "./live";
 import {
   DEFAULT_LIVE_CONCURRENCY as DEFAULT_LIVE_MODELS_CONCURRENCY,
   formatLiveModelsReport,
+  admitSavedLiveModelsReport,
   liveModelsQualificationExitCode,
   parseQualificationPairs,
   runLiveModels,
+  pricingFromFile,
 } from "./livemodels";
 
 function flagValue(args: string[], flag: string): string | undefined {
@@ -74,6 +76,16 @@ async function main() {
   const liveModels =
     process.env.POSTIL_BENCH_MODE === "live" || args.includes("--live-models");
 
+  const admitReport = flagValue(args, "--admit-report");
+  if (admitReport !== undefined) {
+    const manifestOut = flagValue(args, "--manifest-out");
+    if (!manifestOut) throw new Error("--admit-report requires --manifest-out");
+    const manifest = admitSavedLiveModelsReport(await readFile(admitReport, "utf8"));
+    await writeFile(manifestOut, `${JSON.stringify(manifest, null, 2)}\n`);
+    console.log(`admitted ${manifest.profiles.length} qualification profile(s)`);
+    return;
+  }
+
   if (liveModels) {
     const pairs = parseQualificationPairs(
       process.env.POSTIL_BENCH_PAIRS ?? flagValue(args, "--pairs") ?? "",
@@ -82,12 +94,14 @@ async function main() {
     const costCapRaw = process.env.POSTIL_BENCH_COST_CAP_USD ?? flagValue(args, "--cost-cap");
     const repeatsRaw = process.env.POSTIL_BENCH_REPEATS ?? flagValue(args, "--repeats");
     const apiFormat = qualificationApiFormat(process.env.POSTIL_API_FORMAT);
+    const pricingFile = process.env.POSTIL_BENCH_PRICING_FILE ?? flagValue(args, "--pricing-file");
     const report = await runLiveModels(cases, {
       binary,
       pairs,
       repeats: repeatsRaw === undefined ? undefined : Number.parseInt(repeatsRaw, 10),
       apiBase: process.env.POSTIL_API_BASE,
       apiFormat,
+      pricing: pricingFile === undefined ? undefined : await pricingFromFile(pricingFile),
       concurrency,
       costCapUsd: costCapRaw === undefined ? undefined : Number.parseFloat(costCapRaw),
     });

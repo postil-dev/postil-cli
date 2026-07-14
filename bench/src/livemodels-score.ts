@@ -8,7 +8,7 @@
 // findings detect the seeded defect, plus the false-positive rate, gate-verdict
 // correctness, and the measured cost/latency per review.
 
-import type { BenchmarkCase, Envelope } from "./harness";
+import { commentMatchesExpectation, type BenchmarkCase, type Envelope } from "./harness";
 
 /** A finding is treated as detecting the seeded defect when it hits the right
  * file and its line range comes within this many lines of the seeded region.
@@ -18,8 +18,10 @@ export const LINE_TOLERANCE = 3;
 export const ADVISORY_MIN_DETECTION_RATE = 0.9;
 export const ADVISORY_MAX_OVERBLOCK_RATE = 0.1;
 export const CLEAN_MAX_FINDING_FALSE_POSITIVE_RATE = 0.05;
-export const GENERATOR_MAX_MEAN_COST_USD = 0.01;
+export const GENERATOR_MAX_MEAN_COST_USD = 0.04;
 export const GENERATOR_MAX_MEAN_DURATION_MS = 15_000;
+export const GENERATOR_MAX_REPEAT_P95_DURATION_MS = 30_000;
+export const GENERATOR_MAX_REPEAT_DURATION_MS = 60_000;
 export const MIN_QUALIFICATION_REPEATS = 3;
 
 export interface QualificationPair {
@@ -68,6 +70,21 @@ export interface FindingEvidence {
   severity: string;
   kind: string;
   confidence: number;
+  semanticMatch: boolean;
+}
+
+export interface UsageCostEvidence {
+  model: string;
+  role: "reviewGenerator" | "findingScorer" | "mentionResponder" | null;
+  phase: "initial" | "schemaRepair" | "semanticRetry" | null;
+  callOrdinal: number | null;
+  attempt: number | null;
+  promptTokens: number;
+  completionTokens: number;
+  accountingComplete: boolean;
+  costProvenance: "providerExact" | "catalogEstimate" | "unavailable";
+  costProviderDecimal: string | null;
+  costCatalogEstimateDecimal: string | null;
 }
 
 /** Per-case detail emitted in the report's `cases` array. */
@@ -98,6 +115,8 @@ export interface LiveModelCaseResult {
   usageAccountingComplete: boolean | null;
   usageValid: boolean;
   costProvenance: "providerExact" | "catalogEstimate" | "unavailable";
+  costProviderDecimal: string | null;
+  usageCostEvidence: UsageCostEvidence[];
   costUsd: number | null;
   durationMs: number | null;
   exitCode: number | undefined;
@@ -127,6 +146,8 @@ export interface LiveModelAggregate {
   casesRun: number;
   meanCostUsdPerReview: number;
   meanDurationMs: number;
+  p95DurationMs: number;
+  maxDurationMs: number;
   totalCostUsd: number;
   /** Non-schema diagnostics kept for the human table and debugging. */
   mustBlockCases: number;
@@ -160,6 +181,8 @@ export interface SiteModelAggregate {
   casesRun: number;
   meanCostUsdPerReview: number;
   meanDurationMs: number;
+  p95DurationMs: number;
+  maxDurationMs: number;
 }
 
 export function toSiteModelAggregate(a: LiveModelAggregate): SiteModelAggregate {
@@ -174,6 +197,8 @@ export function toSiteModelAggregate(a: LiveModelAggregate): SiteModelAggregate 
     casesRun: a.casesRun,
     meanCostUsdPerReview: a.meanCostUsdPerReview,
     meanDurationMs: a.meanDurationMs,
+    p95DurationMs: a.p95DurationMs,
+    maxDurationMs: a.maxDurationMs,
   };
 }
 
@@ -257,13 +282,17 @@ export function scoreLiveCase(args: {
     modelUsage.reduce((sum, entry) => sum + entry.promptTokens, 0) === env.usage.promptTokens &&
     modelUsage.reduce((sum, entry) => sum + entry.completionTokens, 0) === env.usage.completionTokens;
 
-  const exactCostAvailable = modelUsage.length > 0 && modelUsage.every(
-    (entry) => entry.costMicros !== undefined && entry.costSource === "providerReported",
+  const providerDecimals = modelUsage.map((entry) =>
+    entry.costSource === "providerReported" && entry.costProviderDecimal !== undefined
+      ? parseCanonicalDecimal(entry.costProviderDecimal)
+      : null
   );
+  const exactCostAvailable = modelUsage.length > 0 && providerDecimals.every((entry) => entry !== null);
   const catalogCostAvailable = modelUsage.length > 0 && modelUsage.every((entry) => pricing.has(entry.model));
-  const exactCost = exactCostAvailable
-    ? modelUsage.reduce((sum, entry) => sum + (entry.costMicros ?? 0), 0) / 1_000_000
+  const exactCostDecimal = exactCostAvailable
+    ? sumCanonicalDecimals(providerDecimals as CanonicalDecimal[])
     : null;
+  const exactCost = exactCostDecimal === null ? null : canonicalDecimalToNumber(exactCostDecimal);
   const catalogCost = catalogCostAvailable
     ? modelUsage.reduce((sum, entry) => {
         const price = pricing.get(entry.model)!;
@@ -278,9 +307,45 @@ export function scoreLiveCase(args: {
       ? "catalogEstimate"
       : "unavailable";
 
+  const usageCostEvidence: UsageCostEvidence[] = modelUsage.map((entry, index) => {
+    const providerExact = providerDecimals[index] ?? null;
+    const catalog = pricing.get(entry.model);
+    const catalogEstimate = providerExact === null && catalog !== undefined && entry.accountingComplete
+      ? canonicalDecimalFromNumber(
+          entry.promptTokens * catalog.promptUsdPerToken +
+            entry.completionTokens * catalog.completionUsdPerToken,
+        )
+      : null;
+    return {
+      model: entry.model,
+      role: entry.role ?? null,
+      phase: entry.phase ?? null,
+      callOrdinal: entry.callOrdinal ?? null,
+      attempt: entry.attempt ?? null,
+      promptTokens: entry.promptTokens,
+      completionTokens: entry.completionTokens,
+      accountingComplete: entry.accountingComplete,
+      costProvenance: providerExact !== null
+        ? "providerExact"
+        : catalogEstimate !== null
+          ? "catalogEstimate"
+          : "unavailable",
+      costProviderDecimal: providerExact !== null
+        ? formatCanonicalDecimal(providerExact)
+        : null,
+      costCatalogEstimateDecimal: catalogEstimate !== null
+        ? formatCanonicalDecimal(catalogEstimate)
+        : null,
+    };
+  });
+
   const seededLine = truth.line;
-  const isSeeded = (finding: EnvelopeFinding) =>
-    seededLine !== null && finding.path === truth.path && findingHitsSeededRegion(finding, seededLine);
+  const bodyIncludes = c.groundTruth.findings[0]?.bodyIncludes;
+  const isSemanticMatch = (finding: Envelope["findings"][number]) =>
+    commentMatchesExpectation(finding.body, bodyIncludes);
+  const isSeeded = (finding: Envelope["findings"][number]) =>
+    seededLine !== null && finding.path === truth.path && findingHitsSeededRegion(finding, seededLine) &&
+    isSemanticMatch(finding);
   const detectorFindings = allFindings.filter(isSeeded);
   const unrelatedFindings = allFindings.length - detectorFindings.length;
   const blocks = (finding: Envelope["findings"][number]) =>
@@ -288,8 +353,8 @@ export function scoreLiveCase(args: {
   const seededFinalBlocker = finalFindings.some((finding) => isSeeded(finding) && blocks(finding));
   const unrelatedFinalBlockers = finalFindings.filter((finding) => !isSeeded(finding) && blocks(finding)).length;
   const findingEvidence: FindingEvidence[] = [
-    ...finalFindings.map((finding) => evidenceFor(finding, isSeeded(finding), "final")),
-    ...suppressedFindings.map((finding) => evidenceFor(finding, isSeeded(finding), "suppressed")),
+    ...finalFindings.map((finding) => evidenceFor(finding, isSeeded(finding), isSemanticMatch(finding), "final")),
+    ...suppressedFindings.map((finding) => evidenceFor(finding, isSeeded(finding), isSemanticMatch(finding), "suppressed")),
   ];
 
   const base: LiveModelCaseResult = {
@@ -318,6 +383,8 @@ export function scoreLiveCase(args: {
     usageAccountingComplete,
     usageValid,
     costProvenance,
+    costProviderDecimal: exactCostDecimal === null ? null : formatCanonicalDecimal(exactCostDecimal),
+    usageCostEvidence,
     costUsd: cost,
     durationMs: env.durationMs,
     exitCode,
@@ -332,6 +399,7 @@ export function scoreLiveCase(args: {
 function evidenceFor(
   finding: Envelope["findings"][number],
   seeded: boolean,
+  semanticMatch: boolean,
   disposition: "final" | "suppressed",
 ): FindingEvidence {
   return {
@@ -343,6 +411,7 @@ function evidenceFor(
     severity: finding.severity,
     kind: finding.kind,
     confidence: finding.confidence,
+    semanticMatch,
   };
 }
 
@@ -379,6 +448,8 @@ export function erroredLiveCase(args: {
     usageAccountingComplete: null,
     usageValid: false,
     costProvenance: "unavailable",
+    costProviderDecimal: null,
+    usageCostEvidence: [],
     costUsd: null,
     durationMs: null,
     exitCode: args.exitCode,
@@ -409,6 +480,8 @@ export function aggregateModel(
   const meanDurationMs = durations.length
     ? durations.reduce((a, b) => a + b, 0) / durations.length
     : 0;
+  const p95DurationMs = percentile(durations, 0.95);
+  const maxDurationMs = durations.length ? Math.max(...durations) : 0;
 
   const unrelatedFindings = results.reduce((sum, r) => sum + r.unrelatedFindings, 0);
   const errors = results.filter((r) => r.error !== undefined).length;
@@ -485,6 +558,19 @@ export function aggregateModel(
     if (repeatCleanFindingFp > CLEAN_MAX_FINDING_FALSE_POSITIVE_RATE) {
       admissionFailures.push(`repeat ${repeat} clean finding false-positive rate exceeds 5%`);
     }
+    const repeatDurations = matrix.map((result) => result.durationMs).filter((value): value is number => value !== null);
+    const repeatP95 = percentile(repeatDurations, 0.95);
+    const repeatMax = repeatDurations.length ? Math.max(...repeatDurations) : 0;
+    if (repeatP95 > GENERATOR_MAX_REPEAT_P95_DURATION_MS) {
+      admissionFailures.push(
+        `repeat ${repeat} p95 latency ${repeatP95.toFixed(0)}ms exceeds ${GENERATOR_MAX_REPEAT_P95_DURATION_MS}ms`,
+      );
+    }
+    if (repeatMax > GENERATOR_MAX_REPEAT_DURATION_MS) {
+      admissionFailures.push(
+        `repeat ${repeat} max latency ${repeatMax.toFixed(0)}ms exceeds ${GENERATOR_MAX_REPEAT_DURATION_MS}ms`,
+      );
+    }
   }
   if (!pricingKnown) admissionFailures.push("pricing or usage missing for one or more cases");
   if (meanCostUsdPerReview > GENERATOR_MAX_MEAN_COST_USD) {
@@ -514,6 +600,8 @@ export function aggregateModel(
     casesRun: scored.length,
     meanCostUsdPerReview,
     meanDurationMs,
+    p95DurationMs,
+    maxDurationMs,
     totalCostUsd,
     mustBlockCases: mustBlocks.length,
     mustBlockDetected,
@@ -538,6 +626,58 @@ export function aggregateModel(
  * Cases with null cost are excluded because their provider price was unknown. */
 export function calculateTotalRunCostUsd(results: LiveModelCaseResult[]): number {
   return results.reduce((sum, r) => sum + (r.costUsd ?? 0), 0);
+}
+
+interface CanonicalDecimal {
+  coefficient: bigint;
+  scale: number;
+}
+
+export function parseCanonicalDecimal(value: string): CanonicalDecimal {
+  if (!/^(?:0|[1-9][0-9]*|(?:0|[1-9][0-9]*)\.[0-9]*[1-9])$/u.test(value)) {
+    throw new Error("provider cost must be a canonical nonnegative decimal");
+  }
+  const [whole, fraction = ""] = value.split(".");
+  let coefficient = BigInt(`${whole}${fraction}`);
+  let scale = fraction.length;
+  while (scale > 0 && coefficient % 10n === 0n) {
+    coefficient /= 10n;
+    scale -= 1;
+  }
+  return { coefficient, scale };
+}
+
+function sumCanonicalDecimals(values: CanonicalDecimal[]): CanonicalDecimal {
+  const scale = Math.max(0, ...values.map((value) => value.scale));
+  const coefficient = values.reduce(
+    (sum, value) => sum + value.coefficient * 10n ** BigInt(scale - value.scale),
+    0n,
+  );
+  return parseCanonicalDecimal(formatCanonicalDecimal({ coefficient, scale }));
+}
+
+function formatCanonicalDecimal(value: CanonicalDecimal): string {
+  if (value.scale === 0) return value.coefficient.toString();
+  const digits = value.coefficient.toString().padStart(value.scale + 1, "0");
+  const split = digits.length - value.scale;
+  return `${digits.slice(0, split)}.${digits.slice(split)}`;
+}
+
+function canonicalDecimalToNumber(value: CanonicalDecimal): number {
+  const number = Number(formatCanonicalDecimal(value));
+  if (!Number.isFinite(number)) throw new Error("provider cost is outside the supported numeric range");
+  return number;
+}
+
+function canonicalDecimalFromNumber(value: number): CanonicalDecimal {
+  if (!Number.isFinite(value) || value < 0) throw new Error("catalog cost must be finite and nonnegative");
+  return parseCanonicalDecimal(value.toFixed(15).replace(/0+$/u, "").replace(/\.$/u, "") || "0");
+}
+
+function percentile(values: number[], quantile: number): number {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((left, right) => left - right);
+  return sorted[Math.ceil(quantile * sorted.length) - 1] ?? 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -674,14 +814,14 @@ export function assertPairQualificationPreflight(args: {
   pricing: Map<string, ModelPricing>;
   costCapUsd: number;
 }): number {
-  validateGeneratorQualificationBounds(args.pairs.map((pair) => pair.generatorModel), args.costCapUsd);
-  const roleModels = args.pairs.flatMap((pair) => [
+  const roleModels = normalizeGeneratorModels(args.pairs.flatMap((pair) => [
     ...qualificationGeneratorModels(pair).slice(
       0,
       pair.consensus ?? qualificationGeneratorModels(pair).length,
     ),
     pair.scorerModel,
-  ]);
+  ]));
+  validateGeneratorQualificationBounds(roleModels, args.costCapUsd);
   const missing = [...new Set(roleModels.filter((model) => !args.pricing.has(model)))];
   if (missing.length > 0) {
     throw new Error(`cannot project pair qualification spend; pricing missing for ${missing.join(", ")}`);

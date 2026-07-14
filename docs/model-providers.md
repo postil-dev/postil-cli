@@ -6,17 +6,17 @@ Postil speaks either an OpenAI-compatible chat-completions interface or the nati
 
 The CLI has no implicit model or fallback chain. Set `REVIEW_MODEL` to a model that passes the repository benchmark for the intended review profile. Set `REVIEW_MODEL_CASCADE` only to other qualified models. Scoring is disabled unless `REVIEW_SCORER_MODEL` names a qualified scorer.
 
-Hosted deployments admit only complete profiles listed in the embedded `qualified-models.json` qualification manifest. A profile binds the canonical API base, provider API format, ordered generator chain, consensus width, ordered scorer chain, repeated-run count, and SHA-256 digests for the review contract, fixture set, and benchmark report. Canonical API bases include lowercase scheme/host, the effective port, and a normalized path, with no userinfo, query, or fragment. The manifest also binds the exact `config.toml` digest. Hosted configuration must match one profile exactly; an empty or mismatched manifest rejects inference.
+Hosted deployments admit only complete profiles listed in the embedded `qualified-models.json` qualification manifest. A profile binds the canonical API base, provider API format, ordered generator chain, consensus width, ordered scorer chain, at least three complete runs, and SHA-256 digests for the review contract, evaluator contract, fixture set, and benchmark report. The manifest also binds the exact `config.toml` digest. Hosted configuration must match one profile exactly; an empty, degraded, or mismatched profile rejects inference.
 
 `benchmarkProviderIdentity` can preserve the upstream route reported by the benchmark as evidence. It does not pin runtime upstream routing; admission pins the API endpoint and model profile that Postil controls.
 
-The review-contract digest hashes, in order, `src/prompt.rs`, `src/llm.rs`, `src/envelope.rs`, `src/diff.rs`, and `src/filter.rs`. The fixture-set digest hashes `bench/fixtures/cases.ts`. Each input is framed as its repository path, a NUL byte, file contents, and a trailing NUL byte. The CLI recomputes both digests from embedded sources; changing either source set invalidates every existing profile until the benchmark emits new evidence.
+The review-contract digest covers `Cargo.toml`, `Cargo.lock`, and every Rust source file. The evaluator digest covers the fixtures and live qualification code. Each input is framed as its repository path, a NUL byte, file contents, and a trailing NUL byte. The binary exposes these embedded digests to the benchmark, which verifies them against the worktree before inference. Changing the runtime, dependencies, defaults, fixtures, or evaluator invalidates existing evidence.
 
 Cross-language framing vector: paths and contents `[("a.txt", "alpha"), ("b/β.txt", "line\n")]` serialize as `a.txt\0alpha\0b/β.txt\0line\n\0` in UTF-8 and hash to `1969c5b03a79915d62106b91c742a28127afae455317dcb3a4670e50829eb9ba`.
 
 ## OpenAI-compatible
 
-OpenRouter is the default endpoint. Ollama, vLLM, SGLang, LiteLLM, and private gateways can use the same contract.
+OpenRouter is the default endpoint. Hosted OpenRouter requests deny data-collecting routes and require ZDR-capable routes through [OpenRouter's per-request provider controls](https://openrouter.ai/docs/guides/routing/provider-selection). OpenRouter can select upstream providers dynamically, so an endpoint identity does not claim a pinned upstream route. Ollama, vLLM, SGLang, LiteLLM, and private gateways can use the same contract. BYOK operators control their provider routing and retention settings.
 
 ```sh
 export MODEL_API_KEY=...

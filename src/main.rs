@@ -1,7 +1,7 @@
 use clap::Parser;
 
 use postil_cli::cli::{Cli, Command, ForgeArg, HookAction};
-use postil_cli::config::{Config, starter_config};
+use postil_cli::config::{Config, qualification_metadata, starter_config};
 use postil_cli::review::{ForgeKind, ReviewArgs};
 use postil_cli::{doctor, hook, plan, respond, review};
 
@@ -20,6 +20,10 @@ async fn main() {
 
 async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
     match cli.command {
+        Command::QualificationMetadata => {
+            println!("{}", serde_json::to_string(&qualification_metadata())?);
+            Ok(0)
+        }
         Command::Review {
             forge,
             repo,

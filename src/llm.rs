@@ -284,6 +284,7 @@ pub struct LlmClient {
     api_key: String,
     api_format: ApiFormat,
     endpoint_auth: Option<EndpointAuth>,
+    require_openrouter_privacy: bool,
     request_timeout: Duration,
     timeout_retry_timeout: Duration,
     review_deadline: Option<Instant>,
@@ -579,6 +580,9 @@ impl LlmClient {
             api_key,
             api_format: cfg.api_format,
             endpoint_auth,
+            require_openrouter_privacy: is_canonical_openrouter_base(&cfg.api_base)
+                && (env_flag("POSTIL_HOSTED_MODE")
+                    || env_flag("POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY")),
             request_timeout,
             timeout_retry_timeout: request_timeout.min(Duration::from_secs(TIMEOUT_RETRY_CAP_SECS)),
             review_deadline,
@@ -684,6 +688,29 @@ impl LlmClient {
                         eprintln!("postil: consensus model {model_log} task panicked: {e}")
                     }
                 }
+            }
+            if consensus_is_incomplete(env_flag("POSTIL_HOSTED_MODE"), ok.len(), n) {
+                let completed = ok.len();
+                for review in ok {
+                    add_usage(&mut failed_usage, review.usage);
+                    failed_model_usage.extend(review.model_usage);
+                    failed_incidents.extend(review.model_incidents);
+                    usage_accounting_complete &= review.usage_accounting_complete;
+                }
+                let cause = last_err
+                    .map(|error| error.error)
+                    .unwrap_or_else(|| anyhow!("consensus task did not complete"));
+                let mut error = ModelError::new(
+                    cause.context(format!(
+                        "hosted consensus requires all {n} admitted models; only {} completed",
+                        completed
+                    )),
+                    failed_usage,
+                    usage_accounting_complete,
+                );
+                error.model_usage = failed_model_usage;
+                error.model_incidents = failed_incidents;
+                return Err(error);
             }
             match ok.len() {
                 // Wrap the last failure so its error class (provider vs
@@ -1695,6 +1722,7 @@ impl LlmClient {
                     ],
                 });
                 body["max_tokens"] = json!(max_tokens);
+                apply_openrouter_privacy(&mut body, self.require_openrouter_privacy);
                 body
             }
             ApiFormat::Anthropic => json!({
@@ -1935,6 +1963,25 @@ impl LlmClient {
         }
         tokio::time::sleep(duration).await;
         Ok(())
+    }
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn consensus_is_incomplete(hosted: bool, completed: usize, required: usize) -> bool {
+    hosted && completed != required
+}
+
+fn apply_openrouter_privacy(body: &mut serde_json::Value, required: bool) {
+    if required {
+        body["provider"] = json!({
+            "data_collection": "deny",
+            "zdr": true,
+        });
     }
 }
 
@@ -3443,6 +3490,26 @@ mod tests {
         });
         let merged = consensus_merge(vec![a, b]);
         assert!(merged.findings.is_empty());
+    }
+
+    #[test]
+    fn hosted_consensus_rejects_every_degraded_subset() {
+        assert!(consensus_is_incomplete(true, 1, 3));
+        assert!(consensus_is_incomplete(true, 2, 3));
+        assert!(!consensus_is_incomplete(true, 3, 3));
+        assert!(!consensus_is_incomplete(false, 1, 3));
+    }
+
+    #[test]
+    fn hosted_openrouter_request_denies_collection_and_requires_zdr() {
+        let mut body = json!({"model": "provider/model"});
+        apply_openrouter_privacy(&mut body, true);
+        assert_eq!(body["provider"]["data_collection"], "deny");
+        assert_eq!(body["provider"]["zdr"], true);
+
+        let mut byok = json!({"model": "provider/model"});
+        apply_openrouter_privacy(&mut byok, false);
+        assert!(byok.get("provider").is_none());
     }
 
     #[test]

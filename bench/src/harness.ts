@@ -168,6 +168,7 @@ export const envelopeV1 = z.object({
         promptTokens: z.number().int().nonnegative(),
         completionTokens: z.number().int().nonnegative(),
         costMicros: z.number().int().nonnegative().optional(),
+        costProviderDecimal: z.string().regex(/^(?:0|[1-9][0-9]*|(?:0|[1-9][0-9]*)\.[0-9]*[1-9])$/u).optional(),
         costSource: z.enum(["providerReported", "unavailable"]).optional(),
         accountingComplete: z.boolean().default(false),
       }),
@@ -436,6 +437,7 @@ export async function startMockGithub(c: BenchmarkCase) {
   const contentsPrefix = `/repos/${c.repo}/contents/`;
   const allowedContent = allowedContextByPath(c);
   const baseSha = "0".repeat(40);
+  const comparePath = `/repos/${c.repo}/compare/${baseSha}...${c.headSha}`;
   const changedPath = c.allowedContext.files[0]?.path;
   const sourceVersions = sourceVersionsFromDiff(c.diff);
 
@@ -478,6 +480,12 @@ export async function startMockGithub(c: BenchmarkCase) {
       ).length;
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify([{ filename, status: "modified", patch, changes }]));
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === comparePath) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ merge_base_commit: { sha: baseSha } }));
       return;
     }
 
@@ -988,7 +996,7 @@ function scoreFindings(
   };
 }
 
-function commentMatchesExpectation(comment: string, bodyIncludes: string | undefined): boolean {
+export function commentMatchesExpectation(comment: string, bodyIncludes: string | undefined): boolean {
   if (bodyIncludes === undefined) return true;
   if (comment.includes(bodyIncludes)) return true;
 

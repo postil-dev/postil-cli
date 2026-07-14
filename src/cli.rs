@@ -33,6 +33,9 @@ pub enum ForgeArg {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)] // Review carries the full flag set by design.
 pub enum Command {
+    /// Print immutable qualification metadata embedded in this binary.
+    #[command(hide = true)]
+    QualificationMetadata,
     /// Review a diff: a PR/MR on a forge, or local changes.
     Review {
         /// Code host for remote review. Inferred as github when --repo is set.

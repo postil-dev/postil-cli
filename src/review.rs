@@ -1030,6 +1030,12 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                                 }
                             }
                         }
+                        if scorer_failure_blocks_hosted(
+                            crate::config::hosted_mode(),
+                            scorer_error.is_some(),
+                        ) {
+                            anyhow::bail!("hosted scorer could not complete the admitted profile");
+                        }
                     }
                     findings = kept;
                 }
@@ -1120,6 +1126,10 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
         head_sha,
         since_sha: args.since_sha.clone(),
     })
+}
+
+fn scorer_failure_blocks_hosted(hosted: bool, scorer_failed: bool) -> bool {
+    hosted && scorer_failed
 }
 
 async fn finish<F: Forge>(
@@ -1324,6 +1334,13 @@ fn error_envelope(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hosted_scorer_failure_blocks_unscored_output() {
+        assert!(scorer_failure_blocks_hosted(true, true));
+        assert!(!scorer_failure_blocks_hosted(true, false));
+        assert!(!scorer_failure_blocks_hosted(false, true));
+    }
     use crate::envelope::{Kind, Severity};
 
     fn finding(path: &str, line: u32, body: &str) -> Finding {

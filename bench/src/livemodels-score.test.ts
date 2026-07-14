@@ -34,7 +34,7 @@ function fixture(
     diff: "diff --git a/src/x.ts b/src/x.ts\n+ bad();\n",
     admission: { classification, contractRule: "test-contract" },
     groundTruth: {
-      findings: severity === null ? [] : [{ path: "src/x.ts", line: 20, severity }],
+      findings: severity === null ? [] : [{ path: "src/x.ts", line: 20, severity, bodyIncludes: "generated detail" }],
     },
     modelOutput: { summary: "", findings: [] },
     expectations: { minFindings: 0 },
@@ -62,7 +62,11 @@ function usage(model: string, role: "reviewGenerator" | "findingScorer", exact =
     attempt: 1,
     promptTokens: 100,
     completionTokens: 20,
-    ...(exact ? { costMicros: 100, costSource: "providerReported" as const } : {}),
+    ...(exact ? {
+      costMicros: 100,
+      costProviderDecimal: "0.0001",
+      costSource: "providerReported" as const,
+    } : {}),
     accountingComplete: true,
   };
 }
@@ -73,6 +77,7 @@ function envelope(args: {
   gateFailing?: boolean;
   exactCost?: boolean;
   scorerError?: string;
+  durationMs?: number;
 } = {}): Envelope {
   const findings = args.findings ?? [];
   const suppressedFindings = args.suppressed ?? [];
@@ -100,7 +105,7 @@ function envelope(args: {
     },
     modelUsage,
     usageAccountingComplete: true,
-    durationMs: 1000,
+    durationMs: args.durationMs ?? 1000,
     baseSha: null,
     headSha: null,
     sinceSha: null,
@@ -167,6 +172,7 @@ describe("pair scoring", () => {
       severity: "warn",
       kind: "risk",
       confidence: 0.9,
+      semanticMatch: true,
     }]);
     expect(JSON.stringify(result.findingEvidence)).not.toContain("generated prose");
     expect(JSON.stringify(result.findingEvidence)).not.toContain("generated detail");
@@ -183,10 +189,19 @@ describe("pair scoring", () => {
     expect(result.finalBlocking).toBe(false);
   });
 
+  test("requires useful defect semantics in addition to a nearby coordinate", () => {
+    const unrelated = { ...finding("error"), body: "This nearby line only changes formatting." };
+    const result = score("mustBlock", 1, envelope({ findings: [unrelated], gateFailing: true }));
+    expect(result.detected).toBe(false);
+    expect(result.findingEvidence[0]?.semanticMatch).toBe(false);
+  });
+
   test("preserves provider-exact and catalog fallback cost provenance", () => {
     const exact = score("advisory", 1, envelope({ findings: [finding("warn")] }));
     expect(exact.costProvenance).toBe("providerExact");
     expect(exact.costUsd).toBeCloseTo(0.0002, 8);
+    expect(exact.costProviderDecimal).toBe("0.0002");
+    expect(exact.usageCostEvidence).toHaveLength(2);
 
     const catalog = score("advisory", 1, envelope({ findings: [finding("warn")], exactCost: false }));
     expect(catalog.costProvenance).toBe("catalogEstimate");
@@ -213,6 +228,14 @@ describe("pair admission", () => {
       passed: true,
       admissionFailures: [],
     });
+  });
+
+  test("rejects a latency outlier that the mean could hide", () => {
+    const matrix = passingMatrix();
+    matrix[0]!.durationMs = 187_000;
+    const aggregate = aggregateModel(pair, matrix, 3);
+    expect(aggregate.passed).toBe(false);
+    expect(aggregate.admissionFailures.some((failure) => failure.includes("max latency"))).toBe(true);
   });
 
   test("fails every attributable quality boundary independently", () => {
@@ -280,6 +303,8 @@ describe("report and pricing utilities", () => {
       casesRun: 183,
       meanCostUsdPerReview: 0.0001803278688524587,
       meanDurationMs: 1000,
+      p95DurationMs: 1000,
+      maxDurationMs: 1000,
     });
   });
 

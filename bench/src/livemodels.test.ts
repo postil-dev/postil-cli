@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { cases as fixtureInputs } from "../fixtures/cases";
 import {
   admissionManifestCandidate,
+  admitSavedLiveModelsReport,
   formatLiveModelsReport,
   hashNamedSources,
   liveEnv,
@@ -101,6 +102,17 @@ describe("pair qualification configuration", () => {
 });
 
 describe("qualification report", () => {
+  test("machine admission rejects insufficient and failed reports without emitting a manifest", () => {
+    const report = {
+      repeats: 2,
+      profiles: [],
+      cases: [],
+      passed: false,
+    };
+    expect(() => admitSavedLiveModelsReport(JSON.stringify(report))).toThrow(
+      "at least 3 complete repeats",
+    );
+  });
   test("matches the runtime named-source framing vector", () => {
     expect(hashNamedSources([
       ["a.txt", Buffer.from("alpha")],
@@ -118,6 +130,7 @@ describe("qualification report", () => {
       scorerModels: ["provider/scorer"],
       fixtureHash: "a".repeat(64),
       reviewContractHash: "b".repeat(64),
+      evaluatorContractHash: "f".repeat(64),
       configHash: "c".repeat(64),
       cliBinaryHash: "d".repeat(64),
       repeats: 3,
@@ -134,6 +147,7 @@ describe("qualification report", () => {
         apiFormat: "openai-compatible",
         reviewContractSha256: "b".repeat(64),
         fixtureSetSha256: "a".repeat(64),
+        evaluatorContractSha256: "f".repeat(64),
         reportSha256: "e".repeat(64),
         repeatedRuns: 3,
       }],
@@ -148,8 +162,11 @@ describe("qualification report", () => {
       apiBase: "https://example.test/v1",
       apiFormat: "openai-compatible",
       providerEndpointIdentity: "https://example.test:443/v1",
+      upstreamProviderPinned: false,
+      upstreamProviderIdentity: null,
       fixtureHash: "a".repeat(64),
       reviewContractHash: "b".repeat(64),
+      evaluatorContractHash: "f".repeat(64),
       configHash: "d".repeat(64),
       cliBinaryHash: "c".repeat(64),
       evidenceHash: "e".repeat(64),
@@ -174,6 +191,8 @@ describe("qualification report", () => {
         casesRun: 183,
         meanCostUsdPerReview: cost,
         meanDurationMs: 1200,
+        p95DurationMs: 1200,
+        maxDurationMs: 1200,
         totalCostUsd: cost,
         mustBlockCases: 102,
         mustBlockDetected: 102,

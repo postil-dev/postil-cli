@@ -85,7 +85,9 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   `POSTIL_API_FORMAT` select `openai-compatible` (default) or `anthropic`.
   Hosted admission matches the complete ordered generator/scorer configuration and
   consensus width to one immutable qualification profile. Each profile binds benchmark
-  report, fixture-set, review-contract, and model-default digests plus repeat evidence.
+  report, fixture-set, evaluator-contract, full runtime/dependency-contract, and
+  model-default digests plus repeat evidence. Hosted consensus and scoring reject
+  degraded subsets rather than publishing output from an unqualified path.
 
 ## Prompt-injected policy sources
 
