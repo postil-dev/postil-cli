@@ -41,11 +41,13 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   and response decoding vary by API format while retry, timeout, deadline, cascade, and
   secret-redaction semantics remain shared. Optional private-endpoint authentication is
   a separate header whose name cannot collide with provider-managed headers. A shared
-  admission ledger reserves each HTTP attempt, serialized input bytes, maximum output,
+  admission ledger reserves each HTTP attempt, exact serialized JSON request bytes,
+  maximum output,
   and worst-case token spend before sending any initial, retry, repair, planner,
   scorer, or mention-response call. Hosted preflight covers every active cascade or
   consensus model, schema and semantic repair, transport retry, output bound, and
-  admitted-model price bound before the first provider request.
+  admitted-model price bound before the first provider request. Exact serialization
+  includes JSON expansion for quotes, backslashes, and control characters.
   Every provider HTTP call has a model-usage record with a product role, logical phase,
   operation-wide call ordinal, phase-local attempt, token counts, and exact-cost source.
   OpenRouter's response `usage.cost` is preserved as canonical decimal dollars without
@@ -56,20 +58,25 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   one UTF-8 byte counts as one projected token rather than using an optimistic ratio;
   reviews every evidence batch outside hosted inference. Hosted inference uses a
   bounded, schema-validated planner over deterministic candidate digests, always
-  including boundary, high-risk, and global-synthesis evidence. Its prompts state
-  that literal line coverage is non-exhaustive. One bounded cross-batch synthesis is
-  built from deterministic heuristic semantic categories (contracts, sources, sinks,
+  including boundary, high-risk, and global-synthesis evidence. A planner outage or
+  invalid response retains its complete usage and cost records, then falls back to the
+  deterministic mandatory selection instead of aborting the review. The prompts state
+  that literal line coverage is non-exhaustive. A bounded synthesis tree is built from
+  deterministic heuristic semantic categories (contracts, sources, sinks,
   validation, lifecycle, and dependencies) with at least one bounded representative
   for every rendered file region; aggregates findings before grounding and scoring; owns
-  fail-closed semantics (`fail_closed_finding`); and owns
-  check-run lifecycle ordering (checks are created before the model runs so a crash can
-  still be reported against them). It persists safe structured model incidents for
-  monitoring without raw provider or model text.
+  fail-closed semantics (`fail_closed_finding`); records exhaustive or bounded
+  source-batch coverage, selected and total source-batch counts, and planner fallback in
+  the envelope; and owns check-run lifecycle ordering (checks are created before the model
+  runs so a crash can still be reported against them). It persists safe structured model
+  incidents for monitoring without raw provider or model text.
 - `forge/`: trait + GitHub, GitLab, Bitbucket Cloud, and Azure DevOps implementations,
   with self-managed base URLs where the same API contract applies. Paginated forge
-  metadata has aggregate byte and changed-file bounds. Source responses require a
-  declared `Content-Length` and an exact matching byte count. They stream into the
-  operation workspace without the metadata page-size ceiling. GitHub
+  metadata has aggregate byte and changed-file bounds. Source responses stream to
+  successful transport EOF without the metadata page-size ceiling. A declared length
+  must match the received byte count. Authoritative forge size and SHA-256 metadata are
+  verified when available, including GitLab source headers. Truncated transports and
+  metadata mismatches fail closed. GitHub
   reconstructs full reviews from merge-base/head file content after exhausting the declared
   changed-file count, and rejects an ambiguous 300-file incremental compare. Bitbucket exhausts
   paginated diffstat and reconstructs bounded source content from the compared commits.
@@ -148,7 +155,11 @@ additions (violations are `kind: contentPolicy`). Content policy is on by defaul
     requests, HTTP attempts including repair/retry paths, per-response output tokens,
     planner and scorer input, worst-case token exposure, and projected cost across
     cascade or consensus before provider contact.
-12. Operational and provider virtual anchors expire after each run. Reviewable
+12. Every completed review envelope records source-batch coverage when batching runs.
+    Synthesis requests remain outside those counts. Bounded reviews expose selected and
+    total source-batch counts in compact output. Planner
+    fallback remains audit metadata and does not expose provider failure details to a PR.
+13. Operational and provider virtual anchors expire after each run. Reviewable
     PR-description and change-metadata anchors carry across unrelated incremental
     reviews, and a same-head rerun with either anchor falls back to a full review.
     Change-metadata supersession requires an exact stable semantic ID; synthetic line

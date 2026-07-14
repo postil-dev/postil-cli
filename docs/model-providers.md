@@ -16,7 +16,7 @@ Cross-language framing vector: paths and contents `[("a.txt", "alpha"), ("b/β.t
 
 ## Hosted resource admission
 
-Hosted reviews preflight the complete planner, review, scorer, repair, retry, fallback, and consensus path before contacting a provider. Large diffs use deterministic boundary, risk, and global-synthesis evidence plus a bounded planner selection. The resulting review is explicitly non-exhaustive at the literal-line level. Acquired sources, reconstructed diffs, normalized windows, and model batches share one 512 MiB file-backed operation quota.
+Hosted reviews preflight the complete planner, review, scorer, repair, retry, fallback, and consensus path before contacting a provider. Admission measures each JSON request after serialization, including escaped quotes, backslashes, and control characters. Large diffs use deterministic boundary, risk, and global-synthesis evidence plus a bounded planner selection. If every planner call fails or returns invalid output, Postil retains the planner usage records and reviews the deterministic mandatory selection. The envelope records exhaustive or bounded mode, selected and total source-batch counts, and planner fallback for audit. Compact output discloses bounded coverage without publishing provider errors. Acquired sources, reconstructed diffs, normalized windows, and model batches share one 512 MiB file-backed operation quota.
 
 ## OpenAI-compatible
 

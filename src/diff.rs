@@ -614,15 +614,16 @@ pub struct ModelBatchSpool {
     file: File,
     _lease: WorkspaceLease,
     pub count: usize,
+    pub source_count: usize,
     pub metadata_count: u32,
-    pub total_batch_bytes: usize,
-    pub largest_batch_bytes: usize,
+    synthesis_ids: BTreeSet<usize>,
 }
 
 pub struct HostedBatchCandidates {
     pub manifest: String,
     pub mandatory_ids: Vec<usize>,
     pub candidate_ids: BTreeSet<usize>,
+    pub source_batch_count: usize,
 }
 
 impl ModelBatchSpool {
@@ -655,7 +656,7 @@ impl ModelBatchSpool {
             id = id
                 .checked_add(1)
                 .context("hosted planner batch id overflowed")?;
-            let synthesis = batch.contains("Cross-window semantic digests");
+            let synthesis = self.synthesis_ids.contains(&id);
             if synthesis {
                 final_synthesis = Some(id);
             } else {
@@ -741,7 +742,14 @@ impl ModelBatchSpool {
                 .into_iter()
                 .map(|candidate| candidate.id)
                 .collect(),
+            source_batch_count: self.source_count,
         })
+    }
+
+    pub fn selected_source_count(&self, ids: &BTreeSet<usize>) -> usize {
+        ids.iter()
+            .filter(|id| !self.synthesis_ids.contains(id))
+            .count()
     }
 
     pub fn selected_batches(&mut self, ids: &BTreeSet<usize>) -> Result<Vec<String>> {
@@ -867,8 +875,8 @@ pub fn spool_model_batches(
     let mut lease = WorkspaceLease::new(prepared._window_lease.budget.clone());
     let mut spool_bytes = 0u64;
     let mut count = 0usize;
-    let mut total_batch_bytes = 0usize;
-    let mut largest_batch_bytes = 0usize;
+    let mut source_count = 0usize;
+    let mut synthesis_ids = BTreeSet::new();
     let mut metadata_count = 0u32;
     let synthesis_header = "Cross-window semantic digests:\n";
     let mut cross_window = synthesis_header.to_string();
@@ -916,6 +924,9 @@ pub fn spool_model_batches(
             count = count
                 .checked_add(1)
                 .context("model batch count overflowed")?;
+            source_count = source_count
+                .checked_add(1)
+                .context("source model batch count overflowed")?;
         }
         if let Some(synthesis) = plan.synthesis {
             write_length_prefixed(
@@ -931,6 +942,7 @@ pub fn spool_model_batches(
             count = count
                 .checked_add(1)
                 .context("model batch count overflowed")?;
+            synthesis_ids.insert(count);
         }
     }
 
@@ -954,7 +966,7 @@ pub fn spool_model_batches(
             anyhow::bail!("compact artifact metadata could not fit a bounded model request");
         }
         metadata_count = metadata_count.max(plan.metadata_count);
-        for batch in plan.batches.into_iter().chain(plan.synthesis) {
+        for batch in plan.batches {
             write_length_prefixed(
                 &mut file,
                 &mut lease,
@@ -968,6 +980,25 @@ pub fn spool_model_batches(
             count = count
                 .checked_add(1)
                 .context("model batch count overflowed")?;
+            source_count = source_count
+                .checked_add(1)
+                .context("source model batch count overflowed")?;
+        }
+        if let Some(synthesis) = plan.synthesis {
+            write_length_prefixed(
+                &mut file,
+                &mut lease,
+                &synthesis,
+                max_batch_bytes,
+                "artifact synthesis batch",
+            )?;
+            spool_bytes = spool_bytes
+                .checked_add(synthesis.len() as u64 + 8)
+                .context("model-batch spool size overflowed")?;
+            count = count
+                .checked_add(1)
+                .context("model batch count overflowed")?;
+            synthesis_ids.insert(count);
         }
         lock_start = lock_end;
         artifact_start = artifact_end;
@@ -995,6 +1026,7 @@ pub fn spool_model_batches(
                 count = count
                     .checked_add(1)
                     .context("model batch count overflowed")?;
+                synthesis_ids.insert(count);
                 digests.push(recursive_semantic_digest(&chunk));
             }
             if chunk_count == 1 {
@@ -1015,6 +1047,7 @@ pub fn spool_model_batches(
         write_length_prefixed(&mut file, &mut lease, "", max_batch_bytes, "model batch")?;
         spool_bytes = spool_bytes.saturating_add(8);
         count = 1;
+        source_count = 1;
     }
     let aggregate = prepared
         .snapshot_bytes
@@ -1027,27 +1060,13 @@ pub fn spool_model_batches(
     );
     file.seek(SeekFrom::Start(0))
         .context("rewinding model-batch spool")?;
-    let mut planning_reader = file
-        .try_clone()
-        .context("cloning model-batch spool for planning")?;
-    planning_reader
-        .seek(SeekFrom::Start(0))
-        .context("rewinding model-batch planning reader")?;
-    while let Some(batch) = read_length_prefixed(&mut planning_reader, "planned model batch")? {
-        total_batch_bytes = total_batch_bytes
-            .checked_add(batch.len())
-            .context("planned model input size overflowed")?;
-        largest_batch_bytes = largest_batch_bytes.max(batch.len());
-    }
-    file.seek(SeekFrom::Start(0))
-        .context("rewinding model-batch spool after planning")?;
     Ok(ModelBatchSpool {
         file,
         _lease: lease,
         count,
+        source_count,
         metadata_count,
-        total_batch_bytes,
-        largest_batch_bytes,
+        synthesis_ids,
     })
 }
 
@@ -3496,14 +3515,21 @@ diff --git a/two.rs b/two.rs
         let mut prepared = prepare_review(&snapshot).unwrap();
         let mut batches = spool_model_batches(&mut prepared, 4_096, 1_024, false).unwrap();
         assert!(batches.count > 22);
+        assert!(batches.source_count < batches.count);
         let candidates = batches.hosted_candidates(5, 32).unwrap();
+        assert_eq!(candidates.source_batch_count, batches.source_count);
         assert!(candidates.mandatory_ids.len() <= 5);
         assert!(candidates.mandatory_ids.contains(&1));
         assert!(candidates.mandatory_ids.iter().any(|id| *id > 22));
-        let selected = batches
-            .selected_batches(&candidates.mandatory_ids.iter().copied().collect())
-            .unwrap();
+        let selected_ids = candidates
+            .mandatory_ids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let selected_source_count = batches.selected_source_count(&selected_ids);
+        let selected = batches.selected_batches(&selected_ids).unwrap();
         assert_eq!(selected.len(), candidates.mandatory_ids.len());
+        assert!(selected_source_count < selected.len());
         assert!(
             selected
                 .iter()

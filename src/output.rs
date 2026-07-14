@@ -55,7 +55,7 @@ fn render_csv(envelope: &Envelope) -> String {
     let mut out = String::from(
         "version,silent,summary,path,line,endLine,severity,kind,confidence,title,body,\
          gateFailOn,gateFailing,modelUsed,promptTokens,completionTokens,durationMs,baseSha,\
-         headSha,sinceSha\n",
+         headSha,sinceSha,coverageMode,selectedBatches,totalBatches,plannerFallback\n",
     );
     if envelope.findings.is_empty() {
         push_csv_row(&mut out, envelope, None);
@@ -97,6 +97,30 @@ fn push_csv_row(out: &mut String, envelope: &Envelope, finding: Option<&crate::e
         envelope.base_sha.clone().unwrap_or_default(),
         envelope.head_sha.clone().unwrap_or_default(),
         envelope.since_sha.clone().unwrap_or_default(),
+        envelope
+            .review_coverage
+            .as_ref()
+            .map(|coverage| match coverage.mode {
+                crate::envelope::ReviewCoverageMode::Exhaustive => "exhaustive",
+                crate::envelope::ReviewCoverageMode::Bounded => "bounded",
+            })
+            .unwrap_or_default()
+            .to_string(),
+        envelope
+            .review_coverage
+            .as_ref()
+            .map(|coverage| coverage.selected_batches.to_string())
+            .unwrap_or_default(),
+        envelope
+            .review_coverage
+            .as_ref()
+            .map(|coverage| coverage.total_batches.to_string())
+            .unwrap_or_default(),
+        envelope
+            .review_coverage
+            .as_ref()
+            .map(|coverage| coverage.planner_fallback.to_string())
+            .unwrap_or_default(),
     ]);
     out.push_str(
         &fields
@@ -173,6 +197,14 @@ pub fn print_pretty(envelope: &Envelope) {
         out.push_str(&format!(
             "{} finding(s) suppressed by policy.\n",
             envelope.counts.suppressed
+        ));
+    }
+    if let Some(coverage) = &envelope.review_coverage
+        && coverage.mode == crate::envelope::ReviewCoverageMode::Bounded
+    {
+        out.push_str(&format!(
+            "coverage: {}/{} source batches (bounded selection)\n",
+            coverage.selected_batches, coverage.total_batches
         ));
     }
     let gate = if envelope.gate.failing {
@@ -277,6 +309,7 @@ mod tests {
             usage: Default::default(),
             model_usage: vec![],
             model_incidents: vec![],
+            review_coverage: None,
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
@@ -306,5 +339,53 @@ mod tests {
         let field = csv_field("\x1b[31mred\x1b[0m,\"quoted\"\nnext".into());
         assert_eq!(field, "\"[31mred[0m,\"\"quoted\"\"\nnext\"");
         assert!(!field.contains('\x1b'));
+    }
+
+    #[test]
+    fn csv_records_bounded_coverage_and_planner_fallback() {
+        use crate::envelope::{Gate, ReviewCoverage, ReviewCoverageMode};
+
+        let env = Envelope {
+            version: 1,
+            summary: String::new(),
+            silent: true,
+            findings: vec![],
+            suppressed_findings: vec![],
+            resolved: vec![],
+            counts: Default::default(),
+            confidence_buckets: [0; 5],
+            gate: Gate {
+                fail_on: "error".into(),
+                failing: false,
+                block_on_kinds: vec![],
+            },
+            model_used: "review-model".into(),
+            scorer_model: None,
+            scorer_error: None,
+            scorer_disagreements: None,
+            usage: Default::default(),
+            model_usage: vec![],
+            model_incidents: vec![],
+            review_coverage: Some(ReviewCoverage {
+                mode: ReviewCoverageMode::Bounded,
+                selected_batches: 5,
+                total_batches: 21,
+                planner_fallback: true,
+            }),
+            usage_accounting_complete: true,
+            duration_ms: 0,
+            base_sha: None,
+            head_sha: None,
+            since_sha: None,
+        };
+
+        let csv = render_csv(&env);
+        assert!(
+            csv.lines()
+                .next()
+                .unwrap()
+                .ends_with("coverageMode,selectedBatches,totalBatches,plannerFallback")
+        );
+        assert!(csv.lines().nth(1).unwrap().ends_with("bounded,5,21,true"));
     }
 }

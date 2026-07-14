@@ -128,13 +128,40 @@ impl GitLab {
             .send()
             .await
             .context("fetching GitLab source file")?;
-        let snapshot = super::response_snapshot_in(
-            Self::check_ok(response, "source file fetch").await?,
-            "GitLab source file",
-            workspace,
-            None,
-        )
-        .await?;
+        let response = Self::check_ok(response, "source file fetch").await?;
+        let authoritative_size = response
+            .headers()
+            .get("x-gitlab-size")
+            .map(|value| {
+                value
+                    .to_str()
+                    .context("GitLab source size header is not text")?
+                    .parse::<u64>()
+                    .context("GitLab source size header is not numeric")
+            })
+            .transpose()?;
+        let authoritative_sha256 = response
+            .headers()
+            .get("x-gitlab-content-sha256")
+            .map(|value| {
+                let value = value
+                    .to_str()
+                    .context("GitLab source SHA-256 header is not text")?;
+                ensure!(
+                    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                    "GitLab source SHA-256 header is malformed"
+                );
+                Ok::<_, anyhow::Error>(value.to_string())
+            })
+            .transpose()?;
+        let authoritative = (authoritative_size.is_some() || authoritative_sha256.is_some())
+            .then_some(super::SourceExpectation {
+                size: authoritative_size,
+                sha256: authoritative_sha256,
+            });
+        let snapshot =
+            super::response_snapshot_in(response, "GitLab source file", workspace, authoritative)
+                .await?;
         let byte_count = snapshot.as_bytes().len();
         Ok((snapshot, byte_count))
     }

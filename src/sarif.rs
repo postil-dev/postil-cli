@@ -138,6 +138,7 @@ mod tests {
             usage: Usage::default(),
             model_usage: vec![],
             model_incidents: vec![],
+            review_coverage: None,
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,

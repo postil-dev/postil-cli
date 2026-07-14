@@ -7,7 +7,10 @@ use anyhow::{Context, Result, anyhow};
 
 use crate::config::{Config, GateLevel, OnError};
 use crate::diff;
-use crate::envelope::{Envelope, Finding, Gate, Kind, ModelUsage, Usage, fail_closed_finding};
+use crate::envelope::{
+    Envelope, Finding, Gate, Kind, ModelUsage, ReviewCoverage, ReviewCoverageMode, Usage,
+    fail_closed_finding,
+};
 use crate::filter;
 use crate::forge::{
     CheckState, Forge, PrMeta, azure::Azure, bitbucket::Bitbucket, github::GitHub, gitlab::GitLab,
@@ -649,6 +652,57 @@ fn sort_findings_for_display(findings: &mut [Finding]) {
     });
 }
 
+struct ReviewBatchPromptContext<'a> {
+    cfg: &'a Config,
+    repo: Option<&'a str>,
+    meta: Option<&'a PrMeta>,
+    incremental: bool,
+    content_policy_active: bool,
+    bounded_selection: bool,
+    multiple: bool,
+}
+
+fn review_batch_prompt(
+    context: &ReviewBatchPromptContext<'_>,
+    mut annotated: String,
+    first: bool,
+) -> (String, String, bool) {
+    let synthesis = annotated.starts_with("Cross-window semantic digests")
+        || annotated.starts_with("Cross-batch semantic digests");
+    if context.bounded_selection {
+        let kind = if synthesis { "synthesis" } else { "source" };
+        annotated.insert_str(0, &format!(
+            "This {kind} batch was selected from a larger diff. Review only the supplied grounded evidence. Do not claim literal examination of every changed line. Boundary, risk, and synthesis evidence are reviewed as separate requests.\n\n"
+        ));
+    }
+    let prompt_context = PrContext {
+        repo: context.repo,
+        title: if !context.content_policy_active || first {
+            context.meta.map(|value| value.title.as_str())
+        } else {
+            None
+        },
+        body: if !context.content_policy_active || first {
+            context.meta.map(|value| value.body.as_str())
+        } else {
+            None
+        },
+        incremental: context.incremental,
+        content_policy: first && context.content_policy_active,
+    };
+    let mut user = prompt::user_prompt(&prompt_context, &annotated, context.cfg.max_findings);
+    if synthesis {
+        user.push_str(
+            "\n\nThis bounded synthesis window joins semantic evidence from adjacent source windows. Look specifically for merge-relevant relationships such as caller/API, config/consumer, validation/sink, and lifecycle pairs. Cite the exact numbered path and line retained in the digest.",
+        );
+    } else if context.multiple {
+        user.push_str(
+            "\n\nReview this selected source batch independently. Other selected source batches are reviewed separately.",
+        );
+    }
+    (annotated, user, synthesis)
+}
+
 async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) -> Result<Envelope> {
     let ReviewInput {
         diff_snapshot,
@@ -689,6 +743,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
     let mut usage = Usage::default();
     let mut model_usage: Vec<ModelUsage> = Vec::new();
     let mut model_incidents = Vec::new();
+    let mut review_coverage = None;
     let mut usage_accounting_complete = true;
     let mut suppressed = 0u32;
     let mut ungrounded = 0u32;
@@ -780,25 +835,71 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                 let planned_batch_count = hosted_candidates
                     .as_ref()
                     .map_or(batches.count, |_| MAX_HOSTED_SELECTED_BATCHES);
-                let planned_batch_bytes = if hosted_candidates.is_some() {
-                    batches
-                        .largest_batch_bytes
-                        .saturating_mul(planned_batch_count)
-                } else {
-                    batches.total_batch_bytes
-                };
-                client.preflight_review_plan(
+                let preflight_prompt_context = ReviewBatchPromptContext {
                     cfg,
-                    planned_batch_count,
-                    planned_batch_bytes,
-                    batches.largest_batch_bytes,
-                    shared_context_token_upper_bound,
-                    hosted_candidates
-                        .as_ref()
-                        .map(|candidates| candidates.manifest.len()),
-                )?;
+                    repo,
+                    meta,
+                    incremental,
+                    content_policy_active,
+                    bounded_selection: hosted_candidates.is_some(),
+                    multiple: planned_batch_count > 1,
+                };
+                if crate::config::hosted_mode() {
+                    let preflight_ids = if let Some(candidates) = &hosted_candidates {
+                        candidates
+                            .candidate_ids
+                            .iter()
+                            .chain(&candidates.mandatory_ids)
+                            .copied()
+                            .collect::<std::collections::BTreeSet<_>>()
+                    } else {
+                        (1..=batches.count).collect()
+                    };
+                    let preflight_batches = batches.selected_batches(&preflight_ids)?;
+                    let candidate_prompts = preflight_batches
+                        .into_iter()
+                        .map(|batch| {
+                            let first =
+                                review_batch_prompt(&preflight_prompt_context, batch.clone(), true)
+                                    .1;
+                            let later =
+                                review_batch_prompt(&preflight_prompt_context, batch, false).1;
+                            (first, later)
+                        })
+                        .collect::<Vec<_>>();
+                    let candidate_first_users = candidate_prompts
+                        .iter()
+                        .map(|(first, _)| first.clone())
+                        .collect::<Vec<_>>();
+                    let candidate_later_users = candidate_prompts
+                        .into_iter()
+                        .map(|(_, later)| later)
+                        .collect::<Vec<_>>();
+                    let planner = hosted_candidates.as_ref().map(|candidates| {
+                        (
+                            candidates.manifest.as_str(),
+                            MAX_HOSTED_SELECTED_BATCHES
+                                .saturating_sub(candidates.mandatory_ids.len()),
+                        )
+                    });
+                    client.preflight_review_plan(
+                        cfg,
+                        planned_batch_count,
+                        &system,
+                        &candidate_first_users,
+                        &candidate_later_users,
+                        planner,
+                    )?;
+                }
                 let mut selected_batches = None;
+                let total_source_batches = batches.source_count;
+                let mut selected_source_batches = total_source_batches;
+                let mut planner_fallback = false;
                 if let Some(candidates) = hosted_candidates {
+                    anyhow::ensure!(
+                        candidates.source_batch_count == total_source_batches,
+                        "hosted planner source-batch inventory changed during selection"
+                    );
                     let remaining =
                         MAX_HOSTED_SELECTED_BATCHES.saturating_sub(candidates.mandatory_ids.len());
                     let mut additional_candidates = candidates.candidate_ids.clone();
@@ -819,7 +920,9 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                         .completion_tokens
                         .saturating_add(plan.usage.completion_tokens);
                     model_usage.extend(plan.model_usage);
+                    model_incidents.extend(plan.model_incidents);
                     usage_accounting_complete &= plan.usage_accounting_complete;
+                    planner_fallback = plan.fallback_used;
                     let mut ids = candidates
                         .mandatory_ids
                         .into_iter()
@@ -830,11 +933,12 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                         }
                         ids.insert(id);
                     }
+                    selected_source_batches = batches.selected_source_count(&ids);
                     let selected = batches.selected_batches(&ids)?;
+                    let selected_synthesis_requests =
+                        selected.len().saturating_sub(selected_source_batches);
                     eprintln!(
-                        "postil: hosted planner selected {} of {} bounded review batches",
-                        selected.len(),
-                        batches.count
+                        "postil: hosted selection uses {selected_source_batches} of {total_source_batches} source batches and {selected_synthesis_requests} synthesis requests (planner fallback={planner_fallback})",
                     );
                     selected_batches = Some(selected.into_iter());
                 }
@@ -842,6 +946,22 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                     .as_ref()
                     .map_or(batches.count, |selected| selected.len());
                 let risk_selected_review = selected_batches.is_some();
+                let runtime_prompt_context = ReviewBatchPromptContext {
+                    multiple: total_requests > 1,
+                    ..preflight_prompt_context
+                };
+                review_coverage = Some(ReviewCoverage {
+                    mode: if risk_selected_review {
+                        ReviewCoverageMode::Bounded
+                    } else {
+                        ReviewCoverageMode::Exhaustive
+                    },
+                    selected_batches: u32::try_from(selected_source_batches)
+                        .context("selected review batch count exceeds envelope range")?,
+                    total_batches: u32::try_from(total_source_batches)
+                        .context("total review batch count exceeds envelope range")?,
+                    planner_fallback,
+                });
                 let mut raw_findings = Vec::new();
                 let mut summary_parts = Vec::new();
                 let mut finding_contexts = Vec::new();
@@ -856,15 +976,10 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                     } else {
                         batches.next_batch()?
                     };
-                    let Some(mut annotated) = next else { break };
-                    let cross_window_synthesis =
-                        annotated.starts_with("Cross-window semantic digests:");
-                    if risk_selected_review {
-                        annotated.insert_str(
-                            0,
-                            "This evidence batch was selected by a bounded risk planner from a larger diff. Review only the supplied grounded evidence. Do not claim that every changed line was examined literally. Global recursive synthesis and deterministic boundary/high-risk batches are supplied separately.\n\n",
-                        );
-                    }
+                    let Some(batch) = next else { break };
+                    let first = request_index == 0;
+                    let (annotated, user, cross_window_synthesis) =
+                        review_batch_prompt(&runtime_prompt_context, batch, first);
                     eprintln!(
                         "postil: reviewing {} request {}/{} ({} bytes)",
                         if cross_window_synthesis {
@@ -876,35 +991,6 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                         total_requests,
                         annotated.len()
                     );
-                    let first = request_index == 0;
-                    let ctx = PrContext {
-                        repo,
-                        title: if !content_policy_active || first {
-                            meta.map(|m| m.title.as_str())
-                        } else {
-                            None
-                        },
-                        body: if !content_policy_active || first {
-                            meta.map(|m| m.body.as_str())
-                        } else {
-                            None
-                        },
-                        incremental,
-                        content_policy: first && content_policy_active,
-                    };
-                    let mut user = prompt::user_prompt(&ctx, &annotated, cfg.max_findings);
-                    if cross_window_synthesis {
-                        user.push_str(
-                        "\n\nThis bounded synthesis window joins semantic evidence from adjacent source windows. Look specifically for merge-relevant relationships such as caller/API, config/consumer, validation/sink, and lifecycle pairs. Cite the exact numbered path and line retained in the digest.",
-                    );
-                    } else if total_requests > 1 {
-                        user.push_str(&format!(
-                            "\n\nThis is source batch {} of {}. Review this batch independently; \
-                     other source batches are reviewed separately.",
-                            request_index + 1,
-                            total_requests
-                        ));
-                    }
                     match client.review(cfg, &system, &user).await {
                         Ok(mut model_review) => {
                             usage.prompt_tokens += model_review.usage.prompt_tokens;
@@ -1196,6 +1282,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
         usage,
         model_usage,
         model_incidents,
+        review_coverage,
         usage_accounting_complete,
         duration_ms: review_started.elapsed().as_millis() as u64,
         base_sha: meta.map(|m| m.base_sha.clone()),
@@ -1399,6 +1486,7 @@ fn error_envelope(
         usage: Usage::default(),
         model_usage: vec![],
         model_incidents: vec![],
+        review_coverage: None,
         usage_accounting_complete: true,
         duration_ms,
         base_sha: Some(meta.base_sha.clone()),
