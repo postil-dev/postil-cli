@@ -509,7 +509,7 @@ describe("scorer proxy and isolated runtime", () => {
         join(runArtifacts, "stderr.log"),
         "utf8",
       );
-      expect(stderr).toContain("postil: hosted selection uses");
+      expect(stderr).toContain("postil: bounded selection uses");
       expect(stderr).toContain("planner fallback=false");
       expect(stderr).toContain("postil: reviewing source request");
     } finally {
