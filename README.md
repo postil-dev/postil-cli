@@ -28,7 +28,7 @@ postil review --base origin/main         # review the branch
 postil hook install                      # add a pre-push review
 ```
 
-Postil exits `0` when the gate passes, `1` for gate-level findings, and `2` for an operational failure. Operational failures fail closed unless repository policy explicitly makes provider outages advisory.
+`postil review` exits `0` when the gate passes, `1` when it fails, and `2` when it cannot produce a review envelope.
 
 ## Review a pull request
 

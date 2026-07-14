@@ -32,7 +32,7 @@ The report shows which findings become visible or suppressed and which gate resu
 
 ## Interactive replies
 
-`postil respond` answers a mention on a pull request or issue. It does not open pull requests or push commits.
+`postil respond` answers a mention on a pull request. GitHub and GitLab also support issue mentions. It does not open pull requests or push commits.
 
 ```sh
 POSTIL_COMMENT='@postil is this safe?' \
