@@ -10,7 +10,7 @@ use serde_json::json;
 use std::io::Write;
 
 use super::{CheckState, Forge, PrMeta, ThreadKind, check_summary, check_title};
-use crate::diff::{DiffSnapshot, DiffSpool};
+use crate::diff::{DiffSnapshot, DiffSpool, WorkspaceBudget};
 use crate::envelope::{Envelope, Finding};
 
 pub struct GitLab {
@@ -108,7 +108,12 @@ impl GitLab {
         super::bounded_response_json(Self::check_ok(resp, "MR fetch").await?, "GitLab MR").await
     }
 
-    async fn source_file(&self, revision: &str, path: &str) -> Result<(DiffSnapshot, usize)> {
+    async fn source_file(
+        &self,
+        revision: &str,
+        path: &str,
+        workspace: WorkspaceBudget,
+    ) -> Result<(DiffSnapshot, usize)> {
         ensure!(
             super::valid_repository_path(path),
             "GitLab returned an unsafe repository path"
@@ -123,9 +128,11 @@ impl GitLab {
             .send()
             .await
             .context("fetching GitLab source file")?;
-        let snapshot = super::response_snapshot(
+        let snapshot = super::response_snapshot_in(
             Self::check_ok(response, "source file fetch").await?,
             "GitLab source file",
+            workspace,
+            None,
         )
         .await?;
         let byte_count = snapshot.as_bytes().len();
@@ -137,6 +144,7 @@ impl GitLab {
         items: Vec<FileDiffItem>,
         base_sha: &str,
         head_sha: &str,
+        workspace: WorkspaceBudget,
     ) -> Result<DiffSnapshot> {
         for item in &items {
             ensure!(
@@ -145,19 +153,22 @@ impl GitLab {
                 "GitLab returned an unsafe repository path"
             );
         }
-        let mut sections = stream::iter(items.into_iter().enumerate().map(
-            |(index, item)| async move {
+        let mut sections = stream::iter(items.into_iter().enumerate().map(|(index, item)| {
+            let workspace = workspace.clone();
+            async move {
                 let (old, old_bytes) = if item.new_file {
-                    (DiffSnapshot::from_bytes(b"")?, 0)
+                    (DiffSnapshot::from_bytes_in(b"", workspace.clone())?, 0)
                 } else {
-                    self.source_file(base_sha, &item.old_path).await?
+                    self.source_file(base_sha, &item.old_path, workspace.clone())
+                        .await?
                 };
                 let (new, new_bytes) = if item.deleted_file {
-                    (DiffSnapshot::from_bytes(b"")?, 0)
+                    (DiffSnapshot::from_bytes_in(b"", workspace.clone())?, 0)
                 } else {
-                    self.source_file(head_sha, &item.new_path).await?
+                    self.source_file(head_sha, &item.new_path, workspace.clone())
+                        .await?
                 };
-                let mut section = DiffSpool::new()?;
+                let mut section = DiffSpool::new_in(workspace.clone())?;
                 super::azure::write_diff_section(
                     &mut section,
                     &item.old_path,
@@ -168,10 +179,10 @@ impl GitLab {
                     item.deleted_file,
                 )?;
                 Ok::<_, anyhow::Error>((index, old_bytes, new_bytes, section.finish()?))
-            },
-        ))
+            }
+        }))
         .buffered(4);
-        let mut output = DiffSpool::new()?;
+        let mut output = DiffSpool::new_in(workspace.clone())?;
         while let Some((_, old_bytes, new_bytes, section)) = sections.try_next().await? {
             old_bytes
                 .checked_add(new_bytes)
@@ -322,6 +333,7 @@ impl Forge for GitLab {
     }
 
     async fn fetch_diff(&self, snapshot: &PrMeta) -> Result<DiffSnapshot> {
+        let workspace = WorkspaceBudget::new();
         const PER_PAGE: usize = 100;
         const MAX_PAGES: usize = 100;
         const MAX_ITEMS: usize = 10_000;
@@ -335,6 +347,7 @@ impl Forge for GitLab {
             "GitLab diff version exceeds {MAX_ITEMS} files"
         );
         let mut items = Vec::with_capacity(expected_items);
+        let mut retained_bytes = 0usize;
         let mut item_count = 0usize;
         let mut page = 1usize;
         loop {
@@ -360,6 +373,11 @@ impl Forge for GitLab {
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_string);
             let page_text = super::bounded_response_text(checked, "GitLab diff page").await?;
+            retained_bytes = super::checked_metadata_total(
+                retained_bytes,
+                page_text.len(),
+                "GitLab diff pages",
+            )?;
             let batch: Vec<FileDiffItem> =
                 serde_json::from_str(&page_text).context("decoding GitLab diff page")?;
             drop(page_text);
@@ -392,11 +410,12 @@ impl Forge for GitLab {
             current.head_sha == snapshot.head_sha && current.base_sha == snapshot.base_sha,
             "GitLab merge request changed while its diff was being acquired"
         );
-        self.build_complete_diff(items, &snapshot.base_sha, &snapshot.head_sha)
+        self.build_complete_diff(items, &snapshot.base_sha, &snapshot.head_sha, workspace)
             .await
     }
 
     async fn fetch_diff_since(&self, since_sha: &str, head_sha: &str) -> Result<DiffSnapshot> {
+        let workspace = WorkspaceBudget::new();
         let resp = self
             .request(
                 reqwest::Method::GET,
@@ -416,7 +435,7 @@ impl Forge for GitLab {
             !cmp.compare_timeout,
             "GitLab compare timed out or exceeded provider limits"
         );
-        self.build_complete_diff(cmp.diffs, since_sha, head_sha)
+        self.build_complete_diff(cmp.diffs, since_sha, head_sha, workspace)
             .await
     }
 

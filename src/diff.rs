@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::RangeInclusive;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use memmap2::Mmap;
@@ -27,12 +28,99 @@ const MAX_DIFF_INDEX_PATHS: usize = 100_000;
 const MAX_DIFF_INDEX_RANGES: usize = 250_000;
 const NORMALIZED_MANIFEST_RESERVE_BYTES: usize = 16 * 1024;
 
+#[derive(Clone)]
+pub struct WorkspaceBudget {
+    retained: Arc<Mutex<u64>>,
+    limit: u64,
+}
+
+impl Default for WorkspaceBudget {
+    fn default() -> Self {
+        Self {
+            retained: Arc::new(Mutex::new(0)),
+            limit: MAX_REVIEW_SPOOL_BYTES,
+        }
+    }
+}
+
+impl WorkspaceBudget {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn reserve(&self, bytes: u64) -> std::io::Result<()> {
+        let mut retained = self
+            .retained
+            .lock()
+            .map_err(|_| std::io::Error::other("review workspace budget lock is poisoned"))?;
+        let next = retained
+            .checked_add(bytes)
+            .ok_or_else(|| std::io::Error::other("review workspace size overflowed"))?;
+        if next > self.limit {
+            return Err(std::io::Error::other(format!(
+                "review workspace exceeded the {} byte operation quota",
+                self.limit
+            )));
+        }
+        *retained = next;
+        Ok(())
+    }
+
+    fn release(&self, bytes: u64) {
+        if let Ok(mut retained) = self.retained.lock() {
+            *retained = retained.saturating_sub(bytes);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn retained_bytes(&self) -> u64 {
+        *self.retained.lock().unwrap()
+    }
+
+    #[cfg(test)]
+    pub fn with_limit(limit: u64) -> Self {
+        Self {
+            retained: Arc::new(Mutex::new(0)),
+            limit,
+        }
+    }
+}
+
+struct WorkspaceLease {
+    budget: WorkspaceBudget,
+    bytes: u64,
+}
+
+impl WorkspaceLease {
+    fn new(budget: WorkspaceBudget) -> Self {
+        Self { budget, bytes: 0 }
+    }
+
+    fn reserve(&mut self, bytes: u64) -> std::io::Result<()> {
+        self.budget.reserve(bytes)?;
+        self.bytes = self.bytes.saturating_add(bytes);
+        Ok(())
+    }
+
+    fn release(&mut self, bytes: u64) {
+        self.budget.release(bytes);
+        self.bytes = self.bytes.saturating_sub(bytes);
+    }
+}
+
+impl Drop for WorkspaceLease {
+    fn drop(&mut self) {
+        self.budget.release(self.bytes);
+    }
+}
+
 /// Immutable, file-backed diff snapshot. Acquisition writes to disk and review
 /// maps it read-only, so aggregate diff size does not become aggregate heap.
 pub struct DiffSnapshot {
     _file: File,
     map: Option<Mmap>,
     valid_utf8: bool,
+    lease: WorkspaceLease,
 }
 
 impl DiffSnapshot {
@@ -51,7 +139,13 @@ impl DiffSnapshot {
         spool.finish()
     }
 
-    fn from_file(file: File) -> Result<Self> {
+    pub fn from_bytes_in(bytes: &[u8], budget: WorkspaceBudget) -> Result<Self> {
+        let mut spool = DiffSpool::new_in(budget)?;
+        spool.write_all(bytes).context("writing diff snapshot")?;
+        spool.finish()
+    }
+
+    fn from_file(file: File, lease: WorkspaceLease) -> Result<Self> {
         if file
             .metadata()
             .context("reading diff snapshot metadata")?
@@ -62,6 +156,7 @@ impl DiffSnapshot {
                 _file: file,
                 map: None,
                 valid_utf8: true,
+                lease,
             });
         }
         // SAFETY: the file handle remains owned by the snapshot and callers
@@ -73,10 +168,11 @@ impl DiffSnapshot {
             _file: file,
             map: Some(map),
             valid_utf8: true,
+            lease,
         })
     }
 
-    fn from_source_file(file: File) -> Result<Self> {
+    fn from_source_file(file: File, lease: WorkspaceLease) -> Result<Self> {
         if file
             .metadata()
             .context("reading source snapshot metadata")?
@@ -87,6 +183,7 @@ impl DiffSnapshot {
                 _file: file,
                 map: None,
                 valid_utf8: true,
+                lease,
             });
         }
         // SAFETY: the immutable mapping remains owned by the snapshot.
@@ -96,6 +193,7 @@ impl DiffSnapshot {
             _file: file,
             map: Some(map),
             valid_utf8,
+            lease,
         })
     }
 
@@ -120,18 +218,28 @@ impl DiffSnapshot {
     pub fn source_str(&self) -> &str {
         if self.valid_utf8 { self.as_str() } else { "\0" }
     }
+
+    pub fn workspace_budget(&self) -> WorkspaceBudget {
+        self.lease.budget.clone()
+    }
 }
 
 pub struct DiffSpool {
     file: File,
     written: u64,
+    lease: Option<WorkspaceLease>,
 }
 
 impl DiffSpool {
     pub fn new() -> Result<Self> {
+        Self::new_in(WorkspaceBudget::new())
+    }
+
+    pub fn new_in(budget: WorkspaceBudget) -> Result<Self> {
         Ok(Self {
             file: tempfile::tempfile().context("creating diff spool")?,
             written: 0,
+            lease: Some(WorkspaceLease::new(budget)),
         })
     }
 
@@ -140,7 +248,10 @@ impl DiffSpool {
         self.file
             .seek(SeekFrom::Start(0))
             .context("rewinding diff spool")?;
-        DiffSnapshot::from_file(self.file)
+        DiffSnapshot::from_file(
+            self.file,
+            self.lease.take().expect("unfinished spool owns its lease"),
+        )
     }
 
     pub fn finish_source(mut self) -> Result<DiffSnapshot> {
@@ -148,22 +259,31 @@ impl DiffSpool {
         self.file
             .seek(SeekFrom::Start(0))
             .context("rewinding source spool")?;
-        DiffSnapshot::from_source_file(self.file)
+        DiffSnapshot::from_source_file(
+            self.file,
+            self.lease.take().expect("unfinished spool owns its lease"),
+        )
     }
 }
 
 impl Write for DiffSpool {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        let next = self
-            .written
+        self.written
             .checked_add(buffer.len() as u64)
             .ok_or_else(|| std::io::Error::other("diff spool size overflowed"))?;
-        if next > MAX_REVIEW_SPOOL_BYTES {
-            return Err(std::io::Error::other(format!(
-                "diff spool exceeded the {MAX_REVIEW_SPOOL_BYTES} byte operation quota"
-            )));
-        }
-        let written = self.file.write(buffer)?;
+        let lease = self
+            .lease
+            .as_mut()
+            .expect("unfinished spool owns its lease");
+        lease.reserve(buffer.len() as u64)?;
+        let written = match self.file.write(buffer) {
+            Ok(written) => written,
+            Err(error) => {
+                lease.release(buffer.len() as u64);
+                return Err(error);
+            }
+        };
+        lease.release((buffer.len() - written) as u64);
         self.written = self.written.saturating_add(written as u64);
         Ok(written)
     }
@@ -449,6 +569,7 @@ impl DiffIndex {
 /// evidence remain in memory.
 pub struct PreparedReview {
     windows: File,
+    _window_lease: WorkspaceLease,
     snapshot_bytes: u64,
     window_bytes: u64,
     pub index: DiffIndex,
@@ -491,16 +612,195 @@ impl PreparedReview {
 
 pub struct ModelBatchSpool {
     file: File,
+    _lease: WorkspaceLease,
     pub count: usize,
     pub metadata_count: u32,
     pub total_batch_bytes: usize,
     pub largest_batch_bytes: usize,
 }
 
+pub struct HostedBatchCandidates {
+    pub manifest: String,
+    pub mandatory_ids: Vec<usize>,
+    pub candidate_ids: BTreeSet<usize>,
+}
+
 impl ModelBatchSpool {
     pub fn next_batch(&mut self) -> Result<Option<String>> {
         read_length_prefixed(&mut self.file, "model batch")
     }
+
+    pub fn hosted_candidates(
+        &mut self,
+        selected_limit: usize,
+        candidate_limit: usize,
+    ) -> Result<HostedBatchCandidates> {
+        #[derive(Clone)]
+        struct Candidate {
+            id: usize,
+            score: usize,
+            digest: String,
+            synthesis: bool,
+        }
+
+        self.file
+            .seek(SeekFrom::Start(0))
+            .context("rewinding model batches for hosted planning")?;
+        let mut candidates = Vec::<Candidate>::new();
+        let mut first_source = None;
+        let mut last_source = None;
+        let mut final_synthesis = None;
+        let mut id = 0usize;
+        while let Some(batch) = read_length_prefixed(&mut self.file, "hosted planner batch")? {
+            id = id
+                .checked_add(1)
+                .context("hosted planner batch id overflowed")?;
+            let synthesis = batch.contains("Cross-window semantic digests");
+            if synthesis {
+                final_synthesis = Some(id);
+            } else {
+                first_source.get_or_insert(id);
+                last_source = Some(id);
+            }
+            let mut digest = semantic_digest(&batch);
+            if digest.is_empty() {
+                digest = batch.chars().take(800).collect();
+            } else {
+                digest = truncate_owned_utf8(digest, 1_200);
+            }
+            candidates.push(Candidate {
+                id,
+                score: hosted_risk_score(&batch),
+                digest,
+                synthesis,
+            });
+            candidates.sort_by(|left, right| {
+                right
+                    .score
+                    .cmp(&left.score)
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+            candidates.truncate(candidate_limit);
+        }
+        self.file
+            .seek(SeekFrom::Start(0))
+            .context("rewinding model batches after hosted planning")?;
+
+        let mut mandatory = BTreeSet::new();
+        if let Some(id) = first_source {
+            mandatory.insert(id);
+        }
+        if let Some(id) = last_source {
+            mandatory.insert(id);
+        }
+        if let Some(id) = final_synthesis {
+            mandatory.insert(id);
+        }
+        for candidate in candidates.iter().filter(|candidate| !candidate.synthesis) {
+            if mandatory.len() >= selected_limit.min(4) {
+                break;
+            }
+            mandatory.insert(candidate.id);
+        }
+        while mandatory.len() > selected_limit {
+            let removable = mandatory
+                .iter()
+                .copied()
+                .find(|id| Some(*id) != final_synthesis && Some(*id) != first_source)
+                .or_else(|| mandatory.iter().next_back().copied())
+                .expect("non-empty mandatory selection");
+            mandatory.remove(&removable);
+        }
+
+        candidates.sort_by_key(|candidate| candidate.id);
+        let mut manifest = format!(
+            "The complete diff was normalized into {id} bounded batches. Select only batch IDs from this candidate set. Boundary, highest-risk, and global-synthesis batches are already mandatory.\nMandatory IDs: {:?}\n",
+            mandatory.iter().copied().collect::<Vec<_>>()
+        );
+        for candidate in &candidates {
+            manifest.push_str(&format!(
+                "\nBatch {} risk={} kind={}\n{}",
+                candidate.id,
+                candidate.score,
+                if candidate.synthesis {
+                    "synthesis"
+                } else {
+                    "source"
+                },
+                candidate.digest
+            ));
+        }
+        anyhow::ensure!(
+            manifest.len() <= 120_000,
+            "hosted planner manifest exceeded its fixed bound"
+        );
+        Ok(HostedBatchCandidates {
+            manifest,
+            mandatory_ids: mandatory.into_iter().collect(),
+            candidate_ids: candidates
+                .into_iter()
+                .map(|candidate| candidate.id)
+                .collect(),
+        })
+    }
+
+    pub fn selected_batches(&mut self, ids: &BTreeSet<usize>) -> Result<Vec<String>> {
+        self.file
+            .seek(SeekFrom::Start(0))
+            .context("rewinding model batches for selection")?;
+        let mut selected = Vec::with_capacity(ids.len());
+        let mut id = 0usize;
+        while let Some(batch) = read_length_prefixed(&mut self.file, "selected model batch")? {
+            id += 1;
+            if ids.contains(&id) {
+                selected.push(batch);
+            }
+        }
+        self.file
+            .seek(SeekFrom::Start(0))
+            .context("rewinding model batches after selection")?;
+        anyhow::ensure!(
+            selected.len() == ids.len(),
+            "hosted planner selected a batch outside the materialized spool"
+        );
+        Ok(selected)
+    }
+}
+
+fn truncate_owned_utf8(mut value: String, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+    value
+}
+
+fn hosted_risk_score(batch: &str) -> usize {
+    let lower = batch.to_ascii_lowercase();
+    [
+        ("unsafe", 12usize),
+        ("eval", 12),
+        ("exec", 10),
+        ("authoriz", 10),
+        ("permission", 10),
+        ("secret", 9),
+        ("password", 9),
+        ("token", 7),
+        ("query", 7),
+        ("delete", 6),
+        ("timeout", 5),
+        ("retry", 4),
+        ("validate", 4),
+        ("guard", 4),
+        ("unwrap", 2),
+    ]
+    .into_iter()
+    .map(|(marker, weight)| lower.matches(marker).count().min(8) * weight)
+    .sum()
 }
 
 /// Build one bounded, line-grounded context for an interactive answer. Every
@@ -564,6 +864,7 @@ pub fn spool_model_batches(
     force_empty: bool,
 ) -> Result<ModelBatchSpool> {
     let mut file = tempfile::tempfile().context("creating model-batch spool")?;
+    let mut lease = WorkspaceLease::new(prepared._window_lease.budget.clone());
     let mut spool_bytes = 0u64;
     let mut count = 0usize;
     let mut total_batch_bytes = 0usize;
@@ -602,7 +903,13 @@ pub fn spool_model_batches(
                 );
                 cross_window.push_str(&entry);
             }
-            write_length_prefixed(&mut file, &batch, max_batch_bytes, "model batch")?;
+            write_length_prefixed(
+                &mut file,
+                &mut lease,
+                &batch,
+                max_batch_bytes,
+                "model batch",
+            )?;
             spool_bytes = spool_bytes
                 .checked_add(batch.len() as u64 + 8)
                 .context("model-batch spool size overflowed")?;
@@ -611,7 +918,13 @@ pub fn spool_model_batches(
                 .context("model batch count overflowed")?;
         }
         if let Some(synthesis) = plan.synthesis {
-            write_length_prefixed(&mut file, &synthesis, max_batch_bytes, "model batch")?;
+            write_length_prefixed(
+                &mut file,
+                &mut lease,
+                &synthesis,
+                max_batch_bytes,
+                "model batch",
+            )?;
             spool_bytes = spool_bytes
                 .checked_add(synthesis.len() as u64 + 8)
                 .context("model-batch spool size overflowed")?;
@@ -642,7 +955,13 @@ pub fn spool_model_batches(
         }
         metadata_count = metadata_count.max(plan.metadata_count);
         for batch in plan.batches.into_iter().chain(plan.synthesis) {
-            write_length_prefixed(&mut file, &batch, max_batch_bytes, "artifact model batch")?;
+            write_length_prefixed(
+                &mut file,
+                &mut lease,
+                &batch,
+                max_batch_bytes,
+                "artifact model batch",
+            )?;
             spool_bytes = spool_bytes
                 .checked_add(batch.len() as u64 + 8)
                 .context("model-batch spool size overflowed")?;
@@ -665,6 +984,7 @@ pub fn spool_model_batches(
             for chunk in chunks {
                 write_length_prefixed(
                     &mut file,
+                    &mut lease,
                     &chunk,
                     max_batch_bytes,
                     "cross-window synthesis batch",
@@ -692,7 +1012,7 @@ pub fn spool_model_batches(
         }
     }
     if count == 0 && force_empty {
-        write_length_prefixed(&mut file, "", max_batch_bytes, "model batch")?;
+        write_length_prefixed(&mut file, &mut lease, "", max_batch_bytes, "model batch")?;
         spool_bytes = spool_bytes.saturating_add(8);
         count = 1;
     }
@@ -723,6 +1043,7 @@ pub fn spool_model_batches(
         .context("rewinding model-batch spool after planning")?;
     Ok(ModelBatchSpool {
         file,
+        _lease: lease,
         count,
         metadata_count,
         total_batch_bytes,
@@ -819,6 +1140,7 @@ fn recursive_semantic_digest(batch: &str) -> String {
 
 fn write_length_prefixed(
     file: &mut File,
+    lease: &mut WorkspaceLease,
     value: &str,
     max_bytes: usize,
     context: &str,
@@ -827,10 +1149,17 @@ fn write_length_prefixed(
         value.len() <= max_bytes,
         "{context} exceeded its fixed bound"
     );
-    file.write_all(&(value.len() as u64).to_le_bytes())
-        .with_context(|| format!("writing {context} length"))?;
-    file.write_all(value.as_bytes())
-        .with_context(|| format!("writing {context}"))?;
+    let bytes = value.len() as u64 + 8;
+    lease
+        .reserve(bytes)
+        .with_context(|| format!("reserving {context} workspace"))?;
+    if let Err(error) = file
+        .write_all(&(value.len() as u64).to_le_bytes())
+        .and_then(|_| file.write_all(value.as_bytes()))
+    {
+        lease.release(bytes);
+        return Err(error).with_context(|| format!("writing {context}"));
+    }
     Ok(())
 }
 
@@ -854,6 +1183,7 @@ fn read_length_prefixed(file: &mut File, context: &str) -> Result<Option<String>
 pub fn prepare_review(snapshot: &DiffSnapshot) -> Result<PreparedReview> {
     let text = snapshot.as_str();
     let mut windows = tempfile::tempfile().context("creating review-window spool")?;
+    let mut window_lease = WorkspaceLease::new(snapshot.workspace_budget());
     let mut index = DiffIndex::default();
     let mut lockfiles = Vec::new();
     let mut compacted_artifacts = Vec::new();
@@ -866,6 +1196,7 @@ pub fn prepare_review(snapshot: &DiffSnapshot) -> Result<PreparedReview> {
         anyhow::ensure!(text.trim().is_empty(), "review input is not a unified diff");
         return Ok(PreparedReview {
             windows,
+            _window_lease: window_lease,
             index,
             lockfiles,
             compacted_artifacts,
@@ -911,7 +1242,7 @@ pub fn prepare_review(snapshot: &DiffSnapshot) -> Result<PreparedReview> {
                         || pending_manifest_bytes.saturating_add(window_manifest_bytes)
                             > NORMALIZED_MANIFEST_RESERVE_BYTES)
                 {
-                    write_window(&mut windows, &pending_window)?;
+                    write_window(&mut windows, &mut window_lease, &pending_window)?;
                     window_bytes = window_bytes
                         .checked_add(pending_window.len() as u64 + 8)
                         .context("review-window spool size overflowed")?;
@@ -928,7 +1259,7 @@ pub fn prepare_review(snapshot: &DiffSnapshot) -> Result<PreparedReview> {
         cursor = end;
     }
     if !pending_window.is_empty() {
-        write_window(&mut windows, &pending_window)?;
+        write_window(&mut windows, &mut window_lease, &pending_window)?;
         window_bytes = window_bytes
             .checked_add(pending_window.len() as u64 + 8)
             .context("review-window spool size overflowed")?;
@@ -950,6 +1281,7 @@ pub fn prepare_review(snapshot: &DiffSnapshot) -> Result<PreparedReview> {
         .context("rewinding review-window spool")?;
     Ok(PreparedReview {
         windows,
+        _window_lease: window_lease,
         index,
         lockfiles,
         compacted_artifacts,
@@ -960,15 +1292,22 @@ pub fn prepare_review(snapshot: &DiffSnapshot) -> Result<PreparedReview> {
     })
 }
 
-fn write_window(file: &mut File, window: &str) -> Result<()> {
+fn write_window(file: &mut File, lease: &mut WorkspaceLease, window: &str) -> Result<()> {
     anyhow::ensure!(
         window.len() <= STREAM_WINDOW_BYTES,
         "normalized review window exceeded its fixed bound"
     );
-    file.write_all(&(window.len() as u64).to_le_bytes())
-        .context("writing review window length")?;
-    file.write_all(window.as_bytes())
-        .context("writing review window")?;
+    let bytes = window.len() as u64 + 8;
+    lease
+        .reserve(bytes)
+        .context("reserving review-window workspace")?;
+    if let Err(error) = file
+        .write_all(&(window.len() as u64).to_le_bytes())
+        .and_then(|_| file.write_all(window.as_bytes()))
+    {
+        lease.release(bytes);
+        return Err(error).context("writing review window");
+    }
     Ok(())
 }
 
@@ -3124,5 +3463,51 @@ diff --git a/two.rs b/two.rs
         assert!(idx.contains("one.rs", 2));
         assert!(!idx.contains("one.rs", 3));
         assert!(idx.contains("two.rs", 2));
+    }
+
+    #[test]
+    fn workspace_budget_is_shared_across_live_spools() {
+        let budget = WorkspaceBudget::with_limit(12);
+        let mut first = DiffSpool::new_in(budget.clone()).unwrap();
+        let mut second = DiffSpool::new_in(budget.clone()).unwrap();
+        first.write_all(b"12345678").unwrap();
+        assert_eq!(budget.retained_bytes(), 8);
+        let error = second.write_all(b"12345").unwrap_err();
+        assert!(error.to_string().contains("operation quota"));
+        drop(first);
+        second.write_all(b"12345").unwrap();
+        assert_eq!(budget.retained_bytes(), 5);
+    }
+
+    #[test]
+    fn hosted_planner_bounds_large_handwritten_diff_without_losing_global_synthesis() {
+        use std::fmt::Write as _;
+
+        let mut source = String::new();
+        for file in 1..=80 {
+            writeln!(
+                source,
+                "diff --git a/src/file_{file}.rs b/src/file_{file}.rs\n--- a/src/file_{file}.rs\n+++ b/src/file_{file}.rs\n@@ -0,0 +1 @@\n+fn changed_{file}() {{ validate(input); {} }}",
+                "x".repeat(2_000)
+            )
+            .unwrap();
+        }
+        let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+        let mut prepared = prepare_review(&snapshot).unwrap();
+        let mut batches = spool_model_batches(&mut prepared, 4_096, 1_024, false).unwrap();
+        assert!(batches.count > 22);
+        let candidates = batches.hosted_candidates(5, 32).unwrap();
+        assert!(candidates.mandatory_ids.len() <= 5);
+        assert!(candidates.mandatory_ids.contains(&1));
+        assert!(candidates.mandatory_ids.iter().any(|id| *id > 22));
+        let selected = batches
+            .selected_batches(&candidates.mandatory_ids.iter().copied().collect())
+            .unwrap();
+        assert_eq!(selected.len(), candidates.mandatory_ids.len());
+        assert!(
+            selected
+                .iter()
+                .any(|batch| batch.contains("Cross-window semantic digests"))
+        );
     }
 }

@@ -16,6 +16,20 @@ use std::io::Write;
 use crate::diff::DiffSnapshot;
 use crate::envelope::{Envelope, Finding, Severity, SuppressionReason};
 
+pub const MAX_FORGE_METADATA_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_FORGE_CHANGED_FILES: usize = 20_000;
+
+pub fn checked_metadata_total(current: usize, additional: usize, context: &str) -> Result<usize> {
+    let total = current
+        .checked_add(additional)
+        .ok_or_else(|| anyhow::anyhow!("{context} metadata byte count overflowed"))?;
+    ensure!(
+        total <= MAX_FORGE_METADATA_BYTES,
+        "{context} metadata exceeds the {MAX_FORGE_METADATA_BYTES} byte aggregate limit"
+    );
+    Ok(total)
+}
+
 #[derive(Debug)]
 pub struct ForgeServiceFailure(pub String);
 
@@ -170,9 +184,15 @@ pub async fn bounded_response_bytes_with_limit(
 /// This is used for individual source files whose size is not a review-scope
 /// decision. Transport truncation remains fatal, while heap use stays bounded
 /// by the response chunk size.
-pub async fn response_snapshot(
+pub async fn response_snapshot(response: reqwest::Response, context: &str) -> Result<DiffSnapshot> {
+    response_snapshot_in(response, context, crate::diff::WorkspaceBudget::new(), None).await
+}
+
+pub async fn response_snapshot_in(
     mut response: reqwest::Response,
     context: &str,
+    workspace: crate::diff::WorkspaceBudget,
+    authoritative_size: Option<u64>,
 ) -> Result<DiffSnapshot> {
     ensure!(
         response.status() != reqwest::StatusCode::PARTIAL_CONTENT,
@@ -188,16 +208,33 @@ pub async fn response_snapshot(
             return Err(anyhow::anyhow!("{context} reported truncated content"));
         }
     }
-    let mut spool = crate::diff::DiffSpool::new()?;
+    let declared_size = response.content_length().context(format!(
+        "{context} omitted Content-Length; completeness is unverifiable"
+    ))?;
+    if let Some(expected) = authoritative_size {
+        ensure!(
+            declared_size == expected,
+            "{context} declared {declared_size} bytes but forge metadata requires {expected}"
+        );
+    }
+    let mut spool = crate::diff::DiffSpool::new_in(workspace)?;
+    let mut received = 0u64;
     while let Some(chunk) = response
         .chunk()
         .await
         .with_context(|| format!("reading {context}"))?
     {
+        received = received
+            .checked_add(chunk.len() as u64)
+            .ok_or_else(|| anyhow::anyhow!("{context} byte count overflowed"))?;
         spool
             .write_all(&chunk)
             .with_context(|| format!("spooling {context}"))?;
     }
+    ensure!(
+        received == declared_size,
+        "{context} ended after {received} of {declared_size} declared bytes"
+    );
     spool.finish_source()
 }
 
@@ -830,6 +867,46 @@ pub fn format_confidence(c: f64) -> String {
 mod tests {
     use super::*;
     use crate::envelope::{Kind, Severity};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn forge_metadata_limit_is_aggregate_and_overflow_safe() {
+        assert_eq!(
+            checked_metadata_total(MAX_FORGE_METADATA_BYTES - 7, 7, "pages").unwrap(),
+            MAX_FORGE_METADATA_BYTES
+        );
+        assert!(
+            checked_metadata_total(MAX_FORGE_METADATA_BYTES, 1, "pages")
+                .unwrap_err()
+                .to_string()
+                .contains("aggregate limit")
+        );
+        assert!(checked_metadata_total(usize::MAX, 1, "pages").is_err());
+    }
+
+    #[tokio::test]
+    async fn source_snapshot_streams_above_page_limit_with_complete_length() {
+        let server = MockServer::start().await;
+        let body = vec![b'x'; crate::diff::MAX_FORGE_RESPONSE_BYTES + 1];
+        Mock::given(method("GET"))
+            .and(path("/large-source"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let response = reqwest::get(format!("{}/large-source", server.uri()))
+            .await
+            .unwrap();
+        let snapshot = response_snapshot(response, "large forge source")
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.len(), body.len() as u64);
+        assert_eq!(snapshot.as_bytes().first(), Some(&b'x'));
+        assert_eq!(snapshot.as_bytes().last(), Some(&b'x'));
+    }
 
     #[test]
     fn only_typed_service_failures_remain_advisory_eligible() {

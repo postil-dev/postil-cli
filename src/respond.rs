@@ -292,6 +292,7 @@ async fn respond_with<F: Forge>(
         comment.trim()
     );
     let client = LlmClient::from_env(cfg)?;
+    client.preflight_respond_plan(cfg, &system, &user)?;
     let answer = client
         .answer(cfg, &system, &user, validate_respond_output)
         .await?;

@@ -24,7 +24,9 @@ use std::collections::HashMap;
 /// enforced by `LlmClient` while raw diff size never decides reviewability.
 const MAX_REVIEW_BATCH_BYTES: usize = 120_000;
 const MAX_REVIEW_MANIFEST_BYTES: usize = 24_000;
-const MAX_MODELS_PER_REQUEST: usize = 3;
+pub(crate) const MAX_HOSTED_SELECTED_BATCHES: usize = 5;
+const MAX_HOSTED_PLANNER_CANDIDATES: usize = 96;
+pub(crate) const MAX_MODELS_PER_REQUEST: usize = 3;
 const MAX_SCORER_INPUT_TOKENS: usize = 64_000;
 const MAX_STREAMED_CANDIDATE_MULTIPLIER: usize = 8;
 const MAX_STREAMED_SUMMARY_BYTES: usize = 64_000;
@@ -755,6 +757,16 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                 model_used = "none (empty diff)".to_string();
                 full_review_trustworthy = true;
             } else {
+                let hosted_candidates = if crate::config::hosted_mode()
+                    && batches.count > MAX_HOSTED_SELECTED_BATCHES
+                {
+                    Some(batches.hosted_candidates(
+                        MAX_HOSTED_SELECTED_BATCHES,
+                        MAX_HOSTED_PLANNER_CANDIDATES,
+                    )?)
+                } else {
+                    None
+                };
                 let client = match llm_budget_started_at {
                     Some(started_at) => LlmClient::from_env_for_remote_review(
                         cfg,
@@ -765,14 +777,71 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                     )?,
                     None => LlmClient::from_env(cfg)?,
                 };
+                let planned_batch_count = hosted_candidates
+                    .as_ref()
+                    .map_or(batches.count, |_| MAX_HOSTED_SELECTED_BATCHES);
+                let planned_batch_bytes = if hosted_candidates.is_some() {
+                    batches
+                        .largest_batch_bytes
+                        .saturating_mul(planned_batch_count)
+                } else {
+                    batches.total_batch_bytes
+                };
                 client.preflight_review_plan(
                     cfg,
-                    batches.count,
-                    batches.total_batch_bytes,
+                    planned_batch_count,
+                    planned_batch_bytes,
                     batches.largest_batch_bytes,
                     shared_context_token_upper_bound,
+                    hosted_candidates
+                        .as_ref()
+                        .map(|candidates| candidates.manifest.len()),
                 )?;
-                let total_requests = batches.count;
+                let mut selected_batches = None;
+                if let Some(candidates) = hosted_candidates {
+                    let remaining =
+                        MAX_HOSTED_SELECTED_BATCHES.saturating_sub(candidates.mandatory_ids.len());
+                    let mut additional_candidates = candidates.candidate_ids.clone();
+                    for id in &candidates.mandatory_ids {
+                        additional_candidates.remove(id);
+                    }
+                    let plan = client
+                        .plan_review_batches(
+                            cfg,
+                            &candidates.manifest,
+                            &additional_candidates,
+                            remaining,
+                        )
+                        .await?;
+                    usage.prompt_tokens =
+                        usage.prompt_tokens.saturating_add(plan.usage.prompt_tokens);
+                    usage.completion_tokens = usage
+                        .completion_tokens
+                        .saturating_add(plan.usage.completion_tokens);
+                    model_usage.extend(plan.model_usage);
+                    usage_accounting_complete &= plan.usage_accounting_complete;
+                    let mut ids = candidates
+                        .mandatory_ids
+                        .into_iter()
+                        .collect::<std::collections::BTreeSet<_>>();
+                    for id in plan.batch_ids {
+                        if ids.len() >= MAX_HOSTED_SELECTED_BATCHES {
+                            break;
+                        }
+                        ids.insert(id);
+                    }
+                    let selected = batches.selected_batches(&ids)?;
+                    eprintln!(
+                        "postil: hosted planner selected {} of {} bounded review batches",
+                        selected.len(),
+                        batches.count
+                    );
+                    selected_batches = Some(selected.into_iter());
+                }
+                let total_requests = selected_batches
+                    .as_ref()
+                    .map_or(batches.count, |selected| selected.len());
+                let risk_selected_review = selected_batches.is_some();
                 let mut raw_findings = Vec::new();
                 let mut summary_parts = Vec::new();
                 let mut finding_contexts = Vec::new();
@@ -781,9 +850,21 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                 let mut batch_failure = None;
                 let mut batch_ungrounded = 0u32;
                 let mut request_index = 0usize;
-                while let Some(annotated) = batches.next_batch()? {
+                loop {
+                    let next = if let Some(selected) = selected_batches.as_mut() {
+                        selected.next()
+                    } else {
+                        batches.next_batch()?
+                    };
+                    let Some(mut annotated) = next else { break };
                     let cross_window_synthesis =
                         annotated.starts_with("Cross-window semantic digests:");
+                    if risk_selected_review {
+                        annotated.insert_str(
+                            0,
+                            "This evidence batch was selected by a bounded risk planner from a larger diff. Review only the supplied grounded evidence. Do not claim that every changed line was examined literally. Global recursive synthesis and deterministic boundary/high-risk batches are supplied separately.\n\n",
+                        );
+                    }
                     eprintln!(
                         "postil: reviewing {} request {}/{} ({} bytes)",
                         if cross_window_synthesis {

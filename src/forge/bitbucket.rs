@@ -21,7 +21,7 @@ use sha2::Digest;
 use std::io::Write;
 
 use super::{CheckState, Forge, PrMeta, ThreadKind, check_summary, check_title};
-use crate::diff::{DiffSnapshot, DiffSpool};
+use crate::diff::{DiffSnapshot, DiffSpool, WorkspaceBudget};
 use crate::envelope::{Envelope, Finding};
 
 const ENABLE_INCREMENTAL_ENV: &str = "POSTIL_ENABLE_BITBUCKET_INCREMENTAL";
@@ -214,7 +214,7 @@ impl Bitbucket {
     }
 
     async fn diffstat_pages(&self, initial_url: String) -> Result<Vec<DiffStat>> {
-        const MAX_FILES: usize = 20_000;
+        const MAX_FILES: usize = super::MAX_FORGE_CHANGED_FILES;
         const MAX_PAGES: usize = 200;
         let expected_origin =
             reqwest::Url::parse(&self.api_base).context("invalid Bitbucket API URL")?;
@@ -248,20 +248,24 @@ impl Bitbucket {
                 .send()
                 .await
                 .context("fetching diffstat page")?;
-            let page: DiffStatPage = super::bounded_response_json(
+            let page_text = super::bounded_response_text(
                 Self::check_ok(response, "diffstat fetch").await?,
                 "Bitbucket diffstat page",
             )
             .await?;
+            retained_bytes = super::checked_metadata_total(
+                retained_bytes,
+                page_text.len(),
+                "Bitbucket diffstat pages",
+            )?;
+            let page: DiffStatPage =
+                serde_json::from_str(&page_text).context("decoding Bitbucket diffstat page")?;
             ensure!(
                 !page.values.is_empty() || page.next.is_none(),
                 "Bitbucket diffstat pagination reported a next page without progress"
             );
             for entry in &page.values {
                 validate_diffstat(entry)?;
-                retained_bytes = retained_bytes
-                    .checked_add(diffstat_retained_bytes(entry))
-                    .ok_or_else(|| anyhow!("Bitbucket diffstat metadata size overflowed"))?;
             }
             entries.extend(page.values);
             ensure!(
@@ -273,7 +277,12 @@ impl Bitbucket {
         Ok(entries)
     }
 
-    async fn source_file(&self, commit: &str, path: &str) -> Result<(DiffSnapshot, usize)> {
+    async fn source_file(
+        &self,
+        commit: &str,
+        path: &str,
+        workspace: WorkspaceBudget,
+    ) -> Result<(DiffSnapshot, usize)> {
         validate_commit(commit)?;
         ensure!(
             !path.starts_with('/')
@@ -288,9 +297,11 @@ impl Bitbucket {
             .send()
             .await
             .with_context(|| format!("fetching Bitbucket source file {}", safe_path(path)))?;
-        let snapshot = super::response_snapshot(
+        let snapshot = super::response_snapshot_in(
             Self::check_ok(response, "source fetch").await?,
             "Bitbucket source file",
+            workspace,
+            None,
         )
         .await?;
         let byte_count = snapshot.as_bytes().len();
@@ -302,10 +313,12 @@ impl Bitbucket {
         base_sha: &str,
         head_sha: &str,
         diffstat_url: String,
+        workspace: WorkspaceBudget,
     ) -> Result<DiffSnapshot> {
         let entries = self.diffstat_pages(diffstat_url).await?;
-        let mut sections = stream::iter(entries.into_iter().enumerate().map(
-            |(index, entry)| async move {
+        let mut sections = stream::iter(entries.into_iter().enumerate().map(|(index, entry)| {
+            let workspace = workspace.clone();
+            async move {
                 let old_path = entry.old.as_ref().map(|file| file.path.as_str());
                 let new_path = entry.new.as_ref().map(|file| file.path.as_str());
                 let path = new_path
@@ -315,16 +328,18 @@ impl Bitbucket {
                 let is_add = status == "added" || old_path.is_none();
                 let is_delete = status == "removed" || new_path.is_none();
                 let (old, old_bytes) = if is_add {
-                    (DiffSnapshot::from_bytes(b"")?, 0)
+                    (DiffSnapshot::from_bytes_in(b"", workspace.clone())?, 0)
                 } else {
-                    self.source_file(base_sha, old_path.unwrap_or(path)).await?
+                    self.source_file(base_sha, old_path.unwrap_or(path), workspace.clone())
+                        .await?
                 };
                 let (new, new_bytes) = if is_delete {
-                    (DiffSnapshot::from_bytes(b"")?, 0)
+                    (DiffSnapshot::from_bytes_in(b"", workspace.clone())?, 0)
                 } else {
-                    self.source_file(head_sha, new_path.unwrap_or(path)).await?
+                    self.source_file(head_sha, new_path.unwrap_or(path), workspace.clone())
+                        .await?
                 };
-                let mut section = DiffSpool::new()?;
+                let mut section = DiffSpool::new_in(workspace.clone())?;
                 super::azure::write_diff_section(
                     &mut section,
                     old_path.unwrap_or(path),
@@ -335,10 +350,10 @@ impl Bitbucket {
                     is_delete,
                 )?;
                 Ok::<_, anyhow::Error>((index, old_bytes, new_bytes, section.finish()?))
-            },
-        ))
+            }
+        }))
         .buffered(4);
-        let mut output = DiffSpool::new()?;
+        let mut output = DiffSpool::new_in(workspace.clone())?;
         while let Some((_, old_bytes, new_bytes, section)) = sections.try_next().await? {
             old_bytes
                 .checked_add(new_bytes)
@@ -349,12 +364,6 @@ impl Bitbucket {
         }
         output.finish()
     }
-}
-
-fn diffstat_retained_bytes(entry: &DiffStat) -> usize {
-    entry.status.len()
-        + entry.old.as_ref().map_or(0, |file| file.path.len())
-        + entry.new.as_ref().map_or(0, |file| file.path.len())
 }
 
 fn validate_diffstat(entry: &DiffStat) -> Result<()> {
@@ -437,11 +446,13 @@ impl Forge for Bitbucket {
     }
 
     async fn fetch_diff(&self, snapshot: &PrMeta) -> Result<DiffSnapshot> {
+        let workspace = WorkspaceBudget::new();
         let diff = self
             .build_complete_diff(
                 &snapshot.base_sha,
                 &snapshot.head_sha,
                 self.url(&format!("/pullrequests/{}/diffstat?pagelen=100", self.pr)),
+                workspace,
             )
             .await?;
         let current = self.fetch_pr_meta().await?;
@@ -453,6 +464,7 @@ impl Forge for Bitbucket {
     }
 
     async fn fetch_diff_since(&self, since_sha: &str, head_sha: &str) -> Result<DiffSnapshot> {
+        let workspace = WorkspaceBudget::new();
         if std::env::var(ENABLE_INCREMENTAL_ENV).as_deref() != Ok("1") {
             return Err(anyhow!(
                 "Bitbucket incremental review is disabled because the compare-diff path has \
@@ -466,6 +478,7 @@ impl Forge for Bitbucket {
             since_sha,
             head_sha,
             self.url(&format!("/diffstat/{head_sha}..{since_sha}?pagelen=100")),
+            workspace,
         )
         .await
     }

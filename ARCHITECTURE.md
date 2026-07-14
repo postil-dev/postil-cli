@@ -42,7 +42,10 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   secret-redaction semantics remain shared. Optional private-endpoint authentication is
   a separate header whose name cannot collide with provider-managed headers. A shared
   admission ledger reserves each HTTP attempt, serialized input bytes, maximum output,
-  and worst-case token spend before sending any initial, retry, repair, or scorer call.
+  and worst-case token spend before sending any initial, retry, repair, planner,
+  scorer, or mention-response call. Hosted preflight covers every active cascade or
+  consensus model, schema and semantic repair, transport retry, output bound, and
+  admitted-model price bound before the first provider request.
   Every provider HTTP call has a model-usage record with a product role, logical phase,
   operation-wide call ordinal, phase-local attempt, token counts, and exact-cost source.
   OpenRouter's response `usage.cost` is preserved as canonical decimal dollars without
@@ -51,17 +54,22 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
 - `review.rs`: orchestration; enforces acquisition, model-aware context, request,
   provider-attempt, output-token, and worst-case token-exposure budgets before calls;
   one UTF-8 byte counts as one projected token rather than using an optimistic ratio;
-  runs every evidence
-  batch plus one bounded cross-batch synthesis built from deterministic heuristic
-  semantic categories (contracts, sources, sinks, validation, lifecycle, and
-  dependencies) with at least one bounded representative for every rendered
-  file region; aggregates findings before grounding and scoring; owns
+  reviews every evidence batch outside hosted inference. Hosted inference uses a
+  bounded, schema-validated planner over deterministic candidate digests, always
+  including boundary, high-risk, and global-synthesis evidence. Its prompts state
+  that literal line coverage is non-exhaustive. One bounded cross-batch synthesis is
+  built from deterministic heuristic semantic categories (contracts, sources, sinks,
+  validation, lifecycle, and dependencies) with at least one bounded representative
+  for every rendered file region; aggregates findings before grounding and scoring; owns
   fail-closed semantics (`fail_closed_finding`); and owns
   check-run lifecycle ordering (checks are created before the model runs so a crash can
   still be reported against them). It persists safe structured model incidents for
   monitoring without raw provider or model text.
 - `forge/`: trait + GitHub, GitLab, Bitbucket Cloud, and Azure DevOps implementations,
-  with self-managed base URLs where the same API contract applies. GitHub
+  with self-managed base URLs where the same API contract applies. Paginated forge
+  metadata has aggregate byte and changed-file bounds. Source responses require a
+  declared `Content-Length` and an exact matching byte count. They stream into the
+  operation workspace without the metadata page-size ceiling. GitHub
   reconstructs full reviews from merge-base/head file content after exhausting the declared
   changed-file count, and rejects an ambiguous 300-file incremental compare. Bitbucket exhausts
   paginated diffstat and reconstructs bounded source content from the compared commits.
@@ -129,15 +137,17 @@ additions (violations are `kind: contentPolicy`). Content policy is on by defaul
    emits the generic internal `Review incomplete` operational finding before any model
    call, preserves the hosted global deadline, and keeps full-review reconciliation
    untrustworthy.
-10. Diff acquisition streams into a 32 MiB hard cap for local files, Git stdout,
-    bounded JSON, source-file acquisition, and reconstructed forge diffs. Forge error
-    bodies are never retained; opaque request identifiers are hashed before logs. The reviewable non-lockfile
-    source cap is 8 MiB. Supported lockfile sections compact before that source cap and
-    have a separate 16 MiB per-section cap.
+10. Bounded JSON metadata pages use a 32 MiB per-page cap and a 64 MiB aggregate
+    metadata cap. Source files and reconstructed diffs stream beyond that page limit
+    into one 512 MiB operation workspace shared by acquired source snapshots,
+    reconstruction sections, the final diff, normalized windows, and model batches.
+    Forge error bodies are never retained; opaque request identifiers are hashed before logs.
+    Supported lockfile sections compact independently and have a 16 MiB per-section cap.
 11. Every configured chain is planned against the smallest conservative model context.
     A review admits at most three models per logical request and hard-caps logical
     requests, HTTP attempts including repair/retry paths, per-response output tokens,
-    scorer input, and worst-case token exposure across cascade or consensus.
+    planner and scorer input, worst-case token exposure, and projected cost across
+    cascade or consensus before provider contact.
 12. Operational and provider virtual anchors expire after each run. Reviewable
     PR-description and change-metadata anchors carry across unrelated incremental
     reviews, and a same-head rerun with either anchor falls back to a full review.

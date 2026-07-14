@@ -17,7 +17,7 @@ use serde_json::json;
 use std::io::Write;
 
 use super::{CheckState, Forge, PrMeta, ThreadKind, check_summary, check_title};
-use crate::diff::{DiffSnapshot, DiffSpool};
+use crate::diff::{DiffSnapshot, DiffSpool, WorkspaceBudget};
 use crate::envelope::{Envelope, Finding};
 
 const API_VERSION: &str = "7.1";
@@ -143,7 +143,12 @@ impl Azure {
 
     /// File content at a commit. Added and deleted sides are skipped by the
     /// caller, so a missing expected item is an incomplete acquisition.
-    async fn item_at(&self, path: &str, commit: &str) -> Result<DiffSnapshot> {
+    async fn item_at(
+        &self,
+        path: &str,
+        commit: &str,
+        workspace: WorkspaceBudget,
+    ) -> Result<DiffSnapshot> {
         let q = format!(
             "path={}&versionType=commit&version={commit}&includeContent=true",
             urlencode(path)
@@ -154,9 +159,11 @@ impl Azure {
             .send()
             .await
             .with_context(|| format!("fetching {path} at {commit}"))?;
-        super::response_snapshot(
+        super::response_snapshot_in(
             Self::check_ok(resp, "item fetch").await?,
             "Azure item content",
+            workspace,
+            None,
         )
         .await
     }
@@ -167,7 +174,6 @@ impl Azure {
     /// exhaustion and fails closed on a runaway list rather than truncating.
     async fn change_list(&self, base_sha: &str, head_sha: &str) -> Result<Vec<Change>> {
         const PAGE: usize = 100;
-        const MAX_CHANGES: usize = 20_000;
         let mut changes: Vec<Change> = Vec::new();
         let mut retained_bytes = 0usize;
         loop {
@@ -182,39 +188,35 @@ impl Azure {
                 .send()
                 .await
                 .context("fetching change list")?;
-            let page: DiffResponse = super::bounded_response_json(
+            let page_text = super::bounded_response_text(
                 Self::check_ok(resp, "change list fetch").await?,
                 "Azure change-list page",
             )
             .await?;
+            retained_bytes = super::checked_metadata_total(
+                retained_bytes,
+                page_text.len(),
+                "Azure change-list pages",
+            )?;
+            let page: DiffResponse =
+                serde_json::from_str(&page_text).context("decoding Azure change-list page")?;
             let n = page.changes.len();
-            let page_bytes = page
-                .changes
-                .iter()
-                .map(|change| {
-                    change.change_type.len()
-                        + change.item.path.len()
-                        + change.source_server_item.as_ref().map_or(0, String::len)
-                })
-                .sum::<usize>();
-            retained_bytes = retained_bytes
-                .checked_add(page_bytes)
-                .ok_or_else(|| anyhow!("Azure change-list metadata byte count overflowed"))?;
+            validate_change_page(changes.len(), n, PAGE)?;
             let all_changes_included = page.all_changes_included;
             changes.extend(page.changes);
+            debug_assert!(changes.len() <= super::MAX_FORGE_CHANGED_FILES);
             if azure_page_complete(n, all_changes_included)? {
                 return Ok(changes);
-            }
-            if changes.len() > MAX_CHANGES {
-                return Err(anyhow!(
-                    "PR change list exceeds {MAX_CHANGES} entries; refusing to review a \
-                     truncated change set"
-                ));
             }
         }
     }
 
-    async fn build_diff(&self, base_sha: &str, head_sha: &str) -> Result<DiffSnapshot> {
+    async fn build_diff(
+        &self,
+        base_sha: &str,
+        head_sha: &str,
+        workspace: WorkspaceBudget,
+    ) -> Result<DiffSnapshot> {
         let changes = self.change_list(base_sha, head_sha).await?;
         let mut jobs = Vec::with_capacity(changes.len());
         for change in changes {
@@ -256,35 +258,42 @@ impl Azure {
             jobs.push((base_path.to_string(), path.to_string(), is_add, is_delete));
         }
         let mut sections = stream::iter(jobs.into_iter().enumerate().map(
-            |(index, (base_path, path, is_add, is_delete))| async move {
-                let old = if is_add {
-                    DiffSnapshot::from_bytes(b"")?
-                } else {
-                    self.item_at(&base_path, base_sha).await?
-                };
-                let new = if is_delete {
-                    DiffSnapshot::from_bytes(b"")?
-                } else {
-                    self.item_at(&path, head_sha).await?
-                };
-                if old.as_bytes() == new.as_bytes() {
-                    return Ok::<_, anyhow::Error>((index, DiffSnapshot::from_bytes(b"")?));
+            |(index, (base_path, path, is_add, is_delete))| {
+                let workspace = workspace.clone();
+                async move {
+                    let old = if is_add {
+                        DiffSnapshot::from_bytes_in(b"", workspace.clone())?
+                    } else {
+                        self.item_at(&base_path, base_sha, workspace.clone())
+                            .await?
+                    };
+                    let new = if is_delete {
+                        DiffSnapshot::from_bytes_in(b"", workspace.clone())?
+                    } else {
+                        self.item_at(&path, head_sha, workspace.clone()).await?
+                    };
+                    if old.as_bytes() == new.as_bytes() {
+                        return Ok::<_, anyhow::Error>((
+                            index,
+                            DiffSnapshot::from_bytes_in(b"", workspace.clone())?,
+                        ));
+                    }
+                    let mut section = DiffSpool::new_in(workspace.clone())?;
+                    write_diff_section(
+                        &mut section,
+                        &base_path,
+                        &path,
+                        old.source_str(),
+                        new.source_str(),
+                        is_add,
+                        is_delete,
+                    )?;
+                    Ok((index, section.finish()?))
                 }
-                let mut section = DiffSpool::new()?;
-                write_diff_section(
-                    &mut section,
-                    &base_path,
-                    &path,
-                    old.source_str(),
-                    new.source_str(),
-                    is_add,
-                    is_delete,
-                )?;
-                Ok((index, section.finish()?))
             },
         ))
         .buffered(4);
-        let mut out = DiffSpool::new()?;
+        let mut out = DiffSpool::new_in(workspace.clone())?;
         while let Some((_, section)) = sections.try_next().await? {
             out.write_all(section.as_bytes())
                 .context("spooling Azure reconstructed diff")?;
@@ -409,8 +418,9 @@ impl Forge for Azure {
     }
 
     async fn fetch_diff(&self, snapshot: &PrMeta) -> Result<DiffSnapshot> {
+        let workspace = WorkspaceBudget::new();
         let diff = self
-            .build_diff(&snapshot.base_sha, &snapshot.head_sha)
+            .build_diff(&snapshot.base_sha, &snapshot.head_sha, workspace)
             .await?;
         let current = self.fetch_pr_meta().await?;
         ensure!(
@@ -421,7 +431,8 @@ impl Forge for Azure {
     }
 
     async fn fetch_diff_since(&self, since_sha: &str, head_sha: &str) -> Result<DiffSnapshot> {
-        self.build_diff(since_sha, head_sha).await
+        self.build_diff(since_sha, head_sha, WorkspaceBudget::new())
+            .await
     }
 
     async fn post_review(
@@ -581,6 +592,26 @@ fn azure_page_complete(count: usize, marker: bool) -> Result<bool> {
         )),
         false => Ok(false),
     }
+}
+
+fn validate_change_page(
+    current: usize,
+    page_count: usize,
+    requested_page_size: usize,
+) -> Result<()> {
+    ensure!(
+        page_count <= requested_page_size,
+        "Azure change-list page exceeded the requested {requested_page_size} entries"
+    );
+    let total = current
+        .checked_add(page_count)
+        .ok_or_else(|| anyhow!("Azure change-list entry count overflowed"))?;
+    ensure!(
+        total <= super::MAX_FORGE_CHANGED_FILES,
+        "PR change list exceeds {} entries; refusing to review a truncated change set",
+        super::MAX_FORGE_CHANGED_FILES
+    );
+    Ok(())
 }
 
 /// One file's diff section, or a "differ" marker if the content is binary.
@@ -832,5 +863,12 @@ mod tests {
         assert!(!azure_page_complete(12, false).unwrap());
         assert!(azure_page_complete(100, true).unwrap());
         assert!(azure_page_complete(0, false).is_err());
+    }
+
+    #[test]
+    fn terminal_marker_cannot_bypass_aggregate_change_limit() {
+        assert!(validate_change_page(crate::forge::MAX_FORGE_CHANGED_FILES, 1, 100).is_err());
+        assert!(validate_change_page(crate::forge::MAX_FORGE_CHANGED_FILES - 1, 1, 100).is_ok());
+        assert!(validate_change_page(0, 101, 100).is_err());
     }
 }

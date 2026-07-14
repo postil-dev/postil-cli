@@ -4,7 +4,7 @@
 //! OpenAI-compatible endpoints use `POST {base}/chat/completions` by default.
 //! Native Anthropic endpoints use `POST {base}/messages` when explicitly selected.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -274,6 +274,19 @@ struct RawScore {
     reason: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RawBatchSelection {
+    batch_ids: Vec<usize>,
+}
+
+pub struct BatchPlannerResult {
+    pub batch_ids: Vec<usize>,
+    pub usage: Usage,
+    pub model_usage: Vec<ModelUsage>,
+    pub usage_accounting_complete: bool,
+}
+
 fn default_confidence() -> f64 {
     0.5
 }
@@ -339,7 +352,11 @@ pub(crate) const MAX_REPORTED_TOKEN_SPEND: usize = 20_000_000;
 const MAX_PROVIDER_INPUT_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE: usize = 2_000_000;
 pub const HOSTED_OPERATION_COST_CAP_MICROS: u64 = 1_000_000;
-const MAX_HOSTED_PLANNED_CALLS_BY_WATCHDOG: usize = 42;
+// Five selected review batches and one planner request, each across at most
+// three generator models with one repair, consume 36 logical calls. The two
+// scorer models with one repair consume four more. Any larger plan diverges
+// from the bounded hosted workflow that fits under the phase deadlines.
+const MAX_HOSTED_PLANNED_CALLS_BY_WATCHDOG: usize = 40;
 const MAX_LOGICAL_CALLS_PER_REVIEW_MODEL: usize = 2;
 const MAX_LOGICAL_CALLS_PER_SCORER_MODEL: usize = 2;
 const MAX_TRANSPORT_ATTEMPTS_PER_CALL: usize = TRANSIENT_RETRIES as usize + 1;
@@ -354,6 +371,7 @@ const SCORER_REASON_MAX_BYTES: usize = 240;
 // Keep generation bounded too, so an invalid model cannot spend an article's
 // worth of output tokens before the validator rejects it.
 const RESPOND_MAX_TOKENS: u32 = 1024;
+const PLANNER_MAX_TOKENS: u32 = 1024;
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 pub(crate) const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 480;
 const REQUEST_TIMEOUT_ENV: &str = "POSTIL_LLM_REQUEST_TIMEOUT_SECS";
@@ -408,6 +426,30 @@ fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> &str {
     }
     &value[..end]
 }
+
+fn validate_batch_selection(
+    content: &str,
+    allowed_ids: &BTreeSet<usize>,
+    max_selected: usize,
+) -> Result<Vec<usize>> {
+    let raw: RawBatchSelection = serde_json::from_str(content.trim())
+        .context("planner response is not the exact batch-selection JSON object")?;
+    ensure!(
+        raw.batch_ids.len() <= max_selected,
+        "planner selected more than {max_selected} batches"
+    );
+    let original_len = raw.batch_ids.len();
+    let selected = raw.batch_ids.into_iter().collect::<BTreeSet<_>>();
+    ensure!(
+        selected.len() == original_len,
+        "planner batch selection contains duplicates"
+    );
+    ensure!(
+        selected.iter().all(|id| allowed_ids.contains(id)),
+        "planner selected a batch ID outside the grounded candidate set"
+    );
+    Ok(selected.into_iter().collect())
+}
 /// Marker context attached to transport/provider-level failures (endpoint
 /// unreachable, HTTP error status, timeout, malformed HTTP envelope), the
 /// class a malicious diff cannot induce. `gate.onError: advisory` stands aside
@@ -438,6 +480,7 @@ fn reqwest_error(error: &anyhow::Error) -> Option<&reqwest::Error> {
 
 #[derive(Debug, Clone, Copy)]
 enum LlmPhase {
+    Planner,
     Review,
     Scorer,
     Respond,
@@ -455,6 +498,7 @@ enum LlmCallPhase {
 impl LlmPhase {
     fn as_str(self) -> &'static str {
         match self {
+            Self::Planner => "planner",
             Self::Review => "review",
             Self::Scorer => "scorer",
             Self::Respond => "respond",
@@ -464,7 +508,7 @@ impl LlmPhase {
 
     fn usage_role(self) -> ModelUsageRole {
         match self {
-            Self::Review | Self::Total => ModelUsageRole::ReviewGenerator,
+            Self::Planner | Self::Review | Self::Total => ModelUsageRole::ReviewGenerator,
             Self::Scorer => ModelUsageRole::FindingScorer,
             Self::Respond => ModelUsageRole::MentionResponder,
         }
@@ -516,6 +560,7 @@ struct DeadlineExceeded(LlmPhase);
 impl std::fmt::Display for DeadlineExceeded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.0 {
+            LlmPhase::Planner => f.write_str("LLM planner deadline exceeded"),
             LlmPhase::Review => f.write_str("LLM review deadline exceeded"),
             LlmPhase::Scorer | LlmPhase::Respond | LlmPhase::Total => {
                 f.write_str("LLM total deadline exceeded")
@@ -538,6 +583,197 @@ impl std::fmt::Display for RequestTimedOut {
 impl std::error::Error for RequestTimedOut {}
 
 impl LlmClient {
+    pub(crate) fn preflight_respond_plan(
+        &self,
+        cfg: &Config,
+        system: &str,
+        user: &str,
+    ) -> Result<()> {
+        let Some(bounds) = &self.hosted_price_bounds else {
+            return Ok(());
+        };
+        let models = cfg.model_chain();
+        ensure!(!models.is_empty(), "hosted respond has no admitted model");
+        let attempts = models
+            .len()
+            .checked_mul(MAX_TRANSPORT_ATTEMPTS_PER_CALL)
+            .context("planned respond attempt count overflowed")?;
+        ensure!(
+            attempts <= MAX_PROVIDER_ATTEMPTS,
+            "complete hosted respond needs {attempts} provider attempts, exceeding the {MAX_PROVIDER_ATTEMPTS}-attempt cap"
+        );
+        let mut input_bytes = 0usize;
+        let mut output_tokens = 0usize;
+        let mut projected_cost = 0u64;
+        for model in models {
+            let body = self.request_body(&model, system, user, RESPOND_MAX_TOKENS, 0.1);
+            let body_bytes = serde_json::to_vec(&body)
+                .context("serializing hosted respond request for preflight")?
+                .len();
+            input_bytes = input_bytes
+                .checked_add(
+                    body_bytes
+                        .checked_mul(MAX_TRANSPORT_ATTEMPTS_PER_CALL)
+                        .context("planned respond input exposure overflowed")?,
+                )
+                .context("planned respond input exposure overflowed")?;
+            output_tokens = output_tokens
+                .checked_add(
+                    (RESPOND_MAX_TOKENS as usize)
+                        .checked_mul(MAX_TRANSPORT_ATTEMPTS_PER_CALL)
+                        .context("planned respond output exposure overflowed")?,
+                )
+                .context("planned respond output exposure overflowed")?;
+            let price = bounds.get(&model).ok_or_else(|| {
+                anyhow!("hosted respond model {model:?} has no admitted price bound")
+            })?;
+            projected_cost = projected_cost
+                .checked_add(
+                    projected_request_cost_micros(body_bytes, RESPOND_MAX_TOKENS as usize, price)?
+                        .checked_mul(MAX_TRANSPORT_ATTEMPTS_PER_CALL as u64)
+                        .context("planned respond cost overflowed")?,
+                )
+                .context("planned respond cost overflowed")?;
+        }
+        ensure!(
+            input_bytes <= MAX_PROVIDER_INPUT_BYTES,
+            "complete hosted respond exceeds the provider input cap"
+        );
+        ensure!(
+            output_tokens <= MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE,
+            "complete hosted respond exceeds the provider output cap"
+        );
+        ensure!(
+            input_bytes.saturating_add(output_tokens) <= MAX_REPORTED_TOKEN_SPEND,
+            "complete hosted respond exceeds the provider token-exposure cap"
+        );
+        ensure!(
+            projected_cost <= HOSTED_OPERATION_COST_CAP_MICROS,
+            "complete hosted respond exceeds the hosted operation cost cap"
+        );
+        Ok(())
+    }
+
+    pub async fn plan_review_batches(
+        &self,
+        cfg: &Config,
+        manifest: &str,
+        allowed_ids: &BTreeSet<usize>,
+        max_selected: usize,
+    ) -> Result<BatchPlannerResult> {
+        let system = "You select bounded code-review batches from an untrusted semantic manifest. Return exactly one JSON object {\"batchIds\":[integer,...]}. Select only IDs present in the candidate set, with no duplicates, and select at most the requested count. Prefer concrete security, correctness, data-loss, concurrency, and lifecycle evidence. The mandatory boundary and global-synthesis batches are reviewed separately.";
+        let user = format!(
+            "Select at most {max_selected} additional batch IDs for detailed review.\n\n{manifest}"
+        );
+        let mut aggregate_usage = Usage::default();
+        let mut aggregate_model_usage = Vec::new();
+        let mut accounting_complete = true;
+        let mut last_error = None;
+        let planner_models = if cfg.consensus > 1 {
+            cfg.model_chain()
+                .into_iter()
+                .take(cfg.consensus)
+                .collect::<Vec<_>>()
+        } else {
+            cfg.model_chain()
+        };
+        for model in planner_models {
+            match self
+                .plan_with_model(&model, system, &user, allowed_ids, max_selected)
+                .await
+            {
+                Ok(mut result) => {
+                    add_usage(&mut result.usage, aggregate_usage);
+                    result.model_usage.splice(0..0, aggregate_model_usage);
+                    result.usage_accounting_complete &= accounting_complete;
+                    return Ok(result);
+                }
+                Err(error) => {
+                    accounting_complete &= error.usage_accounting_complete;
+                    add_usage(&mut aggregate_usage, error.usage);
+                    aggregate_model_usage.extend(error.model_usage);
+                    last_error = Some(error.error);
+                }
+            }
+        }
+        Err(last_error
+            .unwrap_or_else(|| anyhow!("empty planner model chain"))
+            .context("no model produced a valid grounded batch plan"))
+    }
+
+    async fn plan_with_model(
+        &self,
+        model: &str,
+        system: &str,
+        user: &str,
+        allowed_ids: &BTreeSet<usize>,
+        max_selected: usize,
+    ) -> std::result::Result<BatchPlannerResult, ModelError> {
+        let mut usage = Usage::default();
+        let mut model_usage = Vec::new();
+        let mut accounting_complete = true;
+        let content = self
+            .chat(
+                model,
+                system,
+                user,
+                &mut usage,
+                &mut model_usage,
+                &mut accounting_complete,
+                PLANNER_MAX_TOKENS,
+                LlmPhase::Planner,
+                LlmCallPhase::Initial,
+            )
+            .await
+            .map_err(|error| {
+                let mut error = ModelError::new(error, usage, accounting_complete);
+                error.model_usage = model_usage.clone();
+                error
+            })?;
+        let selected = match validate_batch_selection(&content, allowed_ids, max_selected) {
+            Ok(selected) => selected,
+            Err(first_error) => {
+                let invalid = truncate_utf8_bytes(&content, 8_192);
+                let repair_user = format!(
+                    "{user}\n\nThe previous response was invalid ({first_error}). Return only the corrected JSON object. Invalid response:\n{invalid}"
+                );
+                let repaired = self
+                    .chat(
+                        model,
+                        "Repair the batch-selection JSON. Return only {\"batchIds\":[integer,...]}.",
+                        &repair_user,
+                        &mut usage,
+                        &mut model_usage,
+                        &mut accounting_complete,
+                        PLANNER_MAX_TOKENS,
+                        LlmPhase::Planner,
+                        LlmCallPhase::SchemaRepair,
+                    )
+                    .await
+                    .map_err(|error| {
+                        let mut error = ModelError::new(error, usage, accounting_complete);
+                        error.model_usage = model_usage.clone();
+                        error
+                    })?;
+                validate_batch_selection(&repaired, allowed_ids, max_selected).map_err(|error| {
+                    let mut error = ModelError::new(
+                        error.context("planner output invalid after schema repair"),
+                        usage,
+                        accounting_complete,
+                    );
+                    error.model_usage = model_usage.clone();
+                    error
+                })?
+            }
+        };
+        Ok(BatchPlannerResult {
+            batch_ids: selected,
+            usage,
+            model_usage,
+            usage_accounting_complete: accounting_complete,
+        })
+    }
+
     pub(crate) fn preflight_review_plan(
         &self,
         cfg: &Config,
@@ -545,6 +781,7 @@ impl LlmClient {
         total_batch_bytes: usize,
         largest_batch_bytes: usize,
         shared_context_bytes: usize,
+        planner_manifest_bytes: Option<usize>,
     ) -> Result<()> {
         let Some(bounds) = &self.hosted_price_bounds else {
             return Ok(());
@@ -570,8 +807,18 @@ impl LlmClient {
             .len()
             .checked_mul(MAX_LOGICAL_CALLS_PER_SCORER_MODEL)
             .context("planned scorer call count overflowed")?;
+        let planner_logical_calls = planner_manifest_bytes
+            .map(|_| {
+                review_models
+                    .len()
+                    .checked_mul(MAX_LOGICAL_CALLS_PER_REVIEW_MODEL)
+                    .context("planned planner call count overflowed")
+            })
+            .transpose()?
+            .unwrap_or(0);
         let logical_calls = review_logical_calls
             .checked_add(scorer_logical_calls)
+            .and_then(|value| value.checked_add(planner_logical_calls))
             .context("planned model call count overflowed")?;
         anyhow::ensure!(
             logical_calls <= MAX_HOSTED_PLANNED_CALLS_BY_WATCHDOG,
@@ -592,6 +839,7 @@ impl LlmClient {
         let largest_review_input = largest_batch_bytes
             .saturating_add(shared_context_bytes)
             .saturating_add(PLANNED_REQUEST_ENVELOPE_BYTES)
+            .saturating_add(16_384 * 6)
             .max(32 * 1024);
         let review_input = largest_review_input
             .checked_mul(batch_count)
@@ -599,13 +847,30 @@ impl LlmClient {
             .and_then(|value| value.checked_mul(MAX_LOGICAL_CALLS_PER_REVIEW_MODEL))
             .and_then(|value| value.checked_mul(MAX_TRANSPORT_ATTEMPTS_PER_CALL))
             .context("planned review input exposure overflowed")?;
-        let scorer_input_per_attempt = 64_000usize.saturating_add(PLANNED_REQUEST_ENVELOPE_BYTES);
+        let scorer_input_per_attempt = 64_000usize
+            .saturating_add(PLANNED_REQUEST_ENVELOPE_BYTES)
+            .saturating_add(
+                scorer_max_tokens(SCORER_MAX_FINDINGS)
+                    .expect("maximum scorer finding count has a token bound")
+                    as usize
+                    * SCORER_REPAIR_BYTES_PER_OUTPUT_TOKEN
+                    * 6,
+            );
         let scorer_input = scorer_input_per_attempt
             .checked_mul(scorer_logical_calls)
             .and_then(|value| value.checked_mul(MAX_TRANSPORT_ATTEMPTS_PER_CALL))
             .context("planned scorer input exposure overflowed")?;
+        let planner_input_per_attempt = planner_manifest_bytes
+            .unwrap_or(0)
+            .saturating_add(PLANNED_REQUEST_ENVELOPE_BYTES)
+            .saturating_add(8_192 * 6);
+        let planner_input = planner_input_per_attempt
+            .checked_mul(planner_logical_calls)
+            .and_then(|value| value.checked_mul(MAX_TRANSPORT_ATTEMPTS_PER_CALL))
+            .context("planned planner input exposure overflowed")?;
         let input_bytes = review_input
             .checked_add(scorer_input)
+            .and_then(|value| value.checked_add(planner_input))
             .context("planned provider input exposure overflowed")?;
         anyhow::ensure!(
             input_bytes <= MAX_PROVIDER_INPUT_BYTES,
@@ -624,8 +889,13 @@ impl LlmClient {
             .checked_mul(MAX_TRANSPORT_ATTEMPTS_PER_CALL)
             .and_then(|value| value.checked_mul(scorer_output_per_attempt))
             .context("planned scorer output exposure overflowed")?;
+        let planner_output = planner_logical_calls
+            .checked_mul(MAX_TRANSPORT_ATTEMPTS_PER_CALL)
+            .and_then(|value| value.checked_mul(PLANNER_MAX_TOKENS as usize))
+            .context("planned planner output exposure overflowed")?;
         let output_tokens = review_output
             .checked_add(scorer_output)
+            .and_then(|value| value.checked_add(planner_output))
             .context("planned provider output exposure overflowed")?;
         anyhow::ensure!(
             output_tokens <= MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE,
@@ -680,6 +950,29 @@ impl LlmClient {
                         .context("planned scorer cost overflowed")?,
                 )
                 .context("planned scorer cost overflowed")?;
+        }
+        if planner_manifest_bytes.is_some() {
+            for model in &review_models {
+                let price = bounds.get(model).ok_or_else(|| {
+                    anyhow!("hosted planner model {model:?} has no admitted price bound")
+                })?;
+                let one_attempt = projected_request_cost_micros(
+                    planner_input_per_attempt,
+                    PLANNER_MAX_TOKENS as usize,
+                    price,
+                )?;
+                projected_cost = projected_cost
+                    .checked_add(
+                        one_attempt
+                            .checked_mul(
+                                (MAX_LOGICAL_CALLS_PER_REVIEW_MODEL
+                                    * MAX_TRANSPORT_ATTEMPTS_PER_CALL)
+                                    as u64,
+                            )
+                            .context("planned planner cost overflowed")?,
+                    )
+                    .context("planned planner cost overflowed")?;
+            }
         }
         anyhow::ensure!(
             projected_cost <= HOSTED_OPERATION_COST_CAP_MICROS,
@@ -2177,7 +2470,7 @@ impl LlmClient {
 
     fn remaining_budget(&self, phase: LlmPhase) -> Result<Option<Duration>> {
         let deadline = match phase {
-            LlmPhase::Review => self.review_deadline,
+            LlmPhase::Planner | LlmPhase::Review => self.review_deadline,
             LlmPhase::Scorer => self.scorer_deadline.or(self.total_deadline),
             LlmPhase::Respond | LlmPhase::Total => self.total_deadline,
         };
@@ -3194,7 +3487,59 @@ mod tests {
     }
 
     #[test]
-    fn hosted_review_plan_rejects_complete_work_beyond_watchdog_before_calls() {
+    fn planner_selection_is_exact_unique_bounded_and_grounded() {
+        let allowed = BTreeSet::from([2usize, 4, 8]);
+        assert_eq!(
+            validate_batch_selection(r#"{"batchIds":[8,2]}"#, &allowed, 2).unwrap(),
+            vec![2, 8]
+        );
+        assert!(validate_batch_selection(r#"{"batchIds":[2,2]}"#, &allowed, 2).is_err());
+        assert!(validate_batch_selection(r#"{"batchIds":[3]}"#, &allowed, 2).is_err());
+        assert!(validate_batch_selection(r#"{"batchIds":[2,4,8]}"#, &allowed, 2).is_err());
+        assert!(validate_batch_selection(r#"{"batchIds":[2],"extra":true}"#, &allowed, 2).is_err());
+    }
+
+    #[test]
+    fn hosted_respond_preflight_accounts_for_every_fallback_before_calls() {
+        let config = Config {
+            model: "provider/primary".into(),
+            cascade: vec!["provider/fallback".into()],
+            ..Config::default()
+        };
+        let mut client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        client.hosted_price_bounds = Some(Arc::new(HashMap::from([
+            (
+                "provider/primary".into(),
+                ModelPriceBound {
+                    model: "provider/primary".into(),
+                    input_micros_per_million_tokens: 1,
+                    output_micros_per_million_tokens: 1,
+                },
+            ),
+            (
+                "provider/fallback".into(),
+                ModelPriceBound {
+                    model: "provider/fallback".into(),
+                    input_micros_per_million_tokens: 1,
+                    output_micros_per_million_tokens: 1,
+                },
+            ),
+        ])));
+        client
+            .preflight_respond_plan(&config, "system", "bounded user context")
+            .unwrap();
+        assert_eq!(client.admission.lock().unwrap().attempts, 0);
+    }
+
+    #[test]
+    fn hosted_review_plan_admits_bounded_selection_independent_of_raw_batch_count() {
         let config = Config {
             model: "provider/model".into(),
             scorer_enabled: false,
@@ -3216,11 +3561,73 @@ mod tests {
                 output_micros_per_million_tokens: 1,
             },
         )])));
-        let error = client
-            .preflight_review_plan(&config, 22, 22 * 4_096, 4_096, 2_048)
-            .unwrap_err();
-        assert!(error.to_string().contains("watchdog plan"));
+        client
+            .preflight_review_plan(
+                &config,
+                crate::review::MAX_HOSTED_SELECTED_BATCHES,
+                crate::review::MAX_HOSTED_SELECTED_BATCHES * 4_096,
+                4_096,
+                2_048,
+                Some(96_000),
+            )
+            .unwrap();
         assert_eq!(client.admission.lock().unwrap().attempts, 0);
+    }
+
+    #[test]
+    fn maximum_hosted_plan_matches_watchdog_and_transport_arithmetic() {
+        let review_calls = crate::review::MAX_HOSTED_SELECTED_BATCHES
+            * crate::review::MAX_MODELS_PER_REQUEST
+            * MAX_LOGICAL_CALLS_PER_REVIEW_MODEL;
+        let planner_calls =
+            crate::review::MAX_MODELS_PER_REQUEST * MAX_LOGICAL_CALLS_PER_REVIEW_MODEL;
+        let scorer_calls = 2 * MAX_LOGICAL_CALLS_PER_SCORER_MODEL;
+        let logical_calls = review_calls + planner_calls + scorer_calls;
+
+        assert_eq!(logical_calls, MAX_HOSTED_PLANNED_CALLS_BY_WATCHDOG);
+        assert!(logical_calls * MAX_TRANSPORT_ATTEMPTS_PER_CALL <= MAX_PROVIDER_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn deterministic_hosted_rejection_contacts_no_provider() {
+        let server = wiremock::MockServer::start().await;
+        let config = Config {
+            api_base: server.uri(),
+            model: "provider/model".into(),
+            scorer_enabled: false,
+            ..Config::default()
+        };
+        let mut client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        client.hosted_price_bounds = Some(Arc::new(HashMap::from([(
+            "provider/model".into(),
+            ModelPriceBound {
+                model: "provider/model".into(),
+                input_micros_per_million_tokens: 1,
+                output_micros_per_million_tokens: 1,
+            },
+        )])));
+
+        let error = client
+            .preflight_review_plan(
+                &config,
+                crate::review::MAX_HOSTED_SELECTED_BATCHES,
+                crate::review::MAX_HOSTED_SELECTED_BATCHES * 4_096,
+                4_096,
+                MAX_PROVIDER_INPUT_BYTES,
+                Some(96_000),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("complete hosted review"));
+        assert_eq!(client.admission.lock().unwrap().attempts, 0);
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[test]
