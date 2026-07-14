@@ -7,10 +7,10 @@
 // primary-model output.
 
 import { execFile as execFileCb } from "node:child_process";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { cases as fixtureInputs } from "../fixtures/cases";
 import { API_KEY_ENV_NAMES_TEXT, resolveApiKeyName } from "./api-key";
@@ -30,6 +30,9 @@ export const SCORER_REASON_MAX_BYTES = 240;
 export const SCORER_MAX_P50_MS = 5_000;
 export const SCORER_MAX_P95_MS = 10_000;
 export const SCORER_MAX_CASE_MS = 20_000;
+export const SCORER_CASE_TIMEOUT_GRACE_MS = 1_000;
+export const SCORER_CASE_EXEC_TIMEOUT_MS = SCORER_MAX_CASE_MS + SCORER_CASE_TIMEOUT_GRACE_MS;
+export const SCORER_PROXY_UPSTREAM_TIMEOUT_MS = SCORER_MAX_CASE_MS;
 export const SCORER_MAX_MEAN_COST_USD = 0.005;
 export const SCORER_MIN_FALSE_DOWNSCORE_RATE = 0.8;
 export const SCORER_MAX_CANDIDATES = 6;
@@ -65,6 +68,7 @@ export interface ScorerEvalCase {
   name: string;
   scenario: Scenario;
   model: string;
+  timedOut: boolean;
   envelopeProduced: boolean;
   scorerModel: string | null;
   scorerError: string | null;
@@ -87,6 +91,7 @@ export interface ScorerEvalCase {
 export interface ScorerEvalAggregate {
   id: string;
   casesRun: number;
+  timedOutCases: number;
   structuredFailures: number;
   trueFindingHighConfidence: number;
   trueFindingCases: number;
@@ -114,6 +119,7 @@ export interface ScorerEvalReport {
 }
 
 interface ScorerAttempt {
+  outcome: "completed" | "failed" | "timedOut" | "teardownAborted";
   durationMs: number;
   promptTokens: number;
   completionTokens: number;
@@ -124,6 +130,24 @@ interface ScorerAttempt {
 interface EmbeddedScorerDefaults {
   enabled: boolean;
   qualification_candidates: string[];
+}
+
+export interface BoundedChildResult {
+  exitCode: number | undefined;
+  stdout: string;
+  stderr: string;
+  timedOut: boolean;
+}
+
+export interface ScorerEvalCheckpoint {
+  version: 1;
+  status: "in_progress";
+  updatedAt: string;
+  repeats: number;
+  models: string[];
+  completedCases: number;
+  totalCases: number;
+  cases: Array<Omit<ScorerEvalCase, "name" | "reason" | "scorerError">>;
 }
 
 function flagValue(args: string[], flag: string): string | undefined {
@@ -146,6 +170,87 @@ export function parseRepeatCount(raw: string | undefined): number {
     throw new Error("scorer qualification repeats must be an integer in 1..10");
   }
   return repeats;
+}
+
+export async function runBoundedChild(
+  file: string,
+  args: string[],
+  options: {
+    cwd: string;
+    env: NodeJS.ProcessEnv;
+    timeoutMs: number;
+    maxBuffer: number;
+  },
+): Promise<BoundedChildResult> {
+  if (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs <= 0) {
+    throw new Error("child timeout must be a positive integer");
+  }
+  try {
+    const out = await execFile(file, args, {
+      cwd: options.cwd,
+      env: options.env,
+      timeout: options.timeoutMs,
+      killSignal: "SIGKILL",
+      maxBuffer: options.maxBuffer,
+    });
+    return { exitCode: 0, stdout: out.stdout, stderr: out.stderr, timedOut: false };
+  } catch (error) {
+    const childError = error as {
+      code?: unknown;
+      killed?: boolean;
+      signal?: unknown;
+      stdout?: string;
+      stderr?: string;
+    };
+    const timedOut = childError.killed === true && childError.signal === "SIGKILL";
+    return {
+      exitCode: typeof childError.code === "number" ? childError.code : undefined,
+      stdout: childError.stdout ?? "",
+      stderr: childError.stderr ?? "",
+      timedOut,
+    };
+  }
+}
+
+export function scorerCheckpointPath(jsonOut: string): string {
+  return `${resolve(jsonOut)}.partial`;
+}
+
+export async function writeScorerEvalCheckpoint(
+  jsonOut: string,
+  models: string[],
+  repeats: number,
+  totalCases: number,
+  results: ScorerEvalCase[],
+): Promise<void> {
+  const checkpoint: ScorerEvalCheckpoint = {
+    version: 1,
+    status: "in_progress",
+    updatedAt: new Date().toISOString(),
+    repeats,
+    models: [...models],
+    completedCases: results.length,
+    totalCases,
+    cases: results.map(({ name: _name, reason: _reason, scorerError: _scorerError, ...result }) => result),
+  };
+  await atomicWriteFile(scorerCheckpointPath(jsonOut), `${JSON.stringify(checkpoint, null, 2)}\n`);
+}
+
+export async function finalizeScorerEvalReport(jsonOut: string, contents: string): Promise<void> {
+  await atomicWriteFile(resolve(jsonOut), contents);
+  await rm(scorerCheckpointPath(jsonOut), { force: true });
+}
+
+async function atomicWriteFile(path: string, contents: string): Promise<void> {
+  const absolute = resolve(path);
+  await mkdir(dirname(absolute), { recursive: true });
+  const temporary = `${absolute}.tmp-${process.pid}-${crypto.randomUUID()}`;
+  try {
+    await writeFile(temporary, contents, { mode: 0o600 });
+    await rename(temporary, absolute);
+  } finally {
+    await rm(temporary, { force: true });
+  }
 }
 
 export async function loadEmbeddedScorerDefaults(
@@ -173,6 +278,9 @@ export async function loadEmbeddedScorerDefaults(
 async function main() {
   const args = process.argv.slice(2);
   const jsonOut = flagValue(args, "--json-out");
+  if (args.includes("--json-out") && jsonOut === undefined) {
+    throw new Error("--json-out requires a path");
+  }
   const apiBase = process.env.POSTIL_API_BASE ?? DEFAULT_API_BASE;
   const keyName = resolveApiKeyName();
   if (!keyName) {
@@ -202,22 +310,31 @@ async function main() {
   const selected = selectEvalCases(fixtures);
 
   const results: ScorerEvalCase[] = [];
+  const totalCases = models.length * repeats * selected.length;
+  if (jsonOut) {
+    await writeScorerEvalCheckpoint(jsonOut, models, repeats, totalCases, results);
+    await rm(jsonOut, { force: true });
+  }
   for (const model of models) {
+    candidateCases:
     for (let repeat = 1; repeat <= repeats; repeat += 1) {
       for (const c of selected) {
-        results.push(
-          await runScorerEvalCase(
-            c.case,
-            c.scenario,
-            model,
-            repeat,
-            binary,
-            rootDir,
-            apiBase,
-            keyName,
-            pricing.get(model) ?? null,
-          ),
+        const result = await runScorerEvalCase(
+          c.case,
+          c.scenario,
+          model,
+          repeat,
+          binary,
+          rootDir,
+          apiBase,
+          keyName,
+          pricing.get(model) ?? null,
         );
+        results.push(result);
+        if (jsonOut) {
+          await writeScorerEvalCheckpoint(jsonOut, models, repeats, totalCases, results);
+        }
+        if (result.timedOut) break candidateCases;
       }
     }
   }
@@ -235,7 +352,7 @@ async function main() {
   };
   const json = JSON.stringify(report, null, 2);
   if (jsonOut) {
-    await writeFile(jsonOut, `${json}\n`);
+    await finalizeScorerEvalReport(jsonOut, `${json}\n`);
   }
   console.log(formatReport(report));
   process.exitCode = qualificationExitCode(report);
@@ -268,6 +385,7 @@ async function runScorerEvalCase(
   apiBase: string,
   keyName: string,
   pricing: ModelPricing | null,
+  executionTimeoutMs = SCORER_CASE_EXEC_TIMEOUT_MS,
 ): Promise<ScorerEvalCase> {
   const runDir = join(rootDir, safeSegment(scorerModel), `repeat-${repeat}`, c.id);
   await rm(runDir, { recursive: true, force: true });
@@ -280,40 +398,59 @@ async function runScorerEvalCase(
 
   const github = await startMockGithub(c);
   const proxy = await startScorerProxy(c, scenario, apiBase, process.env[keyName] as string);
-  let exitCode: number | undefined;
-  let stdout = "";
-  let stderr = "";
+  let child: BoundedChildResult;
   try {
-    const out = await execFile(binary, ["review", "--repo", c.repo, "--pr", String(c.pullNumber), "--output-json"], {
+    child = await runBoundedChild(binary, ["review", "--repo", c.repo, "--pr", String(c.pullNumber), "--output-json"], {
       cwd: runDir,
       env: isolatedEnv(homeDir, tmpDir, github.baseUrl, proxy.baseUrl, scorerModel),
-      timeout: 240_000,
+      timeoutMs: executionTimeoutMs,
       maxBuffer: 8 * 1024 * 1024,
     });
-    exitCode = 0;
-    stdout = out.stdout;
-    stderr = out.stderr;
-  } catch (err) {
-    const e = err as { code?: unknown; stdout?: string; stderr?: string };
-    exitCode = typeof e.code === "number" ? e.code : undefined;
-    stdout = e.stdout ?? "";
-    stderr = e.stderr ?? "";
   } finally {
     await github.close();
     await proxy.close();
   }
+  const caseTimedOut = child.timedOut || proxy.attempts.some((attempt) => attempt.outcome === "timedOut");
+  const timeoutLog = caseTimedOut
+    ? `postil scorer eval: case exceeded the ${SCORER_MAX_CASE_MS}ms admission limit (child cutoff ${executionTimeoutMs}ms)\n`
+    : "";
+  const stderr = `${child.stderr}${child.stderr.endsWith("\n") || child.stderr.length === 0 ? "" : "\n"}${timeoutLog}`;
   await writeFile(join(artifactsDir, "stderr.log"), stderr, { mode: 0o600 });
 
-  const envelope = safeJson(stdout) as Record<string, any> | undefined;
+  const durationMs = proxy.attempts.reduce((sum, attempt) => sum + attempt.durationMs, 0);
+  const promptTokens = proxy.attempts.reduce((sum, attempt) => sum + attempt.promptTokens, 0);
+  const completionTokens = proxy.attempts.reduce((sum, attempt) => sum + attempt.completionTokens, 0);
+  const exactCosts = proxy.attempts.map((attempt) => attempt.costUsd);
+  const exactCost = exactCosts.length > 0 && exactCosts.every((cost) => cost !== null)
+    ? exactCosts.reduce((sum, cost) => sum + (cost ?? 0), 0)
+    : null;
+  const costUsd = exactCost ?? (pricing
+    ? promptTokens * pricing.promptUsdPerToken + completionTokens * pricing.completionUsdPerToken
+    : null);
+  const telemetry = {
+    upstreamRequests: proxy.attempts.length,
+    durationMs: proxy.attempts.length > 0 ? durationMs : null,
+    promptTokens,
+    completionTokens,
+    costUsd,
+  };
+
+  const envelope = safeJson(child.stdout) as Record<string, any> | undefined;
   if (!envelope || envelope.version !== 1) {
-    return baseResult(
-      c,
-      scenario,
-      scorerModel,
-      repeat,
-      false,
-      `no valid v1 envelope (exit ${exitCode ?? "unknown"})`,
-    );
+    return {
+      ...baseResult(
+        c,
+        scenario,
+        scorerModel,
+        repeat,
+        false,
+        caseTimedOut
+          ? `case exceeded the ${SCORER_MAX_CASE_MS}ms admission limit`
+          : `no valid v1 envelope (exit ${child.exitCode ?? "unknown"})`,
+        caseTimedOut,
+      ),
+      ...telemetry,
+    };
   }
   const finding = scoredFinding(envelope);
   const scorerError = typeof envelope.scorerError === "string" ? envelope.scorerError : null;
@@ -327,18 +464,8 @@ async function runScorerEvalCase(
   const usageAccountingComplete =
     typeof envelope.usageAccountingComplete === "boolean" ? envelope.usageAccountingComplete : null;
   const usageValid = proxy.attempts.length === 1 && proxy.attempts[0]!.usageValid;
-  const durationMs = proxy.attempts.reduce((sum, attempt) => sum + attempt.durationMs, 0);
-  const promptTokens = proxy.attempts.reduce((sum, attempt) => sum + attempt.promptTokens, 0);
-  const completionTokens = proxy.attempts.reduce((sum, attempt) => sum + attempt.completionTokens, 0);
-  const exactCosts = proxy.attempts.map((attempt) => attempt.costUsd);
-  const exactCost = exactCosts.length > 0 && exactCosts.every((cost) => cost !== null)
-    ? exactCosts.reduce((sum, cost) => sum + (cost ?? 0), 0)
-    : null;
-  const costUsd = exactCost ?? (pricing
-    ? promptTokens * pricing.promptUsdPerToken + completionTokens * pricing.completionUsdPerToken
-    : null);
-
   const structuredOk =
+    !caseTimedOut &&
     actualScorer === scorerModel &&
     scorerError === null &&
     scorerConfidence !== null &&
@@ -349,7 +476,9 @@ async function runScorerEvalCase(
     proxy.attempts.length === 1;
   let passed = false;
   let reason = "";
-  if (!structuredOk) {
+  if (caseTimedOut) {
+    reason = `case exceeded the ${SCORER_MAX_CASE_MS}ms admission limit`;
+  } else if (!structuredOk) {
     reason = scorerError ?? `scorer model mismatch or missing score (${actualScorer ?? "none"})`;
   } else if (scenario === "trueFinding") {
     passed = scorerConfidence >= 0.6 && scorerKind === "risk";
@@ -365,6 +494,7 @@ async function runScorerEvalCase(
     name: c.name,
     scenario,
     model: scorerModel,
+    timedOut: caseTimedOut,
     envelopeProduced: true,
     scorerModel: actualScorer,
     scorerError,
@@ -377,11 +507,7 @@ async function runScorerEvalCase(
     reasonContractValid,
     usageAccountingComplete,
     usageValid,
-    upstreamRequests: proxy.attempts.length,
-    durationMs: proxy.attempts.length > 0 ? durationMs : null,
-    promptTokens,
-    completionTokens,
-    costUsd,
+    ...telemetry,
   };
 }
 
@@ -392,6 +518,7 @@ function baseResult(
   repeat: number,
   envelopeProduced: boolean,
   reason: string,
+  timedOut = false,
 ): ScorerEvalCase {
   return {
     repeat,
@@ -399,6 +526,7 @@ function baseResult(
     name: c.name,
     scenario,
     model,
+    timedOut,
     envelopeProduced,
     scorerModel: null,
     scorerError: null,
@@ -424,8 +552,11 @@ export async function startScorerProxy(
   scenario: Scenario,
   apiBase: string,
   apiKey: string,
+  upstreamTimeoutMs = SCORER_PROXY_UPSTREAM_TIMEOUT_MS,
 ) {
   const attempts: ScorerAttempt[] = [];
+  const upstreamControllers = new Set<AbortController>();
+  let closing = false;
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     if (req.method !== "POST" || req.url !== "/chat/completions") {
       res.writeHead(404, { "content-type": "application/json" });
@@ -445,42 +576,77 @@ export async function startScorerProxy(
       return;
     }
 
-    const signal = AbortSignal.timeout(180_000);
+    const controller = new AbortController();
+    upstreamControllers.add(controller);
+    let deadlineExceeded = false;
+    const timeout = setTimeout(() => {
+      deadlineExceeded = true;
+      controller.abort();
+    }, upstreamTimeoutMs);
     const startedAt = performance.now();
-    const upstream = await fetch(`${apiBase.replace(/\/$/, "")}/chat/completions`, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${apiKey}`,
-        "content-type": "application/json",
-        "http-referer": "https://postil.dev",
-        "x-title": "Postil scorer eval",
-      },
-      body: bodyText,
-      signal,
-    });
-    const text = await upstream.text();
-    const response = safeJson(text) as {
-      usage?: { prompt_tokens?: number; completion_tokens?: number; cost?: number };
-    } | undefined;
-    const usageValid = isValidUsage(response?.usage);
-    attempts.push({
-      durationMs: performance.now() - startedAt,
-      promptTokens: Number(response?.usage?.prompt_tokens ?? 0),
-      completionTokens: Number(response?.usage?.completion_tokens ?? 0),
-      costUsd: typeof response?.usage?.cost === "number" && Number.isFinite(response.usage.cost)
-        ? response.usage.cost
-        : null,
-      usageValid,
-    });
-    res.writeHead(upstream.status, { "content-type": upstream.headers.get("content-type") ?? "application/json" });
-    res.end(text);
+    try {
+      const upstream = await fetch(`${apiBase.replace(/\/$/, "")}/chat/completions`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${apiKey}`,
+          "content-type": "application/json",
+          "http-referer": "https://postil.dev",
+          "x-title": "Postil scorer eval",
+        },
+        body: bodyText,
+        signal: controller.signal,
+      });
+      const text = await upstream.text();
+      const response = safeJson(text) as {
+        usage?: { prompt_tokens?: number; completion_tokens?: number; cost?: number };
+      } | undefined;
+      const usageValid = isValidUsage(response?.usage);
+      attempts.push({
+        outcome: "completed",
+        durationMs: performance.now() - startedAt,
+        promptTokens: Number(response?.usage?.prompt_tokens ?? 0),
+        completionTokens: Number(response?.usage?.completion_tokens ?? 0),
+        costUsd: typeof response?.usage?.cost === "number" && Number.isFinite(response.usage.cost)
+          ? response.usage.cost
+          : null,
+        usageValid,
+      });
+      res.writeHead(upstream.status, { "content-type": upstream.headers.get("content-type") ?? "application/json" });
+      res.end(text);
+    } catch {
+      attempts.push({
+        outcome: closing ? "teardownAborted" : deadlineExceeded ? "timedOut" : "failed",
+        durationMs: performance.now() - startedAt,
+        promptTokens: 0,
+        completionTokens: 0,
+        costUsd: null,
+        usageValid: false,
+      });
+      if (!res.destroyed && !res.headersSent) {
+        res.writeHead(closing ? 503 : 504, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: closing ? "scorer proxy closing" : "scorer upstream unavailable" }));
+      }
+    } finally {
+      clearTimeout(timeout);
+      upstreamControllers.delete(controller);
+    }
   });
 
   await listen(server);
+  let closePromise: Promise<void> | undefined;
   return {
     baseUrl: serverBaseUrl(server),
     attempts,
-    close: () => closeServer(server),
+    close: () => {
+      closePromise ??= (async () => {
+        closing = true;
+        const closed = closeServer(server);
+        for (const controller of upstreamControllers) controller.abort();
+        server.closeAllConnections();
+        await closed;
+      })();
+      return closePromise;
+    },
   };
 }
 
@@ -634,8 +800,10 @@ export function aggregate(
   cases: ScorerEvalCase[],
   repeats = DEFAULT_QUALIFICATION_REPEATS,
 ): ScorerEvalAggregate {
+  const timedOutCases = cases.filter((c) => c.timedOut).length;
   const structuredFailures = cases.filter(
     (c) =>
+      c.timedOut ||
       !c.envelopeProduced ||
       c.scorerError !== null ||
       c.scorerModel !== model ||
@@ -671,6 +839,7 @@ export function aggregate(
     );
   }
   if (structuredFailures > 0) admissionFailures.push(`${structuredFailures} structured-output failure(s)`);
+  if (timedOutCases > 0) admissionFailures.push(`${timedOutCases} case timeout(s)`);
   if (trueFindingHighConfidence !== trueCases.length) {
     admissionFailures.push(
       `${trueCases.length - trueFindingHighConfidence} true finding(s) were not kept as confident risks`,
@@ -711,6 +880,7 @@ export function aggregate(
   return {
     id: model,
     casesRun: cases.length,
+    timedOutCases,
     structuredFailures,
     trueFindingHighConfidence,
     trueFindingCases: trueCases.length,
@@ -734,12 +904,13 @@ export function formatReport(report: ScorerEvalReport): string {
     `postil scorer qualification (LIVE scorer, mocked generator, ${report.repeats} repeats)`,
     "",
   ];
-  lines.push("model                                  struct  true kept  false down  p50 ms  p95 ms  max ms   $/case    pass");
-  lines.push("-----------------------------------------------------------------------------------------------------------");
+  lines.push("model                                  timeout  struct  true kept  false down  p50 ms  p95 ms  max ms   $/case    pass");
+  lines.push("--------------------------------------------------------------------------------------------------------------------");
   for (const a of report.models) {
     lines.push(
       [
         pad(a.id, 38),
+        pad(String(a.timedOutCases), 8),
         pad(String(a.structuredFailures), 7),
         pad(`${a.trueFindingHighConfidence}/${a.trueFindingCases}`, 10),
         pad(`${a.falseFindingDownscored}/${a.falseFindingCases}`, 11),

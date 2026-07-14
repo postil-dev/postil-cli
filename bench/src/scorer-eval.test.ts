@@ -1,16 +1,22 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { cases as fixtureInputs } from "../fixtures/cases";
 import { benchmarkCase } from "./harness";
 import {
   FALSE_FINDING_CASES,
   GENERATOR_MODEL,
+  SCORER_CASE_EXEC_TIMEOUT_MS,
+  SCORER_MAX_CASE_MS,
   TRUE_FINDING_CASES,
   aggregate,
   assertQualificationPreflight,
   falseFinding,
   firstAddedLine,
+  finalizeScorerEvalReport,
   formatReport,
   isValidReason,
   isolatedEnv,
@@ -20,9 +26,12 @@ import {
   percentile,
   qualificationExitCode,
   projectedQualificationSpendUsd,
+  runBoundedChild,
+  scorerCheckpointPath,
   selectEvalCases,
   startScorerProxy,
   trueFinding,
+  writeScorerEvalCheckpoint,
   type ScorerEvalCase,
   type ScorerEvalReport,
 } from "./scorer-eval";
@@ -42,6 +51,7 @@ function result(overrides: Partial<ScorerEvalCase>): ScorerEvalCase {
     name: "Case",
     scenario: "trueFinding",
     model: "scorer/model",
+    timedOut: false,
     envelopeProduced: true,
     scorerModel: "scorer/model",
     scorerError: null,
@@ -210,11 +220,72 @@ describe("scorer proxy and isolated runtime", () => {
       expect(forwarded[0]).toMatchObject({ authorization: "Bearer proxy-test-key" });
       expect(JSON.parse(forwarded[0]!.body)).toMatchObject({ model: "scorer/model" });
       expect(proxy.attempts).toHaveLength(1);
-      expect(proxy.attempts[0]).toMatchObject({ promptTokens: 3, completionTokens: 2, usageValid: true });
+      expect(proxy.attempts[0]).toMatchObject({
+        outcome: "completed",
+        promptTokens: 3,
+        completionTokens: 2,
+        usageValid: true,
+      });
     } finally {
       await proxy.close();
       await close(upstream);
     }
+  });
+
+  test("aborts an in-flight upstream request before proxy teardown waits", async () => {
+    let markUpstreamStarted: (() => void) | undefined;
+    const upstreamStarted = new Promise<void>((resolve) => {
+      markUpstreamStarted = resolve;
+    });
+    const upstream = createServer(async (req: IncomingMessage) => {
+      await requestBody(req);
+      markUpstreamStarted?.();
+      await new Promise(() => {});
+    });
+    const upstreamBase = await listen(upstream);
+    const proxy = await startScorerProxy(
+      fixture("clean-docs-only"),
+      "falseFinding",
+      upstreamBase,
+      "proxy-test-key",
+      10_000,
+    );
+    try {
+      const pending = fetch(`${proxy.baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "scorer/model", messages: [] }),
+      }).catch(() => undefined);
+      await upstreamStarted;
+      const startedAt = performance.now();
+      await proxy.close();
+      expect(performance.now() - startedAt).toBeLessThan(1_000);
+      await pending;
+      expect(proxy.attempts).toHaveLength(1);
+      expect(proxy.attempts[0]?.outcome).toBe("teardownAborted");
+    } finally {
+      upstream.closeAllConnections();
+      if (upstream.listening) await close(upstream);
+    }
+  });
+
+  test("kills child execution just beyond the admission latency bound", async () => {
+    expect(SCORER_CASE_EXEC_TIMEOUT_MS).toBeGreaterThan(SCORER_MAX_CASE_MS);
+    expect(SCORER_CASE_EXEC_TIMEOUT_MS - SCORER_MAX_CASE_MS).toBeLessThanOrEqual(1_000);
+    const startedAt = performance.now();
+    const child = await runBoundedChild(
+      process.execPath,
+      ["-e", "await Bun.sleep(10_000)"],
+      {
+        cwd: process.cwd(),
+        env: { PATH: process.env.PATH },
+        timeoutMs: 50,
+        maxBuffer: 1_024,
+      },
+    );
+    expect(child.timedOut).toBe(true);
+    expect(child.exitCode).toBeUndefined();
+    expect(performance.now() - startedAt).toBeLessThan(1_000);
   });
 
   test("isolates review execution from the caller environment", () => {
@@ -246,6 +317,44 @@ describe("scorer proxy and isolated runtime", () => {
   });
 });
 
+describe("scorer evaluation checkpoints", () => {
+  test("atomically preserves completed safe metrics and removes the partial on completion", async () => {
+    const root = await mkdtemp(join(tmpdir(), "postil-scorer-checkpoint-"));
+    const jsonOut = join(root, "report.json");
+    const sensitive = result({
+      name: "MODEL_BODY_MARKER",
+      reason: "API_SECRET_MARKER",
+      scorerError: "UPSTREAM_RESPONSE_MARKER",
+    });
+    try {
+      await writeScorerEvalCheckpoint(jsonOut, ["scorer/model"], 1, 2, [sensitive]);
+      const partial = scorerCheckpointPath(jsonOut);
+      const firstRaw = await readFile(partial, "utf8");
+      const first = JSON.parse(firstRaw);
+      expect(first).toMatchObject({
+        version: 1,
+        status: "in_progress",
+        completedCases: 1,
+        totalCases: 2,
+      });
+      expect(first.cases).toHaveLength(1);
+      expect(firstRaw).not.toContain("MODEL_BODY_MARKER");
+      expect(firstRaw).not.toContain("API_SECRET_MARKER");
+      expect(firstRaw).not.toContain("UPSTREAM_RESPONSE_MARKER");
+
+      await writeScorerEvalCheckpoint(jsonOut, ["scorer/model"], 1, 2, [sensitive, result({ id: "second" })]);
+      expect(JSON.parse(await readFile(partial, "utf8")).completedCases).toBe(2);
+      expect((await readdir(root)).some((name) => name.includes(".tmp-"))).toBe(false);
+
+      await finalizeScorerEvalReport(jsonOut, "{\"passed\":true}\n");
+      expect(await readFile(jsonOut, "utf8")).toBe("{\"passed\":true}\n");
+      expect(await Bun.file(partial).exists()).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("aggregate", () => {
   test("passes a complete repeated scorer matrix with strict calibration, latency, and cost", () => {
     const cases = qualificationCases(5);
@@ -266,10 +375,17 @@ describe("aggregate", () => {
 
   test("fails a scorer with missing structured score fields", () => {
     const cases = qualificationCases(1);
-    cases[0] = result({ id: TRUE_FINDING_CASES[0], scorerModel: null, scorerConfidence: null });
+    cases[0] = result({
+      id: TRUE_FINDING_CASES[0],
+      timedOut: true,
+      scorerModel: null,
+      scorerConfidence: null,
+    });
 
     expect(aggregate("scorer/model", cases, 1)).toMatchObject({
+      timedOutCases: 1,
       structuredFailures: 1,
+      admissionFailures: expect.arrayContaining(["1 case timeout(s)"]),
       passed: false,
     });
   });
@@ -377,6 +493,7 @@ describe("formatReport", () => {
         {
           id: "scorer/model",
           casesRun: 2,
+          timedOutCases: 0,
           structuredFailures: 0,
           trueFindingHighConfidence: 1,
           trueFindingCases: 1,

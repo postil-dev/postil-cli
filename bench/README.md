@@ -238,9 +238,14 @@ a 17,000-byte prompt bound, an 896-token output bound, and at most 3,584 bytes
 of repair context. Scorer responses also fail
 admission when provider usage is missing or malformed, runtime accounting is
 incomplete, or the assessment is not trimmed single-line text of at most
-240 UTF-8 bytes ending in sentence punctuation. Scorer output is bounded from
-the supplied finding count, up to the supported maximum of 20 findings, and
-schema-repair context is byte-bounded from the same output limit.
+240 UTF-8 bytes ending in sentence punctuation. Each case is killed one second
+after the 20-second admission limit, and teardown aborts outstanding provider
+requests. A timeout rejects that candidate immediately rather than running the
+rest of its matrix. With `--json-out`, `<path>.partial` atomically records
+completed case metrics without prompts, responses, credentials, or error text;
+the final report replaces it after the matrix completes. Scorer output is
+bounded from the supplied finding count, up to the supported maximum of 20
+findings, and schema-repair context is byte-bounded from the same output limit.
 
 ## Diff-file live mode (opt-in, single model, no forge)
 
