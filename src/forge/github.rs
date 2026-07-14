@@ -1473,6 +1473,26 @@ mod tests {
         assert_eq!(files.len(), 200);
     }
 
+    #[tokio::test]
+    async fn github_pull_files_accepts_a_partial_page_after_a_full_page() {
+        let server = MockServer::start().await;
+        for (page, start, count) in [(1, 0, 100), (2, 100, 1)] {
+            Mock::given(method("GET"))
+                .and(path("/repos/owner/repo/pulls/1/files"))
+                .and(query_param("per_page", "100"))
+                .and(query_param("page", page.to_string()))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(pull_file_page(start, count)),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+
+        let files = test_github(&server).pull_files(101).await.unwrap();
+        assert_eq!(files.len(), 101);
+    }
+
     #[test]
     fn github_copied_files_require_their_previous_path() {
         let missing_source = PullFile {
