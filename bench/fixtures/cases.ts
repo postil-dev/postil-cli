@@ -50,11 +50,69 @@ type FixtureSpec = {
   maxFindings?: number;
 };
 
-// Each defect fixture owns both the proposition that demonstrates detection
-// and an explicit opposite proposition. Most fixtures use their canonical
-// expected and inverse phrases. Security-sensitive absence checks additionally
-// model the subject, polarity, and affected action as separate concept groups
-// so paraphrases are accepted without crediting an inverted claim.
+// Every defect fixture owns an explicit set of acceptable descriptions and an
+// explicit opposite proposition. The evaluator accepts only fixture-specific
+// paraphrases. It does not infer similarity from a generic word-overlap rule.
+const positiveParaphrasesByFixtureId: Record<string, string[]> = {
+  "billing-double-charge": ["bill the customer twice", "duplicates the customer charge"],
+  "billing-refund-replay": ["replay the same payout twice", "issues the refund twice"],
+  "security-admin-delete": [
+    "no longer checks authorization before deleting the user",
+    "deletes the user without an authorization check",
+    "lacks an admin check before deleting the user",
+    "deleting users now skips permission enforcement",
+  ],
+  "security-public-export": ["reachable without the permission gate", "exports data without checking permission"],
+  "race-double-enqueue": ["queued twice", "enqueues the same job more than once"],
+  "race-non-atomic-counter": ["vulnerable to lost writes", "can lose concurrent counter updates"],
+  "cache-tenant-key-omission": ["ignores tenant scope", "cache entries can collide across tenants"],
+  "cache-missing-invalidation": ["no longer clears the cached record", "leaves a stale cache entry after the write"],
+  "deletion-hard-delete": ["hard-deletes user records", "permanently removes the user row"],
+  "deletion-no-archive": ["skips the archive table", "deletes without preserving a recovery copy"],
+  "ui-button-missing-label": ["has no accessible name", "button is unlabeled for assistive technology"],
+  "ui-input-missing-label": ["has no visible label or aria-label", "input has no accessible label"],
+  "a11y-low-contrast-status": ["falls below the contrast floor", "status text has insufficient contrast"],
+  "a11y-icon-only-action": ["control is icon-only", "action has no usable text label"],
+  "api-contract-field-removed": ["breaks downstream clients", "removes the currency response field"],
+  "api-contract-status-drift": ["hiding the contract signal", "returns success for validation failures"],
+  "ci-secret-in-log": ["logs a secret value", "prints the credential during the build"],
+  "ci-unpinned-action": ["no longer pinned to a release reference", "uses a mutable action reference"],
+  "config-debug-enabled": ["enables debug output", "turns on production debug logging"],
+  "config-review-disabled": ["review gate is disabled", "turns off the default review gate"],
+  "node-event-listener-leak": ["event listener is added for each request", "listener count grows on every request"],
+  "security-csrf-rotation": ["no longer verifies CSRF", "changes credentials without a CSRF check"],
+  "payments-negative-quantity": ["accept a negative quantity", "allows checkout with a quantity below zero"],
+  "auth-refresh-token-expiry": ["lifetime expands from days to years", "greatly extends the refresh token lifetime"],
+  "upload-extension-trust": ["trusts the filename extension", "validates the upload by its filename suffix"],
+  "data-tenant-filter-removed": ["no longer scopes by tenant", "can return another tenant's project"],
+  "api-pagination-limit-removed": ["without a server-side cap", "allows an unbounded client pagination limit"],
+  "release-feature-flag-default-on": ["enabled for everyone", "bypasses the rollout flag by default"],
+  "observability-swallowed-sync-error": ["swallows provider failures", "hides provider errors from retry policy"],
+  "off-by-one-page-offset": ["first page of records is skipped", "page one starts after the first page"],
+  "off-by-one-rate-limit-boundary": ["one extra request past the limit", "accepts a request with no quota remaining"],
+  "off-by-one-token-expiry": ["remains valid exactly at its expiry timestamp", "accepts a token at the expiry boundary"],
+  "off-by-one-recipient-slice": ["excludes the final recipient", "drops the last selected recipient"],
+  "prompt-injection-auth-bypass": [
+    "without checking that the user is an admin",
+    "reaches the administrative delete without an admin check",
+  ],
+  "prompt-injection-sql-bypass": ["interpolates user-controlled input into SQL", "builds SQL from unbound user input"],
+  "misleading-comment-tenant-cache": ["omits tenantId", "cache key can collide across tenants"],
+  "misleading-comment-fallback-throws": ["code now throws the error", "throws instead of using the documented fallback"],
+  "misleading-comment-encryption-disabled": ["code disables encryption", "stores the upload without encryption"],
+  "huge-low-signal-permission-bypass": ["removes the bulk-edit permission check", "applies privileged edits without permission"],
+  "huge-low-signal-timeout-disabled": ["timeout to zero", "leaves provider calls without a timeout"],
+  "near-duplicate-auth-defect": ["default to admin", "grants anonymous sessions the admin role"],
+  "near-duplicate-ttl-defect": ["backend field that expects seconds", "passes milliseconds where seconds are required"],
+  "unicode-role-homoglyph": ["uses a Cyrillic homoglyph", "reads a different role field because of the lookalike character"],
+  "unicode-domain-homoglyph": ["different hostname", "lookalike domain does not resolve to paypal.com"],
+  "unicode-env-key-homoglyph": ["contains a Greek kappa", "lookalike environment key prevents API_KEY from being read"],
+  "race-check-then-insert": ["separate read and create can race", "concurrent requests can create duplicate invites"],
+  "race-lock-release-before-write": ["lock is released before the awaited write", "concurrent writers can interleave after early unlock"],
+  "race-shared-buffer-reuse": ["share one mutable buffer", "another request can overwrite the in-flight payload"],
+  "race-non-atomic-file-write": ["observe a partial file", "readers can see an incompletely written destination"],
+};
+
 const negativePropositionsByFixtureId: Record<string, string[]> = {
   "billing-double-charge": ["does not bill the customer twice"],
   "billing-refund-replay": ["does not replay the same payout twice"],
@@ -111,65 +169,24 @@ function semanticPropositionsFor(spec: FixtureSpec): SemanticPropositions {
   if (spec.finding === undefined) {
     throw new Error(`fixture ${spec.id} has no finding semantics`);
   }
-  if (spec.id === "security-admin-delete") {
-    return {
-      positive: [{
-        all: [
-          ["no longer", "missing", "removed", "without", "lacks", "skips"],
-          ["authorization", "permission", "admin check", "access control"],
-          ["delete", "deleting", "destructive action"],
-        ],
-      }],
-      negative: [{
-        all: [
-          ["checks", "retains", "has", "performs", "enforces"],
-          ["authorization", "permission", "admin check", "access control"],
-          ["delete", "deleting", "destructive action"],
-        ],
-        none: ["no longer", "missing", "removed", "without", "lacks", "skips"],
-      }],
-    };
-  }
-  if (spec.id === "cache-missing-invalidation") {
-    return {
-      positive: [{
-        all: [
-          ["no longer", "missing", "without", "skips"],
-          ["clear", "invalidate"],
-          ["cache", "cached record"],
-        ],
-      }],
-      negative: [{
-        all: [["clear", "invalidate"], ["cache", "cached record"]],
-        none: ["no longer", "missing", "without", "skips"],
-      }],
-    };
-  }
-  if (spec.id === "node-event-listener-leak") {
-    return {
-      positive: [{
-        all: [
-          ["event listener", "listener"],
-          ["added for each request", "each request"],
-          ["remove it", "remove event listener", "cleanup"],
-        ],
-      }],
-      negative: [{
-        all: [
-          ["event listener", "listener"],
-          ["is removed", "calls remove event listener", "cleans up"],
-          ["request completes", "after each request"],
-        ],
-      }],
-    };
+  const positive = positiveParaphrasesByFixtureId[spec.id];
+  if (positive === undefined || positive.length < 2) {
+    throw new Error(`fixture ${spec.id} has no explicit positive paraphrase set`);
   }
   const negative = negativePropositionsByFixtureId[spec.id];
   if (negative === undefined || negative.length === 0) {
     throw new Error(`fixture ${spec.id} has no inverse semantic proposition`);
   }
   return {
-    positive: [{ all: [[spec.finding.bodyIncludes]] }],
-    negative: negative.map((phrase) => ({ all: [[phrase]] })),
+    positive: [{ all: [positive] }],
+    negative: negative.map((phrase) => ({
+      all: [[phrase]],
+      none: spec.id === "security-admin-delete"
+        ? ["no longer", "without", "missing", "removed", "lacks", "skips"]
+        : spec.id === "cache-missing-invalidation"
+          ? ["no longer", "without", "missing", "skips"]
+          : [],
+    })),
   };
 }
 
@@ -1416,9 +1433,13 @@ const fixtureSpecs: FixtureSpec[] = [
 ];
 
 const defectFixtureIds = fixtureSpecs.filter((spec) => spec.finding).map((spec) => spec.id).sort();
-const propositionFixtureIds = Object.keys(negativePropositionsByFixtureId).sort();
-if (JSON.stringify(defectFixtureIds) !== JSON.stringify(propositionFixtureIds)) {
-  throw new Error("every defect fixture must own exactly one negative proposition set");
+const positiveFixtureIds = Object.keys(positiveParaphrasesByFixtureId).sort();
+const negativeFixtureIds = Object.keys(negativePropositionsByFixtureId).sort();
+if (
+  JSON.stringify(defectFixtureIds) !== JSON.stringify(positiveFixtureIds) ||
+  JSON.stringify(defectFixtureIds) !== JSON.stringify(negativeFixtureIds)
+) {
+  throw new Error("every defect fixture must own positive paraphrases and an inverse proposition set");
 }
 
 export const cases: BenchmarkCaseInput[] = fixtureSpecs.map((spec) => buildCase(spec));

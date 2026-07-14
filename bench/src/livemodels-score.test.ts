@@ -329,6 +329,22 @@ describe("report and pricing utilities", () => {
     expect(catalog.get(pair.generatorModel)).toEqual(prices.get(pair.generatorModel));
   });
 
+  test("rejects duplicate requested catalog ids and canonical aliases before pricing", () => {
+    const price = { prompt: "0.000001", completion: "0.000002" };
+    expect(() => pricingFromCatalog({ data: [
+      { id: pair.generatorModel, pricing: price },
+      { id: "provider/alias", canonical_slug: pair.generatorModel, pricing: price },
+    ] }, [pair.generatorModel])).toThrow("duplicate rows 0 and 1");
+
+    const aliases = pricingFromCatalog({ data: [{
+      id: "provider/alias",
+      canonical_slug: pair.generatorModel,
+      pricing: price,
+    }] }, ["provider/alias", pair.generatorModel]);
+    expect(aliases.get("provider/alias")).toEqual(prices.get(pair.generatorModel));
+    expect(aliases.get(pair.generatorModel)).toEqual(prices.get(pair.generatorModel));
+  });
+
   test("rejects negative, malformed, noncanonical, and nonfinite catalog prices", () => {
     for (const invalid of ["-1", "1junk", "NaN", "Infinity", "0.0000010"]) {
       const catalog = pricingFromCatalog({ data: [{

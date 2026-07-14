@@ -578,15 +578,25 @@ export function liveEnv(
 }
 
 export function normalizeQualificationPairs(pairs: QualificationPair[]): QualificationPair[] {
-  const normalized = pairs
-    .map((pair) => ({
-      generatorModel: pair.generatorModel.trim(),
-      generatorCascade: (pair.generatorCascade ?? []).map((model) => model.trim()).filter(Boolean),
+  const normalized = pairs.map((pair) => {
+    const generatorChain = [pair.generatorModel, ...(pair.generatorCascade ?? [])]
+      .map((model) => model.trim());
+    const scorerChain = [pair.scorerModel, ...(pair.scorerCascade ?? [])]
+      .map((model) => model.trim());
+    if (generatorChain.some((model) => model.length === 0)) {
+      throw new Error("pair generator chain contains an empty model component");
+    }
+    if (scorerChain.some((model) => model.length === 0)) {
+      throw new Error("pair scorer chain contains an empty model component");
+    }
+    return {
+      generatorModel: generatorChain[0]!,
+      generatorCascade: generatorChain.slice(1),
       consensus: pair.consensus,
-      scorerModel: pair.scorerModel.trim(),
-      scorerCascade: (pair.scorerCascade ?? []).map((model) => model.trim()).filter(Boolean),
-    }))
-    .filter((pair) => pair.generatorModel.length > 0 || pair.scorerModel.length > 0);
+      scorerModel: scorerChain[0]!,
+      scorerCascade: scorerChain.slice(1),
+    };
+  });
   if (normalized.length === 0) {
     throw new Error("live qualification needs at least one generator+scorer pair");
   }
@@ -615,16 +625,28 @@ export function normalizeQualificationPairs(pairs: QualificationPair[]): Qualifi
 }
 
 export function parseQualificationPairs(raw: string): QualificationPair[] {
-  return raw
-    .split(",")
-    .filter((value) => value.trim().length > 0)
-    .map((value) => {
+  const pairSpecs = raw.split(",");
+  if (pairSpecs.some((value) => value.trim().length === 0)) {
+    throw new Error("qualification pair list contains an empty pair component");
+  }
+  return normalizeQualificationPairs(pairSpecs.map((value) => {
       const fields = value.split("::");
+      if (fields.length !== 2 && fields.length !== 3) {
+        throw new Error(
+          "qualification pairs use generators::scorer+fallback or generators::consensus::scorer+fallback syntax",
+        );
+      }
       const [generatorChain, consensusField, scorerChain] = fields.length === 3
         ? fields
         : [fields[0], undefined, fields[1]];
-      const generatorModels = generatorChain?.split("+").map((model) => model.trim()).filter(Boolean) ?? [];
-      const scorerModels = scorerChain?.split("+").map((model) => model.trim()).filter(Boolean) ?? [];
+      const generatorModels = generatorChain?.split("+").map((model) => model.trim()) ?? [];
+      const scorerModels = scorerChain?.split("+").map((model) => model.trim()) ?? [];
+      if (generatorModels.some((model) => model.length === 0)) {
+        throw new Error("qualification generator chain contains an empty model component");
+      }
+      if (scorerModels.some((model) => model.length === 0)) {
+        throw new Error("qualification scorer chain contains an empty model component");
+      }
       const generatorModel = generatorModels[0];
       const scorerModel = scorerModels[0];
       const consensus = consensusField === undefined
@@ -633,7 +655,6 @@ export function parseQualificationPairs(raw: string): QualificationPair[] {
           ? Number(consensusField.trim())
           : Number.NaN;
       if (
-        (fields.length !== 2 && fields.length !== 3) ||
         !generatorModel?.trim() || !scorerModel?.trim() ||
         !Number.isSafeInteger(consensus)
       ) {
@@ -648,7 +669,7 @@ export function parseQualificationPairs(raw: string): QualificationPair[] {
         scorerModel: scorerModel.trim(),
         scorerCascade: scorerModels.slice(1),
       };
-    });
+    }));
 }
 
 async function hashFile(path: string): Promise<string> {

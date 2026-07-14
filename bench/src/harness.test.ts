@@ -52,8 +52,29 @@ describe("benchmark fixtures", () => {
           .map((alternatives) => alternatives[0])
           .join(" ");
         expect(commentMatchesExpectation(inverse, finding.semantics)).toBe(false);
+
+        for (const proposition of finding.semantics!.positive) {
+          expect(proposition.all).toHaveLength(1);
+          for (const paraphrase of proposition.all[0]!) {
+            expect(commentMatchesExpectation(paraphrase, finding.semantics)).toBe(true);
+          }
+        }
+        for (const proposition of finding.semantics!.negative) {
+          const inversion = proposition.all.map((alternatives) => alternatives[0]).join(" ");
+          expect(commentMatchesExpectation(inversion, finding.semantics)).toBe(false);
+        }
       }
     }
+  });
+
+  test("distinguishes billing defect paraphrases from their inversions", () => {
+    const candidate = benchmarkCase.parse(
+      cases.find((fixture) => fixture.id === "billing-double-charge"),
+    );
+    const semantics = candidate.groundTruth.findings[0]?.semantics;
+    expect(semantics).toBeDefined();
+    expect(commentMatchesExpectation("This duplicates the customer charge on retry.", semantics)).toBe(true);
+    expect(commentMatchesExpectation("The retry does not bill the customer twice.", semantics)).toBe(false);
   });
 
   test("keeps authorization polarity while accepting useful paraphrases", () => {

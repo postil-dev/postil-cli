@@ -48,6 +48,9 @@ describe("pair qualification configuration", () => {
     expect(() => parseQualificationPairs("a/generator")).toThrow(
       "generators::scorer+fallback or generators::consensus::scorer+fallback",
     );
+    expect(() => parseQualificationPairs("a/generator::1::s/scorer::ignored")).toThrow(
+      "generators::scorer+fallback or generators::consensus::scorer+fallback",
+    );
     expect(normalizeQualificationPairs([pair, { ...pair }])).toEqual([{
       ...pair,
       generatorCascade: [],
@@ -65,6 +68,38 @@ describe("pair qualification configuration", () => {
       generatorCascade: ["a/generator"],
       scorerModel: "s/scorer",
     }])).toThrow("generator chain must not repeat");
+
+    for (const malformed of [
+      "a/generator::s/scorer,",
+      ",a/generator::s/scorer",
+      "a/generator::s/scorer,,b/generator::s/scorer",
+    ]) {
+      expect(() => parseQualificationPairs(malformed)).toThrow("empty pair component");
+    }
+    for (const malformed of [
+      "+a/generator::s/scorer",
+      "a/generator+::s/scorer",
+      "a/generator++b/fallback::s/scorer",
+    ]) {
+      expect(() => parseQualificationPairs(malformed)).toThrow("generator chain contains an empty model component");
+    }
+    for (const malformed of [
+      "a/generator::+s/scorer",
+      "a/generator::s/scorer+",
+      "a/generator::s/scorer++s/fallback",
+    ]) {
+      expect(() => parseQualificationPairs(malformed)).toThrow("scorer chain contains an empty model component");
+    }
+    expect(() => normalizeQualificationPairs([{
+      generatorModel: "a/generator",
+      generatorCascade: [" "],
+      scorerModel: "s/scorer",
+    }])).toThrow("generator chain contains an empty model component");
+    expect(() => normalizeQualificationPairs([{
+      generatorModel: "a/generator",
+      scorerModel: "s/scorer",
+      scorerCascade: [""],
+    }])).toThrow("scorer chain contains an empty model component");
   });
 
   test("forces the exact pair and no fallback model", () => {

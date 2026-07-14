@@ -709,9 +709,24 @@ export function pricingFromCatalog(
 ): Map<string, ModelPricing> {
   const wanted = new Set(wantedModels);
   const out = new Map<string, ModelPricing>();
-  for (const m of catalog.data ?? []) {
-    const matched = [m.id, m.canonical_slug].find((id): id is string => id !== undefined && wanted.has(id));
-    if (!matched) continue;
+  const matchedCatalogRows = new Map<string, number>();
+  const matchesByRow = (catalog.data ?? []).map((model, row) => {
+    const matches = [...new Set([model.id, model.canonical_slug])]
+      .filter((id): id is string => id !== undefined && wanted.has(id));
+    for (const match of matches) {
+      const previousRow = matchedCatalogRows.get(match);
+      if (previousRow !== undefined) {
+        throw new Error(
+          `provider catalog maps requested model ${match} from duplicate rows ${previousRow} and ${row}`,
+        );
+      }
+      matchedCatalogRows.set(match, row);
+    }
+    return matches;
+  });
+  for (const [row, m] of (catalog.data ?? []).entries()) {
+    const matches = matchesByRow[row]!;
+    if (matches.length === 0) continue;
     let prompt: number;
     let completion: number;
     try {
@@ -720,7 +735,9 @@ export function pricingFromCatalog(
     } catch {
       continue;
     }
-    out.set(matched, { promptUsdPerToken: prompt, completionUsdPerToken: completion });
+    for (const matched of matches) {
+      out.set(matched, { promptUsdPerToken: prompt, completionUsdPerToken: completion });
+    }
   }
   return out;
 }
