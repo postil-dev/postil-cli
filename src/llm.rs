@@ -4,7 +4,7 @@
 //! OpenAI-compatible endpoints use `POST {base}/chat/completions` by default.
 //! Native Anthropic endpoints use `POST {base}/messages` when explicitly selected.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -436,6 +436,7 @@ struct PlannedExposure {
     input_bytes: usize,
     output_tokens: usize,
     projected_cost_micros: u64,
+    model_costs_micros: BTreeMap<String, u64>,
 }
 
 impl TryFrom<&PlannedExposure> for ReviewAdmission {
@@ -481,14 +482,20 @@ impl PlannedExposure {
                     .context("planned provider output exposure overflowed")?,
             )
             .context("planned provider output exposure overflowed")?;
+        let request_cost = projected_request_cost_micros(serialized_bytes, output_tokens, price)?
+            .checked_mul(MAX_TRANSPORT_ATTEMPTS_PER_CALL as u64)
+            .context("planned provider cost exposure overflowed")?;
         self.projected_cost_micros = self
             .projected_cost_micros
-            .checked_add(
-                projected_request_cost_micros(serialized_bytes, output_tokens, price)?
-                    .checked_mul(MAX_TRANSPORT_ATTEMPTS_PER_CALL as u64)
-                    .context("planned provider cost exposure overflowed")?,
-            )
+            .checked_add(request_cost)
             .context("planned provider cost exposure overflowed")?;
+        let model_cost = self
+            .model_costs_micros
+            .entry(price.model.clone())
+            .or_default();
+        *model_cost = model_cost
+            .checked_add(request_cost)
+            .context("planned model cost exposure overflowed")?;
         Ok(())
     }
 }
@@ -737,9 +744,15 @@ impl LlmClient {
             token_exposure <= MAX_REPORTED_TOKEN_SPEND,
             "complete hosted {operation} needs {token_exposure} tokens of exposure, exceeding the {MAX_REPORTED_TOKEN_SPEND} token cap"
         );
+        let model_costs = exposure
+            .model_costs_micros
+            .iter()
+            .map(|(model, cost)| format!("{model}={cost}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         ensure!(
             exposure.projected_cost_micros <= HOSTED_OPERATION_COST_CAP_MICROS,
-            "complete hosted {operation} projects {} micro-dollars of provider exposure across {} attempts, {} serialized input bytes, and {} output tokens, exceeding the {HOSTED_OPERATION_COST_CAP_MICROS} micro-dollar operation cap",
+            "complete hosted {operation} projects {} micro-dollars of provider exposure across {} attempts, {} serialized input bytes, and {} output tokens (per-model micro-dollars: {model_costs}), exceeding the {HOSTED_OPERATION_COST_CAP_MICROS} micro-dollar operation cap",
             exposure.projected_cost_micros,
             exposure.attempts,
             exposure.input_bytes,
@@ -3976,6 +3989,10 @@ mod tests {
                     input_bytes: 12_345,
                     output_tokens: 678,
                     projected_cost_micros: HOSTED_OPERATION_COST_CAP_MICROS + 1,
+                    model_costs_micros: BTreeMap::from([(
+                        "provider/model".to_string(),
+                        HOSTED_OPERATION_COST_CAP_MICROS + 1,
+                    )]),
                 },
             )
             .unwrap_err();
@@ -3983,6 +4000,7 @@ mod tests {
         assert!(message.contains("provider exposure across 6 attempts"));
         assert!(message.contains("12345 serialized input bytes"));
         assert!(message.contains("678 output tokens"));
+        assert!(message.contains("provider/model=1000001"));
     }
 
     #[test]
