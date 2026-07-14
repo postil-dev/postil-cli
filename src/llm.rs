@@ -353,6 +353,7 @@ const TIMEOUT_RETRIES: u32 = 1;
 const EMPTY_RESPONSE_RETRIES: u32 = 1;
 const TIMEOUT_RETRY_CAP_SECS: u64 = 90;
 const EMPTY_RESPONSE_RETRY_TIMEOUT_SECS: u64 = 30;
+const EXHAUSTED_OUTPUT_RETRY_MAX_TOKENS: u32 = 16_000;
 const PROVIDER_RETRY_DELAY_CAP_SECS: u64 = 30;
 
 /// Unqualified models receive a bounded review budget. A larger bound belongs
@@ -665,6 +666,7 @@ struct SafeResponseSummary {
     returned_model: Option<String>,
     provider: Option<String>,
     finish_reason: Option<String>,
+    reasoning_tokens: Option<u64>,
     error_type: Option<String>,
     choices: Option<usize>,
     usage: Option<Usage>,
@@ -680,6 +682,25 @@ impl std::fmt::Display for EmptyModelResponse {
 }
 
 impl std::error::Error for EmptyModelResponse {}
+
+#[derive(Debug)]
+struct MissingModelChoices;
+
+impl std::fmt::Display for MissingModelChoices {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("model response had no choices")
+    }
+}
+
+impl std::error::Error for MissingModelChoices {}
+
+fn classify_chat_error(error: anyhow::Error) -> anyhow::Error {
+    if error.downcast_ref::<EmptyModelResponse>().is_some() {
+        error
+    } else {
+        error.context(ProviderError)
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct DeadlineExceeded(LlmPhase);
@@ -1013,14 +1034,19 @@ impl LlmClient {
                 .get(model)
                 .ok_or_else(|| anyhow!("hosted model {model:?} has no admitted price bound"))?;
             let path_for = |user: &str| -> Result<(usize, usize)> {
-                let initial =
-                    self.planned_request_bytes(model, system, user, REVIEW_MAX_TOKENS, 0.1)?;
+                let initial = self.planned_request_bytes(
+                    model,
+                    system,
+                    user,
+                    EXHAUSTED_OUTPUT_RETRY_MAX_TOKENS,
+                    0.1,
+                )?;
                 let schema_user = review_schema_repair_user(&hostile_review_output, &hostile_error);
                 let schema = self.planned_request_bytes(
                     model,
                     "You repair malformed JSON. Output only valid JSON.",
                     &schema_user,
-                    REVIEW_MAX_TOKENS,
+                    EXHAUSTED_OUTPUT_RETRY_MAX_TOKENS,
                     0.1,
                 )?;
                 let semantic_user = review_semantic_retry_user(user, &hostile_review_output);
@@ -1028,7 +1054,7 @@ impl LlmClient {
                     model,
                     system,
                     &semantic_user,
-                    REVIEW_MAX_TOKENS,
+                    EXHAUSTED_OUTPUT_RETRY_MAX_TOKENS,
                     0.1,
                 )?;
                 Ok((initial, schema.max(semantic)))
@@ -1067,8 +1093,8 @@ impl LlmClient {
                 }
             }
             for (initial, repair) in worst_paths {
-                exposure.add_request(initial, REVIEW_MAX_TOKENS as usize, price)?;
-                exposure.add_request(repair, REVIEW_MAX_TOKENS as usize, price)?;
+                exposure.add_request(initial, EXHAUSTED_OUTPUT_RETRY_MAX_TOKENS as usize, price)?;
+                exposure.add_request(repair, EXHAUSTED_OUTPUT_RETRY_MAX_TOKENS as usize, price)?;
             }
         }
 
@@ -1982,7 +2008,6 @@ impl LlmClient {
             call_phase,
         )
         .await
-        .map_err(|e| e.context(ProviderError))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2012,10 +2037,12 @@ impl LlmClient {
             call_phase,
         )
         .await
-        .map_err(|e| e.context(ProviderError))
+        .map_err(classify_chat_error)
     }
 
-    /// Transport + HTTP envelope handling; every error here is provider-class.
+    /// Transport, HTTP envelope, and assistant-content handling. The caller
+    /// classifies a valid response with unusable assistant content separately
+    /// from provider and protocol failures.
     #[allow(clippy::too_many_arguments)]
     async fn chat_inner(
         &self,
@@ -2033,7 +2060,8 @@ impl LlmClient {
         // This mutable flag is stack-local state held through one exclusively
         // borrowed async call. Request retries run sequentially in this loop,
         // so updating it before continuing or returning needs no atomic type.
-        let body = self.request_body(model, system, user, max_tokens, temperature);
+        let mut request_max_tokens = max_tokens;
+        let mut body = self.request_body(model, system, user, request_max_tokens, temperature);
         let mut retries = 0u32;
         let mut timeout_retries = 0u32;
         let mut empty_response_retries = 0u32;
@@ -2111,7 +2139,7 @@ impl LlmClient {
                     }
                     if response.status.is_success() {
                         eprintln!(
-                            "postil: llm response phase={} model={} attempt={} status={} elapsed={} bytes={} request_id={} response_id={} returned_model={} provider={} choices={} finish={} usage={} prompt_tokens={} completion_tokens={} category={}",
+                            "postil: llm response phase={} model={} attempt={} status={} elapsed={} bytes={} request_id={} response_id={} returned_model={} provider={} choices={} finish={} usage={} prompt_tokens={} completion_tokens={} reasoning_tokens={} category={}",
                             phase.as_str(),
                             log_text(model),
                             retries + 1,
@@ -2133,6 +2161,9 @@ impl LlmClient {
                             },
                             summary.usage.map_or(0, |value| value.prompt_tokens),
                             summary.usage.map_or(0, |value| value.completion_tokens),
+                            summary
+                                .reasoning_tokens
+                                .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
                             summary.error_type.as_deref().unwrap_or("none"),
                         );
                         let usage_before_parse = *usage;
@@ -2162,22 +2193,53 @@ impl LlmClient {
                                 if summary.usage.is_none() {
                                     *usage_accounting_complete = false;
                                 }
-                                if error.downcast_ref::<EmptyModelResponse>().is_some()
+                                if (error.downcast_ref::<EmptyModelResponse>().is_some()
+                                    || error.downcast_ref::<MissingModelChoices>().is_some())
                                     && empty_response_retries < EMPTY_RESPONSE_RETRIES
                                     && retries < TRANSIENT_RETRIES
                                 {
                                     retries += 1;
                                     empty_response_retries += 1;
                                     let wait = Duration::from_secs(2 * retries as u64);
-                                    eprintln!(
-                                        "postil: model {} returned empty content after {elapsed}, retrying in {}s (empty retry {empty_response_retries}/{EMPTY_RESPONSE_RETRIES}; retry {retries}/{TRANSIENT_RETRIES})",
-                                        log_text(model),
-                                        wait.as_secs(),
-                                    );
+                                    let exhausted_output_budget = summary.finish_reason.as_deref()
+                                        == Some("length")
+                                        && summary.usage.is_some_and(|value| {
+                                            value.completion_tokens >= u64::from(request_max_tokens)
+                                        })
+                                        && request_max_tokens < EXHAUSTED_OUTPUT_RETRY_MAX_TOKENS;
+                                    if exhausted_output_budget {
+                                        let expanded_max_tokens = request_max_tokens
+                                            .saturating_mul(2)
+                                            .min(EXHAUSTED_OUTPUT_RETRY_MAX_TOKENS);
+                                        eprintln!(
+                                            "postil: model {} exhausted {request_max_tokens} output tokens before content after {elapsed}, expanding the retry to {expanded_max_tokens} tokens in {}s (empty retry {empty_response_retries}/{EMPTY_RESPONSE_RETRIES}; retry {retries}/{TRANSIENT_RETRIES})",
+                                            log_text(model),
+                                            wait.as_secs(),
+                                        );
+                                        request_max_tokens = expanded_max_tokens;
+                                        body = self.request_body(
+                                            model,
+                                            system,
+                                            user,
+                                            request_max_tokens,
+                                            temperature,
+                                        );
+                                    } else {
+                                        eprintln!(
+                                            "postil: model {} returned empty content after {elapsed}, retrying in {}s (empty retry {empty_response_retries}/{EMPTY_RESPONSE_RETRIES}; retry {retries}/{TRANSIENT_RETRIES})",
+                                            log_text(model),
+                                            wait.as_secs(),
+                                        );
+                                    }
                                     self.sleep_with_budget(phase, wait).await?;
-                                    attempt_timeout = self.request_timeout.min(
-                                        Duration::from_secs(EMPTY_RESPONSE_RETRY_TIMEOUT_SECS),
-                                    );
+                                    attempt_timeout = if exhausted_output_budget {
+                                        self.request_timeout
+                                            .min(Duration::from_secs(TIMEOUT_RETRY_CAP_SECS))
+                                    } else {
+                                        self.request_timeout.min(Duration::from_secs(
+                                            EMPTY_RESPONSE_RETRY_TIMEOUT_SECS,
+                                        ))
+                                    };
                                     continue;
                                 }
                                 return Err(error);
@@ -2383,11 +2445,14 @@ impl LlmClient {
                         u.cost.and_then(|raw| ProviderCost::parse(raw.get())),
                     );
                 }
-                parsed
+                let choice = parsed
                     .choices
                     .into_iter()
                     .next()
-                    .and_then(|choice| choice.message.content)
+                    .ok_or_else(|| anyhow::Error::new(MissingModelChoices))?;
+                choice
+                    .message
+                    .content
                     .filter(|content| !content.trim().is_empty())
                     .ok_or_else(|| anyhow::Error::new(EmptyModelResponse))
             }
@@ -2766,6 +2831,17 @@ fn safe_error_category(value: &str) -> &'static str {
     }
 }
 
+fn safe_finish_reason(value: &str) -> &'static str {
+    match value {
+        "stop" => "stop",
+        "length" | "max_tokens" => "length",
+        "tool_calls" => "tool_calls",
+        "content_filter" => "content_filter",
+        "error" => "error",
+        _ => "reported",
+    }
+}
+
 fn provider_http_status_detail(
     status: reqwest::StatusCode,
     summary: &SafeResponseSummary,
@@ -2845,8 +2921,14 @@ fn safe_response_summary(
         response_id: string_at(&["id"]),
         returned_model: string_at(&["model"]),
         provider: string_at(&["provider"]),
-        finish_reason: string_at(&["choices", "0", "finish_reason"])
-            .or_else(|| string_at(&["stop_reason"])),
+        finish_reason: raw_string_at(&["choices", "0", "finish_reason"])
+            .or_else(|| raw_string_at(&["stop_reason"]))
+            .map(safe_finish_reason)
+            .map(str::to_string),
+        reasoning_tokens: usage_value
+            .and_then(|usage| usage.get("completion_tokens_details"))
+            .and_then(|details| details.get("reasoning_tokens"))
+            .and_then(serde_json::Value::as_u64),
         error_type: raw_string_at(&["error", "metadata", "error_type"])
             .or_else(|| raw_string_at(&["error", "error_type"]))
             .map(safe_error_category)
@@ -4395,8 +4477,16 @@ mod tests {
         assert_eq!(summary.response_id.as_deref(), Some("present"));
         assert_eq!(summary.returned_model.as_deref(), Some("present"));
         assert_eq!(summary.provider.as_deref(), Some("present"));
-        assert_eq!(summary.finish_reason.as_deref(), Some("present"));
+        assert_eq!(summary.finish_reason.as_deref(), Some("reported"));
         assert_eq!(summary.error_type.as_deref(), Some("reported"));
+
+        let exhausted = safe_response_summary(
+            r#"{"choices":[{"finish_reason":"length"}],"usage":{"completion_tokens_details":{"reasoning_tokens":8000}}}"#,
+            ApiFormat::OpenaiCompatible,
+            false,
+        );
+        assert_eq!(exhausted.finish_reason.as_deref(), Some("length"));
+        assert_eq!(exhausted.reasoning_tokens, Some(8_000));
 
         let public_summary = safe_response_summary(
             r#"{"id":"response-1","model":"safe/model-v1","provider":"provider-1"}"#,

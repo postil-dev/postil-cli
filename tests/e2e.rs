@@ -171,6 +171,29 @@ struct GitHubHeadRaceResponder {
     calls: Arc<AtomicUsize>,
 }
 
+struct OutputBudgetResponder;
+
+impl Respond for OutputBudgetResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        if body["max_tokens"] == 8_000 {
+            ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{
+                    "finish_reason": "length",
+                    "message": {"content": null, "reasoning": "budget exhausted"}
+                }],
+                "usage": {
+                    "prompt_tokens": 30_745,
+                    "completion_tokens": 8_000,
+                    "completion_tokens_details": {"reasoning_tokens": 8_000}
+                }
+            }))
+        } else {
+            ResponseTemplate::new(200).set_body_json(llm_content(json!([])))
+        }
+    }
+}
+
 impl Respond for GitHubHeadRaceResponder {
     fn respond(&self, _request: &Request) -> ResponseTemplate {
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
@@ -3789,6 +3812,55 @@ async fn empty_success_response_retries_same_model_and_accumulates_usage() {
 
     let requests = server.received_requests().await.unwrap();
     assert_eq!(requests.len(), 2);
+    assert!(
+        requests
+            .iter()
+            .all(|request| { request.body_json::<Value>().unwrap()["max_tokens"] == 8_000 })
+    );
+}
+
+#[tokio::test]
+async fn exhausted_reasoning_budget_expands_the_same_model_retry() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("primary-model"))
+        .respond_with(OutputBudgetResponder)
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "primary-model")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .code(0);
+
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["modelUsed"], "primary-model");
+    assert_eq!(envelope["usage"]["promptTokens"], 30_845);
+    assert_eq!(envelope["usage"]["completionTokens"], 8_050);
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(stderr.contains("exhausted 8000 output tokens before content"));
+    assert!(stderr.contains("expanding the retry to 16000 tokens"));
+    assert!(stderr.contains("reasoning_tokens=8000"));
+
+    let requests = server.received_requests().await.unwrap();
+    let max_tokens = requests
+        .iter()
+        .map(|request| {
+            request.body_json::<Value>().unwrap()["max_tokens"]
+                .as_u64()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(max_tokens, vec![8_000, 16_000]);
 }
 
 #[tokio::test]
