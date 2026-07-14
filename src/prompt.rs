@@ -39,7 +39,10 @@ pub fn review_contract(cfg: &Config) -> String {
          accountable owner can choose among them; guardrail = violates a stated repo rule; \
          uncertainty = you cannot verify something critical from the diff. Never classify \
          an ordinary bug as humanEscalation merely because it is uncertain or needs \
-         confirmation.\n\
+         confirmation. Classify the primary merge reason: a concrete code or security \
+         defect is risk even when changed prose also contradicts that defect. Use \
+         contentPolicy only when the prose violation itself is merge-relevant and no \
+         concrete code defect is established. Do not duplicate one issue under both kinds.\n\
          \n\
          Confidence is your honest probability the finding is real and merge-relevant. \
          Do not inflate it; low-confidence findings are suppressed and that is correct.\n\
@@ -349,6 +352,9 @@ mod tests {
         assert!(p.contains("CONTENT POLICY"));
         assert!(p.contains("Never fabricate a claim"));
         assert!(p.contains("kind \"contentPolicy\""));
+        assert!(p.contains("Classify the primary merge reason"));
+        assert!(p.contains("concrete code or security defect is risk"));
+        assert!(p.contains("Do not duplicate one issue under both kinds"));
     }
 
     #[test]

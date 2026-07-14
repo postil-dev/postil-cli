@@ -31,6 +31,7 @@ import {
   runScorerEvalCase,
   runScorerEvalMatrix,
   reviewCoverageFailure,
+  scorerCasePasses,
   scorerCheckpointPath,
   selectEvalCases,
   startScorerProxy,
@@ -109,6 +110,8 @@ function result(overrides: Partial<ScorerEvalCase>): ScorerEvalCase {
     scorerKind: "risk",
     finalConfidence: 0.9,
     finalKind: "risk",
+    findingPublished: true,
+    gateFailing: true,
     passed: true,
     reason: "ok",
     reasonContractValid: true,
@@ -132,7 +135,17 @@ function qualificationCases(repeats: number): ScorerEvalCase[] {
     }
     for (const id of FALSE_FINDING_CASES) {
       cases.push(
-        result({ id, repeat, scenario: "falseFinding", scorerConfidence: 0.2, scorerKind: "uncertainty" }),
+        result({
+          id,
+          repeat,
+          scenario: "falseFinding",
+          scorerConfidence: 0.2,
+          scorerKind: "uncertainty",
+          finalConfidence: 0.2,
+          finalKind: "uncertainty",
+          findingPublished: false,
+          gateFailing: false,
+        }),
       );
     }
   }
@@ -445,6 +458,8 @@ describe("scorer proxy and isolated runtime", () => {
         upstreamRequests: 1,
         usageValid: true,
         passed: true,
+        findingPublished: false,
+        gateFailing: false,
       });
       expect(scorerRequests).toHaveLength(1);
       const scorerRequest = JSON.parse(scorerRequests[0]!) as {
@@ -608,6 +623,7 @@ describe("candidate matrix execution", () => {
       result({ usageAccountingComplete: false }),
       result({ usageValid: false }),
       result({ coverageValid: false }),
+      result({ gateFailing: null }),
       result({ upstreamRequests: 2 }),
     ];
     expect(fatalCases.every((item) => isAdmissionFatalStructuralResult(item, "scorer/model"))).toBe(true);
@@ -622,6 +638,41 @@ describe("candidate matrix execution", () => {
       "no generator finding survived grounding and filtering to reach the scorer",
     );
     expect(scorerStructuralFailureReason("provider unavailable", 0, null)).toBe("provider unavailable");
+  });
+
+  test("qualifies actual production disposition, not a raw kind shortcut", () => {
+    const trueRisk = {
+      scenario: "trueFinding" as const,
+      scorerConfidence: 0.9,
+      scorerKind: "risk",
+      finalConfidence: 0.9,
+      finalKind: "risk",
+      findingPublished: true,
+      gateFailing: true,
+    };
+    expect(scorerCasePasses(trueRisk)).toBe(true);
+    expect(scorerCasePasses({ ...trueRisk, scorerKind: "contentPolicy" })).toBe(false);
+    expect(scorerCasePasses({ ...trueRisk, findingPublished: false })).toBe(false);
+    expect(scorerCasePasses({ ...trueRisk, gateFailing: false })).toBe(false);
+
+    const suppressedFalse = {
+      scenario: "falseFinding" as const,
+      scorerConfidence: 0.2,
+      scorerKind: "risk",
+      finalConfidence: 0.2,
+      finalKind: "uncertainty",
+      findingPublished: false,
+      gateFailing: false,
+    };
+    expect(scorerCasePasses(suppressedFalse)).toBe(true);
+    expect(scorerCasePasses({
+      ...suppressedFalse,
+      scorerConfidence: 0.95,
+      scorerKind: "uncertainty",
+      finalConfidence: 0.95,
+      finalKind: "risk",
+      findingPublished: true,
+    })).toBe(false);
   });
 
   test("stops a structurally failed candidate while quality misses and later candidates continue", async () => {
@@ -762,6 +813,10 @@ describe("aggregate", () => {
     for (const c of cases.filter((candidate) => candidate.id === FALSE_FINDING_CASES[0]).slice(0, 2)) {
       c.scorerConfidence = 0.9;
       c.scorerKind = "risk";
+      c.finalConfidence = 0.9;
+      c.finalKind = "risk";
+      c.findingPublished = true;
+      c.passed = false;
     }
     cases[0]!.durationMs = 20_001;
     cases[1]!.costUsd = null;

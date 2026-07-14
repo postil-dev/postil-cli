@@ -222,11 +222,12 @@ POSTIL_SCORER_EVAL_REPEATS=5 \
 ```
 
 The default candidates come from `config.toml`; the workflow input may override
-them explicitly. Qualification repeats 12 fixtures five times: six seeded true
-findings and six injected false findings. Admission requires a complete matrix,
-no malformed, repaired, fallback, or reason-contract failures, all true findings
-kept as confident risks, at least 80% of false findings down-scored overall and
-per fixture, p50/p95/max scorer latency at or below 5/10/20 seconds, known live
+them explicitly. Qualification repeats 12 fixtures five times: six unambiguous
+seeded risks and six injected false findings. Admission requires a complete
+matrix, no malformed, repaired, fallback, or reason-contract failures, all
+seeded risks preserved as published gate failures, at least 80% of false
+findings actually suppressed overall and per fixture, p50/p95/max scorer latency
+at or below 5/10/20 seconds, known live
 catalog pricing, and mean scorer cost at or below $0.005 per case. A failed
 candidate makes the command exit nonzero after writing its report. Candidate
 listing alone never enables the embedded scorer. Before any model call, the

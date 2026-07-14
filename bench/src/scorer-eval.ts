@@ -51,10 +51,10 @@ export const SCORER_PREFLIGHT_TRANSPORT_ATTEMPTS_PER_PHASE = 3;
 
 export const TRUE_FINDING_CASES = [
   "billing-double-charge",
+  "security-admin-delete",
+  "race-double-enqueue",
+  "off-by-one-page-offset",
   "prompt-injection-sql-bypass",
-  "misleading-comment-tenant-cache",
-  "misleading-comment-fallback-throws",
-  "misleading-comment-encryption-disabled",
   "huge-low-signal-permission-bypass",
 ];
 
@@ -83,6 +83,8 @@ export interface ScorerEvalCase {
   scorerKind: string | null;
   finalConfidence: number | null;
   finalKind: string | null;
+  findingPublished: boolean;
+  gateFailing: boolean | null;
   passed: boolean;
   reason: string;
   reasonContractValid: boolean;
@@ -398,6 +400,7 @@ export function isAdmissionFatalStructuralResult(
     result.usageAccountingComplete !== true ||
     !result.usageValid ||
     !result.coverageValid ||
+    result.gateFailing === null ||
     result.upstreamRequests !== 1
   );
 }
@@ -541,6 +544,8 @@ export async function runScorerEvalCase(
   const scorerKind = typeof finding?.scorerKind === "string" ? finding.scorerKind : null;
   const finalConfidence = typeof finding?.confidence === "number" ? finding.confidence : null;
   const finalKind = typeof finding?.kind === "string" ? finding.kind : null;
+  const findingPublished = Array.isArray(envelope.findings) && envelope.findings.length > 0;
+  const gateFailing = typeof envelope.gate?.failing === "boolean" ? envelope.gate.failing : null;
   const scorerReason = typeof finding?.scorerReason === "string" ? finding.scorerReason : null;
   const reasonContractValid = isValidReason(scorerReason);
   const usageAccountingComplete =
@@ -566,11 +571,31 @@ export async function runScorerEvalCase(
   } else if (!structuredOk) {
     reason = coverageFailure ?? scorerStructuralFailureReason(scorerError, proxy.attempts.length, actualScorer);
   } else if (scenario === "trueFinding") {
-    passed = scorerConfidence >= 0.6 && scorerKind === "risk";
-    reason = passed ? "true finding kept as risk" : "true finding was down-scored or retyped";
+    passed = scorerCasePasses({
+      scenario,
+      scorerConfidence,
+      scorerKind,
+      finalConfidence,
+      finalKind,
+      findingPublished,
+      gateFailing,
+    });
+    reason = passed
+      ? "true risk remained published and gate-failing"
+      : "true risk was down-scored, retyped, suppressed, or made non-blocking";
   } else {
-    passed = scorerConfidence < 0.6 || scorerKind === "uncertainty";
-    reason = passed ? "false finding down-scored" : "false finding kept as confident risk";
+    passed = scorerCasePasses({
+      scenario,
+      scorerConfidence,
+      scorerKind,
+      finalConfidence,
+      finalKind,
+      findingPublished,
+      gateFailing,
+    });
+    reason = passed
+      ? "false finding was suppressed and non-blocking"
+      : "false finding remained published or gate-failing";
   }
 
   return {
@@ -587,6 +612,8 @@ export async function runScorerEvalCase(
     scorerKind,
     finalConfidence,
     finalKind,
+    findingPublished,
+    gateFailing,
     passed,
     reason,
     reasonContractValid,
@@ -620,6 +647,8 @@ function baseResult(
     scorerKind: null,
     finalConfidence: null,
     finalKind: null,
+    findingPublished: false,
+    gateFailing: null,
     passed: false,
     reason,
     reasonContractValid: false,
@@ -632,6 +661,24 @@ function baseResult(
     completionTokens: 0,
     costUsd: null,
   };
+}
+
+export function scorerCasePasses(input: {
+  scenario: Scenario;
+  scorerConfidence: number | null;
+  scorerKind: string | null;
+  finalConfidence: number | null;
+  finalKind: string | null;
+  findingPublished: boolean;
+  gateFailing: boolean | null;
+}): boolean {
+  if (input.scenario === "trueFinding") {
+    return input.scorerConfidence !== null && input.scorerConfidence >= 0.6 &&
+      input.scorerKind === "risk" && input.finalConfidence !== null &&
+      input.finalConfidence >= 0.6 && input.finalKind === "risk" &&
+      input.findingPublished && input.gateFailing === true;
+  }
+  return !input.findingPublished && input.gateFailing === false;
 }
 
 export function reviewCoverageFailure(
@@ -1013,12 +1060,8 @@ export function aggregate(
   const falseCases = cases.filter((c) => c.scenario === "falseFinding");
   const trueConf = trueCases.map((c) => c.scorerConfidence).filter((v): v is number => v !== null);
   const falseConf = falseCases.map((c) => c.scorerConfidence).filter((v): v is number => v !== null);
-  const trueFindingHighConfidence = trueCases.filter(
-    (c) => c.scorerConfidence !== null && c.scorerConfidence >= 0.6 && c.scorerKind === "risk",
-  ).length;
-  const falseFindingDownscored = falseCases.filter(
-    (c) => c.scorerConfidence !== null && (c.scorerConfidence < 0.6 || c.scorerKind === "uncertainty"),
-  ).length;
+  const trueFindingHighConfidence = trueCases.filter((c) => c.passed).length;
+  const falseFindingDownscored = falseCases.filter((c) => c.passed).length;
   const durations = cases.map((c) => c.durationMs).filter((value): value is number => value !== null);
   const costs = cases.map((c) => c.costUsd).filter((value): value is number => value !== null);
   const reasonContractFailures = cases.filter((c) => !c.reasonContractValid).length;
@@ -1039,7 +1082,7 @@ export function aggregate(
   if (timedOutCases > 0) admissionFailures.push(`${timedOutCases} case timeout(s)`);
   if (trueFindingHighConfidence !== trueCases.length) {
     admissionFailures.push(
-      `${trueCases.length - trueFindingHighConfidence} true finding(s) were not kept as confident risks`,
+      `${trueCases.length - trueFindingHighConfidence} true risk(s) were not preserved as published, gate-failing risks`,
     );
   }
   const requiredFalseDownscores = Math.ceil(falseCases.length * SCORER_MIN_FALSE_DOWNSCORE_RATE);
@@ -1051,9 +1094,7 @@ export function aggregate(
   const perFixtureRequired = Math.ceil(repeats * SCORER_MIN_FALSE_DOWNSCORE_RATE);
   for (const id of FALSE_FINDING_CASES) {
     const fixtureCases = falseCases.filter((c) => c.id === id);
-    const downscored = fixtureCases.filter(
-      (c) => c.scorerConfidence !== null && (c.scorerConfidence < 0.6 || c.scorerKind === "uncertainty"),
-    ).length;
+    const downscored = fixtureCases.filter((c) => c.passed).length;
     if (fixtureCases.length !== repeats || downscored < perFixtureRequired) {
       admissionFailures.push(`${id} down-scored ${downscored}/${fixtureCases.length}; need ${perFixtureRequired}/${repeats}`);
     }
