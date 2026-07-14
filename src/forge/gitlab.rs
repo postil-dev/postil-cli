@@ -4,6 +4,7 @@
 //! operational error marks both statuses `failed`: fail closed, never grey.
 
 use anyhow::{Context, Result, anyhow, ensure};
+use futures::{StreamExt, TryStreamExt, stream};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -37,14 +38,8 @@ struct MrResponse {
 struct FileDiffItem {
     old_path: String,
     new_path: String,
-    #[cfg(test)]
-    diff: String,
     new_file: bool,
     deleted_file: bool,
-    #[cfg(test)]
-    collapsed: bool,
-    #[cfg(test)]
-    too_large: bool,
 }
 
 #[derive(Deserialize)]
@@ -111,56 +106,6 @@ impl GitLab {
         super::bounded_response_json(Self::check_ok(resp, "MR fetch").await?, "GitLab MR").await
     }
 
-    #[cfg(test)]
-    fn append_unified(out: &mut String, items: &[FileDiffItem]) -> Result<()> {
-        for item in items {
-            if item.collapsed || item.too_large {
-                return Err(anyhow!(
-                    "GitLab omitted diff content for {}; refusing a partial review",
-                    item.new_path
-                ));
-            }
-            let old_marker = crate::diff::display_path(&format!("a/{}", item.old_path));
-            let new_marker = crate::diff::display_path(&format!("b/{}", item.new_path));
-            let mut section = format!("diff --git {old_marker} {new_marker}\n");
-            if item.new_file {
-                section.push_str(&format!("--- /dev/null\n+++ {new_marker}\n"));
-            } else if item.deleted_file {
-                section.push_str(&format!("--- {old_marker}\n+++ /dev/null\n"));
-            } else {
-                section.push_str(&format!("--- {old_marker}\n+++ {new_marker}\n"));
-            }
-            section.push_str(&item.diff);
-            if !item.diff.ends_with('\n') {
-                section.push('\n');
-            }
-            ensure!(
-                out.len().saturating_add(section.len())
-                    <= crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES,
-                "GitLab assembled diff exceeds the {} byte acquisition limit",
-                crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES
-            );
-            out.push_str(&section);
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn assemble_unified(items: &[FileDiffItem]) -> Result<String> {
-        let mut out = String::new();
-        Self::append_unified(&mut out, items)?;
-        Ok(out)
-    }
-
-    #[cfg(test)]
-    fn assemble_compare(compare: CompareResponse) -> Result<String> {
-        ensure!(
-            !compare.compare_timeout,
-            "GitLab compare timed out or exceeded provider limits"
-        );
-        Self::assemble_unified(&compare.diffs)
-    }
-
     async fn source_file(&self, revision: &str, path: &str) -> Result<(String, usize)> {
         const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
         ensure!(
@@ -197,33 +142,45 @@ impl GitLab {
         base_sha: &str,
         head_sha: &str,
     ) -> Result<String> {
-        let mut output = String::new();
-        let mut acquired = 0usize;
-        for item in items {
+        for item in &items {
             ensure!(
                 super::valid_repository_path(&item.old_path)
                     && super::valid_repository_path(&item.new_path),
                 "GitLab returned an unsafe repository path"
             );
-            let (old, old_bytes) = if item.new_file {
-                (String::new(), 0)
-            } else {
-                self.source_file(base_sha, &item.old_path).await?
-            };
+        }
+        let mut sections = stream::iter(items.into_iter().enumerate().map(
+            |(index, item)| async move {
+                let (old, old_bytes) = if item.new_file {
+                    (String::new(), 0)
+                } else {
+                    self.source_file(base_sha, &item.old_path).await?
+                };
+                let (new, new_bytes) = if item.deleted_file {
+                    (String::new(), 0)
+                } else {
+                    self.source_file(head_sha, &item.new_path).await?
+                };
+                let section = super::azure::diff_section(
+                    &item.old_path,
+                    &item.new_path,
+                    &old,
+                    &new,
+                    item.new_file,
+                    item.deleted_file,
+                );
+                Ok::<_, anyhow::Error>((index, old_bytes, new_bytes, section))
+            },
+        ))
+        .buffer_unordered(8)
+        .try_collect::<Vec<_>>()
+        .await?;
+        sections.sort_unstable_by_key(|(index, _, _, _)| *index);
+        let mut output = String::new();
+        let mut acquired = 0usize;
+        for (_, old_bytes, new_bytes, section) in sections {
             acquired = checked_acquired_bytes(acquired, old_bytes)?;
-            let (new, new_bytes) = if item.deleted_file {
-                (String::new(), 0)
-            } else {
-                self.source_file(head_sha, &item.new_path).await?
-            };
             acquired = checked_acquired_bytes(acquired, new_bytes)?;
-            let section = super::azure::diff_section(
-                &item.new_path,
-                &old,
-                &new,
-                item.new_file,
-                item.deleted_file,
-            );
             ensure!(
                 output.len().saturating_add(section.len())
                     <= crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES,
@@ -381,15 +338,15 @@ impl Forge for GitLab {
             body: mr.description.unwrap_or_default(),
             head_sha: mr.diff_refs.head_sha,
             base_sha: mr.diff_refs.base_sha,
+            changed_files: None,
         })
     }
 
-    async fn fetch_diff(&self) -> Result<String> {
+    async fn fetch_diff(&self, snapshot: &PrMeta) -> Result<String> {
         const PER_PAGE: usize = 100;
         const MAX_PAGES: usize = 100;
         const MAX_ITEMS: usize = 10_000;
         let version = self.latest_diff_version().await?;
-        let mr = self.mr().await?;
         let expected_items: usize = version
             .real_size
             .parse()
@@ -459,7 +416,12 @@ impl Forge for GitLab {
             }
         }
         Self::validate_diff_version(&version, item_count)?;
-        self.build_complete_diff(items, &mr.diff_refs.base_sha, &mr.diff_refs.head_sha)
+        let current = self.fetch_pr_meta().await?;
+        ensure!(
+            current.head_sha == snapshot.head_sha && current.base_sha == snapshot.base_sha,
+            "GitLab merge request changed while its diff was being acquired"
+        );
+        self.build_complete_diff(items, &snapshot.base_sha, &snapshot.head_sha)
             .await
     }
 
@@ -634,34 +596,8 @@ impl Forge for GitLab {
 mod tests {
     use super::*;
 
-    fn item(collapsed: bool, too_large: bool) -> FileDiffItem {
-        FileDiffItem {
-            old_path: "src/lib.rs".to_string(),
-            new_path: "src/lib.rs".to_string(),
-            diff: "@@ -1 +1 @@\n-old\n+new\n".to_string(),
-            new_file: false,
-            deleted_file: false,
-            collapsed,
-            too_large,
-        }
-    }
-
     #[test]
-    fn collapsed_and_too_large_diffs_fail_closed() {
-        assert!(GitLab::assemble_unified(&[item(true, false)]).is_err());
-        assert!(GitLab::assemble_unified(&[item(false, true)]).is_err());
-        assert!(GitLab::assemble_unified(&[item(false, false)]).is_ok());
-    }
-
-    #[test]
-    fn compare_timeout_and_incomplete_versions_fail_closed() {
-        assert!(
-            GitLab::assemble_compare(CompareResponse {
-                compare_timeout: true,
-                diffs: vec![item(false, false)],
-            })
-            .is_err()
-        );
+    fn incomplete_versions_fail_closed() {
         assert!(
             GitLab::validate_diff_version(
                 &DiffVersion {

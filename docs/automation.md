@@ -43,4 +43,4 @@ Pass comment text through `POSTIL_COMMENT` in automation because command-line ar
 
 ## Usage receipts
 
-Hosted workers can set `POSTIL_USAGE_RECEIPT_PATH` to a worker-owned path. A successful response writes a mode-`0600` JSON receipt before forge delivery. The receipt includes aggregate usage, per-model usage for cost-relevant attempts, and whether accounting is complete. The caller owns receipt deletion.
+Hosted workers can set `POSTIL_USAGE_RECEIPT_PATH` to a worker-owned path. A successful response writes a mode-`0600` version 2 JSON receipt before forge delivery. Every provider attempt includes its role, phase, operation-wide call ordinal, transport attempt, token counts, accounting-completeness flag, cost source, canonical provider-reported decimal cost when present, and rounded micro-dollar display value. The caller owns receipt deletion. Receipt consumers must accept the additional `costProviderDecimal` field before deploying this CLI.

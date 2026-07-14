@@ -18,6 +18,15 @@ use sha2::{Digest, Sha256};
 use crate::envelope::{Kind, Severity};
 
 const MODEL_DEFAULTS_TOML: &str = include_str!("../config.toml");
+const QUALIFIED_MODELS_JSON: &str = include_str!("../qualified-models.json");
+const REVIEW_CONTRACT_SOURCES: &[(&str, &str)] = &[
+    ("src/prompt.rs", include_str!("prompt.rs")),
+    ("src/llm.rs", include_str!("llm.rs")),
+    ("src/envelope.rs", include_str!("envelope.rs")),
+    ("src/diff.rs", include_str!("diff.rs")),
+    ("src/filter.rs", include_str!("filter.rs")),
+];
+const BENCH_FIXTURES_SOURCE: &str = include_str!("../bench/fixtures/cases.ts");
 pub const DEFAULT_API_BASE: &str = "https://openrouter.ai/api/v1";
 pub const MAX_FINDINGS: usize = 20;
 
@@ -56,6 +65,31 @@ pub struct ModelDefaults {
     pub scorer_model: String,
     pub scorer_fallback: String,
     pub scorer_qualification_candidates: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct QualificationManifest {
+    pub version: u64,
+    pub model_defaults_sha256: String,
+    pub profiles: Vec<QualificationProfile>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct QualificationProfile {
+    pub id: String,
+    pub api_format: ApiFormat,
+    pub api_base: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub benchmark_provider_identity: Option<String>,
+    pub generator_chain: Vec<String>,
+    pub consensus: usize,
+    pub scorer_chain: Vec<String>,
+    pub review_contract_sha256: String,
+    pub fixture_set_sha256: String,
+    pub report_sha256: String,
+    pub repeated_runs: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,6 +135,128 @@ pub fn default_scorer_fallback() -> &'static str {
 
 pub fn scorer_qualification_candidates() -> &'static [String] {
     model_defaults().scorer_qualification_candidates.as_slice()
+}
+
+pub fn qualification_manifest() -> &'static QualificationManifest {
+    static MANIFEST: OnceLock<QualificationManifest> = OnceLock::new();
+    MANIFEST.get_or_init(|| {
+        parse_qualification_manifest(QUALIFIED_MODELS_JSON)
+            .expect("embedded qualification manifest must parse and match model defaults")
+    })
+}
+
+pub fn review_contract_sha256() -> String {
+    sha256_named_sources(REVIEW_CONTRACT_SOURCES)
+}
+
+pub fn fixture_set_sha256() -> String {
+    sha256_named_sources(&[("bench/fixtures/cases.ts", BENCH_FIXTURES_SOURCE)])
+}
+
+fn sha256_named_sources(sources: &[(&str, &str)]) -> String {
+    let mut hasher = Sha256::new();
+    for (path, contents) in sources {
+        hasher.update(path.as_bytes());
+        hasher.update([0]);
+        hasher.update(contents.as_bytes());
+        hasher.update([0]);
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut hex, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    hex
+}
+
+fn parse_qualification_manifest(raw: &str) -> Result<QualificationManifest> {
+    let manifest: QualificationManifest = serde_json::from_str(raw)?;
+    anyhow::ensure!(
+        manifest.version > 0,
+        "qualification manifest version must be greater than zero"
+    );
+    anyhow::ensure!(
+        manifest.model_defaults_sha256 == model_defaults().source_sha256,
+        "qualification manifest does not match the embedded model defaults"
+    );
+    let mut profile_ids = Vec::with_capacity(manifest.profiles.len());
+    let current_review_contract = review_contract_sha256();
+    let current_fixture_set = fixture_set_sha256();
+    for profile in &manifest.profiles {
+        anyhow::ensure!(
+            !profile.id.trim().is_empty(),
+            "qualification profile id must not be empty"
+        );
+        anyhow::ensure!(
+            !profile.generator_chain.is_empty(),
+            "qualification profile generator chain must not be empty"
+        );
+        anyhow::ensure!(
+            (1..=profile.generator_chain.len()).contains(&profile.consensus),
+            "qualification profile consensus must fit its generator chain"
+        );
+        anyhow::ensure!(
+            normalize_api_base(&profile.api_base)? == profile.api_base,
+            "qualification profile apiBase must use its canonical form"
+        );
+        if let Some(provider) = profile.benchmark_provider_identity.as_deref() {
+            anyhow::ensure!(
+                !provider.trim().is_empty() && !provider.contains(['\n', '\r']),
+                "qualification profile benchmark provider identity must be one line"
+            );
+        }
+        for model in &profile.generator_chain {
+            validate_model_id("qualification profile generator chain", model)?;
+        }
+        for model in &profile.scorer_chain {
+            validate_model_id("qualification profile scorer chain", model)?;
+        }
+        anyhow::ensure!(
+            profile.repeated_runs > 0,
+            "qualification profile must record repeated runs"
+        );
+        for (field, digest) in [
+            ("reviewContractSha256", &profile.review_contract_sha256),
+            ("fixtureSetSha256", &profile.fixture_set_sha256),
+            ("reportSha256", &profile.report_sha256),
+        ] {
+            anyhow::ensure!(
+                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                "qualification profile {field} must be a SHA-256 digest"
+            );
+        }
+        anyhow::ensure!(
+            profile.review_contract_sha256 == current_review_contract,
+            "qualification profile review contract is stale"
+        );
+        anyhow::ensure!(
+            profile.fixture_set_sha256 == current_fixture_set,
+            "qualification profile fixture set is stale"
+        );
+        let mut generators = profile.generator_chain.clone();
+        generators.sort();
+        generators.dedup();
+        anyhow::ensure!(
+            generators.len() == profile.generator_chain.len(),
+            "qualification profile generator chain must not repeat models"
+        );
+        let mut scorers = profile.scorer_chain.clone();
+        scorers.sort();
+        scorers.dedup();
+        anyhow::ensure!(
+            scorers.len() == profile.scorer_chain.len(),
+            "qualification profile scorer chain must not repeat models"
+        );
+        profile_ids.push(profile.id.clone());
+    }
+    profile_ids.sort();
+    profile_ids.dedup();
+    anyhow::ensure!(
+        profile_ids.len() == manifest.profiles.len(),
+        "qualification profile ids must be unique"
+    );
+    Ok(manifest)
 }
 
 fn parse_model_defaults(raw: &str) -> Result<ModelDefaults> {
@@ -248,6 +404,7 @@ pub struct Config {
     pub model: String,
     pub cascade: Vec<String>,
     pub scorer: String,
+    pub scorer_fallback: String,
     /// Embedded scoring remains disabled until a candidate passes the repeated
     /// qualification gate. An explicit BYOK scorer enables only that model.
     pub scorer_enabled: bool,
@@ -291,6 +448,7 @@ impl Default for Config {
             model: defaults.default_model.clone(),
             cascade: defaults.cascade.clone(),
             scorer: defaults.scorer_model.clone(),
+            scorer_fallback: defaults.scorer_fallback.clone(),
             scorer_enabled: defaults.scorer_enabled,
             scorer_explicit: false,
             api_base: DEFAULT_API_BASE.to_string(),
@@ -652,23 +810,45 @@ impl Config {
     }
 
     fn require_model_for(&self, hosted: bool) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let generator_chain = self.model_chain();
         anyhow::ensure!(
-            !hosted,
-            "hosted inference has no admitted model; configure BYOK or local inference instead"
-        );
-        anyhow::ensure!(
-            !self.model_chain().is_empty(),
+            !generator_chain.is_empty(),
             "no review model is configured; pass --model, set REVIEW_MODEL, or set model.name in a trusted local config"
         );
+        if hosted {
+            let manifest = qualification_manifest();
+            let scorer_chain = self.scorer_chain();
+            anyhow::ensure!(
+                manifest.profiles.iter().any(|profile| {
+                    profile.generator_chain == generator_chain
+                        && profile.consensus == self.consensus
+                        && profile.scorer_chain == scorer_chain
+                        && profile.api_format == self.api_format
+                        && normalize_api_base(&self.api_base).ok().as_deref()
+                            == Some(profile.api_base.as_str())
+                }),
+                "hosted inference configuration does not exactly match a deployed qualification profile"
+            );
+        }
         Ok(())
     }
 
     /// Scorer models to try, in order, deduplicated.
     pub fn scorer_chain(&self) -> Vec<String> {
-        if !self.scorer_enabled || !self.scorer_explicit || self.scorer.trim().is_empty() {
+        if !self.scorer_enabled || self.scorer.trim().is_empty() {
             return Vec::new();
         }
-        vec![self.scorer.clone()]
+        let mut chain = vec![self.scorer.clone()];
+        if !self.scorer_explicit
+            && !self.scorer_fallback.trim().is_empty()
+            && !chain.contains(&self.scorer_fallback)
+        {
+            chain.push(self.scorer_fallback.clone());
+        }
+        chain
     }
 
     pub fn scorer_enabled(&self) -> bool {
@@ -701,6 +881,37 @@ fn repository_model_config_locked() -> bool {
         || std::env::var("POSTIL_IGNORE_REPOSITORY_MODEL_CONFIG")
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
+}
+
+fn normalize_api_base(value: &str) -> Result<String> {
+    let url = reqwest::Url::parse(value).context("model API base must be an absolute URL")?;
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https"),
+        "model API base must use HTTP or HTTPS"
+    );
+    anyhow::ensure!(
+        url.username().is_empty() && url.password().is_none(),
+        "model API base must not contain credentials"
+    );
+    anyhow::ensure!(
+        url.query().is_none() && url.fragment().is_none(),
+        "model API base must not contain a query or fragment"
+    );
+    let hostname = url
+        .host_str()
+        .context("model API base must include a hostname")?
+        .to_ascii_lowercase();
+    let hostname = if hostname.contains(':') {
+        format!("[{hostname}]")
+    } else {
+        hostname
+    };
+    let port = url
+        .port_or_known_default()
+        .context("model API base must include an effective port")?;
+    let path = url.path().trim_end_matches('/');
+    let path = if path.is_empty() { "/" } else { path };
+    Ok(format!("{}://{hostname}:{port}{path}", url.scheme()))
 }
 
 fn find_first(root: &Path, names: &[&str]) -> Option<PathBuf> {
@@ -1104,6 +1315,70 @@ qualification_candidates = ["example/scorer"]
         };
         explicit.require_model_for(false).unwrap();
         assert!(explicit.require_model_for(true).is_err());
+
+        let disabled = Config {
+            enabled: false,
+            ..Config::default()
+        };
+        disabled.require_model_for(true).unwrap();
+        assert!(qualification_manifest().profiles.is_empty());
+    }
+
+    #[test]
+    fn inherited_scorer_uses_only_the_embedded_fallback_chain() {
+        let config = Config {
+            scorer: "qualified/scorer".into(),
+            scorer_fallback: "qualified/fallback".into(),
+            scorer_enabled: true,
+            scorer_explicit: false,
+            ..Config::default()
+        };
+        assert_eq!(
+            config.scorer_chain(),
+            vec!["qualified/scorer", "qualified/fallback"]
+        );
+
+        let explicit = Config {
+            scorer_explicit: true,
+            ..config
+        };
+        assert_eq!(explicit.scorer_chain(), vec!["qualified/scorer"]);
+    }
+
+    #[test]
+    fn qualification_profile_rejects_stale_embedded_contract_hashes() {
+        let raw = serde_json::json!({
+            "version": 1,
+            "modelDefaultsSha256": model_defaults().source_sha256,
+            "profiles": [{
+                "id": "candidate",
+                "apiFormat": "openai-compatible",
+                "apiBase": "https://openrouter.ai:443/api/v1",
+                "benchmarkProviderIdentity": "openrouter:test-route",
+                "generatorChain": ["provider/model"],
+                "consensus": 1,
+                "scorerChain": [],
+                "reviewContractSha256": "0".repeat(64),
+                "fixtureSetSha256": fixture_set_sha256(),
+                "reportSha256": "1".repeat(64),
+                "repeatedRuns": 3
+            }]
+        });
+        let error = parse_qualification_manifest(&raw.to_string()).unwrap_err();
+        assert!(error.to_string().contains("review contract is stale"));
+    }
+
+    #[test]
+    fn qualification_hash_framing_matches_cross_language_vector() {
+        assert_eq!(
+            sha256_named_sources(&[("a.txt", "alpha"), ("b/β.txt", "line\n")]),
+            "1969c5b03a79915d62106b91c742a28127afae455317dcb3a4670e50829eb9ba"
+        );
+        assert_eq!(
+            normalize_api_base("HTTPS://OpenRouter.AI/api/v1/").unwrap(),
+            "https://openrouter.ai:443/api/v1"
+        );
+        assert!(normalize_api_base("https://example.com/v1?route=x").is_err());
     }
 
     #[test]

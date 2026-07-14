@@ -36,10 +36,48 @@ pub(crate) const HOSTED_LLM_TOTAL_TIMEOUT_SECS: u64 = 540;
 pub(crate) const HOSTED_LLM_REQUEST_TIMEOUT_SECS: u64 = 240;
 pub(crate) const HOSTED_LLM_REVIEW_TIMEOUT_SECS: u64 = 420;
 const FORGE_READ_TIMEOUT_SECS: u64 = 60;
+const FORGE_DIFF_MAX_TIMEOUT_SECS: u64 = 300;
 const CHECK_START_TIMEOUT_SECS: u64 = 30;
 const CHECK_COMPLETION_TIMEOUT_SECS: u64 = 30;
 const REVIEW_POST_TIMEOUT_SECS: u64 = 20;
 pub(crate) const SCORER_TIMEOUT_SECS: u64 = 120;
+
+fn full_diff_timeout_secs(snapshot: &PrMeta) -> u64 {
+    let files = snapshot.changed_files.unwrap_or(480) as u64;
+    let waves = files.div_ceil(8);
+    FORGE_READ_TIMEOUT_SECS
+        .saturating_add(waves.saturating_mul(2))
+        .min(FORGE_DIFF_MAX_TIMEOUT_SECS)
+}
+
+async fn snapshot_is_current<F: Forge>(
+    forge: &F,
+    expected_head_sha: &str,
+    review_started: Instant,
+) -> bool {
+    match run_with_hosted_budget(
+        Some(review_started),
+        FORGE_READ_TIMEOUT_SECS,
+        forge.head_is_current(expected_head_sha),
+        "verifying pull request head before publication",
+    )
+    .await
+    {
+        Ok(true) => true,
+        Ok(false) => {
+            eprintln!(
+                "postil: publication skipped because the pull request head changed after review"
+            );
+            false
+        }
+        Err(error) => {
+            eprintln!(
+                "postil: publication skipped because head freshness could not be verified ({error:#})"
+            );
+            false
+        }
+    }
+}
 
 fn conservative_context_tokens(model: &str) -> usize {
     let model = model.to_ascii_lowercase();
@@ -109,8 +147,6 @@ struct ReviewInput<'a> {
 
 struct RemoteReviewInput<'a> {
     meta: &'a PrMeta,
-    head_sha: &'a str,
-    prefetched_diff: Option<Result<String>>,
     review_started: Instant,
 }
 
@@ -214,62 +250,44 @@ async fn run_remote<F: Forge>(
     repo: &str,
 ) -> Result<i32> {
     let review_started = std::time::Instant::now();
-    // Full-review metadata and diff fetches are independent forge reads. Fetch
-    // the diff while metadata is loading and check ownership is established;
-    // hosted runs with pre-created check IDs save the metadata RTT, while CLI-
-    // created checks also overlap their startup writes. Incremental diffs still
-    // wait for metadata because they depend on the selected head SHA.
-    let setup = async {
-        let meta = run_with_hosted_budget(
-            Some(review_started),
-            FORGE_READ_TIMEOUT_SECS,
-            forge.fetch_pr_meta(),
-            "fetching PR metadata",
-        )
-        .await?;
-        let head_sha = args.sha.clone().unwrap_or_else(|| meta.head_sha.clone());
+    let meta = run_with_hosted_budget(
+        Some(review_started),
+        FORGE_READ_TIMEOUT_SECS,
+        forge.fetch_pr_meta(),
+        "fetching PR metadata",
+    )
+    .await?;
+    if let Some(event_sha) = args.sha.as_deref() {
+        anyhow::ensure!(
+            event_sha == meta.head_sha,
+            "requested review head {event_sha} is no longer the pull request head {}",
+            meta.head_sha
+        );
+    }
+    let head_sha = meta.head_sha.clone();
 
-        // Own the check-runs early so a crash can still be reported against them.
-        let checks = if args.no_post {
-            None
-        } else if let (Some(a), Some(g)) = (&args.check_run_id, &args.gate_check_run_id) {
-            Some((a.clone(), g.clone()))
-        } else {
-            match run_with_hosted_budget(
-                Some(review_started),
-                CHECK_START_TIMEOUT_SECS,
-                forge.start_checks(&head_sha),
-                "creating check runs",
-            )
-            .await
-            {
-                Ok(ids) => Some(ids),
-                Err(e) => {
-                    // CI tokens without checks:write still get review + exit code.
-                    eprintln!("postil: cannot create check runs ({e:#}); continuing without");
-                    None
-                }
+    // Own the check-runs early so a crash can still be reported against them.
+    let checks = if args.no_post {
+        None
+    } else if let (Some(a), Some(g)) = (&args.check_run_id, &args.gate_check_run_id) {
+        Some((a.clone(), g.clone()))
+    } else {
+        match run_with_hosted_budget(
+            Some(review_started),
+            CHECK_START_TIMEOUT_SECS,
+            forge.start_checks(&head_sha),
+            "creating check runs",
+        )
+        .await
+        {
+            Ok(ids) => Some(ids),
+            Err(e) => {
+                // CI tokens without checks:write still get review + exit code.
+                eprintln!("postil: cannot create check runs ({e:#}); continuing without");
+                None
             }
-        };
-        Ok::<_, anyhow::Error>((meta, head_sha, checks))
-    };
-    let prefetch_diff = async {
-        if args.since_sha.is_none() {
-            Some(
-                run_with_hosted_budget(
-                    Some(review_started),
-                    FORGE_READ_TIMEOUT_SECS,
-                    forge.fetch_diff(),
-                    "fetching diff",
-                )
-                .await,
-            )
-        } else {
-            None
         }
     };
-    let (setup, prefetched_diff) = tokio::join!(setup, prefetch_diff);
-    let (meta, head_sha, checks) = setup?;
 
     let result = remote_review(
         args,
@@ -278,15 +296,15 @@ async fn run_remote<F: Forge>(
         repo,
         RemoteReviewInput {
             meta: &meta,
-            head_sha: &head_sha,
-            prefetched_diff,
             review_started,
         },
     )
     .await;
     match result {
         Ok(envelope) => {
-            if let Some((a, g)) = &checks {
+            if let Some((a, g)) = &checks
+                && snapshot_is_current(forge, &head_sha, review_started).await
+            {
                 let gate_state = if envelope.gate.failing {
                     CheckState::Failure
                 } else {
@@ -340,7 +358,9 @@ async fn run_remote<F: Forge>(
                 &meta,
                 review_started.elapsed().as_millis() as u64,
             );
-            if let Some((a, g)) = &checks {
+            if let Some((a, g)) = &checks
+                && snapshot_is_current(forge, &head_sha, review_started).await
+            {
                 let gate_state = if envelope.gate.failing {
                     CheckState::Failure
                 } else {
@@ -383,10 +403,9 @@ async fn remote_review<F: Forge>(
 ) -> Result<Envelope> {
     let RemoteReviewInput {
         meta,
-        head_sha,
-        prefetched_diff,
         review_started,
     } = input;
+    let head_sha = meta.head_sha.as_str();
     let baseline = load_baseline(args)?;
     let has_carryable_baseline = baseline_has_carryable_findings(&baseline);
     let incremental = args.since_sha.as_deref();
@@ -403,20 +422,15 @@ async fn remote_review<F: Forge>(
         .map(|diff| (diff, filter::ReconcileScope::Incremental, false))?,
         Some(_) => (String::new(), filter::ReconcileScope::Incremental, false),
         None => (
-            match prefetched_diff {
-                Some(diff) => diff
-                    .map_err(crate::forge::classify_review_input_error)
-                    .context("diff fetch")?,
-                None => run_with_hosted_budget(
-                    Some(review_started),
-                    FORGE_READ_TIMEOUT_SECS,
-                    forge.fetch_diff(),
-                    "fetching diff",
-                )
-                .await
-                .map_err(crate::forge::classify_review_input_error)
-                .context("diff fetch")?,
-            },
+            run_with_hosted_budget(
+                Some(review_started),
+                full_diff_timeout_secs(meta),
+                forge.fetch_diff(meta),
+                "fetching diff",
+            )
+            .await
+            .map_err(crate::forge::classify_review_input_error)
+            .context("diff fetch")?,
             filter::ReconcileScope::Full { trustworthy: false },
             false,
         ),
@@ -433,8 +447,8 @@ async fn remote_review<F: Forge>(
         (
             run_with_hosted_budget(
                 Some(review_started),
-                FORGE_READ_TIMEOUT_SECS,
-                forge.fetch_diff(),
+                full_diff_timeout_secs(meta),
+                forge.fetch_diff(meta),
                 "fetching full fallback diff",
             )
             .await
@@ -975,18 +989,17 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                                     .to_string(),
                             );
                         } else {
-                            let scored = tokio::time::timeout(
-                                std::time::Duration::from_secs(SCORER_TIMEOUT_SECS),
-                                client.score_findings(
+                            let scored = client
+                                .score_findings(
                                     cfg,
                                     &scorer_system,
                                     &scorer_user,
                                     inputs.len(),
-                                ),
-                            )
-                            .await;
+                                    std::time::Duration::from_secs(SCORER_TIMEOUT_SECS),
+                                )
+                                .await;
                             match scored {
-                                Ok(Ok(scored)) => {
+                                Ok(scored) => {
                                     let disagreements =
                                         apply_scorer_scores(cfg, &mut kept, scored.scores);
                                     let scorer_suppressed =
@@ -1002,7 +1015,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                                     scorer_disagreements = Some(disagreements);
                                     sort_findings_for_display(&mut kept);
                                 }
-                                Ok(Err(e)) => {
+                                Err(e) => {
                                     let detail = format!("{e:#}");
                                     eprintln!(
                                         "postil: scorer failed open after all scorer models failed"
@@ -1014,19 +1027,6 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                                     model_incidents.extend_from_slice(e.model_incidents());
                                     usage_accounting_complete &= e.usage_accounting_complete();
                                     scorer_error = Some(detail);
-                                }
-                                Err(_) => {
-                                    usage_accounting_complete = false;
-                                    let detail =
-                                        format!("scorer timed out after {SCORER_TIMEOUT_SECS}s");
-                                    eprintln!("postil: scorer failed open: {detail}");
-                                    scorer_error = Some(detail);
-                                    model_incidents.push(crate::envelope::ModelIncident {
-                                        phase: crate::envelope::ModelIncidentPhase::Scorer,
-                                        category: crate::envelope::ModelIncidentCategory::Timeout,
-                                        recovered: false,
-                                        recovery: None,
-                                    });
                                 }
                             }
                         }
@@ -1147,6 +1147,16 @@ async fn finish<F: Forge>(
     if let Some(forge) = forge
         && !args.no_post
     {
+        let head = envelope.head_sha.clone().unwrap_or_default();
+        let current = if let Some(started_at) = hosted_budget_started_at {
+            snapshot_is_current(forge, &head, started_at).await
+        } else {
+            forge.head_is_current(&head).await.unwrap_or(false)
+        };
+        if !current {
+            eprintln!("postil: review comment skipped because freshness is not proven");
+            return Ok(if envelope.gate.failing { 1 } else { 0 });
+        }
         let duplicate_of_baseline = load_baseline(args)
             .ok()
             .is_some_and(|baseline| visible_finding_sets_equal(&baseline, &envelope.findings));
@@ -1155,7 +1165,6 @@ async fn finish<F: Forge>(
             && !duplicate_of_baseline;
         if should_comment {
             let summary = forge.review_summary(&envelope);
-            let head = envelope.head_sha.clone().unwrap_or_default();
             // A posting failure here (rate limit, transient 5xx, network blip)
             // must not discard a review that already computed and persisted its
             // envelope/SARIF/stdout output above. Log it and keep going because the

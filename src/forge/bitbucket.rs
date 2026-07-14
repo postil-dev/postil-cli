@@ -1,5 +1,5 @@
-//! Bitbucket forge implementation (bitbucket.org Cloud; Data Center via
-//! `BITBUCKET_API_URL`).
+//! Bitbucket Cloud forge implementation. `BITBUCKET_API_URL` selects a
+//! Cloud-compatible API gateway; Data Center uses a different REST contract.
 //!
 //! Auth: `BITBUCKET_TOKEN`. If `BITBUCKET_USER` is set the token is treated as
 //! an app password and sent via HTTP Basic; otherwise it is a workspace/repo
@@ -14,6 +14,7 @@
 //! unverified hosted runs trust it by default.
 
 use anyhow::{Context, Result, anyhow, ensure};
+use futures::{StreamExt, TryStreamExt, stream};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::Digest;
@@ -312,30 +313,46 @@ impl Bitbucket {
         diffstat_url: String,
     ) -> Result<String> {
         let entries = self.diffstat_pages(diffstat_url).await?;
+        let mut sections = stream::iter(entries.into_iter().enumerate().map(
+            |(index, entry)| async move {
+                let old_path = entry.old.as_ref().map(|file| file.path.as_str());
+                let new_path = entry.new.as_ref().map(|file| file.path.as_str());
+                let path = new_path
+                    .or(old_path)
+                    .ok_or_else(|| anyhow!("Bitbucket diffstat entry has no path"))?;
+                let status = entry.status.to_ascii_lowercase();
+                let is_add = status == "added" || old_path.is_none();
+                let is_delete = status == "removed" || new_path.is_none();
+                let (old, old_bytes) = if is_add {
+                    (String::new(), 0)
+                } else {
+                    self.source_file(base_sha, old_path.unwrap_or(path)).await?
+                };
+                let (new, new_bytes) = if is_delete {
+                    (String::new(), 0)
+                } else {
+                    self.source_file(head_sha, new_path.unwrap_or(path)).await?
+                };
+                let section = super::azure::diff_section(
+                    old_path.unwrap_or(path),
+                    new_path.unwrap_or(path),
+                    &old,
+                    &new,
+                    is_add,
+                    is_delete,
+                );
+                Ok::<_, anyhow::Error>((index, old_bytes, new_bytes, section))
+            },
+        ))
+        .buffer_unordered(8)
+        .try_collect::<Vec<_>>()
+        .await?;
+        sections.sort_unstable_by_key(|(index, _, _, _)| *index);
         let mut output = String::new();
         let mut acquired_bytes = 0usize;
-        for entry in entries {
-            let old_path = entry.old.as_ref().map(|file| file.path.as_str());
-            let new_path = entry.new.as_ref().map(|file| file.path.as_str());
-            let path = new_path
-                .or(old_path)
-                .ok_or_else(|| anyhow!("Bitbucket diffstat entry has no path"))?;
-            let status = entry.status.to_ascii_lowercase();
-            let is_add = status == "added" || old_path.is_none();
-            let is_delete = status == "removed" || new_path.is_none();
-            let (old, old_bytes) = if is_add {
-                (String::new(), 0)
-            } else {
-                self.source_file(base_sha, old_path.unwrap_or(path)).await?
-            };
+        for (_, old_bytes, new_bytes, section) in sections {
             acquired_bytes = checked_acquired_bytes(acquired_bytes, old_bytes)?;
-            let (new, new_bytes) = if is_delete {
-                (String::new(), 0)
-            } else {
-                self.source_file(head_sha, new_path.unwrap_or(path)).await?
-            };
             acquired_bytes = checked_acquired_bytes(acquired_bytes, new_bytes)?;
-            let section = super::azure::diff_section(path, &old, &new, is_add, is_delete);
             let next_len = output
                 .len()
                 .checked_add(section.len())
@@ -420,22 +437,48 @@ fn safe_path(path: &str) -> String {
 impl Forge for Bitbucket {
     async fn fetch_pr_meta(&self) -> Result<PrMeta> {
         let pr = self.pr_meta().await?;
+        validate_commit(&pr.source.commit.hash)?;
+        validate_commit(&pr.destination.commit.hash)?;
+        let merge_base_response = self
+            .request(
+                reqwest::Method::GET,
+                self.url(&format!(
+                    "/merge-base/{}..{}",
+                    pr.destination.commit.hash, pr.source.commit.hash
+                )),
+            )
+            .send()
+            .await
+            .context("fetching Bitbucket pull request merge base")?;
+        let merge_base: Commit = super::bounded_response_json(
+            Self::check_ok(merge_base_response, "merge-base fetch").await?,
+            "Bitbucket merge-base response",
+        )
+        .await?;
+        validate_commit(&merge_base.hash)?;
         Ok(PrMeta {
             title: pr.title,
             body: pr.summary.map(|s| s.raw).unwrap_or_default(),
             head_sha: pr.source.commit.hash,
-            base_sha: pr.destination.commit.hash,
+            base_sha: merge_base.hash,
+            changed_files: None,
         })
     }
 
-    async fn fetch_diff(&self) -> Result<String> {
-        let pr = self.pr_meta().await?;
-        self.build_complete_diff(
-            &pr.destination.commit.hash,
-            &pr.source.commit.hash,
-            self.url(&format!("/pullrequests/{}/diffstat?pagelen=100", self.pr)),
-        )
-        .await
+    async fn fetch_diff(&self, snapshot: &PrMeta) -> Result<String> {
+        let diff = self
+            .build_complete_diff(
+                &snapshot.base_sha,
+                &snapshot.head_sha,
+                self.url(&format!("/pullrequests/{}/diffstat?pagelen=100", self.pr)),
+            )
+            .await?;
+        let current = self.fetch_pr_meta().await?;
+        ensure!(
+            current.head_sha == snapshot.head_sha && current.base_sha == snapshot.base_sha,
+            "Bitbucket pull request changed while its diff was being acquired"
+        );
+        Ok(diff)
     }
 
     async fn fetch_diff_since(&self, since_sha: &str, head_sha: &str) -> Result<String> {

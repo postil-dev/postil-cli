@@ -6,7 +6,13 @@ Postil speaks either an OpenAI-compatible chat-completions interface or the nati
 
 The CLI has no implicit model or fallback chain. Set `REVIEW_MODEL` to a model that passes the repository benchmark for the intended review profile. Set `REVIEW_MODEL_CASCADE` only to other qualified models. Scoring is disabled unless `REVIEW_SCORER_MODEL` names a qualified scorer.
 
-Hosted deployments admit only models in their deployed qualification manifest. An empty manifest rejects hosted inference instead of selecting an untested model.
+Hosted deployments admit only complete profiles listed in the embedded `qualified-models.json` qualification manifest. A profile binds the canonical API base, provider API format, ordered generator chain, consensus width, ordered scorer chain, repeated-run count, and SHA-256 digests for the review contract, fixture set, and benchmark report. Canonical API bases include lowercase scheme/host, the effective port, and a normalized path, with no userinfo, query, or fragment. The manifest also binds the exact `config.toml` digest. Hosted configuration must match one profile exactly; an empty or mismatched manifest rejects inference.
+
+`benchmarkProviderIdentity` can preserve the upstream route reported by the benchmark as evidence. It does not pin runtime upstream routing; admission pins the API endpoint and model profile that Postil controls.
+
+The review-contract digest hashes, in order, `src/prompt.rs`, `src/llm.rs`, `src/envelope.rs`, `src/diff.rs`, and `src/filter.rs`. The fixture-set digest hashes `bench/fixtures/cases.ts`. Each input is framed as its repository path, a NUL byte, file contents, and a trailing NUL byte. The CLI recomputes both digests from embedded sources; changing either source set invalidates every existing profile until the benchmark emits new evidence.
+
+Cross-language framing vector: paths and contents `[("a.txt", "alpha"), ("b/β.txt", "line\n")]` serialize as `a.txt\0alpha\0b/β.txt\0line\n\0` in UTF-8 and hash to `1969c5b03a79915d62106b91c742a28127afae455317dcb3a4670e50829eb9ba`.
 
 ## OpenAI-compatible
 
@@ -47,7 +53,7 @@ REVIEW_MODEL=your-qualified-local-model \
 postil review --staged
 ```
 
-The API hostname is resolved before the request and the client is pinned to accepted addresses while retaining hostname-based TLS checks.
+The API hostname is resolved before the request and the client is pinned to accepted addresses while retaining hostname-based TLS checks. Model clients bypass system proxies so proxy-side DNS cannot evade this validation.
 
 ## Additional gateway authentication
 

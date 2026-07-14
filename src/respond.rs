@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::diff;
+use crate::envelope::{ModelUsageCostSource, ModelUsagePhase, ModelUsageRole};
 use crate::forge::{
     Forge, ThreadKind, azure::Azure, bitbucket::Bitbucket, github::GitHub, gitlab::GitLab,
 };
@@ -68,10 +69,23 @@ struct RespondUsageReceipt<'a> {
 #[serde(rename_all = "camelCase")]
 struct RespondModelUsage<'a> {
     model: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<ModelUsageRole>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<ModelUsagePhase>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    call_ordinal: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attempt: Option<u32>,
     prompt_tokens: u64,
     completion_tokens: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     cost_micros: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_provider_decimal: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_source: Option<ModelUsageCostSource>,
+    accounting_complete: bool,
 }
 
 // PID separates concurrent processes; this sequence separates writers within
@@ -121,7 +135,7 @@ impl UsageReceiptWriter {
 
     fn commit(mut self, answer: &Answer) -> Result<()> {
         let receipt = RespondUsageReceipt {
-            version: 1,
+            version: 2,
             operation: "respond",
             prompt_tokens: answer.usage.prompt_tokens,
             completion_tokens: answer.usage.completion_tokens,
@@ -130,9 +144,16 @@ impl UsageReceiptWriter {
                 .iter()
                 .map(|model| RespondModelUsage {
                     model: &model.model,
+                    role: model.role,
+                    phase: model.phase,
+                    call_ordinal: model.call_ordinal,
+                    attempt: model.attempt,
                     prompt_tokens: model.prompt_tokens,
                     completion_tokens: model.completion_tokens,
                     cost_micros: model.cost_micros,
+                    cost_provider_decimal: model.cost_provider_decimal.as_deref(),
+                    cost_source: model.cost_source,
+                    accounting_complete: model.accounting_complete,
                 })
                 .collect(),
             usage_accounting_complete: answer.usage_accounting_complete,
@@ -696,7 +717,7 @@ async fn build_context<F: Forge>(
     match kind {
         ThreadKind::Pull => {
             let meta = forge.fetch_pr_meta().await?;
-            let raw = forge.fetch_diff().await.context("fetching PR diff")?;
+            let raw = forge.fetch_diff(&meta).await.context("fetching PR diff")?;
             let parsed = diff::parse(&raw);
             ensure!(
                 parsed.complete,

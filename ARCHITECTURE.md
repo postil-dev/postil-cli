@@ -45,8 +45,9 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   and worst-case token spend before sending any initial, retry, repair, or scorer call.
   Every provider HTTP call has a model-usage record with a product role, logical phase,
   operation-wide call ordinal, phase-local attempt, token counts, and exact-cost source.
-  OpenRouter's response `usage.cost` is preserved as optional exact micro-dollar cost;
-  endpoints that omit it retain token-only accounting with unavailable cost provenance.
+  OpenRouter's response `usage.cost` is preserved as canonical decimal dollars without
+  floating-point conversion; rounded micro-dollars remain a display/index field.
+  Endpoints that omit cost retain token-only accounting with unavailable provenance.
 - `review.rs`: orchestration; enforces acquisition, model-aware context, request,
   provider-attempt, output-token, and worst-case token-exposure budgets before calls;
   one UTF-8 byte counts as one projected token rather than using an optimistic ratio;
@@ -59,9 +60,9 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   check-run lifecycle ordering (checks are created before the model runs so a crash can
   still be reported against them). It persists safe structured model incidents for
   monitoring without raw provider or model text.
-- `forge/`: trait + GitHub, GitLab, Bitbucket, and Azure DevOps implementations (each
-  with a self-managed/server base-URL override where the forge API supports it). GitHub
-  reconstructs full reviews from base/head file content after exhausting the declared
+- `forge/`: trait + GitHub, GitLab, Bitbucket Cloud, and Azure DevOps implementations,
+  with self-managed base URLs where the same API contract applies. GitHub
+  reconstructs full reviews from merge-base/head file content after exhausting the declared
   changed-file count, and rejects an ambiguous 300-file incremental compare. Bitbucket exhausts
   paginated diffstat and reconstructs bounded source content from the compared commits.
   Azure has no PR-diff endpoint, so it exhausts the authoritative change marker and
@@ -82,6 +83,9 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   credential); honored only with `POSTIL_ALLOW_CONFIG_API_BASE=1`. The
   `POSTIL_API_BASE` environment variable is always applied. `model.apiFormat` and
   `POSTIL_API_FORMAT` select `openai-compatible` (default) or `anthropic`.
+  Hosted admission matches the complete ordered generator/scorer configuration and
+  consensus width to one immutable qualification profile. Each profile binds benchmark
+  report, fixture-set, review-contract, and model-default digests plus repeat evidence.
 
 ## Prompt-injected policy sources
 

@@ -2,8 +2,8 @@
 
 ## Shipped
 
-- Grounded, fail-closed review engine; local + GitHub + GitLab + Bitbucket + Azure
-  DevOps (each including its self-managed/server variant via a base-URL override).
+- Grounded, fail-closed review engine; local, GitHub, GitLab, Bitbucket Cloud, and
+  Azure DevOps. GitHub, GitLab, and Azure support self-managed base URLs.
 - Two-check semantics (postil/review advisory, postil/gate blocking); `gate.onError:
   block|advisory` for fail-open on provider outages.
 - Incremental re-review with resolved/carried reconciliation.
@@ -28,7 +28,7 @@
 - Model cascade + concurrent multi-model consensus over any OpenAI-compatible endpoint;
   bounded retry with backoff on transient provider errors.
 - Verified `curl | sh` install script with SHA-256 checksum verification; prebuilt
-  release binaries for five targets, including x86_64 musl (Alpine) for static-libc
+  release binaries for six targets, including x86_64 musl (Alpine) for static-libc
   systems.
 - Sigstore keyless signing of release artifacts (cosign, GitHub OIDC); the installer
   verifies the signature when cosign is present and refuses a stripped signature
@@ -42,7 +42,7 @@
   apply merge-base semantics on Cloud; Azure's changed-file reconstruction) that we
   have not yet confirmed end to end.
 - Bitbucket inline-comment threading and Azure DevOps iteration-aware diffs for very
-  large PRs; concurrent per-file content fetches for the Azure reconstruction.
+  large PRs.
 - Learning from dismissals: feed comment-resolution outcomes from the hosted platform
   back into per-repo suppression hints.
 - `postil respond` on the Bitbucket issue tracker and Azure DevOps work items (today

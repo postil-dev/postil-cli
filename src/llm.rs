@@ -19,7 +19,7 @@ use crate::api_key;
 use crate::config::{ApiFormat, Config};
 use crate::envelope::{
     Finding, Kind, ModelIncident, ModelIncidentCategory, ModelIncidentPhase, ModelIncidentRecovery,
-    ModelUsage, ModelUsageCostSource, ModelUsagePhase, ModelUsageRole, Usage,
+    ModelUsage, ModelUsageCostSource, ModelUsagePhase, ModelUsageRole, ProviderCost, Usage,
 };
 
 #[derive(Debug, Clone)]
@@ -151,7 +151,7 @@ impl std::error::Error for ModelError {
 
 fn add_usage(total: &mut Usage, usage: Usage) {
     let total_was_empty =
-        total.prompt_tokens == 0 && total.completion_tokens == 0 && total.cost_micros.is_none();
+        total.prompt_tokens == 0 && total.completion_tokens == 0 && total.provider_cost.is_none();
     total.prompt_tokens = total.prompt_tokens.saturating_add(usage.prompt_tokens);
     total.completion_tokens = total
         .completion_tokens
@@ -162,29 +162,31 @@ fn add_usage(total: &mut Usage, usage: Usage) {
         (None, Some(_)) | (Some(_), None) => None,
         (None, None) => None,
     };
+    total.provider_cost = match (total.provider_cost, usage.provider_cost) {
+        (Some(left), Some(right)) => left.checked_add(right),
+        (None, Some(value)) if total_was_empty => Some(value),
+        (None, Some(_)) | (Some(_), None) => None,
+        (None, None) => None,
+    };
 }
 
 fn has_billable_usage(usage: Usage) -> bool {
-    usage.prompt_tokens > 0 || usage.completion_tokens > 0 || usage.cost_micros.is_some()
-}
-
-fn cost_to_micros(cost: f64) -> Option<u64> {
-    let micros = cost * 1_000_000.0;
-    (cost.is_finite() && cost >= 0.0 && micros <= u64::MAX as f64).then(|| micros.round() as u64)
+    usage.prompt_tokens > 0 || usage.completion_tokens > 0 || usage.provider_cost.is_some()
 }
 
 fn add_response_usage(
     usage: &mut Usage,
     prompt_tokens: u64,
     completion_tokens: u64,
-    cost: Option<f64>,
+    cost: Option<ProviderCost>,
 ) {
     add_usage(
         usage,
         Usage {
             prompt_tokens,
             completion_tokens,
-            cost_micros: cost.and_then(cost_to_micros),
+            cost_micros: cost.and_then(ProviderCost::micros_rounded),
+            provider_cost: cost,
         },
     );
 }
@@ -285,6 +287,7 @@ pub struct LlmClient {
     request_timeout: Duration,
     timeout_retry_timeout: Duration,
     review_deadline: Option<Instant>,
+    scorer_deadline: Option<Instant>,
     total_deadline: Option<Instant>,
     admission: Arc<Mutex<ProviderAdmission>>,
     call_ordinal: Arc<AtomicU32>,
@@ -579,6 +582,7 @@ impl LlmClient {
             request_timeout,
             timeout_retry_timeout: request_timeout.min(Duration::from_secs(TIMEOUT_RETRY_CAP_SECS)),
             review_deadline,
+            scorer_deadline: None,
             total_deadline,
             admission: Arc::new(Mutex::new(ProviderAdmission::default())),
             call_ordinal: Arc::new(AtomicU32::new(0)),
@@ -594,7 +598,7 @@ impl LlmClient {
         usage: Option<Usage>,
     ) -> ModelUsage {
         let reported = usage.is_some_and(|value| {
-            value.prompt_tokens > 0 || value.completion_tokens > 0 || value.cost_micros.is_some()
+            value.prompt_tokens > 0 || value.completion_tokens > 0 || value.provider_cost.is_some()
         });
         let usage = usage.unwrap_or_default();
         ModelUsage {
@@ -606,7 +610,8 @@ impl LlmClient {
             prompt_tokens: usage.prompt_tokens,
             completion_tokens: usage.completion_tokens,
             cost_micros: usage.cost_micros,
-            cost_source: Some(if usage.cost_micros.is_some() {
+            cost_provider_decimal: usage.provider_cost.map(|value| value.to_string()),
+            cost_source: Some(if usage.provider_cost.is_some() {
                 ModelUsageCostSource::ProviderReported
             } else {
                 ModelUsageCostSource::Unavailable
@@ -914,7 +919,14 @@ impl LlmClient {
         system: &str,
         user: &str,
         expected_len: usize,
+        timeout: Duration,
     ) -> std::result::Result<ScorerReview, ModelError> {
+        let mut scorer_client = self.clone();
+        let deadline = Instant::now() + timeout;
+        scorer_client.scorer_deadline = Some(
+            self.total_deadline
+                .map_or(deadline, |total| deadline.min(total)),
+        );
         let mut failed_usage = Usage::default();
         let mut failed_model_usage = Vec::new();
         let mut failed_incidents: Vec<ModelIncident> = Vec::new();
@@ -929,7 +941,7 @@ impl LlmClient {
                 chain.len()
             );
             let started_at = Instant::now();
-            match self
+            match scorer_client
                 .score_with_model(model, system, user, expected_len)
                 .await
             {
@@ -1705,7 +1717,7 @@ impl LlmClient {
                         usage,
                         u.prompt_tokens.unwrap_or(0),
                         u.completion_tokens.unwrap_or(0),
-                        u.cost,
+                        u.cost.and_then(|raw| ProviderCost::parse(raw.get())),
                     );
                 }
                 parsed
@@ -1863,7 +1875,12 @@ impl LlmClient {
             .ok_or_else(|| anyhow!("model provider reported token spend overflowed"))?;
         let total_cost = admission
             .reported_cost_micros
-            .checked_add(usage.cost_micros.unwrap_or(0))
+            .checked_add(
+                usage
+                    .provider_cost
+                    .and_then(ProviderCost::micros_ceiling)
+                    .unwrap_or(0),
+            )
             .ok_or_else(|| anyhow!("model provider reported cost overflowed"))?;
         ensure!(
             total_tokens <= MAX_REPORTED_TOKEN_SPEND,
@@ -1895,7 +1912,8 @@ impl LlmClient {
     fn remaining_budget(&self, phase: LlmPhase) -> Result<Option<Duration>> {
         let deadline = match phase {
             LlmPhase::Review => self.review_deadline,
-            LlmPhase::Scorer | LlmPhase::Respond | LlmPhase::Total => self.total_deadline,
+            LlmPhase::Scorer => self.scorer_deadline.or(self.total_deadline),
+            LlmPhase::Respond | LlmPhase::Total => self.total_deadline,
         };
         let Some(deadline) = deadline else {
             return Ok(None);
@@ -2059,6 +2077,11 @@ fn safe_response_summary(
         })
     };
     let usage_value = value.get("usage").filter(|usage| usage.is_object());
+    let exact_cost = serde_json::from_str::<ChatResponse>(text)
+        .ok()
+        .and_then(|response| response.usage)
+        .and_then(|usage| usage.cost)
+        .and_then(|raw| ProviderCost::parse(raw.get()));
     let usage = match api_format {
         ApiFormat::OpenaiCompatible => usage_value.map(|usage| Usage {
             prompt_tokens: usage
@@ -2069,10 +2092,8 @@ fn safe_response_summary(
                 .get("completion_tokens")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0),
-            cost_micros: usage
-                .get("cost")
-                .and_then(serde_json::Value::as_f64)
-                .and_then(cost_to_micros),
+            cost_micros: exact_cost.and_then(ProviderCost::micros_rounded),
+            provider_cost: exact_cost,
         }),
         ApiFormat::Anthropic => usage_value.map(|usage| Usage {
             prompt_tokens: usage
@@ -2084,6 +2105,7 @@ fn safe_response_summary(
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0),
             cost_micros: None,
+            provider_cost: None,
         }),
     };
     SafeResponseSummary {
@@ -2169,7 +2191,7 @@ struct Message {
 struct ChatUsage {
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
-    cost: Option<f64>,
+    cost: Option<Box<serde_json::value::RawValue>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2195,6 +2217,9 @@ struct AnthropicUsage {
 fn secure_http_client(api_base: &str) -> Result<reqwest::Client> {
     let (hostname, addresses) = resolve_api_endpoint(api_base)?;
     reqwest::Client::builder()
+        // A system proxy resolves the destination itself and would bypass the
+        // validated, pinned DNS result below while carrying provider secrets.
+        .no_proxy()
         // Provider credentials and prompts must never follow an endpoint's
         // redirect to another origin or into an internal network.
         .redirect(reqwest::redirect::Policy::none())
@@ -2614,6 +2639,10 @@ fn consensus_merge(runs: Vec<ModelReview>) -> ModelReview {
         cost_micros: runs
             .iter()
             .try_fold(0u64, |sum, run| sum.checked_add(run.usage.cost_micros?)),
+        provider_cost: runs.iter().try_fold(
+            ProviderCost::parse("0").expect("zero provider cost parses"),
+            |sum, run| sum.checked_add(run.usage.provider_cost?),
+        ),
     };
     let models: Vec<String> = runs.iter().map(|r| r.model_used.clone()).collect();
     let model_usage = runs.iter().flat_map(|r| r.model_usage.clone()).collect();

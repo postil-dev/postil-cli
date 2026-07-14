@@ -1,6 +1,7 @@
 //! GitHub forge implementation (github.com and GHES via GITHUB_API_URL).
 
 use anyhow::{Context, Result, anyhow, ensure};
+use futures::{StreamExt, TryStreamExt, stream};
 use reqwest::header::HeaderMap;
 use serde::Deserialize;
 use serde_json::json;
@@ -64,6 +65,24 @@ impl GitHub {
         if let Some(details_url) = &self.details_url {
             body["details_url"] = json!(details_url);
         }
+    }
+
+    async fn fetch_pr_head_sha(&self) -> Result<String> {
+        let response = self
+            .send_retryable(
+                self.request(
+                    reqwest::Method::GET,
+                    self.url(&format!("/pulls/{}", self.pr)),
+                ),
+                "PR head fetch",
+            )
+            .await?;
+        let pr: PrResponse = super::bounded_response_json(
+            Self::check_ok(response, "PR head fetch").await?,
+            "GitHub PR head",
+        )
+        .await?;
+        Ok(pr.head.sha)
     }
 
     async fn check_ok(resp: reqwest::Response, what: &str) -> Result<reqwest::Response> {
@@ -247,27 +266,43 @@ impl GitHub {
     }
 
     async fn review_exists(&self, marker: &str, head_sha: &str) -> Result<bool> {
-        let response = self
-            .send_retryable(
-                self.request(
-                    reqwest::Method::GET,
-                    self.url(&format!("/pulls/{}/reviews?per_page=100", self.pr)),
-                ),
-                "review reconciliation",
+        const PAGE_SIZE: usize = 100;
+        const MAX_PAGES: usize = 20;
+        for page in 1..=MAX_PAGES {
+            let response = self
+                .send_retryable(
+                    self.request(
+                        reqwest::Method::GET,
+                        self.url(&format!(
+                            "/pulls/{}/reviews?per_page={PAGE_SIZE}&page={page}",
+                            self.pr
+                        )),
+                    ),
+                    "review reconciliation",
+                )
+                .await?;
+            let reviews: Vec<PublishedReview> = super::bounded_response_json(
+                Self::check_ok(response, "review reconciliation").await?,
+                "GitHub review reconciliation",
             )
             .await?;
-        let reviews: Vec<PublishedReview> = super::bounded_response_json(
-            Self::check_ok(response, "review reconciliation").await?,
-            "GitHub review reconciliation",
-        )
-        .await?;
-        Ok(reviews.into_iter().any(|review| {
-            review.commit_id.as_deref() == Some(head_sha)
-                && review
-                    .body
-                    .as_deref()
-                    .is_some_and(|body| body.contains(marker))
-        }))
+            let page_len = reviews.len();
+            if reviews.into_iter().any(|review| {
+                review.commit_id.as_deref() == Some(head_sha)
+                    && review
+                        .body
+                        .as_deref()
+                        .is_some_and(|body| body.contains(marker))
+            }) {
+                return Ok(true);
+            }
+            if page_len < PAGE_SIZE {
+                return Ok(false);
+            }
+        }
+        Err(anyhow!(
+            "GitHub review reconciliation exceeded {MAX_PAGES} pages; refusing an unsafe retry"
+        ))
     }
 
     async fn send_review_reconciled(
@@ -317,23 +352,39 @@ impl GitHub {
     }
 
     async fn comment_exists(&self, number: u64, marker: &str) -> Result<bool> {
-        let response = self
-            .send_retryable(
-                self.request(
-                    reqwest::Method::GET,
-                    self.url(&format!("/issues/{number}/comments?per_page=100")),
-                ),
-                "comment reconciliation",
+        const PAGE_SIZE: usize = 100;
+        const MAX_PAGES: usize = 20;
+        for page in 1..=MAX_PAGES {
+            let response = self
+                .send_retryable(
+                    self.request(
+                        reqwest::Method::GET,
+                        self.url(&format!(
+                            "/issues/{number}/comments?per_page={PAGE_SIZE}&page={page}&sort=created&direction=desc"
+                        )),
+                    ),
+                    "comment reconciliation",
+                )
+                .await?;
+            let comments: Vec<PublishedComment> = super::bounded_response_json(
+                Self::check_ok(response, "comment reconciliation").await?,
+                "GitHub comment reconciliation",
             )
             .await?;
-        let comments: Vec<PublishedComment> = super::bounded_response_json(
-            Self::check_ok(response, "comment reconciliation").await?,
-            "GitHub comment reconciliation",
-        )
-        .await?;
-        Ok(comments
-            .into_iter()
-            .any(|comment| comment.body.contains(marker)))
+            let page_len = comments.len();
+            if comments
+                .into_iter()
+                .any(|comment| comment.body.contains(marker))
+            {
+                return Ok(true);
+            }
+            if page_len < PAGE_SIZE {
+                return Ok(false);
+            }
+        }
+        Err(anyhow!(
+            "GitHub comment reconciliation exceeded {MAX_PAGES} pages; refusing an unsafe retry"
+        ))
     }
 
     async fn post_comment_reconciled(&self, number: u64, body: &str, marker: &str) -> Result<()> {
@@ -481,35 +532,53 @@ impl GitHub {
         head_sha: &str,
         context: &str,
     ) -> Result<String> {
-        let mut output = String::new();
-        let mut acquired_bytes = 0usize;
         let mut seen = HashSet::with_capacity(files.len());
-        for file in files {
-            validate_pull_file(&file, context)?;
+        for file in &files {
+            validate_pull_file(file, context)?;
             ensure!(
                 seen.insert(file.filename.clone()),
                 "{context} returned a duplicate file"
             );
-            let old_path = file.previous_filename.as_deref().unwrap_or(&file.filename);
-            let (is_add, is_delete) = match file.status.as_str() {
-                "added" => (true, false),
-                "removed" => (false, true),
-                "modified" | "changed" | "copied" | "renamed" => (false, false),
-                _ => unreachable!("validated above"),
-            };
-            let (old, old_bytes) = if is_add {
-                (String::new(), 0)
-            } else {
-                self.source_file(base_sha, old_path).await?
-            };
+        }
+        let mut sections = stream::iter(files.into_iter().enumerate().map(
+            |(index, file)| async move {
+                let old_path = file.previous_filename.as_deref().unwrap_or(&file.filename);
+                let (is_add, is_delete) = match file.status.as_str() {
+                    "added" => (true, false),
+                    "removed" => (false, true),
+                    "modified" | "changed" | "copied" | "renamed" => (false, false),
+                    _ => unreachable!("validated above"),
+                };
+                let (old, old_bytes) = if is_add {
+                    (String::new(), 0)
+                } else {
+                    self.source_file(base_sha, old_path).await?
+                };
+                let (new, new_bytes) = if is_delete {
+                    (String::new(), 0)
+                } else {
+                    self.source_file(head_sha, &file.filename).await?
+                };
+                let section = super::azure::diff_section(
+                    old_path,
+                    &file.filename,
+                    &old,
+                    &new,
+                    is_add,
+                    is_delete,
+                );
+                Ok::<_, anyhow::Error>((index, old_bytes, new_bytes, section))
+            },
+        ))
+        .buffer_unordered(8)
+        .try_collect::<Vec<_>>()
+        .await?;
+        sections.sort_unstable_by_key(|(index, _, _, _)| *index);
+        let mut output = String::new();
+        let mut acquired_bytes = 0usize;
+        for (_, old_bytes, new_bytes, section) in sections {
             acquired_bytes = checked_acquired_bytes(acquired_bytes, old_bytes, context)?;
-            let (new, new_bytes) = if is_delete {
-                (String::new(), 0)
-            } else {
-                self.source_file(head_sha, &file.filename).await?
-            };
             acquired_bytes = checked_acquired_bytes(acquired_bytes, new_bytes, context)?;
-            let section = super::azure::diff_section(&file.filename, &old, &new, is_add, is_delete);
             ensure!(
                 output.len().saturating_add(section.len())
                     <= crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES,
@@ -568,87 +637,6 @@ fn validate_pull_file(file: &PullFile, context: &str) -> Result<()> {
         "{context} omitted the previous path for a renamed file"
     );
     Ok(())
-}
-
-#[cfg(test)]
-fn render_complete_file_patches(files: Vec<PullFile>, context: &str) -> Result<String> {
-    let mut seen = HashSet::with_capacity(files.len());
-    let mut output = String::new();
-    for file in files {
-        ensure!(
-            super::valid_repository_path(&file.filename),
-            "{context} returned an unsafe repository path"
-        );
-        if let Some(previous) = file.previous_filename.as_deref() {
-            ensure!(
-                super::valid_repository_path(previous),
-                "{context} returned an unsafe previous repository path"
-            );
-        }
-        ensure!(
-            seen.insert(file.filename.clone()),
-            "{context} returned duplicate file {}",
-            file.filename
-        );
-        let old_path = file.previous_filename.as_deref().unwrap_or(&file.filename);
-        let old_marker = crate::diff::display_path(&format!("a/{old_path}"));
-        let new_marker = crate::diff::display_path(&format!("b/{}", file.filename));
-        let mut section = format!("diff --git {old_marker} {new_marker}\n");
-        match file.status.as_str() {
-            "added" => section.push_str(&format!("--- /dev/null\n+++ {new_marker}\n")),
-            "removed" => section.push_str(&format!("--- {old_marker}\n+++ /dev/null\n")),
-            "renamed" => {
-                section.push_str(&format!(
-                    "rename from {}\nrename to {}\n--- {old_marker}\n+++ {new_marker}\n",
-                    crate::diff::display_path(old_path),
-                    crate::diff::display_path(&file.filename)
-                ));
-            }
-            "modified" | "changed" | "copied" => {
-                section.push_str(&format!("--- {old_marker}\n+++ {new_marker}\n"));
-            }
-            other => {
-                return Err(anyhow!(
-                    "{context} returned unsupported file status {other:?}"
-                ));
-            }
-        }
-        match file.patch {
-            Some(patch) => {
-                ensure!(
-                    patch.starts_with("@@") || patch.is_empty(),
-                    "{context} returned a malformed patch for {}",
-                    file.filename
-                );
-                section.push_str(&patch);
-                if !section.ends_with('\n') {
-                    section.push('\n');
-                }
-            }
-            None if file.changes == 0 => {
-                section.push_str(&format!(
-                    "Binary files {old_marker} and {new_marker} differ\n"
-                ));
-            }
-            None => {
-                return Err(anyhow!(
-                    "{context} omitted the patch for changed text file {}; refusing an incomplete review",
-                    file.filename
-                ));
-            }
-        }
-        let next_len = output
-            .len()
-            .checked_add(section.len())
-            .ok_or_else(|| anyhow!("{context} reconstructed diff size overflowed"))?;
-        ensure!(
-            next_len <= crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES,
-            "{context} reconstructed diff exceeds the {} byte acquisition limit",
-            crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES
-        );
-        output.push_str(&section);
-    }
-    Ok(output)
 }
 
 fn safe_numeric_header(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -834,6 +822,8 @@ impl PullFile {
 
 #[derive(Deserialize)]
 struct CompareResponse {
+    merge_base_commit: RefObj,
+    #[serde(default)]
     files: Vec<PullFile>,
 }
 
@@ -897,32 +887,56 @@ impl Forge for GitHub {
         let pr: PrResponse =
             super::bounded_response_json(Self::check_ok(resp, "PR fetch").await?, "GitHub PR")
                 .await?;
+        ensure!(
+            valid_object_id(&pr.base.sha) && valid_object_id(&pr.head.sha),
+            "GitHub PR refs must be hexadecimal object ids"
+        );
+        let compare_response = self
+            .send_retryable(
+                self.request(
+                    reqwest::Method::GET,
+                    self.url(&format!("/compare/{}...{}", pr.base.sha, pr.head.sha)),
+                ),
+                "PR merge-base fetch",
+            )
+            .await?;
+        let compare: CompareResponse = super::bounded_response_json(
+            Self::check_ok(compare_response, "PR merge-base fetch").await?,
+            "GitHub PR merge-base response",
+        )
+        .await?;
+        ensure!(
+            valid_object_id(&compare.merge_base_commit.sha),
+            "GitHub merge base must be a hexadecimal object id"
+        );
         Ok(PrMeta {
             title: pr.title,
             body: pr.body.unwrap_or_default(),
             head_sha: pr.head.sha,
-            base_sha: pr.base.sha,
+            base_sha: compare.merge_base_commit.sha,
+            changed_files: Some(pr.changed_files),
         })
     }
 
-    async fn fetch_diff(&self) -> Result<String> {
-        let meta_response = self
-            .send_retryable(
-                self.request(
-                    reqwest::Method::GET,
-                    self.url(&format!("/pulls/{}", self.pr)),
-                ),
-                "PR diff metadata fetch",
-            )
-            .await?;
-        let meta: PrResponse = super::bounded_response_json(
-            Self::check_ok(meta_response, "PR diff metadata fetch").await?,
-            "GitHub PR diff metadata",
+    async fn fetch_diff(&self, snapshot: &PrMeta) -> Result<String> {
+        let expected = snapshot
+            .changed_files
+            .context("GitHub immutable review snapshot is missing its changed-file count")?;
+        let files = self.pull_files(expected).await?;
+        let current = self.fetch_pr_meta().await?;
+        ensure!(
+            current.head_sha == snapshot.head_sha
+                && current.base_sha == snapshot.base_sha
+                && current.changed_files == snapshot.changed_files,
+            "GitHub PR changed while its file list was being acquired"
+        );
+        self.build_complete_diff(
+            files,
+            &snapshot.base_sha,
+            &snapshot.head_sha,
+            "GitHub PR files API",
         )
-        .await?;
-        let files = self.pull_files(meta.changed_files).await?;
-        self.build_complete_diff(files, &meta.base.sha, &meta.head.sha, "GitHub PR files API")
-            .await
+        .await
     }
 
     async fn fetch_diff_since(&self, since_sha: &str, head_sha: &str) -> Result<String> {
@@ -965,8 +979,11 @@ impl Forge for GitHub {
         if !findings.is_empty() && findings.iter().all(filter::is_carried) {
             return Ok(());
         }
-        let current_head = self.fetch_pr_meta().await?.head_sha;
-        if current_head != head_sha {
+        if !self.head_is_current(head_sha).await? {
+            let current_head = self
+                .fetch_pr_head_sha()
+                .await
+                .unwrap_or_else(|_| "unknown".to_string());
             eprintln!(
                 "postil: github review delivery skipped because PR head changed reviewed_head={} current_head={}",
                 short_sha(head_sha),
@@ -1067,6 +1084,10 @@ impl Forge for GitHub {
             ids.push(run.id.to_string());
         }
         Ok((ids[0].clone(), ids[1].clone()))
+    }
+
+    async fn head_is_current(&self, expected_head_sha: &str) -> Result<bool> {
+        Ok(self.fetch_pr_head_sha().await? == expected_head_sha)
     }
 
     async fn complete_checks(
@@ -1227,9 +1248,8 @@ fn comment_marker(number: u64, body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        GitHub, PullFile, gate_summary, github_retry_delay_at, github_retryable_response,
-        github_transport_retry_delay, only_operational_findings, render_complete_file_patches,
-        valid_details_url,
+        GitHub, gate_summary, github_retry_delay_at, github_retryable_response,
+        github_transport_retry_delay, only_operational_findings, valid_details_url,
     };
     use crate::envelope::{Envelope, Finding, Gate, Kind, Severity, Usage};
     use crate::forge::{CheckState, Forge};
@@ -1703,28 +1723,5 @@ mod tests {
         assert!(summary.contains("merge check remains blocked"));
         assert!(!summary.contains("provider"));
         assert!(!summary.contains("timeout"));
-    }
-
-    #[test]
-    fn complete_file_patch_reconstruction_rejects_omitted_text() {
-        let omitted = PullFile {
-            filename: "src/a.rs".into(),
-            status: "modified".into(),
-            previous_filename: None,
-            patch: None,
-            changes: 2,
-        };
-        assert!(render_complete_file_patches(vec![omitted], "test").is_err());
-
-        let complete = PullFile {
-            filename: "src/a.rs".into(),
-            status: "modified".into(),
-            previous_filename: None,
-            patch: Some("@@ -1 +1 @@\n-old\n+new".into()),
-            changes: 2,
-        };
-        let diff = render_complete_file_patches(vec![complete], "test").unwrap();
-        let parsed = crate::diff::parse(&diff);
-        assert!(crate::diff::DiffIndex::build(&parsed).contains("src/a.rs", 1));
     }
 }

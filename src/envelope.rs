@@ -393,6 +393,133 @@ pub struct Usage {
     /// Durable attribution is emitted per model through `ModelUsage`.
     #[serde(skip)]
     pub cost_micros: Option<u64>,
+    /// Exact provider-reported decimal dollars. This remains in memory for
+    /// aggregation; durable call records serialize its canonical decimal text.
+    #[serde(skip)]
+    pub provider_cost: Option<ProviderCost>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderCost {
+    coefficient: u128,
+    scale: u32,
+}
+
+impl ProviderCost {
+    pub fn parse(raw: &str) -> Option<Self> {
+        let raw = raw.trim();
+        if raw.is_empty() || raw.starts_with('-') || raw.starts_with('+') {
+            return None;
+        }
+        let (base, exponent) =
+            raw.split_once(['e', 'E'])
+                .map_or((raw, 0i32), |(base, exponent)| {
+                    exponent
+                        .parse::<i32>()
+                        .ok()
+                        .map(|value| (base, value))
+                        .unwrap_or(("", 0))
+                });
+        if base.is_empty() {
+            return None;
+        }
+        let mut digits = String::new();
+        let mut fractional = 0i32;
+        let mut seen_dot = false;
+        for character in base.chars() {
+            match character {
+                '0'..='9' => {
+                    digits.push(character);
+                    if seen_dot {
+                        fractional = fractional.checked_add(1)?;
+                    }
+                }
+                '.' if !seen_dot => seen_dot = true,
+                _ => return None,
+            }
+        }
+        if digits.is_empty() {
+            return None;
+        }
+        let mut coefficient = digits.parse::<u128>().ok()?;
+        let adjusted_scale = fractional.checked_sub(exponent)?;
+        let mut scale = if adjusted_scale < 0 {
+            let zeros = u32::try_from(-adjusted_scale).ok()?;
+            coefficient = coefficient.checked_mul(10u128.checked_pow(zeros)?)?;
+            0
+        } else {
+            u32::try_from(adjusted_scale).ok()?
+        };
+        while scale > 0 && coefficient % 10 == 0 {
+            coefficient /= 10;
+            scale -= 1;
+        }
+        Some(Self { coefficient, scale })
+    }
+
+    pub fn checked_add(self, other: Self) -> Option<Self> {
+        let scale = self.scale.max(other.scale);
+        let left = self
+            .coefficient
+            .checked_mul(10u128.checked_pow(scale - self.scale)?)?;
+        let right = other
+            .coefficient
+            .checked_mul(10u128.checked_pow(scale - other.scale)?)?;
+        let mut value = Self {
+            coefficient: left.checked_add(right)?,
+            scale,
+        };
+        while value.scale > 0 && value.coefficient.is_multiple_of(10) {
+            value.coefficient /= 10;
+            value.scale -= 1;
+        }
+        Some(value)
+    }
+
+    pub fn micros_rounded(self) -> Option<u64> {
+        let micros = if self.scale <= 6 {
+            self.coefficient
+                .checked_mul(10u128.checked_pow(6 - self.scale)?)?
+        } else {
+            let divisor = 10u128.checked_pow(self.scale - 6)?;
+            let quotient = self.coefficient / divisor;
+            let remainder = self.coefficient % divisor;
+            quotient.checked_add(u128::from(remainder.saturating_mul(2) >= divisor))?
+        };
+        u64::try_from(micros).ok()
+    }
+
+    pub fn micros_ceiling(self) -> Option<u64> {
+        let micros = if self.scale <= 6 {
+            self.coefficient
+                .checked_mul(10u128.checked_pow(6 - self.scale)?)?
+        } else {
+            let divisor = 10u128.checked_pow(self.scale - 6)?;
+            self.coefficient.div_ceil(divisor)
+        };
+        u64::try_from(micros).ok()
+    }
+}
+
+impl std::fmt::Display for ProviderCost {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.scale == 0 {
+            return write!(formatter, "{}", self.coefficient);
+        }
+        let digits = self.coefficient.to_string();
+        let scale = self.scale as usize;
+        if digits.len() <= scale {
+            write!(
+                formatter,
+                "0.{}{}",
+                "0".repeat(scale - digits.len()),
+                digits
+            )
+        } else {
+            let split = digits.len() - scale;
+            write!(formatter, "{}.{}", &digits[..split], &digits[split..])
+        }
+    }
 }
 
 /// Token usage attributed to one provider call. Entries include successful
@@ -420,6 +547,10 @@ pub struct ModelUsage {
     /// Exact provider-billed cost when supplied by the endpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_micros: Option<u64>,
+    /// Canonical provider-reported decimal dollars, without binary floating-
+    /// point conversion. `costMicros` remains a rounded display/index value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_provider_decimal: Option<String>,
     /// Explains whether cost came from the provider or is unavailable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_source: Option<ModelUsageCostSource>,
@@ -920,5 +1051,18 @@ mod tests {
         let decoded: Envelope = serde_json::from_value(v).unwrap();
         assert!(decoded.suppressed_findings.is_empty());
         assert!(decoded.model_incidents.is_empty());
+    }
+
+    #[test]
+    fn provider_cost_preserves_decimal_precision_and_derives_micros() {
+        let first = ProviderCost::parse("0.00000049").unwrap();
+        let second = ProviderCost::parse("1.2300e-6").unwrap();
+        assert_eq!(first.to_string(), "0.00000049");
+        assert_eq!(first.micros_rounded(), Some(0));
+        assert_eq!(first.micros_ceiling(), Some(1));
+        assert_eq!(second.to_string(), "0.00000123");
+        assert_eq!(first.checked_add(second).unwrap().to_string(), "0.00000172");
+        assert!(ProviderCost::parse("-0.1").is_none());
+        assert!(ProviderCost::parse("NaN").is_none());
     }
 }

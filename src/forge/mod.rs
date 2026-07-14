@@ -1,7 +1,7 @@
 //! Forge abstraction: everything Postil needs from a code host.
 //!
-//! Ships GitHub, GitLab, Bitbucket, and Azure DevOps. Each covers its
-//! self-managed/server variant through a custom base-URL environment variable.
+//! Ships GitHub, GitLab, Bitbucket Cloud, and Azure DevOps. GitHub, GitLab, and
+//! Azure cover self-managed variants through a custom base URL.
 
 pub mod azure;
 pub mod bitbucket;
@@ -211,12 +211,17 @@ pub fn severity_icon(severity: Severity) -> String {
     })
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrMeta {
     pub title: String,
     pub body: String,
     pub head_sha: String,
+    /// Exact merge base selected for this review snapshot. This is never the
+    /// moving target-branch tip when the forge exposes a distinct merge base.
     pub base_sha: String,
+    /// Authoritative changed-file count when the forge exposes one cheaply.
+    /// It is used only to size a bounded acquisition deadline.
+    pub changed_files: Option<usize>,
 }
 
 /// Check conclusions, mapped per-forge. Postil semantics:
@@ -256,8 +261,9 @@ pub trait Forge {
         check_summary(envelope, self.rich_markdown(), SummaryContext::from_env())
     }
     async fn fetch_pr_meta(&self) -> Result<PrMeta>;
-    /// Unified diff of the full PR.
-    async fn fetch_diff(&self) -> Result<String>;
+    /// Unified diff of the immutable snapshot returned by `fetch_pr_meta`.
+    /// Implementations must not re-read a moving PR head or target tip.
+    async fn fetch_diff(&self, snapshot: &PrMeta) -> Result<String>;
     /// Unified diff covering `since_sha..head_sha` only (incremental reviews).
     /// `head_sha` is the SHA the caller is reviewing, not whatever the PR's
     /// head happens to be at fetch time. A later push must not widen the diff.
@@ -275,6 +281,12 @@ pub trait Forge {
         gate: CheckState,
         envelope: &Envelope,
     ) -> Result<()>;
+
+    /// Confirm that publication still targets the snapshot that was reviewed.
+    /// The caller checks this before publishing either comments or conclusions.
+    async fn head_is_current(&self, expected_head_sha: &str) -> Result<bool> {
+        Ok(self.fetch_pr_meta().await?.head_sha == expected_head_sha)
+    }
 
     /// Title and body of the issue/PR/MR a maintainer mentioned Postil on, used
     /// to ground the answer (`postil respond`). `kind` disambiguates the number

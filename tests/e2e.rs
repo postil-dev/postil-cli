@@ -1,6 +1,8 @@
 //! End-to-end tests: the real binary against mocked LLM and forge endpoints.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use assert_cmd::Command;
 use serde_json::{Value, json};
@@ -164,7 +166,34 @@ impl Respond for GitHubSourceResponder {
     }
 }
 
+#[derive(Clone)]
+struct GitHubHeadRaceResponder {
+    calls: Arc<AtomicUsize>,
+}
+
+impl Respond for GitHubHeadRaceResponder {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let head = if call < 2 { "aaaaaaaa" } else { "cccccccc" };
+        ResponseTemplate::new(200).set_body_json(json!({
+            "title": "t",
+            "body": "b",
+            "head": {"sha": head},
+            "base": {"sha": "bbbbbbbb"},
+            "changed_files": 1
+        }))
+    }
+}
+
 async fn mount_github_complete_diff(server: &MockServer, pr: u64) {
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/repos/acme/api/compare/b+\.\.\.a+$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "merge_base_commit": {"sha": "bbbbbbbb"},
+            "files": []
+        })))
+        .mount(server)
+        .await;
     Mock::given(method("GET"))
         .and(path(format!("/repos/acme/api/pulls/{pr}/files")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
@@ -200,7 +229,18 @@ impl Respond for BitbucketSourceResponder {
     }
 }
 
+async fn mount_bitbucket_merge_base(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/repositories/acme/api/merge-base/b+\.\.a+$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "hash": "bbbbbbbb"
+        })))
+        .mount(server)
+        .await;
+}
+
 async fn mount_bitbucket_complete_diff(server: &MockServer) {
+    mount_bitbucket_merge_base(server).await;
     Mock::given(method("GET"))
         .and(path("/repositories/acme/api/pullrequests/7/diffstat"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -246,6 +286,18 @@ async fn mount_gitlab_source_files(server: &MockServer) {
     Mock::given(method("GET"))
         .and(path_regex(r"^/projects/.+/repository/files/.+/raw$"))
         .respond_with(GitLabSourceResponder)
+        .mount(server)
+        .await;
+}
+
+async fn mount_azure_merge_base(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path(
+            "/myorg/myproj/_apis/git/repositories/myrepo/commits/BASE/mergebases",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "commitId": "BASE"
+        }])))
         .mount(server)
         .await;
 }
@@ -2519,10 +2571,9 @@ fn review_rejects_unknown_output_format() {
 }
 
 #[tokio::test]
-async fn full_remote_review_fetches_metadata_and_diff_concurrently() {
+async fn full_remote_review_uses_an_immutable_merge_base_snapshot() {
     let server = MockServer::start().await;
     mount_github_complete_diff(&server, 7).await;
-    let forge_delay = std::time::Duration::from_millis(1000);
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
@@ -2531,28 +2582,19 @@ async fn full_remote_review_fetches_metadata_and_diff_concurrently() {
     Mock::given(method("GET"))
         .and(path("/repos/acme/api/pulls/7"))
         .and(header("Accept", "application/vnd.github.v3.diff"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_delay(forge_delay)
-                .set_body_string(DIFF),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_string(DIFF))
         .mount(&server)
         .await;
     Mock::given(method("GET"))
         .and(path("/repos/acme/api/pulls/7"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_delay(forge_delay)
-                .set_body_json(json!({
-                    "title": "t", "body": "b",
-                    "head": {"sha": "headsha111"}, "base": {"sha": "basesha222"}, "changed_files": 1
-                })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "t", "body": "b",
+            "head": {"sha": "aaaaaaaaaaaa"}, "base": {"sha": "bbbbbbbbbbbb"}, "changed_files": 1
+        })))
         .mount(&server)
         .await;
 
     let dir = tempfile::tempdir().unwrap();
-    let started = std::time::Instant::now();
     postil()
         .current_dir(dir.path())
         .env("POSTIL_API_BASE", server.uri())
@@ -2570,11 +2612,10 @@ async fn full_remote_review_fetches_metadata_and_diff_concurrently() {
         .assert()
         .code(0);
 
-    assert!(
-        started.elapsed() < std::time::Duration::from_millis(1800),
-        "two 1000ms forge reads did not overlap: {:?}",
-        started.elapsed()
-    );
+    let requests = server.received_requests().await.unwrap();
+    assert!(requests.iter().any(|request| {
+        request.url.path() == "/repos/acme/api/compare/bbbbbbbbbbbb...aaaaaaaaaaaa"
+    }));
 }
 
 #[tokio::test]
@@ -2604,7 +2645,7 @@ async fn remote_setup_time_counts_against_total_llm_budget() {
                 .set_delay(forge_delay)
                 .set_body_json(json!({
                     "title": "t", "body": "b",
-                    "head": {"sha": "headsha111"}, "base": {"sha": "basesha222"}, "changed_files": 1
+                    "head": {"sha": "aaaaaaaaaaaa"}, "base": {"sha": "bbbbbbbbbbbb"}, "changed_files": 1
                 })),
         )
         .mount(&server)
@@ -2699,7 +2740,7 @@ async fn advisory_on_error_lets_gate_stand_aside() {
         .and(path("/repos/acme/api/pulls/7"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "t", "body": "b",
-            "head": {"sha": "headsha111"}, "base": {"sha": "basesha222"}, "changed_files": 1
+            "head": {"sha": "aaaaaaaaaaaa"}, "base": {"sha": "bbbbbbbbbbbb"}, "changed_files": 1
         })))
         .mount(&server)
         .await;
@@ -2755,6 +2796,14 @@ async fn advisory_on_error_lets_gate_stand_aside() {
 // error review comment posts. Parameterized by the .postil.yaml gate policy.
 async fn diff_fetch_failure_server() -> MockServer {
     let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/repos/acme/api/compare/b+\.\.\.a+$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "merge_base_commit": {"sha": "bbbbbbbb"},
+            "files": []
+        })))
+        .mount(&server)
+        .await;
     // The authoritative files fetch fails after meta already succeeded.
     Mock::given(method("GET"))
         .and(path("/repos/acme/api/pulls/7/files"))
@@ -2769,7 +2818,7 @@ async fn diff_fetch_failure_server() -> MockServer {
         .and(path("/repos/acme/api/pulls/7"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "t", "body": "b",
-            "head": {"sha": "headsha111"}, "base": {"sha": "basesha222"}, "changed_files": 1
+            "head": {"sha": "aaaaaaaaaaaa"}, "base": {"sha": "bbbbbbbbbbbb"}, "changed_files": 1
         })))
         .mount(&server)
         .await;
@@ -2816,7 +2865,7 @@ async fn diff_fetch_failure_advisory_emits_envelope_and_exits_zero() {
     // The envelope survived: provider-class error, gate passing under advisory.
     assert_eq!(env["findings"][0]["path"], ".postil/provider");
     assert_eq!(env["gate"]["failing"], false);
-    assert_eq!(env["headSha"], "headsha111");
+    assert_eq!(env["headSha"], "aaaaaaaaaaaa");
 
     // The advisory check went neutral, the gate success.
     let reqs = server.received_requests().await.unwrap();
@@ -3989,7 +4038,7 @@ async fn forge_post_failure_on_success_path_keeps_gate_derived_exit_code() {
         .and(path("/repos/acme/api/pulls/7"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "t", "body": "b",
-            "head": {"sha": "headsha111"}, "base": {"sha": "basesha222"}, "changed_files": 1
+            "head": {"sha": "aaaaaaaaaaaa"}, "base": {"sha": "bbbbbbbbbbbb"}, "changed_files": 1
         })))
         .mount(&server)
         .await;
@@ -4073,7 +4122,7 @@ async fn github_unresolved_inline_line_falls_back_once_to_summary_only() {
         .and(path("/repos/acme/api/pulls/7"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "t", "body": "b",
-            "head": {"sha": "headsha111"}, "base": {"sha": "basesha222"}, "changed_files": 1
+            "head": {"sha": "aaaaaaaaaaaa"}, "base": {"sha": "bbbbbbbbbbbb"}, "changed_files": 1
         })))
         .mount(&server)
         .await;
@@ -4173,7 +4222,7 @@ async fn hosted_path_completes_provided_check_run_ids_without_creating_new_ones(
             "--pr",
             "7",
             "--sha",
-            "h1",
+            "aaaaaaaa",
             "--check-run-id",
             "901",
             "--gate-check-run-id",
@@ -4223,7 +4272,7 @@ async fn github_flow_posts_review_and_completes_both_checks() {
         .and(path("/repos/acme/api/pulls/7"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "Add login", "body": "PR body",
-            "head": {"sha": "headsha111"}, "base": {"sha": "basesha222"}, "changed_files": 1
+            "head": {"sha": "aaaaaaaaaaaa"}, "base": {"sha": "bbbbbbbbbbbb"}, "changed_files": 1
         })))
         .mount(&server)
         .await;
@@ -4258,8 +4307,8 @@ async fn github_flow_posts_review_and_completes_both_checks() {
         .code(1);
     let env: Value =
         serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
-    assert_eq!(env["headSha"], "headsha111");
-    assert_eq!(env["baseSha"], "basesha222");
+    assert_eq!(env["headSha"], "aaaaaaaaaaaa");
+    assert_eq!(env["baseSha"], "bbbbbbbb");
 
     let reqs = server.received_requests().await.unwrap();
     // Two check-run creations.
@@ -4335,6 +4384,57 @@ async fn github_flow_posts_review_and_completes_both_checks() {
     );
 }
 
+#[tokio::test]
+async fn github_push_after_acquisition_suppresses_all_stale_publication() {
+    let server = MockServer::start().await;
+    mount_github_complete_diff(&server, 7).await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(llm_content(json!([finding_at(41, "error", 0.95)]))),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .respond_with(GitHubHeadRaceResponder {
+            calls: Arc::new(AtomicUsize::new(0)),
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/api/check-runs"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": 11})))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path_regex(r"^/repos/acme/api/check-runs/\d+$"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/api/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .args(["review", "--repo", "acme/api", "--pr", "7", "--output-json"])
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains(
+            "publication skipped because the pull request head changed",
+        ));
+}
+
 // An LLM response with a caller-provided summary and findings (used for
 // content-policy scenarios where the finding is not the standard auth one).
 fn llm_with_summary(summary: &str, findings: Value) -> Value {
@@ -4368,7 +4468,7 @@ async fn content_policy_pr_server(llm: Value) -> MockServer {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "Add login",
             "body": "This file is untracked and was written by Claude.",
-            "head": {"sha": "headsha111"}, "base": {"sha": "basesha222"}, "changed_files": 1
+            "head": {"sha": "aaaaaaaaaaaa"}, "base": {"sha": "bbbbbbbbbbbb"}, "changed_files": 1
         })))
         .mount(&server)
         .await;
@@ -4502,7 +4602,7 @@ async fn github_clean_pr_stays_silent_but_completes_checks() {
         .and(path("/repos/acme/api/pulls/7"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "t", "body": null,
-            "head": {"sha": "h1"}, "base": {"sha": "b1"}, "changed_files": 1
+            "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"}, "changed_files": 1
         })))
         .mount(&server)
         .await;
@@ -4727,9 +4827,9 @@ async fn same_head_with_open_baseline_falls_back_to_full_review() {
 
     let requests = server.received_requests().await.unwrap();
     assert!(
-        !requests
+        requests
             .iter()
-            .any(|request| request.url.path().contains("/compare/"))
+            .any(|request| { request.url.path() == "/repos/acme/api/compare/bbbbbbbb...aaaaaaaa" })
     );
     assert!(
         !requests
@@ -4752,6 +4852,14 @@ async fn same_head_with_open_baseline_falls_back_to_full_review() {
 #[tokio::test]
 async fn same_head_without_open_baseline_keeps_empty_diff_noop() {
     let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/compare/bbbbbbbb...aaaaaaaa"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "merge_base_commit": {"sha": "bbbbbbbb"},
+            "files": []
+        })))
+        .mount(&server)
+        .await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
@@ -4762,7 +4870,7 @@ async fn same_head_without_open_baseline_keeps_empty_diff_noop() {
         .and(path("/repos/acme/api/pulls/7"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "t", "body": null,
-            "head": {"sha": "h1"}, "base": {"sha": "b1"}, "changed_files": 1
+            "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"}, "changed_files": 1
         })))
         .mount(&server)
         .await;
@@ -4780,9 +4888,9 @@ async fn same_head_without_open_baseline_keeps_empty_diff_noop() {
             "--pr",
             "7",
             "--sha",
-            "h1",
+            "aaaaaaaa",
             "--since-sha",
-            "h1",
+            "aaaaaaaa",
             "--no-post",
             "--output-json",
         ])
@@ -4794,8 +4902,8 @@ async fn same_head_without_open_baseline_keeps_empty_diff_noop() {
     let requests = server.received_requests().await.unwrap();
     assert_eq!(
         requests.len(),
-        1,
-        "empty no-op fetched more than PR metadata"
+        2,
+        "empty no-op fetched more than the immutable PR snapshot"
     );
 }
 
@@ -4811,6 +4919,7 @@ async fn carried_only_incremental_run_updates_checks_without_posting_review() {
     Mock::given(method("GET"))
         .and(path("/repos/acme/api/compare/cccccccc...aaaaaaaa"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "merge_base_commit": {"sha": "cccccccc"},
             "files": [{"filename": "src/auth.rs", "status": "modified", "changes": 2}]
         })))
         .mount(&server)
@@ -4902,6 +5011,7 @@ async fn identical_fresh_finding_set_does_not_post_duplicate_review() {
     Mock::given(method("GET"))
         .and(path("/repos/acme/api/compare/cccccccc...aaaaaaaa"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "merge_base_commit": {"sha": "cccccccc"},
             "files": [{"filename": "src/auth.rs", "status": "modified", "changes": 2}]
         })))
         .mount(&server)
@@ -5126,6 +5236,7 @@ async fn bitbucket_flow_posts_comment_and_sets_statuses() {
 #[tokio::test]
 async fn bitbucket_incremental_is_disabled_without_verification_gate() {
     let server = MockServer::start().await;
+    mount_bitbucket_merge_base(&server).await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
@@ -5265,6 +5376,7 @@ async fn bitbucket_incremental_fetches_documented_compare_when_enabled() {
 #[tokio::test]
 async fn azure_flow_reconstructs_diff_and_posts_thread() {
     let server = MockServer::start().await;
+    mount_azure_merge_base(&server).await;
     // Small file: line 2 changes; the model flags line 2.
     let old_content = "fn login() {\n    let token = sanitize(user_input);\n}\n";
     let new_content = "fn login() {\n    let token = user_input;\n}\n";
@@ -5383,7 +5495,7 @@ async fn respond_to_pr_mention_posts_grounded_reply() {
         .and(path("/repos/acme/api/pulls/5"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "Add login", "body": "PR body",
-            "head": {"sha": "h"}, "base": {"sha": "b"}, "changed_files": 1
+            "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"}, "changed_files": 1
         })))
         .mount(&server)
         .await;
@@ -5706,7 +5818,7 @@ async fn respond_writes_private_usage_receipt_across_model_fallback() {
         .and(body_string_contains("backup-model"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "choices": [{"message": {"content": respond_payload("Use a bounded worker pool.", None)}}],
-            "usage": {"prompt_tokens": 20, "completion_tokens": 3}
+            "usage": {"prompt_tokens": 20, "completion_tokens": 3, "cost": 0.00000049}
         })))
         .expect(1)
         .mount(&server)
@@ -5751,7 +5863,12 @@ async fn respond_writes_private_usage_receipt_across_model_fallback() {
     assert!(stdout.contains("Use a bounded worker pool."));
     assert!(!stdout.contains("promptTokens"));
     let receipt: Value = serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
-    assert_eq!(receipt["version"], 1);
+    assert_eq!(receipt["version"], 2);
+    assert_eq!(receipt["models"][0]["role"], "mentionResponder");
+    assert_eq!(receipt["models"][0]["phase"], "initial");
+    assert!(receipt["models"][0]["callOrdinal"].is_number());
+    assert!(receipt["models"][0]["attempt"].is_number());
+    assert!(receipt["models"][0]["accountingComplete"].is_boolean());
     assert_eq!(receipt["operation"], "respond");
     assert_eq!(receipt["usageAccountingComplete"], true);
     assert_eq!(receipt["promptTokens"], 40);
@@ -5765,6 +5882,9 @@ async fn respond_writes_private_usage_receipt_across_model_fallback() {
     assert_eq!(receipt["models"][2]["model"], "backup-model");
     assert_eq!(receipt["models"][2]["promptTokens"], 20);
     assert_eq!(receipt["models"][2]["completionTokens"], 3);
+    assert_eq!(receipt["models"][2]["costProviderDecimal"], "0.00000049");
+    assert_eq!(receipt["models"][2]["costMicros"], 0);
+    assert_eq!(receipt["models"][2]["costSource"], "providerReported");
     assert_eq!(
         std::fs::metadata(&receipt_path)
             .unwrap()
@@ -6268,6 +6388,7 @@ async fn respond_bitbucket_pr_mention_posts_comment() {
 #[tokio::test]
 async fn respond_azure_pr_mention_posts_thread() {
     let server = MockServer::start().await;
+    mount_azure_merge_base(&server).await;
     let old_content = "fn login() {\n    let token = sanitize(user_input);\n}\n";
     let new_content = "fn login() {\n    let token = user_input;\n}\n";
     Mock::given(method("POST"))

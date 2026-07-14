@@ -11,6 +11,7 @@
 //! Azure has no neutral, so an operational error marks the gate `failed`.
 
 use anyhow::{Context, Result, anyhow, ensure};
+use futures::{StreamExt, TryStreamExt, stream};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -244,9 +245,8 @@ impl Azure {
 
     async fn build_diff(&self, base_sha: &str, head_sha: &str) -> Result<String> {
         let changes = self.change_list(base_sha, head_sha).await?;
-
-        let mut out = String::new();
-        for change in &changes {
+        let mut jobs = Vec::with_capacity(changes.len());
+        for change in changes {
             let item = &change.item;
             ensure!(!item.path.is_empty(), "Azure change item has an empty path");
             if item.is_folder {
@@ -282,20 +282,33 @@ impl Azure {
                 super::valid_repository_path(base_path),
                 "Azure change item has an unsafe source repository path"
             );
-            let old = if is_add {
-                String::new()
-            } else {
-                self.item_at(base_path, base_sha).await?
-            };
-            let new = if is_delete {
-                String::new()
-            } else {
-                self.item_at(path, head_sha).await?
-            };
-            if old == new {
-                continue;
-            }
-            let section = diff_section(path, &old, &new, is_add, is_delete);
+            jobs.push((base_path.to_string(), path.to_string(), is_add, is_delete));
+        }
+        let mut sections = stream::iter(jobs.into_iter().enumerate().map(
+            |(index, (base_path, path, is_add, is_delete))| async move {
+                let old = if is_add {
+                    String::new()
+                } else {
+                    self.item_at(&base_path, base_sha).await?
+                };
+                let new = if is_delete {
+                    String::new()
+                } else {
+                    self.item_at(&path, head_sha).await?
+                };
+                if old == new {
+                    return Ok::<_, anyhow::Error>((index, String::new()));
+                }
+                let section = diff_section(&base_path, &path, &old, &new, is_add, is_delete);
+                Ok((index, section))
+            },
+        ))
+        .buffer_unordered(8)
+        .try_collect::<Vec<_>>()
+        .await?;
+        sections.sort_unstable_by_key(|(index, _)| *index);
+        let mut out = String::new();
+        for (_, section) in sections {
             if out.len().saturating_add(section.len()) > crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES
             {
                 return Err(anyhow!(
@@ -397,19 +410,43 @@ impl Forge for Azure {
         let pr = self.pr().await?;
         let (source, target) =
             merge_commits(pr.last_merge_source_commit, pr.last_merge_target_commit)?;
+        let query = format!("otherCommitId={}", source.commit_id);
+        let merge_base_response = self
+            .request(
+                reqwest::Method::GET,
+                self.url(&format!("/commits/{}/mergebases", target.commit_id), &query),
+            )
+            .send()
+            .await
+            .context("fetching Azure pull request merge base")?;
+        let merge_bases: Vec<MergeCommit> = super::bounded_response_json(
+            Self::check_ok(merge_base_response, "merge-base fetch").await?,
+            "Azure merge-base response",
+        )
+        .await?;
+        ensure!(
+            merge_bases.len() == 1 && !merge_bases[0].commit_id.is_empty(),
+            "Azure pull request must have exactly one merge base"
+        );
         Ok(PrMeta {
             title: pr.title,
             body: pr.description,
             head_sha: source.commit_id,
-            base_sha: target.commit_id,
+            base_sha: merge_bases[0].commit_id.clone(),
+            changed_files: None,
         })
     }
 
-    async fn fetch_diff(&self) -> Result<String> {
-        let pr = self.pr().await?;
-        let (source, target) =
-            merge_commits(pr.last_merge_source_commit, pr.last_merge_target_commit)?;
-        self.build_diff(&target.commit_id, &source.commit_id).await
+    async fn fetch_diff(&self, snapshot: &PrMeta) -> Result<String> {
+        let diff = self
+            .build_diff(&snapshot.base_sha, &snapshot.head_sha)
+            .await?;
+        let current = self.fetch_pr_meta().await?;
+        ensure!(
+            current.head_sha == snapshot.head_sha && current.base_sha == snapshot.base_sha,
+            "Azure pull request changed while its diff was being acquired"
+        );
+        Ok(diff)
     }
 
     async fn fetch_diff_since(&self, since_sha: &str, head_sha: &str) -> Result<String> {
@@ -579,14 +616,15 @@ fn azure_page_complete(count: usize, marker: bool) -> Result<bool> {
 /// exceeds the per-file size cap. Split out of `build_diff` so the
 /// classification is unit-testable without network access.
 pub(super) fn diff_section(
-    path: &str,
+    old_path: &str,
+    new_path: &str,
     old: &str,
     new: &str,
     is_add: bool,
     is_delete: bool,
 ) -> String {
-    let old_marker = crate::diff::display_path(&format!("a/{path}"));
-    let new_marker = crate::diff::display_path(&format!("b/{path}"));
+    let old_marker = crate::diff::display_path(&format!("a/{old_path}"));
+    let new_marker = crate::diff::display_path(&format!("b/{new_path}"));
     // One oversized file must not be diffed in full before any size cap ever
     // sees it; mark it skipped like a binary file so the path is still
     // visible in the review context.
@@ -604,16 +642,23 @@ pub(super) fn diff_section(
             "diff --git {old_marker} {new_marker}\nBinary files {old_marker} and {new_marker} differ\n"
         );
     }
-    unified_file_diff(path, old, new, is_add, is_delete)
+    unified_file_diff(old_path, new_path, old, new, is_add, is_delete)
 }
 
 /// Build one file's unified-diff section in the format `diff.rs` expects:
 /// a `diff --git` header (so the parser seeds the path even for additions),
 /// the `---`/`+++` lines, and `similar`-generated hunks.
-fn unified_file_diff(path: &str, old: &str, new: &str, is_add: bool, is_delete: bool) -> String {
+fn unified_file_diff(
+    old_path: &str,
+    new_path: &str,
+    old: &str,
+    new: &str,
+    is_add: bool,
+    is_delete: bool,
+) -> String {
     use similar::TextDiff;
-    let old_marker = crate::diff::display_path(&format!("a/{path}"));
-    let new_marker = crate::diff::display_path(&format!("b/{path}"));
+    let old_marker = crate::diff::display_path(&format!("a/{old_path}"));
+    let new_marker = crate::diff::display_path(&format!("b/{new_path}"));
     let mut out = format!("diff --git {old_marker} {new_marker}\n");
     if is_add {
         out.push_str(&format!("--- /dev/null\n+++ {new_marker}\n"));
@@ -657,7 +702,7 @@ mod tests {
     fn reconstructed_diff_parses_and_grounds() {
         let old = "fn a() {\n    let x = 1;\n}\n";
         let new = "fn a() {\n    let x = 2;\n}\n";
-        let section = unified_file_diff("src/a.rs", old, new, false, false);
+        let section = unified_file_diff("src/a.rs", "src/a.rs", old, new, false, false);
         assert!(section.contains("diff --git a/src/a.rs b/src/a.rs"));
         let parsed = diff::parse(&section);
         let index = diff::DiffIndex::build(&parsed);
@@ -667,7 +712,7 @@ mod tests {
 
     #[test]
     fn added_file_uses_dev_null_base() {
-        let section = unified_file_diff("new.rs", "", "a\nb\n", true, false);
+        let section = unified_file_diff("new.rs", "new.rs", "", "a\nb\n", true, false);
         assert!(section.contains("--- /dev/null"));
         assert!(section.contains("+++ b/new.rs"));
         let parsed = diff::parse(&section);
@@ -679,7 +724,7 @@ mod tests {
         // One side exceeds the per-file cap: the section must be marked
         // skipped (parsed as binary, no hunks) rather than diffed in full.
         let huge = "x".repeat(MAX_FILE_BYTES + 1);
-        let section = diff_section("big.bin", "", &huge, true, false);
+        let section = diff_section("big.bin", "big.bin", "", &huge, true, false);
         assert!(section.contains("differ"));
         assert!(section.contains("per-file cap"));
         let parsed = diff::parse(&section);
@@ -692,11 +737,27 @@ mod tests {
     fn ordinary_file_under_cap_is_diffed_normally() {
         let old = "fn a() {\n    let x = 1;\n}\n";
         let new = "fn a() {\n    let x = 2;\n}\n";
-        let section = diff_section("src/a.rs", old, new, false, false);
+        let section = diff_section("src/a.rs", "src/a.rs", old, new, false, false);
         assert!(!section.contains("differ"));
         let parsed = diff::parse(&section);
         assert!(!parsed.files[0].binary);
         assert!(!parsed.files[0].hunks.is_empty());
+    }
+
+    #[test]
+    fn renamed_file_preserves_old_and_new_paths() {
+        let section = diff_section(
+            "src/old.rs",
+            "src/new.rs",
+            "let value = 1;\n",
+            "let value = 2;\n",
+            false,
+            false,
+        );
+        assert!(section.contains("diff --git a/src/old.rs b/src/new.rs"));
+        let parsed = diff::parse(&section);
+        assert_eq!(parsed.files[0].old_path, "src/old.rs");
+        assert_eq!(parsed.files[0].path, "src/new.rs");
     }
 
     #[test]
