@@ -172,6 +172,18 @@ pub struct ModelPriceBound {
     pub output_micros_per_million_tokens: u64,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct QualificationCandidateProfile {
+    pub benchmark_provider_identity: String,
+    pub api_base: String,
+    pub api_format: ApiFormat,
+    pub generator_chain: Vec<String>,
+    pub consensus: usize,
+    pub scorer_chain: Vec<String>,
+    pub model_price_bounds: Vec<ModelPriceBound>,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct QualificationProfileDigestMaterial<'a> {
@@ -196,6 +208,7 @@ pub const HOSTED_OPERATION_COST_CAP_MICROS: u64 = 1_000_000;
 pub const QUALIFICATION_MAX_AGE_DAYS: u32 = 30;
 const QUALIFICATION_MAX_AGE_SECONDS: u64 = QUALIFICATION_MAX_AGE_DAYS as u64 * 24 * 60 * 60;
 const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
+const QUALIFICATION_CANDIDATE_PROFILE_ENV: &str = "POSTIL_QUALIFICATION_CANDIDATE_PROFILE";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -354,6 +367,19 @@ fn admitted_profile_for(
         .cloned()
 }
 
+pub fn admitted_profile_for_config(config: &Config) -> Option<&'static QualificationProfile> {
+    let generator_chain = config.model_chain();
+    let scorer_chain = config.scorer_chain();
+    let api_base = normalize_api_base(&config.api_base).ok()?;
+    qualification_manifest().profiles.iter().find(|profile| {
+        profile.generator_chain == generator_chain
+            && profile.consensus == config.consensus
+            && profile.scorer_chain == scorer_chain
+            && profile.api_base == api_base
+            && profile.api_format == config.api_format
+    })
+}
+
 fn evaluator_runtime_identity() -> String {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -392,6 +418,53 @@ fn sha256_named_sources(sources: &[(&str, &str)]) -> String {
         write!(&mut hex, "{byte:02x}").expect("writing to String cannot fail");
     }
     hex
+}
+
+fn validate_profile_model_price_bounds(
+    label: &str,
+    generator_chain: &[String],
+    scorer_chain: &[String],
+    model_price_bounds: &[ModelPriceBound],
+) -> Result<()> {
+    for model in generator_chain {
+        validate_model_id(&format!("{label} generator chain"), model)?;
+    }
+    for model in scorer_chain {
+        validate_model_id(&format!("{label} scorer chain"), model)?;
+    }
+    let mut expected_models = generator_chain.to_vec();
+    expected_models.extend_from_slice(scorer_chain);
+    expected_models.sort();
+    expected_models.dedup();
+    let mut previous_model: Option<&str> = None;
+    for bound in model_price_bounds {
+        validate_model_id(&format!("{label} model price bound"), &bound.model)?;
+        anyhow::ensure!(
+            previous_model.is_none_or(|previous| previous < bound.model.as_str()),
+            "{label} model price bounds must be unique and sorted by model"
+        );
+        previous_model = Some(&bound.model);
+        anyhow::ensure!(
+            expected_models.binary_search(&bound.model).is_ok(),
+            "{label} model price bound references an unknown model"
+        );
+        anyhow::ensure!(
+            bound.input_micros_per_million_tokens > 0
+                && bound.output_micros_per_million_tokens > 0
+                && bound.input_micros_per_million_tokens <= MAX_SAFE_JSON_INTEGER
+                && bound.output_micros_per_million_tokens <= MAX_SAFE_JSON_INTEGER,
+            "{label} model price bounds must be positive safe integers"
+        );
+    }
+    let bounded_models = model_price_bounds
+        .iter()
+        .map(|bound| bound.model.clone())
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        bounded_models == expected_models,
+        "{label} model price bounds must exactly cover the generator and scorer models"
+    );
+    Ok(())
 }
 
 fn parse_qualification_manifest(raw: &str) -> Result<QualificationManifest> {
@@ -454,45 +527,12 @@ fn parse_qualification_manifest(raw: &str) -> Result<QualificationManifest> {
                 && profile.api_format == ApiFormat::OpenaiCompatible,
             "hosted qualification profile must use the canonical managed OpenRouter endpoint"
         );
-        for model in &profile.generator_chain {
-            validate_model_id("qualification profile generator chain", model)?;
-        }
-        for model in &profile.scorer_chain {
-            validate_model_id("qualification profile scorer chain", model)?;
-        }
-        let mut expected_models = profile.generator_chain.clone();
-        expected_models.extend(profile.scorer_chain.clone());
-        expected_models.sort();
-        expected_models.dedup();
-        let mut previous_model: Option<&str> = None;
-        for bound in &profile.model_price_bounds {
-            validate_model_id("qualification profile model price bound", &bound.model)?;
-            anyhow::ensure!(
-                previous_model.is_none_or(|previous| previous < bound.model.as_str()),
-                "qualification profile model price bounds must be unique and sorted by model"
-            );
-            previous_model = Some(&bound.model);
-            anyhow::ensure!(
-                expected_models.binary_search(&bound.model).is_ok(),
-                "qualification profile model price bound references an unknown model"
-            );
-            anyhow::ensure!(
-                bound.input_micros_per_million_tokens > 0
-                    && bound.output_micros_per_million_tokens > 0
-                    && bound.input_micros_per_million_tokens <= MAX_SAFE_JSON_INTEGER
-                    && bound.output_micros_per_million_tokens <= MAX_SAFE_JSON_INTEGER,
-                "qualification profile model price bounds must be positive safe integers"
-            );
-        }
-        let bounded_models = profile
-            .model_price_bounds
-            .iter()
-            .map(|bound| bound.model.clone())
-            .collect::<Vec<_>>();
-        anyhow::ensure!(
-            bounded_models == expected_models,
-            "qualification profile model price bounds must exactly cover the generator and scorer models"
-        );
+        validate_profile_model_price_bounds(
+            "qualification profile",
+            &profile.generator_chain,
+            &profile.scorer_chain,
+            &profile.model_price_bounds,
+        )?;
         anyhow::ensure!(
             profile.repeated_runs >= 3,
             "qualification profile must record at least three repeated runs"
@@ -1168,6 +1208,19 @@ impl Config {
         if hosted_mode() {
             return Ok(());
         }
+        if qualification_candidate_mode() {
+            let profile = qualification_candidate_profile()?
+                .context("qualification candidate profile is required")?;
+            self.model = profile.generator_chain[0].clone();
+            self.cascade = profile.generator_chain[1..].to_vec();
+            self.consensus = profile.consensus;
+            self.scorer = profile.scorer_chain[0].clone();
+            self.scorer_fallback = profile.scorer_chain.get(1).cloned().unwrap_or_default();
+            self.scorer_enabled = true;
+            self.api_base = profile.api_base;
+            self.api_format = profile.api_format;
+            return Ok(());
+        }
         if let Ok(m) = std::env::var("REVIEW_MODEL")
             && !m.is_empty()
         {
@@ -1245,7 +1298,15 @@ impl Config {
     }
 
     pub fn require_model(&self) -> Result<()> {
-        self.require_model_for(hosted_mode())
+        self.require_model_for(hosted_mode())?;
+        if qualification_candidate_mode() {
+            let profile = qualification_candidate_profile_for_config(self)?;
+            anyhow::ensure!(
+                profile.is_some(),
+                "qualification candidate profile does not exactly match the resolved review configuration"
+            );
+        }
+        Ok(())
     }
 
     fn require_model_for(&self, hosted: bool) -> Result<()> {
@@ -1312,8 +1373,125 @@ pub(crate) fn hosted_mode() -> bool {
         .unwrap_or(false)
 }
 
+pub(crate) fn hosted_runtime_mode() -> bool {
+    hosted_mode() || qualification_candidate_mode()
+}
+
+pub(crate) fn qualification_candidate_mode() -> bool {
+    cfg!(feature = "qualification-candidate")
+        && std::env::var_os(QUALIFICATION_CANDIDATE_PROFILE_ENV).is_some()
+}
+
+pub(crate) fn qualification_plan_only() -> bool {
+    qualification_candidate_mode()
+        && std::env::var("POSTIL_QUALIFICATION_PLAN_ONLY")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+}
+
+#[cfg(feature = "qualification-candidate")]
+fn qualification_candidate_profile() -> Result<Option<QualificationCandidateProfile>> {
+    let Some(path) = std::env::var_os(QUALIFICATION_CANDIDATE_PROFILE_ENV) else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        !hosted_mode(),
+        "qualification candidate mode cannot run inside a hosted deployment"
+    );
+    anyhow::ensure!(
+        std::env::var("CI").as_deref() == Ok("true"),
+        "qualification candidate mode requires the hermetic CI harness"
+    );
+    anyhow::ensure!(
+        std::env::var("POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY").as_deref() == Ok("1"),
+        "qualification candidate mode requires managed provider privacy enforcement"
+    );
+    let github_api = std::env::var("GITHUB_API_URL")
+        .context("qualification candidate mode requires a mock GitHub endpoint")?;
+    let github_url = reqwest::Url::parse(&github_api)
+        .context("qualification candidate mock GitHub endpoint must be an absolute URL")?;
+    let loopback = github_url
+        .host_str()
+        .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+        .is_some_and(|address| address.is_loopback());
+    anyhow::ensure!(
+        github_url.scheme() == "http" && loopback,
+        "qualification candidate mode requires an HTTP loopback GitHub endpoint"
+    );
+    let raw = std::fs::read_to_string(&path).with_context(|| {
+        format!(
+            "reading qualification candidate profile {}",
+            Path::new(&path).display()
+        )
+    })?;
+    let profile: QualificationCandidateProfile =
+        serde_json::from_str(&raw).context("parsing qualification candidate profile")?;
+    anyhow::ensure!(
+        profile.benchmark_provider_identity == MANAGED_OPENROUTER_PROVIDER_IDENTITY,
+        "qualification candidate profile must use the managed provider identity"
+    );
+    anyhow::ensure!(
+        normalize_api_base(&profile.api_base)? == MANAGED_OPENROUTER_API_BASE
+            && profile.api_base == MANAGED_OPENROUTER_API_BASE
+            && profile.api_format == ApiFormat::OpenaiCompatible,
+        "qualification candidate profile must use the canonical managed OpenRouter endpoint"
+    );
+    anyhow::ensure!(
+        !profile.generator_chain.is_empty()
+            && (1..=profile.generator_chain.len()).contains(&profile.consensus),
+        "qualification candidate consensus must fit its generator chain"
+    );
+    anyhow::ensure!(
+        (1..=2).contains(&profile.scorer_chain.len()),
+        "qualification candidate scorer chain must contain a primary and at most one fallback"
+    );
+    validate_profile_model_price_bounds(
+        "qualification candidate profile",
+        &profile.generator_chain,
+        &profile.scorer_chain,
+        &profile.model_price_bounds,
+    )?;
+    Ok(Some(profile))
+}
+
+#[cfg(not(feature = "qualification-candidate"))]
+fn qualification_candidate_profile() -> Result<Option<QualificationCandidateProfile>> {
+    Ok(None)
+}
+
+pub(crate) fn qualification_candidate_profile_for_config(
+    config: &Config,
+) -> Result<Option<QualificationCandidateProfile>> {
+    let Some(profile) = qualification_candidate_profile()? else {
+        return Ok(None);
+    };
+    let api_base = normalize_api_base(&config.api_base)?;
+    anyhow::ensure!(
+        profile.generator_chain == config.model_chain()
+            && profile.consensus == config.consensus
+            && profile.scorer_chain == config.scorer_chain()
+            && profile.api_base == api_base
+            && profile.api_format == config.api_format,
+        "qualification candidate profile does not exactly match the resolved review configuration"
+    );
+    Ok(Some(profile))
+}
+
+pub(crate) fn hosted_price_bounds_for_config(
+    config: &Config,
+) -> Result<Option<Vec<ModelPriceBound>>> {
+    if hosted_mode() {
+        let profile = admitted_profile_for_config(config).ok_or_else(|| {
+            anyhow::anyhow!("hosted inference has no exact admitted qualification profile")
+        })?;
+        return Ok(Some(profile.model_price_bounds.clone()));
+    }
+    Ok(qualification_candidate_profile_for_config(config)?
+        .map(|profile| profile.model_price_bounds))
+}
+
 fn repository_model_config_locked() -> bool {
-    hosted_mode()
+    hosted_runtime_mode()
         || std::env::var("POSTIL_IGNORE_REPOSITORY_MODEL_CONFIG")
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
             .unwrap_or(false)

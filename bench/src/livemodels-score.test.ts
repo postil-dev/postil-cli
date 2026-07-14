@@ -2,13 +2,11 @@ import { describe, expect, test } from "bun:test";
 import { benchmarkCase, type BenchmarkCase, type Envelope } from "./harness";
 import {
   aggregateModel,
-  assertPairQualificationPreflight,
   calculateTotalRunCostUsd,
   canonicalPriceMicrosPerMillion,
   findingHitsSeededRegion,
   groundTruthOf,
   pricingFromCatalog,
-  projectTotalCostUsd,
   qualificationPairId,
   scoreLiveCase,
   toSiteModelAggregate,
@@ -71,12 +69,12 @@ function finding(severity: "info" | "warn" | "error", path = "src/x.ts", line = 
   } as const;
 }
 
-function usage(model: string, role: "reviewGenerator" | "findingScorer", exact = true) {
+function usage(model: string, role: "reviewPlanner" | "reviewGenerator" | "findingScorer", exact = true) {
   return {
     model,
     role,
     phase: "initial" as const,
-    callOrdinal: role === "reviewGenerator" ? 1 : 2,
+    callOrdinal: role === "reviewPlanner" ? 1 : role === "reviewGenerator" ? 2 : 3,
     attempt: 1,
     promptTokens: 100,
     completionTokens: 20,
@@ -96,11 +94,13 @@ function envelope(args: {
   exactCost?: boolean;
   scorerError?: string;
   durationMs?: number;
+  bounded?: boolean;
 } = {}): Envelope {
   const findings = args.findings ?? [];
   const suppressedFindings = args.suppressed ?? [];
   const needsScorer = findings.length + suppressedFindings.length > 0;
   const modelUsage = [
+    ...(args.bounded ? [usage(pair.generatorModel, "reviewPlanner", args.exactCost ?? true)] : []),
     usage(pair.generatorModel, "reviewGenerator", args.exactCost ?? true),
     ...(needsScorer ? [usage(pair.scorerModel, "findingScorer", args.exactCost ?? true)] : []),
   ];
@@ -122,6 +122,9 @@ function envelope(args: {
       completionTokens: modelUsage.reduce((sum, entry) => sum + entry.completionTokens, 0),
     },
     modelUsage,
+    reviewCoverage: args.bounded
+      ? { mode: "bounded", selectedBatches: 5, totalBatches: 8, plannerFallback: false }
+      : { mode: "exhaustive", selectedBatches: 1, totalBatches: 1, plannerFallback: false },
     usageAccountingComplete: true,
     durationMs: args.durationMs ?? 1000,
     baseSha: null,
@@ -177,6 +180,25 @@ describe("fixture contract", () => {
 });
 
 describe("pair scoring", () => {
+  test("requires planner usage only for bounded review coverage", () => {
+    const bounded = envelope({ bounded: true });
+    expect(score("clean", 1, bounded).usageValid).toBe(true);
+
+    const missingPlanner = envelope({ bounded: true });
+    missingPlanner.modelUsage = missingPlanner.modelUsage?.filter((entry) =>
+      entry.role !== "reviewPlanner"
+    );
+    missingPlanner.usage.promptTokens -= 100;
+    missingPlanner.usage.completionTokens -= 20;
+    expect(score("clean", 1, missingPlanner).usageValid).toBe(false);
+
+    const unexpectedPlanner = envelope();
+    unexpectedPlanner.modelUsage?.push(usage(pair.generatorModel, "reviewPlanner"));
+    unexpectedPlanner.usage.promptTokens += 100;
+    unexpectedPlanner.usage.completionTokens += 20;
+    expect(score("clean", 1, unexpectedPlanner).usageValid).toBe(false);
+  });
+
   test("records final and suppressed detector evidence without generated prose", () => {
     const result = score("advisory", 1, envelope({
       suppressed: [{ finding: finding("warn"), reason: "confidence" }],
@@ -379,21 +401,4 @@ describe("report and pricing utilities", () => {
     }
   });
 
-  test("projects separate generator and scorer calls when one model fills both roles", () => {
-    const sameRolePair = { generatorModel: "provider/shared", scorerModel: "provider/shared" };
-    const pricing = new Map([["provider/shared", {
-      promptUsdPerToken: 0.000001,
-      completionUsdPerToken: 0.000002,
-      inputMicrosPerMillionTokens: 1_000_000,
-      outputMicrosPerMillionTokens: 2_000_000,
-    }]]);
-    const oneRole = projectTotalCostUsd({ diffs: ["+ change"], models: ["provider/shared"], pricing });
-    const bothRoles = assertPairQualificationPreflight({
-      diffs: ["+ change"],
-      pairs: [sameRolePair],
-      pricing,
-      costCapUsd: 25,
-    });
-    expect(bothRoles).toBeCloseTo(oneRole * 2, 12);
-  });
 });

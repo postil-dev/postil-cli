@@ -9,8 +9,7 @@
     "bench:live": "bun run src/run.ts --live",
     "bench:live-models": "POSTIL_BENCH_MODE=live bun run src/run.ts",
     "verify-admission": "bun run src/verify-admission.ts",
-    "scorer-eval": "bun run src/scorer-eval.ts",
-    "cost-guard": "bun run src/cost-guard.ts"
+    "scorer-eval": "bun run src/scorer-eval.ts"
   },
   "dependencies": {
     "zod": "^4.4.3"

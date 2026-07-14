@@ -6,14 +6,292 @@
 //! with its new-file line number.
 
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::RangeInclusive;
+use std::sync::{Arc, Mutex};
 
-const MAX_LOCKFILE_EVIDENCE_SECTIONS: usize = 1024;
-const MAX_LOCKFILE_SECTION_BYTES: usize = 16 * 1024 * 1024;
+use anyhow::{Context, Result};
+use memmap2::Mmap;
+
 const MAX_LOCKFILE_DIRECTIONAL_CHANGES: usize = 256;
-pub const MAX_RAW_DIFF_INPUT_BYTES: usize = 8 * 1024 * 1024;
-pub const MAX_RAW_DIFF_ACQUISITION_BYTES: usize = 32 * 1024 * 1024;
+const MAX_LOCKFILE_PACKAGE_RECORDS: usize = 100_000;
+/// Maximum size of one buffered forge metadata page. Changed-file bodies use
+/// file-backed streaming and are deliberately not subject to this limit.
+pub const MAX_FORGE_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+pub const STREAM_WINDOW_BYTES: usize = 2 * 1024 * 1024;
+/// Aggregate on-disk review workspace bound. The original snapshot, normalized
+/// windows, and planned model batches must all fit before provider contact.
+pub const MAX_REVIEW_SPOOL_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_DIFF_INDEX_PATHS: usize = 100_000;
+const MAX_DIFF_INDEX_RANGES: usize = 250_000;
+const NORMALIZED_MANIFEST_RESERVE_BYTES: usize = 16 * 1024;
+
+#[derive(Clone)]
+pub struct WorkspaceBudget {
+    retained: Arc<Mutex<u64>>,
+    limit: u64,
+}
+
+impl Default for WorkspaceBudget {
+    fn default() -> Self {
+        Self {
+            retained: Arc::new(Mutex::new(0)),
+            limit: MAX_REVIEW_SPOOL_BYTES,
+        }
+    }
+}
+
+impl WorkspaceBudget {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn reserve(&self, bytes: u64) -> std::io::Result<()> {
+        let mut retained = self
+            .retained
+            .lock()
+            .map_err(|_| std::io::Error::other("review workspace budget lock is poisoned"))?;
+        let next = retained
+            .checked_add(bytes)
+            .ok_or_else(|| std::io::Error::other("review workspace size overflowed"))?;
+        if next > self.limit {
+            return Err(std::io::Error::other(format!(
+                "review workspace exceeded the {} byte operation quota",
+                self.limit
+            )));
+        }
+        *retained = next;
+        Ok(())
+    }
+
+    fn release(&self, bytes: u64) {
+        if let Ok(mut retained) = self.retained.lock() {
+            *retained = retained.saturating_sub(bytes);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn retained_bytes(&self) -> u64 {
+        *self.retained.lock().unwrap()
+    }
+
+    #[cfg(test)]
+    pub fn with_limit(limit: u64) -> Self {
+        Self {
+            retained: Arc::new(Mutex::new(0)),
+            limit,
+        }
+    }
+}
+
+struct WorkspaceLease {
+    budget: WorkspaceBudget,
+    bytes: u64,
+}
+
+impl WorkspaceLease {
+    fn new(budget: WorkspaceBudget) -> Self {
+        Self { budget, bytes: 0 }
+    }
+
+    fn reserve(&mut self, bytes: u64) -> std::io::Result<()> {
+        self.budget.reserve(bytes)?;
+        self.bytes = self.bytes.saturating_add(bytes);
+        Ok(())
+    }
+
+    fn release(&mut self, bytes: u64) {
+        self.budget.release(bytes);
+        self.bytes = self.bytes.saturating_sub(bytes);
+    }
+}
+
+impl Drop for WorkspaceLease {
+    fn drop(&mut self) {
+        self.budget.release(self.bytes);
+    }
+}
+
+/// Immutable, file-backed diff snapshot. Acquisition writes to disk and review
+/// maps it read-only, so aggregate diff size does not become aggregate heap.
+pub struct DiffSnapshot {
+    _file: File,
+    map: Option<Mmap>,
+    valid_utf8: bool,
+    lease: WorkspaceLease,
+}
+
+impl DiffSnapshot {
+    pub fn from_path(path: &std::path::Path) -> Result<Self> {
+        let mut source = File::open(path)
+            .with_context(|| format!("opening diff snapshot {}", path.display()))?;
+        let mut spool = DiffSpool::new()?;
+        std::io::copy(&mut source, &mut spool)
+            .with_context(|| format!("copying diff snapshot {}", path.display()))?;
+        spool.finish()
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut spool = DiffSpool::new()?;
+        spool.write_all(bytes).context("writing diff snapshot")?;
+        spool.finish()
+    }
+
+    pub fn from_bytes_in(bytes: &[u8], budget: WorkspaceBudget) -> Result<Self> {
+        let mut spool = DiffSpool::new_in(budget)?;
+        spool.write_all(bytes).context("writing diff snapshot")?;
+        spool.finish()
+    }
+
+    fn from_file(file: File, lease: WorkspaceLease) -> Result<Self> {
+        if file
+            .metadata()
+            .context("reading diff snapshot metadata")?
+            .len()
+            == 0
+        {
+            return Ok(Self {
+                _file: file,
+                map: None,
+                valid_utf8: true,
+                lease,
+            });
+        }
+        // SAFETY: the file handle remains owned by the snapshot and callers
+        // receive only an immutable UTF-8 view. Acquisition never mutates a
+        // snapshot after this point.
+        let map = unsafe { Mmap::map(&file) }.context("mapping diff snapshot")?;
+        std::str::from_utf8(&map).context("diff snapshot is not valid UTF-8")?;
+        Ok(Self {
+            _file: file,
+            map: Some(map),
+            valid_utf8: true,
+            lease,
+        })
+    }
+
+    fn from_source_file(file: File, lease: WorkspaceLease) -> Result<Self> {
+        if file
+            .metadata()
+            .context("reading source snapshot metadata")?
+            .len()
+            == 0
+        {
+            return Ok(Self {
+                _file: file,
+                map: None,
+                valid_utf8: true,
+                lease,
+            });
+        }
+        // SAFETY: the immutable mapping remains owned by the snapshot.
+        let map = unsafe { Mmap::map(&file) }.context("mapping source snapshot")?;
+        let valid_utf8 = std::str::from_utf8(&map).is_ok();
+        Ok(Self {
+            _file: file,
+            map: Some(map),
+            valid_utf8,
+            lease,
+        })
+    }
+
+    pub fn as_str(&self) -> &str {
+        assert!(self.valid_utf8, "binary source snapshot has no UTF-8 view");
+        std::str::from_utf8(self.as_bytes())
+            .expect("private immutable diff snapshot was validated as UTF-8")
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_none()
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        self.map.as_deref().unwrap_or_default()
+    }
+
+    pub fn len(&self) -> u64 {
+        self.map.as_ref().map_or(0, |map| map.len() as u64)
+    }
+
+    pub fn source_str(&self) -> &str {
+        if self.valid_utf8 { self.as_str() } else { "\0" }
+    }
+
+    pub fn workspace_budget(&self) -> WorkspaceBudget {
+        self.lease.budget.clone()
+    }
+}
+
+pub struct DiffSpool {
+    file: File,
+    written: u64,
+    lease: Option<WorkspaceLease>,
+}
+
+impl DiffSpool {
+    pub fn new() -> Result<Self> {
+        Self::new_in(WorkspaceBudget::new())
+    }
+
+    pub fn new_in(budget: WorkspaceBudget) -> Result<Self> {
+        Ok(Self {
+            file: tempfile::tempfile().context("creating diff spool")?,
+            written: 0,
+            lease: Some(WorkspaceLease::new(budget)),
+        })
+    }
+
+    pub fn finish(mut self) -> Result<DiffSnapshot> {
+        self.file.flush().context("flushing diff spool")?;
+        self.file
+            .seek(SeekFrom::Start(0))
+            .context("rewinding diff spool")?;
+        DiffSnapshot::from_file(
+            self.file,
+            self.lease.take().expect("unfinished spool owns its lease"),
+        )
+    }
+
+    pub fn finish_source(mut self) -> Result<DiffSnapshot> {
+        self.file.flush().context("flushing source spool")?;
+        self.file
+            .seek(SeekFrom::Start(0))
+            .context("rewinding source spool")?;
+        DiffSnapshot::from_source_file(
+            self.file,
+            self.lease.take().expect("unfinished spool owns its lease"),
+        )
+    }
+}
+
+impl Write for DiffSpool {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.written
+            .checked_add(buffer.len() as u64)
+            .ok_or_else(|| std::io::Error::other("diff spool size overflowed"))?;
+        let lease = self
+            .lease
+            .as_mut()
+            .expect("unfinished spool owns its lease");
+        lease.reserve(buffer.len() as u64)?;
+        let written = match self.file.write(buffer) {
+            Ok(written) => written,
+            Err(error) => {
+                lease.release(buffer.len() as u64);
+                return Err(error);
+            }
+        };
+        lease.release((buffer.len() - written) as u64);
+        self.written = self.written.saturating_add(written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct ReviewBatchPlan {
@@ -32,10 +310,20 @@ pub struct LockfileEvidence {
     pub changes: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct CompactedArtifactEvidence {
+    pub path: String,
+    pub kind: &'static str,
+    pub added: usize,
+    pub removed: usize,
+    pub bytes: usize,
+}
+
 #[derive(Debug)]
 pub struct PreparedDiff<'a> {
     pub source: Option<Cow<'a, str>>,
     pub lockfiles: Vec<LockfileEvidence>,
+    pub compacted_artifacts: Vec<CompactedArtifactEvidence>,
     pub incomplete: bool,
 }
 
@@ -105,47 +393,106 @@ impl Diff {
 }
 
 /// Index answering "does (path, line) fall inside a changed hunk's new side?"
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct DiffIndex {
     ranges: HashMap<String, Vec<RangeInclusive<u32>>>,
     old_ranges: HashMap<String, Vec<RangeInclusive<u32>>>,
+    range_count: usize,
+    complete: bool,
     /// Reserved synthetic-path line ranges that only content-policy findings may
     /// ground against (e.g. the rendered PR title/description). Kept separate
     /// from `ranges` so a non-content-policy finding cannot exploit them.
     content_policy_ranges: HashMap<String, RangeInclusive<u32>>,
 }
 
+impl Default for DiffIndex {
+    fn default() -> Self {
+        Self {
+            ranges: HashMap::new(),
+            old_ranges: HashMap::new(),
+            range_count: 0,
+            complete: true,
+            content_policy_ranges: HashMap::new(),
+        }
+    }
+}
+
 impl DiffIndex {
     pub fn build(diff: &Diff) -> Self {
-        let mut ranges: HashMap<String, Vec<RangeInclusive<u32>>> = HashMap::new();
-        let mut old_ranges: HashMap<String, Vec<RangeInclusive<u32>>> = HashMap::new();
+        let mut index = Self::default();
         for file in &diff.files {
             if file.binary {
                 continue;
             }
             for hunk in &file.hunks {
                 if hunk.old_count > 0 {
-                    old_ranges
-                        .entry(file.old_path.clone())
-                        .or_default()
-                        .push(hunk.old_range());
+                    index.insert_range(file.old_path.clone(), hunk.old_range(), true);
                 }
             }
             if file.deleted {
                 continue;
             }
-            let entry = ranges.entry(file.path.clone()).or_default();
             for hunk in &file.hunks {
                 if hunk.new_count > 0 {
-                    entry.push(hunk.new_range());
+                    index.insert_range(file.path.clone(), hunk.new_range(), false);
                 }
             }
         }
-        DiffIndex {
-            ranges,
-            old_ranges,
-            content_policy_ranges: HashMap::new(),
+        index
+    }
+
+    pub fn extend(&mut self, diff: &Diff) {
+        let next = Self::build(diff);
+        for (path, ranges) in next.ranges {
+            for range in ranges {
+                self.insert_range(path.clone(), range, false);
+            }
         }
+        for (path, ranges) in next.old_ranges {
+            for range in ranges {
+                self.insert_range(path.clone(), range, true);
+            }
+        }
+    }
+
+    fn insert_range(&mut self, path: String, range: RangeInclusive<u32>, old: bool) {
+        if !self.complete {
+            return;
+        }
+        let exists = if old {
+            self.old_ranges.contains_key(&path)
+        } else {
+            self.ranges.contains_key(&path)
+        };
+        if !exists
+            && self.ranges.len().saturating_add(self.old_ranges.len()) >= MAX_DIFF_INDEX_PATHS
+        {
+            self.complete = false;
+            return;
+        }
+        let map = if old {
+            &mut self.old_ranges
+        } else {
+            &mut self.ranges
+        };
+        let ranges = map.entry(path).or_default();
+        if let Some(last) = ranges.last_mut()
+            && range.start() <= &last.end().saturating_add(1)
+        {
+            let end = (*last.end()).max(*range.end());
+            *last = *last.start()..=end;
+            return;
+        }
+        if self.range_count >= MAX_DIFF_INDEX_RANGES {
+            self.complete = false;
+            return;
+        }
+        ranges.push(range);
+        self.range_count += 1;
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.complete
     }
 
     /// Register `path` as groundable for content-policy findings over lines
@@ -217,24 +564,950 @@ impl DiffIndex {
     }
 }
 
-/// Compact exact, known lockfile sections before parsing while retaining
-/// bounded dependency-oriented evidence for the model. Every other path,
-/// including names such as `generated`, `dist`, and `node_modules`, remains
-/// ordinary untrusted source. The source-size check happens before allocation.
-pub fn prepare_diff(text: &str, max_source_bytes: usize) -> PreparedDiff<'_> {
+/// Bounded, replayable review input. Each normalized unified-diff window is
+/// length-prefixed on disk, while grounding ranges and compact artifact
+/// evidence remain in memory.
+pub struct PreparedReview {
+    windows: File,
+    _window_lease: WorkspaceLease,
+    snapshot_bytes: u64,
+    window_bytes: u64,
+    pub index: DiffIndex,
+    pub lockfiles: Vec<LockfileEvidence>,
+    pub compacted_artifacts: Vec<CompactedArtifactEvidence>,
+    pub has_source: bool,
+    pub reserved_anchor: bool,
+}
+
+impl PreparedReview {
+    pub fn rewind(&mut self) -> Result<()> {
+        self.windows
+            .seek(SeekFrom::Start(0))
+            .context("rewinding review windows")?;
+        Ok(())
+    }
+
+    pub fn next_window(&mut self) -> Result<Option<String>> {
+        let mut length = [0u8; 8];
+        match self.windows.read_exact(&mut length) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(error) => return Err(error).context("reading review window length"),
+        }
+        let length = usize::try_from(u64::from_le_bytes(length))
+            .context("review window length does not fit this platform")?;
+        anyhow::ensure!(
+            length <= STREAM_WINDOW_BYTES,
+            "review window exceeded its fixed memory bound"
+        );
+        let mut bytes = vec![0u8; length];
+        self.windows
+            .read_exact(&mut bytes)
+            .context("reading review window")?;
+        String::from_utf8(bytes)
+            .map(Some)
+            .context("normalized review window is not UTF-8")
+    }
+}
+
+pub struct ModelBatchSpool {
+    file: File,
+    _lease: WorkspaceLease,
+    pub count: usize,
+    pub source_count: usize,
+    pub metadata_count: u32,
+    synthesis_ids: BTreeSet<usize>,
+}
+
+pub struct HostedBatchCandidates {
+    pub manifest: String,
+    pub mandatory_ids: Vec<usize>,
+    pub candidate_ids: BTreeSet<usize>,
+    pub source_batch_count: usize,
+}
+
+impl ModelBatchSpool {
+    pub fn next_batch(&mut self) -> Result<Option<String>> {
+        read_length_prefixed(&mut self.file, "model batch")
+    }
+
+    pub fn hosted_candidates(
+        &mut self,
+        selected_limit: usize,
+        candidate_limit: usize,
+    ) -> Result<HostedBatchCandidates> {
+        #[derive(Clone)]
+        struct Candidate {
+            id: usize,
+            score: usize,
+            digest: String,
+            synthesis: bool,
+        }
+
+        self.file
+            .seek(SeekFrom::Start(0))
+            .context("rewinding model batches for hosted planning")?;
+        let mut candidates = Vec::<Candidate>::new();
+        let mut first_source = None;
+        let mut last_source = None;
+        let mut final_synthesis = None;
+        let mut id = 0usize;
+        while let Some(batch) = read_length_prefixed(&mut self.file, "hosted planner batch")? {
+            id = id
+                .checked_add(1)
+                .context("hosted planner batch id overflowed")?;
+            let synthesis = self.synthesis_ids.contains(&id);
+            if synthesis {
+                final_synthesis = Some(id);
+            } else {
+                first_source.get_or_insert(id);
+                last_source = Some(id);
+            }
+            let mut digest = semantic_digest(&batch);
+            if digest.is_empty() {
+                digest = batch.chars().take(800).collect();
+            } else {
+                digest = truncate_owned_utf8(digest, 1_200);
+            }
+            candidates.push(Candidate {
+                id,
+                score: hosted_risk_score(&batch),
+                digest,
+                synthesis,
+            });
+            candidates.sort_by(|left, right| {
+                right
+                    .score
+                    .cmp(&left.score)
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+            candidates.truncate(candidate_limit);
+        }
+        self.file
+            .seek(SeekFrom::Start(0))
+            .context("rewinding model batches after hosted planning")?;
+
+        let mut mandatory = BTreeSet::new();
+        if let Some(id) = first_source {
+            mandatory.insert(id);
+        }
+        if let Some(id) = last_source {
+            mandatory.insert(id);
+        }
+        if let Some(id) = final_synthesis {
+            mandatory.insert(id);
+        }
+        for candidate in candidates.iter().filter(|candidate| !candidate.synthesis) {
+            if mandatory.len() >= selected_limit.min(4) {
+                break;
+            }
+            mandatory.insert(candidate.id);
+        }
+        while mandatory.len() > selected_limit {
+            let removable = mandatory
+                .iter()
+                .copied()
+                .find(|id| Some(*id) != final_synthesis && Some(*id) != first_source)
+                .or_else(|| mandatory.iter().next_back().copied())
+                .expect("non-empty mandatory selection");
+            mandatory.remove(&removable);
+        }
+
+        candidates.sort_by_key(|candidate| candidate.id);
+        let mut manifest = format!(
+            "The complete diff was normalized into {id} bounded batches. Select only batch IDs from this candidate set. Boundary, highest-risk, and global-synthesis batches are already mandatory.\nMandatory IDs: {:?}\n",
+            mandatory.iter().copied().collect::<Vec<_>>()
+        );
+        for candidate in &candidates {
+            manifest.push_str(&format!(
+                "\nBatch {} risk={} kind={}\n{}",
+                candidate.id,
+                candidate.score,
+                if candidate.synthesis {
+                    "synthesis"
+                } else {
+                    "source"
+                },
+                candidate.digest
+            ));
+        }
+        anyhow::ensure!(
+            manifest.len() <= 120_000,
+            "hosted planner manifest exceeded its fixed bound"
+        );
+        Ok(HostedBatchCandidates {
+            manifest,
+            mandatory_ids: mandatory.into_iter().collect(),
+            candidate_ids: candidates
+                .into_iter()
+                .map(|candidate| candidate.id)
+                .collect(),
+            source_batch_count: self.source_count,
+        })
+    }
+
+    pub fn selected_source_count(&self, ids: &BTreeSet<usize>) -> usize {
+        ids.iter()
+            .filter(|id| !self.synthesis_ids.contains(id))
+            .count()
+    }
+
+    pub fn selected_batches(&mut self, ids: &BTreeSet<usize>) -> Result<Vec<String>> {
+        self.file
+            .seek(SeekFrom::Start(0))
+            .context("rewinding model batches for selection")?;
+        let mut selected = Vec::with_capacity(ids.len());
+        let mut id = 0usize;
+        while let Some(batch) = read_length_prefixed(&mut self.file, "selected model batch")? {
+            id += 1;
+            if ids.contains(&id) {
+                selected.push(batch);
+            }
+        }
+        self.file
+            .seek(SeekFrom::Start(0))
+            .context("rewinding model batches after selection")?;
+        anyhow::ensure!(
+            selected.len() == ids.len(),
+            "hosted planner selected a batch outside the materialized spool"
+        );
+        Ok(selected)
+    }
+}
+
+fn truncate_owned_utf8(mut value: String, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+    value
+}
+
+fn hosted_risk_score(batch: &str) -> usize {
+    let lower = batch.to_ascii_lowercase();
+    [
+        ("unsafe", 12usize),
+        ("eval", 12),
+        ("exec", 10),
+        ("authoriz", 10),
+        ("permission", 10),
+        ("secret", 9),
+        ("password", 9),
+        ("token", 7),
+        ("query", 7),
+        ("delete", 6),
+        ("timeout", 5),
+        ("retry", 4),
+        ("validate", 4),
+        ("guard", 4),
+        ("unwrap", 2),
+    ]
+    .into_iter()
+    .map(|(marker, weight)| lower.matches(marker).count().min(8) * weight)
+    .sum()
+}
+
+/// Build one bounded, line-grounded context for an interactive answer. Every
+/// source window contributes semantic evidence; large inputs are reduced with
+/// the same bounded fan-in used by review synthesis rather than byte truncation.
+pub fn bounded_respond_context(
+    snapshot: &DiffSnapshot,
+    max_bytes: usize,
+    max_manifest_bytes: usize,
+) -> Result<(String, bool)> {
+    let mut prepared = prepare_review(snapshot)?;
+    let reserved_anchor = prepared.reserved_anchor;
+    let mut batches = spool_model_batches(&mut prepared, max_bytes, max_manifest_bytes, false)?;
+    if batches.count == 0 {
+        return Ok((String::new(), reserved_anchor));
+    }
+    let mut first: Option<String> = None;
+    let mut digests = Vec::with_capacity(batches.count.min(1_024));
+    while let Some(batch) = batches.next_batch()? {
+        if let Some(previous) = first.take() {
+            if digests.is_empty() {
+                digests.push(semantic_digest(&previous));
+            }
+            digests.push(semantic_digest(&batch));
+        } else if digests.is_empty() {
+            first = Some(batch);
+        } else {
+            digests.push(semantic_digest(&batch));
+        }
+    }
+    if digests.is_empty() {
+        return Ok((first.expect("one batch was counted"), reserved_anchor));
+    }
+    let mut level = 1usize;
+    loop {
+        let chunks = pack_semantic_digests(&digests, level, max_bytes)?;
+        if chunks.len() == 1 {
+            return Ok((
+                chunks.into_iter().next().expect("checked above"),
+                reserved_anchor,
+            ));
+        }
+        anyhow::ensure!(
+            chunks.len() < digests.len(),
+            "interactive context synthesis did not reduce its bounded fan-in"
+        );
+        digests = chunks
+            .iter()
+            .map(|chunk| recursive_semantic_digest(chunk))
+            .collect();
+        level = level
+            .checked_add(1)
+            .context("interactive synthesis level overflowed")?;
+    }
+}
+
+pub fn spool_model_batches(
+    prepared: &mut PreparedReview,
+    max_batch_bytes: usize,
+    max_manifest_bytes: usize,
+    force_empty: bool,
+) -> Result<ModelBatchSpool> {
+    let mut file = tempfile::tempfile().context("creating model-batch spool")?;
+    let mut lease = WorkspaceLease::new(prepared._window_lease.budget.clone());
+    let mut spool_bytes = 0u64;
+    let mut count = 0usize;
+    let mut source_count = 0usize;
+    let mut synthesis_ids = BTreeSet::new();
+    let mut metadata_count = 0u32;
+    let synthesis_header = "Cross-window semantic digests:\n";
+    let mut cross_window = synthesis_header.to_string();
+    let mut synthesis_chunks = Vec::new();
+    let mut digest_ordinal = 0usize;
+    prepared.rewind()?;
+    while let Some(window) = prepared.next_window()? {
+        let parsed = parse(&window);
+        anyhow::ensure!(parsed.complete, "normalized review window is incomplete");
+        let plan = render_review_batches(&parsed, &[], &[], max_batch_bytes, max_manifest_bytes);
+        anyhow::ensure!(
+            !plan.incomplete,
+            "normalized review window could not be rendered"
+        );
+        metadata_count = metadata_count.max(plan.metadata_count);
+        for batch in plan.batches {
+            let digest = semantic_digest(&batch);
+            if !digest.is_empty() {
+                digest_ordinal = digest_ordinal
+                    .checked_add(1)
+                    .context("semantic digest ordinal overflowed")?;
+                let entry = format!("\nSource window {digest_ordinal}:\n{digest}");
+                if cross_window.len().saturating_add(entry.len()) > max_batch_bytes {
+                    if cross_window.len() > synthesis_header.len() {
+                        synthesis_chunks.push(std::mem::take(&mut cross_window));
+                    }
+                    cross_window.push_str(synthesis_header);
+                }
+                anyhow::ensure!(
+                    cross_window.len().saturating_add(entry.len()) <= max_batch_bytes,
+                    "one semantic digest exceeded the synthesis bound"
+                );
+                cross_window.push_str(&entry);
+            }
+            write_length_prefixed(
+                &mut file,
+                &mut lease,
+                &batch,
+                max_batch_bytes,
+                "model batch",
+            )?;
+            spool_bytes = spool_bytes
+                .checked_add(batch.len() as u64 + 8)
+                .context("model-batch spool size overflowed")?;
+            count = count
+                .checked_add(1)
+                .context("model batch count overflowed")?;
+            source_count = source_count
+                .checked_add(1)
+                .context("source model batch count overflowed")?;
+        }
+        if let Some(synthesis) = plan.synthesis {
+            write_length_prefixed(
+                &mut file,
+                &mut lease,
+                &synthesis,
+                max_batch_bytes,
+                "model batch",
+            )?;
+            spool_bytes = spool_bytes
+                .checked_add(synthesis.len() as u64 + 8)
+                .context("model-batch spool size overflowed")?;
+            count = count
+                .checked_add(1)
+                .context("model batch count overflowed")?;
+            synthesis_ids.insert(count);
+        }
+    }
+
+    // Artifact evidence is already compact. Partition it so a repository with
+    // many lockfiles or bundles cannot overflow one request manifest.
+    let mut lock_start = 0usize;
+    let mut artifact_start = 0usize;
+    while lock_start < prepared.lockfiles.len()
+        || artifact_start < prepared.compacted_artifacts.len()
+    {
+        let lock_end = (lock_start + 16).min(prepared.lockfiles.len());
+        let artifact_end = (artifact_start + 16).min(prepared.compacted_artifacts.len());
+        let plan = render_review_batches(
+            &Diff::default(),
+            &prepared.lockfiles[lock_start..lock_end],
+            &prepared.compacted_artifacts[artifact_start..artifact_end],
+            max_batch_bytes,
+            max_manifest_bytes,
+        );
+        if plan.incomplete {
+            anyhow::bail!("compact artifact metadata could not fit a bounded model request");
+        }
+        metadata_count = metadata_count.max(plan.metadata_count);
+        for batch in plan.batches {
+            write_length_prefixed(
+                &mut file,
+                &mut lease,
+                &batch,
+                max_batch_bytes,
+                "artifact model batch",
+            )?;
+            spool_bytes = spool_bytes
+                .checked_add(batch.len() as u64 + 8)
+                .context("model-batch spool size overflowed")?;
+            count = count
+                .checked_add(1)
+                .context("model batch count overflowed")?;
+            source_count = source_count
+                .checked_add(1)
+                .context("source model batch count overflowed")?;
+        }
+        if let Some(synthesis) = plan.synthesis {
+            write_length_prefixed(
+                &mut file,
+                &mut lease,
+                &synthesis,
+                max_batch_bytes,
+                "artifact synthesis batch",
+            )?;
+            spool_bytes = spool_bytes
+                .checked_add(synthesis.len() as u64 + 8)
+                .context("model-batch spool size overflowed")?;
+            count = count
+                .checked_add(1)
+                .context("model batch count overflowed")?;
+            synthesis_ids.insert(count);
+        }
+        lock_start = lock_end;
+        artifact_start = artifact_end;
+    }
+    if cross_window.len() > synthesis_header.len() && digest_ordinal > 1 {
+        synthesis_chunks.push(cross_window);
+    }
+    if digest_ordinal > 1 {
+        let mut level = 1usize;
+        let mut chunks = synthesis_chunks;
+        while !chunks.is_empty() {
+            let chunk_count = chunks.len();
+            let mut digests = Vec::with_capacity(chunk_count);
+            for chunk in chunks {
+                write_length_prefixed(
+                    &mut file,
+                    &mut lease,
+                    &chunk,
+                    max_batch_bytes,
+                    "cross-window synthesis batch",
+                )?;
+                spool_bytes = spool_bytes
+                    .checked_add(chunk.len() as u64 + 8)
+                    .context("model-batch spool size overflowed")?;
+                count = count
+                    .checked_add(1)
+                    .context("model batch count overflowed")?;
+                synthesis_ids.insert(count);
+                digests.push(recursive_semantic_digest(&chunk));
+            }
+            if chunk_count == 1 {
+                break;
+            }
+            let next = pack_semantic_digests(&digests, level + 1, max_batch_bytes)?;
+            anyhow::ensure!(
+                next.len() < chunk_count,
+                "recursive synthesis did not reduce its bounded fan-in"
+            );
+            chunks = next;
+            level = level
+                .checked_add(1)
+                .context("recursive synthesis level overflowed")?;
+        }
+    }
+    if count == 0 && force_empty {
+        write_length_prefixed(&mut file, &mut lease, "", max_batch_bytes, "model batch")?;
+        spool_bytes = spool_bytes.saturating_add(8);
+        count = 1;
+        source_count = 1;
+    }
+    let aggregate = prepared
+        .snapshot_bytes
+        .checked_add(prepared.window_bytes)
+        .and_then(|bytes| bytes.checked_add(spool_bytes))
+        .context("aggregate review spool size overflowed")?;
+    anyhow::ensure!(
+        aggregate <= MAX_REVIEW_SPOOL_BYTES,
+        "review workspace needs {aggregate} bytes, exceeding the {MAX_REVIEW_SPOOL_BYTES} byte operation quota"
+    );
+    file.seek(SeekFrom::Start(0))
+        .context("rewinding model-batch spool")?;
+    Ok(ModelBatchSpool {
+        file,
+        _lease: lease,
+        count,
+        source_count,
+        metadata_count,
+        synthesis_ids,
+    })
+}
+
+fn pack_semantic_digests(
+    digests: &[String],
+    level: usize,
+    max_batch_bytes: usize,
+) -> Result<Vec<String>> {
+    let header = format!("Cross-window semantic digests level {level}:\n");
+    let mut chunks = Vec::new();
+    let mut current = header.clone();
+    for (index, digest) in digests.iter().enumerate() {
+        anyhow::ensure!(
+            !digest.is_empty(),
+            "synthesis digest lost all semantic evidence"
+        );
+        let entry = format!("\nSynthesis group {}:\n{digest}", index + 1);
+        if current.len().saturating_add(entry.len()) > max_batch_bytes {
+            anyhow::ensure!(
+                current.len() > header.len(),
+                "one synthesis digest exceeded its bound"
+            );
+            chunks.push(std::mem::replace(&mut current, header.clone()));
+        }
+        anyhow::ensure!(
+            current.len().saturating_add(entry.len()) <= max_batch_bytes,
+            "one synthesis digest exceeded its bound"
+        );
+        current.push_str(&entry);
+    }
+    if current.len() > header.len() {
+        chunks.push(current);
+    }
+    Ok(chunks)
+}
+
+fn recursive_semantic_digest(batch: &str) -> String {
+    type Evidence = (String, String);
+    type EvidenceBoundary = (Evidence, Evidence);
+
+    let digest = semantic_digest(batch);
+    let mut path = String::new();
+    let mut category = String::new();
+    let mut priority: BTreeMap<String, EvidenceBoundary> = BTreeMap::new();
+    let mut fallback: Option<EvidenceBoundary> = None;
+    for line in digest.lines() {
+        if let Some(value) = line.strip_prefix("### ") {
+            path = value.to_string();
+        } else if let Some(value) = line
+            .strip_prefix("@@ semantic category=")
+            .and_then(|value| value.strip_suffix(" @@"))
+        {
+            category = value.to_string();
+        } else if line
+            .trim_start()
+            .split_once(' ')
+            .is_some_and(|(number, _)| number.parse::<u32>().is_ok())
+        {
+            let evidence = (path.clone(), line.to_string());
+            fallback
+                .get_or_insert_with(|| (evidence.clone(), evidence.clone()))
+                .1 = evidence.clone();
+            if category != "uncategorized" {
+                priority
+                    .entry(category.clone())
+                    .and_modify(|entry| entry.1 = evidence.clone())
+                    .or_insert_with(|| (evidence.clone(), evidence));
+            }
+        }
+    }
+    let mut selected = priority.into_iter().collect::<Vec<_>>();
+    if let Some(pair) = fallback {
+        selected.push(("boundary".to_string(), pair));
+    }
+    let mut retained = String::new();
+    for (category, (first, last)) in selected {
+        retained.push_str(&format!(
+            "### {}\n@@ semantic category={category} @@\n{}\n",
+            first.0, first.1
+        ));
+        if last != first {
+            retained.push_str(&format!(
+                "### {}\n@@ semantic category={category} @@\n{}\n",
+                last.0, last.1
+            ));
+        }
+    }
+    retained
+}
+
+fn write_length_prefixed(
+    file: &mut File,
+    lease: &mut WorkspaceLease,
+    value: &str,
+    max_bytes: usize,
+    context: &str,
+) -> Result<()> {
+    anyhow::ensure!(
+        value.len() <= max_bytes,
+        "{context} exceeded its fixed bound"
+    );
+    let bytes = value.len() as u64 + 8;
+    lease
+        .reserve(bytes)
+        .with_context(|| format!("reserving {context} workspace"))?;
+    if let Err(error) = file
+        .write_all(&(value.len() as u64).to_le_bytes())
+        .and_then(|_| file.write_all(value.as_bytes()))
+    {
+        lease.release(bytes);
+        return Err(error).with_context(|| format!("writing {context}"));
+    }
+    Ok(())
+}
+
+fn read_length_prefixed(file: &mut File, context: &str) -> Result<Option<String>> {
+    let mut length = [0u8; 8];
+    match file.read_exact(&mut length) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("reading {context} length")),
+    }
+    let length = usize::try_from(u64::from_le_bytes(length))
+        .with_context(|| format!("{context} length does not fit this platform"))?;
+    let mut bytes = vec![0u8; length];
+    file.read_exact(&mut bytes)
+        .with_context(|| format!("reading {context}"))?;
+    String::from_utf8(bytes)
+        .map(Some)
+        .with_context(|| format!("{context} is not UTF-8"))
+}
+
+pub fn prepare_review(snapshot: &DiffSnapshot) -> Result<PreparedReview> {
+    let text = snapshot.as_str();
+    let mut windows = tempfile::tempfile().context("creating review-window spool")?;
+    let mut window_lease = WorkspaceLease::new(snapshot.workspace_budget());
+    let mut index = DiffIndex::default();
+    let mut lockfiles = Vec::new();
+    let mut compacted_artifacts = Vec::new();
+    let mut window_bytes = 0u64;
+    let mut has_source = false;
+    let mut reserved_anchor = false;
+    let mut pending_window = String::new();
+    let mut pending_manifest_bytes = 0usize;
+    let Some(mut cursor) = next_diff_start(text, 0) else {
+        anyhow::ensure!(text.trim().is_empty(), "review input is not a unified diff");
+        return Ok(PreparedReview {
+            windows,
+            _window_lease: window_lease,
+            index,
+            lockfiles,
+            compacted_artifacts,
+            has_source,
+            reserved_anchor,
+            snapshot_bytes: snapshot.len(),
+            window_bytes,
+        });
+    };
+    anyhow::ensure!(
+        text[..cursor].trim().is_empty(),
+        "review input has an invalid preamble"
+    );
+    while cursor < text.len() {
+        let end = next_diff_start(text, cursor + "diff --git ".len()).unwrap_or(text.len());
+        let section = &text[cursor..end];
+        let path = section_path(section).context("review section has an invalid path header")?;
+        if is_known_lockfile(&path)
+            && let Some(evidence) = lockfile_evidence(&path, section)
+        {
+            lockfiles.push(evidence);
+        } else if is_compactable_generated_artifact(&path, section) || is_binary_section(section) {
+            compacted_artifacts.push(compacted_artifact_evidence(&path, section));
+        } else {
+            for_each_section_window(section, STREAM_WINDOW_BYTES, |window| {
+                let parsed = parse(window);
+                anyhow::ensure!(parsed.complete, "review section is structurally incomplete");
+                reserved_anchor |= parsed
+                    .files
+                    .iter()
+                    .any(|file| crate::envelope::is_reserved_anchor(&file.path));
+                index.extend(&parsed);
+                has_source |= parsed.has_review_evidence();
+                let window_manifest_bytes = parsed
+                    .files
+                    .iter()
+                    .try_fold(0usize, |total, file| {
+                        total.checked_add(manifest_path(&file.path).len().saturating_add(512))
+                    })
+                    .context("review-window manifest size overflowed")?;
+                if !pending_window.is_empty()
+                    && (pending_window.len().saturating_add(window.len()) > STREAM_WINDOW_BYTES
+                        || pending_manifest_bytes.saturating_add(window_manifest_bytes)
+                            > NORMALIZED_MANIFEST_RESERVE_BYTES)
+                {
+                    write_window(&mut windows, &mut window_lease, &pending_window)?;
+                    window_bytes = window_bytes
+                        .checked_add(pending_window.len() as u64 + 8)
+                        .context("review-window spool size overflowed")?;
+                    pending_window.clear();
+                    pending_manifest_bytes = 0;
+                }
+                pending_window.push_str(window);
+                pending_manifest_bytes = pending_manifest_bytes
+                    .checked_add(window_manifest_bytes)
+                    .context("review-window manifest size overflowed")?;
+                Ok(())
+            })?;
+        }
+        cursor = end;
+    }
+    if !pending_window.is_empty() {
+        write_window(&mut windows, &mut window_lease, &pending_window)?;
+        window_bytes = window_bytes
+            .checked_add(pending_window.len() as u64 + 8)
+            .context("review-window spool size overflowed")?;
+    }
+    anyhow::ensure!(
+        index.is_complete(),
+        "diff grounding index exceeded its fixed resource bound"
+    );
+    let initial_workspace = snapshot
+        .len()
+        .checked_add(window_bytes)
+        .context("aggregate review spool size overflowed")?;
+    anyhow::ensure!(
+        initial_workspace <= MAX_REVIEW_SPOOL_BYTES,
+        "review workspace needs {initial_workspace} bytes before batching, exceeding the {MAX_REVIEW_SPOOL_BYTES} byte operation quota"
+    );
+    windows
+        .seek(SeekFrom::Start(0))
+        .context("rewinding review-window spool")?;
+    Ok(PreparedReview {
+        windows,
+        _window_lease: window_lease,
+        index,
+        lockfiles,
+        compacted_artifacts,
+        has_source,
+        reserved_anchor,
+        snapshot_bytes: snapshot.len(),
+        window_bytes,
+    })
+}
+
+fn write_window(file: &mut File, lease: &mut WorkspaceLease, window: &str) -> Result<()> {
+    anyhow::ensure!(
+        window.len() <= STREAM_WINDOW_BYTES,
+        "normalized review window exceeded its fixed bound"
+    );
+    let bytes = window.len() as u64 + 8;
+    lease
+        .reserve(bytes)
+        .context("reserving review-window workspace")?;
+    if let Err(error) = file
+        .write_all(&(window.len() as u64).to_le_bytes())
+        .and_then(|_| file.write_all(window.as_bytes()))
+    {
+        lease.release(bytes);
+        return Err(error).context("writing review window");
+    }
+    Ok(())
+}
+
+fn is_binary_section(section: &str) -> bool {
+    section
+        .lines()
+        .any(|line| line.starts_with("Binary files ") || line == "GIT binary patch")
+}
+
+fn for_each_section_window(
+    section: &str,
+    max_bytes: usize,
+    mut visit: impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    if section.len() <= max_bytes {
+        return visit(section);
+    }
+    let first_hunk = section
+        .find("\n@@ ")
+        .map(|offset| offset + 1)
+        .context("oversized non-binary diff section has no hunk")?;
+    let prefix = &section[..first_hunk];
+    anyhow::ensure!(
+        prefix.len().saturating_add(128) < max_bytes,
+        "diff section metadata is too large to normalize"
+    );
+    let mut cursor = first_hunk;
+    while cursor < section.len() {
+        let end = section[cursor + 1..]
+            .find("\n@@ ")
+            .map(|offset| cursor + 1 + offset + 1)
+            .unwrap_or(section.len());
+        split_hunk_window(prefix, &section[cursor..end], max_bytes, &mut visit)?;
+        cursor = end;
+    }
+    Ok(())
+}
+
+fn split_hunk_window(
+    prefix: &str,
+    hunk: &str,
+    max_bytes: usize,
+    visit: &mut impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    let header_end = hunk.find('\n').context("diff hunk has no body")?;
+    let header = hunk[..header_end]
+        .strip_prefix("@@ ")
+        .context("diff hunk header is malformed")?;
+    let (mut old_line, old_count, mut new_line, new_count) =
+        parse_hunk_header(header).context("diff hunk range is malformed")?;
+    let mut old_seen = 0u32;
+    let mut new_seen = 0u32;
+    let body_budget = max_bytes.saturating_sub(prefix.len() + 128);
+    let mut body = String::new();
+    let mut chunk_old_start = old_line;
+    let mut chunk_new_start = new_line;
+    let mut chunk_old = 0u32;
+    let mut chunk_new = 0u32;
+
+    let flush = |body: &mut String,
+                 chunk_old_start: u32,
+                 chunk_new_start: u32,
+                 chunk_old: u32,
+                 chunk_new: u32,
+                 visit: &mut dyn FnMut(&str) -> Result<()>|
+     -> Result<()> {
+        if body.is_empty() {
+            return Ok(());
+        }
+        let window = format!(
+            "{prefix}@@ -{chunk_old_start},{chunk_old} +{chunk_new_start},{chunk_new} @@ streamed window\n{body}"
+        );
+        anyhow::ensure!(
+            window.len() <= max_bytes,
+            "streamed hunk window exceeded its bound"
+        );
+        visit(&window)?;
+        body.clear();
+        Ok(())
+    };
+
+    for raw in hunk[header_end + 1..].split_inclusive('\n') {
+        if raw.starts_with('\\') {
+            continue;
+        }
+        let marker = raw.as_bytes().first().copied().unwrap_or(b' ');
+        let consumes_old = marker != b'+';
+        let consumes_new = marker != b'-';
+        if raw.len() > body_budget {
+            flush(
+                &mut body,
+                chunk_old_start,
+                chunk_new_start,
+                chunk_old,
+                chunk_new,
+                visit,
+            )?;
+            body = String::new();
+            chunk_old = 0;
+            chunk_new = 0;
+            let content = raw.strip_suffix('\n').unwrap_or(raw);
+            let (marker_text, content) = content.split_at(content.len().min(1));
+            let fragment_budget = body_budget.saturating_sub(marker_text.len() + 1).max(1);
+            let mut from = 0usize;
+            while from < content.len() {
+                let mut to = (from + fragment_budget).min(content.len());
+                while !content.is_char_boundary(to) {
+                    to -= 1;
+                }
+                let fragment = &content[from..to];
+                let fragment_body = format!("{marker_text}{fragment}\n");
+                let window = format!(
+                    "{prefix}@@ -{old_line},{} +{new_line},{} @@ streamed line fragment\n{fragment_body}",
+                    u32::from(consumes_old),
+                    u32::from(consumes_new),
+                );
+                visit(&window)?;
+                from = to;
+            }
+        } else {
+            if body.is_empty() {
+                chunk_old_start = old_line;
+                chunk_new_start = new_line;
+            }
+            if !body.is_empty() && body.len().saturating_add(raw.len()) > body_budget {
+                flush(
+                    &mut body,
+                    chunk_old_start,
+                    chunk_new_start,
+                    chunk_old,
+                    chunk_new,
+                    visit,
+                )?;
+                chunk_old_start = old_line;
+                chunk_new_start = new_line;
+                chunk_old = 0;
+                chunk_new = 0;
+            }
+            body.push_str(raw);
+            chunk_old = chunk_old.saturating_add(u32::from(consumes_old));
+            chunk_new = chunk_new.saturating_add(u32::from(consumes_new));
+        }
+        old_seen = old_seen.saturating_add(u32::from(consumes_old));
+        new_seen = new_seen.saturating_add(u32::from(consumes_new));
+        old_line = old_line.saturating_add(u32::from(consumes_old));
+        new_line = new_line.saturating_add(u32::from(consumes_new));
+    }
+    flush(
+        &mut body,
+        chunk_old_start,
+        chunk_new_start,
+        chunk_old,
+        chunk_new,
+        visit,
+    )?;
+    anyhow::ensure!(
+        old_seen == old_count && new_seen == new_count,
+        "diff hunk body does not match its declared range"
+    );
+    Ok(())
+}
+
+/// Compact exact lockfiles and unmistakable build artifacts before parsing.
+/// Generated-looking source names such as `client.generated.ts` remain normal
+/// untrusted source. Only sourcemaps and minified bundles are summarized.
+pub fn prepare_diff(text: &str) -> PreparedDiff<'_> {
     let mut cursor = next_diff_start(text, 0);
     if cursor.is_none() {
         return PreparedDiff {
-            source: (text.len() <= max_source_bytes).then_some(Cow::Borrowed(text)),
+            source: Some(Cow::Borrowed(text)),
             lockfiles: Vec::new(),
-            incomplete: text.len() > max_source_bytes,
+            compacted_artifacts: Vec::new(),
+            incomplete: false,
         };
     }
 
     let preamble_len = cursor.unwrap_or(0);
     let mut kept_len = preamble_len;
     let mut lockfiles = Vec::new();
-    let mut saw_lockfile = false;
+    let mut compacted_artifacts = Vec::new();
+    let mut compacted = false;
     while let Some(start) = cursor {
         let end = next_diff_start(text, start + "diff --git ".len()).unwrap_or(text.len());
         let section = &text[start..end];
@@ -242,43 +1515,31 @@ pub fn prepare_diff(text: &str, max_source_bytes: usize) -> PreparedDiff<'_> {
             return PreparedDiff {
                 source: None,
                 lockfiles: Vec::new(),
+                compacted_artifacts: Vec::new(),
                 incomplete: true,
             };
         };
         if is_known_lockfile(&path) {
-            saw_lockfile = true;
-            let Some(evidence) = lockfile_evidence(&path, section) else {
-                return PreparedDiff {
-                    source: None,
-                    lockfiles: Vec::new(),
-                    incomplete: true,
-                };
-            };
-            lockfiles.push(evidence);
-            if lockfiles.len() > MAX_LOCKFILE_EVIDENCE_SECTIONS {
-                return PreparedDiff {
-                    source: None,
-                    lockfiles: Vec::new(),
-                    incomplete: true,
-                };
+            if let Some(evidence) = lockfile_evidence(&path, section) {
+                compacted = true;
+                lockfiles.push(evidence);
+            } else {
+                kept_len = kept_len.saturating_add(section.len());
             }
+        } else if is_compactable_generated_artifact(&path, section) {
+            compacted = true;
+            compacted_artifacts.push(compacted_artifact_evidence(&path, section));
         } else {
             kept_len = kept_len.saturating_add(section.len());
         }
         cursor = (end < text.len()).then_some(end);
     }
 
-    if kept_len > max_source_bytes {
-        return PreparedDiff {
-            source: None,
-            lockfiles,
-            incomplete: true,
-        };
-    }
-    if !saw_lockfile {
+    if !compacted {
         return PreparedDiff {
             source: Some(Cow::Borrowed(text)),
             lockfiles,
+            compacted_artifacts,
             incomplete: false,
         };
     }
@@ -293,10 +1554,13 @@ pub fn prepare_diff(text: &str, max_source_bytes: usize) -> PreparedDiff<'_> {
             return PreparedDiff {
                 source: None,
                 lockfiles: Vec::new(),
+                compacted_artifacts: Vec::new(),
                 incomplete: true,
             };
         };
-        if !is_known_lockfile(&path) {
+        let compact_lockfile =
+            is_known_lockfile(&path) && lockfile_evidence(&path, section).is_some();
+        if !compact_lockfile && !is_compactable_generated_artifact(&path, section) {
             source.push_str(section);
         }
         cursor = (end < text.len()).then_some(end);
@@ -304,7 +1568,59 @@ pub fn prepare_diff(text: &str, max_source_bytes: usize) -> PreparedDiff<'_> {
     PreparedDiff {
         source: Some(Cow::Owned(source)),
         lockfiles,
+        compacted_artifacts,
         incomplete: false,
+    }
+}
+
+fn is_compactable_generated_artifact(path: &str, section: &str) -> bool {
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    let mut prefix_end = section.len().min(64 * 1024);
+    while !section.is_char_boundary(prefix_end) {
+        prefix_end -= 1;
+    }
+    let lower = section[..prefix_end].to_ascii_lowercase();
+    let explicit_generator = [
+        "@generated",
+        "generated by ",
+        "sourcemappingurl=",
+        "source mappingurl=",
+        "do not edit",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    let structured_source_map = normalized.ends_with(".map")
+        && lower.contains("\"version\"")
+        && lower.contains("\"mappings\"")
+        && lower.contains("\"sources\"");
+    let minified_bundle = (normalized.ends_with(".min.js") || normalized.ends_with(".min.css"))
+        && explicit_generator
+        && section.lines().any(|line| {
+            matches!(line.as_bytes().first(), Some(b'+') | Some(b'-')) && line.len() >= 4_096
+        });
+    structured_source_map || minified_bundle
+}
+
+fn compacted_artifact_evidence(path: &str, section: &str) -> CompactedArtifactEvidence {
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    for line in section.lines() {
+        if line.starts_with('+') && !line.starts_with("+++") {
+            added = added.saturating_add(1);
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            removed = removed.saturating_add(1);
+        }
+    }
+    CompactedArtifactEvidence {
+        path: path.to_string(),
+        kind: if is_binary_section(section) {
+            "binary change"
+        } else {
+            "verified generated artifact"
+        },
+        added,
+        removed,
+        bytes: section.len(),
     }
 }
 
@@ -456,38 +1772,52 @@ fn prompt_paths_equal(left: &str, right: &str) -> bool {
 }
 
 fn lockfile_evidence(path: &str, section: &str) -> Option<LockfileEvidence> {
-    if section.len() > MAX_LOCKFILE_SECTION_BYTES {
-        return None;
-    }
     let mut added = 0;
     let mut removed = 0;
-    let mut old_lines = Vec::new();
-    let mut new_lines = Vec::new();
     for line in section.lines() {
         if line.starts_with('+') && !line.starts_with("+++") {
             added += 1;
-            new_lines.push(&line[1..]);
         } else if line.starts_with('-') && !line.starts_with("---") {
             removed += 1;
-            old_lines.push(&line[1..]);
-        } else if let Some(content) = line.strip_prefix(' ') {
-            old_lines.push(content);
-            new_lines.push(content);
-        } else {
-            continue;
         }
     }
-    let old = parse_lockfile_packages(path, &old_lines)?;
-    let new = parse_lockfile_packages(path, &new_lines)?;
+    let old = parse_lockfile_packages(
+        path,
+        section.lines().filter_map(|line| {
+            if line.starts_with('-') && !line.starts_with("---") {
+                Some(&line[1..])
+            } else {
+                line.strip_prefix(' ')
+            }
+        }),
+    )?;
+    let new = parse_lockfile_packages(
+        path,
+        section.lines().filter_map(|line| {
+            if line.starts_with('+') && !line.starts_with("+++") {
+                Some(&line[1..])
+            } else {
+                line.strip_prefix(' ')
+            }
+        }),
+    )?;
     let mut changes = Vec::new();
-    for package in old.difference(&new) {
+    for package in old.difference(&new).take(MAX_LOCKFILE_DIRECTIONAL_CHANGES) {
         changes.push(format!("removed {package}"));
     }
-    for package in new.difference(&old) {
+    let remaining = MAX_LOCKFILE_DIRECTIONAL_CHANGES.saturating_sub(changes.len());
+    for package in new.difference(&old).take(remaining) {
         changes.push(format!("added {package}"));
     }
-    if changes.is_empty() || changes.len() > MAX_LOCKFILE_DIRECTIONAL_CHANGES {
+    if changes.is_empty() {
         return None;
+    }
+    let total_changes = old.difference(&new).count() + new.difference(&old).count();
+    if total_changes > changes.len() {
+        changes.push(format!(
+            "{} additional dependency changes summarized",
+            total_changes - changes.len()
+        ));
     }
     Some(LockfileEvidence {
         path: path.to_string(),
@@ -497,7 +1827,10 @@ fn lockfile_evidence(path: &str, section: &str) -> Option<LockfileEvidence> {
     })
 }
 
-fn parse_lockfile_packages(path: &str, lines: &[&str]) -> Option<BTreeSet<String>> {
+fn parse_lockfile_packages<'a>(
+    path: &str,
+    lines: impl Iterator<Item = &'a str>,
+) -> Option<BTreeSet<String>> {
     let name = path.rsplit('/').next()?.to_ascii_lowercase();
     match name.as_str() {
         "cargo.lock" => parse_named_version_records(lines, "name", "version"),
@@ -509,8 +1842,8 @@ fn parse_lockfile_packages(path: &str, lines: &[&str]) -> Option<BTreeSet<String
     }
 }
 
-fn parse_named_version_records(
-    lines: &[&str],
+fn parse_named_version_records<'a>(
+    lines: impl Iterator<Item = &'a str>,
     name_key: &str,
     version_key: &str,
 ) -> Option<BTreeSet<String>> {
@@ -524,6 +1857,9 @@ fn parse_named_version_records(
             && let Some(name) = package.take()
         {
             packages.insert(format!("{name}@{version}"));
+            if packages.len() > MAX_LOCKFILE_PACKAGE_RECORDS {
+                return None;
+            }
         }
     }
     (!packages.is_empty()).then_some(packages)
@@ -549,7 +1885,9 @@ fn safe_package_atom(value: &str) -> Option<String> {
     Some(value.to_string())
 }
 
-fn parse_package_lock_records(lines: &[&str]) -> Option<BTreeSet<String>> {
+fn parse_package_lock_records<'a>(
+    lines: impl Iterator<Item = &'a str>,
+) -> Option<BTreeSet<String>> {
     let mut packages = BTreeSet::new();
     let mut package = None;
     for line in lines {
@@ -574,6 +1912,9 @@ fn parse_package_lock_records(lines: &[&str]) -> Option<BTreeSet<String>> {
             && let Some(name) = package.take()
         {
             packages.insert(format!("{name}@{version}"));
+            if packages.len() > MAX_LOCKFILE_PACKAGE_RECORDS {
+                return None;
+            }
         }
     }
     (!packages.is_empty()).then_some(packages)
@@ -585,7 +1926,7 @@ fn json_string_field(line: &str, field: &str) -> Option<String> {
     safe_package_atom(value.trim_matches('"'))
 }
 
-fn parse_yarn_records(lines: &[&str]) -> Option<BTreeSet<String>> {
+fn parse_yarn_records<'a>(lines: impl Iterator<Item = &'a str>) -> Option<BTreeSet<String>> {
     let mut packages = BTreeSet::new();
     let mut package = None;
     for line in lines {
@@ -610,12 +1951,15 @@ fn parse_yarn_records(lines: &[&str]) -> Option<BTreeSet<String>> {
             && let Some(version) = safe_package_atom(version.trim().trim_matches('"'))
         {
             packages.insert(format!("{name}@{version}"));
+            if packages.len() > MAX_LOCKFILE_PACKAGE_RECORDS {
+                return None;
+            }
         }
     }
     (!packages.is_empty()).then_some(packages)
 }
 
-fn parse_pnpm_records(lines: &[&str]) -> Option<BTreeSet<String>> {
+fn parse_pnpm_records<'a>(lines: impl Iterator<Item = &'a str>) -> Option<BTreeSet<String>> {
     let mut packages = BTreeSet::new();
     for line in lines {
         let value = line.trim().trim_end_matches(':').trim_matches(['\'', '"']);
@@ -631,12 +1975,15 @@ fn parse_pnpm_records(lines: &[&str]) -> Option<BTreeSet<String>> {
                 safe_package_atom(name)?,
                 safe_package_atom(version)?
             ));
+            if packages.len() > MAX_LOCKFILE_PACKAGE_RECORDS {
+                return None;
+            }
         }
     }
     (!packages.is_empty()).then_some(packages)
 }
 
-fn parse_go_sum_records(lines: &[&str]) -> Option<BTreeSet<String>> {
+fn parse_go_sum_records<'a>(lines: impl Iterator<Item = &'a str>) -> Option<BTreeSet<String>> {
     let mut packages = BTreeSet::new();
     for line in lines {
         if line.trim().is_empty() {
@@ -646,6 +1993,9 @@ fn parse_go_sum_records(lines: &[&str]) -> Option<BTreeSet<String>> {
         let name = safe_package_atom(fields.next()?)?;
         let version = safe_package_atom(fields.next()?)?;
         packages.insert(format!("{name}@{}", version.trim_end_matches("/go.mod")));
+        if packages.len() > MAX_LOCKFILE_PACKAGE_RECORDS {
+            return None;
+        }
     }
     (!packages.is_empty()).then_some(packages)
 }
@@ -992,15 +2342,15 @@ struct ChangeManifest {
 pub fn render_review_batches(
     diff: &Diff,
     lockfiles: &[LockfileEvidence],
+    compacted_artifacts: &[CompactedArtifactEvidence],
     max_bytes: usize,
-    max_batches: usize,
     max_manifest_bytes: usize,
 ) -> ReviewBatchPlan {
     assert!(
         max_bytes >= 4096,
         "review batch limit must leave room for context"
     );
-    let manifest = build_manifest(diff, lockfiles, max_manifest_bytes);
+    let manifest = build_manifest(diff, lockfiles, compacted_artifacts, max_manifest_bytes);
     let mut plan = ReviewBatchPlan {
         incomplete: manifest.incomplete || manifest.text.len() >= max_bytes,
         metadata_count: manifest.metadata_count,
@@ -1016,24 +2366,14 @@ pub fn render_review_batches(
             continue;
         }
         for hunk in &file.hunks {
-            let Some(units) = render_hunk_units(
-                file,
-                hunk,
-                max_bytes.saturating_sub(manifest.text.len()),
-                max_batches.saturating_mul(16),
-            ) else {
+            let Some(units) =
+                render_hunk_units(file, hunk, max_bytes.saturating_sub(manifest.text.len()))
+            else {
                 plan.incomplete = true;
                 return plan;
             };
             for unit in units {
-                if !append_unit(
-                    &mut plan,
-                    &mut current,
-                    &manifest.text,
-                    &unit,
-                    max_bytes,
-                    max_batches,
-                ) {
+                if !append_unit(&mut plan, &mut current, &manifest.text, &unit, max_bytes) {
                     plan.incomplete = true;
                     return plan;
                 }
@@ -1041,27 +2381,27 @@ pub fn render_review_batches(
         }
     }
     if !current.is_empty() {
-        if plan.batches.len() >= max_batches {
-            plan.incomplete = true;
-            return plan;
-        }
         plan.batches.push(current);
-    } else if plan.batches.is_empty() && (!diff.files.is_empty() || !lockfiles.is_empty()) {
+    } else if plan.batches.is_empty()
+        && (!diff.files.is_empty() || !lockfiles.is_empty() || !compacted_artifacts.is_empty())
+    {
         plan.batches.push(manifest.text.clone());
     }
 
     if plan.batches.len() > 1 {
         plan.synthesis = build_synthesis(&manifest.text, &plan.batches, max_bytes);
-        if plan.synthesis.is_none() {
-            plan.incomplete = true;
-        }
     }
     plan.projected_input_bytes = plan.batches.iter().map(String::len).sum::<usize>()
         + plan.synthesis.as_ref().map_or(0, String::len);
     plan
 }
 
-fn build_manifest(diff: &Diff, lockfiles: &[LockfileEvidence], max_bytes: usize) -> ChangeManifest {
+fn build_manifest(
+    diff: &Diff,
+    lockfiles: &[LockfileEvidence],
+    compacted_artifacts: &[CompactedArtifactEvidence],
+    max_bytes: usize,
+) -> ChangeManifest {
     let mut text = String::from("Changed-file manifest:\n");
     let mut metadata = Vec::new();
     let mut metadata_bytes = 0usize;
@@ -1156,6 +2496,43 @@ fn build_manifest(diff: &Diff, lockfiles: &[LockfileEvidence], max_bytes: usize)
         }
         metadata.push(entry);
     }
+    for artifact in compacted_artifacts {
+        let manifest_entry = format!(
+            "- {} [compacted {} evidence]\n",
+            manifest_path(&artifact.path),
+            artifact.kind,
+        );
+        if text
+            .len()
+            .saturating_add(manifest_entry.len())
+            .saturating_add(metadata_bytes)
+            > max_bytes
+        {
+            return ChangeManifest {
+                text,
+                metadata_count: 0,
+                incomplete: true,
+            };
+        }
+        text.push_str(&manifest_entry);
+        let entry = format!(
+            "{}: {}, {} additions, {} deletions, {} raw bytes represented by bounded evidence",
+            manifest_path(&artifact.path),
+            artifact.kind,
+            artifact.added,
+            artifact.removed,
+            artifact.bytes,
+        );
+        metadata_bytes = metadata_bytes.saturating_add(entry.len() + 16);
+        if text.len().saturating_add(metadata_bytes) > max_bytes {
+            return ChangeManifest {
+                text,
+                metadata_count: 0,
+                incomplete: true,
+            };
+        }
+        metadata.push(entry);
+    }
     let metadata_count = metadata.len() as u32;
     if !metadata.is_empty() {
         text.push_str(&format!(
@@ -1177,12 +2554,7 @@ fn manifest_path(path: &str) -> String {
     display_path(path)
 }
 
-fn render_hunk_units(
-    file: &FileDiff,
-    hunk: &Hunk,
-    budget: usize,
-    max_units: usize,
-) -> Option<Vec<String>> {
+fn render_hunk_units(file: &FileDiff, hunk: &Hunk, budget: usize) -> Option<Vec<String>> {
     let file_header = if file.deleted {
         format!(
             "### {}\n@@ deleted; cite {} metadata line @@\n",
@@ -1203,12 +2575,9 @@ fn render_hunk_units(
 
     for raw in &hunk.lines {
         let (marker, content) = raw.split_at(if raw.is_empty() { 0 } else { 1 });
-        let rendered = render_line_segments(marker, content, old_line, new_line, max_units)?;
+        let rendered = render_line_segments(marker, content, old_line, new_line);
         for rendered_line in rendered {
             if !segment.is_empty() && segment.len() + rendered_line.len() > segment_budget {
-                if units.len() >= max_units {
-                    return None;
-                }
                 units.push(format!(
                     "{file_header}@@ segment starting near new line {segment_start} @@\n{segment}"
                 ));
@@ -1237,9 +2606,6 @@ fn render_hunk_units(
         }
     }
     if !segment.is_empty() {
-        if units.len() >= max_units {
-            return None;
-        }
         units.push(format!(
             "{file_header}@@ segment starting near new line {segment_start} @@\n{segment}"
         ));
@@ -1247,27 +2613,18 @@ fn render_hunk_units(
     Some(units)
 }
 
-fn render_line_segments(
-    marker: &str,
-    content: &str,
-    old_line: u32,
-    new_line: u32,
-    max_chunks: usize,
-) -> Option<Vec<String>> {
+fn render_line_segments(marker: &str, content: &str, old_line: u32, new_line: u32) -> Vec<String> {
     let prefix = match marker {
         "+" => format!("{new_line:>6} + "),
         "-" => format!("old {old_line:>6} - "),
         _ => format!("{new_line:>6}   "),
     };
     if content.len() <= LINE_CHUNK_BYTES {
-        return Some(vec![format!("{prefix}{content}\n")]);
+        return vec![format!("{prefix}{content}\n")];
     }
     let step = LINE_CHUNK_BYTES.saturating_sub(LINE_CHUNK_OVERLAP).max(1);
     let projected_chunks = content.len().saturating_sub(1) / step + 1;
-    if projected_chunks > max_chunks {
-        return None;
-    }
-    let mut rendered = Vec::new();
+    let mut rendered = Vec::with_capacity(projected_chunks);
     let mut start = 0;
     while start < content.len() {
         let mut end = (start + LINE_CHUNK_BYTES).min(content.len());
@@ -1287,7 +2644,7 @@ fn render_line_segments(
         }
         start = next;
     }
-    Some(rendered)
+    rendered
 }
 
 fn append_unit(
@@ -1296,7 +2653,6 @@ fn append_unit(
     manifest: &str,
     unit: &str,
     max_bytes: usize,
-    max_batches: usize,
 ) -> bool {
     if manifest.len() + unit.len() > max_bytes {
         return false;
@@ -1306,9 +2662,6 @@ fn append_unit(
         current.push('\n');
     }
     if current.len() + unit.len() > max_bytes {
-        if plan.batches.len() >= max_batches {
-            return false;
-        }
         plan.batches.push(std::mem::take(current));
         current.push_str(manifest);
         current.push('\n');
@@ -1375,6 +2728,9 @@ fn semantic_digest(batch: &str) -> String {
         label: String,
         categories: Vec<Option<String>>,
         fallback: Option<String>,
+        last: Option<String>,
+        lines: Vec<String>,
+        lines_overflowed: bool,
     }
 
     fn flush_region(regions: &mut Vec<Region>, current: &mut Option<Region>) {
@@ -1405,6 +2761,9 @@ fn semantic_digest(batch: &str) -> String {
                     label: label.trim_end_matches(" @@").to_string(),
                     categories: vec![None; CATEGORIES.len()],
                     fallback: None,
+                    last: None,
+                    lines: Vec::new(),
+                    lines_overflowed: false,
                 });
             }
             continue;
@@ -1424,9 +2783,18 @@ fn semantic_digest(batch: &str) -> String {
             label: "source region".to_string(),
             categories: vec![None; CATEGORIES.len()],
             fallback: None,
+            last: None,
+            lines: Vec::new(),
+            lines_overflowed: false,
         });
         let bounded: String = rendered.chars().take(360).collect();
         region.fallback.get_or_insert_with(|| bounded.clone());
+        region.last = Some(bounded.clone());
+        if region.lines.len() < 8 {
+            region.lines.push(bounded.clone());
+        } else {
+            region.lines_overflowed = true;
+        }
         let lower = content.to_ascii_lowercase();
         for (category_index, (_, markers)) in CATEGORIES.iter().enumerate() {
             if region.categories[category_index].is_none()
@@ -1445,6 +2813,16 @@ fn semantic_digest(batch: &str) -> String {
             region.path, region.label
         ));
         let mut emitted = BTreeSet::new();
+        if !region.lines_overflowed {
+            for rendered in region.lines {
+                if emitted.insert(rendered.clone()) {
+                    out.push_str(&format!(
+                        "@@ semantic category=complete-small-region @@\n{rendered}\n"
+                    ));
+                }
+            }
+            continue;
+        }
         for ((category, _), rendered) in CATEGORIES.iter().zip(region.categories) {
             if let Some(rendered) = rendered
                 && emitted.insert(rendered.clone())
@@ -1452,11 +2830,18 @@ fn semantic_digest(batch: &str) -> String {
                 out.push_str(&format!("@@ semantic category={category} @@\n{rendered}\n"));
             }
         }
-        if emitted.is_empty()
-            && let Some(rendered) = region.fallback
+        if let Some(rendered) = region.fallback
+            && emitted.insert(rendered.clone())
         {
             out.push_str(&format!(
                 "@@ semantic category=uncategorized @@\n{rendered}\n"
+            ));
+        }
+        if let Some(rendered) = region.last
+            && emitted.insert(rendered.clone())
+        {
+            out.push_str(&format!(
+                "@@ semantic category=region-boundary @@\n{rendered}\n"
             ));
         }
     }
@@ -1613,6 +2998,26 @@ Binary files a/img.png and b/img.png differ
 ";
 
     #[test]
+    fn empty_snapshot_is_a_valid_review_input() {
+        let snapshot = DiffSnapshot::from_bytes(b"").unwrap();
+        assert!(snapshot.is_empty());
+        assert_eq!(snapshot.as_str(), "");
+        let prepared = prepare_review(&snapshot).unwrap();
+        assert!(!prepared.has_source);
+    }
+
+    #[test]
+    fn external_snapshot_is_private_and_immutable_after_acquisition() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("input.diff");
+        std::fs::write(&path, SAMPLE).unwrap();
+        let snapshot = DiffSnapshot::from_path(&path).unwrap();
+        std::fs::write(&path, b"\xff\x00mutated").unwrap();
+        assert_eq!(snapshot.as_str(), SAMPLE);
+        assert!(prepare_review(&snapshot).is_ok());
+    }
+
+    #[test]
     fn parses_files_hunks_and_kinds() {
         let d = parse(SAMPLE);
         assert!(d.complete);
@@ -1697,7 +3102,7 @@ Binary files a/img.png and b/img.png differ
     #[test]
     fn generated_named_source_is_reviewed_as_untrusted_code() {
         let source = "diff --git a/src/client.generated.ts b/src/client.generated.ts\n--- a/src/client.generated.ts\n+++ b/src/client.generated.ts\n@@ -0,0 +1 @@\n+eval(userInput);\n";
-        let prepared = prepare_diff(source, 4096);
+        let prepared = prepare_diff(source);
         assert!(!prepared.incomplete);
         assert!(
             prepared
@@ -1716,7 +3121,7 @@ Binary files a/img.png and b/img.png differ
         assert_eq!(parsed.files.len(), 1);
         assert_eq!(parsed.files[0].path, "src/tab\tquote\"slash\\日.rs");
         assert_eq!(parsed.files[0].old_path, "src/tab\tquote\"slash\\日.rs");
-        let prepared = prepare_diff(source, 4096);
+        let prepared = prepare_diff(source);
         assert!(!prepared.incomplete);
     }
 
@@ -1770,7 +3175,7 @@ Binary files a/img.png and b/img.png differ
         let lock = "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1,3 +1,3 @@\n name = \"dangerous-dependency\"\n-version = \"1.2.2\"\n+version = \"1.2.3\"\n checksum = \"large-hash\"\n";
         let generated = "diff --git a/web/api.generated.ts b/web/api.generated.ts\n--- a/web/api.generated.ts\n+++ b/web/api.generated.ts\n@@ -0,0 +1 @@\n+eval(userInput);\n";
         let mixed = format!("{lock}{generated}");
-        let prepared = prepare_diff(&mixed, 4096);
+        let prepared = prepare_diff(&mixed);
         assert_eq!(prepared.lockfiles.len(), 1);
         assert!(!prepared.source.as_deref().unwrap().contains("Cargo.lock"));
         assert!(
@@ -1790,20 +3195,123 @@ Binary files a/img.png and b/img.png differ
     }
 
     #[test]
-    fn malformed_and_unsupported_lockfiles_fail_preparation_closed() {
-        let malformed = "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1 +1 @@\n-checksum = \"old\"\n+checksum = \"new\"\n";
-        assert!(prepare_diff(malformed, 4096).incomplete);
-        let unsupported = "diff --git a/composer.lock b/composer.lock\n--- a/composer.lock\n+++ b/composer.lock\n@@ -1 +1 @@\n-old\n+new\n";
-        assert!(prepare_diff(unsupported, 4096).incomplete);
+    fn generated_extension_alone_never_compacts_hand_maintained_source() {
+        let source = "diff --git a/web/security.min.js b/web/security.min.js\n--- a/web/security.min.js\n+++ b/web/security.min.js\n@@ -0,0 +1 @@\n+eval(userInput);\n";
+        let prepared = prepare_diff(source);
+        assert!(prepared.compacted_artifacts.is_empty());
+        assert!(
+            prepared
+                .source
+                .as_deref()
+                .unwrap()
+                .contains("eval(userInput)")
+        );
     }
 
     #[test]
-    fn supported_lockfile_larger_than_source_budget_is_compacted_first() {
-        let padding = "x".repeat(MAX_RAW_DIFF_INPUT_BYTES + 1);
+    fn generated_bundle_and_structured_source_map_use_bounded_evidence() {
+        let bundle = format!(
+            "diff --git a/web/app.min.js b/web/app.min.js\n--- a/web/app.min.js\n+++ b/web/app.min.js\n@@ -0,0 +1 @@\n+/* generated by esbuild; do not edit */{}\n",
+            "x".repeat(4_096)
+        );
+        let map = "diff --git a/web/app.js.map b/web/app.js.map\n--- a/web/app.js.map\n+++ b/web/app.js.map\n@@ -0,0 +1 @@\n+{\"version\":3,\"sources\":[\"app.ts\"],\"mappings\":\"AAAA\"}\n";
+        let combined = format!("{bundle}{map}");
+        let prepared = prepare_diff(&combined);
+        assert_eq!(prepared.compacted_artifacts.len(), 2);
+        assert_eq!(prepared.source.as_deref(), Some(""));
+        assert!(
+            prepared
+                .compacted_artifacts
+                .iter()
+                .all(|artifact| artifact.kind == "verified generated artifact")
+        );
+    }
+
+    #[test]
+    fn recursive_synthesis_retains_distant_first_and_last_regions() {
+        let digests = (1..=400)
+            .map(|index| {
+                format!(
+                    "### src/file_{index:03}.rs\n@@ semantic region: source @@\n@@ semantic category=uncategorized @@\n{index:>6} + {}\n",
+                    if index == 1 {
+                        "validate_pair(input);"
+                    } else if index == 400 {
+                        "dangerous_sink(original);"
+                    } else {
+                        "ordinary_change();"
+                    }
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut level = pack_semantic_digests(&digests, 1, 24_000).unwrap();
+        while level.len() > 1 {
+            let previous = level.len();
+            let next_digests = level
+                .iter()
+                .map(|chunk| recursive_semantic_digest(chunk))
+                .collect::<Vec<_>>();
+            level = pack_semantic_digests(&next_digests, 2, 24_000).unwrap();
+            assert!(level.len() < previous);
+        }
+        assert!(level[0].contains("validate_pair(input)"));
+        assert!(level[0].contains("dangerous_sink(original)"));
+    }
+
+    #[test]
+    fn interactive_context_streams_distant_evidence_without_byte_truncation() {
+        use std::fmt::Write as _;
+
+        let mut source = String::from(
+            "diff --git a/src/flow.rs b/src/flow.rs\n--- a/src/flow.rs\n+++ b/src/flow.rs\n@@ -0,0 +1,400 @@\n",
+        );
+        for line in 1..=400 {
+            if line == 1 {
+                source.push_str("+let checked = validate_pair(input);\n");
+            } else if line == 400 {
+                source.push_str("+dangerous_sink(original);\n");
+            } else {
+                writeln!(
+                    source,
+                    "+let padding_{line} = ordinary; // {}",
+                    "x".repeat(1_000)
+                )
+                .unwrap();
+            }
+        }
+        let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+        let (context, reserved) = bounded_respond_context(&snapshot, 120_000, 24_000).unwrap();
+        assert!(!reserved);
+        assert!(context.len() <= 120_000);
+        assert!(context.contains("validate_pair(input)"));
+        assert!(context.contains("dangerous_sink(original)"));
+        assert!(!context.contains("diff truncated"));
+    }
+
+    #[test]
+    fn malformed_and_unsupported_lockfiles_fall_back_to_source_review() {
+        let malformed = "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1 +1 @@\n-checksum = \"old\"\n+checksum = \"new\"\n";
+        let malformed = prepare_diff(malformed);
+        assert!(!malformed.incomplete);
+        assert!(malformed.source.as_deref().unwrap().contains("checksum"));
+        let unsupported = "diff --git a/composer.lock b/composer.lock\n--- a/composer.lock\n+++ b/composer.lock\n@@ -1 +1 @@\n-old\n+new\n";
+        let unsupported = prepare_diff(unsupported);
+        assert!(!unsupported.incomplete);
+        assert!(
+            unsupported
+                .source
+                .as_deref()
+                .unwrap()
+                .contains("composer.lock")
+        );
+    }
+
+    #[test]
+    fn supported_lockfile_larger_than_legacy_acquisition_limit_is_compacted() {
+        let padding = "x".repeat(32 * 1024 * 1024 + 1);
         let source = format!(
             "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1,3 +1,3 @@\n name = \"package-one\"\n-version = \"1.0.0\"\n+version = \"2.0.0\"\n checksum = \"{padding}\"\n"
         );
-        let prepared = prepare_diff(&source, MAX_RAW_DIFF_INPUT_BYTES);
+        let prepared = prepare_diff(&source);
         assert!(!prepared.incomplete);
         assert_eq!(prepared.source.as_deref(), Some(""));
         assert_eq!(prepared.lockfiles[0].changes.len(), 2);
@@ -1812,14 +3320,14 @@ Binary files a/img.png and b/img.png differ
     #[test]
     fn yarn_berry_and_package_lock_v1_have_directional_evidence() {
         let yarn = "diff --git a/yarn.lock b/yarn.lock\n--- a/yarn.lock\n+++ b/yarn.lock\n@@ -1,2 +1,2 @@\n \"@scope/pkg@npm:^1.0.0\":\n-  version: 1.0.0\n+  version: 1.1.0\n";
-        let yarn = prepare_diff(yarn, 4096);
+        let yarn = prepare_diff(yarn);
         assert_eq!(
             yarn.lockfiles[0].changes,
             ["removed @scope/pkg@1.0.0", "added @scope/pkg@1.1.0"]
         );
 
         let npm = "diff --git a/package-lock.json b/package-lock.json\n--- a/package-lock.json\n+++ b/package-lock.json\n@@ -1,3 +1,3 @@\n \"left-pad\": {\n-  \"version\": \"1.0.0\"\n+  \"version\": \"1.1.0\"\n";
-        let npm = prepare_diff(npm, 4096);
+        let npm = prepare_diff(npm);
         assert_eq!(
             npm.lockfiles[0].changes,
             ["removed left-pad@1.0.0", "added left-pad@1.1.0"]
@@ -1834,7 +3342,7 @@ Binary files a/img.png and b/img.png differ
             "x".repeat(40_000)
         );
         let parsed = parse(&source);
-        let plan = render_review_batches(&parsed, &[], 24_000, 8, 4096);
+        let plan = render_review_batches(&parsed, &[], &[], 24_000, 4096);
         assert!(!plan.incomplete);
         assert!(plan.batches.iter().any(|batch| batch.contains(tail)));
         assert!(plan.batches.iter().all(|batch| batch.len() <= 24_000));
@@ -1853,7 +3361,7 @@ Binary files a/img.png and b/img.png differ
     fn deletion_binary_rename_and_mode_changes_get_numbered_metadata() {
         let source = "diff --git a/src/auth.rs b/src/auth.rs\ndeleted file mode 100644\n--- a/src/auth.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-require_admin();\ndiff --git a/logo.bin b/logo.bin\nold mode 100644\nnew mode 100755\nBinary files a/logo.bin and b/logo.bin differ\ndiff --git a/old.rs b/new.rs\nsimilarity index 100%\nrename from old.rs\nrename to new.rs\n";
         let parsed = parse(source);
-        let plan = render_review_batches(&parsed, &[], 32_000, 4, 4096);
+        let plan = render_review_batches(&parsed, &[], &[], 32_000, 4096);
         assert!(!plan.incomplete);
         assert_eq!(plan.metadata_count, 3);
         let rendered = plan.batches.join("\n");
@@ -1974,5 +3482,58 @@ diff --git a/two.rs b/two.rs
         assert!(idx.contains("one.rs", 2));
         assert!(!idx.contains("one.rs", 3));
         assert!(idx.contains("two.rs", 2));
+    }
+
+    #[test]
+    fn workspace_budget_is_shared_across_live_spools() {
+        let budget = WorkspaceBudget::with_limit(12);
+        let mut first = DiffSpool::new_in(budget.clone()).unwrap();
+        let mut second = DiffSpool::new_in(budget.clone()).unwrap();
+        first.write_all(b"12345678").unwrap();
+        assert_eq!(budget.retained_bytes(), 8);
+        let error = second.write_all(b"12345").unwrap_err();
+        assert!(error.to_string().contains("operation quota"));
+        drop(first);
+        second.write_all(b"12345").unwrap();
+        assert_eq!(budget.retained_bytes(), 5);
+    }
+
+    #[test]
+    fn hosted_planner_bounds_large_handwritten_diff_without_losing_global_synthesis() {
+        use std::fmt::Write as _;
+
+        let mut source = String::new();
+        for file in 1..=80 {
+            writeln!(
+                source,
+                "diff --git a/src/file_{file}.rs b/src/file_{file}.rs\n--- a/src/file_{file}.rs\n+++ b/src/file_{file}.rs\n@@ -0,0 +1 @@\n+fn changed_{file}() {{ validate(input); {} }}",
+                "x".repeat(2_000)
+            )
+            .unwrap();
+        }
+        let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+        let mut prepared = prepare_review(&snapshot).unwrap();
+        let mut batches = spool_model_batches(&mut prepared, 4_096, 1_024, false).unwrap();
+        assert!(batches.count > 22);
+        assert!(batches.source_count < batches.count);
+        let candidates = batches.hosted_candidates(5, 32).unwrap();
+        assert_eq!(candidates.source_batch_count, batches.source_count);
+        assert!(candidates.mandatory_ids.len() <= 5);
+        assert!(candidates.mandatory_ids.contains(&1));
+        assert!(candidates.mandatory_ids.iter().any(|id| *id > 22));
+        let selected_ids = candidates
+            .mandatory_ids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let selected_source_count = batches.selected_source_count(&selected_ids);
+        let selected = batches.selected_batches(&selected_ids).unwrap();
+        assert_eq!(selected.len(), candidates.mandatory_ids.len());
+        assert!(selected_source_count < selected.len());
+        assert!(
+            selected
+                .iter()
+                .any(|batch| batch.contains("Cross-window semantic digests"))
+        );
     }
 }

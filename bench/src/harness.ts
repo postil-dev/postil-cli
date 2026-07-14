@@ -99,6 +99,7 @@ export const benchmarkCase = z.object({
   admission: z.object({
     classification: z.enum(["mustBlock", "advisory", "clean"]),
     contractRule: z.string().min(1),
+    expectedCoverage: z.enum(["exhaustive", "bounded"]).optional(),
   }),
   groundTruth: z.object({ findings: z.array(expectedFinding).default([]) }).default({
     findings: [],
@@ -170,7 +171,7 @@ export const envelopeV1 = z.object({
     .array(
       z.object({
         model: z.string().min(1),
-        role: z.enum(["reviewGenerator", "findingScorer", "mentionResponder"]).optional(),
+        role: z.enum(["reviewPlanner", "reviewGenerator", "findingScorer", "mentionResponder"]).optional(),
         phase: z.enum(["initial", "schemaRepair", "semanticRetry"]).optional(),
         callOrdinal: z.number().int().positive().optional(),
         attempt: z.number().int().positive().optional(),
@@ -183,6 +184,18 @@ export const envelopeV1 = z.object({
       }),
     )
     .optional(),
+  reviewCoverage: z.object({
+    mode: z.enum(["exhaustive", "bounded"]),
+    selectedBatches: z.number().int().nonnegative(),
+    totalBatches: z.number().int().nonnegative(),
+    plannerFallback: z.boolean().default(false),
+  }).optional(),
+  reviewAdmission: z.object({
+    providerAttempts: z.number().int().nonnegative(),
+    serializedInputBytes: z.number().int().nonnegative(),
+    outputTokens: z.number().int().nonnegative(),
+    projectedCostMicros: z.number().int().nonnegative().max(1_000_000),
+  }).optional(),
   usageAccountingComplete: z.boolean().optional(),
   durationMs: z.number().int().nonnegative(),
   baseSha: z.string().nullable(),
@@ -447,8 +460,7 @@ export async function startMockGithub(c: BenchmarkCase) {
   const allowedContent = allowedContextByPath(c);
   const baseSha = "0".repeat(40);
   const comparePath = `/repos/${c.repo}/compare/${baseSha}...${c.headSha}`;
-  const changedPath = c.allowedContext.files[0]?.path;
-  const sourceVersions = sourceVersionsFromDiff(c.diff);
+  const changedFiles = parseUnifiedDiffFiles(c.diff);
 
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
@@ -468,7 +480,7 @@ export async function startMockGithub(c: BenchmarkCase) {
             body: "",
             head: { sha: c.headSha },
             base: { sha: baseSha },
-            changed_files: 1,
+            changed_files: changedFiles.length,
           }),
         );
       }
@@ -476,19 +488,12 @@ export async function startMockGithub(c: BenchmarkCase) {
     }
 
     if (req.method === "GET" && url.pathname === pullFilesPath) {
-      const lines = c.diff.split("\n");
-      const filename = lines
-        .find((line) => line.startsWith("+++ b/"))
-        ?.slice("+++ b/".length) ?? c.allowedContext.files[0]?.path ?? "changed-file";
-      const patchStart = lines.findIndex((line) => line.startsWith("@@ "));
-      const patch = patchStart >= 0 ? lines.slice(patchStart).join("\n").trimEnd() : undefined;
-      const changes = lines.filter(
-        (line) =>
-          (line.startsWith("+") && !line.startsWith("+++")) ||
-          (line.startsWith("-") && !line.startsWith("---")),
-      ).length;
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify([{ filename, status: "modified", patch, changes }]));
+      res.end(JSON.stringify(changedFiles.map((file) => ({
+        filename: file.path,
+        status: file.status,
+        changes: file.changes,
+      }))));
       return;
     }
 
@@ -501,10 +506,11 @@ export async function startMockGithub(c: BenchmarkCase) {
     if (req.method === "GET" && url.pathname.startsWith(contentsPrefix)) {
       const requested = decodeURIComponent(url.pathname.slice(contentsPrefix.length));
       const ref = url.searchParams.get("ref");
-      const content = requested === changedPath && ref === baseSha
-        ? sourceVersions.before
-        : requested === changedPath && ref === c.headSha
-          ? sourceVersions.after
+      const changed = changedFiles.find((file) => file.path === requested);
+      const content = changed !== undefined && ref === baseSha
+        ? changed.before
+        : changed !== undefined && ref === c.headSha
+          ? changed.after
           : allowedContent.get(requested);
       if (content !== undefined) {
         res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
@@ -554,12 +560,53 @@ export async function startMockGithub(c: BenchmarkCase) {
   };
 }
 
-function sourceVersionsFromDiff(diff: string): { before: string; after: string } {
+export interface ParsedUnifiedDiffFile {
+  path: string;
+  status: "added" | "modified" | "removed";
+  patch: string | undefined;
+  changes: number;
+  before: string;
+  after: string;
+}
+
+export function parseUnifiedDiffFiles(diff: string): ParsedUnifiedDiffFile[] {
+  const lines = diff.split("\n");
+  const starts = lines
+    .map((line, index) => line.startsWith("diff --git ") ? index : -1)
+    .filter((index) => index >= 0);
+  return starts.map((start, position) => {
+    const section = lines.slice(start, starts[position + 1] ?? lines.length);
+    const oldHeader = section.find((line) => line.startsWith("--- "));
+    const newHeader = section.find((line) => line.startsWith("+++ "));
+    const oldPath = oldHeader?.startsWith("--- a/") ? oldHeader.slice(6) : undefined;
+    const newPath = newHeader?.startsWith("+++ b/") ? newHeader.slice(6) : undefined;
+    const path = newPath ?? oldPath;
+    if (path === undefined || path.length === 0) {
+      throw new Error("benchmark diff section has no canonical file path");
+    }
+    const patchStart = section.findIndex((line) => line.startsWith("@@ "));
+    const patch = patchStart >= 0 ? section.slice(patchStart).join("\n").trimEnd() : undefined;
+    const versions = sourceVersionsFromSection(section);
+    return {
+      path,
+      status: oldHeader === "--- /dev/null" ? "added" : newHeader === "+++ /dev/null" ? "removed" : "modified",
+      patch,
+      changes: section.filter(
+        (line) =>
+          (line.startsWith("+") && !line.startsWith("+++")) ||
+          (line.startsWith("-") && !line.startsWith("---")),
+      ).length,
+      ...versions,
+    };
+  });
+}
+
+function sourceVersionsFromSection(lines: string[]): { before: string; after: string } {
   const before: string[] = [];
   const after: string[] = [];
   let oldLine = 0;
   let newLine = 0;
-  for (const line of diff.split("\n")) {
+  for (const line of lines) {
     const header = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/u.exec(line);
     if (header) {
       oldLine = Number.parseInt(header[1]!, 10);

@@ -87,6 +87,13 @@ missing, mismatched, stale, or invalid bundle rejects a nonempty manifest. The
 empty manifest is exempt because it admits no models. Report and profile
 checksums detect changes; they do not authenticate who produced a candidate.
 
+The workflow builds a qualification-only binary feature that accepts one exact
+candidate profile inside the hermetic benchmark. The feature requires CI,
+managed privacy enforcement, and a loopback mock forge. Release binaries omit
+the feature. Candidate runs therefore execute the production hosted planner,
+request preflight, price ceilings, consensus, and scorer behavior without
+granting unqualified profiles authority in a deployed service.
+
 ```sh
 export MODEL_API_KEY=... # or POSTIL_API_KEY, OPENROUTER_API_KEY, or LLM_API_KEY
 export POSTIL_BENCH_MODE=live
@@ -144,6 +151,7 @@ Admission requires all of these in every repeat:
 - no clean false blocks and at most 5% clean cases with any finding
 - no execution, structured-output, grounding, statusline, or usage-accounting failure
 - mean pair cost at most $0.04 and mean review latency at most 15 seconds
+- every review costs at most the $1 hosted operation cap
 - per-repeat p95 latency at most 30 seconds and maximum latency at most 60 seconds
 
 Findings suppressed by the scorer count as detector evidence but cannot satisfy
@@ -176,9 +184,13 @@ candidate paths are invalidated before a run and replaced atomically; mock mode
 rejects `--manifest-out`. Output aliases are rejected by canonical parent path
 and existing file identity, including symlinked parents and hardlinks.
 
-The preflight prices every generator and scorer role invocation across the configured
-repeats before inference. It rejects missing prices, more than six models, and
-a cap outside `(0, $25]`. A single model used for both roles is priced twice.
+The managed preflight runs the CLI's exact normalized and compacted request
+plan for every fixture before inference. It includes bounded planner, selected
+source and synthesis requests, scoring, consensus, fallback, repair, and
+transport retries. It rejects missing prices, more than six models, a review
+above the $1 hosted operation cap, a total above the configured qualification
+cap, or a cap outside `(0, $25]`. A single model used for more than one role is
+priced for each planned invocation.
 The inference key stays in the child environment and is never printed or placed
 on an argument list.
 

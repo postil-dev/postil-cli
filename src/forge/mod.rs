@@ -11,8 +11,24 @@ pub mod gitlab;
 use anyhow::{Context, Result, ensure};
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
+use std::io::Write;
 
+use crate::diff::DiffSnapshot;
 use crate::envelope::{Envelope, Finding, Severity, SuppressionReason};
+
+pub const MAX_FORGE_METADATA_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_FORGE_CHANGED_FILES: usize = 20_000;
+
+pub fn checked_metadata_total(current: usize, additional: usize, context: &str) -> Result<usize> {
+    let total = current
+        .checked_add(additional)
+        .ok_or_else(|| anyhow::anyhow!("{context} metadata byte count overflowed"))?;
+    ensure!(
+        total <= MAX_FORGE_METADATA_BYTES,
+        "{context} metadata exceeds the {MAX_FORGE_METADATA_BYTES} byte aggregate limit"
+    );
+    Ok(total)
+}
 
 #[derive(Debug)]
 pub struct ForgeServiceFailure(pub String);
@@ -86,7 +102,7 @@ pub async fn bounded_response_text(
     bounded_response_text_with_limit(
         &mut response,
         context,
-        crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES,
+        crate::diff::MAX_FORGE_RESPONSE_BYTES,
     )
     .await
 }
@@ -162,6 +178,103 @@ pub async fn bounded_response_bytes_with_limit(
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
+}
+
+/// Stream a complete UTF-8 forge response to a file-backed immutable snapshot.
+/// This is used for individual source files whose size is not a review-scope
+/// decision. Transport truncation remains fatal, while heap use stays bounded
+/// by the response chunk size.
+pub async fn response_snapshot(response: reqwest::Response, context: &str) -> Result<DiffSnapshot> {
+    response_snapshot_in(response, context, crate::diff::WorkspaceBudget::new(), None).await
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SourceExpectation {
+    pub size: Option<u64>,
+    pub sha256: Option<String>,
+}
+
+pub async fn response_snapshot_in(
+    mut response: reqwest::Response,
+    context: &str,
+    workspace: crate::diff::WorkspaceBudget,
+    authoritative: Option<SourceExpectation>,
+) -> Result<DiffSnapshot> {
+    ensure!(
+        response.status() != reqwest::StatusCode::PARTIAL_CONTENT,
+        "{context} returned partial content"
+    );
+    for header in ["x-diff-truncated", "x-content-truncated", "x-truncated"] {
+        if response
+            .headers()
+            .get(header)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.eq_ignore_ascii_case("true") || value == "1")
+        {
+            return Err(anyhow::anyhow!("{context} reported truncated content"));
+        }
+    }
+    let declared_size = response.content_length();
+    if let (Some(declared), Some(expected)) = (
+        declared_size,
+        authoritative.as_ref().and_then(|value| value.size),
+    ) {
+        ensure!(
+            declared == expected,
+            "{context} declared {declared} bytes but forge metadata requires {expected}"
+        );
+    }
+    let mut spool = crate::diff::DiffSpool::new_in(workspace)?;
+    let mut received = 0u64;
+    let mut digest = authoritative
+        .as_ref()
+        .and_then(|value| value.sha256.as_ref())
+        .map(|_| Sha256::new());
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .with_context(|| format!("reading {context}"))?
+    {
+        received = received
+            .checked_add(chunk.len() as u64)
+            .ok_or_else(|| anyhow::anyhow!("{context} byte count overflowed"))?;
+        if let Some(digest) = &mut digest {
+            digest.update(&chunk);
+        }
+        spool
+            .write_all(&chunk)
+            .with_context(|| format!("spooling {context}"))?;
+    }
+    if let Some(declared) = declared_size {
+        ensure!(
+            received == declared,
+            "{context} ended after {received} of {declared} declared bytes"
+        );
+    }
+    if let Some(expected) = authoritative.as_ref().and_then(|value| value.size) {
+        ensure!(
+            received == expected,
+            "{context} ended after {received} bytes but forge metadata requires {expected}"
+        );
+    }
+    if let (Some(expected), Some(actual)) = (
+        authoritative
+            .as_ref()
+            .and_then(|value| value.sha256.as_ref()),
+        digest.map(|value| {
+            value
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        }),
+    ) {
+        ensure!(
+            expected.eq_ignore_ascii_case(&actual),
+            "{context} content hash does not match forge metadata"
+        );
+    }
+    spool.finish_source()
 }
 
 pub async fn bounded_response_json<T: DeserializeOwned>(
@@ -263,11 +376,11 @@ pub trait Forge {
     async fn fetch_pr_meta(&self) -> Result<PrMeta>;
     /// Unified diff of the immutable snapshot returned by `fetch_pr_meta`.
     /// Implementations must not re-read a moving PR head or target tip.
-    async fn fetch_diff(&self, snapshot: &PrMeta) -> Result<String>;
+    async fn fetch_diff(&self, snapshot: &PrMeta) -> Result<DiffSnapshot>;
     /// Unified diff covering `since_sha..head_sha` only (incremental reviews).
     /// `head_sha` is the SHA the caller is reviewing, not whatever the PR's
     /// head happens to be at fetch time. A later push must not widen the diff.
-    async fn fetch_diff_since(&self, since_sha: &str, head_sha: &str) -> Result<String>;
+    async fn fetch_diff_since(&self, since_sha: &str, head_sha: &str) -> Result<DiffSnapshot>;
     /// Post the batched review: one summary plus inline comments per finding.
     async fn post_review(&self, summary: &str, findings: &[Finding], head_sha: &str) -> Result<()>;
     /// Ensure both check runs exist (in_progress); returns (advisory_id, gate_id).
@@ -699,6 +812,29 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
         }
     }
 
+    if let Some(coverage) = &envelope.review_coverage {
+        let fallback = if coverage.planner_fallback {
+            "yes"
+        } else {
+            "no"
+        };
+        if rich {
+            s.push_str(&format!(
+                "\n<sub>{}/{} source batches · {} · planner fallback: {fallback}</sub>\n",
+                coverage.selected_batches,
+                coverage.total_batches,
+                coverage.mode.as_str(),
+            ));
+        } else {
+            s.push_str(&format!(
+                "\n{}/{} source batches ({}; planner fallback: {fallback}).\n",
+                coverage.selected_batches,
+                coverage.total_batches,
+                coverage.mode.as_str(),
+            ));
+        }
+    }
+
     if context.prevention_hint && !operational && !envelope.silent {
         if rich {
             s.push_str("\n<details><summary>Before the next push</summary>\n\n");
@@ -793,6 +929,162 @@ pub fn format_confidence(c: f64) -> String {
 mod tests {
     use super::*;
     use crate::envelope::{Kind, Severity};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn raw_http_server(response: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4_096];
+            let _ = stream.read(&mut request);
+            stream.write_all(&response).unwrap();
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    #[test]
+    fn forge_metadata_limit_is_aggregate_and_overflow_safe() {
+        assert_eq!(
+            checked_metadata_total(MAX_FORGE_METADATA_BYTES - 7, 7, "pages").unwrap(),
+            MAX_FORGE_METADATA_BYTES
+        );
+        assert!(
+            checked_metadata_total(MAX_FORGE_METADATA_BYTES, 1, "pages")
+                .unwrap_err()
+                .to_string()
+                .contains("aggregate limit")
+        );
+        assert!(checked_metadata_total(usize::MAX, 1, "pages").is_err());
+    }
+
+    #[tokio::test]
+    async fn source_snapshot_streams_above_page_limit_with_complete_length() {
+        let server = MockServer::start().await;
+        let body = vec![b'x'; crate::diff::MAX_FORGE_RESPONSE_BYTES + 1];
+        Mock::given(method("GET"))
+            .and(path("/large-source"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let response = reqwest::get(format!("{}/large-source", server.uri()))
+            .await
+            .unwrap();
+        let snapshot = response_snapshot(response, "large forge source")
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.len(), body.len() as u64);
+        assert_eq!(snapshot.as_bytes().first(), Some(&b'x'));
+        assert_eq!(snapshot.as_bytes().last(), Some(&b'x'));
+    }
+
+    #[tokio::test]
+    async fn source_snapshot_accepts_complete_chunked_response_without_length() {
+        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\nsafe\r\n5\r\n body\r\n0\r\n\r\n".to_vec();
+        let (url, server) = raw_http_server(response);
+        let response = reqwest::get(url).await.unwrap();
+        assert_eq!(response.content_length(), None);
+
+        let snapshot = response_snapshot(response, "chunked forge source")
+            .await
+            .unwrap();
+
+        server.join().unwrap();
+        assert_eq!(snapshot.as_bytes(), b"safe body");
+    }
+
+    #[tokio::test]
+    async fn source_snapshot_enforces_workspace_quota_without_declared_length() {
+        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\nsafe\r\n5\r\n body\r\n0\r\n\r\n".to_vec();
+        let (url, server) = raw_http_server(response);
+        let response = reqwest::get(url).await.unwrap();
+
+        let error = match response_snapshot_in(
+            response,
+            "quota-bound chunked source",
+            crate::diff::WorkspaceBudget::with_limit(8),
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("chunked source must respect the shared workspace quota"),
+            Err(error) => error,
+        };
+
+        server.join().unwrap();
+        assert!(format!("{error:#}").contains("operation quota"));
+    }
+
+    #[tokio::test]
+    async fn source_snapshot_rejects_transport_truncation() {
+        let response =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nshort".to_vec();
+        let (url, server) = raw_http_server(response);
+        let response = reqwest::get(url).await.unwrap();
+
+        let error = match response_snapshot(response, "truncated forge source").await {
+            Ok(_) => panic!("truncated response must be rejected"),
+            Err(error) => error,
+        };
+
+        server.join().unwrap();
+        assert!(error.to_string().contains("reading truncated forge source"));
+    }
+
+    #[tokio::test]
+    async fn source_snapshot_verifies_authoritative_size_and_hash() {
+        let body = b"complete source";
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/source"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let expected_hash = Sha256::digest(body)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let valid = response_snapshot_in(
+            reqwest::get(format!("{}/source", server.uri()))
+                .await
+                .unwrap(),
+            "verified forge source",
+            crate::diff::WorkspaceBudget::new(),
+            Some(SourceExpectation {
+                size: Some(body.len() as u64),
+                sha256: Some(expected_hash),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(valid.as_bytes(), body);
+
+        let error = match response_snapshot_in(
+            reqwest::get(format!("{}/source", server.uri()))
+                .await
+                .unwrap(),
+            "mismatched forge source",
+            crate::diff::WorkspaceBudget::new(),
+            Some(SourceExpectation {
+                size: Some(body.len() as u64),
+                sha256: Some("0".repeat(64)),
+            }),
+        )
+        .await
+        {
+            Ok(_) => panic!("hash mismatch must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("content hash"));
+    }
 
     #[test]
     fn only_typed_service_failures_remain_advisory_eligible() {
@@ -852,6 +1144,8 @@ mod tests {
             usage: Default::default(),
             model_usage: vec![],
             model_incidents: vec![],
+            review_coverage: None,
+            review_admission: None,
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
@@ -939,6 +1233,8 @@ mod tests {
             },
             model_usage: vec![],
             model_incidents: vec![],
+            review_coverage: None,
+            review_admission: None,
             usage_accounting_complete: true,
             duration_ms: 1_250,
             base_sha: None,
@@ -1052,6 +1348,36 @@ mod tests {
     }
 
     #[test]
+    fn review_coverage_is_compact_and_auditable_in_every_mode() {
+        let mut env = envelope_with_findings(vec![finding()]);
+        env.review_coverage = Some(crate::envelope::ReviewCoverage {
+            mode: crate::envelope::ReviewCoverageMode::Bounded,
+            selected_batches: 5,
+            total_batches: 19,
+            planner_fallback: true,
+        });
+
+        let rich = check_summary(&env, true, Default::default());
+        assert!(rich.contains("<sub>5/19 source batches · bounded · planner fallback: yes</sub>"));
+
+        let plain = check_summary(&env, false, Default::default());
+        assert!(plain.contains("5/19 source batches (bounded; planner fallback: yes)."));
+
+        env.review_coverage = Some(crate::envelope::ReviewCoverage {
+            mode: crate::envelope::ReviewCoverageMode::Exhaustive,
+            selected_batches: 19,
+            total_batches: 19,
+            planner_fallback: false,
+        });
+        let rich = check_summary(&env, true, Default::default());
+        assert!(
+            rich.contains("<sub>19/19 source batches · exhaustive · planner fallback: no</sub>")
+        );
+        let plain = check_summary(&env, false, Default::default());
+        assert!(plain.contains("19/19 source batches (exhaustive; planner fallback: no)."));
+    }
+
+    #[test]
     fn pr_description_finding_is_visible_without_exposing_operational_detail() {
         let mut pr_description = finding();
         pr_description.path = crate::envelope::PR_DESCRIPTION_PATH.into();
@@ -1106,6 +1432,8 @@ mod tests {
             usage: Default::default(),
             model_usage: vec![],
             model_incidents: vec![],
+            review_coverage: None,
+            review_admission: None,
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
@@ -1170,6 +1498,8 @@ mod tests {
             usage: Default::default(),
             model_usage: vec![],
             model_incidents: vec![],
+            review_coverage: None,
+            review_admission: None,
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
@@ -1203,6 +1533,8 @@ mod tests {
             usage: Default::default(),
             model_usage: vec![],
             model_incidents: vec![],
+            review_coverage: None,
+            review_admission: None,
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,

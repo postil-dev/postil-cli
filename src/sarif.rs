@@ -88,6 +88,21 @@ pub fn to_sarif(envelope: &Envelope) -> Value {
         })
         .collect();
 
+    let mut properties = json!({
+        "gateFailing": envelope.gate.failing,
+        "gateFailOn": envelope.gate.fail_on,
+        "modelUsed": envelope.model_used,
+        "silent": envelope.silent
+    });
+    if let Some(coverage) = &envelope.review_coverage {
+        properties["reviewCoverage"] = json!({
+            "mode": coverage.mode.as_str(),
+            "selectedBatches": coverage.selected_batches,
+            "totalBatches": coverage.total_batches,
+            "plannerFallback": coverage.planner_fallback,
+        });
+    }
+
     json!({
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
         "version": "2.1.0",
@@ -101,12 +116,7 @@ pub fn to_sarif(envelope: &Envelope) -> Value {
                 }
             },
             "results": results,
-            "properties": {
-                "gateFailing": envelope.gate.failing,
-                "gateFailOn": envelope.gate.fail_on,
-                "modelUsed": envelope.model_used,
-                "silent": envelope.silent
-            }
+            "properties": properties
         }]
     })
 }
@@ -138,6 +148,8 @@ mod tests {
             usage: Usage::default(),
             model_usage: vec![],
             model_incidents: vec![],
+            review_coverage: None,
+            review_admission: None,
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
@@ -186,5 +198,36 @@ mod tests {
         let s = to_sarif(&env_with(vec![]));
         assert_eq!(s["runs"][0]["results"].as_array().unwrap().len(), 0);
         assert_eq!(s["runs"][0]["properties"]["silent"], true);
+    }
+
+    #[test]
+    fn records_optional_review_coverage_in_run_properties() {
+        use crate::envelope::{ReviewCoverage, ReviewCoverageMode};
+
+        let without_coverage = to_sarif(&env_with(vec![]));
+        assert!(
+            without_coverage["runs"][0]["properties"]
+                .get("reviewCoverage")
+                .is_none()
+        );
+
+        for (mode, expected_mode, selected_batches, planner_fallback) in [
+            (ReviewCoverageMode::Bounded, "bounded", 5, true),
+            (ReviewCoverageMode::Exhaustive, "exhaustive", 19, false),
+        ] {
+            let mut env = env_with(vec![]);
+            env.review_coverage = Some(ReviewCoverage {
+                mode,
+                selected_batches,
+                total_batches: 19,
+                planner_fallback,
+            });
+            let sarif = to_sarif(&env);
+            let coverage = &sarif["runs"][0]["properties"]["reviewCoverage"];
+            assert_eq!(coverage["mode"], expected_mode);
+            assert_eq!(coverage["selectedBatches"], selected_batches);
+            assert_eq!(coverage["totalBatches"], 19);
+            assert_eq!(coverage["plannerFallback"], planner_fallback);
+        }
     }
 }

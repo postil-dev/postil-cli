@@ -14,12 +14,19 @@ path = "src/main.rs"
 name = "postil_cli"
 path = "src/lib.rs"
 
+[features]
+default = []
+# Builds the hermetic candidate-admission path used by the managed benchmark.
+# Release artifacts do not enable this feature.
+qualification-candidate = []
+
 [dependencies]
 anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive"] }
 futures = "0.3.32"
 globset = "0.4.18"
 httpdate = "1.0.3"
+memmap2 = "0.9.11"
 owo-colors = "4.3.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "charset"] }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -27,6 +34,7 @@ serde_json = { version = "1.0.150", features = ["raw_value"] }
 serde_yaml = "0.9.34"
 sha2 = "0.11.0"
 similar = "3.1.1"
+tempfile = "3.27.0"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "process", "time"] }
 toml = "1.1.2"
 

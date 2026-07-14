@@ -1,12 +1,12 @@
 //! Local diff acquisition: the same engine, before the PR exists.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::process::Stdio;
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow};
 use tokio::process::Command;
 
-use crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES;
+use crate::diff::{DiffSnapshot, DiffSpool};
 
 pub enum LocalSource {
     /// `git diff --cached`
@@ -17,30 +17,9 @@ pub enum LocalSource {
     DiffFile(std::path::PathBuf),
 }
 
-pub async fn acquire(source: &LocalSource) -> Result<String> {
+pub async fn acquire(source: &LocalSource) -> Result<DiffSnapshot> {
     match source {
-        LocalSource::DiffFile(path) => {
-            let size = std::fs::metadata(path)
-                .with_context(|| format!("reading diff file metadata {}", path.display()))?
-                .len();
-            ensure!(
-                size <= MAX_RAW_DIFF_ACQUISITION_BYTES as u64,
-                "diff input exceeds the {} byte acquisition limit",
-                MAX_RAW_DIFF_ACQUISITION_BYTES
-            );
-            let file = std::fs::File::open(path)
-                .with_context(|| format!("opening diff file {}", path.display()))?;
-            let mut bytes = Vec::with_capacity(size as usize);
-            file.take((MAX_RAW_DIFF_ACQUISITION_BYTES + 1) as u64)
-                .read_to_end(&mut bytes)
-                .with_context(|| format!("reading diff file {}", path.display()))?;
-            ensure!(
-                bytes.len() <= MAX_RAW_DIFF_ACQUISITION_BYTES,
-                "diff input exceeds the {} byte acquisition limit",
-                MAX_RAW_DIFF_ACQUISITION_BYTES
-            );
-            String::from_utf8(bytes).context("diff file is not valid UTF-8")
-        }
+        LocalSource::DiffFile(path) => DiffSnapshot::from_path(path),
         LocalSource::Staged => git_diff(&["diff", "--cached", "--no-color"]).await,
         LocalSource::Base(base) => {
             let range = format!("{base}...HEAD");
@@ -49,7 +28,7 @@ pub async fn acquire(source: &LocalSource) -> Result<String> {
     }
 }
 
-async fn git_diff(args: &[&str]) -> Result<String> {
+async fn git_diff(args: &[&str]) -> Result<DiffSnapshot> {
     let owned: Vec<String> = args
         .iter()
         .map(|argument| (*argument).to_string())
@@ -70,23 +49,16 @@ async fn git_diff(args: &[&str]) -> Result<String> {
                 .read_to_end(&mut bytes)
                 .map(|_| String::from_utf8_lossy(&bytes).into_owned())
         });
-        let mut bytes = Vec::new();
+        let mut spool = DiffSpool::new()?;
         let mut chunk = [0u8; 64 * 1024];
         loop {
             let count = stdout.read(&mut chunk).context("reading git diff")?;
             if count == 0 {
                 break;
             }
-            if bytes.len().saturating_add(count) > MAX_RAW_DIFF_ACQUISITION_BYTES {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stderr_reader.join();
-                return Err(anyhow!(
-                    "git diff exceeds the {} byte acquisition limit",
-                    MAX_RAW_DIFF_ACQUISITION_BYTES
-                ));
-            }
-            bytes.extend_from_slice(&chunk[..count]);
+            spool
+                .write_all(&chunk[..count])
+                .context("spooling git diff")?;
         }
         let status = child.wait().context("waiting for git")?;
         let stderr = stderr_reader
@@ -96,7 +68,7 @@ async fn git_diff(args: &[&str]) -> Result<String> {
         if !status.success() {
             return Err(anyhow!("git {} failed: {}", owned.join(" "), stderr.trim()));
         }
-        String::from_utf8(bytes).context("git diff is not valid UTF-8")
+        spool.finish()
     })
     .await
     .context("joining git diff reader")?

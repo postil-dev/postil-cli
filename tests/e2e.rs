@@ -211,6 +211,23 @@ async fn mount_github_complete_diff(server: &MockServer, pr: u64) {
 }
 
 #[derive(Clone)]
+struct GitHubLargeLockfileResponder;
+
+impl Respond for GitHubLargeLockfileResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let base = request
+            .url
+            .query()
+            .is_some_and(|query| query.contains("ref=bbbbbbbb"));
+        let version = if base { "1.2.2" } else { "1.2.3" };
+        ResponseTemplate::new(200).set_body_string(format!(
+            "name = \"large-dependency\"\nversion = \"{version}\"\nchecksum = \"{}\"\n",
+            "x".repeat(33 * 1024 * 1024),
+        ))
+    }
+}
+
+#[derive(Clone)]
 struct BitbucketSourceResponder;
 
 impl Respond for BitbucketSourceResponder {
@@ -269,12 +286,11 @@ impl Respond for GitLabSourceResponder {
             .query_pairs()
             .any(|(name, value)| name == "ref" && (value == "b" || value == "base"));
         let old = "context line\ntrailing context\n";
-        let marker =
-            if request.url.path().contains("late.rs") || request.url.path().contains("late%2Ers") {
-                "let AUTHORITATIVE_LAST_PAGE = true;\n"
-            } else {
-                ""
-            };
+        let marker = if request.url.path().contains("late") {
+            "let AUTHORITATIVE_LAST_PAGE = true;\n"
+        } else {
+            ""
+        };
         let new = format!(
             "context line\nlet token = user_input;\nexec_query(token);\n{marker}trailing context\n"
         );
@@ -311,6 +327,9 @@ fn postil() -> Command {
         .env_remove("REVIEW_SCORER_MODEL_CASCADE")
         .env_remove("POSTIL_DISABLE_SCORER")
         .env_remove("POSTIL_HOSTED_MODE")
+        .env_remove("POSTIL_QUALIFICATION_CANDIDATE_PROFILE")
+        .env_remove("POSTIL_QUALIFICATION_PLAN_ONLY")
+        .env_remove("POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY")
         .env_remove("POSTIL_LLM_REQUEST_TIMEOUT_SECS")
         .env_remove("POSTIL_LLM_TOTAL_TIMEOUT_SECS")
         .env_remove("MODEL_API_KEY")
@@ -815,7 +834,7 @@ async fn provider_403_redacts_key_management_url_from_cli_and_finding() {
 }
 
 #[tokio::test]
-async fn provider_reported_spend_above_hard_cap_fails_closed() {
+async fn byok_reported_spend_is_not_subject_to_the_hosted_operation_cap() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
@@ -835,14 +854,86 @@ async fn provider_reported_spend_above_hard_cap_fails_closed() {
         .arg(&diff)
         .args(["--output", "json"])
         .assert()
-        .code(1);
+        .success();
     let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
-    assert_eq!(
-        envelope["findings"][0]["title"],
-        "Model provider unavailable"
-    );
+    assert!(envelope["findings"].as_array().unwrap().is_empty());
     assert_eq!(envelope["modelUsage"][0]["promptTokens"], 20_000_001_u64);
-    assert!(!String::from_utf8_lossy(&out.get_output().stderr).contains("20000001"));
+}
+
+#[cfg(feature = "qualification-candidate")]
+#[test]
+fn qualification_candidate_preflights_the_bounded_hosted_path_without_provider_contact() {
+    let dir = tempfile::tempdir().unwrap();
+    let diff_path = dir.path().join("bounded.diff");
+    let mut diff = String::new();
+    for file in 0..7 {
+        let path = format!("src/churn-{file}.rs");
+        diff.push_str(&format!(
+            "diff --git a/{path} b/{path}\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,130 @@\n"
+        ));
+        for line in 0..130 {
+            diff.push_str(&format!(
+                "+const CHURN_{file}_{line}: &str = \"{}\";\n",
+                "x".repeat(900)
+            ));
+        }
+    }
+    std::fs::write(&diff_path, diff).unwrap();
+
+    let metadata = postil_cli::config::qualification_metadata();
+    let generator_chain = vec!["openai/gpt-5-mini".to_string()];
+    let scorer_chain = vec!["openai/gpt-5-mini".to_string()];
+    let mut models = generator_chain.clone();
+    models.extend(scorer_chain.clone());
+    models.sort();
+    models.dedup();
+    let profile_path = dir.path().join("candidate.json");
+    std::fs::write(
+        &profile_path,
+        serde_json::to_vec(&json!({
+            "benchmarkProviderIdentity": postil_cli::config::MANAGED_OPENROUTER_PROVIDER_IDENTITY,
+            "apiBase": metadata.default_api_base,
+            "apiFormat": metadata.default_api_format,
+            "generatorChain": generator_chain,
+            "consensus": 1,
+            "scorerChain": scorer_chain,
+            "modelPriceBounds": models.into_iter().map(|model| json!({
+                "model": model,
+                "inputMicrosPerMillionTokens": 1,
+                "outputMicrosPerMillionTokens": 1
+            })).collect::<Vec<_>>()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let out = postil()
+        .current_dir(dir.path())
+        .env("CI", "true")
+        .env("GITHUB_API_URL", "http://127.0.0.1:9")
+        .env("POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY", "1")
+        .env("POSTIL_QUALIFICATION_CANDIDATE_PROFILE", &profile_path)
+        .env("POSTIL_QUALIFICATION_PLAN_ONLY", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff_path)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["reviewCoverage"]["mode"], "bounded");
+    assert!(
+        envelope["reviewCoverage"]["selectedBatches"]
+            .as_u64()
+            .unwrap()
+            < envelope["reviewCoverage"]["totalBatches"].as_u64().unwrap()
+    );
+    assert!(
+        envelope["reviewAdmission"]["projectedCostMicros"]
+            .as_u64()
+            .unwrap()
+            <= 1_000_000
+    );
+    assert!(envelope.get("modelUsage").is_none());
 }
 
 #[tokio::test]
@@ -1086,13 +1177,13 @@ async fn remote_diff_reader_rejects_explicit_truncation_signals() {
 }
 
 #[tokio::test]
-async fn remote_diff_reader_rejects_declared_oversized_bodies_before_buffering() {
+async fn remote_page_reader_rejects_declared_oversized_bodies_before_buffering() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/oversized.diff"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![
             b'x';
-            postil_cli::diff::MAX_RAW_DIFF_ACQUISITION_BYTES
+            postil_cli::diff::MAX_FORGE_RESPONSE_BYTES
                 + 1
         ]))
         .mount(&server)
@@ -1180,11 +1271,13 @@ async fn large_source_diff_reviews_every_bounded_batch_and_aggregates_findings()
     for line in 1..10_000 {
         writeln!(
             source,
-            "+let reviewed_{line:05} = validate(input_{line:05});"
+            "+let reviewed_{line:05} = validate(input_{line:05}); // {}",
+            "x".repeat(3_500),
         )
         .unwrap();
     }
     source.push_str("+dangerous_final_call(user_input);\n");
+    assert!(source.len() > 32 * 1024 * 1024);
 
     let dir = tempfile::tempdir().unwrap();
     let diff = dir.path().join("large-source.diff");
@@ -1288,7 +1381,12 @@ async fn final_synthesis_detects_cross_batch_validation_sink_relationship() {
         if line == 1100 {
             source.push_str("+let validated = validate_pair(left, right);\n");
         } else {
-            writeln!(source, "+let padding_a_{line:04} = trusted;").unwrap();
+            writeln!(
+                source,
+                "+let padding_a_{line:04} = trusted; // {}",
+                "a".repeat(1_000)
+            )
+            .unwrap();
         }
     }
     source.push_str(
@@ -1298,7 +1396,12 @@ async fn final_synthesis_detects_cross_batch_validation_sink_relationship() {
         if line == 1100 {
             source.push_str("+dangerous_sink(original);\n");
         } else {
-            writeln!(source, "+let padding_b_{line:04} = original;").unwrap();
+            writeln!(
+                source,
+                "+let padding_b_{line:04} = original; // {}",
+                "b".repeat(1_000)
+            )
+            .unwrap();
         }
     }
 
@@ -1322,10 +1425,21 @@ async fn final_synthesis_detects_cross_batch_validation_sink_relationship() {
     assert!(requests.len() >= 3);
     assert!(requests.iter().any(|request| {
         let body = String::from_utf8_lossy(&request.body);
-        body.contains("final bounded synthesis request")
+        body.contains("bounded synthesis window")
             && body.contains("validate_pair")
             && body.contains("dangerous_sink")
     }));
+    assert!(
+        requests
+            .iter()
+            .filter(|request| {
+                let body = String::from_utf8_lossy(&request.body);
+                body.contains("validate_pair") && body.contains("dangerous_sink")
+            })
+            .all(|request| {
+                String::from_utf8_lossy(&request.body).contains("Cross-window semantic digests")
+            })
+    );
 }
 
 #[tokio::test]
@@ -1424,29 +1538,6 @@ async fn multiline_finding_range_is_collapsed_when_endpoint_is_not_in_same_segme
     assert!(envelope["findings"][0].get("endLine").is_none());
 }
 
-#[test]
-fn review_budget_exhaustion_fails_closed_without_calling_a_provider() {
-    let dir = tempfile::tempdir().unwrap();
-    let diff = dir.path().join("over-budget.diff");
-    let source = format!(
-        "diff --git a/src/huge.rs b/src/huge.rs\n--- a/src/huge.rs\n+++ b/src/huge.rs\n@@ -0,0 +1 @@\n+{}\n",
-        "x".repeat(2 * 1024 * 1024)
-    );
-    std::fs::write(&diff, source).unwrap();
-    let out = postil()
-        .current_dir(dir.path())
-        .env_remove("MODEL_API_KEY")
-        .args(["review", "--diff-file"])
-        .arg(&diff)
-        .args(["--output", "json"])
-        .assert()
-        .failure();
-    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
-    assert_eq!(envelope["findings"][0]["title"], "Review incomplete");
-    assert_eq!(envelope["modelUsed"], "none (review budget exhausted)");
-    assert_eq!(envelope["usage"]["promptTokens"], 0);
-}
-
 #[tokio::test]
 async fn model_chain_above_hard_cap_fails_before_provider_calls() {
     let server = MockServer::start().await;
@@ -1473,28 +1564,30 @@ async fn model_chain_above_hard_cap_fails_before_provider_calls() {
     assert!(server.received_requests().await.unwrap().is_empty());
 }
 
-#[test]
-fn local_diff_file_is_stopped_at_the_acquisition_limit() {
-    let dir = tempfile::tempdir().unwrap();
-    let diff = dir.path().join("huge.diff");
-    let source = format!(
-        "diff --git a/huge.rs b/huge.rs\n--- a/huge.rs\n+++ b/huge.rs\n@@ -0,0 +1 @@\n+{}\n",
-        "x".repeat(postil_cli::diff::MAX_RAW_DIFF_ACQUISITION_BYTES)
-    );
-    std::fs::write(&diff, source).unwrap();
-    let out = postil()
-        .current_dir(dir.path())
-        .args(["review", "--diff-file"])
-        .arg(&diff)
-        .args(["--output", "json"])
-        .assert()
-        .code(2);
-    assert!(out.get_output().stdout.is_empty());
-    assert!(String::from_utf8_lossy(&out.get_output().stderr).contains("acquisition limit"));
-}
-
-#[test]
-fn staged_git_diff_is_stopped_at_the_acquisition_limit() {
+#[tokio::test]
+async fn staged_diff_compacts_large_generated_noise_and_reviews_late_source() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(|request: &wiremock::Request| {
+            let body = String::from_utf8_lossy(&request.body);
+            let findings = if body.contains("late_dangerous_call") {
+                json!([{
+                    "path": "late.rs",
+                    "line": 1,
+                    "severity": "warn",
+                    "kind": "risk",
+                    "confidence": 0.99,
+                    "title": "Validate the late call",
+                    "body": "The late call receives untrusted input without validation."
+                }])
+            } else {
+                json!([])
+            };
+            ResponseTemplate::new(200).set_body_json(llm_content(findings))
+        })
+        .mount(&server)
+        .await;
     let dir = tempfile::tempdir().unwrap();
     assert!(
         std::process::Command::new("git")
@@ -1505,13 +1598,21 @@ fn staged_git_diff_is_stopped_at_the_acquisition_limit() {
             .success()
     );
     std::fs::write(
-        dir.path().join("huge.rs"),
-        "x".repeat(postil_cli::diff::MAX_RAW_DIFF_ACQUISITION_BYTES),
+        dir.path().join("bundle.min.js"),
+        format!(
+            "/* generated by esbuild; do not edit */{}",
+            "x".repeat(33 * 1024 * 1024)
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("late.rs"),
+        "late_dangerous_call(user_input);\n",
     )
     .unwrap();
     assert!(
         std::process::Command::new("git")
-            .args(["add", "huge.rs"])
+            .args(["add", "bundle.min.js", "late.rs"])
             .current_dir(dir.path())
             .status()
             .unwrap()
@@ -1519,11 +1620,22 @@ fn staged_git_diff_is_stopped_at_the_acquisition_limit() {
     );
     let out = postil()
         .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
         .args(["review", "--staged", "--output", "json"])
         .assert()
-        .code(2);
-    assert!(out.get_output().stdout.is_empty());
-    assert!(String::from_utf8_lossy(&out.get_output().stderr).contains("acquisition limit"));
+        .success();
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["findings"][0]["path"], "late.rs");
+    let requests = server.received_requests().await.unwrap();
+    assert!(requests.iter().any(|request| {
+        String::from_utf8_lossy(&request.body).contains("verified generated artifact")
+    }));
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.body.len() < 512 * 1024)
+    );
 }
 
 #[tokio::test]
@@ -1532,10 +1644,10 @@ async fn lockfile_only_diff_is_reviewed_from_compact_dependency_evidence() {
     mock_review(&server, json!([])).await;
     let dir = tempfile::tempdir().unwrap();
     let diff = dir.path().join("lockfile-only.diff");
-    std::fs::write(
-        &diff,
-        "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1,2 +1,2 @@\n name = \"dangerous-dependency\"\n-version = \"1.2.2\"\n+version = \"1.2.3\"\n",
-    )
+    let padding = "x".repeat(33 * 1024 * 1024);
+    std::fs::write(&diff, format!(
+        "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1,3 +1,3 @@\n name = \"dangerous-dependency\"\n-version = \"1.2.2\"\n+version = \"1.2.3\"\n checksum = \"{padding}\"\n"
+    ))
     .unwrap();
 
     let out = postil()
@@ -1552,6 +1664,8 @@ async fn lockfile_only_diff_is_reviewed_from_compact_dependency_evidence() {
     let requests = server.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
     let body = String::from_utf8_lossy(&requests[0].body);
+    assert!(body.contains("dangerous-dependency@1.2.3"));
+    assert!(!body.contains(&padding[..4096]));
     assert!(body.contains("Cargo.lock"));
     assert!(body.contains("dangerous-dependency"));
     assert!(body.contains("removed dangerous-dependency@1.2.2"));
@@ -1630,8 +1744,10 @@ async fn c_quoted_prompt_path_round_trips_into_canonical_finding_path() {
     assert_eq!(envelope["findings"][0]["path"], canonical);
 }
 
-#[test]
-fn malformed_lockfile_fails_closed_without_provider_credentials() {
+#[tokio::test]
+async fn malformed_lockfile_falls_back_to_source_review() {
+    let server = MockServer::start().await;
+    mock_review(&server, json!([])).await;
     let dir = tempfile::tempdir().unwrap();
     let diff = dir.path().join("malformed-lockfile.diff");
     std::fs::write(
@@ -1641,15 +1757,19 @@ fn malformed_lockfile_fails_closed_without_provider_credentials() {
     .unwrap();
     let out = postil()
         .current_dir(dir.path())
-        .env_remove("MODEL_API_KEY")
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
         .args(["review", "--diff-file"])
         .arg(&diff)
         .args(["--output", "json"])
         .assert()
-        .failure();
+        .success();
     let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
-    assert_eq!(envelope["findings"][0]["title"], "Review incomplete");
-    assert_eq!(envelope["usage"]["promptTokens"], 0);
+    assert!(envelope["findings"].as_array().unwrap().is_empty());
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let body = String::from_utf8_lossy(&requests[0].body);
+    assert!(body.contains(r#"checksum = \"new\""#));
 }
 
 async fn mock_review_model(server: &MockServer, model: &str, findings: Value) {
@@ -2618,6 +2738,75 @@ async fn full_remote_review_uses_an_immutable_merge_base_snapshot() {
     assert!(requests.iter().any(|request| {
         request.url.path() == "/repos/acme/api/compare/bbbbbbbbbbbb...aaaaaaaaaaaa"
     }));
+}
+
+#[tokio::test]
+async fn github_large_lockfile_streams_past_legacy_response_limit_and_compacts() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/repos/acme/api/compare/b+\.\.\.a+$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "merge_base_commit": {"sha": "bbbbbbbb"},
+            "files": []
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7/files"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "filename": "Cargo.lock",
+            "status": "modified",
+            "changes": 2
+        }])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/contents/Cargo.lock"))
+        .respond_with(GitHubLargeLockfileResponder)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "large lockfile", "body": "",
+            "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"},
+            "changed_files": 1
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .args([
+            "review",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--no-post",
+            "--output-json",
+        ])
+        .assert()
+        .success();
+
+    let requests = server.received_requests().await.unwrap();
+    let model = requests
+        .iter()
+        .find(|request| request.url.path() == "/chat/completions")
+        .expect("model request");
+    let body = String::from_utf8_lossy(&model.body);
+    assert!(body.contains("large-dependency@1.2.3"));
+    assert!(model.body.len() < 512 * 1024);
 }
 
 #[tokio::test]
@@ -6253,11 +6442,10 @@ async fn gitlab_diff_pagination_follows_authoritative_next_page_to_exhaustion() 
         .find(|request| request.url.path() == "/chat/completions")
         .unwrap();
     let body: Value = model.body_json().unwrap();
+    let model_context = body["messages"][1]["content"].as_str().unwrap();
     assert!(
-        body["messages"][1]["content"]
-            .as_str()
-            .unwrap()
-            .contains("AUTHORITATIVE_LAST_PAGE")
+        model_context.contains("AUTHORITATIVE_LAST_PAGE"),
+        "final paginated evidence missing from bounded context: {model_context}"
     );
 }
 

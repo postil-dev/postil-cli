@@ -562,6 +562,7 @@ pub struct ModelUsage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ModelUsageRole {
+    ReviewPlanner,
     ReviewGenerator,
     FindingScorer,
     MentionResponder,
@@ -585,6 +586,7 @@ pub enum ModelUsageCostSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ModelIncidentPhase {
+    Planner,
     Review,
     Scorer,
     Respond,
@@ -614,6 +616,49 @@ pub struct ModelIncident {
     pub recovered: bool,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub recovery: Option<ModelIncidentRecovery>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ReviewCoverageMode {
+    Exhaustive,
+    Bounded,
+}
+
+impl ReviewCoverageMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Exhaustive => "exhaustive",
+            Self::Bounded => "bounded",
+        }
+    }
+}
+
+/// Audit record for the source-evidence batches sent to review models. Synthesis
+/// requests are excluded from both counts. This additive v1 field lets stored
+/// envelopes without coverage accounting deserialize with `review_coverage = None`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewCoverage {
+    pub mode: ReviewCoverageMode,
+    pub selected_batches: u32,
+    pub total_batches: u32,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub planner_fallback: bool,
+}
+
+/// Conservative hosted-provider exposure reserved before the first model call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewAdmission {
+    pub provider_attempts: u32,
+    pub serialized_input_bytes: u64,
+    pub output_tokens: u64,
+    pub projected_cost_micros: u64,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -651,6 +696,14 @@ pub struct Envelope {
     /// or model-generated content is stored here.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub model_incidents: Vec<ModelIncident>,
+    /// Source-evidence batch selection used for this review. An absent value
+    /// represents a v1 envelope without coverage accounting.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub review_coverage: Option<ReviewCoverage>,
+    /// Conservative hosted exposure computed from the exact serialized request
+    /// plan. It is absent for BYOK and historical envelopes.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub review_admission: Option<ReviewAdmission>,
     /// False when any sent provider request can have unknown billed usage,
     /// including timeouts and ambiguous transport failures.
     #[serde(default)]
@@ -1026,6 +1079,8 @@ mod tests {
             usage: Usage::default(),
             model_usage: vec![],
             model_incidents: vec![],
+            review_coverage: None,
+            review_admission: None,
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
@@ -1046,6 +1101,25 @@ mod tests {
         assert_eq!(v["modelIncidents"][0]["phase"], "scorer");
         assert_eq!(v["modelIncidents"][0]["category"], "invalidOutput");
         assert_eq!(v["modelIncidents"][0]["recovery"], "repair");
+
+        env.review_coverage = Some(ReviewCoverage {
+            mode: ReviewCoverageMode::Bounded,
+            selected_batches: 5,
+            total_batches: 17,
+            planner_fallback: true,
+        });
+        let mut with_coverage = serde_json::to_value(&env).unwrap();
+        assert_eq!(with_coverage["reviewCoverage"]["mode"], "bounded");
+        assert_eq!(with_coverage["reviewCoverage"]["selectedBatches"], 5);
+        assert_eq!(with_coverage["reviewCoverage"]["totalBatches"], 17);
+        assert_eq!(with_coverage["reviewCoverage"]["plannerFallback"], true);
+
+        with_coverage
+            .as_object_mut()
+            .unwrap()
+            .remove("reviewCoverage");
+        let historical: Envelope = serde_json::from_value(with_coverage).unwrap();
+        assert!(historical.review_coverage.is_none());
 
         v.as_object_mut().unwrap().remove("modelIncidents");
         let decoded: Envelope = serde_json::from_value(v).unwrap();

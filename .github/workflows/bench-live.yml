@@ -54,7 +54,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Build release binary
-        run: cargo build --quiet --release
+        run: cargo build --quiet --release --features qualification-candidate
 
       - name: Install benchmark dependencies
         working-directory: bench

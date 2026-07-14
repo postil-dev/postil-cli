@@ -19,6 +19,7 @@ export const ADVISORY_MIN_DETECTION_RATE = 0.9;
 export const ADVISORY_MAX_OVERBLOCK_RATE = 0.1;
 export const CLEAN_MAX_FINDING_FALSE_POSITIVE_RATE = 0.05;
 export const GENERATOR_MAX_MEAN_COST_USD = 0.04;
+export const HOSTED_OPERATION_COST_CAP_USD = 1;
 export const GENERATOR_MAX_MEAN_DURATION_MS = 15_000;
 export const GENERATOR_MAX_REPEAT_P95_DURATION_MS = 30_000;
 export const GENERATOR_MAX_REPEAT_DURATION_MS = 60_000;
@@ -84,7 +85,7 @@ export interface FindingEvidence {
 
 export interface UsageCostEvidence {
   model: string;
-  role: "reviewGenerator" | "findingScorer" | "mentionResponder" | null;
+  role: "reviewPlanner" | "reviewGenerator" | "findingScorer" | "mentionResponder" | null;
   phase: "initial" | "schemaRepair" | "semanticRetry" | null;
   callOrdinal: number | null;
   attempt: number | null;
@@ -275,6 +276,17 @@ export function scoreLiveCase(args: {
   const allGeneratorModels = qualificationGeneratorModels(pair);
   const generatorModels = allGeneratorModels.slice(0, pair.consensus ?? allGeneratorModels.length);
   const scorerModels = qualificationScorerModels(pair);
+  const coverage = env.reviewCoverage;
+  const boundedCoverage = coverage?.mode === "bounded";
+  const plannerUsage = modelUsage.filter((entry) => entry.role === "reviewPlanner");
+  const coverageValid = coverage !== undefined &&
+    coverage.totalBatches > 0 &&
+    coverage.selectedBatches > 0 &&
+    coverage.selectedBatches <= coverage.totalBatches &&
+    (coverage.mode === "bounded"
+      ? coverage.selectedBatches < coverage.totalBatches && plannerUsage.length > 0
+      : coverage.selectedBatches === coverage.totalBatches && !coverage.plannerFallback && plannerUsage.length === 0) &&
+    (c.admission.expectedCoverage === undefined || coverage.mode === c.admission.expectedCoverage);
   const usageValid =
     modelUsage.length > 0 &&
     modelUsage.every((entry) => entry.accountingComplete) &&
@@ -285,8 +297,10 @@ export function scoreLiveCase(args: {
     modelUsage.every(
       (entry) =>
         (generatorModels.includes(entry.model) && entry.role === "reviewGenerator") ||
+        (boundedCoverage && generatorModels.includes(entry.model) && entry.role === "reviewPlanner") ||
         (scorerModels.includes(entry.model) && entry.role === "findingScorer"),
     ) &&
+    coverageValid &&
     env.usage.promptTokens > 0 &&
     env.usage.completionTokens > 0 &&
     modelUsage.reduce((sum, entry) => sum + entry.promptTokens, 0) === env.usage.promptTokens &&
@@ -589,6 +603,14 @@ export function aggregateModel(
     }
   }
   if (!pricingKnown) admissionFailures.push("pricing or usage missing for one or more cases");
+  const overCapCases = scored.filter((result) =>
+    result.costUsd !== null && result.costUsd > HOSTED_OPERATION_COST_CAP_USD
+  );
+  if (overCapCases.length > 0) {
+    admissionFailures.push(
+      `${overCapCases.length} review(s) exceed the $${HOSTED_OPERATION_COST_CAP_USD.toFixed(2)} hosted operation cap`,
+    );
+  }
   if (meanCostUsdPerReview > GENERATOR_MAX_MEAN_COST_USD) {
     admissionFailures.push(
       `mean cost $${meanCostUsdPerReview.toFixed(6)} exceeds $${GENERATOR_MAX_MEAN_COST_USD.toFixed(3)}`,
@@ -773,49 +795,8 @@ export function pricingFromCatalog(
   return out;
 }
 
-/** Rough per-case token estimate used only for the pre-run cost guardrail: the
- * prompt is dominated by the diff plus a fixed system-prompt overhead, and the
- * completion is bounded by a conservative cap. Deliberately an over-estimate so
- * the projected cost is an upper bound, never an under-count. */
-export const GUARDRAIL_FIXED_PROMPT_BYTES = 8_200;
-export const GUARDRAIL_COMPLETION_TOKENS = 8_000;
-export const GUARDRAIL_REPAIR_INPUT_TOKENS = 16_384;
-export const GUARDRAIL_TRANSPORT_ATTEMPTS_PER_PHASE = 3;
 export const MAX_GENERATOR_COST_CAP_USD = 25;
 export const MAX_GENERATOR_CANDIDATES = 6;
-
-export function estimateCasePromptTokens(diff: string): number {
-  return GUARDRAIL_FIXED_PROMPT_BYTES + Buffer.byteLength(diff, "utf8");
-}
-
-/**
- * Upper-bound projected total cost (USD) of running every case against every
- * model, from fixture diff sizes and the model pricing map. A model with
- * unknown pricing contributes zero (its cost cannot be projected); the caller
- * decides how to treat unknown-priced models. Used by the CI cost guardrail.
- */
-export function projectTotalCostUsd(args: {
-  diffs: string[];
-  models: string[];
-  pricing: Map<string, ModelPricing>;
-}): number {
-  let total = 0;
-  for (const model of args.models) {
-    const price = args.pricing.get(model);
-    if (!price) continue;
-    for (const diff of args.diffs) {
-      const promptTokens = estimateCasePromptTokens(diff);
-      const initialAttempt =
-        promptTokens * price.promptUsdPerToken +
-        GUARDRAIL_COMPLETION_TOKENS * price.completionUsdPerToken;
-      const repairAttempt =
-        (promptTokens + GUARDRAIL_REPAIR_INPUT_TOKENS) * price.promptUsdPerToken +
-        GUARDRAIL_COMPLETION_TOKENS * price.completionUsdPerToken;
-      total += GUARDRAIL_TRANSPORT_ATTEMPTS_PER_PHASE * (initialAttempt + repairAttempt);
-    }
-  }
-  return total;
-}
 
 /** Normalize candidate ids once before pricing, job creation, or aggregation. */
 export function normalizeGeneratorModels(models: string[]): string[] {
@@ -839,62 +820,4 @@ export function validateGeneratorQualificationBounds(models: string[], costCapUs
       `generator qualification cost cap must be greater than zero and at most $${MAX_GENERATOR_COST_CAP_USD}`,
     );
   }
-}
-
-/** Enforce the projected-spend bound before inference jobs are created. */
-export function assertGeneratorQualificationPreflight(args: {
-  diffs: string[];
-  models: string[];
-  pricing: Map<string, ModelPricing>;
-  costCapUsd: number;
-}): number {
-  validateGeneratorQualificationBounds(args.models, args.costCapUsd);
-  const missing = args.models.filter((model) => !args.pricing.has(model));
-  if (missing.length > 0) {
-    throw new Error(
-      `cannot project generator qualification spend; pricing missing for ${missing.join(", ")}`,
-    );
-  }
-  const projected = projectTotalCostUsd(args);
-  if (!Number.isFinite(projected) || projected > args.costCapUsd) {
-    throw new Error(
-      `projected generator qualification spend $${projected.toFixed(4)} exceeds the $${args.costCapUsd.toFixed(2)} cap`,
-    );
-  }
-  return projected;
-}
-
-/** Bound the complete deployed generator/scorer combinations before any call.
- * The scorer uses the generator request bound here deliberately: this is a
- * conservative spend ceiling, while admission uses measured pair cost. */
-export function assertPairQualificationPreflight(args: {
-  diffs: string[];
-  pairs: QualificationPair[];
-  pricing: Map<string, ModelPricing>;
-  costCapUsd: number;
-}): number {
-  const roleInvocations = args.pairs.flatMap((pair) => [
-    ...qualificationGeneratorModels(pair),
-    ...qualificationScorerModels(pair),
-  ]);
-  const uniqueModels = normalizeGeneratorModels(roleInvocations);
-  validateGeneratorQualificationBounds(uniqueModels, args.costCapUsd);
-  const missing = [...new Set(uniqueModels.filter((model) => !args.pricing.has(model)))];
-  if (missing.length > 0) {
-    throw new Error(`cannot project pair qualification spend; pricing missing for ${missing.join(", ")}`);
-  }
-  // Preserve duplicate ids across roles. A model used once as the generator and
-  // once as the scorer causes two separately billed provider invocations.
-  const projected = projectTotalCostUsd({
-    diffs: args.diffs,
-    models: roleInvocations,
-    pricing: args.pricing,
-  });
-  if (projected > args.costCapUsd) {
-    throw new Error(
-      `projected pair qualification spend $${projected.toFixed(4)} exceeds the ` +
-      `$${args.costCapUsd.toFixed(2)} cap`,
-    );
-  }
-  return projected;
 }

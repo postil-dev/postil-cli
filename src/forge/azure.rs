@@ -14,20 +14,13 @@ use anyhow::{Context, Result, anyhow, ensure};
 use futures::{StreamExt, TryStreamExt, stream};
 use serde::Deserialize;
 use serde_json::json;
+use std::io::Write;
 
 use super::{CheckState, Forge, PrMeta, ThreadKind, check_summary, check_title};
+use crate::diff::{DiffSnapshot, DiffSpool, WorkspaceBudget};
 use crate::envelope::{Envelope, Finding};
 
 const API_VERSION: &str = "7.1";
-
-/// Per-file cap on fetched content before diffing. Azure's `/items` endpoint
-/// returns full file text with no size limit and no cheap way to learn the
-/// length up front, so without this a single huge file (a lockfile, a
-/// vendored bundle) is fetched in full and handed to `similar::TextDiff`
-/// before the assembled diff reaches the bounded review-source pipeline.
-/// Generous for any ordinary source file; anything larger is marked skipped,
-/// the same way binary content is below.
-const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
 
 pub struct Azure {
     http: reqwest::Client,
@@ -150,7 +143,12 @@ impl Azure {
 
     /// File content at a commit. Added and deleted sides are skipped by the
     /// caller, so a missing expected item is an incomplete acquisition.
-    async fn item_at(&self, path: &str, commit: &str) -> Result<String> {
+    async fn item_at(
+        &self,
+        path: &str,
+        commit: &str,
+        workspace: WorkspaceBudget,
+    ) -> Result<DiffSnapshot> {
         let q = format!(
             "path={}&versionType=commit&version={commit}&includeContent=true",
             urlencode(path)
@@ -161,27 +159,13 @@ impl Azure {
             .send()
             .await
             .with_context(|| format!("fetching {path} at {commit}"))?;
-        let mut response = Self::check_ok(resp, "item fetch").await?;
-        if response
-            .content_length()
-            .is_some_and(|length| length > MAX_FILE_BYTES as u64)
-        {
-            return Err(anyhow!(
-                "Azure item {path} exceeds the {MAX_FILE_BYTES} byte limit"
-            ));
-        }
-        let text = super::bounded_response_text_with_limit(
-            &mut response,
+        super::response_snapshot_in(
+            Self::check_ok(resp, "item fetch").await?,
             "Azure item content",
-            MAX_FILE_BYTES,
+            workspace,
+            None,
         )
-        .await?;
-        if text.len() > MAX_FILE_BYTES {
-            return Err(anyhow!(
-                "Azure item {path} exceeds the {MAX_FILE_BYTES} byte limit"
-            ));
-        }
-        Ok(text)
+        .await
     }
 
     /// The full change list across pages. `/diffs/commits` pages `changes`
@@ -190,7 +174,6 @@ impl Azure {
     /// exhaustion and fails closed on a runaway list rather than truncating.
     async fn change_list(&self, base_sha: &str, head_sha: &str) -> Result<Vec<Change>> {
         const PAGE: usize = 100;
-        const MAX_CHANGES: usize = 20_000;
         let mut changes: Vec<Change> = Vec::new();
         let mut retained_bytes = 0usize;
         loop {
@@ -205,45 +188,35 @@ impl Azure {
                 .send()
                 .await
                 .context("fetching change list")?;
-            let page: DiffResponse = super::bounded_response_json(
+            let page_text = super::bounded_response_text(
                 Self::check_ok(resp, "change list fetch").await?,
                 "Azure change-list page",
             )
             .await?;
+            retained_bytes = super::checked_metadata_total(
+                retained_bytes,
+                page_text.len(),
+                "Azure change-list pages",
+            )?;
+            let page: DiffResponse =
+                serde_json::from_str(&page_text).context("decoding Azure change-list page")?;
             let n = page.changes.len();
-            let page_bytes = page
-                .changes
-                .iter()
-                .map(|change| {
-                    change.change_type.len()
-                        + change.item.path.len()
-                        + change.source_server_item.as_ref().map_or(0, String::len)
-                })
-                .sum::<usize>();
-            retained_bytes = retained_bytes
-                .checked_add(page_bytes)
-                .ok_or_else(|| anyhow!("Azure change-list metadata byte count overflowed"))?;
-            if retained_bytes > crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES {
-                return Err(anyhow!(
-                    "Azure change-list metadata exceeds the {} byte acquisition limit",
-                    crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES
-                ));
-            }
+            validate_change_page(changes.len(), n, PAGE)?;
             let all_changes_included = page.all_changes_included;
             changes.extend(page.changes);
+            debug_assert!(changes.len() <= super::MAX_FORGE_CHANGED_FILES);
             if azure_page_complete(n, all_changes_included)? {
                 return Ok(changes);
-            }
-            if changes.len() > MAX_CHANGES {
-                return Err(anyhow!(
-                    "PR change list exceeds {MAX_CHANGES} entries; refusing to review a \
-                     truncated change set"
-                ));
             }
         }
     }
 
-    async fn build_diff(&self, base_sha: &str, head_sha: &str) -> Result<String> {
+    async fn build_diff(
+        &self,
+        base_sha: &str,
+        head_sha: &str,
+        workspace: WorkspaceBudget,
+    ) -> Result<DiffSnapshot> {
         let changes = self.change_list(base_sha, head_sha).await?;
         let mut jobs = Vec::with_capacity(changes.len());
         for change in changes {
@@ -285,40 +258,47 @@ impl Azure {
             jobs.push((base_path.to_string(), path.to_string(), is_add, is_delete));
         }
         let mut sections = stream::iter(jobs.into_iter().enumerate().map(
-            |(index, (base_path, path, is_add, is_delete))| async move {
-                let old = if is_add {
-                    String::new()
-                } else {
-                    self.item_at(&base_path, base_sha).await?
-                };
-                let new = if is_delete {
-                    String::new()
-                } else {
-                    self.item_at(&path, head_sha).await?
-                };
-                if old == new {
-                    return Ok::<_, anyhow::Error>((index, String::new()));
+            |(index, (base_path, path, is_add, is_delete))| {
+                let workspace = workspace.clone();
+                async move {
+                    let old = if is_add {
+                        DiffSnapshot::from_bytes_in(b"", workspace.clone())?
+                    } else {
+                        self.item_at(&base_path, base_sha, workspace.clone())
+                            .await?
+                    };
+                    let new = if is_delete {
+                        DiffSnapshot::from_bytes_in(b"", workspace.clone())?
+                    } else {
+                        self.item_at(&path, head_sha, workspace.clone()).await?
+                    };
+                    if old.as_bytes() == new.as_bytes() {
+                        return Ok::<_, anyhow::Error>((
+                            index,
+                            DiffSnapshot::from_bytes_in(b"", workspace.clone())?,
+                        ));
+                    }
+                    let mut section = DiffSpool::new_in(workspace.clone())?;
+                    write_diff_section(
+                        &mut section,
+                        &base_path,
+                        &path,
+                        old.source_str(),
+                        new.source_str(),
+                        is_add,
+                        is_delete,
+                    )?;
+                    Ok((index, section.finish()?))
                 }
-                let section = diff_section(&base_path, &path, &old, &new, is_add, is_delete);
-                Ok((index, section))
             },
         ))
-        .buffer_unordered(8)
-        .try_collect::<Vec<_>>()
-        .await?;
-        sections.sort_unstable_by_key(|(index, _)| *index);
-        let mut out = String::new();
-        for (_, section) in sections {
-            if out.len().saturating_add(section.len()) > crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES
-            {
-                return Err(anyhow!(
-                    "Azure reconstructed diff exceeds the {} byte acquisition limit",
-                    crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES
-                ));
-            }
-            out.push_str(&section);
+        .buffered(4);
+        let mut out = DiffSpool::new_in(workspace.clone())?;
+        while let Some((_, section)) = sections.try_next().await? {
+            out.write_all(section.as_bytes())
+                .context("spooling Azure reconstructed diff")?;
         }
-        Ok(out)
+        out.finish()
     }
 
     /// Post one finding as an anchored thread, falling back to a non-anchored
@@ -437,9 +417,10 @@ impl Forge for Azure {
         })
     }
 
-    async fn fetch_diff(&self, snapshot: &PrMeta) -> Result<String> {
+    async fn fetch_diff(&self, snapshot: &PrMeta) -> Result<DiffSnapshot> {
+        let workspace = WorkspaceBudget::new();
         let diff = self
-            .build_diff(&snapshot.base_sha, &snapshot.head_sha)
+            .build_diff(&snapshot.base_sha, &snapshot.head_sha, workspace)
             .await?;
         let current = self.fetch_pr_meta().await?;
         ensure!(
@@ -449,8 +430,9 @@ impl Forge for Azure {
         Ok(diff)
     }
 
-    async fn fetch_diff_since(&self, since_sha: &str, head_sha: &str) -> Result<String> {
-        self.build_diff(since_sha, head_sha).await
+    async fn fetch_diff_since(&self, since_sha: &str, head_sha: &str) -> Result<DiffSnapshot> {
+        self.build_diff(since_sha, head_sha, WorkspaceBudget::new())
+            .await
     }
 
     async fn post_review(
@@ -612,9 +594,30 @@ fn azure_page_complete(count: usize, marker: bool) -> Result<bool> {
     }
 }
 
-/// One file's diff section, or a "differ" marker if the content is binary or
-/// exceeds the per-file size cap. Split out of `build_diff` so the
-/// classification is unit-testable without network access.
+fn validate_change_page(
+    current: usize,
+    page_count: usize,
+    requested_page_size: usize,
+) -> Result<()> {
+    ensure!(
+        page_count <= requested_page_size,
+        "Azure change-list page exceeded the requested {requested_page_size} entries"
+    );
+    let total = current
+        .checked_add(page_count)
+        .ok_or_else(|| anyhow!("Azure change-list entry count overflowed"))?;
+    ensure!(
+        total <= super::MAX_FORGE_CHANGED_FILES,
+        "PR change list exceeds {} entries; refusing to review a truncated change set",
+        super::MAX_FORGE_CHANGED_FILES
+    );
+    Ok(())
+}
+
+/// One file's diff section, or a "differ" marker if the content is binary.
+/// Split out of `build_diff` so classification is unit-testable without
+/// network access.
+#[cfg(test)]
 pub(super) fn diff_section(
     old_path: &str,
     new_path: &str,
@@ -623,31 +626,37 @@ pub(super) fn diff_section(
     is_add: bool,
     is_delete: bool,
 ) -> String {
+    let mut out = Vec::new();
+    write_diff_section(&mut out, old_path, new_path, old, new, is_add, is_delete)
+        .expect("writing a diff to memory cannot fail");
+    String::from_utf8(out).expect("text diff output is UTF-8")
+}
+
+pub(super) fn write_diff_section(
+    mut out: impl Write,
+    old_path: &str,
+    new_path: &str,
+    old: &str,
+    new: &str,
+    is_add: bool,
+    is_delete: bool,
+) -> Result<()> {
     let old_marker = crate::diff::display_path(&format!("a/{old_path}"));
     let new_marker = crate::diff::display_path(&format!("b/{new_path}"));
-    // One oversized file must not be diffed in full before any size cap ever
-    // sees it; mark it skipped like a binary file so the path is still
-    // visible in the review context.
-    if old.len() > MAX_FILE_BYTES || new.len() > MAX_FILE_BYTES {
-        return format!(
-            "diff --git {old_marker} {new_marker}\nBinary files {old_marker} and {new_marker} differ \
-             (exceeds {}MiB per-file cap, not diffed)\n",
-            MAX_FILE_BYTES / (1024 * 1024)
-        );
-    }
     // Binary content cannot be line-diffed; mark it like git does so the path
     // is still visible in the review context.
     if old.contains('\0') || new.contains('\0') {
-        return format!(
-            "diff --git {old_marker} {new_marker}\nBinary files {old_marker} and {new_marker} differ\n"
-        );
+        writeln!(out, "diff --git {old_marker} {new_marker}")?;
+        writeln!(out, "Binary files {old_marker} and {new_marker} differ")?;
+        return Ok(());
     }
-    unified_file_diff(old_path, new_path, old, new, is_add, is_delete)
+    write_unified_file_diff(&mut out, old_path, new_path, old, new, is_add, is_delete)
 }
 
 /// Build one file's unified-diff section in the format `diff.rs` expects:
 /// a `diff --git` header (so the parser seeds the path even for additions),
 /// the `---`/`+++` lines, and `similar`-generated hunks.
+#[cfg(test)]
 fn unified_file_diff(
     old_path: &str,
     new_path: &str,
@@ -656,24 +665,100 @@ fn unified_file_diff(
     is_add: bool,
     is_delete: bool,
 ) -> String {
+    let mut out = Vec::new();
+    write_unified_file_diff(&mut out, old_path, new_path, old, new, is_add, is_delete)
+        .expect("writing a diff to memory cannot fail");
+    String::from_utf8(out).expect("text diff output is UTF-8")
+}
+
+fn write_unified_file_diff(
+    mut out: impl Write,
+    old_path: &str,
+    new_path: &str,
+    old: &str,
+    new: &str,
+    is_add: bool,
+    is_delete: bool,
+) -> Result<()> {
     use similar::TextDiff;
+    const MAX_IN_MEMORY_MODIFIED_FILE_BYTES: usize = 32 * 1024 * 1024;
     let old_marker = crate::diff::display_path(&format!("a/{old_path}"));
     let new_marker = crate::diff::display_path(&format!("b/{new_path}"));
-    let mut out = format!("diff --git {old_marker} {new_marker}\n");
+    writeln!(out, "diff --git {old_marker} {new_marker}")?;
     if is_add {
-        out.push_str(&format!("--- /dev/null\n+++ {new_marker}\n"));
+        writeln!(out, "--- /dev/null")?;
+        writeln!(out, "+++ {new_marker}")?;
     } else if is_delete {
-        out.push_str(&format!("--- {old_marker}\n+++ /dev/null\n"));
+        writeln!(out, "--- {old_marker}")?;
+        writeln!(out, "+++ /dev/null")?;
     } else {
-        out.push_str(&format!("--- {old_marker}\n+++ {new_marker}\n"));
+        writeln!(out, "--- {old_marker}")?;
+        writeln!(out, "+++ {new_marker}")?;
+    }
+    if is_add {
+        write_full_file_hunk(&mut out, new, true)?;
+        return Ok(());
+    }
+    if is_delete {
+        write_full_file_hunk(&mut out, old, false)?;
+        return Ok(());
+    }
+    let reconstruction_bytes = old
+        .len()
+        .checked_add(new.len())
+        .context("modified-file reconstruction size overflowed")?;
+    if reconstruction_bytes > MAX_IN_MEMORY_MODIFIED_FILE_BYTES {
+        write_replacement_hunk(&mut out, old, new)?;
+        return Ok(());
     }
     let diff = TextDiff::from_lines(old, new);
-    let hunks = diff.unified_diff().context_radius(3).to_string();
-    out.push_str(&hunks);
-    if !out.ends_with('\n') {
-        out.push('\n');
+    diff.unified_diff().context_radius(3).to_writer(out)?;
+    Ok(())
+}
+
+fn write_replacement_hunk(mut out: impl Write, old: &str, new: &str) -> Result<()> {
+    let old_lines = u32::try_from(old.lines().count())
+        .context("old source file has too many lines to represent")?;
+    let new_lines = u32::try_from(new.lines().count())
+        .context("new source file has too many lines to represent")?;
+    writeln!(
+        out,
+        "@@ -1,{old_lines} +1,{new_lines} @@ bounded full-file reconstruction"
+    )?;
+    for line in old.lines() {
+        writeln!(out, "-{line}")?;
     }
-    out
+    if !old.is_empty() && !old.ends_with('\n') {
+        writeln!(out, "\\ No newline at end of file")?;
+    }
+    for line in new.lines() {
+        writeln!(out, "+{line}")?;
+    }
+    if !new.is_empty() && !new.ends_with('\n') {
+        writeln!(out, "\\ No newline at end of file")?;
+    }
+    Ok(())
+}
+
+fn write_full_file_hunk(mut out: impl Write, content: &str, added: bool) -> Result<()> {
+    if content.is_empty() {
+        return Ok(());
+    }
+    let lines = content.lines().count();
+    let lines = u32::try_from(lines).context("source file has too many lines to represent")?;
+    if added {
+        writeln!(out, "@@ -0,0 +1,{lines} @@")?;
+    } else {
+        writeln!(out, "@@ -1,{lines} +0,0 @@")?;
+    }
+    let marker = if added { '+' } else { '-' };
+    for line in content.lines() {
+        writeln!(out, "{marker}{line}")?;
+    }
+    if !content.ends_with('\n') {
+        writeln!(out, "\\ No newline at end of file")?;
+    }
+    Ok(())
 }
 
 /// Minimal percent-encoding for the `path` query-parameter value. `/` is left
@@ -720,17 +805,30 @@ mod tests {
     }
 
     #[test]
-    fn oversized_file_is_marked_skipped_not_diffed() {
-        // One side exceeds the per-file cap: the section must be marked
-        // skipped (parsed as binary, no hunks) rather than diffed in full.
-        let huge = "x".repeat(MAX_FILE_BYTES + 1);
-        let section = diff_section("big.bin", "big.bin", "", &huge, true, false);
-        assert!(section.contains("differ"));
-        assert!(section.contains("per-file cap"));
-        let parsed = diff::parse(&section);
-        assert_eq!(parsed.files.len(), 1);
-        assert!(parsed.files[0].binary);
-        assert!(parsed.files[0].hunks.is_empty());
+    fn many_line_added_file_above_32_mib_reconstructs_with_bounded_index() {
+        use std::fmt::Write as _;
+
+        let line_count = 34_000u32;
+        let mut source = String::new();
+        for line in 1..=line_count {
+            writeln!(source, "let value_{line} = {};", "x".repeat(1_000)).unwrap();
+        }
+        assert!(source.len() > 32 * 1024 * 1024);
+        let mut spool = DiffSpool::new().unwrap();
+        write_diff_section(
+            &mut spool,
+            "src/huge.rs",
+            "src/huge.rs",
+            "",
+            &source,
+            true,
+            false,
+        )
+        .unwrap();
+        let snapshot = spool.finish().unwrap();
+        let prepared = crate::diff::prepare_review(&snapshot).unwrap();
+        assert!(prepared.index.is_complete());
+        assert!(prepared.index.contains("src/huge.rs", line_count));
     }
 
     #[test]
@@ -765,5 +863,12 @@ mod tests {
         assert!(!azure_page_complete(12, false).unwrap());
         assert!(azure_page_complete(100, true).unwrap());
         assert!(azure_page_complete(0, false).is_err());
+    }
+
+    #[test]
+    fn terminal_marker_cannot_bypass_aggregate_change_limit() {
+        assert!(validate_change_page(crate::forge::MAX_FORGE_CHANGED_FILES, 1, 100).is_err());
+        assert!(validate_change_page(crate::forge::MAX_FORGE_CHANGED_FILES - 1, 1, 100).is_ok());
+        assert!(validate_change_page(0, 101, 100).is_err());
     }
 }

@@ -4,6 +4,7 @@
 //! OpenAI-compatible endpoints use `POST {base}/chat/completions` by default.
 //! Native Anthropic endpoints use `POST {base}/messages` when explicitly selected.
 
+use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,10 +17,11 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::api_key;
-use crate::config::{ApiFormat, Config};
+use crate::config::{ApiFormat, Config, HOSTED_OPERATION_COST_CAP_MICROS, ModelPriceBound};
 use crate::envelope::{
     Finding, Kind, ModelIncident, ModelIncidentCategory, ModelIncidentPhase, ModelIncidentRecovery,
-    ModelUsage, ModelUsageCostSource, ModelUsagePhase, ModelUsageRole, ProviderCost, Usage,
+    ModelUsage, ModelUsageCostSource, ModelUsagePhase, ModelUsageRole, ProviderCost,
+    ReviewAdmission, Usage,
 };
 
 #[derive(Debug, Clone)]
@@ -150,6 +152,13 @@ impl std::error::Error for ModelError {
 }
 
 fn add_usage(total: &mut Usage, usage: Usage) {
+    if usage.prompt_tokens == 0
+        && usage.completion_tokens == 0
+        && usage.cost_micros.is_none()
+        && usage.provider_cost.is_none()
+    {
+        return;
+    }
     let total_was_empty =
         total.prompt_tokens == 0 && total.completion_tokens == 0 && total.provider_cost.is_none();
     total.prompt_tokens = total.prompt_tokens.saturating_add(usage.prompt_tokens);
@@ -273,6 +282,21 @@ struct RawScore {
     reason: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RawBatchSelection {
+    batch_ids: Vec<usize>,
+}
+
+pub struct BatchPlannerResult {
+    pub batch_ids: Vec<usize>,
+    pub usage: Usage,
+    pub model_usage: Vec<ModelUsage>,
+    pub model_incidents: Vec<ModelIncident>,
+    pub usage_accounting_complete: bool,
+    pub fallback_used: bool,
+}
+
 fn default_confidence() -> f64 {
     0.5
 }
@@ -291,6 +315,7 @@ pub struct LlmClient {
     scorer_deadline: Option<Instant>,
     total_deadline: Option<Instant>,
     admission: Arc<Mutex<ProviderAdmission>>,
+    hosted_price_bounds: Option<Arc<HashMap<String, ModelPriceBound>>>,
     call_ordinal: Arc<AtomicU32>,
 }
 
@@ -302,6 +327,7 @@ struct ProviderAdmission {
     token_exposure_upper_bound: usize,
     reported_token_spend: usize,
     reported_cost_micros: u64,
+    projected_cost_exposure_micros: u64,
 }
 
 #[derive(Clone)]
@@ -335,17 +361,26 @@ pub(crate) const MAX_PROVIDER_ATTEMPTS: usize = 216;
 pub(crate) const MAX_REPORTED_TOKEN_SPEND: usize = 20_000_000;
 const MAX_PROVIDER_INPUT_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE: usize = 2_000_000;
-const MAX_PROVIDER_COST_MICROS: u64 = 25_000_000;
+// Five selected review batches and one planner request, each across at most
+// three generator models with one repair, consume 36 logical calls. The two
+// scorer models with one repair consume four more. Any larger plan diverges
+// from the bounded hosted workflow that fits under the phase deadlines.
+const MAX_HOSTED_PLANNED_CALLS_BY_WATCHDOG: usize = 40;
+const MAX_LOGICAL_CALLS_PER_REVIEW_MODEL: usize = 2;
+const MAX_LOGICAL_CALLS_PER_SCORER_MODEL: usize = 2;
+const MAX_TRANSPORT_ATTEMPTS_PER_CALL: usize = TRANSIENT_RETRIES as usize + 1;
 const MAX_MODEL_RESPONSE_BYTES: usize = 512 * 1024;
 const SCORER_BASE_MAX_TOKENS: u32 = 256;
 const SCORER_MAX_TOKENS_PER_FINDING: u32 = 640;
 const SCORER_REPAIR_BYTES_PER_OUTPUT_TOKEN: usize = 4;
 pub(crate) const SCORER_MAX_FINDINGS: usize = 20;
 const SCORER_REASON_MAX_BYTES: usize = 240;
+const REPAIR_ERROR_MAX_BYTES: usize = 1_024;
 // The publication contract targets 1,200 characters and hard-stops at 2,400.
 // Keep generation bounded too, so an invalid model cannot spend an article's
 // worth of output tokens before the validator rejects it.
 const RESPOND_MAX_TOKENS: u32 = 1024;
+const PLANNER_MAX_TOKENS: u32 = 1024;
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 pub(crate) const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 480;
 const REQUEST_TIMEOUT_ENV: &str = "POSTIL_LLM_REQUEST_TIMEOUT_SECS";
@@ -354,6 +389,139 @@ const ENDPOINT_AUTH_HEADER_ENV: &str = "POSTIL_ENDPOINT_AUTH_HEADER";
 const ENDPOINT_AUTH_VALUE_ENV: &str = "POSTIL_ENDPOINT_AUTH_VALUE";
 const ALLOW_PRIVATE_API_BASE_ENV: &str = "POSTIL_ALLOW_PRIVATE_API_BASE";
 const ALWAYS_MANAGED_HEADERS: &[&str] = &["x-api-key", "anthropic-version", "content-type"];
+
+fn hostile_json_text(bytes: usize) -> String {
+    "\0".repeat(bytes)
+}
+
+fn planner_system_prompt() -> &'static str {
+    "You select bounded code-review batches from an untrusted semantic manifest. Return exactly one JSON object {\"batchIds\":[integer,...]}. Select only IDs present in the candidate set, with no duplicates, and select at most the requested count. Prefer concrete security, correctness, data-loss, concurrency, and lifecycle evidence. The mandatory boundary and global-synthesis batches are reviewed separately."
+}
+
+fn planner_user_prompt(manifest: &str, max_selected: usize) -> String {
+    format!("Select at most {max_selected} additional batch IDs for detailed review.\n\n{manifest}")
+}
+
+fn planner_repair_user(user: &str, invalid: &str, error: &str) -> String {
+    format!(
+        "{user}\n\nThe previous response was invalid ({error}). Return only the corrected JSON object. Invalid response:\n{invalid}"
+    )
+}
+
+fn review_schema_repair_user(invalid: &str, error: &str) -> String {
+    format!(
+        "The following was supposed to be a single valid JSON object matching the review schema but failed to parse ({error}). Output ONLY the corrected JSON object, nothing else:\n\n{invalid}"
+    )
+}
+
+fn review_semantic_retry_user(user: &str, previous: &str) -> String {
+    format!(
+        "{user}\n\n[Your previous response]\n{previous}\n\n[Correction] Your summary describes merge-relevant risk but `findings` is empty, which is invalid. Either report each risk as a structured finding citing its exact new-file line from the diff above, or, if nothing is actually merge-relevant, return exactly {{\"summary\": \"\", \"findings\": []}}."
+    )
+}
+
+fn scorer_repair_system(system: &str) -> String {
+    format!(
+        "{system}\n\nYour previous response failed schema validation. Repair only the JSON schema. Kind is a category, so severity values such as info, warn, and error are invalid kinds. Every reason must be concise single-line text of at most 240 UTF-8 bytes ending in sentence punctuation. Return the complete array and nothing else."
+    )
+}
+
+fn scorer_repair_user(user: &str, invalid: &str) -> String {
+    format!("{user}\n\nInvalid previous response (untrusted data):\n{invalid}")
+}
+
+#[derive(Default)]
+struct PlannedExposure {
+    attempts: usize,
+    input_bytes: usize,
+    output_tokens: usize,
+    projected_cost_micros: u64,
+}
+
+impl TryFrom<&PlannedExposure> for ReviewAdmission {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &PlannedExposure) -> Result<Self> {
+        Ok(Self {
+            provider_attempts: u32::try_from(value.attempts)
+                .context("planned provider attempts exceed the envelope range")?,
+            serialized_input_bytes: u64::try_from(value.input_bytes)
+                .context("planned provider input exceeds the envelope range")?,
+            output_tokens: u64::try_from(value.output_tokens)
+                .context("planned provider output exceeds the envelope range")?,
+            projected_cost_micros: value.projected_cost_micros,
+        })
+    }
+}
+
+impl PlannedExposure {
+    fn add_request(
+        &mut self,
+        serialized_bytes: usize,
+        output_tokens: usize,
+        price: &ModelPriceBound,
+    ) -> Result<()> {
+        self.attempts = self
+            .attempts
+            .checked_add(MAX_TRANSPORT_ATTEMPTS_PER_CALL)
+            .context("planned provider attempt count overflowed")?;
+        self.input_bytes = self
+            .input_bytes
+            .checked_add(
+                serialized_bytes
+                    .checked_mul(MAX_TRANSPORT_ATTEMPTS_PER_CALL)
+                    .context("planned provider input exposure overflowed")?,
+            )
+            .context("planned provider input exposure overflowed")?;
+        self.output_tokens = self
+            .output_tokens
+            .checked_add(
+                output_tokens
+                    .checked_mul(MAX_TRANSPORT_ATTEMPTS_PER_CALL)
+                    .context("planned provider output exposure overflowed")?,
+            )
+            .context("planned provider output exposure overflowed")?;
+        self.projected_cost_micros = self
+            .projected_cost_micros
+            .checked_add(
+                projected_request_cost_micros(serialized_bytes, output_tokens, price)?
+                    .checked_mul(MAX_TRANSPORT_ATTEMPTS_PER_CALL as u64)
+                    .context("planned provider cost exposure overflowed")?,
+            )
+            .context("planned provider cost exposure overflowed")?;
+        Ok(())
+    }
+}
+
+fn projected_request_cost_micros(
+    input_token_upper_bound: usize,
+    output_token_upper_bound: usize,
+    price: &ModelPriceBound,
+) -> Result<u64> {
+    fn priced_tokens(tokens: usize, micros_per_million: u64) -> Result<u128> {
+        let numerator = (tokens as u128)
+            .checked_mul(u128::from(micros_per_million))
+            .ok_or_else(|| anyhow!("hosted model price projection overflowed"))?;
+        numerator
+            .checked_add(999_999)
+            .map(|rounded| rounded / 1_000_000)
+            .ok_or_else(|| anyhow!("hosted model price projection overflowed"))
+    }
+    let input = priced_tokens(
+        input_token_upper_bound,
+        price.input_micros_per_million_tokens,
+    )?;
+    let output = priced_tokens(
+        output_token_upper_bound,
+        price.output_micros_per_million_tokens,
+    )?;
+    u64::try_from(
+        input
+            .checked_add(output)
+            .ok_or_else(|| anyhow!("hosted model price projection overflowed"))?,
+    )
+    .context("hosted model price projection does not fit micro-dollar accounting")
+}
 
 pub(crate) fn scorer_max_tokens(expected_len: usize) -> Option<u32> {
     (expected_len <= SCORER_MAX_FINDINGS)
@@ -369,6 +537,30 @@ fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> &str {
         end -= 1;
     }
     &value[..end]
+}
+
+fn validate_batch_selection(
+    content: &str,
+    allowed_ids: &BTreeSet<usize>,
+    max_selected: usize,
+) -> Result<Vec<usize>> {
+    let raw: RawBatchSelection = serde_json::from_str(content.trim())
+        .context("planner response is not the exact batch-selection JSON object")?;
+    ensure!(
+        raw.batch_ids.len() <= max_selected,
+        "planner selected more than {max_selected} batches"
+    );
+    let original_len = raw.batch_ids.len();
+    let selected = raw.batch_ids.into_iter().collect::<BTreeSet<_>>();
+    ensure!(
+        selected.len() == original_len,
+        "planner batch selection contains duplicates"
+    );
+    ensure!(
+        selected.iter().all(|id| allowed_ids.contains(id)),
+        "planner selected a batch ID outside the grounded candidate set"
+    );
+    Ok(selected.into_iter().collect())
 }
 /// Marker context attached to transport/provider-level failures (endpoint
 /// unreachable, HTTP error status, timeout, malformed HTTP envelope), the
@@ -400,6 +592,7 @@ fn reqwest_error(error: &anyhow::Error) -> Option<&reqwest::Error> {
 
 #[derive(Debug, Clone, Copy)]
 enum LlmPhase {
+    Planner,
     Review,
     Scorer,
     Respond,
@@ -417,6 +610,7 @@ enum LlmCallPhase {
 impl LlmPhase {
     fn as_str(self) -> &'static str {
         match self {
+            Self::Planner => "planner",
             Self::Review => "review",
             Self::Scorer => "scorer",
             Self::Respond => "respond",
@@ -426,6 +620,7 @@ impl LlmPhase {
 
     fn usage_role(self) -> ModelUsageRole {
         match self {
+            Self::Planner => ModelUsageRole::ReviewPlanner,
             Self::Review | Self::Total => ModelUsageRole::ReviewGenerator,
             Self::Scorer => ModelUsageRole::FindingScorer,
             Self::Respond => ModelUsageRole::MentionResponder,
@@ -478,6 +673,7 @@ struct DeadlineExceeded(LlmPhase);
 impl std::fmt::Display for DeadlineExceeded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.0 {
+            LlmPhase::Planner => f.write_str("LLM planner deadline exceeded"),
             LlmPhase::Review => f.write_str("LLM review deadline exceeded"),
             LlmPhase::Scorer | LlmPhase::Respond | LlmPhase::Total => {
                 f.write_str("LLM total deadline exceeded")
@@ -500,6 +696,410 @@ impl std::fmt::Display for RequestTimedOut {
 impl std::error::Error for RequestTimedOut {}
 
 impl LlmClient {
+    fn planned_request_bytes(
+        &self,
+        model: &str,
+        system: &str,
+        user: &str,
+        max_tokens: u32,
+        temperature: f64,
+    ) -> Result<usize> {
+        serde_json::to_vec(&self.request_body(model, system, user, max_tokens, temperature))
+            .context("serializing hosted request for preflight")
+            .map(|bytes| bytes.len())
+    }
+
+    fn validate_hosted_exposure(
+        &self,
+        operation: &str,
+        exposure: &PlannedExposure,
+    ) -> Result<ReviewAdmission> {
+        ensure!(
+            exposure.attempts <= MAX_PROVIDER_ATTEMPTS,
+            "complete hosted {operation} needs {} provider attempts, exceeding the {MAX_PROVIDER_ATTEMPTS}-attempt cap",
+            exposure.attempts
+        );
+        ensure!(
+            exposure.input_bytes <= MAX_PROVIDER_INPUT_BYTES,
+            "complete hosted {operation} needs {} bytes of serialized provider input, exceeding the {MAX_PROVIDER_INPUT_BYTES} byte cap",
+            exposure.input_bytes
+        );
+        ensure!(
+            exposure.output_tokens <= MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE,
+            "complete hosted {operation} needs {} output tokens of exposure, exceeding the {MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE} token cap",
+            exposure.output_tokens
+        );
+        let token_exposure = exposure
+            .input_bytes
+            .checked_add(exposure.output_tokens)
+            .context("planned token exposure overflowed")?;
+        ensure!(
+            token_exposure <= MAX_REPORTED_TOKEN_SPEND,
+            "complete hosted {operation} needs {token_exposure} tokens of exposure, exceeding the {MAX_REPORTED_TOKEN_SPEND} token cap"
+        );
+        ensure!(
+            exposure.projected_cost_micros <= HOSTED_OPERATION_COST_CAP_MICROS,
+            "complete hosted {operation} projects {} micro-dollars of provider exposure, exceeding the {HOSTED_OPERATION_COST_CAP_MICROS} micro-dollar operation cap",
+            exposure.projected_cost_micros
+        );
+        ReviewAdmission::try_from(exposure)
+    }
+
+    pub(crate) fn preflight_respond_plan(
+        &self,
+        cfg: &Config,
+        system: &str,
+        user: &str,
+    ) -> Result<()> {
+        let Some(bounds) = &self.hosted_price_bounds else {
+            return Ok(());
+        };
+        let models = cfg.model_chain();
+        ensure!(!models.is_empty(), "hosted respond has no admitted model");
+        let mut exposure = PlannedExposure::default();
+        for model in models {
+            let price = bounds.get(&model).ok_or_else(|| {
+                anyhow!("hosted respond model {model:?} has no admitted price bound")
+            })?;
+            exposure.add_request(
+                self.planned_request_bytes(&model, system, user, RESPOND_MAX_TOKENS, 0.1)?,
+                RESPOND_MAX_TOKENS as usize,
+                price,
+            )?;
+        }
+        self.validate_hosted_exposure("respond", &exposure)
+            .map(|_| ())
+    }
+
+    pub async fn plan_review_batches(
+        &self,
+        cfg: &Config,
+        manifest: &str,
+        allowed_ids: &BTreeSet<usize>,
+        max_selected: usize,
+    ) -> Result<BatchPlannerResult> {
+        let system = planner_system_prompt();
+        let user = planner_user_prompt(manifest, max_selected);
+        let mut aggregate_usage = Usage::default();
+        let mut aggregate_model_usage = Vec::new();
+        let mut aggregate_incidents: Vec<ModelIncident> = Vec::new();
+        let mut accounting_complete = true;
+        let planner_models = if cfg.consensus > 1 {
+            cfg.model_chain()
+                .into_iter()
+                .take(cfg.consensus)
+                .collect::<Vec<_>>()
+        } else {
+            cfg.model_chain()
+        };
+        for model in planner_models {
+            match self
+                .plan_with_model(&model, system, &user, allowed_ids, max_selected)
+                .await
+            {
+                Ok(mut result) => {
+                    result.fallback_used |= !aggregate_incidents.is_empty();
+                    add_usage(&mut result.usage, aggregate_usage);
+                    result.model_usage.splice(0..0, aggregate_model_usage);
+                    for incident in &mut aggregate_incidents {
+                        incident.recovered = true;
+                        incident.recovery = Some(ModelIncidentRecovery::Fallback);
+                    }
+                    result.model_incidents.splice(0..0, aggregate_incidents);
+                    result.usage_accounting_complete &= accounting_complete;
+                    return Ok(result);
+                }
+                Err(error) => {
+                    let incident = error.incident(ModelIncidentPhase::Planner);
+                    accounting_complete &= error.usage_accounting_complete;
+                    add_usage(&mut aggregate_usage, error.usage);
+                    aggregate_incidents.extend(error.model_incidents.clone());
+                    aggregate_model_usage.extend(error.model_usage);
+                    aggregate_incidents.push(incident);
+                }
+            }
+        }
+        for incident in &mut aggregate_incidents {
+            incident.recovered = true;
+            incident.recovery = Some(ModelIncidentRecovery::Fallback);
+        }
+        Ok(BatchPlannerResult {
+            batch_ids: Vec::new(),
+            usage: aggregate_usage,
+            model_usage: aggregate_model_usage,
+            model_incidents: aggregate_incidents,
+            usage_accounting_complete: accounting_complete,
+            fallback_used: true,
+        })
+    }
+
+    async fn plan_with_model(
+        &self,
+        model: &str,
+        system: &str,
+        user: &str,
+        allowed_ids: &BTreeSet<usize>,
+        max_selected: usize,
+    ) -> std::result::Result<BatchPlannerResult, ModelError> {
+        let mut usage = Usage::default();
+        let mut model_usage = Vec::new();
+        let mut model_incidents = Vec::new();
+        let mut accounting_complete = true;
+        let content = self
+            .chat(
+                model,
+                system,
+                user,
+                &mut usage,
+                &mut model_usage,
+                &mut accounting_complete,
+                PLANNER_MAX_TOKENS,
+                LlmPhase::Planner,
+                LlmCallPhase::Initial,
+            )
+            .await
+            .map_err(|error| {
+                let mut error = ModelError::new(error, usage, accounting_complete);
+                error.model_usage = model_usage.clone();
+                error
+            })?;
+        let selected = match validate_batch_selection(&content, allowed_ids, max_selected) {
+            Ok(selected) => selected,
+            Err(first_error) => {
+                let incident = ModelIncident {
+                    phase: ModelIncidentPhase::Planner,
+                    category: ModelIncidentCategory::InvalidOutput,
+                    recovered: false,
+                    recovery: None,
+                };
+                let invalid = truncate_utf8_bytes(&content, 8_192);
+                let first_error = first_error.to_string();
+                let repair_user = planner_repair_user(
+                    user,
+                    invalid,
+                    truncate_utf8_bytes(&first_error, REPAIR_ERROR_MAX_BYTES),
+                );
+                let repaired = self
+                    .chat(
+                        model,
+                        "Repair the batch-selection JSON. Return only {\"batchIds\":[integer,...]}.",
+                        &repair_user,
+                        &mut usage,
+                        &mut model_usage,
+                        &mut accounting_complete,
+                        PLANNER_MAX_TOKENS,
+                        LlmPhase::Planner,
+                        LlmCallPhase::SchemaRepair,
+                    )
+                    .await
+                    .map_err(|error| {
+                        let mut error = ModelError::new(error, usage, accounting_complete);
+                        error.model_usage = model_usage.clone();
+                        error.model_incidents.push(incident.clone());
+                        error
+                    })?;
+                let selected = validate_batch_selection(&repaired, allowed_ids, max_selected)
+                    .map_err(|error| {
+                        let mut error = ModelError::new(
+                            error.context("planner output invalid after schema repair"),
+                            usage,
+                            accounting_complete,
+                        );
+                        error.model_usage = model_usage.clone();
+                        error.model_incidents.push(incident.clone());
+                        error
+                    })?;
+                model_incidents.push(ModelIncident {
+                    recovered: true,
+                    recovery: Some(ModelIncidentRecovery::Repair),
+                    ..incident
+                });
+                selected
+            }
+        };
+        Ok(BatchPlannerResult {
+            batch_ids: selected,
+            usage,
+            model_usage,
+            model_incidents,
+            usage_accounting_complete: accounting_complete,
+            fallback_used: false,
+        })
+    }
+
+    pub(crate) fn preflight_review_plan(
+        &self,
+        cfg: &Config,
+        batch_count: usize,
+        system: &str,
+        candidate_first_users: &[String],
+        candidate_later_users: &[String],
+        planner: Option<(&str, usize)>,
+    ) -> Result<ReviewAdmission> {
+        let Some(bounds) = &self.hosted_price_bounds else {
+            anyhow::bail!("hosted review preflight has no admitted price bounds");
+        };
+        ensure!(
+            candidate_first_users.len() >= batch_count
+                && candidate_first_users.len() == candidate_later_users.len(),
+            "hosted preflight has fewer candidate prompts than selectable batches"
+        );
+        let review_models = if cfg.consensus > 1 {
+            cfg.model_chain()
+                .into_iter()
+                .take(cfg.consensus)
+                .collect::<Vec<_>>()
+        } else {
+            cfg.model_chain()
+        };
+        let scorer_models = if cfg.scorer_enabled() {
+            cfg.scorer_chain()
+        } else {
+            Vec::new()
+        };
+        let review_logical_calls = batch_count
+            .checked_mul(review_models.len())
+            .and_then(|value| value.checked_mul(MAX_LOGICAL_CALLS_PER_REVIEW_MODEL))
+            .context("planned review call count overflowed")?;
+        let scorer_logical_calls = scorer_models
+            .len()
+            .checked_mul(MAX_LOGICAL_CALLS_PER_SCORER_MODEL)
+            .context("planned scorer call count overflowed")?;
+        let planner_logical_calls = planner
+            .map(|_| {
+                review_models
+                    .len()
+                    .checked_mul(MAX_LOGICAL_CALLS_PER_REVIEW_MODEL)
+                    .context("planned planner call count overflowed")
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let logical_calls = review_logical_calls
+            .checked_add(scorer_logical_calls)
+            .and_then(|value| value.checked_add(planner_logical_calls))
+            .context("planned model call count overflowed")?;
+        anyhow::ensure!(
+            logical_calls <= MAX_HOSTED_PLANNED_CALLS_BY_WATCHDOG,
+            "complete hosted review needs {logical_calls} logical model calls, exceeding the {MAX_HOSTED_PLANNED_CALLS_BY_WATCHDOG}-call watchdog plan"
+        );
+        let mut exposure = PlannedExposure::default();
+        let hostile_review_output = hostile_json_text(16_384);
+        let hostile_error = hostile_json_text(REPAIR_ERROR_MAX_BYTES);
+        for model in &review_models {
+            let price = bounds
+                .get(model)
+                .ok_or_else(|| anyhow!("hosted model {model:?} has no admitted price bound"))?;
+            let path_for = |user: &str| -> Result<(usize, usize)> {
+                let initial =
+                    self.planned_request_bytes(model, system, user, REVIEW_MAX_TOKENS, 0.1)?;
+                let schema_user = review_schema_repair_user(&hostile_review_output, &hostile_error);
+                let schema = self.planned_request_bytes(
+                    model,
+                    "You repair malformed JSON. Output only valid JSON.",
+                    &schema_user,
+                    REVIEW_MAX_TOKENS,
+                    0.1,
+                )?;
+                let semantic_user = review_semantic_retry_user(user, &hostile_review_output);
+                let semantic = self.planned_request_bytes(
+                    model,
+                    system,
+                    &semantic_user,
+                    REVIEW_MAX_TOKENS,
+                    0.1,
+                )?;
+                Ok((initial, schema.max(semantic)))
+            };
+            let first_paths = candidate_first_users
+                .iter()
+                .map(|user| path_for(user))
+                .collect::<Result<Vec<_>>>()?;
+            let later_paths = candidate_later_users
+                .iter()
+                .map(|user| path_for(user))
+                .collect::<Result<Vec<_>>>()?;
+            let mut worst_paths = Vec::new();
+            let mut worst_bytes = 0usize;
+            for (first_index, first) in first_paths.iter().copied().enumerate() {
+                let mut paths = later_paths
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .filter(|(index, _)| *index != first_index)
+                    .map(|(_, path)| path)
+                    .collect::<Vec<_>>();
+                paths.sort_unstable_by_key(|(initial, repair)| {
+                    std::cmp::Reverse(initial.saturating_add(*repair))
+                });
+                paths.truncate(batch_count.saturating_sub(1));
+                paths.push(first);
+                let bytes = paths.iter().try_fold(0usize, |sum, (initial, repair)| {
+                    sum.checked_add(*initial)
+                        .and_then(|value| value.checked_add(*repair))
+                        .context("planned review path size overflowed")
+                })?;
+                if bytes > worst_bytes {
+                    worst_bytes = bytes;
+                    worst_paths = paths;
+                }
+            }
+            for (initial, repair) in worst_paths {
+                exposure.add_request(initial, REVIEW_MAX_TOKENS as usize, price)?;
+                exposure.add_request(repair, REVIEW_MAX_TOKENS as usize, price)?;
+            }
+        }
+
+        for model in &scorer_models {
+            let price = bounds
+                .get(model)
+                .ok_or_else(|| anyhow!("hosted scorer {model:?} has no admitted price bound"))?;
+            let scorer_system = crate::prompt::scorer_system_prompt(cfg);
+            let scorer_user_bytes = 64_000usize.saturating_sub(scorer_system.len());
+            let scorer_user = hostile_json_text(scorer_user_bytes);
+            let max_tokens = scorer_max_tokens(SCORER_MAX_FINDINGS)
+                .expect("maximum scorer finding count has a token bound");
+            let initial =
+                self.planned_request_bytes(model, &scorer_system, &scorer_user, max_tokens, 0.0)?;
+            let repair_system = scorer_repair_system(&scorer_system);
+            let invalid =
+                hostile_json_text(max_tokens as usize * SCORER_REPAIR_BYTES_PER_OUTPUT_TOKEN);
+            let repair_user = scorer_repair_user(&scorer_user, &invalid);
+            let repair =
+                self.planned_request_bytes(model, &repair_system, &repair_user, max_tokens, 0.0)?;
+            exposure.add_request(initial, max_tokens as usize, price)?;
+            exposure.add_request(repair, max_tokens as usize, price)?;
+        }
+
+        if let Some((manifest, max_selected)) = planner {
+            let user = planner_user_prompt(manifest, max_selected);
+            let invalid = hostile_json_text(8_192);
+            let error = hostile_json_text(REPAIR_ERROR_MAX_BYTES);
+            let repair_user = planner_repair_user(&user, &invalid, &error);
+            for model in &review_models {
+                let price = bounds.get(model).ok_or_else(|| {
+                    anyhow!("hosted planner model {model:?} has no admitted price bound")
+                })?;
+                let initial = self.planned_request_bytes(
+                    model,
+                    planner_system_prompt(),
+                    &user,
+                    PLANNER_MAX_TOKENS,
+                    0.1,
+                )?;
+                let repair = self.planned_request_bytes(
+                    model,
+                    "Repair the batch-selection JSON. Return only {\"batchIds\":[integer,...]}.",
+                    &repair_user,
+                    PLANNER_MAX_TOKENS,
+                    0.1,
+                )?;
+                exposure.add_request(initial, PLANNER_MAX_TOKENS as usize, price)?;
+                exposure.add_request(repair, PLANNER_MAX_TOKENS as usize, price)?;
+            }
+        }
+        self.validate_hosted_exposure("review", &exposure)
+    }
+
     pub(crate) async fn doctor_probe(cfg: &Config, api_key: String) -> Result<()> {
         let client = Self::build(cfg, api_key, Duration::from_secs(30), None, None)?;
         let body = client.request_body(&cfg.model, "", "ping", 1, 0.0);
@@ -571,6 +1171,18 @@ impl LlmClient {
         total_deadline: Option<Instant>,
     ) -> Result<Self> {
         let endpoint_auth = endpoint_auth_from_env(cfg.api_format)?;
+        let hosted_price_bounds = if crate::config::hosted_runtime_mode() {
+            ensure_hosted_provider_contract(cfg.api_format, &cfg.api_base)?;
+            Some(Arc::new(
+                crate::config::hosted_price_bounds_for_config(cfg)?
+                    .ok_or_else(|| anyhow!("hosted inference has no exact price-bound profile"))?
+                    .into_iter()
+                    .map(|bound| (bound.model.clone(), bound))
+                    .collect(),
+            ))
+        } else {
+            None
+        };
         Ok(LlmClient {
             // The attempt timeout wraps both sending the request and consuming
             // the complete response body, so header and body stalls take the
@@ -581,7 +1193,7 @@ impl LlmClient {
             api_format: cfg.api_format,
             endpoint_auth,
             require_openrouter_privacy: is_canonical_openrouter_base(&cfg.api_base)
-                && (env_flag("POSTIL_HOSTED_MODE")
+                && (crate::config::hosted_runtime_mode()
                     || env_flag("POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY")),
             request_timeout,
             timeout_retry_timeout: request_timeout.min(Duration::from_secs(TIMEOUT_RETRY_CAP_SECS)),
@@ -589,6 +1201,7 @@ impl LlmClient {
             scorer_deadline: None,
             total_deadline,
             admission: Arc::new(Mutex::new(ProviderAdmission::default())),
+            hosted_price_bounds,
             call_ordinal: Arc::new(AtomicU32::new(0)),
         })
     }
@@ -689,7 +1302,7 @@ impl LlmClient {
                     }
                 }
             }
-            if consensus_is_incomplete(env_flag("POSTIL_HOSTED_MODE"), ok.len(), n) {
+            if consensus_is_incomplete(crate::config::hosted_runtime_mode(), ok.len(), n) {
                 let completed = ok.len();
                 for review in ok {
                     add_usage(&mut failed_usage, review.usage);
@@ -1083,10 +1696,10 @@ impl LlmClient {
                 };
                 // One repair attempt: ask the same model to fix its own JSON.
                 let invalid = truncate_utf8_bytes(&content, 16_384);
-                let repair_user = format!(
-                    "The following was supposed to be a single valid JSON object matching the \
-                     review schema but failed to parse ({parse_err}). Output ONLY the corrected \
-                     JSON object, nothing else:\n\n{invalid}"
+                let parse_error = parse_err;
+                let repair_user = review_schema_repair_user(
+                    invalid,
+                    truncate_utf8_bytes(&parse_error, REPAIR_ERROR_MAX_BYTES),
                 );
                 let repaired = match self
                     .chat(
@@ -1159,13 +1772,7 @@ impl LlmClient {
                 recovery: None,
             });
             let previous = truncate_utf8_bytes(&content, 16_384);
-            let retry_user = format!(
-                "{user}\n\n[Your previous response]\n{previous}\n\n[Correction] Your summary \
-                 describes merge-relevant risk but `findings` is empty, which is invalid. \
-                 Either report each risk as a structured finding citing its exact new-file \
-                 line from the diff above, or, if nothing is actually merge-relevant, \
-                 return exactly {{\"summary\": \"\", \"findings\": []}}."
-            );
+            let retry_user = review_semantic_retry_user(user, previous);
             let mut retry_usage = usage;
             match self
                 .chat(
@@ -1266,11 +1873,8 @@ impl LlmClient {
                     &content,
                     max_tokens as usize * SCORER_REPAIR_BYTES_PER_OUTPUT_TOKEN,
                 );
-                let repair_system = format!(
-                    "{system}\n\nYour previous response failed schema validation. Repair only the JSON schema. Kind is a category, so severity values such as info, warn, and error are invalid kinds. Every reason must be concise single-line text of at most 240 UTF-8 bytes ending in sentence punctuation. Return the complete array and nothing else."
-                );
-                let repair_user =
-                    format!("{user}\n\nInvalid previous response (untrusted data):\n{invalid}");
+                let repair_system = scorer_repair_system(system);
+                let repair_user = scorer_repair_user(user, invalid);
                 let incident = ModelIncident {
                     phase: ModelIncidentPhase::Scorer,
                     category: ModelIncidentCategory::InvalidOutput,
@@ -1723,6 +2327,14 @@ impl LlmClient {
                 });
                 body["max_tokens"] = json!(max_tokens);
                 apply_openrouter_privacy(&mut body, self.require_openrouter_privacy);
+                if is_canonical_openrouter_base(&self.api_base)
+                    && let Some(bound) = self
+                        .hosted_price_bounds
+                        .as_ref()
+                        .and_then(|bounds| bounds.get(model))
+                {
+                    apply_openrouter_price_ceiling(&mut body, bound);
+                }
                 body
             }
             ApiFormat::Anthropic => json!({
@@ -1834,6 +2446,18 @@ impl LlmClient {
             .and_then(serde_json::Value::as_u64)
             .and_then(|value| usize::try_from(value).ok())
             .ok_or_else(|| anyhow!("model request is missing a bounded max_tokens value"))?;
+        let projected_cost_micros = if let Some(bounds) = &self.hosted_price_bounds {
+            let model = body
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("hosted model request is missing its model identifier"))?;
+            let bound = bounds
+                .get(model)
+                .ok_or_else(|| anyhow!("hosted model {model:?} has no admitted price bound"))?;
+            projected_request_cost_micros(input_bytes, output_tokens, bound)?
+        } else {
+            0
+        };
         // Every input token consumes at least one byte of serialized request
         // content, so the byte count is a conservative upper bound on input
         // tokens. Keep the byte and output-token counters separate for their
@@ -1864,26 +2488,37 @@ impl LlmClient {
             .token_exposure_upper_bound
             .checked_add(token_exposure_upper_bound)
             .ok_or_else(|| anyhow!("model provider spend exposure overflowed"))?;
-        ensure!(
-            attempts <= MAX_PROVIDER_ATTEMPTS,
-            "model provider attempt hard cap ({MAX_PROVIDER_ATTEMPTS}) exceeded"
-        );
-        ensure!(
-            total_input <= MAX_PROVIDER_INPUT_BYTES,
-            "model provider input hard cap ({MAX_PROVIDER_INPUT_BYTES} bytes) exceeded"
-        );
-        ensure!(
-            total_output <= MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE,
-            "model provider output exposure hard cap ({MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE} tokens) exceeded"
-        );
-        ensure!(
-            total_token_exposure <= MAX_REPORTED_TOKEN_SPEND,
-            "model token spend exposure exceeded the {MAX_REPORTED_TOKEN_SPEND} token hard cap"
-        );
+        let total_projected_cost = admission
+            .projected_cost_exposure_micros
+            .checked_add(projected_cost_micros)
+            .ok_or_else(|| anyhow!("model provider projected cost exposure overflowed"))?;
+        if self.hosted_price_bounds.is_some() {
+            ensure!(
+                attempts <= MAX_PROVIDER_ATTEMPTS,
+                "model provider attempt hard cap ({MAX_PROVIDER_ATTEMPTS}) exceeded"
+            );
+            ensure!(
+                total_input <= MAX_PROVIDER_INPUT_BYTES,
+                "model provider input hard cap ({MAX_PROVIDER_INPUT_BYTES} bytes) exceeded"
+            );
+            ensure!(
+                total_output <= MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE,
+                "model provider output exposure hard cap ({MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE} tokens) exceeded"
+            );
+            ensure!(
+                total_token_exposure <= MAX_REPORTED_TOKEN_SPEND,
+                "model token spend exposure exceeded the {MAX_REPORTED_TOKEN_SPEND} token hard cap"
+            );
+            ensure!(
+                total_projected_cost <= HOSTED_OPERATION_COST_CAP_MICROS,
+                "model provider projected cost exposure exceeded the {HOSTED_OPERATION_COST_CAP_MICROS} micro-dollar hosted operation cap"
+            );
+        }
         admission.attempts = attempts;
         admission.input_bytes = total_input;
         admission.output_token_exposure = total_output;
         admission.token_exposure_upper_bound = total_token_exposure;
+        admission.projected_cost_exposure_micros = total_projected_cost;
         Ok(())
     }
 
@@ -1910,15 +2545,17 @@ impl LlmClient {
                     .unwrap_or(0),
             )
             .ok_or_else(|| anyhow!("model provider reported cost overflowed"))?;
-        ensure!(
-            total_tokens <= MAX_REPORTED_TOKEN_SPEND,
-            "model token spend exceeded the {MAX_REPORTED_TOKEN_SPEND} token hard cap"
-        );
-        ensure!(
-            total_cost <= MAX_PROVIDER_COST_MICROS,
-            "model provider cost exceeded the {} micro-dollar hard cap",
-            MAX_PROVIDER_COST_MICROS
-        );
+        if self.hosted_price_bounds.is_some() {
+            ensure!(
+                total_tokens <= MAX_REPORTED_TOKEN_SPEND,
+                "model token spend exceeded the {MAX_REPORTED_TOKEN_SPEND} token hard cap"
+            );
+            ensure!(
+                total_cost <= HOSTED_OPERATION_COST_CAP_MICROS,
+                "model provider cost exceeded the {} micro-dollar hard cap",
+                HOSTED_OPERATION_COST_CAP_MICROS
+            );
+        }
         admission.reported_token_spend = total_tokens;
         admission.reported_cost_micros = total_cost;
         Ok(())
@@ -1939,7 +2576,7 @@ impl LlmClient {
 
     fn remaining_budget(&self, phase: LlmPhase) -> Result<Option<Duration>> {
         let deadline = match phase {
-            LlmPhase::Review => self.review_deadline,
+            LlmPhase::Planner | LlmPhase::Review => self.review_deadline,
             LlmPhase::Scorer => self.scorer_deadline.or(self.total_deadline),
             LlmPhase::Respond | LlmPhase::Total => self.total_deadline,
         };
@@ -1985,6 +2622,24 @@ fn apply_openrouter_privacy(body: &mut serde_json::Value, required: bool) {
     }
 }
 
+fn apply_openrouter_price_ceiling(body: &mut serde_json::Value, bound: &ModelPriceBound) {
+    let provider = body
+        .as_object_mut()
+        .expect("model request body is an object")
+        .entry("provider")
+        .or_insert_with(|| json!({}));
+    let provider = provider
+        .as_object_mut()
+        .expect("provider routing configuration is an object");
+    provider.insert(
+        "max_price".to_string(),
+        json!({
+            "prompt": bound.input_micros_per_million_tokens as f64 / 1_000_000.0,
+            "completion": bound.output_micros_per_million_tokens as f64 / 1_000_000.0,
+        }),
+    );
+}
+
 fn is_canonical_openrouter_base(api_base: &str) -> bool {
     reqwest::Url::parse(api_base).is_ok_and(|url| {
         url.scheme() == "https"
@@ -1994,6 +2649,14 @@ fn is_canonical_openrouter_base(api_base: &str) -> bool {
             && url.query().is_none()
             && url.fragment().is_none()
     })
+}
+
+fn ensure_hosted_provider_contract(api_format: ApiFormat, api_base: &str) -> Result<()> {
+    ensure!(
+        api_format == ApiFormat::OpenaiCompatible && is_canonical_openrouter_base(api_base),
+        "hosted inference requires the canonical OpenRouter OpenAI-compatible endpoint so admitted price and privacy ceilings are enforceable"
+    );
+    Ok(())
 }
 
 fn retry_after_duration(headers: &HeaderMap) -> Option<Duration> {
@@ -2693,6 +3356,8 @@ mod tests {
     use crate::config::Config;
     use crate::envelope::{Kind, Severity};
     use std::sync::{Mutex, OnceLock};
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     struct EnvRestore {
         saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
@@ -2905,6 +3570,429 @@ mod tests {
             timeouts.request,
             Duration::from_secs(crate::review::HOSTED_LLM_REQUEST_TIMEOUT_SECS)
         );
+    }
+
+    #[test]
+    fn hosted_provider_contract_requires_canonical_openrouter_openai() {
+        assert!(
+            ensure_hosted_provider_contract(
+                ApiFormat::OpenaiCompatible,
+                "https://openrouter.ai/api/v1/"
+            )
+            .is_ok()
+        );
+        assert!(
+            ensure_hosted_provider_contract(ApiFormat::Anthropic, "https://api.anthropic.com/v1")
+                .is_err()
+        );
+        assert!(
+            ensure_hosted_provider_contract(
+                ApiFormat::OpenaiCompatible,
+                "https://private.example/v1"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn planner_selection_is_exact_unique_bounded_and_grounded() {
+        let allowed = BTreeSet::from([2usize, 4, 8]);
+        assert_eq!(
+            validate_batch_selection(r#"{"batchIds":[8,2]}"#, &allowed, 2).unwrap(),
+            vec![2, 8]
+        );
+        assert!(validate_batch_selection(r#"{"batchIds":[2,2]}"#, &allowed, 2).is_err());
+        assert!(validate_batch_selection(r#"{"batchIds":[3]}"#, &allowed, 2).is_err());
+        assert!(validate_batch_selection(r#"{"batchIds":[2,4,8]}"#, &allowed, 2).is_err());
+        assert!(validate_batch_selection(r#"{"batchIds":[2],"extra":true}"#, &allowed, 2).is_err());
+    }
+
+    #[tokio::test]
+    async fn planner_failure_falls_back_and_preserves_usage_cost_and_incidents() {
+        let server = MockServer::start().await;
+        for (model, prompt_tokens, completion_tokens, cost) in [
+            ("provider/primary", 10, 2, "0.000010"),
+            ("provider/fallback", 20, 3, "0.000020"),
+        ] {
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .and(body_string_contains(model))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {"content": "not valid planner json"}}],
+                    "usage": {
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "cost": serde_json::from_str::<serde_json::Value>(cost).unwrap()
+                    }
+                })))
+                .expect(2)
+                .mount(&server)
+                .await;
+        }
+        let config = Config {
+            api_base: server.uri(),
+            api_format: ApiFormat::OpenaiCompatible,
+            model: "provider/primary".into(),
+            cascade: vec!["provider/fallback".into()],
+            scorer_enabled: false,
+            ..Config::default()
+        };
+        let client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(2),
+            None,
+            None,
+        )
+        .unwrap();
+        *client.http.lock().unwrap() = Some(reqwest::Client::new());
+
+        let result = client
+            .plan_review_batches(
+                &config,
+                "Batch 2 risk=1 kind=source\nchange",
+                &BTreeSet::from([2usize]),
+                1,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.fallback_used);
+        assert!(result.batch_ids.is_empty());
+        assert_eq!(result.usage.prompt_tokens, 60);
+        assert_eq!(result.usage.completion_tokens, 10);
+        assert_eq!(result.usage.provider_cost.unwrap().to_string(), "0.00006");
+        assert_eq!(result.model_usage.len(), 4);
+        assert!(
+            result
+                .model_usage
+                .iter()
+                .all(|usage| usage.role == Some(ModelUsageRole::ReviewPlanner))
+        );
+        assert_eq!(result.model_incidents.len(), 4);
+        assert!(result.model_incidents.iter().all(|incident| {
+            incident.phase == ModelIncidentPhase::Planner
+                && incident.category == ModelIncidentCategory::InvalidOutput
+                && incident.recovered
+                && incident.recovery == Some(ModelIncidentRecovery::Fallback)
+        }));
+        assert!(result.usage_accounting_complete);
+    }
+
+    #[tokio::test]
+    async fn planner_schema_repair_preserves_usage_cost_and_recovery_incident() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("The previous response was invalid"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "{\"batchIds\":[2]}"}}],
+                "usage": {
+                    "prompt_tokens": 20,
+                    "completion_tokens": 3,
+                    "cost": serde_json::from_str::<serde_json::Value>("0.000020").unwrap()
+                }
+            })))
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "not valid planner json"}}],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                    "cost": serde_json::from_str::<serde_json::Value>("0.000010").unwrap()
+                }
+            })))
+            .with_priority(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let config = Config {
+            api_base: server.uri(),
+            api_format: ApiFormat::OpenaiCompatible,
+            model: "provider/model".into(),
+            scorer_enabled: false,
+            ..Config::default()
+        };
+        let client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(2),
+            None,
+            None,
+        )
+        .unwrap();
+        *client.http.lock().unwrap() = Some(reqwest::Client::new());
+
+        let result = client
+            .plan_review_batches(
+                &config,
+                "Batch 2 risk=1 kind=source\nchange",
+                &BTreeSet::from([2usize]),
+                1,
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.fallback_used);
+        assert_eq!(result.batch_ids, vec![2]);
+        assert_eq!(result.usage.prompt_tokens, 30);
+        assert_eq!(result.usage.completion_tokens, 5);
+        assert_eq!(result.usage.provider_cost.unwrap().to_string(), "0.00003");
+        assert_eq!(result.model_usage.len(), 2);
+        assert_eq!(result.model_incidents.len(), 1);
+        let incident = &result.model_incidents[0];
+        assert_eq!(incident.phase, ModelIncidentPhase::Planner);
+        assert_eq!(incident.category, ModelIncidentCategory::InvalidOutput);
+        assert!(incident.recovered);
+        assert_eq!(incident.recovery, Some(ModelIncidentRecovery::Repair));
+        assert!(result.usage_accounting_complete);
+    }
+
+    #[tokio::test]
+    async fn planner_model_cascade_marks_fallback_and_preserves_incidents() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("provider/primary"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "invalid"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("provider/fallback"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "{\"batchIds\":[2]}"}}],
+                "usage": {"prompt_tokens": 20, "completion_tokens": 3}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let config = Config {
+            api_base: server.uri(),
+            api_format: ApiFormat::OpenaiCompatible,
+            model: "provider/primary".into(),
+            cascade: vec!["provider/fallback".into()],
+            scorer_enabled: false,
+            ..Config::default()
+        };
+        let client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(2),
+            None,
+            None,
+        )
+        .unwrap();
+        *client.http.lock().unwrap() = Some(reqwest::Client::new());
+
+        let result = client
+            .plan_review_batches(
+                &config,
+                "Batch 2 risk=1 kind=source\nchange",
+                &BTreeSet::from([2usize]),
+                1,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.fallback_used);
+        assert_eq!(result.batch_ids, vec![2]);
+        assert_eq!(result.usage.prompt_tokens, 40);
+        assert_eq!(result.usage.completion_tokens, 7);
+        assert_eq!(result.model_usage.len(), 3);
+        assert_eq!(result.model_incidents.len(), 2);
+        assert!(result.model_incidents.iter().all(|incident| {
+            incident.phase == ModelIncidentPhase::Planner
+                && incident.category == ModelIncidentCategory::InvalidOutput
+                && incident.recovered
+                && incident.recovery == Some(ModelIncidentRecovery::Fallback)
+        }));
+    }
+
+    #[test]
+    fn hosted_respond_preflight_accounts_for_every_fallback_before_calls() {
+        let config = Config {
+            model: "provider/primary".into(),
+            cascade: vec!["provider/fallback".into()],
+            ..Config::default()
+        };
+        let mut client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        client.hosted_price_bounds = Some(Arc::new(HashMap::from([
+            (
+                "provider/primary".into(),
+                ModelPriceBound {
+                    model: "provider/primary".into(),
+                    input_micros_per_million_tokens: 1,
+                    output_micros_per_million_tokens: 1,
+                },
+            ),
+            (
+                "provider/fallback".into(),
+                ModelPriceBound {
+                    model: "provider/fallback".into(),
+                    input_micros_per_million_tokens: 1,
+                    output_micros_per_million_tokens: 1,
+                },
+            ),
+        ])));
+        client
+            .preflight_respond_plan(&config, "system", "bounded user context")
+            .unwrap();
+        assert_eq!(client.admission.lock().unwrap().attempts, 0);
+    }
+
+    #[test]
+    fn hosted_review_plan_admits_bounded_selection_independent_of_raw_batch_count() {
+        let config = Config {
+            model: "provider/model".into(),
+            scorer_enabled: false,
+            ..Config::default()
+        };
+        let mut client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        client.hosted_price_bounds = Some(Arc::new(HashMap::from([(
+            "provider/model".into(),
+            ModelPriceBound {
+                model: "provider/model".into(),
+                input_micros_per_million_tokens: 1,
+                output_micros_per_million_tokens: 1,
+            },
+        )])));
+        client
+            .preflight_review_plan(
+                &config,
+                crate::review::MAX_HOSTED_SELECTED_BATCHES,
+                "system",
+                &vec!["bounded candidate".to_string(); crate::review::MAX_HOSTED_SELECTED_BATCHES],
+                &vec!["bounded candidate".to_string(); crate::review::MAX_HOSTED_SELECTED_BATCHES],
+                Some((&"m".repeat(96_000), 1)),
+            )
+            .unwrap();
+        assert_eq!(client.admission.lock().unwrap().attempts, 0);
+    }
+
+    #[test]
+    fn maximum_hosted_plan_matches_watchdog_and_transport_arithmetic() {
+        let review_calls = crate::review::MAX_HOSTED_SELECTED_BATCHES
+            * crate::review::MAX_MODELS_PER_REQUEST
+            * MAX_LOGICAL_CALLS_PER_REVIEW_MODEL;
+        let planner_calls =
+            crate::review::MAX_MODELS_PER_REQUEST * MAX_LOGICAL_CALLS_PER_REVIEW_MODEL;
+        let scorer_calls = 2 * MAX_LOGICAL_CALLS_PER_SCORER_MODEL;
+        let logical_calls = review_calls + planner_calls + scorer_calls;
+
+        assert_eq!(logical_calls, MAX_HOSTED_PLANNED_CALLS_BY_WATCHDOG);
+        assert!(logical_calls * MAX_TRANSPORT_ATTEMPTS_PER_CALL <= MAX_PROVIDER_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn deterministic_hosted_rejection_contacts_no_provider() {
+        let server = wiremock::MockServer::start().await;
+        let config = Config {
+            api_base: server.uri(),
+            model: "provider/model".into(),
+            scorer_enabled: false,
+            ..Config::default()
+        };
+        let mut client = {
+            let _lock = env_lock().lock().unwrap();
+            let _env = EnvRestore::capture(&[ENDPOINT_AUTH_HEADER_ENV, ENDPOINT_AUTH_VALUE_ENV]);
+            EnvRestore::remove(ENDPOINT_AUTH_HEADER_ENV);
+            EnvRestore::remove(ENDPOINT_AUTH_VALUE_ENV);
+            LlmClient::build(
+                &config,
+                "test-key".into(),
+                Duration::from_secs(1),
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        client.hosted_price_bounds = Some(Arc::new(HashMap::from([(
+            "provider/model".into(),
+            ModelPriceBound {
+                model: "provider/model".into(),
+                input_micros_per_million_tokens: 1,
+                output_micros_per_million_tokens: 1,
+            },
+        )])));
+
+        let error = client
+            .preflight_review_plan(
+                &config,
+                crate::review::MAX_HOSTED_SELECTED_BATCHES,
+                "system",
+                &vec![hostile_json_text(400_000); crate::review::MAX_HOSTED_SELECTED_BATCHES],
+                &vec![hostile_json_text(400_000); crate::review::MAX_HOSTED_SELECTED_BATCHES],
+                Some(("manifest", 1)),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("complete hosted review"));
+        assert_eq!(client.admission.lock().unwrap().attempts, 0);
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn hosted_preflight_counts_exact_hostile_json_expansion() {
+        let config = Config {
+            model: "provider/model".into(),
+            scorer_enabled: false,
+            ..Config::default()
+        };
+        let client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        let hostile = "\0".repeat(64 * 1_024);
+
+        let exact = client
+            .planned_request_bytes(
+                "provider/model",
+                "system with \"quotes\" and \\slashes",
+                &hostile,
+                REVIEW_MAX_TOKENS,
+                0.0,
+            )
+            .unwrap();
+        let actual = serde_json::to_vec(&client.request_body(
+            "provider/model",
+            "system with \"quotes\" and \\slashes",
+            &hostile,
+            REVIEW_MAX_TOKENS,
+            0.0,
+        ))
+        .unwrap()
+        .len();
+
+        assert_eq!(exact, actual);
+        assert!(exact > hostile.len() * 5);
     }
 
     #[test]
@@ -3510,6 +4598,121 @@ mod tests {
         let mut byok = json!({"model": "provider/model"});
         apply_openrouter_privacy(&mut byok, false);
         assert!(byok.get("provider").is_none());
+    }
+
+    #[test]
+    fn hosted_openrouter_request_pins_the_admitted_price_ceiling() {
+        let mut body = json!({"model": "provider/model"});
+        apply_openrouter_privacy(&mut body, true);
+        apply_openrouter_price_ceiling(
+            &mut body,
+            &ModelPriceBound {
+                model: "provider/model".into(),
+                input_micros_per_million_tokens: 80_000,
+                output_micros_per_million_tokens: 400_000,
+            },
+        );
+        assert_eq!(body["provider"]["max_price"]["prompt"], 0.08);
+        assert_eq!(body["provider"]["max_price"]["completion"], 0.4);
+        assert_eq!(body["provider"]["data_collection"], "deny");
+        assert_eq!(body["provider"]["zdr"], true);
+    }
+
+    #[test]
+    fn byok_openai_and_direct_anthropic_request_bodies_have_no_hosted_routing_fields() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvRestore::capture(&["POSTIL_HOSTED_MODE"]);
+        EnvRestore::remove("POSTIL_HOSTED_MODE");
+
+        let openai = LlmClient::build(
+            &Config {
+                model: "provider/model".into(),
+                ..Config::default()
+            },
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        let openai_body = openai.request_body("provider/model", "system", "user", 100, 0.0);
+        assert!(openai_body.get("provider").is_none());
+
+        let anthropic = LlmClient::build(
+            &Config {
+                model: "provider/model".into(),
+                api_format: ApiFormat::Anthropic,
+                api_base: "https://api.anthropic.com/v1".into(),
+                ..Config::default()
+            },
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        let anthropic_body = anthropic.request_body("provider/model", "system", "user", 100, 0.0);
+        assert!(anthropic_body.get("provider").is_none());
+        assert_eq!(anthropic_body["system"], "system");
+    }
+
+    #[test]
+    fn hosted_projected_and_reported_costs_cannot_cross_the_service_reservation() {
+        let config = Config {
+            model: "provider/model".into(),
+            ..Config::default()
+        };
+        let mut client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        client.hosted_price_bounds = Some(Arc::new(HashMap::from([(
+            "provider/model".into(),
+            ModelPriceBound {
+                model: "provider/model".into(),
+                input_micros_per_million_tokens: 1,
+                output_micros_per_million_tokens: 100_000_000,
+            },
+        )])));
+        let body = json!({"model": "provider/model", "max_tokens": 6_000});
+        client.reserve_provider_attempt(&body).unwrap();
+        let error = client.reserve_provider_attempt(&body).unwrap_err();
+        assert!(error.to_string().contains("hosted operation cap"));
+        assert_eq!(
+            client
+                .admission
+                .lock()
+                .unwrap()
+                .projected_cost_exposure_micros,
+            600_001
+        );
+
+        let error = client
+            .record_reported_usage(Usage {
+                provider_cost: ProviderCost::parse("1.000001"),
+                ..Usage::default()
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("1000000 micro-dollar hard cap"));
+    }
+
+    #[test]
+    fn projected_price_uses_bytes_as_a_conservative_input_token_bound() {
+        let projected = projected_request_cost_micros(
+            1_000_001,
+            8_000,
+            &ModelPriceBound {
+                model: "provider/model".into(),
+                input_micros_per_million_tokens: 100_000,
+                output_micros_per_million_tokens: 1_000_000,
+            },
+        )
+        .unwrap();
+        assert_eq!(projected, 108_001);
     }
 
     #[test]

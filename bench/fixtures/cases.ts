@@ -10,7 +10,11 @@
 
 import crypto from "crypto";
 
-import type { BenchmarkCaseInput, SemanticPropositions } from "../src/harness";
+import {
+  parseUnifiedDiffFiles,
+  type BenchmarkCaseInput,
+  type SemanticPropositions,
+} from "../src/harness";
 
 type DisallowedSource =
   | string
@@ -41,6 +45,7 @@ type FixtureSpec = {
     classification: "mustBlock" | "advisory" | "clean";
     contractRule: string;
   };
+  expectedCoverage?: "exhaustive" | "bounded";
   finding?: {
     severity: "info" | "warn" | "error";
     body: string;
@@ -48,6 +53,8 @@ type FixtureSpec = {
   };
   disallowedSources?: DisallowedSource[];
   maxFindings?: number;
+  prefixDiff?: string;
+  suffixDiff?: string;
 };
 
 // Explicit sentences preserve the fixture's minimum accepted semantic
@@ -387,7 +394,45 @@ export function makeDiff(path: string, hunks: FixtureHunk[]): string {
   ].join("\n");
 }
 
+function makeDistantStreamingChurn(side: "prefix" | "suffix"): string {
+  return Array.from({ length: 3 }, (_, fileIndex) => {
+    const lines = [`+export function ordinary_${side}_${fileIndex}(actor: Actor) {`];
+    for (let line = 2; line < 130; line += 1) {
+      lines.push(`+  const ordinary_${side}_${fileIndex}_${line} = actor.id; // ${"x".repeat(900)}`);
+    }
+    lines.push("+  return actor.id;", "+}");
+    const path = `src/churn/${side}-${fileIndex}.ts`;
+    return [
+      `diff --git a/${path} b/${path}`,
+      "--- /dev/null",
+      `+++ b/${path}`,
+      `@@ -0,0 +1,${lines.length} @@`,
+      ...lines,
+      "",
+    ].join("\n");
+  }).join("");
+}
+
+function makeManyLineGeneratedNoise(): string {
+  const paddingLines = 33_000;
+  const padding = `+  "${"x".repeat(1_010)}",\n`.repeat(paddingLines);
+  return [
+    "diff --git a/web/generated-noise.js.map b/web/generated-noise.js.map",
+    "--- /dev/null",
+    "+++ b/web/generated-noise.js.map",
+    `@@ -0,0 +1,${paddingLines + 2} @@`,
+    '+{"version":3,"sources":["source.ts"],"mappings":"AAAA","padding":[',
+    padding.trimEnd(),
+    "+]}",
+    "",
+  ].join("\n");
+}
+
 function buildCase(spec: FixtureSpec): BenchmarkCaseInput {
+  const diff = `${spec.prefixDiff ?? ""}${makeDiff(spec.path, spec.hunks ?? [{ line: spec.line, before: spec.before, after: spec.after }])}${spec.suffixDiff ?? ""}`;
+  const additionalFiles = parseUnifiedDiffFiles(diff)
+    .filter((file) => file.path !== spec.path)
+    .map((file) => ({ path: file.path, content: file.after }));
   const expected = spec.finding
     ? [
         {
@@ -405,20 +450,22 @@ function buildCase(spec: FixtureSpec): BenchmarkCaseInput {
     repo: repoFullName,
     pullNumber: spec.pullNumber,
     headSha: makeHeadSha(spec.pullNumber),
-    diff: makeDiff(spec.path, spec.hunks ?? [{ line: spec.line, before: spec.before, after: spec.after }]),
+    diff,
     allowedContext: {
-      files: [{ path: spec.path, content: spec.allowedFileContent }],
+      files: [{ path: spec.path, content: spec.allowedFileContent }, ...additionalFiles],
       docs: [{ path: "review-policy.md", content: spec.policy }],
     },
     disallowedSources: spec.disallowedSources ?? [],
     scoringLabels: spec.scoringLabels,
-    admission:
-      spec.admission ??
-      (spec.finding?.severity === "error"
-        ? { classification: "mustBlock", contractRule: "merge-relevant-defect" }
-        : spec.finding
-          ? { classification: "advisory", contractRule: "conditional-merge-risk" }
-          : { classification: "clean", contractRule: "no-merge-relevant-defect" }),
+    admission: {
+      ...(spec.admission ??
+        (spec.finding?.severity === "error"
+          ? { classification: "mustBlock" as const, contractRule: "merge-relevant-defect" }
+          : spec.finding
+            ? { classification: "advisory" as const, contractRule: "conditional-merge-risk" }
+            : { classification: "clean" as const, contractRule: "no-merge-relevant-defect" })),
+      expectedCoverage: spec.expectedCoverage,
+    },
     groundTruth: { findings: expected },
     guardrails: { forbiddenPromptSubstrings: [] },
     modelOutput: {
@@ -1338,6 +1385,9 @@ const fixtureSpecs: FixtureSpec[] = [
       "export async function bulkEdit(actor: Actor, changeSet: ChangeSet) { await applyBulkEdit(changeSet); }",
     policy: "Huge diffs still need authorization checks on privileged writes.",
     scoringLabels: ["huge-low-signal", "multi-hunk", "security", "authorization", "error"],
+    prefixDiff: makeDistantStreamingChurn("prefix"),
+    suffixDiff: makeDistantStreamingChurn("suffix"),
+    expectedCoverage: "bounded",
     finding: {
       severity: "error",
       body: "The large refactor removes the bulk-edit permission check before applying privileged changes.",
@@ -1391,6 +1441,9 @@ const fixtureSpecs: FixtureSpec[] = [
       "export function copyLabel(label: string) { const disabled = false; return label.trim(); }",
     policy: "Low-signal formatting churn should not create review findings without a behavior change.",
     scoringLabels: ["huge-low-signal", "multi-hunk", "clean", "silence"],
+    prefixDiff: `${makeManyLineGeneratedNoise()}${makeDistantStreamingChurn("prefix")}`,
+    suffixDiff: makeDistantStreamingChurn("suffix"),
+    expectedCoverage: "bounded",
   },
   {
     id: "near-duplicate-auth-defect",

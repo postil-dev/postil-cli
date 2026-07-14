@@ -5,7 +5,13 @@ import {
   positiveParaphrasesByFixtureId,
   semanticProbesByFixtureId,
 } from "../fixtures/cases";
-import { benchmarkCase, commentMatchesExpectation, scanForForbidden } from "./harness";
+import {
+  benchmarkCase,
+  commentMatchesExpectation,
+  parseUnifiedDiffFiles,
+  scanForForbidden,
+  startMockGithub,
+} from "./harness";
 
 describe("benchmark fixtures", () => {
   test("cover the expanded saturated-case categories", () => {
@@ -209,17 +215,69 @@ describe("benchmark fixtures", () => {
     }
 
     for (const c of hugeCases) {
-      const removed = c.diff
+      const primaryPath = c.allowedContext.files[0]?.path;
+      const primaryDiff = parseUnifiedDiffFiles(c.diff).find((file) =>
+        file.path === primaryPath
+      )?.patch ?? "";
+      const removed = primaryDiff
         .split("\n")
         .filter((line) => line.startsWith("- "))
         .map((line) => line.slice(2));
-      const added = c.diff
+      const added = primaryDiff
         .split("\n")
         .filter((line) => line.startsWith("+ "))
         .map((line) => line.slice(2));
       expect(removed.length).toBeGreaterThan(1);
       expect(added.length).toBe(removed.length);
       expect(added.every((line, index) => line !== removed[index])).toBe(true);
+    }
+
+    const distant = hugeCases.find((fixture) =>
+      fixture.id === "huge-low-signal-permission-bypass"
+    );
+    expect(distant?.diff.length).toBeGreaterThan(600_000);
+    expect(distant?.diff).toContain("src/churn/prefix-0.ts");
+    expect(distant?.diff).toContain("src/admin/bulk-edit.ts");
+    expect(distant?.admission.expectedCoverage).toBe("bounded");
+    const distantFiles = parseUnifiedDiffFiles(distant!.diff);
+    const defectIndex = distantFiles.findIndex((file) => file.path === "src/admin/bulk-edit.ts");
+    expect(distantFiles.length).toBe(7);
+    expect(defectIndex).toBeGreaterThan(0);
+    expect(defectIndex).toBeLessThan(distantFiles.length - 1);
+
+    const generatedNoise = hugeCases.find((fixture) =>
+      fixture.id === "huge-low-signal-clean"
+    );
+    expect(generatedNoise?.diff.length).toBeGreaterThan(32 * 1024 * 1024);
+    expect(generatedNoise?.diff).toContain("generated-noise.js.map");
+    expect(generatedNoise?.diff.match(/^\+  \"x/gm)?.length).toBeGreaterThan(30_000);
+    expect(generatedNoise?.admission.expectedCoverage).toBe("bounded");
+  });
+
+  test("the GitHub mock reports and serves every changed file independently", async () => {
+    const c = benchmarkCase.parse(cases.find((candidate) =>
+      candidate.id === "huge-low-signal-permission-bypass"
+    ));
+    const github = await startMockGithub(c);
+    try {
+      const pull = await fetch(`${github.baseUrl}${github.pullPath}`, {
+        headers: { accept: "application/json" },
+      }).then((response) => response.json()) as { changed_files: number };
+      expect(pull.changed_files).toBe(7);
+
+      const files = await fetch(`${github.baseUrl}${github.pullPath}/files`).then((response) =>
+        response.json()
+      ) as Array<{ filename: string }>;
+      expect(files.map((file) => file.filename)).toContain("src/admin/bulk-edit.ts");
+      expect(files.map((file) => file.filename)).toContain("src/churn/suffix-2.ts");
+
+      const primary = await fetch(
+        `${github.baseUrl}/repos/${c.repo}/contents/src%2Fadmin%2Fbulk-edit.ts?ref=${c.headSha}`,
+      ).then((response) => response.text());
+      expect(primary).toContain("applyBulkEdit(changeSet)");
+      expect(primary).not.toContain("ordinary_prefix");
+    } finally {
+      await github.close();
     }
   });
 });

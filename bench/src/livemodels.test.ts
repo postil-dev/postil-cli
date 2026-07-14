@@ -20,6 +20,7 @@ import {
   normalizeApiBase,
   normalizeQualificationPairs,
   parseQualificationPairs,
+  qualificationCandidateDocument,
   qualificationProfileDigest,
   runLiveModels,
   type LiveModelsReport,
@@ -144,6 +145,40 @@ describe("pair qualification configuration", () => {
     expect(env.POSTIL_DISABLE_SCORER).toBeUndefined();
   });
 
+  test("binds candidate hosted execution to an exact profile file", () => {
+    const pricing = new Map([
+      [pair.generatorModel, {
+        promptUsdPerToken: 0.000001,
+        completionUsdPerToken: 0.000002,
+        inputMicrosPerMillionTokens: 1_000_000,
+        outputMicrosPerMillionTokens: 2_000_000,
+      }],
+      [pair.scorerModel, {
+        promptUsdPerToken: 0.000001,
+        completionUsdPerToken: 0.000002,
+        inputMicrosPerMillionTokens: 1_000_000,
+        outputMicrosPerMillionTokens: 2_000_000,
+      }],
+    ]);
+    const apiBase = normalizeApiBase("https://openrouter.ai/api/v1");
+    expect(qualificationCandidateDocument(pair, pricing, apiBase, "openai-compatible"))
+      .toMatchObject({
+        benchmarkProviderIdentity: MANAGED_OPENROUTER_PROVIDER_IDENTITY,
+        apiBase,
+        generatorChain: [pair.generatorModel],
+        scorerChain: [pair.scorerModel],
+      });
+    expect(liveEnv(
+      "/tmp/home",
+      "/tmp/tmp",
+      "http://127.0.0.1:1234",
+      pair,
+      apiBase,
+      "openai-compatible",
+      "/tmp/candidate.json",
+    ).POSTIL_QUALIFICATION_CANDIDATE_PROFILE).toBe("/tmp/candidate.json");
+  });
+
   test("forwards validated endpoint authentication without exposing managed headers", () => {
     const inheritedHeader = process.env.POSTIL_ENDPOINT_AUTH_HEADER;
     const inheritedValue = process.env.POSTIL_ENDPOINT_AUTH_VALUE;
@@ -212,28 +247,6 @@ describe("pair qualification configuration", () => {
       pricing: new Map(),
     })).rejects.toThrow("at most 6 candidates");
 
-    const inheritedKey = process.env.POSTIL_API_KEY;
-    process.env.POSTIL_API_KEY = "test-only-key";
-    try {
-      await expect(runLiveModels(fixtureInputs, {
-        binary: "/missing/postil",
-        pairs: [{ generatorModel: "costly/model", scorerModel: "cheap/scorer" }],
-        pricing: new Map([
-          ["costly/model", {
-            promptUsdPerToken: 0.001, completionUsdPerToken: 0.001,
-            inputMicrosPerMillionTokens: 1_000_000_000, outputMicrosPerMillionTokens: 1_000_000_000,
-          }],
-          ["cheap/scorer", {
-            promptUsdPerToken: 0.000001, completionUsdPerToken: 0.000001,
-            inputMicrosPerMillionTokens: 1_000_000, outputMicrosPerMillionTokens: 1_000_000,
-          }],
-        ]),
-        costCapUsd: 1,
-      })).rejects.toThrow("projected pair qualification spend");
-    } finally {
-      if (inheritedKey === undefined) delete process.env.POSTIL_API_KEY;
-      else process.env.POSTIL_API_KEY = inheritedKey;
-    }
   });
 });
 

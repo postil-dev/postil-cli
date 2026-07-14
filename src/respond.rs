@@ -41,7 +41,8 @@ pub struct RespondArgs {
     pub no_post: bool,
 }
 
-const MAX_DIFF_BYTES: usize = 200_000;
+const MAX_RESPOND_DIFF_CONTEXT_BYTES: usize = 120_000;
+const MAX_RESPOND_MANIFEST_BYTES: usize = 24_000;
 const USAGE_RECEIPT_PATH_ENV: &str = "POSTIL_USAGE_RECEIPT_PATH";
 const RESPOND_MAX_CHARS: usize = 2_400;
 const RESPOND_MAX_NONBLANK_LINES: usize = 24;
@@ -291,6 +292,7 @@ async fn respond_with<F: Forge>(
         comment.trim()
     );
     let client = LlmClient::from_env(cfg)?;
+    client.preflight_respond_plan(cfg, &system, &user)?;
     let answer = client
         .answer(cfg, &system, &user, validate_respond_output)
         .await?;
@@ -718,19 +720,15 @@ async fn build_context<F: Forge>(
         ThreadKind::Pull => {
             let meta = forge.fetch_pr_meta().await?;
             let raw = forge.fetch_diff(&meta).await.context("fetching PR diff")?;
-            let parsed = diff::parse(&raw);
+            let (annotated, reserved_anchor) = diff::bounded_respond_context(
+                &raw,
+                MAX_RESPOND_DIFF_CONTEXT_BYTES,
+                MAX_RESPOND_MANIFEST_BYTES,
+            )?;
             ensure!(
-                parsed.complete,
-                "pull request diff is structurally incomplete"
-            );
-            ensure!(
-                !parsed
-                    .files
-                    .iter()
-                    .any(|file| crate::envelope::is_reserved_anchor(&file.path)),
+                !reserved_anchor,
                 "pull request contains a path reserved for Postil's virtual review evidence"
             );
-            let (annotated, truncated) = diff::render_annotated(&parsed, MAX_DIFF_BYTES);
             let mut ctx = format!(
                 "Context: pull request #{number} in {repo}\nTitle: {}\n",
                 meta.title
@@ -741,9 +739,6 @@ async fn build_context<F: Forge>(
             }
             ctx.push_str("\nDiff (left-margin numbers are new-file lines):\n\n");
             ctx.push_str(&annotated);
-            if truncated {
-                ctx.push_str("\n[diff truncated at the size limit]\n");
-            }
             Ok(ctx)
         }
         ThreadKind::Issue => {

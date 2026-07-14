@@ -16,6 +16,10 @@ The review-contract digest covers `Cargo.toml`, `Cargo.lock`, and every Rust sou
 
 Cross-language framing vector: paths and contents `[("a.txt", "alpha"), ("b/β.txt", "line\n")]` serialize as `a.txt\0alpha\0b/β.txt\0line\n\0` in UTF-8 and hash to `1969c5b03a79915d62106b91c742a28127afae455317dcb3a4670e50829eb9ba`.
 
+## Hosted resource admission
+
+Hosted reviews preflight the complete planner, review, scorer, repair, retry, fallback, and consensus path before contacting a provider. Admission measures each JSON request after serialization, including escaped quotes, backslashes, and control characters. The envelope records the conservative attempt, input, output, and cost exposure reserved by that plan. Large diffs use deterministic boundary, risk, and global-synthesis evidence plus a bounded planner selection. If every planner call fails or returns invalid output, Postil retains the planner usage records and reviews the deterministic mandatory selection. The envelope and compact output record exhaustive or bounded mode, selected and total source-batch counts, and whether planner fallback ran. Provider errors stay out of pull request output. Acquired sources, reconstructed diffs, normalized windows, and model batches share one 512 MiB file-backed operation quota.
+
 ## OpenAI-compatible
 
 OpenRouter is the default endpoint. Hosted OpenRouter requests deny data-collecting routes and require ZDR-capable routes through [OpenRouter's per-request provider controls](https://openrouter.ai/docs/guides/routing/provider-selection). OpenRouter can select upstream providers dynamically, so an endpoint identity does not claim a pinned upstream route. Ollama, vLLM, SGLang, LiteLLM, and private gateways can use the same contract. BYOK operators control their provider routing and retention settings.

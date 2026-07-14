@@ -7,12 +7,14 @@ use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::io::Write;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{
     CheckState, Forge, PrMeta, SummaryContext, ThreadKind, check_summary, check_title,
     only_operational_findings, valid_details_url, wrap_plain_text,
 };
+use crate::diff::{DiffSnapshot, DiffSpool, WorkspaceBudget};
 use crate::envelope::{Envelope, Finding, Severity};
 use crate::filter;
 
@@ -435,9 +437,9 @@ impl GitHub {
             "GitHub PR has {expected} changed files, beyond the complete files API limit of {MAX_FILES}"
         );
         let mut files = Vec::with_capacity(expected);
+        let mut retained_bytes = 0usize;
         let mut page = 1usize;
         let max_pages = expected.div_ceil(PAGE_SIZE).max(1);
-        let mut retained_bytes = 0usize;
         loop {
             ensure!(
                 page <= max_pages,
@@ -455,26 +457,26 @@ impl GitHub {
                     "PR files fetch",
                 )
                 .await?;
-            let batch: Vec<PullFile> = super::bounded_response_json(
+            let page_text = super::bounded_response_text(
                 Self::check_ok(response, "PR files fetch").await?,
                 "GitHub PR files page",
             )
             .await?;
+            retained_bytes = super::checked_metadata_total(
+                retained_bytes,
+                page_text.len(),
+                "GitHub PR files pages",
+            )?;
+            let batch: Vec<PullFile> =
+                serde_json::from_str(&page_text).context("decoding GitHub PR files page")?;
             let count = batch.len();
             ensure!(
                 count <= PAGE_SIZE,
                 "GitHub PR files page exceeded requested size"
             );
             for file in &batch {
-                retained_bytes = retained_bytes
-                    .checked_add(file.retained_bytes()?)
-                    .ok_or_else(|| anyhow!("GitHub PR files metadata size overflowed"))?;
+                file.retained_bytes()?;
             }
-            ensure!(
-                retained_bytes <= crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES,
-                "GitHub PR files metadata exceeds the {} byte acquisition limit",
-                crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES
-            );
             files.extend(batch);
             ensure!(
                 files.len() <= expected && files.len() <= MAX_FILES,
@@ -495,8 +497,12 @@ impl GitHub {
         Ok(files)
     }
 
-    async fn source_file(&self, revision: &str, path: &str) -> Result<(String, usize)> {
-        const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
+    async fn source_file(
+        &self,
+        revision: &str,
+        path: &str,
+        workspace: WorkspaceBudget,
+    ) -> Result<(DiffSnapshot, usize)> {
         ensure!(
             super::valid_repository_path(path),
             "GitHub returned an unsafe repository path"
@@ -511,18 +517,15 @@ impl GitHub {
                 "source file fetch",
             )
             .await?;
-        let mut response = Self::check_ok(response, "source file fetch").await?;
-        let bytes = super::bounded_response_bytes_with_limit(
-            &mut response,
+        let snapshot = super::response_snapshot_in(
+            Self::check_ok(response, "source file fetch").await?,
             "GitHub source file",
-            MAX_FILE_BYTES,
+            workspace,
+            None,
         )
         .await?;
-        let byte_count = bytes.len();
-        Ok((
-            String::from_utf8(bytes).unwrap_or_else(|_| "\0".to_string()),
-            byte_count,
-        ))
+        let byte_count = snapshot.as_bytes().len();
+        Ok((snapshot, byte_count))
     }
 
     async fn build_complete_diff(
@@ -531,7 +534,8 @@ impl GitHub {
         base_sha: &str,
         head_sha: &str,
         context: &str,
-    ) -> Result<String> {
+        workspace: WorkspaceBudget,
+    ) -> Result<DiffSnapshot> {
         let mut seen = HashSet::with_capacity(files.len());
         for file in &files {
             validate_pull_file(file, context)?;
@@ -540,8 +544,9 @@ impl GitHub {
                 "{context} returned a duplicate file"
             );
         }
-        let mut sections = stream::iter(files.into_iter().enumerate().map(
-            |(index, file)| async move {
+        let mut sections = stream::iter(files.into_iter().enumerate().map(|(index, file)| {
+            let workspace = workspace.clone();
+            async move {
                 let old_path = file.previous_filename.as_deref().unwrap_or(&file.filename);
                 let (is_add, is_delete) = match file.status.as_str() {
                     "added" => (true, false),
@@ -550,44 +555,41 @@ impl GitHub {
                     _ => unreachable!("validated above"),
                 };
                 let (old, old_bytes) = if is_add {
-                    (String::new(), 0)
+                    (DiffSnapshot::from_bytes_in(b"", workspace.clone())?, 0)
                 } else {
-                    self.source_file(base_sha, old_path).await?
+                    self.source_file(base_sha, old_path, workspace.clone())
+                        .await?
                 };
                 let (new, new_bytes) = if is_delete {
-                    (String::new(), 0)
+                    (DiffSnapshot::from_bytes_in(b"", workspace.clone())?, 0)
                 } else {
-                    self.source_file(head_sha, &file.filename).await?
+                    self.source_file(head_sha, &file.filename, workspace.clone())
+                        .await?
                 };
-                let section = super::azure::diff_section(
+                let mut section = DiffSpool::new_in(workspace.clone())?;
+                super::azure::write_diff_section(
+                    &mut section,
                     old_path,
                     &file.filename,
-                    &old,
-                    &new,
+                    old.source_str(),
+                    new.source_str(),
                     is_add,
                     is_delete,
-                );
-                Ok::<_, anyhow::Error>((index, old_bytes, new_bytes, section))
-            },
-        ))
-        .buffer_unordered(8)
-        .try_collect::<Vec<_>>()
-        .await?;
-        sections.sort_unstable_by_key(|(index, _, _, _)| *index);
-        let mut output = String::new();
-        let mut acquired_bytes = 0usize;
-        for (_, old_bytes, new_bytes, section) in sections {
-            acquired_bytes = checked_acquired_bytes(acquired_bytes, old_bytes, context)?;
-            acquired_bytes = checked_acquired_bytes(acquired_bytes, new_bytes, context)?;
-            ensure!(
-                output.len().saturating_add(section.len())
-                    <= crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES,
-                "{context} reconstructed diff exceeds the {} byte acquisition limit",
-                crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES
-            );
-            output.push_str(&section);
+                )?;
+                Ok::<_, anyhow::Error>((index, old_bytes, new_bytes, section.finish()?))
+            }
+        }))
+        .buffered(4);
+        let mut output = DiffSpool::new_in(workspace.clone())?;
+        while let Some((_, old_bytes, new_bytes, section)) = sections.try_next().await? {
+            let _ = old_bytes
+                .checked_add(new_bytes)
+                .ok_or_else(|| anyhow!("{context} source acquisition size overflowed"))?;
+            output
+                .write_all(section.as_bytes())
+                .with_context(|| format!("spooling {context}"))?;
         }
-        Ok(output)
+        output.finish()
     }
 }
 
@@ -600,18 +602,6 @@ fn encode_path(path: &str) -> String {
             _ => format!("%{byte:02X}"),
         })
         .collect()
-}
-
-fn checked_acquired_bytes(current: usize, additional: usize, context: &str) -> Result<usize> {
-    let total = current
-        .checked_add(additional)
-        .ok_or_else(|| anyhow!("{context} source acquisition size overflowed"))?;
-    ensure!(
-        total <= crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES,
-        "{context} source acquisition exceeds the {} byte limit",
-        crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES
-    );
-    Ok(total)
 }
 
 fn validate_pull_file(file: &PullFile, context: &str) -> Result<()> {
@@ -801,8 +791,6 @@ struct PullFile {
     status: String,
     #[serde(default)]
     previous_filename: Option<String>,
-    #[serde(default)]
-    patch: Option<String>,
     changes: usize,
 }
 
@@ -815,7 +803,6 @@ impl PullFile {
             .and_then(|total| {
                 total.checked_add(self.previous_filename.as_ref().map_or(0, String::len))
             })
-            .and_then(|total| total.checked_add(self.patch.as_ref().map_or(0, String::len)))
             .ok_or_else(|| anyhow!("GitHub PR file metadata size overflowed"))
     }
 }
@@ -918,7 +905,8 @@ impl Forge for GitHub {
         })
     }
 
-    async fn fetch_diff(&self, snapshot: &PrMeta) -> Result<String> {
+    async fn fetch_diff(&self, snapshot: &PrMeta) -> Result<DiffSnapshot> {
+        let workspace = WorkspaceBudget::new();
         let expected = snapshot
             .changed_files
             .context("GitHub immutable review snapshot is missing its changed-file count")?;
@@ -935,11 +923,13 @@ impl Forge for GitHub {
             &snapshot.base_sha,
             &snapshot.head_sha,
             "GitHub PR files API",
+            workspace,
         )
         .await
     }
 
-    async fn fetch_diff_since(&self, since_sha: &str, head_sha: &str) -> Result<String> {
+    async fn fetch_diff_since(&self, since_sha: &str, head_sha: &str) -> Result<DiffSnapshot> {
+        let workspace = WorkspaceBudget::new();
         ensure!(
             valid_object_id(since_sha) && valid_object_id(head_sha),
             "GitHub compare revisions must be hexadecimal object ids"
@@ -965,8 +955,14 @@ impl Forge for GitHub {
             compare.files.len() < 300,
             "GitHub compare reached the 300-file response cap; refusing an incomplete incremental review"
         );
-        self.build_complete_diff(compare.files, since_sha, head_sha, "GitHub compare API")
-            .await
+        self.build_complete_diff(
+            compare.files,
+            since_sha,
+            head_sha,
+            "GitHub compare API",
+            workspace,
+        )
+        .await
     }
 
     async fn post_review(&self, summary: &str, findings: &[Finding], head_sha: &str) -> Result<()> {
@@ -1547,6 +1543,8 @@ mod tests {
             usage: Usage::default(),
             model_usage: vec![],
             model_incidents: vec![],
+            review_coverage: None,
+            review_admission: None,
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: Some("base".into()),
@@ -1674,6 +1672,8 @@ mod tests {
             usage: Usage::default(),
             model_usage: vec![],
             model_incidents: vec![],
+            review_coverage: None,
+            review_admission: None,
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
@@ -1709,6 +1709,8 @@ mod tests {
             usage: Usage::default(),
             model_usage: vec![],
             model_incidents: vec![],
+            review_coverage: None,
+            review_admission: None,
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,

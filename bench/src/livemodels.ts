@@ -38,7 +38,6 @@ import {
 } from "./harness";
 import {
   aggregateModel,
-  assertPairQualificationPreflight,
   calculateTotalRunCostUsd,
   canonicalPriceMicrosPerMillion,
   erroredLiveCase,
@@ -276,14 +275,6 @@ export async function runLiveModels(
   const apiFormat = options.apiFormat ?? "openai-compatible";
   const rootDir = options.rootDir ?? resolve(import.meta.dir, "..", ".runs", "live-models");
   const suppliedPricing = options.pricing;
-  if (suppliedPricing !== undefined) {
-    assertPairQualificationPreflight({
-      diffs: Array.from({ length: repeats }, () => cases.map((candidate) => candidate.diff)).flat(),
-      pairs,
-      pricing: suppliedPricing,
-      costCapUsd,
-    });
-  }
   await assertBinary(options.binary);
   const repositoryRoot = resolve(import.meta.dir, "..", "..");
   const qualificationSourceSha = await resolveQualificationSourceSha(repositoryRoot);
@@ -302,11 +293,16 @@ export async function runLiveModels(
     configHash, apiBase, apiFormat, pairs,
   });
   const pricing = suppliedPricing ?? (await fetchPricing(apiBase, apiFormat, models));
-  if (suppliedPricing === undefined) {
-    assertPairQualificationPreflight({
-      diffs: Array.from({ length: repeats }, () => cases.map((candidate) => candidate.diff)).flat(),
+  if (benchmarkProviderIdentityFor(apiBase, apiFormat) !== null) {
+    await assertRuntimeShapedQualificationPreflight({
+      binary: options.binary,
+      rootDir,
+      cases,
       pairs,
+      repeats,
       pricing,
+      apiBase,
+      apiFormat,
       costCapUsd,
     });
   }
@@ -505,6 +501,18 @@ async function runLiveModelCase(
   await mkdir(homeDir, { recursive: true, mode: 0o700 });
   await mkdir(tmpDir, { recursive: true, mode: 0o700 });
   await mkdir(artifactsDir, { recursive: true, mode: 0o700 });
+  const apiBase = normalizeApiBase(options.apiBase ?? DEFAULT_API_BASE);
+  const apiFormat = options.apiFormat ?? "openai-compatible";
+  const candidateProfilePath = benchmarkProviderIdentityFor(apiBase, apiFormat) === null
+    ? undefined
+    : join(runDir, "qualification-candidate.json");
+  if (candidateProfilePath !== undefined) {
+    await writeFile(
+      candidateProfilePath,
+      JSON.stringify(qualificationCandidateDocument(pair, pricing, apiBase, apiFormat)),
+      { mode: 0o600 },
+    );
+  }
 
   const github = await startMockGithub(c);
   let exitCode: number | undefined;
@@ -521,8 +529,9 @@ async function runLiveModelCase(
           tmpDir,
           github.baseUrl,
           pair,
-          options.apiBase ?? DEFAULT_API_BASE,
-          options.apiFormat ?? "openai-compatible",
+          apiBase,
+          apiFormat,
+          candidateProfilePath,
         ),
         timeout: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
         maxBuffer: 8 * 1024 * 1024,
@@ -596,6 +605,99 @@ async function runLiveModelCase(
   });
 }
 
+export function qualificationCandidateDocument(
+  pair: QualificationPair,
+  pricing: Map<string, ModelPricing>,
+  apiBase: string,
+  apiFormat: "openai-compatible" | "anthropic",
+) {
+  return {
+    benchmarkProviderIdentity: benchmarkProviderIdentityFor(apiBase, apiFormat),
+    apiBase,
+    apiFormat,
+    generatorChain: qualificationGeneratorModels(pair),
+    consensus: pair.consensus,
+    scorerChain: qualificationScorerModels(pair),
+    modelPriceBounds: modelPriceBoundsFor(pair, pricing),
+  };
+}
+
+async function assertRuntimeShapedQualificationPreflight(args: {
+  binary: string;
+  rootDir: string;
+  cases: BenchmarkCase[];
+  pairs: QualificationPair[];
+  repeats: number;
+  pricing: Map<string, ModelPricing>;
+  apiBase: string;
+  apiFormat: "openai-compatible" | "anthropic";
+  costCapUsd: number;
+}): Promise<number> {
+  let projectedMicros = 0;
+  const planRoot = join(args.rootDir, "preflight");
+  await rm(planRoot, { recursive: true, force: true });
+  try {
+    for (const pair of args.pairs) {
+      for (const [caseIndex, c] of args.cases.entries()) {
+        const runDir = join(
+          planRoot,
+          safeSegment(qualificationPairId(pair)),
+          caseRunDirName(caseIndex, c.id),
+        );
+        const homeDir = join(runDir, "home");
+        const tmpDir = join(runDir, "tmp");
+        await mkdir(homeDir, { recursive: true, mode: 0o700 });
+        await mkdir(tmpDir, { recursive: true, mode: 0o700 });
+        const profilePath = join(runDir, "qualification-candidate.json");
+        await writeFile(
+          profilePath,
+          JSON.stringify(qualificationCandidateDocument(pair, args.pricing, args.apiBase, args.apiFormat)),
+          { mode: 0o600 },
+        );
+        const github = await startMockGithub(c);
+        try {
+          const env = liveEnv(
+            homeDir,
+            tmpDir,
+            github.baseUrl,
+            pair,
+            args.apiBase,
+            args.apiFormat,
+            profilePath,
+          );
+          env.POSTIL_QUALIFICATION_PLAN_ONLY = "1";
+          const { stdout } = await execFile(
+            args.binary,
+            ["review", "--repo", c.repo, "--pr", String(c.pullNumber), "--no-post", "--output-json"],
+            { cwd: runDir, env, timeout: 60_000, maxBuffer: 2 * 1024 * 1024 },
+          );
+          const parsed = envelopeV1.safeParse(safeJson(stdout));
+          if (!parsed.success || parsed.data.reviewAdmission === undefined) {
+            throw new Error(`runtime preflight did not emit review admission for ${c.id}`);
+          }
+          const coverage = parsed.data.reviewCoverage;
+          if (coverage === undefined ||
+            (c.admission.expectedCoverage !== undefined && coverage.mode !== c.admission.expectedCoverage)) {
+            throw new Error(`runtime preflight emitted the wrong coverage mode for ${c.id}`);
+          }
+          projectedMicros += parsed.data.reviewAdmission.projectedCostMicros * args.repeats;
+        } finally {
+          await github.close();
+        }
+      }
+    }
+  } finally {
+    await rm(planRoot, { recursive: true, force: true });
+  }
+  const projectedUsd = projectedMicros / 1_000_000;
+  if (!Number.isFinite(projectedUsd) || projectedUsd > args.costCapUsd) {
+    throw new Error(
+      `runtime-shaped qualification spend $${projectedUsd.toFixed(4)} exceeds the $${args.costCapUsd.toFixed(2)} cap`,
+    );
+  }
+  return projectedUsd;
+}
+
 /** Environment for a live-models run: an isolated HOME/TMPDIR/XDG so the binary
  * discovers no developer config, the mock GitHub for forge I/O, and the selected
  * provider endpoint. The API key is forwarded from the parent process and is
@@ -607,6 +709,7 @@ export function liveEnv(
   pair: QualificationPair,
   apiBase: string,
   apiFormat: "openai-compatible" | "anthropic" = "openai-compatible",
+  candidateProfilePath?: string,
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     PATH: process.env.PATH,
@@ -632,6 +735,9 @@ export function liveEnv(
     REVIEW_SCORER_MODEL: pair.scorerModel,
     REVIEW_SCORER_MODEL_CASCADE: (pair.scorerCascade ?? []).join(","),
   };
+  if (candidateProfilePath !== undefined) {
+    env.POSTIL_QUALIFICATION_CANDIDATE_PROFILE = candidateProfilePath;
+  }
   const endpointAuth = endpointAuthFromEnvironment(apiFormat);
   if (endpointAuth) {
     env.POSTIL_ENDPOINT_AUTH_HEADER = endpointAuth.header;
