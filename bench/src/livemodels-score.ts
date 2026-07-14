@@ -53,6 +53,10 @@ export interface ModelPricing {
   promptUsdPerToken: number;
   /** USD per completion (output) token. */
   completionUsdPerToken: number;
+  /** Exact integer price bound carried into the admission profile. */
+  inputMicrosPerMillionTokens: number;
+  /** Exact integer price bound carried into the admission profile. */
+  outputMicrosPerMillionTokens: number;
 }
 
 /** Ground truth distilled from a fixture: the seeded defect's file and line, or
@@ -675,6 +679,18 @@ function canonicalDecimalToNumber(value: CanonicalDecimal): number {
   return number;
 }
 
+export function canonicalPriceMicrosPerMillion(value: string): number {
+  const parsed = parseCanonicalDecimal(value);
+  if (parsed.coefficient <= 0n || parsed.scale > 12) {
+    throw new Error("model price must be positive and exactly representable in micros per million tokens");
+  }
+  const micros = parsed.coefficient * 10n ** BigInt(12 - parsed.scale);
+  if (micros > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error("model price bound exceeds the supported integer range");
+  }
+  return Number(micros);
+}
+
 function canonicalDecimalFromNumber(value: number): CanonicalDecimal {
   if (!Number.isFinite(value) || value < 0) throw new Error("catalog cost must be finite and nonnegative");
   return parseCanonicalDecimal(value.toFixed(15).replace(/0+$/u, "").replace(/\.$/u, "") || "0");
@@ -730,13 +746,22 @@ export function pricingFromCatalog(
     let prompt: number;
     let completion: number;
     try {
-      prompt = canonicalDecimalToNumber(parseCanonicalDecimal(m.pricing?.prompt ?? ""));
-      completion = canonicalDecimalToNumber(parseCanonicalDecimal(m.pricing?.completion ?? ""));
+      const promptText = m.pricing?.prompt ?? "";
+      const completionText = m.pricing?.completion ?? "";
+      prompt = canonicalDecimalToNumber(parseCanonicalDecimal(promptText));
+      completion = canonicalDecimalToNumber(parseCanonicalDecimal(completionText));
+      const inputMicrosPerMillionTokens = canonicalPriceMicrosPerMillion(promptText);
+      const outputMicrosPerMillionTokens = canonicalPriceMicrosPerMillion(completionText);
+      for (const matched of matches) {
+        out.set(matched, {
+          promptUsdPerToken: prompt,
+          completionUsdPerToken: completion,
+          inputMicrosPerMillionTokens,
+          outputMicrosPerMillionTokens,
+        });
+      }
     } catch {
       continue;
-    }
-    for (const matched of matches) {
-      out.set(matched, { promptUsdPerToken: prompt, completionUsdPerToken: completion });
     }
   }
   return out;

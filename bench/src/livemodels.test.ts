@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import type { AddressInfo } from "node:net";
+import { resolve } from "node:path";
 import { cases as fixtureInputs } from "../fixtures/cases";
 import { benchmarkCase } from "./harness";
 import {
@@ -6,10 +9,12 @@ import {
   assertExactQualificationFixtures,
   endpointAuthFromEnvironment,
   EVALUATOR_CONTRACT_SOURCE_PATHS,
+  fetchPricing,
   formatLiveModelsReport,
   hashNamedSources,
   liveEnv,
   liveModelsQualificationExitCode,
+  modelPriceBoundsFor,
   normalizeApiBase,
   normalizeQualificationPairs,
   parseQualificationPairs,
@@ -19,6 +24,22 @@ import {
 import type { QualificationPair } from "./livemodels-score";
 
 const pair: QualificationPair = { generatorModel: "test/generator", scorerModel: "test/scorer" };
+
+async function listen(
+  handler: (request: IncomingMessage, response: ServerResponse) => void,
+): Promise<{ origin: string; server: Server }> {
+  const server = createServer(handler);
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+  const address = server.address() as AddressInfo;
+  return { origin: `http://127.0.0.1:${address.port}`, server };
+}
+
+async function close(server: Server): Promise<void> {
+  await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+}
 
 describe("pair qualification configuration", () => {
   test("requires and normalizes exact generator/scorer pairs", () => {
@@ -187,8 +208,14 @@ describe("pair qualification configuration", () => {
         binary: "/missing/postil",
         pairs: [{ generatorModel: "costly/model", scorerModel: "cheap/scorer" }],
         pricing: new Map([
-          ["costly/model", { promptUsdPerToken: 0.001, completionUsdPerToken: 0.001 }],
-          ["cheap/scorer", { promptUsdPerToken: 0.000001, completionUsdPerToken: 0.000001 }],
+          ["costly/model", {
+            promptUsdPerToken: 0.001, completionUsdPerToken: 0.001,
+            inputMicrosPerMillionTokens: 1_000_000_000, outputMicrosPerMillionTokens: 1_000_000_000,
+          }],
+          ["cheap/scorer", {
+            promptUsdPerToken: 0.000001, completionUsdPerToken: 0.000001,
+            inputMicrosPerMillionTokens: 1_000_000, outputMicrosPerMillionTokens: 1_000_000,
+          }],
         ]),
         costCapUsd: 1,
       })).rejects.toThrow("projected pair qualification spend");
@@ -196,6 +223,81 @@ describe("pair qualification configuration", () => {
       if (inheritedKey === undefined) delete process.env.POSTIL_API_KEY;
       else process.env.POSTIL_API_KEY = inheritedKey;
     }
+  });
+});
+
+describe("pricing transport isolation", () => {
+  test("rejects redirects without forwarding provider or endpoint credentials", async () => {
+    const keyNames = ["MODEL_API_KEY", "LLM_API_KEY", "OPENROUTER_API_KEY", "POSTIL_API_KEY"] as const;
+    const authNames = ["POSTIL_ENDPOINT_AUTH_HEADER", "POSTIL_ENDPOINT_AUTH_VALUE"] as const;
+    const inherited = new Map([...keyNames, ...authNames].map((name) => [name, process.env[name]]));
+    for (const name of [...keyNames, ...authNames]) delete process.env[name];
+
+    const targetRequests: IncomingMessage[] = [];
+    const target = await listen((request, response) => {
+      targetRequests.push(request);
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end('{"data":[]}');
+    });
+    try {
+      for (const scenario of [
+        { format: "openai-compatible" as const, status: 301, providerHeader: "authorization" },
+        { format: "anthropic" as const, status: 302, providerHeader: "x-api-key" },
+        { format: "openai-compatible" as const, status: 303, providerHeader: "authorization" },
+        { format: "anthropic" as const, status: 307, providerHeader: "x-api-key" },
+        { format: "openai-compatible" as const, status: 308, providerHeader: "authorization" },
+      ]) {
+        process.env.MODEL_API_KEY = "test-provider-credential";
+        process.env.POSTIL_ENDPOINT_AUTH_HEADER = "X-Endpoint-Auth";
+        process.env.POSTIL_ENDPOINT_AUTH_VALUE = "test-endpoint-credential";
+        let sourceHeaders: IncomingMessage["headers"] | undefined;
+        const source = await listen((request, response) => {
+          sourceHeaders = request.headers;
+          response.writeHead(scenario.status, { location: `${target.origin}/captured` });
+          response.end();
+        });
+        try {
+          await expect(fetchPricing(`${source.origin}/v1`, scenario.format, ["provider/model"]))
+            .rejects.toThrow("pricing redirects are not allowed");
+          expect(sourceHeaders?.[scenario.providerHeader]).toBe(
+            scenario.format === "openai-compatible"
+              ? "Bearer test-provider-credential"
+              : "test-provider-credential",
+          );
+          expect(sourceHeaders?.["x-endpoint-auth"]).toBe("test-endpoint-credential");
+          expect(targetRequests).toHaveLength(0);
+        } finally {
+          await close(source.server);
+        }
+      }
+    } finally {
+      await close(target.server);
+      for (const [name, value] of inherited) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  });
+});
+
+describe("managed admission workflow", () => {
+  test("pins OpenRouter and isolates candidate output from the checkout", async () => {
+    const workflow = await Bun.file(
+      resolve(import.meta.dir, "..", "..", ".github", "workflows", "bench-live.yml"),
+    ).text();
+    expect(workflow).toContain("POSTIL_API_BASE: https://openrouter.ai/api/v1");
+    expect(workflow).toContain("POSTIL_API_FORMAT: openai-compatible");
+    expect(workflow).toContain("POSTIL_BENCH_REPEATS: \"3\"");
+    expect(workflow).toContain("POSTIL_BENCH_PAIRS: ${{ inputs.pairs }}");
+    expect(workflow).toContain("${{ runner.temp }}/postil-qualified-models-${{ github.run_id }}-${{ github.run_attempt }}.json");
+    expect(workflow).toContain('rm -f "$POSTIL_REPORT_OUT" "$POSTIL_MANIFEST_OUT"');
+    expect(workflow).toContain('--manifest-out "$POSTIL_MANIFEST_OUT"');
+    expect(workflow).toMatch(/name: Upload admission report\n\s+if: always\(\)/u);
+    expect(workflow).toMatch(/name: Upload admitted candidate\n\s+if: success\(\)/u);
+    expect(workflow).not.toContain("$GITHUB_WORKSPACE/qualified-models.json");
+    expect(workflow).not.toContain("inputs.api_base");
+    expect(workflow).not.toContain("inputs.api_format");
+    expect(workflow).not.toContain("POSTIL_BENCH_MODELS");
   });
 });
 
@@ -226,6 +328,23 @@ describe("qualification report", () => {
       generatorModels: ["provider/one", "provider/two"],
       consensus: 2,
       scorerModels: ["provider/scorer"],
+      modelPriceBounds: [
+        {
+          model: "provider/one",
+          inputMicrosPerMillionTokens: 1_000_000,
+          outputMicrosPerMillionTokens: 2_000_000,
+        },
+        {
+          model: "provider/scorer",
+          inputMicrosPerMillionTokens: 3_000_000,
+          outputMicrosPerMillionTokens: 4_000_000,
+        },
+        {
+          model: "provider/two",
+          inputMicrosPerMillionTokens: 5_000_000,
+          outputMicrosPerMillionTokens: 6_000_000,
+        },
+      ],
       fixtureHash: "a".repeat(64),
       reviewContractHash: "b".repeat(64),
       evaluatorContractHash: "f".repeat(64),
@@ -244,6 +363,23 @@ describe("qualification report", () => {
         generatorChain: ["provider/one", "provider/two"],
         consensus: 2,
         scorerChain: ["provider/scorer"],
+        modelPriceBounds: [
+          {
+            model: "provider/one",
+            inputMicrosPerMillionTokens: 1_000_000,
+            outputMicrosPerMillionTokens: 2_000_000,
+          },
+          {
+            model: "provider/scorer",
+            inputMicrosPerMillionTokens: 3_000_000,
+            outputMicrosPerMillionTokens: 4_000_000,
+          },
+          {
+            model: "provider/two",
+            inputMicrosPerMillionTokens: 5_000_000,
+            outputMicrosPerMillionTokens: 6_000_000,
+          },
+        ],
         apiFormat: "openai-compatible",
         reviewContractSha256: "b".repeat(64),
         fixtureSetSha256: "a".repeat(64),
@@ -272,6 +408,7 @@ describe("qualification report", () => {
       configHash: "d".repeat(64),
       cliBinaryHash: "c".repeat(64),
       evidenceHash: "e".repeat(64),
+      hostedOperationCostCapMicros: 1_000_000,
       repeats: 3,
       profiles: [],
       manifestCandidate: { version: 1, modelDefaultsSha256: "d".repeat(64), profiles: [] },
@@ -326,5 +463,37 @@ describe("qualification report", () => {
     expect(output).not.toContain("$0.123456");
     expect(output).toContain("FAIL: mean cost exceeds admission limit");
     expect(liveModelsQualificationExitCode(report)).toBe(1);
+  });
+
+  test("derives exact sorted price bounds for the generator and scorer union", () => {
+    const shared = { generatorModel: "provider/shared", scorerModel: "provider/shared" };
+    expect(modelPriceBoundsFor(shared, new Map([["provider/shared", {
+      promptUsdPerToken: 0.000001,
+      completionUsdPerToken: 0.000002,
+      inputMicrosPerMillionTokens: 1_000_000,
+      outputMicrosPerMillionTokens: 2_000_000,
+    }]]))).toEqual([{
+      model: "provider/shared",
+      inputMicrosPerMillionTokens: 1_000_000,
+      outputMicrosPerMillionTokens: 2_000_000,
+    }]);
+
+    expect(() => modelPriceBoundsFor(pair, new Map())).toThrow(
+      "qualification price bound missing for test/generator",
+    );
+    expect(() => modelPriceBoundsFor(pair, new Map([
+      [pair.generatorModel, {
+        promptUsdPerToken: 0.000001,
+        completionUsdPerToken: 0.000002,
+        inputMicrosPerMillionTokens: 0,
+        outputMicrosPerMillionTokens: 2_000_000,
+      }],
+      [pair.scorerModel, {
+        promptUsdPerToken: 0.000001,
+        completionUsdPerToken: 0.000002,
+        inputMicrosPerMillionTokens: 1_000_000,
+        outputMicrosPerMillionTokens: 2_000_000,
+      }],
+    ]))).toThrow("must be a positive safe integer");
   });
 });

@@ -49,6 +49,11 @@ consensus width are part of the qualified profile. The scorer runs through the p
 prompt, filtering, usage accounting, and gate path. Each pair must complete the
 entire matrix at least three times.
 
+The manual `Bench (managed OpenRouter admission)` workflow is fixed to the
+managed OpenRouter endpoint and its OpenAI-compatible interface. The local
+command below supports operator-owned OpenAI-compatible and Anthropic BYOK
+endpoints; those endpoints are not candidates for the managed workflow.
+
 ```sh
 export MODEL_API_KEY=... # or POSTIL_API_KEY, OPENROUTER_API_KEY, or LLM_API_KEY
 export POSTIL_BENCH_MODE=live
@@ -79,9 +84,13 @@ pricing file instead of a public model catalog:
 ```
 
 Pass it with `--pricing-file prices.json` or
-`POSTIL_BENCH_PRICING_FILE=prices.json`. Prices are canonical decimal strings.
-The catalog request uses the inference credential when no file is supplied and
-fails closed when any model is unpriced.
+`POSTIL_BENCH_PRICING_FILE=prices.json`. Prices are positive canonical decimal
+strings that must be exactly representable as integer micros per million
+tokens. Each admitted profile carries immutable input and output price bounds
+for its exact generator and scorer model set. The catalog request uses the
+inference credential when no file is supplied and fails closed when any model
+is unpriced. Catalog redirects are rejected so credentials remain bound to the
+configured endpoint origin.
 
 Private gateways may set `POSTIL_ENDPOINT_AUTH_HEADER` and
 `POSTIL_ENDPOINT_AUTH_VALUE`. The harness validates and forwards the pair to

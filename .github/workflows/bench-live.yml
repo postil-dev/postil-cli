@@ -1,25 +1,13 @@
-name: Bench (live admission)
+name: Bench (managed OpenRouter admission)
 
-# Manual only. A run spends provider tokens and can emit an admission manifest
-# only when the exact generator, scorer, runtime, and fixture profile passes.
+# Manual only. This qualifies the managed hosted profile through OpenRouter.
+# Direct BYOK endpoints use the local benchmark command documented in bench/.
 on:
   workflow_dispatch:
     inputs:
       pairs:
         description: Exact generators::consensus::scorer+fallback profile
         required: true
-      api_base:
-        description: Model provider API base
-        required: true
-        default: https://openrouter.ai/api/v1
-      api_format:
-        description: Model provider interface
-        required: true
-        type: choice
-        options:
-          - openai-compatible
-          - anthropic
-        default: openai-compatible
       cost_cap_usd:
         description: Abort when projected qualification spend exceeds this amount
         required: true
@@ -39,8 +27,10 @@ jobs:
       POSTIL_BENCH_PAIRS: ${{ inputs.pairs }}
       POSTIL_BENCH_REPEATS: "3"
       POSTIL_BENCH_COST_CAP_USD: ${{ inputs.cost_cap_usd }}
-      POSTIL_API_BASE: ${{ inputs.api_base }}
-      POSTIL_API_FORMAT: ${{ inputs.api_format }}
+      POSTIL_API_BASE: https://openrouter.ai/api/v1
+      POSTIL_API_FORMAT: openai-compatible
+      POSTIL_REPORT_OUT: ${{ runner.temp }}/postil-live-report-${{ github.run_id }}-${{ github.run_attempt }}.json
+      POSTIL_MANIFEST_OUT: ${{ runner.temp }}/postil-qualified-models-${{ github.run_id }}-${{ github.run_attempt }}.json
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -56,23 +46,23 @@ jobs:
         working-directory: bench
         run: bun install --frozen-lockfile
 
+      - name: Prepare unique evidence paths
+        run: rm -f "$POSTIL_REPORT_OUT" "$POSTIL_MANIFEST_OUT"
+
       - name: Run exact admission profile
         working-directory: bench
         env:
-          POSTIL_API_KEY: ${{ secrets.POSTIL_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
-          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
         run: >-
           bun run src/run.ts
-          --json-out "$GITHUB_WORKSPACE/bench-live-report.json"
-          --manifest-out "$GITHUB_WORKSPACE/qualified-models.json"
+          --json-out "$POSTIL_REPORT_OUT"
+          --manifest-out "$POSTIL_MANIFEST_OUT"
 
       - name: Write admission summary
         if: always()
         working-directory: bench
         run: |
-          report="$GITHUB_WORKSPACE/bench-live-report.json"
+          report="$POSTIL_REPORT_OUT"
           {
             echo '## Live admission'
             echo ''
@@ -82,7 +72,7 @@ jobs:
             fi
             echo '```'
             bun -e '
-              const r = await Bun.file(process.env.GITHUB_WORKSPACE + "/bench-live-report.json").json();
+              const r = await Bun.file(process.env.POSTIL_REPORT_OUT).json();
               const pct = (value) => (value * 100).toFixed(1) + "%";
               const pad = (value, width) => String(value).length >= width
                 ? String(value)
@@ -113,15 +103,21 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload admission evidence
+      - name: Upload admission report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bench-live-admission
-          path: |
-            bench-live-report.json
-            qualified-models.json
+          name: bench-live-report
+          path: ${{ env.POSTIL_REPORT_OUT }}
           if-no-files-found: warn
+
+      - name: Upload admitted candidate
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qualified-models-candidate
+          path: ${{ env.POSTIL_MANIFEST_OUT }}
+          if-no-files-found: error
 
       - name: Upload raw runs
         if: always()

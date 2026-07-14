@@ -4,6 +4,7 @@ import {
   aggregateModel,
   assertPairQualificationPreflight,
   calculateTotalRunCostUsd,
+  canonicalPriceMicrosPerMillion,
   findingHitsSeededRegion,
   groundTruthOf,
   pricingFromCatalog,
@@ -18,8 +19,14 @@ import {
 
 const pair: QualificationPair = { generatorModel: "provider/generator", scorerModel: "provider/scorer" };
 const prices = new Map<string, ModelPricing>([
-  [pair.generatorModel, { promptUsdPerToken: 0.000001, completionUsdPerToken: 0.000002 }],
-  [pair.scorerModel, { promptUsdPerToken: 0.000001, completionUsdPerToken: 0.000002 }],
+  [pair.generatorModel, {
+    promptUsdPerToken: 0.000001, completionUsdPerToken: 0.000002,
+    inputMicrosPerMillionTokens: 1_000_000, outputMicrosPerMillionTokens: 2_000_000,
+  }],
+  [pair.scorerModel, {
+    promptUsdPerToken: 0.000001, completionUsdPerToken: 0.000002,
+    inputMicrosPerMillionTokens: 1_000_000, outputMicrosPerMillionTokens: 2_000_000,
+  }],
 ]);
 
 function fixture(
@@ -355,11 +362,21 @@ describe("report and pricing utilities", () => {
     }
   });
 
+  test("converts canonical per-token prices to exact micros per million tokens", () => {
+    expect(canonicalPriceMicrosPerMillion("0.000001")).toBe(1_000_000);
+    expect(canonicalPriceMicrosPerMillion("0.000000000001")).toBe(1);
+    for (const invalid of ["0", "0.0000000000001", "9008"]) {
+      expect(() => canonicalPriceMicrosPerMillion(invalid)).toThrow();
+    }
+  });
+
   test("projects separate generator and scorer calls when one model fills both roles", () => {
     const sameRolePair = { generatorModel: "provider/shared", scorerModel: "provider/shared" };
     const pricing = new Map([["provider/shared", {
       promptUsdPerToken: 0.000001,
       completionUsdPerToken: 0.000002,
+      inputMicrosPerMillionTokens: 1_000_000,
+      outputMicrosPerMillionTokens: 2_000_000,
     }]]);
     const oneRole = projectTotalCostUsd({ diffs: ["+ change"], models: ["provider/shared"], pricing });
     const bothRoles = assertPairQualificationPreflight({

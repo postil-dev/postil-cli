@@ -35,7 +35,7 @@ const proposition = z.object({
 
 export const semanticPropositions = z.object({
   positive: z.array(proposition).min(1),
-  negative: z.array(proposition).min(1),
+  negative: z.array(proposition).default([]),
 });
 
 const expectedFinding = z.object({
@@ -1016,26 +1016,117 @@ export function commentMatchesExpectation(
   semantics: SemanticPropositions | undefined,
 ): boolean {
   if (semantics === undefined) return true;
-  const normalized = normalizeProposition(comment);
-  const matches = (proposition: SemanticPropositions["positive"][number]) =>
-    proposition.all.every((alternatives) =>
-      alternatives.some((alternative) => normalized.includes(normalizeProposition(alternative)))
-    ) && proposition.none.every(
-      (excluded) => !normalized.includes(normalizeProposition(excluded)),
-    );
+  const tokens = propositionTokens(comment);
+  const matches = (proposition: SemanticPropositions["positive"][number]) => {
+    if (proposition.none.some((excluded) => containsTokenSequence(tokens, propositionTokens(excluded)))) {
+      return false;
+    }
+    const polarityGroup = proposition.all.length - 1;
+    return proposition.all.every((alternatives, groupIndex) => alternatives.some((alternative) => {
+      const needle = propositionTokens(alternative).filter((token) => !isClauseBoundary(token));
+      return tokenSequenceStarts(tokens, needle).some(
+        (start) => groupIndex !== polarityGroup || !isLocallyNegated(tokens, start),
+      );
+    }));
+  };
   if (semantics.negative.some(matches)) {
     return false;
   }
   return semantics.positive.some(matches);
 }
 
-function normalizeProposition(value: string): string {
+function propositionTokens(value: string): string[] {
   return value
     .replace(/([a-z0-9])([A-Z])/gu, "$1 $2")
+    .replace(/\bwon['’]t\b/giu, "will not")
+    .replace(/\bcan['’]t\b/giu, "cannot")
+    .replace(/\b([a-z]+)n['’]t\b/giu, "$1 not")
     .toLowerCase()
-    .split(/[^a-z0-9]+/u)
-    .filter(Boolean)
-    .join(" ");
+    .match(/[a-z0-9]+|[.!?;:]/gu) ?? [];
+}
+
+function isClauseBoundary(token: string): boolean {
+  return token === "." || token === "!" || token === "?" || token === ";" || token === ":";
+}
+
+function tokenSequenceStarts(tokens: string[], needle: string[]): number[] {
+  if (needle.length === 0) return [];
+  const starts: number[] = [];
+  for (let index = 0; index <= tokens.length - needle.length; index += 1) {
+    if (needle.every((token, offset) => equivalentToken(tokens[index + offset]!, token))) starts.push(index);
+  }
+  return starts;
+}
+
+function equivalentToken(left: string, right: string): boolean {
+  if (left === right) return true;
+  const forms = (token: string) => {
+    const values = new Set([token]);
+    if (token.length > 4 && token.endsWith("ies")) values.add(`${token.slice(0, -3)}y`);
+    if (token.length > 4 && token.endsWith("ing")) {
+      const base = token.slice(0, -3);
+      values.add(base);
+      values.add(`${base}e`);
+      if (base.length > 2 && base.at(-1) === base.at(-2)) values.add(base.slice(0, -1));
+    }
+    if (token.length > 3 && token.endsWith("ed")) {
+      const base = token.slice(0, -2);
+      values.add(base);
+      values.add(`${base}e`);
+      if (base.length > 2 && base.at(-1) === base.at(-2)) values.add(base.slice(0, -1));
+    }
+    if (token.length > 3 && token.endsWith("es")) {
+      values.add(token.slice(0, -2));
+      values.add(token.slice(0, -1));
+    }
+    if (token.length > 3 && token.endsWith("s")) values.add(token.slice(0, -1));
+    if (token.length > 4 && token.endsWith("ly")) values.add(token.slice(0, -2));
+    return values;
+  };
+  const leftForms = forms(left);
+  return [...forms(right)].some((form) => leftForms.has(form));
+}
+
+function containsTokenSequence(tokens: string[], needle: string[]): boolean {
+  return tokenSequenceStarts(tokens, needle.filter((token) => !isClauseBoundary(token))).length > 0;
+}
+
+const scopedNegations = [
+  ["false", "that"],
+  ["not", "true", "that"],
+  ["never", "true", "that"],
+  ["never", "happens", "that"],
+  ["no", "evidence", "that"],
+  ["cannot", "be", "true", "that"],
+  ["without"],
+  ["prevent"],
+  ["avoid"],
+  ["eliminate"],
+  ["fix"],
+  ["resolve"],
+  ["stop"],
+  ["no", "longer", "cause"],
+] as const;
+
+/** Reject a concept occurrence when its own clause denies that occurrence.
+ * This is deliberately local: an unrelated `not` in an earlier sentence must
+ * not erase affirmative defect evidence in the next sentence. */
+function isLocallyNegated(tokens: string[], start: number): boolean {
+  let clauseStart = start;
+  while (clauseStart > 0 && !isClauseBoundary(tokens[clauseStart - 1]!)) clauseStart -= 1;
+  const prefix = tokens.slice(clauseStart, start);
+  if (scopedNegations.some((scope) => containsTokenSequence(prefix, [...scope]))) return true;
+
+  const local = prefix.slice(-5);
+  for (let index = 0; index < local.length; index += 1) {
+    const token = local[index];
+    const next = local[index + 1];
+    if (token === "not" && next === "only") continue;
+    if (["not", "never", "no", "cannot", "cant", "neither", "nor"].includes(token ?? "")) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function sumMetrics(metrics: BenchmarkMetrics[]): BenchmarkMetrics {

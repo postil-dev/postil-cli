@@ -133,6 +133,7 @@ pub struct QualificationProfile {
     pub generator_chain: Vec<String>,
     pub consensus: usize,
     pub scorer_chain: Vec<String>,
+    pub model_price_bounds: Vec<ModelPriceBound>,
     pub review_contract_sha256: String,
     pub fixture_set_sha256: String,
     pub evaluator_contract_sha256: String,
@@ -140,6 +141,17 @@ pub struct QualificationProfile {
     pub report_sha256: String,
     pub repeated_runs: u32,
 }
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ModelPriceBound {
+    pub model: String,
+    pub input_micros_per_million_tokens: u64,
+    pub output_micros_per_million_tokens: u64,
+}
+
+pub const HOSTED_OPERATION_COST_CAP_MICROS: u64 = 1_000_000;
+const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -222,6 +234,7 @@ pub struct QualificationMetadata {
     pub generator_chain: Vec<String>,
     pub consensus: usize,
     pub scorer_chain: Vec<String>,
+    pub hosted_operation_cost_cap_micros: u64,
     pub admitted_profile: Option<QualificationProfile>,
 }
 
@@ -242,6 +255,7 @@ pub fn qualification_metadata() -> QualificationMetadata {
         generator_chain,
         consensus: defaults.consensus,
         scorer_chain,
+        hosted_operation_cost_cap_micros: HOSTED_OPERATION_COST_CAP_MICROS,
         admitted_profile,
     }
 }
@@ -370,6 +384,39 @@ fn parse_qualification_manifest(raw: &str) -> Result<QualificationManifest> {
         for model in &profile.scorer_chain {
             validate_model_id("qualification profile scorer chain", model)?;
         }
+        let mut expected_models = profile.generator_chain.clone();
+        expected_models.extend(profile.scorer_chain.clone());
+        expected_models.sort();
+        expected_models.dedup();
+        let mut previous_model: Option<&str> = None;
+        for bound in &profile.model_price_bounds {
+            validate_model_id("qualification profile model price bound", &bound.model)?;
+            anyhow::ensure!(
+                previous_model.is_none_or(|previous| previous < bound.model.as_str()),
+                "qualification profile model price bounds must be unique and sorted by model"
+            );
+            previous_model = Some(&bound.model);
+            anyhow::ensure!(
+                expected_models.binary_search(&bound.model).is_ok(),
+                "qualification profile model price bound references an unknown model"
+            );
+            anyhow::ensure!(
+                bound.input_micros_per_million_tokens > 0
+                    && bound.output_micros_per_million_tokens > 0
+                    && bound.input_micros_per_million_tokens <= MAX_SAFE_JSON_INTEGER
+                    && bound.output_micros_per_million_tokens <= MAX_SAFE_JSON_INTEGER,
+                "qualification profile model price bounds must be positive safe integers"
+            );
+        }
+        let bounded_models = profile
+            .model_price_bounds
+            .iter()
+            .map(|bound| bound.model.clone())
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            bounded_models == expected_models,
+            "qualification profile model price bounds must exactly cover the generator and scorer models"
+        );
         anyhow::ensure!(
             profile.repeated_runs >= 3,
             "qualification profile must record at least three repeated runs"
@@ -1281,6 +1328,39 @@ mod tests {
         model_defaults().cascade.clone()
     }
 
+    fn valid_qualification_manifest_json() -> serde_json::Value {
+        serde_json::json!({
+            "version": 1,
+            "modelDefaultsSha256": model_defaults().source_sha256,
+            "profiles": [{
+                "id": "candidate",
+                "apiFormat": "openai-compatible",
+                "apiBase": "https://openrouter.ai:443/api/v1",
+                "generatorChain": ["provider/model"],
+                "consensus": 1,
+                "scorerChain": ["provider/scorer"],
+                "modelPriceBounds": [
+                    {
+                        "model": "provider/model",
+                        "inputMicrosPerMillionTokens": 1_000_000,
+                        "outputMicrosPerMillionTokens": 2_000_000
+                    },
+                    {
+                        "model": "provider/scorer",
+                        "inputMicrosPerMillionTokens": 3_000_000,
+                        "outputMicrosPerMillionTokens": 4_000_000
+                    }
+                ],
+                "reviewContractSha256": review_contract_sha256(),
+                "fixtureSetSha256": fixture_set_sha256(),
+                "evaluatorContractSha256": evaluator_contract_sha256(),
+                "evaluatorRuntimeIdentity": evaluator_runtime_identity(),
+                "reportSha256": "1".repeat(64),
+                "repeatedRuns": 3
+            }]
+        })
+    }
+
     #[test]
     fn embedded_model_defaults_match_root_config_file() {
         let parsed = parse_model_defaults(MODEL_DEFAULTS_TOML).unwrap();
@@ -1624,6 +1704,18 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
                 "generatorChain": ["provider/model"],
                 "consensus": 1,
                 "scorerChain": ["provider/scorer"],
+                "modelPriceBounds": [
+                    {
+                        "model": "provider/model",
+                        "inputMicrosPerMillionTokens": 1000000,
+                        "outputMicrosPerMillionTokens": 2000000
+                    },
+                    {
+                        "model": "provider/scorer",
+                        "inputMicrosPerMillionTokens": 1000000,
+                        "outputMicrosPerMillionTokens": 2000000
+                    }
+                ],
                 "reviewContractSha256": "0".repeat(64),
                 "fixtureSetSha256": fixture_set_sha256(),
                 "evaluatorContractSha256": evaluator_contract_sha256(),
@@ -1648,6 +1740,18 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
                 "generatorChain": ["provider/model"],
                 "consensus": 1,
                 "scorerChain": ["provider/scorer"],
+                "modelPriceBounds": [
+                    {
+                        "model": "provider/model",
+                        "inputMicrosPerMillionTokens": 1000000,
+                        "outputMicrosPerMillionTokens": 2000000
+                    },
+                    {
+                        "model": "provider/scorer",
+                        "inputMicrosPerMillionTokens": 1000000,
+                        "outputMicrosPerMillionTokens": 2000000
+                    }
+                ],
                 "reviewContractSha256": review_contract_sha256(),
                 "fixtureSetSha256": fixture_set_sha256(),
                 "evaluatorContractSha256": evaluator_contract_sha256(),
@@ -1672,6 +1776,18 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
                 "generatorChain": ["provider/model"],
                 "consensus": 1,
                 "scorerChain": ["provider/scorer"],
+                "modelPriceBounds": [
+                    {
+                        "model": "provider/model",
+                        "inputMicrosPerMillionTokens": 1000000,
+                        "outputMicrosPerMillionTokens": 2000000
+                    },
+                    {
+                        "model": "provider/scorer",
+                        "inputMicrosPerMillionTokens": 1000000,
+                        "outputMicrosPerMillionTokens": 2000000
+                    }
+                ],
                 "reviewContractSha256": review_contract_sha256(),
                 "fixtureSetSha256": fixture_set_sha256(),
                 "evaluatorContractSha256": evaluator_contract_sha256(),
@@ -1682,6 +1798,104 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
         });
         let error = parse_qualification_manifest(&raw.to_string()).unwrap_err();
         assert!(error.to_string().contains("evaluator runtime is stale"));
+    }
+
+    #[test]
+    fn qualification_profile_requires_exact_safe_sorted_model_price_bounds() {
+        let valid = valid_qualification_manifest_json();
+        parse_qualification_manifest(&valid.to_string()).unwrap();
+
+        let mut missing_field = valid.clone();
+        missing_field["profiles"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("modelPriceBounds");
+        assert!(
+            parse_qualification_manifest(&missing_field.to_string())
+                .unwrap_err()
+                .to_string()
+                .contains("missing field `modelPriceBounds`")
+        );
+
+        let mut duplicate = valid.clone();
+        duplicate["profiles"][0]["modelPriceBounds"] = serde_json::json!([
+            {
+                "model": "provider/model",
+                "inputMicrosPerMillionTokens": 1,
+                "outputMicrosPerMillionTokens": 1
+            },
+            {
+                "model": "provider/model",
+                "inputMicrosPerMillionTokens": 1,
+                "outputMicrosPerMillionTokens": 1
+            },
+            {
+                "model": "provider/scorer",
+                "inputMicrosPerMillionTokens": 1,
+                "outputMicrosPerMillionTokens": 1
+            }
+        ]);
+        assert!(
+            parse_qualification_manifest(&duplicate.to_string())
+                .unwrap_err()
+                .to_string()
+                .contains("unique and sorted")
+        );
+
+        let mut unknown = valid.clone();
+        unknown["profiles"][0]["modelPriceBounds"][1]["model"] =
+            serde_json::json!("provider/unknown");
+        assert!(
+            parse_qualification_manifest(&unknown.to_string())
+                .unwrap_err()
+                .to_string()
+                .contains("unknown model")
+        );
+
+        let mut missing_model = valid.clone();
+        missing_model["profiles"][0]["modelPriceBounds"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        assert!(
+            parse_qualification_manifest(&missing_model.to_string())
+                .unwrap_err()
+                .to_string()
+                .contains("exactly cover")
+        );
+
+        let mut out_of_order = valid.clone();
+        out_of_order["profiles"][0]["modelPriceBounds"]
+            .as_array_mut()
+            .unwrap()
+            .reverse();
+        assert!(
+            parse_qualification_manifest(&out_of_order.to_string())
+                .unwrap_err()
+                .to_string()
+                .contains("unique and sorted")
+        );
+
+        for invalid in [0_u64, MAX_SAFE_JSON_INTEGER + 1] {
+            let mut unsafe_bound = valid.clone();
+            unsafe_bound["profiles"][0]["modelPriceBounds"][0]["inputMicrosPerMillionTokens"] =
+                serde_json::json!(invalid);
+            assert!(
+                parse_qualification_manifest(&unsafe_bound.to_string())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("positive safe integers")
+            );
+        }
+    }
+
+    #[test]
+    fn qualification_metadata_exposes_the_hosted_cost_cap_at_top_level() {
+        let metadata = serde_json::to_value(qualification_metadata()).unwrap();
+        assert_eq!(
+            metadata["hostedOperationCostCapMicros"],
+            serde_json::json!(1_000_000)
+        );
     }
 
     #[test]
@@ -1720,6 +1934,28 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
             generator_chain: vec!["provider/generator".into(), "provider/fallback".into()],
             consensus: 1,
             scorer_chain: vec!["provider/scorer".into(), "provider/scorer-fallback".into()],
+            model_price_bounds: vec![
+                ModelPriceBound {
+                    model: "provider/fallback".into(),
+                    input_micros_per_million_tokens: 1_000_000,
+                    output_micros_per_million_tokens: 2_000_000,
+                },
+                ModelPriceBound {
+                    model: "provider/generator".into(),
+                    input_micros_per_million_tokens: 1_000_000,
+                    output_micros_per_million_tokens: 2_000_000,
+                },
+                ModelPriceBound {
+                    model: "provider/scorer".into(),
+                    input_micros_per_million_tokens: 1_000_000,
+                    output_micros_per_million_tokens: 2_000_000,
+                },
+                ModelPriceBound {
+                    model: "provider/scorer-fallback".into(),
+                    input_micros_per_million_tokens: 1_000_000,
+                    output_micros_per_million_tokens: 2_000_000,
+                },
+            ],
             review_contract_sha256: "b".repeat(64),
             fixture_set_sha256: "c".repeat(64),
             evaluator_contract_sha256: "d".repeat(64),

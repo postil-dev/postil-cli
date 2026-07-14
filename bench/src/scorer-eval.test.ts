@@ -326,7 +326,10 @@ describe("qualification utilities", () => {
 
   test("bounds candidates, repeats, missing prices, and projected spend before calls", () => {
     const cheap = new Map([
-      ["a/model", { promptUsdPerToken: 0.0000001, completionUsdPerToken: 0.0000002 }],
+      ["a/model", {
+        promptUsdPerToken: 0.0000001, completionUsdPerToken: 0.0000002,
+        inputMicrosPerMillionTokens: 100_000, outputMicrosPerMillionTokens: 200_000,
+      }],
     ]);
     expect(projectedQualificationSpendUsd(["a/model"], 5, cheap)).toBeCloseTo(0.741024, 6);
     expect(assertQualificationPreflight(["a/model"], 5, cheap)).toBeCloseTo(0.741024, 6);
@@ -339,7 +342,10 @@ describe("qualification utilities", () => {
       ),
     ).toThrow("at most 6 candidates");
     const expensive = new Map([
-      ["a/model", { promptUsdPerToken: 0.001, completionUsdPerToken: 0.001 }],
+      ["a/model", {
+        promptUsdPerToken: 0.001, completionUsdPerToken: 0.001,
+        inputMicrosPerMillionTokens: 1_000_000_000, outputMicrosPerMillionTokens: 1_000_000_000,
+      }],
     ]);
     expect(() => assertQualificationPreflight(["a/model"], 5, expensive)).toThrow("projected scorer qualification spend");
   });

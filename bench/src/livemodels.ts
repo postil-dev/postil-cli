@@ -39,6 +39,7 @@ import {
   aggregateModel,
   assertPairQualificationPreflight,
   calculateTotalRunCostUsd,
+  canonicalPriceMicrosPerMillion,
   erroredLiveCase,
   MAX_GENERATOR_COST_CAP_USD,
   MIN_QUALIFICATION_REPEATS,
@@ -61,6 +62,7 @@ import {
 const execFile = promisify(execFileCb);
 
 export const DEFAULT_API_BASE = "https://openrouter.ai/api/v1";
+export const HOSTED_OPERATION_COST_CAP_MICROS = 1_000_000;
 
 export const REVIEW_CONTRACT_SOURCE_PATHS = [
   "Cargo.toml", "Cargo.lock",
@@ -129,6 +131,7 @@ export interface LiveModelsReport {
   configHash: string;
   cliBinaryHash: string;
   evidenceHash: string;
+  hostedOperationCostCapMicros: number;
   repeats: number;
   profiles: QualificationProfile[];
   manifestCandidate?: AdmissionManifestCandidate;
@@ -155,7 +158,14 @@ export interface BinaryQualificationMetadata {
   generatorChain: string[];
   consensus: number;
   scorerChain: string[];
+  hostedOperationCostCapMicros: number;
   admittedProfile: AdmissionManifestCandidate["profiles"][number] | null;
+}
+
+export interface ModelPriceBound {
+  model: string;
+  inputMicrosPerMillionTokens: number;
+  outputMicrosPerMillionTokens: number;
 }
 
 export interface QualificationProfile {
@@ -166,6 +176,7 @@ export interface QualificationProfile {
   generatorModels: string[];
   consensus: number;
   scorerModels: string[];
+  modelPriceBounds: ModelPriceBound[];
   fixtureHash: string;
   reviewContractHash: string;
   evaluatorContractHash: string;
@@ -185,6 +196,7 @@ export interface AdmissionManifestCandidate {
     generatorChain: string[];
     consensus: number;
     scorerChain: string[];
+    modelPriceBounds: ModelPriceBound[];
     apiFormat: "openai-compatible" | "anthropic";
     reviewContractSha256: string;
     fixtureSetSha256: string;
@@ -317,6 +329,7 @@ export async function runLiveModels(
     configHash,
     cliBinaryHash,
     repeats,
+    modelPriceBounds: modelPriceBoundsFor(pair, pricing),
   }));
   const evidence = {
     cliVersion,
@@ -331,6 +344,7 @@ export async function runLiveModels(
     evaluatorRuntimeIdentity,
     configHash,
     cliBinaryHash,
+    hostedOperationCostCapMicros: HOSTED_OPERATION_COST_CAP_MICROS,
     repeats,
     profiles,
     cases: results,
@@ -353,6 +367,7 @@ export async function runLiveModels(
     configHash,
     cliBinaryHash,
     evidenceHash,
+    hostedOperationCostCapMicros: HOSTED_OPERATION_COST_CAP_MICROS,
     repeats,
     profiles,
     passed,
@@ -395,6 +410,7 @@ export function admissionManifestCandidate(
       generatorChain: profile.generatorModels,
       consensus: profile.consensus,
       scorerChain: profile.scorerModels,
+      modelPriceBounds: profile.modelPriceBounds,
       apiFormat: profile.apiFormat,
       reviewContractSha256: profile.reviewContractHash,
       fixtureSetSha256: profile.fixtureHash,
@@ -756,6 +772,7 @@ function qualificationProfile(args: Omit<QualificationProfile, "id" | "generator
     generatorModels,
     consensus,
     scorerModels: qualificationScorerModels(args.pair),
+    modelPriceBounds: args.modelPriceBounds,
     fixtureHash: args.fixtureHash,
     reviewContractHash: args.reviewContractHash,
     evaluatorContractHash: args.evaluatorContractHash,
@@ -767,10 +784,37 @@ function qualificationProfile(args: Omit<QualificationProfile, "id" | "generator
   return { id: hashText(JSON.stringify(material)), ...material };
 }
 
+export function modelPriceBoundsFor(
+  pair: QualificationPair,
+  pricing: Map<string, ModelPricing>,
+): ModelPriceBound[] {
+  const models = [...new Set([
+    ...qualificationGeneratorModels(pair),
+    ...qualificationScorerModels(pair),
+  ])].sort();
+  return models.map((model) => {
+    const price = pricing.get(model);
+    if (!price) throw new Error(`qualification price bound missing for ${model}`);
+    for (const [field, value] of [
+      ["inputMicrosPerMillionTokens", price.inputMicrosPerMillionTokens],
+      ["outputMicrosPerMillionTokens", price.outputMicrosPerMillionTokens],
+    ] as const) {
+      if (!Number.isSafeInteger(value) || value <= 0) {
+        throw new Error(`qualification price bound ${model}.${field} must be a positive safe integer`);
+      }
+    }
+    return {
+      model,
+      inputMicrosPerMillionTokens: price.inputMicrosPerMillionTokens,
+      outputMicrosPerMillionTokens: price.outputMicrosPerMillionTokens,
+    };
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Pricing
 
-async function fetchPricing(
+export async function fetchPricing(
   apiBase: string,
   apiFormat: "openai-compatible" | "anthropic",
   models: string[],
@@ -785,7 +829,10 @@ async function fetchPricing(
   }
   const endpointAuth = endpointAuthFromEnvironment(apiFormat);
   if (endpointAuth) headers[endpointAuth.header] = endpointAuth.value;
-  const res = await fetch(url, { headers });
+  const res = await fetch(url, { headers, redirect: "manual" });
+  if (res.status >= 300 && res.status < 400) {
+    throw new Error(`provider pricing redirects are not allowed (${res.status}) from ${url}`);
+  }
   if (!res.ok) {
     throw new Error(`failed to fetch provider pricing (${res.status}) from ${url}`);
   }
@@ -833,22 +880,32 @@ export async function pricingFromFile(path: string): Promise<Map<string, ModelPr
       throw new Error(`qualification pricing for ${model} must be an object`);
     }
     const record = value as Record<string, unknown>;
+    const prompt = strictPrice(record.promptUsdPerToken, `${model}.promptUsdPerToken`);
+    const completion = strictPrice(record.completionUsdPerToken, `${model}.completionUsdPerToken`);
     out.set(model, {
-      promptUsdPerToken: strictPrice(record.promptUsdPerToken, `${model}.promptUsdPerToken`),
-      completionUsdPerToken: strictPrice(record.completionUsdPerToken, `${model}.completionUsdPerToken`),
+      promptUsdPerToken: prompt.usdPerToken,
+      completionUsdPerToken: completion.usdPerToken,
+      inputMicrosPerMillionTokens: prompt.microsPerMillionTokens,
+      outputMicrosPerMillionTokens: completion.microsPerMillionTokens,
     });
   }
   if (out.size === 0) throw new Error("qualification pricing file must contain at least one model");
   return out;
 }
 
-function strictPrice(value: unknown, field: string): number {
+function strictPrice(
+  value: unknown,
+  field: string,
+): { usdPerToken: number; microsPerMillionTokens: number } {
   if (typeof value !== "string" || !/^(?:0|[1-9][0-9]*|(?:0|[1-9][0-9]*)\.[0-9]*[1-9])$/u.test(value)) {
     throw new Error(`${field} must be a canonical nonnegative decimal string`);
   }
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed < 0) throw new Error(`${field} is outside the supported range`);
-  return parsed;
+  return {
+    usdPerToken: parsed,
+    microsPerMillionTokens: canonicalPriceMicrosPerMillion(value),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -974,6 +1031,9 @@ function assertBinaryMatchesQualificationWorktree(args: {
   }
   if (metadata.evaluatorRuntimeIdentity !== args.evaluatorRuntimeIdentity) {
     throw new Error("supplied binary evaluator runtime does not match this worktree");
+  }
+  if (metadata.hostedOperationCostCapMicros !== HOSTED_OPERATION_COST_CAP_MICROS) {
+    throw new Error("supplied binary hosted operation cost cap does not match the admission contract");
   }
   if (metadata.defaultApiBase !== args.apiBase || metadata.defaultApiFormat !== args.apiFormat) {
     throw new Error("qualification endpoint does not match the supplied binary defaults");

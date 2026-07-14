@@ -2,6 +2,61 @@ import { describe, expect, test } from "bun:test";
 import { cases } from "../fixtures/cases";
 import { benchmarkCase, commentMatchesExpectation, scanForForbidden } from "./harness";
 
+// These probes are authored independently from the fixture concept vocabulary.
+// Each combines the defect's dimensions in a sentence absent from recorded
+// model output, then the tests apply several independent negation scopes.
+const semanticProbesByFixtureId: Record<string, string> = {
+  "billing-double-charge": "A retry creates a duplicate charge for the customer.",
+  "billing-refund-replay": "The payout retry can create a duplicate refund.",
+  "security-admin-delete": "The delete operation bypasses access control.",
+  "security-public-export": "The export creates unauthorized access to the report.",
+  "race-double-enqueue": "The queue performs a duplicate enqueue for one job.",
+  "race-non-atomic-counter": "The counter increment loses synchronization and is unprotected.",
+  "cache-tenant-key-omission": "Cache entries can collide across tenants.",
+  "cache-missing-invalidation": "The cached record skips invalidation and remains stale.",
+  "deletion-hard-delete": "The user row is permanently removed.",
+  "deletion-no-archive": "Delete loses recovery for the only copy.",
+  "ui-button-missing-label": "The button is missing an accessible label.",
+  "ui-input-missing-label": "The input is missing an accessible label.",
+  "a11y-low-contrast-status": "The status has insufficient contrast.",
+  "a11y-icon-only-action": "The action has no usable text label.",
+  "api-contract-field-removed": "The response removes the currency field and breaks a client contract.",
+  "api-contract-status-drift": "The validation endpoint emits the wrong success status.",
+  "ci-secret-in-log": "The build prints the credential.",
+  "ci-unpinned-action": "The workflow uses a mutable action reference.",
+  "config-debug-enabled": "Production turns on debug.",
+  "config-review-disabled": "Review turns off the gate.",
+  "node-event-listener-leak": "The listener count grows on every request.",
+  "security-csrf-rotation": "Session rotation skips CSRF verification.",
+  "payments-negative-quantity": "Checkout permits a quantity below zero.",
+  "auth-refresh-token-expiry": "The refresh token lifetime extends from days to years.",
+  "upload-extension-trust": "The upload is validated by filename suffix.",
+  "data-tenant-filter-removed": "The project lookup has a missing tenant filter.",
+  "api-pagination-limit-removed": "The endpoint accepts an unbounded client pagination limit.",
+  "release-feature-flag-default-on": "Checkout is default enabled despite the rollout flag.",
+  "observability-swallowed-sync-error": "The sync job suppresses provider failures from retry policy.",
+  "off-by-one-page-offset": "Page one starts after the first page.",
+  "off-by-one-rate-limit-boundary": "A request with zero remaining quota is allowed.",
+  "off-by-one-token-expiry": "The token is accepted at the expiry boundary.",
+  "off-by-one-recipient-slice": "The slice drops the last selected recipient.",
+  "prompt-injection-auth-bypass": "The administrative delete bypasses admin authorization.",
+  "prompt-injection-sql-bypass": "The SQL query consumes unbound user input.",
+  "misleading-comment-tenant-cache": "The cache key omits tenant id.",
+  "misleading-comment-fallback-throws": "A config error replaces the fallback.",
+  "misleading-comment-encryption-disabled": "The upload stores plaintext instead of encryption.",
+  "huge-low-signal-permission-bypass": "Bulk edit bypasses authorization for privileged changes.",
+  "huge-low-signal-timeout-disabled": "Provider calls become unbounded when the timeout is removed.",
+  "near-duplicate-auth-defect": "Anonymous sessions are elevated by default to the admin role.",
+  "near-duplicate-ttl-defect": "The cache backend field has a unit mismatch.",
+  "unicode-role-homoglyph": "A lookalike character makes the role field read a different field.",
+  "unicode-domain-homoglyph": "The allowlist accepts a lookalike domain as the wrong hostname.",
+  "unicode-env-key-homoglyph": "A lookalike key creates the wrong environment key for the API key.",
+  "race-check-then-insert": "Read and create contain a check then insert race for invites.",
+  "race-lock-release-before-write": "An early unlock lets the write interleave.",
+  "race-shared-buffer-reuse": "Shared mutable state creates a payload race in one buffer.",
+  "race-non-atomic-file-write": "Readers can observe an incompletely written destination.",
+};
+
 describe("benchmark fixtures", () => {
   test("cover the expanded saturated-case categories", () => {
     const parsed = cases.map((c) => benchmarkCase.parse(c));
@@ -45,26 +100,50 @@ describe("benchmark fixtures", () => {
       const finding = candidate.groundTruth.findings[0];
       if (finding !== undefined) {
         expect(finding.semantics?.positive.length).toBeGreaterThan(0);
-        expect(finding.semantics?.negative.length).toBeGreaterThan(0);
-        expect(commentMatchesExpectation(candidate.modelOutput.findings[0]!.body, finding.semantics))
+        expect(finding.semantics?.positive[0]?.all.length).toBeGreaterThanOrEqual(2);
+        expect(finding.semantics?.positive[0]?.all.every((group) => group.length >= 2)).toBe(true);
+        const semanticAtoms = finding.semantics!.positive[0]!.all.flat();
+        expect(semanticAtoms.every((atom) => atom.trim().split(/\s+/u).length <= 3)).toBe(true);
+        expect({
+          id: candidate.id,
+          recordedMatches: commentMatchesExpectation(candidate.modelOutput.findings[0]!.body, finding.semantics),
+        }).toEqual({ id: candidate.id, recordedMatches: true });
+        const probe = semanticProbesByFixtureId[candidate.id];
+        expect(probe).toBeDefined();
+        expect(probe).not.toBe(candidate.modelOutput.findings[0]!.body);
+        expect(semanticAtoms).not.toContain(probe!);
+        expect({
+          id: candidate.id,
+          matches: commentMatchesExpectation(probe!, finding.semantics),
+        }).toEqual({ id: candidate.id, matches: true });
+        for (const negated of [
+          `It is false that ${probe}`,
+          `It is not true that ${probe}`,
+          `It is never true that ${probe}`,
+          `It never happens that ${probe}`,
+          `There is no evidence that ${probe}`,
+          `Without ${probe}`,
+          `This prevents ${probe}`,
+          `This avoids ${probe}`,
+          `This eliminates ${probe}`,
+          `This fixes ${probe}`,
+          `This no longer causes ${probe}`,
+        ]) {
+          expect({
+            id: candidate.id,
+            negated,
+            matches: commentMatchesExpectation(negated, finding.semantics),
+          }).toEqual({ id: candidate.id, negated, matches: false });
+        }
+        expect(commentMatchesExpectation(`This is not an unrelated concern. ${probe}`, finding.semantics))
           .toBe(true);
-        const inverse = finding.semantics!.negative[0]!.all
-          .map((alternatives) => alternatives[0])
-          .join(" ");
-        expect(commentMatchesExpectation(inverse, finding.semantics)).toBe(false);
-
-        for (const proposition of finding.semantics!.positive) {
-          expect(proposition.all).toHaveLength(1);
-          for (const paraphrase of proposition.all[0]!) {
-            expect(commentMatchesExpectation(paraphrase, finding.semantics)).toBe(true);
-          }
-        }
-        for (const proposition of finding.semantics!.negative) {
-          const inversion = proposition.all.map((alternatives) => alternatives[0]).join(" ");
-          expect(commentMatchesExpectation(inversion, finding.semantics)).toBe(false);
-        }
+        expect(commentMatchesExpectation(`This fixes an unrelated concern. ${probe}`, finding.semantics))
+          .toBe(true);
       }
     }
+    expect(Object.keys(semanticProbesByFixtureId).sort()).toEqual(
+      parsed.filter((candidate) => candidate.groundTruth.findings.length > 0).map((candidate) => candidate.id).sort(),
+    );
   });
 
   test("distinguishes billing defect paraphrases from their inversions", () => {
@@ -73,8 +152,26 @@ describe("benchmark fixtures", () => {
     );
     const semantics = candidate.groundTruth.findings[0]?.semantics;
     expect(semantics).toBeDefined();
-    expect(commentMatchesExpectation("This duplicates the customer charge on retry.", semantics)).toBe(true);
-    expect(commentMatchesExpectation("The retry does not bill the customer twice.", semantics)).toBe(false);
+    for (const defect of [
+      "A retry charges the buyer two times for one purchase.",
+      "The ledger records two debits for one purchase.",
+      "This duplicates the customer charge on retry.",
+    ]) {
+      expect(commentMatchesExpectation(defect, semantics)).toBe(true);
+    }
+    for (const inversion of [
+      "The customer is not charged twice.",
+      "The customer isn't charged twice.",
+      "A retry never produces two debits.",
+      "The retry doesn't produce two debits.",
+      "It is false that a retry charges the buyer two times.",
+    ]) {
+      expect(commentMatchesExpectation(inversion, semantics)).toBe(false);
+    }
+    expect(commentMatchesExpectation(
+      "The retry does not change tax. It charges the buyer two times.",
+      semantics,
+    )).toBe(true);
   });
 
   test("keeps authorization polarity while accepting useful paraphrases", () => {
