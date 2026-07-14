@@ -706,7 +706,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
         || input_incomplete
         || prepared.has_source
         || !prepared.lockfiles.is_empty()
-        || !prepared.generated_artifacts.is_empty()
+        || !prepared.compacted_artifacts.is_empty()
         || pr_desc_lines > 0
     {
         let system = prompt::system_prompt(cfg);
@@ -765,6 +765,13 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                     )?,
                     None => LlmClient::from_env(cfg)?,
                 };
+                client.preflight_review_plan(
+                    cfg,
+                    batches.count,
+                    batches.total_batch_bytes,
+                    batches.largest_batch_bytes,
+                    shared_context_token_upper_bound,
+                )?;
                 let total_requests = batches.count;
                 let mut raw_findings = Vec::new();
                 let mut summary_parts = Vec::new();

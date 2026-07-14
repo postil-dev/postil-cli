@@ -108,11 +108,14 @@ describe("benchmark fixtures", () => {
     }
 
     for (const c of hugeCases) {
-      const removed = c.diff
+      const primaryPath = c.allowedContext.files[0]?.path;
+      const primaryStart = c.diff.lastIndexOf(`diff --git a/${primaryPath}`);
+      const primaryDiff = c.diff.slice(primaryStart);
+      const removed = primaryDiff
         .split("\n")
         .filter((line) => line.startsWith("- "))
         .map((line) => line.slice(2));
-      const added = c.diff
+      const added = primaryDiff
         .split("\n")
         .filter((line) => line.startsWith("+ "))
         .map((line) => line.slice(2));
@@ -120,6 +123,20 @@ describe("benchmark fixtures", () => {
       expect(added.length).toBe(removed.length);
       expect(added.every((line, index) => line !== removed[index])).toBe(true);
     }
+
+    const distant = hugeCases.find((fixture) =>
+      fixture.id === "huge-low-signal-permission-bypass"
+    );
+    expect(distant?.diff.length).toBeGreaterThan(120_000);
+    expect(distant?.diff).toContain("src/admin/validate-bulk-edit.ts");
+    expect(distant?.diff).toContain("src/admin/bulk-edit.ts");
+
+    const generatedNoise = hugeCases.find((fixture) =>
+      fixture.id === "huge-low-signal-clean"
+    );
+    expect(generatedNoise?.diff.length).toBeGreaterThan(32 * 1024 * 1024);
+    expect(generatedNoise?.diff).toContain("generated-noise.js.map");
+    expect(generatedNoise?.diff.match(/^\+  \"x/gm)?.length).toBeGreaterThan(30_000);
   });
 });
 

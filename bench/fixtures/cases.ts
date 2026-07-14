@@ -48,6 +48,7 @@ type FixtureSpec = {
   };
   disallowedSources?: DisallowedSource[];
   maxFindings?: number;
+  prefixDiff?: string;
 };
 
 // Every defect fixture owns an explicit set of acceptable descriptions and an
@@ -219,6 +220,37 @@ export function makeDiff(path: string, hunks: FixtureHunk[]): string {
   ].join("\n");
 }
 
+function makeDistantStreamingPrelude(): string {
+  const lines = ["+export function validateBulkEdit(actor: Actor) {"];
+  for (let line = 2; line < 180; line += 1) {
+    lines.push(`+  const ordinary_${line} = actor.id; // ${"x".repeat(900)}`);
+  }
+  lines.push("+  return actor.can('bulkEdit');", "+}");
+  return [
+    "diff --git a/src/admin/validate-bulk-edit.ts b/src/admin/validate-bulk-edit.ts",
+    "--- /dev/null",
+    "+++ b/src/admin/validate-bulk-edit.ts",
+    `@@ -0,0 +1,${lines.length} @@`,
+    ...lines,
+    "",
+  ].join("\n");
+}
+
+function makeManyLineGeneratedNoise(): string {
+  const paddingLines = 33_000;
+  const padding = `+  "${"x".repeat(1_010)}",\n`.repeat(paddingLines);
+  return [
+    "diff --git a/web/generated-noise.js.map b/web/generated-noise.js.map",
+    "--- /dev/null",
+    "+++ b/web/generated-noise.js.map",
+    `@@ -0,0 +1,${paddingLines + 2} @@`,
+    '+{"version":3,"sources":["source.ts"],"mappings":"AAAA","padding":[',
+    padding.trimEnd(),
+    "+]}",
+    "",
+  ].join("\n");
+}
+
 function buildCase(spec: FixtureSpec): BenchmarkCaseInput {
   const expected = spec.finding
     ? [
@@ -237,7 +269,7 @@ function buildCase(spec: FixtureSpec): BenchmarkCaseInput {
     repo: repoFullName,
     pullNumber: spec.pullNumber,
     headSha: makeHeadSha(spec.pullNumber),
-    diff: makeDiff(spec.path, spec.hunks ?? [{ line: spec.line, before: spec.before, after: spec.after }]),
+    diff: `${spec.prefixDiff ?? ""}${makeDiff(spec.path, spec.hunks ?? [{ line: spec.line, before: spec.before, after: spec.after }])}`,
     allowedContext: {
       files: [{ path: spec.path, content: spec.allowedFileContent }],
       docs: [{ path: "review-policy.md", content: spec.policy }],
@@ -1170,6 +1202,7 @@ const fixtureSpecs: FixtureSpec[] = [
       "export async function bulkEdit(actor: Actor, changeSet: ChangeSet) { await applyBulkEdit(changeSet); }",
     policy: "Huge diffs still need authorization checks on privileged writes.",
     scoringLabels: ["huge-low-signal", "multi-hunk", "security", "authorization", "error"],
+    prefixDiff: makeDistantStreamingPrelude(),
     finding: {
       severity: "error",
       body: "The large refactor removes the bulk-edit permission check before applying privileged changes.",
@@ -1223,6 +1256,7 @@ const fixtureSpecs: FixtureSpec[] = [
       "export function copyLabel(label: string) { const disabled = false; return label.trim(); }",
     policy: "Low-signal formatting churn should not create review findings without a behavior change.",
     scoringLabels: ["huge-low-signal", "multi-hunk", "clean", "silence"],
+    prefixDiff: makeManyLineGeneratedNoise(),
   },
   {
     id: "near-duplicate-auth-defect",

@@ -650,6 +650,7 @@ fn write_unified_file_diff(
     is_delete: bool,
 ) -> Result<()> {
     use similar::TextDiff;
+    const MAX_IN_MEMORY_MODIFIED_FILE_BYTES: usize = 32 * 1024 * 1024;
     let old_marker = crate::diff::display_path(&format!("a/{old_path}"));
     let new_marker = crate::diff::display_path(&format!("b/{new_path}"));
     writeln!(out, "diff --git {old_marker} {new_marker}")?;
@@ -663,8 +664,69 @@ fn write_unified_file_diff(
         writeln!(out, "--- {old_marker}")?;
         writeln!(out, "+++ {new_marker}")?;
     }
+    if is_add {
+        write_full_file_hunk(&mut out, new, true)?;
+        return Ok(());
+    }
+    if is_delete {
+        write_full_file_hunk(&mut out, old, false)?;
+        return Ok(());
+    }
+    let reconstruction_bytes = old
+        .len()
+        .checked_add(new.len())
+        .context("modified-file reconstruction size overflowed")?;
+    if reconstruction_bytes > MAX_IN_MEMORY_MODIFIED_FILE_BYTES {
+        write_replacement_hunk(&mut out, old, new)?;
+        return Ok(());
+    }
     let diff = TextDiff::from_lines(old, new);
     diff.unified_diff().context_radius(3).to_writer(out)?;
+    Ok(())
+}
+
+fn write_replacement_hunk(mut out: impl Write, old: &str, new: &str) -> Result<()> {
+    let old_lines = u32::try_from(old.lines().count())
+        .context("old source file has too many lines to represent")?;
+    let new_lines = u32::try_from(new.lines().count())
+        .context("new source file has too many lines to represent")?;
+    writeln!(
+        out,
+        "@@ -1,{old_lines} +1,{new_lines} @@ bounded full-file reconstruction"
+    )?;
+    for line in old.lines() {
+        writeln!(out, "-{line}")?;
+    }
+    if !old.is_empty() && !old.ends_with('\n') {
+        writeln!(out, "\\ No newline at end of file")?;
+    }
+    for line in new.lines() {
+        writeln!(out, "+{line}")?;
+    }
+    if !new.is_empty() && !new.ends_with('\n') {
+        writeln!(out, "\\ No newline at end of file")?;
+    }
+    Ok(())
+}
+
+fn write_full_file_hunk(mut out: impl Write, content: &str, added: bool) -> Result<()> {
+    if content.is_empty() {
+        return Ok(());
+    }
+    let lines = content.lines().count();
+    let lines = u32::try_from(lines).context("source file has too many lines to represent")?;
+    if added {
+        writeln!(out, "@@ -0,0 +1,{lines} @@")?;
+    } else {
+        writeln!(out, "@@ -1,{lines} +0,0 @@")?;
+    }
+    let marker = if added { '+' } else { '-' };
+    for line in content.lines() {
+        writeln!(out, "{marker}{line}")?;
+    }
+    if !content.ends_with('\n') {
+        writeln!(out, "\\ No newline at end of file")?;
+    }
     Ok(())
 }
 
@@ -709,6 +771,33 @@ mod tests {
         assert!(section.contains("+++ b/new.rs"));
         let parsed = diff::parse(&section);
         assert_eq!(parsed.files.len(), 1);
+    }
+
+    #[test]
+    fn many_line_added_file_above_32_mib_reconstructs_with_bounded_index() {
+        use std::fmt::Write as _;
+
+        let line_count = 34_000u32;
+        let mut source = String::new();
+        for line in 1..=line_count {
+            writeln!(source, "let value_{line} = {};", "x".repeat(1_000)).unwrap();
+        }
+        assert!(source.len() > 32 * 1024 * 1024);
+        let mut spool = DiffSpool::new().unwrap();
+        write_diff_section(
+            &mut spool,
+            "src/huge.rs",
+            "src/huge.rs",
+            "",
+            &source,
+            true,
+            false,
+        )
+        .unwrap();
+        let snapshot = spool.finish().unwrap();
+        let prepared = crate::diff::prepare_review(&snapshot).unwrap();
+        assert!(prepared.index.is_complete());
+        assert!(prepared.index.contains("src/huge.rs", line_count));
     }
 
     #[test]

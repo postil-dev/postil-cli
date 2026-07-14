@@ -6,7 +6,7 @@
 //! with its new-file line number.
 
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::RangeInclusive;
@@ -20,6 +20,11 @@ const MAX_LOCKFILE_PACKAGE_RECORDS: usize = 100_000;
 /// file-backed streaming and are deliberately not subject to this limit.
 pub const MAX_FORGE_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 pub const STREAM_WINDOW_BYTES: usize = 2 * 1024 * 1024;
+/// Aggregate on-disk review workspace bound. The original snapshot, normalized
+/// windows, and planned model batches must all fit before provider contact.
+pub const MAX_REVIEW_SPOOL_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_DIFF_INDEX_PATHS: usize = 100_000;
+const MAX_DIFF_INDEX_RANGES: usize = 250_000;
 const NORMALIZED_MANIFEST_RESERVE_BYTES: usize = 16 * 1024;
 
 /// Immutable, file-backed diff snapshot. Acquisition writes to disk and review
@@ -32,9 +37,12 @@ pub struct DiffSnapshot {
 
 impl DiffSnapshot {
     pub fn from_path(path: &std::path::Path) -> Result<Self> {
-        let file = File::open(path)
+        let mut source = File::open(path)
             .with_context(|| format!("opening diff snapshot {}", path.display()))?;
-        Self::from_file(file)
+        let mut spool = DiffSpool::new()?;
+        std::io::copy(&mut source, &mut spool)
+            .with_context(|| format!("copying diff snapshot {}", path.display()))?;
+        spool.finish()
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
@@ -93,11 +101,8 @@ impl DiffSnapshot {
 
     pub fn as_str(&self) -> &str {
         assert!(self.valid_utf8, "binary source snapshot has no UTF-8 view");
-        // Validated once in `from_file`; the immutable mapping cannot change.
-        self.map.as_deref().map_or("", |map| {
-            // SAFETY: `from_file` validates the complete immutable mapping.
-            unsafe { std::str::from_utf8_unchecked(map) }
-        })
+        std::str::from_utf8(self.as_bytes())
+            .expect("private immutable diff snapshot was validated as UTF-8")
     }
 
     pub fn is_empty(&self) -> bool {
@@ -108,6 +113,10 @@ impl DiffSnapshot {
         self.map.as_deref().unwrap_or_default()
     }
 
+    pub fn len(&self) -> u64 {
+        self.map.as_ref().map_or(0, |map| map.len() as u64)
+    }
+
     pub fn source_str(&self) -> &str {
         if self.valid_utf8 { self.as_str() } else { "\0" }
     }
@@ -115,12 +124,14 @@ impl DiffSnapshot {
 
 pub struct DiffSpool {
     file: File,
+    written: u64,
 }
 
 impl DiffSpool {
     pub fn new() -> Result<Self> {
         Ok(Self {
             file: tempfile::tempfile().context("creating diff spool")?,
+            written: 0,
         })
     }
 
@@ -143,7 +154,18 @@ impl DiffSpool {
 
 impl Write for DiffSpool {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        self.file.write(buffer)
+        let next = self
+            .written
+            .checked_add(buffer.len() as u64)
+            .ok_or_else(|| std::io::Error::other("diff spool size overflowed"))?;
+        if next > MAX_REVIEW_SPOOL_BYTES {
+            return Err(std::io::Error::other(format!(
+                "diff spool exceeded the {MAX_REVIEW_SPOOL_BYTES} byte operation quota"
+            )));
+        }
+        let written = self.file.write(buffer)?;
+        self.written = self.written.saturating_add(written as u64);
+        Ok(written)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -169,8 +191,9 @@ pub struct LockfileEvidence {
 }
 
 #[derive(Debug, Clone)]
-pub struct GeneratedArtifactEvidence {
+pub struct CompactedArtifactEvidence {
     pub path: String,
+    pub kind: &'static str,
     pub added: usize,
     pub removed: usize,
     pub bytes: usize,
@@ -180,7 +203,7 @@ pub struct GeneratedArtifactEvidence {
 pub struct PreparedDiff<'a> {
     pub source: Option<Cow<'a, str>>,
     pub lockfiles: Vec<LockfileEvidence>,
-    pub generated_artifacts: Vec<GeneratedArtifactEvidence>,
+    pub compacted_artifacts: Vec<CompactedArtifactEvidence>,
     pub incomplete: bool,
 }
 
@@ -250,57 +273,106 @@ impl Diff {
 }
 
 /// Index answering "does (path, line) fall inside a changed hunk's new side?"
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct DiffIndex {
     ranges: HashMap<String, Vec<RangeInclusive<u32>>>,
     old_ranges: HashMap<String, Vec<RangeInclusive<u32>>>,
+    range_count: usize,
+    complete: bool,
     /// Reserved synthetic-path line ranges that only content-policy findings may
     /// ground against (e.g. the rendered PR title/description). Kept separate
     /// from `ranges` so a non-content-policy finding cannot exploit them.
     content_policy_ranges: HashMap<String, RangeInclusive<u32>>,
 }
 
+impl Default for DiffIndex {
+    fn default() -> Self {
+        Self {
+            ranges: HashMap::new(),
+            old_ranges: HashMap::new(),
+            range_count: 0,
+            complete: true,
+            content_policy_ranges: HashMap::new(),
+        }
+    }
+}
+
 impl DiffIndex {
     pub fn build(diff: &Diff) -> Self {
-        let mut ranges: HashMap<String, Vec<RangeInclusive<u32>>> = HashMap::new();
-        let mut old_ranges: HashMap<String, Vec<RangeInclusive<u32>>> = HashMap::new();
+        let mut index = Self::default();
         for file in &diff.files {
             if file.binary {
                 continue;
             }
             for hunk in &file.hunks {
                 if hunk.old_count > 0 {
-                    old_ranges
-                        .entry(file.old_path.clone())
-                        .or_default()
-                        .push(hunk.old_range());
+                    index.insert_range(file.old_path.clone(), hunk.old_range(), true);
                 }
             }
             if file.deleted {
                 continue;
             }
-            let entry = ranges.entry(file.path.clone()).or_default();
             for hunk in &file.hunks {
                 if hunk.new_count > 0 {
-                    entry.push(hunk.new_range());
+                    index.insert_range(file.path.clone(), hunk.new_range(), false);
                 }
             }
         }
-        DiffIndex {
-            ranges,
-            old_ranges,
-            content_policy_ranges: HashMap::new(),
-        }
+        index
     }
 
     pub fn extend(&mut self, diff: &Diff) {
         let next = Self::build(diff);
         for (path, ranges) in next.ranges {
-            self.ranges.entry(path).or_default().extend(ranges);
+            for range in ranges {
+                self.insert_range(path.clone(), range, false);
+            }
         }
         for (path, ranges) in next.old_ranges {
-            self.old_ranges.entry(path).or_default().extend(ranges);
+            for range in ranges {
+                self.insert_range(path.clone(), range, true);
+            }
         }
+    }
+
+    fn insert_range(&mut self, path: String, range: RangeInclusive<u32>, old: bool) {
+        if !self.complete {
+            return;
+        }
+        let exists = if old {
+            self.old_ranges.contains_key(&path)
+        } else {
+            self.ranges.contains_key(&path)
+        };
+        if !exists
+            && self.ranges.len().saturating_add(self.old_ranges.len()) >= MAX_DIFF_INDEX_PATHS
+        {
+            self.complete = false;
+            return;
+        }
+        let map = if old {
+            &mut self.old_ranges
+        } else {
+            &mut self.ranges
+        };
+        let ranges = map.entry(path).or_default();
+        if let Some(last) = ranges.last_mut()
+            && range.start() <= &last.end().saturating_add(1)
+        {
+            let end = (*last.end()).max(*range.end());
+            *last = *last.start()..=end;
+            return;
+        }
+        if self.range_count >= MAX_DIFF_INDEX_RANGES {
+            self.complete = false;
+            return;
+        }
+        ranges.push(range);
+        self.range_count += 1;
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.complete
     }
 
     /// Register `path` as groundable for content-policy findings over lines
@@ -377,9 +449,11 @@ impl DiffIndex {
 /// evidence remain in memory.
 pub struct PreparedReview {
     windows: File,
+    snapshot_bytes: u64,
+    window_bytes: u64,
     pub index: DiffIndex,
     pub lockfiles: Vec<LockfileEvidence>,
-    pub generated_artifacts: Vec<GeneratedArtifactEvidence>,
+    pub compacted_artifacts: Vec<CompactedArtifactEvidence>,
     pub has_source: bool,
     pub reserved_anchor: bool,
 }
@@ -419,11 +493,67 @@ pub struct ModelBatchSpool {
     file: File,
     pub count: usize,
     pub metadata_count: u32,
+    pub total_batch_bytes: usize,
+    pub largest_batch_bytes: usize,
 }
 
 impl ModelBatchSpool {
     pub fn next_batch(&mut self) -> Result<Option<String>> {
         read_length_prefixed(&mut self.file, "model batch")
+    }
+}
+
+/// Build one bounded, line-grounded context for an interactive answer. Every
+/// source window contributes semantic evidence; large inputs are reduced with
+/// the same bounded fan-in used by review synthesis rather than byte truncation.
+pub fn bounded_respond_context(
+    snapshot: &DiffSnapshot,
+    max_bytes: usize,
+    max_manifest_bytes: usize,
+) -> Result<(String, bool)> {
+    let mut prepared = prepare_review(snapshot)?;
+    let reserved_anchor = prepared.reserved_anchor;
+    let mut batches = spool_model_batches(&mut prepared, max_bytes, max_manifest_bytes, false)?;
+    if batches.count == 0 {
+        return Ok((String::new(), reserved_anchor));
+    }
+    let mut first: Option<String> = None;
+    let mut digests = Vec::with_capacity(batches.count.min(1_024));
+    while let Some(batch) = batches.next_batch()? {
+        if let Some(previous) = first.take() {
+            if digests.is_empty() {
+                digests.push(semantic_digest(&previous));
+            }
+            digests.push(semantic_digest(&batch));
+        } else if digests.is_empty() {
+            first = Some(batch);
+        } else {
+            digests.push(semantic_digest(&batch));
+        }
+    }
+    if digests.is_empty() {
+        return Ok((first.expect("one batch was counted"), reserved_anchor));
+    }
+    let mut level = 1usize;
+    loop {
+        let chunks = pack_semantic_digests(&digests, level, max_bytes)?;
+        if chunks.len() == 1 {
+            return Ok((
+                chunks.into_iter().next().expect("checked above"),
+                reserved_anchor,
+            ));
+        }
+        anyhow::ensure!(
+            chunks.len() < digests.len(),
+            "interactive context synthesis did not reduce its bounded fan-in"
+        );
+        digests = chunks
+            .iter()
+            .map(|chunk| recursive_semantic_digest(chunk))
+            .collect();
+        level = level
+            .checked_add(1)
+            .context("interactive synthesis level overflowed")?;
     }
 }
 
@@ -434,10 +564,14 @@ pub fn spool_model_batches(
     force_empty: bool,
 ) -> Result<ModelBatchSpool> {
     let mut file = tempfile::tempfile().context("creating model-batch spool")?;
+    let mut spool_bytes = 0u64;
     let mut count = 0usize;
+    let mut total_batch_bytes = 0usize;
+    let mut largest_batch_bytes = 0usize;
     let mut metadata_count = 0u32;
     let synthesis_header = "Cross-window semantic digests:\n";
     let mut cross_window = synthesis_header.to_string();
+    let mut synthesis_chunks = Vec::new();
     let mut digest_ordinal = 0usize;
     prepared.rewind()?;
     while let Some(window) = prepared.next_window()? {
@@ -458,17 +592,8 @@ pub fn spool_model_batches(
                 let entry = format!("\nSource window {digest_ordinal}:\n{digest}");
                 if cross_window.len().saturating_add(entry.len()) > max_batch_bytes {
                     if cross_window.len() > synthesis_header.len() {
-                        write_length_prefixed(
-                            &mut file,
-                            &cross_window,
-                            max_batch_bytes,
-                            "cross-window synthesis batch",
-                        )?;
-                        count = count
-                            .checked_add(1)
-                            .context("model batch count overflowed")?;
+                        synthesis_chunks.push(std::mem::take(&mut cross_window));
                     }
-                    cross_window.clear();
                     cross_window.push_str(synthesis_header);
                 }
                 anyhow::ensure!(
@@ -478,12 +603,18 @@ pub fn spool_model_batches(
                 cross_window.push_str(&entry);
             }
             write_length_prefixed(&mut file, &batch, max_batch_bytes, "model batch")?;
+            spool_bytes = spool_bytes
+                .checked_add(batch.len() as u64 + 8)
+                .context("model-batch spool size overflowed")?;
             count = count
                 .checked_add(1)
                 .context("model batch count overflowed")?;
         }
         if let Some(synthesis) = plan.synthesis {
             write_length_prefixed(&mut file, &synthesis, max_batch_bytes, "model batch")?;
+            spool_bytes = spool_bytes
+                .checked_add(synthesis.len() as u64 + 8)
+                .context("model-batch spool size overflowed")?;
             count = count
                 .checked_add(1)
                 .context("model batch count overflowed")?;
@@ -495,14 +626,14 @@ pub fn spool_model_batches(
     let mut lock_start = 0usize;
     let mut artifact_start = 0usize;
     while lock_start < prepared.lockfiles.len()
-        || artifact_start < prepared.generated_artifacts.len()
+        || artifact_start < prepared.compacted_artifacts.len()
     {
         let lock_end = (lock_start + 16).min(prepared.lockfiles.len());
-        let artifact_end = (artifact_start + 16).min(prepared.generated_artifacts.len());
+        let artifact_end = (artifact_start + 16).min(prepared.compacted_artifacts.len());
         let plan = render_review_batches(
             &Diff::default(),
             &prepared.lockfiles[lock_start..lock_end],
-            &prepared.generated_artifacts[artifact_start..artifact_end],
+            &prepared.compacted_artifacts[artifact_start..artifact_end],
             max_batch_bytes,
             max_manifest_bytes,
         );
@@ -512,6 +643,9 @@ pub fn spool_model_batches(
         metadata_count = metadata_count.max(plan.metadata_count);
         for batch in plan.batches.into_iter().chain(plan.synthesis) {
             write_length_prefixed(&mut file, &batch, max_batch_bytes, "artifact model batch")?;
+            spool_bytes = spool_bytes
+                .checked_add(batch.len() as u64 + 8)
+                .context("model-batch spool size overflowed")?;
             count = count
                 .checked_add(1)
                 .context("model batch count overflowed")?;
@@ -520,27 +654,167 @@ pub fn spool_model_batches(
         artifact_start = artifact_end;
     }
     if cross_window.len() > synthesis_header.len() && digest_ordinal > 1 {
-        write_length_prefixed(
-            &mut file,
-            &cross_window,
-            max_batch_bytes,
-            "cross-window synthesis batch",
-        )?;
-        count = count
-            .checked_add(1)
-            .context("model batch count overflowed")?;
+        synthesis_chunks.push(cross_window);
+    }
+    if digest_ordinal > 1 {
+        let mut level = 1usize;
+        let mut chunks = synthesis_chunks;
+        while !chunks.is_empty() {
+            let chunk_count = chunks.len();
+            let mut digests = Vec::with_capacity(chunk_count);
+            for chunk in chunks {
+                write_length_prefixed(
+                    &mut file,
+                    &chunk,
+                    max_batch_bytes,
+                    "cross-window synthesis batch",
+                )?;
+                spool_bytes = spool_bytes
+                    .checked_add(chunk.len() as u64 + 8)
+                    .context("model-batch spool size overflowed")?;
+                count = count
+                    .checked_add(1)
+                    .context("model batch count overflowed")?;
+                digests.push(recursive_semantic_digest(&chunk));
+            }
+            if chunk_count == 1 {
+                break;
+            }
+            let next = pack_semantic_digests(&digests, level + 1, max_batch_bytes)?;
+            anyhow::ensure!(
+                next.len() < chunk_count,
+                "recursive synthesis did not reduce its bounded fan-in"
+            );
+            chunks = next;
+            level = level
+                .checked_add(1)
+                .context("recursive synthesis level overflowed")?;
+        }
     }
     if count == 0 && force_empty {
         write_length_prefixed(&mut file, "", max_batch_bytes, "model batch")?;
+        spool_bytes = spool_bytes.saturating_add(8);
         count = 1;
     }
+    let aggregate = prepared
+        .snapshot_bytes
+        .checked_add(prepared.window_bytes)
+        .and_then(|bytes| bytes.checked_add(spool_bytes))
+        .context("aggregate review spool size overflowed")?;
+    anyhow::ensure!(
+        aggregate <= MAX_REVIEW_SPOOL_BYTES,
+        "review workspace needs {aggregate} bytes, exceeding the {MAX_REVIEW_SPOOL_BYTES} byte operation quota"
+    );
     file.seek(SeekFrom::Start(0))
         .context("rewinding model-batch spool")?;
+    let mut planning_reader = file
+        .try_clone()
+        .context("cloning model-batch spool for planning")?;
+    planning_reader
+        .seek(SeekFrom::Start(0))
+        .context("rewinding model-batch planning reader")?;
+    while let Some(batch) = read_length_prefixed(&mut planning_reader, "planned model batch")? {
+        total_batch_bytes = total_batch_bytes
+            .checked_add(batch.len())
+            .context("planned model input size overflowed")?;
+        largest_batch_bytes = largest_batch_bytes.max(batch.len());
+    }
+    file.seek(SeekFrom::Start(0))
+        .context("rewinding model-batch spool after planning")?;
     Ok(ModelBatchSpool {
         file,
         count,
         metadata_count,
+        total_batch_bytes,
+        largest_batch_bytes,
     })
+}
+
+fn pack_semantic_digests(
+    digests: &[String],
+    level: usize,
+    max_batch_bytes: usize,
+) -> Result<Vec<String>> {
+    let header = format!("Cross-window semantic digests level {level}:\n");
+    let mut chunks = Vec::new();
+    let mut current = header.clone();
+    for (index, digest) in digests.iter().enumerate() {
+        anyhow::ensure!(
+            !digest.is_empty(),
+            "synthesis digest lost all semantic evidence"
+        );
+        let entry = format!("\nSynthesis group {}:\n{digest}", index + 1);
+        if current.len().saturating_add(entry.len()) > max_batch_bytes {
+            anyhow::ensure!(
+                current.len() > header.len(),
+                "one synthesis digest exceeded its bound"
+            );
+            chunks.push(std::mem::replace(&mut current, header.clone()));
+        }
+        anyhow::ensure!(
+            current.len().saturating_add(entry.len()) <= max_batch_bytes,
+            "one synthesis digest exceeded its bound"
+        );
+        current.push_str(&entry);
+    }
+    if current.len() > header.len() {
+        chunks.push(current);
+    }
+    Ok(chunks)
+}
+
+fn recursive_semantic_digest(batch: &str) -> String {
+    type Evidence = (String, String);
+    type EvidenceBoundary = (Evidence, Evidence);
+
+    let digest = semantic_digest(batch);
+    let mut path = String::new();
+    let mut category = String::new();
+    let mut priority: BTreeMap<String, EvidenceBoundary> = BTreeMap::new();
+    let mut fallback: Option<EvidenceBoundary> = None;
+    for line in digest.lines() {
+        if let Some(value) = line.strip_prefix("### ") {
+            path = value.to_string();
+        } else if let Some(value) = line
+            .strip_prefix("@@ semantic category=")
+            .and_then(|value| value.strip_suffix(" @@"))
+        {
+            category = value.to_string();
+        } else if line
+            .trim_start()
+            .split_once(' ')
+            .is_some_and(|(number, _)| number.parse::<u32>().is_ok())
+        {
+            let evidence = (path.clone(), line.to_string());
+            fallback
+                .get_or_insert_with(|| (evidence.clone(), evidence.clone()))
+                .1 = evidence.clone();
+            if category != "uncategorized" {
+                priority
+                    .entry(category.clone())
+                    .and_modify(|entry| entry.1 = evidence.clone())
+                    .or_insert_with(|| (evidence.clone(), evidence));
+            }
+        }
+    }
+    let mut selected = priority.into_iter().collect::<Vec<_>>();
+    if let Some(pair) = fallback {
+        selected.push(("boundary".to_string(), pair));
+    }
+    let mut retained = String::new();
+    for (category, (first, last)) in selected {
+        retained.push_str(&format!(
+            "### {}\n@@ semantic category={category} @@\n{}\n",
+            first.0, first.1
+        ));
+        if last != first {
+            retained.push_str(&format!(
+                "### {}\n@@ semantic category={category} @@\n{}\n",
+                last.0, last.1
+            ));
+        }
+    }
+    retained
 }
 
 fn write_length_prefixed(
@@ -582,7 +856,8 @@ pub fn prepare_review(snapshot: &DiffSnapshot) -> Result<PreparedReview> {
     let mut windows = tempfile::tempfile().context("creating review-window spool")?;
     let mut index = DiffIndex::default();
     let mut lockfiles = Vec::new();
-    let mut generated_artifacts = Vec::new();
+    let mut compacted_artifacts = Vec::new();
+    let mut window_bytes = 0u64;
     let mut has_source = false;
     let mut reserved_anchor = false;
     let mut pending_window = String::new();
@@ -593,9 +868,11 @@ pub fn prepare_review(snapshot: &DiffSnapshot) -> Result<PreparedReview> {
             windows,
             index,
             lockfiles,
-            generated_artifacts,
+            compacted_artifacts,
             has_source,
             reserved_anchor,
+            snapshot_bytes: snapshot.len(),
+            window_bytes,
         });
     };
     anyhow::ensure!(
@@ -610,8 +887,8 @@ pub fn prepare_review(snapshot: &DiffSnapshot) -> Result<PreparedReview> {
             && let Some(evidence) = lockfile_evidence(&path, section)
         {
             lockfiles.push(evidence);
-        } else if is_compactable_generated_artifact(&path) || is_binary_section(section) {
-            generated_artifacts.push(generated_artifact_evidence(&path, section));
+        } else if is_compactable_generated_artifact(&path, section) || is_binary_section(section) {
+            compacted_artifacts.push(compacted_artifact_evidence(&path, section));
         } else {
             for_each_section_window(section, STREAM_WINDOW_BYTES, |window| {
                 let parsed = parse(window);
@@ -635,6 +912,9 @@ pub fn prepare_review(snapshot: &DiffSnapshot) -> Result<PreparedReview> {
                             > NORMALIZED_MANIFEST_RESERVE_BYTES)
                 {
                     write_window(&mut windows, &pending_window)?;
+                    window_bytes = window_bytes
+                        .checked_add(pending_window.len() as u64 + 8)
+                        .context("review-window spool size overflowed")?;
                     pending_window.clear();
                     pending_manifest_bytes = 0;
                 }
@@ -649,7 +929,22 @@ pub fn prepare_review(snapshot: &DiffSnapshot) -> Result<PreparedReview> {
     }
     if !pending_window.is_empty() {
         write_window(&mut windows, &pending_window)?;
+        window_bytes = window_bytes
+            .checked_add(pending_window.len() as u64 + 8)
+            .context("review-window spool size overflowed")?;
     }
+    anyhow::ensure!(
+        index.is_complete(),
+        "diff grounding index exceeded its fixed resource bound"
+    );
+    let initial_workspace = snapshot
+        .len()
+        .checked_add(window_bytes)
+        .context("aggregate review spool size overflowed")?;
+    anyhow::ensure!(
+        initial_workspace <= MAX_REVIEW_SPOOL_BYTES,
+        "review workspace needs {initial_workspace} bytes before batching, exceeding the {MAX_REVIEW_SPOOL_BYTES} byte operation quota"
+    );
     windows
         .seek(SeekFrom::Start(0))
         .context("rewinding review-window spool")?;
@@ -657,9 +952,11 @@ pub fn prepare_review(snapshot: &DiffSnapshot) -> Result<PreparedReview> {
         windows,
         index,
         lockfiles,
-        generated_artifacts,
+        compacted_artifacts,
         has_source,
         reserved_anchor,
+        snapshot_bytes: snapshot.len(),
+        window_bytes,
     })
 }
 
@@ -843,7 +1140,7 @@ pub fn prepare_diff(text: &str) -> PreparedDiff<'_> {
         return PreparedDiff {
             source: Some(Cow::Borrowed(text)),
             lockfiles: Vec::new(),
-            generated_artifacts: Vec::new(),
+            compacted_artifacts: Vec::new(),
             incomplete: false,
         };
     }
@@ -851,7 +1148,7 @@ pub fn prepare_diff(text: &str) -> PreparedDiff<'_> {
     let preamble_len = cursor.unwrap_or(0);
     let mut kept_len = preamble_len;
     let mut lockfiles = Vec::new();
-    let mut generated_artifacts = Vec::new();
+    let mut compacted_artifacts = Vec::new();
     let mut compacted = false;
     while let Some(start) = cursor {
         let end = next_diff_start(text, start + "diff --git ".len()).unwrap_or(text.len());
@@ -860,7 +1157,7 @@ pub fn prepare_diff(text: &str) -> PreparedDiff<'_> {
             return PreparedDiff {
                 source: None,
                 lockfiles: Vec::new(),
-                generated_artifacts: Vec::new(),
+                compacted_artifacts: Vec::new(),
                 incomplete: true,
             };
         };
@@ -871,9 +1168,9 @@ pub fn prepare_diff(text: &str) -> PreparedDiff<'_> {
             } else {
                 kept_len = kept_len.saturating_add(section.len());
             }
-        } else if is_compactable_generated_artifact(&path) {
+        } else if is_compactable_generated_artifact(&path, section) {
             compacted = true;
-            generated_artifacts.push(generated_artifact_evidence(&path, section));
+            compacted_artifacts.push(compacted_artifact_evidence(&path, section));
         } else {
             kept_len = kept_len.saturating_add(section.len());
         }
@@ -884,7 +1181,7 @@ pub fn prepare_diff(text: &str) -> PreparedDiff<'_> {
         return PreparedDiff {
             source: Some(Cow::Borrowed(text)),
             lockfiles,
-            generated_artifacts,
+            compacted_artifacts,
             incomplete: false,
         };
     }
@@ -899,13 +1196,13 @@ pub fn prepare_diff(text: &str) -> PreparedDiff<'_> {
             return PreparedDiff {
                 source: None,
                 lockfiles: Vec::new(),
-                generated_artifacts: Vec::new(),
+                compacted_artifacts: Vec::new(),
                 incomplete: true,
             };
         };
         let compact_lockfile =
             is_known_lockfile(&path) && lockfile_evidence(&path, section).is_some();
-        if !compact_lockfile && !is_compactable_generated_artifact(&path) {
+        if !compact_lockfile && !is_compactable_generated_artifact(&path, section) {
             source.push_str(section);
         }
         cursor = (end < text.len()).then_some(end);
@@ -913,19 +1210,40 @@ pub fn prepare_diff(text: &str) -> PreparedDiff<'_> {
     PreparedDiff {
         source: Some(Cow::Owned(source)),
         lockfiles,
-        generated_artifacts,
+        compacted_artifacts,
         incomplete: false,
     }
 }
 
-fn is_compactable_generated_artifact(path: &str) -> bool {
+fn is_compactable_generated_artifact(path: &str, section: &str) -> bool {
     let normalized = path.replace('\\', "/").to_ascii_lowercase();
-    normalized.ends_with(".map")
-        || normalized.ends_with(".min.js")
-        || normalized.ends_with(".min.css")
+    let mut prefix_end = section.len().min(64 * 1024);
+    while !section.is_char_boundary(prefix_end) {
+        prefix_end -= 1;
+    }
+    let lower = section[..prefix_end].to_ascii_lowercase();
+    let explicit_generator = [
+        "@generated",
+        "generated by ",
+        "sourcemappingurl=",
+        "source mappingurl=",
+        "do not edit",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    let structured_source_map = normalized.ends_with(".map")
+        && lower.contains("\"version\"")
+        && lower.contains("\"mappings\"")
+        && lower.contains("\"sources\"");
+    let minified_bundle = (normalized.ends_with(".min.js") || normalized.ends_with(".min.css"))
+        && explicit_generator
+        && section.lines().any(|line| {
+            matches!(line.as_bytes().first(), Some(b'+') | Some(b'-')) && line.len() >= 4_096
+        });
+    structured_source_map || minified_bundle
 }
 
-fn generated_artifact_evidence(path: &str, section: &str) -> GeneratedArtifactEvidence {
+fn compacted_artifact_evidence(path: &str, section: &str) -> CompactedArtifactEvidence {
     let mut added = 0usize;
     let mut removed = 0usize;
     for line in section.lines() {
@@ -935,8 +1253,13 @@ fn generated_artifact_evidence(path: &str, section: &str) -> GeneratedArtifactEv
             removed = removed.saturating_add(1);
         }
     }
-    GeneratedArtifactEvidence {
+    CompactedArtifactEvidence {
         path: path.to_string(),
+        kind: if is_binary_section(section) {
+            "binary change"
+        } else {
+            "verified generated artifact"
+        },
         added,
         removed,
         bytes: section.len(),
@@ -1661,7 +1984,7 @@ struct ChangeManifest {
 pub fn render_review_batches(
     diff: &Diff,
     lockfiles: &[LockfileEvidence],
-    generated_artifacts: &[GeneratedArtifactEvidence],
+    compacted_artifacts: &[CompactedArtifactEvidence],
     max_bytes: usize,
     max_manifest_bytes: usize,
 ) -> ReviewBatchPlan {
@@ -1669,7 +1992,7 @@ pub fn render_review_batches(
         max_bytes >= 4096,
         "review batch limit must leave room for context"
     );
-    let manifest = build_manifest(diff, lockfiles, generated_artifacts, max_manifest_bytes);
+    let manifest = build_manifest(diff, lockfiles, compacted_artifacts, max_manifest_bytes);
     let mut plan = ReviewBatchPlan {
         incomplete: manifest.incomplete || manifest.text.len() >= max_bytes,
         metadata_count: manifest.metadata_count,
@@ -1702,7 +2025,7 @@ pub fn render_review_batches(
     if !current.is_empty() {
         plan.batches.push(current);
     } else if plan.batches.is_empty()
-        && (!diff.files.is_empty() || !lockfiles.is_empty() || !generated_artifacts.is_empty())
+        && (!diff.files.is_empty() || !lockfiles.is_empty() || !compacted_artifacts.is_empty())
     {
         plan.batches.push(manifest.text.clone());
     }
@@ -1718,7 +2041,7 @@ pub fn render_review_batches(
 fn build_manifest(
     diff: &Diff,
     lockfiles: &[LockfileEvidence],
-    generated_artifacts: &[GeneratedArtifactEvidence],
+    compacted_artifacts: &[CompactedArtifactEvidence],
     max_bytes: usize,
 ) -> ChangeManifest {
     let mut text = String::from("Changed-file manifest:\n");
@@ -1815,10 +2138,11 @@ fn build_manifest(
         }
         metadata.push(entry);
     }
-    for artifact in generated_artifacts {
+    for artifact in compacted_artifacts {
         let manifest_entry = format!(
-            "- {} [generated artifact summary]\n",
-            manifest_path(&artifact.path)
+            "- {} [compacted {} evidence]\n",
+            manifest_path(&artifact.path),
+            artifact.kind,
         );
         if text
             .len()
@@ -1834,8 +2158,9 @@ fn build_manifest(
         }
         text.push_str(&manifest_entry);
         let entry = format!(
-            "{}: generated artifact changed, {} additions, {} deletions, {} raw bytes compacted",
+            "{}: {}, {} additions, {} deletions, {} raw bytes represented by bounded evidence",
             manifest_path(&artifact.path),
+            artifact.kind,
             artifact.added,
             artifact.removed,
             artifact.bytes,
@@ -2045,6 +2370,9 @@ fn semantic_digest(batch: &str) -> String {
         label: String,
         categories: Vec<Option<String>>,
         fallback: Option<String>,
+        last: Option<String>,
+        lines: Vec<String>,
+        lines_overflowed: bool,
     }
 
     fn flush_region(regions: &mut Vec<Region>, current: &mut Option<Region>) {
@@ -2075,6 +2403,9 @@ fn semantic_digest(batch: &str) -> String {
                     label: label.trim_end_matches(" @@").to_string(),
                     categories: vec![None; CATEGORIES.len()],
                     fallback: None,
+                    last: None,
+                    lines: Vec::new(),
+                    lines_overflowed: false,
                 });
             }
             continue;
@@ -2094,9 +2425,18 @@ fn semantic_digest(batch: &str) -> String {
             label: "source region".to_string(),
             categories: vec![None; CATEGORIES.len()],
             fallback: None,
+            last: None,
+            lines: Vec::new(),
+            lines_overflowed: false,
         });
         let bounded: String = rendered.chars().take(360).collect();
         region.fallback.get_or_insert_with(|| bounded.clone());
+        region.last = Some(bounded.clone());
+        if region.lines.len() < 8 {
+            region.lines.push(bounded.clone());
+        } else {
+            region.lines_overflowed = true;
+        }
         let lower = content.to_ascii_lowercase();
         for (category_index, (_, markers)) in CATEGORIES.iter().enumerate() {
             if region.categories[category_index].is_none()
@@ -2115,6 +2455,16 @@ fn semantic_digest(batch: &str) -> String {
             region.path, region.label
         ));
         let mut emitted = BTreeSet::new();
+        if !region.lines_overflowed {
+            for rendered in region.lines {
+                if emitted.insert(rendered.clone()) {
+                    out.push_str(&format!(
+                        "@@ semantic category=complete-small-region @@\n{rendered}\n"
+                    ));
+                }
+            }
+            continue;
+        }
         for ((category, _), rendered) in CATEGORIES.iter().zip(region.categories) {
             if let Some(rendered) = rendered
                 && emitted.insert(rendered.clone())
@@ -2122,11 +2472,18 @@ fn semantic_digest(batch: &str) -> String {
                 out.push_str(&format!("@@ semantic category={category} @@\n{rendered}\n"));
             }
         }
-        if emitted.is_empty()
-            && let Some(rendered) = region.fallback
+        if let Some(rendered) = region.fallback
+            && emitted.insert(rendered.clone())
         {
             out.push_str(&format!(
                 "@@ semantic category=uncategorized @@\n{rendered}\n"
+            ));
+        }
+        if let Some(rendered) = region.last
+            && emitted.insert(rendered.clone())
+        {
+            out.push_str(&format!(
+                "@@ semantic category=region-boundary @@\n{rendered}\n"
             ));
         }
     }
@@ -2289,6 +2646,17 @@ Binary files a/img.png and b/img.png differ
         assert_eq!(snapshot.as_str(), "");
         let prepared = prepare_review(&snapshot).unwrap();
         assert!(!prepared.has_source);
+    }
+
+    #[test]
+    fn external_snapshot_is_private_and_immutable_after_acquisition() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("input.diff");
+        std::fs::write(&path, SAMPLE).unwrap();
+        let snapshot = DiffSnapshot::from_path(&path).unwrap();
+        std::fs::write(&path, b"\xff\x00mutated").unwrap();
+        assert_eq!(snapshot.as_str(), SAMPLE);
+        assert!(prepare_review(&snapshot).is_ok());
     }
 
     #[test]
@@ -2466,6 +2834,99 @@ Binary files a/img.png and b/img.png differ
                 "added dangerous-dependency@1.2.3"
             ]
         );
+    }
+
+    #[test]
+    fn generated_extension_alone_never_compacts_hand_maintained_source() {
+        let source = "diff --git a/web/security.min.js b/web/security.min.js\n--- a/web/security.min.js\n+++ b/web/security.min.js\n@@ -0,0 +1 @@\n+eval(userInput);\n";
+        let prepared = prepare_diff(source);
+        assert!(prepared.compacted_artifacts.is_empty());
+        assert!(
+            prepared
+                .source
+                .as_deref()
+                .unwrap()
+                .contains("eval(userInput)")
+        );
+    }
+
+    #[test]
+    fn generated_bundle_and_structured_source_map_use_bounded_evidence() {
+        let bundle = format!(
+            "diff --git a/web/app.min.js b/web/app.min.js\n--- a/web/app.min.js\n+++ b/web/app.min.js\n@@ -0,0 +1 @@\n+/* generated by esbuild; do not edit */{}\n",
+            "x".repeat(4_096)
+        );
+        let map = "diff --git a/web/app.js.map b/web/app.js.map\n--- a/web/app.js.map\n+++ b/web/app.js.map\n@@ -0,0 +1 @@\n+{\"version\":3,\"sources\":[\"app.ts\"],\"mappings\":\"AAAA\"}\n";
+        let combined = format!("{bundle}{map}");
+        let prepared = prepare_diff(&combined);
+        assert_eq!(prepared.compacted_artifacts.len(), 2);
+        assert_eq!(prepared.source.as_deref(), Some(""));
+        assert!(
+            prepared
+                .compacted_artifacts
+                .iter()
+                .all(|artifact| artifact.kind == "verified generated artifact")
+        );
+    }
+
+    #[test]
+    fn recursive_synthesis_retains_distant_first_and_last_regions() {
+        let digests = (1..=400)
+            .map(|index| {
+                format!(
+                    "### src/file_{index:03}.rs\n@@ semantic region: source @@\n@@ semantic category=uncategorized @@\n{index:>6} + {}\n",
+                    if index == 1 {
+                        "validate_pair(input);"
+                    } else if index == 400 {
+                        "dangerous_sink(original);"
+                    } else {
+                        "ordinary_change();"
+                    }
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut level = pack_semantic_digests(&digests, 1, 24_000).unwrap();
+        while level.len() > 1 {
+            let previous = level.len();
+            let next_digests = level
+                .iter()
+                .map(|chunk| recursive_semantic_digest(chunk))
+                .collect::<Vec<_>>();
+            level = pack_semantic_digests(&next_digests, 2, 24_000).unwrap();
+            assert!(level.len() < previous);
+        }
+        assert!(level[0].contains("validate_pair(input)"));
+        assert!(level[0].contains("dangerous_sink(original)"));
+    }
+
+    #[test]
+    fn interactive_context_streams_distant_evidence_without_byte_truncation() {
+        use std::fmt::Write as _;
+
+        let mut source = String::from(
+            "diff --git a/src/flow.rs b/src/flow.rs\n--- a/src/flow.rs\n+++ b/src/flow.rs\n@@ -0,0 +1,400 @@\n",
+        );
+        for line in 1..=400 {
+            if line == 1 {
+                source.push_str("+let checked = validate_pair(input);\n");
+            } else if line == 400 {
+                source.push_str("+dangerous_sink(original);\n");
+            } else {
+                writeln!(
+                    source,
+                    "+let padding_{line} = ordinary; // {}",
+                    "x".repeat(1_000)
+                )
+                .unwrap();
+            }
+        }
+        let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+        let (context, reserved) = bounded_respond_context(&snapshot, 120_000, 24_000).unwrap();
+        assert!(!reserved);
+        assert!(context.len() <= 120_000);
+        assert!(context.contains("validate_pair(input)"));
+        assert!(context.contains("dangerous_sink(original)"));
+        assert!(!context.contains("diff truncated"));
     }
 
     #[test]

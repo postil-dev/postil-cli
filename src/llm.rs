@@ -339,6 +339,11 @@ pub(crate) const MAX_REPORTED_TOKEN_SPEND: usize = 20_000_000;
 const MAX_PROVIDER_INPUT_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE: usize = 2_000_000;
 pub const HOSTED_OPERATION_COST_CAP_MICROS: u64 = 1_000_000;
+const MAX_HOSTED_PLANNED_CALLS_BY_WATCHDOG: usize = 42;
+const MAX_LOGICAL_CALLS_PER_REVIEW_MODEL: usize = 2;
+const MAX_LOGICAL_CALLS_PER_SCORER_MODEL: usize = 2;
+const MAX_TRANSPORT_ATTEMPTS_PER_CALL: usize = TRANSIENT_RETRIES as usize + 1;
+const PLANNED_REQUEST_ENVELOPE_BYTES: usize = 8 * 1024;
 const MAX_MODEL_RESPONSE_BYTES: usize = 512 * 1024;
 const SCORER_BASE_MAX_TOKENS: u32 = 256;
 const SCORER_MAX_TOKENS_PER_FINDING: u32 = 640;
@@ -533,6 +538,156 @@ impl std::fmt::Display for RequestTimedOut {
 impl std::error::Error for RequestTimedOut {}
 
 impl LlmClient {
+    pub(crate) fn preflight_review_plan(
+        &self,
+        cfg: &Config,
+        batch_count: usize,
+        total_batch_bytes: usize,
+        largest_batch_bytes: usize,
+        shared_context_bytes: usize,
+    ) -> Result<()> {
+        let Some(bounds) = &self.hosted_price_bounds else {
+            return Ok(());
+        };
+        let review_models = if cfg.consensus > 1 {
+            cfg.model_chain()
+                .into_iter()
+                .take(cfg.consensus)
+                .collect::<Vec<_>>()
+        } else {
+            cfg.model_chain()
+        };
+        let scorer_models = if cfg.scorer_enabled() {
+            cfg.scorer_chain()
+        } else {
+            Vec::new()
+        };
+        let review_logical_calls = batch_count
+            .checked_mul(review_models.len())
+            .and_then(|value| value.checked_mul(MAX_LOGICAL_CALLS_PER_REVIEW_MODEL))
+            .context("planned review call count overflowed")?;
+        let scorer_logical_calls = scorer_models
+            .len()
+            .checked_mul(MAX_LOGICAL_CALLS_PER_SCORER_MODEL)
+            .context("planned scorer call count overflowed")?;
+        let logical_calls = review_logical_calls
+            .checked_add(scorer_logical_calls)
+            .context("planned model call count overflowed")?;
+        anyhow::ensure!(
+            logical_calls <= MAX_HOSTED_PLANNED_CALLS_BY_WATCHDOG,
+            "complete hosted review needs {logical_calls} logical model calls, exceeding the {MAX_HOSTED_PLANNED_CALLS_BY_WATCHDOG}-call watchdog plan"
+        );
+        let attempts = logical_calls
+            .checked_mul(MAX_TRANSPORT_ATTEMPTS_PER_CALL)
+            .context("planned provider attempt count overflowed")?;
+        anyhow::ensure!(
+            attempts <= MAX_PROVIDER_ATTEMPTS,
+            "complete hosted review needs {attempts} provider attempts, exceeding the {MAX_PROVIDER_ATTEMPTS}-attempt cap"
+        );
+
+        anyhow::ensure!(
+            total_batch_bytes <= largest_batch_bytes.saturating_mul(batch_count),
+            "planned review batch accounting is inconsistent"
+        );
+        let largest_review_input = largest_batch_bytes
+            .saturating_add(shared_context_bytes)
+            .saturating_add(PLANNED_REQUEST_ENVELOPE_BYTES)
+            .max(32 * 1024);
+        let review_input = largest_review_input
+            .checked_mul(batch_count)
+            .and_then(|value| value.checked_mul(review_models.len()))
+            .and_then(|value| value.checked_mul(MAX_LOGICAL_CALLS_PER_REVIEW_MODEL))
+            .and_then(|value| value.checked_mul(MAX_TRANSPORT_ATTEMPTS_PER_CALL))
+            .context("planned review input exposure overflowed")?;
+        let scorer_input_per_attempt = 64_000usize.saturating_add(PLANNED_REQUEST_ENVELOPE_BYTES);
+        let scorer_input = scorer_input_per_attempt
+            .checked_mul(scorer_logical_calls)
+            .and_then(|value| value.checked_mul(MAX_TRANSPORT_ATTEMPTS_PER_CALL))
+            .context("planned scorer input exposure overflowed")?;
+        let input_bytes = review_input
+            .checked_add(scorer_input)
+            .context("planned provider input exposure overflowed")?;
+        anyhow::ensure!(
+            input_bytes <= MAX_PROVIDER_INPUT_BYTES,
+            "complete hosted review needs {input_bytes} bytes of provider input exposure, exceeding the {MAX_PROVIDER_INPUT_BYTES} byte cap"
+        );
+        let review_output = batch_count
+            .checked_mul(review_models.len())
+            .and_then(|value| value.checked_mul(MAX_LOGICAL_CALLS_PER_REVIEW_MODEL))
+            .and_then(|value| value.checked_mul(MAX_TRANSPORT_ATTEMPTS_PER_CALL))
+            .and_then(|value| value.checked_mul(REVIEW_MAX_TOKENS as usize))
+            .context("planned review output exposure overflowed")?;
+        let scorer_output_per_attempt = scorer_max_tokens(SCORER_MAX_FINDINGS)
+            .expect("maximum scorer finding count has a token bound")
+            as usize;
+        let scorer_output = scorer_logical_calls
+            .checked_mul(MAX_TRANSPORT_ATTEMPTS_PER_CALL)
+            .and_then(|value| value.checked_mul(scorer_output_per_attempt))
+            .context("planned scorer output exposure overflowed")?;
+        let output_tokens = review_output
+            .checked_add(scorer_output)
+            .context("planned provider output exposure overflowed")?;
+        anyhow::ensure!(
+            output_tokens <= MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE,
+            "complete hosted review needs {output_tokens} output tokens of exposure, exceeding the {MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE} token cap"
+        );
+        let token_exposure = input_bytes
+            .checked_add(output_tokens)
+            .context("planned token exposure overflowed")?;
+        anyhow::ensure!(
+            token_exposure <= MAX_REPORTED_TOKEN_SPEND,
+            "complete hosted review needs {token_exposure} tokens of exposure, exceeding the {MAX_REPORTED_TOKEN_SPEND} token cap"
+        );
+
+        let mut projected_cost = 0u64;
+        for model in &review_models {
+            let price = bounds
+                .get(model)
+                .ok_or_else(|| anyhow!("hosted model {model:?} has no admitted price bound"))?;
+            let one_attempt = projected_request_cost_micros(
+                largest_review_input,
+                REVIEW_MAX_TOKENS as usize,
+                price,
+            )?;
+            let model_attempts = batch_count
+                .checked_mul(MAX_LOGICAL_CALLS_PER_REVIEW_MODEL)
+                .and_then(|value| value.checked_mul(MAX_TRANSPORT_ATTEMPTS_PER_CALL))
+                .context("planned model attempt count overflowed")?;
+            projected_cost = projected_cost
+                .checked_add(
+                    one_attempt
+                        .checked_mul(model_attempts as u64)
+                        .context("planned review cost overflowed")?,
+                )
+                .context("planned review cost overflowed")?;
+        }
+        for model in &scorer_models {
+            let price = bounds
+                .get(model)
+                .ok_or_else(|| anyhow!("hosted scorer {model:?} has no admitted price bound"))?;
+            let one_attempt = projected_request_cost_micros(
+                scorer_input_per_attempt,
+                scorer_output_per_attempt,
+                price,
+            )?;
+            projected_cost = projected_cost
+                .checked_add(
+                    one_attempt
+                        .checked_mul(
+                            (MAX_LOGICAL_CALLS_PER_SCORER_MODEL * MAX_TRANSPORT_ATTEMPTS_PER_CALL)
+                                as u64,
+                        )
+                        .context("planned scorer cost overflowed")?,
+                )
+                .context("planned scorer cost overflowed")?;
+        }
+        anyhow::ensure!(
+            projected_cost <= HOSTED_OPERATION_COST_CAP_MICROS,
+            "complete hosted review projects {projected_cost} micro-dollars of provider exposure, exceeding the {HOSTED_OPERATION_COST_CAP_MICROS} micro-dollar operation cap"
+        );
+        Ok(())
+    }
+
     pub(crate) async fn doctor_probe(cfg: &Config, api_key: String) -> Result<()> {
         let client = Self::build(cfg, api_key, Duration::from_secs(30), None, None)?;
         let body = client.request_body(&cfg.model, "", "ping", 1, 0.0);
@@ -605,6 +760,7 @@ impl LlmClient {
     ) -> Result<Self> {
         let endpoint_auth = endpoint_auth_from_env(cfg.api_format)?;
         let hosted_price_bounds = if crate::config::hosted_mode() {
+            ensure_hosted_provider_contract(cfg.api_format, &cfg.api_base)?;
             let profile = crate::config::admitted_profile_for_config(cfg).ok_or_else(|| {
                 anyhow!("hosted inference has no exact admitted qualification profile")
             })?;
@@ -2096,6 +2252,14 @@ fn is_canonical_openrouter_base(api_base: &str) -> bool {
     })
 }
 
+fn ensure_hosted_provider_contract(api_format: ApiFormat, api_base: &str) -> Result<()> {
+    ensure!(
+        api_format == ApiFormat::OpenaiCompatible && is_canonical_openrouter_base(api_base),
+        "hosted inference requires the canonical OpenRouter OpenAI-compatible endpoint so admitted price and privacy ceilings are enforceable"
+    );
+    Ok(())
+}
+
 fn retry_after_duration(headers: &HeaderMap) -> Option<Duration> {
     retry_after_duration_at(headers, std::time::SystemTime::now())
 }
@@ -3008,6 +3172,58 @@ mod tests {
     }
 
     #[test]
+    fn hosted_provider_contract_requires_canonical_openrouter_openai() {
+        assert!(
+            ensure_hosted_provider_contract(
+                ApiFormat::OpenaiCompatible,
+                "https://openrouter.ai/api/v1/"
+            )
+            .is_ok()
+        );
+        assert!(
+            ensure_hosted_provider_contract(ApiFormat::Anthropic, "https://api.anthropic.com/v1")
+                .is_err()
+        );
+        assert!(
+            ensure_hosted_provider_contract(
+                ApiFormat::OpenaiCompatible,
+                "https://private.example/v1"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn hosted_review_plan_rejects_complete_work_beyond_watchdog_before_calls() {
+        let config = Config {
+            model: "provider/model".into(),
+            scorer_enabled: false,
+            ..Config::default()
+        };
+        let mut client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        client.hosted_price_bounds = Some(Arc::new(HashMap::from([(
+            "provider/model".into(),
+            ModelPriceBound {
+                model: "provider/model".into(),
+                input_micros_per_million_tokens: 1,
+                output_micros_per_million_tokens: 1,
+            },
+        )])));
+        let error = client
+            .preflight_review_plan(&config, 22, 22 * 4_096, 4_096, 2_048)
+            .unwrap_err();
+        assert!(error.to_string().contains("watchdog plan"));
+        assert_eq!(client.admission.lock().unwrap().attempts, 0);
+    }
+
+    #[test]
     fn default_timeout_profile_sets_no_setup_scorer_window_and_worker_margin() {
         let _lock = env_lock().lock().unwrap();
         let _env = EnvRestore::capture(&[REQUEST_TIMEOUT_ENV, TOTAL_TIMEOUT_ENV]);
@@ -3686,7 +3902,7 @@ mod tests {
             "provider/model".into(),
             ModelPriceBound {
                 model: "provider/model".into(),
-                input_micros_per_million_tokens: 0,
+                input_micros_per_million_tokens: 1,
                 output_micros_per_million_tokens: 100_000_000,
             },
         )])));
@@ -3700,7 +3916,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .projected_cost_exposure_micros,
-            600_000
+            600_001
         );
 
         let error = client
