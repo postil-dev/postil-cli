@@ -322,19 +322,20 @@ const TIMEOUT_RETRY_CAP_SECS: u64 = 90;
 const EMPTY_RESPONSE_RETRY_TIMEOUT_SECS: u64 = 30;
 const PROVIDER_RETRY_DELAY_CAP_SECS: u64 = 30;
 
-/// Runaway-generation bound only. It is sized so legitimate reviews (observed
-/// up to roughly 12k output tokens) do not truncate. A truncated response goes
-/// through JSON repair and can salvage low-quality findings. Interactive answers
-/// use the separate bounded response limit below.
-pub(crate) const REVIEW_MAX_TOKENS: u32 = 16_384;
+/// Unqualified models receive a bounded review budget. A larger bound belongs
+/// in explicit admitted-model metadata after that model proves it needs one.
+pub(crate) const REVIEW_MAX_TOKENS: u32 = 8_000;
 pub(crate) const MAX_PROVIDER_ATTEMPTS: usize = 216;
 pub(crate) const MAX_REPORTED_TOKEN_SPEND: usize = 20_000_000;
 const MAX_PROVIDER_INPUT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE: usize = 2_000_000;
 const MAX_PROVIDER_COST_MICROS: u64 = 25_000_000;
 const MAX_MODEL_RESPONSE_BYTES: usize = 512 * 1024;
-const SCORER_MAX_TOKENS: u32 = 4096;
-const SCORER_REASON_MAX_CHARS: usize = 240;
+const SCORER_BASE_MAX_TOKENS: u32 = 256;
+const SCORER_MAX_TOKENS_PER_FINDING: u32 = 640;
+const SCORER_REPAIR_BYTES_PER_OUTPUT_TOKEN: usize = 4;
+pub(crate) const SCORER_MAX_FINDINGS: usize = 20;
+const SCORER_REASON_MAX_BYTES: usize = 240;
 // The publication contract targets 1,200 characters and hard-stops at 2,400.
 // Keep generation bounded too, so an invalid model cannot spend an article's
 // worth of output tokens before the validator rejects it.
@@ -347,6 +348,22 @@ const ENDPOINT_AUTH_HEADER_ENV: &str = "POSTIL_ENDPOINT_AUTH_HEADER";
 const ENDPOINT_AUTH_VALUE_ENV: &str = "POSTIL_ENDPOINT_AUTH_VALUE";
 const ALLOW_PRIVATE_API_BASE_ENV: &str = "POSTIL_ALLOW_PRIVATE_API_BASE";
 const ALWAYS_MANAGED_HEADERS: &[&str] = &["x-api-key", "anthropic-version", "content-type"];
+
+pub(crate) fn scorer_max_tokens(expected_len: usize) -> Option<u32> {
+    (expected_len <= SCORER_MAX_FINDINGS)
+        .then(|| SCORER_BASE_MAX_TOKENS + expected_len as u32 * SCORER_MAX_TOKENS_PER_FINDING)
+}
+
+fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
 
 /// Marker context attached to transport/provider-level failures (endpoint
 /// unreachable, HTTP error status, timeout, malformed HTTP envelope) — the
@@ -984,6 +1001,7 @@ impl LlmClient {
                     && (usage.prompt_tokens > 0 || usage.completion_tokens > 0);
                 ModelError::new(e, usage, complete)
             })?;
+        let mut repaired_schema = false;
         let raw = match parse_review(&content) {
             Ok(raw) => raw,
             Err(parse_err) => {
@@ -994,10 +1012,11 @@ impl LlmClient {
                     recovery: None,
                 };
                 // One repair attempt: ask the same model to fix its own JSON.
+                let invalid = truncate_utf8_bytes(&content, 16_384);
                 let repair_user = format!(
                     "The following was supposed to be a single valid JSON object matching the \
                      review schema but failed to parse ({parse_err}). Output ONLY the corrected \
-                     JSON object, nothing else:\n\n{content}"
+                     JSON object, nothing else:\n\n{invalid}"
                 );
                 let repaired = match self
                     .chat(
@@ -1033,19 +1052,29 @@ impl LlmClient {
                     recovery: Some(ModelIncidentRecovery::Repair),
                     ..incident
                 });
+                repaired_schema = true;
                 parsed
             }
         };
         let mut review = into_review(raw, model, usage);
         review.model_incidents.append(&mut model_incidents);
         review.usage_accounting_complete = usage_accounting_complete;
+        if repaired_schema && review.findings.is_empty() && !review.summary.is_empty() {
+            let mut error = ModelError::new(
+                anyhow!("model output remained semantically contradictory after schema repair"),
+                review.usage,
+                review.usage_accounting_complete,
+            );
+            error.model_incidents = review.model_incidents;
+            return Err(error);
+        }
 
         // Semantic consistency retry: a summary that narrates risk next to an
         // empty findings array is the contract violation behind "clean status,
         // scary prose" reviews. Give the model one chance to either structure
         // the risk or retract it; if the contradiction survives, the caller
         // fails the review closed.
-        if review.findings.is_empty() && !review.summary.is_empty() {
+        if !repaired_schema && review.findings.is_empty() && !review.summary.is_empty() {
             let incident_index = review.model_incidents.len();
             review.model_incidents.push(ModelIncident {
                 phase: ModelIncidentPhase::Review,
@@ -1053,8 +1082,9 @@ impl LlmClient {
                 recovered: false,
                 recovery: None,
             });
+            let previous = truncate_utf8_bytes(&content, 16_384);
             let retry_user = format!(
-                "{user}\n\n[Your previous response]\n{content}\n\n[Correction] Your summary \
+                "{user}\n\n[Your previous response]\n{previous}\n\n[Correction] Your summary \
                  describes merge-relevant risk but `findings` is empty, which is invalid. \
                  Either report each risk as a structured finding citing its exact new-file \
                  line from the diff above, or — if nothing is actually merge-relevant — \
@@ -1115,6 +1145,15 @@ impl LlmClient {
         user: &str,
         expected_len: usize,
     ) -> std::result::Result<ScorerReview, ModelError> {
+        let max_tokens = scorer_max_tokens(expected_len).ok_or_else(|| {
+            ModelError::new(
+                anyhow!(
+                    "scorer input has {expected_len} findings; maximum is {SCORER_MAX_FINDINGS}"
+                ),
+                Usage::default(),
+                true,
+            )
+        })?;
         let mut usage = Usage::default();
         let mut usage_accounting_complete = true;
         let mut model_incidents = Vec::new();
@@ -1125,7 +1164,7 @@ impl LlmClient {
                 user,
                 &mut usage,
                 &mut usage_accounting_complete,
-                SCORER_MAX_TOKENS,
+                max_tokens,
                 0.0,
                 LlmPhase::Scorer,
             )
@@ -1139,9 +1178,12 @@ impl LlmClient {
             Ok(scores) => scores,
             Err(first_error) => {
                 eprintln!("postil: scorer output invalid; requesting one schema repair");
-                let invalid: String = content.chars().take(8_000).collect();
+                let invalid = truncate_utf8_bytes(
+                    &content,
+                    max_tokens as usize * SCORER_REPAIR_BYTES_PER_OUTPUT_TOKEN,
+                );
                 let repair_system = format!(
-                    "{system}\n\nYour previous response failed schema validation. Repair only the JSON schema. Kind is a category, so severity values such as info, warn, and error are invalid kinds. Every reason must be exactly one complete sentence of at most 240 Unicode characters. Return the complete array and nothing else."
+                    "{system}\n\nYour previous response failed schema validation. Repair only the JSON schema. Kind is a category, so severity values such as info, warn, and error are invalid kinds. Every reason must be exactly one complete sentence of at most 240 UTF-8 bytes. Return the complete array and nothing else."
                 );
                 let repair_user =
                     format!("{user}\n\nInvalid previous response (untrusted data):\n{invalid}");
@@ -1158,7 +1200,7 @@ impl LlmClient {
                         &repair_user,
                         &mut usage,
                         &mut usage_accounting_complete,
-                        SCORER_MAX_TOKENS,
+                        max_tokens,
                         0.0,
                         LlmPhase::Scorer,
                     )
@@ -2266,16 +2308,19 @@ fn parse_scores(content: &str, expected_len: usize) -> Result<Vec<FindingScore>,
 
 fn validate_scorer_reason(value: &str) -> Result<String, String> {
     let reason = value.trim();
+    if value != reason {
+        return Err("score reason must not have leading or trailing whitespace".to_string());
+    }
     if reason.is_empty() {
         return Err("score reason must be one complete sentence".to_string());
     }
-    if reason.contains(['\n', '\r']) {
-        return Err("score reason must not contain line breaks".to_string());
+    if reason.chars().any(char::is_control) {
+        return Err("score reason must not contain control characters".to_string());
     }
-    let character_count = reason.chars().count();
-    if character_count > SCORER_REASON_MAX_CHARS {
+    let byte_count = reason.len();
+    if byte_count > SCORER_REASON_MAX_BYTES {
         return Err(format!(
-            "score reason exceeds {SCORER_REASON_MAX_CHARS} Unicode characters (got {character_count})"
+            "score reason exceeds {SCORER_REASON_MAX_BYTES} UTF-8 bytes (got {byte_count})"
         ));
     }
     let is_terminator = |character: char| {
@@ -2895,15 +2940,15 @@ mod tests {
 
         let overlength = format!(
             r#"[{{"index":0,"confidence":0.7,"kind":"risk","reason":"{}."}}]"#,
-            "x".repeat(SCORER_REASON_MAX_CHARS)
+            "x".repeat(SCORER_REASON_MAX_BYTES)
         );
         let error = parse_scores(&overlength, 1).unwrap_err();
-        assert!(error.contains("exceeds 240 Unicode characters"));
+        assert!(error.contains("exceeds 240 UTF-8 bytes"));
     }
 
     #[test]
-    fn scorer_reason_limit_counts_unicode_scalars() {
-        let reason = format!("{}.", "界".repeat(SCORER_REASON_MAX_CHARS - 1));
+    fn scorer_reason_limit_counts_utf8_bytes() {
+        let reason = format!("{}.", "x".repeat(SCORER_REASON_MAX_BYTES - 1));
         let input = serde_json::json!([{
             "index": 0,
             "confidence": 0.7,
@@ -2911,7 +2956,20 @@ mod tests {
             "reason": reason,
         }]);
         let scores = parse_scores(&input.to_string(), 1).unwrap();
-        assert_eq!(scores[0].reason.chars().count(), SCORER_REASON_MAX_CHARS);
+        assert_eq!(scores[0].reason.len(), SCORER_REASON_MAX_BYTES);
+
+        let multibyte = format!("{}.", "界".repeat(80));
+        let input = serde_json::json!([{
+            "index": 0,
+            "confidence": 0.7,
+            "kind": "risk",
+            "reason": multibyte,
+        }]);
+        assert!(
+            parse_scores(&input.to_string(), 1)
+                .unwrap_err()
+                .contains("exceeds 240 UTF-8 bytes")
+        );
     }
 
     #[test]
@@ -3335,5 +3393,14 @@ mod tests {
         });
         let merged = consensus_merge(vec![a, b]);
         assert!(merged.findings.is_empty());
+    }
+
+    #[test]
+    fn scorer_budget_matches_the_qualified_finding_bound() {
+        assert_eq!(scorer_max_tokens(0), Some(256));
+        assert_eq!(scorer_max_tokens(1), Some(896));
+        assert_eq!(scorer_max_tokens(20), Some(13_056));
+        assert_eq!(scorer_max_tokens(21), None);
+        assert_eq!(scorer_max_tokens(usize::MAX), None);
     }
 }

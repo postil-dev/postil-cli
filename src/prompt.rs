@@ -158,7 +158,7 @@ pub fn scorer_system_prompt(cfg: &Config) -> String {
          exactly one object per supplied finding:\n\
          [{\"index\": <number>, \"confidence\": <0..1>, \
          \"kind\": \"risk|humanEscalation|guardrail|uncertainty|contentPolicy\", \
-         \"reason\": \"one complete sentence of at most 240 Unicode characters\"}]\n\
+         \"reason\": \"one complete sentence of at most 240 UTF-8 bytes\"}]\n\
          \n\
          The `kind` value is a finding category. `info`, `warn`, and `error` are \
          severities and are NEVER valid kind values. An ordinary concrete defect is \
@@ -166,7 +166,7 @@ pub fn scorer_system_prompt(cfg: &Config) -> String {
          `humanEscalation` only when multiple valid outcomes remain and an accountable \
          owner must choose among them. Every `reason` must be exactly one complete \
          sentence, end with sentence punctuation, contain no line breaks, and contain \
-         at most 240 Unicode characters.\n\
+         at most 240 UTF-8 bytes.\n\
          \n\
          The input intentionally omits the generator's original confidence and kind. Do \
          not infer them from absence; score independently from the finding text and local \

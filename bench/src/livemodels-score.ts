@@ -361,7 +361,11 @@ export function calculateTotalRunCostUsd(results: LiveModelCaseResult[]): number
 
 /** Minimal shape of GET /api/v1/models we depend on. */
 export interface OpenRouterModelsResponse {
-  data: Array<{ id: string; pricing?: { prompt?: string; completion?: string } }>;
+  data: Array<{
+    id: string;
+    canonical_slug?: string;
+    pricing?: { prompt?: string; completion?: string };
+  }>;
 }
 
 /**
@@ -376,11 +380,12 @@ export function pricingFromCatalog(
   const wanted = new Set(wantedModels);
   const out = new Map<string, ModelPricing>();
   for (const m of catalog.data ?? []) {
-    if (!wanted.has(m.id)) continue;
+    const matched = [m.id, m.canonical_slug].find((id): id is string => id !== undefined && wanted.has(id));
+    if (!matched) continue;
     const prompt = Number.parseFloat(m.pricing?.prompt ?? "");
     const completion = Number.parseFloat(m.pricing?.completion ?? "");
     if (!Number.isFinite(prompt) || !Number.isFinite(completion)) continue;
-    out.set(m.id, { promptUsdPerToken: prompt, completionUsdPerToken: completion });
+    out.set(matched, { promptUsdPerToken: prompt, completionUsdPerToken: completion });
   }
   return out;
 }
@@ -389,22 +394,15 @@ export function pricingFromCatalog(
  * prompt is dominated by the diff plus a fixed system-prompt overhead, and the
  * completion is bounded by a conservative cap. Deliberately an over-estimate so
  * the projected cost is an upper bound, never an under-count. */
-export const GUARDRAIL_SYSTEM_PROMPT_TOKENS = 1500;
-export const GUARDRAIL_COMPLETION_TOKENS = 16_384;
+export const GUARDRAIL_FIXED_PROMPT_BYTES = 8_200;
+export const GUARDRAIL_COMPLETION_TOKENS = 8_000;
 export const GUARDRAIL_REPAIR_INPUT_TOKENS = 16_384;
-export const GUARDRAIL_PROVIDER_ATTEMPTS_PER_PHASE = 3;
-export const GUARDRAIL_GENERATION_PHASES_PER_CASE = 3;
-export const GUARDRAIL_MAX_PROVIDER_REQUESTS_PER_CASE =
-  GUARDRAIL_PROVIDER_ATTEMPTS_PER_PHASE * GUARDRAIL_GENERATION_PHASES_PER_CASE;
+export const GUARDRAIL_TRANSPORT_ATTEMPTS_PER_PHASE = 3;
 export const MAX_GENERATOR_COST_CAP_USD = 25;
 export const MAX_GENERATOR_CANDIDATES = 6;
 
-/** Chars-per-token divisor for the crude diff-size estimate (English/code text
- * averages ~4 chars/token; 3 is used to over-estimate). */
-const GUARDRAIL_CHARS_PER_TOKEN = 3;
-
 export function estimateCasePromptTokens(diff: string): number {
-  return GUARDRAIL_SYSTEM_PROMPT_TOKENS + Math.ceil(diff.length / GUARDRAIL_CHARS_PER_TOKEN);
+  return GUARDRAIL_FIXED_PROMPT_BYTES + Buffer.byteLength(diff, "utf8");
 }
 
 /**
@@ -424,10 +422,13 @@ export function projectTotalCostUsd(args: {
     if (!price) continue;
     for (const diff of args.diffs) {
       const promptTokens = estimateCasePromptTokens(diff);
-      total +=
-        GUARDRAIL_MAX_PROVIDER_REQUESTS_PER_CASE *
-        ((promptTokens + GUARDRAIL_REPAIR_INPUT_TOKENS) * price.promptUsdPerToken +
-          GUARDRAIL_COMPLETION_TOKENS * price.completionUsdPerToken);
+      const initialAttempt =
+        promptTokens * price.promptUsdPerToken +
+        GUARDRAIL_COMPLETION_TOKENS * price.completionUsdPerToken;
+      const repairAttempt =
+        (promptTokens + GUARDRAIL_REPAIR_INPUT_TOKENS) * price.promptUsdPerToken +
+        GUARDRAIL_COMPLETION_TOKENS * price.completionUsdPerToken;
+      total += GUARDRAIL_TRANSPORT_ATTEMPTS_PER_PHASE * (initialAttempt + repairAttempt);
     }
   }
   return total;

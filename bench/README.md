@@ -58,18 +58,18 @@ nonzero unless every candidate completes the full isolated matrix with no
 execution or pipeline-fidelity failures, at least 90% seeded-defect detection,
 no more than 5% false findings per completed case, correct gate verdicts, known
 pricing, mean cost at or below $0.01, and mean latency at or below 15 seconds.
-The embedded roster remains the last qualified production chain until an
-isolated candidate report passes and the roster is updated separately.
+The production roster remains empty until an isolated candidate report passes
+and the admission manifest is updated separately.
 The generator cost guard rejects more than six candidates or a configured cap
-above $25. Its projection prices nine provider requests per fixture, covering
-three transport attempts each for initial generation, JSON repair, and
-semantic-consistency repair. Every request includes the 16,384-token review
-completion ceiling plus another 16,384 input tokens for repair context.
+above $25. Its projection prices the runtime retry graph: three transport
+attempts for the initial request and three for at most one schema-repair or
+semantic-retry request. Unqualified models receive an 8,000-token completion
+bound, and corrective context is limited to 16,384 UTF-8 bytes.
 
 ```sh
 export MODEL_API_KEY=...          # or LLM_API_KEY / OPENROUTER_API_KEY; never logged or printed
 export POSTIL_BENCH_MODE=live
-export POSTIL_BENCH_MODELS=z-ai/glm-5.2,moonshotai/kimi-k2.7-code,deepseek/deepseek-v4-flash,google/gemini-3.5-flash,stepfun/step-3.7-flash
+export POSTIL_BENCH_MODELS=provider/candidate-a,provider/candidate-b
 bun run bench --json-out report.json   # or: bun run bench:live-models
 # POSTIL_API_BASE overrides the endpoint (default https://openrouter.ai/api/v1)
 # --concurrency <n> or BENCH_CONCURRENCY sets case parallelism (default 4)
@@ -171,13 +171,16 @@ catalog pricing, and mean scorer cost at or below $0.005 per case. A failed
 candidate makes the command exit nonzero after writing its report. Candidate
 listing alone never enables the embedded scorer. Before any model call, the
 evaluator rejects more than six candidates, more than ten repeats, missing
-prices, or a conservative projected total above $10. The projection prices six
-provider requests per case, covering three transport attempts plus schema
-repair, with 20,000 base input tokens, another 4,096 repair-context input
-tokens, and the 4,096-token output ceiling on every request. Scorer responses also fail
+prices, or a conservative projected total above $10. The projection prices the
+runtime retry graph: three transport attempts for the initial request and three
+for at most one schema-repair request. A one-finding qualification request uses
+a 17,000-byte prompt bound, an 896-token output bound, and at most 3,584 bytes
+of repair context. Scorer responses also fail
 admission when provider usage is missing or malformed, runtime accounting is
 incomplete, or the assessment is not a trimmed, single-line sentence of at most
-240 Unicode characters ending in sentence punctuation.
+240 UTF-8 bytes ending in sentence punctuation. Scorer output is bounded from
+the supplied finding count, up to the supported maximum of 20 findings, and
+schema-repair context is byte-bounded from the same output limit.
 
 ## Diff-file live mode (opt-in, single model, no forge)
 

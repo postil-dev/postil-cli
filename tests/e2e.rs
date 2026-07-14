@@ -235,7 +235,7 @@ async fn native_anthropic_review_uses_messages_shape_auth_and_usage() {
     assert!(body["system"].as_str().is_some());
     assert_eq!(body["messages"].as_array().unwrap().len(), 1);
     assert_eq!(body["messages"][0]["role"], "user");
-    assert_eq!(body["max_tokens"], 16_384);
+    assert_eq!(body["max_tokens"], 8_000);
     assert!(body.get("choices").is_none());
 }
 
@@ -1566,8 +1566,18 @@ async fn local_review_reports_grounded_finding_and_gates() {
 
     let requests = server.received_requests().await.unwrap();
     let request: Value = requests[0].body_json().unwrap();
-    assert_eq!(request["max_tokens"], 16_384);
+    assert_eq!(request["max_tokens"], 8_000);
     assert_eq!(request["messages"].as_array().unwrap().len(), 2);
+    let prompt_bytes = request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|message| message["content"].as_str().unwrap().len())
+        .sum::<usize>();
+    assert!(
+        prompt_bytes <= 8_200 + DIFF.len(),
+        "qualification prompt bound is too small: {prompt_bytes} bytes"
+    );
 }
 
 #[tokio::test]
@@ -1692,6 +1702,17 @@ async fn scorer_lowers_confidence_and_stores_both_values() {
         .find(|body| body["model"] == "anthropic/claude-haiku-4.5")
         .unwrap();
     assert_eq!(scorer_request["temperature"], 0.0);
+    assert_eq!(scorer_request["max_tokens"], 896);
+    let scorer_prompt_bytes = scorer_request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|message| message["content"].as_str().unwrap().len())
+        .sum::<usize>();
+    assert!(
+        scorer_prompt_bytes <= 17_000,
+        "qualification scorer prompt bound is too small: {scorer_prompt_bytes} bytes"
+    );
     let scorer_user = scorer_request["messages"][1]["content"].as_str().unwrap();
     assert!(!scorer_user.contains("0.92"));
     assert!(!scorer_user.contains("\"kind\": \"risk\""));
@@ -2813,6 +2834,40 @@ async fn narrated_risk_without_findings_fails_closed() {
             .unwrap()
             .contains("SQL injection risk in auth path.")
     );
+}
+
+#[tokio::test]
+async fn schema_repair_contradiction_fails_without_a_third_model_call() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_text("not json")))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_contradictory()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "test-model")
+        .env("REVIEW_MODEL_CASCADE", "test-model")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .code(1);
+    let env: Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+    assert_eq!(env["gate"]["failing"], true);
+    assert_eq!(env["findings"][0]["path"], ".postil/model-output");
 }
 
 #[tokio::test]

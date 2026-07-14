@@ -313,7 +313,11 @@ describe("qualification utilities", () => {
     expect(isValidReason("One short reason.")).toBe(true);
     expect(isValidReason(" leading")).toBe(false);
     expect(isValidReason("two\nlines")).toBe(false);
+    expect(isValidReason("two\tparts.")).toBe(false);
+    expect(isValidReason("embedded\0byte.")).toBe(false);
     expect(isValidReason("x".repeat(241))).toBe(false);
+    expect(isValidReason(`${"é".repeat(120)}.`)).toBe(false);
+    expect(isValidReason(`${"a".repeat(239)}.`)).toBe(true);
     expect(isValidReason("Missing terminal punctuation")).toBe(false);
     expect(isValidReason("Unicode conclusion…")).toBe(true);
     expect(isValidReason("First sentence. Second sentence.")).toBe(false);
@@ -325,8 +329,8 @@ describe("qualification utilities", () => {
     const cheap = new Map([
       ["a/model", { promptUsdPerToken: 0.0000001, completionUsdPerToken: 0.0000002 }],
     ]);
-    expect(projectedQualificationSpendUsd(["a/model"], 5, cheap)).toBeCloseTo(1.162368, 6);
-    expect(assertQualificationPreflight(["a/model"], 5, cheap)).toBeCloseTo(1.162368, 6);
+    expect(projectedQualificationSpendUsd(["a/model"], 5, cheap)).toBeCloseTo(0.741024, 6);
+    expect(assertQualificationPreflight(["a/model"], 5, cheap)).toBeCloseTo(0.741024, 6);
     expect(() => assertQualificationPreflight(["missing/model"], 5, cheap)).toThrow("pricing missing");
     expect(() =>
       assertQualificationPreflight(

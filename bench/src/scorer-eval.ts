@@ -26,7 +26,7 @@ const execFile = promisify(execFileCb);
 export const GENERATOR_MODEL = "postil-scorer-eval/generator";
 const DEFAULT_API_BASE = "https://openrouter.ai/api/v1";
 export const DEFAULT_QUALIFICATION_REPEATS = 5;
-export const SCORER_REASON_MAX_CHARS = 240;
+export const SCORER_REASON_MAX_BYTES = 240;
 export const SCORER_MAX_P50_MS = 5_000;
 export const SCORER_MAX_P95_MS = 10_000;
 export const SCORER_MAX_CASE_MS = 20_000;
@@ -34,10 +34,10 @@ export const SCORER_MAX_MEAN_COST_USD = 0.005;
 export const SCORER_MIN_FALSE_DOWNSCORE_RATE = 0.8;
 export const SCORER_MAX_CANDIDATES = 6;
 export const SCORER_MAX_PROJECTED_SPEND_USD = 10;
-export const SCORER_PREFLIGHT_PROMPT_TOKENS_PER_CASE = 20_000;
-export const SCORER_PREFLIGHT_COMPLETION_TOKENS_PER_ATTEMPT = 4_096;
-export const SCORER_PREFLIGHT_REPAIR_INPUT_TOKENS_PER_ATTEMPT = 4_096;
-export const SCORER_PREFLIGHT_MAX_REQUESTS_PER_CASE = 6;
+export const SCORER_PREFLIGHT_PROMPT_BYTES_PER_CASE = 17_000;
+export const SCORER_PREFLIGHT_COMPLETION_TOKENS_PER_ATTEMPT = 896;
+export const SCORER_PREFLIGHT_REPAIR_INPUT_BYTES_PER_ATTEMPT = 3_584;
+export const SCORER_PREFLIGHT_TRANSPORT_ATTEMPTS_PER_PHASE = 3;
 
 export const TRUE_FINDING_CASES = [
   "billing-double-charge",
@@ -503,7 +503,8 @@ export function isValidReason(reason: string | null): boolean {
   return (
     !reason.includes("\n") &&
     !reason.includes("\r") &&
-    [...reason].length <= SCORER_REASON_MAX_CHARS &&
+    !/\p{Cc}/u.test(reason) &&
+    Buffer.byteLength(reason, "utf8") <= SCORER_REASON_MAX_BYTES &&
     /[.!?…]$/u.test(reason) &&
     !/[.!?…]\s+\S/u.test(withoutAbbreviations)
   );
@@ -528,13 +529,15 @@ export function projectedQualificationSpendUsd(
   return models.reduce((total, model) => {
     const price = pricing.get(model);
     if (!price) return Number.POSITIVE_INFINITY;
-    return (
-      total +
-      callsPerModel * SCORER_PREFLIGHT_MAX_REQUESTS_PER_CASE *
-        ((SCORER_PREFLIGHT_PROMPT_TOKENS_PER_CASE + SCORER_PREFLIGHT_REPAIR_INPUT_TOKENS_PER_ATTEMPT) *
-          price.promptUsdPerToken +
-          SCORER_PREFLIGHT_COMPLETION_TOKENS_PER_ATTEMPT * price.completionUsdPerToken)
-    );
+    const initialAttempt =
+      SCORER_PREFLIGHT_PROMPT_BYTES_PER_CASE * price.promptUsdPerToken +
+      SCORER_PREFLIGHT_COMPLETION_TOKENS_PER_ATTEMPT * price.completionUsdPerToken;
+    const repairAttempt =
+      (SCORER_PREFLIGHT_PROMPT_BYTES_PER_CASE + SCORER_PREFLIGHT_REPAIR_INPUT_BYTES_PER_ATTEMPT) *
+        price.promptUsdPerToken +
+      SCORER_PREFLIGHT_COMPLETION_TOKENS_PER_ATTEMPT * price.completionUsdPerToken;
+    return total + callsPerModel * SCORER_PREFLIGHT_TRANSPORT_ATTEMPTS_PER_PHASE *
+      (initialAttempt + repairAttempt);
   }, 0);
 }
 

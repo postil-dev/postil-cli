@@ -7,11 +7,9 @@ import {
   estimateCasePromptTokens,
   findingHitsSeededRegion,
   GUARDRAIL_COMPLETION_TOKENS,
-  GUARDRAIL_GENERATION_PHASES_PER_CASE,
-  GUARDRAIL_MAX_PROVIDER_REQUESTS_PER_CASE,
-  GUARDRAIL_PROVIDER_ATTEMPTS_PER_PHASE,
+  GUARDRAIL_FIXED_PROMPT_BYTES,
   GUARDRAIL_REPAIR_INPUT_TOKENS,
-  GUARDRAIL_SYSTEM_PROMPT_TOKENS,
+  GUARDRAIL_TRANSPORT_ATTEMPTS_PER_PHASE,
   groundTruthOf,
   LINE_TOLERANCE,
   pricingFromCatalog,
@@ -440,7 +438,7 @@ describe("pricingFromCatalog", () => {
   const catalog = {
     data: [
       { id: "a/model", pricing: { prompt: "0.000001", completion: "0.000002" } },
-      { id: "b/model", pricing: { prompt: "0", completion: "0" } },
+      { id: "b/model", canonical_slug: "b/model-20260709", pricing: { prompt: "0", completion: "0" } },
       { id: "c/model", pricing: { prompt: "", completion: "x" } },
       { id: "d/unwanted", pricing: { prompt: "0.5", completion: "0.5" } },
     ],
@@ -453,21 +451,21 @@ describe("pricingFromCatalog", () => {
     expect(p.has("c/model")).toBe(false); // unparseable
     expect(p.has("d/unwanted")).toBe(false); // not requested
   });
+
+  test("matches the immutable canonical slug", () => {
+    const p = pricingFromCatalog(catalog, ["b/model-20260709"]);
+    expect(p.get("b/model-20260709")).toEqual({ promptUsdPerToken: 0, completionUsdPerToken: 0 });
+  });
 });
 
 // ---------------------------------------------------------------------------
 // Cost guardrail projection
 
 describe("projectTotalCostUsd", () => {
-  test("covers initial generation, JSON repair, and semantic repair with three attempts each", () => {
-    expect(GUARDRAIL_GENERATION_PHASES_PER_CASE).toBe(3);
-    expect(GUARDRAIL_PROVIDER_ATTEMPTS_PER_PHASE).toBe(3);
-    expect(GUARDRAIL_MAX_PROVIDER_REQUESTS_PER_CASE).toBe(9);
-  });
-
-  test("estimate is a fixed overhead plus diff length over the divisor", () => {
-    expect(estimateCasePromptTokens("")).toBe(GUARDRAIL_SYSTEM_PROMPT_TOKENS);
-    expect(estimateCasePromptTokens("a".repeat(30))).toBe(GUARDRAIL_SYSTEM_PROMPT_TOKENS + 10);
+  test("estimate is a fixed overhead plus UTF-8 diff bytes", () => {
+    expect(estimateCasePromptTokens("")).toBe(GUARDRAIL_FIXED_PROMPT_BYTES);
+    expect(estimateCasePromptTokens("a".repeat(30))).toBe(GUARDRAIL_FIXED_PROMPT_BYTES + 30);
+    expect(estimateCasePromptTokens("🛰️")).toBe(GUARDRAIL_FIXED_PROMPT_BYTES + Buffer.byteLength("🛰️"));
   });
 
   test("projects prompt+completion cost across every case-model pair", () => {
@@ -482,10 +480,12 @@ describe("projectTotalCostUsd", () => {
     for (const model of models) {
       const price = p.get(model)!;
       for (const diff of diffs) {
-        expected +=
-          GUARDRAIL_MAX_PROVIDER_REQUESTS_PER_CASE *
-          ((estimateCasePromptTokens(diff) + GUARDRAIL_REPAIR_INPUT_TOKENS) * price.promptUsdPerToken +
-            GUARDRAIL_COMPLETION_TOKENS * price.completionUsdPerToken);
+        const promptTokens = estimateCasePromptTokens(diff);
+        const initial = promptTokens * price.promptUsdPerToken +
+          GUARDRAIL_COMPLETION_TOKENS * price.completionUsdPerToken;
+        const repair = (promptTokens + GUARDRAIL_REPAIR_INPUT_TOKENS) * price.promptUsdPerToken +
+          GUARDRAIL_COMPLETION_TOKENS * price.completionUsdPerToken;
+        expected += GUARDRAIL_TRANSPORT_ATTEMPTS_PER_PHASE * (initial + repair);
       }
     }
     expect(total).toBeCloseTo(expected, 12);
