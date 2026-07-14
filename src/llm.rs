@@ -459,14 +459,14 @@ impl PlannedExposure {
     fn add_request(
         &mut self,
         serialized_bytes: usize,
-        output_tokens: usize,
+        request_output_tokens: usize,
         price: &ModelPriceBound,
     ) -> Result<()> {
-        self.attempts = self
+        let attempts = self
             .attempts
             .checked_add(MAX_TRANSPORT_ATTEMPTS_PER_CALL)
             .context("planned provider attempt count overflowed")?;
-        self.input_bytes = self
+        let input_bytes = self
             .input_bytes
             .checked_add(
                 serialized_bytes
@@ -474,28 +474,35 @@ impl PlannedExposure {
                     .context("planned provider input exposure overflowed")?,
             )
             .context("planned provider input exposure overflowed")?;
-        self.output_tokens = self
+        let output_tokens = self
             .output_tokens
             .checked_add(
-                output_tokens
+                request_output_tokens
                     .checked_mul(MAX_TRANSPORT_ATTEMPTS_PER_CALL)
                     .context("planned provider output exposure overflowed")?,
             )
             .context("planned provider output exposure overflowed")?;
-        let request_cost = projected_request_cost_micros(serialized_bytes, output_tokens, price)?
-            .checked_mul(MAX_TRANSPORT_ATTEMPTS_PER_CALL as u64)
-            .context("planned provider cost exposure overflowed")?;
-        self.projected_cost_micros = self
+        let request_cost =
+            projected_request_cost_micros(serialized_bytes, request_output_tokens, price)?
+                .checked_mul(MAX_TRANSPORT_ATTEMPTS_PER_CALL as u64)
+                .context("planned provider cost exposure overflowed")?;
+        let projected_cost_micros = self
             .projected_cost_micros
             .checked_add(request_cost)
             .context("planned provider cost exposure overflowed")?;
-        let model_cost = self
+        let model_cost_micros = self
             .model_costs_micros
-            .entry(price.model.clone())
-            .or_default();
-        *model_cost = model_cost
+            .get(&price.model)
+            .copied()
+            .unwrap_or_default()
             .checked_add(request_cost)
             .context("planned model cost exposure overflowed")?;
+        self.attempts = attempts;
+        self.input_bytes = input_bytes;
+        self.output_tokens = output_tokens;
+        self.projected_cost_micros = projected_cost_micros;
+        self.model_costs_micros
+            .insert(price.model.clone(), model_cost_micros);
         Ok(())
     }
 }
@@ -747,7 +754,7 @@ impl LlmClient {
         let model_costs = exposure
             .model_costs_micros
             .iter()
-            .map(|(model, cost)| format!("{model}={cost}"))
+            .map(|(model, cost)| format!("{:?}={cost}", log_text(model)))
             .collect::<Vec<_>>()
             .join(", ");
         ensure!(
@@ -4000,7 +4007,67 @@ mod tests {
         assert!(message.contains("provider exposure across 6 attempts"));
         assert!(message.contains("12345 serialized input bytes"));
         assert!(message.contains("678 output tokens"));
-        assert!(message.contains("provider/model=1000001"));
+        assert!(message.contains(r#""provider/model"=1000001"#));
+    }
+
+    #[test]
+    fn planned_exposure_aggregates_atomic_per_model_transport_costs() {
+        let first = ModelPriceBound {
+            model: "provider/first".to_string(),
+            input_micros_per_million_tokens: 1_000_000,
+            output_micros_per_million_tokens: 2_000_000,
+        };
+        let second = ModelPriceBound {
+            model: "provider/second\u{1b}[2J,=value".to_string(),
+            input_micros_per_million_tokens: 2_000_000,
+            output_micros_per_million_tokens: 3_000_000,
+        };
+        let mut exposure = PlannedExposure::default();
+        exposure.add_request(100, 10, &first).unwrap();
+        exposure.add_request(100, 10, &first).unwrap();
+        exposure.add_request(50, 4, &second).unwrap();
+
+        assert_eq!(exposure.attempts, 9);
+        assert_eq!(exposure.input_bytes, 750);
+        assert_eq!(exposure.output_tokens, 72);
+        assert_eq!(exposure.model_costs_micros["provider/first"], 720);
+        assert_eq!(exposure.model_costs_micros[&second.model], 336);
+        assert_eq!(
+            exposure.model_costs_micros.values().sum::<u64>(),
+            exposure.projected_cost_micros
+        );
+        assert_eq!(exposure.projected_cost_micros, 1_056);
+
+        exposure.projected_cost_micros = HOSTED_OPERATION_COST_CAP_MICROS + 1;
+        let error = LlmClient::build(
+            &Config::default(),
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap()
+        .validate_hosted_exposure("review", &exposure)
+        .unwrap_err()
+        .to_string();
+        assert!(!error.contains('\u{1b}'));
+        assert!(error.contains(r#""provider/second\\u{1b}[2J,=value"=336"#));
+
+        let mut overflow = PlannedExposure::default();
+        overflow
+            .model_costs_micros
+            .insert(first.model.clone(), u64::MAX);
+        let error = overflow.add_request(1, 1, &first).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("planned model cost exposure overflowed")
+        );
+        assert_eq!(overflow.attempts, 0);
+        assert_eq!(overflow.input_bytes, 0);
+        assert_eq!(overflow.output_tokens, 0);
+        assert_eq!(overflow.projected_cost_micros, 0);
+        assert_eq!(overflow.model_costs_micros[&first.model], u64::MAX);
     }
 
     #[test]
