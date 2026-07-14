@@ -699,11 +699,14 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
             .map(|model| conservative_context_tokens(model))
             .min()
             .unwrap_or(32_000);
-        let shared_context_tokens =
+        // Serialized UTF-8 bytes conservatively upper-bound the corresponding
+        // input token count. This intentionally under-fills the model context
+        // rather than relying on a provider-specific tokenizer.
+        let shared_context_token_upper_bound =
             system.len() + meta.map_or(0, |value| value.title.len() + value.body.len()) + 4096;
         let batch_budget = context_tokens
             .saturating_sub(crate::llm::REVIEW_MAX_TOKENS as usize)
-            .saturating_sub(shared_context_tokens)
+            .saturating_sub(shared_context_token_upper_bound)
             .min(MAX_REVIEW_BATCH_BYTES);
         let mut plan = if prepared.incomplete || batch_budget < 4_096 {
             diff::ReviewBatchPlan {
@@ -726,10 +729,11 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
         let request_count = plan.batches.len() + usize::from(plan.synthesis.is_some());
         let projected_input_bytes = plan
             .projected_input_bytes
-            .saturating_add(shared_context_tokens.saturating_mul(request_count));
-        // One UTF-8 byte per token is deliberately pessimistic across BPE
-        // tokenizers and avoids the unsafe bytes/4 approximation.
-        let projected_input_tokens = projected_input_bytes;
+            .saturating_add(shared_context_token_upper_bound.saturating_mul(request_count));
+        // One serialized UTF-8 byte per possible input token is deliberately
+        // pessimistic across provider tokenizers and avoids the unsafe bytes/4
+        // approximation. The byte projection remains separate for byte caps.
+        let projected_input_token_upper_bound = projected_input_bytes;
         let attempts_per_request =
             active_model_count.saturating_mul((crate::llm::TRANSIENT_RETRIES as usize + 1) * 2);
         let scorer_attempts = usize::from(cfg.scorer_enabled())
@@ -738,7 +742,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
         let projected_attempts = request_count
             .saturating_mul(attempts_per_request)
             .saturating_add(scorer_attempts);
-        let review_exposure = projected_input_tokens
+        let review_exposure = projected_input_token_upper_bound
             .saturating_add(request_count.saturating_mul(crate::llm::REVIEW_MAX_TOKENS as usize))
             .saturating_mul(attempts_per_request);
         let scorer_exposure =
@@ -748,13 +752,13 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
             || request_count > MAX_REVIEW_REQUESTS
             || active_model_count == 0
             || active_model_count > MAX_MODELS_PER_REQUEST
-            || projected_input_tokens > MAX_REVIEW_PROJECTED_INPUT_TOKENS
+            || projected_input_token_upper_bound > MAX_REVIEW_PROJECTED_INPUT_TOKENS
             || projected_attempts > crate::llm::MAX_PROVIDER_ATTEMPTS
             || projected_token_exposure > crate::llm::MAX_REPORTED_TOKEN_SPEND;
 
         if budget_exhausted {
             eprintln!(
-                "postil: review incomplete before model calls (requests {request_count}/{MAX_REVIEW_REQUESTS}, models {active_model_count}/{MAX_MODELS_PER_REQUEST}, projected input <= {projected_input_tokens} tokens, attempts {projected_attempts}/{}, token exposure {projected_token_exposure}/{})",
+                "postil: review incomplete before model calls (requests {request_count}/{MAX_REVIEW_REQUESTS}, models {active_model_count}/{MAX_MODELS_PER_REQUEST}, projected input <= {projected_input_token_upper_bound} tokens, attempts {projected_attempts}/{}, token exposure {projected_token_exposure}/{})",
                 crate::llm::MAX_PROVIDER_ATTEMPTS,
                 crate::llm::MAX_REPORTED_TOKEN_SPEND,
             );

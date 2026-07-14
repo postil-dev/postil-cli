@@ -439,6 +439,12 @@ fn prompt_header_path(header: &str) -> &str {
     header
 }
 
+fn prompt_paths_equal(left: &str, right: &str) -> bool {
+    canonical_prompt_path(left)
+        .zip(canonical_prompt_path(right))
+        .is_some_and(|(left, right)| left == right)
+}
+
 fn lockfile_evidence(path: &str, section: &str) -> Option<LockfileEvidence> {
     if section.len() > MAX_LOCKFILE_SECTION_BYTES {
         return None;
@@ -1407,7 +1413,7 @@ fn review_batch_segments(annotated: &str, path: &str, line: u32) -> Vec<usize> {
             segment = segment.saturating_add(1);
             continue;
         }
-        if current_path != Some(path) {
+        if !current_path.is_some_and(|current| prompt_paths_equal(current, path)) {
             continue;
         }
         let Some((number, _)) = rendered.trim_start().split_once(' ') else {
@@ -1444,10 +1450,10 @@ pub fn render_review_batch_context(
     let mut target = None;
     for (index, rendered) in lines.iter().enumerate() {
         if let Some(header) = rendered.strip_prefix("### ") {
-            current_path = Some(header.split(" (").next().unwrap_or(header).trim());
+            current_path = Some(prompt_header_path(header));
             continue;
         }
-        if current_path != Some(path) {
+        if !current_path.is_some_and(|current| prompt_paths_equal(current, path)) {
             continue;
         }
         let Some((number, _)) = rendered.trim_start().split_once(' ') else {
@@ -1632,7 +1638,7 @@ Binary files a/img.png and b/img.png differ
 
     #[test]
     fn prompt_path_spelling_is_reversible_and_groundable() {
-        let canonical = " src/tab\tline\rbreak\nquote\"slash\\日.rs ";
+        let canonical = " src/odd (name)\ttab\rbreak\nquote\"slash\\日.rs ";
         let displayed = display_path(canonical);
         assert!(!displayed.contains('\t'));
         assert!(!displayed.contains('\r'));
@@ -1644,6 +1650,8 @@ Binary files a/img.png and b/img.png differ
 
         let batch = format!("### {displayed}\n@@ region @@\n     7 + dangerous_sink(input);\n");
         assert!(review_batch_contains_range(&batch, &displayed, 7, 7));
+        assert!(review_batch_contains_range(&batch, canonical, 7, 7));
+        assert!(render_review_batch_context(&batch, canonical, 7, 1, 4096).is_some());
     }
 
     #[test]

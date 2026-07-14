@@ -293,7 +293,7 @@ struct ProviderAdmission {
     attempts: usize,
     input_bytes: usize,
     output_token_exposure: usize,
-    token_spend_exposure: usize,
+    token_exposure_upper_bound: usize,
     reported_token_spend: usize,
     reported_cost_micros: u64,
 }
@@ -1673,10 +1673,14 @@ impl LlmClient {
             .and_then(serde_json::Value::as_u64)
             .and_then(|value| usize::try_from(value).ok())
             .ok_or_else(|| anyhow!("model request is missing a bounded max_tokens value"))?;
-        // One UTF-8 byte per input token is deliberately pessimistic. Reserving
-        // before the network call means retries, repairs, scorer calls, and
-        // concurrent consensus calls cannot cross any cap between check/use.
-        let spend_exposure = input_bytes
+        // Every input token consumes at least one byte of serialized request
+        // content, so the byte count is a conservative upper bound on input
+        // tokens. Keep the byte and output-token counters separate for their
+        // individual caps, and combine only this explicit token upper bound for
+        // the aggregate spend cap. Reserving before the network call means
+        // retries, repairs, scorer calls, and concurrent consensus calls cannot
+        // cross any cap between check/use.
+        let token_exposure_upper_bound = input_bytes
             .checked_add(output_tokens)
             .ok_or_else(|| anyhow!("model request token exposure overflowed"))?;
         let mut admission = self
@@ -1695,9 +1699,9 @@ impl LlmClient {
             .output_token_exposure
             .checked_add(output_tokens)
             .ok_or_else(|| anyhow!("model provider output exposure overflowed"))?;
-        let total_spend = admission
-            .token_spend_exposure
-            .checked_add(spend_exposure)
+        let total_token_exposure = admission
+            .token_exposure_upper_bound
+            .checked_add(token_exposure_upper_bound)
             .ok_or_else(|| anyhow!("model provider spend exposure overflowed"))?;
         ensure!(
             attempts <= MAX_PROVIDER_ATTEMPTS,
@@ -1712,13 +1716,13 @@ impl LlmClient {
             "model provider output exposure hard cap ({MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE} tokens) exceeded"
         );
         ensure!(
-            total_spend <= MAX_REPORTED_TOKEN_SPEND,
+            total_token_exposure <= MAX_REPORTED_TOKEN_SPEND,
             "model token spend exposure exceeded the {MAX_REPORTED_TOKEN_SPEND} token hard cap"
         );
         admission.attempts = attempts;
         admission.input_bytes = total_input;
         admission.output_token_exposure = total_output;
-        admission.token_spend_exposure = total_spend;
+        admission.token_exposure_upper_bound = total_token_exposure;
         Ok(())
     }
 
