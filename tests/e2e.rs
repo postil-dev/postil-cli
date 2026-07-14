@@ -235,7 +235,7 @@ async fn native_anthropic_review_uses_messages_shape_auth_and_usage() {
     assert!(body["system"].as_str().is_some());
     assert_eq!(body["messages"].as_array().unwrap().len(), 1);
     assert_eq!(body["messages"][0]["role"], "user");
-    assert_eq!(body["max_tokens"], 4096);
+    assert_eq!(body["max_tokens"], 16_384);
     assert!(body.get("choices").is_none());
 }
 
@@ -1566,7 +1566,7 @@ async fn local_review_reports_grounded_finding_and_gates() {
 
     let requests = server.received_requests().await.unwrap();
     let request: Value = requests[0].body_json().unwrap();
-    assert_eq!(request["max_tokens"], 4096);
+    assert_eq!(request["max_tokens"], 16_384);
     assert_eq!(request["messages"].as_array().unwrap().len(), 2);
 }
 

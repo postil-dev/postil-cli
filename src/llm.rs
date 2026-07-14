@@ -326,7 +326,7 @@ const PROVIDER_RETRY_DELAY_CAP_SECS: u64 = 30;
 /// up to roughly 12k output tokens) do not truncate. A truncated response goes
 /// through JSON repair and can salvage low-quality findings. Interactive answers
 /// use the separate bounded response limit below.
-pub(crate) const REVIEW_MAX_TOKENS: u32 = 4096;
+pub(crate) const REVIEW_MAX_TOKENS: u32 = 16_384;
 pub(crate) const MAX_PROVIDER_ATTEMPTS: usize = 216;
 pub(crate) const MAX_REPORTED_TOKEN_SPEND: usize = 20_000_000;
 const MAX_PROVIDER_INPUT_BYTES: usize = 64 * 1024 * 1024;
