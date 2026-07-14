@@ -814,7 +814,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                 model_used = "none (empty diff)".to_string();
                 full_review_trustworthy = true;
             } else {
-                let hosted_candidates = if crate::config::hosted_runtime_mode()
+                let hosted_candidates = if crate::config::bounded_review_selection_mode()
                     && batches.count > MAX_HOSTED_SELECTED_BATCHES
                 {
                     Some(batches.hosted_candidates(

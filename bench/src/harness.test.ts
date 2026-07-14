@@ -13,7 +13,131 @@ import {
   startMockGithub,
 } from "./harness";
 
+function minimalFixture(diff: string, primaryChange?: { path: string; line: number }) {
+  return {
+    id: "coordinate-contract",
+    name: "Coordinate contract",
+    repo: "benchmark/example",
+    pullNumber: 1,
+    headSha: "abc",
+    diff,
+    primaryChange,
+    allowedContext: { files: [], docs: [] },
+    admission: { classification: "clean" as const, contractRule: "no-merge-relevant-defect" },
+    modelOutput: { summary: "", findings: [] },
+    expectations: { minFindings: 0, maxFindings: 0, requiredFindings: [] },
+  };
+}
+
 describe("benchmark fixtures", () => {
+  test("every canonical fixture declares a real added coordinate", () => {
+    const parsed = cases.map((candidate) => benchmarkCase.parse(candidate));
+    expect(parsed).toHaveLength(61);
+    for (const candidate of parsed) {
+      expect(candidate.primaryChange).toBeDefined();
+      const changedFile = parseUnifiedDiffFiles(candidate.diff).find(
+        (file) => file.path === candidate.primaryChange?.path,
+      );
+      expect(changedFile?.addedLines).toContain(candidate.primaryChange?.line);
+    }
+  });
+
+  test("rejects primary paths and lines that are not added coordinates", () => {
+    const diff = [
+      "diff --git a/src/example.ts b/src/example.ts",
+      "--- a/src/example.ts",
+      "+++ b/src/example.ts",
+      "@@ -10,3 +10,3 @@",
+      " const context = true;",
+      "-const oldValue = 1;",
+      "+const newValue = 2;",
+      " const tail = true;",
+      "",
+    ].join("\n");
+
+    const missingPath = benchmarkCase.safeParse(
+      minimalFixture(diff, { path: "src/missing.ts", line: 11 }),
+    );
+    expect(missingPath.success).toBe(false);
+    expect(missingPath.error?.issues[0]?.message).toContain("does not name a file in the diff");
+    expect(missingPath.error?.issues[0]?.message.length).toBeLessThan(240);
+
+    const contextLine = benchmarkCase.safeParse(
+      minimalFixture(diff, { path: "src/example.ts", line: 10 }),
+    );
+    expect(contextLine.success).toBe(false);
+    expect(contextLine.error?.issues[0]?.message).toContain("is not an added line in the diff");
+
+    const deletionOnlyDiff = [
+      "diff --git a/src/removed.ts b/src/removed.ts",
+      "--- a/src/removed.ts",
+      "+++ b/src/removed.ts",
+      "@@ -7,1 +7,0 @@",
+      "-removedOnly();",
+      "",
+    ].join("\n");
+    const deletedOnlyLine = benchmarkCase.safeParse(
+      minimalFixture(deletionOnlyDiff, { path: "src/removed.ts", line: 7 }),
+    );
+    expect(deletedOnlyLine.success).toBe(false);
+    expect(deletedOnlyLine.error?.issues[0]?.path).toEqual(["primaryChange", "line"]);
+
+    const unknownPrimaryField = benchmarkCase.safeParse({
+      ...minimalFixture(diff),
+      primaryChange: { path: "src/example.ts", line: 11, note: "not part of the contract" },
+    });
+    expect(unknownPrimaryField.success).toBe(false);
+    expect(unknownPrimaryField.error?.issues[0]?.code).toBe("unrecognized_keys");
+  });
+
+  test("parses exact added coordinates across renames, multiple files, and multiple hunks", () => {
+    const diff = [
+      "diff --git a/src/old.ts b/src/new.ts",
+      "similarity index 80%",
+      "rename from src/old.ts",
+      "rename to src/new.ts",
+      "--- a/src/old.ts",
+      "+++ b/src/new.ts",
+      "@@ -4,2 +4,2 @@",
+      " keep();",
+      "+addedAtFive();",
+      "@@ -20,1 +20,2 @@",
+      "-removedAtTwenty();",
+      "+addedAtTwenty();",
+      "+++contentBeginningWithPluses();",
+      "diff --git a/src/other.ts b/src/other.ts",
+      "--- a/src/other.ts",
+      "+++ b/src/other.ts",
+      "@@ -1 +1,2 @@",
+      " existing();",
+      "+otherAddition();",
+      "",
+    ].join("\n");
+
+    const parsed = parseUnifiedDiffFiles(diff);
+    expect(parsed.map((file) => file.path)).toEqual(["src/new.ts", "src/other.ts"]);
+    expect(parsed[0]?.addedLines).toEqual([5, 20, 21]);
+    expect(parsed[1]?.addedLines).toEqual([2]);
+    expect(benchmarkCase.parse(minimalFixture(diff, { path: "src/new.ts", line: 20 })).primaryChange)
+      .toEqual({ path: "src/new.ts", line: 20 });
+
+    const headerlessRename = [
+      "diff --git a/src/before.ts b/src/after.ts",
+      "similarity index 100%",
+      "rename from src/before.ts",
+      "rename to src/after.ts",
+      "",
+    ].join("\n");
+    expect(parseUnifiedDiffFiles(headerlessRename)).toMatchObject([
+      { path: "src/after.ts", status: "modified", addedLines: [], changes: 0 },
+    ]);
+    expect(
+      benchmarkCase.safeParse(
+        minimalFixture(headerlessRename, { path: "src/after.ts", line: 1 }),
+      ).success,
+    ).toBe(false);
+  });
+
   test("cover the expanded saturated-case categories", () => {
     const parsed = cases.map((c) => benchmarkCase.parse(c));
     expect(parsed).toHaveLength(61);

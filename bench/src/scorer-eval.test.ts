@@ -5,7 +5,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { cases as fixtureInputs } from "../fixtures/cases";
-import { benchmarkCase } from "./harness";
+import { benchmarkCase, envelopeV1 } from "./harness";
 import {
   FALSE_FINDING_CASES,
   GENERATOR_MODEL,
@@ -30,6 +30,7 @@ import {
   runBoundedChild,
   runScorerEvalCase,
   runScorerEvalMatrix,
+  reviewCoverageFailure,
   scorerCheckpointPath,
   selectEvalCases,
   startScorerProxy,
@@ -46,6 +47,51 @@ function fixture(id: string) {
   const c = fixtures.find((candidate) => candidate.id === id);
   if (!c) throw new Error(`missing fixture ${id}`);
   return c;
+}
+
+function boundedScorerFixture() {
+  const ordinaryFile = (ordinal: number) => {
+    const path = `src/ordinary/segment-${ordinal}.ts`;
+    const lines = Array.from(
+      { length: 2_200 },
+      (_, line) => `+export const ordinary_${ordinal}_${line} = ${ordinal + line}; // ordinary source behavior`,
+    );
+    return [
+      `diff --git a/${path} b/${path}`,
+      "--- /dev/null",
+      `+++ b/${path}`,
+      `@@ -0,0 +1,${lines.length} @@`,
+      ...lines,
+      "",
+    ].join("\n");
+  };
+  const target = [
+    "diff --git a/src/ui/copy.ts b/src/ui/copy.ts",
+    "--- a/src/ui/copy.ts",
+    "+++ b/src/ui/copy.ts",
+    "@@ -42,3 +42,4 @@",
+    " export const heading = 'Account';",
+    " export const description = 'Manage your account';",
+    "+export const hint = 'Changes save automatically';",
+    " export const action = 'Save';",
+    "",
+  ].join("\n");
+  const diff = [
+    ...Array.from({ length: 4 }, (_, index) => ordinaryFile(index)),
+    target,
+    ...Array.from({ length: 4 }, (_, index) => ordinaryFile(index + 4)),
+  ].join("");
+  const base = fixture("huge-low-signal-clean");
+  return benchmarkCase.parse({
+    ...base,
+    id: "bounded-scorer-clean",
+    name: "Bounded scorer clean calibration",
+    pullNumber: 9_901,
+    headSha: "a".repeat(40),
+    diff,
+    primaryChange: { path: "src/ui/copy.ts", line: 44 },
+    allowedContext: { files: [], docs: base.allowedContext.docs },
+  });
 }
 
 function result(overrides: Partial<ScorerEvalCase>): ScorerEvalCase {
@@ -68,6 +114,7 @@ function result(overrides: Partial<ScorerEvalCase>): ScorerEvalCase {
     reasonContractValid: true,
     usageAccountingComplete: true,
     usageValid: true,
+    coverageValid: true,
     upstreamRequests: 1,
     durationMs: 1000,
     promptTokens: 10,
@@ -187,6 +234,36 @@ describe("scorer calibration findings", () => {
       path: "src/ui/copy.ts",
       line: 44,
     });
+  });
+
+  test("path fallback returns only an actual addition and otherwise fails closed", () => {
+    const diff = [
+      "diff --git a/src/example.ts b/src/example.ts",
+      "--- a/src/example.ts",
+      "+++ b/src/example.ts",
+      "@@ -10,2 +10,2 @@",
+      " context();",
+      "-oldValue();",
+      "+newValue();",
+      "diff --git a/src/deleted.ts b/src/deleted.ts",
+      "--- a/src/deleted.ts",
+      "+++ b/src/deleted.ts",
+      "@@ -4,1 +4,0 @@",
+      "-deletedOnly();",
+      "",
+    ].join("\n");
+    expect(firstAddedLineForPath(diff, "src/example.ts")).toBe(11);
+    expect(firstAddedLineForPath(diff, "src/deleted.ts")).toBeNull();
+    expect(firstAddedLineForPath(diff, "src/absent.ts")).toBeNull();
+    expect(firstAddedLineForPath(diff, undefined)).toBeNull();
+
+    const clean = fixture("clean-docs-only");
+    expect(() => falseFinding({
+      ...clean,
+      primaryChange: undefined,
+      allowedContext: { ...clean.allowedContext, files: [] },
+      modelOutput: { summary: "", findings: [] },
+    })).toThrow("has no added coordinate");
   });
 });
 
@@ -322,7 +399,7 @@ describe("scorer proxy and isolated runtime", () => {
     }
   });
 
-  test("sends the large clean fixture's declared finding through the real CLI scorer path once", async () => {
+  test("selects an interior clean change through bounded planning and scores it exactly once", async () => {
     const scorerRequests: string[] = [];
     const upstream = createServer(async (req: IncomingMessage, res: ServerResponse) => {
       scorerRequests.push(await requestBody(req));
@@ -343,8 +420,9 @@ describe("scorer proxy and isolated runtime", () => {
     const previousKey = process.env[keyName];
     process.env[keyName] = "local-test-key";
     try {
+      const calibration = boundedScorerFixture();
       const evaluation = await runScorerEvalCase(
-        fixture("huge-low-signal-clean"),
+        calibration,
         "falseFinding",
         "scorer/model",
         1,
@@ -358,6 +436,7 @@ describe("scorer proxy and isolated runtime", () => {
           inputMicrosPerMillionTokens: 1_000_000,
           outputMicrosPerMillionTokens: 2_000_000,
         },
+        SCORER_CASE_EXEC_TIMEOUT_MS,
       );
       expect(evaluation).toMatchObject({
         envelopeProduced: true,
@@ -374,10 +453,49 @@ describe("scorer proxy and isolated runtime", () => {
       const scorerPrompt = scorerRequest.messages?.map((message) => message.content ?? "").join("\n") ?? "";
       expect(scorerPrompt).toContain("src/ui/copy.ts");
       expect(scorerPrompt).toContain('"line": 44');
+      const runArtifacts = join(root, "scorer_model", "repeat-1", calibration.id, "artifacts");
+      const envelope = envelopeV1.parse(JSON.parse(await readFile(join(runArtifacts, "stdout.json"), "utf8")));
+      expect(envelope.reviewCoverage?.mode).toBe("bounded");
+      expect(envelope.reviewCoverage?.selectedBatches).toBeLessThan(envelope.reviewCoverage!.totalBatches);
+      expect(envelope.reviewCoverage?.plannerFallback).toBe(false);
+      const plannerUsage = envelope.modelUsage?.filter((usage) => usage.role === "reviewPlanner") ?? [];
+      expect(plannerUsage).toHaveLength(1);
+      expect(plannerUsage[0]).toMatchObject({
+        model: GENERATOR_MODEL,
+        phase: "initial",
+        promptTokens: 20,
+        completionTokens: 4,
+      });
+      const proxyTelemetry = JSON.parse(
+        await readFile(join(runArtifacts, "proxy-telemetry.json"), "utf8"),
+      ) as {
+        plannerRequests: number;
+        generatorRequests: number;
+        generatorRequestKinds: Array<"source" | "synthesis">;
+        plannerSelections: Array<{
+          targetBatchId: number | null;
+          targetWasMandatory: boolean;
+          returnedBatchIds: number[];
+        }>;
+      };
+      expect(proxyTelemetry.plannerRequests).toBe(1);
+      expect(proxyTelemetry.generatorRequests).toBe(5);
+      expect(proxyTelemetry.generatorRequestKinds.filter((kind) => kind === "source"))
+        .toHaveLength(envelope.reviewCoverage!.selectedBatches);
+      expect(proxyTelemetry.generatorRequestKinds.filter((kind) => kind === "synthesis"))
+        .toHaveLength(1);
+      expect(proxyTelemetry.plannerSelections).toHaveLength(1);
+      expect(proxyTelemetry.plannerSelections[0]?.targetWasMandatory).toBe(false);
+      expect(proxyTelemetry.plannerSelections[0]?.targetBatchId).toBeGreaterThan(0);
+      expect(proxyTelemetry.plannerSelections[0]?.returnedBatchIds).toEqual([
+        proxyTelemetry.plannerSelections[0]?.targetBatchId,
+      ]);
       const stderr = await readFile(
-        join(root, "scorer_model", "repeat-1", "huge-low-signal-clean", "artifacts", "stderr.log"),
+        join(runArtifacts, "stderr.log"),
         "utf8",
       );
+      expect(stderr).toContain("postil: hosted selection uses");
+      expect(stderr).toContain("planner fallback=false");
       expect(stderr).toContain("postil: reviewing source request");
     } finally {
       if (previousKey === undefined) delete process.env[keyName];
@@ -489,6 +607,7 @@ describe("candidate matrix execution", () => {
       result({ reasonContractValid: false }),
       result({ usageAccountingComplete: false }),
       result({ usageValid: false }),
+      result({ coverageValid: false }),
       result({ upstreamRequests: 2 }),
     ];
     expect(fatalCases.every((item) => isAdmissionFatalStructuralResult(item, "scorer/model"))).toBe(true);
@@ -557,6 +676,37 @@ describe("candidate matrix execution", () => {
           "incomplete matrix: got 1 true/0 false cases for 2 repeats",
         ]),
       });
+  });
+
+  test("rejects missing, exhaustive, or fallback coverage for a bounded scorer case", () => {
+    const calibration = boundedScorerFixture();
+    const baseEnvelope = {
+      modelUsage: [{ role: "reviewPlanner" }],
+      reviewCoverage: {
+        mode: "bounded",
+        selectedBatches: 4,
+        totalBatches: 9,
+        plannerFallback: false,
+      },
+    };
+    expect(reviewCoverageFailure(calibration, baseEnvelope)).toBeNull();
+    expect(reviewCoverageFailure(calibration, {})).toContain("does not match bounded");
+    expect(reviewCoverageFailure(calibration, {
+      ...baseEnvelope,
+      reviewCoverage: { ...baseEnvelope.reviewCoverage, mode: "exhaustive" },
+    })).toContain("does not match bounded");
+    expect(reviewCoverageFailure(calibration, {
+      ...baseEnvelope,
+      reviewCoverage: { ...baseEnvelope.reviewCoverage, selectedBatches: 9 },
+    })).toContain("did not select fewer batches");
+    expect(reviewCoverageFailure(calibration, {
+      ...baseEnvelope,
+      reviewCoverage: { ...baseEnvelope.reviewCoverage, plannerFallback: true },
+    })).toContain("non-fallback planner selection");
+    expect(reviewCoverageFailure(calibration, {
+      ...baseEnvelope,
+      modelUsage: [],
+    })).toContain("0 planner usage event");
   });
 });
 

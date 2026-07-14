@@ -36,7 +36,7 @@ rejected.
 ## Running (mock mode: default, CI)
 
 ```sh
-cargo build --quiet --release   # from the repo root
+cargo build --quiet --release --features qualification-candidate   # from the repo root
 cd bench
 bun install
 bun run bench                   # add --json or --json-out report.json for machine output
@@ -213,7 +213,7 @@ This diagnostic can reject a scorer but cannot admit a production pair; pair
 qualification above is the admission authority.
 
 ```sh
-cargo build --quiet --release
+cargo build --quiet --release --features qualification-candidate
 cd bench
 export MODEL_API_KEY=...          # or LLM_API_KEY / OPENROUTER_API_KEY
 POSTIL_SCORER_EVAL_MODELS=provider/candidate-a,provider/candidate-b \

@@ -209,6 +209,7 @@ pub const QUALIFICATION_MAX_AGE_DAYS: u32 = 30;
 const QUALIFICATION_MAX_AGE_SECONDS: u64 = QUALIFICATION_MAX_AGE_DAYS as u64 * 24 * 60 * 60;
 const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
 const QUALIFICATION_CANDIDATE_PROFILE_ENV: &str = "POSTIL_QUALIFICATION_CANDIDATE_PROFILE";
+const BENCH_FORCE_BOUNDED_SELECTION_ENV: &str = "POSTIL_BENCH_FORCE_BOUNDED_SELECTION";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -998,6 +999,7 @@ impl Config {
             Config::default()
         };
         cfg.apply_env()?;
+        validate_benchmark_bounded_selection(&cfg)?;
         // Repo guardrails are a separate file so they can be long-form prose.
         let guardrails_path = root.join(".postil").join("guardrails.md");
         if let Ok(text) = std::fs::read_to_string(&guardrails_path) {
@@ -1377,6 +1379,78 @@ pub(crate) fn hosted_runtime_mode() -> bool {
     hosted_mode() || qualification_candidate_mode()
 }
 
+pub(crate) fn bounded_review_selection_mode() -> bool {
+    hosted_runtime_mode() || benchmark_force_bounded_selection()
+}
+
+fn benchmark_force_bounded_selection_requested() -> bool {
+    std::env::var(BENCH_FORCE_BOUNDED_SELECTION_ENV)
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn benchmark_force_bounded_selection() -> bool {
+    cfg!(feature = "qualification-candidate") && benchmark_force_bounded_selection_requested()
+}
+
+fn validate_benchmark_bounded_selection(config: &Config) -> Result<()> {
+    if !benchmark_force_bounded_selection_requested() {
+        return Ok(());
+    }
+    let ci = std::env::var("CI").ok();
+    let private_api_opt_in = std::env::var("POSTIL_ALLOW_PRIVATE_API_BASE").ok();
+    let github_api = std::env::var("GITHUB_API_URL").ok();
+    validate_benchmark_bounded_selection_values(
+        cfg!(feature = "qualification-candidate"),
+        ci.as_deref(),
+        private_api_opt_in.as_deref(),
+        config.api_base.as_str(),
+        github_api.as_deref(),
+    )
+}
+
+fn validate_benchmark_bounded_selection_values(
+    feature_enabled: bool,
+    ci: Option<&str>,
+    private_api_opt_in: Option<&str>,
+    model_api: &str,
+    github_api: Option<&str>,
+) -> Result<()> {
+    anyhow::ensure!(
+        feature_enabled,
+        "benchmark bounded selection requires the non-default qualification-candidate feature"
+    );
+    anyhow::ensure!(
+        ci == Some("true"),
+        "benchmark bounded selection requires the hermetic CI harness"
+    );
+    anyhow::ensure!(
+        private_api_opt_in.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
+        "benchmark bounded selection requires explicit private API-base opt-in"
+    );
+    let github_api =
+        github_api.context("benchmark bounded selection requires a mock GitHub endpoint")?;
+    for (label, value) in [("model API", model_api), ("GitHub API", github_api)] {
+        let url = reqwest::Url::parse(value).with_context(|| {
+            format!("benchmark bounded selection {label} must be an absolute URL")
+        })?;
+        let loopback = url
+            .host_str()
+            .and_then(|host| {
+                host.trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .parse::<std::net::IpAddr>()
+                    .ok()
+            })
+            .is_some_and(|address| address.is_loopback());
+        anyhow::ensure!(
+            url.scheme() == "http" && loopback,
+            "benchmark bounded selection {label} must be an HTTP loopback endpoint"
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn qualification_candidate_mode() -> bool {
     cfg!(feature = "qualification-candidate")
         && std::env::var_os(QUALIFICATION_CANDIDATE_PROFILE_ENV).is_some()
@@ -1492,6 +1566,7 @@ pub(crate) fn hosted_price_bounds_for_config(
 
 fn repository_model_config_locked() -> bool {
     hosted_runtime_mode()
+        || benchmark_force_bounded_selection_requested()
         || std::env::var("POSTIL_IGNORE_REPOSITORY_MODEL_CONFIG")
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
@@ -1906,6 +1981,66 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
             c.gate_fail_on,
             GateLevel::Severity(Severity::Error)
         ));
+    }
+
+    #[test]
+    fn benchmark_bounded_selection_requires_the_hermetic_feature_and_loopback_endpoints() {
+        let valid = || {
+            validate_benchmark_bounded_selection_values(
+                true,
+                Some("true"),
+                Some("1"),
+                "http://127.0.0.1:4100/v1",
+                Some("http://[::1]:4200"),
+            )
+        };
+        valid().unwrap();
+
+        let invalid = [
+            validate_benchmark_bounded_selection_values(
+                false,
+                Some("true"),
+                Some("1"),
+                "http://127.0.0.1:4100/v1",
+                Some("http://127.0.0.1:4200"),
+            ),
+            validate_benchmark_bounded_selection_values(
+                true,
+                Some("false"),
+                Some("1"),
+                "http://127.0.0.1:4100/v1",
+                Some("http://127.0.0.1:4200"),
+            ),
+            validate_benchmark_bounded_selection_values(
+                true,
+                Some("true"),
+                None,
+                "http://127.0.0.1:4100/v1",
+                Some("http://127.0.0.1:4200"),
+            ),
+            validate_benchmark_bounded_selection_values(
+                true,
+                Some("true"),
+                Some("1"),
+                "https://openrouter.ai/api/v1",
+                Some("http://127.0.0.1:4200"),
+            ),
+            validate_benchmark_bounded_selection_values(
+                true,
+                Some("true"),
+                Some("1"),
+                "http://127.0.0.1:4100/v1",
+                Some("http://example.test"),
+            ),
+            validate_benchmark_bounded_selection_values(
+                true,
+                Some("true"),
+                Some("1"),
+                "http://127.0.0.1:4100/v1",
+                None,
+            ),
+        ];
+        assert!(invalid.iter().all(Result::is_err));
     }
 
     #[test]

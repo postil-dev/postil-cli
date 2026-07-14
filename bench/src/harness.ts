@@ -82,7 +82,7 @@ const modelOutput = z
     message: "a clean recorded response must have an empty summary (CLI contract)",
   });
 
-export const benchmarkCase = z.object({
+const benchmarkCaseShape = z.object({
   id: z.string().min(1),
   name: z.string().min(1),
   repo: z.string().regex(/^[^/]+\/[^/]+$/u),
@@ -92,7 +92,7 @@ export const benchmarkCase = z.object({
   primaryChange: z.object({
     path: z.string().min(1),
     line: z.number().int().positive(),
-  }).optional(),
+  }).strict().optional(),
   allowedContext: allowedContext.default({ files: [], docs: [] }),
   /// Fixture metadata (policy phrasing, ground-truth labels) that must never
   /// leak into the prompt or any pipeline output. Prompt-injection fixtures may
@@ -117,6 +117,37 @@ export const benchmarkCase = z.object({
     maxFindings: z.number().int().nonnegative().optional(),
     requiredFindings: z.array(expectedFinding).default([]),
   }),
+});
+
+export const benchmarkCase = benchmarkCaseShape.superRefine((candidate, ctx) => {
+  if (candidate.primaryChange === undefined) return;
+  let changedFile: ParsedUnifiedDiffFile | undefined;
+  try {
+    changedFile = parseUnifiedDiffFiles(candidate.diff).find(
+      (file) => file.path === candidate.primaryChange?.path,
+    );
+  } catch (error) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["primaryChange"],
+      message: `primaryChange cannot be validated because the diff is invalid: ${boundedErrorMessage(error)}`,
+    });
+    return;
+  }
+  const coordinate = `${boundedText(candidate.primaryChange.path, 160)}:${candidate.primaryChange.line}`;
+  if (changedFile === undefined) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["primaryChange", "path"],
+      message: `primaryChange ${coordinate} does not name a file in the diff`,
+    });
+  } else if (!changedFile.addedLines.includes(candidate.primaryChange.line)) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["primaryChange", "line"],
+      message: `primaryChange ${coordinate} is not an added line in the diff`,
+    });
+  }
 });
 
 export type BenchmarkCase = z.infer<typeof benchmarkCase>;
@@ -337,7 +368,13 @@ async function runCase(
       ["review", "--repo", c.repo, "--pr", String(c.pullNumber), "--output-json"],
       {
         cwd: runDir,
-        env: isolatedEnv(homeDir, tmpDir, github.baseUrl, model.baseUrl),
+        env: isolatedEnv(
+          homeDir,
+          tmpDir,
+          github.baseUrl,
+          model.baseUrl,
+          c.admission.expectedCoverage === "bounded",
+        ),
         timeout: options.timeoutMs ?? 120_000,
         maxBuffer: 4 * 1024 * 1024,
       },
@@ -420,6 +457,7 @@ function isolatedEnv(
   tmpDir: string,
   githubBaseUrl: string,
   modelBaseUrl: string,
+  forceBoundedSelection: boolean,
 ): NodeJS.ProcessEnv {
   // A fresh environment, never the parent's: no developer keys, no repo
   // config discovery beyond the run directory.
@@ -440,6 +478,7 @@ function isolatedEnv(
     GITHUB_API_URL: githubBaseUrl,
     GITHUB_TOKEN: "benchmark-github-token",
     REVIEW_MODEL: "postil-bench/recorded",
+    ...(forceBoundedSelection ? { POSTIL_BENCH_FORCE_BOUNDED_SELECTION: "1" } : {}),
   };
 }
 
@@ -569,6 +608,7 @@ export interface ParsedUnifiedDiffFile {
   status: "added" | "modified" | "removed";
   patch: string | undefined;
   changes: number;
+  addedLines: number[];
   before: string;
   after: string;
 }
@@ -582,8 +622,10 @@ export function parseUnifiedDiffFiles(diff: string): ParsedUnifiedDiffFile[] {
     const section = lines.slice(start, starts[position + 1] ?? lines.length);
     const oldHeader = section.find((line) => line.startsWith("--- "));
     const newHeader = section.find((line) => line.startsWith("+++ "));
-    const oldPath = oldHeader?.startsWith("--- a/") ? oldHeader.slice(6) : undefined;
-    const newPath = newHeader?.startsWith("+++ b/") ? newHeader.slice(6) : undefined;
+    const renameFrom = section.find((line) => line.startsWith("rename from "))?.slice(12);
+    const renameTo = section.find((line) => line.startsWith("rename to "))?.slice(10);
+    const oldPath = oldHeader?.startsWith("--- a/") ? oldHeader.slice(6) : renameFrom;
+    const newPath = newHeader?.startsWith("+++ b/") ? newHeader.slice(6) : renameTo;
     const path = newPath ?? oldPath;
     if (path === undefined || path.length === 0) {
       throw new Error("benchmark diff section has no canonical file path");
@@ -595,35 +637,43 @@ export function parseUnifiedDiffFiles(diff: string): ParsedUnifiedDiffFile[] {
       path,
       status: oldHeader === "--- /dev/null" ? "added" : newHeader === "+++ /dev/null" ? "removed" : "modified",
       patch,
-      changes: section.filter(
-        (line) =>
-          (line.startsWith("+") && !line.startsWith("+++")) ||
-          (line.startsWith("-") && !line.startsWith("---")),
-      ).length,
+      changes: versions.changes,
       ...versions,
     };
   });
 }
 
-function sourceVersionsFromSection(lines: string[]): { before: string; after: string } {
+function sourceVersionsFromSection(lines: string[]): {
+  before: string;
+  after: string;
+  addedLines: number[];
+  changes: number;
+} {
   const before: string[] = [];
   const after: string[] = [];
+  const addedLines: number[] = [];
   let oldLine = 0;
   let newLine = 0;
+  let inHunk = false;
+  let changes = 0;
   for (const line of lines) {
     const header = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/u.exec(line);
     if (header) {
       oldLine = Number.parseInt(header[1]!, 10);
       newLine = Number.parseInt(header[2]!, 10);
+      inHunk = true;
       continue;
     }
-    if (oldLine === 0 || line.startsWith("\\ No newline")) continue;
-    if (line.startsWith("-") && !line.startsWith("---")) {
+    if (!inHunk || line.startsWith("\\ No newline")) continue;
+    if (line.startsWith("-")) {
       before[oldLine - 1] = line.slice(1);
       oldLine += 1;
-    } else if (line.startsWith("+") && !line.startsWith("+++")) {
+      changes += 1;
+    } else if (line.startsWith("+")) {
       after[newLine - 1] = line.slice(1);
+      addedLines.push(newLine);
       newLine += 1;
+      changes += 1;
     } else if (line.startsWith(" ")) {
       before[oldLine - 1] = line.slice(1);
       after[newLine - 1] = line.slice(1);
@@ -634,7 +684,19 @@ function sourceVersionsFromSection(lines: string[]): { before: string; after: st
   return {
     before: Array.from({ length: before.length }, (_, index) => before[index] ?? "").join("\n"),
     after: Array.from({ length: after.length }, (_, index) => after[index] ?? "").join("\n"),
+    addedLines,
+    changes,
   };
+}
+
+function boundedText(value: string, maxBytes: number): string {
+  const bytes = Buffer.from(value, "utf8");
+  if (bytes.length <= maxBytes) return value;
+  return `${bytes.subarray(0, maxBytes).toString("utf8").replace(/\uFFFD$/u, "")}…`;
+}
+
+function boundedErrorMessage(error: unknown): string {
+  return boundedText(error instanceof Error ? error.message : String(error), 200);
 }
 
 async function startMockModel(c: BenchmarkCase, artifactsDir: string) {
@@ -646,10 +708,36 @@ async function startMockModel(c: BenchmarkCase, artifactsDir: string) {
       await writeFile(join(artifactsDir, `model-request-${requestBodies.length}.json`), body, {
         mode: 0o600,
       });
+      const request = safeJson(body) as {
+        messages?: Array<{ role?: string; content?: string }>;
+      } | undefined;
+      const system = request?.messages?.find((message) => message.role === "system")?.content ?? "";
+      const user = request?.messages?.find((message) => message.role === "user")?.content ?? "";
+      if (system.includes("select bounded code-review batches")) {
+        const targetId = plannerBatchIdForPath(user, c.primaryChange?.path);
+        const mandatoryIds = plannerMandatoryIds(user);
+        const batchIds = targetId !== null && !mandatoryIds.has(targetId) ? [targetId] : [];
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            choices: [{ message: { content: JSON.stringify({ batchIds }) } }],
+            usage: { prompt_tokens: 20, completion_tokens: 4, total_tokens: 24 },
+          }),
+        );
+        return;
+      }
+      const targetPath = c.primaryChange?.path ?? c.modelOutput.findings[0]?.path;
+      const synthesis = user.includes("This bounded synthesis window joins semantic evidence");
+      const targetBatch = targetPath === undefined || user
+        .split("\n")
+        .some((line) => line.trim() === `### ${targetPath}`);
+      const output = !synthesis && targetBatch
+        ? c.modelOutput
+        : { summary: "", findings: [] };
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
         JSON.stringify({
-          choices: [{ message: { content: JSON.stringify(c.modelOutput) } }],
+          choices: [{ message: { content: JSON.stringify(output) } }],
           usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
         }),
       );
@@ -665,6 +753,27 @@ async function startMockModel(c: BenchmarkCase, artifactsDir: string) {
     requestBodies,
     close: () => closeServer(server),
   };
+}
+
+function plannerMandatoryIds(prompt: string): Set<number> {
+  const match = /Mandatory IDs: \[([^\]]*)\]/u.exec(prompt);
+  if (!match) return new Set();
+  return new Set(
+    match[1]!
+      .split(",")
+      .map((value) => Number.parseInt(value.trim(), 10))
+      .filter(Number.isSafeInteger),
+  );
+}
+
+function plannerBatchIdForPath(prompt: string, path: string | undefined): number | null {
+  if (path === undefined) return null;
+  for (const block of prompt.split("\nBatch ").slice(1)) {
+    if (!block.includes(path)) continue;
+    const id = Number.parseInt(block, 10);
+    if (Number.isSafeInteger(id) && id > 0) return id;
+  }
+  return null;
 }
 
 function listen(server: ReturnType<typeof createServer>): Promise<void> {
@@ -789,9 +898,27 @@ export function expectedGateFailing(c: BenchmarkCase): boolean {
 function evaluateEnvelope(c: BenchmarkCase, env: Envelope, exitCode: number | undefined): string[] {
   const failures: string[] = [];
   const clean = c.groundTruth.findings.length === 0;
+  const expectedCoverage = c.admission.expectedCoverage;
 
   if (env.headSha !== c.headSha) {
     failures.push(`envelope headSha ${env.headSha} != PR head ${c.headSha}`);
+  }
+  if (expectedCoverage !== undefined && env.reviewCoverage?.mode !== expectedCoverage) {
+    failures.push(
+      `reviewCoverage.mode=${env.reviewCoverage?.mode ?? "missing"}, expected ${expectedCoverage}`,
+    );
+  }
+  if (expectedCoverage === "bounded") {
+    if (env.reviewCoverage === undefined || env.reviewCoverage.selectedBatches >= env.reviewCoverage.totalBatches) {
+      failures.push("bounded review did not select fewer batches than the full source set");
+    }
+    if (env.reviewCoverage?.plannerFallback !== false) {
+      failures.push("bounded review did not complete a non-fallback planner selection");
+    }
+    const plannerUsage = env.modelUsage?.filter((usage) => usage.role === "reviewPlanner") ?? [];
+    if (plannerUsage.length !== 1) {
+      failures.push(`bounded review recorded ${plannerUsage.length} planner usage event(s), expected 1`);
+    }
   }
   if (env.counts.ungrounded !== 0) {
     failures.push(`counts.ungrounded is ${env.counts.ungrounded}: the pipeline dropped grounded findings`);

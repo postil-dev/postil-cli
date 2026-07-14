@@ -16,6 +16,7 @@ import { cases as fixtureInputs } from "../fixtures/cases";
 import { API_KEY_ENV_NAMES_TEXT, resolveApiKeyName } from "./api-key";
 import {
   benchmarkCase,
+  envelopeV1,
   parseUnifiedDiffFiles,
   safeJson,
   startMockGithub,
@@ -87,6 +88,7 @@ export interface ScorerEvalCase {
   reasonContractValid: boolean;
   usageAccountingComplete: boolean | null;
   usageValid: boolean;
+  coverageValid: boolean;
   upstreamRequests: number;
   durationMs: number | null;
   promptTokens: number;
@@ -395,6 +397,7 @@ export function isAdmissionFatalStructuralResult(
     !result.reasonContractValid ||
     result.usageAccountingComplete !== true ||
     !result.usageValid ||
+    !result.coverageValid ||
     result.upstreamRequests !== 1
   );
 }
@@ -462,7 +465,14 @@ export async function runScorerEvalCase(
   try {
     child = await runBoundedChild(binary, ["review", "--repo", c.repo, "--pr", String(c.pullNumber), "--output-json"], {
       cwd: runDir,
-      env: isolatedEnv(homeDir, tmpDir, github.baseUrl, proxy.baseUrl, scorerModel),
+      env: isolatedEnv(
+        homeDir,
+        tmpDir,
+        github.baseUrl,
+        proxy.baseUrl,
+        scorerModel,
+        c.admission.expectedCoverage === "bounded",
+      ),
       timeoutMs: executionTimeoutMs,
       maxBuffer: 8 * 1024 * 1024,
     });
@@ -476,6 +486,17 @@ export async function runScorerEvalCase(
     : "";
   const stderr = `${child.stderr}${child.stderr.endsWith("\n") || child.stderr.length === 0 ? "" : "\n"}${timeoutLog}`;
   await writeFile(join(artifactsDir, "stderr.log"), stderr, { mode: 0o600 });
+  await writeFile(join(artifactsDir, "stdout.json"), child.stdout, { mode: 0o600 });
+  await writeFile(
+    join(artifactsDir, "proxy-telemetry.json"),
+    JSON.stringify({
+      plannerRequests: proxy.plannerRequests.length,
+      generatorRequests: proxy.generatorRequests.length,
+      generatorRequestKinds: proxy.generatorRequestKinds,
+      plannerSelections: proxy.plannerSelections,
+    }),
+    { mode: 0o600 },
+  );
 
   const durationMs = proxy.attempts.reduce((sum, attempt) => sum + attempt.durationMs, 0);
   const promptTokens = proxy.attempts.reduce((sum, attempt) => sum + attempt.promptTokens, 0);
@@ -495,8 +516,8 @@ export async function runScorerEvalCase(
     costUsd,
   };
 
-  const envelope = safeJson(child.stdout) as Record<string, any> | undefined;
-  if (!envelope || envelope.version !== 1) {
+  const parsedEnvelope = envelopeV1.safeParse(safeJson(child.stdout));
+  if (!parsedEnvelope.success) {
     return {
       ...baseResult(
         c,
@@ -512,6 +533,7 @@ export async function runScorerEvalCase(
       ...telemetry,
     };
   }
+  const envelope = parsedEnvelope.data as Record<string, any>;
   const finding = scoredFinding(envelope);
   const scorerError = typeof envelope.scorerError === "string" ? envelope.scorerError : null;
   const actualScorer = typeof envelope.scorerModel === "string" ? envelope.scorerModel : null;
@@ -524,6 +546,8 @@ export async function runScorerEvalCase(
   const usageAccountingComplete =
     typeof envelope.usageAccountingComplete === "boolean" ? envelope.usageAccountingComplete : null;
   const usageValid = proxy.attempts.length === 1 && proxy.attempts[0]!.usageValid;
+  const coverageFailure = reviewCoverageFailure(c, envelope);
+  const coverageValid = coverageFailure === null;
   const structuredOk =
     !caseTimedOut &&
     actualScorer === scorerModel &&
@@ -533,13 +557,14 @@ export async function runScorerEvalCase(
     reasonContractValid &&
     usageAccountingComplete === true &&
     usageValid &&
+    coverageValid &&
     proxy.attempts.length === 1;
   let passed = false;
   let reason = "";
   if (caseTimedOut) {
     reason = `case exceeded the ${SCORER_MAX_CASE_MS}ms admission limit`;
   } else if (!structuredOk) {
-    reason = scorerStructuralFailureReason(scorerError, proxy.attempts.length, actualScorer);
+    reason = coverageFailure ?? scorerStructuralFailureReason(scorerError, proxy.attempts.length, actualScorer);
   } else if (scenario === "trueFinding") {
     passed = scorerConfidence >= 0.6 && scorerKind === "risk";
     reason = passed ? "true finding kept as risk" : "true finding was down-scored or retyped";
@@ -567,6 +592,7 @@ export async function runScorerEvalCase(
     reasonContractValid,
     usageAccountingComplete,
     usageValid,
+    coverageValid,
     ...telemetry,
   };
 }
@@ -599,12 +625,56 @@ function baseResult(
     reasonContractValid: false,
     usageAccountingComplete: null,
     usageValid: false,
+    coverageValid: false,
     upstreamRequests: 0,
     durationMs: null,
     promptTokens: 0,
     completionTokens: 0,
     costUsd: null,
   };
+}
+
+export function reviewCoverageFailure(
+  c: BenchmarkCase,
+  envelope: Record<string, any>,
+): string | null {
+  const expected = c.admission.expectedCoverage;
+  if (expected === undefined) return null;
+  const coverage = envelope.reviewCoverage as {
+    mode?: unknown;
+    selectedBatches?: unknown;
+    totalBatches?: unknown;
+    plannerFallback?: unknown;
+  } | undefined;
+  if (coverage?.mode !== expected) {
+    return `review coverage mode ${String(coverage?.mode ?? "missing")} does not match ${expected}`;
+  }
+  if (
+    typeof coverage.selectedBatches !== "number" ||
+    typeof coverage.totalBatches !== "number" ||
+    coverage.totalBatches < 1 ||
+    coverage.selectedBatches < 1 ||
+    coverage.selectedBatches > coverage.totalBatches
+  ) {
+    return "review coverage batch counts are invalid";
+  }
+  const plannerUsage = Array.isArray(envelope.modelUsage)
+    ? envelope.modelUsage.filter((usage) => usage?.role === "reviewPlanner").length
+    : 0;
+  if (expected === "bounded") {
+    if (coverage.selectedBatches >= coverage.totalBatches) {
+      return "bounded review did not select fewer batches than the full source set";
+    }
+    if (coverage.plannerFallback !== false) {
+      return "bounded review did not complete a non-fallback planner selection";
+    }
+    if (plannerUsage !== 1) {
+      return `bounded review recorded ${plannerUsage} planner usage event(s), expected 1`;
+    }
+  } else if (coverage.selectedBatches !== coverage.totalBatches || plannerUsage !== 0) {
+    return "exhaustive review did not cover every batch without planner usage";
+  }
+  return null;
 }
 
 export async function startScorerProxy(
@@ -615,6 +685,14 @@ export async function startScorerProxy(
   upstreamTimeoutMs = SCORER_PROXY_UPSTREAM_TIMEOUT_MS,
 ) {
   const attempts: ScorerAttempt[] = [];
+  const plannerRequests: string[] = [];
+  const generatorRequests: string[] = [];
+  const generatorRequestKinds: Array<"source" | "synthesis"> = [];
+  const plannerSelections: Array<{
+    targetBatchId: number | null;
+    targetWasMandatory: boolean;
+    returnedBatchIds: number[];
+  }> = [];
   const upstreamControllers = new Set<AbortController>();
   let closing = false;
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
@@ -624,8 +702,35 @@ export async function startScorerProxy(
       return;
     }
     const bodyText = await readRequestBody(req);
-    const body = safeJson(bodyText) as { model?: string } | undefined;
+    const body = safeJson(bodyText) as {
+      model?: string;
+      messages?: Array<{ role?: string; content?: string }>;
+    } | undefined;
     if (body?.model === GENERATOR_MODEL) {
+      const system = body.messages?.find((message) => message.role === "system")?.content ?? "";
+      if (system.includes("select bounded code-review batches")) {
+        plannerRequests.push(bodyText);
+        const user = body.messages?.find((message) => message.role === "user")?.content ?? "";
+        const targetId = plannerBatchIdForPath(user, c.primaryChange?.path);
+        const mandatoryIds = plannerMandatoryIds(user);
+        const batchIds = targetId !== null && !mandatoryIds.has(targetId) ? [targetId] : [];
+        plannerSelections.push({
+          targetBatchId: targetId,
+          targetWasMandatory: targetId !== null && mandatoryIds.has(targetId),
+          returnedBatchIds: batchIds,
+        });
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          choices: [{ message: { content: JSON.stringify({ batchIds }) } }],
+          usage: { prompt_tokens: 20, completion_tokens: 4, total_tokens: 24 },
+        }));
+        return;
+      }
+      generatorRequests.push(bodyText);
+      const user = body.messages?.find((message) => message.role === "user")?.content ?? "";
+      generatorRequestKinds.push(
+        user.includes("This bounded synthesis window joins semantic evidence") ? "synthesis" : "source",
+      );
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
         JSON.stringify({
@@ -697,6 +802,10 @@ export async function startScorerProxy(
   return {
     baseUrl: serverBaseUrl(server),
     attempts,
+    plannerRequests,
+    generatorRequests,
+    generatorRequestKinds,
+    plannerSelections,
     close: () => {
       closePromise ??= (async () => {
         closing = true;
@@ -708,6 +817,27 @@ export async function startScorerProxy(
       return closePromise;
     },
   };
+}
+
+function plannerMandatoryIds(prompt: string): Set<number> {
+  const match = /Mandatory IDs: \[([^\]]*)\]/u.exec(prompt);
+  if (!match) return new Set();
+  return new Set(
+    match[1]!
+      .split(",")
+      .map((value) => Number.parseInt(value.trim(), 10))
+      .filter(Number.isSafeInteger),
+  );
+}
+
+function plannerBatchIdForPath(prompt: string, path: string | undefined): number | null {
+  if (path === undefined) return null;
+  for (const block of prompt.split("\nBatch ").slice(1)) {
+    if (!block.includes(path)) continue;
+    const id = Number.parseInt(block, 10);
+    if (Number.isSafeInteger(id) && id > 0) return id;
+  }
+  return null;
 }
 
 function scoredFinding(envelope: Record<string, any>): Record<string, any> | undefined {
@@ -797,7 +927,10 @@ export function trueFinding(c: BenchmarkCase) {
 
 export function falseFinding(c: BenchmarkCase) {
   const path = c.primaryChange?.path ?? c.allowedContext.files[0]?.path ?? c.modelOutput.findings[0]?.path;
-  const line = c.primaryChange?.line ?? firstAddedLineForPath(c.diff, path) ?? c.modelOutput.findings[0]?.line ?? 1;
+  const line = c.primaryChange?.line ?? firstAddedLineForPath(c.diff, path);
+  if (path === undefined || line === null) {
+    throw new Error(`fixture ${c.id} has no added coordinate for scorer false-finding calibration`);
+  }
   // The injected false positive is intentionally plausible and overconfident:
   // calibration succeeds only when the scorer pushes it below gate relevance.
   return {
@@ -814,9 +947,7 @@ export function falseFinding(c: BenchmarkCase) {
 
 export function firstAddedLineForPath(diff: string, path: string | undefined): number | null {
   if (path === undefined) return null;
-  const patch = parseUnifiedDiffFiles(diff).find((file) => file.path === path)?.patch;
-  const match = patch?.match(/@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/u);
-  return match ? Number.parseInt(match[1]!, 10) : null;
+  return parseUnifiedDiffFiles(diff).find((file) => file.path === path)?.addedLines[0] ?? null;
 }
 
 export function scorerStructuralFailureReason(
@@ -837,6 +968,7 @@ export function isolatedEnv(
   githubBaseUrl: string,
   modelBaseUrl: string,
   scorerModel: string,
+  forceBoundedSelection = false,
 ): NodeJS.ProcessEnv {
   return {
     PATH: process.env.PATH,
@@ -857,6 +989,7 @@ export function isolatedEnv(
     REVIEW_MODEL: GENERATOR_MODEL,
     REVIEW_MODEL_CASCADE: GENERATOR_MODEL,
     REVIEW_SCORER_MODEL: scorerModel,
+    ...(forceBoundedSelection ? { POSTIL_BENCH_FORCE_BOUNDED_SELECTION: "1" } : {}),
   };
 }
 
