@@ -22,6 +22,7 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
+import evaluatorContractSourcePaths from "../evaluator-contract-sources.json";
 import { API_KEY_ENV_NAMES_TEXT, forwardApiKey, resolveApiKeyName } from "./api-key";
 import { cases as admissionFixtureInputs } from "../fixtures/cases";
 import {
@@ -63,6 +64,10 @@ const execFile = promisify(execFileCb);
 
 export const DEFAULT_API_BASE = "https://openrouter.ai/api/v1";
 export const HOSTED_OPERATION_COST_CAP_MICROS = 1_000_000;
+export const QUALIFICATION_MAX_AGE_DAYS = 30;
+export const QUALIFICATION_MAX_AGE_SECONDS = QUALIFICATION_MAX_AGE_DAYS * 24 * 60 * 60;
+const MANAGED_OPENROUTER_API_BASE = "https://openrouter.ai:443/api/v1";
+export const MANAGED_OPENROUTER_PROVIDER_IDENTITY = "openrouter:managed-routing";
 
 export const REVIEW_CONTRACT_SOURCE_PATHS = [
   "Cargo.toml", "Cargo.lock",
@@ -78,12 +83,7 @@ export const REVIEW_CONTRACT_SOURCE_PATHS = [
   "src/filter.rs",
 ] as const;
 export const FIXTURE_SET_SOURCE_PATHS = ["bench/fixtures/cases.ts"] as const;
-export const EVALUATOR_CONTRACT_SOURCE_PATHS = [
-  "bench/package.json", "bench/bun.lock",
-  "bench/fixtures/cases.ts", "bench/src/api-key.ts", "bench/src/harness.ts",
-  "bench/src/livemodels-score.ts", "bench/src/livemodels.ts", "bench/src/run.ts",
-  "bench/src/verify-admission.ts",
-] as const;
+export const EVALUATOR_CONTRACT_SOURCE_PATHS = evaluatorContractSourcePaths as readonly string[];
 
 /** Cases in flight at once. Live inference is provider-I/O-bound; a modest pool
  * cuts wall-clock time without hammering the API. */
@@ -194,6 +194,9 @@ export interface QualificationProfile {
 export interface AdmissionManifestCandidate {
   version: 1;
   qualificationSourceSha: string;
+  qualificationIssuedAtUnixSeconds: number;
+  qualificationExpiresAtUnixSeconds: number;
+  qualificationMaxAgeDays: typeof QUALIFICATION_MAX_AGE_DAYS;
   modelDefaultsSha256: string;
   profiles: Array<{
     id: string;
@@ -416,11 +419,13 @@ export async function runLiveModels(
     totalRunCostUsd: calculateTotalRunCostUsd(results),
     cases: results,
   };
-  if (passed) {
+  if (passed && profiles.every(isManagedAdmissionProfile)) {
+    const qualificationIssuedAtUnixSeconds = Math.floor(Date.now() / 1_000);
     report.manifestCandidate = admissionManifestCandidate(
       qualificationSourceSha,
       configHash,
       profiles,
+      qualificationIssuedAtUnixSeconds,
     );
   }
   return report;
@@ -443,13 +448,33 @@ export function admissionManifestCandidate(
   qualificationSourceSha: string,
   modelDefaultsSha256: string,
   profiles: QualificationProfile[],
+  qualificationIssuedAtUnixSeconds = Math.floor(Date.now() / 1_000),
 ): AdmissionManifestCandidate {
+  for (const profile of profiles) assertManagedAdmissionProfile(profile);
   return {
     version: 1,
     qualificationSourceSha,
+    qualificationIssuedAtUnixSeconds,
+    qualificationExpiresAtUnixSeconds:
+      qualificationIssuedAtUnixSeconds + QUALIFICATION_MAX_AGE_SECONDS,
+    qualificationMaxAgeDays: QUALIFICATION_MAX_AGE_DAYS,
     modelDefaultsSha256,
     profiles: profiles.map((profile) => ({ id: profile.id, ...qualificationProfileDigestMaterial(profile) })),
   };
+}
+
+function assertManagedAdmissionProfile(profile: QualificationProfile): void {
+  if (!isManagedAdmissionProfile(profile)) {
+    throw new Error(
+      "hosted admission requires the canonical managed OpenRouter endpoint and provider identity",
+    );
+  }
+}
+
+function isManagedAdmissionProfile(profile: QualificationProfile): boolean {
+  return profile.apiBase === MANAGED_OPENROUTER_API_BASE &&
+    profile.apiFormat === "openai-compatible" &&
+    profile.benchmarkProviderIdentity === MANAGED_OPENROUTER_PROVIDER_IDENTITY;
 }
 
 // ---------------------------------------------------------------------------
@@ -791,6 +816,15 @@ export function normalizeApiBase(value: string): string {
   return `${url.protocol}//${hostname}:${port}${path}`;
 }
 
+export function benchmarkProviderIdentityFor(
+  apiBase: string,
+  apiFormat: "openai-compatible" | "anthropic",
+): string | null {
+  return apiBase === MANAGED_OPENROUTER_API_BASE && apiFormat === "openai-compatible"
+    ? MANAGED_OPENROUTER_PROVIDER_IDENTITY
+    : null;
+}
+
 function qualificationProfileEvidence(args: Omit<
   QualificationProfileEvidence,
   "generatorModels" | "consensus" | "scorerModels" | "benchmarkProviderIdentity"
@@ -803,7 +837,7 @@ function qualificationProfileEvidence(args: Omit<
     qualificationSourceSha: args.qualificationSourceSha,
     apiBase: args.apiBase,
     apiFormat: args.apiFormat,
-    benchmarkProviderIdentity: null,
+    benchmarkProviderIdentity: benchmarkProviderIdentityFor(args.apiBase, args.apiFormat),
     generatorModels,
     consensus,
     scorerModels: qualificationScorerModels(args.pair),

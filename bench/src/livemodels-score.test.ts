@@ -48,8 +48,9 @@ function fixture(
         line: 20,
         severity,
         semantics: {
-          positive: [{ all: [["generated detail"]] }],
-          negative: [{ all: [["no generated detail"]] }],
+          positive: ["generated detail must not persist"],
+          negative: ["no generated detail"],
+          failedRemediation: ["the fix does not prevent generated detail"],
         },
       }],
     },

@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "qualificationSourceSha": "9999999999999999999999999999999999999999",
+  "modelDefaultsSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "qualificationIssuedAtUnixSeconds": 1800000000,
+  "qualificationExpiresAtUnixSeconds": 1802592000,
+  "qualificationMaxAgeDays": 30,
+  "profiles": [
+    {
+      "id": "e050df18c0f82fe6758eafd91c0c8d5b9eaccfe4a6cd0d01ca2edb8fc0a91d09",
+      "qualificationSourceSha": "9999999999999999999999999999999999999999",
+      "modelDefaultsSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "apiBase": "https://openrouter.ai:443/api/v1",
+      "benchmarkProviderIdentity": "openrouter:managed-routing",
+      "generatorChain": [
+        "provider/one",
+        "provider/two"
+      ],
+      "consensus": 2,
+      "scorerChain": [
+        "provider/scorer"
+      ],
+      "modelPriceBounds": [
+        {
+          "model": "provider/one",
+          "inputMicrosPerMillionTokens": 1000000,
+          "outputMicrosPerMillionTokens": 2000000
+        },
+        {
+          "model": "provider/scorer",
+          "inputMicrosPerMillionTokens": 3000000,
+          "outputMicrosPerMillionTokens": 4000000
+        },
+        {
+          "model": "provider/two",
+          "inputMicrosPerMillionTokens": 5000000,
+          "outputMicrosPerMillionTokens": 6000000
+        }
+      ],
+      "apiFormat": "openai-compatible",
+      "reviewContractSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "fixtureSetSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "evaluatorContractSha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "evaluatorRuntimeIdentity": "bun@1.3.14",
+      "reportSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "repeatedRuns": 3
+    }
+  ]
+}

@@ -25,17 +25,13 @@ const execFile = promisify(execFileCb);
 
 export const severity = z.enum(["info", "warn", "error"]);
 
-const proposition = z.object({
-  // Every concept group must match. Alternatives inside one group preserve
-  // paraphrase tolerance without making argument order or polarity irrelevant.
-  all: z.array(z.array(z.string().trim().min(2)).min(1)).min(1),
-  // Explicit polarity markers that invalidate this proposition.
-  none: z.array(z.string().trim().min(2)).default([]),
-});
-
 export const semanticPropositions = z.object({
-  positive: z.array(proposition).min(1),
-  negative: z.array(proposition).default([]),
+  // These fixture-owned phrases are part of the signed evaluator contract.
+  // Matching is intentionally conservative: unlisted wording may be rejected,
+  // while a known inverse or remediation always takes precedence.
+  positive: z.array(z.string().trim().min(2)).min(1),
+  negative: z.array(z.string().trim().min(2)).min(1),
+  failedRemediation: z.array(z.string().trim().min(2)).min(1),
 });
 
 const expectedFinding = z.object({
@@ -1017,25 +1013,18 @@ export function commentMatchesExpectation(
 ): boolean {
   if (semantics === undefined) return true;
   const tokens = propositionTokens(comment);
-  const matches = (proposition: SemanticPropositions["positive"][number]) => {
-    if (proposition.none.some((excluded) => containsTokenSequence(tokens, propositionTokens(excluded)))) {
-      return false;
-    }
-    return propositionClauses(tokens).some((clause) => {
-      const groups = proposition.all.map((alternatives) => alternatives.flatMap((alternative) => {
-        const needle = propositionTokens(alternative).filter((token) => !isClauseBoundary(token));
-        return tokenSequenceStarts(clause, needle)
-          .filter((start) => !isLocallyNegated(clause, start))
-          .map((start) => ({ start, end: start + needle.length - 1 }));
-      }));
-      if (groups.some((occurrences) => occurrences.length === 0)) return false;
-      return hasAffirmativeOccurrenceCombination(clause, groups, 0, []);
-    });
+  const exact = (phrase: string) => {
+    const candidate = propositionTokens(phrase);
+    return candidate.length === tokens.length && candidate.every((token, index) => tokens[index] === token);
   };
-  if (semantics.negative.some(matches)) {
+  if (semantics.negative.some(exact)) return false;
+  if ([...semantics.failedRemediation, ...semantics.positive].some(exact)) return true;
+  if (semantics.negative.some((phrase) => containsTokenSequence(tokens, propositionTokens(phrase)))) {
     return false;
   }
-  return semantics.positive.some(matches);
+  return [...semantics.failedRemediation, ...semantics.positive].some((phrase) =>
+    affirmativeSignedPhrase(tokens, propositionTokens(phrase))
+  );
 }
 
 function propositionTokens(value: string): string[] {
@@ -1046,83 +1035,24 @@ function propositionTokens(value: string): string[] {
     .replace(/\bcan['’]t\b/giu, "cannot")
     .replace(/\b([a-z]+)n['’]t\b/giu, "$1 not")
     .toLowerCase()
-    .match(/[a-z0-9]+|[.!?;:]/gu) ?? [];
-}
-
-function isClauseBoundary(token: string): boolean {
-  return token === "." || token === "!" || token === "?" || token === ";" || token === ":" ||
-    token === "but" || token === "however" || token === "whereas" || token === "yet";
-}
-
-function propositionClauses(tokens: string[]): string[][] {
-  const clauses: string[][] = [];
-  let clause: string[] = [];
-  for (const token of tokens) {
-    if (isClauseBoundary(token)) {
-      if (clause.length > 0) clauses.push(clause);
-      clause = [];
-    } else {
-      clause.push(token);
-    }
-  }
-  if (clause.length > 0) clauses.push(clause);
-  return clauses;
+    .match(/[a-z0-9]+/gu) ?? [];
 }
 
 function tokenSequenceStarts(tokens: string[], needle: string[]): number[] {
   if (needle.length === 0) return [];
   const starts: number[] = [];
   for (let index = 0; index <= tokens.length - needle.length; index += 1) {
-    if (needle.every((token, offset) => equivalentToken(tokens[index + offset]!, token))) starts.push(index);
+    if (needle.every((token, offset) => tokens[index + offset] === token)) starts.push(index);
   }
   return starts;
 }
 
-function equivalentToken(left: string, right: string): boolean {
-  if (left === right) return true;
-  const forms = (token: string) => {
-    const values = new Set([token]);
-    if (token.length > 4 && token.endsWith("ies")) values.add(`${token.slice(0, -3)}y`);
-    if (token.length > 4 && token.endsWith("ing")) {
-      const base = token.slice(0, -3);
-      values.add(base);
-      values.add(`${base}e`);
-      if (base.length > 2 && base.at(-1) === base.at(-2)) values.add(base.slice(0, -1));
-    }
-    if (token.length > 3 && token.endsWith("ed")) {
-      const base = token.slice(0, -2);
-      values.add(base);
-      values.add(`${base}e`);
-      if (base.length > 2 && base.at(-1) === base.at(-2)) values.add(base.slice(0, -1));
-    }
-    if (token.length > 3 && token.endsWith("es")) {
-      values.add(token.slice(0, -2));
-      values.add(token.slice(0, -1));
-    }
-    if (token.length > 3 && token.endsWith("s")) values.add(token.slice(0, -1));
-    if (token.length > 4 && token.endsWith("ly")) values.add(token.slice(0, -2));
-    return values;
-  };
-  const leftForms = forms(left);
-  return [...forms(right)].some((form) => leftForms.has(form));
-}
-
 function containsTokenSequence(tokens: string[], needle: string[]): boolean {
-  return tokenSequenceStarts(tokens, needle.filter((token) => !isClauseBoundary(token))).length > 0;
+  return tokenSequenceStarts(tokens, needle).length > 0;
 }
 
-const scopedNegations = [
-  ["false", "that"],
-  ["not", "true", "that"],
-  ["never", "true", "that"],
-  ["never", "happens", "that"],
-  ["no", "evidence", "that"],
-  ["cannot", "be", "true", "that"],
-  ["without"],
-  ["no", "longer", "cause"],
-] as const;
-
-const remediationTokens = new Set([
+const hostileContextTokens = new Set([
+  "false", "not", "never", "no", "without", "cannot", "cant", "impossible",
   "prevent", "prevents", "prevented", "preventing",
   "avoid", "avoids", "avoided", "avoiding",
   "eliminate", "eliminates", "eliminated", "eliminating",
@@ -1132,76 +1062,12 @@ const remediationTokens = new Set([
   "protect", "protects", "protected", "protecting", "protection",
 ]);
 
-const failedRemediationTokens = new Set([
-  "fail", "fails", "failed", "failing", "cannot", "cant", "not", "unable", "lack", "lacks",
-  "lacked", "lacking", "without", "no",
-]);
-
-/** A finding must describe a defect, not a defect-shaped phrase that the same
- * clause says is fixed, prevented, protected, or impossible. Conversely,
- * failure to remediate is affirmative defect evidence. */
-function hasAffirmativeOccurrenceCombination(
-  tokens: string[],
-  groups: Array<Array<{ start: number; end: number }>>,
-  groupIndex: number,
-  selected: Array<{ start: number; end: number }>,
-): boolean {
-  if (groupIndex === groups.length) {
-    const start = Math.min(...selected.map((occurrence) => occurrence.start));
-    const end = Math.max(...selected.map((occurrence) => occurrence.end));
-    return !clauseDeniesDefect(tokens, start, end);
-  }
-  return groups[groupIndex]!.some((occurrence) =>
-    hasAffirmativeOccurrenceCombination(tokens, groups, groupIndex + 1, [...selected, occurrence])
-  );
-}
-
-function clauseDeniesDefect(tokens: string[], matchStart: number, matchEnd: number): boolean {
-  for (let index = 0; index < tokens.length; index += 1) {
-    if (index >= matchStart && index <= matchEnd) continue;
-    const token = tokens[index]!;
-    if (remediationTokens.has(token) && !remediationIsNegated(tokens, index)) return true;
-    if (token === "impossible" && !hasNegationImmediatelyBefore(tokens, index)) return true;
-    if (
-      (token === "cannot" || token === "cant") &&
-      ["occur", "happen", "arise", "result", "exist"].includes(tokens[index + 1] ?? "")
-    ) return true;
-  }
-  return false;
-}
-
-function remediationIsNegated(tokens: string[], remediationIndex: number): boolean {
-  const prefix = tokens.slice(Math.max(0, remediationIndex - 4), remediationIndex);
-  if (prefix.at(-1) === "only") return false;
-  return prefix.some((token) => failedRemediationTokens.has(token));
-}
-
-function hasNegationImmediatelyBefore(tokens: string[], index: number): boolean {
-  return tokens.slice(Math.max(0, index - 3), index)
-    .some((token) => ["not", "never", "no", "cannot", "cant"].includes(token));
-}
-
-/** Reject a concept occurrence when its own clause denies that occurrence.
- * This is deliberately local: an unrelated `not` in an earlier sentence must
- * not erase affirmative defect evidence in the next sentence. */
-function isLocallyNegated(tokens: string[], start: number): boolean {
-  let clauseStart = start;
-  while (clauseStart > 0 && !isClauseBoundary(tokens[clauseStart - 1]!)) clauseStart -= 1;
-  const prefix = tokens.slice(clauseStart, start);
-  if (scopedNegations.some((scope) => containsTokenSequence(prefix, [...scope]))) return true;
-
-  const local = prefix.slice(-5);
-  for (let index = 0; index < local.length; index += 1) {
-    const token = local[index];
-    const next = local[index + 1];
-    if (token === "not" && next === "only") continue;
-    if (["not", "never", "no", "cannot", "cant", "neither", "nor"].includes(token ?? "")) {
-      const suffix = local.slice(index + 1);
-      if (suffix.some((candidate) => remediationTokens.has(candidate))) continue;
-      return true;
-    }
-  }
-  return false;
+function affirmativeSignedPhrase(tokens: string[], phrase: string[]): boolean {
+  return tokenSequenceStarts(tokens, phrase).some((start) => {
+    const end = start + phrase.length;
+    const context = [...tokens.slice(0, start), ...tokens.slice(end)];
+    return context.every((token) => !hostileContextTokens.has(token));
+  });
 }
 
 function sumMetrics(metrics: BenchmarkMetrics[]): BenchmarkMetrics {

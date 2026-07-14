@@ -7,6 +7,7 @@ import { benchmarkCase } from "./harness";
 import {
   admissionManifestCandidate,
   assertExactQualificationFixtures,
+  benchmarkProviderIdentityFor,
   endpointAuthFromEnvironment,
   EVALUATOR_CONTRACT_SOURCE_PATHS,
   fetchPricing,
@@ -14,6 +15,7 @@ import {
   hashNamedSources,
   liveEnv,
   liveModelsQualificationExitCode,
+  MANAGED_OPENROUTER_PROVIDER_IDENTITY,
   modelPriceBoundsFor,
   normalizeApiBase,
   normalizeQualificationPairs,
@@ -182,6 +184,14 @@ describe("pair qualification configuration", () => {
     expect(() => normalizeApiBase("https://example.test/v1?route=x")).toThrow(
       "must not contain a query or fragment",
     );
+    expect(benchmarkProviderIdentityFor(
+      "https://openrouter.ai:443/api/v1",
+      "openai-compatible",
+    )).toBe(MANAGED_OPENROUTER_PROVIDER_IDENTITY);
+    expect(benchmarkProviderIdentityFor("https://models.example:443/v1", "openai-compatible"))
+      .toBeNull();
+    expect(benchmarkProviderIdentityFor("https://openrouter.ai:443/api/v1", "anthropic"))
+      .toBeNull();
   });
 
   test("enforces cost and candidate bounds before execution", async () => {
@@ -290,8 +300,10 @@ describe("managed admission workflow", () => {
     expect(workflow).toContain("POSTIL_API_FORMAT: openai-compatible");
     expect(workflow).toContain("POSTIL_BENCH_REPEATS: \"3\"");
     expect(workflow).toContain("POSTIL_BENCH_PAIRS: ${{ inputs.pairs }}");
-    expect(workflow).toContain("${{ runner.temp }}/postil-qualified-models-${{ github.run_id }}-${{ github.run_attempt }}.json");
-    expect(workflow).toContain('rm -f "$POSTIL_REPORT_OUT" "$POSTIL_MANIFEST_OUT"');
+    expect(workflow).toContain('echo "POSTIL_MANIFEST_OUT=${RUNNER_TEMP}/postil-qualified-models-${suffix}.json"');
+    expect(workflow).toContain('>> "$GITHUB_ENV"');
+    expect(workflow).toContain('test "$GITHUB_REF" = "refs/heads/main"');
+    expect(workflow).toContain('rm -f "$POSTIL_REPORT_OUT" "$POSTIL_MANIFEST_OUT" "$POSTIL_ATTESTATION_BUNDLE_OUT"');
     expect(workflow).toContain('--manifest-out "$POSTIL_MANIFEST_OUT"');
     expect(workflow).toContain("POSTIL_QUALIFICATION_SOURCE_SHA: ${{ github.sha }}");
     expect(workflow).toContain("uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4");
@@ -308,14 +320,23 @@ describe("managed admission workflow", () => {
       resolve(import.meta.dir, "..", "..", ".github", "workflows", "ci.yml"),
     ).text();
     expect(ci).toContain("bun run verify-admission");
-    const ciActionReferences = [...ci.matchAll(/^\s*-?\s*uses:\s*([^\s#]+)(?:\s+#\s*(\S+))?$/gmu)];
-    expect(ciActionReferences.length).toBeGreaterThan(0);
-    expect(ciActionReferences.every((match) => /@[0-9a-f]{40}$/u.test(match[1] ?? ""))).toBe(true);
-    expect(ciActionReferences.every((match) => (match[2] ?? "").length > 0)).toBe(true);
-    const actionReferences = [...workflow.matchAll(/^\s*-?\s*uses:\s*([^\s#]+)(?:\s+#\s*(\S+))?$/gmu)];
-    expect(actionReferences.length).toBeGreaterThan(0);
-    expect(actionReferences.every((match) => /@[0-9a-f]{40}$/u.test(match[1] ?? ""))).toBe(true);
-    expect(actionReferences.every((match) => (match[2] ?? "").length > 0)).toBe(true);
+    expect(ci).toMatch(/bench:\n[\s\S]*?fetch-depth: 0/u);
+    let checkedReferences = 0;
+    const workflowGlob = new Bun.Glob("*.yml");
+    for await (const workflowName of workflowGlob.scan(resolve(import.meta.dir, "..", "..", ".github", "workflows"))) {
+      const source = await Bun.file(resolve(import.meta.dir, "..", "..", ".github", "workflows", workflowName)).text();
+      const actionReferences = [...source.matchAll(/^\s*-?\s*uses:\s*([^\s#]+)(?:\s+#\s*(\S+))?$/gmu)];
+      checkedReferences += actionReferences.length;
+      expect({
+        workflowName,
+        mutable: actionReferences.filter((match) => !/@[0-9a-f]{40}$/u.test(match[1] ?? "")),
+      }).toEqual({ workflowName, mutable: [] });
+      expect({
+        workflowName,
+        unlabelled: actionReferences.filter((match) => (match[2] ?? "").length === 0),
+      }).toEqual({ workflowName, unlabelled: [] });
+    }
+    expect(checkedReferences).toBeGreaterThan(0);
   });
 });
 
@@ -337,14 +358,14 @@ describe("qualification report", () => {
     ])).toBe("1969c5b03a79915d62106b91c742a28127afae455317dcb3a4670e50829eb9ba");
   });
 
-  test("emits the exact runtime admission manifest profile", () => {
+  test("emits the exact cross-language admission manifest vector", async () => {
     const profileMaterial = {
       qualificationSourceSha: "9".repeat(40),
       modelDefaultsSha256: "c".repeat(64),
       reportSha256: "e".repeat(64),
       apiBase: "https://openrouter.ai:443/api/v1",
       apiFormat: "openai-compatible" as const,
-      benchmarkProviderIdentity: "openrouter:test-route",
+      benchmarkProviderIdentity: MANAGED_OPENROUTER_PROVIDER_IDENTITY,
       generatorModels: ["provider/one", "provider/two"],
       consensus: 2,
       scorerModels: ["provider/scorer"],
@@ -374,46 +395,22 @@ describe("qualification report", () => {
       repeats: 3,
     };
     const profile = { id: qualificationProfileDigest(profileMaterial), ...profileMaterial };
-    expect(profile.id).toBe("60b69c663b3731b28a7a30767abf6a41e9f6a2003c5a5185fc89384776c1b875");
-    expect(admissionManifestCandidate("9".repeat(40), "c".repeat(64), [profile])).toEqual({
-      version: 1,
-      qualificationSourceSha: "9".repeat(40),
-      modelDefaultsSha256: "c".repeat(64),
-      profiles: [{
-        id: profile.id,
-        qualificationSourceSha: "9".repeat(40),
-        modelDefaultsSha256: "c".repeat(64),
-        apiBase: "https://openrouter.ai:443/api/v1",
-        benchmarkProviderIdentity: "openrouter:test-route",
-        generatorChain: ["provider/one", "provider/two"],
-        consensus: 2,
-        scorerChain: ["provider/scorer"],
-        modelPriceBounds: [
-          {
-            model: "provider/one",
-            inputMicrosPerMillionTokens: 1_000_000,
-            outputMicrosPerMillionTokens: 2_000_000,
-          },
-          {
-            model: "provider/scorer",
-            inputMicrosPerMillionTokens: 3_000_000,
-            outputMicrosPerMillionTokens: 4_000_000,
-          },
-          {
-            model: "provider/two",
-            inputMicrosPerMillionTokens: 5_000_000,
-            outputMicrosPerMillionTokens: 6_000_000,
-          },
-        ],
-        apiFormat: "openai-compatible",
-        reviewContractSha256: "b".repeat(64),
-        fixtureSetSha256: "a".repeat(64),
-        evaluatorContractSha256: "f".repeat(64),
-        evaluatorRuntimeIdentity: "bun@1.3.14",
-        reportSha256: "e".repeat(64),
-        repeatedRuns: 3,
-      }],
-    });
+    expect(profile.id).toBe("e050df18c0f82fe6758eafd91c0c8d5b9eaccfe4a6cd0d01ca2edb8fc0a91d09");
+    const vector = await Bun.file(
+      resolve(import.meta.dir, "..", "admission-manifest-candidate-vector.json"),
+    ).json();
+    expect(admissionManifestCandidate(
+      "9".repeat(40),
+      "c".repeat(64),
+      [profile],
+      1_800_000_000,
+    )).toEqual(vector);
+    expect(() => admissionManifestCandidate(
+      "9".repeat(40),
+      "c".repeat(64),
+      [{ ...profile, benchmarkProviderIdentity: null }],
+      1_800_000_000,
+    )).toThrow("canonical managed OpenRouter endpoint and provider identity");
   });
 
   test("prints attributable metrics, hashes, provider, and bounded costs", () => {
@@ -441,6 +438,9 @@ describe("qualification report", () => {
         version: 1,
         qualificationSourceSha: "9".repeat(40),
         modelDefaultsSha256: "d".repeat(64),
+        qualificationIssuedAtUnixSeconds: 1_800_000_000,
+        qualificationExpiresAtUnixSeconds: 1_802_592_000,
+        qualificationMaxAgeDays: 30,
         profiles: [],
       },
       passed: false,

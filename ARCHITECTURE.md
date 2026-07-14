@@ -87,13 +87,22 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   consensus width to one immutable qualification profile. Each profile binds benchmark
   report, provider identity, canonical endpoint and interface, sorted price bounds,
   fixture-set, evaluator-contract, pinned Bun evaluator runtime,
-  full runtime/dependency-contract, and model-default digests plus repeat evidence.
-  The managed workflow binds each candidate to its clean source commit and creates
-  SLSA provenance for the exact candidate bytes with GitHub OIDC and public Sigstore.
+  full runtime/dependency-contract, model-default digests, repeat evidence, and a
+  30-day qualification authority window. One checked-in manifest defines the exact
+  Rust and TypeScript evaluator source list, including the attestation verifier.
+  Managed profiles bind the canonical endpoint to the exact
+  `openrouter:managed-routing` identity; custom endpoints cannot enter the hosted
+  manifest.
+  The managed workflow runs only from `refs/heads/main`, binds each candidate to its
+  clean source commit, and creates SLSA provenance for the exact candidate bytes with
+  GitHub OIDC and public Sigstore.
   CI admits a nonempty manifest only when its committed bundle verifies against the
-  exact repository, workflow, source and signer commit, OIDC issuer, and hosted runner.
-  Internal checksums detect mutation but do not authenticate the producer. An empty
-  manifest has no qualification source or bundle and grants no model authority.
+  exact repository, workflow, main source ref, source and signer commit, OIDC issuer,
+  and hosted runner. The source is an ancestor of the candidate; their diff is limited
+  to the manifest and bundle. A verified Sigstore timestamp matches the signed issue
+  time and the authority window. CI and runtime reject expired authority. Internal
+  checksums detect mutation but do not authenticate the producer. An empty manifest
+  has no qualification source, temporal authority, or bundle and grants no model authority.
   Rust recomputes the profile identifier from the same canonical JSON material as
   the evaluator. The report carries the evaluated binary hash; the profile identifier
   omits that hash because embedding the profile changes the binary bytes.

@@ -32,9 +32,6 @@ jobs:
       POSTIL_BENCH_COST_CAP_USD: ${{ inputs.cost_cap_usd }}
       POSTIL_API_BASE: https://openrouter.ai/api/v1
       POSTIL_API_FORMAT: openai-compatible
-      POSTIL_REPORT_OUT: ${{ runner.temp }}/postil-live-report-${{ github.run_id }}-${{ github.run_attempt }}.json
-      POSTIL_MANIFEST_OUT: ${{ runner.temp }}/postil-qualified-models-${{ github.run_id }}-${{ github.run_attempt }}.json
-      POSTIL_ATTESTATION_BUNDLE_OUT: ${{ runner.temp }}/postil-qualified-models-${{ github.run_id }}-${{ github.run_attempt }}.attestation.json
       POSTIL_QUALIFICATION_SOURCE_SHA: ${{ github.sha }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -44,6 +41,18 @@ jobs:
         with:
           bun-version: 1.3.14
 
+      - name: Require main branch qualification
+        run: test "$GITHUB_REF" = "refs/heads/main"
+
+      - name: Initialize unique evidence paths
+        run: |
+          suffix="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          {
+            echo "POSTIL_REPORT_OUT=${RUNNER_TEMP}/postil-live-report-${suffix}.json"
+            echo "POSTIL_MANIFEST_OUT=${RUNNER_TEMP}/postil-qualified-models-${suffix}.json"
+            echo "POSTIL_ATTESTATION_BUNDLE_OUT=${RUNNER_TEMP}/postil-qualified-models-${suffix}.attestation.json"
+          } >> "$GITHUB_ENV"
+
       - name: Build release binary
         run: cargo build --quiet --release
 
@@ -52,7 +61,7 @@ jobs:
         run: bun install --frozen-lockfile
 
       - name: Prepare unique evidence paths
-        run: rm -f "$POSTIL_REPORT_OUT" "$POSTIL_MANIFEST_OUT"
+        run: rm -f "$POSTIL_REPORT_OUT" "$POSTIL_MANIFEST_OUT" "$POSTIL_ATTESTATION_BUNDLE_OUT"
 
       - name: Run exact admission profile
         working-directory: bench

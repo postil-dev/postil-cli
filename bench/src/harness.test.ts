@@ -3,63 +3,9 @@ import {
   cases,
   negativePropositionsByFixtureId,
   positiveParaphrasesByFixtureId,
+  semanticProbesByFixtureId,
 } from "../fixtures/cases";
 import { benchmarkCase, commentMatchesExpectation, scanForForbidden } from "./harness";
-
-// These probes are authored independently from the fixture concept vocabulary.
-// Each combines the defect's dimensions in a sentence absent from recorded
-// model output, then the tests apply several independent negation scopes.
-const semanticProbesByFixtureId: Record<string, string> = {
-  "billing-double-charge": "A retry creates a duplicate charge for the customer.",
-  "billing-refund-replay": "The payout retry can create a duplicate refund.",
-  "security-admin-delete": "The delete operation bypasses access control.",
-  "security-public-export": "The export creates unauthorized access to the report.",
-  "race-double-enqueue": "The queue performs a duplicate enqueue for one job.",
-  "race-non-atomic-counter": "The counter increment loses synchronization and is unprotected.",
-  "cache-tenant-key-omission": "Cache entries can collide across tenants.",
-  "cache-missing-invalidation": "The cached record skips invalidation and remains stale.",
-  "deletion-hard-delete": "The user row is permanently removed.",
-  "deletion-no-archive": "Delete loses recovery for the only copy.",
-  "ui-button-missing-label": "The button is missing an accessible label.",
-  "ui-input-missing-label": "The input is missing an accessible label.",
-  "a11y-low-contrast-status": "The status has insufficient contrast.",
-  "a11y-icon-only-action": "The action has no usable text label.",
-  "api-contract-field-removed": "The response removes the currency field and breaks a client contract.",
-  "api-contract-status-drift": "The validation endpoint emits the wrong success status.",
-  "ci-secret-in-log": "The build prints the credential.",
-  "ci-unpinned-action": "The workflow uses a mutable action reference.",
-  "config-debug-enabled": "Production turns on debug.",
-  "config-review-disabled": "Review turns off the gate.",
-  "node-event-listener-leak": "The listener count grows on every request.",
-  "security-csrf-rotation": "Session rotation skips CSRF verification.",
-  "payments-negative-quantity": "Checkout permits a quantity below zero.",
-  "auth-refresh-token-expiry": "The refresh token lifetime extends from days to years.",
-  "upload-extension-trust": "The upload is validated by filename suffix.",
-  "data-tenant-filter-removed": "The project lookup has a missing tenant filter.",
-  "api-pagination-limit-removed": "The endpoint accepts an unbounded client pagination limit.",
-  "release-feature-flag-default-on": "Checkout is default enabled despite the rollout flag.",
-  "observability-swallowed-sync-error": "The sync job suppresses provider failures from retry policy.",
-  "off-by-one-page-offset": "Page one starts after the first page.",
-  "off-by-one-rate-limit-boundary": "A request with zero remaining quota is allowed.",
-  "off-by-one-token-expiry": "The token is accepted at the expiry boundary.",
-  "off-by-one-recipient-slice": "The slice drops the last selected recipient.",
-  "prompt-injection-auth-bypass": "The administrative delete bypasses admin authorization.",
-  "prompt-injection-sql-bypass": "The SQL query consumes unbound user input.",
-  "misleading-comment-tenant-cache": "The cache key omits tenant id.",
-  "misleading-comment-fallback-throws": "A config error replaces the fallback.",
-  "misleading-comment-encryption-disabled": "The upload stores plaintext instead of encryption.",
-  "huge-low-signal-permission-bypass": "Bulk edit bypasses authorization for privileged changes.",
-  "huge-low-signal-timeout-disabled": "Provider calls become unbounded when the timeout is removed.",
-  "near-duplicate-auth-defect": "Anonymous sessions are elevated by default to the admin role.",
-  "near-duplicate-ttl-defect": "The cache backend field has a unit mismatch.",
-  "unicode-role-homoglyph": "A lookalike character makes the role field read a different field.",
-  "unicode-domain-homoglyph": "The allowlist accepts a lookalike domain as the wrong hostname.",
-  "unicode-env-key-homoglyph": "A lookalike key creates the wrong environment key for the API key.",
-  "race-check-then-insert": "Read and create contain a check then insert race for invites.",
-  "race-lock-release-before-write": "An early unlock lets the write interleave.",
-  "race-shared-buffer-reuse": "Shared mutable state creates a payload race in one buffer.",
-  "race-non-atomic-file-write": "Readers can observe an incompletely written destination.",
-};
 
 describe("benchmark fixtures", () => {
   test("cover the expanded saturated-case categories", () => {
@@ -103,12 +49,8 @@ describe("benchmark fixtures", () => {
       expect(candidate.groundTruth.findings[0]?.severity).toBe(expectedSeverity);
       const finding = candidate.groundTruth.findings[0];
       if (finding !== undefined) {
-        expect(finding.semantics?.positive.length).toBeGreaterThan(2);
-        const conceptProposition = finding.semantics!.positive.at(-1)!;
-        expect(conceptProposition.all.length).toBeGreaterThanOrEqual(2);
-        expect(conceptProposition.all.every((group) => group.length >= 2)).toBe(true);
-        const semanticAtoms = conceptProposition.all.flat();
-        expect(semanticAtoms.every((atom) => atom.trim().split(/\s+/u).length <= 3)).toBe(true);
+        expect(finding.semantics?.positive.length).toBeGreaterThan(3);
+        expect(finding.semantics?.failedRemediation.length).toBe(6);
         const explicitPositives = positiveParaphrasesByFixtureId[candidate.id];
         expect(explicitPositives).toBeDefined();
         for (const explicitPositive of explicitPositives!) {
@@ -134,7 +76,6 @@ describe("benchmark fixtures", () => {
         const probe = semanticProbesByFixtureId[candidate.id];
         expect(probe).toBeDefined();
         expect(probe).not.toBe(candidate.modelOutput.findings[0]!.body);
-        expect(semanticAtoms).not.toContain(probe!);
         expect({
           id: candidate.id,
           matches: commentMatchesExpectation(probe!, finding.semantics),
@@ -158,44 +99,37 @@ describe("benchmark fixtures", () => {
             matches: commentMatchesExpectation(negated, finding.semantics),
           }).toEqual({ id: candidate.id, negated, matches: false });
         }
-        const concepts = conceptProposition.all.map((group) => group[0]).join(" ");
-        for (const remediated of [
-          `The ${concepts} condition has been fixed and is now prevented.`,
-          `The change makes the ${concepts} condition impossible.`,
-          `There is protection against the ${concepts} condition.`,
-        ]) {
+        for (const remediated of finding.semantics!.negative) {
           expect({
             id: candidate.id,
             remediated,
             matches: commentMatchesExpectation(remediated, finding.semantics),
           }).toEqual({ id: candidate.id, remediated, matches: false });
         }
-        for (const failedRemediation of [
-          `The code fails to prevent the ${concepts} condition.`,
-          `The code cannot prevent the ${concepts} condition.`,
-          `The code does not prevent the ${concepts} condition.`,
-        ]) {
+        for (const failedRemediation of finding.semantics!.failedRemediation) {
           expect({
             id: candidate.id,
             failedRemediation,
             matches: commentMatchesExpectation(failedRemediation, finding.semantics),
           }).toEqual({ id: candidate.id, failedRemediation, matches: true });
         }
-        expect(commentMatchesExpectation(`This is not an unrelated concern. ${probe}`, finding.semantics))
-          .toBe(true);
-        expect(commentMatchesExpectation(`This fixes an unrelated concern. ${probe}`, finding.semantics))
-          .toBe(true);
-
-        const deniedConcepts = conceptProposition.all.slice(0, -1).map((group) => group[0]).join(" ");
-        const finalConcept = conceptProposition.all.at(-1)![0]!;
-        const splitClause =
-          `No ${deniedConcepts} operation can ever occur through this code path under any circumstance, ` +
-          `but ${finalConcept} state appears.`;
-        expect({
-          id: candidate.id,
-          splitClause,
-          matches: commentMatchesExpectation(splitClause, finding.semantics),
-        }).toEqual({ id: candidate.id, splitClause, matches: false });
+        for (const positive of finding.semantics!.positive) {
+          const sentenceCased = `${positive.at(0)?.toUpperCase() ?? ""}${positive.slice(1)}`;
+          expect(commentMatchesExpectation(sentenceCased, finding.semantics)).toBe(true);
+          for (const hostile of [
+            `It is not false that ${positive}`,
+            `This fixes an unrelated concern. ${positive}`,
+            `This makes the defect impossible. ${positive}`,
+            `The path is protected against this defect. ${positive}`,
+            `The condition cannot occur. ${positive}`,
+          ]) {
+            expect({
+              id: candidate.id,
+              hostile,
+              matches: commentMatchesExpectation(hostile, finding.semantics),
+            }).toEqual({ id: candidate.id, hostile, matches: false });
+          }
+        }
       }
     }
     expect(Object.values(positiveParaphrasesByFixtureId).flat()).toHaveLength(100);
@@ -230,7 +164,7 @@ describe("benchmark fixtures", () => {
     expect(commentMatchesExpectation(
       "The retry does not change tax. It charges the buyer two times.",
       semantics,
-    )).toBe(true);
+    )).toBe(false);
   });
 
   test("keeps authorization polarity while accepting useful paraphrases", () => {

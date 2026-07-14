@@ -1,0 +1,13 @@
+[
+  "bench/admission-manifest-candidate-vector.json",
+  "bench/evaluator-contract-sources.json",
+  "bench/package.json",
+  "bench/bun.lock",
+  "bench/fixtures/cases.ts",
+  "bench/src/api-key.ts",
+  "bench/src/harness.ts",
+  "bench/src/livemodels-score.ts",
+  "bench/src/livemodels.ts",
+  "bench/src/run.ts",
+  "bench/src/verify-admission.ts"
+]

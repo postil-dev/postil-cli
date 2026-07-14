@@ -49,7 +49,17 @@ const REVIEW_CONTRACT_SOURCES: &[(&str, &str)] = &[
 const BENCH_FIXTURES_SOURCE: &str = include_str!("../bench/fixtures/cases.ts");
 const BENCH_PACKAGE_JSON: &str = include_str!("../bench/package.json");
 const BENCH_BUN_LOCK: &str = include_str!("../bench/bun.lock");
+const EVALUATOR_CONTRACT_PATHS_JSON: &str =
+    include_str!("../bench/evaluator-contract-sources.json");
 const EVALUATOR_CONTRACT_SOURCES: &[(&str, &str)] = &[
+    (
+        "bench/admission-manifest-candidate-vector.json",
+        include_str!("../bench/admission-manifest-candidate-vector.json"),
+    ),
+    (
+        "bench/evaluator-contract-sources.json",
+        EVALUATOR_CONTRACT_PATHS_JSON,
+    ),
     ("bench/package.json", BENCH_PACKAGE_JSON),
     ("bench/bun.lock", BENCH_BUN_LOCK),
     ("bench/fixtures/cases.ts", BENCH_FIXTURES_SOURCE),
@@ -70,8 +80,14 @@ const EVALUATOR_CONTRACT_SOURCES: &[(&str, &str)] = &[
         include_str!("../bench/src/livemodels.ts"),
     ),
     ("bench/src/run.ts", include_str!("../bench/src/run.ts")),
+    (
+        "bench/src/verify-admission.ts",
+        include_str!("../bench/src/verify-admission.ts"),
+    ),
 ];
 pub const DEFAULT_API_BASE: &str = "https://openrouter.ai/api/v1";
+pub const MANAGED_OPENROUTER_API_BASE: &str = "https://openrouter.ai:443/api/v1";
+pub const MANAGED_OPENROUTER_PROVIDER_IDENTITY: &str = "openrouter:managed-routing";
 pub const MAX_FINDINGS: usize = 20;
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -119,6 +135,9 @@ pub struct ModelDefaults {
 pub struct QualificationManifest {
     pub version: u64,
     pub qualification_source_sha: Option<String>,
+    pub qualification_issued_at_unix_seconds: Option<u64>,
+    pub qualification_expires_at_unix_seconds: Option<u64>,
+    pub qualification_max_age_days: Option<u32>,
     pub model_defaults_sha256: String,
     pub profiles: Vec<QualificationProfile>,
 }
@@ -174,6 +193,8 @@ struct QualificationProfileDigestMaterial<'a> {
 }
 
 pub const HOSTED_OPERATION_COST_CAP_MICROS: u64 = 1_000_000;
+pub const QUALIFICATION_MAX_AGE_DAYS: u32 = 30;
+const QUALIFICATION_MAX_AGE_SECONDS: u64 = QUALIFICATION_MAX_AGE_DAYS as u64 * 24 * 60 * 60;
 const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
 
 #[derive(Debug, Deserialize)]
@@ -371,22 +392,14 @@ fn parse_qualification_manifest(raw: &str) -> Result<QualificationManifest> {
         "qualification manifest does not match the embedded model defaults"
     );
     let mut profile_ids = Vec::with_capacity(manifest.profiles.len());
+    validate_qualification_authority(&manifest, current_unix_seconds()?)?;
     if manifest.profiles.is_empty() {
         anyhow::ensure!(
-            manifest.qualification_source_sha.is_none(),
-            "empty qualification manifest must not claim a qualification source"
-        );
-    } else {
-        let source_sha = manifest
-            .qualification_source_sha
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("qualification manifest source SHA is required"))?;
-        anyhow::ensure!(
-            matches!(source_sha.len(), 40 | 64)
-                && source_sha
-                    .bytes()
-                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
-            "qualification manifest source SHA must be a lowercase Git commit SHA"
+            manifest.qualification_source_sha.is_none()
+                && manifest.qualification_issued_at_unix_seconds.is_none()
+                && manifest.qualification_expires_at_unix_seconds.is_none()
+                && manifest.qualification_max_age_days.is_none(),
+            "empty qualification manifest must not claim qualification authority"
         );
     }
     let current_review_contract = review_contract_sha256();
@@ -413,12 +426,21 @@ fn parse_qualification_manifest(raw: &str) -> Result<QualificationManifest> {
             normalize_api_base(&profile.api_base)? == profile.api_base,
             "qualification profile apiBase must use its canonical form"
         );
-        if let Some(provider) = profile.benchmark_provider_identity.as_deref() {
-            anyhow::ensure!(
-                !provider.trim().is_empty() && !provider.contains(['\n', '\r']),
-                "qualification profile benchmark provider identity must be one line"
-            );
-        }
+        let provider = profile
+            .benchmark_provider_identity
+            .as_deref()
+            .ok_or_else(|| {
+                anyhow::anyhow!("hosted qualification profile provider identity is required")
+            })?;
+        anyhow::ensure!(
+            provider == MANAGED_OPENROUTER_PROVIDER_IDENTITY,
+            "hosted qualification profile provider identity must be {MANAGED_OPENROUTER_PROVIDER_IDENTITY}"
+        );
+        anyhow::ensure!(
+            profile.api_base == MANAGED_OPENROUTER_API_BASE
+                && profile.api_format == ApiFormat::OpenaiCompatible,
+            "hosted qualification profile must use the canonical managed OpenRouter endpoint"
+        );
         for model in &profile.generator_chain {
             validate_model_id("qualification profile generator chain", model)?;
         }
@@ -530,6 +552,50 @@ fn parse_qualification_manifest(raw: &str) -> Result<QualificationManifest> {
         "qualification profile ids must be unique"
     );
     Ok(manifest)
+}
+
+fn current_unix_seconds() -> Result<u64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_secs())
+}
+
+fn validate_qualification_authority(manifest: &QualificationManifest, now: u64) -> Result<()> {
+    if manifest.profiles.is_empty() {
+        return Ok(());
+    }
+    let source_sha = manifest
+        .qualification_source_sha
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("qualification manifest source SHA is required"))?;
+    anyhow::ensure!(
+        matches!(source_sha.len(), 40 | 64)
+            && source_sha
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+        "qualification manifest source SHA must be a lowercase Git commit SHA"
+    );
+    let issued = manifest
+        .qualification_issued_at_unix_seconds
+        .ok_or_else(|| anyhow::anyhow!("qualification issue time is required"))?;
+    let expires = manifest
+        .qualification_expires_at_unix_seconds
+        .ok_or_else(|| anyhow::anyhow!("qualification expiry time is required"))?;
+    anyhow::ensure!(
+        manifest.qualification_max_age_days == Some(QUALIFICATION_MAX_AGE_DAYS),
+        "qualification maximum age must be {QUALIFICATION_MAX_AGE_DAYS} days"
+    );
+    anyhow::ensure!(
+        expires.checked_sub(issued) == Some(QUALIFICATION_MAX_AGE_SECONDS),
+        "qualification expiry window is invalid"
+    );
+    anyhow::ensure!(now <= expires, "qualification evidence has expired");
+    anyhow::ensure!(
+        issued <= now.saturating_add(15 * 60),
+        "qualification issue time is in the future"
+    );
+    Ok(())
 }
 
 fn parse_model_defaults(raw: &str) -> Result<ModelDefaults> {
@@ -1409,9 +1475,13 @@ mod tests {
     }
 
     fn valid_qualification_manifest_json() -> serde_json::Value {
+        let issued = current_unix_seconds().unwrap();
         let mut manifest = serde_json::json!({
             "version": 1,
             "qualificationSourceSha": "9".repeat(40),
+            "qualificationIssuedAtUnixSeconds": issued,
+            "qualificationExpiresAtUnixSeconds": issued + QUALIFICATION_MAX_AGE_SECONDS,
+            "qualificationMaxAgeDays": QUALIFICATION_MAX_AGE_DAYS,
             "modelDefaultsSha256": model_defaults().source_sha256,
             "profiles": [{
                 "id": "0".repeat(64),
@@ -1419,7 +1489,7 @@ mod tests {
                 "modelDefaultsSha256": model_defaults().source_sha256,
                 "apiFormat": "openai-compatible",
                 "apiBase": "https://openrouter.ai:443/api/v1",
-                "benchmarkProviderIdentity": null,
+                "benchmarkProviderIdentity": MANAGED_OPENROUTER_PROVIDER_IDENTITY,
                 "generatorChain": ["provider/model"],
                 "consensus": 1,
                 "scorerChain": ["provider/scorer"],
@@ -1810,6 +1880,9 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
         let mut empty = valid_qualification_manifest_json();
         empty["profiles"] = serde_json::json!([]);
         empty["qualificationSourceSha"] = serde_json::Value::Null;
+        empty["qualificationIssuedAtUnixSeconds"] = serde_json::Value::Null;
+        empty["qualificationExpiresAtUnixSeconds"] = serde_json::Value::Null;
+        empty["qualificationMaxAgeDays"] = serde_json::Value::Null;
         assert!(
             parse_qualification_manifest(&empty.to_string())
                 .unwrap()
@@ -1820,6 +1893,23 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
         empty["qualificationSourceSha"] = serde_json::json!("9".repeat(40));
         let error = parse_qualification_manifest(&empty.to_string()).unwrap_err();
         assert!(error.to_string().contains("must not claim"));
+    }
+
+    #[test]
+    fn qualification_authority_expires_against_runtime_time() {
+        let mut raw = valid_qualification_manifest_json();
+        raw["qualificationIssuedAtUnixSeconds"] = serde_json::json!(1_000_000_u64);
+        raw["qualificationExpiresAtUnixSeconds"] =
+            serde_json::json!(1_000_000_u64 + QUALIFICATION_MAX_AGE_SECONDS);
+        let manifest: QualificationManifest = serde_json::from_value(raw).unwrap();
+        validate_qualification_authority(&manifest, 1_000_000_u64 + QUALIFICATION_MAX_AGE_SECONDS)
+            .unwrap();
+        let error = validate_qualification_authority(
+            &manifest,
+            1_000_001_u64 + QUALIFICATION_MAX_AGE_SECONDS,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("expired"));
     }
 
     #[test]
@@ -1950,12 +2040,52 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
     }
 
     #[test]
+    fn evaluator_contract_manifest_matches_the_exact_runtime_source_set() {
+        let declared: Vec<String> = serde_json::from_str(EVALUATOR_CONTRACT_PATHS_JSON).unwrap();
+        let embedded = EVALUATOR_CONTRACT_SOURCES
+            .iter()
+            .map(|(path, _)| path.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(declared, embedded);
+        assert!(declared.contains(&"bench/src/verify-admission.ts".to_string()));
+    }
+
+    #[test]
+    fn emitted_candidate_vector_parses_in_the_runtime_admission_parser() {
+        let mut candidate: serde_json::Value = serde_json::from_str(include_str!(
+            "../bench/admission-manifest-candidate-vector.json"
+        ))
+        .unwrap();
+        let issued = current_unix_seconds().unwrap();
+        candidate["qualificationIssuedAtUnixSeconds"] = serde_json::json!(issued);
+        candidate["qualificationExpiresAtUnixSeconds"] =
+            serde_json::json!(issued + QUALIFICATION_MAX_AGE_SECONDS);
+        candidate["modelDefaultsSha256"] = serde_json::json!(model_defaults().source_sha256);
+        candidate["profiles"][0]["modelDefaultsSha256"] =
+            serde_json::json!(model_defaults().source_sha256);
+        candidate["profiles"][0]["reviewContractSha256"] =
+            serde_json::json!(review_contract_sha256());
+        candidate["profiles"][0]["fixtureSetSha256"] = serde_json::json!(fixture_set_sha256());
+        candidate["profiles"][0]["evaluatorContractSha256"] =
+            serde_json::json!(evaluator_contract_sha256());
+        let profile: QualificationProfile =
+            serde_json::from_value(candidate["profiles"][0].clone()).unwrap();
+        candidate["profiles"][0]["id"] = serde_json::json!(qualification_profile_digest(&profile));
+        let parsed = parse_qualification_manifest(&candidate.to_string()).unwrap();
+        assert_eq!(parsed.profiles.len(), 1);
+        assert_eq!(
+            parsed.qualification_max_age_days,
+            Some(QUALIFICATION_MAX_AGE_DAYS)
+        );
+    }
+
+    #[test]
     fn qualification_profile_digest_matches_cross_language_vector() {
         let profile = QualificationProfile {
             id: String::new(),
             qualification_source_sha: "9".repeat(40),
             model_defaults_sha256: "c".repeat(64),
-            benchmark_provider_identity: Some("openrouter:test-route".into()),
+            benchmark_provider_identity: Some(MANAGED_OPENROUTER_PROVIDER_IDENTITY.into()),
             api_base: "https://openrouter.ai:443/api/v1".into(),
             api_format: ApiFormat::OpenaiCompatible,
             generator_chain: vec!["provider/one".into(), "provider/two".into()],
@@ -1987,19 +2117,15 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
         };
         assert_eq!(
             qualification_profile_digest(&profile),
-            "60b69c663b3731b28a7a30767abf6a41e9f6a2003c5a5185fc89384776c1b875"
+            "e050df18c0f82fe6758eafd91c0c8d5b9eaccfe4a6cd0d01ca2edb8fc0a91d09"
         );
     }
 
     #[test]
     fn qualification_profile_rejects_tampered_digest_material() {
-        for field in ["provider", "price", "report", "repeats"] {
+        for field in ["price", "report", "repeats"] {
             let mut raw = valid_qualification_manifest_json();
             match field {
-                "provider" => {
-                    raw["profiles"][0]["benchmarkProviderIdentity"] =
-                        serde_json::json!("different-route")
-                }
                 "price" => {
                     raw["profiles"][0]["modelPriceBounds"][0]["inputMicrosPerMillionTokens"] =
                         serde_json::json!(1_000_001)
@@ -2016,6 +2142,20 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
                 "{field}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn qualification_profile_rejects_other_openrouter_identities() {
+        let mut raw = valid_qualification_manifest_json();
+        raw["profiles"][0]["benchmarkProviderIdentity"] =
+            serde_json::json!("openrouter:other-routing");
+        let error = parse_qualification_manifest(&raw.to_string()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(MANAGED_OPENROUTER_PROVIDER_IDENTITY),
+            "{error}"
+        );
     }
 
     #[test]
@@ -2075,6 +2215,11 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
         let manifest = QualificationManifest {
             version: 1,
             qualification_source_sha: Some("9".repeat(40)),
+            qualification_issued_at_unix_seconds: Some(current_unix_seconds().unwrap()),
+            qualification_expires_at_unix_seconds: Some(
+                current_unix_seconds().unwrap() + QUALIFICATION_MAX_AGE_SECONDS,
+            ),
+            qualification_max_age_days: Some(QUALIFICATION_MAX_AGE_DAYS),
             model_defaults_sha256: defaults.source_sha256.clone(),
             profiles: vec![profile.clone()],
         };

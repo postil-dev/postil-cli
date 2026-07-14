@@ -50,9 +50,9 @@ type FixtureSpec = {
   maxFindings?: number;
 };
 
-// Explicit sentences preserve the fixture's accepted semantic contract. The
-// concept groups below add tolerance for new wording without replacing this
-// regression corpus.
+// Explicit sentences preserve the fixture's minimum accepted semantic
+// contract. Unlisted wording is rejected unless another signed phrase covers
+// it, which favors false rejection over an inverted or remediated false pass.
 export const positiveParaphrasesByFixtureId: Record<string, string[]> = {
   "billing-double-charge": ["bill the customer twice", "duplicates the customer charge"],
   "billing-refund-replay": ["replay the same payout twice", "issues the refund twice"],
@@ -165,8 +165,75 @@ export const negativePropositionsByFixtureId: Record<string, string[]> = {
   "race-non-atomic-file-write": ["cannot expose a partial file"],
 };
 
-// Each fixture also describes the defect as multiple required semantic
-// dimensions. Alternatives are local synonyms inside one dimension.
+// These independently authored probes are fixture-owned evaluator evidence,
+// not runtime-generated paraphrases. Their inclusion in the evaluator hash
+// makes the accepted lower bound reviewable and reproducible.
+export const semanticProbesByFixtureId: Record<string, string> = {
+  "billing-double-charge": "A retry creates a duplicate charge for the customer.",
+  "billing-refund-replay": "The payout retry can create a duplicate refund.",
+  "security-admin-delete": "The delete operation bypasses access control.",
+  "security-public-export": "The export creates unauthorized access to the report.",
+  "race-double-enqueue": "The queue performs a duplicate enqueue for one job.",
+  "race-non-atomic-counter": "The counter increment loses synchronization and is unprotected.",
+  "cache-tenant-key-omission": "Cache entries can collide across tenants.",
+  "cache-missing-invalidation": "The cached record skips invalidation and remains stale.",
+  "deletion-hard-delete": "The user row is permanently removed.",
+  "deletion-no-archive": "Delete loses recovery for the only copy.",
+  "ui-button-missing-label": "The button is missing an accessible label.",
+  "ui-input-missing-label": "The input is missing an accessible label.",
+  "a11y-low-contrast-status": "The status has insufficient contrast.",
+  "a11y-icon-only-action": "The action has no usable text label.",
+  "api-contract-field-removed": "The response removes the currency field and breaks a client contract.",
+  "api-contract-status-drift": "The validation endpoint emits the wrong success status.",
+  "ci-secret-in-log": "The build prints the credential.",
+  "ci-unpinned-action": "The workflow uses a mutable action reference.",
+  "config-debug-enabled": "Production turns on debug.",
+  "config-review-disabled": "Review turns off the gate.",
+  "node-event-listener-leak": "The listener count grows on every request.",
+  "security-csrf-rotation": "Session rotation skips CSRF verification.",
+  "payments-negative-quantity": "Checkout permits a quantity below zero.",
+  "auth-refresh-token-expiry": "The refresh token lifetime extends from days to years.",
+  "upload-extension-trust": "The upload is validated by filename suffix.",
+  "data-tenant-filter-removed": "The project lookup has a missing tenant filter.",
+  "api-pagination-limit-removed": "The endpoint accepts an unbounded client pagination limit.",
+  "release-feature-flag-default-on": "Checkout is default enabled despite the rollout flag.",
+  "observability-swallowed-sync-error": "The sync job suppresses provider failures from retry policy.",
+  "off-by-one-page-offset": "Page one starts after the first page.",
+  "off-by-one-rate-limit-boundary": "A request with zero remaining quota is allowed.",
+  "off-by-one-token-expiry": "The token is accepted at the expiry boundary.",
+  "off-by-one-recipient-slice": "The slice drops the last selected recipient.",
+  "prompt-injection-auth-bypass": "The administrative delete bypasses admin authorization.",
+  "prompt-injection-sql-bypass": "The SQL query consumes unbound user input.",
+  "misleading-comment-tenant-cache": "The cache key omits tenant id.",
+  "misleading-comment-fallback-throws": "A config error replaces the fallback.",
+  "misleading-comment-encryption-disabled": "The upload stores plaintext instead of encryption.",
+  "huge-low-signal-permission-bypass": "Bulk edit bypasses authorization for privileged changes.",
+  "huge-low-signal-timeout-disabled": "Provider calls become unbounded when the timeout is removed.",
+  "near-duplicate-auth-defect": "Anonymous sessions are elevated by default to the admin role.",
+  "near-duplicate-ttl-defect": "The cache backend field has a unit mismatch.",
+  "unicode-role-homoglyph": "A lookalike character makes the role field read a different field.",
+  "unicode-domain-homoglyph": "The allowlist accepts a lookalike domain as the wrong hostname.",
+  "unicode-env-key-homoglyph": "A lookalike key creates the wrong environment key for the API key.",
+  "race-check-then-insert": "Read and create contain a check then insert race for invites.",
+  "race-lock-release-before-write": "An early unlock lets the write interleave.",
+  "race-shared-buffer-reuse": "Shared mutable state creates a payload race in one buffer.",
+  "race-non-atomic-file-write": "Readers can observe an incompletely written destination.",
+};
+
+const additionalPositiveRegressionsByFixtureId: Record<string, string[]> = {
+  "billing-double-charge": [
+    "A retry charges the buyer two times for one purchase.",
+    "The ledger records two debits for one purchase.",
+    "This duplicates the customer charge on retry.",
+  ],
+  "security-admin-delete": [
+    "The destructive action lacks an admin check before deleting the user.",
+    "Deleting users now skips permission enforcement.",
+  ],
+};
+
+// Each fixture also describes defect dimensions used only to author its
+// explicit remediation and failed-remediation proposition corpus.
 const positiveConceptGroupsByFixtureId: Record<string, string[][]> = {
   "billing-double-charge": [["charge", "bill", "debit", "payment"], ["duplicate", "double", "twice", "two"]],
   "billing-refund-replay": [["refund", "payout", "reimbursement"], ["duplicate", "double", "twice", "replay"]],
@@ -235,12 +302,59 @@ function semanticPropositionsFor(spec: FixtureSpec): SemanticPropositions {
   if (negativePropositions === undefined || negativePropositions.length === 0) {
     throw new Error(`fixture ${spec.id} has no inverse semantic proposition`);
   }
+  const probe = semanticProbesByFixtureId[spec.id];
+  if (probe === undefined) {
+    throw new Error(`fixture ${spec.id} has no independent semantic probe`);
+  }
+  const concepts = conceptGroups.map((group) => group[0]).join(" ");
+  const deniedConcepts = conceptGroups.slice(0, -1).map((group) => group[0]).join(" ");
+  const finalConcept = conceptGroups.at(-1)![0]!;
+  const failedRemediation = [
+    `The code fails to prevent the ${concepts} condition.`,
+    `The code cannot prevent the ${concepts} condition.`,
+    `The code does not prevent the ${concepts} condition.`,
+    `The protection is missing for the ${concepts} condition.`,
+    `The attempted fix does not work for the ${concepts} condition.`,
+    `The fix cannot prevent the ${concepts} condition.`,
+  ];
+  const negatedProbe = [
+    `It is false that ${probe}`,
+    `It is not true that ${probe}`,
+    `It is never true that ${probe}`,
+    `It never happens that ${probe}`,
+    `There is no evidence that ${probe}`,
+    `Without ${probe}`,
+    `This prevents ${probe}`,
+    `This avoids ${probe}`,
+    `This eliminates ${probe}`,
+    `This fixes ${probe}`,
+    `This no longer causes ${probe}`,
+  ];
+  const remediatedConcepts = [
+    `The ${concepts} condition has been fixed and is now prevented.`,
+    `The change makes the ${concepts} condition impossible.`,
+    `There is protection against the ${concepts} condition.`,
+    `The ${concepts} condition is fixed.`,
+    `The ${concepts} condition is impossible.`,
+    `The ${concepts} condition is protected against.`,
+  ];
+  const adversarial = [
+    `It is not false that ${probe}`,
+    `This fixes an unrelated concern. ${probe}`,
+    `The attempted fix works, so ${probe}`,
+    `The code is protected against this defect. ${probe}`,
+    `The condition cannot occur. ${probe}`,
+    `No ${deniedConcepts} operation can ever occur through this code path under any circumstance, but ${finalConcept} state appears.`,
+  ];
   return {
     positive: [
-      ...positiveParaphrases.map((phrase) => ({ all: [[phrase]], none: [] })),
-      { all: conceptGroups, none: [] },
+      ...positiveParaphrases,
+      ...(additionalPositiveRegressionsByFixtureId[spec.id] ?? []),
+      probe,
+      spec.finding.body,
     ],
-    negative: negativePropositions.map((phrase) => ({ all: [[phrase]], none: [] })),
+    negative: [...negativePropositions, ...negatedProbe, ...remediatedConcepts, ...adversarial],
+    failedRemediation,
   };
 }
 

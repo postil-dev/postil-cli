@@ -28,6 +28,13 @@ misleading comments, huge low-signal multi-hunk diffs, near-duplicate clean and
 defect pairs, Unicode homoglyphs, subtle races, and clean changes where silence
 is the expected review.
 
+Seeded findings match a fixture-owned, signed proposition corpus. The corpus
+sets a lower bound of accepted positive wording and gives explicit inverses,
+remediations, split denials, and hostile polarity variants precedence. It also
+lists accepted failed-remediation wording. Unlisted wording can be rejected;
+the evaluator favors a false rejection over counting a fixed, impossible,
+protected, double-negated, or irrelevant-remediation statement as a defect.
+
 ## Running (mock mode: default, CI)
 
 ```sh
@@ -54,10 +61,13 @@ managed OpenRouter endpoint and its OpenAI-compatible interface. The local
 command below supports operator-owned OpenAI-compatible and Anthropic BYOK
 endpoints; those endpoints are not candidates for the managed workflow.
 
-The managed workflow runs from a clean commit, includes that immutable source
-SHA in every candidate profile, and attests the exact candidate file with
-GitHub OIDC through Sigstore. It uploads the candidate and its attestation
-bundle together. To admit a profile, commit the downloaded candidate as
+The managed workflow runs only from the exact `refs/heads/main` ref, includes
+that immutable source SHA and a 30-day authority window in every candidate
+profile, and attests the exact candidate file with GitHub OIDC through
+Sigstore. Every hosted candidate binds the canonical endpoint to
+`openrouter:managed-routing`; custom and local evidence cannot produce a
+hosted manifest candidate. The workflow uploads the candidate and its
+attestation bundle together. To admit a profile, commit the downloaded candidate as
 `qualified-models.json` and its bundle as
 `qualified-models.attestation.json`. CI verifies both with:
 
@@ -68,11 +78,15 @@ bun run verify-admission
 
 Verification uses [`gh attestation verify`](https://cli.github.com/manual/gh_attestation_verify)
 to pin `postil-dev/postil-cli`, the exact admission workflow,
-source and signer commit, GitHub's OIDC issuer, the SLSA provenance predicate,
-public Sigstore trust, and a GitHub-hosted runner. A missing, mismatched, or
-invalid bundle rejects a nonempty manifest. The empty manifest is exempt
-because it admits no models. Report and profile checksums detect changes; they
-do not authenticate who produced a candidate.
+the main source ref, source and signer commit, GitHub's OIDC issuer, the SLSA
+provenance predicate, public Sigstore trust, and a GitHub-hosted runner. The
+source commit must be an ancestor of the candidate commit, and the intervening
+diff may contain only the manifest and bundle. A cryptographically verified
+Sigstore timestamp must match the signed issue time within 15 minutes and fit
+inside the 30-day window. CI and the runtime reject expired authority. A
+missing, mismatched, stale, or invalid bundle rejects a nonempty manifest. The
+empty manifest is exempt because it admits no models. Report and profile
+checksums detect changes; they do not authenticate who produced a candidate.
 
 ```sh
 export MODEL_API_KEY=... # or POSTIL_API_KEY, OPENROUTER_API_KEY, or LLM_API_KEY
@@ -140,8 +154,10 @@ finding titles or bodies. It records separate fixture, review-contract source,
 configuration, evaluator contract, and CLI binary SHA-256 hashes; the canonical API base and
 provider interface; the ordered generator chain and consensus width; the
 ordered scorer chain; repeat number; and provider-exact or catalog-estimate
-cost provenance. The evaluator contract includes `bench/package.json` and
-`bench/bun.lock`, while `packageManager` pins the Bun runtime identity.
+cost provenance. One checked-in source manifest defines the identical Rust and
+TypeScript evaluator source list, including the attestation verifier,
+`bench/package.json`, and `bench/bun.lock`; `packageManager` pins the Bun
+runtime identity.
 Source-bundle hashes use the runtime's ordered
 `path + NUL + exact bytes + NUL` framing. Each immutable profile and the
 complete sanitized evidence payload have their own SHA-256 identifier.
