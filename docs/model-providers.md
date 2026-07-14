@@ -2,6 +2,10 @@
 
 Postil speaks either an OpenAI-compatible chat-completions interface or the native Anthropic Messages API. Provider requests do not follow redirects, credentials are never written to logs, and private-network endpoints require an explicit opt-in.
 
+## Built-in model set
+
+The default review chain is `mistralai/mistral-small-3.2-24b-instruct`, `google/gemma-3-27b-it`, then `qwen/qwen3-32b`. Scoring is disabled by default. Its qualified candidates are `openai/gpt-5.4-nano`, `google/gemini-3.5-flash`, and `stepfun/step-3.7-flash` when an operator enables it.
+
 ## OpenAI-compatible
 
 OpenRouter is the default endpoint. Ollama, vLLM, SGLang, LiteLLM, and private gateways can use the same contract.
