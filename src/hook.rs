@@ -57,7 +57,7 @@ while read -r local_ref local_oid remote_ref remote_oid; do
     fi
 
     [ -s "$tmp" ] || continue
-    postil review --diff-file "$tmp"
+    postil review --bounded --diff-file "$tmp"
 done
 "#;
 
@@ -199,7 +199,7 @@ mod tests {
         let path = dir.join("postil");
         std::fs::write(
             &path,
-            "#!/bin/sh\nset -eu\n[ \"$1\" = review ]\n[ \"$2\" = --diff-file ]\nprintf '%s\\n' '--- review ---' >>\"$POSTIL_TEST_LOG\"\ncat \"$3\" >>\"$POSTIL_TEST_LOG\"\n",
+            "#!/bin/sh\nset -eu\n[ \"$1\" = review ]\n[ \"$2\" = --bounded ]\n[ \"$3\" = --diff-file ]\nprintf '%s\\n' '--- review ---' >>\"$POSTIL_TEST_LOG\"\ncat \"$4\" >>\"$POSTIL_TEST_LOG\"\n",
         )
         .unwrap();
         #[cfg(unix)]
@@ -219,6 +219,7 @@ mod tests {
         let script = std::fs::read_to_string(&hook).unwrap();
         assert!(script.contains("while read -r local_ref local_oid"));
         assert!(script.contains("git diff --find-renames \"$remote_oid\" \"$local_oid\""));
+        assert!(script.contains("postil review --bounded --diff-file \"$tmp\""));
         assert!(!script.contains("--no-verify"));
         assert!(script.contains("git hash-object -t tree /dev/null"));
         assert!(install(dir.path(), false).is_err());

@@ -126,6 +126,7 @@ pub struct ReviewArgs {
     pub fail_on: Option<String>,
     pub config: Option<PathBuf>,
     pub model: Option<String>,
+    pub bounded: bool,
     pub no_post: bool,
 }
 
@@ -814,7 +815,8 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                 model_used = "none (empty diff)".to_string();
                 full_review_trustworthy = true;
             } else {
-                let hosted_candidates = if crate::config::bounded_review_selection_mode()
+                let bounded_candidates = if (args.bounded
+                    || crate::config::bounded_review_selection_mode())
                     && batches.count > MAX_HOSTED_SELECTED_BATCHES
                 {
                     Some(batches.hosted_candidates(
@@ -834,7 +836,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                     )?,
                     None => LlmClient::from_env(cfg)?,
                 };
-                let planned_batch_count = hosted_candidates
+                let planned_batch_count = bounded_candidates
                     .as_ref()
                     .map_or(batches.count, |_| MAX_HOSTED_SELECTED_BATCHES);
                 let preflight_prompt_context = ReviewBatchPromptContext {
@@ -843,11 +845,11 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                     meta,
                     incremental,
                     content_policy_active,
-                    bounded_selection: hosted_candidates.is_some(),
+                    bounded_selection: bounded_candidates.is_some(),
                     multiple: planned_batch_count > 1,
                 };
                 if crate::config::hosted_runtime_mode() {
-                    let preflight_ids = if let Some(candidates) = &hosted_candidates {
+                    let preflight_ids = if let Some(candidates) = &bounded_candidates {
                         candidates
                             .candidate_ids
                             .iter()
@@ -877,7 +879,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                         .into_iter()
                         .map(|(_, later)| later)
                         .collect::<Vec<_>>();
-                    let planner = hosted_candidates.as_ref().map(|candidates| {
+                    let planner = bounded_candidates.as_ref().map(|candidates| {
                         (
                             candidates.manifest.as_str(),
                             MAX_HOSTED_SELECTED_BATCHES
@@ -894,7 +896,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                     )?;
                     review_admission = Some(admission);
                     if crate::config::qualification_plan_only() {
-                        let bounded = hosted_candidates.is_some();
+                        let bounded = bounded_candidates.is_some();
                         let source_count = batches.source_count;
                         let selected_count = if bounded {
                             source_count
@@ -930,10 +932,10 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                 let total_source_batches = batches.source_count;
                 let mut selected_source_batches = total_source_batches;
                 let mut planner_fallback = false;
-                if let Some(candidates) = hosted_candidates {
+                if let Some(candidates) = bounded_candidates {
                     anyhow::ensure!(
                         candidates.source_batch_count == total_source_batches,
-                        "hosted planner source-batch inventory changed during selection"
+                        "bounded planner source-batch inventory changed during selection"
                     );
                     let remaining =
                         MAX_HOSTED_SELECTED_BATCHES.saturating_sub(candidates.mandatory_ids.len());
@@ -973,7 +975,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                     let selected_synthesis_requests =
                         selected.len().saturating_sub(selected_source_batches);
                     eprintln!(
-                        "postil: hosted selection uses {selected_source_batches} of {total_source_batches} source batches and {selected_synthesis_requests} synthesis requests (planner fallback={planner_fallback})",
+                        "postil: bounded selection uses {selected_source_batches} of {total_source_batches} source batches and {selected_synthesis_requests} synthesis requests (planner fallback={planner_fallback})",
                     );
                     selected_batches = Some(selected.into_iter());
                 }

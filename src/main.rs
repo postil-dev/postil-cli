@@ -43,6 +43,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
             fail_on,
             config,
             model,
+            bounded,
             no_post,
         } => {
             let local_mode = staged || base.is_some() || diff_file.is_some();
@@ -75,6 +76,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
                 fail_on,
                 config,
                 model,
+                bounded,
                 no_post,
             })
             .await

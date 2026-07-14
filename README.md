@@ -26,6 +26,7 @@ export REVIEW_MODEL=provider/qualified-model
 postil doctor                            # validate the endpoint and repository
 postil review --staged                   # review the staged change
 postil review --base origin/main         # review the branch
+postil review --bounded --base origin/main # cap large reviews at five source batches
 postil hook install                      # add a pre-push review
 ```
 

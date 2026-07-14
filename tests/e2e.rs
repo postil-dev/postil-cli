@@ -329,6 +329,7 @@ fn postil() -> Command {
         .env_remove("POSTIL_HOSTED_MODE")
         .env_remove("POSTIL_QUALIFICATION_CANDIDATE_PROFILE")
         .env_remove("POSTIL_QUALIFICATION_PLAN_ONLY")
+        .env_remove("POSTIL_BENCH_FORCE_BOUNDED_SELECTION")
         .env_remove("POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY")
         .env_remove("POSTIL_LLM_REQUEST_TIMEOUT_SECS")
         .env_remove("POSTIL_LLM_TOTAL_TIMEOUT_SECS")
@@ -1305,6 +1306,157 @@ async fn large_source_diff_reviews_every_bounded_batch_and_aggregates_findings()
             .iter()
             .all(|request| { !String::from_utf8_lossy(&request.body).contains("diff truncated") })
     );
+}
+
+#[tokio::test]
+async fn local_bounded_is_explicit_and_default_local_review_remains_exhaustive() {
+    use std::fmt::Write as _;
+
+    fn first_optional_batch_id(prompt: &str) -> usize {
+        let mandatory = prompt
+            .lines()
+            .find_map(|line| line.strip_prefix("Mandatory IDs: "))
+            .map(|ids| serde_json::from_str::<Vec<usize>>(ids).unwrap())
+            .unwrap();
+        prompt
+            .lines()
+            .filter_map(|line| line.strip_prefix("Batch "))
+            .filter_map(|line| line.split_once(' '))
+            .map(|(id, _)| id.parse::<usize>().unwrap())
+            .find(|id| !mandatory.contains(id))
+            .expect("planner manifest has an optional candidate")
+    }
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(|request: &wiremock::Request| {
+            let body = String::from_utf8_lossy(&request.body);
+            let response = if body.contains("select bounded code-review batches") {
+                let request: Value = serde_json::from_slice(&request.body).unwrap();
+                let prompt = request["messages"][1]["content"].as_str().unwrap();
+                llm_text(&format!(
+                    r#"{{"batchIds":[{}]}}"#,
+                    first_optional_batch_id(prompt)
+                ))
+            } else {
+                llm_content(json!([]))
+            };
+            ResponseTemplate::new(200).set_body_json(response)
+        })
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff_path = dir.path().join("bounded-local.diff");
+    let mut source = String::new();
+    for file in 0..7 {
+        let path = format!("src/churn-{file}.rs");
+        writeln!(
+            source,
+            "diff --git a/{path} b/{path}\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,130 @@"
+        )
+        .unwrap();
+        for line in 0..130 {
+            writeln!(
+                source,
+                "+const CHURN_{file}_{line}: &str = \"{}\";",
+                "x".repeat(900)
+            )
+            .unwrap();
+        }
+    }
+    std::fs::write(&diff_path, source).unwrap();
+
+    let bounded = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--bounded", "--diff-file"])
+        .arg(&diff_path)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+    let bounded_envelope: Value = serde_json::from_slice(&bounded.get_output().stdout).unwrap();
+    let bounded_coverage = &bounded_envelope["reviewCoverage"];
+    assert_eq!(bounded_coverage["mode"], "bounded");
+    assert!(bounded_coverage["selectedBatches"].as_u64().unwrap() <= 5);
+    assert!(
+        bounded_coverage["selectedBatches"].as_u64().unwrap()
+            < bounded_coverage["totalBatches"].as_u64().unwrap()
+    );
+    assert!(
+        !bounded_coverage["plannerFallback"]
+            .as_bool()
+            .unwrap_or(false)
+    );
+    assert!(
+        bounded_envelope["modelUsage"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|usage| usage["role"] == "reviewPlanner")
+    );
+    assert_model_usage_matches_aggregate(&bounded_envelope);
+    let bounded_requests = server.received_requests().await.unwrap();
+    let planner_request: Value = serde_json::from_slice(
+        &bounded_requests
+            .iter()
+            .find(|request| {
+                String::from_utf8_lossy(&request.body)
+                    .contains("select bounded code-review batches")
+            })
+            .unwrap()
+            .body,
+    )
+    .unwrap();
+    let planner_prompt = planner_request["messages"][1]["content"].as_str().unwrap();
+    let selected_id = first_optional_batch_id(planner_prompt);
+    let selected_block = planner_prompt
+        .split_once(&format!("Batch {selected_id} "))
+        .unwrap()
+        .1
+        .split("\nBatch ")
+        .next()
+        .unwrap();
+    let marker_start = selected_block.find("CHURN_").unwrap();
+    let selected_marker = selected_block[marker_start..]
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .next()
+        .unwrap();
+    assert!(bounded_requests.iter().any(|request| {
+        let body = String::from_utf8_lossy(&request.body);
+        !body.contains("select bounded code-review batches") && body.contains(selected_marker)
+    }));
+    let bounded_request_count = bounded_requests.len();
+    assert!(bounded_request_count <= 6);
+
+    let exhaustive = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff_path)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+    let exhaustive_envelope: Value =
+        serde_json::from_slice(&exhaustive.get_output().stdout).unwrap();
+    let exhaustive_coverage = &exhaustive_envelope["reviewCoverage"];
+    assert_eq!(exhaustive_coverage["mode"], "exhaustive");
+    assert_eq!(
+        exhaustive_coverage["selectedBatches"],
+        exhaustive_coverage["totalBatches"]
+    );
+    assert!(
+        exhaustive_envelope["modelUsage"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|usage| usage["role"] != "reviewPlanner")
+    );
+    let all_requests = server.received_requests().await.unwrap();
+    assert!(all_requests.len() - bounded_request_count > 5);
 }
 
 #[tokio::test]
