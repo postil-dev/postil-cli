@@ -335,7 +335,6 @@ const MAX_PROVIDER_COST_MICROS: u64 = 25_000_000;
 const MAX_MODEL_RESPONSE_BYTES: usize = 512 * 1024;
 const SCORER_MAX_TOKENS: u32 = 4096;
 const SCORER_REASON_MAX_CHARS: usize = 240;
-const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 4096;
 // The publication contract targets 1,200 characters and hard-stops at 2,400.
 // Keep generation bounded too, so an invalid model cannot spend an article's
 // worth of output tokens before the validator rejects it.
@@ -456,7 +455,7 @@ impl std::error::Error for RequestTimedOut {}
 impl LlmClient {
     pub(crate) async fn doctor_probe(cfg: &Config, api_key: String) -> Result<()> {
         let client = Self::build(cfg, api_key, Duration::from_secs(30), None, None)?;
-        let body = client.request_body(&cfg.model, "", "ping", Some(1), 0.0);
+        let body = client.request_body(&cfg.model, "", "ping", 1, 0.0);
         let response = tokio::time::timeout(Duration::from_secs(30), client.request_once(&body))
             .await
             .map_err(|_| RequestTimedOut)??;
@@ -784,7 +783,7 @@ impl LlmClient {
                     user,
                     &mut model_usage,
                     &mut model_accounting_complete,
-                    Some(RESPOND_MAX_TOKENS),
+                    RESPOND_MAX_TOKENS,
                     LlmPhase::Respond,
                 )
                 .await
@@ -976,7 +975,7 @@ impl LlmClient {
                 user,
                 &mut usage,
                 &mut usage_accounting_complete,
-                Some(REVIEW_MAX_TOKENS),
+                REVIEW_MAX_TOKENS,
                 LlmPhase::Review,
             )
             .await
@@ -1007,7 +1006,7 @@ impl LlmClient {
                         &repair_user,
                         &mut usage,
                         &mut usage_accounting_complete,
-                        Some(REVIEW_MAX_TOKENS),
+                        REVIEW_MAX_TOKENS,
                         LlmPhase::Review,
                     )
                     .await
@@ -1069,7 +1068,7 @@ impl LlmClient {
                     &retry_user,
                     &mut retry_usage,
                     &mut usage_accounting_complete,
-                    Some(REVIEW_MAX_TOKENS),
+                    REVIEW_MAX_TOKENS,
                     LlmPhase::Review,
                 )
                 .await
@@ -1126,7 +1125,7 @@ impl LlmClient {
                 user,
                 &mut usage,
                 &mut usage_accounting_complete,
-                Some(SCORER_MAX_TOKENS),
+                SCORER_MAX_TOKENS,
                 0.0,
                 LlmPhase::Scorer,
             )
@@ -1159,7 +1158,7 @@ impl LlmClient {
                         &repair_user,
                         &mut usage,
                         &mut usage_accounting_complete,
-                        Some(SCORER_MAX_TOKENS),
+                        SCORER_MAX_TOKENS,
                         0.0,
                         LlmPhase::Scorer,
                     )
@@ -1208,7 +1207,7 @@ impl LlmClient {
         user: &str,
         usage: &mut Usage,
         usage_accounting_complete: &mut bool,
-        max_tokens: Option<u32>,
+        max_tokens: u32,
         phase: LlmPhase,
     ) -> Result<String> {
         self.chat_with_temperature(
@@ -1233,7 +1232,7 @@ impl LlmClient {
         user: &str,
         usage: &mut Usage,
         usage_accounting_complete: &mut bool,
-        max_tokens: Option<u32>,
+        max_tokens: u32,
         temperature: f64,
         phase: LlmPhase,
     ) -> Result<String> {
@@ -1260,7 +1259,7 @@ impl LlmClient {
         user: &str,
         usage: &mut Usage,
         usage_accounting_complete: &mut bool,
-        max_tokens: Option<u32>,
+        max_tokens: u32,
         temperature: f64,
         phase: LlmPhase,
     ) -> Result<String> {
@@ -1546,7 +1545,7 @@ impl LlmClient {
         model: &str,
         system: &str,
         user: &str,
-        max_tokens: Option<u32>,
+        max_tokens: u32,
         temperature: f64,
     ) -> serde_json::Value {
         match self.api_format {
@@ -1559,16 +1558,14 @@ impl LlmClient {
                         {"role": "user", "content": user},
                     ],
                 });
-                if let Some(max_tokens) = max_tokens {
-                    body["max_tokens"] = json!(max_tokens);
-                }
+                body["max_tokens"] = json!(max_tokens);
                 body
             }
             ApiFormat::Anthropic => json!({
                 "model": model,
                 "system": system,
                 "messages": [{"role": "user", "content": user}],
-                "max_tokens": max_tokens.unwrap_or(ANTHROPIC_DEFAULT_MAX_TOKENS),
+                "max_tokens": max_tokens,
                 "temperature": temperature,
             }),
         }

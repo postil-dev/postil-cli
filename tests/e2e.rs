@@ -140,6 +140,10 @@ fn finding_with_text(line: u32, severity: &str, confidence: f64, title: &str, bo
     })
 }
 
+fn fixture_credential(label: &str) -> String {
+    format!("postil-fixture-{label}-{}", std::process::id())
+}
+
 fn postil() -> Command {
     let mut cmd = Command::cargo_bin("postil").unwrap();
     // Isolate from developer environment and repo config discovery.
@@ -164,7 +168,7 @@ fn postil() -> Command {
         .env_remove("POSTIL_PREVENTION_COMMANDS_JSON")
         .env_remove("GITHUB_SERVER_URL")
         .env_remove("POSTIL_ENABLE_BITBUCKET_INCREMENTAL")
-        .env("MODEL_API_KEY", "test-key")
+        .env("MODEL_API_KEY", fixture_credential("provider"))
         // Mock providers bind loopback. Production and normal CLI invocations
         // reject private API endpoints unless this explicit local-only escape
         // hatch is set by the caller.
@@ -772,9 +776,13 @@ async fn doctor_probes_native_anthropic_format() {
 #[tokio::test]
 async fn doctor_probes_openai_compatible_format_by_default() {
     let server = MockServer::start().await;
+    let provider_credential = fixture_credential("provider");
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .and(header("authorization", "Bearer test-key"))
+        .and(header(
+            "authorization",
+            format!("Bearer {provider_credential}"),
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(llm_text("p")))
         .mount(&server)
         .await;
@@ -801,10 +809,18 @@ async fn doctor_probes_openai_compatible_format_by_default() {
 async fn doctor_does_not_follow_provider_redirect_or_forward_auth() {
     let redirect_target = MockServer::start().await;
     let provider = MockServer::start().await;
+    let provider_credential = fixture_credential("provider-redirect");
+    let endpoint_credential = fixture_credential("endpoint-redirect");
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .and(header("authorization", "Bearer provider-secret"))
-        .and(header("x-private-endpoint-token", "endpoint-secret"))
+        .and(header(
+            "authorization",
+            format!("Bearer {provider_credential}"),
+        ))
+        .and(header(
+            "x-private-endpoint-token",
+            endpoint_credential.as_str(),
+        ))
         .respond_with(
             ResponseTemplate::new(307)
                 .insert_header("Location", format!("{}/captured", redirect_target.uri())),
@@ -824,17 +840,17 @@ async fn doctor_does_not_follow_provider_redirect_or_forward_auth() {
     );
     let out = postil()
         .current_dir(dir.path())
-        .env("MODEL_API_KEY", "provider-secret")
+        .env("MODEL_API_KEY", &provider_credential)
         .env("POSTIL_API_BASE", provider.uri())
         .env("POSTIL_ENDPOINT_AUTH_HEADER", "X-Private-Endpoint-Token")
-        .env("POSTIL_ENDPOINT_AUTH_VALUE", "endpoint-secret")
+        .env("POSTIL_ENDPOINT_AUTH_VALUE", &endpoint_credential)
         .arg("doctor")
         .assert()
         .failure();
     let stderr = String::from_utf8_lossy(&out.get_output().stderr);
     assert!(stderr.contains("307"));
-    assert!(!stderr.contains("provider-secret"));
-    assert!(!stderr.contains("endpoint-secret"));
+    assert!(!stderr.contains(&provider_credential));
+    assert!(!stderr.contains(&endpoint_credential));
     assert!(
         redirect_target
             .received_requests()
@@ -4162,10 +4178,10 @@ async fn content_policy_pr_body_finding_survives_grounding() {
         "path": ".postil/pr-description", "line": 1, "severity": "warn",
         "kind": "contentPolicy", "confidence": 0.9,
         "title": "AI-authorship residue in PR description",
-        "body": "Rule 3: the description states it was written by Claude."
+        "body": "Rule 3: the description contains model-authorship residue."
     }]);
     let server = content_policy_pr_server(llm_with_summary(
-        "PR description narrates AI authorship.",
+        "PR description contains model-authorship residue.",
         cp_finding,
     ))
     .await;
@@ -4217,7 +4233,7 @@ async fn content_policy_pr_body_finding_survives_grounding() {
     )));
     assert!(summary.contains("AI-authorship residue in PR description"));
     assert!(summary.contains("in pull request description"));
-    assert!(summary.contains("Rule 3: the description states it was written by Claude."));
+    assert!(summary.contains("Rule 3: the description contains model-authorship residue."));
 }
 
 #[tokio::test]
@@ -5751,7 +5767,7 @@ async fn respond_gitlab_mr_mention_posts_note() {
         .current_dir(dir.path())
         .env("POSTIL_API_BASE", server.uri())
         .env("GITLAB_API_URL", server.uri())
-        .env("GITLAB_TOKEN", "gl-test-token")
+        .env("GITLAB_TOKEN", fixture_credential("gitlab"))
         .args([
             "respond",
             "--forge",
@@ -5858,7 +5874,7 @@ async fn gitlab_diff_pagination_follows_authoritative_next_page_to_exhaustion() 
         .current_dir(dir.path())
         .env("POSTIL_API_BASE", server.uri())
         .env("GITLAB_API_URL", server.uri())
-        .env("GITLAB_TOKEN", "gl-test-token")
+        .env("GITLAB_TOKEN", fixture_credential("gitlab"))
         .args([
             "respond",
             "--forge",
@@ -5915,7 +5931,7 @@ async fn respond_gitlab_issue_mention_uses_issue_body() {
         .current_dir(dir.path())
         .env("POSTIL_API_BASE", server.uri())
         .env("GITLAB_API_URL", server.uri())
-        .env("GITLAB_TOKEN", "gl-test-token")
+        .env("GITLAB_TOKEN", fixture_credential("gitlab"))
         .args([
             "respond",
             "--forge",

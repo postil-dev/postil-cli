@@ -387,9 +387,7 @@ async fn remote_review<F: Forge>(
         review_started,
     } = input;
     let baseline = load_baseline(args)?;
-    let has_carryable_baseline = baseline
-        .iter()
-        .any(|f| !crate::envelope::is_ephemeral_anchor(&f.path));
+    let has_carryable_baseline = baseline_has_carryable_findings(&baseline);
     let incremental = args.since_sha.as_deref();
     let (diff_text, scope, force_model) = match incremental {
         Some(since) if since != head_sha => run_with_hosted_budget(
@@ -1218,6 +1216,12 @@ fn visible_finding_sets_equal(previous: &[Finding], current: &[Finding]) -> bool
     })
 }
 
+fn baseline_has_carryable_findings(findings: &[Finding]) -> bool {
+    findings
+        .iter()
+        .any(|finding| !crate::envelope::is_ephemeral_anchor(&finding.path))
+}
+
 fn same_visible_finding(a: &Finding, b: &Finding) -> bool {
     a.path == b.path
         && a.line == b.line
@@ -1447,6 +1451,23 @@ mod tests {
         let metadata = finding(crate::envelope::CHANGE_METADATA_PATH, 1, "dependency risk");
         let metadata_slice = std::slice::from_ref(&metadata);
         assert!(visible_finding_sets_equal(metadata_slice, metadata_slice));
+    }
+
+    #[test]
+    fn baseline_carries_reviewable_virtual_findings_but_not_operational_state() {
+        assert!(baseline_has_carryable_findings(&[finding(
+            crate::envelope::CHANGE_METADATA_PATH,
+            1,
+            "dependency risk",
+        )]));
+        assert!(baseline_has_carryable_findings(&[finding(
+            crate::envelope::PR_DESCRIPTION_PATH,
+            1,
+            "content policy finding",
+        )]));
+        assert!(!baseline_has_carryable_findings(&[
+            crate::envelope::provider_error_finding("fixture provider failure"),
+        ]));
     }
 
     fn score(index: usize, confidence: f64, kind: Kind) -> FindingScore {
