@@ -165,6 +165,17 @@ describe("benchmark fixtures", () => {
       "The retry does not change tax. It charges the buyer two times.",
       semantics,
     )).toBe(false);
+    for (const unlisted of [
+      "The report alleges that a retry creates a duplicate charge for the customer, but that allegation is incorrect.",
+      "Supposedly a retry creates a duplicate charge for the customer; however, this assertion is wrong.",
+      "A reviewer claimed a retry creates a duplicate charge for the customer. The reviewer was mistaken.",
+      "Historically, a retry creates a duplicate charge for the customer; this patch corrects that behavior.",
+      "The old implementation meant a retry creates a duplicate charge for the customer. The new transaction removes that risk.",
+      "If the guard were absent, a retry creates a duplicate charge for the customer, but the guard is present.",
+      "A retry creates a duplicate charge for the customer. This is additional unlisted context.",
+    ]) {
+      expect(commentMatchesExpectation(unlisted, semantics)).toBe(false);
+    }
   });
 
   test("keeps authorization polarity while accepting useful paraphrases", () => {

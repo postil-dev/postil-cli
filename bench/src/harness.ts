@@ -1013,18 +1013,10 @@ export function commentMatchesExpectation(
 ): boolean {
   if (semantics === undefined) return true;
   const tokens = propositionTokens(comment);
-  const exact = (phrase: string) => {
+  return [...semantics.failedRemediation, ...semantics.positive].some((phrase) => {
     const candidate = propositionTokens(phrase);
     return candidate.length === tokens.length && candidate.every((token, index) => tokens[index] === token);
-  };
-  if (semantics.negative.some(exact)) return false;
-  if ([...semantics.failedRemediation, ...semantics.positive].some(exact)) return true;
-  if (semantics.negative.some((phrase) => containsTokenSequence(tokens, propositionTokens(phrase)))) {
-    return false;
-  }
-  return [...semantics.failedRemediation, ...semantics.positive].some((phrase) =>
-    affirmativeSignedPhrase(tokens, propositionTokens(phrase))
-  );
+  });
 }
 
 function propositionTokens(value: string): string[] {
@@ -1036,38 +1028,6 @@ function propositionTokens(value: string): string[] {
     .replace(/\b([a-z]+)n['’]t\b/giu, "$1 not")
     .toLowerCase()
     .match(/[a-z0-9]+/gu) ?? [];
-}
-
-function tokenSequenceStarts(tokens: string[], needle: string[]): number[] {
-  if (needle.length === 0) return [];
-  const starts: number[] = [];
-  for (let index = 0; index <= tokens.length - needle.length; index += 1) {
-    if (needle.every((token, offset) => tokens[index + offset] === token)) starts.push(index);
-  }
-  return starts;
-}
-
-function containsTokenSequence(tokens: string[], needle: string[]): boolean {
-  return tokenSequenceStarts(tokens, needle).length > 0;
-}
-
-const hostileContextTokens = new Set([
-  "false", "not", "never", "no", "without", "cannot", "cant", "impossible",
-  "prevent", "prevents", "prevented", "preventing",
-  "avoid", "avoids", "avoided", "avoiding",
-  "eliminate", "eliminates", "eliminated", "eliminating",
-  "fix", "fixes", "fixed", "fixing",
-  "resolve", "resolves", "resolved", "resolving",
-  "stop", "stops", "stopped", "stopping",
-  "protect", "protects", "protected", "protecting", "protection",
-]);
-
-function affirmativeSignedPhrase(tokens: string[], phrase: string[]): boolean {
-  return tokenSequenceStarts(tokens, phrase).some((start) => {
-    const end = start + phrase.length;
-    const context = [...tokens.slice(0, start), ...tokens.slice(end)];
-    return context.every((token) => !hostileContextTokens.has(token));
-  });
 }
 
 function sumMetrics(metrics: BenchmarkMetrics[]): BenchmarkMetrics {

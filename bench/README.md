@@ -28,12 +28,10 @@ misleading comments, huge low-signal multi-hunk diffs, near-duplicate clean and
 defect pairs, Unicode homoglyphs, subtle races, and clean changes where silence
 is the expected review.
 
-Seeded findings match a fixture-owned, signed proposition corpus. The corpus
-sets a lower bound of accepted positive wording and gives explicit inverses,
-remediations, split denials, and hostile polarity variants precedence. It also
-lists accepted failed-remediation wording. Unlisted wording can be rejected;
-the evaluator favors a false rejection over counting a fixed, impossible,
-protected, double-negated, or irrelevant-remediation statement as a defect.
+Seeded findings match a fixture-owned, signed proposition corpus. Detection
+credit requires full normalized equality with a listed positive or
+failed-remediation proposition. Signed negatives and all unlisted wording are
+rejected.
 
 ## Running (mock mode: default, CI)
 
@@ -83,7 +81,8 @@ provenance predicate, public Sigstore trust, and a GitHub-hosted runner. The
 source commit must be an ancestor of the candidate commit, and the intervening
 diff may contain only the manifest and bundle. A cryptographically verified
 Sigstore timestamp must match the signed issue time within 15 minutes and fit
-inside the 30-day window. CI and the runtime reject expired authority. A
+inside the 30-day window. The expiry second is outside the authority window.
+CI, release validation, and the runtime reject expired authority. A
 missing, mismatched, stale, or invalid bundle rejects a nonempty manifest. The
 empty manifest is exempt because it admits no models. Report and profile
 checksums detect changes; they do not authenticate who produced a candidate.

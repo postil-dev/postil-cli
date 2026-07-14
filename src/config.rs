@@ -268,6 +268,9 @@ pub fn evaluator_contract_sha256() -> String {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QualificationMetadata {
+    pub qualification_issued_at_unix_seconds: Option<u64>,
+    pub qualification_expires_at_unix_seconds: Option<u64>,
+    pub qualification_max_age_days: Option<u32>,
     pub model_defaults_sha256: String,
     pub review_contract_sha256: String,
     pub fixture_set_sha256: String,
@@ -286,9 +289,19 @@ pub struct QualificationMetadata {
 pub fn qualification_metadata() -> QualificationMetadata {
     let defaults = model_defaults();
     let manifest = qualification_manifest();
+    qualification_metadata_for(defaults, manifest)
+}
+
+fn qualification_metadata_for(
+    defaults: &ModelDefaults,
+    manifest: &QualificationManifest,
+) -> QualificationMetadata {
     let admitted_profile = admitted_profile_for(defaults, manifest);
     let (generator_chain, scorer_chain, api_base) = qualification_defaults(defaults);
     QualificationMetadata {
+        qualification_issued_at_unix_seconds: manifest.qualification_issued_at_unix_seconds,
+        qualification_expires_at_unix_seconds: manifest.qualification_expires_at_unix_seconds,
+        qualification_max_age_days: manifest.qualification_max_age_days,
         model_defaults_sha256: defaults.source_sha256.clone(),
         review_contract_sha256: review_contract_sha256(),
         fixture_set_sha256: fixture_set_sha256(),
@@ -583,6 +596,11 @@ fn validate_qualification_authority(manifest: &QualificationManifest, now: u64) 
         .qualification_expires_at_unix_seconds
         .ok_or_else(|| anyhow::anyhow!("qualification expiry time is required"))?;
     anyhow::ensure!(
+        (1..=MAX_SAFE_JSON_INTEGER).contains(&issued)
+            && (1..=MAX_SAFE_JSON_INTEGER).contains(&expires),
+        "qualification authority timestamps must be positive JSON-safe integers"
+    );
+    anyhow::ensure!(
         manifest.qualification_max_age_days == Some(QUALIFICATION_MAX_AGE_DAYS),
         "qualification maximum age must be {QUALIFICATION_MAX_AGE_DAYS} days"
     );
@@ -590,7 +608,7 @@ fn validate_qualification_authority(manifest: &QualificationManifest, now: u64) 
         expires.checked_sub(issued) == Some(QUALIFICATION_MAX_AGE_SECONDS),
         "qualification expiry window is invalid"
     );
-    anyhow::ensure!(now <= expires, "qualification evidence has expired");
+    anyhow::ensure!(now < expires, "qualification evidence has expired");
     anyhow::ensure!(
         issued <= now.saturating_add(15 * 60),
         "qualification issue time is in the future"
@@ -1902,14 +1920,33 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
         raw["qualificationExpiresAtUnixSeconds"] =
             serde_json::json!(1_000_000_u64 + QUALIFICATION_MAX_AGE_SECONDS);
         let manifest: QualificationManifest = serde_json::from_value(raw).unwrap();
-        validate_qualification_authority(&manifest, 1_000_000_u64 + QUALIFICATION_MAX_AGE_SECONDS)
-            .unwrap();
         let error = validate_qualification_authority(
             &manifest,
-            1_000_001_u64 + QUALIFICATION_MAX_AGE_SECONDS,
+            1_000_000_u64 + QUALIFICATION_MAX_AGE_SECONDS,
         )
         .unwrap_err();
         assert!(error.to_string().contains("expired"));
+
+        validate_qualification_authority(&manifest, 999_999_u64 + QUALIFICATION_MAX_AGE_SECONDS)
+            .unwrap();
+    }
+
+    #[test]
+    fn qualification_authority_timestamps_are_service_compatible_integers() {
+        let mut raw = valid_qualification_manifest_json();
+        raw["qualificationIssuedAtUnixSeconds"] = serde_json::json!(0);
+        raw["qualificationExpiresAtUnixSeconds"] = serde_json::json!(QUALIFICATION_MAX_AGE_SECONDS);
+        let manifest: QualificationManifest = serde_json::from_value(raw).unwrap();
+        let error = validate_qualification_authority(&manifest, 1).unwrap_err();
+        assert!(error.to_string().contains("positive JSON-safe integers"));
+
+        let mut raw = valid_qualification_manifest_json();
+        raw["qualificationIssuedAtUnixSeconds"] = serde_json::json!(MAX_SAFE_JSON_INTEGER);
+        raw["qualificationExpiresAtUnixSeconds"] =
+            serde_json::json!(MAX_SAFE_JSON_INTEGER + QUALIFICATION_MAX_AGE_SECONDS);
+        let manifest: QualificationManifest = serde_json::from_value(raw).unwrap();
+        let error = validate_qualification_authority(&manifest, MAX_SAFE_JSON_INTEGER).unwrap_err();
+        assert!(error.to_string().contains("positive JSON-safe integers"));
     }
 
     #[test]
@@ -2024,6 +2061,15 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
             metadata["hostedOperationCostCapMicros"],
             serde_json::json!(1_000_000)
         );
+        assert_eq!(
+            metadata["qualificationIssuedAtUnixSeconds"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            metadata["qualificationExpiresAtUnixSeconds"],
+            serde_json::Value::Null
+        );
+        assert_eq!(metadata["qualificationMaxAgeDays"], serde_json::Value::Null);
     }
 
     #[test]
@@ -2076,6 +2122,20 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
         assert_eq!(
             parsed.qualification_max_age_days,
             Some(QUALIFICATION_MAX_AGE_DAYS)
+        );
+        let metadata =
+            serde_json::to_value(qualification_metadata_for(model_defaults(), &parsed)).unwrap();
+        assert_eq!(
+            metadata["qualificationIssuedAtUnixSeconds"],
+            candidate["qualificationIssuedAtUnixSeconds"]
+        );
+        assert_eq!(
+            metadata["qualificationExpiresAtUnixSeconds"],
+            candidate["qualificationExpiresAtUnixSeconds"]
+        );
+        assert_eq!(
+            metadata["qualificationMaxAgeDays"],
+            candidate["qualificationMaxAgeDays"]
         );
     }
 
@@ -2212,19 +2272,30 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
             report_sha256: "e".repeat(64),
             repeated_runs: 3,
         };
+        let issued = 1_800_000_000;
         let manifest = QualificationManifest {
             version: 1,
             qualification_source_sha: Some("9".repeat(40)),
-            qualification_issued_at_unix_seconds: Some(current_unix_seconds().unwrap()),
-            qualification_expires_at_unix_seconds: Some(
-                current_unix_seconds().unwrap() + QUALIFICATION_MAX_AGE_SECONDS,
-            ),
+            qualification_issued_at_unix_seconds: Some(issued),
+            qualification_expires_at_unix_seconds: Some(issued + QUALIFICATION_MAX_AGE_SECONDS),
             qualification_max_age_days: Some(QUALIFICATION_MAX_AGE_DAYS),
             model_defaults_sha256: defaults.source_sha256.clone(),
             profiles: vec![profile.clone()],
         };
 
         assert_eq!(admitted_profile_for(&defaults, &manifest), Some(profile));
+        let metadata =
+            serde_json::to_value(qualification_metadata_for(&defaults, &manifest)).unwrap();
+        assert_eq!(metadata["qualificationIssuedAtUnixSeconds"], issued);
+        assert_eq!(
+            metadata["qualificationExpiresAtUnixSeconds"],
+            issued + QUALIFICATION_MAX_AGE_SECONDS
+        );
+        assert_eq!(
+            metadata["qualificationMaxAgeDays"],
+            QUALIFICATION_MAX_AGE_DAYS
+        );
+        assert!(metadata["admittedProfile"].is_object());
 
         for tamper in ["generator", "consensus", "scorer", "apiBase", "apiFormat"] {
             let mut altered = defaults.clone();
@@ -2241,9 +2312,23 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
 
         let empty = QualificationManifest {
             profiles: Vec::new(),
+            qualification_source_sha: None,
+            qualification_issued_at_unix_seconds: None,
+            qualification_expires_at_unix_seconds: None,
+            qualification_max_age_days: None,
             ..manifest
         };
         assert_eq!(admitted_profile_for(&defaults, &empty), None);
+        let metadata = serde_json::to_value(qualification_metadata_for(&defaults, &empty)).unwrap();
+        assert_eq!(
+            metadata["qualificationIssuedAtUnixSeconds"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            metadata["qualificationExpiresAtUnixSeconds"],
+            serde_json::Value::Null
+        );
+        assert_eq!(metadata["qualificationMaxAgeDays"], serde_json::Value::Null);
     }
 
     #[test]

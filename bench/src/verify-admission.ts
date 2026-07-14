@@ -217,7 +217,7 @@ function verifyAttestationFreshness(
   if (attested > now + ATTESTATION_CLOCK_SKEW_SECONDS) {
     throw new Error("qualification attestation timestamp is in the future");
   }
-  if (now > expires || now > attested + QUALIFICATION_MAX_AGE_SECONDS) {
+  if (now >= expires || now >= attested + QUALIFICATION_MAX_AGE_SECONDS) {
     throw new Error("qualification evidence has expired");
   }
 }

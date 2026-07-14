@@ -6508,6 +6508,23 @@ fn init_writes_starter_and_config_shows_provenance() {
 }
 
 #[test]
+fn qualification_metadata_cli_emits_service_authority_fields() {
+    let output = Command::cargo_bin("postil")
+        .unwrap()
+        .args(["qualification-metadata"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let metadata: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(metadata["qualificationIssuedAtUnixSeconds"], Value::Null);
+    assert_eq!(metadata["qualificationExpiresAtUnixSeconds"], Value::Null);
+    assert_eq!(metadata["qualificationMaxAgeDays"], Value::Null);
+    assert!(metadata["admittedProfile"].is_null());
+}
+
+#[test]
 fn coderabbit_config_is_translated() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(

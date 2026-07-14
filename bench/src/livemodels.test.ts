@@ -321,6 +321,11 @@ describe("managed admission workflow", () => {
     ).text();
     expect(ci).toContain("bun run verify-admission");
     expect(ci).toMatch(/bench:\n[\s\S]*?fetch-depth: 0/u);
+    const release = await Bun.file(
+      resolve(import.meta.dir, "..", "..", ".github", "workflows", "release.yml"),
+    ).text();
+    expect(release).toMatch(/validate-tag:\n[\s\S]*?fetch-depth: 0[\s\S]*?bun-version: 1\.3\.14[\s\S]*?bun install --frozen-lockfile[\s\S]*?bun run verify-admission[\s\S]*?\n  build:\n/u);
+    expect(release).toMatch(/build:\n\s+needs: validate-tag/u);
     let checkedReferences = 0;
     const workflowGlob = new Bun.Glob("*.yml");
     for await (const workflowName of workflowGlob.scan(resolve(import.meta.dir, "..", "..", ".github", "workflows"))) {

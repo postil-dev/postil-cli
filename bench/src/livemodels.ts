@@ -150,6 +150,9 @@ export interface LiveModelsReport {
 }
 
 export interface BinaryQualificationMetadata {
+  qualificationIssuedAtUnixSeconds: number | null;
+  qualificationExpiresAtUnixSeconds: number | null;
+  qualificationMaxAgeDays: typeof QUALIFICATION_MAX_AGE_DAYS | null;
   modelDefaultsSha256: string;
   reviewContractSha256: string;
   fixtureSetSha256: string;

@@ -135,8 +135,14 @@ describe("admission attestation verification", () => {
     await expect(verifyAdmissionManifest(manifest, bundle, {
       runGh: async () => verifiedOutput(),
       runGit: admittedSourceGit,
-      nowUnixSeconds: expires + 1,
+      nowUnixSeconds: expires,
     })).rejects.toThrow("expired");
+
+    expect(await verifyAdmissionManifest(manifest, bundle, {
+      runGh: async () => verifiedOutput(),
+      runGit: admittedSourceGit,
+      nowUnixSeconds: expires - 1,
+    })).toBe("verified");
   });
 
   test("rejects stale or fabricated source commits before attestation acceptance", async () => {
