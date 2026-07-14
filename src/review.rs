@@ -19,13 +19,9 @@ use crate::prompt::{self, PrContext};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
-const MAX_DIFF_BYTES: usize = 400_000;
-/// Hard cap on the raw fetched diff text before parsing. A generous multiple of
-/// the render cap so ordinary changes are never affected, but bounds the work a
-/// pathologically large fetched diff can force. Over the cap, the raw text is
-/// truncated at a line boundary and the review is flagged truncated so the
-/// uncertainty finding fires (a truncated review must not read as a full pass).
-const MAX_RAW_DIFF_BYTES: usize = MAX_DIFF_BYTES * 4;
+/// Each model request stays bounded, while aggregate review size is handled by
+/// artifact classification and additional batches rather than truncation.
+const MAX_REVIEW_BATCH_BYTES: usize = 120_000;
 const HOSTED_WORKER_WATCHDOG_SECS: u64 = 600;
 pub(crate) const HOSTED_LLM_TOTAL_TIMEOUT_SECS: u64 = 540;
 /// Hosted reviews get a 240s primary attempt plus one timeout retry capped at
@@ -601,10 +597,8 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
         llm_budget_started_at,
     } = input;
     let review_started = std::time::Instant::now();
-    // Cap the raw diff before parsing so an oversized fetched diff cannot force
-    // unbounded parse work; a cut here forces the truncated path below.
-    let (diff_text, raw_truncated) = diff::cap_raw_diff(diff_text, MAX_RAW_DIFF_BYTES);
-    let parsed = diff::parse(diff_text);
+    let selected = diff::select_reviewable_diff(diff_text);
+    let parsed = diff::parse(&selected.text);
     let mut index = DiffIndex::build(&parsed);
     let incremental = matches!(scope, filter::ReconcileScope::Incremental);
 
@@ -647,52 +641,131 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
     if !cfg.enabled {
         model_used = "none (disabled by config)".to_string();
     } else if force_model || !parsed.is_empty() || pr_desc_lines > 0 {
-        let (annotated, render_truncated) = diff::render_annotated(&parsed, MAX_DIFF_BYTES);
-        // Either the raw input was capped or the rendered output hit the limit;
-        // both mean the model did not see the full change.
-        let truncated = render_truncated || raw_truncated;
-        let ctx = PrContext {
-            repo,
-            title: meta.map(|m| m.title.as_str()),
-            body: meta.map(|m| m.body.as_str()),
-            incremental,
-            content_policy: content_policy_active,
-        };
-        let system = prompt::system_prompt(cfg);
-        let mut user = prompt::user_prompt(&ctx, &annotated, cfg.max_findings);
-        if truncated {
-            user.push_str(
-                "\n\n[NOTE: the diff was truncated at the size limit; review only what \
-                 is shown above.]",
+        let mut plan = diff::render_review_batches(&parsed, MAX_REVIEW_BATCH_BYTES);
+        plan.omitted_lockfiles += selected.omitted_lockfiles;
+        plan.omitted_generated += selected.omitted_generated;
+        if plan.omitted_lockfiles > 0 || plan.omitted_generated > 0 {
+            eprintln!(
+                "postil: review scope omitted {} lockfile(s) and {} generated file(s)",
+                plan.omitted_lockfiles, plan.omitted_generated
             );
         }
-        let client = match llm_budget_started_at {
-            Some(started_at) => LlmClient::from_env_for_remote_review(
-                cfg,
-                started_at,
-                Duration::from_secs(HOSTED_LLM_REQUEST_TIMEOUT_SECS),
-                Duration::from_secs(HOSTED_LLM_REVIEW_TIMEOUT_SECS),
-                Duration::from_secs(HOSTED_LLM_TOTAL_TIMEOUT_SECS),
-            )?,
-            None => LlmClient::from_env(cfg)?,
-        };
-        match client.review(cfg, &system, &user).await {
-            Ok(model_review) => {
-                let outcome = filter::apply(cfg, &index, model_review.findings)?;
-                model_used = model_review.model_used;
-                usage = model_review.usage;
-                model_usage = model_review.model_usage;
-                model_incidents = model_review.model_incidents;
-                usage_accounting_complete = model_review.usage_accounting_complete;
+        if plan.batches.is_empty() && (force_model || pr_desc_lines > 0) {
+            plan.batches.push(String::new());
+        }
+        if plan.batches.is_empty() {
+            model_used = "none (empty diff)".to_string();
+            full_review_trustworthy = true;
+        }
+        if !plan.batches.is_empty() {
+            let system = prompt::system_prompt(cfg);
+            let client = match llm_budget_started_at {
+                Some(started_at) => LlmClient::from_env_for_remote_review(
+                    cfg,
+                    started_at,
+                    Duration::from_secs(HOSTED_LLM_REQUEST_TIMEOUT_SECS),
+                    Duration::from_secs(HOSTED_LLM_REVIEW_TIMEOUT_SECS),
+                    Duration::from_secs(HOSTED_LLM_TOTAL_TIMEOUT_SECS),
+                )?,
+                None => LlmClient::from_env(cfg)?,
+            };
+            let total_batches = plan.batches.len();
+            let mut raw_findings = Vec::new();
+            let mut summary_parts = Vec::new();
+            let mut batch_models = Vec::new();
+            let mut batch_failed = false;
+            let mut batch_ungrounded = 0u32;
+            for (batch_index, annotated) in plan.batches.iter().enumerate() {
+                eprintln!(
+                    "postil: reviewing source batch {}/{} ({} bytes)",
+                    batch_index + 1,
+                    total_batches,
+                    annotated.len()
+                );
+                let first = batch_index == 0;
+                let ctx = PrContext {
+                    repo,
+                    title: if first {
+                        meta.map(|m| m.title.as_str())
+                    } else {
+                        None
+                    },
+                    body: if first {
+                        meta.map(|m| m.body.as_str())
+                    } else {
+                        None
+                    },
+                    incremental,
+                    content_policy: first && content_policy_active,
+                };
+                let mut user = prompt::user_prompt(&ctx, annotated, cfg.max_findings);
+                if total_batches > 1 {
+                    user.push_str(&format!(
+                        "\n\nThis is source batch {} of {}. Review this batch independently; \
+                     other source batches are reviewed separately.",
+                        batch_index + 1,
+                        total_batches
+                    ));
+                }
+                match client.review(cfg, &system, &user).await {
+                    Ok(mut model_review) => {
+                        usage.prompt_tokens += model_review.usage.prompt_tokens;
+                        usage.completion_tokens += model_review.usage.completion_tokens;
+                        model_usage.extend(model_review.model_usage);
+                        model_incidents.extend(model_review.model_incidents);
+                        usage_accounting_complete &= model_review.usage_accounting_complete;
+                        if !batch_models.contains(&model_review.model_used) {
+                            batch_models.push(model_review.model_used);
+                        }
+                        if !model_review.summary.trim().is_empty() {
+                            summary_parts.push(model_review.summary);
+                        }
+                        let before = model_review.findings.len();
+                        model_review.findings.retain(|finding| {
+                            diff::review_batch_contains(annotated, &finding.path, finding.line)
+                                || (first
+                                    && finding.kind == crate::envelope::Kind::ContentPolicy
+                                    && index.contains_content_policy(&finding.path, finding.line))
+                        });
+                        batch_ungrounded += (before - model_review.findings.len()) as u32;
+                        raw_findings.extend(model_review.findings);
+                    }
+                    Err(e) => {
+                        usage.prompt_tokens += e.usage().prompt_tokens;
+                        usage.completion_tokens += e.usage().completion_tokens;
+                        model_usage.extend_from_slice(e.model_usage());
+                        model_incidents.extend_from_slice(e.model_incidents());
+                        usage_accounting_complete &= e.usage_accounting_complete();
+                        let detail = format!("{e:#}");
+                        findings = vec![if e.is_provider() {
+                            crate::envelope::provider_error_finding(&detail)
+                        } else {
+                            fail_closed_finding(&detail)
+                        }];
+                        if batch_models.is_empty() {
+                            model_used = cfg.model_chain().join(" -> ");
+                        }
+                        batch_failed = true;
+                        break;
+                    }
+                }
+            }
+            if !batch_models.is_empty() {
+                model_used = batch_models.join(", ");
+            }
+            if !batch_failed && !plan.batches.is_empty() {
+                let grounded_candidate_count = raw_findings.len();
+                let outcome = filter::apply(cfg, &index, raw_findings)?;
                 suppressed = outcome.suppressed;
                 suppressed_findings = outcome.suppressed_findings;
-                ungrounded = outcome.ungrounded;
-                if outcome.all_ungrounded {
+                ungrounded = outcome.ungrounded + batch_ungrounded;
+                if outcome.all_ungrounded || (grounded_candidate_count == 0 && batch_ungrounded > 0)
+                {
                     findings = vec![fail_closed_finding(&format!(
                         "model reported {} finding(s), none grounded in the diff",
-                        outcome.ungrounded
+                        ungrounded
                     ))];
-                } else if outcome.kept.is_empty() && !model_review.summary.trim().is_empty() {
+                } else if outcome.kept.is_empty() && !summary_parts.is_empty() {
                     // Risk narrated in prose while NO finding survives to the
                     // gate. Passing this as clean is the predecessor product's
                     // worst failure mode; fail closed instead and carry the
@@ -702,16 +775,16 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                     // hole this closes is a model that returns findings which are
                     // all removed by min_confidence/severity/ignore suppression
                     // (so raw_findings != 0) while the summary still narrates
-                    // risk — that previously slipped through silently. The
+                    // risk. That previously slipped through silently. The
                     // all_ungrounded case is handled above, so this branch only
                     // fires for the genuinely-empty-after-policy case and does
                     // not double-fire.
                     findings = vec![crate::envelope::narrated_risk_finding(
-                        &model_review.summary,
+                        &summary_parts.join("\n\n"),
                     )];
                 } else {
                     full_review_trustworthy = true;
-                    summary = model_review.summary;
+                    summary = summary_parts.join("\n\n");
                     let mut kept = outcome.kept;
                     if !kept.is_empty() && cfg.scorer_enabled() {
                         let inputs = scorer_inputs(&parsed, &kept);
@@ -770,48 +843,6 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                     findings = kept;
                 }
             }
-            Err(e) => {
-                model_used = cfg.model_chain().join(" -> ");
-                usage = e.usage();
-                model_usage = e.model_usage().to_vec();
-                model_incidents = e.model_incidents().to_vec();
-                usage_accounting_complete = e.usage_accounting_complete();
-                let detail = format!("{e:#}");
-                // Provider-class failures (outage, timeout) are the only ones
-                // `gate.onError: advisory` may stand aside for; unusable model
-                // content is attacker-influenceable and always fails closed.
-                findings = vec![if e.is_provider() {
-                    crate::envelope::provider_error_finding(&detail)
-                } else {
-                    fail_closed_finding(&detail)
-                }];
-            }
-        }
-        // A truncated review must never read as a full pass: the unreviewed
-        // tail is surfaced as an explicit uncertainty finding.
-        if truncated {
-            full_review_trustworthy = false;
-            findings.push(Finding {
-                path: crate::envelope::DIFF_PATH.to_string(),
-                line: 1,
-                end_line: None,
-                severity: crate::envelope::Severity::Info,
-                kind: crate::envelope::Kind::Uncertainty,
-                confidence: 1.0,
-                generator_confidence: None,
-                scorer_confidence: None,
-                generator_kind: None,
-                scorer_kind: None,
-                scorer_reason: None,
-                title: "Diff truncated at the review size limit".to_string(),
-                id: None,
-                body: format!(
-                    "This change exceeds the {} KB review limit; only the first part was \
-                     reviewed. Files beyond the cut were not assessed. Split the change \
-                     or review the remainder manually.",
-                    MAX_DIFF_BYTES / 1000
-                ),
-            });
         }
     }
 

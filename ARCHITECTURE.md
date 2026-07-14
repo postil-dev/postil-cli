@@ -7,42 +7,47 @@ contract shared with postil-dev/postil (hosted worker) and `postil plan`.
 ## Pipeline
 
 ```
-acquire diff ──> parse + index ──> prompt ──> model (cascade/consensus)
-                                                 │
-   envelope <── gate <── reconcile <── filter <──┘
+acquire diff ──> classify artifacts ──> parse + index ──> bounded source batches
+                                                               │
+   envelope <── gate <── reconcile <── filter + aggregate <── model
+                                                          (cascade/consensus)
       │                  (baseline)   (ground, policy)
       ├─ stdout JSON (--output-json)
       ├─ terminal (stderr)
       └─ forge: compact summary + inline findings + review and gate checks
 ```
 
-- `diff.rs` — unified-diff parser, `DiffIndex` (which (path, line) pairs exist on the
+- `diff.rs`: unified-diff parser, `DiffIndex` (which (path, line) pairs exist on the
   new side), and the annotated rendering whose margin line numbers are the only numbers
-  the model is allowed to cite.
-- `filter.rs` — grounding (uncited findings dropped; all-uncited = untrusted run),
+  the model is allowed to cite. Review preparation removes standard lockfiles and
+  explicitly generated paths before allocating per-line parser state, then streams all
+  remaining source hunks into bounded batches. Aggregate diff size does not truncate
+  the review or create a finding.
+- `filter.rs`: grounding (uncited findings dropped; all-uncited = untrusted run),
   policy suppression (ignore globs, severityThreshold, minConfidence, maxFindings),
   structured retention of suppressed grounded findings, and
   baseline reconciliation (resolved / carried) for incremental reviews.
-- `llm.rs` — shared model transport for OpenAI-compatible chat completions and the
+- `llm.rs`: shared model transport for OpenAI-compatible chat completions and the
   native Anthropic Messages API; model cascade on failure, one JSON-repair retry for
   generator output and one schema-repair retry for scorer output,
   optional N-model consensus (agreement by path + line proximity). Request construction
   and response decoding vary by API format while retry, timeout, deadline, cascade, and
   secret-redaction semantics remain shared. Optional private-endpoint authentication is
   a separate header whose name cannot collide with provider-managed headers.
-- `review.rs` — orchestration; owns fail-closed semantics (`fail_closed_finding`) and
+- `review.rs`: orchestration; runs every source batch, aggregates findings before
+  grounding and scoring, owns fail-closed semantics (`fail_closed_finding`), and owns
   check-run lifecycle ordering (checks are created before the model runs so a crash can
   still be reported against them). It persists safe structured model incidents for
   monitoring without raw provider or model text.
-- `forge/` — trait + GitHub, GitLab, Bitbucket, and Azure DevOps implementations (each
+- `forge/`: trait + GitHub, GitLab, Bitbucket, and Azure DevOps implementations (each
   with a self-managed/server base-URL override). Azure has no PR-diff endpoint, so it
   reconstructs a unified diff from changed-file content with `similar`. The gate check is
   never `neutral`: an errored run is a failed gate unless `gate.onError: advisory`.
-- `respond.rs` — interactive bot (`postil respond`): answers an @postil mention on a PR
+- `respond.rs`: interactive bot (`postil respond`): answers an @postil mention on a PR
   or issue, grounded in the diff/issue, and posts one reply. Review-and-answer only; it
   never opens PRs or pushes commits.
-- `sarif.rs` — envelope → SARIF 2.1.0 for code-scanning ingestion (`--sarif`).
-- `config.rs` — precedence (flags > env > .postil.* > .coderabbit.yaml > defaults),
+- `sarif.rs`: envelope → SARIF 2.1.0 for code-scanning ingestion (`--sarif`).
+- `config.rs`: precedence (flags > env > .postil.* > .coderabbit.yaml > defaults),
   `deny_unknown_fields` so typos fail loudly. Also resolves `guardrails` and
   `content_policy`, the two prompt-injected repo policy sources (see below).
   Exception to precedence: `model.apiBase` from a config file is ignored by
@@ -56,7 +61,7 @@ acquire diff ──> parse + index ──> prompt ──> model (cascade/consens
 Both are prompt-section injections into the single system prompt (`prompt.rs`), not a
 second model call: guardrails are repo-specific merge rules from `.postil/guardrails.md`
 (violations are `kind: guardrail`); content policy reviews human-readable prose only
-(Markdown, comments, docstrings, user-facing strings, PR title/body — never code logic
+(Markdown, comments, docstrings, user-facing strings, PR title/body, never code logic
 or identifiers) against a built-in baseline plus optional `.postil/content-policy.md`
 additions (violations are `kind: contentPolicy`). Content policy is on by default;
 `contentPolicy.enabled: false` fully disables the baseline and repo additions.
@@ -71,7 +76,7 @@ additions (violations are `kind: contentPolicy`). Content policy is on by defaul
    detail appears in the compact PR summary and the linked run instead of an inline
    annotation.
 2. An invalid/untrusted model run produces `error` at `.postil/model-output:1`, exit 1.
-3. A clean review posts nothing (onClean: skip) — checks complete, no comments.
+3. A clean review posts nothing (onClean: skip): checks complete, no comments.
 4. Carried baseline findings keep the gate failing until their code changes.
 5. Exit codes: 0 clean/below gate, 1 gate failing, 2 operational error.
 6. Content-policy findings are scoped to prose; a model asserting `kind: contentPolicy`
@@ -89,7 +94,7 @@ The grounding and fail-closed checks catch two attacker shapes: a run where ever
 finding is ungrounded (all-uncited = untrusted, invariant 2) and one where the summary
 narrates merge-relevant risk while the findings array is empty (`narrated_risk_finding`).
 A diff whose injected text instead convinces the model to emit a normal-looking,
-grounded, *empty* envelope — no narrated risk, nothing to contradict — is
+grounded, *empty* envelope with no narrated risk and nothing to contradict is
 indistinguishable from an honest clean review, so the CLI cannot detect it. This is
 inherent to any LLM reviewer: the tool can verify that reported findings are grounded,
 not that unreported ones do not exist. A clean Postil review is therefore not a security

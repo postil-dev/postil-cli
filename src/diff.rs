@@ -5,8 +5,31 @@
 //! the model cite real numbers, the rendered diff annotates every kept/added line
 //! with its new-file line number.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::RangeInclusive;
+
+/// Why a changed file is excluded from model context. These files remain in
+/// the parsed diff and grounding index, but deterministic artifacts do not
+/// consume review-model context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OmittedFileKind {
+    Lockfile,
+    Generated,
+}
+
+#[derive(Debug, Default)]
+pub struct ReviewBatchPlan {
+    pub batches: Vec<String>,
+    pub omitted_lockfiles: usize,
+    pub omitted_generated: usize,
+}
+
+pub struct SelectedDiff<'a> {
+    pub text: Cow<'a, str>,
+    pub omitted_lockfiles: usize,
+    pub omitted_generated: usize,
+}
 
 #[derive(Debug, Clone)]
 pub struct Hunk {
@@ -156,27 +179,66 @@ impl DiffIndex {
     }
 }
 
-/// Cap the raw diff text before parsing so a pathologically large fetched diff
-/// (many thousands of files, a giant generated blob) cannot drive unbounded
-/// parse/allocation work. Truncation happens at a line boundary at or before
-/// `max_bytes`; the returned bool reports whether anything was cut so the caller
-/// can force the truncation/uncertainty path (a truncated review must never read
-/// as a full pass). `max_bytes` is expected to be a generous multiple of the
-/// render cap so ordinary diffs are never touched.
-pub fn cap_raw_diff(text: &str, max_bytes: usize) -> (&str, bool) {
-    if text.len() <= max_bytes {
-        return (text, false);
+/// Remove deterministic artifact file sections before the allocating parser.
+/// The acquired diff already exists as one string; this prevents a large
+/// lockfile or generated output from being copied into per-line parser state.
+/// When no artifact is present, the original string is borrowed without copy.
+pub fn select_reviewable_diff(text: &str) -> SelectedDiff<'_> {
+    let starts: Vec<usize> = text
+        .match_indices("diff --git ")
+        .filter_map(|(index, _)| {
+            (index == 0 || text.as_bytes().get(index.wrapping_sub(1)) == Some(&b'\n'))
+                .then_some(index)
+        })
+        .collect();
+    if starts.is_empty() {
+        return SelectedDiff {
+            text: Cow::Borrowed(text),
+            omitted_lockfiles: 0,
+            omitted_generated: 0,
+        };
     }
-    // The cap can land inside a multi-byte character; back up to a char
-    // boundary before slicing, or the index below panics on non-ASCII input.
-    let mut b = max_bytes;
-    while b > 0 && !text.is_char_boundary(b) {
-        b -= 1;
+
+    let mut omitted_lockfiles = 0;
+    let mut omitted_generated = 0;
+    let mut kept_sections = Vec::with_capacity(starts.len());
+    for (position, start) in starts.iter().copied().enumerate() {
+        let end = starts.get(position + 1).copied().unwrap_or(text.len());
+        let section = &text[start..end];
+        let header = section.lines().next().unwrap_or_default();
+        let path = header
+            .strip_prefix("diff --git ")
+            .and_then(|rest| rest.rsplit_once(" b/").map(|(_, path)| path))
+            .unwrap_or_default();
+        match classify_omitted_file(path) {
+            Some(OmittedFileKind::Lockfile) => omitted_lockfiles += 1,
+            Some(OmittedFileKind::Generated) => omitted_generated += 1,
+            None => kept_sections.push(section),
+        }
     }
-    // Cut at the last newline at or before the cap so the final retained hunk
-    // line stays intact; if there is none, hard-cut at the char boundary.
-    let cut = text[..b].rfind('\n').map(|i| i + 1).unwrap_or(b);
-    (&text[..cut], true)
+    if omitted_lockfiles == 0 && omitted_generated == 0 {
+        return SelectedDiff {
+            text: Cow::Borrowed(text),
+            omitted_lockfiles,
+            omitted_generated,
+        };
+    }
+
+    let kept_len = text[..starts[0]].len()
+        + kept_sections
+            .iter()
+            .map(|section| section.len())
+            .sum::<usize>();
+    let mut selected = String::with_capacity(kept_len);
+    selected.push_str(&text[..starts[0]]);
+    for section in kept_sections {
+        selected.push_str(section);
+    }
+    SelectedDiff {
+        text: Cow::Owned(selected),
+        omitted_lockfiles,
+        omitted_generated,
+    }
 }
 
 /// Parse a unified diff (git format). Tolerant of mode lines, renames, and
@@ -398,6 +460,184 @@ pub fn render_annotated(diff: &Diff, max_bytes: usize) -> (String, bool) {
     (out, truncated)
 }
 
+/// Split reviewable source changes into independently bounded model inputs.
+///
+/// Aggregate diff size is not a review failure. Lockfiles and paths that
+/// explicitly identify generated outputs are omitted, then source hunks are
+/// streamed into as many bounded batches as necessary. A single pathological
+/// line is abbreviated rather than allowing one line to defeat the batch cap.
+pub fn render_review_batches(diff: &Diff, max_bytes: usize) -> ReviewBatchPlan {
+    assert!(
+        max_bytes >= 1024,
+        "review batch limit must leave room for context"
+    );
+    let mut plan = ReviewBatchPlan::default();
+    let mut current = String::new();
+
+    for file in &diff.files {
+        match classify_omitted_file(&file.path) {
+            Some(OmittedFileKind::Lockfile) => {
+                plan.omitted_lockfiles += 1;
+                continue;
+            }
+            Some(OmittedFileKind::Generated) => {
+                plan.omitted_generated += 1;
+                continue;
+            }
+            None => {}
+        }
+        if file.binary || file.deleted || file.hunks.is_empty() {
+            continue;
+        }
+
+        let file_header = format!("### {}\n", file.path);
+        for hunk in &file.hunks {
+            let mut line_no = hunk.new_start;
+            let mut hunk_header = format!("@@ starting at line {line_no} @@\n");
+            let mut need_headers = true;
+            for raw in &hunk.lines {
+                let (marker, content) = raw.split_at(if raw.is_empty() { 0 } else { 1 });
+                let rendered_line = line_no;
+                // Reserve enough room for either hunk-header form. This keeps
+                // the cap exact even when an oversized hunk continues in a
+                // later batch with a longer header.
+                let line_budget = max_bytes.saturating_sub(file_header.len() + 64);
+                let rendered = match marker {
+                    "+" => {
+                        let rendered = bounded_rendered_line(line_no, "+", content, line_budget);
+                        line_no += 1;
+                        rendered
+                    }
+                    "-" => bounded_rendered_line(0, "-", content, line_budget),
+                    _ => {
+                        let rendered = bounded_rendered_line(line_no, " ", content, line_budget);
+                        line_no += 1;
+                        rendered
+                    }
+                };
+                let prefix_len = if need_headers {
+                    file_header.len() + hunk_header.len()
+                } else {
+                    0
+                };
+                if !current.is_empty() && current.len() + prefix_len + rendered.len() > max_bytes {
+                    plan.batches.push(std::mem::take(&mut current));
+                    hunk_header = format!("@@ continuing at line {rendered_line} @@\n");
+                    need_headers = true;
+                }
+                if need_headers {
+                    current.push_str(&file_header);
+                    current.push_str(&hunk_header);
+                    need_headers = false;
+                }
+                current.push_str(&rendered);
+                if current.len() >= max_bytes {
+                    plan.batches.push(std::mem::take(&mut current));
+                    hunk_header = format!("@@ continuing at line {line_no} @@\n");
+                    need_headers = true;
+                }
+            }
+            if !current.is_empty() {
+                if current.len() < max_bytes {
+                    current.push('\n');
+                } else {
+                    plan.batches.push(std::mem::take(&mut current));
+                }
+            }
+        }
+    }
+    if !current.is_empty() {
+        plan.batches.push(current);
+    }
+    plan
+}
+
+fn bounded_rendered_line(line_no: u32, marker: &str, content: &str, max_bytes: usize) -> String {
+    let prefix = if marker == "-" {
+        "       - ".to_string()
+    } else {
+        format!("{line_no:>6} {marker} ")
+    };
+    let max_content = max_bytes.saturating_sub(prefix.len() + 64);
+    if content.len() <= max_content {
+        return format!("{prefix}{content}\n");
+    }
+    let mut cut = max_content;
+    while cut > 0 && !content.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!(
+        "{prefix}{} [line abbreviated: {} bytes omitted]\n",
+        &content[..cut],
+        content.len() - cut
+    )
+}
+
+pub fn classify_omitted_file(path: &str) -> Option<OmittedFileKind> {
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    let name = normalized.rsplit('/').next().unwrap_or(&normalized);
+    let lockfile = matches!(
+        name,
+        "cargo.lock"
+            | "package-lock.json"
+            | "npm-shrinkwrap.json"
+            | "pnpm-lock.yaml"
+            | "yarn.lock"
+            | "bun.lock"
+            | "bun.lockb"
+            | "composer.lock"
+            | "gemfile.lock"
+            | "poetry.lock"
+            | "uv.lock"
+            | "pipfile.lock"
+            | "go.sum"
+            | "mix.lock"
+            | "pubspec.lock"
+            | "gradle.lockfile"
+            | "packages.lock.json"
+            | ".terraform.lock.hcl"
+    );
+    if lockfile {
+        return Some(OmittedFileKind::Lockfile);
+    }
+
+    let generated_component = normalized
+        .split('/')
+        .any(|part| matches!(part, "dist" | "coverage" | "node_modules"));
+    let generated_name = name.contains(".generated.")
+        || name.contains("_generated.")
+        || name.ends_with(".g.dart")
+        || name.contains(".pb.")
+        || name.ends_with(".min.js")
+        || name.ends_with(".min.css")
+        || name.ends_with(".snap");
+    (generated_component || generated_name).then_some(OmittedFileKind::Generated)
+}
+
+/// Confirm that a model citation was present in the exact annotated batch it
+/// received. The full-diff index alone is insufficient for batched reviews: a
+/// hallucinated citation from another batch is valid globally but was not
+/// evidence available to this request.
+pub fn review_batch_contains(annotated: &str, path: &str, line: u32) -> bool {
+    let mut current_path: Option<&str> = None;
+    for rendered in annotated.lines() {
+        if let Some(header) = rendered.strip_prefix("### ") {
+            current_path = Some(header.trim());
+            continue;
+        }
+        if current_path != Some(path) {
+            continue;
+        }
+        let Some((number, _)) = rendered.trim_start().split_once(' ') else {
+            continue;
+        };
+        if number.parse::<u32>().ok() == Some(line) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Render the hunk around a cited new-file line for the independent scorer.
 /// The scorer receives only a small local window, not the whole prompt-sized diff.
 pub fn render_hunk_context(diff: &Diff, path: &str, line: u32, radius: u32) -> Option<String> {
@@ -528,6 +768,116 @@ Binary files a/img.png and b/img.png differ
         assert!(text.contains("[diff truncated"));
     }
 
+    #[test]
+    fn review_batches_omit_artifacts_and_cover_all_source_lines() {
+        let mut diff = Diff::default();
+        for path in ["Cargo.lock", "web/schema.generated.ts"] {
+            diff.files.push(FileDiff {
+                old_path: path.into(),
+                path: path.into(),
+                deleted: false,
+                binary: false,
+                hunks: vec![Hunk {
+                    old_start: 1,
+                    old_count: 0,
+                    new_start: 1,
+                    new_count: 400,
+                    lines: (0..400).map(|i| format!("+artifact-{i}")).collect(),
+                }],
+            });
+        }
+        diff.files.push(FileDiff {
+            old_path: "src/lib.rs".into(),
+            path: "src/lib.rs".into(),
+            deleted: false,
+            binary: false,
+            hunks: vec![Hunk {
+                old_start: 1,
+                old_count: 0,
+                new_start: 1,
+                new_count: 200,
+                lines: (1..=200)
+                    .map(|i| format!("+let source_{i} = {i};"))
+                    .collect(),
+            }],
+        });
+
+        let plan = render_review_batches(&diff, 1024);
+        assert_eq!(plan.omitted_lockfiles, 1);
+        assert_eq!(plan.omitted_generated, 1);
+        assert!(plan.batches.len() > 1);
+        assert!(plan.batches.iter().all(|batch| batch.len() <= 1024));
+        let rendered = plan.batches.join("\n");
+        assert!(!rendered.contains("Cargo.lock"));
+        assert!(!rendered.contains("schema.generated.ts"));
+        assert!(rendered.contains("     1 + let source_1 = 1;"));
+        assert!(rendered.contains("   200 + let source_200 = 200;"));
+    }
+
+    #[test]
+    fn review_batches_abbreviate_one_pathological_source_line() {
+        let diff = Diff {
+            files: vec![FileDiff {
+                old_path: "src/lib.rs".into(),
+                path: "src/lib.rs".into(),
+                deleted: false,
+                binary: false,
+                hunks: vec![Hunk {
+                    old_start: 1,
+                    old_count: 0,
+                    new_start: 1,
+                    new_count: 1,
+                    lines: vec![format!("+{}", "x".repeat(10_000))],
+                }],
+            }],
+        };
+
+        let plan = render_review_batches(&diff, 1024);
+        assert_eq!(plan.batches.len(), 1);
+        assert!(plan.batches[0].len() <= 1024);
+        assert!(plan.batches[0].contains("line abbreviated"));
+    }
+
+    #[test]
+    fn artifact_classification_is_conservative() {
+        assert_eq!(
+            classify_omitted_file("frontend/package-lock.json"),
+            Some(OmittedFileKind::Lockfile)
+        );
+        assert_eq!(
+            classify_omitted_file("src/client.generated.ts"),
+            Some(OmittedFileKind::Generated)
+        );
+        assert_eq!(classify_omitted_file("src/generated.rs"), None);
+        assert_eq!(classify_omitted_file("vendor/security_patch.rs"), None);
+    }
+
+    #[test]
+    fn artifacts_are_removed_before_allocating_parse_state() {
+        let lock = "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -0,0 +1,2 @@\n+first\n+second\n";
+        let generated = "diff --git a/web/api.generated.ts b/web/api.generated.ts\n--- a/web/api.generated.ts\n+++ b/web/api.generated.ts\n@@ -0,0 +1 @@\n+generated\n";
+        let mixed = format!("{lock}{generated}{SAMPLE}");
+
+        let selected = select_reviewable_diff(&mixed);
+        assert_eq!(selected.omitted_lockfiles, 1);
+        assert_eq!(selected.omitted_generated, 1);
+        assert!(!selected.text.contains("Cargo.lock"));
+        assert!(!selected.text.contains("api.generated.ts"));
+        assert!(selected.text.contains("src/lib.rs"));
+
+        let unchanged = select_reviewable_diff(SAMPLE);
+        assert!(matches!(unchanged.text, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn batch_grounding_is_scoped_to_the_exact_rendered_part() {
+        let batch = "### src/a.rs\n    10 + first\n### src/b.rs\n    10 + second\n";
+        assert!(review_batch_contains(batch, "src/a.rs", 10));
+        assert!(review_batch_contains(batch, "src/b.rs", 10));
+        assert!(!review_batch_contains(batch, "src/a.rs", 11));
+        assert!(!review_batch_contains(batch, "src/c.rs", 10));
+    }
+
     // Header-only files (binary/deleted or files with no hunks) still emit a
     // "### path" line each; without a size check on those pushes, a diff of many
     // thousands of such files would render unbounded output with truncated=false,
@@ -548,36 +898,6 @@ Binary files a/img.png and b/img.png differ
         assert!(truncated, "header-only render bypassed the size cap");
         assert!(text.len() < 4000, "output ran past the cap unbounded");
         assert!(text.contains("[diff truncated"));
-    }
-
-    #[test]
-    fn raw_diff_cap_truncates_at_line_boundary() {
-        let big = format!("### header line\n{}", "some diff line\n".repeat(1000));
-        let (capped, truncated) = cap_raw_diff(&big, 100);
-        assert!(truncated);
-        assert!(capped.len() <= 100);
-        // Cut on a newline: the retained text ends cleanly, no partial line.
-        assert!(capped.ends_with('\n'));
-        // Under the cap: untouched.
-        let (same, t) = cap_raw_diff("small\n", 100);
-        assert!(!t);
-        assert_eq!(same, "small\n");
-    }
-
-    #[test]
-    fn raw_diff_cap_handles_multibyte_at_the_boundary() {
-        // No newline anywhere, and the cap lands mid-character: the cut must
-        // back up to a char boundary instead of panicking.
-        let s = "é".repeat(100); // 2 bytes per char, 200 bytes total
-        let (capped, truncated) = cap_raw_diff(&s, 99);
-        assert!(truncated);
-        assert_eq!(capped.len(), 98);
-        assert!(capped.chars().all(|c| c == 'é'));
-        // Newline present before a mid-character cap: still cuts on the line.
-        let s2 = format!("line one\n{}", "é".repeat(100));
-        let (capped2, truncated2) = cap_raw_diff(&s2, 15);
-        assert!(truncated2);
-        assert_eq!(capped2, "line one\n");
     }
 
     #[test]

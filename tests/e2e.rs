@@ -736,6 +736,163 @@ async fn mock_review(server: &MockServer, findings: Value) {
         .await;
 }
 
+#[tokio::test]
+async fn large_mixed_diff_omits_artifacts_and_reviews_late_source_change() {
+    use std::fmt::Write as _;
+
+    let server = MockServer::start().await;
+    mock_review(&server, json!([finding_at(41, "warn", 0.95)])).await;
+
+    let mut mixed = String::new();
+    let artifact_lines = 45_000;
+    writeln!(
+        mixed,
+        "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -0,0 +1,{artifact_lines} @@"
+    )
+    .unwrap();
+    for i in 0..artifact_lines {
+        writeln!(
+            mixed,
+            "+lock-entry-{i:05}=dependency-with-a-long-checksum-{i:05}"
+        )
+        .unwrap();
+    }
+    writeln!(
+        mixed,
+        "diff --git a/web/schema.generated.ts b/web/schema.generated.ts\n--- a/web/schema.generated.ts\n+++ b/web/schema.generated.ts\n@@ -0,0 +1,{artifact_lines} @@"
+    )
+    .unwrap();
+    for i in 0..artifact_lines {
+        writeln!(mixed, "+export const generated_{i:05} = '{i:05}';").unwrap();
+    }
+    mixed.push_str(DIFF);
+    assert!(
+        mixed.len() > 1_600_000,
+        "fixture must exceed the former raw cap"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = dir.path().join("large-mixed.diff");
+    std::fs::write(&diff, mixed).unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["findings"][0]["path"], "src/auth.rs");
+    assert_eq!(envelope["findings"][0]["line"], 41);
+    assert!(
+        envelope["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|finding| finding["title"] != "Diff truncated at the review size limit")
+    );
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(stderr.contains("omitted 1 lockfile(s) and 1 generated file(s)"));
+    assert!(stderr.contains("reviewing source batch 1/1"));
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let body = String::from_utf8_lossy(&requests[0].body);
+    assert!(body.contains("src/auth.rs"));
+    assert!(body.contains("exec_query"));
+    assert!(!body.contains("lock-entry-"));
+    assert!(!body.contains("generated_00000"));
+    assert!(!body.contains("diff truncated"));
+}
+
+#[tokio::test]
+async fn large_source_diff_reviews_every_bounded_batch_and_aggregates_findings() {
+    use std::fmt::Write as _;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(|request: &wiremock::Request| {
+            let body = String::from_utf8_lossy(&request.body);
+            let findings = if body.contains("dangerous_final_call") {
+                json!([finding_at(10_000, "warn", 0.95)])
+            } else {
+                json!([])
+            };
+            ResponseTemplate::new(200).set_body_json(llm_content(findings))
+        })
+        .mount(&server)
+        .await;
+
+    let mut source = String::new();
+    writeln!(
+        source,
+        "diff --git a/src/auth.rs b/src/auth.rs\n--- a/src/auth.rs\n+++ b/src/auth.rs\n@@ -0,0 +1,10000 @@"
+    )
+    .unwrap();
+    for line in 1..10_000 {
+        writeln!(
+            source,
+            "+let reviewed_{line:05} = validate(input_{line:05});"
+        )
+        .unwrap();
+    }
+    source.push_str("+dangerous_final_call(user_input);\n");
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = dir.path().join("large-source.diff");
+    std::fs::write(&diff, source).unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["findings"][0]["path"], "src/auth.rs");
+    assert_eq!(envelope["findings"][0]["line"], 10_000);
+    let requests = server.received_requests().await.unwrap();
+    assert!(
+        requests.len() > 1,
+        "large source changes must use multiple batches"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| { !String::from_utf8_lossy(&request.body).contains("diff truncated") })
+    );
+}
+
+#[test]
+fn artifact_only_diff_finishes_clean_without_model_credentials() {
+    let dir = tempfile::tempdir().unwrap();
+    let diff = dir.path().join("lockfile-only.diff");
+    std::fs::write(
+        &diff,
+        "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1 +1 @@\n-old\n+new\n",
+    )
+    .unwrap();
+
+    let out = postil()
+        .current_dir(dir.path())
+        .env_remove("MODEL_API_KEY")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["findings"], json!([]));
+    assert_eq!(envelope["modelUsed"], "none (empty diff)");
+}
+
 async fn mock_review_model(server: &MockServer, model: &str, findings: Value) {
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
@@ -3358,13 +3515,18 @@ async fn github_flow_posts_review_and_completes_both_checks() {
     assert_eq!(body["comments"][0]["path"], "src/auth.rs");
     assert_eq!(body["comments"][0]["line"], 41);
     let summary = body["body"].as_str().unwrap();
-    assert!(summary.starts_with("**1 finding has applied the brakes.** Fix it, then push again."));
+    assert!(summary.starts_with(&format!(
+        "{} **1 blocking finding**\n",
+        postil_cli::forge::icon_md("error")
+    )));
     assert!(!summary.contains("Unsanitized input reaches query"));
     assert!(!summary.contains("`src/auth.rs:41`"));
     assert!(!summary.contains("Review metadata"));
     assert!(!summary.contains("headsha"));
     assert!(!summary.contains("Tokens"));
-    assert!(summary.contains("[Review details](https://postil.dev/orgs/acme/runs/review-7)"));
+    assert!(
+        summary.contains("<sub>[Review details](https://postil.dev/orgs/acme/runs/review-7)</sub>")
+    );
 }
 
 // An LLM response with a caller-provided summary and findings (used for
@@ -3479,7 +3641,10 @@ async fn content_policy_pr_body_finding_survives_grounding() {
         "reserved-path finding was posted as an inline comment"
     );
     let summary = body["body"].as_str().unwrap();
-    assert!(summary.contains("1 finding worth a look"));
+    assert!(summary.contains(&format!(
+        "{} **1 advisory finding**",
+        postil_cli::forge::icon_md("info")
+    )));
     assert!(summary.contains("AI-authorship residue in PR description"));
     assert!(summary.contains("in pull request description"));
     assert!(summary.contains("Rule 3: the description states it was written by Claude."));
@@ -3627,7 +3792,10 @@ async fn github_clean_pr_stays_silent_but_completes_checks() {
     assert!(clean_summary.starts_with("Postil reviewed this change"));
     assert!(clean_summary.contains("Postil reviewed this change and found nothing"));
     assert!(!clean_summary.contains("Review metadata"));
-    assert!(clean_summary.contains("[Review details](https://postil.dev/orgs/acme/runs/clean-7)"));
+    assert!(
+        clean_summary
+            .contains("<sub>[Review details](https://postil.dev/orgs/acme/runs/clean-7)</sub>")
+    );
 }
 
 #[tokio::test]

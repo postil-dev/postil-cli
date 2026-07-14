@@ -304,6 +304,21 @@ fn parse_prevention_commands(raw: &str) -> Vec<String> {
         .collect()
 }
 
+fn summary_count(
+    rich: bool,
+    status: &str,
+    count: usize,
+    singular: &str,
+    plural_label: &str,
+) -> String {
+    let label = plural(count, singular, plural_label);
+    if rich {
+        format!("{} **{count} {label}**", icon_md(status))
+    } else {
+        format!("{status}: **{count} {label}**")
+    }
+}
+
 pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -> String {
     let mut s = String::new();
     let operational = only_operational_findings(&envelope.findings);
@@ -346,29 +361,52 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
             })
             .count();
         if has_operational && visible > 0 {
-            s.push_str(&format!(
-                "**{} {} posted inline.** Review {}, then follow the merge check.\n",
+            s.push_str(&summary_count(
+                rich,
+                "warn",
                 visible,
-                plural(visible, "finding is", "findings are"),
-                plural(visible, "it", "them"),
+                "finding; review incomplete",
+                "findings; review incomplete",
             ));
+            s.push('\n');
         } else if blocking > 0 {
-            s.push_str(&format!(
-                "**{} {} applied the brakes.** Fix {}, then push again.\n",
+            s.push_str(&summary_count(
+                rich,
+                "error",
                 blocking,
-                plural(blocking, "finding has", "findings have"),
-                plural(blocking, "it", "them"),
+                "blocking finding",
+                "blocking findings",
             ));
+            let advisory = visible.saturating_sub(blocking);
+            if advisory > 0 {
+                s.push_str(" · ");
+                s.push_str(&summary_count(
+                    rich,
+                    "info",
+                    advisory,
+                    "advisory finding",
+                    "advisory findings",
+                ));
+            }
+            s.push('\n');
         } else if visible > 0 {
-            s.push_str(&format!(
-                "**{} {} worth a look.** {} {} not block this merge.\n",
+            s.push_str(&summary_count(
+                rich,
+                "info",
                 visible,
-                plural(visible, "finding", "findings"),
-                plural(visible, "It", "They"),
-                plural(visible, "does", "do"),
+                "advisory finding",
+                "advisory findings",
             ));
+            s.push('\n');
         } else {
-            s.push_str("**A finding needs attention in the review details.**\n");
+            s.push_str(&summary_count(
+                rich,
+                "info",
+                1,
+                "finding in review details",
+                "findings in review details",
+            ));
+            s.push('\n');
         }
     }
 
@@ -415,11 +453,14 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
         }
     }
     if !envelope.resolved.is_empty() {
-        s.push_str(&format!(
-            "{} earlier {} resolved.\n",
+        s.push_str(&summary_count(
+            rich,
+            "pass",
             envelope.resolved.len(),
-            plural(envelope.resolved.len(), "finding", "findings"),
+            "resolved finding",
+            "resolved findings",
         ));
+        s.push('\n');
     }
 
     let eligible: Vec<_> = envelope
@@ -431,20 +472,21 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
     if !disclosed.is_empty() {
         if rich {
             s.push_str(&format!(
-                "\n<details><summary>{} lower-priority {}, not posted inline{}</summary>\n\n",
+                "\n<details><summary>{} {} suppressed{}</summary>\n\n",
+                icon_md("info"),
                 eligible.len(),
-                plural(eligible.len(), "finding", "findings"),
                 if eligible.len() > disclosed.len() {
-                    format!("; showing {} of {}", disclosed.len(), eligible.len())
+                    format!(" (showing {})", disclosed.len())
                 } else {
                     String::new()
                 },
             ));
         } else {
             s.push_str(&format!(
-                "\nLower-priority findings not posted inline{}:\n",
+                "\ninfo: {} suppressed{}:\n",
+                eligible.len(),
                 if eligible.len() > disclosed.len() {
-                    format!(" (showing {} of {})", disclosed.len(), eligible.len())
+                    format!(" (showing {})", disclosed.len())
                 } else {
                     String::new()
                 },
@@ -487,7 +529,11 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
     }
 
     if let Some(details_url) = context.details_url {
-        s.push_str(&format!("\n[Review details]({details_url})\n"));
+        if rich {
+            s.push_str(&format!("\n<sub>[Review details]({details_url})</sub>\n"));
+        } else {
+            s.push_str(&format!("\n[Review details]({details_url})\n"));
+        }
     }
     s
 }
@@ -701,12 +747,16 @@ mod tests {
             },
         );
 
-        assert!(summary.starts_with("**1 finding worth a look.**"));
+        assert!(summary.starts_with(&format!("{} **1 advisory finding**", icon_md("info"))));
+        assert!(!summary.contains("does not block"));
         assert!(!summary.contains("Unsanitized input reaches query"));
         assert!(!summary.contains("src/auth.rs:41"));
         assert!(!summary.contains("Review metadata"));
         assert!(!summary.contains("abcdef1"));
-        assert!(summary.contains("6 lower-priority findings, not posted inline; showing 5 of 6"));
+        assert!(summary.contains(&format!(
+            "<details><summary>{} 6 suppressed (showing 5)</summary>",
+            icon_md("info")
+        )));
         assert!(summary.contains("Lower confidence concern 0"));
         assert!(summary.contains("severity error, confidence 0.91"));
         assert!(summary.contains("Evidence from the changed branch"));
@@ -714,11 +764,82 @@ mod tests {
         assert!(summary.contains("postil review --staged"));
         assert!(summary.contains("postil hook install"));
         assert!(summary.contains("cargo test --lib"));
-        assert!(summary.contains("[Review details](https://postil.dev/orgs/acme/runs/run-1)"));
+        assert!(
+            summary
+                .contains("<sub>[Review details](https://postil.dev/orgs/acme/runs/run-1)</sub>")
+        );
 
         let plain = check_summary(&env, false, Default::default());
-        assert!(plain.contains("Lower-priority findings not posted inline (showing 5 of 6):"));
+        assert!(plain.contains("info: 6 suppressed (showing 5):"));
         assert!(!plain.contains("<details>"));
+    }
+
+    #[test]
+    fn summary_counts_cover_blocking_advisory_resolved_and_suppressed() {
+        let blocking = envelope_with_findings(vec![finding()]);
+        let blocking_summary = check_summary(&blocking, true, Default::default());
+        assert!(
+            blocking_summary.starts_with(&format!("{} **1 blocking finding**\n", icon_md("error")))
+        );
+        let blocking_plural = envelope_with_findings(vec![finding(), finding()]);
+        assert!(
+            check_summary(&blocking_plural, true, Default::default())
+                .starts_with(&format!("{} **2 blocking findings**\n", icon_md("error")))
+        );
+
+        let mut advisory_one = finding();
+        advisory_one.severity = Severity::Warn;
+        let mut advisory_two = advisory_one.clone();
+        advisory_two.line = 42;
+        let mut advisory = envelope_with_findings(vec![advisory_one, advisory_two]);
+        advisory.gate.failing = false;
+        let advisory_summary = check_summary(&advisory, true, Default::default());
+        assert!(
+            advisory_summary.starts_with(&format!("{} **2 advisory findings**\n", icon_md("info")))
+        );
+
+        let mut resolved_singular = envelope_with_findings(vec![finding()]);
+        resolved_singular.resolved = vec![finding()];
+        assert!(
+            check_summary(&resolved_singular, true, Default::default())
+                .contains(&format!("{} **1 resolved finding**\n", icon_md("pass")))
+        );
+
+        let mut detail_counts = envelope_with_findings(vec![finding()]);
+        detail_counts.resolved = vec![finding(), finding()];
+        detail_counts.suppressed_findings = vec![crate::envelope::SuppressedFinding {
+            finding: finding(),
+            reason: SuppressionReason::BelowConfidence,
+        }];
+        let detail_summary = check_summary(&detail_counts, true, Default::default());
+        assert!(detail_summary.contains(&format!("{} **2 resolved findings**\n", icon_md("pass"))));
+        assert!(detail_summary.contains(&format!(
+            "<details><summary>{} 1 suppressed</summary>",
+            icon_md("info")
+        )));
+        assert!(!detail_summary.contains("earlier finding"));
+    }
+
+    #[test]
+    fn review_details_are_subordinate_when_present_and_absent_when_unset() {
+        let env = envelope_with_findings(vec![finding()]);
+        let with_details = check_summary(
+            &env,
+            true,
+            SummaryContext {
+                details_url: Some("https://postil.dev/orgs/acme/runs/run-1".into()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            with_details.ends_with(
+                "<sub>[Review details](https://postil.dev/orgs/acme/runs/run-1)</sub>\n"
+            )
+        );
+
+        let without_details = check_summary(&env, true, Default::default());
+        assert!(!without_details.contains("Review details"));
+        assert!(!without_details.contains("<sub>"));
     }
 
     #[test]
