@@ -482,7 +482,7 @@ impl GitHub {
                 files.len() <= expected && files.len() <= MAX_FILES,
                 "GitHub PR files pagination exceeded the declared changed-file count"
             );
-            if count < PAGE_SIZE {
+            if files.len() == expected || count < PAGE_SIZE {
                 break;
             }
             page = page
@@ -623,8 +623,8 @@ fn validate_pull_file(file: &PullFile, context: &str) -> Result<()> {
         );
     }
     ensure!(
-        file.status != "renamed" || file.previous_filename.is_some(),
-        "{context} omitted the previous path for a renamed file"
+        !matches!(file.status.as_str(), "renamed" | "copied") || file.previous_filename.is_some(),
+        "{context} omitted the previous path for a renamed or copied file"
     );
     Ok(())
 }
@@ -948,6 +948,10 @@ impl Forge for GitHub {
             "GitHub compare response",
         )
         .await?;
+        ensure!(
+            compare.merge_base_commit.sha == since_sha,
+            "GitHub incremental compare no longer descends from the requested baseline; refusing an incomplete review"
+        );
         // GitHub documents that compare responses include at most 300 files
         // and expose no complete file count. Exactly 300 is therefore
         // ambiguous and must fail closed.
@@ -1244,14 +1248,15 @@ fn comment_marker(number: u64, body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        GitHub, gate_summary, github_retry_delay_at, github_retryable_response,
+        GitHub, PullFile, gate_summary, github_retry_delay_at, github_retryable_response,
         github_transport_retry_delay, only_operational_findings, valid_details_url,
+        validate_pull_file,
     };
     use crate::envelope::{Envelope, Finding, Gate, Kind, Severity, Usage};
     use crate::forge::{CheckState, Forge};
     use reqwest::header::{HeaderMap, HeaderValue};
     use std::time::Duration;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
@@ -1420,6 +1425,93 @@ mod tests {
             repo: "repo".into(),
             pr: 1,
         }
+    }
+
+    fn pull_file_page(start: usize, count: usize) -> Vec<serde_json::Value> {
+        (start..start + count)
+            .map(|index| {
+                serde_json::json!({
+                    "filename": format!("src/file-{index}.rs"),
+                    "status": "modified",
+                    "changes": 1
+                })
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn github_pull_files_stops_at_one_complete_full_page() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1/files"))
+            .and(query_param("per_page", "100"))
+            .and(query_param("page", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(pull_file_page(0, 100)))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let files = test_github(&server).pull_files(100).await.unwrap();
+        assert_eq!(files.len(), 100);
+    }
+
+    #[tokio::test]
+    async fn github_pull_files_stops_at_two_complete_full_pages() {
+        let server = MockServer::start().await;
+        for (page, start) in [(1, 0), (2, 100)] {
+            Mock::given(method("GET"))
+                .and(path("/repos/owner/repo/pulls/1/files"))
+                .and(query_param("per_page", "100"))
+                .and(query_param("page", page.to_string()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(pull_file_page(start, 100)))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+
+        let files = test_github(&server).pull_files(200).await.unwrap();
+        assert_eq!(files.len(), 200);
+    }
+
+    #[test]
+    fn github_copied_files_require_their_previous_path() {
+        let missing_source = PullFile {
+            filename: "src/copy.rs".into(),
+            status: "copied".into(),
+            previous_filename: None,
+            changes: 1,
+        };
+        let error = validate_pull_file(&missing_source, "fixture").unwrap_err();
+        assert!(error.to_string().contains("renamed or copied"));
+
+        let with_source = PullFile {
+            previous_filename: Some("src/original.rs".into()),
+            ..missing_source
+        };
+        validate_pull_file(&with_source, "fixture").unwrap();
+    }
+
+    #[tokio::test]
+    async fn github_incremental_diff_rejects_a_non_ancestor_baseline() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/compare/aaaaaaaa...bbbbbbbb"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "merge_base_commit": {"sha": "cccccccc"},
+                "files": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let error = match test_github(&server)
+            .fetch_diff_since("aaaaaaaa", "bbbbbbbb")
+            .await
+        {
+            Ok(_) => panic!("non-ancestor incremental compare was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("no longer descends"));
     }
 
     #[tokio::test]
