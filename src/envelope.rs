@@ -554,6 +554,10 @@ pub const PROVIDER_PATH: &str = ".postil/provider";
 /// be posted as inline code annotations (there is no file line); they are
 /// surfaced in the check-run summary and PR comment body instead.
 pub const PR_DESCRIPTION_PATH: &str = ".postil/pr-description";
+/// Reserved path for numbered change metadata that has no valid new-side line,
+/// including deletions, binary changes, renames, mode changes, and compact
+/// lockfile evidence.
+pub const CHANGE_METADATA_PATH: &str = ".postil/change-metadata";
 pub const DIFF_PATH: &str = ".postil/diff";
 
 /// Exact virtual anchors emitted by Postil itself. Repository files under the
@@ -562,8 +566,30 @@ pub const DIFF_PATH: &str = ".postil/diff";
 pub fn is_reserved_anchor(path: &str) -> bool {
     matches!(
         path,
-        OPERATIONAL_PATH | PROVIDER_PATH | PR_DESCRIPTION_PATH | DIFF_PATH
+        OPERATIONAL_PATH | PROVIDER_PATH | PR_DESCRIPTION_PATH | CHANGE_METADATA_PATH | DIFF_PATH
     )
+}
+
+/// A complete, trustworthy review could not fit inside Postil's bounded local
+/// resource and provider-request budget. This is an internal fail-closed state;
+/// forge adapters expose only generic check text for operational findings.
+pub fn incomplete_review_finding() -> Finding {
+    Finding {
+        path: OPERATIONAL_PATH.to_string(),
+        line: 1,
+        end_line: None,
+        severity: Severity::Error,
+        kind: Kind::Uncertainty,
+        confidence: 1.0,
+        title: "Review incomplete".to_string(),
+        body: "The complete change did not fit within Postil's bounded review budget. No clean verdict was issued. Split the change or run focused local reviews before retrying.".to_string(),
+        id: None,
+        generator_confidence: None,
+        scorer_confidence: None,
+        generator_kind: None,
+        scorer_kind: None,
+        scorer_reason: None,
+    }
 }
 
 /// The synthetic finding emitted when the model produced unusable output.

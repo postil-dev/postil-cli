@@ -23,7 +23,7 @@ const API_VERSION: &str = "7.1";
 /// returns full file text with no size limit and no cheap way to learn the
 /// length up front, so without this a single huge file (a lockfile, a
 /// vendored bundle) is fetched in full and handed to `similar::TextDiff`
-/// before the assembled diff ever reaches `MAX_RAW_DIFF_BYTES` in review.rs.
+/// before the assembled diff reaches the bounded review-source pipeline.
 /// Generous for any ordinary source file; anything larger is marked skipped,
 /// the same way binary content is below.
 const MAX_FILE_BYTES: usize = 2 * 1024 * 1024;

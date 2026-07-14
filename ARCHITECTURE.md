@@ -7,10 +7,10 @@ contract shared with postil-dev/postil (hosted worker) and `postil plan`.
 ## Pipeline
 
 ```
-acquire diff ──> classify artifacts ──> parse + index ──> bounded source batches
-                                                               │
-   envelope <── gate <── reconcile <── filter + aggregate <── model
-                                                          (cascade/consensus)
+acquire diff --> compact exact lockfiles --> parse + index --> bounded evidence batches
+                                                                    |
+   envelope <-- gate <-- reconcile <-- filter + aggregate <-- model + final synthesis
+                                                               (cascade/consensus)
       │                  (baseline)   (ground, policy)
       ├─ stdout JSON (--output-json)
       ├─ terminal (stderr)
@@ -18,11 +18,13 @@ acquire diff ──> classify artifacts ──> parse + index ──> bounded so
 ```
 
 - `diff.rs`: unified-diff parser, `DiffIndex` (which (path, line) pairs exist on the
-  new side), and the annotated rendering whose margin line numbers are the only numbers
-  the model is allowed to cite. Review preparation removes standard lockfiles and
-  explicitly generated paths before allocating per-line parser state, then streams all
-  remaining source hunks into bounded batches. Aggregate diff size does not truncate
-  the review or create a finding.
+  new side), and annotated evidence whose margin line numbers are the only numbers
+  the model is allowed to cite. Exact known lockfiles become bounded dependency
+  metadata. Every other path remains untrusted reviewable source, including generated,
+  distribution, vendor, snapshot, and dependency-directory names. Source evidence
+  splits at file and hunk boundaries with overlap, repeats a bounded changed-file
+  manifest, segments oversized lines without hiding the tail, and records deletion,
+  binary, rename, and mode evidence under `.postil/change-metadata`.
 - `filter.rs`: grounding (uncited findings dropped; all-uncited = untrusted run),
   policy suppression (ignore globs, severityThreshold, minConfidence, maxFindings),
   structured retention of suppressed grounded findings, and
@@ -34,8 +36,10 @@ acquire diff ──> classify artifacts ──> parse + index ──> bounded so
   and response decoding vary by API format while retry, timeout, deadline, cascade, and
   secret-redaction semantics remain shared. Optional private-endpoint authentication is
   a separate header whose name cannot collide with provider-managed headers.
-- `review.rs`: orchestration; runs every source batch, aggregates findings before
-  grounding and scoring, owns fail-closed semantics (`fail_closed_finding`), and owns
+- `review.rs`: orchestration; enforces raw-source, batch, request, projected-input,
+  and token budgets before provider calls; runs every evidence batch plus one bounded
+  cross-batch synthesis; aggregates findings before grounding and scoring; owns
+  fail-closed semantics (`fail_closed_finding`); and owns
   check-run lifecycle ordering (checks are created before the model runs so a crash can
   still be reported against them). It persists safe structured model incidents for
   monitoring without raw provider or model text.
@@ -68,7 +72,10 @@ additions (violations are `kind: contentPolicy`). Content policy is on by defaul
 
 ## Invariants
 
-1. Every reported finding cites a line present in the reviewed diff. Exception:
+1. Every reported finding cites a line present in the exact request that produced it.
+   Ordinary source findings cite new-side diff lines. Deletion, binary, rename, mode,
+   and compact lockfile findings cite numbered `.postil/change-metadata` evidence.
+   Both endpoints of a multiline range occur in the same rendered segment. Exception:
    when content policy is active, a `kind: contentPolicy` finding may instead cite
    the reserved `.postil/pr-description` path, whose valid lines are the numbered
    PR title/description block rendered into the prompt. Only content-policy
@@ -87,6 +94,10 @@ additions (violations are `kind: contentPolicy`). Content policy is on by defaul
 8. `humanEscalation` blocks by kind at confidence 0.30 or above. It represents an
    irreducible owner decision, not uncertainty about a concrete defect. Admin overrides
    apply to that kind-only decision rather than ordinary risk findings.
+9. Review resource or request-budget exhaustion cannot produce a clean verdict. It
+   emits the generic internal `Review incomplete` operational finding before any model
+   call, preserves the hosted global deadline, and keeps full-review reconciliation
+   untrustworthy.
 
 ## Residual prompt-injection surface
 

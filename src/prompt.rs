@@ -56,8 +56,11 @@ pub fn review_contract(cfg: &Config) -> String {
          credential, (2) purge it from git history (the commit is permanent otherwise), \
          and (3) move it to an environment variable or secrets store.\n\
          \n\
-         Cite ONLY line numbers printed in the left margin of the diff (the new-file line \
-         numbers). Findings citing other lines are discarded as ungrounded.\n",
+         Cite ONLY line numbers printed in the left margin of the supplied evidence. For \
+         ordinary source, cite the new-file line. For deletion, binary, rename, mode, or \
+         compact lockfile evidence, cite the matching numbered line under \
+         `.postil/change-metadata`. Findings citing other lines are discarded as \
+         ungrounded.\n",
     );
     if !cfg.focus.is_empty() {
         p.push_str(&format!(
@@ -306,7 +309,7 @@ pub fn user_prompt(ctx: &PrContext, annotated_diff: &str, max_findings: usize) -
     }
     p.push_str(&format!(
         "\nReport at most {max_findings} findings; if more exist, keep the most severe.\n\
-         \nDiff (left margin numbers are new-file line numbers — cite exactly these):\n\n"
+         \nReview evidence (cite exactly the numbered new-file or change-metadata lines):\n\n"
     ));
     p.push_str(annotated_diff);
     p
