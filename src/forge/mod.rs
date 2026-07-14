@@ -812,18 +812,25 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
         }
     }
 
-    if let Some(coverage) = &envelope.review_coverage
-        && coverage.mode == crate::envelope::ReviewCoverageMode::Bounded
-    {
+    if let Some(coverage) = &envelope.review_coverage {
+        let fallback = if coverage.planner_fallback {
+            "yes"
+        } else {
+            "no"
+        };
         if rich {
             s.push_str(&format!(
-                "\n<sub>{}/{} source batches · bounded selection</sub>\n",
-                coverage.selected_batches, coverage.total_batches
+                "\n<sub>{}/{} source batches · {} · planner fallback: {fallback}</sub>\n",
+                coverage.selected_batches,
+                coverage.total_batches,
+                coverage.mode.as_str(),
             ));
         } else {
             s.push_str(&format!(
-                "\n{}/{} source batches (bounded selection).\n",
-                coverage.selected_batches, coverage.total_batches
+                "\n{}/{} source batches ({}; planner fallback: {fallback}).\n",
+                coverage.selected_batches,
+                coverage.total_batches,
+                coverage.mode.as_str(),
             ));
         }
     }
@@ -1339,7 +1346,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_review_coverage_is_compact_and_auditable() {
+    fn review_coverage_is_compact_and_auditable_in_every_mode() {
         let mut env = envelope_with_findings(vec![finding()]);
         env.review_coverage = Some(crate::envelope::ReviewCoverage {
             mode: crate::envelope::ReviewCoverageMode::Bounded,
@@ -1349,11 +1356,23 @@ mod tests {
         });
 
         let rich = check_summary(&env, true, Default::default());
-        assert!(rich.contains("<sub>5/19 source batches · bounded selection</sub>"));
-        assert!(!rich.contains("planner"));
+        assert!(rich.contains("<sub>5/19 source batches · bounded · planner fallback: yes</sub>"));
 
         let plain = check_summary(&env, false, Default::default());
-        assert!(plain.contains("5/19 source batches (bounded selection)."));
+        assert!(plain.contains("5/19 source batches (bounded; planner fallback: yes)."));
+
+        env.review_coverage = Some(crate::envelope::ReviewCoverage {
+            mode: crate::envelope::ReviewCoverageMode::Exhaustive,
+            selected_batches: 19,
+            total_batches: 19,
+            planner_fallback: false,
+        });
+        let rich = check_summary(&env, true, Default::default());
+        assert!(
+            rich.contains("<sub>19/19 source batches · exhaustive · planner fallback: no</sub>")
+        );
+        let plain = check_summary(&env, false, Default::default());
+        assert!(plain.contains("19/19 source batches (exhaustive; planner fallback: no)."));
     }
 
     #[test]

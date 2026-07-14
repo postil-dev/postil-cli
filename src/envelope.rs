@@ -625,6 +625,15 @@ pub enum ReviewCoverageMode {
     Bounded,
 }
 
+impl ReviewCoverageMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Exhaustive => "exhaustive",
+            Self::Bounded => "bounded",
+        }
+    }
+}
+
 /// Audit record for the source-evidence batches sent to review models. Synthesis
 /// requests are excluded from both counts. This additive v1 field lets stored
 /// envelopes without coverage accounting deserialize with `review_coverage = None`.

@@ -3899,14 +3899,20 @@ mod tests {
             scorer_enabled: false,
             ..Config::default()
         };
-        let mut client = LlmClient::build(
-            &config,
-            "test-key".into(),
-            Duration::from_secs(1),
-            None,
-            None,
-        )
-        .unwrap();
+        let mut client = {
+            let _lock = env_lock().lock().unwrap();
+            let _env = EnvRestore::capture(&[ENDPOINT_AUTH_HEADER_ENV, ENDPOINT_AUTH_VALUE_ENV]);
+            EnvRestore::remove(ENDPOINT_AUTH_HEADER_ENV);
+            EnvRestore::remove(ENDPOINT_AUTH_VALUE_ENV);
+            LlmClient::build(
+                &config,
+                "test-key".into(),
+                Duration::from_secs(1),
+                None,
+                None,
+            )
+            .unwrap()
+        };
         client.hosted_price_bounds = Some(Arc::new(HashMap::from([(
             "provider/model".into(),
             ModelPriceBound {
