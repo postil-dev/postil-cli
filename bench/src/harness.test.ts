@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { cases } from "../fixtures/cases";
+import {
+  cases,
+  negativePropositionsByFixtureId,
+  positiveParaphrasesByFixtureId,
+} from "../fixtures/cases";
 import { benchmarkCase, commentMatchesExpectation, scanForForbidden } from "./harness";
 
 // These probes are authored independently from the fixture concept vocabulary.
@@ -99,11 +103,30 @@ describe("benchmark fixtures", () => {
       expect(candidate.groundTruth.findings[0]?.severity).toBe(expectedSeverity);
       const finding = candidate.groundTruth.findings[0];
       if (finding !== undefined) {
-        expect(finding.semantics?.positive.length).toBeGreaterThan(0);
-        expect(finding.semantics?.positive[0]?.all.length).toBeGreaterThanOrEqual(2);
-        expect(finding.semantics?.positive[0]?.all.every((group) => group.length >= 2)).toBe(true);
-        const semanticAtoms = finding.semantics!.positive[0]!.all.flat();
+        expect(finding.semantics?.positive.length).toBeGreaterThan(2);
+        const conceptProposition = finding.semantics!.positive.at(-1)!;
+        expect(conceptProposition.all.length).toBeGreaterThanOrEqual(2);
+        expect(conceptProposition.all.every((group) => group.length >= 2)).toBe(true);
+        const semanticAtoms = conceptProposition.all.flat();
         expect(semanticAtoms.every((atom) => atom.trim().split(/\s+/u).length <= 3)).toBe(true);
+        const explicitPositives = positiveParaphrasesByFixtureId[candidate.id];
+        expect(explicitPositives).toBeDefined();
+        for (const explicitPositive of explicitPositives!) {
+          expect({
+            id: candidate.id,
+            explicitPositive,
+            matches: commentMatchesExpectation(explicitPositive, finding.semantics),
+          }).toEqual({ id: candidate.id, explicitPositive, matches: true });
+        }
+        const inversePropositions = negativePropositionsByFixtureId[candidate.id];
+        expect(inversePropositions).toBeDefined();
+        for (const inverse of inversePropositions!) {
+          expect({
+            id: candidate.id,
+            inverse,
+            matches: commentMatchesExpectation(inverse, finding.semantics),
+          }).toEqual({ id: candidate.id, inverse, matches: false });
+        }
         expect({
           id: candidate.id,
           recordedMatches: commentMatchesExpectation(candidate.modelOutput.findings[0]!.body, finding.semantics),
@@ -139,8 +162,21 @@ describe("benchmark fixtures", () => {
           .toBe(true);
         expect(commentMatchesExpectation(`This fixes an unrelated concern. ${probe}`, finding.semantics))
           .toBe(true);
+
+        const deniedConcepts = conceptProposition.all.slice(0, -1).map((group) => group[0]).join(" ");
+        const finalConcept = conceptProposition.all.at(-1)![0]!;
+        const splitClause =
+          `No ${deniedConcepts} operation can ever occur through this code path under any circumstance, ` +
+          `but ${finalConcept} state appears.`;
+        expect({
+          id: candidate.id,
+          splitClause,
+          matches: commentMatchesExpectation(splitClause, finding.semantics),
+        }).toEqual({ id: candidate.id, splitClause, matches: false });
       }
     }
+    expect(Object.values(positiveParaphrasesByFixtureId).flat()).toHaveLength(100);
+    expect(Object.values(negativePropositionsByFixtureId).flat()).toHaveLength(49);
     expect(Object.keys(semanticProbesByFixtureId).sort()).toEqual(
       parsed.filter((candidate) => candidate.groundTruth.findings.length > 0).map((candidate) => candidate.id).sort(),
     );

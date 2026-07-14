@@ -1021,13 +1021,12 @@ export function commentMatchesExpectation(
     if (proposition.none.some((excluded) => containsTokenSequence(tokens, propositionTokens(excluded)))) {
       return false;
     }
-    const polarityGroup = proposition.all.length - 1;
-    return proposition.all.every((alternatives, groupIndex) => alternatives.some((alternative) => {
-      const needle = propositionTokens(alternative).filter((token) => !isClauseBoundary(token));
-      return tokenSequenceStarts(tokens, needle).some(
-        (start) => groupIndex !== polarityGroup || !isLocallyNegated(tokens, start),
-      );
-    }));
+    return propositionClauses(tokens).some((clause) =>
+      proposition.all.every((alternatives) => alternatives.some((alternative) => {
+        const needle = propositionTokens(alternative).filter((token) => !isClauseBoundary(token));
+        return tokenSequenceStarts(clause, needle).some((start) => !isLocallyNegated(clause, start));
+      }))
+    );
   };
   if (semantics.negative.some(matches)) {
     return false;
@@ -1038,6 +1037,7 @@ export function commentMatchesExpectation(
 function propositionTokens(value: string): string[] {
   return value
     .replace(/([a-z0-9])([A-Z])/gu, "$1 $2")
+    .replace(/(?<=[a-z0-9])\.(?=[a-z0-9])/giu, " ")
     .replace(/\bwon['’]t\b/giu, "will not")
     .replace(/\bcan['’]t\b/giu, "cannot")
     .replace(/\b([a-z]+)n['’]t\b/giu, "$1 not")
@@ -1046,7 +1046,23 @@ function propositionTokens(value: string): string[] {
 }
 
 function isClauseBoundary(token: string): boolean {
-  return token === "." || token === "!" || token === "?" || token === ";" || token === ":";
+  return token === "." || token === "!" || token === "?" || token === ";" || token === ":" ||
+    token === "but" || token === "however" || token === "whereas" || token === "yet";
+}
+
+function propositionClauses(tokens: string[]): string[][] {
+  const clauses: string[][] = [];
+  let clause: string[] = [];
+  for (const token of tokens) {
+    if (isClauseBoundary(token)) {
+      if (clause.length > 0) clauses.push(clause);
+      clause = [];
+    } else {
+      clause.push(token);
+    }
+  }
+  if (clause.length > 0) clauses.push(clause);
+  return clauses;
 }
 
 function tokenSequenceStarts(tokens: string[], needle: string[]): number[] {

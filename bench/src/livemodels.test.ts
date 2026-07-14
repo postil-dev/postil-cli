@@ -18,6 +18,7 @@ import {
   normalizeApiBase,
   normalizeQualificationPairs,
   parseQualificationPairs,
+  qualificationProfileDigest,
   runLiveModels,
   type LiveModelsReport,
 } from "./livemodels";
@@ -298,6 +299,10 @@ describe("managed admission workflow", () => {
     expect(workflow).not.toContain("inputs.api_base");
     expect(workflow).not.toContain("inputs.api_format");
     expect(workflow).not.toContain("POSTIL_BENCH_MODELS");
+    const actionReferences = [...workflow.matchAll(/^\s*-?\s*uses:\s*([^\s#]+)(?:\s+#\s*(\S+))?$/gmu)];
+    expect(actionReferences.length).toBeGreaterThan(0);
+    expect(actionReferences.every((match) => /@[0-9a-f]{40}$/u.test(match[1] ?? ""))).toBe(true);
+    expect(actionReferences.every((match) => (match[2] ?? "").length > 0)).toBe(true);
   });
 });
 
@@ -320,8 +325,9 @@ describe("qualification report", () => {
   });
 
   test("emits the exact runtime admission manifest profile", () => {
-    const profile = {
-      id: "profile-id",
+    const profileMaterial = {
+      modelDefaultsSha256: "c".repeat(64),
+      reportSha256: "e".repeat(64),
       apiBase: "https://openrouter.ai:443/api/v1",
       apiFormat: "openai-compatible" as const,
       benchmarkProviderIdentity: "openrouter:test-route",
@@ -353,11 +359,14 @@ describe("qualification report", () => {
       cliBinaryHash: "d".repeat(64),
       repeats: 3,
     };
-    expect(admissionManifestCandidate("c".repeat(64), "e".repeat(64), [profile])).toEqual({
+    const profile = { id: qualificationProfileDigest(profileMaterial), ...profileMaterial };
+    expect(profile.id).toBe("91a2206079adb57e9e25b869cdc8f01955f45cdc814b128c21e2a3f48614382b");
+    expect(admissionManifestCandidate("c".repeat(64), [profile])).toEqual({
       version: 1,
       modelDefaultsSha256: "c".repeat(64),
       profiles: [{
-        id: "profile-id",
+        id: profile.id,
+        modelDefaultsSha256: "c".repeat(64),
         apiBase: "https://openrouter.ai:443/api/v1",
         benchmarkProviderIdentity: "openrouter:test-route",
         generatorChain: ["provider/one", "provider/two"],

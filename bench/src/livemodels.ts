@@ -170,9 +170,11 @@ export interface ModelPriceBound {
 
 export interface QualificationProfile {
   id: string;
+  modelDefaultsSha256: string;
+  reportSha256: string;
   apiBase: string;
   apiFormat: "openai-compatible" | "anthropic";
-  benchmarkProviderIdentity?: string;
+  benchmarkProviderIdentity: string | null;
   generatorModels: string[];
   consensus: number;
   scorerModels: string[];
@@ -191,8 +193,9 @@ export interface AdmissionManifestCandidate {
   modelDefaultsSha256: string;
   profiles: Array<{
     id: string;
+    modelDefaultsSha256: string;
     apiBase: string;
-    benchmarkProviderIdentity?: string;
+    benchmarkProviderIdentity: string | null;
     generatorChain: string[];
     consensus: number;
     scorerChain: string[];
@@ -206,6 +209,28 @@ export interface AdmissionManifestCandidate {
     repeatedRuns: number;
   }>;
 }
+
+export interface QualificationProfileDigestMaterial {
+  modelDefaultsSha256: string;
+  benchmarkProviderIdentity: string | null;
+  apiBase: string;
+  apiFormat: "openai-compatible" | "anthropic";
+  generatorChain: string[];
+  consensus: number;
+  scorerChain: string[];
+  modelPriceBounds: ModelPriceBound[];
+  reviewContractSha256: string;
+  fixtureSetSha256: string;
+  evaluatorContractSha256: string;
+  evaluatorRuntimeIdentity: string;
+  reportSha256: string;
+  repeatedRuns: number;
+}
+
+type QualificationProfileEvidence = Omit<
+  QualificationProfile,
+  "id" | "modelDefaultsSha256" | "reportSha256"
+>;
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -318,7 +343,7 @@ export async function runLiveModels(
     ),
   );
   const identity = apiBase;
-  const profiles = pairs.map((pair) => qualificationProfile({
+  const profileEvidence = pairs.map((pair) => qualificationProfileEvidence({
     pair,
     apiBase,
     apiFormat,
@@ -346,10 +371,15 @@ export async function runLiveModels(
     cliBinaryHash,
     hostedOperationCostCapMicros: HOSTED_OPERATION_COST_CAP_MICROS,
     repeats,
-    profiles,
+    profiles: profileEvidence,
     cases: results,
   };
   const evidenceHash = hashSanitizedEvidence(evidence);
+  const profiles = profileEvidence.map((profile) => finalizeQualificationProfile(
+    profile,
+    configHash,
+    evidenceHash,
+  ));
   const passed = repeats >= MIN_QUALIFICATION_REPEATS && aggregates.length > 0 &&
     aggregates.every((aggregate) => aggregate.passed);
   const report: LiveModelsReport = {
@@ -376,7 +406,7 @@ export async function runLiveModels(
     totalRunCostUsd: calculateTotalRunCostUsd(results),
     cases: results,
   };
-  if (passed) report.manifestCandidate = admissionManifestCandidate(configHash, evidenceHash, profiles);
+  if (passed) report.manifestCandidate = admissionManifestCandidate(configHash, profiles);
   return report;
 }
 
@@ -395,30 +425,12 @@ export function hashSanitizedEvidence(value: object): string {
 
 export function admissionManifestCandidate(
   modelDefaultsSha256: string,
-  reportSha256: string,
   profiles: QualificationProfile[],
 ): AdmissionManifestCandidate {
   return {
     version: 1,
     modelDefaultsSha256,
-    profiles: profiles.map((profile) => ({
-      id: profile.id,
-      apiBase: profile.apiBase,
-      ...(profile.benchmarkProviderIdentity === undefined
-        ? {}
-        : { benchmarkProviderIdentity: profile.benchmarkProviderIdentity }),
-      generatorChain: profile.generatorModels,
-      consensus: profile.consensus,
-      scorerChain: profile.scorerModels,
-      modelPriceBounds: profile.modelPriceBounds,
-      apiFormat: profile.apiFormat,
-      reviewContractSha256: profile.reviewContractHash,
-      fixtureSetSha256: profile.fixtureHash,
-      evaluatorContractSha256: profile.evaluatorContractHash,
-      evaluatorRuntimeIdentity: profile.evaluatorRuntimeIdentity,
-      reportSha256,
-      repeatedRuns: profile.repeats,
-    })),
+    profiles: profiles.map((profile) => ({ id: profile.id, ...qualificationProfileDigestMaterial(profile) })),
   };
 }
 
@@ -761,14 +773,18 @@ export function normalizeApiBase(value: string): string {
   return `${url.protocol}//${hostname}:${port}${path}`;
 }
 
-function qualificationProfile(args: Omit<QualificationProfile, "id" | "generatorModels" | "consensus" | "scorerModels"> & {
+function qualificationProfileEvidence(args: Omit<
+  QualificationProfileEvidence,
+  "generatorModels" | "consensus" | "scorerModels" | "benchmarkProviderIdentity"
+> & {
   pair: QualificationPair;
-}): QualificationProfile {
+}): QualificationProfileEvidence {
   const generatorModels = qualificationGeneratorModels(args.pair);
   const consensus = args.pair.consensus ?? generatorModels.length;
-  const material = {
+  return {
     apiBase: args.apiBase,
     apiFormat: args.apiFormat,
+    benchmarkProviderIdentity: null,
     generatorModels,
     consensus,
     scorerModels: qualificationScorerModels(args.pair),
@@ -781,7 +797,40 @@ function qualificationProfile(args: Omit<QualificationProfile, "id" | "generator
     cliBinaryHash: args.cliBinaryHash,
     repeats: args.repeats,
   };
-  return { id: hashText(JSON.stringify(material)), ...material };
+}
+
+function finalizeQualificationProfile(
+  evidence: QualificationProfileEvidence,
+  modelDefaultsSha256: string,
+  reportSha256: string,
+): QualificationProfile {
+  const profile: Omit<QualificationProfile, "id"> = { ...evidence, modelDefaultsSha256, reportSha256 };
+  return { id: qualificationProfileDigest(profile), ...profile };
+}
+
+export function qualificationProfileDigestMaterial(
+  profile: Omit<QualificationProfile, "id">,
+): QualificationProfileDigestMaterial {
+  return {
+    modelDefaultsSha256: profile.modelDefaultsSha256,
+    benchmarkProviderIdentity: profile.benchmarkProviderIdentity,
+    apiBase: profile.apiBase,
+    apiFormat: profile.apiFormat,
+    generatorChain: profile.generatorModels,
+    consensus: profile.consensus,
+    scorerChain: profile.scorerModels,
+    modelPriceBounds: profile.modelPriceBounds,
+    reviewContractSha256: profile.reviewContractHash,
+    fixtureSetSha256: profile.fixtureHash,
+    evaluatorContractSha256: profile.evaluatorContractHash,
+    evaluatorRuntimeIdentity: profile.evaluatorRuntimeIdentity,
+    reportSha256: profile.reportSha256,
+    repeatedRuns: profile.repeats,
+  };
+}
+
+export function qualificationProfileDigest(profile: Omit<QualificationProfile, "id">): string {
+  return hashText(JSON.stringify(qualificationProfileDigestMaterial(profile)));
 }
 
 export function modelPriceBoundsFor(

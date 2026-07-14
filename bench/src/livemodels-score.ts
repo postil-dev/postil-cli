@@ -504,6 +504,9 @@ export function aggregateModel(
   const usageFailures = scored.filter(
     (result) => result.usageAccountingComplete !== true || !result.usageValid,
   ).length;
+  const processExitFailures = scored.filter(
+    (result) => result.exitCode !== (result.gateFailingActual === true ? 1 : 0),
+  ).length;
   const mustBlockDetected = mustBlocks.filter((result) => result.detected).length;
   const mustBlockFinalBlocking = mustBlocks.filter((result) => result.finalBlocking).length;
   const advisoryDetected = advisories.filter((result) => result.detected).length;
@@ -529,6 +532,9 @@ export function aggregateModel(
     admissionFailures.push(`${structuredOutputFailures} structured-output failure(s)`);
   }
   if (usageFailures > 0) admissionFailures.push(`${usageFailures} provider usage accounting failure(s)`);
+  if (processExitFailures > 0) {
+    admissionFailures.push(`${processExitFailures} process exit fidelity failure(s)`);
+  }
   if (expectedRepeats < MIN_QUALIFICATION_REPEATS) {
     admissionFailures.push(`qualification needs at least ${MIN_QUALIFICATION_REPEATS} complete repeats`);
   }

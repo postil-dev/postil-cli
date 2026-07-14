@@ -85,8 +85,12 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   `POSTIL_API_FORMAT` select `openai-compatible` (default) or `anthropic`.
   Hosted admission matches the complete ordered generator/scorer configuration and
   consensus width to one immutable qualification profile. Each profile binds benchmark
-  report, fixture-set, evaluator-contract, pinned Bun evaluator runtime,
+  report, provider identity, canonical endpoint and interface, sorted price bounds,
+  fixture-set, evaluator-contract, pinned Bun evaluator runtime,
   full runtime/dependency-contract, and model-default digests plus repeat evidence.
+  Rust recomputes the profile identifier from the same canonical JSON material as
+  the evaluator. The report carries the evaluated binary hash; the profile identifier
+  omits that hash because embedding the profile changes the binary bytes.
   The qualification metadata exposes the complete admitted profile only when
   the embedded defaults match it exactly. Hosted consensus and scoring reject
   degraded subsets rather than publishing output from an unqualified path.

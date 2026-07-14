@@ -40,8 +40,9 @@
 //   BENCH_LIVE              set to 1 to select diff-file live mode
 //   BENCH_CONCURRENCY       live-mode case parallelism (else --concurrency, else default)
 
-import { mkdir, writeFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { randomUUID } from "node:crypto";
+import { mkdir, rename, rm, writeFile } from "node:fs/promises";
+import { basename, dirname, resolve } from "node:path";
 import { cases } from "../fixtures/cases";
 import { formatReport, runBenchmark } from "./harness";
 import { DEFAULT_LIVE_CONCURRENCY, formatLiveReport, runLive } from "./live";
@@ -72,11 +73,24 @@ async function main() {
   const args = process.argv.slice(2);
   const json = args.includes("--json");
   const jsonOut = flagValue(args, "--json-out");
+  const manifestOut = flagValue(args, "--manifest-out");
   const binary =
     process.env.POSTIL_BIN ??
     resolve(import.meta.dir, "..", "..", "target", "release", "postil");
   const liveModels =
     process.env.POSTIL_BENCH_MODE === "live" || args.includes("--live-models");
+
+  if (args.includes("--json-out") && jsonOut === undefined) {
+    throw new Error("--json-out requires a path");
+  }
+  if (args.includes("--manifest-out") && manifestOut === undefined) {
+    throw new Error("--manifest-out requires a path");
+  }
+  validateOutputPaths(jsonOut, manifestOut);
+  await invalidateExplicitOutputs([jsonOut, manifestOut]);
+  if (manifestOut !== undefined && !liveModels) {
+    throw new Error("--manifest-out is available only in live-models admission mode");
+  }
 
   if (liveModels) {
     const pairs = parseQualificationPairs(
@@ -98,12 +112,11 @@ async function main() {
       costCapUsd: costCapRaw === undefined ? undefined : Number.parseFloat(costCapRaw),
     });
     await writeLiveModelsReport(jsonOut, JSON.stringify(report, null, 2));
-    const manifestOut = flagValue(args, "--manifest-out");
     if (manifestOut) {
       if (!report.manifestCandidate) {
         throw new Error("qualification did not pass; no manifest candidate was emitted");
       }
-      await writeFile(manifestOut, `${JSON.stringify(report.manifestCandidate, null, 2)}\n`);
+      await atomicWriteOutput(manifestOut, `${JSON.stringify(report.manifestCandidate, null, 2)}\n`);
     }
     console.log(json ? JSON.stringify(report, null, 2) : formatLiveModelsReport(report));
     process.exitCode = liveModelsQualificationExitCode(report);
@@ -131,7 +144,7 @@ async function main() {
 
   const jsonReport = JSON.stringify(report, null, 2);
   if (jsonOut) {
-    await writeFile(jsonOut, `${jsonReport}\n`);
+    await atomicWriteOutput(jsonOut, `${jsonReport}\n`);
   }
   console.log(json ? jsonReport : formatReport(report));
 
@@ -165,7 +178,7 @@ async function writeLiveModelsReport(jsonOut: string | undefined, jsonReport: st
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   await writeFile(resolve(runsDir, `live-models-${stamp}.json`), `${jsonReport}\n`);
   if (jsonOut) {
-    await writeFile(jsonOut, `${jsonReport}\n`);
+    await atomicWriteOutput(jsonOut, `${jsonReport}\n`);
   }
 }
 
@@ -177,11 +190,35 @@ async function writeReport(jsonOut: string | undefined, jsonReport: string) {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   await writeFile(resolve(runsDir, `live-${stamp}.json`), `${jsonReport}\n`);
   if (jsonOut) {
-    await writeFile(jsonOut, `${jsonReport}\n`);
+    await atomicWriteOutput(jsonOut, `${jsonReport}\n`);
   }
 }
 
-main().catch((err) => {
-  console.error(err instanceof Error ? err.message : String(err));
-  process.exitCode = 1;
-});
+export function validateOutputPaths(jsonOut: string | undefined, manifestOut: string | undefined): void {
+  if (jsonOut !== undefined && manifestOut !== undefined && resolve(jsonOut) === resolve(manifestOut)) {
+    throw new Error("--json-out and --manifest-out must use different paths");
+  }
+}
+
+export async function invalidateExplicitOutputs(paths: Array<string | undefined>): Promise<void> {
+  await Promise.all(paths.filter((path): path is string => path !== undefined).map((path) => rm(path, { force: true })));
+}
+
+export async function atomicWriteOutput(path: string, contents: string): Promise<void> {
+  const absolute = resolve(path);
+  const temporary = resolve(dirname(absolute), `.${basename(absolute)}.${process.pid}.${randomUUID()}.tmp`);
+  try {
+    await writeFile(temporary, contents, { mode: 0o600 });
+    await rename(temporary, absolute);
+  } catch (error) {
+    await rm(temporary, { force: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
+if (import.meta.main) {
+  main().catch((err) => {
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exitCode = 1;
+  });
+}

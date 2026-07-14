@@ -126,9 +126,10 @@ pub struct QualificationManifest {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct QualificationProfile {
     pub id: String,
+    pub model_defaults_sha256: String,
     pub api_format: ApiFormat,
     pub api_base: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub benchmark_provider_identity: Option<String>,
     pub generator_chain: Vec<String>,
     pub consensus: usize,
@@ -148,6 +149,25 @@ pub struct ModelPriceBound {
     pub model: String,
     pub input_micros_per_million_tokens: u64,
     pub output_micros_per_million_tokens: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QualificationProfileDigestMaterial<'a> {
+    model_defaults_sha256: &'a str,
+    benchmark_provider_identity: &'a Option<String>,
+    api_base: &'a str,
+    api_format: ApiFormat,
+    generator_chain: &'a [String],
+    consensus: usize,
+    scorer_chain: &'a [String],
+    model_price_bounds: &'a [ModelPriceBound],
+    review_contract_sha256: &'a str,
+    fixture_set_sha256: &'a str,
+    evaluator_contract_sha256: &'a str,
+    evaluator_runtime_identity: &'a str,
+    report_sha256: &'a str,
+    repeated_runs: u32,
 }
 
 pub const HOSTED_OPERATION_COST_CAP_MICROS: u64 = 1_000_000;
@@ -422,6 +442,8 @@ fn parse_qualification_manifest(raw: &str) -> Result<QualificationManifest> {
             "qualification profile must record at least three repeated runs"
         );
         for (field, digest) in [
+            ("id", &profile.id),
+            ("modelDefaultsSha256", &profile.model_defaults_sha256),
             ("reviewContractSha256", &profile.review_contract_sha256),
             ("fixtureSetSha256", &profile.fixture_set_sha256),
             (
@@ -435,6 +457,10 @@ fn parse_qualification_manifest(raw: &str) -> Result<QualificationManifest> {
                 "qualification profile {field} must be a SHA-256 digest"
             );
         }
+        anyhow::ensure!(
+            profile.model_defaults_sha256 == manifest.model_defaults_sha256,
+            "qualification profile model defaults digest does not match its manifest"
+        );
         anyhow::ensure!(
             profile.review_contract_sha256 == current_review_contract,
             "qualification profile review contract is stale"
@@ -464,6 +490,10 @@ fn parse_qualification_manifest(raw: &str) -> Result<QualificationManifest> {
         anyhow::ensure!(
             scorers.len() == profile.scorer_chain.len(),
             "qualification profile scorer chain must not repeat models"
+        );
+        anyhow::ensure!(
+            profile.id == qualification_profile_digest(profile),
+            "qualification profile id does not match its canonical digest material"
         );
         profile_ids.push(profile.id.clone());
     }
@@ -571,6 +601,29 @@ fn sha256_hex(raw: &str) -> String {
         write!(&mut hex, "{byte:02x}").expect("writing to String cannot fail");
     }
     hex
+}
+
+fn qualification_profile_digest(profile: &QualificationProfile) -> String {
+    let material = QualificationProfileDigestMaterial {
+        model_defaults_sha256: &profile.model_defaults_sha256,
+        benchmark_provider_identity: &profile.benchmark_provider_identity,
+        api_base: &profile.api_base,
+        api_format: profile.api_format,
+        generator_chain: &profile.generator_chain,
+        consensus: profile.consensus,
+        scorer_chain: &profile.scorer_chain,
+        model_price_bounds: &profile.model_price_bounds,
+        review_contract_sha256: &profile.review_contract_sha256,
+        fixture_set_sha256: &profile.fixture_set_sha256,
+        evaluator_contract_sha256: &profile.evaluator_contract_sha256,
+        evaluator_runtime_identity: &profile.evaluator_runtime_identity,
+        report_sha256: &profile.report_sha256,
+        repeated_runs: profile.repeated_runs,
+    };
+    sha256_hex(
+        &serde_json::to_string(&material)
+            .expect("qualification profile digest material must serialize"),
+    )
 }
 
 fn yaml_scalar(value: &str) -> String {
@@ -1329,13 +1382,15 @@ mod tests {
     }
 
     fn valid_qualification_manifest_json() -> serde_json::Value {
-        serde_json::json!({
+        let mut manifest = serde_json::json!({
             "version": 1,
             "modelDefaultsSha256": model_defaults().source_sha256,
             "profiles": [{
-                "id": "candidate",
+                "id": "0".repeat(64),
+                "modelDefaultsSha256": model_defaults().source_sha256,
                 "apiFormat": "openai-compatible",
                 "apiBase": "https://openrouter.ai:443/api/v1",
+                "benchmarkProviderIdentity": null,
                 "generatorChain": ["provider/model"],
                 "consensus": 1,
                 "scorerChain": ["provider/scorer"],
@@ -1358,7 +1413,11 @@ mod tests {
                 "reportSha256": "1".repeat(64),
                 "repeatedRuns": 3
             }]
-        })
+        });
+        let profile: QualificationProfile =
+            serde_json::from_value(manifest["profiles"][0].clone()).unwrap();
+        manifest["profiles"][0]["id"] = serde_json::json!(qualification_profile_digest(&profile));
+        manifest
     }
 
     #[test]
@@ -1693,109 +1752,24 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
 
     #[test]
     fn qualification_profile_rejects_stale_embedded_contract_hashes() {
-        let raw = serde_json::json!({
-            "version": 1,
-            "modelDefaultsSha256": model_defaults().source_sha256,
-            "profiles": [{
-                "id": "candidate",
-                "apiFormat": "openai-compatible",
-                "apiBase": "https://openrouter.ai:443/api/v1",
-                "benchmarkProviderIdentity": "openrouter:test-route",
-                "generatorChain": ["provider/model"],
-                "consensus": 1,
-                "scorerChain": ["provider/scorer"],
-                "modelPriceBounds": [
-                    {
-                        "model": "provider/model",
-                        "inputMicrosPerMillionTokens": 1000000,
-                        "outputMicrosPerMillionTokens": 2000000
-                    },
-                    {
-                        "model": "provider/scorer",
-                        "inputMicrosPerMillionTokens": 1000000,
-                        "outputMicrosPerMillionTokens": 2000000
-                    }
-                ],
-                "reviewContractSha256": "0".repeat(64),
-                "fixtureSetSha256": fixture_set_sha256(),
-                "evaluatorContractSha256": evaluator_contract_sha256(),
-                "evaluatorRuntimeIdentity": evaluator_runtime_identity(),
-                "reportSha256": "1".repeat(64),
-                "repeatedRuns": 3
-            }]
-        });
+        let mut raw = valid_qualification_manifest_json();
+        raw["profiles"][0]["reviewContractSha256"] = serde_json::json!("0".repeat(64));
         let error = parse_qualification_manifest(&raw.to_string()).unwrap_err();
         assert!(error.to_string().contains("review contract is stale"));
     }
 
     #[test]
     fn qualification_profile_requires_three_complete_repeats() {
-        let raw = serde_json::json!({
-            "version": 1,
-            "modelDefaultsSha256": model_defaults().source_sha256,
-            "profiles": [{
-                "id": "candidate",
-                "apiFormat": "openai-compatible",
-                "apiBase": "https://openrouter.ai:443/api/v1",
-                "generatorChain": ["provider/model"],
-                "consensus": 1,
-                "scorerChain": ["provider/scorer"],
-                "modelPriceBounds": [
-                    {
-                        "model": "provider/model",
-                        "inputMicrosPerMillionTokens": 1000000,
-                        "outputMicrosPerMillionTokens": 2000000
-                    },
-                    {
-                        "model": "provider/scorer",
-                        "inputMicrosPerMillionTokens": 1000000,
-                        "outputMicrosPerMillionTokens": 2000000
-                    }
-                ],
-                "reviewContractSha256": review_contract_sha256(),
-                "fixtureSetSha256": fixture_set_sha256(),
-                "evaluatorContractSha256": evaluator_contract_sha256(),
-                "evaluatorRuntimeIdentity": evaluator_runtime_identity(),
-                "reportSha256": "1".repeat(64),
-                "repeatedRuns": 2
-            }]
-        });
+        let mut raw = valid_qualification_manifest_json();
+        raw["profiles"][0]["repeatedRuns"] = serde_json::json!(2);
         let error = parse_qualification_manifest(&raw.to_string()).unwrap_err();
         assert!(error.to_string().contains("at least three repeated runs"));
     }
 
     #[test]
     fn qualification_profile_rejects_a_stale_evaluator_runtime() {
-        let raw = serde_json::json!({
-            "version": 1,
-            "modelDefaultsSha256": model_defaults().source_sha256,
-            "profiles": [{
-                "id": "candidate",
-                "apiFormat": "openai-compatible",
-                "apiBase": "https://openrouter.ai:443/api/v1",
-                "generatorChain": ["provider/model"],
-                "consensus": 1,
-                "scorerChain": ["provider/scorer"],
-                "modelPriceBounds": [
-                    {
-                        "model": "provider/model",
-                        "inputMicrosPerMillionTokens": 1000000,
-                        "outputMicrosPerMillionTokens": 2000000
-                    },
-                    {
-                        "model": "provider/scorer",
-                        "inputMicrosPerMillionTokens": 1000000,
-                        "outputMicrosPerMillionTokens": 2000000
-                    }
-                ],
-                "reviewContractSha256": review_contract_sha256(),
-                "fixtureSetSha256": fixture_set_sha256(),
-                "evaluatorContractSha256": evaluator_contract_sha256(),
-                "evaluatorRuntimeIdentity": "bun@0.0.0",
-                "reportSha256": "1".repeat(64),
-                "repeatedRuns": 3
-            }]
-        });
+        let mut raw = valid_qualification_manifest_json();
+        raw["profiles"][0]["evaluatorRuntimeIdentity"] = serde_json::json!("bun@0.0.0");
         let error = parse_qualification_manifest(&raw.to_string()).unwrap_err();
         assert!(error.to_string().contains("evaluator runtime is stale"));
     }
@@ -1912,6 +1886,74 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
     }
 
     #[test]
+    fn qualification_profile_digest_matches_cross_language_vector() {
+        let profile = QualificationProfile {
+            id: String::new(),
+            model_defaults_sha256: "c".repeat(64),
+            benchmark_provider_identity: Some("openrouter:test-route".into()),
+            api_base: "https://openrouter.ai:443/api/v1".into(),
+            api_format: ApiFormat::OpenaiCompatible,
+            generator_chain: vec!["provider/one".into(), "provider/two".into()],
+            consensus: 2,
+            scorer_chain: vec!["provider/scorer".into()],
+            model_price_bounds: vec![
+                ModelPriceBound {
+                    model: "provider/one".into(),
+                    input_micros_per_million_tokens: 1_000_000,
+                    output_micros_per_million_tokens: 2_000_000,
+                },
+                ModelPriceBound {
+                    model: "provider/scorer".into(),
+                    input_micros_per_million_tokens: 3_000_000,
+                    output_micros_per_million_tokens: 4_000_000,
+                },
+                ModelPriceBound {
+                    model: "provider/two".into(),
+                    input_micros_per_million_tokens: 5_000_000,
+                    output_micros_per_million_tokens: 6_000_000,
+                },
+            ],
+            review_contract_sha256: "b".repeat(64),
+            fixture_set_sha256: "a".repeat(64),
+            evaluator_contract_sha256: "f".repeat(64),
+            evaluator_runtime_identity: "bun@1.3.14".into(),
+            report_sha256: "e".repeat(64),
+            repeated_runs: 3,
+        };
+        assert_eq!(
+            qualification_profile_digest(&profile),
+            "91a2206079adb57e9e25b869cdc8f01955f45cdc814b128c21e2a3f48614382b"
+        );
+    }
+
+    #[test]
+    fn qualification_profile_rejects_tampered_digest_material() {
+        for field in ["provider", "price", "report", "repeats"] {
+            let mut raw = valid_qualification_manifest_json();
+            match field {
+                "provider" => {
+                    raw["profiles"][0]["benchmarkProviderIdentity"] =
+                        serde_json::json!("different-route")
+                }
+                "price" => {
+                    raw["profiles"][0]["modelPriceBounds"][0]["inputMicrosPerMillionTokens"] =
+                        serde_json::json!(1_000_001)
+                }
+                "report" => raw["profiles"][0]["reportSha256"] = serde_json::json!("2".repeat(64)),
+                "repeats" => raw["profiles"][0]["repeatedRuns"] = serde_json::json!(4),
+                _ => unreachable!(),
+            }
+            let error = parse_qualification_manifest(&raw.to_string()).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("id does not match its canonical digest material"),
+                "{field}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn qualification_metadata_attests_only_an_exact_default_profile() {
         let defaults = ModelDefaults {
             version: 1,
@@ -1928,6 +1970,7 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
         };
         let profile = QualificationProfile {
             id: "qualified-profile".into(),
+            model_defaults_sha256: defaults.source_sha256.clone(),
             api_format: ApiFormat::OpenaiCompatible,
             api_base: "https://models.example:443/v1".into(),
             benchmark_provider_identity: Some("provider-route".into()),

@@ -125,10 +125,20 @@ cost provenance. The evaluator contract includes `bench/package.json` and
 Source-bundle hashes use the runtime's ordered
 `path + NUL + exact bytes + NUL` framing. Each immutable profile and the
 complete sanitized evidence payload have their own SHA-256 identifier.
+The runtime recomputes the profile identifier from one canonical manifest
+material object: model defaults, provider identity, endpoint and interface,
+ordered model chains and consensus, sorted price bounds, review and evaluator
+contracts, evaluator runtime, report digest, and repeat count. The report
+records the evaluated binary hash, but the profile identifier excludes it
+because embedding the resulting manifest changes the binary bytes and would
+create a self-referential digest. Source-contract and report digests bind the
+profile to the evaluated binary without that cycle.
 `manifestCandidate` uses the runtime admission-manifest schema directly and is
 absent from a failed report. Only the process that performs the live run can
 write a candidate, using `--manifest-out` on that invocation. Saved JSON
-reports are evidence only and cannot be admitted later.
+reports are evidence only and cannot be admitted later. Explicit report and
+candidate paths are invalidated before a run and replaced atomically; mock mode
+rejects `--manifest-out`.
 
 The preflight prices every generator and scorer role invocation across the configured
 repeats before inference. It rejects missing prices, more than six models, and

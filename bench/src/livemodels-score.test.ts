@@ -255,6 +255,14 @@ describe("pair admission", () => {
     expect(aggregate.admissionFailures.some((failure) => failure.includes("max latency"))).toBe(true);
   });
 
+  test("rejects a complete matrix with the wrong process exit status", () => {
+    const matrix = passingMatrix();
+    for (const result of matrix) result.exitCode = 2;
+    const aggregate = aggregateModel(pair, matrix, 3);
+    expect(aggregate.passed).toBe(false);
+    expect(aggregate.admissionFailures).toContain("183 process exit fidelity failure(s)");
+  });
+
   test("fails every attributable quality boundary independently", () => {
     const missedBlock = passingMatrix();
     missedBlock[0] = score("mustBlock", 1, envelope(), "m-0");
