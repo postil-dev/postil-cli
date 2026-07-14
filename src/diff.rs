@@ -803,12 +803,13 @@ fn parse_hunk_header(header: &str) -> Option<(u32, u32, u32, u32)> {
     let (old_start, old_count) = header
         .split_whitespace()
         .find(|t| t.starts_with('-'))
-        .and_then(range_of)
-        .unwrap_or((0, 0));
+        .and_then(range_of)?;
     let (new_start, new_count) = header
         .split_whitespace()
         .find(|t| t.starts_with('+'))
         .and_then(range_of)?;
+    old_start.checked_add(old_count.saturating_sub(1))?;
+    new_start.checked_add(new_count.saturating_sub(1))?;
     Some((old_start, old_count, new_start, new_count))
 }
 
@@ -868,13 +869,21 @@ pub fn render_annotated(diff: &Diff, max_bytes: usize) -> (String, bool) {
                 let rendered = match marker {
                     "+" => {
                         let s = format!("{line_no:>6} + {content}\n");
-                        line_no += 1;
+                        let Some(next) = line_no.checked_add(1) else {
+                            truncated = true;
+                            break 'files;
+                        };
+                        line_no = next;
                         s
                     }
                     "-" => format!("       - {content}\n"),
                     _ => {
                         let s = format!("{line_no:>6}   {content}\n");
-                        line_no += 1;
+                        let Some(next) = line_no.checked_add(1) else {
+                            truncated = true;
+                            break 'files;
+                        };
+                        line_no = next;
                         s
                     }
                 };
@@ -1148,11 +1157,11 @@ fn render_hunk_units(
             }
         }
         match marker {
-            "+" => new_line = new_line.saturating_add(1),
-            "-" => old_line = old_line.saturating_add(1),
+            "+" => new_line = new_line.checked_add(1)?,
+            "-" => old_line = old_line.checked_add(1)?,
             _ => {
-                old_line = old_line.saturating_add(1);
-                new_line = new_line.saturating_add(1);
+                old_line = old_line.checked_add(1)?;
+                new_line = new_line.checked_add(1)?;
             }
         }
     }
@@ -1487,7 +1496,7 @@ pub fn render_hunk_context(diff: &Diff, path: &str, line: u32, radius: u32) -> O
                 if (start..=end).contains(&line_no) {
                     out.push_str(&format!("{line_no:>6} + {content}\n"));
                 }
-                line_no += 1;
+                line_no = line_no.checked_add(1)?;
             }
             "-" => {
                 if (start..=end).contains(&line_no) {
@@ -1498,7 +1507,7 @@ pub fn render_hunk_context(diff: &Diff, path: &str, line: u32, radius: u32) -> O
                 if (start..=end).contains(&line_no) {
                     out.push_str(&format!("{line_no:>6}   {content}\n"));
                 }
-                line_no += 1;
+                line_no = line_no.checked_add(1)?;
             }
         }
     }
@@ -1807,6 +1816,16 @@ Binary files a/img.png and b/img.png differ
         assert_eq!(parse_hunk_header("-1 +5 @@"), Some((1, 1, 5, 1)));
         assert_eq!(parse_hunk_header("-1,2 +3,4 @@"), Some((1, 2, 3, 4)));
         assert_eq!(parse_hunk_header("-0,0 +1,3 @@"), Some((0, 0, 1, 3)));
+    }
+
+    #[test]
+    fn hunk_header_rejects_u32_coordinate_overflow() {
+        assert_eq!(parse_hunk_header("-1 +4294967295,2 @@"), None);
+        assert_eq!(parse_hunk_header("-4294967295,2 +1 @@"), None);
+        let parsed = parse(
+            "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +4294967295,2 @@\n+x\n+y\n",
+        );
+        assert!(parsed.files[0].hunks.is_empty());
     }
 
     #[test]

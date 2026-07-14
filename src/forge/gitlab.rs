@@ -94,8 +94,10 @@ impl GitLab {
         if status.is_success() {
             return Ok(resp);
         }
-        let snippet = super::bounded_error_snippet(resp).await;
-        Err(anyhow!("GitLab {what} failed: {status}: {snippet}"))
+        let request_id = super::response_request_id(&resp).unwrap_or_else(|| "none".into());
+        Err(anyhow!(
+            "GitLab {what} failed: {status} (request id {request_id})"
+        ))
     }
 
     async fn mr(&self) -> Result<MrResponse> {

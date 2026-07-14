@@ -133,8 +133,10 @@ impl Azure {
         if status.is_success() {
             return Ok(resp);
         }
-        let snippet = super::bounded_error_snippet(resp).await;
-        Err(anyhow!("Azure DevOps {what} failed: {status}: {snippet}"))
+        let request_id = super::response_request_id(&resp).unwrap_or_else(|| "none".into());
+        Err(anyhow!(
+            "Azure DevOps {what} failed: {status} (request id {request_id})"
+        ))
     }
 
     async fn pr(&self) -> Result<PrResponse> {
@@ -149,8 +151,8 @@ impl Azure {
         super::bounded_response_json(Self::check_ok(resp, "PR fetch").await?, "Azure PR").await
     }
 
-    /// File content at a commit, or empty string if the file does not exist
-    /// there (added/deleted files have one missing side).
+    /// File content at a commit. Added and deleted sides are skipped by the
+    /// caller, so a missing expected item is an incomplete acquisition.
     async fn item_at(&self, path: &str, commit: &str) -> Result<String> {
         let q = format!(
             "path={}&versionType=commit&version={commit}&includeContent=true",
@@ -162,9 +164,6 @@ impl Azure {
             .send()
             .await
             .with_context(|| format!("fetching {path} at {commit}"))?;
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(String::new());
-        }
         let mut response = Self::check_ok(resp, "item fetch").await?;
         if response
             .content_length()
@@ -224,16 +223,18 @@ impl Azure {
                         + change.source_server_item.as_ref().map_or(0, String::len)
                 })
                 .sum::<usize>();
-            retained_bytes = retained_bytes.saturating_add(page_bytes);
+            retained_bytes = retained_bytes
+                .checked_add(page_bytes)
+                .ok_or_else(|| anyhow!("Azure change-list metadata byte count overflowed"))?;
             if retained_bytes > crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES {
                 return Err(anyhow!(
                     "Azure change-list metadata exceeds the {} byte acquisition limit",
                     crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES
                 ));
             }
+            let all_changes_included = page.all_changes_included;
             changes.extend(page.changes);
-            // A short page with no explicit "more" marker means exhaustion.
-            if n == 0 || (n < PAGE && page.all_changes_included != Some(false)) {
+            if azure_page_complete(n, PAGE, all_changes_included)? {
                 return Ok(changes);
             }
             if changes.len() > MAX_CHANGES {
@@ -547,10 +548,27 @@ fn merge_commits(
     }
 }
 
+fn azure_page_complete(count: usize, page_size: usize, marker: Option<bool>) -> Result<bool> {
+    match marker {
+        Some(true) => Ok(true),
+        Some(false) if count == 0 => Err(anyhow!(
+            "Azure change-list pagination reported more changes but made no progress"
+        )),
+        Some(false) => Ok(false),
+        None => Ok(count == 0 || count < page_size),
+    }
+}
+
 /// One file's diff section, or a "differ" marker if the content is binary or
 /// exceeds the per-file size cap. Split out of `build_diff` so the
 /// classification is unit-testable without network access.
-fn diff_section(path: &str, old: &str, new: &str, is_add: bool, is_delete: bool) -> String {
+pub(super) fn diff_section(
+    path: &str,
+    old: &str,
+    new: &str,
+    is_add: bool,
+    is_delete: bool,
+) -> String {
     let old_marker = crate::diff::display_path(&format!("a/{path}"));
     let new_marker = crate::diff::display_path(&format!("b/{path}"));
     // One oversized file must not be diffed in full before any size cap ever
@@ -663,5 +681,13 @@ mod tests {
         let parsed = diff::parse(&section);
         assert!(!parsed.files[0].binary);
         assert!(!parsed.files[0].hunks.is_empty());
+    }
+
+    #[test]
+    fn pagination_marker_is_authoritative_and_no_progress_fails() {
+        assert!(!azure_page_complete(12, 100, Some(false)).unwrap());
+        assert!(azure_page_complete(100, 100, Some(true)).unwrap());
+        assert!(azure_page_complete(12, 100, None).unwrap());
+        assert!(azure_page_complete(0, 100, Some(false)).is_err());
     }
 }

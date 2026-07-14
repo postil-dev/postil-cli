@@ -389,6 +389,10 @@ pub struct Gate {
 pub struct Usage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// Exact provider-billed cost represented by this in-memory aggregate.
+    /// Durable attribution is emitted per model through `ModelUsage`.
+    #[serde(skip)]
+    pub cost_micros: Option<u64>,
 }
 
 /// Token usage attributed to one provider model attempt. Entries include
@@ -400,6 +404,9 @@ pub struct ModelUsage {
     pub model: String,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// Exact provider-billed cost when supplied by the endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_micros: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -657,7 +664,7 @@ pub fn narrated_risk_finding(summary: &str) -> Finding {
 }
 
 /// The synthetic finding emitted when the provider could not be reached at all.
-pub fn provider_error_finding(detail: &str) -> Finding {
+pub fn provider_error_finding(_detail: &str) -> Finding {
     Finding {
         path: PROVIDER_PATH.to_string(),
         line: 1,
@@ -666,10 +673,9 @@ pub fn provider_error_finding(detail: &str) -> Finding {
         kind: Kind::Uncertainty,
         confidence: 1.0,
         title: "Model provider unavailable".to_string(),
-        body: format!(
-            "Postil could not complete the model request and is failing closed rather \
-             than passing unreviewed code.\n\nDetail: {detail}"
-        ),
+        body: "Postil could not complete the model request and is failing closed rather \
+             than passing unreviewed code. The failure is available to Postil operators."
+            .to_string(),
         id: None,
         generator_confidence: None,
         scorer_confidence: None,

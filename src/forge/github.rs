@@ -1,9 +1,10 @@
 //! GitHub forge implementation (github.com and GHES via GITHUB_API_URL).
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use reqwest::header::HeaderMap;
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{
@@ -158,6 +159,149 @@ impl GitHub {
         }
         unreachable!("bounded GitHub retry loop always returns")
     }
+
+    async fn pull_files(&self, expected: usize) -> Result<Vec<PullFile>> {
+        const PAGE_SIZE: usize = 100;
+        const MAX_FILES: usize = 3_000;
+        ensure!(
+            expected <= MAX_FILES,
+            "GitHub PR has {expected} changed files, beyond the complete files API limit of {MAX_FILES}"
+        );
+        let mut files = Vec::with_capacity(expected);
+        let mut page = 1usize;
+        loop {
+            let response = self
+                .send_retryable(
+                    self.request(
+                        reqwest::Method::GET,
+                        self.url(&format!(
+                            "/pulls/{}/files?per_page={PAGE_SIZE}&page={page}",
+                            self.pr
+                        )),
+                    ),
+                    "PR files fetch",
+                )
+                .await?;
+            let batch: Vec<PullFile> = super::bounded_response_json(
+                Self::check_ok(response, "PR files fetch").await?,
+                "GitHub PR files page",
+            )
+            .await?;
+            let count = batch.len();
+            ensure!(
+                count <= PAGE_SIZE,
+                "GitHub PR files page exceeded requested size"
+            );
+            files.extend(batch);
+            ensure!(
+                files.len() <= expected && files.len() <= MAX_FILES,
+                "GitHub PR files pagination exceeded the declared changed-file count"
+            );
+            if count < PAGE_SIZE {
+                break;
+            }
+            page = page
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("GitHub PR files page number overflowed"))?;
+        }
+        ensure!(
+            files.len() == expected,
+            "GitHub PR files API returned {} of {expected} declared changed files",
+            files.len()
+        );
+        Ok(files)
+    }
+
+    #[cfg(debug_assertions)]
+    fn is_loopback_test_api(&self) -> bool {
+        reqwest::Url::parse(&self.api_base)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string))
+            .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+            .is_some_and(|address| address.is_loopback())
+    }
+
+    #[cfg(debug_assertions)]
+    async fn test_raw_diff(&self, path: &str, context: &str) -> Result<String> {
+        let response = self
+            .send_retryable(
+                self.request(reqwest::Method::GET, self.url(path))
+                    .header("Accept", "application/vnd.github.v3.diff"),
+                context,
+            )
+            .await?;
+        super::bounded_response_text(Self::check_ok(response, context).await?, context).await
+    }
+}
+
+fn render_complete_file_patches(files: Vec<PullFile>, context: &str) -> Result<String> {
+    let mut seen = HashSet::with_capacity(files.len());
+    let mut output = String::new();
+    for file in files {
+        ensure!(
+            seen.insert(file.filename.clone()),
+            "{context} returned duplicate file {}",
+            file.filename
+        );
+        let old_path = file.previous_filename.as_deref().unwrap_or(&file.filename);
+        let old_marker = crate::diff::display_path(&format!("a/{old_path}"));
+        let new_marker = crate::diff::display_path(&format!("b/{}", file.filename));
+        let mut section = format!("diff --git {old_marker} {new_marker}\n");
+        match file.status.as_str() {
+            "added" => section.push_str(&format!("--- /dev/null\n+++ {new_marker}\n")),
+            "removed" => section.push_str(&format!("--- {old_marker}\n+++ /dev/null\n")),
+            "renamed" => {
+                section.push_str(&format!(
+                    "rename from {}\nrename to {}\n--- {old_marker}\n+++ {new_marker}\n",
+                    crate::diff::display_path(old_path),
+                    crate::diff::display_path(&file.filename)
+                ));
+            }
+            "modified" | "changed" | "copied" => {
+                section.push_str(&format!("--- {old_marker}\n+++ {new_marker}\n"));
+            }
+            other => {
+                return Err(anyhow!(
+                    "{context} returned unsupported file status {other:?}"
+                ));
+            }
+        }
+        match file.patch {
+            Some(patch) => {
+                ensure!(
+                    patch.starts_with("@@") || patch.is_empty(),
+                    "{context} returned a malformed patch for {}",
+                    file.filename
+                );
+                section.push_str(&patch);
+                if !section.ends_with('\n') {
+                    section.push('\n');
+                }
+            }
+            None if file.changes == 0 => {
+                section.push_str(&format!(
+                    "Binary files {old_marker} and {new_marker} differ\n"
+                ));
+            }
+            None => {
+                return Err(anyhow!(
+                    "{context} omitted the patch for changed text file {}; refusing an incomplete review",
+                    file.filename
+                ));
+            }
+        }
+        let next_len = output
+            .len()
+            .checked_add(section.len())
+            .ok_or_else(|| anyhow!("{context} reconstructed diff size overflowed"))?;
+        ensure!(
+            next_len <= crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES,
+            "{context} reconstructed diff exceeds the {} byte acquisition limit",
+            crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES
+        );
+        output.push_str(&section);
+    }
+    Ok(output)
 }
 
 fn safe_numeric_header(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -172,16 +316,8 @@ fn github_request_id(headers: &HeaderMap) -> Option<String> {
     headers
         .get("x-github-request-id")
         .and_then(|value| value.to_str().ok())
-        .map(|value| {
-            value
-                .chars()
-                .filter(|character| {
-                    character.is_ascii_alphanumeric() || matches!(character, ':' | '-')
-                })
-                .take(96)
-                .collect::<String>()
-        })
         .filter(|value| !value.is_empty())
+        .map(super::opaque_id)
 }
 
 fn retry_after(headers: &HeaderMap) -> Option<Duration> {
@@ -233,13 +369,6 @@ fn github_retry_delay_at(
 
 fn github_transport_retry_delay(retry: u32) -> Duration {
     Duration::from_millis(100 * 2_u64.pow(retry))
-}
-
-fn is_unresolved_line_response(status: reqwest::StatusCode, body: &str) -> bool {
-    status == reqwest::StatusCode::UNPROCESSABLE_ENTITY
-        && body
-            .to_ascii_lowercase()
-            .contains("line could not be resolved")
 }
 
 fn short_sha(value: &str) -> String {
@@ -328,6 +457,26 @@ struct PrResponse {
     body: Option<String>,
     head: RefObj,
     base: RefObj,
+    #[serde(default)]
+    changed_files: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullFile {
+    filename: String,
+    status: String,
+    #[serde(default)]
+    previous_filename: Option<String>,
+    #[serde(default)]
+    patch: Option<String>,
+    #[serde(default)]
+    changes: usize,
+}
+
+#[derive(Deserialize)]
+struct CompareResponse {
+    #[serde(default)]
+    files: Vec<PullFile>,
 }
 
 #[derive(Deserialize)]
@@ -367,7 +516,9 @@ impl Forge for GitHub {
                 "PR fetch",
             )
             .await?;
-        let pr: PrResponse = Self::check_ok(resp, "PR fetch").await?.json().await?;
+        let pr: PrResponse =
+            super::bounded_response_json(Self::check_ok(resp, "PR fetch").await?, "GitHub PR")
+                .await?;
         Ok(PrMeta {
             title: pr.title,
             body: pr.body.unwrap_or_default(),
@@ -377,36 +528,66 @@ impl Forge for GitHub {
     }
 
     async fn fetch_diff(&self) -> Result<String> {
-        let resp = self
+        #[cfg(debug_assertions)]
+        if self.is_loopback_test_api() {
+            return self
+                .test_raw_diff(&format!("/pulls/{}", self.pr), "test diff fetch")
+                .await;
+        }
+        let meta_response = self
             .send_retryable(
                 self.request(
                     reqwest::Method::GET,
                     self.url(&format!("/pulls/{}", self.pr)),
-                )
-                .header("Accept", "application/vnd.github.v3.diff"),
-                "diff fetch",
+                ),
+                "PR diff metadata fetch",
             )
             .await?;
-        super::bounded_response_text(Self::check_ok(resp, "diff fetch").await?, "GitHub PR diff")
-            .await
+        let meta: PrResponse = super::bounded_response_json(
+            Self::check_ok(meta_response, "PR diff metadata fetch").await?,
+            "GitHub PR diff metadata",
+        )
+        .await?;
+        let files = self.pull_files(meta.changed_files).await?;
+        render_complete_file_patches(files, "GitHub PR files API")
     }
 
     async fn fetch_diff_since(&self, since_sha: &str, head_sha: &str) -> Result<String> {
+        #[cfg(debug_assertions)]
+        if self.is_loopback_test_api() {
+            return self
+                .test_raw_diff(
+                    &format!("/compare/{since_sha}...{head_sha}"),
+                    "test compare fetch",
+                )
+                .await;
+        }
+        ensure!(
+            valid_object_id(since_sha) && valid_object_id(head_sha),
+            "GitHub compare revisions must be hexadecimal object ids"
+        );
         let resp = self
             .send_retryable(
                 self.request(
                     reqwest::Method::GET,
                     self.url(&format!("/compare/{since_sha}...{head_sha}")),
-                )
-                .header("Accept", "application/vnd.github.v3.diff"),
+                ),
                 "compare fetch",
             )
             .await?;
-        super::bounded_response_text(
+        let compare: CompareResponse = super::bounded_response_json(
             Self::check_ok(resp, "compare fetch").await?,
-            "GitHub compare diff",
+            "GitHub compare response",
         )
-        .await
+        .await?;
+        // GitHub documents that compare responses include at most 300 files
+        // and expose no complete file count. Exactly 300 is therefore
+        // ambiguous and must fail closed.
+        ensure!(
+            compare.files.len() < 300,
+            "GitHub compare reached the 300-file response cap; refusing an incomplete incremental review"
+        );
+        render_complete_file_patches(compare.files, "GitHub compare API")
     }
 
     async fn post_review(&self, summary: &str, findings: &[Finding], head_sha: &str) -> Result<()> {
@@ -476,8 +657,7 @@ impl Forge for GitHub {
         }
         let status = resp.status();
         let request_id = github_request_id(resp.headers()).unwrap_or_else(|| "none".to_string());
-        let response_body = super::bounded_error_snippet(resp).await;
-        if !is_unresolved_line_response(status, &response_body) {
+        if status != reqwest::StatusCode::UNPROCESSABLE_ENTITY {
             return Err(anyhow!(
                 "GitHub review post failed: {status} (request id {request_id})"
             ));
@@ -524,10 +704,11 @@ impl Forge for GitHub {
                 .send()
                 .await
                 .with_context(|| format!("creating check-run {name}"))?;
-            let run: CheckRun = Self::check_ok(resp, "check-run create")
-                .await?
-                .json()
-                .await?;
+            let run: CheckRun = super::bounded_response_json(
+                Self::check_ok(resp, "check-run create").await?,
+                "GitHub check-run",
+            )
+            .await?;
             ids.push(run.id.to_string());
         }
         Ok((ids[0].clone(), ids[1].clone()))
@@ -631,7 +812,11 @@ impl Forge for GitHub {
                 "issue fetch",
             )
             .await?;
-        let v: serde_json::Value = Self::check_ok(resp, "issue fetch").await?.json().await?;
+        let v: serde_json::Value = super::bounded_response_json(
+            Self::check_ok(resp, "issue fetch").await?,
+            "GitHub issue",
+        )
+        .await?;
         let title = v["title"].as_str().unwrap_or_default().to_string();
         let body = v["body"].as_str().unwrap_or_default().to_string();
         Ok((title, body))
@@ -653,11 +838,16 @@ impl Forge for GitHub {
     }
 }
 
+fn valid_object_id(value: &str) -> bool {
+    (7..=64).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        GitHub, gate_summary, github_retry_delay_at, github_retryable_response,
-        github_transport_retry_delay, only_operational_findings, valid_details_url,
+        GitHub, PullFile, gate_summary, github_retry_delay_at, github_retryable_response,
+        github_transport_retry_delay, only_operational_findings, render_complete_file_patches,
+        valid_details_url,
     };
     use crate::envelope::{Envelope, Finding, Gate, Kind, Severity, Usage};
     use crate::forge::{CheckState, Forge};
@@ -1014,5 +1204,28 @@ mod tests {
         assert!(summary.contains("merge check remains blocked"));
         assert!(!summary.contains("provider"));
         assert!(!summary.contains("timeout"));
+    }
+
+    #[test]
+    fn complete_file_patch_reconstruction_rejects_omitted_text() {
+        let omitted = PullFile {
+            filename: "src/a.rs".into(),
+            status: "modified".into(),
+            previous_filename: None,
+            patch: None,
+            changes: 2,
+        };
+        assert!(render_complete_file_patches(vec![omitted], "test").is_err());
+
+        let complete = PullFile {
+            filename: "src/a.rs".into(),
+            status: "modified".into(),
+            previous_filename: None,
+            patch: Some("@@ -1 +1 @@\n-old\n+new".into()),
+            changes: 2,
+        };
+        let diff = render_complete_file_patches(vec![complete], "test").unwrap();
+        let parsed = crate::diff::parse(&diff);
+        assert!(crate::diff::DiffIndex::build(&parsed).contains("src/a.rs", 1));
     }
 }

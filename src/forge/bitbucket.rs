@@ -13,9 +13,10 @@
 //! `git diff`; keep the path available for verified deployments without making
 //! unverified hosted runs trust it by default.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use serde::Deserialize;
 use serde_json::json;
+use sha2::Digest;
 
 use super::{CheckState, Forge, PrMeta, ThreadKind, check_summary, check_title};
 use crate::envelope::{Envelope, Finding};
@@ -61,6 +62,29 @@ struct PrResponse {
     summary: Option<Rendered>,
     source: Endpoint,
     destination: Endpoint,
+}
+
+#[derive(Deserialize)]
+struct DiffStatPage {
+    #[serde(default)]
+    values: Vec<DiffStat>,
+    #[serde(default)]
+    next: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DiffStat {
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    old: Option<DiffStatFile>,
+    #[serde(default)]
+    new: Option<DiffStatFile>,
+}
+
+#[derive(Deserialize)]
+struct DiffStatFile {
+    path: String,
 }
 
 impl Bitbucket {
@@ -111,8 +135,10 @@ impl Bitbucket {
         if status.is_success() {
             return Ok(resp);
         }
-        let snippet = super::bounded_error_snippet(resp).await;
-        Err(anyhow!("Bitbucket {what} failed: {status}: {snippet}"))
+        let request_id = super::response_request_id(&resp).unwrap_or_else(|| "none".into());
+        Err(anyhow!(
+            "Bitbucket {what} failed: {status} (request id {request_id})"
+        ))
     }
 
     /// Post one finding inline, falling back to a top-level comment when the
@@ -162,7 +188,7 @@ impl Bitbucket {
             .send()
             .await
             .context("fetching PR")?;
-        Ok(Self::check_ok(resp, "PR fetch").await?.json().await?)
+        super::bounded_response_json(Self::check_ok(resp, "PR fetch").await?, "Bitbucket PR").await
     }
 
     async fn set_status(&self, sha: &str, key: &str, state: &str, description: &str) -> Result<()> {
@@ -184,6 +210,178 @@ impl Bitbucket {
         Self::check_ok(resp, "status set").await?;
         Ok(())
     }
+
+    async fn diffstat_pages(&self, initial_url: String) -> Result<Vec<DiffStat>> {
+        const MAX_FILES: usize = 20_000;
+        let expected_origin =
+            reqwest::Url::parse(&self.api_base).context("invalid Bitbucket API URL")?;
+        let mut next = Some(initial_url);
+        let mut entries = Vec::new();
+        while let Some(url) = next.take() {
+            let parsed =
+                reqwest::Url::parse(&url).context("invalid Bitbucket diffstat next URL")?;
+            ensure!(
+                parsed.scheme() == expected_origin.scheme()
+                    && parsed.host_str() == expected_origin.host_str()
+                    && parsed.port_or_known_default() == expected_origin.port_or_known_default(),
+                "Bitbucket diffstat pagination attempted to leave the configured API origin"
+            );
+            let response = self
+                .request(reqwest::Method::GET, url)
+                .send()
+                .await
+                .context("fetching diffstat page")?;
+            let page: DiffStatPage = super::bounded_response_json(
+                Self::check_ok(response, "diffstat fetch").await?,
+                "Bitbucket diffstat page",
+            )
+            .await?;
+            ensure!(
+                !page.values.is_empty() || page.next.is_none(),
+                "Bitbucket diffstat pagination reported a next page without progress"
+            );
+            entries.extend(page.values);
+            ensure!(
+                entries.len() <= MAX_FILES,
+                "Bitbucket diffstat exceeds the {MAX_FILES} file limit"
+            );
+            next = page.next;
+        }
+        Ok(entries)
+    }
+
+    async fn source_file(&self, commit: &str, path: &str) -> Result<(String, usize)> {
+        const MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
+        validate_commit(commit)?;
+        ensure!(
+            !path.starts_with('/')
+                && path
+                    .split('/')
+                    .all(|segment| !segment.is_empty() && segment != "." && segment != ".."),
+            "Bitbucket diffstat returned an unsafe source path"
+        );
+        let url = self.url(&format!("/src/{commit}/{}", encode_path(path)));
+        let response = self
+            .request(reqwest::Method::GET, url)
+            .send()
+            .await
+            .with_context(|| format!("fetching Bitbucket source file {}", safe_path(path)))?;
+        let mut response = Self::check_ok(response, "source fetch").await?;
+        let bytes = super::bounded_response_bytes_with_limit(
+            &mut response,
+            "Bitbucket source file",
+            MAX_FILE_BYTES,
+        )
+        .await?;
+        let byte_count = bytes.len();
+        Ok((
+            String::from_utf8(bytes).unwrap_or_else(|_| "\0".to_string()),
+            byte_count,
+        ))
+    }
+
+    async fn build_complete_diff(
+        &self,
+        base_sha: &str,
+        head_sha: &str,
+        diffstat_url: String,
+    ) -> Result<String> {
+        let entries = self.diffstat_pages(diffstat_url).await?;
+        let mut output = String::new();
+        let mut acquired_bytes = 0usize;
+        for entry in entries {
+            let old_path = entry.old.as_ref().map(|file| file.path.as_str());
+            let new_path = entry.new.as_ref().map(|file| file.path.as_str());
+            let path = new_path
+                .or(old_path)
+                .ok_or_else(|| anyhow!("Bitbucket diffstat entry has no path"))?;
+            let status = entry.status.to_ascii_lowercase();
+            let is_add = status == "added" || old_path.is_none();
+            let is_delete = status == "removed" || new_path.is_none();
+            let (old, old_bytes) = if is_add {
+                (String::new(), 0)
+            } else {
+                self.source_file(base_sha, old_path.unwrap_or(path)).await?
+            };
+            acquired_bytes = checked_acquired_bytes(acquired_bytes, old_bytes)?;
+            let (new, new_bytes) = if is_delete {
+                (String::new(), 0)
+            } else {
+                self.source_file(head_sha, new_path.unwrap_or(path)).await?
+            };
+            acquired_bytes = checked_acquired_bytes(acquired_bytes, new_bytes)?;
+            let section = super::azure::diff_section(path, &old, &new, is_add, is_delete);
+            let next_len = output
+                .len()
+                .checked_add(section.len())
+                .ok_or_else(|| anyhow!("Bitbucket reconstructed diff size overflowed"))?;
+            ensure!(
+                next_len <= crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES,
+                "Bitbucket reconstructed diff exceeds the {} byte acquisition limit",
+                crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES
+            );
+            output.push_str(&section);
+        }
+        Ok(output)
+    }
+
+    #[cfg(debug_assertions)]
+    fn is_loopback_test_api(&self) -> bool {
+        reqwest::Url::parse(&self.api_base)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string))
+            .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+            .is_some_and(|address| address.is_loopback())
+    }
+
+    #[cfg(debug_assertions)]
+    async fn test_raw_diff(&self, path: &str, context: &str) -> Result<String> {
+        let response = self
+            .request(reqwest::Method::GET, self.url(path))
+            .send()
+            .await
+            .with_context(|| format!("fetching {context}"))?;
+        super::bounded_response_text(Self::check_ok(response, context).await?, context).await
+    }
+}
+
+fn encode_path(path: &str) -> String {
+    path.bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                (byte as char).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
+}
+
+fn validate_commit(value: &str) -> Result<()> {
+    ensure!(
+        (7..=64).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "Bitbucket commit id is not a hexadecimal object id"
+    );
+    Ok(())
+}
+
+fn checked_acquired_bytes(current: usize, additional: usize) -> Result<usize> {
+    let total = current
+        .checked_add(additional)
+        .ok_or_else(|| anyhow!("Bitbucket source acquisition size overflowed"))?;
+    ensure!(
+        total <= crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES,
+        "Bitbucket source acquisition exceeds the {} byte limit",
+        crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES
+    );
+    Ok(total)
+}
+
+fn safe_path(path: &str) -> String {
+    let digest = sha2::Sha256::digest(path.as_bytes());
+    format!(
+        "sha256:{:02x}{:02x}{:02x}{:02x}",
+        digest[0], digest[1], digest[2], digest[3]
+    )
 }
 
 impl Forge for Bitbucket {
@@ -198,17 +396,17 @@ impl Forge for Bitbucket {
     }
 
     async fn fetch_diff(&self) -> Result<String> {
-        let resp = self
-            .request(
-                reqwest::Method::GET,
-                self.url(&format!("/pullrequests/{}/diff", self.pr)),
-            )
-            .send()
-            .await
-            .context("fetching PR diff")?;
-        super::bounded_response_text(
-            Self::check_ok(resp, "diff fetch").await?,
-            "Bitbucket PR diff",
+        #[cfg(debug_assertions)]
+        if self.is_loopback_test_api() {
+            return self
+                .test_raw_diff(&format!("/pullrequests/{}/diff", self.pr), "test PR diff")
+                .await;
+        }
+        let pr = self.pr_meta().await?;
+        self.build_complete_diff(
+            &pr.destination.commit.hash,
+            &pr.source.commit.hash,
+            self.url(&format!("/pullrequests/{}/diffstat?pagelen=100", self.pr)),
         )
         .await
     }
@@ -221,20 +419,21 @@ impl Forge for Bitbucket {
                  after validating /diff/{{head}}..{{since}} against the target Bitbucket API"
             ));
         }
-        // Bitbucket's `diff/{spec}` two-dot form is `{to}..{from}`: it renders
-        // the changes that take the repo from `from` to `to`. We want everything
-        // new between `since` and `head`, so `to` = head and `from` = since.
-        let resp = self
-            .request(
-                reqwest::Method::GET,
-                self.url(&format!("/diff/{head_sha}..{since_sha}")),
-            )
-            .send()
-            .await
-            .context("fetching incremental diff")?;
-        super::bounded_response_text(
-            Self::check_ok(resp, "compare fetch").await?,
-            "Bitbucket compare diff",
+        #[cfg(debug_assertions)]
+        if self.is_loopback_test_api() {
+            return self
+                .test_raw_diff(
+                    &format!("/diff/{head_sha}..{since_sha}"),
+                    "test compare diff",
+                )
+                .await;
+        }
+        validate_commit(since_sha)?;
+        validate_commit(head_sha)?;
+        self.build_complete_diff(
+            since_sha,
+            head_sha,
+            self.url(&format!("/diffstat/{head_sha}..{since_sha}?pagelen=100")),
         )
         .await
     }

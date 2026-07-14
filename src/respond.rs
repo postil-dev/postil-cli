@@ -70,6 +70,8 @@ struct RespondModelUsage<'a> {
     model: &'a str,
     prompt_tokens: u64,
     completion_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_micros: Option<u64>,
 }
 
 // PID separates concurrent processes; this sequence separates writers within
@@ -130,6 +132,7 @@ impl UsageReceiptWriter {
                     model: &model.model,
                     prompt_tokens: model.prompt_tokens,
                     completion_tokens: model.completion_tokens,
+                    cost_micros: model.cost_micros,
                 })
                 .collect(),
             usage_accounting_complete: answer.usage_accounting_complete,

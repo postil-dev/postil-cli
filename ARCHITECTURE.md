@@ -40,7 +40,11 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   optional N-model consensus (agreement by path + line proximity). Request construction
   and response decoding vary by API format while retry, timeout, deadline, cascade, and
   secret-redaction semantics remain shared. Optional private-endpoint authentication is
-  a separate header whose name cannot collide with provider-managed headers.
+  a separate header whose name cannot collide with provider-managed headers. A shared
+  admission ledger reserves each HTTP attempt, serialized input bytes, maximum output,
+  and worst-case token spend before sending any initial, retry, repair, or scorer call.
+  OpenRouter's response `usage.cost` is preserved as optional exact micro-dollar cost
+  on each model-usage record; endpoints that omit it retain token-only accounting.
 - `review.rs`: orchestration; enforces acquisition, model-aware context, request,
   provider-attempt, output-token, and worst-case token-exposure budgets before calls;
   one UTF-8 byte counts as one projected token rather than using an optimistic ratio;
@@ -54,7 +58,11 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   still be reported against them). It persists safe structured model incidents for
   monitoring without raw provider or model text.
 - `forge/`: trait + GitHub, GitLab, Bitbucket, and Azure DevOps implementations (each
-  with a self-managed/server base-URL override). Azure has no PR-diff endpoint, so it
+  with a self-managed/server base-URL override). GitHub reconstructs full reviews from
+  the declared changed-file count and exhausted paginated file patches, and rejects
+  omitted text patches or an ambiguous 300-file incremental compare. Bitbucket exhausts
+  paginated diffstat and reconstructs bounded source content from the compared commits.
+  Azure has no PR-diff endpoint, so it exhausts the authoritative change marker and
   reconstructs a unified diff from changed-file content with `similar`. The gate check is
   never `neutral`: an errored run is a failed gate unless `gate.onError: advisory`.
   GitLab full reviews require a collected diff version whose `real_size` matches the
@@ -111,7 +119,8 @@ additions (violations are `kind: contentPolicy`). Content policy is on by defaul
    call, preserves the hosted global deadline, and keeps full-review reconciliation
    untrustworthy.
 10. Diff acquisition streams into a 32 MiB hard cap for local files, Git stdout,
-    remote response bodies, and reconstructed forge diffs. The reviewable non-lockfile
+    bounded JSON, source-file acquisition, and reconstructed forge diffs. Forge error
+    bodies are never retained; opaque request identifiers are hashed before logs. The reviewable non-lockfile
     source cap is 8 MiB. Supported lockfile sections compact before that source cap and
     have a separate 16 MiB per-section cap.
 11. Every configured chain is planned against the smallest conservative model context.

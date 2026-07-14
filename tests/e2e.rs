@@ -31,14 +31,14 @@ fn llm_content(findings: Value) -> Value {
             "summary": summary,
             "findings": findings
         }).to_string()}}],
-        "usage": {"prompt_tokens": 100, "completion_tokens": 50}
+        "usage": {"prompt_tokens": 100, "completion_tokens": 50, "cost": 0.000123}
     })
 }
 
 fn scorer_content(scores: Value) -> Value {
     json!({
         "choices": [{"message": {"content": scores.to_string()}}],
-        "usage": {"prompt_tokens": 30, "completion_tokens": 10}
+        "usage": {"prompt_tokens": 30, "completion_tokens": 10, "cost": 0.000045}
     })
 }
 
@@ -637,10 +637,12 @@ async fn provider_403_redacts_key_management_url_from_cli_and_finding() {
         assert!(!output.contains(key_url));
         assert!(!output.contains("key-management-identifier"));
         assert!(!output.contains("Manage this key"));
-        assert!(output.contains("403 Forbidden"));
-        assert!(output.contains("category reported"));
-        assert!(output.contains("request id present"));
     }
+    assert!(stderr.contains("category=provider"));
+    assert_eq!(
+        serde_json::from_str::<Value>(&stdout).unwrap()["findings"][0]["title"],
+        "Model provider unavailable"
+    );
 }
 
 #[tokio::test]
@@ -670,7 +672,8 @@ async fn provider_reported_spend_above_hard_cap_fails_closed() {
         envelope["findings"][0]["title"],
         "Model provider unavailable"
     );
-    assert!(String::from_utf8_lossy(&out.get_output().stderr).contains("token hard cap"));
+    assert_eq!(envelope["modelUsage"][0]["promptTokens"], 20_000_001_u64);
+    assert!(!String::from_utf8_lossy(&out.get_output().stderr).contains("20000001"));
 }
 
 #[tokio::test]
@@ -697,7 +700,7 @@ async fn provider_response_body_above_hard_cap_fails_closed() {
         envelope["findings"][0]["title"],
         "Model provider unavailable"
     );
-    assert!(String::from_utf8_lossy(&out.get_output().stderr).contains("byte hard cap"));
+    assert!(!String::from_utf8_lossy(&out.get_output().stderr).contains(&"x".repeat(128)));
 }
 
 #[tokio::test]
@@ -1623,6 +1626,8 @@ async fn scorer_lowers_confidence_and_stores_both_values() {
     assert_eq!(env["usage"]["promptTokens"], 130);
     assert_eq!(env["usage"]["completionTokens"], 60);
     assert_eq!(env["modelUsage"].as_array().unwrap().len(), 2);
+    assert_eq!(env["modelUsage"][0]["costMicros"], 123);
+    assert_eq!(env["modelUsage"][1]["costMicros"], 45);
     assert_model_usage_matches_aggregate(&env);
     assert!(stderr.contains("postil: attempting model: generator-model"));
     assert!(stderr.contains("postil: model generator-model responded in"));
@@ -3408,7 +3413,7 @@ fn empty_response_retry_connection_failure_stops_without_a_third_request() {
     let stderr = String::from_utf8_lossy(&out.get_output().stderr);
     assert!(stderr.contains("model=primary-model attempt=2/3"));
     assert!(!stderr.contains("model=primary-model attempt=3/3"));
-    assert!(stderr.contains("connection failed after empty-response retry"));
+    assert!(!stderr.contains("127.0.0.1"));
 }
 
 #[tokio::test]
@@ -4892,10 +4897,10 @@ async fn bitbucket_incremental_is_disabled_without_verification_gate() {
         serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
     assert_eq!(env["findings"][0]["path"], ".postil/provider");
     assert!(
-        env["findings"][0]["body"]
+        !env["findings"][0]["body"]
             .as_str()
             .unwrap()
-            .contains("POSTIL_ENABLE_BITBUCKET_INCREMENTAL=1")
+            .contains("POSTIL_ENABLE_BITBUCKET_INCREMENTAL")
     );
 
     let reqs = server.received_requests().await.unwrap();

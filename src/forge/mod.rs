@@ -10,6 +10,7 @@ pub mod gitlab;
 
 use anyhow::{Context, Result, ensure};
 use serde::de::DeserializeOwned;
+use sha2::{Digest, Sha256};
 
 use crate::envelope::{Envelope, Finding, Severity, SuppressionReason};
 
@@ -67,6 +68,37 @@ pub async fn bounded_response_text_with_limit(
     String::from_utf8(bytes).with_context(|| format!("{context} is not valid UTF-8"))
 }
 
+pub async fn bounded_response_bytes_with_limit(
+    response: &mut reqwest::Response,
+    context: &str,
+    limit: usize,
+) -> Result<Vec<u8>> {
+    ensure!(
+        response.status() != reqwest::StatusCode::PARTIAL_CONTENT,
+        "{context} returned partial content"
+    );
+    if let Some(length) = response.content_length() {
+        ensure!(
+            length <= limit as u64,
+            "{context} exceeds the {limit} byte limit"
+        );
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .with_context(|| format!("reading {context}"))?
+    {
+        let next = bytes
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(|| anyhow::anyhow!("{context} byte count overflowed"))?;
+        ensure!(next <= limit, "{context} exceeds the {limit} byte limit");
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
 pub async fn bounded_response_json<T: DeserializeOwned>(
     response: reqwest::Response,
     context: &str,
@@ -75,24 +107,22 @@ pub async fn bounded_response_json<T: DeserializeOwned>(
     serde_json::from_str(&text).with_context(|| format!("decoding {context}"))
 }
 
-/// Read enough of an unsuccessful forge response to make its diagnostic
-/// useful without buffering an attacker-controlled error page.
-pub async fn bounded_error_snippet(mut response: reqwest::Response) -> String {
-    const MAX_ERROR_BODY_BYTES: usize = 4_096;
+/// Stable, non-reversible diagnostic for an opaque provider request id.
+pub fn opaque_id(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    format!(
+        "sha256:{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        digest[0], digest[1], digest[2], digest[3], digest[4], digest[5]
+    )
+}
 
-    let mut bytes = Vec::new();
-    while bytes.len() < MAX_ERROR_BODY_BYTES {
-        let chunk = match response.chunk().await {
-            Ok(Some(chunk)) => chunk,
-            Ok(None) | Err(_) => break,
-        };
-        let remaining = MAX_ERROR_BODY_BYTES - bytes.len();
-        bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
-        if chunk.len() > remaining {
-            break;
-        }
-    }
-    String::from_utf8_lossy(&bytes).chars().take(300).collect()
+pub fn response_request_id(response: &reqwest::Response) -> Option<String> {
+    ["x-request-id", "x-github-request-id", "x-trace-id"]
+        .iter()
+        .find_map(|name| response.headers().get(*name))
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .map(opaque_id)
 }
 
 /// Base URL for the brand status icons rendered in PR comments and check
@@ -811,6 +841,7 @@ mod tests {
             usage: crate::envelope::Usage {
                 prompt_tokens: 10,
                 completion_tokens: 5,
+                ..Default::default()
             },
             model_usage: vec![],
             model_incidents: vec![],

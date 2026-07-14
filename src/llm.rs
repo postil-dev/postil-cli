@@ -5,7 +5,6 @@
 //! Native Anthropic endpoints use `POST {base}/messages` when explicitly selected.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -13,6 +12,7 @@ use anyhow::{Context, Result, anyhow, ensure};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::api_key;
 use crate::config::{ApiFormat, Config};
@@ -149,8 +149,43 @@ impl std::error::Error for ModelError {
 }
 
 fn add_usage(total: &mut Usage, usage: Usage) {
-    total.prompt_tokens += usage.prompt_tokens;
-    total.completion_tokens += usage.completion_tokens;
+    let total_was_empty =
+        total.prompt_tokens == 0 && total.completion_tokens == 0 && total.cost_micros.is_none();
+    total.prompt_tokens = total.prompt_tokens.saturating_add(usage.prompt_tokens);
+    total.completion_tokens = total
+        .completion_tokens
+        .saturating_add(usage.completion_tokens);
+    total.cost_micros = match (total.cost_micros, usage.cost_micros) {
+        (Some(left), Some(right)) => left.checked_add(right),
+        (None, Some(value)) if total_was_empty => Some(value),
+        (None, Some(_)) | (Some(_), None) => None,
+        (None, None) => None,
+    };
+}
+
+fn has_billable_usage(usage: Usage) -> bool {
+    usage.prompt_tokens > 0 || usage.completion_tokens > 0 || usage.cost_micros.is_some()
+}
+
+fn cost_to_micros(cost: f64) -> Option<u64> {
+    let micros = cost * 1_000_000.0;
+    (cost.is_finite() && cost >= 0.0 && micros <= u64::MAX as f64).then(|| micros.round() as u64)
+}
+
+fn add_response_usage(
+    usage: &mut Usage,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    cost: Option<f64>,
+) {
+    add_usage(
+        usage,
+        Usage {
+            prompt_tokens,
+            completion_tokens,
+            cost_micros: cost.and_then(cost_to_micros),
+        },
+    );
 }
 
 fn elapsed_text(elapsed: Duration) -> String {
@@ -171,6 +206,32 @@ fn log_text(value: &str) -> String {
         }
     }
     sanitized
+}
+
+fn safe_model_error_category(error: &ModelError) -> &'static str {
+    if error.is_deadline_exceeded() {
+        "deadline"
+    } else if error.is_timeout() {
+        "timeout"
+    } else if error.is_provider() {
+        "provider"
+    } else {
+        "invalid-output"
+    }
+}
+
+fn safe_anyhow_category(error: &anyhow::Error) -> &'static str {
+    if error.downcast_ref::<DeadlineExceeded>().is_some() {
+        "deadline"
+    } else if reqwest_error(error).is_some_and(reqwest::Error::is_timeout)
+        || error.downcast_ref::<RequestTimedOut>().is_some()
+    {
+        "timeout"
+    } else if error.downcast_ref::<ProviderError>().is_some() {
+        "provider"
+    } else {
+        "invalid-output"
+    }
 }
 
 /// Raw shape we ask the model for. Findings are validated leniently here and
@@ -224,8 +285,17 @@ pub struct LlmClient {
     timeout_retry_timeout: Duration,
     review_deadline: Option<Instant>,
     total_deadline: Option<Instant>,
-    provider_attempts: Arc<AtomicUsize>,
-    reported_token_spend: Arc<AtomicUsize>,
+    admission: Arc<Mutex<ProviderAdmission>>,
+}
+
+#[derive(Debug, Default)]
+struct ProviderAdmission {
+    attempts: usize,
+    input_bytes: usize,
+    output_token_exposure: usize,
+    token_spend_exposure: usize,
+    reported_token_spend: usize,
+    reported_cost_micros: u64,
 }
 
 #[derive(Clone)]
@@ -259,6 +329,9 @@ const PROVIDER_RETRY_DELAY_CAP_SECS: u64 = 30;
 pub(crate) const REVIEW_MAX_TOKENS: u32 = 4096;
 pub(crate) const MAX_PROVIDER_ATTEMPTS: usize = 216;
 pub(crate) const MAX_REPORTED_TOKEN_SPEND: usize = 20_000_000;
+const MAX_PROVIDER_INPUT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE: usize = 2_000_000;
+const MAX_PROVIDER_COST_MICROS: u64 = 25_000_000;
 const MAX_MODEL_RESPONSE_BYTES: usize = 512 * 1024;
 const SCORER_MAX_TOKENS: u32 = 4096;
 const SCORER_REASON_MAX_CHARS: usize = 240;
@@ -465,8 +538,7 @@ impl LlmClient {
             timeout_retry_timeout: request_timeout.min(Duration::from_secs(TIMEOUT_RETRY_CAP_SECS)),
             review_deadline,
             total_deadline,
-            provider_attempts: Arc::new(AtomicUsize::new(0)),
-            reported_token_spend: Arc::new(AtomicUsize::new(0)),
+            admission: Arc::new(Mutex::new(ProviderAdmission::default())),
         })
     }
 
@@ -501,8 +573,8 @@ impl LlmClient {
                                 "postil: consensus model {model_log} timed out after {elapsed}"
                             ),
                             Err(error) => eprintln!(
-                                "postil: consensus model {model_log} failed after {elapsed}: {}",
-                                log_text(&format!("{error:#}"))
+                                "postil: consensus model {model_log} failed after {elapsed} category={}",
+                                safe_model_error_category(error)
                             ),
                         }
                         result
@@ -524,13 +596,12 @@ impl LlmClient {
                         failed_incidents.extend(e.model_incidents.clone());
                         failed_incidents.push(e.incident(ModelIncidentPhase::Review));
                         usage_accounting_complete &= e.usage_accounting_complete;
-                        if e.model_usage.is_empty()
-                            && (e.usage.prompt_tokens > 0 || e.usage.completion_tokens > 0)
-                        {
+                        if e.model_usage.is_empty() && has_billable_usage(e.usage) {
                             e.model_usage.push(ModelUsage {
                                 model: model.clone(),
                                 prompt_tokens: e.usage.prompt_tokens,
                                 completion_tokens: e.usage.completion_tokens,
+                                cost_micros: e.usage.cost_micros,
                             });
                         }
                         failed_model_usage.extend(e.model_usage.clone());
@@ -623,13 +694,12 @@ impl LlmClient {
                         failed_incidents.extend(e.model_incidents.clone());
                         failed_incidents.push(e.incident(ModelIncidentPhase::Review));
                         usage_accounting_complete &= e.usage_accounting_complete;
-                        if e.model_usage.is_empty()
-                            && (e.usage.prompt_tokens > 0 || e.usage.completion_tokens > 0)
-                        {
+                        if e.model_usage.is_empty() && has_billable_usage(e.usage) {
                             e.model_usage.push(ModelUsage {
                                 model: model.clone(),
                                 prompt_tokens: e.usage.prompt_tokens,
                                 completion_tokens: e.usage.completion_tokens,
+                                cost_micros: e.usage.cost_micros,
                             });
                         }
                         failed_model_usage.extend(e.model_usage.clone());
@@ -657,13 +727,13 @@ impl LlmClient {
                             }
                         } else if has_fallback {
                             eprintln!(
-                                "postil: model {model_log} failed after {elapsed}, falling back to next model: {}",
-                                log_text(&format!("{e:#}"))
+                                "postil: model {model_log} failed after {elapsed}, falling back to next model category={}",
+                                safe_model_error_category(&e)
                             );
                         } else {
                             eprintln!(
-                                "postil: model {model_log} failed after {elapsed}; no fallback models remain: {}",
-                                log_text(&format!("{e:#}"))
+                                "postil: model {model_log} failed after {elapsed}; no fallback models remain category={}",
+                                safe_model_error_category(&e)
                             );
                         }
                         add_usage(&mut failed_usage, e.usage);
@@ -726,6 +796,7 @@ impl LlmClient {
                         model: model.clone(),
                         prompt_tokens: model_usage.prompt_tokens,
                         completion_tokens: model_usage.completion_tokens,
+                        cost_micros: model_usage.cost_micros,
                     });
                     match validate(&content) {
                         Ok(content) => {
@@ -744,9 +815,9 @@ impl LlmClient {
                                 "no fallback models remain"
                             };
                             eprintln!(
-                                "postil: model {} produced an invalid reply; {disposition}: {}",
+                                "postil: model {} produced an invalid reply; {disposition} category={}",
                                 log_text(&model),
-                                log_text(&format!("{error:#}")),
+                                safe_anyhow_category(&error),
                             );
                             last_err = Some(error.context("model reply failed publication checks"));
                         }
@@ -756,22 +827,25 @@ impl LlmClient {
                     // Usage parsed from a provider response is complete even
                     // when the response has no usable answer. A transport
                     // failure with no response usage is ambiguous.
-                    if !model_accounting_complete
-                        || (model_usage.prompt_tokens == 0 && model_usage.completion_tokens == 0)
-                    {
+                    if !model_accounting_complete || !has_billable_usage(model_usage) {
                         usage_accounting_complete = false;
                     }
-                    eprintln!("postil: model {model} failed: {e:#}");
+                    eprintln!(
+                        "postil: model {} failed category={}",
+                        log_text(&model),
+                        safe_anyhow_category(&e)
+                    );
                     // Provider failures that report no tokens have no billable
                     // usage to attribute. Omit them rather than emitting a
                     // misleading accounting entry; token-bearing failures are
                     // retained and priced by the hosted control plane.
-                    if model_usage.prompt_tokens > 0 || model_usage.completion_tokens > 0 {
+                    if has_billable_usage(model_usage) {
                         add_usage(&mut usage, model_usage);
                         models.push(ModelUsage {
                             model: model.clone(),
                             prompt_tokens: model_usage.prompt_tokens,
                             completion_tokens: model_usage.completion_tokens,
+                            cost_micros: model_usage.cost_micros,
                         });
                     }
                     if e.downcast_ref::<DeadlineExceeded>().is_some() {
@@ -828,13 +902,12 @@ impl LlmClient {
                     failed_incidents.extend(e.model_incidents.clone());
                     failed_incidents.push(e.incident(ModelIncidentPhase::Scorer));
                     usage_accounting_complete &= e.usage_accounting_complete;
-                    if e.model_usage.is_empty()
-                        && (e.usage.prompt_tokens > 0 || e.usage.completion_tokens > 0)
-                    {
+                    if e.model_usage.is_empty() && has_billable_usage(e.usage) {
                         e.model_usage.push(ModelUsage {
                             model: model.clone(),
                             prompt_tokens: e.usage.prompt_tokens,
                             completion_tokens: e.usage.completion_tokens,
+                            cost_micros: e.usage.cost_micros,
                         });
                     }
                     failed_model_usage.extend(e.model_usage.clone());
@@ -860,13 +933,13 @@ impl LlmClient {
                         );
                     } else if has_fallback {
                         eprintln!(
-                            "postil: scorer {model_log} failed after {elapsed}, falling back to next scorer: {}",
-                            log_text(&format!("{e:#}"))
+                            "postil: scorer {model_log} failed after {elapsed}, falling back to next scorer category={}",
+                            safe_model_error_category(&e)
                         );
                     } else {
                         eprintln!(
-                            "postil: scorer {model_log} failed after {elapsed}; no fallback scorers remain: {}",
-                            log_text(&format!("{e:#}"))
+                            "postil: scorer {model_log} failed after {elapsed}; no fallback scorers remain category={}",
+                            safe_model_error_category(&e)
                         );
                     }
                     add_usage(&mut failed_usage, e.usage);
@@ -1252,19 +1325,11 @@ impl LlmClient {
                         is_canonical_openrouter_base(&self.api_base),
                     );
                     let elapsed = elapsed_text(attempt_started_at.elapsed());
-                    if let Some(response_usage) = summary.usage {
-                        let response_tokens = response_usage
-                            .prompt_tokens
-                            .saturating_add(response_usage.completion_tokens)
-                            as usize;
-                        let previous = self
-                            .reported_token_spend
-                            .fetch_add(response_tokens, Ordering::Relaxed);
-                        if previous.saturating_add(response_tokens) > MAX_REPORTED_TOKEN_SPEND {
-                            return Err(anyhow!(
-                                "model token spend exceeded the {MAX_REPORTED_TOKEN_SPEND} token hard cap"
-                            ));
-                        }
+                    if let Some(response_usage) = summary.usage
+                        && let Err(error) = self.record_reported_usage(response_usage)
+                    {
+                        add_usage(usage, response_usage);
+                        return Err(error);
                     }
                     if response.status.is_success() {
                         eprintln!(
@@ -1352,8 +1417,9 @@ impl LlmClient {
                     );
                     if let Some(response_usage) = summary.usage {
                         add_usage(usage, response_usage);
+                    } else {
+                        *usage_accounting_complete = false;
                     }
-                    *usage_accounting_complete = false;
                     let status = response.status;
                     if empty_response_retries > 0 {
                         let detail = provider_http_status_detail(
@@ -1513,8 +1579,12 @@ impl LlmClient {
                 let parsed: ChatResponse = serde_json::from_str(text)
                     .context("model endpoint returned non-JSON OpenAI-compatible body")?;
                 if let Some(u) = parsed.usage {
-                    usage.prompt_tokens += u.prompt_tokens.unwrap_or(0);
-                    usage.completion_tokens += u.completion_tokens.unwrap_or(0);
+                    add_response_usage(
+                        usage,
+                        u.prompt_tokens.unwrap_or(0),
+                        u.completion_tokens.unwrap_or(0),
+                        u.cost,
+                    );
                 }
                 parsed
                     .choices
@@ -1548,11 +1618,7 @@ impl LlmClient {
     }
 
     async fn request_once(&self, body: &serde_json::Value) -> Result<ModelHttpResponse> {
-        let attempt = self.provider_attempts.fetch_add(1, Ordering::Relaxed);
-        ensure!(
-            attempt < MAX_PROVIDER_ATTEMPTS,
-            "model provider attempt hard cap ({MAX_PROVIDER_ATTEMPTS}) exceeded"
-        );
+        self.reserve_provider_attempt(body)?;
         let http = self.http_client()?;
         let mut request = match self.api_format {
             ApiFormat::OpenaiCompatible => {
@@ -1595,6 +1661,96 @@ impl LlmClient {
             retry_after,
             request_id,
         })
+    }
+
+    fn reserve_provider_attempt(&self, body: &serde_json::Value) -> Result<()> {
+        let input_bytes = serde_json::to_vec(body)
+            .context("serializing model request for admission")?
+            .len();
+        let output_tokens = body
+            .get("max_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| anyhow!("model request is missing a bounded max_tokens value"))?;
+        // One UTF-8 byte per input token is deliberately pessimistic. Reserving
+        // before the network call means retries, repairs, scorer calls, and
+        // concurrent consensus calls cannot cross any cap between check/use.
+        let spend_exposure = input_bytes
+            .checked_add(output_tokens)
+            .ok_or_else(|| anyhow!("model request token exposure overflowed"))?;
+        let mut admission = self
+            .admission
+            .lock()
+            .map_err(|_| anyhow!("model admission lock is poisoned"))?;
+        let attempts = admission
+            .attempts
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("model provider attempt count overflowed"))?;
+        let total_input = admission
+            .input_bytes
+            .checked_add(input_bytes)
+            .ok_or_else(|| anyhow!("model provider input byte count overflowed"))?;
+        let total_output = admission
+            .output_token_exposure
+            .checked_add(output_tokens)
+            .ok_or_else(|| anyhow!("model provider output exposure overflowed"))?;
+        let total_spend = admission
+            .token_spend_exposure
+            .checked_add(spend_exposure)
+            .ok_or_else(|| anyhow!("model provider spend exposure overflowed"))?;
+        ensure!(
+            attempts <= MAX_PROVIDER_ATTEMPTS,
+            "model provider attempt hard cap ({MAX_PROVIDER_ATTEMPTS}) exceeded"
+        );
+        ensure!(
+            total_input <= MAX_PROVIDER_INPUT_BYTES,
+            "model provider input hard cap ({MAX_PROVIDER_INPUT_BYTES} bytes) exceeded"
+        );
+        ensure!(
+            total_output <= MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE,
+            "model provider output exposure hard cap ({MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE} tokens) exceeded"
+        );
+        ensure!(
+            total_spend <= MAX_REPORTED_TOKEN_SPEND,
+            "model token spend exposure exceeded the {MAX_REPORTED_TOKEN_SPEND} token hard cap"
+        );
+        admission.attempts = attempts;
+        admission.input_bytes = total_input;
+        admission.output_token_exposure = total_output;
+        admission.token_spend_exposure = total_spend;
+        Ok(())
+    }
+
+    fn record_reported_usage(&self, usage: Usage) -> Result<()> {
+        let tokens = usage
+            .prompt_tokens
+            .checked_add(usage.completion_tokens)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| anyhow!("model provider reported token count overflowed"))?;
+        let mut admission = self
+            .admission
+            .lock()
+            .map_err(|_| anyhow!("model admission lock is poisoned"))?;
+        let total_tokens = admission
+            .reported_token_spend
+            .checked_add(tokens)
+            .ok_or_else(|| anyhow!("model provider reported token spend overflowed"))?;
+        let total_cost = admission
+            .reported_cost_micros
+            .checked_add(usage.cost_micros.unwrap_or(0))
+            .ok_or_else(|| anyhow!("model provider reported cost overflowed"))?;
+        ensure!(
+            total_tokens <= MAX_REPORTED_TOKEN_SPEND,
+            "model token spend exceeded the {MAX_REPORTED_TOKEN_SPEND} token hard cap"
+        );
+        ensure!(
+            total_cost <= MAX_PROVIDER_COST_MICROS,
+            "model provider cost exceeded the {} micro-dollar hard cap",
+            MAX_PROVIDER_COST_MICROS
+        );
+        admission.reported_token_spend = total_tokens;
+        admission.reported_cost_micros = total_cost;
+        Ok(())
     }
 
     fn http_client(&self) -> Result<reqwest::Client> {
@@ -1679,13 +1835,7 @@ fn safe_header_value(value: Option<&HeaderValue>) -> Option<String> {
             if value.is_empty() {
                 return None;
             }
-            if value.chars().all(|character| {
-                character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-' | ':')
-            }) {
-                Some(value.chars().take(96).collect())
-            } else {
-                Some("present".to_string())
-            }
+            Some(opaque_identifier(value))
         })
 }
 
@@ -1706,13 +1856,15 @@ fn safe_response_identifier(value: &str) -> Option<String> {
     if value.is_empty() {
         return None;
     }
-    if value.chars().all(|character| {
-        character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-' | ':' | '/')
-    }) {
-        Some(value.chars().take(96).collect())
-    } else {
-        Some("present".to_string())
-    }
+    Some(opaque_identifier(value))
+}
+
+fn opaque_identifier(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    format!(
+        "sha256:{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        digest[0], digest[1], digest[2], digest[3], digest[4], digest[5]
+    )
 }
 
 fn safe_error_category(value: &str) -> &'static str {
@@ -1791,6 +1943,10 @@ fn safe_response_summary(
                 .get("completion_tokens")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0),
+            cost_micros: usage
+                .get("cost")
+                .and_then(serde_json::Value::as_f64)
+                .and_then(cost_to_micros),
         }),
         ApiFormat::Anthropic => usage_value.map(|usage| Usage {
             prompt_tokens: usage
@@ -1801,6 +1957,7 @@ fn safe_response_summary(
                 .get("output_tokens")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0),
+            cost_micros: None,
         }),
     };
     SafeResponseSummary {
@@ -1886,6 +2043,7 @@ struct Message {
 struct ChatUsage {
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
+    cost: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2314,6 +2472,7 @@ fn single_model_usage(model: &str, usage: Usage) -> Vec<ModelUsage> {
         model: model.to_string(),
         prompt_tokens: usage.prompt_tokens,
         completion_tokens: usage.completion_tokens,
+        cost_micros: usage.cost_micros,
     }]
 }
 
@@ -2326,6 +2485,9 @@ fn consensus_merge(runs: Vec<ModelReview>) -> ModelReview {
     let total_usage = Usage {
         prompt_tokens: runs.iter().map(|r| r.usage.prompt_tokens).sum(),
         completion_tokens: runs.iter().map(|r| r.usage.completion_tokens).sum(),
+        cost_micros: runs
+            .iter()
+            .try_fold(0u64, |sum, run| sum.checked_add(run.usage.cost_micros?)),
     };
     let models: Vec<String> = runs.iter().map(|r| r.model_used.clone()).collect();
     let model_usage = runs.iter().flat_map(|r| r.model_usage.clone()).collect();
@@ -2872,11 +3034,21 @@ mod tests {
             ApiFormat::OpenaiCompatible,
             true,
         );
-        assert_eq!(public_summary.response_id.as_deref(), Some("response-1"));
-        assert_eq!(
-            public_summary.returned_model.as_deref(),
-            Some("safe/model-v1")
+        assert!(
+            public_summary
+                .response_id
+                .as_deref()
+                .unwrap()
+                .starts_with("sha256:")
         );
+        assert!(
+            public_summary
+                .returned_model
+                .as_deref()
+                .unwrap()
+                .starts_with("sha256:")
+        );
+        assert_ne!(public_summary.response_id.as_deref(), Some("response-1"));
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -2884,9 +3056,11 @@ mod tests {
             HeaderValue::from_static("token-shaped-secret"),
         );
         assert_eq!(safe_request_id(&headers, false).as_deref(), Some("present"));
-        assert_eq!(
-            safe_request_id(&headers, true).as_deref(),
-            Some("token-shaped-secret")
+        assert!(
+            safe_request_id(&headers, true)
+                .as_deref()
+                .unwrap()
+                .starts_with("sha256:")
         );
     }
 
@@ -2919,10 +3093,12 @@ mod tests {
             Usage {
                 prompt_tokens: 1,
                 completion_tokens: 0,
+                ..Default::default()
             },
             Usage {
                 prompt_tokens: 0,
                 completion_tokens: 1,
+                ..Default::default()
             },
         ] {
             assert_eq!(
@@ -2934,6 +3110,7 @@ mod tests {
             successful_response_usage_issue(Some(Usage {
                 prompt_tokens: 1,
                 completion_tokens: 1,
+                ..Default::default()
             })),
             None
         );
@@ -3084,6 +3261,7 @@ mod tests {
             usage: Usage {
                 prompt_tokens: 10,
                 completion_tokens: 5,
+                ..Default::default()
             },
             model_usage: vec![],
             model_incidents: vec![],

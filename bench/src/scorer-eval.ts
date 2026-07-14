@@ -117,6 +117,7 @@ interface ScorerAttempt {
   durationMs: number;
   promptTokens: number;
   completionTokens: number;
+  costUsd: number | null;
   usageValid: boolean;
 }
 
@@ -330,9 +331,13 @@ async function runScorerEvalCase(
   const durationMs = proxy.attempts.reduce((sum, attempt) => sum + attempt.durationMs, 0);
   const promptTokens = proxy.attempts.reduce((sum, attempt) => sum + attempt.promptTokens, 0);
   const completionTokens = proxy.attempts.reduce((sum, attempt) => sum + attempt.completionTokens, 0);
-  const costUsd = pricing
-    ? promptTokens * pricing.promptUsdPerToken + completionTokens * pricing.completionUsdPerToken
+  const exactCosts = proxy.attempts.map((attempt) => attempt.costUsd);
+  const exactCost = exactCosts.length > 0 && exactCosts.every((cost) => cost !== null)
+    ? exactCosts.reduce((sum, cost) => sum + (cost ?? 0), 0)
     : null;
+  const costUsd = exactCost ?? (pricing
+    ? promptTokens * pricing.promptUsdPerToken + completionTokens * pricing.completionUsdPerToken
+    : null);
 
   const structuredOk =
     actualScorer === scorerModel &&
@@ -456,13 +461,16 @@ export async function startScorerProxy(
     });
     const text = await upstream.text();
     const response = safeJson(text) as {
-      usage?: { prompt_tokens?: number; completion_tokens?: number };
+      usage?: { prompt_tokens?: number; completion_tokens?: number; cost?: number };
     } | undefined;
     const usageValid = isValidUsage(response?.usage);
     attempts.push({
       durationMs: performance.now() - startedAt,
       promptTokens: Number(response?.usage?.prompt_tokens ?? 0),
       completionTokens: Number(response?.usage?.completion_tokens ?? 0),
+      costUsd: typeof response?.usage?.cost === "number" && Number.isFinite(response.usage.cost)
+        ? response.usage.cost
+        : null,
       usageValid,
     });
     res.writeHead(upstream.status, { "content-type": upstream.headers.get("content-type") ?? "application/json" });

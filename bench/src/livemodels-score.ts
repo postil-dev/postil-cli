@@ -186,9 +186,15 @@ export function scoreLiveCase(args: {
     modelUsage.reduce((sum, entry) => sum + entry.promptTokens, 0) === env.usage.promptTokens &&
     modelUsage.reduce((sum, entry) => sum + entry.completionTokens, 0) === env.usage.completionTokens;
 
-  const cost = pricing && usageAccountingComplete === true && usageValid
-    ? env.usage.promptTokens * pricing.promptUsdPerToken +
-      env.usage.completionTokens * pricing.completionUsdPerToken
+  const exactCosts = modelUsage.map((entry) => entry.costMicros);
+  const exactCost = exactCosts.length > 0 && exactCosts.every((value) => value !== undefined)
+    ? exactCosts.reduce((sum, value) => sum + (value ?? 0), 0) / 1_000_000
+    : null;
+  const cost = usageAccountingComplete === true && usageValid
+    ? exactCost ?? (pricing
+      ? env.usage.promptTokens * pricing.promptUsdPerToken +
+        env.usage.completionTokens * pricing.completionUsdPerToken
+      : null)
     : null;
 
   const base: LiveModelCaseResult = {

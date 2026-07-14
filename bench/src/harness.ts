@@ -148,6 +148,7 @@ export const envelopeV1 = z.object({
         model: z.string().min(1),
         promptTokens: z.number().int().nonnegative(),
         completionTokens: z.number().int().nonnegative(),
+        costMicros: z.number().int().nonnegative().optional(),
       }),
     )
     .optional(),
