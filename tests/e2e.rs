@@ -308,6 +308,7 @@ fn postil() -> Command {
     cmd.env_remove("REVIEW_MODEL")
         .env_remove("REVIEW_MODEL_CASCADE")
         .env_remove("REVIEW_SCORER_MODEL")
+        .env_remove("REVIEW_SCORER_MODEL_CASCADE")
         .env_remove("POSTIL_DISABLE_SCORER")
         .env_remove("POSTIL_HOSTED_MODE")
         .env_remove("POSTIL_LLM_REQUEST_TIMEOUT_SECS")

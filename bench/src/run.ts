@@ -7,7 +7,7 @@
 //   bun run bench [--json] [--json-out <path>]
 //
 // Live-models mode (opt-in, NOT run in CI, spends real tokens): keeps the
-// per-case mock GitHub API but points the CLI at the real OpenRouter endpoint,
+// per-case mock GitHub API but points the CLI at the selected provider endpoint,
 // running each fixture repeatedly through exact generator/scorer pairs. It
 // measures attributable detection and measured pair cost. Requires an inference
 // key (POSTIL_API_KEY, OPENROUTER_API_KEY, MODEL_API_KEY, or LLM_API_KEY).
@@ -27,8 +27,11 @@
 //   POSTIL_BENCH_MODE       set to "live" to select live-models mode
 //   POSTIL_BENCH_PAIRS      comma-separated generator::scorer model pairs
 //   POSTIL_BENCH_REPEATS    complete matrix repetitions (admission requires at least 3)
-//   POSTIL_API_BASE         OpenRouter-compatible base (default https://openrouter.ai/api/v1)
+//   POSTIL_API_BASE         provider API base (default https://openrouter.ai/api/v1)
 //   POSTIL_API_FORMAT       provider interface (openai-compatible or anthropic)
+//   POSTIL_BENCH_PRICING_FILE  JSON pricing for endpoints without catalog prices
+//   POSTIL_ENDPOINT_AUTH_HEADER additional private-gateway authentication header
+//   POSTIL_ENDPOINT_AUTH_VALUE  value paired with POSTIL_ENDPOINT_AUTH_HEADER
 //   MODEL_API_KEY           inference key for live modes; never printed
 //   LLM_API_KEY             equivalent neutral inference-key alias
 //   OPENROUTER_API_KEY      provider-specific inference-key alias
@@ -37,7 +40,7 @@
 //   BENCH_LIVE              set to 1 to select diff-file live mode
 //   BENCH_CONCURRENCY       live-mode case parallelism (else --concurrency, else default)
 
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { cases } from "../fixtures/cases";
 import { formatReport, runBenchmark } from "./harness";
@@ -45,7 +48,6 @@ import { DEFAULT_LIVE_CONCURRENCY, formatLiveReport, runLive } from "./live";
 import {
   DEFAULT_LIVE_CONCURRENCY as DEFAULT_LIVE_MODELS_CONCURRENCY,
   formatLiveModelsReport,
-  admitSavedLiveModelsReport,
   liveModelsQualificationExitCode,
   parseQualificationPairs,
   runLiveModels,
@@ -76,16 +78,6 @@ async function main() {
   const liveModels =
     process.env.POSTIL_BENCH_MODE === "live" || args.includes("--live-models");
 
-  const admitReport = flagValue(args, "--admit-report");
-  if (admitReport !== undefined) {
-    const manifestOut = flagValue(args, "--manifest-out");
-    if (!manifestOut) throw new Error("--admit-report requires --manifest-out");
-    const manifest = admitSavedLiveModelsReport(await readFile(admitReport, "utf8"));
-    await writeFile(manifestOut, `${JSON.stringify(manifest, null, 2)}\n`);
-    console.log(`admitted ${manifest.profiles.length} qualification profile(s)`);
-    return;
-  }
-
   if (liveModels) {
     const pairs = parseQualificationPairs(
       process.env.POSTIL_BENCH_PAIRS ?? flagValue(args, "--pairs") ?? "",
@@ -106,6 +98,13 @@ async function main() {
       costCapUsd: costCapRaw === undefined ? undefined : Number.parseFloat(costCapRaw),
     });
     await writeLiveModelsReport(jsonOut, JSON.stringify(report, null, 2));
+    const manifestOut = flagValue(args, "--manifest-out");
+    if (manifestOut) {
+      if (!report.manifestCandidate) {
+        throw new Error("qualification did not pass; no manifest candidate was emitted");
+      }
+      await writeFile(manifestOut, `${JSON.stringify(report.manifestCandidate, null, 2)}\n`);
+    }
     console.log(json ? JSON.stringify(report, null, 2) : formatLiveModelsReport(report));
     process.exitCode = liveModelsQualificationExitCode(report);
     return;

@@ -52,10 +52,10 @@ entire matrix at least three times.
 ```sh
 export MODEL_API_KEY=... # or POSTIL_API_KEY, OPENROUTER_API_KEY, or LLM_API_KEY
 export POSTIL_BENCH_MODE=live
-export POSTIL_BENCH_PAIRS=provider/generator::provider/scorer
+export POSTIL_BENCH_PAIRS=provider/generator::provider/scorer+provider/scorer-fallback
 export POSTIL_BENCH_REPEATS=3
 export POSTIL_API_FORMAT=openai-compatible # or anthropic
-bun run bench --json-out report.json
+bun run bench --json-out report.json --manifest-out ../qualified-models.json
 ```
 
 The release binary must embed the exact profile under test. Set the intended
@@ -83,9 +83,17 @@ Pass it with `--pricing-file prices.json` or
 The catalog request uses the inference credential when no file is supplied and
 fails closed when any model is unpriced.
 
-Use `provider/one+provider/two+provider/three::provider/scorer` to qualify a
-three-model consensus generator chain. Every listed generator is consulted;
-the CLI's production two-model agreement rule determines the merged findings.
+Private gateways may set `POSTIL_ENDPOINT_AUTH_HEADER` and
+`POSTIL_ENDPOINT_AUTH_VALUE`. The harness validates and forwards the pair to
+both catalog and inference requests. Provider-managed headers cannot be
+overridden.
+
+Pair syntax is `generators::scorer+fallback` or
+`generators::consensus::scorer+fallback`. For example,
+`provider/one+provider/two+provider/three::2::provider/scorer` qualifies an
+ordered three-model generator chain with two-model consensus. Omitting the
+consensus field requires every listed generator. The optional scorer fallback
+is tried after the primary scorer.
 
 Admission requires all of these in every repeat:
 
@@ -103,22 +111,19 @@ finding titles or bodies. It records separate fixture, review-contract source,
 configuration, evaluator contract, and CLI binary SHA-256 hashes; the canonical API base and
 provider interface; the ordered generator chain and consensus width; the
 ordered scorer chain; repeat number; and provider-exact or catalog-estimate
-cost provenance. Source-bundle hashes use the runtime's ordered
+cost provenance. The evaluator contract includes `bench/package.json` and
+`bench/bun.lock`, while `packageManager` pins the Bun runtime identity.
+Source-bundle hashes use the runtime's ordered
 `path + NUL + exact bytes + NUL` framing. Each immutable profile and the
 complete sanitized evidence payload have their own SHA-256 identifier.
 `manifestCandidate` uses the runtime admission-manifest schema directly and is
-absent from a failed report. Admit a saved passing report with:
+absent from a failed report. Only the process that performs the live run can
+write a candidate, using `--manifest-out` on that invocation. Saved JSON
+reports are evidence only and cannot be admitted later.
 
-```sh
-bun run bench --admit-report report.json --manifest-out ../qualified-models.json
-```
-
-This command recomputes the sanitized evidence hash and every admission gate.
-It emits no manifest when the report is incomplete, stale, altered, or failed.
-
-The preflight prices every unique generator and scorer across the configured
+The preflight prices every generator and scorer role invocation across the configured
 repeats before inference. It rejects missing prices, more than six models, and
-a cap outside `(0, $25]`.
+a cap outside `(0, $25]`. A single model used for both roles is priced twice.
 The inference key stays in the child environment and is never printed or placed
 on an argument list.
 

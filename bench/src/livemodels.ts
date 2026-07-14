@@ -23,6 +23,7 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { API_KEY_ENV_NAMES_TEXT, forwardApiKey, resolveApiKeyName } from "./api-key";
+import { cases as admissionFixtureInputs } from "../fixtures/cases";
 import {
   benchmarkCase,
   envelopeV1,
@@ -30,6 +31,7 @@ import {
   evaluateStatusline,
   safeJson,
   startMockGithub,
+  validateUniqueCaseIds,
   type BenchmarkCase,
   type BenchmarkCaseInput,
 } from "./harness";
@@ -45,6 +47,7 @@ import {
   scoreLiveCase,
   qualificationPairId,
   qualificationGeneratorModels,
+  qualificationScorerModels,
   toSiteModelAggregate,
   type LiveModelAggregate,
   type LiveModelCaseResult,
@@ -74,6 +77,7 @@ export const REVIEW_CONTRACT_SOURCE_PATHS = [
 ] as const;
 export const FIXTURE_SET_SOURCE_PATHS = ["bench/fixtures/cases.ts"] as const;
 export const EVALUATOR_CONTRACT_SOURCE_PATHS = [
+  "bench/package.json", "bench/bun.lock",
   "bench/fixtures/cases.ts", "bench/src/api-key.ts", "bench/src/harness.ts",
   "bench/src/livemodels-score.ts", "bench/src/livemodels.ts", "bench/src/run.ts",
 ] as const;
@@ -92,7 +96,7 @@ export interface LiveModelsOptions {
   pairs: QualificationPair[];
   /** Complete matrix repetitions. Admission requires at least three. */
   repeats?: number;
-  /** OpenRouter-compatible base URL (default DEFAULT_API_BASE). */
+  /** Provider API base URL (default DEFAULT_API_BASE). */
   apiBase?: string;
   /** Provider interface used by the exact profile. */
   apiFormat?: "openai-compatible" | "anthropic";
@@ -121,6 +125,7 @@ export interface LiveModelsReport {
   fixtureHash: string;
   reviewContractHash: string;
   evaluatorContractHash: string;
+  evaluatorRuntimeIdentity: string;
   configHash: string;
   cliBinaryHash: string;
   evidenceHash: string;
@@ -144,23 +149,27 @@ export interface BinaryQualificationMetadata {
   reviewContractSha256: string;
   fixtureSetSha256: string;
   evaluatorContractSha256: string;
+  evaluatorRuntimeIdentity: string;
   defaultApiBase: string;
   defaultApiFormat: "openai-compatible" | "anthropic";
   generatorChain: string[];
   consensus: number;
   scorerChain: string[];
+  admittedProfile: AdmissionManifestCandidate["profiles"][number] | null;
 }
 
 export interface QualificationProfile {
   id: string;
   apiBase: string;
   apiFormat: "openai-compatible" | "anthropic";
+  benchmarkProviderIdentity?: string;
   generatorModels: string[];
   consensus: number;
   scorerModels: string[];
   fixtureHash: string;
   reviewContractHash: string;
   evaluatorContractHash: string;
+  evaluatorRuntimeIdentity: string;
   configHash: string;
   cliBinaryHash: string;
   repeats: number;
@@ -172,6 +181,7 @@ export interface AdmissionManifestCandidate {
   profiles: Array<{
     id: string;
     apiBase: string;
+    benchmarkProviderIdentity?: string;
     generatorChain: string[];
     consensus: number;
     scorerChain: string[];
@@ -179,6 +189,7 @@ export interface AdmissionManifestCandidate {
     reviewContractSha256: string;
     fixtureSetSha256: string;
     evaluatorContractSha256: string;
+    evaluatorRuntimeIdentity: string;
     reportSha256: string;
     repeatedRuns: number;
   }>;
@@ -193,7 +204,10 @@ export async function runLiveModels(
 ): Promise<LiveModelsReport> {
   const pairs = normalizeQualificationPairs(options.pairs);
   const models = normalizeGeneratorModels(
-    pairs.flatMap((pair) => [...qualificationGeneratorModels(pair), pair.scorerModel]),
+    pairs.flatMap((pair) => [
+      ...qualificationGeneratorModels(pair),
+      ...qualificationScorerModels(pair),
+    ]),
   );
   const repeats = options.repeats ?? MIN_QUALIFICATION_REPEATS;
   if (!Number.isSafeInteger(repeats) || repeats < 1 || repeats > 10) {
@@ -201,13 +215,14 @@ export async function runLiveModels(
   }
   const costCapUsd = options.costCapUsd ?? MAX_GENERATOR_COST_CAP_USD;
   validateGeneratorQualificationBounds(models, costCapUsd);
+  const cases = inputs.map((input) => benchmarkCase.parse(input));
+  assertExactQualificationFixtures(cases);
   if (!resolveApiKeyName()) {
     throw new Error(
       `live mode needs a real model key: set ${API_KEY_ENV_NAMES_TEXT} in the ` +
         "environment (it is never logged or printed). Mock mode (bun run bench) needs no key.",
     );
   }
-  const cases = inputs.map((input) => benchmarkCase.parse(input));
   const apiBase = normalizeApiBase(options.apiBase ?? DEFAULT_API_BASE);
   const apiFormat = options.apiFormat ?? "openai-compatible";
   const rootDir = options.rootDir ?? resolve(import.meta.dir, "..", ".runs", "live-models");
@@ -222,6 +237,7 @@ export async function runLiveModels(
   }
   await assertBinary(options.binary);
   const repositoryRoot = resolve(import.meta.dir, "..", "..");
+  const evaluatorRuntimeIdentity = await assertEvaluatorRuntime(repositoryRoot);
   const [fixtureHash, reviewContractHash, evaluatorContractHash, configHash, cliBinaryHash, binaryMetadata] = await Promise.all([
     hashRepositorySources(repositoryRoot, FIXTURE_SET_SOURCE_PATHS),
     hashRepositorySources(repositoryRoot, REVIEW_CONTRACT_SOURCE_PATHS),
@@ -232,9 +248,10 @@ export async function runLiveModels(
   ]);
   assertBinaryMatchesQualificationWorktree({
     metadata: binaryMetadata, fixtureHash, reviewContractHash, evaluatorContractHash,
+    evaluatorRuntimeIdentity,
     configHash, apiBase, apiFormat, pairs,
   });
-  const pricing = suppliedPricing ?? (await fetchPricing(apiBase, models));
+  const pricing = suppliedPricing ?? (await fetchPricing(apiBase, apiFormat, models));
   if (suppliedPricing === undefined) {
     assertPairQualificationPreflight({
       diffs: Array.from({ length: repeats }, () => cases.map((candidate) => candidate.diff)).flat(),
@@ -296,6 +313,7 @@ export async function runLiveModels(
     fixtureHash,
     reviewContractHash,
     evaluatorContractHash,
+    evaluatorRuntimeIdentity,
     configHash,
     cliBinaryHash,
     repeats,
@@ -310,6 +328,7 @@ export async function runLiveModels(
     fixtureHash,
     reviewContractHash,
     evaluatorContractHash,
+    evaluatorRuntimeIdentity,
     configHash,
     cliBinaryHash,
     repeats,
@@ -330,6 +349,7 @@ export async function runLiveModels(
     fixtureHash,
     reviewContractHash,
     evaluatorContractHash,
+    evaluatorRuntimeIdentity,
     configHash,
     cliBinaryHash,
     evidenceHash,
@@ -345,66 +365,17 @@ export async function runLiveModels(
   return report;
 }
 
+export function assertExactQualificationFixtures(actual: BenchmarkCase[]): void {
+  validateUniqueCaseIds(actual);
+  const expected = admissionFixtureInputs.map((input) => benchmarkCase.parse(input));
+  validateUniqueCaseIds(expected);
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new Error("live qualification must run the exact embedded fixture matrix once per repeat");
+  }
+}
+
 export function hashSanitizedEvidence(value: object): string {
   return hashText(JSON.stringify(value));
-}
-
-export function sanitizedEvidenceFromReport(report: LiveModelsReport): object {
-  return {
-    cliVersion: report.cliVersion,
-    apiBase: report.apiBase,
-    apiFormat: report.apiFormat,
-    providerEndpointIdentity: report.providerEndpointIdentity,
-    upstreamProviderPinned: report.upstreamProviderPinned,
-    upstreamProviderIdentity: report.upstreamProviderIdentity,
-    fixtureHash: report.fixtureHash,
-    reviewContractHash: report.reviewContractHash,
-    evaluatorContractHash: report.evaluatorContractHash,
-    configHash: report.configHash,
-    cliBinaryHash: report.cliBinaryHash,
-    repeats: report.repeats,
-    profiles: report.profiles,
-    cases: report.cases,
-  };
-}
-
-export function admitSavedLiveModelsReport(raw: string): AdmissionManifestCandidate {
-  const report = JSON.parse(raw) as LiveModelsReport;
-  if (!report || typeof report !== "object" || !Array.isArray(report.profiles) || !Array.isArray(report.cases)) {
-    throw new Error("qualification report has an invalid shape");
-  }
-  if (!Number.isSafeInteger(report.repeats) || report.repeats < MIN_QUALIFICATION_REPEATS) {
-    throw new Error(`qualification needs at least ${MIN_QUALIFICATION_REPEATS} complete repeats`);
-  }
-  if (report.upstreamProviderPinned !== false || report.upstreamProviderIdentity !== null) {
-    throw new Error("qualification report does not prove a pinned upstream provider route");
-  }
-  if (hashSanitizedEvidence(sanitizedEvidenceFromReport(report)) !== report.evidenceHash) {
-    throw new Error("qualification report evidence hash does not match");
-  }
-  if (report.profiles.length === 0) throw new Error("qualification report contains no profiles");
-  for (const profile of report.profiles) {
-    if (
-      profile.fixtureHash !== report.fixtureHash || profile.reviewContractHash !== report.reviewContractHash ||
-      profile.evaluatorContractHash !== report.evaluatorContractHash ||
-      profile.configHash !== report.configHash || profile.cliBinaryHash !== report.cliBinaryHash ||
-      profile.repeats !== report.repeats || profile.apiBase !== report.apiBase ||
-      profile.apiFormat !== report.apiFormat || profile.generatorModels.length === 0 ||
-      profile.scorerModels.length !== 1
-    ) throw new Error(`qualification profile ${profile.id || "(empty)"} does not match its report`);
-    const pair: QualificationPair = {
-      generatorModel: profile.generatorModels[0]!, generatorCascade: profile.generatorModels.slice(1),
-      consensus: profile.consensus, scorerModel: profile.scorerModels[0]!,
-    };
-    const aggregate = aggregateModel(
-      pair, report.cases.filter((candidate) => candidate.pairId === qualificationPairId(pair)), report.repeats,
-    );
-    if (!aggregate.passed) {
-      throw new Error(`qualification profile ${profile.id} failed: ${aggregate.admissionFailures.join("; ")}`);
-    }
-  }
-  if (!report.passed) throw new Error("qualification report is not passing");
-  return admissionManifestCandidate(report.configHash, report.evidenceHash, report.profiles);
 }
 
 export function admissionManifestCandidate(
@@ -418,6 +389,9 @@ export function admissionManifestCandidate(
     profiles: profiles.map((profile) => ({
       id: profile.id,
       apiBase: profile.apiBase,
+      ...(profile.benchmarkProviderIdentity === undefined
+        ? {}
+        : { benchmarkProviderIdentity: profile.benchmarkProviderIdentity }),
       generatorChain: profile.generatorModels,
       consensus: profile.consensus,
       scorerChain: profile.scorerModels,
@@ -425,6 +399,7 @@ export function admissionManifestCandidate(
       reviewContractSha256: profile.reviewContractHash,
       fixtureSetSha256: profile.fixtureHash,
       evaluatorContractSha256: profile.evaluatorContractHash,
+      evaluatorRuntimeIdentity: profile.evaluatorRuntimeIdentity,
       reportSha256,
       repeatedRuns: profile.repeats,
     })),
@@ -528,10 +503,10 @@ async function runLiveModelCase(
   }
   if (
     envelope.findings.length + envelope.suppressedFindings.length > 0 &&
-    envelope.scorerModel !== pair.scorerModel
+    !qualificationScorerModels(pair).includes(envelope.scorerModel ?? "")
   ) {
     structuredOutputFailures.push(
-      `qualification used scorer ${envelope.scorerModel ?? "none"} instead of ${pair.scorerModel}`,
+      `qualification used scorer ${envelope.scorerModel ?? "none"} outside ${qualificationScorerModels(pair).join(" -> ")}`,
     );
   }
 
@@ -548,8 +523,8 @@ async function runLiveModelCase(
 }
 
 /** Environment for a live-models run: an isolated HOME/TMPDIR/XDG so the binary
- * discovers no developer config, the mock GitHub for forge I/O, and the real
- * OpenRouter endpoint. The API key is forwarded from the parent process and is
+ * discovers no developer config, the mock GitHub for forge I/O, and the selected
+ * provider endpoint. The API key is forwarded from the parent process and is
  * never logged or placed on argv here. */
 export function liveEnv(
   homeDir: string,
@@ -581,7 +556,20 @@ export function liveEnv(
     REVIEW_MODEL_CASCADE: qualificationGeneratorModels(pair).join(","),
     REVIEW_MODEL_CONSENSUS: String(pair.consensus ?? qualificationGeneratorModels(pair).length),
     REVIEW_SCORER_MODEL: pair.scorerModel,
+    REVIEW_SCORER_MODEL_CASCADE: (pair.scorerCascade ?? []).join(","),
   };
+  const endpointAuth = endpointAuthFromEnvironment(apiFormat);
+  if (endpointAuth) {
+    env.POSTIL_ENDPOINT_AUTH_HEADER = endpointAuth.header;
+    env.POSTIL_ENDPOINT_AUTH_VALUE = endpointAuth.value;
+  }
+  const allowPrivate = process.env.POSTIL_ALLOW_PRIVATE_API_BASE;
+  if (allowPrivate !== undefined) {
+    if (allowPrivate !== "1" && allowPrivate.toLowerCase() !== "true") {
+      throw new Error("POSTIL_ALLOW_PRIVATE_API_BASE must be 1 or true when set");
+    }
+    env.POSTIL_ALLOW_PRIVATE_API_BASE = allowPrivate;
+  }
   // Forward the selected inference-key variable without logging or placing the
   // value on argv. Neutral aliases are also mirrored into POSTIL_API_KEY so
   // older binaries can run from the same benchmark harness.
@@ -596,6 +584,7 @@ export function normalizeQualificationPairs(pairs: QualificationPair[]): Qualifi
       generatorCascade: (pair.generatorCascade ?? []).map((model) => model.trim()).filter(Boolean),
       consensus: pair.consensus,
       scorerModel: pair.scorerModel.trim(),
+      scorerCascade: (pair.scorerCascade ?? []).map((model) => model.trim()).filter(Boolean),
     }))
     .filter((pair) => pair.generatorModel.length > 0 || pair.scorerModel.length > 0);
   if (normalized.length === 0) {
@@ -606,11 +595,21 @@ export function normalizeQualificationPairs(pairs: QualificationPair[]): Qualifi
       throw new Error("each qualification pair needs both generator and scorer model ids");
     }
     const generatorCount = qualificationGeneratorModels(pair).length;
+    const scorerCount = qualificationScorerModels(pair).length;
+    if (generatorCount !== 1 + pair.generatorCascade.length) {
+      throw new Error("pair generator chain must not repeat models");
+    }
     const consensus = pair.consensus ?? generatorCount;
     if (!Number.isSafeInteger(consensus) || consensus < 1 || consensus > generatorCount) {
       throw new Error("pair consensus must be an integer within the generator chain");
     }
     pair.consensus = consensus;
+    if (scorerCount !== 1 + pair.scorerCascade.length) {
+      throw new Error("pair scorer chain must not repeat models");
+    }
+    if (pair.scorerCascade.length > 1) {
+      throw new Error("pair scorer chain supports exactly one ordered fallback");
+    }
   }
   return [...new Map(normalized.map((pair) => [qualificationPairId(pair), pair])).values()];
 }
@@ -620,23 +619,59 @@ export function parseQualificationPairs(raw: string): QualificationPair[] {
     .split(",")
     .filter((value) => value.trim().length > 0)
     .map((value) => {
-      const [generatorChain, scorerModel, extra] = value.split("::");
+      const fields = value.split("::");
+      const [generatorChain, consensusField, scorerChain] = fields.length === 3
+        ? fields
+        : [fields[0], undefined, fields[1]];
       const generatorModels = generatorChain?.split("+").map((model) => model.trim()).filter(Boolean) ?? [];
+      const scorerModels = scorerChain?.split("+").map((model) => model.trim()).filter(Boolean) ?? [];
       const generatorModel = generatorModels[0];
-      if (extra !== undefined || !generatorModel?.trim() || !scorerModel?.trim()) {
-        throw new Error("qualification pairs use generator/model::scorer/model syntax");
+      const scorerModel = scorerModels[0];
+      const consensus = consensusField === undefined
+        ? generatorModels.length
+        : /^(?:[1-9][0-9]*)$/u.test(consensusField.trim())
+          ? Number(consensusField.trim())
+          : Number.NaN;
+      if (
+        (fields.length !== 2 && fields.length !== 3) ||
+        !generatorModel?.trim() || !scorerModel?.trim() ||
+        !Number.isSafeInteger(consensus)
+      ) {
+        throw new Error(
+          "qualification pairs use generators::scorer+fallback or generators::consensus::scorer+fallback syntax",
+        );
       }
       return {
         generatorModel,
         generatorCascade: generatorModels.slice(1),
-        consensus: generatorModels.length,
+        consensus,
         scorerModel: scorerModel.trim(),
+        scorerCascade: scorerModels.slice(1),
       };
     });
 }
 
 async function hashFile(path: string): Promise<string> {
   return hashText(await readFile(path));
+}
+
+export async function assertEvaluatorRuntime(repositoryRoot: string): Promise<string> {
+  const packageFile = JSON.parse(
+    await readFile(resolve(repositoryRoot, "bench/package.json"), "utf8"),
+  ) as { packageManager?: unknown };
+  if (
+    typeof packageFile.packageManager !== "string" ||
+    !/^bun@[0-9]+\.[0-9]+\.[0-9]+$/u.test(packageFile.packageManager)
+  ) {
+    throw new Error("bench packageManager must pin an exact Bun runtime");
+  }
+  const expected = packageFile.packageManager.slice("bun@".length);
+  if (Bun.version !== expected) {
+    throw new Error(
+      `qualification requires ${packageFile.packageManager}; running bun@${Bun.version}`,
+    );
+  }
+  return packageFile.packageManager;
 }
 
 /** Hash a named source bundle exactly as the runtime does: ordered UTF-8 path,
@@ -699,10 +734,11 @@ function qualificationProfile(args: Omit<QualificationProfile, "id" | "generator
     apiFormat: args.apiFormat,
     generatorModels,
     consensus,
-    scorerModels: [args.pair.scorerModel],
+    scorerModels: qualificationScorerModels(args.pair),
     fixtureHash: args.fixtureHash,
     reviewContractHash: args.reviewContractHash,
     evaluatorContractHash: args.evaluatorContractHash,
+    evaluatorRuntimeIdentity: args.evaluatorRuntimeIdentity,
     configHash: args.configHash,
     cliBinaryHash: args.cliBinaryHash,
     repeats: args.repeats,
@@ -715,20 +751,54 @@ function qualificationProfile(args: Omit<QualificationProfile, "id" | "generator
 
 async function fetchPricing(
   apiBase: string,
+  apiFormat: "openai-compatible" | "anthropic",
   models: string[],
 ): Promise<Map<string, ModelPricing>> {
   const url = `${apiBase.replace(/\/$/, "")}/models`;
   const keyName = resolveApiKeyName();
   const key = keyName === undefined ? undefined : process.env[keyName];
   const headers: Record<string, string> = { accept: "application/json" };
-  if (key) headers.authorization = `Bearer ${key}`;
+  if (key) {
+    if (apiFormat === "anthropic") headers["x-api-key"] = key;
+    else headers.authorization = `Bearer ${key}`;
+  }
+  const endpointAuth = endpointAuthFromEnvironment(apiFormat);
+  if (endpointAuth) headers[endpointAuth.header] = endpointAuth.value;
   const res = await fetch(url, { headers });
   if (!res.ok) {
-    throw new Error(`failed to fetch OpenRouter pricing (${res.status}) from ${url}`);
+    throw new Error(`failed to fetch provider pricing (${res.status}) from ${url}`);
   }
   const catalog = (await res.json()) as OpenRouterModelsResponse;
   const pricing = pricingFromCatalog(catalog, models);
   return pricing;
+}
+
+export function endpointAuthFromEnvironment(
+  apiFormat: "openai-compatible" | "anthropic",
+): { header: string; value: string } | null {
+  const rawHeader = process.env.POSTIL_ENDPOINT_AUTH_HEADER;
+  const rawValue = process.env.POSTIL_ENDPOINT_AUTH_VALUE;
+  const header = rawHeader?.trim() || undefined;
+  const value = rawValue === "" ? undefined : rawValue;
+  if (header === undefined && value === undefined) return null;
+  if (header === undefined) {
+    throw new Error("POSTIL_ENDPOINT_AUTH_HEADER must be set when POSTIL_ENDPOINT_AUTH_VALUE is set");
+  }
+  if (value === undefined) {
+    throw new Error("POSTIL_ENDPOINT_AUTH_VALUE must be set when POSTIL_ENDPOINT_AUTH_HEADER is set");
+  }
+  if (!/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/u.test(header)) {
+    throw new Error("POSTIL_ENDPOINT_AUTH_HEADER is not a valid HTTP header name");
+  }
+  if (/[^\t\x20-\x7e\x80-\xff]/u.test(value)) {
+    throw new Error("POSTIL_ENDPOINT_AUTH_VALUE is not a valid HTTP header value");
+  }
+  const normalized = header.toLowerCase();
+  const managed = new Set(["x-api-key", "anthropic-version", "content-type"]);
+  if (managed.has(normalized) || (apiFormat === "openai-compatible" && normalized === "authorization")) {
+    throw new Error("POSTIL_ENDPOINT_AUTH_HEADER cannot override a provider-managed header");
+  }
+  return { header, value };
 }
 
 export async function pricingFromFile(path: string): Promise<Map<string, ModelPricing>> {
@@ -866,6 +936,7 @@ function assertBinaryMatchesQualificationWorktree(args: {
   fixtureHash: string;
   reviewContractHash: string;
   evaluatorContractHash: string;
+  evaluatorRuntimeIdentity: string;
   configHash: string;
   apiBase: string;
   apiFormat: "openai-compatible" | "anthropic";
@@ -880,6 +951,9 @@ function assertBinaryMatchesQualificationWorktree(args: {
   ] as const) {
     if (actual !== expected) throw new Error(`supplied binary ${label} does not match this worktree`);
   }
+  if (metadata.evaluatorRuntimeIdentity !== args.evaluatorRuntimeIdentity) {
+    throw new Error("supplied binary evaluator runtime does not match this worktree");
+  }
   if (metadata.defaultApiBase !== args.apiBase || metadata.defaultApiFormat !== args.apiFormat) {
     throw new Error("qualification endpoint does not match the supplied binary defaults");
   }
@@ -890,7 +964,7 @@ function assertBinaryMatchesQualificationWorktree(args: {
   if (
     JSON.stringify(qualificationGeneratorModels(pair)) !== JSON.stringify(metadata.generatorChain) ||
     pair.consensus !== metadata.consensus ||
-    JSON.stringify([pair.scorerModel]) !== JSON.stringify(metadata.scorerChain)
+    JSON.stringify(qualificationScorerModels(pair)) !== JSON.stringify(metadata.scorerChain)
   ) {
     throw new Error("qualification pair does not match the supplied binary's embedded default profile");
   }

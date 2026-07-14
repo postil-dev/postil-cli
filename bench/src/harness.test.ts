@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { cases } from "../fixtures/cases";
-import { benchmarkCase, scanForForbidden } from "./harness";
+import { benchmarkCase, commentMatchesExpectation, scanForForbidden } from "./harness";
 
 describe("benchmark fixtures", () => {
   test("cover the expanded saturated-case categories", () => {
@@ -42,7 +42,38 @@ describe("benchmark fixtures", () => {
           ? "warn"
           : undefined;
       expect(candidate.groundTruth.findings[0]?.severity).toBe(expectedSeverity);
+      const finding = candidate.groundTruth.findings[0];
+      if (finding !== undefined) {
+        expect(finding.semantics?.positive.length).toBeGreaterThan(0);
+        expect(finding.semantics?.negative.length).toBeGreaterThan(0);
+        expect(commentMatchesExpectation(candidate.modelOutput.findings[0]!.body, finding.semantics))
+          .toBe(true);
+        const inverse = finding.semantics!.negative[0]!.all
+          .map((alternatives) => alternatives[0])
+          .join(" ");
+        expect(commentMatchesExpectation(inverse, finding.semantics)).toBe(false);
+      }
     }
+  });
+
+  test("keeps authorization polarity while accepting useful paraphrases", () => {
+    const candidate = benchmarkCase.parse(
+      cases.find((fixture) => fixture.id === "security-admin-delete"),
+    );
+    const semantics = candidate.groundTruth.findings[0]?.semantics;
+    expect(semantics).toBeDefined();
+    expect(commentMatchesExpectation(
+      "This path checks authorization before deleting the user.",
+      semantics,
+    )).toBe(false);
+    expect(commentMatchesExpectation(
+      "The destructive action lacks an admin check before deleting the user.",
+      semantics,
+    )).toBe(true);
+    expect(commentMatchesExpectation(
+      "Deleting users now skips permission enforcement.",
+      semantics,
+    )).toBe(true);
   });
 
   test("huge low-signal fixtures can carry multiple hunks in one diff", () => {

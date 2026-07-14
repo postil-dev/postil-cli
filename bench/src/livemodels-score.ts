@@ -29,16 +29,21 @@ export interface QualificationPair {
   generatorCascade?: string[];
   consensus?: number;
   scorerModel: string;
+  scorerCascade?: string[];
 }
 
 export function qualificationPairId(pair: QualificationPair): string {
   const generators = qualificationGeneratorModels(pair);
   const consensus = pair.consensus ?? generators.length;
-  return `${generators.join(" -> ")} [consensus ${consensus}] + ${pair.scorerModel}`;
+  return `${generators.join(" -> ")} [consensus ${consensus}] + ${qualificationScorerModels(pair).join(" -> ")}`;
 }
 
 export function qualificationGeneratorModels(pair: QualificationPair): string[] {
   return [...new Set([pair.generatorModel, ...(pair.generatorCascade ?? [])])];
+}
+
+export function qualificationScorerModels(pair: QualificationPair): string[] {
+  return [...new Set([pair.scorerModel, ...(pair.scorerCascade ?? [])])];
 }
 
 /** OpenRouter per-token prices for one model (USD per token, as returned by
@@ -265,17 +270,18 @@ export function scoreLiveCase(args: {
   const requiresScorerUsage = allFindings.length > 0;
   const allGeneratorModels = qualificationGeneratorModels(pair);
   const generatorModels = allGeneratorModels.slice(0, pair.consensus ?? allGeneratorModels.length);
+  const scorerModels = qualificationScorerModels(pair);
   const usageValid =
     modelUsage.length > 0 &&
     modelUsage.every((entry) => entry.accountingComplete) &&
     generatorModels.every((model) =>
       modelUsage.some((entry) => entry.model === model && entry.role === "reviewGenerator")) &&
     (!requiresScorerUsage ||
-      modelUsage.some((entry) => entry.model === pair.scorerModel && entry.role === "findingScorer")) &&
+      modelUsage.some((entry) => scorerModels.includes(entry.model) && entry.role === "findingScorer")) &&
     modelUsage.every(
       (entry) =>
         (generatorModels.includes(entry.model) && entry.role === "reviewGenerator") ||
-        (entry.model === pair.scorerModel && entry.role === "findingScorer"),
+        (scorerModels.includes(entry.model) && entry.role === "findingScorer"),
     ) &&
     env.usage.promptTokens > 0 &&
     env.usage.completionTokens > 0 &&
@@ -340,9 +346,9 @@ export function scoreLiveCase(args: {
   });
 
   const seededLine = truth.line;
-  const bodyIncludes = c.groundTruth.findings[0]?.bodyIncludes;
+  const semantics = c.groundTruth.findings[0]?.semantics;
   const isSemanticMatch = (finding: Envelope["findings"][number]) =>
-    commentMatchesExpectation(finding.body, bodyIncludes);
+    commentMatchesExpectation(finding.body, semantics);
   const isSeeded = (finding: Envelope["findings"][number]) =>
     seededLine !== null && finding.path === truth.path && findingHitsSeededRegion(finding, seededLine) &&
     isSemanticMatch(finding);
@@ -706,9 +712,14 @@ export function pricingFromCatalog(
   for (const m of catalog.data ?? []) {
     const matched = [m.id, m.canonical_slug].find((id): id is string => id !== undefined && wanted.has(id));
     if (!matched) continue;
-    const prompt = Number.parseFloat(m.pricing?.prompt ?? "");
-    const completion = Number.parseFloat(m.pricing?.completion ?? "");
-    if (!Number.isFinite(prompt) || !Number.isFinite(completion)) continue;
+    let prompt: number;
+    let completion: number;
+    try {
+      prompt = canonicalDecimalToNumber(parseCanonicalDecimal(m.pricing?.prompt ?? ""));
+      completion = canonicalDecimalToNumber(parseCanonicalDecimal(m.pricing?.completion ?? ""));
+    } catch {
+      continue;
+    }
     out.set(matched, { promptUsdPerToken: prompt, completionUsdPerToken: completion });
   }
   return out;
@@ -814,19 +825,23 @@ export function assertPairQualificationPreflight(args: {
   pricing: Map<string, ModelPricing>;
   costCapUsd: number;
 }): number {
-  const roleModels = normalizeGeneratorModels(args.pairs.flatMap((pair) => [
-    ...qualificationGeneratorModels(pair).slice(
-      0,
-      pair.consensus ?? qualificationGeneratorModels(pair).length,
-    ),
-    pair.scorerModel,
-  ]));
-  validateGeneratorQualificationBounds(roleModels, args.costCapUsd);
-  const missing = [...new Set(roleModels.filter((model) => !args.pricing.has(model)))];
+  const roleInvocations = args.pairs.flatMap((pair) => [
+    ...qualificationGeneratorModels(pair),
+    ...qualificationScorerModels(pair),
+  ]);
+  const uniqueModels = normalizeGeneratorModels(roleInvocations);
+  validateGeneratorQualificationBounds(uniqueModels, args.costCapUsd);
+  const missing = [...new Set(uniqueModels.filter((model) => !args.pricing.has(model)))];
   if (missing.length > 0) {
     throw new Error(`cannot project pair qualification spend; pricing missing for ${missing.join(", ")}`);
   }
-  const projected = projectTotalCostUsd({ diffs: args.diffs, models: roleModels, pricing: args.pricing });
+  // Preserve duplicate ids across roles. A model used once as the generator and
+  // once as the scorer causes two separately billed provider invocations.
+  const projected = projectTotalCostUsd({
+    diffs: args.diffs,
+    models: roleInvocations,
+    pricing: args.pricing,
+  });
   if (projected > args.costCapUsd) {
     throw new Error(
       `projected pair qualification spend $${projected.toFixed(4)} exceeds the ` +

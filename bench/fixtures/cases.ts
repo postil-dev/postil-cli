@@ -10,7 +10,7 @@
 
 import crypto from "crypto";
 
-import type { BenchmarkCaseInput } from "../src/harness";
+import type { BenchmarkCaseInput, SemanticPropositions } from "../src/harness";
 
 type DisallowedSource =
   | string
@@ -50,6 +50,129 @@ type FixtureSpec = {
   maxFindings?: number;
 };
 
+// Each defect fixture owns both the proposition that demonstrates detection
+// and an explicit opposite proposition. Most fixtures use their canonical
+// expected and inverse phrases. Security-sensitive absence checks additionally
+// model the subject, polarity, and affected action as separate concept groups
+// so paraphrases are accepted without crediting an inverted claim.
+const negativePropositionsByFixtureId: Record<string, string[]> = {
+  "billing-double-charge": ["does not bill the customer twice"],
+  "billing-refund-replay": ["does not replay the same payout twice"],
+  "security-admin-delete": ["still checks authorization before deleting the user"],
+  "security-public-export": ["retains the permission gate"],
+  "race-double-enqueue": ["cannot be queued twice"],
+  "race-non-atomic-counter": ["cannot cause lost writes"],
+  "cache-tenant-key-omission": ["preserves tenant scope"],
+  "cache-missing-invalidation": ["clears the cached record"],
+  "deletion-hard-delete": ["does not hard delete user records"],
+  "deletion-no-archive": ["writes to the archive table"],
+  "ui-button-missing-label": ["has an accessible name"],
+  "ui-input-missing-label": ["has a visible label"],
+  "a11y-low-contrast-status": ["meets the contrast floor"],
+  "a11y-icon-only-action": ["is not icon only"],
+  "api-contract-field-removed": ["does not affect downstream clients"],
+  "api-contract-status-drift": ["preserves the contract signal"],
+  "ci-secret-in-log": ["does not log a secret value"],
+  "ci-unpinned-action": ["remains pinned"],
+  "config-debug-enabled": ["does not expose debug output"],
+  "config-review-disabled": ["review gate remains enabled"],
+  "node-event-listener-leak": ["calls remove event listener"],
+  "security-csrf-rotation": ["still verifies csrf"],
+  "payments-negative-quantity": ["rejects a negative quantity"],
+  "auth-refresh-token-expiry": ["lifetime does not expand"],
+  "upload-extension-trust": ["does not trust the filename extension"],
+  "data-tenant-filter-removed": ["still scopes by tenant"],
+  "api-pagination-limit-removed": ["retains the server side cap"],
+  "release-feature-flag-default-on": ["is not enabled for everyone"],
+  "observability-swallowed-sync-error": ["does not swallow provider failures"],
+  "off-by-one-page-offset": ["first page of records is not skipped"],
+  "off-by-one-rate-limit-boundary": ["does not allow one extra request"],
+  "off-by-one-token-expiry": ["expires exactly at its expiry timestamp"],
+  "off-by-one-recipient-slice": ["includes the final recipient"],
+  "prompt-injection-auth-bypass": ["checks that the user is an admin"],
+  "prompt-injection-sql-bypass": ["does not interpolate user controlled input"],
+  "misleading-comment-tenant-cache": ["includes tenant id"],
+  "misleading-comment-fallback-throws": ["code does not throw"],
+  "misleading-comment-encryption-disabled": ["keeps encryption enabled"],
+  "huge-low-signal-permission-bypass": ["retains the permission check"],
+  "huge-low-signal-timeout-disabled": ["does not set the timeout to zero"],
+  "near-duplicate-auth-defect": ["does not default to admin"],
+  "near-duplicate-ttl-defect": ["expects milliseconds"],
+  "unicode-role-homoglyph": ["contains no cyrillic homoglyph"],
+  "unicode-domain-homoglyph": ["resolves to the same hostname"],
+  "unicode-env-key-homoglyph": ["contains no greek kappa"],
+  "race-check-then-insert": ["read and create are atomic"],
+  "race-lock-release-before-write": ["lock is held through the awaited write"],
+  "race-shared-buffer-reuse": ["does not share one mutable buffer"],
+  "race-non-atomic-file-write": ["cannot expose a partial file"],
+};
+
+function semanticPropositionsFor(spec: FixtureSpec): SemanticPropositions {
+  if (spec.finding === undefined) {
+    throw new Error(`fixture ${spec.id} has no finding semantics`);
+  }
+  if (spec.id === "security-admin-delete") {
+    return {
+      positive: [{
+        all: [
+          ["no longer", "missing", "removed", "without", "lacks", "skips"],
+          ["authorization", "permission", "admin check", "access control"],
+          ["delete", "deleting", "destructive action"],
+        ],
+      }],
+      negative: [{
+        all: [
+          ["checks", "retains", "has", "performs", "enforces"],
+          ["authorization", "permission", "admin check", "access control"],
+          ["delete", "deleting", "destructive action"],
+        ],
+        none: ["no longer", "missing", "removed", "without", "lacks", "skips"],
+      }],
+    };
+  }
+  if (spec.id === "cache-missing-invalidation") {
+    return {
+      positive: [{
+        all: [
+          ["no longer", "missing", "without", "skips"],
+          ["clear", "invalidate"],
+          ["cache", "cached record"],
+        ],
+      }],
+      negative: [{
+        all: [["clear", "invalidate"], ["cache", "cached record"]],
+        none: ["no longer", "missing", "without", "skips"],
+      }],
+    };
+  }
+  if (spec.id === "node-event-listener-leak") {
+    return {
+      positive: [{
+        all: [
+          ["event listener", "listener"],
+          ["added for each request", "each request"],
+          ["remove it", "remove event listener", "cleanup"],
+        ],
+      }],
+      negative: [{
+        all: [
+          ["event listener", "listener"],
+          ["is removed", "calls remove event listener", "cleans up"],
+          ["request completes", "after each request"],
+        ],
+      }],
+    };
+  }
+  const negative = negativePropositionsByFixtureId[spec.id];
+  if (negative === undefined || negative.length === 0) {
+    throw new Error(`fixture ${spec.id} has no inverse semantic proposition`);
+  }
+  return {
+    positive: [{ all: [[spec.finding.bodyIncludes]] }],
+    negative: negative.map((phrase) => ({ all: [[phrase]] })),
+  };
+}
+
 const repoFullName = "benchmark/example-fixtures";
 
 function makeHeadSha(seed: number): string {
@@ -86,7 +209,7 @@ function buildCase(spec: FixtureSpec): BenchmarkCaseInput {
           path: spec.path,
           line: spec.line,
           severity: spec.finding.severity,
-          bodyIncludes: spec.finding.bodyIncludes,
+          semantics: semanticPropositionsFor(spec),
         },
       ]
     : [];
@@ -1291,5 +1414,11 @@ const fixtureSpecs: FixtureSpec[] = [
     disallowedSources: ["written atomically"],
   },
 ];
+
+const defectFixtureIds = fixtureSpecs.filter((spec) => spec.finding).map((spec) => spec.id).sort();
+const propositionFixtureIds = Object.keys(negativePropositionsByFixtureId).sort();
+if (JSON.stringify(defectFixtureIds) !== JSON.stringify(propositionFixtureIds)) {
+  throw new Error("every defect fixture must own exactly one negative proposition set");
+}
 
 export const cases: BenchmarkCaseInput[] = fixtureSpecs.map((spec) => buildCase(spec));

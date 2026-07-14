@@ -47,7 +47,11 @@ const REVIEW_CONTRACT_SOURCES: &[(&str, &str)] = &[
     ("src/filter.rs", include_str!("filter.rs")),
 ];
 const BENCH_FIXTURES_SOURCE: &str = include_str!("../bench/fixtures/cases.ts");
+const BENCH_PACKAGE_JSON: &str = include_str!("../bench/package.json");
+const BENCH_BUN_LOCK: &str = include_str!("../bench/bun.lock");
 const EVALUATOR_CONTRACT_SOURCES: &[(&str, &str)] = &[
+    ("bench/package.json", BENCH_PACKAGE_JSON),
+    ("bench/bun.lock", BENCH_BUN_LOCK),
     ("bench/fixtures/cases.ts", BENCH_FIXTURES_SOURCE),
     (
         "bench/src/api-key.ts",
@@ -132,6 +136,7 @@ pub struct QualificationProfile {
     pub review_contract_sha256: String,
     pub fixture_set_sha256: String,
     pub evaluator_contract_sha256: String,
+    pub evaluator_runtime_identity: String,
     pub report_sha256: String,
     pub repeated_runs: u32,
 }
@@ -211,16 +216,37 @@ pub struct QualificationMetadata {
     pub review_contract_sha256: String,
     pub fixture_set_sha256: String,
     pub evaluator_contract_sha256: String,
+    pub evaluator_runtime_identity: String,
     pub default_api_base: String,
     pub default_api_format: ApiFormat,
     pub generator_chain: Vec<String>,
     pub consensus: usize,
     pub scorer_chain: Vec<String>,
+    pub admitted_profile: Option<QualificationProfile>,
 }
 
 /// Immutable qualification inputs embedded in this exact binary.
 pub fn qualification_metadata() -> QualificationMetadata {
     let defaults = model_defaults();
+    let manifest = qualification_manifest();
+    let admitted_profile = admitted_profile_for(defaults, manifest);
+    let (generator_chain, scorer_chain, api_base) = qualification_defaults(defaults);
+    QualificationMetadata {
+        model_defaults_sha256: defaults.source_sha256.clone(),
+        review_contract_sha256: review_contract_sha256(),
+        fixture_set_sha256: fixture_set_sha256(),
+        evaluator_contract_sha256: evaluator_contract_sha256(),
+        evaluator_runtime_identity: evaluator_runtime_identity(),
+        default_api_base: api_base,
+        default_api_format: defaults.api_format,
+        generator_chain,
+        consensus: defaults.consensus,
+        scorer_chain,
+        admitted_profile,
+    }
+}
+
+fn qualification_defaults(defaults: &ModelDefaults) -> (Vec<String>, Vec<String>, String) {
     let mut generator_chain = Vec::new();
     if !defaults.default_model.is_empty() {
         generator_chain.push(defaults.default_model.clone());
@@ -234,18 +260,50 @@ pub fn qualification_metadata() -> QualificationMetadata {
             scorer_chain.push(defaults.scorer_fallback.clone());
         }
     }
-    QualificationMetadata {
-        model_defaults_sha256: defaults.source_sha256.clone(),
-        review_contract_sha256: review_contract_sha256(),
-        fixture_set_sha256: fixture_set_sha256(),
-        evaluator_contract_sha256: evaluator_contract_sha256(),
-        default_api_base: normalize_api_base(&defaults.api_base)
-            .expect("embedded API base must be canonicalizable"),
-        default_api_format: defaults.api_format,
-        generator_chain,
-        consensus: defaults.consensus,
-        scorer_chain,
+    let api_base =
+        normalize_api_base(&defaults.api_base).expect("embedded API base must be canonicalizable");
+    (generator_chain, scorer_chain, api_base)
+}
+
+fn admitted_profile_for(
+    defaults: &ModelDefaults,
+    manifest: &QualificationManifest,
+) -> Option<QualificationProfile> {
+    let (generator_chain, scorer_chain, api_base) = qualification_defaults(defaults);
+    manifest
+        .profiles
+        .iter()
+        .find(|profile| {
+            profile.generator_chain == generator_chain
+                && profile.consensus == defaults.consensus
+                && profile.scorer_chain == scorer_chain
+                && profile.api_base == api_base
+                && profile.api_format == defaults.api_format
+        })
+        .cloned()
+}
+
+fn evaluator_runtime_identity() -> String {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct BenchPackage {
+        package_manager: String,
     }
+    let package: BenchPackage =
+        serde_json::from_str(BENCH_PACKAGE_JSON).expect("bench package.json must parse");
+    let version = package
+        .package_manager
+        .strip_prefix("bun@")
+        .expect("bench packageManager must pin Bun");
+    let parts = version.split('.').collect::<Vec<_>>();
+    assert!(
+        parts.len() == 3
+            && parts
+                .iter()
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())),
+        "bench packageManager must pin an exact Bun runtime version"
+    );
+    package.package_manager
 }
 
 fn sha256_named_sources(sources: &[(&str, &str)]) -> String {
@@ -341,6 +399,10 @@ fn parse_qualification_manifest(raw: &str) -> Result<QualificationManifest> {
         anyhow::ensure!(
             profile.evaluator_contract_sha256 == current_evaluator_contract,
             "qualification profile evaluator contract is stale"
+        );
+        anyhow::ensure!(
+            profile.evaluator_runtime_identity == evaluator_runtime_identity(),
+            "qualification profile evaluator runtime is stale"
         );
         let mut generators = profile.generator_chain.clone();
         generators.sort();
@@ -547,11 +609,8 @@ pub struct Config {
     pub scorer: String,
     pub scorer_fallback: String,
     /// Embedded scoring remains disabled until a candidate passes the repeated
-    /// qualification gate. An explicit BYOK scorer enables only that model.
+    /// qualification gate. BYOK can select a scorer and one fallback.
     pub scorer_enabled: bool,
-    /// True when the scorer was selected by config or environment rather than
-    /// inherited from the OpenRouter-oriented built-in defaults.
-    pub scorer_explicit: bool,
     pub api_base: String,
     pub api_format: ApiFormat,
     /// Run the first N models of [model + cascade] and keep agreeing findings.
@@ -591,7 +650,6 @@ impl Default for Config {
             scorer: defaults.scorer_model.clone(),
             scorer_fallback: defaults.scorer_fallback.clone(),
             scorer_enabled: defaults.scorer_enabled,
-            scorer_explicit: false,
             api_base: defaults.api_base.clone(),
             api_format: defaults.api_format,
             consensus: defaults.consensus,
@@ -810,8 +868,8 @@ impl Config {
                 }
                 if let Some(s) = m.scorer {
                     self.scorer = s;
+                    self.scorer_fallback.clear();
                     self.scorer_enabled = true;
-                    self.scorer_explicit = true;
                 }
                 if let Some(b) = m.api_base {
                     // `model.apiBase` from `.postil.yaml` is repo-controlled, and the
@@ -923,8 +981,24 @@ impl Config {
             && !s.is_empty()
         {
             self.scorer = s;
+            self.scorer_fallback.clear();
             self.scorer_enabled = true;
-            self.scorer_explicit = true;
+        }
+        if let Ok(cascade) = std::env::var("REVIEW_SCORER_MODEL_CASCADE")
+            && !cascade.trim().is_empty()
+        {
+            let models = cascade
+                .split(',')
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .collect::<Vec<_>>();
+            anyhow::ensure!(
+                models.len() == 1,
+                "REVIEW_SCORER_MODEL_CASCADE supports exactly one embedded scorer fallback"
+            );
+            validate_model_id("REVIEW_SCORER_MODEL_CASCADE", models[0])?;
+            self.scorer_fallback = models[0].to_string();
+            self.scorer_enabled = true;
         }
         if std::env::var("POSTIL_DISABLE_SCORER")
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
@@ -996,10 +1070,7 @@ impl Config {
             return Vec::new();
         }
         let mut chain = vec![self.scorer.clone()];
-        if !self.scorer_explicit
-            && !self.scorer_fallback.trim().is_empty()
-            && !chain.contains(&self.scorer_fallback)
-        {
+        if !self.scorer_fallback.trim().is_empty() && !chain.contains(&self.scorer_fallback) {
             chain.push(self.scorer_fallback.clone());
         }
         chain
@@ -1527,24 +1598,17 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
     }
 
     #[test]
-    fn inherited_scorer_uses_only_the_embedded_fallback_chain() {
+    fn scorer_chain_preserves_the_ordered_fallback() {
         let config = Config {
             scorer: "qualified/scorer".into(),
             scorer_fallback: "qualified/fallback".into(),
             scorer_enabled: true,
-            scorer_explicit: false,
             ..Config::default()
         };
         assert_eq!(
             config.scorer_chain(),
             vec!["qualified/scorer", "qualified/fallback"]
         );
-
-        let explicit = Config {
-            scorer_explicit: true,
-            ..config
-        };
-        assert_eq!(explicit.scorer_chain(), vec!["qualified/scorer"]);
     }
 
     #[test]
@@ -1563,6 +1627,7 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
                 "reviewContractSha256": "0".repeat(64),
                 "fixtureSetSha256": fixture_set_sha256(),
                 "evaluatorContractSha256": evaluator_contract_sha256(),
+                "evaluatorRuntimeIdentity": evaluator_runtime_identity(),
                 "reportSha256": "1".repeat(64),
                 "repeatedRuns": 3
             }]
@@ -1586,12 +1651,37 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
                 "reviewContractSha256": review_contract_sha256(),
                 "fixtureSetSha256": fixture_set_sha256(),
                 "evaluatorContractSha256": evaluator_contract_sha256(),
+                "evaluatorRuntimeIdentity": evaluator_runtime_identity(),
                 "reportSha256": "1".repeat(64),
                 "repeatedRuns": 2
             }]
         });
         let error = parse_qualification_manifest(&raw.to_string()).unwrap_err();
         assert!(error.to_string().contains("at least three repeated runs"));
+    }
+
+    #[test]
+    fn qualification_profile_rejects_a_stale_evaluator_runtime() {
+        let raw = serde_json::json!({
+            "version": 1,
+            "modelDefaultsSha256": model_defaults().source_sha256,
+            "profiles": [{
+                "id": "candidate",
+                "apiFormat": "openai-compatible",
+                "apiBase": "https://openrouter.ai:443/api/v1",
+                "generatorChain": ["provider/model"],
+                "consensus": 1,
+                "scorerChain": ["provider/scorer"],
+                "reviewContractSha256": review_contract_sha256(),
+                "fixtureSetSha256": fixture_set_sha256(),
+                "evaluatorContractSha256": evaluator_contract_sha256(),
+                "evaluatorRuntimeIdentity": "bun@0.0.0",
+                "reportSha256": "1".repeat(64),
+                "repeatedRuns": 3
+            }]
+        });
+        let error = parse_qualification_manifest(&raw.to_string()).unwrap_err();
+        assert!(error.to_string().contains("evaluator runtime is stale"));
     }
 
     #[test]
@@ -1605,6 +1695,64 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
             "https://openrouter.ai:443/api/v1"
         );
         assert!(normalize_api_base("https://example.com/v1?route=x").is_err());
+    }
+
+    #[test]
+    fn qualification_metadata_attests_only_an_exact_default_profile() {
+        let defaults = ModelDefaults {
+            version: 1,
+            source_sha256: "a".repeat(64),
+            default_model: "provider/generator".into(),
+            cascade: vec!["provider/fallback".into()],
+            consensus: 1,
+            api_base: "https://models.example/v1".into(),
+            api_format: ApiFormat::OpenaiCompatible,
+            scorer_enabled: true,
+            scorer_model: "provider/scorer".into(),
+            scorer_fallback: "provider/scorer-fallback".into(),
+            scorer_qualification_candidates: Vec::new(),
+        };
+        let profile = QualificationProfile {
+            id: "qualified-profile".into(),
+            api_format: ApiFormat::OpenaiCompatible,
+            api_base: "https://models.example:443/v1".into(),
+            benchmark_provider_identity: Some("provider-route".into()),
+            generator_chain: vec!["provider/generator".into(), "provider/fallback".into()],
+            consensus: 1,
+            scorer_chain: vec!["provider/scorer".into(), "provider/scorer-fallback".into()],
+            review_contract_sha256: "b".repeat(64),
+            fixture_set_sha256: "c".repeat(64),
+            evaluator_contract_sha256: "d".repeat(64),
+            evaluator_runtime_identity: "bun@1.3.14".into(),
+            report_sha256: "e".repeat(64),
+            repeated_runs: 3,
+        };
+        let manifest = QualificationManifest {
+            version: 1,
+            model_defaults_sha256: defaults.source_sha256.clone(),
+            profiles: vec![profile.clone()],
+        };
+
+        assert_eq!(admitted_profile_for(&defaults, &manifest), Some(profile));
+
+        for tamper in ["generator", "consensus", "scorer", "apiBase", "apiFormat"] {
+            let mut altered = defaults.clone();
+            match tamper {
+                "generator" => altered.default_model = "provider/other".into(),
+                "consensus" => altered.consensus = 2,
+                "scorer" => altered.scorer_model = "provider/other-scorer".into(),
+                "apiBase" => altered.api_base = "https://other.example/v1".into(),
+                "apiFormat" => altered.api_format = ApiFormat::Anthropic,
+                _ => unreachable!(),
+            }
+            assert_eq!(admitted_profile_for(&altered, &manifest), None, "{tamper}");
+        }
+
+        let empty = QualificationManifest {
+            profiles: Vec::new(),
+            ..manifest
+        };
+        assert_eq!(admitted_profile_for(&defaults, &empty), None);
     }
 
     #[test]

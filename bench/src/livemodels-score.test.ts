@@ -2,10 +2,12 @@ import { describe, expect, test } from "bun:test";
 import { benchmarkCase, type BenchmarkCase, type Envelope } from "./harness";
 import {
   aggregateModel,
+  assertPairQualificationPreflight,
   calculateTotalRunCostUsd,
   findingHitsSeededRegion,
   groundTruthOf,
   pricingFromCatalog,
+  projectTotalCostUsd,
   qualificationPairId,
   scoreLiveCase,
   toSiteModelAggregate,
@@ -34,7 +36,15 @@ function fixture(
     diff: "diff --git a/src/x.ts b/src/x.ts\n+ bad();\n",
     admission: { classification, contractRule: "test-contract" },
     groundTruth: {
-      findings: severity === null ? [] : [{ path: "src/x.ts", line: 20, severity, bodyIncludes: "generated detail" }],
+      findings: severity === null ? [] : [{
+        path: "src/x.ts",
+        line: 20,
+        severity,
+        semantics: {
+          positive: [{ all: [["generated detail"]] }],
+          negative: [{ all: [["no generated detail"]] }],
+        },
+      }],
     },
     modelOutput: { summary: "", findings: [] },
     expectations: { minFindings: 0 },
@@ -317,5 +327,31 @@ describe("report and pricing utilities", () => {
       pricing: { prompt: "0.000001", completion: "0.000002" },
     }] }, [pair.generatorModel]);
     expect(catalog.get(pair.generatorModel)).toEqual(prices.get(pair.generatorModel));
+  });
+
+  test("rejects negative, malformed, noncanonical, and nonfinite catalog prices", () => {
+    for (const invalid of ["-1", "1junk", "NaN", "Infinity", "0.0000010"]) {
+      const catalog = pricingFromCatalog({ data: [{
+        id: pair.generatorModel,
+        pricing: { prompt: invalid, completion: "0.000002" },
+      }] }, [pair.generatorModel]);
+      expect(catalog.has(pair.generatorModel)).toBe(false);
+    }
+  });
+
+  test("projects separate generator and scorer calls when one model fills both roles", () => {
+    const sameRolePair = { generatorModel: "provider/shared", scorerModel: "provider/shared" };
+    const pricing = new Map([["provider/shared", {
+      promptUsdPerToken: 0.000001,
+      completionUsdPerToken: 0.000002,
+    }]]);
+    const oneRole = projectTotalCostUsd({ diffs: ["+ change"], models: ["provider/shared"], pricing });
+    const bothRoles = assertPairQualificationPreflight({
+      diffs: ["+ change"],
+      pairs: [sameRolePair],
+      pricing,
+      costCapUsd: 25,
+    });
+    expect(bothRoles).toBeCloseTo(oneRole * 2, 12);
   });
 });

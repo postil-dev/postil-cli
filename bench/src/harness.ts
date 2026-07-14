@@ -25,11 +25,24 @@ const execFile = promisify(execFileCb);
 
 export const severity = z.enum(["info", "warn", "error"]);
 
+const proposition = z.object({
+  // Every concept group must match. Alternatives inside one group preserve
+  // paraphrase tolerance without making argument order or polarity irrelevant.
+  all: z.array(z.array(z.string().trim().min(2)).min(1)).min(1),
+  // Explicit polarity markers that invalidate this proposition.
+  none: z.array(z.string().trim().min(2)).default([]),
+});
+
+export const semanticPropositions = z.object({
+  positive: z.array(proposition).min(1),
+  negative: z.array(proposition).min(1),
+});
+
 const expectedFinding = z.object({
   path: z.string(),
   line: z.number().int().positive().optional(),
   severity: severity.optional(),
-  bodyIncludes: z.string().optional(),
+  semantics: semanticPropositions.optional(),
 });
 
 const fixtureFile = z.object({
@@ -938,7 +951,7 @@ function evaluateExpectations(
       if (finding.path !== required.path) return false;
       if (required.line !== undefined && finding.line !== required.line) return false;
       if (required.severity !== undefined && finding.severity !== required.severity) return false;
-      return commentMatchesExpectation(finding.body, required.bodyIncludes);
+      return commentMatchesExpectation(finding.body, required.semantics);
     });
     if (!match) {
       failures.push(`missing required finding in ${required.path}`);
@@ -981,7 +994,7 @@ function scoreFindings(
     if (want.line !== undefined && finding.line === want.line) {
       fileLineMatches += 1;
     }
-    if (commentMatchesExpectation(finding.body, want.bodyIncludes)) {
+    if (commentMatchesExpectation(finding.body, want.semantics)) {
       commentUsefulness += 1;
     }
   }
@@ -996,29 +1009,33 @@ function scoreFindings(
   };
 }
 
-export function commentMatchesExpectation(comment: string, bodyIncludes: string | undefined): boolean {
-  if (bodyIncludes === undefined) return true;
-  if (comment.includes(bodyIncludes)) return true;
+export type SemanticPropositions = z.infer<typeof semanticPropositions>;
 
-  const expectedTokens = tokenizeForUsefulness(bodyIncludes);
-  if (expectedTokens.length === 0) return true;
-
-  const commentTokens = new Set(tokenizeForUsefulness(comment));
-  return expectedTokens.every((token) => commentTokens.has(token));
+export function commentMatchesExpectation(
+  comment: string,
+  semantics: SemanticPropositions | undefined,
+): boolean {
+  if (semantics === undefined) return true;
+  const normalized = normalizeProposition(comment);
+  const matches = (proposition: SemanticPropositions["positive"][number]) =>
+    proposition.all.every((alternatives) =>
+      alternatives.some((alternative) => normalized.includes(normalizeProposition(alternative)))
+    ) && proposition.none.every(
+      (excluded) => !normalized.includes(normalizeProposition(excluded)),
+    );
+  if (semantics.negative.some(matches)) {
+    return false;
+  }
+  return semantics.positive.some(matches);
 }
 
-function tokenizeForUsefulness(value: string): string[] {
+function normalizeProposition(value: string): string {
   return value
     .replace(/([a-z0-9])([A-Z])/gu, "$1 $2")
     .toLowerCase()
     .split(/[^a-z0-9]+/u)
-    .map(normalizeUsefulnessToken)
-    .filter((token) => token.length > 2);
-}
-
-function normalizeUsefulnessToken(token: string): string {
-  if (token.startsWith("remov")) return "remove";
-  return token;
+    .filter(Boolean)
+    .join(" ");
 }
 
 function sumMetrics(metrics: BenchmarkMetrics[]): BenchmarkMetrics {
@@ -1046,7 +1063,7 @@ function emptyMetrics(): BenchmarkMetrics {
   };
 }
 
-function validateUniqueCaseIds(cases: BenchmarkCase[]) {
+export function validateUniqueCaseIds(cases: BenchmarkCase[]) {
   const ids = new Set<string>();
   for (const c of cases) {
     if (ids.has(c.id)) {

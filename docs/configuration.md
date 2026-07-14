@@ -51,6 +51,7 @@ Place organization-specific merge rules in `.postil/guardrails.md`. Place additi
 | `REVIEW_MODEL` | Primary model override |
 | `REVIEW_MODEL_CASCADE` | Comma-separated fallback models |
 | `REVIEW_SCORER_MODEL` | Scorer model override |
+| `REVIEW_SCORER_MODEL_CASCADE` | One scorer fallback model |
 | `POSTIL_LLM_TOTAL_TIMEOUT_SECS` | Optional total local-review model deadline |
 | `POSTIL_DETAILS_URL` | HTTP(S) details link for forge check runs |
 

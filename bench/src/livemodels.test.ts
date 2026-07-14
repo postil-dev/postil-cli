@@ -1,8 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { cases as fixtureInputs } from "../fixtures/cases";
+import { benchmarkCase } from "./harness";
 import {
   admissionManifestCandidate,
-  admitSavedLiveModelsReport,
+  assertExactQualificationFixtures,
+  endpointAuthFromEnvironment,
+  EVALUATOR_CONTRACT_SOURCE_PATHS,
   formatLiveModelsReport,
   hashNamedSources,
   liveEnv,
@@ -20,21 +23,48 @@ const pair: QualificationPair = { generatorModel: "test/generator", scorerModel:
 describe("pair qualification configuration", () => {
   test("requires and normalizes exact generator/scorer pairs", () => {
     expect(parseQualificationPairs(" a/generator::b/scorer ")).toEqual([
-      { generatorModel: "a/generator", generatorCascade: [], consensus: 1, scorerModel: "b/scorer" },
+      {
+        generatorModel: "a/generator",
+        generatorCascade: [],
+        consensus: 1,
+        scorerModel: "b/scorer",
+        scorerCascade: [],
+      },
     ]);
     expect(parseQualificationPairs("a/one+b/two+c/three::s/scorer")).toEqual([{
       generatorModel: "a/one",
       generatorCascade: ["b/two", "c/three"],
       consensus: 3,
       scorerModel: "s/scorer",
+      scorerCascade: [],
     }]);
-    expect(() => parseQualificationPairs("a/generator")).toThrow("generator/model::scorer/model");
+    expect(parseQualificationPairs("a/one+b/two::1::s/one+s/two")).toEqual([{
+      generatorModel: "a/one",
+      generatorCascade: ["b/two"],
+      consensus: 1,
+      scorerModel: "s/one",
+      scorerCascade: ["s/two"],
+    }]);
+    expect(() => parseQualificationPairs("a/generator")).toThrow(
+      "generators::scorer+fallback or generators::consensus::scorer+fallback",
+    );
     expect(normalizeQualificationPairs([pair, { ...pair }])).toEqual([{
       ...pair,
       generatorCascade: [],
       consensus: 1,
+      scorerCascade: [],
     }]);
     expect(() => normalizeQualificationPairs([])).toThrow("at least one generator+scorer pair");
+    expect(() => normalizeQualificationPairs([{
+      generatorModel: "a/generator",
+      scorerModel: "s/one",
+      scorerCascade: ["s/two", "s/three"],
+    }])).toThrow("exactly one ordered fallback");
+    expect(() => normalizeQualificationPairs([{
+      generatorModel: "a/generator",
+      generatorCascade: ["a/generator"],
+      scorerModel: "s/scorer",
+    }])).toThrow("generator chain must not repeat");
   });
 
   test("forces the exact pair and no fallback model", () => {
@@ -53,6 +83,39 @@ describe("pair qualification configuration", () => {
       POSTIL_API_FORMAT: "openai-compatible",
     });
     expect(env.POSTIL_DISABLE_SCORER).toBeUndefined();
+  });
+
+  test("forwards validated endpoint authentication without exposing managed headers", () => {
+    const inheritedHeader = process.env.POSTIL_ENDPOINT_AUTH_HEADER;
+    const inheritedValue = process.env.POSTIL_ENDPOINT_AUTH_VALUE;
+    try {
+      process.env.POSTIL_ENDPOINT_AUTH_HEADER = "X-Private-Auth";
+      process.env.POSTIL_ENDPOINT_AUTH_VALUE = "opaque credential";
+      expect(endpointAuthFromEnvironment("openai-compatible")).toEqual({
+        header: "X-Private-Auth",
+        value: "opaque credential",
+      });
+      expect(liveEnv("/tmp/home", "/tmp/tmp", "http://github.test", pair, "https://models.test/v1"))
+        .toMatchObject({
+          POSTIL_ENDPOINT_AUTH_HEADER: "X-Private-Auth",
+          POSTIL_ENDPOINT_AUTH_VALUE: "opaque credential",
+        });
+      process.env.POSTIL_ENDPOINT_AUTH_HEADER = "Authorization";
+      expect(() => endpointAuthFromEnvironment("openai-compatible")).toThrow("provider-managed");
+      process.env.POSTIL_ENDPOINT_AUTH_HEADER = "Bad Header";
+      expect(() => endpointAuthFromEnvironment("anthropic")).toThrow("valid HTTP header name");
+      process.env.POSTIL_ENDPOINT_AUTH_HEADER = "X-Private-Auth";
+      process.env.POSTIL_ENDPOINT_AUTH_VALUE = "bad\r\nvalue";
+      expect(() => endpointAuthFromEnvironment("anthropic")).toThrow("valid HTTP header value");
+      delete process.env.POSTIL_ENDPOINT_AUTH_HEADER;
+      process.env.POSTIL_ENDPOINT_AUTH_VALUE = "value-only";
+      expect(() => endpointAuthFromEnvironment("anthropic")).toThrow("HEADER must be set");
+    } finally {
+      if (inheritedHeader === undefined) delete process.env.POSTIL_ENDPOINT_AUTH_HEADER;
+      else process.env.POSTIL_ENDPOINT_AUTH_HEADER = inheritedHeader;
+      if (inheritedValue === undefined) delete process.env.POSTIL_ENDPOINT_AUTH_VALUE;
+      else process.env.POSTIL_ENDPOINT_AUTH_VALUE = inheritedValue;
+    }
   });
 
   test("canonicalizes the provider endpoint exactly like the runtime", () => {
@@ -85,7 +148,7 @@ describe("pair qualification configuration", () => {
     const inheritedKey = process.env.POSTIL_API_KEY;
     process.env.POSTIL_API_KEY = "test-only-key";
     try {
-      await expect(runLiveModels([fixtureInputs[0]!], {
+      await expect(runLiveModels(fixtureInputs, {
         binary: "/missing/postil",
         pairs: [{ generatorModel: "costly/model", scorerModel: "cheap/scorer" }],
         pricing: new Map([
@@ -102,16 +165,15 @@ describe("pair qualification configuration", () => {
 });
 
 describe("qualification report", () => {
-  test("machine admission rejects insufficient and failed reports without emitting a manifest", () => {
-    const report = {
-      repeats: 2,
-      profiles: [],
-      cases: [],
-      passed: false,
-    };
-    expect(() => admitSavedLiveModelsReport(JSON.stringify(report))).toThrow(
-      "at least 3 complete repeats",
-    );
+  test("binds the exact fixture matrix and evaluator toolchain sources", () => {
+    const exact = fixtureInputs.map((input) => benchmarkCase.parse(input));
+    expect(() => assertExactQualificationFixtures(exact)).not.toThrow();
+    const changed = exact.map((candidate, index) => index === 0
+      ? { ...candidate, name: `${candidate.name} substituted` }
+      : candidate);
+    expect(() => assertExactQualificationFixtures(changed)).toThrow("exact embedded fixture matrix");
+    expect(EVALUATOR_CONTRACT_SOURCE_PATHS).toContain("bench/package.json");
+    expect(EVALUATOR_CONTRACT_SOURCE_PATHS).toContain("bench/bun.lock");
   });
   test("matches the runtime named-source framing vector", () => {
     expect(hashNamedSources([
@@ -125,12 +187,14 @@ describe("qualification report", () => {
       id: "profile-id",
       apiBase: "https://openrouter.ai:443/api/v1",
       apiFormat: "openai-compatible" as const,
+      benchmarkProviderIdentity: "openrouter:test-route",
       generatorModels: ["provider/one", "provider/two"],
       consensus: 2,
       scorerModels: ["provider/scorer"],
       fixtureHash: "a".repeat(64),
       reviewContractHash: "b".repeat(64),
       evaluatorContractHash: "f".repeat(64),
+      evaluatorRuntimeIdentity: "bun@1.3.14",
       configHash: "c".repeat(64),
       cliBinaryHash: "d".repeat(64),
       repeats: 3,
@@ -141,6 +205,7 @@ describe("qualification report", () => {
       profiles: [{
         id: "profile-id",
         apiBase: "https://openrouter.ai:443/api/v1",
+        benchmarkProviderIdentity: "openrouter:test-route",
         generatorChain: ["provider/one", "provider/two"],
         consensus: 2,
         scorerChain: ["provider/scorer"],
@@ -148,6 +213,7 @@ describe("qualification report", () => {
         reviewContractSha256: "b".repeat(64),
         fixtureSetSha256: "a".repeat(64),
         evaluatorContractSha256: "f".repeat(64),
+        evaluatorRuntimeIdentity: "bun@1.3.14",
         reportSha256: "e".repeat(64),
         repeatedRuns: 3,
       }],
@@ -167,6 +233,7 @@ describe("qualification report", () => {
       fixtureHash: "a".repeat(64),
       reviewContractHash: "b".repeat(64),
       evaluatorContractHash: "f".repeat(64),
+      evaluatorRuntimeIdentity: "bun@1.3.14",
       configHash: "d".repeat(64),
       cliBinaryHash: "c".repeat(64),
       evidenceHash: "e".repeat(64),
