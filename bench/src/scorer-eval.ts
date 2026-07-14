@@ -14,7 +14,13 @@ import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { cases as fixtureInputs } from "../fixtures/cases";
 import { API_KEY_ENV_NAMES_TEXT, resolveApiKeyName } from "./api-key";
-import { benchmarkCase, safeJson, startMockGithub, type BenchmarkCase } from "./harness";
+import {
+  benchmarkCase,
+  parseUnifiedDiffFiles,
+  safeJson,
+  startMockGithub,
+  type BenchmarkCase,
+} from "./harness";
 import {
   pricingFromCatalog,
   type ModelPricing,
@@ -429,7 +435,7 @@ function evalCase(
   return { case: c, scenario };
 }
 
-async function runScorerEvalCase(
+export async function runScorerEvalCase(
   c: BenchmarkCase,
   scenario: Scenario,
   scorerModel: string,
@@ -533,7 +539,7 @@ async function runScorerEvalCase(
   if (caseTimedOut) {
     reason = `case exceeded the ${SCORER_MAX_CASE_MS}ms admission limit`;
   } else if (!structuredOk) {
-    reason = scorerError ?? `scorer model mismatch or missing score (${actualScorer ?? "none"})`;
+    reason = scorerStructuralFailureReason(scorerError, proxy.attempts.length, actualScorer);
   } else if (scenario === "trueFinding") {
     passed = scorerConfidence >= 0.6 && scorerKind === "risk";
     reason = passed ? "true finding kept as risk" : "true finding was down-scored or retyped";
@@ -790,8 +796,8 @@ export function trueFinding(c: BenchmarkCase) {
 }
 
 export function falseFinding(c: BenchmarkCase) {
-  const path = c.allowedContext.files[0]?.path ?? c.modelOutput.findings[0]?.path;
-  const line = firstAddedLine(c.diff) ?? c.modelOutput.findings[0]?.line ?? 1;
+  const path = c.primaryChange?.path ?? c.allowedContext.files[0]?.path ?? c.modelOutput.findings[0]?.path;
+  const line = c.primaryChange?.line ?? firstAddedLineForPath(c.diff, path) ?? c.modelOutput.findings[0]?.line ?? 1;
   // The injected false positive is intentionally plausible and overconfident:
   // calibration succeeds only when the scorer pushes it below gate relevance.
   return {
@@ -806,9 +812,23 @@ export function falseFinding(c: BenchmarkCase) {
   };
 }
 
-export function firstAddedLine(diff: string): number | null {
-  const match = diff.match(/@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/u);
+export function firstAddedLineForPath(diff: string, path: string | undefined): number | null {
+  if (path === undefined) return null;
+  const patch = parseUnifiedDiffFiles(diff).find((file) => file.path === path)?.patch;
+  const match = patch?.match(/@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/u);
   return match ? Number.parseInt(match[1]!, 10) : null;
+}
+
+export function scorerStructuralFailureReason(
+  scorerError: string | null,
+  upstreamRequests: number,
+  actualScorer: string | null,
+): string {
+  if (scorerError !== null) return scorerError;
+  if (upstreamRequests === 0) {
+    return "no generator finding survived grounding and filtering to reach the scorer";
+  }
+  return `scorer model mismatch or missing score (${actualScorer ?? "none"})`;
 }
 
 export function isolatedEnv(

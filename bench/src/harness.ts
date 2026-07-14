@@ -89,6 +89,10 @@ export const benchmarkCase = z.object({
   pullNumber: z.number().int().positive(),
   headSha: z.string().min(1),
   diff: z.string().min(1),
+  primaryChange: z.object({
+    path: z.string().min(1),
+    line: z.number().int().positive(),
+  }).optional(),
   allowedContext: allowedContext.default({ files: [], docs: [] }),
   /// Fixture metadata (policy phrasing, ground-truth labels) that must never
   /// leak into the prompt or any pipeline output. Prompt-injection fixtures may

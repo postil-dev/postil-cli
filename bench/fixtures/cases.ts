@@ -451,6 +451,7 @@ function buildCase(spec: FixtureSpec): BenchmarkCaseInput {
     pullNumber: spec.pullNumber,
     headSha: makeHeadSha(spec.pullNumber),
     diff,
+    primaryChange: { path: spec.path, line: spec.line },
     allowedContext: {
       files: [{ path: spec.path, content: spec.allowedFileContent }, ...additionalFiles],
       docs: [{ path: "review-policy.md", content: spec.policy }],

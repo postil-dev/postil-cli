@@ -3,7 +3,7 @@ import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { cases as fixtureInputs } from "../fixtures/cases";
 import { benchmarkCase } from "./harness";
 import {
@@ -15,7 +15,7 @@ import {
   aggregate,
   assertQualificationPreflight,
   falseFinding,
-  firstAddedLine,
+  firstAddedLineForPath,
   finalizeScorerEvalReport,
   formatReport,
   isAdmissionFatalStructuralResult,
@@ -28,10 +28,12 @@ import {
   qualificationExitCode,
   projectedQualificationSpendUsd,
   runBoundedChild,
+  runScorerEvalCase,
   runScorerEvalMatrix,
   scorerCheckpointPath,
   selectEvalCases,
   startScorerProxy,
+  scorerStructuralFailureReason,
   trueFinding,
   writeScorerEvalCheckpoint,
   type ScorerEvalCase,
@@ -169,13 +171,22 @@ describe("scorer calibration findings", () => {
     const clean = fixture("clean-docs-only");
     const finding = falseFinding(clean);
     expect(finding).toMatchObject({
-      path: clean.allowedContext.files[0]?.path,
-      line: firstAddedLine(clean.diff),
+      path: clean.primaryChange?.path,
+      line: clean.primaryChange?.line,
       severity: "warn",
       kind: "risk",
       confidence: 0.95,
     });
     expect(finding.body).toContain("break callers");
+  });
+
+  test("anchors a large clean fixture to its declared interior change rather than prefix noise", () => {
+    const clean = fixture("huge-low-signal-clean");
+    expect(firstAddedLineForPath(clean.diff, "src/churn/prefix-0.ts")).toBe(1);
+    expect(falseFinding(clean)).toMatchObject({
+      path: "src/ui/copy.ts",
+      line: 44,
+    });
   });
 });
 
@@ -311,6 +322,71 @@ describe("scorer proxy and isolated runtime", () => {
     }
   });
 
+  test("sends the large clean fixture's declared finding through the real CLI scorer path once", async () => {
+    const scorerRequests: string[] = [];
+    const upstream = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+      scorerRequests.push(await requestBody(req));
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        choices: [{ message: { content: JSON.stringify([{
+          index: 0,
+          confidence: 0.2,
+          kind: "uncertainty",
+          reason: "The claimed runtime break is not supported by the changed behavior.",
+        }]) } }],
+        usage: { prompt_tokens: 30, completion_tokens: 10, cost: 0.000045 },
+      }));
+    });
+    const upstreamBase = await listen(upstream);
+    const root = await mkdtemp(join(tmpdir(), "postil-scorer-grounding-"));
+    const keyName = "POSTIL_SCORER_EVAL_TEST_KEY";
+    const previousKey = process.env[keyName];
+    process.env[keyName] = "local-test-key";
+    try {
+      const evaluation = await runScorerEvalCase(
+        fixture("huge-low-signal-clean"),
+        "falseFinding",
+        "scorer/model",
+        1,
+        resolve(import.meta.dir, "..", "..", "target", "release", "postil"),
+        root,
+        upstreamBase,
+        keyName,
+        {
+          promptUsdPerToken: 0.000001,
+          completionUsdPerToken: 0.000002,
+          inputMicrosPerMillionTokens: 1_000_000,
+          outputMicrosPerMillionTokens: 2_000_000,
+        },
+      );
+      expect(evaluation).toMatchObject({
+        envelopeProduced: true,
+        scorerModel: "scorer/model",
+        scorerError: null,
+        upstreamRequests: 1,
+        usageValid: true,
+        passed: true,
+      });
+      expect(scorerRequests).toHaveLength(1);
+      const scorerRequest = JSON.parse(scorerRequests[0]!) as {
+        messages?: Array<{ content?: string }>;
+      };
+      const scorerPrompt = scorerRequest.messages?.map((message) => message.content ?? "").join("\n") ?? "";
+      expect(scorerPrompt).toContain("src/ui/copy.ts");
+      expect(scorerPrompt).toContain('"line": 44');
+      const stderr = await readFile(
+        join(root, "scorer_model", "repeat-1", "huge-low-signal-clean", "artifacts", "stderr.log"),
+        "utf8",
+      );
+      expect(stderr).toContain("postil: reviewing source request");
+    } finally {
+      if (previousKey === undefined) delete process.env[keyName];
+      else process.env[keyName] = previousKey;
+      await rm(root, { recursive: true, force: true });
+      await close(upstream);
+    }
+  });
+
   test("kills child execution just beyond the admission latency bound", async () => {
     expect(SCORER_CASE_EXEC_TIMEOUT_MS).toBeGreaterThan(SCORER_MAX_CASE_MS);
     expect(SCORER_CASE_EXEC_TIMEOUT_MS - SCORER_MAX_CASE_MS).toBeLessThanOrEqual(1_000);
@@ -420,6 +496,13 @@ describe("candidate matrix execution", () => {
       passed: false,
       reason: "ordinary quality miss",
     }), "scorer/model")).toBe(false);
+  });
+
+  test("describes zero scorer requests as a grounding/filtering result", () => {
+    expect(scorerStructuralFailureReason(null, 0, null)).toBe(
+      "no generator finding survived grounding and filtering to reach the scorer",
+    );
+    expect(scorerStructuralFailureReason("provider unavailable", 0, null)).toBe("provider unavailable");
   });
 
   test("stops a structurally failed candidate while quality misses and later candidates continue", async () => {
