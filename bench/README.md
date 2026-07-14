@@ -241,11 +241,16 @@ incomplete, or the assessment is not trimmed single-line text of at most
 240 UTF-8 bytes ending in sentence punctuation. Each case is killed one second
 after the 20-second admission limit, and teardown aborts outstanding provider
 requests. A timeout rejects that candidate immediately rather than running the
-rest of its matrix. With `--json-out`, `<path>.partial` atomically records
-completed case metrics without prompts, responses, credentials, or error text;
-the final report replaces it after the matrix completes. Scorer output is
-bounded from the supplied finding count, up to the supported maximum of 20
-findings, and schema-repair context is byte-bounded from the same output limit.
+rest of its matrix. Any other admission-fatal structural result, including an
+unroutable provider response, malformed envelope, scorer mismatch, invalid
+reason, incomplete usage, or repair attempt, also stops only that candidate.
+Ordinary true/false quality misses run the complete statistical matrix. Reports
+record completed and expected case counts explicitly. With `--json-out`,
+`<path>.partial` atomically records completed case metrics without prompts,
+responses, credentials, or error text; the final report replaces it after the
+run completes. Scorer output is bounded from the supplied finding count, up to
+the supported maximum of 20 findings, and schema-repair context is byte-bounded
+from the same output limit.
 
 ## Diff-file live mode (opt-in, single model, no forge)
 

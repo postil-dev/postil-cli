@@ -18,6 +18,7 @@ import {
   firstAddedLine,
   finalizeScorerEvalReport,
   formatReport,
+  isAdmissionFatalStructuralResult,
   isValidReason,
   isolatedEnv,
   loadEmbeddedScorerDefaults,
@@ -27,6 +28,7 @@ import {
   qualificationExitCode,
   projectedQualificationSpendUsd,
   runBoundedChild,
+  runScorerEvalMatrix,
   scorerCheckpointPath,
   selectEvalCases,
   startScorerProxy,
@@ -269,6 +271,46 @@ describe("scorer proxy and isolated runtime", () => {
     }
   });
 
+  test("records an endpoint-policy 404 as an admission-fatal structural result", async () => {
+    const upstream = createServer(async (_req: IncomingMessage, res: ServerResponse) => {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "No endpoints satisfy the account data policy." } }));
+    });
+    const upstreamBase = await listen(upstream);
+    const proxy = await startScorerProxy(
+      fixture("clean-docs-only"),
+      "falseFinding",
+      upstreamBase,
+      "proxy-test-key",
+    );
+    try {
+      const response = await fetch(`${proxy.baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "unroutable/model", messages: [] }),
+      });
+      expect(response.status).toBe(404);
+      await response.text();
+      expect(proxy.attempts).toHaveLength(1);
+      expect(proxy.attempts[0]).toMatchObject({
+        outcome: "completed",
+        promptTokens: 0,
+        completionTokens: 0,
+        usageValid: false,
+      });
+      expect(isAdmissionFatalStructuralResult(result({
+        model: "unroutable/model",
+        scorerModel: null,
+        scorerError: "scorer provider unavailable",
+        usageAccountingComplete: false,
+        usageValid: proxy.attempts[0]!.usageValid,
+      }), "unroutable/model")).toBe(true);
+    } finally {
+      await proxy.close();
+      await close(upstream);
+    }
+  });
+
   test("kills child execution just beyond the admission latency bound", async () => {
     expect(SCORER_CASE_EXEC_TIMEOUT_MS).toBeGreaterThan(SCORER_MAX_CASE_MS);
     expect(SCORER_CASE_EXEC_TIMEOUT_MS - SCORER_MAX_CASE_MS).toBeLessThanOrEqual(1_000);
@@ -336,6 +378,7 @@ describe("scorer evaluation checkpoints", () => {
         status: "in_progress",
         completedCases: 1,
         totalCases: 2,
+        matrixComplete: false,
       });
       expect(first.cases).toHaveLength(1);
       expect(firstRaw).not.toContain("MODEL_BODY_MARKER");
@@ -343,7 +386,10 @@ describe("scorer evaluation checkpoints", () => {
       expect(firstRaw).not.toContain("UPSTREAM_RESPONSE_MARKER");
 
       await writeScorerEvalCheckpoint(jsonOut, ["scorer/model"], 1, 2, [sensitive, result({ id: "second" })]);
-      expect(JSON.parse(await readFile(partial, "utf8")).completedCases).toBe(2);
+      expect(JSON.parse(await readFile(partial, "utf8"))).toMatchObject({
+        completedCases: 2,
+        matrixComplete: true,
+      });
       expect((await readdir(root)).some((name) => name.includes(".tmp-"))).toBe(false);
 
       await finalizeScorerEvalReport(jsonOut, "{\"passed\":true}\n");
@@ -355,11 +401,89 @@ describe("scorer evaluation checkpoints", () => {
   });
 });
 
+describe("candidate matrix execution", () => {
+  test("classifies every zero-tolerance structural invariant independently of quality", () => {
+    const fatalCases = [
+      result({ timedOut: true }),
+      result({ envelopeProduced: false }),
+      result({ scorerError: "provider unavailable" }),
+      result({ scorerModel: "other/model" }),
+      result({ scorerConfidence: null }),
+      result({ scorerKind: null }),
+      result({ reasonContractValid: false }),
+      result({ usageAccountingComplete: false }),
+      result({ usageValid: false }),
+      result({ upstreamRequests: 2 }),
+    ];
+    expect(fatalCases.every((item) => isAdmissionFatalStructuralResult(item, "scorer/model"))).toBe(true);
+    expect(isAdmissionFatalStructuralResult(result({
+      passed: false,
+      reason: "ordinary quality miss",
+    }), "scorer/model")).toBe(false);
+  });
+
+  test("stops a structurally failed candidate while quality misses and later candidates continue", async () => {
+    const selected = selectEvalCases(fixtures).slice(0, 2);
+    const calls: string[] = [];
+    const checkpointCounts: number[] = [];
+    const results = await runScorerEvalMatrix(
+      ["unroutable/model", "quality/model"],
+      2,
+      selected,
+      async (model, repeat, selectedCase) => {
+        calls.push(`${model}:${repeat}:${selectedCase.case.id}`);
+        if (model === "unroutable/model") {
+          return result({
+            repeat,
+            id: selectedCase.case.id,
+            scenario: selectedCase.scenario,
+            model,
+            scorerModel: null,
+            scorerError: "scorer provider unavailable",
+            usageAccountingComplete: false,
+            usageValid: false,
+            passed: false,
+          });
+        }
+        return result({
+          repeat,
+          id: selectedCase.case.id,
+          scenario: selectedCase.scenario,
+          model,
+          scorerModel: model,
+          passed: false,
+          reason: "ordinary quality miss",
+        });
+      },
+      async (completed) => {
+        checkpointCounts.push(completed.length);
+      },
+    );
+
+    expect(calls.filter((call) => call.startsWith("unroutable/model:"))).toHaveLength(1);
+    expect(calls.filter((call) => call.startsWith("quality/model:"))).toHaveLength(4);
+    expect(results).toHaveLength(5);
+    expect(checkpointCounts).toEqual([1, 2, 3, 4, 5]);
+    expect(aggregate("unroutable/model", results.filter((item) => item.model === "unroutable/model"), 2))
+      .toMatchObject({
+        casesRun: 1,
+        expectedCases: 24,
+        matrixComplete: false,
+        structuredFailures: 1,
+        admissionFailures: expect.arrayContaining([
+          "incomplete matrix: got 1 true/0 false cases for 2 repeats",
+        ]),
+      });
+  });
+});
+
 describe("aggregate", () => {
   test("passes a complete repeated scorer matrix with strict calibration, latency, and cost", () => {
     const cases = qualificationCases(5);
     expect(aggregate("scorer/model", cases, 5)).toMatchObject({
       casesRun: 60,
+      expectedCases: 60,
+      matrixComplete: true,
       structuredFailures: 0,
       trueFindingHighConfidence: 30,
       trueFindingCases: 30,
@@ -472,12 +596,16 @@ describe("qualification utilities", () => {
       generatedAt: "2026-07-11T00:00:00.000Z",
       apiBase: "https://example.test/v1",
       repeats: 1,
+      completedCases: 12,
+      totalCases: 12,
+      matrixComplete: true,
       passed: models.length > 0 && models.every((model) => model.passed),
       models,
       cases: [],
     });
     expect(qualificationExitCode(report([passing]))).toBe(0);
     expect(qualificationExitCode(report([{ ...passing, passed: false }]))).toBe(1);
+    expect(qualificationExitCode({ ...report([passing]), completedCases: 1, matrixComplete: false })).toBe(1);
     expect(qualificationExitCode(report([]))).toBe(1);
   });
 });
@@ -488,11 +616,16 @@ describe("formatReport", () => {
       generatedAt: "2026-07-11T00:00:00.000Z",
       apiBase: "https://example.test/v1",
       repeats: 5,
+      completedCases: 2,
+      totalCases: 2,
+      matrixComplete: true,
       passed: true,
       models: [
         {
           id: "scorer/model",
           casesRun: 2,
+          expectedCases: 2,
+          matrixComplete: true,
           timedOutCases: 0,
           structuredFailures: 0,
           trueFindingHighConfidence: 1,
@@ -517,6 +650,7 @@ describe("formatReport", () => {
     const output = formatReport(report);
     expect(output).toContain("postil scorer qualification");
     expect(output).toContain("scorer/model");
+    expect(output).toContain("2/2");
     expect(output).toContain("1/1");
     expect(output).toContain("yes");
   });

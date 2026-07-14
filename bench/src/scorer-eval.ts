@@ -91,6 +91,8 @@ export interface ScorerEvalCase {
 export interface ScorerEvalAggregate {
   id: string;
   casesRun: number;
+  expectedCases: number;
+  matrixComplete: boolean;
   timedOutCases: number;
   structuredFailures: number;
   trueFindingHighConfidence: number;
@@ -113,6 +115,9 @@ export interface ScorerEvalReport {
   generatedAt: string;
   apiBase: string;
   repeats: number;
+  completedCases: number;
+  totalCases: number;
+  matrixComplete: boolean;
   passed: boolean;
   models: ScorerEvalAggregate[];
   cases: ScorerEvalCase[];
@@ -147,7 +152,13 @@ export interface ScorerEvalCheckpoint {
   models: string[];
   completedCases: number;
   totalCases: number;
+  matrixComplete: boolean;
   cases: Array<Omit<ScorerEvalCase, "name" | "reason" | "scorerError">>;
+}
+
+export interface SelectedScorerEvalCase {
+  case: BenchmarkCase;
+  scenario: Scenario;
 }
 
 function flagValue(args: string[], flag: string): string | undefined {
@@ -231,6 +242,7 @@ export async function writeScorerEvalCheckpoint(
     models: [...models],
     completedCases: results.length,
     totalCases,
+    matrixComplete: results.length === totalCases,
     cases: results.map(({ name: _name, reason: _reason, scorerError: _scorerError, ...result }) => result),
   };
   await atomicWriteFile(scorerCheckpointPath(jsonOut), `${JSON.stringify(checkpoint, null, 2)}\n`);
@@ -309,35 +321,30 @@ async function main() {
   const fixtures = fixtureInputs.map((input) => benchmarkCase.parse(input));
   const selected = selectEvalCases(fixtures);
 
-  const results: ScorerEvalCase[] = [];
   const totalCases = models.length * repeats * selected.length;
   if (jsonOut) {
-    await writeScorerEvalCheckpoint(jsonOut, models, repeats, totalCases, results);
+    await writeScorerEvalCheckpoint(jsonOut, models, repeats, totalCases, []);
     await rm(jsonOut, { force: true });
   }
-  for (const model of models) {
-    candidateCases:
-    for (let repeat = 1; repeat <= repeats; repeat += 1) {
-      for (const c of selected) {
-        const result = await runScorerEvalCase(
-          c.case,
-          c.scenario,
-          model,
-          repeat,
-          binary,
-          rootDir,
-          apiBase,
-          keyName,
-          pricing.get(model) ?? null,
-        );
-        results.push(result);
-        if (jsonOut) {
-          await writeScorerEvalCheckpoint(jsonOut, models, repeats, totalCases, results);
-        }
-        if (result.timedOut) break candidateCases;
-      }
-    }
-  }
+  const results = await runScorerEvalMatrix(
+    models,
+    repeats,
+    selected,
+    (model, repeat, c) => runScorerEvalCase(
+      c.case,
+      c.scenario,
+      model,
+      repeat,
+      binary,
+      rootDir,
+      apiBase,
+      keyName,
+      pricing.get(model) ?? null,
+    ),
+    jsonOut
+      ? (completed) => writeScorerEvalCheckpoint(jsonOut, models, repeats, totalCases, completed)
+      : undefined,
+  );
 
   const aggregates = models.map((model) =>
     aggregate(model, results.filter((result) => result.model === model), repeats),
@@ -346,7 +353,10 @@ async function main() {
     generatedAt: new Date().toISOString(),
     apiBase,
     repeats,
-    passed: aggregates.every((model) => model.passed),
+    completedCases: results.length,
+    totalCases,
+    matrixComplete: results.length === totalCases,
+    passed: results.length === totalCases && aggregates.every((model) => model.passed),
     models: aggregates,
     cases: results,
   };
@@ -358,11 +368,55 @@ async function main() {
   process.exitCode = qualificationExitCode(report);
 }
 
-export function selectEvalCases(fixtures: BenchmarkCase[]): Array<{ case: BenchmarkCase; scenario: Scenario }> {
+export function selectEvalCases(fixtures: BenchmarkCase[]): SelectedScorerEvalCase[] {
   return [
     ...TRUE_FINDING_CASES.map((id) => evalCase(fixtures, id, "trueFinding")),
     ...FALSE_FINDING_CASES.map((id) => evalCase(fixtures, id, "falseFinding")),
   ];
+}
+
+export function isAdmissionFatalStructuralResult(
+  result: ScorerEvalCase,
+  expectedModel: string,
+): boolean {
+  return (
+    result.timedOut ||
+    !result.envelopeProduced ||
+    result.scorerError !== null ||
+    result.scorerModel !== expectedModel ||
+    result.scorerConfidence === null ||
+    result.scorerKind === null ||
+    !result.reasonContractValid ||
+    result.usageAccountingComplete !== true ||
+    !result.usageValid ||
+    result.upstreamRequests !== 1
+  );
+}
+
+export async function runScorerEvalMatrix(
+  models: string[],
+  repeats: number,
+  selected: SelectedScorerEvalCase[],
+  runCase: (
+    model: string,
+    repeat: number,
+    selectedCase: SelectedScorerEvalCase,
+  ) => Promise<ScorerEvalCase>,
+  onResult?: (results: ScorerEvalCase[], result: ScorerEvalCase) => Promise<void>,
+): Promise<ScorerEvalCase[]> {
+  const results: ScorerEvalCase[] = [];
+  for (const model of models) {
+    candidateCases:
+    for (let repeat = 1; repeat <= repeats; repeat += 1) {
+      for (const selectedCase of selected) {
+        const result = await runCase(model, repeat, selectedCase);
+        results.push(result);
+        await onResult?.(results, result);
+        if (isAdmissionFatalStructuralResult(result, model)) break candidateCases;
+      }
+    }
+  }
+  return results;
 }
 
 function evalCase(
@@ -801,19 +855,7 @@ export function aggregate(
   repeats = DEFAULT_QUALIFICATION_REPEATS,
 ): ScorerEvalAggregate {
   const timedOutCases = cases.filter((c) => c.timedOut).length;
-  const structuredFailures = cases.filter(
-    (c) =>
-      c.timedOut ||
-      !c.envelopeProduced ||
-      c.scorerError !== null ||
-      c.scorerModel !== model ||
-      c.scorerConfidence === null ||
-      c.scorerKind === null ||
-      !c.reasonContractValid ||
-      c.usageAccountingComplete !== true ||
-      !c.usageValid ||
-      c.upstreamRequests !== 1,
-  ).length;
+  const structuredFailures = cases.filter((c) => isAdmissionFatalStructuralResult(c, model)).length;
   const trueCases = cases.filter((c) => c.scenario === "trueFinding");
   const falseCases = cases.filter((c) => c.scenario === "falseFinding");
   const trueConf = trueCases.map((c) => c.scorerConfidence).filter((v): v is number => v !== null);
@@ -833,6 +875,8 @@ export function aggregate(
   const meanCostUsd = mean(costs);
   const admissionFailures: string[] = [];
   const expectedPerScenario = repeats * TRUE_FINDING_CASES.length;
+  const expectedCases = repeats * (TRUE_FINDING_CASES.length + FALSE_FINDING_CASES.length);
+  const matrixComplete = cases.length === expectedCases;
   if (trueCases.length !== expectedPerScenario || falseCases.length !== repeats * FALSE_FINDING_CASES.length) {
     admissionFailures.push(
       `incomplete matrix: got ${trueCases.length} true/${falseCases.length} false cases for ${repeats} repeats`,
@@ -880,6 +924,8 @@ export function aggregate(
   return {
     id: model,
     casesRun: cases.length,
+    expectedCases,
+    matrixComplete,
     timedOutCases,
     structuredFailures,
     trueFindingHighConfidence,
@@ -904,12 +950,13 @@ export function formatReport(report: ScorerEvalReport): string {
     `postil scorer qualification (LIVE scorer, mocked generator, ${report.repeats} repeats)`,
     "",
   ];
-  lines.push("model                                  timeout  struct  true kept  false down  p50 ms  p95 ms  max ms   $/case    pass");
-  lines.push("--------------------------------------------------------------------------------------------------------------------");
+  lines.push("model                                  cases    timeout  struct  true kept  false down  p50 ms  p95 ms  max ms   $/case    pass");
+  lines.push("-----------------------------------------------------------------------------------------------------------------------------");
   for (const a of report.models) {
     lines.push(
       [
         pad(a.id, 38),
+        pad(`${a.casesRun}/${a.expectedCases}`, 8),
         pad(String(a.timedOutCases), 8),
         pad(String(a.structuredFailures), 7),
         pad(`${a.trueFindingHighConfidence}/${a.trueFindingCases}`, 10),
@@ -927,7 +974,9 @@ export function formatReport(report: ScorerEvalReport): string {
 }
 
 export function qualificationExitCode(report: ScorerEvalReport): number {
-  return report.passed && report.models.length > 0 ? 0 : 1;
+  return report.passed && report.matrixComplete && report.completedCases === report.totalCases && report.models.length > 0
+    ? 0
+    : 1;
 }
 
 export function percentile(values: number[], quantile: number): number {
