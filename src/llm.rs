@@ -1376,7 +1376,8 @@ impl LlmClient {
                                 let parse_added_usage = usage.prompt_tokens
                                     != usage_before_parse.prompt_tokens
                                     || usage.completion_tokens
-                                        != usage_before_parse.completion_tokens;
+                                        != usage_before_parse.completion_tokens
+                                    || usage.cost_micros != usage_before_parse.cost_micros;
                                 if !parse_added_usage && let Some(response_usage) = summary.usage {
                                     add_usage(usage, response_usage);
                                 }

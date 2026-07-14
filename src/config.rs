@@ -958,15 +958,17 @@ qualification_candidates = ["example/scorer"]
     }
 
     #[test]
-    fn readme_model_example_mentions_embedded_defaults() {
+    fn provider_guide_mentions_embedded_defaults() {
         let readme = include_str!("../README.md");
+        assert!(readme.contains("docs/model-providers.md"));
+        let provider_guide = include_str!("../docs/model-providers.md");
         let defaults = model_defaults();
-        assert!(readme.contains(&defaults.default_model));
+        assert!(provider_guide.contains(&defaults.default_model));
         for model in &defaults.cascade {
-            assert!(readme.contains(model));
+            assert!(provider_guide.contains(model));
         }
         for model in &defaults.scorer_qualification_candidates {
-            assert!(readme.contains(model));
+            assert!(provider_guide.contains(model));
         }
     }
 

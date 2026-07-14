@@ -704,6 +704,41 @@ async fn provider_response_body_above_hard_cap_fails_closed() {
 }
 
 #[tokio::test]
+async fn zero_token_failed_attempt_cost_is_recorded_once_per_call() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "cost": 0.001}
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".postil.yaml"),
+        "model:\n  name: one-model\n  cascade: []\n",
+    )
+    .unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .code(1);
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["modelUsage"].as_array().unwrap().len(), 1);
+    assert_eq!(envelope["modelUsage"][0]["costMicros"], 2_000);
+    assert_eq!(envelope["modelUsage"][0]["promptTokens"], 0);
+    assert_eq!(envelope["modelUsage"][0]["completionTokens"], 0);
+}
+
+#[tokio::test]
 async fn doctor_probes_native_anthropic_format() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -2979,7 +3014,7 @@ async fn cascade_falls_back_to_next_model() {
     assert_eq!(env["modelUsage"][0]["model"], "primary-model");
     assert_eq!(env["modelUsage"][0]["promptTokens"], 36);
     assert_model_usage_matches_aggregate(&env);
-    assert_eq!(env["usageAccountingComplete"], false);
+    assert_eq!(env["usageAccountingComplete"], true);
     let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
     assert!(stderr.contains("postil: attempting model: primary-model"));
     assert!(stderr.contains("postil: model primary-model returned retryable HTTP 500"));
