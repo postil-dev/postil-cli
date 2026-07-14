@@ -6,7 +6,7 @@
 //! with its new-file line number.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::RangeInclusive;
@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use memmap2::Mmap;
+use sha2::{Digest, Sha256};
 
 const MAX_LOCKFILE_DIRECTIONAL_CHANGES: usize = 256;
 const MAX_LOCKFILE_PACKAGE_RECORDS: usize = 100_000;
@@ -855,10 +856,7 @@ pub fn bounded_respond_context(
             chunks.len() < digests.len(),
             "interactive context synthesis did not reduce its bounded fan-in"
         );
-        digests = chunks
-            .iter()
-            .map(|chunk| recursive_semantic_digest(chunk))
-            .collect();
+        digests = chunks;
         level = level
             .checked_add(1)
             .context("interactive synthesis level overflowed")?;
@@ -895,20 +893,22 @@ pub fn spool_model_batches(
         for batch in plan.batches {
             let digest = semantic_digest(&batch);
             if !digest.is_empty() {
-                digest_ordinal = digest_ordinal
+                let next_ordinal = digest_ordinal
                     .checked_add(1)
                     .context("semantic digest ordinal overflowed")?;
-                let entry = format!("\nSource window {digest_ordinal}:\n{digest}");
+                let heading = format!("\nSource window {next_ordinal}:\n");
+                let digest_bound = max_batch_bytes
+                    .checked_sub(synthesis_header.len().saturating_add(heading.len()))
+                    .context("semantic synthesis header exceeded its bound")?;
+                let digest = compact_semantic_digest(digest, digest_bound)?;
+                let entry = format!("{heading}{digest}");
                 if cross_window.len().saturating_add(entry.len()) > max_batch_bytes {
                     if cross_window.len() > synthesis_header.len() {
                         synthesis_chunks.push(std::mem::take(&mut cross_window));
                     }
                     cross_window.push_str(synthesis_header);
                 }
-                anyhow::ensure!(
-                    cross_window.len().saturating_add(entry.len()) <= max_batch_bytes,
-                    "one semantic digest exceeded the synthesis bound"
-                );
+                digest_ordinal = next_ordinal;
                 cross_window.push_str(&entry);
             }
             write_length_prefixed(
@@ -1027,7 +1027,7 @@ pub fn spool_model_batches(
                     .checked_add(1)
                     .context("model batch count overflowed")?;
                 synthesis_ids.insert(count);
-                digests.push(recursive_semantic_digest(&chunk));
+                digests.push(chunk);
             }
             if chunk_count == 1 {
                 break;
@@ -1076,85 +1076,251 @@ fn pack_semantic_digests(
     max_batch_bytes: usize,
 ) -> Result<Vec<String>> {
     let header = format!("Cross-window semantic digests level {level}:\n");
-    let mut chunks = Vec::new();
-    let mut current = header.clone();
-    for (index, digest) in digests.iter().enumerate() {
+    let mut chunks = Vec::with_capacity(digests.len().div_ceil(2));
+    for (pair_index, pair) in digests.chunks(2).enumerate() {
+        let first_index = pair_index
+            .checked_mul(2)
+            .and_then(|index| index.checked_add(1))
+            .context("synthesis group ordinal overflowed")?;
+        let headings = (0..pair.len())
+            .map(|offset| format!("\nSynthesis group {}:\n", first_index + offset))
+            .collect::<Vec<_>>();
+        let heading_bytes = headings.iter().map(String::len).sum::<usize>();
+        let payload_bytes = max_batch_bytes
+            .checked_sub(header.len().saturating_add(heading_bytes))
+            .context("synthesis header exceeded its bound")?;
         anyhow::ensure!(
-            !digest.is_empty(),
-            "synthesis digest lost all semantic evidence"
+            payload_bytes >= pair.len(),
+            "semantic digest capacity too small for synthesis payload"
         );
-        let entry = format!("\nSynthesis group {}:\n{digest}", index + 1);
-        if current.len().saturating_add(entry.len()) > max_batch_bytes {
+
+        let mut chunk = header.clone();
+        let mut remaining = payload_bytes;
+        for (offset, digest) in pair.iter().enumerate() {
             anyhow::ensure!(
-                current.len() > header.len(),
-                "one synthesis digest exceeded its bound"
+                !digest.is_empty(),
+                "synthesis digest lost all semantic evidence"
             );
-            chunks.push(std::mem::replace(&mut current, header.clone()));
+            let remaining_items = pair.len() - offset;
+            let digest_bound = remaining / remaining_items;
+            let digest = compact_semantic_digest(digest.clone(), digest_bound)?;
+            remaining = remaining.saturating_sub(digest.len());
+            chunk.push_str(&headings[offset]);
+            chunk.push_str(&digest);
         }
         anyhow::ensure!(
-            current.len().saturating_add(entry.len()) <= max_batch_bytes,
-            "one synthesis digest exceeded its bound"
+            chunk.len() <= max_batch_bytes,
+            "synthesis packing exceeded its fixed bound"
         );
-        current.push_str(&entry);
-    }
-    if current.len() > header.len() {
-        chunks.push(current);
+        chunks.push(chunk);
     }
     Ok(chunks)
 }
 
-fn recursive_semantic_digest(batch: &str) -> String {
-    type Evidence = (String, String);
-    type EvidenceBoundary = (Evidence, Evidence);
+#[derive(Clone, Copy)]
+struct SemanticEvidence<'a> {
+    source_ordinal: Option<usize>,
+    path: &'a str,
+    category: &'static str,
+    evidence: &'a str,
+}
 
-    let digest = semantic_digest(batch);
-    let mut path = String::new();
-    let mut category = String::new();
-    let mut priority: BTreeMap<String, EvidenceBoundary> = BTreeMap::new();
-    let mut fallback: Option<EvidenceBoundary> = None;
+const SEMANTIC_CATEGORIES: [(&str, &[&str]); 6] = [
+    (
+        "sinks",
+        &[
+            "sink", "exec", "query", "write", "send", "delete", "unsafe", "eval",
+        ],
+    ),
+    (
+        "validation",
+        &["validate", "sanitize", "authoriz", "check", "guard"],
+    ),
+    (
+        "sources",
+        &["input", "request", "user", "read", "recv", "source"],
+    ),
+    (
+        "contracts",
+        &["fn ", "def ", "class ", "interface ", "type ", "pub "],
+    ),
+    (
+        "lifecycle",
+        &[
+            "create", "close", "drop", "start", "stop", "retry", "commit", "rollback",
+        ],
+    ),
+    (
+        "dependencies",
+        &["import", "require", "package", "dependency", " use "],
+    ),
+];
+
+fn compact_semantic_digest(digest: String, max_bytes: usize) -> Result<String> {
+    if digest.len() <= max_bytes {
+        return Ok(digest);
+    }
+    let records = parse_semantic_evidence(&digest);
+    anyhow::ensure!(
+        !records.is_empty(),
+        "semantic digest contained no bounded evidence records"
+    );
+
+    let mut selected = BTreeSet::from([0, records.len() - 1]);
+    for (category, _) in SEMANTIC_CATEGORIES {
+        if let Some(index) = records
+            .iter()
+            .position(|record| record.category == category)
+        {
+            selected.insert(index);
+        }
+    }
+    let selected = selected
+        .into_iter()
+        .map(|index| records[index])
+        .collect::<Vec<_>>();
+    render_semantic_evidence(&selected, max_bytes)
+}
+
+fn parse_semantic_evidence(digest: &str) -> Vec<SemanticEvidence<'_>> {
+    let mut source_ordinal = None;
+    let mut path = "";
+    let mut category = "uncategorized";
+    let mut records = Vec::new();
     for line in digest.lines() {
-        if let Some(value) = line.strip_prefix("### ") {
-            path = value.to_string();
+        if let Some(ordinal) = line
+            .trim()
+            .strip_prefix("Source window ")
+            .and_then(|value| value.strip_suffix(':'))
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            source_ordinal = Some(ordinal);
+        } else if let Some(value) = line.strip_prefix("### ") {
+            path = value;
+            category = "uncategorized";
         } else if let Some(value) = line
             .strip_prefix("@@ semantic category=")
             .and_then(|value| value.strip_suffix(" @@"))
         {
-            category = value.to_string();
+            category = SEMANTIC_CATEGORIES
+                .iter()
+                .map(|(candidate, _)| *candidate)
+                .find(|candidate| *candidate == value)
+                .unwrap_or("uncategorized");
         } else if line
             .trim_start()
             .split_once(' ')
             .is_some_and(|(number, _)| number.parse::<u32>().is_ok())
         {
-            let evidence = (path.clone(), line.to_string());
-            fallback
-                .get_or_insert_with(|| (evidence.clone(), evidence.clone()))
-                .1 = evidence.clone();
-            if category != "uncategorized" {
-                priority
-                    .entry(category.clone())
-                    .and_modify(|entry| entry.1 = evidence.clone())
-                    .or_insert_with(|| (evidence.clone(), evidence));
+            records.push(SemanticEvidence {
+                source_ordinal,
+                path,
+                category,
+                evidence: line,
+            });
+        }
+    }
+    records
+}
+
+fn render_semantic_evidence(records: &[SemanticEvidence<'_>], max_bytes: usize) -> Result<String> {
+    const MIN_PATH_BYTES: usize = 48;
+    const MAX_PATH_BYTES: usize = 240;
+    const MIN_EVIDENCE_BYTES: usize = 80;
+    const MAX_EVIDENCE_BYTES: usize = 480;
+
+    let mut fixed_bytes = 0usize;
+    let mut previous_ordinal = None;
+    for record in records {
+        if record.source_ordinal != previous_ordinal {
+            if let Some(ordinal) = record.source_ordinal {
+                fixed_bytes = fixed_bytes
+                    .checked_add(format!("Source window {ordinal}:\n").len())
+                    .context("semantic source heading size overflowed")?;
             }
+            previous_ordinal = record.source_ordinal;
         }
+        fixed_bytes = fixed_bytes
+            .checked_add("### \n@@ semantic category= @@\n\n".len())
+            .and_then(|bytes| bytes.checked_add(record.category.len()))
+            .context("semantic record size overflowed")?;
     }
-    let mut selected = priority.into_iter().collect::<Vec<_>>();
-    if let Some(pair) = fallback {
-        selected.push(("boundary".to_string(), pair));
+
+    let minimum_bytes = records.iter().try_fold(fixed_bytes, |total, record| {
+        total
+            .checked_add(record.path.len().min(MIN_PATH_BYTES))
+            .and_then(|bytes| bytes.checked_add(record.evidence.len().min(MIN_EVIDENCE_BYTES)))
+            .context("semantic evidence size overflowed")
+    })?;
+    anyhow::ensure!(
+        minimum_bytes <= max_bytes,
+        "semantic digest capacity too small for boundary and high-signal evidence"
+    );
+
+    let mut remaining = max_bytes - minimum_bytes;
+    let mut remaining_fields = records.len().saturating_mul(2);
+    let mut capacities = Vec::with_capacity(records.len());
+    for record in records {
+        let path_minimum = record.path.len().min(MIN_PATH_BYTES);
+        let path_desired = record.path.len().min(MAX_PATH_BYTES);
+        let path_extra = (path_desired - path_minimum).min(remaining / remaining_fields.max(1));
+        let path_capacity = path_minimum + path_extra;
+        remaining -= path_extra;
+        remaining_fields -= 1;
+
+        let evidence_minimum = record.evidence.len().min(MIN_EVIDENCE_BYTES);
+        let evidence_desired = record.evidence.len().min(MAX_EVIDENCE_BYTES);
+        let evidence_extra =
+            (evidence_desired - evidence_minimum).min(remaining / remaining_fields.max(1));
+        let evidence_capacity = evidence_minimum + evidence_extra;
+        remaining -= evidence_extra;
+        remaining_fields -= 1;
+        capacities.push((path_capacity, evidence_capacity));
     }
-    let mut retained = String::new();
-    for (category, (first, last)) in selected {
-        retained.push_str(&format!(
-            "### {}\n@@ semantic category={category} @@\n{}\n",
-            first.0, first.1
+
+    let mut rendered = String::with_capacity(max_bytes.min(16 * 1024));
+    previous_ordinal = None;
+    for (record, (path_capacity, evidence_capacity)) in records.iter().zip(capacities) {
+        if record.source_ordinal != previous_ordinal {
+            if let Some(ordinal) = record.source_ordinal {
+                rendered.push_str(&format!("Source window {ordinal}:\n"));
+            }
+            previous_ordinal = record.source_ordinal;
+        }
+        let path = bound_utf8_identity(record.path, path_capacity)?;
+        let evidence = bound_utf8_identity(record.evidence, evidence_capacity)?;
+        rendered.push_str(&format!(
+            "### {path}\n@@ semantic category={} @@\n{evidence}\n",
+            record.category
         ));
-        if last != first {
-            retained.push_str(&format!(
-                "### {}\n@@ semantic category={category} @@\n{}\n",
-                last.0, last.1
-            ));
-        }
     }
-    retained
+    anyhow::ensure!(
+        rendered.len() <= max_bytes,
+        "semantic digest rendering exceeded its fixed bound"
+    );
+    Ok(rendered)
+}
+
+fn bound_utf8_identity(value: &str, max_bytes: usize) -> Result<String> {
+    if value.len() <= max_bytes {
+        return Ok(value.to_string());
+    }
+    let digest = Sha256::digest(value.as_bytes());
+    let identity = digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let suffix = format!("…#{identity}");
+    anyhow::ensure!(
+        max_bytes >= suffix.len(),
+        "semantic digest capacity too small for stable evidence identity"
+    );
+    let prefix_bytes = max_bytes - suffix.len();
+    let mut split = prefix_bytes.min(value.len());
+    while !value.is_char_boundary(split) {
+        split -= 1;
+    }
+    Ok(format!("{}{suffix}", &value[..split]))
 }
 
 fn write_length_prefixed(
@@ -2692,44 +2858,24 @@ fn build_synthesis(manifest: &str, batches: &[String], max_bytes: usize) -> Opti
     Some(synthesis)
 }
 
+fn semantic_category_matches(content: &str) -> [bool; SEMANTIC_CATEGORIES.len()] {
+    let lower = content.to_ascii_lowercase();
+    std::array::from_fn(|index| {
+        SEMANTIC_CATEGORIES[index]
+            .1
+            .iter()
+            .any(|marker| lower.contains(marker))
+    })
+}
+
 fn semantic_digest(batch: &str) -> String {
-    const CATEGORIES: [(&str, &[&str]); 6] = [
-        (
-            "contracts",
-            &["fn ", "def ", "class ", "interface ", "type ", "pub "],
-        ),
-        (
-            "sources",
-            &["input", "request", "user", "read", "recv", "source"],
-        ),
-        (
-            "sinks",
-            &[
-                "sink", "exec", "query", "write", "send", "delete", "unsafe", "eval",
-            ],
-        ),
-        (
-            "validation",
-            &["validate", "sanitize", "authoriz", "check", "guard"],
-        ),
-        (
-            "lifecycle",
-            &[
-                "create", "close", "drop", "start", "stop", "retry", "commit", "rollback",
-            ],
-        ),
-        (
-            "dependencies",
-            &["import", "require", "package", "dependency", " use "],
-        ),
-    ];
     struct Region {
         path: String,
         label: String,
         categories: Vec<Option<String>>,
         fallback: Option<String>,
         last: Option<String>,
-        lines: Vec<String>,
+        lines: Vec<(String, &'static str)>,
         lines_overflowed: bool,
     }
 
@@ -2759,7 +2905,7 @@ fn semantic_digest(batch: &str) -> String {
                 current_region = Some(Region {
                     path: path.clone(),
                     label: label.trim_end_matches(" @@").to_string(),
-                    categories: vec![None; CATEGORIES.len()],
+                    categories: vec![None; SEMANTIC_CATEGORIES.len()],
                     fallback: None,
                     last: None,
                     lines: Vec::new(),
@@ -2781,7 +2927,7 @@ fn semantic_digest(batch: &str) -> String {
         let region = current_region.get_or_insert_with(|| Region {
             path: path.clone(),
             label: "source region".to_string(),
-            categories: vec![None; CATEGORIES.len()],
+            categories: vec![None; SEMANTIC_CATEGORIES.len()],
             fallback: None,
             last: None,
             lines: Vec::new(),
@@ -2790,16 +2936,19 @@ fn semantic_digest(batch: &str) -> String {
         let bounded: String = rendered.chars().take(360).collect();
         region.fallback.get_or_insert_with(|| bounded.clone());
         region.last = Some(bounded.clone());
+        let category_matches = semantic_category_matches(content);
+        let primary_category = category_matches
+            .iter()
+            .position(|matched| *matched)
+            .map(|index| SEMANTIC_CATEGORIES[index].0)
+            .unwrap_or("complete-small-region");
         if region.lines.len() < 8 {
-            region.lines.push(bounded.clone());
+            region.lines.push((bounded.clone(), primary_category));
         } else {
             region.lines_overflowed = true;
         }
-        let lower = content.to_ascii_lowercase();
-        for (category_index, (_, markers)) in CATEGORIES.iter().enumerate() {
-            if region.categories[category_index].is_none()
-                && markers.iter().any(|marker| lower.contains(marker))
-            {
+        for (category_index, matched) in category_matches.into_iter().enumerate() {
+            if region.categories[category_index].is_none() && matched {
                 region.categories[category_index] = Some(bounded.clone());
             }
         }
@@ -2814,16 +2963,14 @@ fn semantic_digest(batch: &str) -> String {
         ));
         let mut emitted = BTreeSet::new();
         if !region.lines_overflowed {
-            for rendered in region.lines {
+            for (rendered, category) in region.lines {
                 if emitted.insert(rendered.clone()) {
-                    out.push_str(&format!(
-                        "@@ semantic category=complete-small-region @@\n{rendered}\n"
-                    ));
+                    out.push_str(&format!("@@ semantic category={category} @@\n{rendered}\n"));
                 }
             }
             continue;
         }
-        for ((category, _), rendered) in CATEGORIES.iter().zip(region.categories) {
+        for ((category, _), rendered) in SEMANTIC_CATEGORIES.iter().zip(region.categories) {
             if let Some(rendered) = rendered
                 && emitted.insert(rendered.clone())
             {
@@ -3246,15 +3393,117 @@ Binary files a/img.png and b/img.png differ
         let mut level = pack_semantic_digests(&digests, 1, 24_000).unwrap();
         while level.len() > 1 {
             let previous = level.len();
-            let next_digests = level
-                .iter()
-                .map(|chunk| recursive_semantic_digest(chunk))
-                .collect::<Vec<_>>();
-            level = pack_semantic_digests(&next_digests, 2, 24_000).unwrap();
+            level = pack_semantic_digests(&level, 2, 24_000).unwrap();
             assert!(level.len() < previous);
         }
         assert!(level[0].contains("validate_pair(input)"));
         assert!(level[0].contains("dangerous_sink(original)"));
+    }
+
+    #[test]
+    fn semantic_compaction_retains_middle_high_signal_evidence() {
+        let digest = format!(
+            "### src/first.rs\n@@ semantic category=uncategorized @@\n1 + FIRST_BOUNDARY {}\n\
+             ### src/risk.rs\n@@ semantic category=sinks @@\n2 + MIDDLE_SINK dangerous_sink(input) {}\n\
+             ### src/last.rs\n@@ semantic category=uncategorized @@\n3 + LAST_BOUNDARY {}\n",
+            "a".repeat(1_500),
+            "b".repeat(1_500),
+            "c".repeat(1_500)
+        );
+        let compacted = compact_semantic_digest(digest, 1_200).unwrap();
+        assert!(compacted.len() <= 1_200);
+        assert!(compacted.contains("FIRST_BOUNDARY"));
+        assert!(compacted.contains("MIDDLE_SINK dangerous_sink(input)"));
+        assert!(compacted.contains("LAST_BOUNDARY"));
+        assert!(compacted.contains("semantic category=sinks"));
+    }
+
+    #[test]
+    fn semantic_compaction_bounds_long_unicode_identity_by_utf8_bytes() {
+        let path = format!("src/{}.rs", "界".repeat(2_000));
+        let evidence = format!("7 + dangerous_sink({})", "🧪".repeat(2_000));
+        let digest = format!("### {path}\n@@ semantic category=sinks @@\n{evidence}\n");
+        let compacted = compact_semantic_digest(digest, 4_096).unwrap();
+        assert!(compacted.len() <= 4_096);
+        assert!(compacted.contains("semantic category=sinks"));
+        assert!(compacted.matches("…#").count() >= 2);
+        assert!(compacted.is_char_boundary(compacted.len()));
+    }
+
+    #[test]
+    fn truncated_sha256_identities_distinguish_long_shared_prefixes() {
+        let shared = "same-prefix-".repeat(400);
+        let first = bound_utf8_identity(&format!("{shared}first"), 64).unwrap();
+        let second = bound_utf8_identity(&format!("{shared}second"), 64).unwrap();
+        assert_eq!(first.len(), 64);
+        assert_eq!(second.len(), 64);
+        assert_ne!(first, second);
+        assert!(first.starts_with("same-prefix-"));
+        assert!(second.starts_with("same-prefix-"));
+    }
+
+    #[test]
+    fn semantic_compaction_obeys_exact_and_one_byte_over_capacity() {
+        let digest = format!(
+            "### src/exact.rs\n@@ semantic category=validation @@\n9 + validate(input); {}\n",
+            "x".repeat(1_000)
+        );
+        let exact = digest.len();
+        assert_eq!(
+            compact_semantic_digest(digest.clone(), exact).unwrap(),
+            digest
+        );
+        let compacted = compact_semantic_digest(digest, exact - 1).unwrap();
+        assert!(compacted.len() < exact);
+        assert!(compacted.contains("validate(input)"));
+    }
+
+    #[test]
+    fn semantic_compaction_rejects_deterministically_too_small_capacity() {
+        let digest = format!(
+            "### src/tiny.rs\n@@ semantic category=sinks @@\n1 + dangerous_sink(input); {}\n",
+            "x".repeat(1_000)
+        );
+        let error = compact_semantic_digest(digest, 32).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("capacity too small for boundary and high-signal evidence")
+        );
+    }
+
+    #[test]
+    fn semantic_digest_packing_halves_two_near_half_bound_inputs() {
+        let digests = ["first", "second"]
+            .map(|path| {
+                format!(
+                    "### src/{path}.rs\n@@ semantic category=contracts @@\n1 + fn {path}() {{}} // {}\n",
+                    "x".repeat(2_400)
+                )
+            })
+            .to_vec();
+        let packed = pack_semantic_digests(&digests, 1, 4_096).unwrap();
+        assert_eq!(packed.len(), 1);
+        assert!(packed[0].len() <= 4_096);
+        assert!(packed[0].contains("src/first.rs"));
+        assert!(packed[0].contains("src/second.rs"));
+    }
+
+    #[test]
+    fn semantic_compaction_retains_sequential_source_window_ordinals() {
+        let digest = format!(
+            "Source window 1:\n### src/one.rs\n@@ semantic category=uncategorized @@\n1 + FIRST {}\n\
+             Source window 2:\n### src/two.rs\n@@ semantic category=sinks @@\n2 + dangerous_sink(input) {}\n\
+             Source window 3:\n### src/three.rs\n@@ semantic category=uncategorized @@\n3 + LAST {}\n",
+            "a".repeat(1_000),
+            "b".repeat(1_000),
+            "c".repeat(1_000)
+        );
+        let compacted = compact_semantic_digest(digest, 1_200).unwrap();
+        let first = compacted.find("Source window 1:").unwrap();
+        let second = compacted.find("Source window 2:").unwrap();
+        let third = compacted.find("Source window 3:").unwrap();
+        assert!(first < second && second < third);
     }
 
     #[test]
@@ -3535,5 +3784,77 @@ diff --git a/two.rs b/two.rs
                 .iter()
                 .any(|batch| batch.contains("Cross-window semantic digests"))
         );
+    }
+
+    #[test]
+    fn oversized_semantic_digest_compacts_before_spooling() {
+        use std::fmt::Write as _;
+
+        let mut source = String::new();
+        for file in 1..=400 {
+            writeln!(
+                source,
+                "diff --git a/src/tiny_{file}.rs b/src/tiny_{file}.rs\n--- a/src/tiny_{file}.rs\n+++ b/src/tiny_{file}.rs\n@@ -0,0 +1 @@\n+fn changed_{file}(input: &str) {{ validate(input); write(input); }}"
+            )
+            .unwrap();
+        }
+        let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+        let mut prepared = prepare_review(&snapshot).unwrap();
+        let mut batches = spool_model_batches(&mut prepared, 4_096, 1_024, false).unwrap();
+        let mut saw_synthesis = false;
+        while let Some(batch) = batches.next_batch().unwrap() {
+            assert!(batch.len() <= 4_096);
+            saw_synthesis |= batch.contains("Cross-window semantic digests");
+        }
+        assert!(saw_synthesis);
+    }
+
+    #[test]
+    fn multilevel_spool_retains_sole_middle_sink_from_tiny_region() {
+        use std::fmt::Write as _;
+
+        let mut source = String::new();
+        for file in 1..=1_440 {
+            let change = if file == 720 {
+                "dangerous_sink(untrusted_input);".to_string()
+            } else {
+                format!("let ordinary_{file} = constant;")
+            };
+            writeln!(
+                source,
+                "diff --git a/src/tiny_{file}.rs b/src/tiny_{file}.rs\n--- a/src/tiny_{file}.rs\n+++ b/src/tiny_{file}.rs\n@@ -0,0 +1 @@\n+{change}"
+            )
+            .unwrap();
+        }
+        let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+        let mut prepared = prepare_review(&snapshot).unwrap();
+        let mut batches = spool_model_batches(&mut prepared, 4_096, 1_024, false).unwrap();
+        let source_count = batches.source_count;
+        let total_count = batches.count;
+        let mut recursive_levels = BTreeSet::new();
+        let mut final_level = 0usize;
+        let mut final_synthesis = String::new();
+        while let Some(batch) = batches.next_batch().unwrap() {
+            assert!(batch.len() <= 4_096);
+            if let Some(level) = batch
+                .lines()
+                .next()
+                .and_then(|line| line.strip_prefix("Cross-window semantic digests level "))
+                .and_then(|value| value.strip_suffix(':'))
+                .and_then(|value| value.parse::<usize>().ok())
+            {
+                recursive_levels.insert(level);
+                if level >= final_level {
+                    final_level = level;
+                    final_synthesis = batch;
+                }
+            }
+        }
+        assert!(
+            recursive_levels.len() >= 2,
+            "test did not exercise multiple levels: recursive={recursive_levels:?}, source={source_count}, total={total_count}"
+        );
+        assert!(final_synthesis.contains("dangerous_sink(untrusted_input)"));
+        assert!(final_synthesis.contains("semantic category=sinks"));
     }
 }
