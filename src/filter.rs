@@ -190,10 +190,11 @@ pub fn reconcile(
     let mut resolved = Vec::new();
     let mut carried = Vec::new();
     for f in baseline {
-        // Reserved virtual findings (fail-closed, provider, PR description,
-        // truncation) never carry
-        // forward; each run re-earns trust and re-detects its own limits.
-        if crate::envelope::is_reserved_anchor(&f.path) {
+        // Operational virtual findings never carry forward; each run re-earns
+        // trust and re-detects its own limits. Reviewable PR-description and
+        // change-metadata findings remain durable until a full review clears
+        // them or a fresh finding supersedes them.
+        if crate::envelope::is_ephemeral_anchor(&f.path) {
             continue;
         }
         let superseded = new_findings.iter().any(|n| supersedes(f, n));
@@ -420,6 +421,27 @@ mod tests {
         assert!(rec.carried[0].body.starts_with("[carried"));
         assert_eq!(rec.carried[1].path, ".postil/content-policy.md");
         assert!(rec.carried[1].body.starts_with("[carried"));
+    }
+
+    #[test]
+    fn reviewable_virtual_anchors_carry_but_operational_anchors_expire() {
+        let idx = index_for("unrelated.rs", 1, 1);
+        let baseline = vec![
+            f(
+                crate::envelope::CHANGE_METADATA_PATH,
+                1,
+                Severity::Error,
+                0.9,
+            ),
+            f(crate::envelope::PR_DESCRIPTION_PATH, 1, Severity::Warn, 0.8),
+            f(crate::envelope::OPERATIONAL_PATH, 1, Severity::Error, 1.0),
+            f(crate::envelope::PROVIDER_PATH, 1, Severity::Error, 1.0),
+        ];
+        let rec = reconcile(&baseline, &idx, &[], ReconcileScope::Incremental);
+        assert!(rec.resolved.is_empty());
+        assert_eq!(rec.carried.len(), 2);
+        assert_eq!(rec.carried[0].path, crate::envelope::CHANGE_METADATA_PATH);
+        assert_eq!(rec.carried[1].path, crate::envelope::PR_DESCRIPTION_PATH);
     }
 
     #[test]

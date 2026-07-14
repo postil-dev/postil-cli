@@ -7,7 +7,7 @@ contract shared with postil-dev/postil (hosted worker) and `postil plan`.
 ## Pipeline
 
 ```
-acquire diff --> compact exact lockfiles --> parse + index --> bounded evidence batches
+acquire diff --> parse supported lockfiles --> parse + index --> bounded evidence batches
                                                                     |
    envelope <-- gate <-- reconcile <-- filter + aggregate <-- model + final synthesis
                                                                (cascade/consensus)
@@ -19,12 +19,15 @@ acquire diff --> compact exact lockfiles --> parse + index --> bounded evidence 
 
 - `diff.rs`: unified-diff parser, `DiffIndex` (which (path, line) pairs exist on the
   new side), and annotated evidence whose margin line numbers are the only numbers
-  the model is allowed to cite. Exact known lockfiles become bounded dependency
-  metadata. Every other path remains untrusted reviewable source, including generated,
+  the model is allowed to cite. Supported known lockfiles become bounded,
+  format-specific added-package-version and removed-package-version metadata;
+  malformed, unsupported, or over-budget lockfile sections fail closed. Every other
+  path remains untrusted reviewable source, including generated,
   distribution, vendor, snapshot, and dependency-directory names. Source evidence
   splits at file and hunk boundaries with overlap, repeats a bounded changed-file
   manifest, segments oversized lines without hiding the tail, and records deletion,
-  binary, rename, and mode evidence under `.postil/change-metadata`.
+  binary, rename, mode, and dependency evidence under `.postil/change-metadata`.
+  Git C-quoted paths are decoded before classification and grounding.
 - `filter.rs`: grounding (uncited findings dropped; all-uncited = untrusted run),
   policy suppression (ignore globs, severityThreshold, minConfidence, maxFindings),
   structured retention of suppressed grounded findings, and
@@ -36,9 +39,11 @@ acquire diff --> compact exact lockfiles --> parse + index --> bounded evidence 
   and response decoding vary by API format while retry, timeout, deadline, cascade, and
   secret-redaction semantics remain shared. Optional private-endpoint authentication is
   a separate header whose name cannot collide with provider-managed headers.
-- `review.rs`: orchestration; enforces raw-source, batch, request, projected-input,
-  and token budgets before provider calls; runs every evidence batch plus one bounded
-  cross-batch synthesis; aggregates findings before grounding and scoring; owns
+- `review.rs`: orchestration; enforces acquisition, batch, request, projected-input
+  byte, and projected-input token budgets before provider calls; runs every evidence
+  batch plus one bounded cross-batch synthesis built from deterministic heuristic
+  semantic categories (contracts, sources, sinks, validation, lifecycle, and
+  dependencies); aggregates findings before grounding and scoring; owns
   fail-closed semantics (`fail_closed_finding`); and owns
   check-run lifecycle ordering (checks are created before the model runs so a crash can
   still be reported against them). It persists safe structured model incidents for
@@ -98,6 +103,16 @@ additions (violations are `kind: contentPolicy`). Content policy is on by defaul
    emits the generic internal `Review incomplete` operational finding before any model
    call, preserves the hosted global deadline, and keeps full-review reconciliation
    untrustworthy.
+10. Diff acquisition stops before buffering more than the aggregate raw-input cap for
+    local files, Git stdout, remote response streams, and reconstructed forge diffs.
+    This cap includes lockfile-only changes.
+11. Projected-input token accounting is an input-planning guard, not a total provider
+    spend bound. Model output, cascade, consensus, and retry usage remain bounded by
+    model transport limits, request deadlines, and the hosted global deadline and are
+    recorded from provider receipts.
+12. Operational and provider virtual anchors expire after each run. Reviewable
+    PR-description and change-metadata anchors carry across unrelated incremental
+    reviews, and a same-head rerun with either anchor falls back to a full review.
 
 ## Residual prompt-injection surface
 

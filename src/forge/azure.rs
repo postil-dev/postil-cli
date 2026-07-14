@@ -133,8 +133,7 @@ impl Azure {
         if status.is_success() {
             return Ok(resp);
         }
-        let body = resp.text().await.unwrap_or_default();
-        let snippet: String = body.chars().take(300).collect();
+        let snippet = super::bounded_error_snippet(resp).await;
         Err(anyhow!("Azure DevOps {what} failed: {status}: {snippet}"))
     }
 
@@ -166,7 +165,22 @@ impl Azure {
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(String::new());
         }
-        Ok(Self::check_ok(resp, "item fetch").await?.text().await?)
+        let response = Self::check_ok(resp, "item fetch").await?;
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_FILE_BYTES as u64)
+        {
+            return Err(anyhow!(
+                "Azure item {path} exceeds the {MAX_FILE_BYTES} byte limit"
+            ));
+        }
+        let text = super::bounded_response_text(response, "Azure item content").await?;
+        if text.len() > MAX_FILE_BYTES {
+            return Err(anyhow!(
+                "Azure item {path} exceeds the {MAX_FILE_BYTES} byte limit"
+            ));
+        }
+        Ok(text)
     }
 
     /// The full change list across pages. `/diffs/commits` pages `changes`
@@ -240,7 +254,14 @@ impl Azure {
             if old == new {
                 continue;
             }
-            out.push_str(&diff_section(path, &old, &new, is_add, is_delete));
+            let section = diff_section(path, &old, &new, is_add, is_delete);
+            if out.len().saturating_add(section.len()) > crate::diff::MAX_RAW_DIFF_INPUT_BYTES {
+                return Err(anyhow!(
+                    "Azure reconstructed diff exceeds the {} byte acquisition limit",
+                    crate::diff::MAX_RAW_DIFF_INPUT_BYTES
+                ));
+            }
+            out.push_str(&section);
         }
         Ok(out)
     }

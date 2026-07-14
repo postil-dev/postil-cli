@@ -22,7 +22,6 @@ use std::collections::HashMap;
 /// Each model request and the aggregate review stay bounded. Exhausting any
 /// limit produces an internal fail-closed result rather than a partial pass.
 const MAX_REVIEW_BATCH_BYTES: usize = 120_000;
-const MAX_RAW_REVIEW_SOURCE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SOURCE_BATCHES: usize = 8;
 const MAX_REVIEW_REQUESTS: usize = MAX_SOURCE_BATCHES + 1;
 const MAX_REVIEW_PROJECTED_INPUT_BYTES: usize = 1_100_000;
@@ -375,7 +374,7 @@ async fn remote_review<F: Forge>(
     let baseline = load_baseline(args)?;
     let has_carryable_baseline = baseline
         .iter()
-        .any(|f| !crate::envelope::is_reserved_anchor(&f.path));
+        .any(|f| !crate::envelope::is_ephemeral_anchor(&f.path));
     let incremental = args.since_sha.as_deref();
     let (diff_text, scope, force_model) = match incremental {
         Some(since) if since != head_sha => run_with_hosted_budget(
@@ -620,7 +619,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
         llm_budget_started_at,
     } = input;
     let review_started = std::time::Instant::now();
-    let prepared = diff::prepare_diff(diff_text, MAX_RAW_REVIEW_SOURCE_BYTES);
+    let prepared = diff::prepare_diff(diff_text, diff::MAX_RAW_DIFF_INPUT_BYTES);
     let parsed = diff::parse(prepared.source.as_deref().unwrap_or_default());
     let mut index = DiffIndex::build(&parsed);
     let incremental = matches!(scope, filter::ReconcileScope::Incremental);
@@ -758,7 +757,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                 let mut user = prompt::user_prompt(&ctx, annotated, cfg.max_findings);
                 if synthesis {
                     user.push_str(
-                        "\n\nThis is the final bounded synthesis request. Look only for merge-relevant relationships across the supplied batch excerpts. Do not repeat a batch-local finding unless the cross-batch relationship materially changes its impact.",
+                        "\n\nThis is the final bounded synthesis request. Look only for merge-relevant relationships across the structured semantic digests. Every digest entry retains its exact groundable path and line. Do not repeat a batch-local finding unless the cross-batch relationship materially changes its impact.",
                     );
                 } else if plan.batches.len() > 1 {
                     user.push_str(&format!(
@@ -1111,15 +1110,16 @@ fn hosted_worker_remaining(started_at: Instant) -> Option<Duration> {
 }
 
 fn visible_finding_sets_equal(previous: &[Finding], current: &[Finding]) -> bool {
-    // Reserved findings represent this run's virtual review state and must
-    // stay visible even if an earlier run produced the same marker.
+    // Operational findings represent this run's health and must stay visible
+    // even if an earlier run produced the same marker. Reviewable virtual
+    // anchors participate in ordinary duplicate suppression.
     if previous.is_empty()
         || current.is_empty()
         || previous.len() != current.len()
         || previous
             .iter()
             .chain(current)
-            .any(|f| crate::envelope::is_reserved_anchor(&f.path))
+            .any(|f| crate::envelope::is_ephemeral_anchor(&f.path))
     {
         return false;
     }
@@ -1363,6 +1363,9 @@ mod tests {
             &[crate::envelope::provider_error_finding("old")],
             &[crate::envelope::provider_error_finding("old")]
         ));
+        let metadata = finding(crate::envelope::CHANGE_METADATA_PATH, 1, "dependency risk");
+        let metadata_slice = std::slice::from_ref(&metadata);
+        assert!(visible_finding_sets_equal(metadata_slice, metadata_slice));
     }
 
     fn score(index: usize, confidence: f64, kind: Kind) -> FindingScore {

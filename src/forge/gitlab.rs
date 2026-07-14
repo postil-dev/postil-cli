@@ -3,7 +3,7 @@
 //! Check semantics map to commit statuses: GitLab has no `neutral`, so an
 //! operational error marks both statuses `failed` — fail closed, never grey.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -42,6 +42,10 @@ struct FileDiffItem {
     new_file: bool,
     #[serde(default)]
     deleted_file: bool,
+    #[serde(default)]
+    collapsed: bool,
+    #[serde(default)]
+    too_large: bool,
 }
 
 #[derive(Deserialize)]
@@ -82,8 +86,7 @@ impl GitLab {
         if status.is_success() {
             return Ok(resp);
         }
-        let body = resp.text().await.unwrap_or_default();
-        let snippet: String = body.chars().take(300).collect();
+        let snippet = super::bounded_error_snippet(resp).await;
         Err(anyhow!("GitLab {what} failed: {status}: {snippet}"))
     }
 
@@ -99,29 +102,38 @@ impl GitLab {
         Ok(Self::check_ok(resp, "MR fetch").await?.json().await?)
     }
 
-    fn assemble_unified(items: &[FileDiffItem]) -> String {
+    fn assemble_unified(items: &[FileDiffItem]) -> Result<String> {
         let mut out = String::new();
         for item in items {
-            out.push_str(&format!(
-                "diff --git a/{} b/{}\n",
-                item.old_path, item.new_path
-            ));
+            if item.collapsed || item.too_large {
+                return Err(anyhow!(
+                    "GitLab omitted diff content for {}; refusing a partial review",
+                    item.new_path
+                ));
+            }
+            let mut section = format!("diff --git a/{} b/{}\n", item.old_path, item.new_path);
             if item.new_file {
-                out.push_str(&format!("--- /dev/null\n+++ b/{}\n", item.new_path));
+                section.push_str(&format!("--- /dev/null\n+++ b/{}\n", item.new_path));
             } else if item.deleted_file {
-                out.push_str(&format!("--- a/{}\n+++ /dev/null\n", item.old_path));
+                section.push_str(&format!("--- a/{}\n+++ /dev/null\n", item.old_path));
             } else {
-                out.push_str(&format!(
+                section.push_str(&format!(
                     "--- a/{}\n+++ b/{}\n",
                     item.old_path, item.new_path
                 ));
             }
-            out.push_str(&item.diff);
+            section.push_str(&item.diff);
             if !item.diff.ends_with('\n') {
-                out.push('\n');
+                section.push('\n');
             }
+            ensure!(
+                out.len().saturating_add(section.len()) <= crate::diff::MAX_RAW_DIFF_INPUT_BYTES,
+                "GitLab assembled diff exceeds the {} byte acquisition limit",
+                crate::diff::MAX_RAW_DIFF_INPUT_BYTES
+            );
+            out.push_str(&section);
         }
-        out
+        Ok(out)
     }
 
     /// Post one finding as an anchored discussion, falling back to a plain
@@ -210,27 +222,58 @@ impl Forge for GitLab {
     }
 
     async fn fetch_diff(&self) -> Result<String> {
+        const PER_PAGE: usize = 100;
+        const MAX_PAGES: usize = 100;
+        const MAX_ITEMS: usize = 10_000;
         let mut items: Vec<FileDiffItem> = Vec::new();
-        for page in 1..=10 {
+        let mut page = 1usize;
+        loop {
+            ensure!(
+                page <= MAX_PAGES,
+                "GitLab diff pagination exceeds {MAX_PAGES} pages"
+            );
             let resp = self
                 .request(
                     reqwest::Method::GET,
                     self.url(&format!(
-                        "/merge_requests/{}/diffs?per_page=100&page={page}",
+                        "/merge_requests/{}/diffs?per_page={PER_PAGE}&page={page}",
                         self.mr_iid
                     )),
                 )
                 .send()
                 .await
                 .context("fetching MR diffs")?;
-            let batch: Vec<FileDiffItem> = Self::check_ok(resp, "diff fetch").await?.json().await?;
-            let done = batch.len() < 100;
+            let checked = Self::check_ok(resp, "diff fetch").await?;
+            let next_page = checked
+                .headers()
+                .get("x-next-page")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let batch: Vec<FileDiffItem> =
+                super::bounded_response_json(checked, "GitLab diff page").await?;
+            ensure!(
+                items.len().saturating_add(batch.len()) <= MAX_ITEMS,
+                "GitLab diff pagination exceeds {MAX_ITEMS} files"
+            );
+            let batch_len = batch.len();
             items.extend(batch);
-            if done {
-                break;
+            match next_page.as_deref() {
+                Some("") => break,
+                Some(next) => {
+                    let parsed: usize =
+                        next.parse().context("invalid GitLab x-next-page header")?;
+                    ensure!(parsed > page, "GitLab pagination did not advance");
+                    page = parsed;
+                }
+                None if batch_len < PER_PAGE => break,
+                None => {
+                    return Err(anyhow!(
+                        "GitLab returned a full diff page without authoritative pagination headers"
+                    ));
+                }
             }
         }
-        Ok(Self::assemble_unified(&items))
+        Self::assemble_unified(&items)
     }
 
     async fn fetch_diff_since(&self, since_sha: &str, head_sha: &str) -> Result<String> {
@@ -244,8 +287,12 @@ impl Forge for GitLab {
             .send()
             .await
             .context("fetching incremental compare")?;
-        let cmp: CompareResponse = Self::check_ok(resp, "compare fetch").await?.json().await?;
-        Ok(Self::assemble_unified(&cmp.diffs))
+        let cmp: CompareResponse = super::bounded_response_json(
+            Self::check_ok(resp, "compare fetch").await?,
+            "GitLab compare diff",
+        )
+        .await?;
+        Self::assemble_unified(&cmp.diffs)
     }
 
     async fn post_review(
@@ -384,5 +431,29 @@ impl Forge for GitLab {
             .context("posting note")?;
         Self::check_ok(resp, "note post").await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(collapsed: bool, too_large: bool) -> FileDiffItem {
+        FileDiffItem {
+            old_path: "src/lib.rs".to_string(),
+            new_path: "src/lib.rs".to_string(),
+            diff: "@@ -1 +1 @@\n-old\n+new\n".to_string(),
+            new_file: false,
+            deleted_file: false,
+            collapsed,
+            too_large,
+        }
+    }
+
+    #[test]
+    fn collapsed_and_too_large_diffs_fail_closed() {
+        assert!(GitLab::assemble_unified(&[item(true, false)]).is_err());
+        assert!(GitLab::assemble_unified(&[item(false, true)]).is_err());
+        assert!(GitLab::assemble_unified(&[item(false, false)]).is_ok());
     }
 }

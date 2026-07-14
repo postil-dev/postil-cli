@@ -111,8 +111,7 @@ impl Bitbucket {
         if status.is_success() {
             return Ok(resp);
         }
-        let body = resp.text().await.unwrap_or_default();
-        let snippet: String = body.chars().take(300).collect();
+        let snippet = super::bounded_error_snippet(resp).await;
         Err(anyhow!("Bitbucket {what} failed: {status}: {snippet}"))
     }
 
@@ -207,7 +206,11 @@ impl Forge for Bitbucket {
             .send()
             .await
             .context("fetching PR diff")?;
-        Ok(Self::check_ok(resp, "diff fetch").await?.text().await?)
+        super::bounded_response_text(
+            Self::check_ok(resp, "diff fetch").await?,
+            "Bitbucket PR diff",
+        )
+        .await
     }
 
     async fn fetch_diff_since(&self, since_sha: &str, head_sha: &str) -> Result<String> {
@@ -229,7 +232,11 @@ impl Forge for Bitbucket {
             .send()
             .await
             .context("fetching incremental diff")?;
-        Ok(Self::check_ok(resp, "compare fetch").await?.text().await?)
+        super::bounded_response_text(
+            Self::check_ok(resp, "compare fetch").await?,
+            "Bitbucket compare diff",
+        )
+        .await
     }
 
     async fn post_review(

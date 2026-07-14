@@ -570,6 +570,13 @@ pub fn is_reserved_anchor(path: &str) -> bool {
     )
 }
 
+/// Virtual findings that describe only the current run's operational state.
+/// These never carry into a later review. Reviewable PR and change metadata
+/// anchors are reserved for forge publication but remain durable baselines.
+pub fn is_ephemeral_anchor(path: &str) -> bool {
+    matches!(path, OPERATIONAL_PATH | PROVIDER_PATH | DIFF_PATH)
+}
+
 /// A complete, trustworthy review could not fit inside Postil's bounded local
 /// resource and provider-request budget. This is an internal fail-closed state;
 /// forge adapters expose only generic check text for operational findings.

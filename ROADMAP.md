@@ -21,8 +21,9 @@
 - `postil plan` deterministic config dry-run; `postil doctor`; exact-ref pre-push hook.
 - Compact PR summaries with run links, retained policy-suppressed findings, and
   provider-safe operational check text.
-- Bounded large-change review with repeated manifests, exact lockfile summaries,
-  non-line change metadata, oversized-line segmentation, and cross-batch synthesis.
+- Bounded large-change review with repeated manifests, format-specific directional
+  lockfile summaries, non-line change metadata, oversized-line segmentation, and
+  cross-batch synthesis.
 - `.coderabbit.yaml` translation for zero-cost migration.
 - Model cascade + concurrent multi-model consensus over any OpenAI-compatible endpoint;
   bounded retry with backoff on transient provider errors.

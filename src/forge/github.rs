@@ -387,7 +387,8 @@ impl Forge for GitHub {
                 "diff fetch",
             )
             .await?;
-        Ok(Self::check_ok(resp, "diff fetch").await?.text().await?)
+        super::bounded_response_text(Self::check_ok(resp, "diff fetch").await?, "GitHub PR diff")
+            .await
     }
 
     async fn fetch_diff_since(&self, since_sha: &str, head_sha: &str) -> Result<String> {
@@ -401,7 +402,11 @@ impl Forge for GitHub {
                 "compare fetch",
             )
             .await?;
-        Ok(Self::check_ok(resp, "compare fetch").await?.text().await?)
+        super::bounded_response_text(
+            Self::check_ok(resp, "compare fetch").await?,
+            "GitHub compare diff",
+        )
+        .await
     }
 
     async fn post_review(&self, summary: &str, findings: &[Finding], head_sha: &str) -> Result<()> {
@@ -471,7 +476,7 @@ impl Forge for GitHub {
         }
         let status = resp.status();
         let request_id = github_request_id(resp.headers()).unwrap_or_else(|| "none".to_string());
-        let response_body = resp.text().await.context("reading review post failure")?;
+        let response_body = super::bounded_error_snippet(resp).await;
         if !is_unresolved_line_response(status, &response_body) {
             return Err(anyhow!(
                 "GitHub review post failed: {status} (request id {request_id})"

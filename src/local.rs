@@ -1,7 +1,12 @@
 //! Local diff acquisition: the same engine, before the PR exists.
 
-use anyhow::{Context, Result, anyhow};
+use std::io::Read;
+use std::process::Stdio;
+
+use anyhow::{Context, Result, anyhow, ensure};
 use tokio::process::Command;
+
+use crate::diff::MAX_RAW_DIFF_INPUT_BYTES;
 
 pub enum LocalSource {
     /// `git diff --cached`
@@ -14,8 +19,28 @@ pub enum LocalSource {
 
 pub async fn acquire(source: &LocalSource) -> Result<String> {
     match source {
-        LocalSource::DiffFile(path) => std::fs::read_to_string(path)
-            .with_context(|| format!("reading diff file {}", path.display())),
+        LocalSource::DiffFile(path) => {
+            let size = std::fs::metadata(path)
+                .with_context(|| format!("reading diff file metadata {}", path.display()))?
+                .len();
+            ensure!(
+                size <= MAX_RAW_DIFF_INPUT_BYTES as u64,
+                "diff input exceeds the {} byte acquisition limit",
+                MAX_RAW_DIFF_INPUT_BYTES
+            );
+            let file = std::fs::File::open(path)
+                .with_context(|| format!("opening diff file {}", path.display()))?;
+            let mut bytes = Vec::with_capacity(size as usize);
+            file.take((MAX_RAW_DIFF_INPUT_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)
+                .with_context(|| format!("reading diff file {}", path.display()))?;
+            ensure!(
+                bytes.len() <= MAX_RAW_DIFF_INPUT_BYTES,
+                "diff input exceeds the {} byte acquisition limit",
+                MAX_RAW_DIFF_INPUT_BYTES
+            );
+            String::from_utf8(bytes).context("diff file is not valid UTF-8")
+        }
         LocalSource::Staged => git_diff(&["diff", "--cached", "--no-color"]).await,
         LocalSource::Base(base) => {
             let range = format!("{base}...HEAD");
@@ -25,16 +50,56 @@ pub async fn acquire(source: &LocalSource) -> Result<String> {
 }
 
 async fn git_diff(args: &[&str]) -> Result<String> {
-    let out = Command::new("git")
-        .args(args)
-        .output()
-        .await
-        .context("running git (is git installed and is this a repository?)")?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(anyhow!("git {} failed: {}", args.join(" "), stderr.trim()));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    let owned: Vec<String> = args
+        .iter()
+        .map(|argument| (*argument).to_string())
+        .collect();
+    tokio::task::spawn_blocking(move || {
+        let mut child = std::process::Command::new("git")
+            .args(&owned)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("running git (is git installed and is this a repository?)")?;
+        let mut stdout = child.stdout.take().context("capturing git stdout")?;
+        let stderr = child.stderr.take().context("capturing git stderr")?;
+        let stderr_reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stderr
+                .take(4_096)
+                .read_to_end(&mut bytes)
+                .map(|_| String::from_utf8_lossy(&bytes).into_owned())
+        });
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 64 * 1024];
+        loop {
+            let count = stdout.read(&mut chunk).context("reading git diff")?;
+            if count == 0 {
+                break;
+            }
+            if bytes.len().saturating_add(count) > MAX_RAW_DIFF_INPUT_BYTES {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stderr_reader.join();
+                return Err(anyhow!(
+                    "git diff exceeds the {} byte acquisition limit",
+                    MAX_RAW_DIFF_INPUT_BYTES
+                ));
+            }
+            bytes.extend_from_slice(&chunk[..count]);
+        }
+        let status = child.wait().context("waiting for git")?;
+        let stderr = stderr_reader
+            .join()
+            .map_err(|_| anyhow!("joining git stderr reader"))?
+            .context("reading git stderr")?;
+        if !status.success() {
+            return Err(anyhow!("git {} failed: {}", owned.join(" "), stderr.trim()));
+        }
+        String::from_utf8(bytes).context("git diff is not valid UTF-8")
+    })
+    .await
+    .context("joining git diff reader")?
 }
 
 pub async fn head_sha() -> Option<String> {

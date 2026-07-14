@@ -6,10 +6,13 @@
 //! with its new-file line number.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ops::RangeInclusive;
 
 const MAX_LOCKFILE_EVIDENCE_SECTIONS: usize = 1024;
+const MAX_LOCKFILE_SECTION_BYTES: usize = 256 * 1024;
+const MAX_LOCKFILE_DIRECTIONAL_CHANGES: usize = 256;
+pub const MAX_RAW_DIFF_INPUT_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Default)]
 pub struct ReviewBatchPlan {
@@ -25,7 +28,7 @@ pub struct LockfileEvidence {
     pub path: String,
     pub added: usize,
     pub removed: usize,
-    pub samples: Vec<String>,
+    pub changes: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -224,10 +227,23 @@ pub fn prepare_diff(text: &str, max_source_bytes: usize) -> PreparedDiff<'_> {
     while let Some(start) = cursor {
         let end = next_diff_start(text, start + "diff --git ".len()).unwrap_or(text.len());
         let section = &text[start..end];
-        let path = section_path(section);
-        if is_known_lockfile(path) {
+        let Some(path) = section_path(section) else {
+            return PreparedDiff {
+                source: None,
+                lockfiles: Vec::new(),
+                incomplete: true,
+            };
+        };
+        if is_known_lockfile(&path) {
             saw_lockfile = true;
-            lockfiles.push(lockfile_evidence(path, section));
+            let Some(evidence) = lockfile_evidence(&path, section) else {
+                return PreparedDiff {
+                    source: None,
+                    lockfiles: Vec::new(),
+                    incomplete: true,
+                };
+            };
+            lockfiles.push(evidence);
             if lockfiles.len() > MAX_LOCKFILE_EVIDENCE_SECTIONS {
                 return PreparedDiff {
                     source: None,
@@ -262,7 +278,14 @@ pub fn prepare_diff(text: &str, max_source_bytes: usize) -> PreparedDiff<'_> {
     while let Some(start) = cursor {
         let end = next_diff_start(text, start + "diff --git ".len()).unwrap_or(text.len());
         let section = &text[start..end];
-        if !is_known_lockfile(section_path(section)) {
+        let Some(path) = section_path(section) else {
+            return PreparedDiff {
+                source: None,
+                lockfiles: Vec::new(),
+                incomplete: true,
+            };
+        };
+        if !is_known_lockfile(&path) {
             source.push_str(section);
         }
         cursor = (end < text.len()).then_some(end);
@@ -282,80 +305,274 @@ fn next_diff_start(text: &str, from: usize) -> Option<usize> {
     tail.find("\ndiff --git ").map(|offset| from + offset + 1)
 }
 
-fn section_path(section: &str) -> &str {
+fn section_path(section: &str) -> Option<String> {
     section
         .lines()
         .next()
         .and_then(|header| header.strip_prefix("diff --git "))
-        .and_then(|rest| rest.rsplit_once(" b/").map(|(_, path)| path))
-        .unwrap_or_default()
+        .and_then(parse_diff_header_paths)
+        .map(|(_, path)| path)
 }
 
-fn lockfile_evidence(path: &str, section: &str) -> LockfileEvidence {
+fn parse_diff_header_paths(rest: &str) -> Option<(String, String)> {
+    if rest.starts_with('"') {
+        let (old, remainder) = parse_git_path_token(rest)?;
+        let (new, trailing) = parse_git_path_token(remainder.trim_start())?;
+        if !trailing.trim().is_empty() {
+            return None;
+        }
+        return Some((
+            strip_prefix_ab(&old).to_string(),
+            strip_prefix_ab(&new).to_string(),
+        ));
+    }
+    let (old, new) = rest.rsplit_once(" b/")?;
+    Some((
+        strip_prefix_ab(old).to_string(),
+        strip_prefix_ab(new).to_string(),
+    ))
+}
+
+fn parse_git_path_token(input: &str) -> Option<(String, &str)> {
+    if !input.starts_with('"') {
+        let end = input.find(char::is_whitespace).unwrap_or(input.len());
+        return Some((input[..end].to_string(), &input[end..]));
+    }
+    let bytes = input.as_bytes();
+    let mut decoded = Vec::new();
+    let mut index = 1usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => {
+                let value = String::from_utf8(decoded).ok()?;
+                return Some((value, &input[index + 1..]));
+            }
+            b'\\' => {
+                index += 1;
+                let escaped = *bytes.get(index)?;
+                match escaped {
+                    b'"' | b'\\' => decoded.push(escaped),
+                    b't' => decoded.push(b'\t'),
+                    b'n' => decoded.push(b'\n'),
+                    b'r' => decoded.push(b'\r'),
+                    b'0'..=b'7' => {
+                        let mut value = (escaped - b'0') as u16;
+                        let mut digits = 1;
+                        while digits < 3
+                            && index + 1 < bytes.len()
+                            && matches!(bytes[index + 1], b'0'..=b'7')
+                        {
+                            index += 1;
+                            value = value * 8 + (bytes[index] - b'0') as u16;
+                            digits += 1;
+                        }
+                        decoded.push(u8::try_from(value).ok()?);
+                    }
+                    _ => return None,
+                }
+            }
+            byte => decoded.push(byte),
+        }
+        index += 1;
+    }
+    None
+}
+
+fn parse_git_marker_path(value: &str) -> Option<String> {
+    if value == "/dev/null" {
+        return Some(value.to_string());
+    }
+    let (decoded, trailing) = if value.starts_with('"') {
+        parse_git_path_token(value)?
+    } else {
+        (value.split('\t').next()?.to_string(), "")
+    };
+    if !trailing.trim().is_empty() {
+        return None;
+    }
+    Some(strip_prefix_ab(&decoded).to_string())
+}
+
+fn lockfile_evidence(path: &str, section: &str) -> Option<LockfileEvidence> {
+    if section.len() > MAX_LOCKFILE_SECTION_BYTES {
+        return None;
+    }
     let mut added = 0;
     let mut removed = 0;
-    let mut samples = Vec::new();
+    let mut old_lines = Vec::new();
+    let mut new_lines = Vec::new();
     for line in section.lines() {
-        let content = if line.starts_with('+') && !line.starts_with("+++") {
+        if line.starts_with('+') && !line.starts_with("+++") {
             added += 1;
-            &line[1..]
+            new_lines.push(&line[1..]);
         } else if line.starts_with('-') && !line.starts_with("---") {
             removed += 1;
-            &line[1..]
+            old_lines.push(&line[1..]);
+        } else if let Some(content) = line.strip_prefix(' ') {
+            old_lines.push(content);
+            new_lines.push(content);
         } else {
             continue;
-        };
-        if samples.len() < 24
-            && let Some(sample) = safe_lockfile_sample(content)
-        {
-            samples.push(sample);
         }
     }
-    LockfileEvidence {
+    let old = parse_lockfile_packages(path, &old_lines)?;
+    let new = parse_lockfile_packages(path, &new_lines)?;
+    let mut changes = Vec::new();
+    for package in old.difference(&new) {
+        changes.push(format!("removed {package}"));
+    }
+    for package in new.difference(&old) {
+        changes.push(format!("added {package}"));
+    }
+    if changes.is_empty() || changes.len() > MAX_LOCKFILE_DIRECTIONAL_CHANGES {
+        return None;
+    }
+    Some(LockfileEvidence {
         path: path.to_string(),
         added,
         removed,
-        samples,
+        changes,
+    })
+}
+
+fn parse_lockfile_packages(path: &str, lines: &[&str]) -> Option<BTreeSet<String>> {
+    let name = path.rsplit('/').next()?.to_ascii_lowercase();
+    match name.as_str() {
+        "cargo.lock" => parse_named_version_records(lines, "name", "version"),
+        "package-lock.json" | "npm-shrinkwrap.json" => parse_package_lock_records(lines),
+        "yarn.lock" => parse_yarn_records(lines),
+        "pnpm-lock.yaml" => parse_pnpm_records(lines),
+        "go.sum" => parse_go_sum_records(lines),
+        _ => None,
     }
 }
 
-/// Keep only package-name and version fields. Lockfiles can contain registry
-/// URLs and credentials, so arbitrary changed lines never enter model input.
-fn safe_lockfile_sample(content: &str) -> Option<String> {
-    let trimmed = content.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    let dependency_field = lower.starts_with("name ")
-        || lower.starts_with("name=")
-        || lower.starts_with("version ")
-        || lower.starts_with("version=")
-        || lower.starts_with("\"name\"")
-        || lower.starts_with("\"version\"");
-    let sensitive = [
-        "token",
-        "auth",
-        "password",
-        "secret",
-        "api_key",
-        "apikey",
-        "credential",
-        "private_key",
-        "access_key",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker));
-    let long_token = trimmed
-        .split(|character: char| !character.is_ascii_alphanumeric())
-        .any(|part| part.len() > 40);
-    if !dependency_field
-        || sensitive
-        || long_token
-        || lower.contains("://")
-        || lower.contains("git@")
-        || lower.contains("ssh:")
+fn parse_named_version_records(
+    lines: &[&str],
+    name_key: &str,
+    version_key: &str,
+) -> Option<BTreeSet<String>> {
+    let mut packages = BTreeSet::new();
+    let mut package = None;
+    for line in lines {
+        let trimmed = line.trim();
+        if let Some(value) = parse_assignment(trimmed, name_key) {
+            package = Some(value);
+        } else if let Some(version) = parse_assignment(trimmed, version_key)
+            && let Some(name) = package.take()
+        {
+            packages.insert(format!("{name}@{version}"));
+        }
+    }
+    (!packages.is_empty()).then_some(packages)
+}
+
+fn parse_assignment(line: &str, key: &str) -> Option<String> {
+    let value = line
+        .strip_prefix(key)?
+        .trim_start()
+        .strip_prefix('=')?
+        .trim();
+    safe_package_atom(value.trim_matches(['"', '\'']))
+}
+
+fn safe_package_atom(value: &str) -> Option<String> {
+    if value.is_empty()
+        || value.len() > 200
+        || value.contains("://")
+        || value.chars().any(char::is_control)
     {
         return None;
     }
-    Some(trimmed.chars().take(200).collect())
+    Some(value.to_string())
+}
+
+fn parse_package_lock_records(lines: &[&str]) -> Option<BTreeSet<String>> {
+    let mut packages = BTreeSet::new();
+    let mut package = None;
+    for line in lines {
+        let trimmed = line.trim().trim_end_matches(',');
+        if let Some(path) = trimmed
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix("\": {"))
+            .and_then(|value| value.rsplit_once("node_modules/").map(|(_, name)| name))
+            .and_then(safe_package_atom)
+        {
+            package = Some(path);
+        } else if let Some(version) = json_string_field(trimmed, "version")
+            && let Some(name) = package.take()
+        {
+            packages.insert(format!("{name}@{version}"));
+        }
+    }
+    (!packages.is_empty()).then_some(packages)
+}
+
+fn json_string_field(line: &str, field: &str) -> Option<String> {
+    let prefix = format!("\"{field}\":");
+    let value = line.strip_prefix(&prefix)?.trim().trim_end_matches(',');
+    safe_package_atom(value.trim_matches('"'))
+}
+
+fn parse_yarn_records(lines: &[&str]) -> Option<BTreeSet<String>> {
+    let mut packages = BTreeSet::new();
+    let mut package = None;
+    for line in lines {
+        if line
+            .chars()
+            .next()
+            .is_some_and(|character| !character.is_whitespace())
+            && line.trim_end().ends_with(':')
+        {
+            let header = line.trim().trim_end_matches(':').trim_matches('"');
+            let name = header
+                .rsplit_once('@')
+                .map(|(name, _)| name)
+                .unwrap_or(header);
+            package = safe_package_atom(name);
+        } else if let Some(version) = line.trim().strip_prefix("version ")
+            && let Some(name) = package.take()
+            && let Some(version) = safe_package_atom(version.trim_matches('"'))
+        {
+            packages.insert(format!("{name}@{version}"));
+        }
+    }
+    (!packages.is_empty()).then_some(packages)
+}
+
+fn parse_pnpm_records(lines: &[&str]) -> Option<BTreeSet<String>> {
+    let mut packages = BTreeSet::new();
+    for line in lines {
+        let value = line.trim().trim_end_matches(':').trim_matches(['\'', '"']);
+        if let Some((name, version)) = value.rsplit_once('@')
+            && !name.is_empty()
+            && version
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_ascii_digit())
+        {
+            packages.insert(format!(
+                "{}@{}",
+                safe_package_atom(name)?,
+                safe_package_atom(version)?
+            ));
+        }
+    }
+    (!packages.is_empty()).then_some(packages)
+}
+
+fn parse_go_sum_records(lines: &[&str]) -> Option<BTreeSet<String>> {
+    let mut packages = BTreeSet::new();
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let name = safe_package_atom(fields.next()?)?;
+        let version = safe_package_atom(fields.next()?)?;
+        packages.insert(format!("{name}@{}", version.trim_end_matches("/go.mod")));
+    }
+    (!packages.is_empty()).then_some(packages)
 }
 
 pub fn is_known_lockfile(path: &str) -> bool {
@@ -411,15 +628,7 @@ pub fn parse(text: &str) -> Diff {
             }
             // Seed the path from the header (binary diffs have no +++/--- lines);
             // the +++/--- lines that follow refine it for renames.
-            let (old_path, path) = rest
-                .rsplit_once(" b/")
-                .map(|(a, b)| {
-                    (
-                        strip_prefix_ab(a).to_string(),
-                        strip_prefix_ab(b).to_string(),
-                    )
-                })
-                .unwrap_or_default();
+            let (old_path, path) = parse_diff_header_paths(rest).unwrap_or_default();
             current = Some(FileDiff {
                 old_path,
                 path,
@@ -449,15 +658,16 @@ pub fn parse(text: &str) -> Diff {
             if let Some(f) = current.as_mut() {
                 if rest == "/dev/null" {
                     f.deleted = true;
-                } else {
-                    f.path = strip_prefix_ab(rest).to_string();
+                } else if let Some(path) = parse_git_marker_path(rest) {
+                    f.path = path;
                 }
             }
         } else if let Some(rest) = line.strip_prefix("--- ") {
             if let Some(f) = current.as_mut()
                 && rest != "/dev/null"
+                && let Some(old_path) = parse_git_marker_path(rest)
             {
-                f.old_path = strip_prefix_ab(rest).to_string();
+                f.old_path = old_path;
                 // Keep the old path as a fallback for deletions (+++ /dev/null).
                 if f.path.is_empty() {
                     f.path = f.old_path.clone();
@@ -785,17 +995,12 @@ fn build_manifest(diff: &Diff, lockfiles: &[LockfileEvidence], max_bytes: usize)
             };
         }
         text.push_str(&manifest_entry);
-        let samples = if lockfile.samples.is_empty() {
-            "no dependency-oriented lines after hash filtering".to_string()
-        } else {
-            lockfile.samples.join(" | ")
-        };
         let entry = format!(
             "{}: lockfile changed, {} additions, {} deletions; {}",
             manifest_path(&lockfile.path),
             lockfile.added,
             lockfile.removed,
-            samples
+            lockfile.changes.join("; ")
         );
         metadata_bytes = metadata_bytes.saturating_add(entry.len() + 16);
         if text.len().saturating_add(metadata_bytes) > max_bytes {
@@ -969,59 +1174,115 @@ fn append_unit(
 }
 
 fn build_synthesis(manifest: &str, batches: &[String], max_bytes: usize) -> Option<String> {
-    let mut synthesis = format!("{manifest}\nCross-batch evidence excerpts:\n");
-    let available = max_bytes.checked_sub(synthesis.len() + 256)?;
-    let per_batch = available.checked_div(batches.len())?;
-    if per_batch < 512 {
-        return None;
-    }
+    let mut synthesis = format!("{manifest}\nCross-batch semantic digests:\n");
     for (index, batch) in batches.iter().enumerate() {
-        synthesis.push_str(&format!("\nBatch {} excerpt:\n", index + 1));
-        let body = batch.strip_prefix(manifest).unwrap_or(batch).trim_start();
-        synthesis.push_str(&batch_excerpt(body, per_batch));
+        let digest = semantic_digest(batch);
+        if digest.is_empty() {
+            return None;
+        }
+        let heading = format!("\nBatch {} semantic digest:\n", index + 1);
+        if synthesis
+            .len()
+            .saturating_add(heading.len())
+            .saturating_add(digest.len())
+            > max_bytes
+        {
+            return None;
+        }
+        synthesis.push_str(&heading);
+        synthesis.push_str(&digest);
     }
-    (synthesis.len() <= max_bytes).then_some(synthesis)
+    Some(synthesis)
 }
 
-fn batch_excerpt(body: &str, budget: usize) -> String {
-    if body.len() <= budget {
-        return body.to_string();
+fn semantic_digest(batch: &str) -> String {
+    const CATEGORIES: [(&str, &[&str]); 6] = [
+        (
+            "contracts",
+            &["fn ", "def ", "class ", "interface ", "type ", "pub "],
+        ),
+        (
+            "sources",
+            &["input", "request", "user", "read", "recv", "source"],
+        ),
+        (
+            "sinks",
+            &[
+                "sink", "exec", "query", "write", "send", "delete", "unsafe", "eval",
+            ],
+        ),
+        (
+            "validation",
+            &["validate", "sanitize", "authoriz", "check", "guard"],
+        ),
+        (
+            "lifecycle",
+            &[
+                "create", "close", "drop", "start", "stop", "retry", "commit", "rollback",
+            ],
+        ),
+        (
+            "dependencies",
+            &["import", "require", "package", "dependency", " use "],
+        ),
+    ];
+    let mut current_path = None;
+    let mut entries: Vec<Vec<(String, String)>> = vec![Vec::new(); CATEGORIES.len()];
+    let mut fallback = None;
+    for rendered in batch.lines() {
+        if let Some(header) = rendered.strip_prefix("### ") {
+            current_path = Some(
+                header
+                    .split(" (")
+                    .next()
+                    .unwrap_or(header)
+                    .trim()
+                    .to_string(),
+            );
+            continue;
+        }
+        let Some(path) = current_path.as_ref() else {
+            continue;
+        };
+        let trimmed = rendered.trim_start();
+        let Some((number, content)) = trimmed.split_once(' ') else {
+            continue;
+        };
+        if number.parse::<u32>().is_err() {
+            continue;
+        }
+        fallback
+            .get_or_insert_with(|| (path.clone(), rendered.chars().take(360).collect::<String>()));
+        let lower = content.to_ascii_lowercase();
+        for (category_index, (_, markers)) in CATEGORIES.iter().enumerate() {
+            if entries[category_index].len() < 6
+                && markers.iter().any(|marker| lower.contains(marker))
+            {
+                let bounded: String = rendered.chars().take(360).collect();
+                entries[category_index].push((path.clone(), bounded));
+            }
+        }
     }
-    let marker = "\n[excerpt gap]\n";
-    let half = budget.saturating_sub(marker.len()) / 2;
-    let first_limit = floor_char_boundary(body, half.min(body.len()));
-    let first_end = body[..first_limit]
-        .rfind('\n')
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    let tail_target = body.len().saturating_sub(half);
-    let tail_target = floor_char_boundary(body, tail_target);
-    let header_from = body[..tail_target]
-        .rfind("\n### ")
-        .map(|index| index + 1)
-        .or_else(|| {
-            body[tail_target..]
-                .find('\n')
-                .map(|index| tail_target + index + 1)
-        })
-        .unwrap_or(body.len());
-    let mut out = body[..first_end].to_string();
-    out.push_str(marker);
-    out.push_str(&body[header_from..]);
-    if out.len() > budget {
-        let limit = floor_char_boundary(&out, budget);
-        let line_end = out[..limit].rfind('\n').map(|index| index + 1).unwrap_or(0);
-        out.truncate(line_end);
+    let mut out = String::new();
+    for ((category, _), category_entries) in CATEGORIES.iter().zip(entries) {
+        let mut previous_path = None;
+        for (path, rendered) in category_entries {
+            if previous_path.as_deref() != Some(path.as_str()) {
+                out.push_str(&format!("### {path}\n@@ semantic {category} @@\n"));
+                previous_path = Some(path);
+            }
+            out.push_str(&rendered);
+            out.push('\n');
+        }
+    }
+    if out.is_empty()
+        && let Some((path, rendered)) = fallback
+    {
+        out.push_str(&format!(
+            "### {path}\n@@ semantic uncategorized @@\n{rendered}\n"
+        ));
     }
     out
-}
-
-fn floor_char_boundary(text: &str, mut index: usize) -> usize {
-    index = index.min(text.len());
-    while !text.is_char_boundary(index) {
-        index -= 1;
-    }
-    index
 }
 
 /// Return the segment that contains a citation in the exact model input.
@@ -1035,7 +1296,7 @@ fn review_batch_segments(annotated: &str, path: &str, line: u32) -> Vec<usize> {
             segment = segment.saturating_add(1);
             continue;
         }
-        if rendered.starts_with("@@ ") || rendered == "[excerpt gap]" {
+        if rendered.starts_with("@@ ") {
             segment = segment.saturating_add(1);
             continue;
         }
@@ -1251,16 +1512,27 @@ Binary files a/img.png and b/img.png differ
     }
 
     #[test]
+    fn git_c_quoted_paths_decode_without_losing_identity() {
+        let source = "diff --git \"a/src/tab\\tquote\\\"slash\\\\\\346\\227\\245.rs\" \"b/src/tab\\tquote\\\"slash\\\\\\346\\227\\245.rs\"\n--- \"a/src/tab\\tquote\\\"slash\\\\\\346\\227\\245.rs\"\n+++ \"b/src/tab\\tquote\\\"slash\\\\\\346\\227\\245.rs\"\n@@ -0,0 +1 @@\n+safe();\n";
+        let parsed = parse(source);
+        assert_eq!(parsed.files.len(), 1);
+        assert_eq!(parsed.files[0].path, "src/tab\tquote\"slash\\日.rs");
+        assert_eq!(parsed.files[0].old_path, "src/tab\tquote\"slash\\日.rs");
+        let prepared = prepare_diff(source, 4096);
+        assert!(!prepared.incomplete);
+    }
+
+    #[test]
+    fn unquoted_paths_with_spaces_and_renames_parse_both_operands() {
+        let source = "diff --git a/old name.rs b/new name.rs\nsimilarity index 90%\n--- a/old name.rs\n+++ b/new name.rs\n@@ -1 +1 @@\n-old();\n+new();\n";
+        let parsed = parse(source);
+        assert_eq!(parsed.files[0].old_path, "old name.rs");
+        assert_eq!(parsed.files[0].path, "new name.rs");
+    }
+
+    #[test]
     fn only_exact_lockfiles_are_compacted_to_bounded_evidence() {
-        let credential_marker = ["pass", "word"].concat();
-        let scheme = ["ht", "tps"].concat();
-        let user = ["us", "er"].concat();
-        let token_key = ["auth", "token"].join("_");
-        let token_marker = ["do", "not", "send"].join("-");
-        let long_marker = "a".repeat(48);
-        let lock = format!(
-            "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -0,0 +1,6 @@\n+name = \"dangerous-dependency\"\n+checksum = \"large-hash\"\n+version = \"1.2.3\"\n+name = \"{scheme}://{user}:{credential_marker}@example.invalid/package\"\n+{token_key} = \"{token_marker}\"\n+version = \"{long_marker}\"\n"
-        );
+        let lock = "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1,3 +1,3 @@\n name = \"dangerous-dependency\"\n-version = \"1.2.2\"\n+version = \"1.2.3\"\n checksum = \"large-hash\"\n";
         let generated = "diff --git a/web/api.generated.ts b/web/api.generated.ts\n--- a/web/api.generated.ts\n+++ b/web/api.generated.ts\n@@ -0,0 +1 @@\n+eval(userInput);\n";
         let mixed = format!("{lock}{generated}");
         let prepared = prepare_diff(&mixed, 4096);
@@ -1273,22 +1545,21 @@ Binary files a/img.png and b/img.png differ
                 .unwrap()
                 .contains("eval(userInput)")
         );
-        assert!(
-            prepared.lockfiles[0]
-                .samples
-                .iter()
-                .any(|sample| sample.contains("dangerous-dependency"))
+        assert_eq!(
+            prepared.lockfiles[0].changes,
+            [
+                "removed dangerous-dependency@1.2.2",
+                "added dangerous-dependency@1.2.3"
+            ]
         );
-        assert!(
-            prepared.lockfiles[0]
-                .samples
-                .iter()
-                .all(|sample| !sample.contains("checksum"))
-        );
-        let samples = prepared.lockfiles[0].samples.join("\n");
-        assert!(!samples.contains(&credential_marker));
-        assert!(!samples.contains(&token_marker));
-        assert!(!samples.contains(&long_marker));
+    }
+
+    #[test]
+    fn malformed_and_unsupported_lockfiles_fail_preparation_closed() {
+        let malformed = "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1 +1 @@\n-checksum = \"old\"\n+checksum = \"new\"\n";
+        assert!(prepare_diff(malformed, 4096).incomplete);
+        let unsupported = "diff --git a/composer.lock b/composer.lock\n--- a/composer.lock\n+++ b/composer.lock\n@@ -1 +1 @@\n-old\n+new\n";
+        assert!(prepare_diff(unsupported, 4096).incomplete);
     }
 
     #[test]

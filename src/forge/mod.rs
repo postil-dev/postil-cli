@@ -8,9 +8,79 @@ pub mod bitbucket;
 pub mod github;
 pub mod gitlab;
 
-use anyhow::Result;
+use anyhow::{Context, Result, ensure};
+use serde::de::DeserializeOwned;
 
 use crate::envelope::{Envelope, Finding, Severity, SuppressionReason};
+
+pub async fn bounded_response_text(
+    mut response: reqwest::Response,
+    context: &str,
+) -> Result<String> {
+    ensure!(
+        response.status() != reqwest::StatusCode::PARTIAL_CONTENT,
+        "{context} returned partial content"
+    );
+    for header in ["x-diff-truncated", "x-content-truncated", "x-truncated"] {
+        if response
+            .headers()
+            .get(header)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.eq_ignore_ascii_case("true") || value == "1")
+        {
+            return Err(anyhow::anyhow!("{context} reported truncated content"));
+        }
+    }
+    if let Some(length) = response.content_length() {
+        ensure!(
+            length <= crate::diff::MAX_RAW_DIFF_INPUT_BYTES as u64,
+            "{context} exceeds the {} byte acquisition limit",
+            crate::diff::MAX_RAW_DIFF_INPUT_BYTES
+        );
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .with_context(|| format!("reading {context}"))?
+    {
+        ensure!(
+            bytes.len().saturating_add(chunk.len()) <= crate::diff::MAX_RAW_DIFF_INPUT_BYTES,
+            "{context} exceeds the {} byte acquisition limit",
+            crate::diff::MAX_RAW_DIFF_INPUT_BYTES
+        );
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes).with_context(|| format!("{context} is not valid UTF-8"))
+}
+
+pub async fn bounded_response_json<T: DeserializeOwned>(
+    response: reqwest::Response,
+    context: &str,
+) -> Result<T> {
+    let text = bounded_response_text(response, context).await?;
+    serde_json::from_str(&text).with_context(|| format!("decoding {context}"))
+}
+
+/// Read enough of an unsuccessful forge response to make its diagnostic
+/// useful without buffering an attacker-controlled error page.
+pub async fn bounded_error_snippet(mut response: reqwest::Response) -> String {
+    const MAX_ERROR_BODY_BYTES: usize = 4_096;
+
+    let mut bytes = Vec::new();
+    while bytes.len() < MAX_ERROR_BODY_BYTES {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) | Err(_) => break,
+        };
+        let remaining = MAX_ERROR_BODY_BYTES - bytes.len();
+        bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        if chunk.len() > remaining {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&bytes).chars().take(300).collect()
+}
 
 /// Base URL for the brand status icons rendered in PR comments and check
 /// summaries. The four icons (error, warn, info, pass) are served by the
@@ -679,6 +749,7 @@ mod tests {
         assert!(is_synthetic_path(crate::envelope::PROVIDER_PATH));
         assert!(is_synthetic_path(crate::envelope::OPERATIONAL_PATH));
         assert!(is_synthetic_path(crate::envelope::PR_DESCRIPTION_PATH));
+        assert!(is_synthetic_path(crate::envelope::CHANGE_METADATA_PATH));
         assert!(is_synthetic_path(crate::envelope::DIFF_PATH));
         assert!(!is_synthetic_path(".postil/content-policy.md"));
         assert!(!is_synthetic_path(".postil/guardrails.md"));

@@ -387,11 +387,11 @@ impl LlmClient {
                 client.api_format,
                 is_canonical_openrouter_base(&client.api_base),
             );
-            return Err(anyhow!(
-                "model endpoint returned {} (category {})",
+            return Err(anyhow!(provider_http_status_detail(
                 response.status,
-                summary.error_type.as_deref().unwrap_or("unclassified")
-            ));
+                &summary,
+                response.request_id.as_deref(),
+            )));
         }
         client.parse_response(&response.text, &mut Usage::default())?;
         Ok(())
@@ -1244,32 +1244,32 @@ impl LlmClient {
                         is_canonical_openrouter_base(&self.api_base),
                     );
                     let elapsed = elapsed_text(attempt_started_at.elapsed());
-                    eprintln!(
-                        "postil: llm response phase={} model={} attempt={} status={} elapsed={} bytes={} request_id={} response_id={} returned_model={} provider={} choices={} finish={} usage={} prompt_tokens={} completion_tokens={} category={}",
-                        phase.as_str(),
-                        log_text(model),
-                        retries + 1,
-                        response.status.as_u16(),
-                        elapsed,
-                        response.text.len(),
-                        response.request_id.as_deref().unwrap_or("none"),
-                        summary.response_id.as_deref().unwrap_or("none"),
-                        summary.returned_model.as_deref().unwrap_or("none"),
-                        summary.provider.as_deref().unwrap_or("none"),
-                        summary
-                            .choices
-                            .map_or_else(|| "unknown".to_string(), |count| count.to_string()),
-                        summary.finish_reason.as_deref().unwrap_or("none"),
-                        if summary.usage.is_some() {
-                            "present"
-                        } else {
-                            "missing"
-                        },
-                        summary.usage.map_or(0, |value| value.prompt_tokens),
-                        summary.usage.map_or(0, |value| value.completion_tokens),
-                        summary.error_type.as_deref().unwrap_or("none"),
-                    );
                     if response.status.is_success() {
+                        eprintln!(
+                            "postil: llm response phase={} model={} attempt={} status={} elapsed={} bytes={} request_id={} response_id={} returned_model={} provider={} choices={} finish={} usage={} prompt_tokens={} completion_tokens={} category={}",
+                            phase.as_str(),
+                            log_text(model),
+                            retries + 1,
+                            response.status.as_u16(),
+                            elapsed,
+                            response.text.len(),
+                            response.request_id.as_deref().unwrap_or("none"),
+                            summary.response_id.as_deref().unwrap_or("none"),
+                            summary.returned_model.as_deref().unwrap_or("none"),
+                            summary.provider.as_deref().unwrap_or("none"),
+                            summary
+                                .choices
+                                .map_or_else(|| "unknown".to_string(), |count| count.to_string()),
+                            summary.finish_reason.as_deref().unwrap_or("none"),
+                            if summary.usage.is_some() {
+                                "present"
+                            } else {
+                                "missing"
+                            },
+                            summary.usage.map_or(0, |value| value.prompt_tokens),
+                            summary.usage.map_or(0, |value| value.completion_tokens),
+                            summary.error_type.as_deref().unwrap_or("none"),
+                        );
                         let usage_before_parse = *usage;
                         match self.parse_response(&response.text, usage) {
                             Ok(content) => {
@@ -1318,21 +1318,32 @@ impl LlmClient {
                             }
                         }
                     }
+                    eprintln!(
+                        "postil: llm response phase={} model={} attempt={} status={} elapsed={} request_id={} category={}",
+                        phase.as_str(),
+                        log_text(model),
+                        retries + 1,
+                        response.status.as_u16(),
+                        elapsed,
+                        response.request_id.as_deref().unwrap_or("none"),
+                        summary.error_type.as_deref().unwrap_or("unclassified"),
+                    );
                     if let Some(response_usage) = summary.usage {
                         add_usage(usage, response_usage);
                     }
                     *usage_accounting_complete = false;
                     let status = response.status;
                     if empty_response_retries > 0 {
+                        let detail = provider_http_status_detail(
+                            status,
+                            &summary,
+                            response.request_id.as_deref(),
+                        );
                         if timeout_status(status.as_u16()) {
-                            return Err(anyhow::Error::new(RequestTimedOut).context(format!(
-                                "model endpoint returned {status} after empty-response retry"
-                            )));
+                            return Err(anyhow::Error::new(RequestTimedOut)
+                                .context(format!("{detail} after empty-response retry")));
                         }
-                        return Err(anyhow!(
-                            "model endpoint returned {status} after empty-response retry (category {})",
-                            summary.error_type.as_deref().unwrap_or("unclassified")
-                        ));
+                        return Err(anyhow!("{detail} after empty-response retry"));
                     }
                     if timeout_status(status.as_u16())
                         && timeout_retries < TIMEOUT_RETRIES
@@ -1355,10 +1366,12 @@ impl LlmClient {
                         continue;
                     }
                     if timeout_status(status.as_u16()) {
-                        return Err(anyhow::Error::new(RequestTimedOut).context(format!(
-                            "model endpoint returned {status} (category {})",
-                            summary.error_type.as_deref().unwrap_or("timeout")
-                        )));
+                        let detail = provider_http_status_detail(
+                            status,
+                            &summary,
+                            response.request_id.as_deref(),
+                        );
+                        return Err(anyhow::Error::new(RequestTimedOut).context(detail));
                     }
                     if retryable_status(status.as_u16()) && retries < TRANSIENT_RETRIES {
                         retries += 1;
@@ -1376,10 +1389,11 @@ impl LlmClient {
                         attempt_timeout = self.request_timeout;
                         continue;
                     }
-                    return Err(anyhow!(
-                        "model endpoint returned {status} (category {})",
-                        summary.error_type.as_deref().unwrap_or("unclassified")
-                    ));
+                    return Err(anyhow!(provider_http_status_detail(
+                        status,
+                        &summary,
+                        response.request_id.as_deref(),
+                    )));
                 }
                 Err(error)
                     if reqwest_error(&error).is_some_and(reqwest::Error::is_timeout)
@@ -1625,7 +1639,19 @@ fn retry_after_duration_at(headers: &HeaderMap, now: std::time::SystemTime) -> O
 fn safe_header_value(value: Option<&HeaderValue>) -> Option<String> {
     value
         .and_then(|value| value.to_str().ok())
-        .and_then(safe_response_identifier)
+        .and_then(|value| {
+            let value = value.trim();
+            if value.is_empty() {
+                return None;
+            }
+            if value.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-' | ':')
+            }) {
+                Some(value.chars().take(96).collect())
+            } else {
+                Some("present".to_string())
+            }
+        })
 }
 
 fn safe_request_id(headers: &HeaderMap, expose_identifier: bool) -> Option<String> {
@@ -1654,6 +1680,44 @@ fn safe_response_identifier(value: &str) -> Option<String> {
     }
 }
 
+fn safe_error_category(value: &str) -> &'static str {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "api_error" => "api_error",
+        "authentication_error" => "authentication_error",
+        "authorization_error" => "authorization_error",
+        "billing_error" => "billing_error",
+        "credits_exhausted" => "credits_exhausted",
+        "insufficient_credits" => "insufficient_credits",
+        "insufficient_quota" => "insufficient_quota",
+        "invalid_request_error" => "invalid_request_error",
+        "key_limit_exceeded" => "key_limit_exceeded",
+        "not_found_error" => "not_found_error",
+        "overloaded_error" => "overloaded_error",
+        "permission_error" => "permission_error",
+        "provider_error" => "provider_error",
+        "rate_limit_error" => "rate_limit_error",
+        "server_error" => "server_error",
+        "timeout_error" => "timeout_error",
+        _ => "reported",
+    }
+}
+
+fn provider_http_status_detail(
+    status: reqwest::StatusCode,
+    summary: &SafeResponseSummary,
+    request_id: Option<&str>,
+) -> String {
+    let category = summary.error_type.as_deref().unwrap_or("unclassified");
+    match request_id {
+        Some(request_id) => {
+            format!(
+                "model endpoint returned {status} (category {category}, request id {request_id})"
+            )
+        }
+        None => format!("model endpoint returned {status} (category {category})"),
+    }
+}
+
 fn safe_response_summary(
     text: &str,
     api_format: ApiFormat,
@@ -1662,7 +1726,7 @@ fn safe_response_summary(
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
         return SafeResponseSummary::default();
     };
-    let string_at = |path: &[&str]| -> Option<String> {
+    let raw_string_at = |path: &[&str]| -> Option<&str> {
         path.iter()
             .try_fold(&value, |current, key| {
                 key.parse::<usize>()
@@ -1671,13 +1735,15 @@ fn safe_response_summary(
                     .or_else(|| current.get(*key))
             })?
             .as_str()
-            .and_then(|value| {
-                if expose_identifiers {
-                    safe_response_identifier(value)
-                } else {
-                    Some("present".to_string())
-                }
-            })
+    };
+    let string_at = |path: &[&str]| -> Option<String> {
+        raw_string_at(path).and_then(|value| {
+            if expose_identifiers {
+                safe_response_identifier(value)
+            } else {
+                Some("present".to_string())
+            }
+        })
     };
     let usage_value = value.get("usage").filter(|usage| usage.is_object());
     let usage = match api_format {
@@ -1708,8 +1774,10 @@ fn safe_response_summary(
         provider: string_at(&["provider"]),
         finish_reason: string_at(&["choices", "0", "finish_reason"])
             .or_else(|| string_at(&["stop_reason"])),
-        error_type: string_at(&["error", "metadata", "error_type"])
-            .or_else(|| string_at(&["error", "error_type"])),
+        error_type: raw_string_at(&["error", "metadata", "error_type"])
+            .or_else(|| raw_string_at(&["error", "error_type"]))
+            .map(safe_error_category)
+            .map(str::to_string),
         choices: value
             .get("choices")
             .and_then(serde_json::Value::as_array)
@@ -2762,7 +2830,7 @@ mod tests {
         assert_eq!(summary.returned_model.as_deref(), Some("present"));
         assert_eq!(summary.provider.as_deref(), Some("present"));
         assert_eq!(summary.finish_reason.as_deref(), Some("present"));
-        assert_eq!(summary.error_type.as_deref(), Some("present"));
+        assert_eq!(summary.error_type.as_deref(), Some("reported"));
 
         let public_summary = safe_response_summary(
             r#"{"id":"response-1","model":"safe/model-v1","provider":"provider-1"}"#,
@@ -2785,6 +2853,27 @@ mod tests {
             safe_request_id(&headers, true).as_deref(),
             Some("token-shaped-secret")
         );
+    }
+
+    #[test]
+    fn openrouter_403_detail_redacts_response_key_management_url() {
+        let key_url = "https://openrouter.ai/settings/keys/key-management-identifier";
+        let body = format!(
+            r#"{{"error":{{"message":"Manage this key at {key_url}","metadata":{{"error_type":"{key_url}"}}}}}}"#
+        );
+        let summary = safe_response_summary(&body, ApiFormat::OpenaiCompatible, true);
+        let detail = provider_http_status_detail(
+            reqwest::StatusCode::FORBIDDEN,
+            &summary,
+            Some("request-safe-1"),
+        );
+
+        assert_eq!(summary.error_type.as_deref(), Some("reported"));
+        assert!(detail.contains("403 Forbidden"));
+        assert!(detail.contains("category reported"));
+        assert!(detail.contains("request id request-safe-1"));
+        assert!(!detail.contains(key_url));
+        assert!(!detail.contains("key-management-identifier"));
     }
 
     #[test]
