@@ -3,505 +3,294 @@ import { benchmarkCase, type BenchmarkCase, type Envelope } from "./harness";
 import {
   aggregateModel,
   calculateTotalRunCostUsd,
-  erroredLiveCase,
-  estimateCasePromptTokens,
   findingHitsSeededRegion,
-  GUARDRAIL_COMPLETION_TOKENS,
-  GUARDRAIL_FIXED_PROMPT_BYTES,
-  GUARDRAIL_REPAIR_INPUT_TOKENS,
-  GUARDRAIL_TRANSPORT_ATTEMPTS_PER_PHASE,
   groundTruthOf,
-  LINE_TOLERANCE,
   pricingFromCatalog,
-  projectTotalCostUsd,
+  qualificationPairId,
   scoreLiveCase,
   toSiteModelAggregate,
+  type LiveModelCaseResult,
   type ModelPricing,
+  type QualificationPair,
 } from "./livemodels-score";
 
-// ---------------------------------------------------------------------------
-// Fixtures builders
+const pair: QualificationPair = { generatorModel: "provider/generator", scorerModel: "provider/scorer" };
+const prices = new Map<string, ModelPricing>([
+  [pair.generatorModel, { promptUsdPerToken: 0.000001, completionUsdPerToken: 0.000002 }],
+  [pair.scorerModel, { promptUsdPerToken: 0.000001, completionUsdPerToken: 0.000002 }],
+]);
 
-function defectCase(overrides?: {
-  path?: string;
-  line?: number;
-  severity?: "info" | "warn" | "error";
-}): BenchmarkCase {
+function fixture(
+  classification: "mustBlock" | "advisory" | "clean",
+  id = `case-${classification}`,
+): BenchmarkCase {
+  const severity = classification === "mustBlock" ? "error" : classification === "advisory" ? "warn" : null;
   return benchmarkCase.parse({
-    id: "defect-1",
-    name: "seeded defect",
+    id,
+    name: id,
     repo: "benchmark/example",
     pullNumber: 1,
     headSha: "a".repeat(40),
     diff: "diff --git a/src/x.ts b/src/x.ts\n+ bad();\n",
+    admission: { classification, contractRule: "test-contract" },
     groundTruth: {
-      findings: [
-        {
-          path: overrides?.path ?? "src/x.ts",
-          line: overrides?.line ?? 20,
-          severity: overrides?.severity ?? "error",
-        },
-      ],
+      findings: severity === null ? [] : [{ path: "src/x.ts", line: 20, severity }],
     },
     modelOutput: { summary: "", findings: [] },
     expectations: { minFindings: 0 },
-  } satisfies Parameters<typeof benchmarkCase.parse>[0]);
+  });
 }
 
-function cleanCase(): BenchmarkCase {
-  return benchmarkCase.parse({
-    id: "clean-1",
-    name: "clean pr",
-    repo: "benchmark/example",
-    pullNumber: 2,
-    headSha: "b".repeat(40),
-    diff: "diff --git a/src/y.ts b/src/y.ts\n+ ok();\n",
-    groundTruth: { findings: [] },
-    modelOutput: { summary: "", findings: [] },
-    expectations: { minFindings: 0 },
-  } satisfies Parameters<typeof benchmarkCase.parse>[0]);
+function finding(severity: "info" | "warn" | "error", path = "src/x.ts", line = 20) {
+  return {
+    path,
+    line,
+    severity,
+    kind: "risk",
+    confidence: 0.9,
+    title: "generated prose must not persist",
+    body: "generated detail must not persist",
+  } as const;
 }
 
-function envelope(overrides: Partial<Envelope> = {}): Envelope {
-  const usage = overrides.usage ?? { promptTokens: 1000, completionTokens: 200 };
-  const modelUsed = overrides.modelUsed ?? "m";
+function usage(model: string, role: "reviewGenerator" | "findingScorer", exact = true) {
+  return {
+    model,
+    role,
+    phase: "initial" as const,
+    callOrdinal: role === "reviewGenerator" ? 1 : 2,
+    attempt: 1,
+    promptTokens: 100,
+    completionTokens: 20,
+    ...(exact ? { costMicros: 100, costSource: "providerReported" as const } : {}),
+    accountingComplete: true,
+  };
+}
+
+function envelope(args: {
+  findings?: Envelope["findings"];
+  suppressed?: Envelope["suppressedFindings"];
+  gateFailing?: boolean;
+  exactCost?: boolean;
+  scorerError?: string;
+} = {}): Envelope {
+  const findings = args.findings ?? [];
+  const suppressedFindings = args.suppressed ?? [];
+  const needsScorer = findings.length + suppressedFindings.length > 0;
+  const modelUsage = [
+    usage(pair.generatorModel, "reviewGenerator", args.exactCost ?? true),
+    ...(needsScorer ? [usage(pair.scorerModel, "findingScorer", args.exactCost ?? true)] : []),
+  ];
   return {
     version: 1,
     summary: "",
-    silent: false,
-    findings: [],
+    silent: findings.length === 0,
+    findings,
+    suppressedFindings,
     resolved: [],
-    counts: { info: 0, warn: 0, error: 0, suppressed: 0, ungrounded: 0 },
+    counts: { info: 0, warn: 0, error: 0, suppressed: suppressedFindings.length, ungrounded: 0 },
     confidenceBuckets: [0, 0, 0, 0, 0],
-    gate: { failOn: "error", failing: false },
-    modelUsed,
-    usage,
-    modelUsage: overrides.modelUsage ?? [{ model: modelUsed, ...usage }],
-    usageAccountingComplete: overrides.usageAccountingComplete ?? true,
-    durationMs: 1234,
+    gate: { failOn: "error", failing: args.gateFailing ?? false, blockOnKinds: [] },
+    modelUsed: pair.generatorModel,
+    ...(needsScorer ? { scorerModel: pair.scorerModel } : {}),
+    ...(args.scorerError === undefined ? {} : { scorerError: args.scorerError }),
+    usage: {
+      promptTokens: modelUsage.reduce((sum, entry) => sum + entry.promptTokens, 0),
+      completionTokens: modelUsage.reduce((sum, entry) => sum + entry.completionTokens, 0),
+    },
+    modelUsage,
+    usageAccountingComplete: true,
+    durationMs: 1000,
     baseSha: null,
     headSha: null,
     sinceSha: null,
-    ...overrides,
   };
 }
 
-function mkFinding(
-  path: string,
-  line: number,
-  severity: "info" | "warn" | "error",
-  endLine?: number,
-): Envelope["findings"][number] {
-  return { path, line, endLine, severity, kind: "risk", confidence: 0.9, title: "t", body: "b" };
+function score(
+  classification: "mustBlock" | "advisory" | "clean",
+  repeat: number,
+  env: Envelope,
+  id?: string,
+): LiveModelCaseResult {
+  return scoreLiveCase({
+    case: fixture(classification, id),
+    pair,
+    repeat,
+    envelope: env,
+    pricing: prices,
+    exitCode: env.gate.failing ? 1 : 0,
+    fidelityFailures: [],
+  });
 }
 
-const pricing: ModelPricing = { promptUsdPerToken: 0.000001, completionUsdPerToken: 0.000002 };
-
-// ---------------------------------------------------------------------------
-// groundTruthOf
-
-describe("groundTruthOf", () => {
-  test("defect fixture with an error finding demands a failing gate", () => {
-    const gt = groundTruthOf(defectCase({ severity: "error" }));
-    expect(gt).toMatchObject({ clean: false, path: "src/x.ts", line: 20, severity: "error", gateShouldFail: true });
-  });
-
-  test("defect fixture with a warn finding does not demand a failing gate", () => {
-    const gt = groundTruthOf(defectCase({ severity: "warn" }));
-    expect(gt.gateShouldFail).toBe(false);
-  });
-
-  test("clean fixture is clean with a passing gate", () => {
-    const gt = groundTruthOf(cleanCase());
-    expect(gt).toMatchObject({ clean: true, path: null, line: null, gateShouldFail: false });
-  });
-});
-
-// ---------------------------------------------------------------------------
-// findingHitsSeededRegion
-
-describe("findingHitsSeededRegion", () => {
-  test("exact line hit", () => {
-    expect(findingHitsSeededRegion({ path: "x", line: 20 }, 20)).toBe(true);
-  });
-
-  test("within tolerance below and above", () => {
-    expect(findingHitsSeededRegion({ path: "x", line: 20 - LINE_TOLERANCE }, 20)).toBe(true);
-    expect(findingHitsSeededRegion({ path: "x", line: 20 + LINE_TOLERANCE }, 20)).toBe(true);
-  });
-
-  test("just outside tolerance misses", () => {
-    expect(findingHitsSeededRegion({ path: "x", line: 20 + LINE_TOLERANCE + 1 }, 20)).toBe(false);
-  });
-
-  test("endLine range overlapping the seeded line hits", () => {
-    // finding spans lines 40..60; seeded line 20 is far below, no overlap even
-    // with tolerance.
-    expect(findingHitsSeededRegion({ path: "x", line: 40, endLine: 60 }, 20)).toBe(false);
-    // finding spans 10..25; seeded line 20 falls inside the range.
-    expect(findingHitsSeededRegion({ path: "x", line: 10, endLine: 25 }, 20)).toBe(true);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// scoreLiveCase — detection
-
-describe("scoreLiveCase detection", () => {
-  test("a finding on the seeded file within the region is a detection, no FP", () => {
-    const c = defectCase({ line: 20 });
-    const env = envelope({ findings: [mkFinding("src/x.ts", 21, "error")] });
-    const r = scoreLiveCase({ case: c, model: "m", envelope: env, pricing, exitCode: 1, fidelityFailures: [] });
-    expect(r.detected).toBe(true);
-    expect(r.falsePositives).toBe(0);
-  });
-
-  test("a finding on the wrong file is a miss and a false positive", () => {
-    const c = defectCase({ line: 20, path: "src/x.ts" });
-    const env = envelope({ findings: [mkFinding("src/other.ts", 20, "error")] });
-    const r = scoreLiveCase({ case: c, model: "m", envelope: env, pricing, exitCode: 0, fidelityFailures: [] });
-    expect(r.detected).toBe(false);
-    expect(r.falsePositives).toBe(1);
-  });
-
-  test("a finding on the right file outside the region is a miss and a false positive", () => {
-    const c = defectCase({ line: 20 });
-    const env = envelope({ findings: [mkFinding("src/x.ts", 200, "error")] });
-    const r = scoreLiveCase({ case: c, model: "m", envelope: env, pricing, exitCode: 0, fidelityFailures: [] });
-    expect(r.detected).toBe(false);
-    expect(r.falsePositives).toBe(1);
-  });
-
-  test("one detector plus one stray finding: detected with one FP", () => {
-    const c = defectCase({ line: 20 });
-    const env = envelope({
-      findings: [mkFinding("src/x.ts", 20, "error"), mkFinding("src/x.ts", 300, "warn")],
-    });
-    const r = scoreLiveCase({ case: c, model: "m", envelope: env, pricing, exitCode: 1, fidelityFailures: [] });
-    expect(r.detected).toBe(true);
-    expect(r.falsePositives).toBe(1);
-  });
-
-  test("carried/resolved findings never count as detections (only env.findings scored)", () => {
-    const c = defectCase({ line: 20 });
-    // The detector is only present in `resolved`, not in the active findings.
-    const env = envelope({ findings: [], resolved: [mkFinding("src/x.ts", 20, "error")] });
-    const r = scoreLiveCase({ case: c, model: "m", envelope: env, pricing, exitCode: 0, fidelityFailures: [] });
-    expect(r.detected).toBe(false);
-    expect(r.falsePositives).toBe(0);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// scoreLiveCase — clean fixtures and gate
-
-describe("scoreLiveCase clean and gate", () => {
-  test("clean fixture with no findings: no FP, detection undefined", () => {
-    const env = envelope({ findings: [], silent: true });
-    const r = scoreLiveCase({ case: cleanCase(), model: "m", envelope: env, pricing, exitCode: 0, fidelityFailures: [] });
-    expect(r.detected).toBeNull();
-    expect(r.falsePositives).toBe(0);
-    expect(r.type).toBe("clean");
-  });
-
-  test("clean fixture with any finding: every finding is a false positive", () => {
-    const env = envelope({ findings: [mkFinding("src/y.ts", 3, "warn")] });
-    const r = scoreLiveCase({ case: cleanCase(), model: "m", envelope: env, pricing, exitCode: 0, fidelityFailures: [] });
-    expect(r.falsePositives).toBe(1);
-  });
-
-  test("gate correctness: error defect wants a failing gate", () => {
-    const c = defectCase({ severity: "error" });
-    const env = envelope({ findings: [mkFinding("src/x.ts", 20, "error")], gate: { failOn: "error", failing: true } });
-    const r = scoreLiveCase({ case: c, model: "m", envelope: env, pricing, exitCode: 1, fidelityFailures: [] });
-    expect(r.gateFailingExpected).toBe(true);
-    expect(r.gateFailingActual).toBe(true);
-    expect(r.gateCorrect).toBe(true);
-  });
-
-  test("gate correctness: model that fails to fail the gate on an error defect is scored incorrect", () => {
-    const c = defectCase({ severity: "error" });
-    const env = envelope({ findings: [mkFinding("src/x.ts", 20, "warn")], gate: { failOn: "error", failing: false } });
-    const r = scoreLiveCase({ case: c, model: "m", envelope: env, pricing, exitCode: 0, fidelityFailures: [] });
-    expect(r.gateCorrect).toBe(false);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Cost
-
-describe("cost", () => {
-  test("cost is prompt*promptPrice + completion*completionPrice", () => {
-    const env = envelope({ usage: { promptTokens: 1000, completionTokens: 200 }, findings: [] });
-    const r = scoreLiveCase({ case: cleanCase(), model: "m", envelope: env, pricing, exitCode: 0, fidelityFailures: [] });
-    expect(r.costUsd).toBeCloseTo(1000 * 0.000001 + 200 * 0.000002, 12);
-  });
-
-  test("cost is null when pricing is unknown", () => {
-    const env = envelope({ findings: [] });
-    const r = scoreLiveCase({ case: cleanCase(), model: "m", envelope: env, pricing: null, exitCode: 0, fidelityFailures: [] });
-    expect(r.costUsd).toBeNull();
-  });
-});
-
-// ---------------------------------------------------------------------------
-// aggregateModel
-
-describe("aggregateModel", () => {
-  test("admits only a complete isolated generator result that meets quality, cost, and latency thresholds", () => {
-    const admitted = scoreLiveCase({
-      case: defectCase({ line: 20 }),
-      model: "m",
-      envelope: envelope({
-        findings: [mkFinding("src/x.ts", 20, "error")],
-        gate: { failOn: "error", failing: true },
-        durationMs: 1000,
-      }),
-      pricing,
-      exitCode: 1,
-      fidelityFailures: [],
-    });
-    expect(aggregateModel("m", [admitted])).toMatchObject({ passed: true, admissionFailures: [] });
-
-    const fidelityFailure = { ...admitted, fidelityFailures: ["wrong generator"] };
-    expect(aggregateModel("m", [fidelityFailure])).toMatchObject({ passed: false, fidelityFailures: 1 });
-  });
-
-  test("rejects incomplete or missing generator provider usage instead of pricing it as zero", () => {
-    const c = defectCase({ line: 20 });
-    const incomplete = scoreLiveCase({
-      case: c,
-      model: "m",
-      envelope: envelope({
-        findings: [mkFinding("src/x.ts", 20, "error")],
-        gate: { failOn: "error", failing: true },
-        usageAccountingComplete: false,
-      }),
-      pricing,
-      exitCode: 1,
-      fidelityFailures: [],
-    });
-    expect(incomplete).toMatchObject({ costUsd: null, usageAccountingComplete: false, usageValid: true });
-    expect(aggregateModel("m", [incomplete]).admissionFailures.join("\n")).toContain("usage accounting");
-
-    const missing = scoreLiveCase({
-      case: c,
-      model: "m",
-      envelope: envelope({
-        findings: [mkFinding("src/x.ts", 20, "error")],
-        gate: { failOn: "error", failing: true },
-        modelUsage: [],
-      }),
-      pricing,
-      exitCode: 1,
-      fidelityFailures: [],
-    });
-    expect(missing).toMatchObject({ costUsd: null, usageValid: false });
-    expect(aggregateModel("m", [missing]).passed).toBe(false);
-
-    const zero = scoreLiveCase({
-      case: c,
-      model: "m",
-      envelope: envelope({
-        findings: [mkFinding("src/x.ts", 20, "error")],
-        gate: { failOn: "error", failing: true },
-        usage: { promptTokens: 0, completionTokens: 0 },
-      }),
-      pricing,
-      exitCode: 1,
-      fidelityFailures: [],
-    });
-    expect(zero).toMatchObject({ costUsd: null, usageValid: false });
-  });
-
-  test("detection rate, FP sum, mean cost/duration, gate tally, total cost", () => {
-    const c = defectCase({ line: 20 });
-    const hit = scoreLiveCase({
-      case: c,
-      model: "m",
-      envelope: envelope({ findings: [mkFinding("src/x.ts", 20, "error")], usage: { promptTokens: 1000, completionTokens: 100 }, durationMs: 1000, gate: { failOn: "error", failing: true } }),
-      pricing,
-      exitCode: 1,
-      fidelityFailures: [],
-    });
-    const miss = scoreLiveCase({
-      case: c,
-      model: "m",
-      envelope: envelope({ findings: [mkFinding("src/x.ts", 999, "warn")], usage: { promptTokens: 2000, completionTokens: 300 }, durationMs: 3000, gate: { failOn: "error", failing: false } }),
-      pricing,
-      exitCode: 0,
-      fidelityFailures: [],
-    });
-    const agg = aggregateModel("m", [hit, miss]);
-    expect(agg.detectionRate).toBeCloseTo(0.5, 10);
-    expect(agg.defectCases).toBe(2);
-    expect(agg.casesRun).toBe(2);
-    expect(agg.falsePositives).toBe(1); // the miss's stray finding
-    const costHit = 1000 * 0.000001 + 100 * 0.000002;
-    const costMiss = 2000 * 0.000001 + 300 * 0.000002;
-    expect(agg.totalCostUsd).toBeCloseTo(costHit + costMiss, 12);
-    expect(agg.meanCostUsdPerReview).toBeCloseTo((costHit + costMiss) / 2, 12);
-    expect(agg.meanDurationMs).toBeCloseTo(2000, 6);
-    expect(agg.gateScored).toBe(2);
-    // The miss's envelope reports a passing gate on an error-severity defect, so
-    // its gate verdict is scored incorrect; only the hit's gate is correct.
-    expect(agg.gateCorrect).toBe(1);
-  });
-
-  test("errored cases are excluded from scoring but counted as errors", () => {
-    const c = defectCase();
-    const err = erroredLiveCase({ case: c, model: "m", exitCode: 2, error: "no valid v1 envelope (exit 2)" });
-    const agg = aggregateModel("m", [err]);
-    expect(agg.casesRun).toBe(0);
-    expect(agg.errors).toBe(1);
-    expect(agg.detectionRate).toBe(0);
-  });
-
-  test("empty results produce zeroed aggregate", () => {
-    const agg = aggregateModel("m", []);
-    expect(agg).toMatchObject({ detectionRate: 0, casesRun: 0, meanCostUsdPerReview: 0, meanDurationMs: 0, totalCostUsd: 0 });
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Run cost total
-
-describe("calculateTotalRunCostUsd", () => {
-  test("sums included per-case costs and matches per-model totals", () => {
-    const c = defectCase({ line: 20 });
-    const modelA = [
-      scoreLiveCase({
-        case: c,
-        model: "a/model",
-        envelope: envelope({ usage: { promptTokens: 1000, completionTokens: 100 } }),
-        pricing,
-        exitCode: 0,
-        fidelityFailures: [],
-      }),
-      scoreLiveCase({
-        case: cleanCase(),
-        model: "a/model",
-        envelope: envelope({ usage: { promptTokens: 500, completionTokens: 50 } }),
-        pricing,
-        exitCode: 0,
-        fidelityFailures: [],
-      }),
-    ];
-    const modelB = [
-      scoreLiveCase({
-        case: c,
-        model: "b/model",
-        envelope: envelope({ usage: { promptTokens: 200, completionTokens: 20 } }),
-        pricing,
-        exitCode: 0,
-        fidelityFailures: [],
-      }),
-      scoreLiveCase({
-        case: cleanCase(),
-        model: "b/model",
-        envelope: envelope({ usage: { promptTokens: 999, completionTokens: 999 } }),
-        pricing: null,
-        exitCode: 0,
-        fidelityFailures: [],
-      }),
-      erroredLiveCase({ case: c, model: "b/model", exitCode: 2, error: "no valid v1 envelope (exit 2)" }),
-    ];
-
-    const results = [...modelA, ...modelB];
-    const perCaseTotal = results.reduce((sum, r) => sum + (r.costUsd ?? 0), 0);
-    const perModelTotal =
-      aggregateModel("a/model", modelA).totalCostUsd + aggregateModel("b/model", modelB).totalCostUsd;
-
-    expect(calculateTotalRunCostUsd(results)).toBeCloseTo(perCaseTotal, 12);
-    expect(calculateTotalRunCostUsd(results)).toBeCloseTo(perModelTotal, 12);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Site schema shape
-
-describe("toSiteModelAggregate", () => {
-  test("emits exactly the six site fields", () => {
-    const agg = aggregateModel("m", [
-      scoreLiveCase({ case: defectCase({ line: 20 }), model: "m", envelope: envelope({ findings: [mkFinding("src/x.ts", 20, "error")] }), pricing, exitCode: 1, fidelityFailures: [] }),
-    ]);
-    const site = toSiteModelAggregate(agg);
-    expect(Object.keys(site).sort()).toEqual(
-      ["casesRun", "detectionRate", "falsePositives", "id", "meanCostUsdPerReview", "meanDurationMs"].sort(),
-    );
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Pricing catalog
-
-describe("pricingFromCatalog", () => {
-  const catalog = {
-    data: [
-      { id: "a/model", pricing: { prompt: "0.000001", completion: "0.000002" } },
-      { id: "b/model", canonical_slug: "b/model-20260709", pricing: { prompt: "0", completion: "0" } },
-      { id: "c/model", pricing: { prompt: "", completion: "x" } },
-      { id: "d/unwanted", pricing: { prompt: "0.5", completion: "0.5" } },
-    ],
-  };
-
-  test("keeps only wanted models with parseable prices", () => {
-    const p = pricingFromCatalog(catalog, ["a/model", "b/model", "c/model"]);
-    expect(p.get("a/model")).toEqual({ promptUsdPerToken: 0.000001, completionUsdPerToken: 0.000002 });
-    expect(p.get("b/model")).toEqual({ promptUsdPerToken: 0, completionUsdPerToken: 0 });
-    expect(p.has("c/model")).toBe(false); // unparseable
-    expect(p.has("d/unwanted")).toBe(false); // not requested
-  });
-
-  test("matches the immutable canonical slug", () => {
-    const p = pricingFromCatalog(catalog, ["b/model-20260709"]);
-    expect(p.get("b/model-20260709")).toEqual({ promptUsdPerToken: 0, completionUsdPerToken: 0 });
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Cost guardrail projection
-
-describe("projectTotalCostUsd", () => {
-  test("estimate is a fixed overhead plus UTF-8 diff bytes", () => {
-    expect(estimateCasePromptTokens("")).toBe(GUARDRAIL_FIXED_PROMPT_BYTES);
-    expect(estimateCasePromptTokens("a".repeat(30))).toBe(GUARDRAIL_FIXED_PROMPT_BYTES + 30);
-    expect(estimateCasePromptTokens("🛰️")).toBe(GUARDRAIL_FIXED_PROMPT_BYTES + Buffer.byteLength("🛰️"));
-  });
-
-  test("projects prompt+completion cost across every case-model pair", () => {
-    const diffs = ["a".repeat(30), "b".repeat(60)];
-    const models = ["a/model", "b/model"];
-    const p = new Map<string, ModelPricing>([
-      ["a/model", { promptUsdPerToken: 0.000001, completionUsdPerToken: 0.000002 }],
-      ["b/model", { promptUsdPerToken: 0.000003, completionUsdPerToken: 0.000004 }],
-    ]);
-    const total = projectTotalCostUsd({ diffs, models, pricing: p });
-    let expected = 0;
-    for (const model of models) {
-      const price = p.get(model)!;
-      for (const diff of diffs) {
-        const promptTokens = estimateCasePromptTokens(diff);
-        const initial = promptTokens * price.promptUsdPerToken +
-          GUARDRAIL_COMPLETION_TOKENS * price.completionUsdPerToken;
-        const repair = (promptTokens + GUARDRAIL_REPAIR_INPUT_TOKENS) * price.promptUsdPerToken +
-          GUARDRAIL_COMPLETION_TOKENS * price.completionUsdPerToken;
-        expected += GUARDRAIL_TRANSPORT_ATTEMPTS_PER_PHASE * (initial + repair);
-      }
+function passingMatrix(repeats = 3): LiveModelCaseResult[] {
+  const results: LiveModelCaseResult[] = [];
+  for (let repeat = 1; repeat <= repeats; repeat += 1) {
+    for (let i = 0; i < 34; i += 1) {
+      results.push(score("mustBlock", repeat, envelope({ findings: [finding("error")], gateFailing: true }), `m-${i}`));
     }
-    expect(total).toBeCloseTo(expected, 12);
+    for (let i = 0; i < 15; i += 1) {
+      results.push(score("advisory", repeat, envelope({ findings: [finding("warn")] }), `a-${i}`));
+    }
+    for (let i = 0; i < 12; i += 1) {
+      results.push(score("clean", repeat, envelope(), `c-${i}`));
+    }
+  }
+  return results;
+}
+
+describe("fixture contract", () => {
+  test("distinguishes must-block, advisory, and clean ground truth", () => {
+    expect(groundTruthOf(fixture("mustBlock"))).toMatchObject({ classification: "mustBlock", severity: "error" });
+    expect(groundTruthOf(fixture("advisory"))).toMatchObject({ classification: "advisory", severity: "warn" });
+    expect(groundTruthOf(fixture("clean"))).toMatchObject({ classification: "clean", path: null });
   });
 
-  test("models with unknown pricing contribute zero to the projection", () => {
-    const total = projectTotalCostUsd({
-      diffs: ["x".repeat(100)],
-      models: ["priced", "unpriced"],
-      pricing: new Map([["priced", { promptUsdPerToken: 0.000001, completionUsdPerToken: 0.000001 }]]),
+  test("attributes only overlapping findings to the seeded defect", () => {
+    expect(findingHitsSeededRegion({ path: "src/x.ts", line: 17 }, 20)).toBe(true);
+    expect(findingHitsSeededRegion({ path: "src/x.ts", line: 16 }, 20)).toBe(false);
+  });
+});
+
+describe("pair scoring", () => {
+  test("records final and suppressed detector evidence without generated prose", () => {
+    const result = score("advisory", 1, envelope({
+      suppressed: [{ finding: finding("warn"), reason: "confidence" }],
+    }));
+    expect(result.detected).toBe(true);
+    expect(result.findingEvidence).toEqual([{
+      detectorAttribution: "seeded",
+      disposition: "suppressed",
+      path: "src/x.ts",
+      line: 20,
+      severity: "warn",
+      kind: "risk",
+      confidence: 0.9,
+    }]);
+    expect(JSON.stringify(result.findingEvidence)).not.toContain("generated prose");
+    expect(JSON.stringify(result.findingEvidence)).not.toContain("generated detail");
+  });
+
+  test("requires the seeded detector itself to block and rejects unrelated substitute blockers", () => {
+    const result = score("mustBlock", 1, envelope({
+      findings: [finding("warn"), finding("error", "src/other.ts", 8)],
+      gateFailing: true,
+    }));
+    expect(result.detected).toBe(true);
+    expect(result.seededFinalBlocker).toBe(false);
+    expect(result.unrelatedFinalBlockers).toBe(1);
+    expect(result.finalBlocking).toBe(false);
+  });
+
+  test("preserves provider-exact and catalog fallback cost provenance", () => {
+    const exact = score("advisory", 1, envelope({ findings: [finding("warn")] }));
+    expect(exact.costProvenance).toBe("providerExact");
+    expect(exact.costUsd).toBeCloseTo(0.0002, 8);
+
+    const catalog = score("advisory", 1, envelope({ findings: [finding("warn")], exactCost: false }));
+    expect(catalog.costProvenance).toBe("catalogEstimate");
+    expect(catalog.costUsd).toBeCloseTo(0.00028, 8);
+  });
+});
+
+describe("pair admission", () => {
+  test("passes only a repeated complete exact-pair matrix", () => {
+    const aggregate = aggregateModel(pair, passingMatrix(), 3);
+    expect(aggregate).toMatchObject({
+      id: qualificationPairId(pair),
+      casesRun: 183,
+      mustBlockRecall: 1,
+      mustBlockFinalBlockingRate: 1,
+      advisoryDetectionRate: 1,
+      advisoryOverblockRate: 0,
+      cleanFalseBlocks: 0,
+      cleanFindingFalsePositiveRate: 0,
+      errors: 0,
+      fidelityFailures: 0,
+      structuredOutputFailures: 0,
+      usageFailures: 0,
+      passed: true,
+      admissionFailures: [],
     });
-    const only = projectTotalCostUsd({
-      diffs: ["x".repeat(100)],
-      models: ["priced"],
-      pricing: new Map([["priced", { promptUsdPerToken: 0.000001, completionUsdPerToken: 0.000001 }]]),
+  });
+
+  test("fails every attributable quality boundary independently", () => {
+    const missedBlock = passingMatrix();
+    missedBlock[0] = score("mustBlock", 1, envelope(), "m-0");
+    expect(aggregateModel(pair, missedBlock, 3).admissionFailures.join("\n")).toContain("must-block recall");
+
+    const substituteBlock = passingMatrix();
+    substituteBlock[0] = score("mustBlock", 1, envelope({
+      findings: [finding("warn"), finding("error", "src/other.ts", 1)], gateFailing: true,
+    }), "m-0");
+    expect(aggregateModel(pair, substituteBlock, 3).admissionFailures.join("\n")).toContain("final seeded blocking");
+
+    const advisoryMisses = passingMatrix();
+    advisoryMisses[34] = score("advisory", 1, envelope(), "a-0");
+    advisoryMisses[35] = score("advisory", 1, envelope(), "a-1");
+    expect(aggregateModel(pair, advisoryMisses, 3).admissionFailures.join("\n")).toContain("advisory detection");
+
+    const advisoryBlocks = passingMatrix();
+    advisoryBlocks[34] = score("advisory", 1, envelope({ findings: [finding("error")], gateFailing: true }), "a-0");
+    advisoryBlocks[35] = score("advisory", 1, envelope({ findings: [finding("error")], gateFailing: true }), "a-1");
+    expect(aggregateModel(pair, advisoryBlocks, 3).admissionFailures.join("\n")).toContain("advisory overblocking");
+
+    const cleanNoise = passingMatrix();
+    cleanNoise[49] = score("clean", 1, envelope({ findings: [finding("warn", "src/other.ts", 1)] }), "c-0");
+    expect(aggregateModel(pair, cleanNoise, 3).admissionFailures.join("\n")).toContain("clean finding false-positive");
+
+    const cleanBlock = passingMatrix();
+    cleanBlock[49] = score("clean", 1, envelope({ findings: [finding("error", "src/other.ts", 1)], gateFailing: true }), "c-0");
+    expect(aggregateModel(pair, cleanBlock, 3).admissionFailures.join("\n")).toContain("clean false block");
+  });
+
+  test("fails incomplete, single-run, fidelity, structured-output, and accounting results", () => {
+    expect(aggregateModel(pair, passingMatrix(1), 1).admissionFailures.join("\n")).toContain("at least 3");
+
+    const incomplete = passingMatrix();
+    incomplete.pop();
+    expect(aggregateModel(pair, incomplete, 3).admissionFailures.join("\n")).toContain("matrix is");
+
+    const fidelity = passingMatrix();
+    fidelity[0]!.fidelityFailures.push("statusline mismatch");
+    expect(aggregateModel(pair, fidelity, 3).admissionFailures.join("\n")).toContain("pipeline fidelity");
+
+    const structured = passingMatrix();
+    structured[0]!.structuredOutputFailures.push("scorer mismatch");
+    expect(aggregateModel(pair, structured, 3).admissionFailures.join("\n")).toContain("structured-output");
+
+    const usageFailure = passingMatrix();
+    usageFailure[0]!.usageValid = false;
+    expect(aggregateModel(pair, usageFailure, 3).admissionFailures.join("\n")).toContain("usage accounting");
+  });
+});
+
+describe("report and pricing utilities", () => {
+  test("site aggregate identifies the exact pair and attributable metrics", () => {
+    const site = toSiteModelAggregate(aggregateModel(pair, passingMatrix(), 3));
+    expect(site).toEqual({
+      id: qualificationPairId(pair),
+      generatorModel: pair.generatorModel,
+      generatorModels: [pair.generatorModel],
+      scorerModel: pair.scorerModel,
+      mustBlockRecall: 1,
+      advisoryDetectionRate: 1,
+      cleanFindingFalsePositiveRate: 0,
+      casesRun: 183,
+      meanCostUsdPerReview: 0.0001803278688524587,
+      meanDurationMs: 1000,
     });
-    expect(total).toBeCloseTo(only, 12);
+  });
+
+  test("sums case costs and matches canonical catalog ids", () => {
+    const results = passingMatrix();
+    expect(calculateTotalRunCostUsd(results)).toBeCloseTo(0.033, 8);
+    const catalog = pricingFromCatalog({ data: [{
+      id: "alias",
+      canonical_slug: pair.generatorModel,
+      pricing: { prompt: "0.000001", completion: "0.000002" },
+    }] }, [pair.generatorModel]);
+    expect(catalog.get(pair.generatorModel)).toEqual(prices.get(pair.generatorModel));
   });
 });

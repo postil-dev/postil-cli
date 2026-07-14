@@ -87,6 +87,10 @@ export const benchmarkCase = z.object({
   /// can assert the source was not adopted by the reviewer.
   disallowedSources: z.array(disallowedSource).default([]),
   scoringLabels: z.array(z.string().min(1)).default([]),
+  admission: z.object({
+    classification: z.enum(["mustBlock", "advisory", "clean"]),
+    contractRule: z.string().min(1),
+  }),
   groundTruth: z.object({ findings: z.array(expectedFinding).default([]) }).default({
     findings: [],
   }),
@@ -121,11 +125,17 @@ const envelopeFinding = z.object({
   scorerReason: z.string().optional(),
 });
 
+const suppressedEnvelopeFinding = z.object({
+  finding: envelopeFinding,
+  reason: z.string(),
+});
+
 export const envelopeV1 = z.object({
   version: z.literal(1),
   summary: z.string(),
   silent: z.boolean(),
   findings: z.array(envelopeFinding),
+  suppressedFindings: z.array(suppressedEnvelopeFinding).default([]),
   resolved: z.array(envelopeFinding),
   counts: z.object({
     info: z.number().int().nonnegative(),
@@ -135,9 +145,14 @@ export const envelopeV1 = z.object({
     ungrounded: z.number().int().nonnegative(),
   }),
   confidenceBuckets: z.array(z.number().int().nonnegative()).length(5),
-  gate: z.object({ failOn: z.string(), failing: z.boolean() }),
+  gate: z.object({
+    failOn: z.string(),
+    failing: z.boolean(),
+    blockOnKinds: z.array(z.string()).default([]),
+  }),
   modelUsed: z.string(),
   scorerModel: z.string().optional(),
+  scorerError: z.string().optional(),
   usage: z.object({
     promptTokens: z.number().int().nonnegative(),
     completionTokens: z.number().int().nonnegative(),
@@ -146,9 +161,15 @@ export const envelopeV1 = z.object({
     .array(
       z.object({
         model: z.string().min(1),
+        role: z.enum(["reviewGenerator", "findingScorer", "mentionResponder"]).optional(),
+        phase: z.enum(["initial", "schemaRepair", "semanticRetry"]).optional(),
+        callOrdinal: z.number().int().positive().optional(),
+        attempt: z.number().int().positive().optional(),
         promptTokens: z.number().int().nonnegative(),
         completionTokens: z.number().int().nonnegative(),
         costMicros: z.number().int().nonnegative().optional(),
+        costSource: z.enum(["providerReported", "unavailable"]).optional(),
+        accountingComplete: z.boolean().default(false),
       }),
     )
     .optional(),
@@ -410,10 +431,13 @@ export async function startMockGithub(c: BenchmarkCase) {
   const checkRunNames = new Map<string, string>(); // id -> check name
   let nextCheckRunId = 1001;
   const pullPath = `/repos/${c.repo}/pulls/${c.pullNumber}`;
+  const pullFilesPath = `${pullPath}/files`;
   const checkRunsPath = `/repos/${c.repo}/check-runs`;
   const contentsPrefix = `/repos/${c.repo}/contents/`;
   const allowedContent = allowedContextByPath(c);
   const baseSha = "0".repeat(40);
+  const changedPath = c.allowedContext.files[0]?.path;
+  const sourceVersions = sourceVersionsFromDiff(c.diff);
 
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
@@ -433,15 +457,38 @@ export async function startMockGithub(c: BenchmarkCase) {
             body: "",
             head: { sha: c.headSha },
             base: { sha: baseSha },
+            changed_files: 1,
           }),
         );
       }
       return;
     }
 
+    if (req.method === "GET" && url.pathname === pullFilesPath) {
+      const lines = c.diff.split("\n");
+      const filename = lines
+        .find((line) => line.startsWith("+++ b/"))
+        ?.slice("+++ b/".length) ?? c.allowedContext.files[0]?.path ?? "changed-file";
+      const patchStart = lines.findIndex((line) => line.startsWith("@@ "));
+      const patch = patchStart >= 0 ? lines.slice(patchStart).join("\n").trimEnd() : undefined;
+      const changes = lines.filter(
+        (line) =>
+          (line.startsWith("+") && !line.startsWith("+++")) ||
+          (line.startsWith("-") && !line.startsWith("---")),
+      ).length;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify([{ filename, status: "modified", patch, changes }]));
+      return;
+    }
+
     if (req.method === "GET" && url.pathname.startsWith(contentsPrefix)) {
       const requested = decodeURIComponent(url.pathname.slice(contentsPrefix.length));
-      const content = allowedContent.get(requested);
+      const ref = url.searchParams.get("ref");
+      const content = requested === changedPath && ref === baseSha
+        ? sourceVersions.before
+        : requested === changedPath && ref === c.headSha
+          ? sourceVersions.after
+          : allowedContent.get(requested);
       if (content !== undefined) {
         res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
         res.end(content);
@@ -487,6 +534,38 @@ export async function startMockGithub(c: BenchmarkCase) {
     pullPath,
     checkRunsPath,
     close: () => closeServer(server),
+  };
+}
+
+function sourceVersionsFromDiff(diff: string): { before: string; after: string } {
+  const before: string[] = [];
+  const after: string[] = [];
+  let oldLine = 0;
+  let newLine = 0;
+  for (const line of diff.split("\n")) {
+    const header = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/u.exec(line);
+    if (header) {
+      oldLine = Number.parseInt(header[1]!, 10);
+      newLine = Number.parseInt(header[2]!, 10);
+      continue;
+    }
+    if (oldLine === 0 || line.startsWith("\\ No newline")) continue;
+    if (line.startsWith("-") && !line.startsWith("---")) {
+      before[oldLine - 1] = line.slice(1);
+      oldLine += 1;
+    } else if (line.startsWith("+") && !line.startsWith("+++")) {
+      after[newLine - 1] = line.slice(1);
+      newLine += 1;
+    } else if (line.startsWith(" ")) {
+      before[oldLine - 1] = line.slice(1);
+      after[newLine - 1] = line.slice(1);
+      oldLine += 1;
+      newLine += 1;
+    }
+  }
+  return {
+    before: Array.from({ length: before.length }, (_, index) => before[index] ?? "").join("\n"),
+    after: Array.from({ length: after.length }, (_, index) => after[index] ?? "").join("\n"),
   };
 }
 

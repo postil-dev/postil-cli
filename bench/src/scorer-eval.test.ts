@@ -317,8 +317,9 @@ describe("qualification utilities", () => {
     expect(isValidReason(`${"é".repeat(120)}.`)).toBe(false);
     expect(isValidReason(`${"a".repeat(239)}.`)).toBe(true);
     expect(isValidReason("Missing terminal punctuation")).toBe(false);
-    expect(isValidReason("Unicode conclusion…")).toBe(true);
-    expect(isValidReason("First sentence. Second sentence.")).toBe(false);
+    expect(isValidReason("Unicode conclusion…")).toBe(false);
+    expect(isValidReason("Unicode conclusion。")).toBe(true);
+    expect(isValidReason("First sentence. Second sentence.")).toBe(true);
     expect(isValidReason("Use input validation, e.g. a strict allowlist.")).toBe(true);
     expect(isValidReason("Dr. Smith verified the U.S. endpoint.")).toBe(true);
   });

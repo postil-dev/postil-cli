@@ -1,5 +1,6 @@
-// The 64-case fixture set contains 53 seeded defects across languages and
-// change classes plus 11 clean PRs where the correct review is silence.
+// The admission matrix contains 34 must-block defects, 15 advisory defects,
+// and 12 clean PRs where the correct review is silence. Every included case
+// supplies model-visible evidence for its asserted contract classification.
 //
 // Each spec compiles into a hermetic case: a unified diff, the changed file as
 // allowed context, a recorded model response generated from the same spec as
@@ -36,6 +37,10 @@ type FixtureSpec = {
   allowedFileContent: string;
   policy: string;
   scoringLabels: string[];
+  admission?: {
+    classification: "mustBlock" | "advisory" | "clean";
+    contractRule: string;
+  };
   finding?: {
     severity: "info" | "warn" | "error";
     body: string;
@@ -99,6 +104,13 @@ function buildCase(spec: FixtureSpec): BenchmarkCaseInput {
     },
     disallowedSources: spec.disallowedSources ?? [],
     scoringLabels: spec.scoringLabels,
+    admission:
+      spec.admission ??
+      (spec.finding?.severity === "error"
+        ? { classification: "mustBlock", contractRule: "merge-relevant-defect" }
+        : spec.finding
+          ? { classification: "advisory", contractRule: "conditional-merge-risk" }
+          : { classification: "clean", contractRule: "no-merge-relevant-defect" }),
     groundTruth: { findings: expected },
     guardrails: { forbiddenPromptSubstrings: [] },
     modelOutput: {
@@ -241,44 +253,6 @@ const fixtureSpecs: FixtureSpec[] = [
     disallowedSources: ["protected by the lock"],
   },
   {
-    id: "migration-drop-column",
-    name: "Drop a column without preserving the old values",
-    pullNumber: 7,
-    path: "db/migrations/0012_drop_legacy_email.sql",
-    line: 9,
-    before: "INSERT INTO archived_users SELECT id, email FROM users;",
-    after: "ALTER TABLE users DROP COLUMN email;",
-    allowedFileContent:
-      "INSERT INTO archived_users SELECT id, email FROM users;\nALTER TABLE users DROP COLUMN email;",
-    policy: "Schema migrations must preserve data before dropping a column.",
-    scoringLabels: ["migrations", "data-loss", "error"],
-    finding: {
-      severity: "error",
-      body: "The column is dropped before the old values are preserved anywhere else.",
-      bodyIncludes: "dropped before the old values are preserved",
-    },
-    disallowedSources: ["preserve data before dropping a column"],
-  },
-  {
-    id: "migration-nullability-tighten",
-    name: "Tighten nullability with no backfill",
-    pullNumber: 8,
-    path: "db/migrations/0013_require_invoice_status.sql",
-    line: 10,
-    before: "UPDATE invoices SET status = 'pending' WHERE status IS NULL;",
-    after: "ALTER TABLE invoices ALTER COLUMN status SET NOT NULL;",
-    allowedFileContent:
-      "UPDATE invoices SET status = 'pending' WHERE status IS NULL;\nALTER TABLE invoices ALTER COLUMN status SET NOT NULL;",
-    policy: "Nullability tightening needs a backfill step before the constraint changes.",
-    scoringLabels: ["migrations", "data-loss", "error"],
-    finding: {
-      severity: "error",
-      body: "The NOT NULL constraint is added without backfilling the missing rows first.",
-      bodyIncludes: "backfilling the missing rows",
-    },
-    disallowedSources: ["backfill step before the constraint changes"],
-  },
-  {
     id: "cache-tenant-key-omission",
     name: "Cache key drops tenant scope",
     pullNumber: 9,
@@ -288,9 +262,13 @@ const fixtureSpecs: FixtureSpec[] = [
     after: "return path;",
     allowedFileContent: "export function cacheKey(tenantId: string, path: string) { return path; }",
     policy: "Cache keys must retain tenant scope or data can bleed across accounts.",
-    scoringLabels: ["cache", "multi-tenant", "warn"],
+    scoringLabels: ["cache", "multi-tenant", "error"],
+    admission: {
+      classification: "mustBlock",
+      contractRule: "cross-tenant-data-exposure-is-unconditionally-unsafe",
+    },
     finding: {
-      severity: "warn",
+      severity: "error",
       body: "The cache key ignores tenant scope, so entries can bleed across accounts.",
       bodyIncludes: "tenant scope",
     },
@@ -306,9 +284,13 @@ const fixtureSpecs: FixtureSpec[] = [
     after: "return result;",
     allowedFileContent: "export function updateRecord() { return result; }",
     policy: "Writes should invalidate any cached copy of the updated record.",
-    scoringLabels: ["cache", "invalidation", "warn"],
+    scoringLabels: ["cache", "invalidation", "error"],
+    admission: {
+      classification: "mustBlock",
+      contractRule: "stale-read-after-successful-write-is-a-correctness-regression",
+    },
     finding: {
-      severity: "warn",
+      severity: "error",
       body: "The update path no longer clears the cached record after the write.",
       bodyIncludes: "clears the cached record",
     },
@@ -323,32 +305,12 @@ const fixtureSpecs: FixtureSpec[] = [
     before: '"ui-kit": "^1.4.0"',
     after: '"ui-kit": "^2.0.0"',
     allowedFileContent: '{ "dependencies": { "ui-kit": "^2.0.0" } }',
-    policy: "Major dependency upgrades need compatibility review before merge.",
-    scoringLabels: ["dependency", "upgrade", "warn"],
-    finding: {
-      severity: "warn",
-      body: "This dependency jumps to a new major without a compatibility check.",
-      bodyIncludes: "compatibility check",
+    policy: "",
+    scoringLabels: ["dependency", "upgrade", "clean"],
+    admission: {
+      classification: "clean",
+      contractRule: "version-change-alone-is-not-a-defect-without-a-guardrail",
     },
-    disallowedSources: ["compatibility review before merge"],
-  },
-  {
-    id: "dependency-vulnerable-pin",
-    name: "Pinned dependency stays on the vulnerable line",
-    pullNumber: 12,
-    path: "package.json",
-    line: 10,
-    before: '"yaml-parser": "1.2.2"',
-    after: '"yaml-parser": "1.2.3"',
-    allowedFileContent: '{ "dependencies": { "yaml-parser": "1.2.3" } }',
-    policy: "Keep pinned dependencies off the affected release line when the policy says to move.",
-    scoringLabels: ["dependency", "security", "error"],
-    finding: {
-      severity: "error",
-      body: "The dependency remains in the affected release line and should move off it.",
-      bodyIncludes: "affected release line",
-    },
-    disallowedSources: ["move off the affected release line"],
   },
   {
     id: "deletion-hard-delete",
@@ -563,9 +525,13 @@ const fixtureSpecs: FixtureSpec[] = [
     after: "review.enabled: false",
     allowedFileContent: "review:\n  enabled: false",
     policy: "The default review gate should stay on unless a release policy says otherwise.",
-    scoringLabels: ["config", "review", "error"],
+    scoringLabels: ["config", "review", "warn"],
+    admission: {
+      classification: "advisory",
+      contractRule: "review-disable-impact-depends-on-repository-policy",
+    },
     finding: {
-      severity: "error",
+      severity: "warn",
       body: "The review gate is disabled in the default configuration.",
       bodyIncludes: "review gate is disabled",
     },
@@ -701,9 +667,13 @@ const fixtureSpecs: FixtureSpec[] = [
     allowedFileContent:
       "export function refreshToken(now: Date) { return { expiresAt: addYears(now, 10) }; }",
     policy: "Refresh tokens should keep bounded lifetimes unless security explicitly approves a longer window.",
-    scoringLabels: ["security", "auth", "warn"],
+    scoringLabels: ["security", "auth", "error"],
+    admission: {
+      classification: "mustBlock",
+      contractRule: "ten-year-refresh-credential-is-an-account-takeover-regression",
+    },
     finding: {
-      severity: "warn",
+      severity: "error",
       body: "The refresh token lifetime expands from days to years, increasing account takeover exposure.",
       bodyIncludes: "lifetime expands",
     },
@@ -720,9 +690,13 @@ const fixtureSpecs: FixtureSpec[] = [
     allowedFileContent:
       "export function validate(file: File) { if (!file.name.endsWith('.pdf')) throw new Error('unsupported file'); }",
     policy: "Uploads must validate content type instead of trusting user-controlled filenames.",
-    scoringLabels: ["security", "uploads", "warn"],
+    scoringLabels: ["security", "uploads", "error"],
+    admission: {
+      classification: "mustBlock",
+      contractRule: "user-controlled-extension-cannot-enforce-upload-type",
+    },
     finding: {
-      severity: "warn",
+      severity: "error",
       body: "The upload check now trusts the filename extension instead of the content type.",
       bodyIncludes: "filename extension",
     },
@@ -795,9 +769,13 @@ const fixtureSpecs: FixtureSpec[] = [
     allowedFileContent:
       "export async function sync() { try { await provider.sync(); } catch { logger.debug('sync failed'); } }",
     policy: "Background jobs should report and propagate provider failures so retry policy can act.",
-    scoringLabels: ["observability", "retries", "warn"],
+    scoringLabels: ["observability", "retries", "error"],
+    admission: {
+      classification: "mustBlock",
+      contractRule: "swallowed-job-failure-breaks-retry-correctness",
+    },
     finding: {
-      severity: "warn",
+      severity: "error",
       body: "The sync job now swallows provider failures, so retry policy cannot see them.",
       bodyIncludes: "swallows provider failures",
     },
@@ -858,9 +836,13 @@ const fixtureSpecs: FixtureSpec[] = [
     allowedFileContent:
       "export function assertLimit(remaining: number) { if (remaining < 0) throw new Error('rate limited'); }",
     policy: "A zero remaining quota should reject the next request.",
-    scoringLabels: ["off-by-one", "availability", "warn"],
+    scoringLabels: ["off-by-one", "availability", "error"],
+    admission: {
+      classification: "mustBlock",
+      contractRule: "rate-limit-boundary-directly-violates-enforcement",
+    },
     finding: {
-      severity: "warn",
+      severity: "error",
       body: "A request with zero remaining quota is now allowed, granting one extra request past the limit.",
       bodyIncludes: "one extra request",
     },
@@ -973,9 +955,13 @@ const fixtureSpecs: FixtureSpec[] = [
     allowedFileContent:
       "export function projectCacheKey(tenantId: string, projectId: string) { return projectId; /* cache is still tenant isolated */ }",
     policy: "Comments should not contradict a merge-relevant behavior change in the same diff.",
-    scoringLabels: ["misleading-comments", "cache", "multi-tenant", "warn"],
+    scoringLabels: ["misleading-comments", "cache", "multi-tenant", "error"],
+    admission: {
+      classification: "mustBlock",
+      contractRule: "tenant-key-omission-causes-cross-tenant-cache-collision",
+    },
     finding: {
-      severity: "warn",
+      severity: "error",
       body: "The comment claims tenant isolation, but the key now omits tenantId and can collide across tenants.",
       bodyIncludes: "omits tenantId",
     },
@@ -992,9 +978,13 @@ const fixtureSpecs: FixtureSpec[] = [
     allowedFileContent:
       "export function loadConfig(err: Error) { throw err; /* falls back to defaults when config is missing */ }",
     policy: "Fallback comments should match the error behavior introduced by the diff.",
-    scoringLabels: ["misleading-comments", "config", "warn"],
+    scoringLabels: ["misleading-comments", "config", "error"],
+    admission: {
+      classification: "mustBlock",
+      contractRule: "fallback-path-now-throws-instead-of-returning-defaults",
+    },
     finding: {
-      severity: "warn",
+      severity: "error",
       body: "The comment says missing config falls back to defaults, but the code now throws the error.",
       bodyIncludes: "code now throws",
     },
@@ -1189,9 +1179,13 @@ const fixtureSpecs: FixtureSpec[] = [
     allowedFileContent:
       "export const allowedDomains = ['example.com', 'раypal.com'];",
     policy: "Domain allowlists should reject visually confusable Unicode hostnames.",
-    scoringLabels: ["unicode-homoglyphs", "security", "allowlist", "warn"],
+    scoringLabels: ["unicode-homoglyphs", "security", "allowlist", "error"],
+    admission: {
+      classification: "mustBlock",
+      contractRule: "confusable-hostname-defeats-security-allowlist",
+    },
     finding: {
-      severity: "warn",
+      severity: "error",
       body: "The allowlist entry uses Cyrillic characters that look like paypal.com but are a different hostname.",
       bodyIncludes: "different hostname",
     },
@@ -1208,9 +1202,13 @@ const fixtureSpecs: FixtureSpec[] = [
     allowedFileContent:
       "export function apiKey() { return process.env.API_ΚEY; }",
     policy: "Credential environment keys should stay ASCII and exact.",
-    scoringLabels: ["unicode-homoglyphs", "config", "warn"],
+    scoringLabels: ["unicode-homoglyphs", "config", "error"],
+    admission: {
+      classification: "mustBlock",
+      contractRule: "homoglyph-key-prevents-required-credential-loading",
+    },
     finding: {
-      severity: "warn",
+      severity: "error",
       body: "The environment key now contains a Greek kappa, so the configured API_KEY will not be read.",
       bodyIncludes: "Greek kappa",
     },

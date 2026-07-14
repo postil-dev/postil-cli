@@ -158,14 +158,14 @@ pub fn scorer_system_prompt(cfg: &Config) -> String {
          exactly one object per supplied finding:\n\
          [{\"index\": <number>, \"confidence\": <0..1>, \
          \"kind\": \"risk|humanEscalation|guardrail|uncertainty|contentPolicy\", \
-         \"reason\": \"one complete sentence of at most 240 UTF-8 bytes\"}]\n\
+         \"reason\": \"concise single-line text of at most 240 UTF-8 bytes\"}]\n\
          \n\
          The `kind` value is a finding category. `info`, `warn`, and `error` are \
          severities and are NEVER valid kind values. An ordinary concrete defect is \
          `risk`, even when a focused test is needed to confirm it. Use \
          `humanEscalation` only when multiple valid outcomes remain and an accountable \
-         owner must choose among them. Every `reason` must be exactly one complete \
-         sentence, end with sentence punctuation, contain no line breaks, and contain \
+         owner must choose among them. Every `reason` must be concise single-line text, \
+         end with sentence punctuation, contain no line breaks, and contain \
          at most 240 UTF-8 bytes.\n\
          \n\
          The input intentionally omits the generator's original confidence and kind. Do \

@@ -302,7 +302,6 @@ async function runScorerEvalCase(
     await github.close();
     await proxy.close();
   }
-  await writeFile(join(artifactsDir, "stdout.json"), stdout, { mode: 0o600 });
   await writeFile(join(artifactsDir, "stderr.log"), stderr, { mode: 0o600 });
 
   const envelope = safeJson(stdout) as Record<string, any> | undefined;
@@ -493,21 +492,10 @@ function scoredFinding(envelope: Record<string, any>): Record<string, any> | und
 
 export function isValidReason(reason: string | null): boolean {
   if (reason === null || reason !== reason.trim() || reason.length === 0) return false;
-  const withoutAbbreviations = reason
-    .replace(
-      /\b(?:e\.g\.|i\.e\.|etc\.|vs\.|Dr\.|Mr\.|Mrs\.|Ms\.|Prof\.|Sr\.|Jr\.|No\.|Fig\.|St\.)/giu,
-      (value) => value.replaceAll(".", "∯"),
-    )
-    .replace(/(?:\b\p{L}\.){2,}/gu, (value) => value.replaceAll(".", "∯"))
-    .replace(/\b\p{Lu}\.(?=\s+\p{Lu})/gu, (value) => value.replace(".", "∯"));
-  return (
-    !reason.includes("\n") &&
-    !reason.includes("\r") &&
-    !/\p{Cc}/u.test(reason) &&
-    Buffer.byteLength(reason, "utf8") <= SCORER_REASON_MAX_BYTES &&
-    /[.!?…]$/u.test(reason) &&
-    !/[.!?…]\s+\S/u.test(withoutAbbreviations)
-  );
+  if (/\p{Cc}/u.test(reason) || Buffer.byteLength(reason, "utf8") > SCORER_REASON_MAX_BYTES) {
+    return false;
+  }
+  return /[.!?。！？]$/u.test(reason);
 }
 
 function isValidUsage(usage: { prompt_tokens?: number; completion_tokens?: number } | undefined): boolean {

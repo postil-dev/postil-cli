@@ -8,11 +8,11 @@
 //
 // Live-models mode (opt-in, NOT run in CI, spends real tokens): keeps the
 // per-case mock GitHub API but points the CLI at the real OpenRouter endpoint,
-// running each fixture once per model in POSTIL_BENCH_MODELS. It measures
-// detection efficacy and measured cost per real model. Requires an inference
+// running each fixture repeatedly through exact generator/scorer pairs. It
+// measures attributable detection and measured pair cost. Requires an inference
 // key (POSTIL_API_KEY, OPENROUTER_API_KEY, MODEL_API_KEY, or LLM_API_KEY).
 //
-//   POSTIL_BENCH_MODE=live POSTIL_BENCH_MODELS=id1,id2 \
+//   POSTIL_BENCH_MODE=live POSTIL_BENCH_PAIRS=generator::scorer \
 //     MODEL_API_KEY=... bun run bench --json-out report.json
 //
 // Diff-file live mode (single model, no forge): measures detection with
@@ -25,8 +25,10 @@
 //   POSTIL_BIN              path to the postil binary (default ../target/release/postil)
 //   POSTIL_BENCH_KEEP_RUNS  set to 1 to keep run directories after a green run (mock mode)
 //   POSTIL_BENCH_MODE       set to "live" to select live-models mode
-//   POSTIL_BENCH_MODELS     comma-separated OpenRouter model ids for live-models mode
+//   POSTIL_BENCH_PAIRS      comma-separated generator::scorer model pairs
+//   POSTIL_BENCH_REPEATS    complete matrix repetitions (admission requires at least 3)
 //   POSTIL_API_BASE         OpenRouter-compatible base (default https://openrouter.ai/api/v1)
+//   POSTIL_API_FORMAT       provider interface (openai-compatible or anthropic)
 //   MODEL_API_KEY           inference key for live modes; never printed
 //   LLM_API_KEY             equivalent neutral inference-key alias
 //   OPENROUTER_API_KEY      provider-specific inference-key alias
@@ -44,6 +46,7 @@ import {
   DEFAULT_LIVE_CONCURRENCY as DEFAULT_LIVE_MODELS_CONCURRENCY,
   formatLiveModelsReport,
   liveModelsQualificationExitCode,
+  parseQualificationPairs,
   runLiveModels,
 } from "./livemodels";
 
@@ -72,13 +75,19 @@ async function main() {
     process.env.POSTIL_BENCH_MODE === "live" || args.includes("--live-models");
 
   if (liveModels) {
-    const models = (process.env.POSTIL_BENCH_MODELS ?? flagValue(args, "--models") ?? "").split(",");
+    const pairs = parseQualificationPairs(
+      process.env.POSTIL_BENCH_PAIRS ?? flagValue(args, "--pairs") ?? "",
+    );
     const concurrency = liveModelsConcurrency(args);
     const costCapRaw = process.env.POSTIL_BENCH_COST_CAP_USD ?? flagValue(args, "--cost-cap");
+    const repeatsRaw = process.env.POSTIL_BENCH_REPEATS ?? flagValue(args, "--repeats");
+    const apiFormat = qualificationApiFormat(process.env.POSTIL_API_FORMAT);
     const report = await runLiveModels(cases, {
       binary,
-      models,
+      pairs,
+      repeats: repeatsRaw === undefined ? undefined : Number.parseInt(repeatsRaw, 10),
       apiBase: process.env.POSTIL_API_BASE,
+      apiFormat,
       concurrency,
       costCapUsd: costCapRaw === undefined ? undefined : Number.parseFloat(costCapRaw),
     });
@@ -116,6 +125,14 @@ async function main() {
   if (!report.ok) {
     process.exitCode = 1;
   }
+}
+
+function qualificationApiFormat(
+  value: string | undefined,
+): "openai-compatible" | "anthropic" | undefined {
+  if (value === undefined || value.trim() === "") return undefined;
+  if (value === "openai-compatible" || value === "anthropic") return value;
+  throw new Error("POSTIL_API_FORMAT must be openai-compatible or anthropic");
 }
 
 /** Resolve live-models concurrency from BENCH_CONCURRENCY, then --concurrency,

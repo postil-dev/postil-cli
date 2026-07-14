@@ -1,11 +1,11 @@
 # postil bench
 
-Hermetic PR-review regression suite for the `postil` CLI. Each of the 64
-fixtures (seeded defects across languages and change classes, plus clean PRs
-where the correct review is silence) runs the release binary against a per-case
-mock GitHub API and a mock OpenAI-compatible model endpoint in an isolated run
-directory, then scores the v1 envelope and the forge interactions against
-ground truth.
+Hermetic PR-review regression suite for the `postil` CLI. The 61-fixture
+admission matrix contains 34 must-block defects, 15 advisory defects, and 12
+clean PRs where the correct review is silence. Each fixture runs the release
+binary against a per-case mock GitHub API and a mock OpenAI-compatible model
+endpoint in an isolated run directory, then scores the v1 envelope and the
+forge interactions against ground truth.
 
 ## What it measures
 
@@ -41,107 +41,55 @@ bun run bench                   # add --json or --json-out report.json for machi
 `POSTIL_BENCH_KEEP_RUNS=1` keeps per-case run directories under `.runs/`
 (failing cases are always kept).
 
-## Live-models mode (opt-in, seeded-region finding hit rate + cost per model)
+## Pair qualification (opt-in, live inference)
 
-`POSTIL_BENCH_MODE=live` keeps the per-case **mock GitHub API** but points the
-CLI at the real OpenRouter endpoint, running each fixture **once per model** in
-`POSTIL_BENCH_MODELS`. Each run forces a one-model generator chain and disables
-the independent scorer, so fallback and scorer behavior cannot inflate quality,
-latency, or cost. It measures, per real model: seeded-region finding hit
-rate on the seeded defects, non-seeded-region finding count, gate-verdict
-correctness, catalog-priced token-cost estimate, and measured latency. The full
-forge pipeline still runs against the mock GitHub, so grounding and statusline
-correctness are still checked as a model-independent fidelity floor.
-
-This command is an admission gate, not a roster promotion mechanism. It exits
-nonzero unless every candidate completes the full isolated matrix with no
-execution or pipeline-fidelity failures, at least 90% seeded-defect detection,
-no more than 5% false findings per completed case, correct gate verdicts, known
-pricing, mean cost at or below $0.01, and mean latency at or below 15 seconds.
-The production roster remains empty until an isolated candidate report passes
-and the admission manifest is updated separately.
-The generator cost guard rejects more than six candidates or a configured cap
-above $25. Its projection prices the runtime retry graph: three transport
-attempts for the initial request and three for at most one schema-repair or
-semantic-retry request. Unqualified models receive an 8,000-token completion
-bound, and corrective context is limited to 16,384 UTF-8 bytes.
+Live qualification exercises the exact deployed generator and scorer together.
+There are no unlisted or implicit fallbacks: the ordered generator chain and
+consensus width are part of the qualified profile. The scorer runs through the production
+prompt, filtering, usage accounting, and gate path. Each pair must complete the
+entire matrix at least three times.
 
 ```sh
-export MODEL_API_KEY=...          # or LLM_API_KEY / OPENROUTER_API_KEY; never logged or printed
+export MODEL_API_KEY=... # or POSTIL_API_KEY, OPENROUTER_API_KEY, or LLM_API_KEY
 export POSTIL_BENCH_MODE=live
-export POSTIL_BENCH_MODELS=provider/candidate-a,provider/candidate-b
-bun run bench --json-out report.json   # or: bun run bench:live-models
-# POSTIL_API_BASE overrides the endpoint (default https://openrouter.ai/api/v1)
-# --concurrency <n> or BENCH_CONCURRENCY sets case parallelism (default 4)
+export POSTIL_BENCH_PAIRS=provider/generator::provider/scorer
+export POSTIL_BENCH_REPEATS=3
+export POSTIL_API_FORMAT=openai-compatible # or anthropic
+bun run bench --json-out report.json
 ```
 
-The inference key is read from `POSTIL_API_KEY`, `OPENROUTER_API_KEY`,
-`MODEL_API_KEY`, or `LLM_API_KEY`, forwarded to
-the binary only through the environment, and never logged or placed on argv. It
-refuses to run without a key and without at least one model.
+Use `provider/one+provider/two+provider/three::provider/scorer` to qualify a
+three-model consensus generator chain. Every listed generator is consulted;
+the CLI's production two-model agreement rule determines the merged findings.
 
-### What live-models mode scores
+Admission requires all of these in every repeat:
 
-- **Seeded-region finding hit**: a seeded region is found when at least one non-carried
-  finding (in `findings`, not the carried `resolved` set) matches the seeded
-  file and whose line range overlaps the seeded region (±3 lines).
-- **Non-seeded-region finding count**: any finding on a clean fixture, and any
-  finding on a defect fixture that does not overlap the seeded region (wrong
-  file or off the region).
-- **Gate verdict**: whether the envelope's own gate `failing` matches the ground
-  truth (the default `failOn: error` gate should fail iff the seeded defect is
-  error-severity).
-- **Cost + timing**: the envelope's `usage` tokens and `durationMs` per case;
-  cost is `promptTokens × promptPrice + completionTokens × completionPrice`,
-  with prices fetched once per run from `GET /api/v1/models` and matched by id.
-- **Grounding / statusline**: still checked (they are model-independent): every
-  finding grounded (`counts.ungrounded == 0`), no synthetic `.postil/` findings,
-  both check-runs created and completed, `postil/gate` concluding consistently
-  with the envelope's gate. The mock-mode fidelity checks that depend on exact
-  model output (silence-on-clean, exact finding anchoring, min/max findings) are
-  **not** applied here because a real model's output is not known ahead of time.
+- 100% must-block detection and final blocking by the seeded finding itself
+- at least 90% advisory detection and at most 10% advisory overblocking
+- no clean false blocks and at most 5% clean cases with any finding
+- no execution, structured-output, grounding, statusline, or usage-accounting failure
+- mean pair cost at most $0.01 and mean review latency at most 15 seconds
 
-### Report
+Findings suppressed by the scorer count as detector evidence but cannot satisfy
+final blocking. An unrelated error cannot substitute for the seeded finding.
+The report stores only attributable finding coordinates and labels, never model
+finding titles or bodies. It records separate fixture, review-contract source,
+configuration, and CLI binary SHA-256 hashes; the canonical API base and
+provider interface; the ordered generator chain and consensus width; the
+ordered scorer chain; repeat number; and provider-exact or catalog-estimate
+cost provenance. Source-bundle hashes use the runtime's ordered
+`path + NUL + exact bytes + NUL` framing. Each immutable profile and the
+complete sanitized evidence payload have their own SHA-256 identifier.
+`manifestCandidate` uses the runtime admission-manifest schema directly. It
+contains no admission decision and can be copied only after the report passes.
 
-`--json-out <path>` writes `{ generatedAt, cliVersion, apiBase, models[],
-modelAggregates[], totalRunCostUsd, cases[] }`. The `models` array is the exact
-schema the site consumes, one object per model:
+The preflight prices both roles across the configured repeats before inference.
+It rejects missing prices, more than six pairs, and a cap outside `(0, $25]`.
+The inference key stays in the child environment and is never printed or placed
+on an argument list.
 
-```
-{ id, detectionRate, falsePositives, casesRun, meanCostUsdPerReview, meanDurationMs }
-```
-
-`modelAggregates` is a superset with `totalCostUsd`, gate tallies, and error
-counts for the human table; `totalRunCostUsd` is the sum of included per-case
-costs across the full run; `cases` is the per-`(model, case)` detail. Every run
-also writes a timestamped copy under `.runs/live-models/` (gitignored). `--json`
-prints the full report instead of the human table.
-
-### Cost guardrail
-
-`bun run cost-guard` (or `src/cost-guard.ts`) fetches live pricing and projects
-an **upper-bound** total cost of the matrix from fixture diff sizes, exiting
-non-zero if the projection exceeds `--cap <usd>` (default 15) or if any model has
-unknown pricing. CI runs it before the live bench so an over-budget matrix aborts
-before spending anything. It needs no key (the `/models` catalog is public).
-
-### Honesty caveats
-
-These are a **measured baseline for this CLI** on **our own fixtures**: a single
-run per case, diff plus mock repo context, no policy docs. The fixtures are ours
-and **no competitor has been run on them**, so the numbers are not a peer
-comparison. They are our measured seeded-region finding hit rate and
-catalog-priced token-cost estimates on our fixtures. Results vary across runs
-because model inference is nondeterministic. Treat them as internal evidence,
-not a published benchmark.
-
-### CI
-
-`.github/workflows/bench-live.yml` runs this mode on `workflow_dispatch` only
-(it spends real tokens): it builds the release binary, runs the cost guardrail,
-runs the live bench with any configured `POSTIL_API_KEY`, `OPENROUTER_API_KEY`,
-`MODEL_API_KEY`, or `LLM_API_KEY` secret, uploads the JSON report as an artifact,
-and prints the per-model table to the job step summary.
+These fixtures are internal evidence, not a competitor comparison. Inference is
+nondeterministic, so one successful matrix is insufficient for admission.
 
 ## Scorer qualification (opt-in, mocked generator + real scorer)
 
@@ -151,6 +99,8 @@ kind, and calibrates each finding's confidence and kind against local diff
 context. `bun run scorer-eval` qualifies that role directly by mocking the
 primary generator with fixed findings and proxying only scorer requests to the
 real OpenRouter endpoint.
+This diagnostic can reject a scorer but cannot admit a production pair; pair
+qualification above is the admission authority.
 
 ```sh
 cargo build --quiet --release
@@ -177,7 +127,7 @@ for at most one schema-repair request. A one-finding qualification request uses
 a 17,000-byte prompt bound, an 896-token output bound, and at most 3,584 bytes
 of repair context. Scorer responses also fail
 admission when provider usage is missing or malformed, runtime accounting is
-incomplete, or the assessment is not a trimmed, single-line sentence of at most
+incomplete, or the assessment is not trimmed single-line text of at most
 240 UTF-8 bytes ending in sentence punctuation. Scorer output is bounded from
 the supplied finding count, up to the supported maximum of 20 findings, and
 schema-repair context is byte-bounded from the same output limit.

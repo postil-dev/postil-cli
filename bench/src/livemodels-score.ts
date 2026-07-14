@@ -15,10 +15,29 @@ import type { BenchmarkCase, Envelope } from "./harness";
  * The tolerance absorbs the off-by-a-few line drift between where a model
  * anchors a comment and the exact seeded line. */
 export const LINE_TOLERANCE = 3;
-export const GENERATOR_MIN_DETECTION_RATE = 0.9;
-export const GENERATOR_MAX_FALSE_POSITIVE_RATE = 0.05;
+export const ADVISORY_MIN_DETECTION_RATE = 0.9;
+export const ADVISORY_MAX_OVERBLOCK_RATE = 0.1;
+export const CLEAN_MAX_FINDING_FALSE_POSITIVE_RATE = 0.05;
 export const GENERATOR_MAX_MEAN_COST_USD = 0.01;
 export const GENERATOR_MAX_MEAN_DURATION_MS = 15_000;
+export const MIN_QUALIFICATION_REPEATS = 3;
+
+export interface QualificationPair {
+  generatorModel: string;
+  generatorCascade?: string[];
+  consensus?: number;
+  scorerModel: string;
+}
+
+export function qualificationPairId(pair: QualificationPair): string {
+  const generators = qualificationGeneratorModels(pair);
+  const consensus = pair.consensus ?? generators.length;
+  return `${generators.join(" -> ")} [consensus ${consensus}] + ${pair.scorerModel}`;
+}
+
+export function qualificationGeneratorModels(pair: QualificationPair): string[] {
+  return [...new Set([pair.generatorModel, ...(pair.generatorCascade ?? [])])];
+}
 
 /** OpenRouter per-token prices for one model (USD per token, as returned by
  * GET /api/v1/models under `pricing`). */
@@ -32,23 +51,35 @@ export interface ModelPricing {
 /** Ground truth distilled from a fixture: the seeded defect's file and line, or
  * a clean fixture where the correct review is silence. */
 export interface GroundTruth {
-  clean: boolean;
+  classification: "mustBlock" | "advisory" | "clean";
   path: string | null;
   /** Seeded defect line (the region is [line, line], widened by LINE_TOLERANCE
    * when testing overlap). */
   line: number | null;
   severity: string | null;
-  /** The default gate (failOn: error) should fail iff a seeded finding is an
-   * error-severity defect. */
-  gateShouldFail: boolean;
+}
+
+export interface FindingEvidence {
+  detectorAttribution: "seeded" | "unrelated";
+  disposition: "final" | "suppressed";
+  path: string;
+  line: number;
+  endLine?: number;
+  severity: string;
+  kind: string;
+  confidence: number;
 }
 
 /** Per-case detail emitted in the report's `cases` array. */
 export interface LiveModelCaseResult {
   id: string;
   name: string;
-  model: string;
-  type: "defect" | "clean";
+  pairId: string;
+  generatorModel: string;
+  generatorModels: string[];
+  scorerModel: string;
+  repeat: number;
+  classification: "mustBlock" | "advisory" | "clean";
   /** A valid v1 envelope was produced and scored. */
   scored: boolean;
   /** Defect: at least one non-carried finding detected the seeded defect.
@@ -56,16 +87,17 @@ export interface LiveModelCaseResult {
   detected: boolean | null;
   /** Findings that do not detect the seeded defect (defect case) or any finding
    * at all (clean case). */
-  falsePositives: number;
-  /** The envelope's own gate verdict (failing) matched what the ground truth
-   * demands. */
-  gateCorrect: boolean | null;
+  unrelatedFindings: number;
+  seededFinalBlocker: boolean;
+  unrelatedFinalBlockers: number;
+  finalBlocking: boolean;
   gateFailingActual: boolean | null;
-  gateFailingExpected: boolean;
+  findingEvidence: FindingEvidence[];
   promptTokens: number;
   completionTokens: number;
   usageAccountingComplete: boolean | null;
   usageValid: boolean;
+  costProvenance: "providerExact" | "catalogEstimate" | "unavailable";
   costUsd: number | null;
   durationMs: number | null;
   exitCode: number | undefined;
@@ -73,6 +105,7 @@ export interface LiveModelCaseResult {
    * not exclude the case from detection/cost scoring; it is surfaced so a
    * pipeline regression under a live model is still visible. */
   fidelityFailures: string[];
+  structuredOutputFailures: string[];
   error?: string;
 }
 
@@ -80,21 +113,36 @@ export interface LiveModelCaseResult {
  * the site consumes (see toSiteModelAggregate). */
 export interface LiveModelAggregate {
   id: string;
-  detectionRate: number;
-  falsePositives: number;
+  generatorModel: string;
+  generatorModels: string[];
+  scorerModel: string;
+  repeats: number;
+  mustBlockRecall: number;
+  mustBlockFinalBlockingRate: number;
+  advisoryDetectionRate: number;
+  advisoryOverblockRate: number;
+  cleanFalseBlocks: number;
+  cleanFindingFalsePositiveRate: number;
+  unrelatedFindings: number;
   casesRun: number;
   meanCostUsdPerReview: number;
   meanDurationMs: number;
   totalCostUsd: number;
   /** Non-schema diagnostics kept for the human table and debugging. */
-  defectCases: number;
-  detected: number;
+  mustBlockCases: number;
+  mustBlockDetected: number;
+  mustBlockFinalBlocking: number;
+  advisoryCases: number;
+  advisoryDetected: number;
+  advisoryOverblocked: number;
   cleanCases: number;
-  gateCorrect: number;
-  gateScored: number;
   errors: number;
   pricingKnown: boolean;
   fidelityFailures: number;
+  structuredOutputFailures: number;
+  usageFailures: number;
+  providerExactCases: number;
+  catalogEstimateCases: number;
   admissionFailures: string[];
   passed: boolean;
 }
@@ -103,8 +151,12 @@ export interface LiveModelAggregate {
  * site's model-table schema. */
 export interface SiteModelAggregate {
   id: string;
-  detectionRate: number;
-  falsePositives: number;
+  generatorModel: string;
+  generatorModels: string[];
+  scorerModel: string;
+  mustBlockRecall: number;
+  advisoryDetectionRate: number;
+  cleanFindingFalsePositiveRate: number;
   casesRun: number;
   meanCostUsdPerReview: number;
   meanDurationMs: number;
@@ -113,8 +165,12 @@ export interface SiteModelAggregate {
 export function toSiteModelAggregate(a: LiveModelAggregate): SiteModelAggregate {
   return {
     id: a.id,
-    detectionRate: a.detectionRate,
-    falsePositives: a.falsePositives,
+    generatorModel: a.generatorModel,
+    generatorModels: a.generatorModels,
+    scorerModel: a.scorerModel,
+    mustBlockRecall: a.mustBlockRecall,
+    advisoryDetectionRate: a.advisoryDetectionRate,
+    cleanFindingFalsePositiveRate: a.cleanFindingFalsePositiveRate,
     casesRun: a.casesRun,
     meanCostUsdPerReview: a.meanCostUsdPerReview,
     meanDurationMs: a.meanDurationMs,
@@ -126,14 +182,13 @@ export function toSiteModelAggregate(a: LiveModelAggregate): SiteModelAggregate 
 export function groundTruthOf(c: BenchmarkCase): GroundTruth {
   const gt = c.groundTruth.findings[0];
   if (!gt) {
-    return { clean: true, path: null, line: null, severity: null, gateShouldFail: false };
+    return { classification: c.admission.classification, path: null, line: null, severity: null };
   }
   return {
-    clean: false,
+    classification: c.admission.classification,
     path: gt.path,
     line: gt.line ?? null,
     severity: gt.severity ?? null,
-    gateShouldFail: c.groundTruth.findings.some((f) => f.severity === "error"),
   };
 }
 
@@ -166,75 +221,129 @@ export function findingHitsSeededRegion(finding: EnvelopeFinding, seededLine: nu
  */
 export function scoreLiveCase(args: {
   case: BenchmarkCase;
-  model: string;
+  pair: QualificationPair;
+  repeat: number;
   envelope: Envelope;
-  pricing: ModelPricing | null;
+  pricing: Map<string, ModelPricing>;
   exitCode: number | undefined;
   fidelityFailures: string[];
+  structuredOutputFailures?: string[];
 }): LiveModelCaseResult {
-  const { case: c, model, envelope: env, pricing, exitCode, fidelityFailures } = args;
+  const { case: c, pair, repeat, envelope: env, pricing, exitCode, fidelityFailures } = args;
   const truth = groundTruthOf(c);
-  const findings = env.findings;
+  const finalFindings = env.findings;
+  const suppressedFindings = env.suppressedFindings.map((entry) => entry.finding);
+  const allFindings = [...finalFindings, ...suppressedFindings];
 
   const usageAccountingComplete = env.usageAccountingComplete ?? null;
   const modelUsage = env.modelUsage ?? [];
+  const requiresScorerUsage = allFindings.length > 0;
+  const allGeneratorModels = qualificationGeneratorModels(pair);
+  const generatorModels = allGeneratorModels.slice(0, pair.consensus ?? allGeneratorModels.length);
   const usageValid =
     modelUsage.length > 0 &&
-    modelUsage.every((entry) => entry.model === model) &&
+    modelUsage.every((entry) => entry.accountingComplete) &&
+    generatorModels.every((model) =>
+      modelUsage.some((entry) => entry.model === model && entry.role === "reviewGenerator")) &&
+    (!requiresScorerUsage ||
+      modelUsage.some((entry) => entry.model === pair.scorerModel && entry.role === "findingScorer")) &&
+    modelUsage.every(
+      (entry) =>
+        (generatorModels.includes(entry.model) && entry.role === "reviewGenerator") ||
+        (entry.model === pair.scorerModel && entry.role === "findingScorer"),
+    ) &&
     env.usage.promptTokens > 0 &&
     env.usage.completionTokens > 0 &&
     modelUsage.reduce((sum, entry) => sum + entry.promptTokens, 0) === env.usage.promptTokens &&
     modelUsage.reduce((sum, entry) => sum + entry.completionTokens, 0) === env.usage.completionTokens;
 
-  const exactCosts = modelUsage.map((entry) => entry.costMicros);
-  const exactCost = exactCosts.length > 0 && exactCosts.every((value) => value !== undefined)
-    ? exactCosts.reduce((sum, value) => sum + (value ?? 0), 0) / 1_000_000
+  const exactCostAvailable = modelUsage.length > 0 && modelUsage.every(
+    (entry) => entry.costMicros !== undefined && entry.costSource === "providerReported",
+  );
+  const catalogCostAvailable = modelUsage.length > 0 && modelUsage.every((entry) => pricing.has(entry.model));
+  const exactCost = exactCostAvailable
+    ? modelUsage.reduce((sum, entry) => sum + (entry.costMicros ?? 0), 0) / 1_000_000
     : null;
-  const cost = usageAccountingComplete === true && usageValid
-    ? exactCost ?? (pricing
-      ? env.usage.promptTokens * pricing.promptUsdPerToken +
-        env.usage.completionTokens * pricing.completionUsdPerToken
-      : null)
+  const catalogCost = catalogCostAvailable
+    ? modelUsage.reduce((sum, entry) => {
+        const price = pricing.get(entry.model)!;
+        return sum + entry.promptTokens * price.promptUsdPerToken +
+          entry.completionTokens * price.completionUsdPerToken;
+      }, 0)
     : null;
+  const cost = usageAccountingComplete === true && usageValid ? exactCost ?? catalogCost : null;
+  const costProvenance = exactCost !== null
+    ? "providerExact"
+    : catalogCost !== null && usageAccountingComplete === true && usageValid
+      ? "catalogEstimate"
+      : "unavailable";
+
+  const seededLine = truth.line;
+  const isSeeded = (finding: EnvelopeFinding) =>
+    seededLine !== null && finding.path === truth.path && findingHitsSeededRegion(finding, seededLine);
+  const detectorFindings = allFindings.filter(isSeeded);
+  const unrelatedFindings = allFindings.length - detectorFindings.length;
+  const blocks = (finding: Envelope["findings"][number]) =>
+    finding.severity === "error" || env.gate.blockOnKinds.includes(finding.kind);
+  const seededFinalBlocker = finalFindings.some((finding) => isSeeded(finding) && blocks(finding));
+  const unrelatedFinalBlockers = finalFindings.filter((finding) => !isSeeded(finding) && blocks(finding)).length;
+  const findingEvidence: FindingEvidence[] = [
+    ...finalFindings.map((finding) => evidenceFor(finding, isSeeded(finding), "final")),
+    ...suppressedFindings.map((finding) => evidenceFor(finding, isSeeded(finding), "suppressed")),
+  ];
 
   const base: LiveModelCaseResult = {
     id: c.id,
     name: c.name,
-    model,
-    type: truth.clean ? "clean" : "defect",
+    pairId: qualificationPairId(pair),
+    generatorModel: pair.generatorModel,
+    generatorModels: qualificationGeneratorModels(pair),
+    scorerModel: pair.scorerModel,
+    repeat,
+    classification: truth.classification,
     scored: true,
     detected: null,
-    falsePositives: 0,
-    gateCorrect: env.gate.failing === truth.gateShouldFail,
+    unrelatedFindings,
+    seededFinalBlocker,
+    unrelatedFinalBlockers,
+    finalBlocking:
+      truth.classification === "mustBlock" &&
+      env.gate.failing &&
+      seededFinalBlocker &&
+      unrelatedFinalBlockers === 0,
     gateFailingActual: env.gate.failing,
-    gateFailingExpected: truth.gateShouldFail,
+    findingEvidence,
     promptTokens: env.usage.promptTokens,
     completionTokens: env.usage.completionTokens,
     usageAccountingComplete,
     usageValid,
+    costProvenance,
     costUsd: cost,
     durationMs: env.durationMs,
     exitCode,
     fidelityFailures,
+    structuredOutputFailures: args.structuredOutputFailures ?? [],
   };
 
-  if (truth.clean) {
-    // A clean fixture's correct review is silence; every finding is a false
-    // positive.
-    base.falsePositives = findings.length;
-    return base;
-  }
-
-  const seededLine = truth.line as number;
-  const detectors = findings.filter(
-    (f) => f.path === truth.path && findingHitsSeededRegion(f, seededLine),
-  );
-  base.detected = detectors.length > 0;
-  // Every finding that is not a detector of the seeded defect is a false
-  // positive (including extra findings on the seeded file that miss the region,
-  // and any finding outside the seeded file).
-  base.falsePositives = findings.length - detectors.length;
+  base.detected = truth.classification === "clean" ? null : detectorFindings.length > 0;
   return base;
+}
+
+function evidenceFor(
+  finding: Envelope["findings"][number],
+  seeded: boolean,
+  disposition: "final" | "suppressed",
+): FindingEvidence {
+  return {
+    detectorAttribution: seeded ? "seeded" : "unrelated",
+    disposition,
+    path: finding.path,
+    line: finding.line,
+    ...(finding.endLine === undefined ? {} : { endLine: finding.endLine }),
+    severity: finding.severity,
+    kind: finding.kind,
+    confidence: finding.confidence,
+  };
 }
 
 /** Build the result for a case whose binary run never produced a valid
@@ -242,7 +351,8 @@ export function scoreLiveCase(args: {
  * error. */
 export function erroredLiveCase(args: {
   case: BenchmarkCase;
-  model: string;
+  pair: QualificationPair;
+  repeat: number;
   exitCode: number | undefined;
   error: string;
 }): LiveModelCaseResult {
@@ -250,22 +360,30 @@ export function erroredLiveCase(args: {
   return {
     id: args.case.id,
     name: args.case.name,
-    model: args.model,
-    type: truth.clean ? "clean" : "defect",
+    pairId: qualificationPairId(args.pair),
+    generatorModel: args.pair.generatorModel,
+    generatorModels: qualificationGeneratorModels(args.pair),
+    scorerModel: args.pair.scorerModel,
+    repeat: args.repeat,
+    classification: truth.classification,
     scored: false,
     detected: null,
-    falsePositives: 0,
-    gateCorrect: null,
+    unrelatedFindings: 0,
+    seededFinalBlocker: false,
+    unrelatedFinalBlockers: 0,
+    finalBlocking: false,
     gateFailingActual: null,
-    gateFailingExpected: truth.gateShouldFail,
+    findingEvidence: [],
     promptTokens: 0,
     completionTokens: 0,
     usageAccountingComplete: null,
     usageValid: false,
+    costProvenance: "unavailable",
     costUsd: null,
     durationMs: null,
     exitCode: args.exitCode,
     fidelityFailures: [],
+    structuredOutputFailures: [],
     error: args.error,
   };
 }
@@ -273,15 +391,18 @@ export function erroredLiveCase(args: {
 /** Aggregate one model's scored cases into the per-model summary. Detection
  * rate is over defect cases that produced an envelope; cost/duration means are
  * over scored cases; false positives are summed across all cases. */
-export function aggregateModel(model: string, results: LiveModelCaseResult[]): LiveModelAggregate {
+export function aggregateModel(
+  pair: QualificationPair,
+  results: LiveModelCaseResult[],
+  expectedRepeats: number,
+): LiveModelAggregate {
   const scored = results.filter((r) => r.scored);
-  const defects = scored.filter((r) => r.type === "defect");
-  const cleans = scored.filter((r) => r.type === "clean");
-  const detected = defects.filter((r) => r.detected === true).length;
+  const mustBlocks = scored.filter((r) => r.classification === "mustBlock");
+  const advisories = scored.filter((r) => r.classification === "advisory");
+  const cleans = scored.filter((r) => r.classification === "clean");
 
   const costs = scored.map((r) => r.costUsd).filter((v): v is number => v !== null);
   const durations = scored.map((r) => r.durationMs).filter((v): v is number => v !== null);
-  const gateScored = scored.filter((r) => r.gateCorrect !== null);
 
   const totalCostUsd = costs.reduce((a, b) => a + b, 0);
   const meanCostUsdPerReview = costs.length ? totalCostUsd / costs.length : 0;
@@ -289,33 +410,81 @@ export function aggregateModel(model: string, results: LiveModelCaseResult[]): L
     ? durations.reduce((a, b) => a + b, 0) / durations.length
     : 0;
 
-  const falsePositives = results.reduce((sum, r) => sum + r.falsePositives, 0);
+  const unrelatedFindings = results.reduce((sum, r) => sum + r.unrelatedFindings, 0);
   const errors = results.filter((r) => r.error !== undefined).length;
   const pricingKnown = scored.length > 0 && costs.length === scored.length;
   const fidelityFailures = results.reduce((sum, result) => sum + result.fidelityFailures.length, 0);
+  const structuredOutputFailures = results.reduce(
+    (sum, result) => sum + result.structuredOutputFailures.length,
+    0,
+  );
   const usageFailures = scored.filter(
     (result) => result.usageAccountingComplete !== true || !result.usageValid,
   ).length;
-  const detectionRate = defects.length ? detected / defects.length : 0;
-  const gateCorrect = gateScored.filter((r) => r.gateCorrect === true).length;
-  const maxFalsePositives = Math.floor(scored.length * GENERATOR_MAX_FALSE_POSITIVE_RATE);
+  const mustBlockDetected = mustBlocks.filter((result) => result.detected).length;
+  const mustBlockFinalBlocking = mustBlocks.filter((result) => result.finalBlocking).length;
+  const advisoryDetected = advisories.filter((result) => result.detected).length;
+  const advisoryOverblocked = advisories.filter((result) => result.gateFailingActual).length;
+  const cleanFalseBlocks = cleans.filter((result) => result.gateFailingActual).length;
+  const cleanFindingFalsePositiveCases = cleans.filter((result) => result.findingEvidence.length > 0).length;
+  const mustBlockRecall = mustBlocks.length ? mustBlockDetected / mustBlocks.length : 0;
+  const mustBlockFinalBlockingRate = mustBlocks.length ? mustBlockFinalBlocking / mustBlocks.length : 0;
+  const advisoryDetectionRate = advisories.length ? advisoryDetected / advisories.length : 0;
+  const advisoryOverblockRate = advisories.length ? advisoryOverblocked / advisories.length : 0;
+  const cleanFindingFalsePositiveRate = cleans.length
+    ? cleanFindingFalsePositiveCases / cleans.length
+    : 0;
+  const providerExactCases = scored.filter((result) => result.costProvenance === "providerExact").length;
+  const catalogEstimateCases = scored.filter((result) => result.costProvenance === "catalogEstimate").length;
   const admissionFailures: string[] = [];
   if (results.length === 0 || scored.length !== results.length) {
     admissionFailures.push(`incomplete matrix: ${scored.length}/${results.length} cases produced valid envelopes`);
   }
   if (errors > 0) admissionFailures.push(`${errors} execution error(s)`);
   if (fidelityFailures > 0) admissionFailures.push(`${fidelityFailures} pipeline fidelity failure(s)`);
+  if (structuredOutputFailures > 0) {
+    admissionFailures.push(`${structuredOutputFailures} structured-output failure(s)`);
+  }
   if (usageFailures > 0) admissionFailures.push(`${usageFailures} provider usage accounting failure(s)`);
-  if (defects.length === 0 || detectionRate < GENERATOR_MIN_DETECTION_RATE) {
-    admissionFailures.push(
-      `detection ${(detectionRate * 100).toFixed(1)}% is below ${(GENERATOR_MIN_DETECTION_RATE * 100).toFixed(0)}%`,
-    );
+  if (expectedRepeats < MIN_QUALIFICATION_REPEATS) {
+    admissionFailures.push(`qualification needs at least ${MIN_QUALIFICATION_REPEATS} complete repeats`);
   }
-  if (falsePositives > maxFalsePositives) {
-    admissionFailures.push(`false positives ${falsePositives} exceed ${maxFalsePositives}`);
-  }
-  if (gateScored.length !== scored.length || gateCorrect !== gateScored.length) {
-    admissionFailures.push(`gate verdict correct for ${gateCorrect}/${scored.length} cases`);
+  for (let repeat = 1; repeat <= expectedRepeats; repeat += 1) {
+    const matrix = scored.filter((result) => result.repeat === repeat);
+    const repeatMustBlocks = matrix.filter((result) => result.classification === "mustBlock");
+    const repeatAdvisories = matrix.filter((result) => result.classification === "advisory");
+    const repeatCleans = matrix.filter((result) => result.classification === "clean");
+    if (repeatMustBlocks.length !== 34 || repeatAdvisories.length !== 15 || repeatCleans.length !== 12) {
+      admissionFailures.push(
+        `repeat ${repeat} matrix is ${repeatMustBlocks.length}/34 must-block, ` +
+        `${repeatAdvisories.length}/15 advisory, ${repeatCleans.length}/12 clean`,
+      );
+      continue;
+    }
+    if (repeatMustBlocks.some((result) => !result.detected)) {
+      admissionFailures.push(`repeat ${repeat} must-block recall is below 100%`);
+    }
+    if (repeatMustBlocks.some((result) => !result.finalBlocking)) {
+      admissionFailures.push(`repeat ${repeat} final seeded blocking is below 100%`);
+    }
+    const repeatAdvisoryDetection = repeatAdvisories.filter((result) => result.detected).length /
+      repeatAdvisories.length;
+    if (repeatAdvisoryDetection < ADVISORY_MIN_DETECTION_RATE) {
+      admissionFailures.push(`repeat ${repeat} advisory detection is below 90%`);
+    }
+    const repeatAdvisoryOverblocks = repeatAdvisories.filter((result) => result.gateFailingActual).length /
+      repeatAdvisories.length;
+    if (repeatAdvisoryOverblocks > ADVISORY_MAX_OVERBLOCK_RATE) {
+      admissionFailures.push(`repeat ${repeat} advisory overblocking exceeds 10%`);
+    }
+    if (repeatCleans.some((result) => result.gateFailingActual)) {
+      admissionFailures.push(`repeat ${repeat} has a clean false block`);
+    }
+    const repeatCleanFindingFp = repeatCleans.filter((result) => result.findingEvidence.length > 0).length /
+      repeatCleans.length;
+    if (repeatCleanFindingFp > CLEAN_MAX_FINDING_FALSE_POSITIVE_RATE) {
+      admissionFailures.push(`repeat ${repeat} clean finding false-positive rate exceeds 5%`);
+    }
   }
   if (!pricingKnown) admissionFailures.push("pricing or usage missing for one or more cases");
   if (meanCostUsdPerReview > GENERATOR_MAX_MEAN_COST_USD) {
@@ -330,21 +499,36 @@ export function aggregateModel(model: string, results: LiveModelCaseResult[]): L
   }
 
   return {
-    id: model,
-    detectionRate,
-    falsePositives,
+    id: qualificationPairId(pair),
+    generatorModel: pair.generatorModel,
+    generatorModels: qualificationGeneratorModels(pair),
+    scorerModel: pair.scorerModel,
+    repeats: expectedRepeats,
+    mustBlockRecall,
+    mustBlockFinalBlockingRate,
+    advisoryDetectionRate,
+    advisoryOverblockRate,
+    cleanFalseBlocks,
+    cleanFindingFalsePositiveRate,
+    unrelatedFindings,
     casesRun: scored.length,
     meanCostUsdPerReview,
     meanDurationMs,
     totalCostUsd,
-    defectCases: defects.length,
-    detected,
+    mustBlockCases: mustBlocks.length,
+    mustBlockDetected,
+    mustBlockFinalBlocking,
+    advisoryCases: advisories.length,
+    advisoryDetected,
+    advisoryOverblocked,
     cleanCases: cleans.length,
-    gateCorrect,
-    gateScored: gateScored.length,
     errors,
     pricingKnown,
     fidelityFailures,
+    structuredOutputFailures,
+    usageFailures,
+    providerExactCases,
+    catalogEstimateCases,
     admissionFailures,
     passed: admissionFailures.length === 0,
   };
@@ -476,6 +660,37 @@ export function assertGeneratorQualificationPreflight(args: {
   if (!Number.isFinite(projected) || projected > args.costCapUsd) {
     throw new Error(
       `projected generator qualification spend $${projected.toFixed(4)} exceeds the $${args.costCapUsd.toFixed(2)} cap`,
+    );
+  }
+  return projected;
+}
+
+/** Bound the complete deployed generator/scorer combinations before any call.
+ * The scorer uses the generator request bound here deliberately: this is a
+ * conservative spend ceiling, while admission uses measured pair cost. */
+export function assertPairQualificationPreflight(args: {
+  diffs: string[];
+  pairs: QualificationPair[];
+  pricing: Map<string, ModelPricing>;
+  costCapUsd: number;
+}): number {
+  validateGeneratorQualificationBounds(args.pairs.map((pair) => pair.generatorModel), args.costCapUsd);
+  const roleModels = args.pairs.flatMap((pair) => [
+    ...qualificationGeneratorModels(pair).slice(
+      0,
+      pair.consensus ?? qualificationGeneratorModels(pair).length,
+    ),
+    pair.scorerModel,
+  ]);
+  const missing = [...new Set(roleModels.filter((model) => !args.pricing.has(model)))];
+  if (missing.length > 0) {
+    throw new Error(`cannot project pair qualification spend; pricing missing for ${missing.join(", ")}`);
+  }
+  const projected = projectTotalCostUsd({ diffs: args.diffs, models: roleModels, pricing: args.pricing });
+  if (projected > args.costCapUsd) {
+    throw new Error(
+      `projected pair qualification spend $${projected.toFixed(4)} exceeds the ` +
+      `$${args.costCapUsd.toFixed(2)} cap`,
     );
   }
   return projected;

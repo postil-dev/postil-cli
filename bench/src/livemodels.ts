@@ -3,12 +3,13 @@
 // Unlike mock mode (mock forge + mock model, measuring pipeline fidelity) and
 // the diff-file live mode in live.ts (no forge at all, single model), this mode
 // keeps the per-case mock GitHub API but points the CLI at the real OpenRouter
-// endpoint. Each fixture runs once per model in POSTIL_BENCH_MODELS, so the run
-// measures detection efficacy and measured cost per real model while exercising
-// the full forge pipeline (diff fetch, check-runs, review posting).
+// endpoint. Each fixture runs repeatedly through an exact generator/scorer
+// pair, measuring attributable detection, final blocking, cost, and latency
+// while exercising the full forge pipeline.
 //
 //   POSTIL_BENCH_MODE=live \
-//   POSTIL_BENCH_MODELS=provider/candidate-a,provider/candidate-b \
+//   POSTIL_BENCH_PAIRS=provider/generator::provider/scorer \
+//   POSTIL_BENCH_REPEATS=3 \
 //   MODEL_API_KEY=...  bun run bench --json-out report.json
 //
 // The key is read from MODEL_API_KEY, LLM_API_KEY, OPENROUTER_API_KEY, or
@@ -17,6 +18,7 @@
 // https://openrouter.ai/api/v1.
 
 import { execFile as execFileCb } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -33,18 +35,22 @@ import {
 } from "./harness";
 import {
   aggregateModel,
-  assertGeneratorQualificationPreflight,
+  assertPairQualificationPreflight,
   calculateTotalRunCostUsd,
   erroredLiveCase,
   MAX_GENERATOR_COST_CAP_USD,
+  MIN_QUALIFICATION_REPEATS,
   normalizeGeneratorModels,
   pricingFromCatalog,
   scoreLiveCase,
+  qualificationPairId,
+  qualificationGeneratorModels,
   toSiteModelAggregate,
   type LiveModelAggregate,
   type LiveModelCaseResult,
   type ModelPricing,
   type OpenRouterModelsResponse,
+  type QualificationPair,
   type SiteModelAggregate,
   validateGeneratorQualificationBounds,
 } from "./livemodels-score";
@@ -52,6 +58,15 @@ import {
 const execFile = promisify(execFileCb);
 
 export const DEFAULT_API_BASE = "https://openrouter.ai/api/v1";
+
+export const REVIEW_CONTRACT_SOURCE_PATHS = [
+  "src/prompt.rs",
+  "src/llm.rs",
+  "src/envelope.rs",
+  "src/diff.rs",
+  "src/filter.rs",
+] as const;
+export const FIXTURE_SET_SOURCE_PATHS = ["bench/fixtures/cases.ts"] as const;
 
 /** Cases in flight at once. Live inference is provider-I/O-bound; a modest pool
  * cuts wall-clock time without hammering the API. */
@@ -63,11 +78,14 @@ export const DEFAULT_TIMEOUT_MS = 300_000;
 export interface LiveModelsOptions {
   /** Path to the postil binary (a release build). */
   binary: string;
-  /** OpenRouter model ids; each fixture runs once per model with scoring and
-   * the embedded generator cascade disabled. */
-  models: string[];
+  /** Exact generator/scorer combinations. Candidate roles are never mixed. */
+  pairs: QualificationPair[];
+  /** Complete matrix repetitions. Admission requires at least three. */
+  repeats?: number;
   /** OpenRouter-compatible base URL (default DEFAULT_API_BASE). */
   apiBase?: string;
+  /** Provider interface used by the exact profile. */
+  apiFormat?: "openai-compatible" | "anthropic";
   /** Root directory for per-case run dirs. Defaults to bench/.runs/live-models. */
   rootDir?: string;
   /** Per-case timeout (default DEFAULT_TIMEOUT_MS). */
@@ -86,6 +104,16 @@ export interface LiveModelsReport {
   generatedAt: string;
   cliVersion: string;
   apiBase: string;
+  apiFormat: "openai-compatible" | "anthropic";
+  providerEndpointIdentity: string;
+  fixtureHash: string;
+  reviewContractHash: string;
+  configHash: string;
+  cliBinaryHash: string;
+  evidenceHash: string;
+  repeats: number;
+  profiles: QualificationProfile[];
+  manifestCandidate: AdmissionManifestCandidate;
   passed: boolean;
   /** The exact per-model schema the site consumes. */
   models: SiteModelAggregate[];
@@ -98,6 +126,37 @@ export interface LiveModelsReport {
   cases: LiveModelCaseResult[];
 }
 
+export interface QualificationProfile {
+  id: string;
+  apiBase: string;
+  apiFormat: "openai-compatible" | "anthropic";
+  generatorModels: string[];
+  consensus: number;
+  scorerModels: string[];
+  fixtureHash: string;
+  reviewContractHash: string;
+  configHash: string;
+  cliBinaryHash: string;
+  repeats: number;
+}
+
+export interface AdmissionManifestCandidate {
+  version: 1;
+  modelDefaultsSha256: string;
+  profiles: Array<{
+    id: string;
+    apiBase: string;
+    generatorChain: string[];
+    consensus: number;
+    scorerChain: string[];
+    apiFormat: "openai-compatible" | "anthropic";
+    reviewContractSha256: string;
+    fixtureSetSha256: string;
+    reportSha256: string;
+    repeatedRuns: number;
+  }>;
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 
@@ -105,9 +164,16 @@ export async function runLiveModels(
   inputs: BenchmarkCaseInput[],
   options: LiveModelsOptions,
 ): Promise<LiveModelsReport> {
-  const models = normalizeGeneratorModels(options.models);
+  const pairs = normalizeQualificationPairs(options.pairs);
+  const models = normalizeGeneratorModels(
+    pairs.flatMap((pair) => [...qualificationGeneratorModels(pair), pair.scorerModel]),
+  );
+  const repeats = options.repeats ?? MIN_QUALIFICATION_REPEATS;
+  if (!Number.isSafeInteger(repeats) || repeats < 1 || repeats > 10) {
+    throw new Error("qualification repeats must be an integer in 1..10");
+  }
   const costCapUsd = options.costCapUsd ?? MAX_GENERATOR_COST_CAP_USD;
-  validateGeneratorQualificationBounds(models, costCapUsd);
+  validateGeneratorQualificationBounds(pairs.map((pair) => pair.generatorModel), costCapUsd);
   if (!resolveApiKeyName()) {
     throw new Error(
       `live mode needs a real model key: set ${API_KEY_ENV_NAMES_TEXT} in the ` +
@@ -115,27 +181,38 @@ export async function runLiveModels(
     );
   }
   const cases = inputs.map((input) => benchmarkCase.parse(input));
-  const apiBase = options.apiBase ?? DEFAULT_API_BASE;
+  const apiBase = normalizeApiBase(options.apiBase ?? DEFAULT_API_BASE);
+  const apiFormat = options.apiFormat ?? "openai-compatible";
   const rootDir = options.rootDir ?? resolve(import.meta.dir, "..", ".runs", "live-models");
   const pricing = options.pricing ?? (await fetchPricing(apiBase, models));
-  assertGeneratorQualificationPreflight({
-    diffs: cases.map((candidate) => candidate.diff),
-    models,
+  assertPairQualificationPreflight({
+    diffs: Array.from({ length: repeats }, () => cases.map((candidate) => candidate.diff)).flat(),
+    pairs,
     pricing,
     costCapUsd,
   });
   await assertBinary(options.binary);
+  const repositoryRoot = resolve(import.meta.dir, "..", "..");
+  const [fixtureHash, reviewContractHash, configHash, cliBinaryHash] = await Promise.all([
+    hashRepositorySources(repositoryRoot, FIXTURE_SET_SOURCE_PATHS),
+    hashRepositorySources(repositoryRoot, REVIEW_CONTRACT_SOURCE_PATHS),
+    hashFile(resolve(import.meta.dir, "..", "..", "config.toml")),
+    hashFile(options.binary),
+  ]);
 
-  // Task queue: one job per (model, case). A bounded worker pool drains it so at
+  // Task queue: one job per (profile, repeat, case). A bounded worker pool drains it so at
   // most `concurrency` binary runs are in flight regardless of model count.
   interface Job {
-    model: string;
+    pair: QualificationPair;
+    repeat: number;
     case: BenchmarkCase;
     caseIndex: number;
   }
   const jobs: Job[] = [];
-  for (const model of models) {
-    cases.forEach((c, caseIndex) => jobs.push({ model, case: c, caseIndex }));
+  for (const pair of pairs) {
+    for (let repeat = 1; repeat <= repeats; repeat += 1) {
+      cases.forEach((c, caseIndex) => jobs.push({ pair, repeat, case: c, caseIndex }));
+    }
   }
 
   const results = new Array<LiveModelCaseResult>(jobs.length);
@@ -149,32 +226,92 @@ export async function runLiveModels(
       results[index] = await runLiveModelCase(
         job.case,
         job.caseIndex,
-        job.model,
-        pricing.get(job.model) ?? null,
+        job.pair,
+        job.repeat,
+        pricing,
         rootDir,
-        options,
+        { ...options, apiBase, apiFormat },
       );
     }
   };
   await Promise.all(Array.from({ length: concurrency }, () => worker()));
 
   const cliVersion = options.cliVersion ?? (await resolveCliVersion(options.binary));
-  const aggregates = models.map((model) =>
+  const aggregates = pairs.map((pair) =>
     aggregateModel(
-      model,
-      results.filter((r) => r.model === model),
+      pair,
+      results.filter((r) => r.pairId === qualificationPairId(pair)),
+      repeats,
     ),
   );
-
+  const identity = apiBase;
+  const profiles = pairs.map((pair) => qualificationProfile({
+    pair,
+    apiBase,
+    apiFormat,
+    fixtureHash,
+    reviewContractHash,
+    configHash,
+    cliBinaryHash,
+    repeats,
+  }));
+  const evidenceHash = hashText(JSON.stringify({
+    cliVersion,
+    apiBase,
+    apiFormat,
+    providerEndpointIdentity: identity,
+    fixtureHash,
+    reviewContractHash,
+    configHash,
+    cliBinaryHash,
+    repeats,
+    profiles,
+    modelAggregates: aggregates,
+    cases: results,
+  }));
+  const manifestCandidate = admissionManifestCandidate(configHash, evidenceHash, profiles);
   return {
     generatedAt: new Date().toISOString(),
     cliVersion,
     apiBase,
+    apiFormat,
+    providerEndpointIdentity: identity,
+    fixtureHash,
+    reviewContractHash,
+    configHash,
+    cliBinaryHash,
+    evidenceHash,
+    repeats,
+    profiles,
+    manifestCandidate,
     passed: aggregates.length > 0 && aggregates.every((aggregate) => aggregate.passed),
     models: aggregates.map(toSiteModelAggregate),
     modelAggregates: aggregates,
     totalRunCostUsd: calculateTotalRunCostUsd(results),
     cases: results,
+  };
+}
+
+export function admissionManifestCandidate(
+  modelDefaultsSha256: string,
+  reportSha256: string,
+  profiles: QualificationProfile[],
+): AdmissionManifestCandidate {
+  return {
+    version: 1,
+    modelDefaultsSha256,
+    profiles: profiles.map((profile) => ({
+      id: profile.id,
+      apiBase: profile.apiBase,
+      generatorChain: profile.generatorModels,
+      consensus: profile.consensus,
+      scorerChain: profile.scorerModels,
+      apiFormat: profile.apiFormat,
+      reviewContractSha256: profile.reviewContractHash,
+      fixtureSetSha256: profile.fixtureHash,
+      reportSha256,
+      repeatedRuns: profile.repeats,
+    })),
   };
 }
 
@@ -184,12 +321,18 @@ export async function runLiveModels(
 async function runLiveModelCase(
   c: BenchmarkCase,
   caseIndex: number,
-  model: string,
-  pricing: ModelPricing | null,
+  pair: QualificationPair,
+  repeat: number,
+  pricing: Map<string, ModelPricing>,
   rootDir: string,
   options: LiveModelsOptions,
 ): Promise<LiveModelCaseResult> {
-  const runDir = join(rootDir, safeSegment(model), caseRunDirName(caseIndex, c.id));
+  const runDir = join(
+    rootDir,
+    safeSegment(qualificationPairId(pair)),
+    `repeat-${repeat}`,
+    caseRunDirName(caseIndex, c.id),
+  );
   await rm(runDir, { recursive: true, force: true });
   const homeDir = join(runDir, "home");
   const tmpDir = join(runDir, "tmp");
@@ -208,7 +351,14 @@ async function runLiveModelCase(
       ["review", "--repo", c.repo, "--pr", String(c.pullNumber), "--output-json"],
       {
         cwd: runDir,
-        env: liveEnv(homeDir, tmpDir, github.baseUrl, model, options.apiBase ?? DEFAULT_API_BASE),
+        env: liveEnv(
+          homeDir,
+          tmpDir,
+          github.baseUrl,
+          pair,
+          options.apiBase ?? DEFAULT_API_BASE,
+          options.apiFormat ?? "openai-compatible",
+        ),
         timeout: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
         maxBuffer: 8 * 1024 * 1024,
       },
@@ -226,14 +376,14 @@ async function runLiveModelCase(
   } finally {
     await github.close();
   }
-  await writeFile(join(artifactsDir, "stdout.json"), stdout, { mode: 0o600 });
   await writeFile(join(artifactsDir, "stderr.log"), stderr, { mode: 0o600 });
 
   const parsed = envelopeV1.safeParse(safeJson(stdout));
   if (!parsed.success) {
     return erroredLiveCase({
       case: c,
-      model,
+      pair,
+      repeat,
       exitCode,
       error: `no valid v1 envelope (exit ${exitCode ?? "unknown"})`,
     });
@@ -247,14 +397,38 @@ async function runLiveModelCase(
     ...evaluateGrounding(c, envelope),
     ...evaluateStatusline(envelope, github),
   ];
-  if (envelope.modelUsed !== model) {
-    fidelityFailures.push(`generator qualification used ${envelope.modelUsed} instead of ${model}`);
+  const structuredOutputFailures: string[] = [];
+  const generators = qualificationGeneratorModels(pair).slice(0, pair.consensus);
+  const expectedModelUsed = generators.length > 1
+    ? `consensus(${generators.join(", ")})`
+    : generators[0];
+  if (envelope.modelUsed !== expectedModelUsed) {
+    structuredOutputFailures.push(
+      `generator qualification used ${envelope.modelUsed} instead of ${expectedModelUsed}`,
+    );
   }
-  if (envelope.scorerModel !== undefined) {
-    fidelityFailures.push(`generator qualification unexpectedly used scorer ${envelope.scorerModel}`);
+  if (envelope.scorerError !== undefined) {
+    structuredOutputFailures.push("scorer returned an operational or structured-output error");
+  }
+  if (
+    envelope.findings.length + envelope.suppressedFindings.length > 0 &&
+    envelope.scorerModel !== pair.scorerModel
+  ) {
+    structuredOutputFailures.push(
+      `qualification used scorer ${envelope.scorerModel ?? "none"} instead of ${pair.scorerModel}`,
+    );
   }
 
-  return scoreLiveCase({ case: c, model, envelope, pricing, exitCode, fidelityFailures });
+  return scoreLiveCase({
+    case: c,
+    pair,
+    repeat,
+    envelope,
+    pricing,
+    exitCode,
+    fidelityFailures,
+    structuredOutputFailures,
+  });
 }
 
 /** Environment for a live-models run: an isolated HOME/TMPDIR/XDG so the binary
@@ -265,8 +439,9 @@ export function liveEnv(
   homeDir: string,
   tmpDir: string,
   githubBaseUrl: string,
-  model: string,
+  pair: QualificationPair,
   apiBase: string,
+  apiFormat: "openai-compatible" | "anthropic" = "openai-compatible",
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     PATH: process.env.PATH,
@@ -280,19 +455,140 @@ export function liveEnv(
     GIT_CONFIG_NOSYSTEM: "1",
     GIT_TERMINAL_PROMPT: "0",
     POSTIL_API_BASE: apiBase,
+    POSTIL_API_FORMAT: apiFormat,
     GITHUB_API_URL: githubBaseUrl,
     GITHUB_TOKEN: "benchmark-github-token",
-    REVIEW_MODEL: model,
-    // Repeating the primary in the cascade deduplicates to a one-model chain,
-    // so a candidate cannot pass using an embedded fallback.
-    REVIEW_MODEL_CASCADE: model,
-    POSTIL_DISABLE_SCORER: "1",
+    REVIEW_MODEL: pair.generatorModel,
+    // The exact chain and consensus width are part of the candidate contract.
+    REVIEW_MODEL_CASCADE: qualificationGeneratorModels(pair).join(","),
+    REVIEW_MODEL_CONSENSUS: String(pair.consensus ?? qualificationGeneratorModels(pair).length),
+    REVIEW_SCORER_MODEL: pair.scorerModel,
   };
   // Forward the selected inference-key variable without logging or placing the
   // value on argv. Neutral aliases are also mirrored into POSTIL_API_KEY so
   // older binaries can run from the same benchmark harness.
   forwardApiKey(env);
   return env;
+}
+
+export function normalizeQualificationPairs(pairs: QualificationPair[]): QualificationPair[] {
+  const normalized = pairs
+    .map((pair) => ({
+      generatorModel: pair.generatorModel.trim(),
+      generatorCascade: (pair.generatorCascade ?? []).map((model) => model.trim()).filter(Boolean),
+      consensus: pair.consensus,
+      scorerModel: pair.scorerModel.trim(),
+    }))
+    .filter((pair) => pair.generatorModel.length > 0 || pair.scorerModel.length > 0);
+  if (normalized.length === 0) {
+    throw new Error("live qualification needs at least one generator+scorer pair");
+  }
+  for (const pair of normalized) {
+    if (!pair.generatorModel || !pair.scorerModel) {
+      throw new Error("each qualification pair needs both generator and scorer model ids");
+    }
+    const generatorCount = qualificationGeneratorModels(pair).length;
+    const consensus = pair.consensus ?? generatorCount;
+    if (!Number.isSafeInteger(consensus) || consensus < 1 || consensus > generatorCount) {
+      throw new Error("pair consensus must be an integer within the generator chain");
+    }
+    pair.consensus = consensus;
+  }
+  return [...new Map(normalized.map((pair) => [qualificationPairId(pair), pair])).values()];
+}
+
+export function parseQualificationPairs(raw: string): QualificationPair[] {
+  return raw
+    .split(",")
+    .filter((value) => value.trim().length > 0)
+    .map((value) => {
+      const [generatorChain, scorerModel, extra] = value.split("::");
+      const generatorModels = generatorChain?.split("+").map((model) => model.trim()).filter(Boolean) ?? [];
+      const generatorModel = generatorModels[0];
+      if (extra !== undefined || !generatorModel?.trim() || !scorerModel?.trim()) {
+        throw new Error("qualification pairs use generator/model::scorer/model syntax");
+      }
+      return {
+        generatorModel,
+        generatorCascade: generatorModels.slice(1),
+        consensus: generatorModels.length,
+        scorerModel: scorerModel.trim(),
+      };
+    });
+}
+
+async function hashFile(path: string): Promise<string> {
+  return hashText(await readFile(path));
+}
+
+/** Hash a named source bundle exactly as the runtime does: ordered UTF-8 path,
+ * NUL, exact file bytes, NUL. Paths are repository-relative and stable. */
+export function hashNamedSources(sources: ReadonlyArray<readonly [string, Buffer]>): string {
+  const hasher = createHash("sha256");
+  for (const [path, contents] of sources) {
+    hasher.update(path, "utf8");
+    hasher.update(Buffer.from([0]));
+    hasher.update(contents);
+    hasher.update(Buffer.from([0]));
+  }
+  return hasher.digest("hex");
+}
+
+export async function hashRepositorySources(
+  repositoryRoot: string,
+  paths: readonly string[],
+): Promise<string> {
+  const sources = await Promise.all(
+    paths.map(async (path) => [path, await readFile(resolve(repositoryRoot, path))] as const),
+  );
+  return hashNamedSources(sources);
+}
+
+function hashText(value: string | Buffer): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+/** Canonical provider endpoint identity shared with the runtime manifest. */
+export function normalizeApiBase(value: string): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("model API base must be an absolute URL");
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error("model API base must use HTTP or HTTPS");
+  }
+  if (url.username !== "" || url.password !== "") {
+    throw new Error("model API base must not contain credentials");
+  }
+  if (value.includes("?") || value.includes("#")) {
+    throw new Error("model API base must not contain a query or fragment");
+  }
+  const hostname = url.hostname.toLowerCase();
+  const port = url.port || (url.protocol === "https:" ? "443" : "80");
+  const path = url.pathname.replace(/\/+$/, "") || "/";
+  return `${url.protocol}//${hostname}:${port}${path}`;
+}
+
+function qualificationProfile(args: Omit<QualificationProfile, "id" | "generatorModels" | "consensus" | "scorerModels"> & {
+  pair: QualificationPair;
+}): QualificationProfile {
+  const generatorModels = qualificationGeneratorModels(args.pair);
+  const consensus = args.pair.consensus ?? generatorModels.length;
+  const material = {
+    apiBase: args.apiBase,
+    apiFormat: args.apiFormat,
+    generatorModels,
+    consensus,
+    scorerModels: [args.pair.scorerModel],
+    fixtureHash: args.fixtureHash,
+    reviewContractHash: args.reviewContractHash,
+    configHash: args.configHash,
+    cliBinaryHash: args.cliBinaryHash,
+    repeats: args.repeats,
+  };
+  return { id: hashText(JSON.stringify(material)), ...material };
 }
 
 // ---------------------------------------------------------------------------
@@ -321,9 +617,10 @@ export function formatLiveModelsReport(report: LiveModelsReport): string {
     "",
   ];
   const header = [
-    pad("model", 40),
-    pad("detect", 8),
-    pad("FP", 5),
+    pad("generator + scorer", 52),
+    pad("block", 8),
+    pad("adv", 8),
+    pad("clean FP", 9),
     pad("cases", 6),
     pad("$/review", 12),
     pad("total $", 12),
@@ -333,9 +630,10 @@ export function formatLiveModelsReport(report: LiveModelsReport): string {
   for (const a of report.modelAggregates) {
     lines.push(
       [
-        pad(a.id, 40),
-        pad(pct(a.detectionRate), 8),
-        pad(String(a.falsePositives), 5),
+        pad(a.id, 52),
+        pad(pct(a.mustBlockRecall), 8),
+        pad(pct(a.advisoryDetectionRate), 8),
+        pad(pct(a.cleanFindingFalsePositiveRate), 9),
         pad(String(a.casesRun), 6),
         pad(usd(a.meanCostUsdPerReview), 12),
         pad(usd(a.totalCostUsd), 12),
@@ -343,7 +641,7 @@ export function formatLiveModelsReport(report: LiveModelsReport): string {
       ].join(" "),
     );
     if (a.errors > 0) {
-      lines.push(`  ${a.errors} case(s) without a valid envelope (excluded from scoring)`);
+      lines.push(`  ${a.errors} case(s) without a valid envelope`);
     }
     if (!a.pricingKnown) {
       lines.push("  pricing unknown for this model: cost columns are 0");
@@ -354,9 +652,11 @@ export function formatLiveModelsReport(report: LiveModelsReport): string {
     "",
     `Total run cost: ${usd(report.totalRunCostUsd)}`,
     "",
-    "detect = detection rate over defect fixtures; FP = findings that miss the seeded",
-    "region (or any finding on a clean fixture). Fixtures are ours; no competitor peer",
-    "run exists. Costs are our measured OpenRouter spend on our fixtures, one run per case.",
+    `Fixture ${report.fixtureHash}; review contract ${report.reviewContractHash}.`,
+    `Provider endpoint ${report.providerEndpointIdentity}; ${report.repeats} complete repeats.`,
+    "block = must-block seeded-defect recall; adv = advisory seeded-defect recall;",
+    "clean FP = clean cases with any final or suppressed finding. Costs retain provider-exact",
+    "or catalog-estimate provenance in the per-case report.",
   );
   return lines.join("\n");
 }

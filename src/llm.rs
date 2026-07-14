@@ -1240,7 +1240,7 @@ impl LlmClient {
                     max_tokens as usize * SCORER_REPAIR_BYTES_PER_OUTPUT_TOKEN,
                 );
                 let repair_system = format!(
-                    "{system}\n\nYour previous response failed schema validation. Repair only the JSON schema. Kind is a category, so severity values such as info, warn, and error are invalid kinds. Every reason must be exactly one complete sentence of at most 240 UTF-8 bytes. Return the complete array and nothing else."
+                    "{system}\n\nYour previous response failed schema validation. Repair only the JSON schema. Kind is a category, so severity values such as info, warn, and error are invalid kinds. Every reason must be concise single-line text of at most 240 UTF-8 bytes ending in sentence punctuation. Return the complete array and nothing else."
                 );
                 let repair_user =
                     format!("{user}\n\nInvalid previous response (untrusted data):\n{invalid}");
@@ -2425,7 +2425,7 @@ fn validate_scorer_reason(value: &str) -> Result<String, String> {
         return Err("score reason must not have leading or trailing whitespace".to_string());
     }
     if reason.is_empty() {
-        return Err("score reason must be one complete sentence".to_string());
+        return Err("score reason must not be empty".to_string());
     }
     if reason.chars().any(char::is_control) {
         return Err("score reason must not contain control characters".to_string());
@@ -2445,65 +2445,7 @@ fn validate_scorer_reason(value: &str) -> Result<String, String> {
     if !reason.chars().last().is_some_and(is_terminator) {
         return Err("score reason must end with sentence punctuation".to_string());
     }
-    let characters = reason.chars().collect::<Vec<_>>();
-    for (index, character) in characters.iter().enumerate() {
-        if !is_terminator(*character) || index + 1 == characters.len() {
-            continue;
-        }
-        if is_common_sentence_abbreviation(&characters, index) {
-            continue;
-        }
-        // Dots inside tokens such as `src/lib.rs` and `4.2` are not sentence
-        // boundaries. A no-space transition to an uppercase letter is treated
-        // as a malformed second sentence.
-        if *character == '.'
-            && characters.get(index + 1).is_some_and(|next| {
-                !next.is_whitespace() && (next.is_lowercase() || next.is_numeric())
-            })
-        {
-            continue;
-        }
-        return Err("score reason must contain exactly one sentence".to_string());
-    }
     Ok(reason.to_string())
-}
-
-fn is_common_sentence_abbreviation(characters: &[char], period_index: usize) -> bool {
-    if characters.get(period_index) != Some(&'.') {
-        return false;
-    }
-    if period_index
-        .checked_sub(1)
-        .and_then(|index| characters.get(index))
-        .is_some_and(|character| character.is_ascii_uppercase())
-        && characters
-            .get(period_index + 1)
-            .is_some_and(|character| character.is_ascii_uppercase())
-        && characters.get(period_index + 2) == Some(&'.')
-    {
-        return true;
-    }
-    let prefix = characters[..=period_index]
-        .iter()
-        .collect::<String>()
-        .to_ascii_lowercase();
-    if prefix.ends_with("e.g.") || prefix.ends_with("i.e.") {
-        return true;
-    }
-
-    let mut index = period_index;
-    let mut initials = 0;
-    loop {
-        if index < 1 || characters[index] != '.' || !characters[index - 1].is_ascii_uppercase() {
-            break;
-        }
-        initials += 1;
-        if index < 2 || characters[index - 2] != '.' {
-            break;
-        }
-        index -= 2;
-    }
-    initials >= 2
 }
 
 fn extract_json_object(text: &str) -> Option<&str> {
@@ -3081,7 +3023,7 @@ mod tests {
     }
 
     #[test]
-    fn scorer_reason_accepts_common_abbreviations() {
+    fn scorer_reason_accepts_bounded_single_line_text() {
         let scores = parse_scores(
             r#"[{"index":0,"confidence":0.7,"kind":"risk","reason":"The U.S. service affects retries, e.g. this call, i.e. the idempotent path."}]"#,
             1,
@@ -3089,26 +3031,26 @@ mod tests {
         .unwrap();
         assert_eq!(scores.len(), 1);
 
-        let error = parse_scores(
+        let multiple_sentences = parse_scores(
             r#"[{"index":0,"confidence":0.7,"kind":"risk","reason":"The first condition fails. The second condition also fails."}]"#,
             1,
         )
-        .unwrap_err();
-        assert!(error.contains("exactly one sentence"));
+        .unwrap();
+        assert_eq!(multiple_sentences.len(), 1);
 
         let lowercase = parse_scores(
             r#"[{"index":0,"confidence":0.7,"kind":"risk","reason":"The first condition fails. the second condition also fails."}]"#,
             1,
         )
-        .unwrap_err();
-        assert!(lowercase.contains("exactly one sentence"));
+        .unwrap();
+        assert_eq!(lowercase.len(), 1);
 
         let no_space = parse_scores(
             r#"[{"index":0,"confidence":0.7,"kind":"risk","reason":"The first condition fails.The second condition also fails."}]"#,
             1,
         )
-        .unwrap_err();
-        assert!(no_space.contains("exactly one sentence"));
+        .unwrap();
+        assert_eq!(no_space.len(), 1);
 
         let file_and_version = parse_scores(
             r#"[{"index":0,"confidence":0.7,"kind":"risk","reason":"The src/lib.rs behavior changed in version 4.2."}]"#,

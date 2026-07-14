@@ -765,6 +765,16 @@ impl Config {
         {
             self.cascade = c.split(',').map(|s| s.trim().to_string()).collect();
         }
+        if let Ok(value) = std::env::var("REVIEW_MODEL_CONSENSUS")
+            && !value.trim().is_empty()
+        {
+            let consensus = value
+                .trim()
+                .parse::<usize>()
+                .context("REVIEW_MODEL_CONSENSUS must be a positive integer")?;
+            anyhow::ensure!(consensus >= 1, "REVIEW_MODEL_CONSENSUS must be >= 1");
+            self.consensus = consensus;
+        }
         if let Ok(s) = std::env::var("REVIEW_SCORER_MODEL")
             && !s.is_empty()
         {

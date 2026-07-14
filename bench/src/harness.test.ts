@@ -5,7 +5,7 @@ import { benchmarkCase, scanForForbidden } from "./harness";
 describe("benchmark fixtures", () => {
   test("cover the expanded saturated-case categories", () => {
     const parsed = cases.map((c) => benchmarkCase.parse(c));
-    expect(parsed).toHaveLength(64);
+    expect(parsed).toHaveLength(61);
 
     const labels = new Set(parsed.flatMap((c) => c.scoringLabels));
     for (const label of [
@@ -21,10 +21,28 @@ describe("benchmark fixtures", () => {
       expect(labels.has(label)).toBe(true);
     }
 
-    const defectCount = parsed.filter((c) => c.groundTruth.findings.length > 0).length;
-    const cleanCount = parsed.length - defectCount;
-    expect(defectCount).toBe(53);
-    expect(cleanCount).toBe(11);
+    const byClass = Object.groupBy(parsed, (candidate) => candidate.admission.classification);
+    expect(byClass.mustBlock).toHaveLength(34);
+    expect(byClass.advisory).toHaveLength(15);
+    expect(byClass.clean).toHaveLength(12);
+    expect(parsed.filter((candidate) => candidate.groundTruth.findings.length > 0)).toHaveLength(49);
+
+    expect(parsed.map((candidate) => candidate.id)).not.toContain("migration-drop-column");
+    expect(parsed.map((candidate) => candidate.id)).not.toContain("migration-nullability-tighten");
+    expect(parsed.map((candidate) => candidate.id)).not.toContain("dependency-vulnerable-pin");
+    expect(parsed.find((candidate) => candidate.id === "dependency-major-bump")?.admission).toEqual({
+      classification: "clean",
+      contractRule: "version-change-alone-is-not-a-defect-without-a-guardrail",
+    });
+
+    for (const candidate of parsed) {
+      const expectedSeverity = candidate.admission.classification === "mustBlock"
+        ? "error"
+        : candidate.admission.classification === "advisory"
+          ? "warn"
+          : undefined;
+      expect(candidate.groundTruth.findings[0]?.severity).toBe(expectedSeverity);
+    }
   });
 
   test("huge low-signal fixtures can carry multiple hunks in one diff", () => {
@@ -77,6 +95,7 @@ describe("disallowedSources", () => {
       },
       disallowedSources: [{ text: "BENCH_INJECTION_SCOPE_TEST", scope: "output" }],
       scoringLabels: ["prompt-injection"],
+      admission: { classification: "clean", contractRule: "no-merge-relevant-defect" },
       groundTruth: { findings: [] },
       modelOutput: { summary: "", findings: [] },
       expectations: { minFindings: 0, maxFindings: 0, requiredFindings: [] },
