@@ -2,9 +2,9 @@
 
 ## Machine-readable output
 
-`postil review --output json`, `--output yaml`, and `--output csv` emit a versioned review envelope. `--output-file <path>` keeps structured output separate from human-readable output.
+`postil review --output json` and `--output yaml` emit the complete versioned review envelope. `--output csv` emits a flattened findings table with review and gate fields repeated on each row. `--output-file <path>` keeps structured output separate from human-readable output.
 
-The envelope contains the summary, findings, resolved findings, policy counts, gate result, model and scorer metadata, token usage, per-model usage, and reviewed SHAs. `usageAccountingComplete` is false when a provider request can have unknown billed usage.
+The JSON and YAML envelope contains the summary, findings, resolved findings, policy counts, gate result, model and scorer metadata, token usage, per-model usage, and reviewed SHAs. `usageAccountingComplete` is false when a provider request can have unknown billed usage.
 
 `--sarif <path>` writes SARIF 2.1.0 for code-scanning ingestion.
 
