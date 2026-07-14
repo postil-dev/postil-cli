@@ -739,8 +739,11 @@ impl LlmClient {
         );
         ensure!(
             exposure.projected_cost_micros <= HOSTED_OPERATION_COST_CAP_MICROS,
-            "complete hosted {operation} projects {} micro-dollars of provider exposure, exceeding the {HOSTED_OPERATION_COST_CAP_MICROS} micro-dollar operation cap",
-            exposure.projected_cost_micros
+            "complete hosted {operation} projects {} micro-dollars of provider exposure across {} attempts, {} serialized input bytes, and {} output tokens, exceeding the {HOSTED_OPERATION_COST_CAP_MICROS} micro-dollar operation cap",
+            exposure.projected_cost_micros,
+            exposure.attempts,
+            exposure.input_bytes,
+            exposure.output_tokens
         );
         ReviewAdmission::try_from(exposure)
     }
@@ -3953,6 +3956,33 @@ mod tests {
         assert!(error.to_string().contains("complete hosted review"));
         assert_eq!(client.admission.lock().unwrap().attempts, 0);
         assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn hosted_preflight_cost_error_reports_exposure_dimensions() {
+        let client = LlmClient::build(
+            &Config::default(),
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        let error = client
+            .validate_hosted_exposure(
+                "review",
+                &PlannedExposure {
+                    attempts: 6,
+                    input_bytes: 12_345,
+                    output_tokens: 678,
+                    projected_cost_micros: HOSTED_OPERATION_COST_CAP_MICROS + 1,
+                },
+            )
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("provider exposure across 6 attempts"));
+        assert!(message.contains("12345 serialized input bytes"));
+        assert!(message.contains("678 output tokens"));
     }
 
     #[test]
