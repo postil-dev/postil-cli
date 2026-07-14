@@ -2,6 +2,12 @@
 
 use crate::config::Config;
 
+/// Hard validator boundary for scorer assessment text.
+pub(crate) const SCORER_REASON_MAX_BYTES: usize = 240;
+/// Lower prompt target that leaves room for modest model overshoot.
+pub(crate) const SCORER_REASON_PROMPT_MAX_BYTES: usize = 180;
+const _: () = assert!(SCORER_REASON_PROMPT_MAX_BYTES < SCORER_REASON_MAX_BYTES);
+
 pub struct PrContext<'a> {
     pub repo: Option<&'a str>,
     pub title: Option<&'a str>,
@@ -154,14 +160,14 @@ pub fn scorer_system_prompt(cfg: &Config) -> String {
          --- POSTIL REVIEW CONTRACT ---\n",
     );
     p.push_str(&review_contract(cfg));
-    p.push_str(
+    p.push_str(&format!(
         "--- END POSTIL REVIEW CONTRACT ---\n\
          \n\
          Return ONLY a JSON array, no markdown fences, no prose. The array MUST contain \
          exactly one object per supplied finding:\n\
-         [{\"index\": <number>, \"confidence\": <0..1>, \
+         [{{\"index\": <number>, \"confidence\": <0..1>, \
          \"kind\": \"risk|humanEscalation|guardrail|uncertainty|contentPolicy\", \
-         \"reason\": \"concise single-line text of at most 240 UTF-8 bytes\"}]\n\
+         \"reason\": \"concise single-line text of at most {SCORER_REASON_PROMPT_MAX_BYTES} UTF-8 bytes\"}}]\n\
          \n\
          The `kind` value is a finding category. `info`, `warn`, and `error` are \
          severities and are NEVER valid kind values. An ordinary concrete defect is \
@@ -169,12 +175,12 @@ pub fn scorer_system_prompt(cfg: &Config) -> String {
          `humanEscalation` only when multiple valid outcomes remain and an accountable \
          owner must choose among them. Every `reason` must be concise single-line text, \
          end with sentence punctuation, contain no line breaks, and contain \
-         at most 240 UTF-8 bytes.\n\
+         at most {SCORER_REASON_PROMPT_MAX_BYTES} UTF-8 bytes.\n\
          \n\
          The input intentionally omits the generator's original confidence and kind. Do \
          not infer them from absence; score independently from the finding text and local \
          diff hunk.",
-    );
+    ));
     p
 }
 
@@ -355,6 +361,15 @@ mod tests {
         assert!(p.contains("Classify the primary merge reason"));
         assert!(p.contains("concrete code or security defect is risk"));
         assert!(p.contains("Do not duplicate one issue under both kinds"));
+    }
+
+    #[test]
+    fn scorer_prompt_targets_headroom_below_the_hard_reason_limit() {
+        let prompt = scorer_system_prompt(&Config::default());
+        assert!(prompt.contains(&format!(
+            "at most {SCORER_REASON_PROMPT_MAX_BYTES} UTF-8 bytes"
+        )));
+        assert!(!prompt.contains(&format!("at most {SCORER_REASON_MAX_BYTES} UTF-8 bytes")));
     }
 
     #[test]

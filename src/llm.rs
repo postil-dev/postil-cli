@@ -23,6 +23,7 @@ use crate::envelope::{
     ModelUsage, ModelUsageCostSource, ModelUsagePhase, ModelUsageRole, ProviderCost,
     ReviewAdmission, Usage,
 };
+use crate::prompt::{SCORER_REASON_MAX_BYTES, SCORER_REASON_PROMPT_MAX_BYTES};
 
 #[derive(Debug, Clone)]
 pub struct ModelReview {
@@ -374,7 +375,6 @@ const SCORER_BASE_MAX_TOKENS: u32 = 256;
 const SCORER_MAX_TOKENS_PER_FINDING: u32 = 640;
 const SCORER_REPAIR_BYTES_PER_OUTPUT_TOKEN: usize = 4;
 pub(crate) const SCORER_MAX_FINDINGS: usize = 20;
-const SCORER_REASON_MAX_BYTES: usize = 240;
 const REPAIR_ERROR_MAX_BYTES: usize = 1_024;
 // The publication contract targets 1,200 characters and hard-stops at 2,400.
 // Keep generation bounded too, so an invalid model cannot spend an article's
@@ -422,7 +422,7 @@ fn review_semantic_retry_user(user: &str, previous: &str) -> String {
 
 fn scorer_repair_system(system: &str) -> String {
     format!(
-        "{system}\n\nYour previous response failed schema validation. Repair only the JSON schema. Kind is a category, so severity values such as info, warn, and error are invalid kinds. Every reason must be concise single-line text of at most 240 UTF-8 bytes ending in sentence punctuation. Return the complete array and nothing else."
+        "{system}\n\nYour previous response failed schema validation. Repair only the JSON schema. Kind is a category, so severity values such as info, warn, and error are invalid kinds. Every reason must be concise single-line text of at most {SCORER_REASON_PROMPT_MAX_BYTES} UTF-8 bytes ending in sentence punctuation. Return the complete array and nothing else."
     )
 }
 
@@ -4112,6 +4112,15 @@ mod tests {
     #[test]
     fn scorer_rejects_missing_entries() {
         assert!(parse_scores(r#"[{"index":0,"confidence":0.5,"kind":"risk"}]"#, 2).is_err());
+    }
+
+    #[test]
+    fn scorer_repair_prompt_keeps_reason_length_headroom() {
+        let prompt = scorer_repair_system("base scorer contract");
+        assert!(prompt.contains(&format!(
+            "at most {SCORER_REASON_PROMPT_MAX_BYTES} UTF-8 bytes"
+        )));
+        assert!(!prompt.contains(&format!("at most {SCORER_REASON_MAX_BYTES} UTF-8 bytes")));
     }
 
     #[test]
