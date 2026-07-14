@@ -158,6 +158,29 @@ describe("benchmark fixtures", () => {
             matches: commentMatchesExpectation(negated, finding.semantics),
           }).toEqual({ id: candidate.id, negated, matches: false });
         }
+        const concepts = conceptProposition.all.map((group) => group[0]).join(" ");
+        for (const remediated of [
+          `The ${concepts} condition has been fixed and is now prevented.`,
+          `The change makes the ${concepts} condition impossible.`,
+          `There is protection against the ${concepts} condition.`,
+        ]) {
+          expect({
+            id: candidate.id,
+            remediated,
+            matches: commentMatchesExpectation(remediated, finding.semantics),
+          }).toEqual({ id: candidate.id, remediated, matches: false });
+        }
+        for (const failedRemediation of [
+          `The code fails to prevent the ${concepts} condition.`,
+          `The code cannot prevent the ${concepts} condition.`,
+          `The code does not prevent the ${concepts} condition.`,
+        ]) {
+          expect({
+            id: candidate.id,
+            failedRemediation,
+            matches: commentMatchesExpectation(failedRemediation, finding.semantics),
+          }).toEqual({ id: candidate.id, failedRemediation, matches: true });
+        }
         expect(commentMatchesExpectation(`This is not an unrelated concern. ${probe}`, finding.semantics))
           .toBe(true);
         expect(commentMatchesExpectation(`This fixes an unrelated concern. ${probe}`, finding.semantics))

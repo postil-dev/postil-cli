@@ -118,6 +118,7 @@ pub struct ModelDefaults {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct QualificationManifest {
     pub version: u64,
+    pub qualification_source_sha: Option<String>,
     pub model_defaults_sha256: String,
     pub profiles: Vec<QualificationProfile>,
 }
@@ -126,6 +127,7 @@ pub struct QualificationManifest {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct QualificationProfile {
     pub id: String,
+    pub qualification_source_sha: String,
     pub model_defaults_sha256: String,
     pub api_format: ApiFormat,
     pub api_base: String,
@@ -154,6 +156,7 @@ pub struct ModelPriceBound {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct QualificationProfileDigestMaterial<'a> {
+    qualification_source_sha: &'a str,
     model_defaults_sha256: &'a str,
     benchmark_provider_identity: &'a Option<String>,
     api_base: &'a str,
@@ -368,6 +371,24 @@ fn parse_qualification_manifest(raw: &str) -> Result<QualificationManifest> {
         "qualification manifest does not match the embedded model defaults"
     );
     let mut profile_ids = Vec::with_capacity(manifest.profiles.len());
+    if manifest.profiles.is_empty() {
+        anyhow::ensure!(
+            manifest.qualification_source_sha.is_none(),
+            "empty qualification manifest must not claim a qualification source"
+        );
+    } else {
+        let source_sha = manifest
+            .qualification_source_sha
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("qualification manifest source SHA is required"))?;
+        anyhow::ensure!(
+            matches!(source_sha.len(), 40 | 64)
+                && source_sha
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+            "qualification manifest source SHA must be a lowercase Git commit SHA"
+        );
+    }
     let current_review_contract = review_contract_sha256();
     let current_fixture_set = fixture_set_sha256();
     let current_evaluator_contract = evaluator_contract_sha256();
@@ -460,6 +481,11 @@ fn parse_qualification_manifest(raw: &str) -> Result<QualificationManifest> {
         anyhow::ensure!(
             profile.model_defaults_sha256 == manifest.model_defaults_sha256,
             "qualification profile model defaults digest does not match its manifest"
+        );
+        anyhow::ensure!(
+            manifest.qualification_source_sha.as_deref()
+                == Some(profile.qualification_source_sha.as_str()),
+            "qualification profile source SHA does not match its manifest"
         );
         anyhow::ensure!(
             profile.review_contract_sha256 == current_review_contract,
@@ -605,6 +631,7 @@ fn sha256_hex(raw: &str) -> String {
 
 fn qualification_profile_digest(profile: &QualificationProfile) -> String {
     let material = QualificationProfileDigestMaterial {
+        qualification_source_sha: &profile.qualification_source_sha,
         model_defaults_sha256: &profile.model_defaults_sha256,
         benchmark_provider_identity: &profile.benchmark_provider_identity,
         api_base: &profile.api_base,
@@ -1384,9 +1411,11 @@ mod tests {
     fn valid_qualification_manifest_json() -> serde_json::Value {
         let mut manifest = serde_json::json!({
             "version": 1,
+            "qualificationSourceSha": "9".repeat(40),
             "modelDefaultsSha256": model_defaults().source_sha256,
             "profiles": [{
                 "id": "0".repeat(64),
+                "qualificationSourceSha": "9".repeat(40),
                 "modelDefaultsSha256": model_defaults().source_sha256,
                 "apiFormat": "openai-compatible",
                 "apiBase": "https://openrouter.ai:443/api/v1",
@@ -1759,6 +1788,41 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
     }
 
     #[test]
+    fn qualification_manifest_requires_one_canonical_source_commit() {
+        let mut missing = valid_qualification_manifest_json();
+        missing["qualificationSourceSha"] = serde_json::Value::Null;
+        let error = parse_qualification_manifest(&missing.to_string()).unwrap_err();
+        assert!(error.to_string().contains("source SHA is required"));
+
+        let mut uppercase = valid_qualification_manifest_json();
+        uppercase["qualificationSourceSha"] = serde_json::json!("A".repeat(40));
+        let error = parse_qualification_manifest(&uppercase.to_string()).unwrap_err();
+        assert!(error.to_string().contains("lowercase Git commit SHA"));
+
+        let mut mismatch = valid_qualification_manifest_json();
+        mismatch["profiles"][0]["qualificationSourceSha"] = serde_json::json!("8".repeat(40));
+        let error = parse_qualification_manifest(&mismatch.to_string()).unwrap_err();
+        assert!(error.to_string().contains("source SHA does not match"));
+    }
+
+    #[test]
+    fn empty_qualification_manifest_carries_no_source_authority() {
+        let mut empty = valid_qualification_manifest_json();
+        empty["profiles"] = serde_json::json!([]);
+        empty["qualificationSourceSha"] = serde_json::Value::Null;
+        assert!(
+            parse_qualification_manifest(&empty.to_string())
+                .unwrap()
+                .profiles
+                .is_empty()
+        );
+
+        empty["qualificationSourceSha"] = serde_json::json!("9".repeat(40));
+        let error = parse_qualification_manifest(&empty.to_string()).unwrap_err();
+        assert!(error.to_string().contains("must not claim"));
+    }
+
+    #[test]
     fn qualification_profile_requires_three_complete_repeats() {
         let mut raw = valid_qualification_manifest_json();
         raw["profiles"][0]["repeatedRuns"] = serde_json::json!(2);
@@ -1889,6 +1953,7 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
     fn qualification_profile_digest_matches_cross_language_vector() {
         let profile = QualificationProfile {
             id: String::new(),
+            qualification_source_sha: "9".repeat(40),
             model_defaults_sha256: "c".repeat(64),
             benchmark_provider_identity: Some("openrouter:test-route".into()),
             api_base: "https://openrouter.ai:443/api/v1".into(),
@@ -1922,7 +1987,7 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
         };
         assert_eq!(
             qualification_profile_digest(&profile),
-            "91a2206079adb57e9e25b869cdc8f01955f45cdc814b128c21e2a3f48614382b"
+            "60b69c663b3731b28a7a30767abf6a41e9f6a2003c5a5185fc89384776c1b875"
         );
     }
 
@@ -1970,6 +2035,7 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
         };
         let profile = QualificationProfile {
             id: "qualified-profile".into(),
+            qualification_source_sha: "9".repeat(40),
             model_defaults_sha256: defaults.source_sha256.clone(),
             api_format: ApiFormat::OpenaiCompatible,
             api_base: "https://models.example:443/v1".into(),
@@ -2008,6 +2074,7 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
         };
         let manifest = QualificationManifest {
             version: 1,
+            qualification_source_sha: Some("9".repeat(40)),
             model_defaults_sha256: defaults.source_sha256.clone(),
             profiles: vec![profile.clone()],
         };

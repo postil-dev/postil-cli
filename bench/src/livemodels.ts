@@ -82,6 +82,7 @@ export const EVALUATOR_CONTRACT_SOURCE_PATHS = [
   "bench/package.json", "bench/bun.lock",
   "bench/fixtures/cases.ts", "bench/src/api-key.ts", "bench/src/harness.ts",
   "bench/src/livemodels-score.ts", "bench/src/livemodels.ts", "bench/src/run.ts",
+  "bench/src/verify-admission.ts",
 ] as const;
 
 /** Cases in flight at once. Live inference is provider-I/O-bound; a modest pool
@@ -118,6 +119,7 @@ export interface LiveModelsOptions {
 
 export interface LiveModelsReport {
   generatedAt: string;
+  qualificationSourceSha: string;
   cliVersion: string;
   apiBase: string;
   apiFormat: "openai-compatible" | "anthropic";
@@ -170,6 +172,7 @@ export interface ModelPriceBound {
 
 export interface QualificationProfile {
   id: string;
+  qualificationSourceSha: string;
   modelDefaultsSha256: string;
   reportSha256: string;
   apiBase: string;
@@ -190,9 +193,11 @@ export interface QualificationProfile {
 
 export interface AdmissionManifestCandidate {
   version: 1;
+  qualificationSourceSha: string;
   modelDefaultsSha256: string;
   profiles: Array<{
     id: string;
+    qualificationSourceSha: string;
     modelDefaultsSha256: string;
     apiBase: string;
     benchmarkProviderIdentity: string | null;
@@ -211,6 +216,7 @@ export interface AdmissionManifestCandidate {
 }
 
 export interface QualificationProfileDigestMaterial {
+  qualificationSourceSha: string;
   modelDefaultsSha256: string;
   benchmarkProviderIdentity: string | null;
   apiBase: string;
@@ -274,6 +280,7 @@ export async function runLiveModels(
   }
   await assertBinary(options.binary);
   const repositoryRoot = resolve(import.meta.dir, "..", "..");
+  const qualificationSourceSha = await resolveQualificationSourceSha(repositoryRoot);
   const evaluatorRuntimeIdentity = await assertEvaluatorRuntime(repositoryRoot);
   const [fixtureHash, reviewContractHash, evaluatorContractHash, configHash, cliBinaryHash, binaryMetadata] = await Promise.all([
     hashRepositorySources(repositoryRoot, FIXTURE_SET_SOURCE_PATHS),
@@ -345,6 +352,7 @@ export async function runLiveModels(
   const identity = apiBase;
   const profileEvidence = pairs.map((pair) => qualificationProfileEvidence({
     pair,
+    qualificationSourceSha,
     apiBase,
     apiFormat,
     fixtureHash,
@@ -358,6 +366,7 @@ export async function runLiveModels(
   }));
   const evidence = {
     cliVersion,
+    qualificationSourceSha,
     apiBase,
     apiFormat,
     providerEndpointIdentity: identity,
@@ -384,6 +393,7 @@ export async function runLiveModels(
     aggregates.every((aggregate) => aggregate.passed);
   const report: LiveModelsReport = {
     generatedAt: new Date().toISOString(),
+    qualificationSourceSha,
     cliVersion,
     apiBase,
     apiFormat,
@@ -406,7 +416,13 @@ export async function runLiveModels(
     totalRunCostUsd: calculateTotalRunCostUsd(results),
     cases: results,
   };
-  if (passed) report.manifestCandidate = admissionManifestCandidate(configHash, profiles);
+  if (passed) {
+    report.manifestCandidate = admissionManifestCandidate(
+      qualificationSourceSha,
+      configHash,
+      profiles,
+    );
+  }
   return report;
 }
 
@@ -424,11 +440,13 @@ export function hashSanitizedEvidence(value: object): string {
 }
 
 export function admissionManifestCandidate(
+  qualificationSourceSha: string,
   modelDefaultsSha256: string,
   profiles: QualificationProfile[],
 ): AdmissionManifestCandidate {
   return {
     version: 1,
+    qualificationSourceSha,
     modelDefaultsSha256,
     profiles: profiles.map((profile) => ({ id: profile.id, ...qualificationProfileDigestMaterial(profile) })),
   };
@@ -782,6 +800,7 @@ function qualificationProfileEvidence(args: Omit<
   const generatorModels = qualificationGeneratorModels(args.pair);
   const consensus = args.pair.consensus ?? generatorModels.length;
   return {
+    qualificationSourceSha: args.qualificationSourceSha,
     apiBase: args.apiBase,
     apiFormat: args.apiFormat,
     benchmarkProviderIdentity: null,
@@ -812,6 +831,7 @@ export function qualificationProfileDigestMaterial(
   profile: Omit<QualificationProfile, "id">,
 ): QualificationProfileDigestMaterial {
   return {
+    qualificationSourceSha: profile.qualificationSourceSha,
     modelDefaultsSha256: profile.modelDefaultsSha256,
     benchmarkProviderIdentity: profile.benchmarkProviderIdentity,
     apiBase: profile.apiBase,
@@ -827,6 +847,34 @@ export function qualificationProfileDigestMaterial(
     reportSha256: profile.reportSha256,
     repeatedRuns: profile.repeats,
   };
+}
+
+export async function resolveQualificationSourceSha(repositoryRoot: string): Promise<string> {
+  try {
+    await execFile("git", ["diff", "--quiet", "HEAD", "--"], {
+      cwd: repositoryRoot,
+      timeout: 15_000,
+    });
+    await execFile("git", ["diff", "--cached", "--quiet", "HEAD", "--"], {
+      cwd: repositoryRoot,
+      timeout: 15_000,
+    });
+  } catch {
+    throw new Error("live qualification requires a clean tracked worktree");
+  }
+  const { stdout } = await execFile("git", ["rev-parse", "--verify", "HEAD^{commit}"], {
+    cwd: repositoryRoot,
+    timeout: 15_000,
+  });
+  const sourceSha = stdout.trim().toLowerCase();
+  if (!/^[0-9a-f]{40,64}$/u.test(sourceSha)) {
+    throw new Error("live qualification source is not an immutable Git commit SHA");
+  }
+  const expectedSha = process.env.POSTIL_QUALIFICATION_SOURCE_SHA?.trim().toLowerCase();
+  if (expectedSha !== undefined && expectedSha !== sourceSha) {
+    throw new Error("checked-out qualification source does not match POSTIL_QUALIFICATION_SOURCE_SHA");
+  }
+  return sourceSha;
 }
 
 export function qualificationProfileDigest(profile: Omit<QualificationProfile, "id">): string {

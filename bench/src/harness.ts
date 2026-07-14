@@ -1021,12 +1021,16 @@ export function commentMatchesExpectation(
     if (proposition.none.some((excluded) => containsTokenSequence(tokens, propositionTokens(excluded)))) {
       return false;
     }
-    return propositionClauses(tokens).some((clause) =>
-      proposition.all.every((alternatives) => alternatives.some((alternative) => {
+    return propositionClauses(tokens).some((clause) => {
+      const groups = proposition.all.map((alternatives) => alternatives.flatMap((alternative) => {
         const needle = propositionTokens(alternative).filter((token) => !isClauseBoundary(token));
-        return tokenSequenceStarts(clause, needle).some((start) => !isLocallyNegated(clause, start));
-      }))
-    );
+        return tokenSequenceStarts(clause, needle)
+          .filter((start) => !isLocallyNegated(clause, start))
+          .map((start) => ({ start, end: start + needle.length - 1 }));
+      }));
+      if (groups.some((occurrences) => occurrences.length === 0)) return false;
+      return hasAffirmativeOccurrenceCombination(clause, groups, 0, []);
+    });
   };
   if (semantics.negative.some(matches)) {
     return false;
@@ -1115,14 +1119,67 @@ const scopedNegations = [
   ["no", "evidence", "that"],
   ["cannot", "be", "true", "that"],
   ["without"],
-  ["prevent"],
-  ["avoid"],
-  ["eliminate"],
-  ["fix"],
-  ["resolve"],
-  ["stop"],
   ["no", "longer", "cause"],
 ] as const;
+
+const remediationTokens = new Set([
+  "prevent", "prevents", "prevented", "preventing",
+  "avoid", "avoids", "avoided", "avoiding",
+  "eliminate", "eliminates", "eliminated", "eliminating",
+  "fix", "fixes", "fixed", "fixing",
+  "resolve", "resolves", "resolved", "resolving",
+  "stop", "stops", "stopped", "stopping",
+  "protect", "protects", "protected", "protecting", "protection",
+]);
+
+const failedRemediationTokens = new Set([
+  "fail", "fails", "failed", "failing", "cannot", "cant", "not", "unable", "lack", "lacks",
+  "lacked", "lacking", "without", "no",
+]);
+
+/** A finding must describe a defect, not a defect-shaped phrase that the same
+ * clause says is fixed, prevented, protected, or impossible. Conversely,
+ * failure to remediate is affirmative defect evidence. */
+function hasAffirmativeOccurrenceCombination(
+  tokens: string[],
+  groups: Array<Array<{ start: number; end: number }>>,
+  groupIndex: number,
+  selected: Array<{ start: number; end: number }>,
+): boolean {
+  if (groupIndex === groups.length) {
+    const start = Math.min(...selected.map((occurrence) => occurrence.start));
+    const end = Math.max(...selected.map((occurrence) => occurrence.end));
+    return !clauseDeniesDefect(tokens, start, end);
+  }
+  return groups[groupIndex]!.some((occurrence) =>
+    hasAffirmativeOccurrenceCombination(tokens, groups, groupIndex + 1, [...selected, occurrence])
+  );
+}
+
+function clauseDeniesDefect(tokens: string[], matchStart: number, matchEnd: number): boolean {
+  for (let index = 0; index < tokens.length; index += 1) {
+    if (index >= matchStart && index <= matchEnd) continue;
+    const token = tokens[index]!;
+    if (remediationTokens.has(token) && !remediationIsNegated(tokens, index)) return true;
+    if (token === "impossible" && !hasNegationImmediatelyBefore(tokens, index)) return true;
+    if (
+      (token === "cannot" || token === "cant") &&
+      ["occur", "happen", "arise", "result", "exist"].includes(tokens[index + 1] ?? "")
+    ) return true;
+  }
+  return false;
+}
+
+function remediationIsNegated(tokens: string[], remediationIndex: number): boolean {
+  const prefix = tokens.slice(Math.max(0, remediationIndex - 4), remediationIndex);
+  if (prefix.at(-1) === "only") return false;
+  return prefix.some((token) => failedRemediationTokens.has(token));
+}
+
+function hasNegationImmediatelyBefore(tokens: string[], index: number): boolean {
+  return tokens.slice(Math.max(0, index - 3), index)
+    .some((token) => ["not", "never", "no", "cannot", "cant"].includes(token));
+}
 
 /** Reject a concept occurrence when its own clause denies that occurrence.
  * This is deliberately local: an unrelated `not` in an earlier sentence must
@@ -1139,6 +1196,8 @@ function isLocallyNegated(tokens: string[], start: number): boolean {
     const next = local[index + 1];
     if (token === "not" && next === "only") continue;
     if (["not", "never", "no", "cannot", "cant", "neither", "nor"].includes(token ?? "")) {
+      const suffix = local.slice(index + 1);
+      if (suffix.some((candidate) => remediationTokens.has(candidate))) continue;
       return true;
     }
   }

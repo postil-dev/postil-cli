@@ -41,7 +41,7 @@
 //   BENCH_CONCURRENCY       live-mode case parallelism (else --concurrency, else default)
 
 import { randomUUID } from "node:crypto";
-import { mkdir, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 import { cases } from "../fixtures/cases";
 import { formatReport, runBenchmark } from "./harness";
@@ -57,7 +57,8 @@ import {
 
 function flagValue(args: string[], flag: string): string | undefined {
   const index = args.indexOf(flag);
-  return index === -1 ? undefined : args[index + 1];
+  const value = index === -1 ? undefined : args[index + 1];
+  return value?.startsWith("--") === true ? undefined : value;
 }
 
 /** Resolve live-mode concurrency from BENCH_CONCURRENCY, then --concurrency,
@@ -80,14 +81,13 @@ async function main() {
   const liveModels =
     process.env.POSTIL_BENCH_MODE === "live" || args.includes("--live-models");
 
+  await prepareExplicitOutputs(jsonOut, manifestOut);
   if (args.includes("--json-out") && jsonOut === undefined) {
     throw new Error("--json-out requires a path");
   }
   if (args.includes("--manifest-out") && manifestOut === undefined) {
     throw new Error("--manifest-out requires a path");
   }
-  validateOutputPaths(jsonOut, manifestOut);
-  await invalidateExplicitOutputs([jsonOut, manifestOut]);
   if (manifestOut !== undefined && !liveModels) {
     throw new Error("--manifest-out is available only in live-models admission mode");
   }
@@ -194,8 +194,61 @@ async function writeReport(jsonOut: string | undefined, jsonReport: string) {
   }
 }
 
-export function validateOutputPaths(jsonOut: string | undefined, manifestOut: string | undefined): void {
-  if (jsonOut !== undefined && manifestOut !== undefined && resolve(jsonOut) === resolve(manifestOut)) {
+interface OutputPathIdentity {
+  path: string;
+  canonicalPath?: string;
+  device?: number;
+  inode?: number;
+  inspectionError?: unknown;
+}
+
+async function inspectOutputPath(path: string): Promise<OutputPathIdentity> {
+  const absolute = resolve(path);
+  try {
+    const canonicalParent = await realpath(dirname(absolute));
+    const identity: OutputPathIdentity = {
+      path,
+      canonicalPath: resolve(canonicalParent, basename(absolute)),
+    };
+    try {
+      const metadata = await stat(absolute);
+      identity.device = metadata.dev;
+      identity.inode = metadata.ino;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    return identity;
+  } catch (inspectionError) {
+    return { path, inspectionError };
+  }
+}
+
+/** Remove every explicit artifact before rejecting an aliased path or invalid
+ * mode. Identity inspection is side-effect free and defers its errors until
+ * cleanup has completed, so a failed invocation cannot leave stale evidence. */
+export async function prepareExplicitOutputs(
+  jsonOut: string | undefined,
+  manifestOut: string | undefined,
+): Promise<void> {
+  const identities = await Promise.all(
+    [jsonOut, manifestOut]
+      .filter((path): path is string => path !== undefined)
+      .map(inspectOutputPath),
+  );
+  await invalidateExplicitOutputs([jsonOut, manifestOut]);
+  for (const identity of identities) {
+    if (identity.inspectionError !== undefined) throw identity.inspectionError;
+  }
+  if (identities.length !== 2) return;
+  const report = identities[0]!;
+  const manifest = identities[1]!;
+  const sameCanonicalPath = report.canonicalPath === manifest.canonicalPath;
+  const sameExistingFile =
+    report.device !== undefined &&
+    manifest.device !== undefined &&
+    report.device === manifest.device &&
+    report.inode === manifest.inode;
+  if (sameCanonicalPath || sameExistingFile) {
     throw new Error("--json-out and --manifest-out must use different paths");
   }
 }

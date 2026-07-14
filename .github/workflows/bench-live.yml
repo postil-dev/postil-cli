@@ -22,6 +22,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     env:
       POSTIL_BENCH_MODE: live
       POSTIL_BENCH_PAIRS: ${{ inputs.pairs }}
@@ -31,6 +34,8 @@ jobs:
       POSTIL_API_FORMAT: openai-compatible
       POSTIL_REPORT_OUT: ${{ runner.temp }}/postil-live-report-${{ github.run_id }}-${{ github.run_attempt }}.json
       POSTIL_MANIFEST_OUT: ${{ runner.temp }}/postil-qualified-models-${{ github.run_id }}-${{ github.run_attempt }}.json
+      POSTIL_ATTESTATION_BUNDLE_OUT: ${{ runner.temp }}/postil-qualified-models-${{ github.run_id }}-${{ github.run_attempt }}.attestation.json
+      POSTIL_QUALIFICATION_SOURCE_SHA: ${{ github.sha }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -57,6 +62,17 @@ jobs:
           bun run src/run.ts
           --json-out "$POSTIL_REPORT_OUT"
           --manifest-out "$POSTIL_MANIFEST_OUT"
+
+      - name: Attest admitted candidate
+        id: attest-candidate
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4
+        with:
+          subject-path: ${{ env.POSTIL_MANIFEST_OUT }}
+
+      - name: Export attestation bundle
+        env:
+          GENERATED_BUNDLE: ${{ steps.attest-candidate.outputs.bundle-path }}
+        run: cp "$GENERATED_BUNDLE" "$POSTIL_ATTESTATION_BUNDLE_OUT"
 
       - name: Write admission summary
         if: always()
@@ -116,7 +132,9 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: qualified-models-candidate
-          path: ${{ env.POSTIL_MANIFEST_OUT }}
+          path: |
+            ${{ env.POSTIL_MANIFEST_OUT }}
+            ${{ env.POSTIL_ATTESTATION_BUNDLE_OUT }}
           if-no-files-found: error
 
       - name: Upload raw runs

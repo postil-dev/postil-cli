@@ -88,6 +88,12 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   report, provider identity, canonical endpoint and interface, sorted price bounds,
   fixture-set, evaluator-contract, pinned Bun evaluator runtime,
   full runtime/dependency-contract, and model-default digests plus repeat evidence.
+  The managed workflow binds each candidate to its clean source commit and creates
+  SLSA provenance for the exact candidate bytes with GitHub OIDC and public Sigstore.
+  CI admits a nonempty manifest only when its committed bundle verifies against the
+  exact repository, workflow, source and signer commit, OIDC issuer, and hosted runner.
+  Internal checksums detect mutation but do not authenticate the producer. An empty
+  manifest has no qualification source or bundle and grants no model authority.
   Rust recomputes the profile identifier from the same canonical JSON material as
   the evaluator. The report carries the evaluated binary hash; the profile identifier
   omits that hash because embedding the profile changes the binary bytes.

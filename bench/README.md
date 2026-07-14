@@ -54,6 +54,26 @@ managed OpenRouter endpoint and its OpenAI-compatible interface. The local
 command below supports operator-owned OpenAI-compatible and Anthropic BYOK
 endpoints; those endpoints are not candidates for the managed workflow.
 
+The managed workflow runs from a clean commit, includes that immutable source
+SHA in every candidate profile, and attests the exact candidate file with
+GitHub OIDC through Sigstore. It uploads the candidate and its attestation
+bundle together. To admit a profile, commit the downloaded candidate as
+`qualified-models.json` and its bundle as
+`qualified-models.attestation.json`. CI verifies both with:
+
+```sh
+cd bench
+bun run verify-admission
+```
+
+Verification uses [`gh attestation verify`](https://cli.github.com/manual/gh_attestation_verify)
+to pin `postil-dev/postil-cli`, the exact admission workflow,
+source and signer commit, GitHub's OIDC issuer, the SLSA provenance predicate,
+public Sigstore trust, and a GitHub-hosted runner. A missing, mismatched, or
+invalid bundle rejects a nonempty manifest. The empty manifest is exempt
+because it admits no models. Report and profile checksums detect changes; they
+do not authenticate who produced a candidate.
+
 ```sh
 export MODEL_API_KEY=... # or POSTIL_API_KEY, OPENROUTER_API_KEY, or LLM_API_KEY
 export POSTIL_BENCH_MODE=live
@@ -138,7 +158,8 @@ absent from a failed report. Only the process that performs the live run can
 write a candidate, using `--manifest-out` on that invocation. Saved JSON
 reports are evidence only and cannot be admitted later. Explicit report and
 candidate paths are invalidated before a run and replaced atomically; mock mode
-rejects `--manifest-out`.
+rejects `--manifest-out`. Output aliases are rejected by canonical parent path
+and existing file identity, including symlinked parents and hardlinks.
 
 The preflight prices every generator and scorer role invocation across the configured
 repeats before inference. It rejects missing prices, more than six models, and

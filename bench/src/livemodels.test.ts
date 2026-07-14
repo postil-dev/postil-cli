@@ -293,12 +293,25 @@ describe("managed admission workflow", () => {
     expect(workflow).toContain("${{ runner.temp }}/postil-qualified-models-${{ github.run_id }}-${{ github.run_attempt }}.json");
     expect(workflow).toContain('rm -f "$POSTIL_REPORT_OUT" "$POSTIL_MANIFEST_OUT"');
     expect(workflow).toContain('--manifest-out "$POSTIL_MANIFEST_OUT"');
+    expect(workflow).toContain("POSTIL_QUALIFICATION_SOURCE_SHA: ${{ github.sha }}");
+    expect(workflow).toContain("uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4");
+    expect(workflow).toContain("subject-path: ${{ env.POSTIL_MANIFEST_OUT }}");
+    expect(workflow).toContain("${{ steps.attest-candidate.outputs.bundle-path }}");
+    expect(workflow).toContain("${{ env.POSTIL_ATTESTATION_BUNDLE_OUT }}");
     expect(workflow).toMatch(/name: Upload admission report\n\s+if: always\(\)/u);
     expect(workflow).toMatch(/name: Upload admitted candidate\n\s+if: success\(\)/u);
     expect(workflow).not.toContain("$GITHUB_WORKSPACE/qualified-models.json");
     expect(workflow).not.toContain("inputs.api_base");
     expect(workflow).not.toContain("inputs.api_format");
     expect(workflow).not.toContain("POSTIL_BENCH_MODELS");
+    const ci = await Bun.file(
+      resolve(import.meta.dir, "..", "..", ".github", "workflows", "ci.yml"),
+    ).text();
+    expect(ci).toContain("bun run verify-admission");
+    const ciActionReferences = [...ci.matchAll(/^\s*-?\s*uses:\s*([^\s#]+)(?:\s+#\s*(\S+))?$/gmu)];
+    expect(ciActionReferences.length).toBeGreaterThan(0);
+    expect(ciActionReferences.every((match) => /@[0-9a-f]{40}$/u.test(match[1] ?? ""))).toBe(true);
+    expect(ciActionReferences.every((match) => (match[2] ?? "").length > 0)).toBe(true);
     const actionReferences = [...workflow.matchAll(/^\s*-?\s*uses:\s*([^\s#]+)(?:\s+#\s*(\S+))?$/gmu)];
     expect(actionReferences.length).toBeGreaterThan(0);
     expect(actionReferences.every((match) => /@[0-9a-f]{40}$/u.test(match[1] ?? ""))).toBe(true);
@@ -326,6 +339,7 @@ describe("qualification report", () => {
 
   test("emits the exact runtime admission manifest profile", () => {
     const profileMaterial = {
+      qualificationSourceSha: "9".repeat(40),
       modelDefaultsSha256: "c".repeat(64),
       reportSha256: "e".repeat(64),
       apiBase: "https://openrouter.ai:443/api/v1",
@@ -360,12 +374,14 @@ describe("qualification report", () => {
       repeats: 3,
     };
     const profile = { id: qualificationProfileDigest(profileMaterial), ...profileMaterial };
-    expect(profile.id).toBe("91a2206079adb57e9e25b869cdc8f01955f45cdc814b128c21e2a3f48614382b");
-    expect(admissionManifestCandidate("c".repeat(64), [profile])).toEqual({
+    expect(profile.id).toBe("60b69c663b3731b28a7a30767abf6a41e9f6a2003c5a5185fc89384776c1b875");
+    expect(admissionManifestCandidate("9".repeat(40), "c".repeat(64), [profile])).toEqual({
       version: 1,
+      qualificationSourceSha: "9".repeat(40),
       modelDefaultsSha256: "c".repeat(64),
       profiles: [{
         id: profile.id,
+        qualificationSourceSha: "9".repeat(40),
         modelDefaultsSha256: "c".repeat(64),
         apiBase: "https://openrouter.ai:443/api/v1",
         benchmarkProviderIdentity: "openrouter:test-route",
@@ -404,6 +420,7 @@ describe("qualification report", () => {
     const cost = 0.123456;
     const report: LiveModelsReport = {
       generatedAt: "2026-07-11T00:00:00.000Z",
+      qualificationSourceSha: "9".repeat(40),
       cliVersion: "postil 0.6.1",
       apiBase: "https://example.test/v1",
       apiFormat: "openai-compatible",
@@ -420,7 +437,12 @@ describe("qualification report", () => {
       hostedOperationCostCapMicros: 1_000_000,
       repeats: 3,
       profiles: [],
-      manifestCandidate: { version: 1, modelDefaultsSha256: "d".repeat(64), profiles: [] },
+      manifestCandidate: {
+        version: 1,
+        qualificationSourceSha: "9".repeat(40),
+        modelDefaultsSha256: "d".repeat(64),
+        profiles: [],
+      },
       passed: false,
       models: [],
       modelAggregates: [{
