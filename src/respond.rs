@@ -718,7 +718,7 @@ async fn build_context<F: Forge>(
         ThreadKind::Pull => {
             let meta = forge.fetch_pr_meta().await?;
             let raw = forge.fetch_diff(&meta).await.context("fetching PR diff")?;
-            let parsed = diff::parse(&raw);
+            let parsed = diff::parse(raw.as_str());
             ensure!(
                 parsed.complete,
                 "pull request diff is structurally incomplete"

@@ -7,8 +7,10 @@ use anyhow::{Context, Result, anyhow, ensure};
 use futures::{StreamExt, TryStreamExt, stream};
 use serde::Deserialize;
 use serde_json::json;
+use std::io::Write;
 
 use super::{CheckState, Forge, PrMeta, ThreadKind, check_summary, check_title};
+use crate::diff::{DiffSnapshot, DiffSpool};
 use crate::envelope::{Envelope, Finding};
 
 pub struct GitLab {
@@ -106,8 +108,7 @@ impl GitLab {
         super::bounded_response_json(Self::check_ok(resp, "MR fetch").await?, "GitLab MR").await
     }
 
-    async fn source_file(&self, revision: &str, path: &str) -> Result<(String, usize)> {
-        const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
+    async fn source_file(&self, revision: &str, path: &str) -> Result<(DiffSnapshot, usize)> {
         ensure!(
             super::valid_repository_path(path),
             "GitLab returned an unsafe repository path"
@@ -122,18 +123,13 @@ impl GitLab {
             .send()
             .await
             .context("fetching GitLab source file")?;
-        let mut response = Self::check_ok(response, "source file fetch").await?;
-        let bytes = super::bounded_response_bytes_with_limit(
-            &mut response,
+        let snapshot = super::response_snapshot(
+            Self::check_ok(response, "source file fetch").await?,
             "GitLab source file",
-            MAX_FILE_BYTES,
         )
         .await?;
-        let byte_count = bytes.len();
-        Ok((
-            String::from_utf8(bytes).unwrap_or_else(|_| "\0".to_string()),
-            byte_count,
-        ))
+        let byte_count = snapshot.as_bytes().len();
+        Ok((snapshot, byte_count))
     }
 
     async fn build_complete_diff(
@@ -141,7 +137,7 @@ impl GitLab {
         items: Vec<FileDiffItem>,
         base_sha: &str,
         head_sha: &str,
-    ) -> Result<String> {
+    ) -> Result<DiffSnapshot> {
         for item in &items {
             ensure!(
                 super::valid_repository_path(&item.old_path)
@@ -152,44 +148,39 @@ impl GitLab {
         let mut sections = stream::iter(items.into_iter().enumerate().map(
             |(index, item)| async move {
                 let (old, old_bytes) = if item.new_file {
-                    (String::new(), 0)
+                    (DiffSnapshot::from_bytes(b"")?, 0)
                 } else {
                     self.source_file(base_sha, &item.old_path).await?
                 };
                 let (new, new_bytes) = if item.deleted_file {
-                    (String::new(), 0)
+                    (DiffSnapshot::from_bytes(b"")?, 0)
                 } else {
                     self.source_file(head_sha, &item.new_path).await?
                 };
-                let section = super::azure::diff_section(
+                let mut section = DiffSpool::new()?;
+                super::azure::write_diff_section(
+                    &mut section,
                     &item.old_path,
                     &item.new_path,
-                    &old,
-                    &new,
+                    old.source_str(),
+                    new.source_str(),
                     item.new_file,
                     item.deleted_file,
-                );
-                Ok::<_, anyhow::Error>((index, old_bytes, new_bytes, section))
+                )?;
+                Ok::<_, anyhow::Error>((index, old_bytes, new_bytes, section.finish()?))
             },
         ))
-        .buffer_unordered(8)
-        .try_collect::<Vec<_>>()
-        .await?;
-        sections.sort_unstable_by_key(|(index, _, _, _)| *index);
-        let mut output = String::new();
-        let mut acquired = 0usize;
-        for (_, old_bytes, new_bytes, section) in sections {
-            acquired = checked_acquired_bytes(acquired, old_bytes)?;
-            acquired = checked_acquired_bytes(acquired, new_bytes)?;
-            ensure!(
-                output.len().saturating_add(section.len())
-                    <= crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES,
-                "GitLab reconstructed diff exceeds the {} byte acquisition limit",
-                crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES
-            );
-            output.push_str(&section);
+        .buffered(4);
+        let mut output = DiffSpool::new()?;
+        while let Some((_, old_bytes, new_bytes, section)) = sections.try_next().await? {
+            old_bytes
+                .checked_add(new_bytes)
+                .ok_or_else(|| anyhow!("GitLab source acquisition size overflowed"))?;
+            output
+                .write_all(section.as_bytes())
+                .context("spooling GitLab reconstructed diff")?;
         }
-        Ok(output)
+        output.finish()
     }
 
     fn validate_diff_version(version: &DiffVersion, item_count: usize) -> Result<()> {
@@ -314,18 +305,6 @@ fn encode_component(value: &str) -> String {
         .collect()
 }
 
-fn checked_acquired_bytes(current: usize, additional: usize) -> Result<usize> {
-    let total = current
-        .checked_add(additional)
-        .ok_or_else(|| anyhow!("GitLab source acquisition size overflowed"))?;
-    ensure!(
-        total <= crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES,
-        "GitLab source acquisition exceeds the {} byte limit",
-        crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES
-    );
-    Ok(total)
-}
-
 impl Forge for GitLab {
     fn rich_markdown(&self) -> bool {
         true
@@ -342,7 +321,7 @@ impl Forge for GitLab {
         })
     }
 
-    async fn fetch_diff(&self, snapshot: &PrMeta) -> Result<String> {
+    async fn fetch_diff(&self, snapshot: &PrMeta) -> Result<DiffSnapshot> {
         const PER_PAGE: usize = 100;
         const MAX_PAGES: usize = 100;
         const MAX_ITEMS: usize = 10_000;
@@ -356,7 +335,6 @@ impl Forge for GitLab {
             "GitLab diff version exceeds {MAX_ITEMS} files"
         );
         let mut items = Vec::with_capacity(expected_items);
-        let mut retained_bytes = 0usize;
         let mut item_count = 0usize;
         let mut page = 1usize;
         loop {
@@ -382,13 +360,6 @@ impl Forge for GitLab {
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_string);
             let page_text = super::bounded_response_text(checked, "GitLab diff page").await?;
-            retained_bytes = retained_bytes
-                .checked_add(page_text.len())
-                .ok_or_else(|| anyhow!("GitLab diff page size overflowed"))?;
-            ensure!(
-                retained_bytes <= crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES,
-                "GitLab diff pages exceed the aggregate acquisition limit"
-            );
             let batch: Vec<FileDiffItem> =
                 serde_json::from_str(&page_text).context("decoding GitLab diff page")?;
             drop(page_text);
@@ -425,7 +396,7 @@ impl Forge for GitLab {
             .await
     }
 
-    async fn fetch_diff_since(&self, since_sha: &str, head_sha: &str) -> Result<String> {
+    async fn fetch_diff_since(&self, since_sha: &str, head_sha: &str) -> Result<DiffSnapshot> {
         let resp = self
             .request(
                 reqwest::Method::GET,

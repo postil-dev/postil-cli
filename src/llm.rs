@@ -4,6 +4,7 @@
 //! OpenAI-compatible endpoints use `POST {base}/chat/completions` by default.
 //! Native Anthropic endpoints use `POST {base}/messages` when explicitly selected.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,7 +17,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::api_key;
-use crate::config::{ApiFormat, Config};
+use crate::config::{ApiFormat, Config, ModelPriceBound};
 use crate::envelope::{
     Finding, Kind, ModelIncident, ModelIncidentCategory, ModelIncidentPhase, ModelIncidentRecovery,
     ModelUsage, ModelUsageCostSource, ModelUsagePhase, ModelUsageRole, ProviderCost, Usage,
@@ -291,6 +292,7 @@ pub struct LlmClient {
     scorer_deadline: Option<Instant>,
     total_deadline: Option<Instant>,
     admission: Arc<Mutex<ProviderAdmission>>,
+    hosted_price_bounds: Option<Arc<HashMap<String, ModelPriceBound>>>,
     call_ordinal: Arc<AtomicU32>,
 }
 
@@ -302,6 +304,7 @@ struct ProviderAdmission {
     token_exposure_upper_bound: usize,
     reported_token_spend: usize,
     reported_cost_micros: u64,
+    projected_cost_exposure_micros: u64,
 }
 
 #[derive(Clone)]
@@ -335,7 +338,7 @@ pub(crate) const MAX_PROVIDER_ATTEMPTS: usize = 216;
 pub(crate) const MAX_REPORTED_TOKEN_SPEND: usize = 20_000_000;
 const MAX_PROVIDER_INPUT_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE: usize = 2_000_000;
-const MAX_PROVIDER_COST_MICROS: u64 = 25_000_000;
+pub const HOSTED_OPERATION_COST_CAP_MICROS: u64 = 1_000_000;
 const MAX_MODEL_RESPONSE_BYTES: usize = 512 * 1024;
 const SCORER_BASE_MAX_TOKENS: u32 = 256;
 const SCORER_MAX_TOKENS_PER_FINDING: u32 = 640;
@@ -354,6 +357,36 @@ const ENDPOINT_AUTH_HEADER_ENV: &str = "POSTIL_ENDPOINT_AUTH_HEADER";
 const ENDPOINT_AUTH_VALUE_ENV: &str = "POSTIL_ENDPOINT_AUTH_VALUE";
 const ALLOW_PRIVATE_API_BASE_ENV: &str = "POSTIL_ALLOW_PRIVATE_API_BASE";
 const ALWAYS_MANAGED_HEADERS: &[&str] = &["x-api-key", "anthropic-version", "content-type"];
+
+fn projected_request_cost_micros(
+    input_token_upper_bound: usize,
+    output_token_upper_bound: usize,
+    price: &ModelPriceBound,
+) -> Result<u64> {
+    fn priced_tokens(tokens: usize, micros_per_million: u64) -> Result<u128> {
+        let numerator = (tokens as u128)
+            .checked_mul(u128::from(micros_per_million))
+            .ok_or_else(|| anyhow!("hosted model price projection overflowed"))?;
+        numerator
+            .checked_add(999_999)
+            .map(|rounded| rounded / 1_000_000)
+            .ok_or_else(|| anyhow!("hosted model price projection overflowed"))
+    }
+    let input = priced_tokens(
+        input_token_upper_bound,
+        price.input_micros_per_million_tokens,
+    )?;
+    let output = priced_tokens(
+        output_token_upper_bound,
+        price.output_micros_per_million_tokens,
+    )?;
+    u64::try_from(
+        input
+            .checked_add(output)
+            .ok_or_else(|| anyhow!("hosted model price projection overflowed"))?,
+    )
+    .context("hosted model price projection does not fit micro-dollar accounting")
+}
 
 pub(crate) fn scorer_max_tokens(expected_len: usize) -> Option<u32> {
     (expected_len <= SCORER_MAX_FINDINGS)
@@ -571,6 +604,21 @@ impl LlmClient {
         total_deadline: Option<Instant>,
     ) -> Result<Self> {
         let endpoint_auth = endpoint_auth_from_env(cfg.api_format)?;
+        let hosted_price_bounds = if crate::config::hosted_mode() {
+            let profile = crate::config::admitted_profile_for_config(cfg).ok_or_else(|| {
+                anyhow!("hosted inference has no exact admitted qualification profile")
+            })?;
+            Some(Arc::new(
+                profile
+                    .model_price_bounds
+                    .iter()
+                    .cloned()
+                    .map(|bound| (bound.model.clone(), bound))
+                    .collect(),
+            ))
+        } else {
+            None
+        };
         Ok(LlmClient {
             // The attempt timeout wraps both sending the request and consuming
             // the complete response body, so header and body stalls take the
@@ -589,6 +637,7 @@ impl LlmClient {
             scorer_deadline: None,
             total_deadline,
             admission: Arc::new(Mutex::new(ProviderAdmission::default())),
+            hosted_price_bounds,
             call_ordinal: Arc::new(AtomicU32::new(0)),
         })
     }
@@ -1723,6 +1772,14 @@ impl LlmClient {
                 });
                 body["max_tokens"] = json!(max_tokens);
                 apply_openrouter_privacy(&mut body, self.require_openrouter_privacy);
+                if is_canonical_openrouter_base(&self.api_base)
+                    && let Some(bound) = self
+                        .hosted_price_bounds
+                        .as_ref()
+                        .and_then(|bounds| bounds.get(model))
+                {
+                    apply_openrouter_price_ceiling(&mut body, bound);
+                }
                 body
             }
             ApiFormat::Anthropic => json!({
@@ -1834,6 +1891,18 @@ impl LlmClient {
             .and_then(serde_json::Value::as_u64)
             .and_then(|value| usize::try_from(value).ok())
             .ok_or_else(|| anyhow!("model request is missing a bounded max_tokens value"))?;
+        let projected_cost_micros = if let Some(bounds) = &self.hosted_price_bounds {
+            let model = body
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("hosted model request is missing its model identifier"))?;
+            let bound = bounds
+                .get(model)
+                .ok_or_else(|| anyhow!("hosted model {model:?} has no admitted price bound"))?;
+            projected_request_cost_micros(input_bytes, output_tokens, bound)?
+        } else {
+            0
+        };
         // Every input token consumes at least one byte of serialized request
         // content, so the byte count is a conservative upper bound on input
         // tokens. Keep the byte and output-token counters separate for their
@@ -1864,26 +1933,37 @@ impl LlmClient {
             .token_exposure_upper_bound
             .checked_add(token_exposure_upper_bound)
             .ok_or_else(|| anyhow!("model provider spend exposure overflowed"))?;
-        ensure!(
-            attempts <= MAX_PROVIDER_ATTEMPTS,
-            "model provider attempt hard cap ({MAX_PROVIDER_ATTEMPTS}) exceeded"
-        );
-        ensure!(
-            total_input <= MAX_PROVIDER_INPUT_BYTES,
-            "model provider input hard cap ({MAX_PROVIDER_INPUT_BYTES} bytes) exceeded"
-        );
-        ensure!(
-            total_output <= MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE,
-            "model provider output exposure hard cap ({MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE} tokens) exceeded"
-        );
-        ensure!(
-            total_token_exposure <= MAX_REPORTED_TOKEN_SPEND,
-            "model token spend exposure exceeded the {MAX_REPORTED_TOKEN_SPEND} token hard cap"
-        );
+        let total_projected_cost = admission
+            .projected_cost_exposure_micros
+            .checked_add(projected_cost_micros)
+            .ok_or_else(|| anyhow!("model provider projected cost exposure overflowed"))?;
+        if self.hosted_price_bounds.is_some() {
+            ensure!(
+                attempts <= MAX_PROVIDER_ATTEMPTS,
+                "model provider attempt hard cap ({MAX_PROVIDER_ATTEMPTS}) exceeded"
+            );
+            ensure!(
+                total_input <= MAX_PROVIDER_INPUT_BYTES,
+                "model provider input hard cap ({MAX_PROVIDER_INPUT_BYTES} bytes) exceeded"
+            );
+            ensure!(
+                total_output <= MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE,
+                "model provider output exposure hard cap ({MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE} tokens) exceeded"
+            );
+            ensure!(
+                total_token_exposure <= MAX_REPORTED_TOKEN_SPEND,
+                "model token spend exposure exceeded the {MAX_REPORTED_TOKEN_SPEND} token hard cap"
+            );
+            ensure!(
+                total_projected_cost <= HOSTED_OPERATION_COST_CAP_MICROS,
+                "model provider projected cost exposure exceeded the {HOSTED_OPERATION_COST_CAP_MICROS} micro-dollar hosted operation cap"
+            );
+        }
         admission.attempts = attempts;
         admission.input_bytes = total_input;
         admission.output_token_exposure = total_output;
         admission.token_exposure_upper_bound = total_token_exposure;
+        admission.projected_cost_exposure_micros = total_projected_cost;
         Ok(())
     }
 
@@ -1910,15 +1990,17 @@ impl LlmClient {
                     .unwrap_or(0),
             )
             .ok_or_else(|| anyhow!("model provider reported cost overflowed"))?;
-        ensure!(
-            total_tokens <= MAX_REPORTED_TOKEN_SPEND,
-            "model token spend exceeded the {MAX_REPORTED_TOKEN_SPEND} token hard cap"
-        );
-        ensure!(
-            total_cost <= MAX_PROVIDER_COST_MICROS,
-            "model provider cost exceeded the {} micro-dollar hard cap",
-            MAX_PROVIDER_COST_MICROS
-        );
+        if self.hosted_price_bounds.is_some() {
+            ensure!(
+                total_tokens <= MAX_REPORTED_TOKEN_SPEND,
+                "model token spend exceeded the {MAX_REPORTED_TOKEN_SPEND} token hard cap"
+            );
+            ensure!(
+                total_cost <= HOSTED_OPERATION_COST_CAP_MICROS,
+                "model provider cost exceeded the {} micro-dollar hard cap",
+                HOSTED_OPERATION_COST_CAP_MICROS
+            );
+        }
         admission.reported_token_spend = total_tokens;
         admission.reported_cost_micros = total_cost;
         Ok(())
@@ -1983,6 +2065,24 @@ fn apply_openrouter_privacy(body: &mut serde_json::Value, required: bool) {
             "zdr": true,
         });
     }
+}
+
+fn apply_openrouter_price_ceiling(body: &mut serde_json::Value, bound: &ModelPriceBound) {
+    let provider = body
+        .as_object_mut()
+        .expect("model request body is an object")
+        .entry("provider")
+        .or_insert_with(|| json!({}));
+    let provider = provider
+        .as_object_mut()
+        .expect("provider routing configuration is an object");
+    provider.insert(
+        "max_price".to_string(),
+        json!({
+            "prompt": bound.input_micros_per_million_tokens as f64 / 1_000_000.0,
+            "completion": bound.output_micros_per_million_tokens as f64 / 1_000_000.0,
+        }),
+    );
 }
 
 fn is_canonical_openrouter_base(api_base: &str) -> bool {
@@ -3510,6 +3610,121 @@ mod tests {
         let mut byok = json!({"model": "provider/model"});
         apply_openrouter_privacy(&mut byok, false);
         assert!(byok.get("provider").is_none());
+    }
+
+    #[test]
+    fn hosted_openrouter_request_pins_the_admitted_price_ceiling() {
+        let mut body = json!({"model": "provider/model"});
+        apply_openrouter_privacy(&mut body, true);
+        apply_openrouter_price_ceiling(
+            &mut body,
+            &ModelPriceBound {
+                model: "provider/model".into(),
+                input_micros_per_million_tokens: 80_000,
+                output_micros_per_million_tokens: 400_000,
+            },
+        );
+        assert_eq!(body["provider"]["max_price"]["prompt"], 0.08);
+        assert_eq!(body["provider"]["max_price"]["completion"], 0.4);
+        assert_eq!(body["provider"]["data_collection"], "deny");
+        assert_eq!(body["provider"]["zdr"], true);
+    }
+
+    #[test]
+    fn byok_openai_and_direct_anthropic_request_bodies_have_no_hosted_routing_fields() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvRestore::capture(&["POSTIL_HOSTED_MODE"]);
+        EnvRestore::remove("POSTIL_HOSTED_MODE");
+
+        let openai = LlmClient::build(
+            &Config {
+                model: "provider/model".into(),
+                ..Config::default()
+            },
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        let openai_body = openai.request_body("provider/model", "system", "user", 100, 0.0);
+        assert!(openai_body.get("provider").is_none());
+
+        let anthropic = LlmClient::build(
+            &Config {
+                model: "provider/model".into(),
+                api_format: ApiFormat::Anthropic,
+                api_base: "https://api.anthropic.com/v1".into(),
+                ..Config::default()
+            },
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        let anthropic_body = anthropic.request_body("provider/model", "system", "user", 100, 0.0);
+        assert!(anthropic_body.get("provider").is_none());
+        assert_eq!(anthropic_body["system"], "system");
+    }
+
+    #[test]
+    fn hosted_projected_and_reported_costs_cannot_cross_the_service_reservation() {
+        let config = Config {
+            model: "provider/model".into(),
+            ..Config::default()
+        };
+        let mut client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        client.hosted_price_bounds = Some(Arc::new(HashMap::from([(
+            "provider/model".into(),
+            ModelPriceBound {
+                model: "provider/model".into(),
+                input_micros_per_million_tokens: 0,
+                output_micros_per_million_tokens: 100_000_000,
+            },
+        )])));
+        let body = json!({"model": "provider/model", "max_tokens": 6_000});
+        client.reserve_provider_attempt(&body).unwrap();
+        let error = client.reserve_provider_attempt(&body).unwrap_err();
+        assert!(error.to_string().contains("hosted operation cap"));
+        assert_eq!(
+            client
+                .admission
+                .lock()
+                .unwrap()
+                .projected_cost_exposure_micros,
+            600_000
+        );
+
+        let error = client
+            .record_reported_usage(Usage {
+                provider_cost: ProviderCost::parse("1.000001"),
+                ..Usage::default()
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("1000000 micro-dollar hard cap"));
+    }
+
+    #[test]
+    fn projected_price_uses_bytes_as_a_conservative_input_token_bound() {
+        let projected = projected_request_cost_micros(
+            1_000_001,
+            8_000,
+            &ModelPriceBound {
+                model: "provider/model".into(),
+                input_micros_per_million_tokens: 100_000,
+                output_micros_per_million_tokens: 1_000_000,
+            },
+        )
+        .unwrap();
+        assert_eq!(projected, 108_001);
     }
 
     #[test]

@@ -11,7 +11,9 @@ pub mod gitlab;
 use anyhow::{Context, Result, ensure};
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
+use std::io::Write;
 
+use crate::diff::DiffSnapshot;
 use crate::envelope::{Envelope, Finding, Severity, SuppressionReason};
 
 #[derive(Debug)]
@@ -86,7 +88,7 @@ pub async fn bounded_response_text(
     bounded_response_text_with_limit(
         &mut response,
         context,
-        crate::diff::MAX_RAW_DIFF_ACQUISITION_BYTES,
+        crate::diff::MAX_FORGE_RESPONSE_BYTES,
     )
     .await
 }
@@ -162,6 +164,41 @@ pub async fn bounded_response_bytes_with_limit(
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
+}
+
+/// Stream a complete UTF-8 forge response to a file-backed immutable snapshot.
+/// This is used for individual source files whose size is not a review-scope
+/// decision. Transport truncation remains fatal, while heap use stays bounded
+/// by the response chunk size.
+pub async fn response_snapshot(
+    mut response: reqwest::Response,
+    context: &str,
+) -> Result<DiffSnapshot> {
+    ensure!(
+        response.status() != reqwest::StatusCode::PARTIAL_CONTENT,
+        "{context} returned partial content"
+    );
+    for header in ["x-diff-truncated", "x-content-truncated", "x-truncated"] {
+        if response
+            .headers()
+            .get(header)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.eq_ignore_ascii_case("true") || value == "1")
+        {
+            return Err(anyhow::anyhow!("{context} reported truncated content"));
+        }
+    }
+    let mut spool = crate::diff::DiffSpool::new()?;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .with_context(|| format!("reading {context}"))?
+    {
+        spool
+            .write_all(&chunk)
+            .with_context(|| format!("spooling {context}"))?;
+    }
+    spool.finish_source()
 }
 
 pub async fn bounded_response_json<T: DeserializeOwned>(
@@ -263,11 +300,11 @@ pub trait Forge {
     async fn fetch_pr_meta(&self) -> Result<PrMeta>;
     /// Unified diff of the immutable snapshot returned by `fetch_pr_meta`.
     /// Implementations must not re-read a moving PR head or target tip.
-    async fn fetch_diff(&self, snapshot: &PrMeta) -> Result<String>;
+    async fn fetch_diff(&self, snapshot: &PrMeta) -> Result<DiffSnapshot>;
     /// Unified diff covering `since_sha..head_sha` only (incremental reviews).
     /// `head_sha` is the SHA the caller is reviewing, not whatever the PR's
     /// head happens to be at fetch time. A later push must not widen the diff.
-    async fn fetch_diff_since(&self, since_sha: &str, head_sha: &str) -> Result<String>;
+    async fn fetch_diff_since(&self, since_sha: &str, head_sha: &str) -> Result<DiffSnapshot>;
     /// Post the batched review: one summary plus inline comments per finding.
     async fn post_review(&self, summary: &str, findings: &[Finding], head_sha: &str) -> Result<()>;
     /// Ensure both check runs exist (in_progress); returns (advisory_id, gate_id).

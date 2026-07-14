@@ -133,12 +133,21 @@ pub struct QualificationProfile {
     pub generator_chain: Vec<String>,
     pub consensus: usize,
     pub scorer_chain: Vec<String>,
+    pub model_price_bounds: Vec<ModelPriceBound>,
     pub review_contract_sha256: String,
     pub fixture_set_sha256: String,
     pub evaluator_contract_sha256: String,
     pub evaluator_runtime_identity: String,
     pub report_sha256: String,
     pub repeated_runs: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ModelPriceBound {
+    pub model: String,
+    pub input_micros_per_million_tokens: u64,
+    pub output_micros_per_million_tokens: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -223,6 +232,7 @@ pub struct QualificationMetadata {
     pub consensus: usize,
     pub scorer_chain: Vec<String>,
     pub admitted_profile: Option<QualificationProfile>,
+    pub hosted_operation_cost_cap_micros: u64,
 }
 
 /// Immutable qualification inputs embedded in this exact binary.
@@ -243,6 +253,7 @@ pub fn qualification_metadata() -> QualificationMetadata {
         consensus: defaults.consensus,
         scorer_chain,
         admitted_profile,
+        hosted_operation_cost_cap_micros: crate::llm::HOSTED_OPERATION_COST_CAP_MICROS,
     }
 }
 
@@ -281,6 +292,19 @@ fn admitted_profile_for(
                 && profile.api_format == defaults.api_format
         })
         .cloned()
+}
+
+pub fn admitted_profile_for_config(config: &Config) -> Option<&'static QualificationProfile> {
+    let generator_chain = config.model_chain();
+    let scorer_chain = config.scorer_chain();
+    let api_base = normalize_api_base(&config.api_base).ok()?;
+    qualification_manifest().profiles.iter().find(|profile| {
+        profile.generator_chain == generator_chain
+            && profile.consensus == config.consensus
+            && profile.scorer_chain == scorer_chain
+            && profile.api_base == api_base
+            && profile.api_format == config.api_format
+    })
 }
 
 fn evaluator_runtime_identity() -> String {
@@ -370,6 +394,24 @@ fn parse_qualification_manifest(raw: &str) -> Result<QualificationManifest> {
         for model in &profile.scorer_chain {
             validate_model_id("qualification profile scorer chain", model)?;
         }
+        let admitted_models = profile
+            .generator_chain
+            .iter()
+            .chain(&profile.scorer_chain)
+            .collect::<std::collections::HashSet<_>>();
+        let priced_models = profile
+            .model_price_bounds
+            .iter()
+            .map(|bound| &bound.model)
+            .collect::<std::collections::HashSet<_>>();
+        anyhow::ensure!(
+            priced_models.len() == profile.model_price_bounds.len(),
+            "qualification profile model price bounds must not repeat models"
+        );
+        anyhow::ensure!(
+            priced_models == admitted_models,
+            "qualification profile model price bounds must exactly cover admitted models"
+        );
         anyhow::ensure!(
             profile.repeated_runs >= 3,
             "qualification profile must record at least three repeated runs"
@@ -1624,6 +1666,10 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
                 "generatorChain": ["provider/model"],
                 "consensus": 1,
                 "scorerChain": ["provider/scorer"],
+                "modelPriceBounds": [
+                    {"model": "provider/model", "inputMicrosPerMillionTokens": 1, "outputMicrosPerMillionTokens": 1},
+                    {"model": "provider/scorer", "inputMicrosPerMillionTokens": 1, "outputMicrosPerMillionTokens": 1}
+                ],
                 "reviewContractSha256": "0".repeat(64),
                 "fixtureSetSha256": fixture_set_sha256(),
                 "evaluatorContractSha256": evaluator_contract_sha256(),
@@ -1648,6 +1694,10 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
                 "generatorChain": ["provider/model"],
                 "consensus": 1,
                 "scorerChain": ["provider/scorer"],
+                "modelPriceBounds": [
+                    {"model": "provider/model", "inputMicrosPerMillionTokens": 1, "outputMicrosPerMillionTokens": 1},
+                    {"model": "provider/scorer", "inputMicrosPerMillionTokens": 1, "outputMicrosPerMillionTokens": 1}
+                ],
                 "reviewContractSha256": review_contract_sha256(),
                 "fixtureSetSha256": fixture_set_sha256(),
                 "evaluatorContractSha256": evaluator_contract_sha256(),
@@ -1672,6 +1722,10 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
                 "generatorChain": ["provider/model"],
                 "consensus": 1,
                 "scorerChain": ["provider/scorer"],
+                "modelPriceBounds": [
+                    {"model": "provider/model", "inputMicrosPerMillionTokens": 1, "outputMicrosPerMillionTokens": 1},
+                    {"model": "provider/scorer", "inputMicrosPerMillionTokens": 1, "outputMicrosPerMillionTokens": 1}
+                ],
                 "reviewContractSha256": review_contract_sha256(),
                 "fixtureSetSha256": fixture_set_sha256(),
                 "evaluatorContractSha256": evaluator_contract_sha256(),
@@ -1720,6 +1774,19 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
             generator_chain: vec!["provider/generator".into(), "provider/fallback".into()],
             consensus: 1,
             scorer_chain: vec!["provider/scorer".into(), "provider/scorer-fallback".into()],
+            model_price_bounds: [
+                "provider/generator",
+                "provider/fallback",
+                "provider/scorer",
+                "provider/scorer-fallback",
+            ]
+            .into_iter()
+            .map(|model| ModelPriceBound {
+                model: model.into(),
+                input_micros_per_million_tokens: 1,
+                output_micros_per_million_tokens: 1,
+            })
+            .collect(),
             review_contract_sha256: "b".repeat(64),
             fixture_set_sha256: "c".repeat(64),
             evaluator_contract_sha256: "d".repeat(64),
@@ -1753,6 +1820,16 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
             ..manifest
         };
         assert_eq!(admitted_profile_for(&defaults, &empty), None);
+    }
+
+    #[test]
+    fn qualification_metadata_exports_the_runtime_hosted_operation_cost_cap() {
+        let metadata = serde_json::to_value(qualification_metadata()).unwrap();
+        assert_eq!(
+            metadata["hostedOperationCostCapMicros"],
+            crate::llm::HOSTED_OPERATION_COST_CAP_MICROS
+        );
+        assert_eq!(metadata["hostedOperationCostCapMicros"], 1_000_000);
     }
 
     #[test]

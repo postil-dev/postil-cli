@@ -211,6 +211,23 @@ async fn mount_github_complete_diff(server: &MockServer, pr: u64) {
 }
 
 #[derive(Clone)]
+struct GitHubLargeLockfileResponder;
+
+impl Respond for GitHubLargeLockfileResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let base = request
+            .url
+            .query()
+            .is_some_and(|query| query.contains("ref=bbbbbbbb"));
+        let version = if base { "1.2.2" } else { "1.2.3" };
+        ResponseTemplate::new(200).set_body_string(format!(
+            "name = \"large-dependency\"\nversion = \"{version}\"\nchecksum = \"{}\"\n",
+            "x".repeat(33 * 1024 * 1024),
+        ))
+    }
+}
+
+#[derive(Clone)]
 struct BitbucketSourceResponder;
 
 impl Respond for BitbucketSourceResponder {
@@ -815,7 +832,7 @@ async fn provider_403_redacts_key_management_url_from_cli_and_finding() {
 }
 
 #[tokio::test]
-async fn provider_reported_spend_above_hard_cap_fails_closed() {
+async fn byok_reported_spend_is_not_subject_to_the_hosted_operation_cap() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
@@ -835,14 +852,10 @@ async fn provider_reported_spend_above_hard_cap_fails_closed() {
         .arg(&diff)
         .args(["--output", "json"])
         .assert()
-        .code(1);
+        .success();
     let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
-    assert_eq!(
-        envelope["findings"][0]["title"],
-        "Model provider unavailable"
-    );
+    assert!(envelope["findings"].as_array().unwrap().is_empty());
     assert_eq!(envelope["modelUsage"][0]["promptTokens"], 20_000_001_u64);
-    assert!(!String::from_utf8_lossy(&out.get_output().stderr).contains("20000001"));
 }
 
 #[tokio::test]
@@ -1086,13 +1099,13 @@ async fn remote_diff_reader_rejects_explicit_truncation_signals() {
 }
 
 #[tokio::test]
-async fn remote_diff_reader_rejects_declared_oversized_bodies_before_buffering() {
+async fn remote_page_reader_rejects_declared_oversized_bodies_before_buffering() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/oversized.diff"))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![
             b'x';
-            postil_cli::diff::MAX_RAW_DIFF_ACQUISITION_BYTES
+            postil_cli::diff::MAX_FORGE_RESPONSE_BYTES
                 + 1
         ]))
         .mount(&server)
@@ -1180,11 +1193,13 @@ async fn large_source_diff_reviews_every_bounded_batch_and_aggregates_findings()
     for line in 1..10_000 {
         writeln!(
             source,
-            "+let reviewed_{line:05} = validate(input_{line:05});"
+            "+let reviewed_{line:05} = validate(input_{line:05}); // {}",
+            "x".repeat(3_500),
         )
         .unwrap();
     }
     source.push_str("+dangerous_final_call(user_input);\n");
+    assert!(source.len() > 32 * 1024 * 1024);
 
     let dir = tempfile::tempdir().unwrap();
     let diff = dir.path().join("large-source.diff");
@@ -1288,7 +1303,12 @@ async fn final_synthesis_detects_cross_batch_validation_sink_relationship() {
         if line == 1100 {
             source.push_str("+let validated = validate_pair(left, right);\n");
         } else {
-            writeln!(source, "+let padding_a_{line:04} = trusted;").unwrap();
+            writeln!(
+                source,
+                "+let padding_a_{line:04} = trusted; // {}",
+                "a".repeat(1_000)
+            )
+            .unwrap();
         }
     }
     source.push_str(
@@ -1298,7 +1318,12 @@ async fn final_synthesis_detects_cross_batch_validation_sink_relationship() {
         if line == 1100 {
             source.push_str("+dangerous_sink(original);\n");
         } else {
-            writeln!(source, "+let padding_b_{line:04} = original;").unwrap();
+            writeln!(
+                source,
+                "+let padding_b_{line:04} = original; // {}",
+                "b".repeat(1_000)
+            )
+            .unwrap();
         }
     }
 
@@ -1322,10 +1347,21 @@ async fn final_synthesis_detects_cross_batch_validation_sink_relationship() {
     assert!(requests.len() >= 3);
     assert!(requests.iter().any(|request| {
         let body = String::from_utf8_lossy(&request.body);
-        body.contains("final bounded synthesis request")
+        body.contains("bounded synthesis window")
             && body.contains("validate_pair")
             && body.contains("dangerous_sink")
     }));
+    assert!(
+        requests
+            .iter()
+            .filter(|request| {
+                let body = String::from_utf8_lossy(&request.body);
+                body.contains("validate_pair") && body.contains("dangerous_sink")
+            })
+            .all(|request| {
+                String::from_utf8_lossy(&request.body).contains("Cross-window semantic digests")
+            })
+    );
 }
 
 #[tokio::test]
@@ -1424,29 +1460,6 @@ async fn multiline_finding_range_is_collapsed_when_endpoint_is_not_in_same_segme
     assert!(envelope["findings"][0].get("endLine").is_none());
 }
 
-#[test]
-fn review_budget_exhaustion_fails_closed_without_calling_a_provider() {
-    let dir = tempfile::tempdir().unwrap();
-    let diff = dir.path().join("over-budget.diff");
-    let source = format!(
-        "diff --git a/src/huge.rs b/src/huge.rs\n--- a/src/huge.rs\n+++ b/src/huge.rs\n@@ -0,0 +1 @@\n+{}\n",
-        "x".repeat(2 * 1024 * 1024)
-    );
-    std::fs::write(&diff, source).unwrap();
-    let out = postil()
-        .current_dir(dir.path())
-        .env_remove("MODEL_API_KEY")
-        .args(["review", "--diff-file"])
-        .arg(&diff)
-        .args(["--output", "json"])
-        .assert()
-        .failure();
-    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
-    assert_eq!(envelope["findings"][0]["title"], "Review incomplete");
-    assert_eq!(envelope["modelUsed"], "none (review budget exhausted)");
-    assert_eq!(envelope["usage"]["promptTokens"], 0);
-}
-
 #[tokio::test]
 async fn model_chain_above_hard_cap_fails_before_provider_calls() {
     let server = MockServer::start().await;
@@ -1473,28 +1486,30 @@ async fn model_chain_above_hard_cap_fails_before_provider_calls() {
     assert!(server.received_requests().await.unwrap().is_empty());
 }
 
-#[test]
-fn local_diff_file_is_stopped_at_the_acquisition_limit() {
-    let dir = tempfile::tempdir().unwrap();
-    let diff = dir.path().join("huge.diff");
-    let source = format!(
-        "diff --git a/huge.rs b/huge.rs\n--- a/huge.rs\n+++ b/huge.rs\n@@ -0,0 +1 @@\n+{}\n",
-        "x".repeat(postil_cli::diff::MAX_RAW_DIFF_ACQUISITION_BYTES)
-    );
-    std::fs::write(&diff, source).unwrap();
-    let out = postil()
-        .current_dir(dir.path())
-        .args(["review", "--diff-file"])
-        .arg(&diff)
-        .args(["--output", "json"])
-        .assert()
-        .code(2);
-    assert!(out.get_output().stdout.is_empty());
-    assert!(String::from_utf8_lossy(&out.get_output().stderr).contains("acquisition limit"));
-}
-
-#[test]
-fn staged_git_diff_is_stopped_at_the_acquisition_limit() {
+#[tokio::test]
+async fn staged_diff_compacts_large_generated_noise_and_reviews_late_source() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(|request: &wiremock::Request| {
+            let body = String::from_utf8_lossy(&request.body);
+            let findings = if body.contains("late_dangerous_call") {
+                json!([{
+                    "path": "late.rs",
+                    "line": 1,
+                    "severity": "warn",
+                    "kind": "risk",
+                    "confidence": 0.99,
+                    "title": "Validate the late call",
+                    "body": "The late call receives untrusted input without validation."
+                }])
+            } else {
+                json!([])
+            };
+            ResponseTemplate::new(200).set_body_json(llm_content(findings))
+        })
+        .mount(&server)
+        .await;
     let dir = tempfile::tempdir().unwrap();
     assert!(
         std::process::Command::new("git")
@@ -1505,13 +1520,18 @@ fn staged_git_diff_is_stopped_at_the_acquisition_limit() {
             .success()
     );
     std::fs::write(
-        dir.path().join("huge.rs"),
-        "x".repeat(postil_cli::diff::MAX_RAW_DIFF_ACQUISITION_BYTES),
+        dir.path().join("bundle.min.js"),
+        "x".repeat(33 * 1024 * 1024),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("late.rs"),
+        "late_dangerous_call(user_input);\n",
     )
     .unwrap();
     assert!(
         std::process::Command::new("git")
-            .args(["add", "huge.rs"])
+            .args(["add", "bundle.min.js", "late.rs"])
             .current_dir(dir.path())
             .status()
             .unwrap()
@@ -1519,11 +1539,22 @@ fn staged_git_diff_is_stopped_at_the_acquisition_limit() {
     );
     let out = postil()
         .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
         .args(["review", "--staged", "--output", "json"])
         .assert()
-        .code(2);
-    assert!(out.get_output().stdout.is_empty());
-    assert!(String::from_utf8_lossy(&out.get_output().stderr).contains("acquisition limit"));
+        .success();
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["findings"][0]["path"], "late.rs");
+    let requests = server.received_requests().await.unwrap();
+    assert!(requests.iter().any(|request| {
+        String::from_utf8_lossy(&request.body).contains("generated artifact changed")
+    }));
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.body.len() < 512 * 1024)
+    );
 }
 
 #[tokio::test]
@@ -1532,10 +1563,10 @@ async fn lockfile_only_diff_is_reviewed_from_compact_dependency_evidence() {
     mock_review(&server, json!([])).await;
     let dir = tempfile::tempdir().unwrap();
     let diff = dir.path().join("lockfile-only.diff");
-    std::fs::write(
-        &diff,
-        "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1,2 +1,2 @@\n name = \"dangerous-dependency\"\n-version = \"1.2.2\"\n+version = \"1.2.3\"\n",
-    )
+    let padding = "x".repeat(33 * 1024 * 1024);
+    std::fs::write(&diff, format!(
+        "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1,3 +1,3 @@\n name = \"dangerous-dependency\"\n-version = \"1.2.2\"\n+version = \"1.2.3\"\n checksum = \"{padding}\"\n"
+    ))
     .unwrap();
 
     let out = postil()
@@ -1549,6 +1580,11 @@ async fn lockfile_only_diff_is_reviewed_from_compact_dependency_evidence() {
         .success();
     let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     assert_eq!(envelope["findings"], json!([]));
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let body = String::from_utf8_lossy(&requests[0].body);
+    assert!(body.contains("dangerous-dependency@1.2.3"));
+    assert!(!body.contains(&padding[..4096]));
     let requests = server.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
     let body = String::from_utf8_lossy(&requests[0].body);
@@ -1630,8 +1666,10 @@ async fn c_quoted_prompt_path_round_trips_into_canonical_finding_path() {
     assert_eq!(envelope["findings"][0]["path"], canonical);
 }
 
-#[test]
-fn malformed_lockfile_fails_closed_without_provider_credentials() {
+#[tokio::test]
+async fn malformed_lockfile_falls_back_to_source_review() {
+    let server = MockServer::start().await;
+    mock_review(&server, json!([])).await;
     let dir = tempfile::tempdir().unwrap();
     let diff = dir.path().join("malformed-lockfile.diff");
     std::fs::write(
@@ -1641,15 +1679,19 @@ fn malformed_lockfile_fails_closed_without_provider_credentials() {
     .unwrap();
     let out = postil()
         .current_dir(dir.path())
-        .env_remove("MODEL_API_KEY")
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
         .args(["review", "--diff-file"])
         .arg(&diff)
         .args(["--output", "json"])
         .assert()
-        .failure();
+        .success();
     let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
-    assert_eq!(envelope["findings"][0]["title"], "Review incomplete");
-    assert_eq!(envelope["usage"]["promptTokens"], 0);
+    assert!(envelope["findings"].as_array().unwrap().is_empty());
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let body = String::from_utf8_lossy(&requests[0].body);
+    assert!(body.contains(r#"checksum = \"new\""#));
 }
 
 async fn mock_review_model(server: &MockServer, model: &str, findings: Value) {
@@ -2618,6 +2660,75 @@ async fn full_remote_review_uses_an_immutable_merge_base_snapshot() {
     assert!(requests.iter().any(|request| {
         request.url.path() == "/repos/acme/api/compare/bbbbbbbbbbbb...aaaaaaaaaaaa"
     }));
+}
+
+#[tokio::test]
+async fn github_large_lockfile_streams_past_legacy_response_limit_and_compacts() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/repos/acme/api/compare/b+\.\.\.a+$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "merge_base_commit": {"sha": "bbbbbbbb"},
+            "files": []
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7/files"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "filename": "Cargo.lock",
+            "status": "modified",
+            "changes": 2
+        }])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/contents/Cargo.lock"))
+        .respond_with(GitHubLargeLockfileResponder)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "large lockfile", "body": "",
+            "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"},
+            "changed_files": 1
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .args([
+            "review",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--no-post",
+            "--output-json",
+        ])
+        .assert()
+        .success();
+
+    let requests = server.received_requests().await.unwrap();
+    let model = requests
+        .iter()
+        .find(|request| request.url.path() == "/chat/completions")
+        .expect("model request");
+    let body = String::from_utf8_lossy(&model.body);
+    assert!(body.contains("large-dependency@1.2.3"));
+    assert!(model.body.len() < 512 * 1024);
 }
 
 #[tokio::test]

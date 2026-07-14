@@ -7,13 +7,149 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::RangeInclusive;
 
-const MAX_LOCKFILE_EVIDENCE_SECTIONS: usize = 1024;
-const MAX_LOCKFILE_SECTION_BYTES: usize = 16 * 1024 * 1024;
+use anyhow::{Context, Result};
+use memmap2::Mmap;
+
 const MAX_LOCKFILE_DIRECTIONAL_CHANGES: usize = 256;
-pub const MAX_RAW_DIFF_INPUT_BYTES: usize = 8 * 1024 * 1024;
-pub const MAX_RAW_DIFF_ACQUISITION_BYTES: usize = 32 * 1024 * 1024;
+const MAX_LOCKFILE_PACKAGE_RECORDS: usize = 100_000;
+/// Maximum size of one buffered forge metadata page. Changed-file bodies use
+/// file-backed streaming and are deliberately not subject to this limit.
+pub const MAX_FORGE_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+pub const STREAM_WINDOW_BYTES: usize = 2 * 1024 * 1024;
+const NORMALIZED_MANIFEST_RESERVE_BYTES: usize = 16 * 1024;
+
+/// Immutable, file-backed diff snapshot. Acquisition writes to disk and review
+/// maps it read-only, so aggregate diff size does not become aggregate heap.
+pub struct DiffSnapshot {
+    _file: File,
+    map: Option<Mmap>,
+    valid_utf8: bool,
+}
+
+impl DiffSnapshot {
+    pub fn from_path(path: &std::path::Path) -> Result<Self> {
+        let file = File::open(path)
+            .with_context(|| format!("opening diff snapshot {}", path.display()))?;
+        Self::from_file(file)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut spool = DiffSpool::new()?;
+        spool.write_all(bytes).context("writing diff snapshot")?;
+        spool.finish()
+    }
+
+    fn from_file(file: File) -> Result<Self> {
+        if file
+            .metadata()
+            .context("reading diff snapshot metadata")?
+            .len()
+            == 0
+        {
+            return Ok(Self {
+                _file: file,
+                map: None,
+                valid_utf8: true,
+            });
+        }
+        // SAFETY: the file handle remains owned by the snapshot and callers
+        // receive only an immutable UTF-8 view. Acquisition never mutates a
+        // snapshot after this point.
+        let map = unsafe { Mmap::map(&file) }.context("mapping diff snapshot")?;
+        std::str::from_utf8(&map).context("diff snapshot is not valid UTF-8")?;
+        Ok(Self {
+            _file: file,
+            map: Some(map),
+            valid_utf8: true,
+        })
+    }
+
+    fn from_source_file(file: File) -> Result<Self> {
+        if file
+            .metadata()
+            .context("reading source snapshot metadata")?
+            .len()
+            == 0
+        {
+            return Ok(Self {
+                _file: file,
+                map: None,
+                valid_utf8: true,
+            });
+        }
+        // SAFETY: the immutable mapping remains owned by the snapshot.
+        let map = unsafe { Mmap::map(&file) }.context("mapping source snapshot")?;
+        let valid_utf8 = std::str::from_utf8(&map).is_ok();
+        Ok(Self {
+            _file: file,
+            map: Some(map),
+            valid_utf8,
+        })
+    }
+
+    pub fn as_str(&self) -> &str {
+        assert!(self.valid_utf8, "binary source snapshot has no UTF-8 view");
+        // Validated once in `from_file`; the immutable mapping cannot change.
+        self.map.as_deref().map_or("", |map| {
+            // SAFETY: `from_file` validates the complete immutable mapping.
+            unsafe { std::str::from_utf8_unchecked(map) }
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_none()
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        self.map.as_deref().unwrap_or_default()
+    }
+
+    pub fn source_str(&self) -> &str {
+        if self.valid_utf8 { self.as_str() } else { "\0" }
+    }
+}
+
+pub struct DiffSpool {
+    file: File,
+}
+
+impl DiffSpool {
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            file: tempfile::tempfile().context("creating diff spool")?,
+        })
+    }
+
+    pub fn finish(mut self) -> Result<DiffSnapshot> {
+        self.file.flush().context("flushing diff spool")?;
+        self.file
+            .seek(SeekFrom::Start(0))
+            .context("rewinding diff spool")?;
+        DiffSnapshot::from_file(self.file)
+    }
+
+    pub fn finish_source(mut self) -> Result<DiffSnapshot> {
+        self.file.flush().context("flushing source spool")?;
+        self.file
+            .seek(SeekFrom::Start(0))
+            .context("rewinding source spool")?;
+        DiffSnapshot::from_source_file(self.file)
+    }
+}
+
+impl Write for DiffSpool {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.file.write(buffer)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct ReviewBatchPlan {
@@ -32,10 +168,19 @@ pub struct LockfileEvidence {
     pub changes: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct GeneratedArtifactEvidence {
+    pub path: String,
+    pub added: usize,
+    pub removed: usize,
+    pub bytes: usize,
+}
+
 #[derive(Debug)]
 pub struct PreparedDiff<'a> {
     pub source: Option<Cow<'a, str>>,
     pub lockfiles: Vec<LockfileEvidence>,
+    pub generated_artifacts: Vec<GeneratedArtifactEvidence>,
     pub incomplete: bool,
 }
 
@@ -148,6 +293,16 @@ impl DiffIndex {
         }
     }
 
+    pub fn extend(&mut self, diff: &Diff) {
+        let next = Self::build(diff);
+        for (path, ranges) in next.ranges {
+            self.ranges.entry(path).or_default().extend(ranges);
+        }
+        for (path, ranges) in next.old_ranges {
+            self.old_ranges.entry(path).or_default().extend(ranges);
+        }
+    }
+
     /// Register `path` as groundable for content-policy findings over lines
     /// `1..=count` (the numbered PR title/description block). No-op when
     /// `count == 0`.
@@ -217,24 +372,487 @@ impl DiffIndex {
     }
 }
 
-/// Compact exact, known lockfile sections before parsing while retaining
-/// bounded dependency-oriented evidence for the model. Every other path,
-/// including names such as `generated`, `dist`, and `node_modules`, remains
-/// ordinary untrusted source. The source-size check happens before allocation.
-pub fn prepare_diff(text: &str, max_source_bytes: usize) -> PreparedDiff<'_> {
+/// Bounded, replayable review input. Each normalized unified-diff window is
+/// length-prefixed on disk, while grounding ranges and compact artifact
+/// evidence remain in memory.
+pub struct PreparedReview {
+    windows: File,
+    pub index: DiffIndex,
+    pub lockfiles: Vec<LockfileEvidence>,
+    pub generated_artifacts: Vec<GeneratedArtifactEvidence>,
+    pub has_source: bool,
+    pub reserved_anchor: bool,
+}
+
+impl PreparedReview {
+    pub fn rewind(&mut self) -> Result<()> {
+        self.windows
+            .seek(SeekFrom::Start(0))
+            .context("rewinding review windows")?;
+        Ok(())
+    }
+
+    pub fn next_window(&mut self) -> Result<Option<String>> {
+        let mut length = [0u8; 8];
+        match self.windows.read_exact(&mut length) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(error) => return Err(error).context("reading review window length"),
+        }
+        let length = usize::try_from(u64::from_le_bytes(length))
+            .context("review window length does not fit this platform")?;
+        anyhow::ensure!(
+            length <= STREAM_WINDOW_BYTES,
+            "review window exceeded its fixed memory bound"
+        );
+        let mut bytes = vec![0u8; length];
+        self.windows
+            .read_exact(&mut bytes)
+            .context("reading review window")?;
+        String::from_utf8(bytes)
+            .map(Some)
+            .context("normalized review window is not UTF-8")
+    }
+}
+
+pub struct ModelBatchSpool {
+    file: File,
+    pub count: usize,
+    pub metadata_count: u32,
+}
+
+impl ModelBatchSpool {
+    pub fn next_batch(&mut self) -> Result<Option<String>> {
+        read_length_prefixed(&mut self.file, "model batch")
+    }
+}
+
+pub fn spool_model_batches(
+    prepared: &mut PreparedReview,
+    max_batch_bytes: usize,
+    max_manifest_bytes: usize,
+    force_empty: bool,
+) -> Result<ModelBatchSpool> {
+    let mut file = tempfile::tempfile().context("creating model-batch spool")?;
+    let mut count = 0usize;
+    let mut metadata_count = 0u32;
+    let synthesis_header = "Cross-window semantic digests:\n";
+    let mut cross_window = synthesis_header.to_string();
+    let mut digest_ordinal = 0usize;
+    prepared.rewind()?;
+    while let Some(window) = prepared.next_window()? {
+        let parsed = parse(&window);
+        anyhow::ensure!(parsed.complete, "normalized review window is incomplete");
+        let plan = render_review_batches(&parsed, &[], &[], max_batch_bytes, max_manifest_bytes);
+        anyhow::ensure!(
+            !plan.incomplete,
+            "normalized review window could not be rendered"
+        );
+        metadata_count = metadata_count.max(plan.metadata_count);
+        for batch in plan.batches {
+            let digest = semantic_digest(&batch);
+            if !digest.is_empty() {
+                digest_ordinal = digest_ordinal
+                    .checked_add(1)
+                    .context("semantic digest ordinal overflowed")?;
+                let entry = format!("\nSource window {digest_ordinal}:\n{digest}");
+                if cross_window.len().saturating_add(entry.len()) > max_batch_bytes {
+                    if cross_window.len() > synthesis_header.len() {
+                        write_length_prefixed(
+                            &mut file,
+                            &cross_window,
+                            max_batch_bytes,
+                            "cross-window synthesis batch",
+                        )?;
+                        count = count
+                            .checked_add(1)
+                            .context("model batch count overflowed")?;
+                    }
+                    cross_window.clear();
+                    cross_window.push_str(synthesis_header);
+                }
+                anyhow::ensure!(
+                    cross_window.len().saturating_add(entry.len()) <= max_batch_bytes,
+                    "one semantic digest exceeded the synthesis bound"
+                );
+                cross_window.push_str(&entry);
+            }
+            write_length_prefixed(&mut file, &batch, max_batch_bytes, "model batch")?;
+            count = count
+                .checked_add(1)
+                .context("model batch count overflowed")?;
+        }
+        if let Some(synthesis) = plan.synthesis {
+            write_length_prefixed(&mut file, &synthesis, max_batch_bytes, "model batch")?;
+            count = count
+                .checked_add(1)
+                .context("model batch count overflowed")?;
+        }
+    }
+
+    // Artifact evidence is already compact. Partition it so a repository with
+    // many lockfiles or bundles cannot overflow one request manifest.
+    let mut lock_start = 0usize;
+    let mut artifact_start = 0usize;
+    while lock_start < prepared.lockfiles.len()
+        || artifact_start < prepared.generated_artifacts.len()
+    {
+        let lock_end = (lock_start + 16).min(prepared.lockfiles.len());
+        let artifact_end = (artifact_start + 16).min(prepared.generated_artifacts.len());
+        let plan = render_review_batches(
+            &Diff::default(),
+            &prepared.lockfiles[lock_start..lock_end],
+            &prepared.generated_artifacts[artifact_start..artifact_end],
+            max_batch_bytes,
+            max_manifest_bytes,
+        );
+        if plan.incomplete {
+            anyhow::bail!("compact artifact metadata could not fit a bounded model request");
+        }
+        metadata_count = metadata_count.max(plan.metadata_count);
+        for batch in plan.batches.into_iter().chain(plan.synthesis) {
+            write_length_prefixed(&mut file, &batch, max_batch_bytes, "artifact model batch")?;
+            count = count
+                .checked_add(1)
+                .context("model batch count overflowed")?;
+        }
+        lock_start = lock_end;
+        artifact_start = artifact_end;
+    }
+    if cross_window.len() > synthesis_header.len() && digest_ordinal > 1 {
+        write_length_prefixed(
+            &mut file,
+            &cross_window,
+            max_batch_bytes,
+            "cross-window synthesis batch",
+        )?;
+        count = count
+            .checked_add(1)
+            .context("model batch count overflowed")?;
+    }
+    if count == 0 && force_empty {
+        write_length_prefixed(&mut file, "", max_batch_bytes, "model batch")?;
+        count = 1;
+    }
+    file.seek(SeekFrom::Start(0))
+        .context("rewinding model-batch spool")?;
+    Ok(ModelBatchSpool {
+        file,
+        count,
+        metadata_count,
+    })
+}
+
+fn write_length_prefixed(
+    file: &mut File,
+    value: &str,
+    max_bytes: usize,
+    context: &str,
+) -> Result<()> {
+    anyhow::ensure!(
+        value.len() <= max_bytes,
+        "{context} exceeded its fixed bound"
+    );
+    file.write_all(&(value.len() as u64).to_le_bytes())
+        .with_context(|| format!("writing {context} length"))?;
+    file.write_all(value.as_bytes())
+        .with_context(|| format!("writing {context}"))?;
+    Ok(())
+}
+
+fn read_length_prefixed(file: &mut File, context: &str) -> Result<Option<String>> {
+    let mut length = [0u8; 8];
+    match file.read_exact(&mut length) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("reading {context} length")),
+    }
+    let length = usize::try_from(u64::from_le_bytes(length))
+        .with_context(|| format!("{context} length does not fit this platform"))?;
+    let mut bytes = vec![0u8; length];
+    file.read_exact(&mut bytes)
+        .with_context(|| format!("reading {context}"))?;
+    String::from_utf8(bytes)
+        .map(Some)
+        .with_context(|| format!("{context} is not UTF-8"))
+}
+
+pub fn prepare_review(snapshot: &DiffSnapshot) -> Result<PreparedReview> {
+    let text = snapshot.as_str();
+    let mut windows = tempfile::tempfile().context("creating review-window spool")?;
+    let mut index = DiffIndex::default();
+    let mut lockfiles = Vec::new();
+    let mut generated_artifacts = Vec::new();
+    let mut has_source = false;
+    let mut reserved_anchor = false;
+    let mut pending_window = String::new();
+    let mut pending_manifest_bytes = 0usize;
+    let Some(mut cursor) = next_diff_start(text, 0) else {
+        anyhow::ensure!(text.trim().is_empty(), "review input is not a unified diff");
+        return Ok(PreparedReview {
+            windows,
+            index,
+            lockfiles,
+            generated_artifacts,
+            has_source,
+            reserved_anchor,
+        });
+    };
+    anyhow::ensure!(
+        text[..cursor].trim().is_empty(),
+        "review input has an invalid preamble"
+    );
+    while cursor < text.len() {
+        let end = next_diff_start(text, cursor + "diff --git ".len()).unwrap_or(text.len());
+        let section = &text[cursor..end];
+        let path = section_path(section).context("review section has an invalid path header")?;
+        if is_known_lockfile(&path)
+            && let Some(evidence) = lockfile_evidence(&path, section)
+        {
+            lockfiles.push(evidence);
+        } else if is_compactable_generated_artifact(&path) || is_binary_section(section) {
+            generated_artifacts.push(generated_artifact_evidence(&path, section));
+        } else {
+            for_each_section_window(section, STREAM_WINDOW_BYTES, |window| {
+                let parsed = parse(window);
+                anyhow::ensure!(parsed.complete, "review section is structurally incomplete");
+                reserved_anchor |= parsed
+                    .files
+                    .iter()
+                    .any(|file| crate::envelope::is_reserved_anchor(&file.path));
+                index.extend(&parsed);
+                has_source |= parsed.has_review_evidence();
+                let window_manifest_bytes = parsed
+                    .files
+                    .iter()
+                    .try_fold(0usize, |total, file| {
+                        total.checked_add(manifest_path(&file.path).len().saturating_add(512))
+                    })
+                    .context("review-window manifest size overflowed")?;
+                if !pending_window.is_empty()
+                    && (pending_window.len().saturating_add(window.len()) > STREAM_WINDOW_BYTES
+                        || pending_manifest_bytes.saturating_add(window_manifest_bytes)
+                            > NORMALIZED_MANIFEST_RESERVE_BYTES)
+                {
+                    write_window(&mut windows, &pending_window)?;
+                    pending_window.clear();
+                    pending_manifest_bytes = 0;
+                }
+                pending_window.push_str(window);
+                pending_manifest_bytes = pending_manifest_bytes
+                    .checked_add(window_manifest_bytes)
+                    .context("review-window manifest size overflowed")?;
+                Ok(())
+            })?;
+        }
+        cursor = end;
+    }
+    if !pending_window.is_empty() {
+        write_window(&mut windows, &pending_window)?;
+    }
+    windows
+        .seek(SeekFrom::Start(0))
+        .context("rewinding review-window spool")?;
+    Ok(PreparedReview {
+        windows,
+        index,
+        lockfiles,
+        generated_artifacts,
+        has_source,
+        reserved_anchor,
+    })
+}
+
+fn write_window(file: &mut File, window: &str) -> Result<()> {
+    anyhow::ensure!(
+        window.len() <= STREAM_WINDOW_BYTES,
+        "normalized review window exceeded its fixed bound"
+    );
+    file.write_all(&(window.len() as u64).to_le_bytes())
+        .context("writing review window length")?;
+    file.write_all(window.as_bytes())
+        .context("writing review window")?;
+    Ok(())
+}
+
+fn is_binary_section(section: &str) -> bool {
+    section
+        .lines()
+        .any(|line| line.starts_with("Binary files ") || line == "GIT binary patch")
+}
+
+fn for_each_section_window(
+    section: &str,
+    max_bytes: usize,
+    mut visit: impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    if section.len() <= max_bytes {
+        return visit(section);
+    }
+    let first_hunk = section
+        .find("\n@@ ")
+        .map(|offset| offset + 1)
+        .context("oversized non-binary diff section has no hunk")?;
+    let prefix = &section[..first_hunk];
+    anyhow::ensure!(
+        prefix.len().saturating_add(128) < max_bytes,
+        "diff section metadata is too large to normalize"
+    );
+    let mut cursor = first_hunk;
+    while cursor < section.len() {
+        let end = section[cursor + 1..]
+            .find("\n@@ ")
+            .map(|offset| cursor + 1 + offset + 1)
+            .unwrap_or(section.len());
+        split_hunk_window(prefix, &section[cursor..end], max_bytes, &mut visit)?;
+        cursor = end;
+    }
+    Ok(())
+}
+
+fn split_hunk_window(
+    prefix: &str,
+    hunk: &str,
+    max_bytes: usize,
+    visit: &mut impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    let header_end = hunk.find('\n').context("diff hunk has no body")?;
+    let header = hunk[..header_end]
+        .strip_prefix("@@ ")
+        .context("diff hunk header is malformed")?;
+    let (mut old_line, old_count, mut new_line, new_count) =
+        parse_hunk_header(header).context("diff hunk range is malformed")?;
+    let mut old_seen = 0u32;
+    let mut new_seen = 0u32;
+    let body_budget = max_bytes.saturating_sub(prefix.len() + 128);
+    let mut body = String::new();
+    let mut chunk_old_start = old_line;
+    let mut chunk_new_start = new_line;
+    let mut chunk_old = 0u32;
+    let mut chunk_new = 0u32;
+
+    let flush = |body: &mut String,
+                 chunk_old_start: u32,
+                 chunk_new_start: u32,
+                 chunk_old: u32,
+                 chunk_new: u32,
+                 visit: &mut dyn FnMut(&str) -> Result<()>|
+     -> Result<()> {
+        if body.is_empty() {
+            return Ok(());
+        }
+        let window = format!(
+            "{prefix}@@ -{chunk_old_start},{chunk_old} +{chunk_new_start},{chunk_new} @@ streamed window\n{body}"
+        );
+        anyhow::ensure!(
+            window.len() <= max_bytes,
+            "streamed hunk window exceeded its bound"
+        );
+        visit(&window)?;
+        body.clear();
+        Ok(())
+    };
+
+    for raw in hunk[header_end + 1..].split_inclusive('\n') {
+        if raw.starts_with('\\') {
+            continue;
+        }
+        let marker = raw.as_bytes().first().copied().unwrap_or(b' ');
+        let consumes_old = marker != b'+';
+        let consumes_new = marker != b'-';
+        if raw.len() > body_budget {
+            flush(
+                &mut body,
+                chunk_old_start,
+                chunk_new_start,
+                chunk_old,
+                chunk_new,
+                visit,
+            )?;
+            body = String::new();
+            chunk_old = 0;
+            chunk_new = 0;
+            let content = raw.strip_suffix('\n').unwrap_or(raw);
+            let (marker_text, content) = content.split_at(content.len().min(1));
+            let fragment_budget = body_budget.saturating_sub(marker_text.len() + 1).max(1);
+            let mut from = 0usize;
+            while from < content.len() {
+                let mut to = (from + fragment_budget).min(content.len());
+                while !content.is_char_boundary(to) {
+                    to -= 1;
+                }
+                let fragment = &content[from..to];
+                let fragment_body = format!("{marker_text}{fragment}\n");
+                let window = format!(
+                    "{prefix}@@ -{old_line},{} +{new_line},{} @@ streamed line fragment\n{fragment_body}",
+                    u32::from(consumes_old),
+                    u32::from(consumes_new),
+                );
+                visit(&window)?;
+                from = to;
+            }
+        } else {
+            if body.is_empty() {
+                chunk_old_start = old_line;
+                chunk_new_start = new_line;
+            }
+            if !body.is_empty() && body.len().saturating_add(raw.len()) > body_budget {
+                flush(
+                    &mut body,
+                    chunk_old_start,
+                    chunk_new_start,
+                    chunk_old,
+                    chunk_new,
+                    visit,
+                )?;
+                chunk_old_start = old_line;
+                chunk_new_start = new_line;
+                chunk_old = 0;
+                chunk_new = 0;
+            }
+            body.push_str(raw);
+            chunk_old = chunk_old.saturating_add(u32::from(consumes_old));
+            chunk_new = chunk_new.saturating_add(u32::from(consumes_new));
+        }
+        old_seen = old_seen.saturating_add(u32::from(consumes_old));
+        new_seen = new_seen.saturating_add(u32::from(consumes_new));
+        old_line = old_line.saturating_add(u32::from(consumes_old));
+        new_line = new_line.saturating_add(u32::from(consumes_new));
+    }
+    flush(
+        &mut body,
+        chunk_old_start,
+        chunk_new_start,
+        chunk_old,
+        chunk_new,
+        visit,
+    )?;
+    anyhow::ensure!(
+        old_seen == old_count && new_seen == new_count,
+        "diff hunk body does not match its declared range"
+    );
+    Ok(())
+}
+
+/// Compact exact lockfiles and unmistakable build artifacts before parsing.
+/// Generated-looking source names such as `client.generated.ts` remain normal
+/// untrusted source. Only sourcemaps and minified bundles are summarized.
+pub fn prepare_diff(text: &str) -> PreparedDiff<'_> {
     let mut cursor = next_diff_start(text, 0);
     if cursor.is_none() {
         return PreparedDiff {
-            source: (text.len() <= max_source_bytes).then_some(Cow::Borrowed(text)),
+            source: Some(Cow::Borrowed(text)),
             lockfiles: Vec::new(),
-            incomplete: text.len() > max_source_bytes,
+            generated_artifacts: Vec::new(),
+            incomplete: false,
         };
     }
 
     let preamble_len = cursor.unwrap_or(0);
     let mut kept_len = preamble_len;
     let mut lockfiles = Vec::new();
-    let mut saw_lockfile = false;
+    let mut generated_artifacts = Vec::new();
+    let mut compacted = false;
     while let Some(start) = cursor {
         let end = next_diff_start(text, start + "diff --git ".len()).unwrap_or(text.len());
         let section = &text[start..end];
@@ -242,43 +860,31 @@ pub fn prepare_diff(text: &str, max_source_bytes: usize) -> PreparedDiff<'_> {
             return PreparedDiff {
                 source: None,
                 lockfiles: Vec::new(),
+                generated_artifacts: Vec::new(),
                 incomplete: true,
             };
         };
         if is_known_lockfile(&path) {
-            saw_lockfile = true;
-            let Some(evidence) = lockfile_evidence(&path, section) else {
-                return PreparedDiff {
-                    source: None,
-                    lockfiles: Vec::new(),
-                    incomplete: true,
-                };
-            };
-            lockfiles.push(evidence);
-            if lockfiles.len() > MAX_LOCKFILE_EVIDENCE_SECTIONS {
-                return PreparedDiff {
-                    source: None,
-                    lockfiles: Vec::new(),
-                    incomplete: true,
-                };
+            if let Some(evidence) = lockfile_evidence(&path, section) {
+                compacted = true;
+                lockfiles.push(evidence);
+            } else {
+                kept_len = kept_len.saturating_add(section.len());
             }
+        } else if is_compactable_generated_artifact(&path) {
+            compacted = true;
+            generated_artifacts.push(generated_artifact_evidence(&path, section));
         } else {
             kept_len = kept_len.saturating_add(section.len());
         }
         cursor = (end < text.len()).then_some(end);
     }
 
-    if kept_len > max_source_bytes {
-        return PreparedDiff {
-            source: None,
-            lockfiles,
-            incomplete: true,
-        };
-    }
-    if !saw_lockfile {
+    if !compacted {
         return PreparedDiff {
             source: Some(Cow::Borrowed(text)),
             lockfiles,
+            generated_artifacts,
             incomplete: false,
         };
     }
@@ -293,10 +899,13 @@ pub fn prepare_diff(text: &str, max_source_bytes: usize) -> PreparedDiff<'_> {
             return PreparedDiff {
                 source: None,
                 lockfiles: Vec::new(),
+                generated_artifacts: Vec::new(),
                 incomplete: true,
             };
         };
-        if !is_known_lockfile(&path) {
+        let compact_lockfile =
+            is_known_lockfile(&path) && lockfile_evidence(&path, section).is_some();
+        if !compact_lockfile && !is_compactable_generated_artifact(&path) {
             source.push_str(section);
         }
         cursor = (end < text.len()).then_some(end);
@@ -304,7 +913,33 @@ pub fn prepare_diff(text: &str, max_source_bytes: usize) -> PreparedDiff<'_> {
     PreparedDiff {
         source: Some(Cow::Owned(source)),
         lockfiles,
+        generated_artifacts,
         incomplete: false,
+    }
+}
+
+fn is_compactable_generated_artifact(path: &str) -> bool {
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    normalized.ends_with(".map")
+        || normalized.ends_with(".min.js")
+        || normalized.ends_with(".min.css")
+}
+
+fn generated_artifact_evidence(path: &str, section: &str) -> GeneratedArtifactEvidence {
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    for line in section.lines() {
+        if line.starts_with('+') && !line.starts_with("+++") {
+            added = added.saturating_add(1);
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            removed = removed.saturating_add(1);
+        }
+    }
+    GeneratedArtifactEvidence {
+        path: path.to_string(),
+        added,
+        removed,
+        bytes: section.len(),
     }
 }
 
@@ -456,38 +1091,52 @@ fn prompt_paths_equal(left: &str, right: &str) -> bool {
 }
 
 fn lockfile_evidence(path: &str, section: &str) -> Option<LockfileEvidence> {
-    if section.len() > MAX_LOCKFILE_SECTION_BYTES {
-        return None;
-    }
     let mut added = 0;
     let mut removed = 0;
-    let mut old_lines = Vec::new();
-    let mut new_lines = Vec::new();
     for line in section.lines() {
         if line.starts_with('+') && !line.starts_with("+++") {
             added += 1;
-            new_lines.push(&line[1..]);
         } else if line.starts_with('-') && !line.starts_with("---") {
             removed += 1;
-            old_lines.push(&line[1..]);
-        } else if let Some(content) = line.strip_prefix(' ') {
-            old_lines.push(content);
-            new_lines.push(content);
-        } else {
-            continue;
         }
     }
-    let old = parse_lockfile_packages(path, &old_lines)?;
-    let new = parse_lockfile_packages(path, &new_lines)?;
+    let old = parse_lockfile_packages(
+        path,
+        section.lines().filter_map(|line| {
+            if line.starts_with('-') && !line.starts_with("---") {
+                Some(&line[1..])
+            } else {
+                line.strip_prefix(' ')
+            }
+        }),
+    )?;
+    let new = parse_lockfile_packages(
+        path,
+        section.lines().filter_map(|line| {
+            if line.starts_with('+') && !line.starts_with("+++") {
+                Some(&line[1..])
+            } else {
+                line.strip_prefix(' ')
+            }
+        }),
+    )?;
     let mut changes = Vec::new();
-    for package in old.difference(&new) {
+    for package in old.difference(&new).take(MAX_LOCKFILE_DIRECTIONAL_CHANGES) {
         changes.push(format!("removed {package}"));
     }
-    for package in new.difference(&old) {
+    let remaining = MAX_LOCKFILE_DIRECTIONAL_CHANGES.saturating_sub(changes.len());
+    for package in new.difference(&old).take(remaining) {
         changes.push(format!("added {package}"));
     }
-    if changes.is_empty() || changes.len() > MAX_LOCKFILE_DIRECTIONAL_CHANGES {
+    if changes.is_empty() {
         return None;
+    }
+    let total_changes = old.difference(&new).count() + new.difference(&old).count();
+    if total_changes > changes.len() {
+        changes.push(format!(
+            "{} additional dependency changes summarized",
+            total_changes - changes.len()
+        ));
     }
     Some(LockfileEvidence {
         path: path.to_string(),
@@ -497,7 +1146,10 @@ fn lockfile_evidence(path: &str, section: &str) -> Option<LockfileEvidence> {
     })
 }
 
-fn parse_lockfile_packages(path: &str, lines: &[&str]) -> Option<BTreeSet<String>> {
+fn parse_lockfile_packages<'a>(
+    path: &str,
+    lines: impl Iterator<Item = &'a str>,
+) -> Option<BTreeSet<String>> {
     let name = path.rsplit('/').next()?.to_ascii_lowercase();
     match name.as_str() {
         "cargo.lock" => parse_named_version_records(lines, "name", "version"),
@@ -509,8 +1161,8 @@ fn parse_lockfile_packages(path: &str, lines: &[&str]) -> Option<BTreeSet<String
     }
 }
 
-fn parse_named_version_records(
-    lines: &[&str],
+fn parse_named_version_records<'a>(
+    lines: impl Iterator<Item = &'a str>,
     name_key: &str,
     version_key: &str,
 ) -> Option<BTreeSet<String>> {
@@ -524,6 +1176,9 @@ fn parse_named_version_records(
             && let Some(name) = package.take()
         {
             packages.insert(format!("{name}@{version}"));
+            if packages.len() > MAX_LOCKFILE_PACKAGE_RECORDS {
+                return None;
+            }
         }
     }
     (!packages.is_empty()).then_some(packages)
@@ -549,7 +1204,9 @@ fn safe_package_atom(value: &str) -> Option<String> {
     Some(value.to_string())
 }
 
-fn parse_package_lock_records(lines: &[&str]) -> Option<BTreeSet<String>> {
+fn parse_package_lock_records<'a>(
+    lines: impl Iterator<Item = &'a str>,
+) -> Option<BTreeSet<String>> {
     let mut packages = BTreeSet::new();
     let mut package = None;
     for line in lines {
@@ -574,6 +1231,9 @@ fn parse_package_lock_records(lines: &[&str]) -> Option<BTreeSet<String>> {
             && let Some(name) = package.take()
         {
             packages.insert(format!("{name}@{version}"));
+            if packages.len() > MAX_LOCKFILE_PACKAGE_RECORDS {
+                return None;
+            }
         }
     }
     (!packages.is_empty()).then_some(packages)
@@ -585,7 +1245,7 @@ fn json_string_field(line: &str, field: &str) -> Option<String> {
     safe_package_atom(value.trim_matches('"'))
 }
 
-fn parse_yarn_records(lines: &[&str]) -> Option<BTreeSet<String>> {
+fn parse_yarn_records<'a>(lines: impl Iterator<Item = &'a str>) -> Option<BTreeSet<String>> {
     let mut packages = BTreeSet::new();
     let mut package = None;
     for line in lines {
@@ -610,12 +1270,15 @@ fn parse_yarn_records(lines: &[&str]) -> Option<BTreeSet<String>> {
             && let Some(version) = safe_package_atom(version.trim().trim_matches('"'))
         {
             packages.insert(format!("{name}@{version}"));
+            if packages.len() > MAX_LOCKFILE_PACKAGE_RECORDS {
+                return None;
+            }
         }
     }
     (!packages.is_empty()).then_some(packages)
 }
 
-fn parse_pnpm_records(lines: &[&str]) -> Option<BTreeSet<String>> {
+fn parse_pnpm_records<'a>(lines: impl Iterator<Item = &'a str>) -> Option<BTreeSet<String>> {
     let mut packages = BTreeSet::new();
     for line in lines {
         let value = line.trim().trim_end_matches(':').trim_matches(['\'', '"']);
@@ -631,12 +1294,15 @@ fn parse_pnpm_records(lines: &[&str]) -> Option<BTreeSet<String>> {
                 safe_package_atom(name)?,
                 safe_package_atom(version)?
             ));
+            if packages.len() > MAX_LOCKFILE_PACKAGE_RECORDS {
+                return None;
+            }
         }
     }
     (!packages.is_empty()).then_some(packages)
 }
 
-fn parse_go_sum_records(lines: &[&str]) -> Option<BTreeSet<String>> {
+fn parse_go_sum_records<'a>(lines: impl Iterator<Item = &'a str>) -> Option<BTreeSet<String>> {
     let mut packages = BTreeSet::new();
     for line in lines {
         if line.trim().is_empty() {
@@ -646,6 +1312,9 @@ fn parse_go_sum_records(lines: &[&str]) -> Option<BTreeSet<String>> {
         let name = safe_package_atom(fields.next()?)?;
         let version = safe_package_atom(fields.next()?)?;
         packages.insert(format!("{name}@{}", version.trim_end_matches("/go.mod")));
+        if packages.len() > MAX_LOCKFILE_PACKAGE_RECORDS {
+            return None;
+        }
     }
     (!packages.is_empty()).then_some(packages)
 }
@@ -992,15 +1661,15 @@ struct ChangeManifest {
 pub fn render_review_batches(
     diff: &Diff,
     lockfiles: &[LockfileEvidence],
+    generated_artifacts: &[GeneratedArtifactEvidence],
     max_bytes: usize,
-    max_batches: usize,
     max_manifest_bytes: usize,
 ) -> ReviewBatchPlan {
     assert!(
         max_bytes >= 4096,
         "review batch limit must leave room for context"
     );
-    let manifest = build_manifest(diff, lockfiles, max_manifest_bytes);
+    let manifest = build_manifest(diff, lockfiles, generated_artifacts, max_manifest_bytes);
     let mut plan = ReviewBatchPlan {
         incomplete: manifest.incomplete || manifest.text.len() >= max_bytes,
         metadata_count: manifest.metadata_count,
@@ -1016,24 +1685,14 @@ pub fn render_review_batches(
             continue;
         }
         for hunk in &file.hunks {
-            let Some(units) = render_hunk_units(
-                file,
-                hunk,
-                max_bytes.saturating_sub(manifest.text.len()),
-                max_batches.saturating_mul(16),
-            ) else {
+            let Some(units) =
+                render_hunk_units(file, hunk, max_bytes.saturating_sub(manifest.text.len()))
+            else {
                 plan.incomplete = true;
                 return plan;
             };
             for unit in units {
-                if !append_unit(
-                    &mut plan,
-                    &mut current,
-                    &manifest.text,
-                    &unit,
-                    max_bytes,
-                    max_batches,
-                ) {
+                if !append_unit(&mut plan, &mut current, &manifest.text, &unit, max_bytes) {
                     plan.incomplete = true;
                     return plan;
                 }
@@ -1041,27 +1700,27 @@ pub fn render_review_batches(
         }
     }
     if !current.is_empty() {
-        if plan.batches.len() >= max_batches {
-            plan.incomplete = true;
-            return plan;
-        }
         plan.batches.push(current);
-    } else if plan.batches.is_empty() && (!diff.files.is_empty() || !lockfiles.is_empty()) {
+    } else if plan.batches.is_empty()
+        && (!diff.files.is_empty() || !lockfiles.is_empty() || !generated_artifacts.is_empty())
+    {
         plan.batches.push(manifest.text.clone());
     }
 
     if plan.batches.len() > 1 {
         plan.synthesis = build_synthesis(&manifest.text, &plan.batches, max_bytes);
-        if plan.synthesis.is_none() {
-            plan.incomplete = true;
-        }
     }
     plan.projected_input_bytes = plan.batches.iter().map(String::len).sum::<usize>()
         + plan.synthesis.as_ref().map_or(0, String::len);
     plan
 }
 
-fn build_manifest(diff: &Diff, lockfiles: &[LockfileEvidence], max_bytes: usize) -> ChangeManifest {
+fn build_manifest(
+    diff: &Diff,
+    lockfiles: &[LockfileEvidence],
+    generated_artifacts: &[GeneratedArtifactEvidence],
+    max_bytes: usize,
+) -> ChangeManifest {
     let mut text = String::from("Changed-file manifest:\n");
     let mut metadata = Vec::new();
     let mut metadata_bytes = 0usize;
@@ -1156,6 +1815,41 @@ fn build_manifest(diff: &Diff, lockfiles: &[LockfileEvidence], max_bytes: usize)
         }
         metadata.push(entry);
     }
+    for artifact in generated_artifacts {
+        let manifest_entry = format!(
+            "- {} [generated artifact summary]\n",
+            manifest_path(&artifact.path)
+        );
+        if text
+            .len()
+            .saturating_add(manifest_entry.len())
+            .saturating_add(metadata_bytes)
+            > max_bytes
+        {
+            return ChangeManifest {
+                text,
+                metadata_count: 0,
+                incomplete: true,
+            };
+        }
+        text.push_str(&manifest_entry);
+        let entry = format!(
+            "{}: generated artifact changed, {} additions, {} deletions, {} raw bytes compacted",
+            manifest_path(&artifact.path),
+            artifact.added,
+            artifact.removed,
+            artifact.bytes,
+        );
+        metadata_bytes = metadata_bytes.saturating_add(entry.len() + 16);
+        if text.len().saturating_add(metadata_bytes) > max_bytes {
+            return ChangeManifest {
+                text,
+                metadata_count: 0,
+                incomplete: true,
+            };
+        }
+        metadata.push(entry);
+    }
     let metadata_count = metadata.len() as u32;
     if !metadata.is_empty() {
         text.push_str(&format!(
@@ -1177,12 +1871,7 @@ fn manifest_path(path: &str) -> String {
     display_path(path)
 }
 
-fn render_hunk_units(
-    file: &FileDiff,
-    hunk: &Hunk,
-    budget: usize,
-    max_units: usize,
-) -> Option<Vec<String>> {
+fn render_hunk_units(file: &FileDiff, hunk: &Hunk, budget: usize) -> Option<Vec<String>> {
     let file_header = if file.deleted {
         format!(
             "### {}\n@@ deleted; cite {} metadata line @@\n",
@@ -1203,12 +1892,9 @@ fn render_hunk_units(
 
     for raw in &hunk.lines {
         let (marker, content) = raw.split_at(if raw.is_empty() { 0 } else { 1 });
-        let rendered = render_line_segments(marker, content, old_line, new_line, max_units)?;
+        let rendered = render_line_segments(marker, content, old_line, new_line);
         for rendered_line in rendered {
             if !segment.is_empty() && segment.len() + rendered_line.len() > segment_budget {
-                if units.len() >= max_units {
-                    return None;
-                }
                 units.push(format!(
                     "{file_header}@@ segment starting near new line {segment_start} @@\n{segment}"
                 ));
@@ -1237,9 +1923,6 @@ fn render_hunk_units(
         }
     }
     if !segment.is_empty() {
-        if units.len() >= max_units {
-            return None;
-        }
         units.push(format!(
             "{file_header}@@ segment starting near new line {segment_start} @@\n{segment}"
         ));
@@ -1247,27 +1930,18 @@ fn render_hunk_units(
     Some(units)
 }
 
-fn render_line_segments(
-    marker: &str,
-    content: &str,
-    old_line: u32,
-    new_line: u32,
-    max_chunks: usize,
-) -> Option<Vec<String>> {
+fn render_line_segments(marker: &str, content: &str, old_line: u32, new_line: u32) -> Vec<String> {
     let prefix = match marker {
         "+" => format!("{new_line:>6} + "),
         "-" => format!("old {old_line:>6} - "),
         _ => format!("{new_line:>6}   "),
     };
     if content.len() <= LINE_CHUNK_BYTES {
-        return Some(vec![format!("{prefix}{content}\n")]);
+        return vec![format!("{prefix}{content}\n")];
     }
     let step = LINE_CHUNK_BYTES.saturating_sub(LINE_CHUNK_OVERLAP).max(1);
     let projected_chunks = content.len().saturating_sub(1) / step + 1;
-    if projected_chunks > max_chunks {
-        return None;
-    }
-    let mut rendered = Vec::new();
+    let mut rendered = Vec::with_capacity(projected_chunks);
     let mut start = 0;
     while start < content.len() {
         let mut end = (start + LINE_CHUNK_BYTES).min(content.len());
@@ -1287,7 +1961,7 @@ fn render_line_segments(
         }
         start = next;
     }
-    Some(rendered)
+    rendered
 }
 
 fn append_unit(
@@ -1296,7 +1970,6 @@ fn append_unit(
     manifest: &str,
     unit: &str,
     max_bytes: usize,
-    max_batches: usize,
 ) -> bool {
     if manifest.len() + unit.len() > max_bytes {
         return false;
@@ -1306,9 +1979,6 @@ fn append_unit(
         current.push('\n');
     }
     if current.len() + unit.len() > max_bytes {
-        if plan.batches.len() >= max_batches {
-            return false;
-        }
         plan.batches.push(std::mem::take(current));
         current.push_str(manifest);
         current.push('\n');
@@ -1613,6 +2283,15 @@ Binary files a/img.png and b/img.png differ
 ";
 
     #[test]
+    fn empty_snapshot_is_a_valid_review_input() {
+        let snapshot = DiffSnapshot::from_bytes(b"").unwrap();
+        assert!(snapshot.is_empty());
+        assert_eq!(snapshot.as_str(), "");
+        let prepared = prepare_review(&snapshot).unwrap();
+        assert!(!prepared.has_source);
+    }
+
+    #[test]
     fn parses_files_hunks_and_kinds() {
         let d = parse(SAMPLE);
         assert!(d.complete);
@@ -1697,7 +2376,7 @@ Binary files a/img.png and b/img.png differ
     #[test]
     fn generated_named_source_is_reviewed_as_untrusted_code() {
         let source = "diff --git a/src/client.generated.ts b/src/client.generated.ts\n--- a/src/client.generated.ts\n+++ b/src/client.generated.ts\n@@ -0,0 +1 @@\n+eval(userInput);\n";
-        let prepared = prepare_diff(source, 4096);
+        let prepared = prepare_diff(source);
         assert!(!prepared.incomplete);
         assert!(
             prepared
@@ -1716,7 +2395,7 @@ Binary files a/img.png and b/img.png differ
         assert_eq!(parsed.files.len(), 1);
         assert_eq!(parsed.files[0].path, "src/tab\tquote\"slash\\日.rs");
         assert_eq!(parsed.files[0].old_path, "src/tab\tquote\"slash\\日.rs");
-        let prepared = prepare_diff(source, 4096);
+        let prepared = prepare_diff(source);
         assert!(!prepared.incomplete);
     }
 
@@ -1770,7 +2449,7 @@ Binary files a/img.png and b/img.png differ
         let lock = "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1,3 +1,3 @@\n name = \"dangerous-dependency\"\n-version = \"1.2.2\"\n+version = \"1.2.3\"\n checksum = \"large-hash\"\n";
         let generated = "diff --git a/web/api.generated.ts b/web/api.generated.ts\n--- a/web/api.generated.ts\n+++ b/web/api.generated.ts\n@@ -0,0 +1 @@\n+eval(userInput);\n";
         let mixed = format!("{lock}{generated}");
-        let prepared = prepare_diff(&mixed, 4096);
+        let prepared = prepare_diff(&mixed);
         assert_eq!(prepared.lockfiles.len(), 1);
         assert!(!prepared.source.as_deref().unwrap().contains("Cargo.lock"));
         assert!(
@@ -1790,20 +2469,30 @@ Binary files a/img.png and b/img.png differ
     }
 
     #[test]
-    fn malformed_and_unsupported_lockfiles_fail_preparation_closed() {
+    fn malformed_and_unsupported_lockfiles_fall_back_to_source_review() {
         let malformed = "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1 +1 @@\n-checksum = \"old\"\n+checksum = \"new\"\n";
-        assert!(prepare_diff(malformed, 4096).incomplete);
+        let malformed = prepare_diff(malformed);
+        assert!(!malformed.incomplete);
+        assert!(malformed.source.as_deref().unwrap().contains("checksum"));
         let unsupported = "diff --git a/composer.lock b/composer.lock\n--- a/composer.lock\n+++ b/composer.lock\n@@ -1 +1 @@\n-old\n+new\n";
-        assert!(prepare_diff(unsupported, 4096).incomplete);
+        let unsupported = prepare_diff(unsupported);
+        assert!(!unsupported.incomplete);
+        assert!(
+            unsupported
+                .source
+                .as_deref()
+                .unwrap()
+                .contains("composer.lock")
+        );
     }
 
     #[test]
-    fn supported_lockfile_larger_than_source_budget_is_compacted_first() {
-        let padding = "x".repeat(MAX_RAW_DIFF_INPUT_BYTES + 1);
+    fn supported_lockfile_larger_than_legacy_acquisition_limit_is_compacted() {
+        let padding = "x".repeat(32 * 1024 * 1024 + 1);
         let source = format!(
             "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1,3 +1,3 @@\n name = \"package-one\"\n-version = \"1.0.0\"\n+version = \"2.0.0\"\n checksum = \"{padding}\"\n"
         );
-        let prepared = prepare_diff(&source, MAX_RAW_DIFF_INPUT_BYTES);
+        let prepared = prepare_diff(&source);
         assert!(!prepared.incomplete);
         assert_eq!(prepared.source.as_deref(), Some(""));
         assert_eq!(prepared.lockfiles[0].changes.len(), 2);
@@ -1812,14 +2501,14 @@ Binary files a/img.png and b/img.png differ
     #[test]
     fn yarn_berry_and_package_lock_v1_have_directional_evidence() {
         let yarn = "diff --git a/yarn.lock b/yarn.lock\n--- a/yarn.lock\n+++ b/yarn.lock\n@@ -1,2 +1,2 @@\n \"@scope/pkg@npm:^1.0.0\":\n-  version: 1.0.0\n+  version: 1.1.0\n";
-        let yarn = prepare_diff(yarn, 4096);
+        let yarn = prepare_diff(yarn);
         assert_eq!(
             yarn.lockfiles[0].changes,
             ["removed @scope/pkg@1.0.0", "added @scope/pkg@1.1.0"]
         );
 
         let npm = "diff --git a/package-lock.json b/package-lock.json\n--- a/package-lock.json\n+++ b/package-lock.json\n@@ -1,3 +1,3 @@\n \"left-pad\": {\n-  \"version\": \"1.0.0\"\n+  \"version\": \"1.1.0\"\n";
-        let npm = prepare_diff(npm, 4096);
+        let npm = prepare_diff(npm);
         assert_eq!(
             npm.lockfiles[0].changes,
             ["removed left-pad@1.0.0", "added left-pad@1.1.0"]
@@ -1834,7 +2523,7 @@ Binary files a/img.png and b/img.png differ
             "x".repeat(40_000)
         );
         let parsed = parse(&source);
-        let plan = render_review_batches(&parsed, &[], 24_000, 8, 4096);
+        let plan = render_review_batches(&parsed, &[], &[], 24_000, 4096);
         assert!(!plan.incomplete);
         assert!(plan.batches.iter().any(|batch| batch.contains(tail)));
         assert!(plan.batches.iter().all(|batch| batch.len() <= 24_000));
@@ -1853,7 +2542,7 @@ Binary files a/img.png and b/img.png differ
     fn deletion_binary_rename_and_mode_changes_get_numbered_metadata() {
         let source = "diff --git a/src/auth.rs b/src/auth.rs\ndeleted file mode 100644\n--- a/src/auth.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-require_admin();\ndiff --git a/logo.bin b/logo.bin\nold mode 100644\nnew mode 100755\nBinary files a/logo.bin and b/logo.bin differ\ndiff --git a/old.rs b/new.rs\nsimilarity index 100%\nrename from old.rs\nrename to new.rs\n";
         let parsed = parse(source);
-        let plan = render_review_batches(&parsed, &[], 32_000, 4, 4096);
+        let plan = render_review_batches(&parsed, &[], &[], 32_000, 4096);
         assert!(!plan.incomplete);
         assert_eq!(plan.metadata_count, 3);
         let rendered = plan.batches.join("\n");
