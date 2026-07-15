@@ -2196,7 +2196,7 @@ async fn scorer_lowers_confidence_and_stores_both_values() {
         .find(|body| body["model"] == "anthropic/claude-haiku-4.5")
         .unwrap();
     assert_eq!(scorer_request["temperature"], 0.0);
-    assert_eq!(scorer_request["max_tokens"], 896);
+    assert_eq!(scorer_request["max_tokens"], 400);
     let scorer_prompt_bytes = scorer_request["messages"]
         .as_array()
         .unwrap()

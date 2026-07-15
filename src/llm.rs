@@ -373,7 +373,7 @@ const MAX_LOGICAL_CALLS_PER_SCORER_MODEL: usize = 2;
 const MAX_TRANSPORT_ATTEMPTS_PER_CALL: usize = TRANSIENT_RETRIES as usize + 1;
 const MAX_MODEL_RESPONSE_BYTES: usize = 512 * 1024;
 const SCORER_BASE_MAX_TOKENS: u32 = 256;
-const SCORER_MAX_TOKENS_PER_FINDING: u32 = 640;
+const SCORER_MAX_TOKENS_PER_FINDING: u32 = 144;
 const SCORER_REPAIR_BYTES_PER_OUTPUT_TOKEN: usize = 4;
 pub(crate) const SCORER_MAX_FINDINGS: usize = 20;
 const REPAIR_ERROR_MAX_BYTES: usize = 1_024;
@@ -4948,8 +4948,8 @@ mod tests {
     #[test]
     fn scorer_budget_matches_the_qualified_finding_bound() {
         assert_eq!(scorer_max_tokens(0), Some(256));
-        assert_eq!(scorer_max_tokens(1), Some(896));
-        assert_eq!(scorer_max_tokens(20), Some(13_056));
+        assert_eq!(scorer_max_tokens(1), Some(400));
+        assert_eq!(scorer_max_tokens(20), Some(3_136));
         assert_eq!(scorer_max_tokens(21), None);
         assert_eq!(scorer_max_tokens(usize::MAX), None);
     }

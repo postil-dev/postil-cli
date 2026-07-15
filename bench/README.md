@@ -235,7 +235,7 @@ evaluator rejects more than six candidates, more than ten repeats, missing
 prices, or a conservative projected total above $10. The projection prices the
 runtime retry graph: three transport attempts for the initial request and three
 for at most one schema-repair request. A one-finding qualification request uses
-a 17,000-byte prompt bound, an 896-token output bound, and at most 3,584 bytes
+a 17,000-byte prompt bound, a 400-token output bound, and at most 1,600 bytes
 of repair context. Scorer responses also fail
 admission when provider usage is missing or malformed, runtime accounting is
 incomplete, or the assessment is not trimmed single-line text of at most

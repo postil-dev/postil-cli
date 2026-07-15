@@ -859,8 +859,8 @@ describe("qualification utilities", () => {
         inputMicrosPerMillionTokens: 100_000, outputMicrosPerMillionTokens: 200_000,
       }],
     ]);
-    expect(projectedQualificationSpendUsd(["a/model"], 5, cheap)).toBeCloseTo(0.741024, 6);
-    expect(assertQualificationPreflight(["a/model"], 5, cheap)).toBeCloseTo(0.741024, 6);
+    expect(projectedQualificationSpendUsd(["a/model"], 5, cheap)).toBeCloseTo(0.705312, 6);
+    expect(assertQualificationPreflight(["a/model"], 5, cheap)).toBeCloseTo(0.705312, 6);
     expect(() => assertQualificationPreflight(["missing/model"], 5, cheap)).toThrow("pricing missing");
     expect(() =>
       assertQualificationPreflight(
