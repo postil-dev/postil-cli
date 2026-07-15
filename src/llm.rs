@@ -4838,14 +4838,18 @@ mod tests {
             &mut body,
             &ModelPriceBound {
                 model: "provider/model".into(),
-                input_micros_per_million_tokens: 80_000,
-                output_micros_per_million_tokens: 400_000,
+                input_micros_per_million_tokens: 435_000,
+                output_micros_per_million_tokens: 870_000,
             },
         );
-        assert_eq!(body["provider"]["max_price"]["prompt"], 0.08);
-        assert_eq!(body["provider"]["max_price"]["completion"], 0.4);
-        assert_eq!(body["provider"]["data_collection"], "deny");
-        assert_eq!(body["provider"]["zdr"], true);
+        assert_eq!(
+            body["provider"],
+            json!({
+                "data_collection": "deny",
+                "zdr": true,
+                "max_price": { "prompt": 0.435, "completion": 0.87 },
+            })
+        );
     }
 
     #[test]

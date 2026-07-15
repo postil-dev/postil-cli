@@ -7,6 +7,7 @@ import {
   findingHitsSeededRegion,
   groundTruthOf,
   pricingFromCatalog,
+  pricingFromZdrCatalog,
   qualificationPairId,
   scoreLiveCase,
   toSiteModelAggregate,
@@ -365,6 +366,42 @@ describe("report and pricing utilities", () => {
       pricing: { prompt: "0.000001", completion: "0.000002" },
     }] }, [pair.generatorModel]);
     expect(catalog.get(pair.generatorModel)).toEqual(prices.get(pair.generatorModel));
+  });
+
+  test("selects a single cheapest live ZDR endpoint for each managed model", () => {
+    const catalog = pricingFromZdrCatalog({ data: [
+      {
+        model_id: pair.generatorModel,
+        provider_name: "Offline cheapest",
+        status: -2,
+        pricing: { prompt: "0.000000435", completion: "0.00000087" },
+      },
+      {
+        model_id: pair.generatorModel,
+        provider_name: "Prompt cheap",
+        status: 0,
+        pricing: { prompt: "0.000001", completion: "0.000004" },
+      },
+      {
+        model_id: pair.generatorModel,
+        provider_name: "DeepInfra",
+        status: 0,
+        pricing: { prompt: "0.0000013", completion: "0.0000026" },
+      },
+      {
+        model_id: pair.generatorModel,
+        provider_name: "Completion cheap",
+        status: 0,
+        pricing: { prompt: "0.000003", completion: "0.000001" },
+      },
+    ] }, [pair.generatorModel]);
+
+    expect(catalog.get(pair.generatorModel)).toEqual({
+      promptUsdPerToken: 0.0000013,
+      completionUsdPerToken: 0.0000026,
+      inputMicrosPerMillionTokens: 1_300_000,
+      outputMicrosPerMillionTokens: 2_600_000,
+    });
   });
 
   test("rejects duplicate requested catalog ids and canonical aliases before pricing", () => {

@@ -742,6 +742,16 @@ export interface OpenRouterModelsResponse {
   }>;
 }
 
+/** Minimal shape of GET /api/v1/endpoints/zdr used by managed admission. */
+export interface OpenRouterZdrEndpointsResponse {
+  data: Array<{
+    model_id: string;
+    provider_name?: string;
+    status?: number;
+    pricing?: { prompt?: string; completion?: string };
+  }>;
+}
+
 /**
  * Build a model-id -> pricing map from an OpenRouter /models response. Only the
  * requested models are kept. Prices are per-token USD strings in the API; a
@@ -790,6 +800,64 @@ export function pricingFromCatalog(
       }
     } catch {
       continue;
+    }
+  }
+  return out;
+}
+
+/**
+ * Select one live zero-data-retention endpoint per model. A single endpoint
+ * must satisfy both price bounds, so prompt and completion minima are never
+ * combined across providers.
+ */
+export function pricingFromZdrCatalog(
+  catalog: OpenRouterZdrEndpointsResponse,
+  wantedModels: string[],
+): Map<string, ModelPricing> {
+  const wanted = new Set(wantedModels);
+  const candidates = new Map<string, Array<ModelPricing & { provider: string }>>();
+  for (const endpoint of catalog.data ?? []) {
+    if (!wanted.has(endpoint.model_id) || endpoint.status !== 0) continue;
+    try {
+      const promptText = endpoint.pricing?.prompt ?? "";
+      const completionText = endpoint.pricing?.completion ?? "";
+      const candidate = {
+        provider: endpoint.provider_name ?? "",
+        promptUsdPerToken: canonicalDecimalToNumber(parseCanonicalDecimal(promptText)),
+        completionUsdPerToken: canonicalDecimalToNumber(parseCanonicalDecimal(completionText)),
+        inputMicrosPerMillionTokens: canonicalPriceMicrosPerMillion(promptText),
+        outputMicrosPerMillionTokens: canonicalPriceMicrosPerMillion(completionText),
+      };
+      const modelCandidates = candidates.get(endpoint.model_id) ?? [];
+      modelCandidates.push(candidate);
+      candidates.set(endpoint.model_id, modelCandidates);
+    } catch {
+      continue;
+    }
+  }
+
+  const out = new Map<string, ModelPricing>();
+  for (const [model, modelCandidates] of candidates) {
+    modelCandidates.sort((left, right) => {
+      const total = left.inputMicrosPerMillionTokens + left.outputMicrosPerMillionTokens -
+        right.inputMicrosPerMillionTokens - right.outputMicrosPerMillionTokens;
+      if (total !== 0) return total;
+      if (left.inputMicrosPerMillionTokens !== right.inputMicrosPerMillionTokens) {
+        return left.inputMicrosPerMillionTokens - right.inputMicrosPerMillionTokens;
+      }
+      if (left.outputMicrosPerMillionTokens !== right.outputMicrosPerMillionTokens) {
+        return left.outputMicrosPerMillionTokens - right.outputMicrosPerMillionTokens;
+      }
+      return left.provider.localeCompare(right.provider);
+    });
+    const selected = modelCandidates[0];
+    if (selected !== undefined) {
+      out.set(model, {
+        promptUsdPerToken: selected.promptUsdPerToken,
+        completionUsdPerToken: selected.completionUsdPerToken,
+        inputMicrosPerMillionTokens: selected.inputMicrosPerMillionTokens,
+        outputMicrosPerMillionTokens: selected.outputMicrosPerMillionTokens,
+      });
     }
   }
   return out;

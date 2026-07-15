@@ -45,6 +45,7 @@ import {
   MIN_QUALIFICATION_REPEATS,
   normalizeGeneratorModels,
   pricingFromCatalog,
+  pricingFromZdrCatalog,
   scoreLiveCase,
   qualificationPairId,
   qualificationGeneratorModels,
@@ -54,6 +55,7 @@ import {
   type LiveModelCaseResult,
   type ModelPricing,
   type OpenRouterModelsResponse,
+  type OpenRouterZdrEndpointsResponse,
   type QualificationPair,
   type SiteModelAggregate,
   validateGeneratorQualificationBounds,
@@ -1059,7 +1061,8 @@ export async function fetchPricing(
   apiFormat: "openai-compatible" | "anthropic",
   models: string[],
 ): Promise<Map<string, ModelPricing>> {
-  const url = `${apiBase.replace(/\/$/, "")}/models`;
+  const managedOpenRouter = benchmarkProviderIdentityFor(apiBase, apiFormat) !== null;
+  const url = `${apiBase.replace(/\/$/, "")}/${managedOpenRouter ? "endpoints/zdr" : "models"}`;
   const keyName = resolveApiKeyName();
   const key = keyName === undefined ? undefined : process.env[keyName];
   const headers: Record<string, string> = { accept: "application/json" };
@@ -1076,9 +1079,10 @@ export async function fetchPricing(
   if (!res.ok) {
     throw new Error(`failed to fetch provider pricing (${res.status}) from ${url}`);
   }
-  const catalog = (await res.json()) as OpenRouterModelsResponse;
-  const pricing = pricingFromCatalog(catalog, models);
-  return pricing;
+  const catalog = await res.json();
+  return managedOpenRouter
+    ? pricingFromZdrCatalog(catalog as OpenRouterZdrEndpointsResponse, models)
+    : pricingFromCatalog(catalog as OpenRouterModelsResponse, models);
 }
 
 export function endpointAuthFromEnvironment(
