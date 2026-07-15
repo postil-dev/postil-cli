@@ -391,6 +391,7 @@ const ENDPOINT_AUTH_VALUE_ENV: &str = "POSTIL_ENDPOINT_AUTH_VALUE";
 const ALLOW_PRIVATE_API_BASE_ENV: &str = "POSTIL_ALLOW_PRIVATE_API_BASE";
 const ALWAYS_MANAGED_HEADERS: &[&str] = &["x-api-key", "anthropic-version", "content-type"];
 
+#[cfg(test)]
 fn hostile_json_text(bytes: usize) -> String {
     "\0".repeat(bytes)
 }
@@ -464,15 +465,39 @@ impl PlannedExposure {
         request_output_tokens: usize,
         price: &ModelPriceBound,
     ) -> Result<()> {
+        self.add_request_attempts(
+            serialized_bytes,
+            request_output_tokens,
+            price,
+            MAX_TRANSPORT_ATTEMPTS_PER_CALL,
+        )
+    }
+
+    fn add_primary_request(
+        &mut self,
+        serialized_bytes: usize,
+        request_output_tokens: usize,
+        price: &ModelPriceBound,
+    ) -> Result<()> {
+        self.add_request_attempts(serialized_bytes, request_output_tokens, price, 1)
+    }
+
+    fn add_request_attempts(
+        &mut self,
+        serialized_bytes: usize,
+        request_output_tokens: usize,
+        price: &ModelPriceBound,
+        attempts_per_call: usize,
+    ) -> Result<()> {
         let attempts = self
             .attempts
-            .checked_add(MAX_TRANSPORT_ATTEMPTS_PER_CALL)
+            .checked_add(attempts_per_call)
             .context("planned provider attempt count overflowed")?;
         let input_bytes = self
             .input_bytes
             .checked_add(
                 serialized_bytes
-                    .checked_mul(MAX_TRANSPORT_ATTEMPTS_PER_CALL)
+                    .checked_mul(attempts_per_call)
                     .context("planned provider input exposure overflowed")?,
             )
             .context("planned provider input exposure overflowed")?;
@@ -480,13 +505,13 @@ impl PlannedExposure {
             .output_tokens
             .checked_add(
                 request_output_tokens
-                    .checked_mul(MAX_TRANSPORT_ATTEMPTS_PER_CALL)
+                    .checked_mul(attempts_per_call)
                     .context("planned provider output exposure overflowed")?,
             )
             .context("planned provider output exposure overflowed")?;
         let request_cost =
             projected_request_cost_micros(serialized_bytes, request_output_tokens, price)?
-                .checked_mul(MAX_TRANSPORT_ATTEMPTS_PER_CALL as u64)
+                .checked_mul(attempts_per_call as u64)
                 .context("planned provider cost exposure overflowed")?;
         let projected_cost_micros = self
             .projected_cost_micros
@@ -752,17 +777,17 @@ impl LlmClient {
     ) -> Result<ReviewAdmission> {
         ensure!(
             exposure.attempts <= MAX_PROVIDER_ATTEMPTS,
-            "complete hosted {operation} needs {} provider attempts, exceeding the {MAX_PROVIDER_ATTEMPTS}-attempt cap",
+            "hosted {operation} admission needs {} provider attempts, exceeding the {MAX_PROVIDER_ATTEMPTS}-attempt cap",
             exposure.attempts
         );
         ensure!(
             exposure.input_bytes <= MAX_PROVIDER_INPUT_BYTES,
-            "complete hosted {operation} needs {} bytes of serialized provider input, exceeding the {MAX_PROVIDER_INPUT_BYTES} byte cap",
+            "hosted {operation} admission needs {} bytes of serialized provider input, exceeding the {MAX_PROVIDER_INPUT_BYTES} byte cap",
             exposure.input_bytes
         );
         ensure!(
             exposure.output_tokens <= MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE,
-            "complete hosted {operation} needs {} output tokens of exposure, exceeding the {MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE} token cap",
+            "hosted {operation} admission needs {} output tokens of exposure, exceeding the {MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE} token cap",
             exposure.output_tokens
         );
         let token_exposure = exposure
@@ -771,7 +796,7 @@ impl LlmClient {
             .context("planned token exposure overflowed")?;
         ensure!(
             token_exposure <= MAX_REPORTED_TOKEN_SPEND,
-            "complete hosted {operation} needs {token_exposure} tokens of exposure, exceeding the {MAX_REPORTED_TOKEN_SPEND} token cap"
+            "hosted {operation} admission needs {token_exposure} tokens of exposure, exceeding the {MAX_REPORTED_TOKEN_SPEND} token cap"
         );
         let model_costs = exposure
             .model_costs_micros
@@ -781,7 +806,7 @@ impl LlmClient {
             .join(", ");
         ensure!(
             exposure.projected_cost_micros <= HOSTED_OPERATION_COST_CAP_MICROS,
-            "complete hosted {operation} projects {} micro-dollars of provider exposure across {} attempts, {} serialized input bytes, and {} output tokens (per-model micro-dollars: {model_costs}), exceeding the {HOSTED_OPERATION_COST_CAP_MICROS} micro-dollar operation cap",
+            "hosted {operation} admission projects {} micro-dollars of provider exposure across {} attempts, {} serialized input bytes, and {} output tokens (per-model micro-dollars: {model_costs}), exceeding the {HOSTED_OPERATION_COST_CAP_MICROS} micro-dollar operation cap",
             exposure.projected_cost_micros,
             exposure.attempts,
             exposure.input_bytes,
@@ -1027,75 +1052,59 @@ impl LlmClient {
             logical_calls <= MAX_HOSTED_PLANNED_CALLS_BY_WATCHDOG,
             "complete hosted review needs {logical_calls} logical model calls, exceeding the {MAX_HOSTED_PLANNED_CALLS_BY_WATCHDOG}-call watchdog plan"
         );
+        // Admission proves that the normal path can finish within the operation
+        // cap. Repairs and transport retries reserve their actual request cost
+        // atomically before each network call and stop at the same hard cap.
         let mut exposure = PlannedExposure::default();
-        let hostile_review_output = hostile_json_text(16_384);
-        let hostile_error = hostile_json_text(REPAIR_ERROR_MAX_BYTES);
         for model in &review_models {
             let price = bounds
                 .get(model)
                 .ok_or_else(|| anyhow!("hosted model {model:?} has no admitted price bound"))?;
-            let path_for = |user: &str| -> Result<(usize, usize)> {
-                let initial = self.planned_request_bytes(
+            let request_for = |user: &str| -> Result<usize> {
+                self.planned_request_bytes(
                     model,
                     system,
                     user,
                     EXHAUSTED_OUTPUT_RETRY_MAX_TOKENS,
                     0.1,
-                )?;
-                let schema_user = review_schema_repair_user(&hostile_review_output, &hostile_error);
-                let schema = self.planned_request_bytes(
-                    model,
-                    "You repair malformed JSON. Output only valid JSON.",
-                    &schema_user,
-                    EXHAUSTED_OUTPUT_RETRY_MAX_TOKENS,
-                    0.1,
-                )?;
-                let semantic_user = review_semantic_retry_user(user, &hostile_review_output);
-                let semantic = self.planned_request_bytes(
-                    model,
-                    system,
-                    &semantic_user,
-                    EXHAUSTED_OUTPUT_RETRY_MAX_TOKENS,
-                    0.1,
-                )?;
-                Ok((initial, schema.max(semantic)))
+                )
             };
-            let first_paths = candidate_first_users
+            let first_requests = candidate_first_users
                 .iter()
-                .map(|user| path_for(user))
+                .map(|user| request_for(user))
                 .collect::<Result<Vec<_>>>()?;
-            let later_paths = candidate_later_users
+            let later_requests = candidate_later_users
                 .iter()
-                .map(|user| path_for(user))
+                .map(|user| request_for(user))
                 .collect::<Result<Vec<_>>>()?;
-            let mut worst_paths = Vec::new();
+            let mut worst_requests = Vec::new();
             let mut worst_bytes = 0usize;
-            for (first_index, first) in first_paths.iter().copied().enumerate() {
-                let mut paths = later_paths
+            for (first_index, first) in first_requests.iter().copied().enumerate() {
+                let mut requests = later_requests
                     .iter()
                     .copied()
                     .enumerate()
                     .filter(|(index, _)| *index != first_index)
-                    .map(|(_, path)| path)
+                    .map(|(_, request)| request)
                     .collect::<Vec<_>>();
-                paths.sort_unstable_by_key(|(initial, repair)| {
-                    std::cmp::Reverse(initial.saturating_add(*repair))
-                });
-                paths.truncate(batch_count.saturating_sub(1));
-                paths.push(first);
-                let bytes = paths.iter().try_fold(0usize, |sum, (initial, repair)| {
-                    sum.checked_add(*initial)
-                        .and_then(|value| value.checked_add(*repair))
+                requests.sort_unstable_by_key(|request| std::cmp::Reverse(*request));
+                requests.truncate(batch_count.saturating_sub(1));
+                requests.push(first);
+                let bytes = requests.iter().try_fold(0usize, |sum, request| {
+                    sum.checked_add(*request)
                         .context("planned review path size overflowed")
                 })?;
                 if bytes > worst_bytes {
                     worst_bytes = bytes;
-                    worst_paths = paths;
+                    worst_requests = requests;
                 }
             }
-            for (initial, repair) in worst_paths {
-                exposure.add_request(initial, EXHAUSTED_OUTPUT_RETRY_MAX_TOKENS as usize, price)?;
-                exposure.add_request(repair, EXHAUSTED_OUTPUT_RETRY_MAX_TOKENS as usize, price)?;
+            for request in worst_requests {
+                exposure.add_primary_request(
+                    request,
+                    EXHAUSTED_OUTPUT_RETRY_MAX_TOKENS as usize,
+                    price,
+                )?;
             }
         }
 
@@ -1111,20 +1120,11 @@ impl LlmClient {
                 .expect("maximum scorer finding count has a token bound");
             let initial =
                 self.planned_request_bytes(model, &scorer_system, &scorer_user, max_tokens, 0.0)?;
-            let repair_system = scorer_repair_system(&scorer_system);
-            let invalid = "\"".repeat(max_tokens as usize * SCORER_REPAIR_BYTES_PER_OUTPUT_TOKEN);
-            let repair_user = scorer_repair_user(&scorer_user, &invalid);
-            let repair =
-                self.planned_request_bytes(model, &repair_system, &repair_user, max_tokens, 0.0)?;
-            exposure.add_request(initial, max_tokens as usize, price)?;
-            exposure.add_request(repair, max_tokens as usize, price)?;
+            exposure.add_primary_request(initial, max_tokens as usize, price)?;
         }
 
         if let Some((manifest, max_selected)) = planner {
             let user = planner_user_prompt(manifest, max_selected);
-            let invalid = hostile_json_text(8_192);
-            let error = hostile_json_text(REPAIR_ERROR_MAX_BYTES);
-            let repair_user = planner_repair_user(&user, &invalid, &error);
             for model in &review_models {
                 let price = bounds.get(model).ok_or_else(|| {
                     anyhow!("hosted planner model {model:?} has no admitted price bound")
@@ -1136,15 +1136,7 @@ impl LlmClient {
                     PLANNER_MAX_TOKENS,
                     0.1,
                 )?;
-                let repair = self.planned_request_bytes(
-                    model,
-                    "Repair the batch-selection JSON. Return only {\"batchIds\":[integer,...]}.",
-                    &repair_user,
-                    PLANNER_MAX_TOKENS,
-                    0.1,
-                )?;
-                exposure.add_request(initial, PLANNER_MAX_TOKENS as usize, price)?;
-                exposure.add_request(repair, PLANNER_MAX_TOKENS as usize, price)?;
+                exposure.add_primary_request(initial, PLANNER_MAX_TOKENS as usize, price)?;
             }
         }
         self.validate_hosted_exposure("review", &exposure)
@@ -4056,8 +4048,8 @@ mod tests {
             "provider/model".into(),
             ModelPriceBound {
                 model: "provider/model".into(),
-                input_micros_per_million_tokens: 1,
-                output_micros_per_million_tokens: 1,
+                input_micros_per_million_tokens: 1_000_000,
+                output_micros_per_million_tokens: 1_000_000,
             },
         )])));
 
@@ -4072,7 +4064,7 @@ mod tests {
             )
             .unwrap_err();
 
-        assert!(error.to_string().contains("complete hosted review"));
+        assert!(error.to_string().contains("hosted review admission"));
         assert_eq!(client.admission.lock().unwrap().attempts, 0);
         assert!(server.received_requests().await.unwrap().is_empty());
     }
@@ -4121,6 +4113,13 @@ mod tests {
             input_micros_per_million_tokens: 2_000_000,
             output_micros_per_million_tokens: 3_000_000,
         };
+        let mut exposure = PlannedExposure::default();
+        exposure.add_primary_request(100, 10, &first).unwrap();
+        assert_eq!(exposure.attempts, 1);
+        assert_eq!(exposure.input_bytes, 100);
+        assert_eq!(exposure.output_tokens, 10);
+        assert_eq!(exposure.projected_cost_micros, 120);
+
         let mut exposure = PlannedExposure::default();
         exposure.add_request(100, 10, &first).unwrap();
         exposure.add_request(100, 10, &first).unwrap();
