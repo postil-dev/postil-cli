@@ -248,6 +248,18 @@ describe("pair scoring", () => {
     expect(catalog.costProvenance).toBe("catalogEstimate");
     expect(catalog.costUsd).toBeCloseTo(0.00028, 8);
   });
+
+  test("normalizes a provider-exact sum whose aligned coefficient ends in zero", () => {
+    const input = envelope({ findings: [finding("warn")] });
+    input.modelUsage![0]!.costProviderDecimal = "0.00011";
+    input.modelUsage![1]!.costProviderDecimal = "0.00019";
+
+    const result = score("advisory", 1, input);
+
+    expect(result.costProvenance).toBe("providerExact");
+    expect(result.costProviderDecimal).toBe("0.0003");
+    expect(result.costUsd).toBeCloseTo(0.0003, 8);
+  });
 });
 
 describe("pair admission", () => {

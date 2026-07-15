@@ -406,9 +406,16 @@ pub struct ProviderCost {
 }
 
 impl ProviderCost {
+    const MAX_INPUT_BYTES: usize = 128;
+    const MAX_SCALE: u32 = 18;
+
     pub fn parse(raw: &str) -> Option<Self> {
         let raw = raw.trim();
-        if raw.is_empty() || raw.starts_with('-') || raw.starts_with('+') {
+        if raw.is_empty()
+            || raw.len() > Self::MAX_INPUT_BYTES
+            || raw.starts_with('-')
+            || raw.starts_with('+')
+        {
             return None;
         }
         let (base, exponent) =
@@ -442,6 +449,12 @@ impl ProviderCost {
             return None;
         }
         let mut coefficient = digits.parse::<u128>().ok()?;
+        if coefficient == 0 {
+            return Some(Self {
+                coefficient: 0,
+                scale: 0,
+            });
+        }
         let adjusted_scale = fractional.checked_sub(exponent)?;
         let mut scale = if adjusted_scale < 0 {
             let zeros = u32::try_from(-adjusted_scale).ok()?;
@@ -453,6 +466,9 @@ impl ProviderCost {
         while scale > 0 && coefficient % 10 == 0 {
             coefficient /= 10;
             scale -= 1;
+        }
+        if scale > Self::MAX_SCALE {
+            return None;
         }
         Some(Self { coefficient, scale })
     }
@@ -1147,5 +1163,20 @@ mod tests {
         assert_eq!(first.checked_add(second).unwrap().to_string(), "0.00000172");
         assert!(ProviderCost::parse("-0.1").is_none());
         assert!(ProviderCost::parse("NaN").is_none());
+        assert!(ProviderCost::parse("1e-2147483647").is_none());
+        assert_eq!(
+            ProviderCost::parse("0e-2147483647").unwrap().to_string(),
+            "0"
+        );
+        assert_eq!(
+            ProviderCost::parse("0e2147483647").unwrap().to_string(),
+            "0"
+        );
+        assert_eq!(
+            ProviderCost::parse("1e-18").unwrap().to_string(),
+            "0.000000000000000001"
+        );
+        assert!(ProviderCost::parse("1e-19").is_none());
+        assert!(ProviderCost::parse(&format!("0.{}1", "0".repeat(128))).is_none());
     }
 }

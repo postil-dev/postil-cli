@@ -687,11 +687,16 @@ export function parseCanonicalDecimal(value: string): CanonicalDecimal {
 
 function sumCanonicalDecimals(values: CanonicalDecimal[]): CanonicalDecimal {
   const scale = Math.max(0, ...values.map((value) => value.scale));
-  const coefficient = values.reduce(
+  let coefficient = values.reduce(
     (sum, value) => sum + value.coefficient * 10n ** BigInt(scale - value.scale),
     0n,
   );
-  return parseCanonicalDecimal(formatCanonicalDecimal({ coefficient, scale }));
+  let normalizedScale = scale;
+  while (normalizedScale > 0 && coefficient % 10n === 0n) {
+    coefficient /= 10n;
+    normalizedScale -= 1;
+  }
+  return { coefficient, scale: normalizedScale };
 }
 
 function formatCanonicalDecimal(value: CanonicalDecimal): string {
