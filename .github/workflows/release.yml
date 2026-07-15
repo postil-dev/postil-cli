@@ -22,7 +22,7 @@ jobs:
         run: bun install --frozen-lockfile
       - name: Verify embedded model admission
         working-directory: bench
-        run: bun run verify-admission
+        run: bun run verify-admission --require-qualified
       - name: Match release tag to package version
         env:
           RELEASE_TAG: ${{ github.ref_name }}

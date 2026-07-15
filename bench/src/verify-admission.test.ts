@@ -64,6 +64,22 @@ describe("admission attestation verification", () => {
     expect(invoked).toBe(false);
   });
 
+  test("rejects an empty manifest for a release", async () => {
+    const directory = await temporaryDirectory();
+    const manifest = join(directory, "qualified-models.json");
+    await writeFile(manifest, JSON.stringify({
+      version: 1,
+      qualificationSourceSha: null,
+      qualificationIssuedAtUnixSeconds: null,
+      qualificationExpiresAtUnixSeconds: null,
+      qualificationMaxAgeDays: null,
+      profiles: [],
+    }));
+    await expect(verifyAdmissionManifest(manifest, join(directory, "missing.json"), {
+      requireQualifiedProfile: true,
+    })).rejects.toThrow("release requires at least one attested qualified model profile");
+  });
+
   test("pins repository, signer workflow, source commit, OIDC, and public Sigstore", async () => {
     const directory = await temporaryDirectory();
     const manifest = join(directory, "qualified-models.json");
