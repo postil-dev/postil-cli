@@ -173,6 +173,24 @@ struct GitHubHeadRaceResponder {
 
 struct OutputBudgetResponder;
 
+#[derive(Clone)]
+struct SequentialReviewResponder {
+    calls: Arc<AtomicUsize>,
+    responses: Arc<Vec<Value>>,
+}
+
+impl Respond for SequentialReviewResponder {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        let index = self.calls.fetch_add(1, Ordering::SeqCst);
+        let response = self
+            .responses
+            .get(index)
+            .or_else(|| self.responses.last())
+            .expect("sequential responder requires at least one response");
+        ResponseTemplate::new(200).set_body_json(response)
+    }
+}
+
 impl Respond for OutputBudgetResponder {
     fn respond(&self, request: &Request) -> ResponseTemplate {
         let body: Value = serde_json::from_slice(&request.body).unwrap();
@@ -3613,14 +3631,13 @@ async fn low_confidence_only_finding_with_risk_summary_fails_closed() {
 #[tokio::test]
 async fn ungrounded_output_fails_closed() {
     let server = MockServer::start().await;
-    // Model cites line 999 which is not in the diff. Twice (initial + repair is
-    // not triggered for valid-but-ungrounded JSON), so one mock suffices.
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(llm_content(json!([finding_at(999, "error", 0.9)]))),
         )
+        .expect(2)
         .mount(&server)
         .await;
 
@@ -3638,6 +3655,242 @@ async fn ungrounded_output_fails_closed() {
         serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
     assert_eq!(env["findings"][0]["path"], ".postil/model-output");
     assert_eq!(env["gate"]["failing"], true);
+    assert_eq!(env["usage"]["promptTokens"], 200);
+    assert_eq!(env["usage"]["completionTokens"], 100);
+    assert_eq!(env["modelUsage"].as_array().unwrap().len(), 2);
+    assert_eq!(env["modelUsage"][0]["phase"], "initial");
+    assert_eq!(env["modelUsage"][1]["phase"], "semanticRetry");
+    assert_eq!(env["modelIncidents"][0]["category"], "invalidOutput");
+    assert_eq!(env["modelIncidents"][0]["recovered"], false);
+}
+
+#[tokio::test]
+async fn all_ungrounded_output_retries_before_accepting_grounded_success() {
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(SequentialReviewResponder {
+            calls: Arc::clone(&calls),
+            responses: Arc::new(vec![
+                llm_content(json!([finding_at(999, "error", 0.9)])),
+                llm_content(json!([finding_at(41, "error", 0.9)])),
+            ]),
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .code(1);
+    let env: Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(env["findings"][0]["path"], "src/auth.rs");
+    assert_eq!(env["findings"][0]["line"], 41);
+    assert_eq!(env["counts"]["ungrounded"], 0);
+    assert_eq!(env["usage"]["promptTokens"], 200);
+    assert_eq!(env["usage"]["completionTokens"], 100);
+    assert_eq!(env["modelUsage"].as_array().unwrap().len(), 2);
+    assert_eq!(env["modelUsage"][0]["phase"], "initial");
+    assert_eq!(env["modelUsage"][1]["phase"], "semanticRetry");
+    assert_eq!(env["modelIncidents"][0]["category"], "invalidOutput");
+    assert_eq!(env["modelIncidents"][0]["recovered"], true);
+    assert_eq!(env["modelIncidents"][0]["recovery"], "repair");
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("returned unusable review content; requesting one semantic retry"));
+}
+
+#[tokio::test]
+async fn schema_repair_then_all_ungrounded_uses_no_second_correction() {
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(SequentialReviewResponder {
+            calls: Arc::clone(&calls),
+            responses: Arc::new(vec![
+                llm_text("not review JSON"),
+                llm_content(json!([finding_at(999, "error", 0.9)])),
+            ]),
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .code(1);
+    let env: Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(env["findings"][0]["path"], ".postil/model-output");
+    assert_eq!(env["usage"]["promptTokens"], 180);
+    assert_eq!(env["usage"]["completionTokens"], 80);
+    assert_eq!(env["modelUsage"].as_array().unwrap().len(), 2);
+    assert_eq!(env["modelUsage"][0]["phase"], "initial");
+    assert_eq!(env["modelUsage"][1]["phase"], "schemaRepair");
+}
+
+#[tokio::test]
+async fn narration_retry_then_all_ungrounded_uses_no_second_correction() {
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(SequentialReviewResponder {
+            calls: Arc::clone(&calls),
+            responses: Arc::new(vec![
+                llm_contradictory(),
+                llm_content(json!([finding_at(999, "error", 0.9)])),
+            ]),
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .code(1);
+    let env: Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(env["findings"][0]["path"], ".postil/model-output");
+    assert_eq!(env["usage"]["promptTokens"], 200);
+    assert_eq!(env["usage"]["completionTokens"], 100);
+    assert_eq!(env["modelUsage"].as_array().unwrap().len(), 2);
+    assert_eq!(env["modelUsage"][0]["phase"], "initial");
+    assert_eq!(env["modelUsage"][1]["phase"], "semanticRetry");
+}
+
+#[tokio::test]
+async fn all_ungrounded_primary_exhausts_one_retry_then_cascades_before_forge_writes() {
+    let server = MockServer::start().await;
+    mount_github_complete_diff(&server, 7).await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("primary-model"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(llm_content(json!([finding_at(999, "error", 0.9)]))),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("backup-model"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(llm_content(json!([finding_at(41, "error", 0.9)]))),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "t", "body": "b", "state": "open", "merged": false,
+            "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"}, "changed_files": 1
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/api/check-runs"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": 11})))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path_regex(r"^/repos/acme/api/check-runs/\d+$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/api/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .env("REVIEW_MODEL", "primary-model")
+        .env("REVIEW_MODEL_CASCADE", "backup-model")
+        .args([
+            "review",
+            "--publish",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--output-json",
+        ])
+        .assert()
+        .code(1);
+    let env: Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+    assert_eq!(env["findings"][0]["path"], "src/auth.rs");
+    assert_eq!(env["modelUsed"], "backup-model");
+    assert_eq!(env["usage"]["promptTokens"], 300);
+    assert_eq!(env["usage"]["completionTokens"], 150);
+    assert_eq!(env["modelUsage"].as_array().unwrap().len(), 3);
+    assert_eq!(env["modelIncidents"][0]["category"], "invalidOutput");
+    assert_eq!(env["modelIncidents"][0]["recovered"], true);
+    assert_eq!(env["modelIncidents"][0]["recovery"], "fallback");
+
+    let requests = server.received_requests().await.unwrap();
+    let llm_positions = requests
+        .iter()
+        .enumerate()
+        .filter_map(|(index, request)| (request.url.path() == "/chat/completions").then_some(index))
+        .collect::<Vec<_>>();
+    let first_forge_result_write = requests
+        .iter()
+        .enumerate()
+        .find_map(|(index, request)| {
+            (request.method == wiremock::http::Method::PATCH
+                || (request.method == wiremock::http::Method::POST
+                    && request.url.path() == "/repos/acme/api/pulls/7/reviews"))
+                .then_some(index)
+        })
+        .expect("forge result publication write");
+    assert_eq!(llm_positions.len(), 3);
+    assert!(
+        llm_positions
+            .into_iter()
+            .all(|index| index < first_forge_result_write)
+    );
 }
 
 #[tokio::test]
@@ -4958,6 +5211,41 @@ async fn github_flow_posts_review_and_completes_both_checks() {
     assert!(
         summary.contains("<sub>[Review details](https://postil.dev/orgs/acme/runs/review-7)</sub>")
     );
+
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .args([
+            "review",
+            "--publish",
+            "--neutral-gate-check",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--output-json",
+        ])
+        .assert()
+        .code(1);
+    let env: Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+    assert_eq!(env["gate"]["failing"], true);
+
+    let reqs = server.received_requests().await.unwrap();
+    let conclusions: Vec<String> = reqs
+        .iter()
+        .filter(|request| request.method == wiremock::http::Method::PATCH)
+        .skip(2)
+        .map(|request| {
+            request.body_json::<Value>().unwrap()["conclusion"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(conclusions, vec!["success", "neutral"]);
 }
 
 #[tokio::test]

@@ -364,7 +364,7 @@ pub(crate) const MAX_REPORTED_TOKEN_SPEND: usize = 20_000_000;
 const MAX_PROVIDER_INPUT_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE: usize = 2_000_000;
 // Five selected review batches and one planner request, each across at most
-// three generator models with one repair, consume 36 logical calls. The two
+// three generator models with one shared correction call, consume 36 logical calls. The two
 // scorer models with one repair consume four more. Any larger plan diverges
 // from the bounded hosted workflow that fits under the phase deadlines.
 const MAX_HOSTED_PLANNED_CALLS_BY_WATCHDOG: usize = 40;
@@ -419,6 +419,12 @@ fn review_schema_repair_user(invalid: &str, error: &str) -> String {
 fn review_semantic_retry_user(user: &str, previous: &str) -> String {
     format!(
         "{user}\n\n[Your previous response]\n{previous}\n\n[Correction] Your summary describes merge-relevant risk but `findings` is empty, which is invalid. Either report each risk as a structured finding citing its exact new-file line from the diff above, or, if nothing is actually merge-relevant, return exactly {{\"summary\": \"\", \"findings\": []}}."
+    )
+}
+
+fn review_validation_retry_user(user: &str, reason: &str) -> String {
+    format!(
+        "{user}\n\n[Correction] The previous response was unusable ({reason}). Retry once. Every finding must cite an exact path and new-file line displayed in the review input. Return only the corrected review JSON."
     )
 }
 
@@ -1277,6 +1283,23 @@ impl LlmClient {
         system: &str,
         user: &str,
     ) -> std::result::Result<ModelReview, ModelError> {
+        self.review_validated(cfg, system, user, |_| Ok(())).await
+    }
+
+    /// Run a review while treating caller-rejected content as invalid model
+    /// output. Each model gets one bounded semantic correction before the
+    /// configured cascade advances, and every consumed call remains in usage.
+    pub async fn review_validated<F>(
+        &self,
+        cfg: &Config,
+        system: &str,
+        user: &str,
+        validate: F,
+    ) -> std::result::Result<ModelReview, ModelError>
+    where
+        F: Fn(&ModelReview) -> std::result::Result<(), String> + Send + Sync + 'static,
+    {
+        let validate = Arc::new(validate);
         let chain = cfg.model_chain();
         if cfg.consensus > 1 && chain.len() > 1 {
             let n = cfg.consensus.min(chain.len());
@@ -1285,12 +1308,15 @@ impl LlmClient {
                 .map(|m| {
                     let client = self.clone();
                     let (model, system, user) = (m.clone(), system.to_string(), user.to_string());
+                    let validate = Arc::clone(&validate);
                     let task_model = model.clone();
                     let handle = tokio::spawn(async move {
                         let model_log = log_text(&task_model);
                         eprintln!("postil: attempting consensus model: {model_log}");
                         let started_at = Instant::now();
-                        let result = client.review_with_model(&task_model, &system, &user).await;
+                        let result = client
+                            .review_with_model(&task_model, &system, &user, validate.as_ref())
+                            .await;
                         let elapsed = elapsed_text(started_at.elapsed());
                         match &result {
                             Ok(_) => eprintln!(
@@ -1416,7 +1442,10 @@ impl LlmClient {
                     chain.len()
                 );
                 let started_at = Instant::now();
-                match self.review_with_model(model, system, user).await {
+                match self
+                    .review_with_model(model, system, user, validate.as_ref())
+                    .await
+                {
                     Ok(mut r) => {
                         eprintln!(
                             "postil: model {model_log} responded in {}",
@@ -1691,6 +1720,7 @@ impl LlmClient {
         model: &str,
         system: &str,
         user: &str,
+        validate: &(dyn Fn(&ModelReview) -> std::result::Result<(), String> + Send + Sync),
     ) -> std::result::Result<ModelReview, ModelError> {
         let mut usage = Usage::default();
         let mut call_usage = Vec::new();
@@ -1779,6 +1809,7 @@ impl LlmClient {
         review.model_usage = call_usage.clone();
         review.model_incidents.append(&mut model_incidents);
         review.usage_accounting_complete = usage_accounting_complete;
+        let mut correction_used = repaired_schema;
         if repaired_schema && review.findings.is_empty() && !review.summary.is_empty() {
             let mut error = ModelError::new(
                 anyhow!("model output remained semantically contradictory after schema repair"),
@@ -1796,6 +1827,7 @@ impl LlmClient {
         // the risk or retract it; if the contradiction survives, the caller
         // fails the review closed.
         if !repaired_schema && review.findings.is_empty() && !review.summary.is_empty() {
+            correction_used = true;
             let incident_index = review.model_incidents.len();
             review.model_incidents.push(ModelIncident {
                 phase: ModelIncidentPhase::Review,
@@ -1868,6 +1900,83 @@ impl LlmClient {
                 error.model_usage = review.model_usage;
                 return Err(error);
             }
+        }
+
+        if let Err(reason) = validate(&review) {
+            if correction_used {
+                let mut error = ModelError::new(
+                    anyhow!("model output remained unusable after its correction call"),
+                    review.usage,
+                    review.usage_accounting_complete,
+                );
+                error.model_usage = review.model_usage;
+                error.model_incidents = review.model_incidents;
+                return Err(error);
+            }
+            eprintln!(
+                "postil: model {} returned unusable review content; requesting one semantic retry",
+                log_text(model),
+            );
+            let retry_user = review_validation_retry_user(user, &reason);
+            let mut retry_usage = review.usage;
+            let mut retry_accounting_complete = review.usage_accounting_complete;
+            let retry = self
+                .chat(
+                    model,
+                    system,
+                    &retry_user,
+                    &mut retry_usage,
+                    &mut call_usage,
+                    &mut retry_accounting_complete,
+                    REVIEW_MAX_TOKENS,
+                    LlmPhase::Review,
+                    LlmCallPhase::SemanticRetry,
+                )
+                .await;
+            match retry {
+                Ok(content) => {
+                    if let Ok(raw) = parse_review(&content) {
+                        let mut candidate = into_review(raw, model, retry_usage);
+                        candidate.model_usage = call_usage.clone();
+                        candidate.model_incidents = review.model_incidents.clone();
+                        candidate.usage_accounting_complete = retry_accounting_complete;
+                        if validate(&candidate).is_ok() {
+                            candidate.model_incidents.push(ModelIncident {
+                                phase: ModelIncidentPhase::Review,
+                                category: ModelIncidentCategory::InvalidOutput,
+                                recovered: true,
+                                recovery: Some(ModelIncidentRecovery::Repair),
+                            });
+                            return Ok(candidate);
+                        }
+                    }
+                }
+                Err(error) => {
+                    let mut error = ModelError::new(
+                        error.context("review validation retry failed"),
+                        retry_usage,
+                        false,
+                    );
+                    error.model_usage = call_usage;
+                    error.model_incidents = review.model_incidents;
+                    error.model_incidents.push(ModelIncident {
+                        phase: ModelIncidentPhase::Review,
+                        category: ModelIncidentCategory::InvalidOutput,
+                        recovered: false,
+                        recovery: None,
+                    });
+                    return Err(error);
+                }
+            }
+
+            let mut error = ModelError::new(
+                anyhow!("model output remained unusable after semantic retry"),
+                retry_usage,
+                retry_accounting_complete,
+            );
+            error.model_usage = call_usage;
+            error.model_incidents = review.model_incidents;
+            return Err(error);
         }
         Ok(review)
     }

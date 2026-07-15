@@ -47,6 +47,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
             bounded,
             publish,
             no_post,
+            neutral_gate_check,
         } => {
             let local_mode = staged || base.is_some() || diff_file.is_some();
             let kind = match forge {
@@ -81,6 +82,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
                 model,
                 bounded,
                 no_post: no_post || !publish,
+                neutral_gate_check,
             })
             .await
         }

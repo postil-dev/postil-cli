@@ -104,6 +104,9 @@ pub enum Command {
         /// Deprecated compatibility flag. Reviews are local-only by default.
         #[arg(long, hide = true, conflicts_with = "publish")]
         no_post: bool,
+        /// Complete the merge-gate check as neutral while retaining the computed gate verdict.
+        #[arg(long, requires = "publish")]
+        neutral_gate_check: bool,
     },
     /// Reply to an @postil mention on a pull request or issue (interactive bot).
     Respond {
@@ -232,6 +235,35 @@ mod tests {
             panic!("expected review command");
         };
         assert!(publish);
+    }
+
+    #[test]
+    fn neutral_gate_check_is_an_internal_publication_option() {
+        let parsed = Cli::try_parse_from([
+            "postil",
+            "review",
+            "--repo",
+            "postil-dev/postil",
+            "--pr",
+            "1",
+            "--publish",
+            "--neutral-gate-check",
+        ])
+        .unwrap();
+        let Command::Review {
+            neutral_gate_check, ..
+        } = parsed.command
+        else {
+            panic!("expected review command");
+        };
+        assert!(neutral_gate_check);
+
+        let help = Cli::command()
+            .find_subcommand_mut("review")
+            .expect("review subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--neutral-gate-check"));
     }
 
     #[test]

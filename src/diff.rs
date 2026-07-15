@@ -394,7 +394,7 @@ impl Diff {
 }
 
 /// Index answering "does (path, line) fall inside a changed hunk's new side?"
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DiffIndex {
     ranges: HashMap<String, Vec<RangeInclusive<u32>>>,
     old_ranges: HashMap<String, Vec<RangeInclusive<u32>>>,

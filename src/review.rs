@@ -129,6 +129,7 @@ pub struct ReviewArgs {
     pub model: Option<String>,
     pub bounded: bool,
     pub no_post: bool,
+    pub neutral_gate_check: bool,
 }
 
 impl ReviewArgs {
@@ -322,7 +323,9 @@ async fn run_remote<F: Forge>(
             if let Some((a, g)) = &checks
                 && snapshot_is_current(forge, &meta, review_started).await
             {
-                let gate_state = if envelope.gate.failing {
+                let gate_state = if args.neutral_gate_check {
+                    CheckState::Neutral
+                } else if envelope.gate.failing {
                     CheckState::Failure
                 } else {
                     CheckState::Success
@@ -387,7 +390,9 @@ async fn run_remote<F: Forge>(
             if let Some((a, g)) = &checks
                 && snapshot_is_current(forge, &meta, review_started).await
             {
-                let gate_state = if envelope.gate.failing {
+                let gate_state = if args.neutral_gate_check {
+                    CheckState::Neutral
+                } else if envelope.gate.failing {
                     CheckState::Failure
                 } else {
                     CheckState::Success
@@ -1058,7 +1063,30 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                         total_requests,
                         annotated.len()
                     );
-                    match client.review(cfg, &system, &user).await {
+                    let validation_annotated = annotated.clone();
+                    let validation_index = index.clone();
+                    match client
+                        .review_validated(cfg, &system, &user, move |review| {
+                            let has_grounded = review.findings.iter().any(|finding| {
+                                diff::review_batch_contains_range(
+                                    &validation_annotated,
+                                    &finding.path,
+                                    finding.line,
+                                    finding.line,
+                                ) || (first
+                                    && finding.kind == crate::envelope::Kind::ContentPolicy
+                                    && validation_index
+                                        .contains_content_policy(&finding.path, finding.line))
+                            });
+                            if !review.findings.is_empty() && !has_grounded {
+                                Err("every finding cited a location outside the review input"
+                                    .to_string())
+                            } else {
+                                Ok(())
+                            }
+                        })
+                        .await
+                    {
                         Ok(mut model_review) => {
                             usage.prompt_tokens += model_review.usage.prompt_tokens;
                             usage.completion_tokens += model_review.usage.completion_tokens;
