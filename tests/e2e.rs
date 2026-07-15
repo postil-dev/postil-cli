@@ -5749,7 +5749,7 @@ async fn bitbucket_flow_posts_comment_and_sets_statuses() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "Add login",
             "summary": {"raw": "PR body"},
-            "source": {"commit": {"hash": "aaaaaaaa"}},
+            "state": "OPEN", "source": {"commit": {"hash": "aaaaaaaa"}},
             "destination": {"commit": {"hash": "bbbbbbbb"}}
         })))
         .mount(&server)
@@ -5847,7 +5847,7 @@ async fn bitbucket_incremental_is_disabled_without_verification_gate() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "Add login",
             "summary": {"raw": "PR body"},
-            "source": {"commit": {"hash": "aaaaaaaa"}},
+            "state": "OPEN", "source": {"commit": {"hash": "aaaaaaaa"}},
             "destination": {"commit": {"hash": "bbbbbbbb"}}
         })))
         .mount(&server)
@@ -5909,7 +5909,7 @@ async fn bitbucket_incremental_fetches_documented_compare_when_enabled() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "Add login",
             "summary": {"raw": "PR body"},
-            "source": {"commit": {"hash": "aaaaaaaa"}},
+            "state": "OPEN", "source": {"commit": {"hash": "aaaaaaaa"}},
             "destination": {"commit": {"hash": "bbbbbbbb"}}
         })))
         .mount(&server)
@@ -5994,7 +5994,7 @@ async fn azure_flow_reconstructs_diff_and_posts_thread() {
         .and(path(pr_path))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "Add login", "description": "PR body",
-            "lastMergeSourceCommit": {"commitId": "HEAD"},
+            "status": "active", "lastMergeSourceCommit": {"commitId": "HEAD"},
             "lastMergeTargetCommit": {"commitId": "BASE"}
         })))
         .mount(&server)
@@ -6694,7 +6694,7 @@ async fn respond_gitlab_mr_mention_posts_note() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "Add login",
             "description": "MR body",
-            "diff_refs": {"base_sha": "b", "start_sha": "s", "head_sha": "h"}
+            "state": "opened", "diff_refs": {"base_sha": "b", "start_sha": "s", "head_sha": "h"}
         })))
         .mount(&server)
         .await;
@@ -6773,7 +6773,7 @@ async fn gitlab_diff_pagination_follows_authoritative_next_page_to_exhaustion() 
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "Paginated change",
             "description": "",
-            "diff_refs": {"base_sha": "b", "start_sha": "s", "head_sha": "h"}
+            "state": "opened", "diff_refs": {"base_sha": "b", "start_sha": "s", "head_sha": "h"}
         })))
         .mount(&server)
         .await;
@@ -6939,7 +6939,7 @@ async fn respond_bitbucket_pr_mention_posts_comment() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "Add login",
             "summary": {"raw": "PR body"},
-            "source": {"commit": {"hash": "aaaaaaaa"}},
+            "state": "OPEN", "source": {"commit": {"hash": "aaaaaaaa"}},
             "destination": {"commit": {"hash": "bbbbbbbb"}}
         })))
         .mount(&server)
@@ -7009,7 +7009,7 @@ async fn respond_azure_pr_mention_posts_thread() {
         .and(path(pr_path))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "Add login", "description": "PR body",
-            "lastMergeSourceCommit": {"commitId": "HEAD"},
+            "status": "active", "lastMergeSourceCommit": {"commitId": "HEAD"},
             "lastMergeTargetCommit": {"commitId": "BASE"}
         })))
         .mount(&server)

@@ -410,7 +410,9 @@ pub trait Forge {
     /// The caller checks this before publishing either comments or conclusions.
     async fn snapshot_is_current(&self, expected: &PrMeta) -> Result<bool> {
         let current = self.fetch_pr_meta().await?;
-        Ok(current.head_sha == expected.head_sha
+        Ok(current.title == expected.title
+            && current.body == expected.body
+            && current.head_sha == expected.head_sha
             && current.base_sha == expected.base_sha
             && current.target_sha == expected.target_sha)
     }

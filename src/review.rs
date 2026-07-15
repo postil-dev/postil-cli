@@ -1575,11 +1575,15 @@ fn error_envelope(
     }];
     let counts = Envelope::counts_of(&findings, 0);
     let buckets = Envelope::buckets_of(&findings);
-    let blocking = incomplete_input || cfg.gate_on_error == OnError::Block;
+    let gate_disabled = cfg.gate_fail_on.as_str().eq_ignore_ascii_case("never");
+    let blocking = !gate_disabled && (incomplete_input || cfg.gate_on_error == OnError::Block);
     Envelope {
         version: 1,
         summary: if blocking {
             "Postil could not complete this review and is failing closed.".to_string()
+        } else if gate_disabled {
+            "Postil could not complete this review. The merge gate is disabled; the error is shown on postil/review."
+                .to_string()
         } else {
             "Postil could not complete this review. The gate is passing because this \
              repository sets gate.onError: advisory; the error is shown on postil/review."
@@ -1628,6 +1632,47 @@ mod tests {
         assert!(!scorer_failure_blocks_hosted(false, true));
     }
     use crate::envelope::{Kind, Severity};
+
+    fn pr_meta() -> PrMeta {
+        PrMeta {
+            title: "Fixture".to_string(),
+            body: String::new(),
+            head_sha: "head".to_string(),
+            base_sha: "base".to_string(),
+            target_sha: Some("target".to_string()),
+            changed_files: Some(1),
+        }
+    }
+
+    #[test]
+    fn disabled_gate_keeps_provider_error_envelopes_nonblocking() {
+        let cfg = Config {
+            gate_fail_on: crate::config::GateLevel::Never,
+            gate_on_error: OnError::Block,
+            ..Config::default()
+        };
+        let envelope = error_envelope(
+            &cfg,
+            &anyhow::anyhow!("provider unavailable"),
+            "head",
+            &pr_meta(),
+            1,
+        );
+        assert!(!envelope.gate.failing);
+        assert!(envelope.summary.contains("merge gate is disabled"));
+    }
+
+    #[test]
+    fn disabled_gate_keeps_incomplete_input_envelopes_nonblocking() {
+        let cfg = Config {
+            gate_fail_on: crate::config::GateLevel::Never,
+            ..Config::default()
+        };
+        let error = crate::forge::classify_review_input_error(anyhow::anyhow!("invalid diff"));
+        let envelope = error_envelope(&cfg, &error, "head", &pr_meta(), 1);
+        assert!(!envelope.gate.failing);
+        assert!(envelope.summary.contains("merge gate is disabled"));
+    }
 
     fn finding(path: &str, line: u32, body: &str) -> Finding {
         finding_with_title(path, line, "Finding", body)

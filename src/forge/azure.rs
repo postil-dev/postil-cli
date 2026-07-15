@@ -45,6 +45,7 @@ struct PrResponse {
     title: String,
     #[serde(default)]
     description: String,
+    status: String,
     // Absent on PRs with merge conflicts; surfaced as an actionable error.
     last_merge_source_commit: Option<MergeCommit>,
     last_merge_target_commit: Option<MergeCommit>,
@@ -139,6 +140,28 @@ impl Azure {
             .await
             .context("fetching PR")?;
         super::bounded_response_json(Self::check_ok(resp, "PR fetch").await?, "Azure PR").await
+    }
+
+    async fn merge_base(&self, source: &str, target: &str) -> Result<String> {
+        let query = format!("otherCommitId={source}");
+        let response = self
+            .request(
+                reqwest::Method::GET,
+                self.url(&format!("/commits/{target}/mergebases"), &query),
+            )
+            .send()
+            .await
+            .context("fetching Azure pull request merge base")?;
+        let merge_bases: Vec<MergeCommit> = super::bounded_response_json(
+            Self::check_ok(response, "merge-base fetch").await?,
+            "Azure merge-base response",
+        )
+        .await?;
+        ensure!(
+            merge_bases.len() == 1 && !merge_bases[0].commit_id.is_empty(),
+            "Azure pull request must have exactly one merge base"
+        );
+        Ok(merge_bases[0].commit_id.clone())
     }
 
     /// File content at a commit. Added and deleted sides are skipped by the
@@ -388,32 +411,18 @@ impl Azure {
 impl Forge for Azure {
     async fn fetch_pr_meta(&self) -> Result<PrMeta> {
         let pr = self.pr().await?;
+        ensure!(pr.status == "active", "Azure pull request is not active");
         let (source, target) =
             merge_commits(pr.last_merge_source_commit, pr.last_merge_target_commit)?;
-        let query = format!("otherCommitId={}", source.commit_id);
-        let merge_base_response = self
-            .request(
-                reqwest::Method::GET,
-                self.url(&format!("/commits/{}/mergebases", target.commit_id), &query),
-            )
-            .send()
-            .await
-            .context("fetching Azure pull request merge base")?;
-        let merge_bases: Vec<MergeCommit> = super::bounded_response_json(
-            Self::check_ok(merge_base_response, "merge-base fetch").await?,
-            "Azure merge-base response",
-        )
-        .await?;
-        ensure!(
-            merge_bases.len() == 1 && !merge_bases[0].commit_id.is_empty(),
-            "Azure pull request must have exactly one merge base"
-        );
+        let merge_base = self
+            .merge_base(&source.commit_id, &target.commit_id)
+            .await?;
         Ok(PrMeta {
             title: pr.title,
             body: pr.description,
             head_sha: source.commit_id,
-            base_sha: merge_bases[0].commit_id.clone(),
-            target_sha: None,
+            base_sha: merge_base,
+            target_sha: Some(target.commit_id),
             changed_files: None,
         })
     }
@@ -440,9 +449,13 @@ impl Forge for Azure {
         &self,
         summary: &str,
         findings: &[Finding],
-        _snapshot: &PrMeta,
+        snapshot: &PrMeta,
     ) -> Result<()> {
         if super::only_operational_findings(findings) {
+            return Ok(());
+        }
+        if !self.snapshot_is_current(snapshot).await? {
+            eprintln!("postil: azure review delivery skipped because the pull request changed");
             return Ok(());
         }
         // One failed comment must not drop the rest: post everything we can,
@@ -501,8 +514,12 @@ impl Forge for Azure {
         advisory: CheckState,
         gate: CheckState,
         envelope: &Envelope,
-        _snapshot: &PrMeta,
+        snapshot: &PrMeta,
     ) -> Result<()> {
+        if !self.snapshot_is_current(snapshot).await? {
+            eprintln!("postil: azure status delivery skipped because the pull request changed");
+            return Ok(());
+        }
         let head = envelope.head_sha.clone().unwrap_or_default();
         let map = |s: CheckState| match s {
             CheckState::Success => "succeeded",
@@ -528,6 +545,29 @@ impl Forge for Azure {
         self.set_status(&head, "postil/gate", map(gate), &gate_desc)
             .await?;
         Ok(())
+    }
+
+    async fn snapshot_is_current(&self, expected: &PrMeta) -> Result<bool> {
+        let current = self.pr().await?;
+        let (source, target) = match merge_commits(
+            current.last_merge_source_commit,
+            current.last_merge_target_commit,
+        ) {
+            Ok(commits) => commits,
+            Err(_) => return Ok(false),
+        };
+        if current.status != "active"
+            || current.title != expected.title
+            || current.description != expected.body
+            || source.commit_id != expected.head_sha
+            || Some(target.commit_id.as_str()) != expected.target_sha.as_deref()
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .merge_base(&source.commit_id, &target.commit_id)
+            .await?
+            == expected.base_sha)
     }
 
     /// Title and description of a PR. Work-item comments live under a different

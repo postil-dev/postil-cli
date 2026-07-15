@@ -33,7 +33,16 @@ struct DiffRefs {
 struct MrResponse {
     title: String,
     description: Option<String>,
+    state: String,
     diff_refs: DiffRefs,
+}
+
+fn mr_matches_snapshot(mr: &MrResponse, expected: &PrMeta) -> bool {
+    mr.state == "opened"
+        && mr.title == expected.title
+        && mr.description.as_deref().unwrap_or_default() == expected.body
+        && mr.diff_refs.head_sha == expected.head_sha
+        && mr.diff_refs.base_sha == expected.base_sha
 }
 
 #[derive(Deserialize)]
@@ -350,6 +359,7 @@ impl Forge for GitLab {
 
     async fn fetch_pr_meta(&self) -> Result<PrMeta> {
         let mr = self.mr().await?;
+        ensure!(mr.state == "opened", "GitLab merge request is not open");
         Ok(PrMeta {
             title: mr.title,
             body: mr.description.unwrap_or_default(),
@@ -471,12 +481,16 @@ impl Forge for GitLab {
         &self,
         summary: &str,
         findings: &[Finding],
-        _snapshot: &PrMeta,
+        snapshot: &PrMeta,
     ) -> Result<()> {
         if super::only_operational_findings(findings) {
             return Ok(());
         }
         let mr = self.mr().await?;
+        if !mr_matches_snapshot(&mr, snapshot) {
+            eprintln!("postil: gitlab review delivery skipped because the merge request changed");
+            return Ok(());
+        }
         // One failed comment must not drop the rest: post everything we can,
         // then report the failures together.
         let mut failures: Vec<String> = Vec::new();
@@ -532,8 +546,13 @@ impl Forge for GitLab {
         advisory: CheckState,
         gate: CheckState,
         envelope: &Envelope,
-        _snapshot: &PrMeta,
+        snapshot: &PrMeta,
     ) -> Result<()> {
+        let current = self.mr().await?;
+        if !mr_matches_snapshot(&current, snapshot) {
+            eprintln!("postil: gitlab status delivery skipped because the merge request changed");
+            return Ok(());
+        }
         let head = envelope
             .head_sha
             .clone()
@@ -562,6 +581,11 @@ impl Forge for GitLab {
         self.set_status(&head, "postil/gate", map(gate), &gate_desc)
             .await?;
         Ok(())
+    }
+
+    async fn snapshot_is_current(&self, expected: &PrMeta) -> Result<bool> {
+        let current = self.mr().await?;
+        Ok(mr_matches_snapshot(&current, expected))
     }
 
     /// Title and description of an issue or MR. GitLab's issue and merge-request

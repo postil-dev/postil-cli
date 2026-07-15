@@ -1102,6 +1102,8 @@ impl Forge for GitHub {
         let pr = self.fetch_pr_state().await?;
         if pr.state != "open"
             || pr.merged
+            || pr.title != expected.title
+            || pr.body.as_deref().unwrap_or_default() != expected.body
             || pr.head.sha != expected.head_sha
             || Some(pr.base.sha.as_str()) != expected.target_sha.as_deref()
         {
@@ -1841,6 +1843,39 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn github_snapshot_rejects_changed_reviewed_metadata() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "title": "edited title", "body": "b", "state": "open", "merged": false,
+                "head": {"sha": "aaaaaaaaaaaa"},
+                "base": {"sha": "bbbbbbbbbbbb"},
+                "changed_files": 1
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/repos/owner/repo/compare/"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let github = test_github(&server);
+        assert!(
+            !github
+                .snapshot_is_current(&delivery_snapshot(
+                    "aaaaaaaaaaaa",
+                    "bbbbbbbbbbbb",
+                    "cccccccccccc",
+                ))
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

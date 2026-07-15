@@ -63,6 +63,7 @@ struct PrResponse {
     title: String,
     #[serde(default)]
     summary: Option<Rendered>,
+    state: String,
     source: Endpoint,
     destination: Endpoint,
 }
@@ -191,6 +192,24 @@ impl Bitbucket {
             .await
             .context("fetching PR")?;
         super::bounded_response_json(Self::check_ok(resp, "PR fetch").await?, "Bitbucket PR").await
+    }
+
+    async fn merge_base(&self, destination: &str, source: &str) -> Result<String> {
+        let response = self
+            .request(
+                reqwest::Method::GET,
+                self.url(&format!("/merge-base/{destination}..{source}")),
+            )
+            .send()
+            .await
+            .context("fetching Bitbucket pull request merge base")?;
+        let merge_base: Commit = super::bounded_response_json(
+            Self::check_ok(response, "merge-base fetch").await?,
+            "Bitbucket merge-base response",
+        )
+        .await?;
+        validate_commit(&merge_base.hash)?;
+        Ok(merge_base.hash)
     }
 
     async fn set_status(&self, sha: &str, key: &str, state: &str, description: &str) -> Result<()> {
@@ -417,31 +436,18 @@ fn safe_path(path: &str) -> String {
 impl Forge for Bitbucket {
     async fn fetch_pr_meta(&self) -> Result<PrMeta> {
         let pr = self.pr_meta().await?;
+        ensure!(pr.state == "OPEN", "Bitbucket pull request is not open");
         validate_commit(&pr.source.commit.hash)?;
         validate_commit(&pr.destination.commit.hash)?;
-        let merge_base_response = self
-            .request(
-                reqwest::Method::GET,
-                self.url(&format!(
-                    "/merge-base/{}..{}",
-                    pr.destination.commit.hash, pr.source.commit.hash
-                )),
-            )
-            .send()
-            .await
-            .context("fetching Bitbucket pull request merge base")?;
-        let merge_base: Commit = super::bounded_response_json(
-            Self::check_ok(merge_base_response, "merge-base fetch").await?,
-            "Bitbucket merge-base response",
-        )
-        .await?;
-        validate_commit(&merge_base.hash)?;
+        let merge_base = self
+            .merge_base(&pr.destination.commit.hash, &pr.source.commit.hash)
+            .await?;
         Ok(PrMeta {
             title: pr.title,
             body: pr.summary.map(|s| s.raw).unwrap_or_default(),
             head_sha: pr.source.commit.hash,
-            base_sha: merge_base.hash,
-            target_sha: None,
+            base_sha: merge_base,
+            target_sha: Some(pr.destination.commit.hash),
             changed_files: None,
         })
     }
@@ -488,9 +494,13 @@ impl Forge for Bitbucket {
         &self,
         summary: &str,
         findings: &[Finding],
-        _snapshot: &PrMeta,
+        snapshot: &PrMeta,
     ) -> Result<()> {
         if super::only_operational_findings(findings) {
+            return Ok(());
+        }
+        if !self.snapshot_is_current(snapshot).await? {
+            eprintln!("postil: bitbucket review delivery skipped because the pull request changed");
             return Ok(());
         }
         // One failed comment must not drop the rest: post everything we can,
@@ -551,8 +561,12 @@ impl Forge for Bitbucket {
         advisory: CheckState,
         gate: CheckState,
         envelope: &Envelope,
-        _snapshot: &PrMeta,
+        snapshot: &PrMeta,
     ) -> Result<()> {
+        if !self.snapshot_is_current(snapshot).await? {
+            eprintln!("postil: bitbucket status delivery skipped because the pull request changed");
+            return Ok(());
+        }
         let head = envelope
             .head_sha
             .clone()
@@ -581,6 +595,32 @@ impl Forge for Bitbucket {
         self.set_status(&head, "postil/gate", map(gate), &gate_desc)
             .await?;
         Ok(())
+    }
+
+    async fn snapshot_is_current(&self, expected: &PrMeta) -> Result<bool> {
+        let current = self.pr_meta().await?;
+        let body = current
+            .summary
+            .as_ref()
+            .map(|summary| summary.raw.as_str())
+            .unwrap_or_default();
+        if current.state != "OPEN"
+            || current.title != expected.title
+            || body != expected.body
+            || current.source.commit.hash != expected.head_sha
+            || Some(current.destination.commit.hash.as_str()) != expected.target_sha.as_deref()
+        {
+            return Ok(false);
+        }
+        validate_commit(&current.source.commit.hash)?;
+        validate_commit(&current.destination.commit.hash)?;
+        let merge_base = self
+            .merge_base(
+                &current.destination.commit.hash,
+                &current.source.commit.hash,
+            )
+            .await?;
+        Ok(merge_base == expected.base_sha)
     }
 
     /// Title and description of a PR. Bitbucket Cloud's issue tracker is a
