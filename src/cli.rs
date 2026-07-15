@@ -95,8 +95,11 @@ pub enum Command {
         /// Use deterministic semantic synthesis and model-assisted risk selection to cap large reviews at five source batches; report bounded coverage.
         #[arg(long)]
         bounded: bool,
-        /// Do not post comments or checks to the forge; report locally only.
-        #[arg(long)]
+        /// Post review comments and checks to the selected forge. Reviews are local-only by default.
+        #[arg(long, conflicts_with = "no_post")]
+        publish: bool,
+        /// Deprecated compatibility flag. Reviews are local-only by default.
+        #[arg(long, hide = true, conflicts_with = "publish")]
         no_post: bool,
     },
     /// Reply to an @postil mention on a pull request or issue (interactive bot).
@@ -123,8 +126,11 @@ pub enum Command {
         config: Option<PathBuf>,
         #[arg(long)]
         model: Option<String>,
-        /// Print the reply instead of posting it.
-        #[arg(long)]
+        /// Post the reply to the selected forge. Replies are printed locally by default.
+        #[arg(long, conflicts_with = "no_post")]
+        publish: bool,
+        /// Deprecated compatibility flag. Replies are local-only by default.
+        #[arg(long, hide = true, conflicts_with = "publish")]
         no_post: bool,
     },
     /// Replay stored envelopes under a candidate config: what would change?
@@ -191,5 +197,54 @@ mod tests {
         assert!(help.contains(
             "Use deterministic semantic synthesis and model-assisted risk selection to cap large reviews at five source batches; report bounded coverage"
         ));
+    }
+
+    #[test]
+    fn review_publication_requires_an_explicit_flag() {
+        let parsed = Cli::try_parse_from([
+            "postil",
+            "review",
+            "--repo",
+            "postil-dev/postil",
+            "--pr",
+            "1",
+        ])
+        .unwrap();
+        let Command::Review { publish, .. } = parsed.command else {
+            panic!("expected review command");
+        };
+        assert!(!publish);
+
+        let parsed = Cli::try_parse_from([
+            "postil",
+            "review",
+            "--repo",
+            "postil-dev/postil",
+            "--pr",
+            "1",
+            "--publish",
+        ])
+        .unwrap();
+        let Command::Review { publish, .. } = parsed.command else {
+            panic!("expected review command");
+        };
+        assert!(publish);
+    }
+
+    #[test]
+    fn publication_flags_are_mutually_exclusive() {
+        assert!(
+            Cli::try_parse_from([
+                "postil",
+                "review",
+                "--repo",
+                "postil-dev/postil",
+                "--pr",
+                "1",
+                "--publish",
+                "--no-post",
+            ])
+            .is_err()
+        );
     }
 }

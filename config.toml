@@ -9,4 +9,4 @@ api_format = "openai-compatible"
 enabled = false
 default_model = ""
 fallback = ""
-qualification_candidates = []
+qualification_candidates = ["z-ai/glm-5.2"]

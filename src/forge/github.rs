@@ -70,6 +70,10 @@ impl GitHub {
     }
 
     async fn fetch_pr_head_sha(&self) -> Result<String> {
+        Ok(self.fetch_pr_state().await?.head.sha)
+    }
+
+    async fn fetch_pr_state(&self) -> Result<PrResponse> {
         let response = self
             .send_retryable(
                 self.request(
@@ -84,7 +88,7 @@ impl GitHub {
             "GitHub PR head",
         )
         .await?;
-        Ok(pr.head.sha)
+        Ok(pr)
     }
 
     async fn check_ok(resp: reqwest::Response, what: &str) -> Result<reqwest::Response> {
@@ -780,6 +784,9 @@ fn gate_summary(envelope: &Envelope) -> String {
 struct PrResponse {
     title: String,
     body: Option<String>,
+    state: String,
+    #[serde(default)]
+    merged: bool,
     head: RefObj,
     base: RefObj,
     changed_files: usize,
@@ -874,6 +881,10 @@ impl Forge for GitHub {
         let pr: PrResponse =
             super::bounded_response_json(Self::check_ok(resp, "PR fetch").await?, "GitHub PR")
                 .await?;
+        ensure!(
+            pr.state == "open" && !pr.merged,
+            "GitHub pull request is not open"
+        );
         ensure!(
             valid_object_id(&pr.base.sha) && valid_object_id(&pr.head.sha),
             "GitHub PR refs must be hexadecimal object ids"
@@ -1087,7 +1098,8 @@ impl Forge for GitHub {
     }
 
     async fn head_is_current(&self, expected_head_sha: &str) -> Result<bool> {
-        Ok(self.fetch_pr_head_sha().await? == expected_head_sha)
+        let pr = self.fetch_pr_state().await?;
+        Ok(pr.state == "open" && !pr.merged && pr.head.sha == expected_head_sha)
     }
 
     async fn complete_checks(
@@ -1535,13 +1547,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn github_snapshot_rejects_a_closed_pull_request_before_diff_fetch() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "title": "t", "body": "b", "state": "closed", "merged": false,
+                "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"}, "changed_files": 1
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/compare/bbbbbbbb...aaaaaaaa"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let error = test_github(&server).fetch_pr_meta().await.unwrap_err();
+        assert!(error.to_string().contains("not open"));
+    }
+
+    #[tokio::test]
     async fn github_review_is_not_posted_after_the_pr_head_changes() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/repos/owner/repo/pulls/1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "title": "t", "body": "b",
+                "state": "open", "merged": false,
                 "head": {"sha": "bbbbbbbbbbbb"}, "base": {"sha": "base"}, "changed_files": 0
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let github = GitHub {
+            http: reqwest::Client::new(),
+            api_base: server.uri(),
+            details_url: None,
+            token: "test-token".into(),
+            owner: "owner".into(),
+            repo: "repo".into(),
+            pr: 1,
+        };
+        let finding = Finding {
+            path: "src/lib.rs".into(),
+            line: 1,
+            end_line: None,
+            severity: Severity::Warn,
+            kind: Kind::Risk,
+            confidence: 0.9,
+            generator_confidence: None,
+            scorer_confidence: None,
+            generator_kind: None,
+            scorer_kind: None,
+            scorer_reason: None,
+            title: "Finding".into(),
+            body: "A concrete issue.".into(),
+            id: None,
+        };
+
+        github
+            .post_review("Summary", &[finding], "aaaaaaaaaaaa")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn github_review_is_not_posted_after_the_pr_closes() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "title": "t", "body": "b", "state": "closed", "merged": false,
+                "head": {"sha": "aaaaaaaaaaaa"}, "base": {"sha": "base"}, "changed_files": 0
             })))
             .mount(&server)
             .await;
@@ -1590,6 +1674,7 @@ mod tests {
             .and(path("/repos/owner/repo/pulls/1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "title": "t", "body": "b",
+                "state": "open", "merged": false,
                 "head": {"sha": "aaaaaaaaaaaa"}, "base": {"sha": "base"}, "changed_files": 0
             })))
             .mount(&server)

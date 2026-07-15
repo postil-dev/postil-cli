@@ -39,6 +39,7 @@
 //   REVIEW_MODEL            model id for diff-file live mode (else --model, else default)
 //   BENCH_LIVE              set to 1 to select diff-file live mode
 //   BENCH_CONCURRENCY       live-mode case parallelism (else --concurrency, else default)
+//   POSTIL_BENCH_BOUNDED    set to 1 to qualify the bounded large-review path
 
 import { randomUUID } from "node:crypto";
 import { mkdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
@@ -131,7 +132,9 @@ async function main() {
       throw new Error("live benchmark needs an explicitly qualified model: set REVIEW_MODEL or --model");
     }
     const concurrency = liveConcurrency(args);
-    const report = await runLive(cases, { binary, model, concurrency });
+    const bounded =
+      args.includes("--bounded") || process.env.POSTIL_BENCH_BOUNDED === "1";
+    const report = await runLive(cases, { binary, model, concurrency, bounded });
     await writeReport(jsonOut, JSON.stringify(report, null, 2));
     console.log(json ? JSON.stringify(report, null, 2) : formatLiveReport(report));
     return;

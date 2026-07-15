@@ -219,6 +219,16 @@ export const envelopeV1 = z.object({
       }),
     )
     .optional(),
+  modelIncidents: z
+    .array(
+      z.object({
+        phase: z.enum(["planner", "review", "scorer", "respond"]),
+        category: z.enum(["providerError", "invalidOutput", "timeout", "deadline"]),
+        recovered: z.boolean(),
+        recovery: z.enum(["repair", "fallback"]).optional(),
+      }),
+    )
+    .default([]),
   reviewCoverage: z.object({
     mode: z.enum(["exhaustive", "bounded"]),
     selectedBatches: z.number().int().nonnegative(),
@@ -365,7 +375,7 @@ async function runCase(
   try {
     const out = await execFile(
       options.binary,
-      ["review", "--repo", c.repo, "--pr", String(c.pullNumber), "--output-json"],
+      ["review", "--publish", "--repo", c.repo, "--pr", String(c.pullNumber), "--output-json"],
       {
         cwd: runDir,
         env: isolatedEnv(
@@ -521,6 +531,8 @@ export async function startMockGithub(c: BenchmarkCase) {
           JSON.stringify({
             title: c.name,
             body: "",
+            state: "open",
+            merged: false,
             head: { sha: c.headSha },
             base: { sha: baseSha },
             changed_files: changedFiles.length,

@@ -258,13 +258,15 @@ from the same output limit.
 This live mode runs the real release binary against the same fixtures with a
 real model and **no mocked model server**, so it measures seeded-region finding
 hit rate rather than pipeline fidelity. Each case runs in local diff-file mode
-(`postil review --diff-file <fixture.diff> --no-post --output-json`), which does
+(`postil review --diff-file <fixture.diff> --output-json`), which does
 no forge I/O at all, so no GitHub server, mock or real, is involved and nothing
 is written to any repo.
 
 ```sh
 export MODEL_API_KEY=...         # required; never logged or printed
 REVIEW_MODEL=provider/qualified-model bun run bench:live
+# Exercise the production large-review selection and synthesis path.
+REVIEW_MODEL=provider/qualified-model bun run bench:live -- --bounded
 # --model <id> is the equivalent command-line override
 # --concurrency <n> or BENCH_CONCURRENCY sets case parallelism (default 6)
 ```
@@ -274,7 +276,16 @@ or `LLM_API_KEY` and never logs or prints the key value. Live mode is
 **not run in CI**: it spends real tokens and depends on an
 external provider. Every live run writes a timestamped JSON report under
 `.runs/` (gitignored); `--json-out <path>` writes an additional copy and
-`--json` prints the report as JSON.
+`--json` prints the report as JSON. `--bounded` (or
+`POSTIL_BENCH_BOUNDED=1`) qualifies the deterministic risk-selection and
+synthesis path used when a review exceeds five source batches. Every report
+records `reviewMode` as `exhaustive` or `bounded` so admission tooling can
+reject evidence from the wrong execution path. It also records the release
+binary's SHA-256 digest so the report cannot be paired with a different
+executable during admission. Fixture-corpus and evaluator-source digests bind
+the results to the benchmark inputs and scoring code. Live admission runs use
+OpenRouter's managed route and explicitly disable the second-pass scorer so
+the measured model is the only inference model involved.
 
 ### Concurrency and retries
 

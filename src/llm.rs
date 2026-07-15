@@ -1869,6 +1869,22 @@ impl LlmClient {
                     }
                 }
             }
+
+            // A model that repeats the contradiction is not a usable review.
+            // Return an ordinary model failure so the configured cascade gets
+            // a chance to recover before the caller emits an operational
+            // result. Returning Ok here stopped the cascade at its weakest
+            // model and turned harmless descriptive summaries into red gates.
+            if review.findings.is_empty() && !review.summary.is_empty() {
+                let mut error = ModelError::new(
+                    anyhow!("model output remained semantically contradictory after retry"),
+                    review.usage,
+                    review.usage_accounting_complete,
+                );
+                error.model_incidents = review.model_incidents;
+                error.model_usage = review.model_usage;
+                return Err(error);
+            }
         }
         Ok(review)
     }

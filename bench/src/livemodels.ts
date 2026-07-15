@@ -521,7 +521,7 @@ async function runLiveModelCase(
   try {
     const out = await execFile(
       options.binary,
-      ["review", "--repo", c.repo, "--pr", String(c.pullNumber), "--output-json"],
+      ["review", "--publish", "--repo", c.repo, "--pr", String(c.pullNumber), "--output-json"],
       {
         cwd: runDir,
         env: liveEnv(
@@ -668,7 +668,7 @@ async function assertRuntimeShapedQualificationPreflight(args: {
           env.POSTIL_QUALIFICATION_PLAN_ONLY = "1";
           const { stdout } = await execFile(
             args.binary,
-            ["review", "--repo", c.repo, "--pr", String(c.pullNumber), "--no-post", "--output-json"],
+            ["review", "--repo", c.repo, "--pr", String(c.pullNumber), "--output-json"],
             { cwd: runDir, env, timeout: 60_000, maxBuffer: 2 * 1024 * 1024 },
           );
           const parsed = envelopeV1.safeParse(safeJson(stdout));

@@ -466,7 +466,7 @@ export async function runScorerEvalCase(
   const proxy = await startScorerProxy(c, scenario, apiBase, process.env[keyName] as string);
   let child: BoundedChildResult;
   try {
-    child = await runBoundedChild(binary, ["review", "--repo", c.repo, "--pr", String(c.pullNumber), "--output-json"], {
+    child = await runBoundedChild(binary, ["review", "--publish", "--repo", c.repo, "--pr", String(c.pullNumber), "--output-json"], {
       cwd: runDir,
       env: isolatedEnv(
         homeDir,

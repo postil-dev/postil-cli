@@ -36,10 +36,10 @@ postil hook install                      # add a pre-push review
 
 ```sh
 export GITHUB_TOKEN=...
-postil review --repo owner/repository --pr 123
+postil review --repo owner/repository --pr 123 --publish
 ```
 
-The CLI publishes inline findings and separate `postil/review` and `postil/gate` checks. Mark only `postil/gate` as required in branch protection.
+`--publish` is required for any forge write. Without it, the CLI fetches the pull request and reports locally. Published runs create inline findings and separate `postil/review` and `postil/gate` checks. Mark only `postil/gate` as required in branch protection.
 
 For GitHub Actions, use [`postil-action`](https://github.com/postil-dev/postil-action). Hosted GitHub reviews are available at [postil.dev/install](https://postil.dev/install).
 

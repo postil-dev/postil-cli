@@ -645,12 +645,18 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
         s.push_str(clean_review_message(envelope));
         s.push('\n');
     } else {
-        let visible = envelope
+        let open_visible = envelope
             .findings
             .iter()
             .filter(|finding| !is_operational_path(&finding.path))
             .count();
-        let blocking = envelope
+        let new_visible = envelope
+            .findings
+            .iter()
+            .filter(|finding| !is_operational_path(&finding.path))
+            .filter(|finding| !crate::filter::is_carried(finding))
+            .count();
+        let open_blocking = envelope
             .findings
             .iter()
             .filter(|finding| !is_operational_path(&finding.path))
@@ -663,51 +669,50 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
                 )
             })
             .count();
-        if has_operational && visible > 0 {
+        if has_operational && new_visible > 0 {
             s.push_str(&summary_count(
                 rich,
                 "warn",
-                visible,
-                "finding; review incomplete",
-                "findings; review incomplete",
+                new_visible,
+                "new finding; review incomplete",
+                "new findings; review incomplete",
             ));
             s.push('\n');
-        } else if blocking > 0 {
+        } else if open_blocking > 0 {
+            if new_visible > 0 {
+                s.push_str(&summary_count(
+                    rich,
+                    "warn",
+                    new_visible,
+                    "new finding",
+                    "new findings",
+                ));
+                s.push_str(" · ");
+            }
             s.push_str(&summary_count(
                 rich,
                 "error",
-                blocking,
-                "blocking finding",
-                "blocking findings",
+                open_blocking,
+                "blocking finding open",
+                "blocking findings open",
             ));
-            let advisory = visible.saturating_sub(blocking);
-            if advisory > 0 {
-                s.push_str(" · ");
-                s.push_str(&summary_count(
-                    rich,
-                    "info",
-                    advisory,
-                    "advisory finding",
-                    "advisory findings",
-                ));
-            }
             s.push('\n');
-        } else if visible > 0 {
+        } else if new_visible > 0 {
             s.push_str(&summary_count(
                 rich,
                 "info",
-                visible,
-                "advisory finding",
-                "advisory findings",
+                new_visible,
+                "new advisory finding",
+                "new advisory findings",
             ));
             s.push('\n');
-        } else {
+        } else if open_visible > 0 {
             s.push_str(&summary_count(
                 rich,
                 "info",
-                1,
-                "finding in review details",
-                "findings in review details",
+                open_visible,
+                "advisory finding open",
+                "advisory findings open",
             ));
             s.push('\n');
         }
@@ -723,6 +728,7 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
         .iter()
         .filter(|finding| is_synthetic_path(&finding.path))
         .filter(|finding| !is_operational_path(&finding.path))
+        .filter(|finding| !crate::filter::is_carried(finding))
         .take(3)
         .collect();
     if !synthetic_findings.is_empty() {
@@ -745,6 +751,7 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
             .iter()
             .filter(|finding| is_synthetic_path(&finding.path))
             .filter(|finding| !is_operational_path(&finding.path))
+            .filter(|finding| !crate::filter::is_carried(finding))
             .count()
             .saturating_sub(synthetic_findings.len());
         if undisclosed > 0 {
@@ -865,7 +872,18 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
 }
 
 fn safe_evidence_text(value: &str) -> String {
-    safe_markdown_text(value).chars().take(240).collect()
+    let sanitized = sanitize_markdown_text(value);
+    if sanitized.chars().count() <= 240 {
+        return sanitized;
+    }
+    let prefix: String = sanitized.chars().take(239).collect();
+    let boundary = prefix
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| ch.is_whitespace())
+        .map(|(index, _)| index)
+        .unwrap_or(prefix.len());
+    format!("{}…", prefix[..boundary].trim_end())
 }
 
 fn plural<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
@@ -882,13 +900,14 @@ fn suppression_reason(reason: SuppressionReason) -> &'static str {
 }
 
 fn safe_markdown_text(value: &str) -> String {
+    sanitize_markdown_text(value).chars().take(160).collect()
+}
+
+fn sanitize_markdown_text(value: &str) -> String {
     value
         .replace(['\r', '\n'], " ")
         .replace('@', "＠")
         .replace(['[', ']', '*', '_', '<', '>'], "")
-        .chars()
-        .take(160)
-        .collect()
 }
 
 fn safe_code_text(value: &str) -> String {
@@ -1252,7 +1271,7 @@ mod tests {
             },
         );
 
-        assert!(summary.starts_with(&format!("{} **1 advisory finding**", icon_md("info"))));
+        assert!(summary.starts_with(&format!("{} **1 new advisory finding**", icon_md("info"))));
         assert!(!summary.contains("does not block"));
         assert!(!summary.contains("Unsanitized input reaches query"));
         assert!(!summary.contains("src/auth.rs:41"));
@@ -1283,13 +1302,18 @@ mod tests {
     fn summary_counts_cover_blocking_advisory_resolved_and_suppressed() {
         let blocking = envelope_with_findings(vec![finding()]);
         let blocking_summary = check_summary(&blocking, true, Default::default());
-        assert!(
-            blocking_summary.starts_with(&format!("{} **1 blocking finding**\n", icon_md("error")))
-        );
+        assert!(blocking_summary.starts_with(&format!(
+            "{} **1 new finding** · {} **1 blocking finding open**\n",
+            icon_md("warn"),
+            icon_md("error"),
+        )));
         let blocking_plural = envelope_with_findings(vec![finding(), finding()]);
         assert!(
-            check_summary(&blocking_plural, true, Default::default())
-                .starts_with(&format!("{} **2 blocking findings**\n", icon_md("error")))
+            check_summary(&blocking_plural, true, Default::default()).starts_with(&format!(
+                "{} **2 new findings** · {} **2 blocking findings open**\n",
+                icon_md("warn"),
+                icon_md("error"),
+            ))
         );
 
         let mut advisory_one = finding();
@@ -1299,9 +1323,26 @@ mod tests {
         let mut advisory = envelope_with_findings(vec![advisory_one, advisory_two]);
         advisory.gate.failing = false;
         let advisory_summary = check_summary(&advisory, true, Default::default());
-        assert!(
-            advisory_summary.starts_with(&format!("{} **2 advisory findings**\n", icon_md("info")))
+        assert!(advisory_summary.starts_with(&format!(
+            "{} **2 new advisory findings**\n",
+            icon_md("info")
+        )));
+
+        let mut carried = finding();
+        carried.body = format!("{}\n\n{}", crate::filter::CARRIED_MARKER, carried.body);
+        let mut operational = finding();
+        operational.path = crate::envelope::OPERATIONAL_PATH.into();
+        operational.title = "Model output could not be validated".into();
+        let carried_summary = check_summary(
+            &envelope_with_findings(vec![carried, operational]),
+            true,
+            Default::default(),
         );
+        assert!(carried_summary.starts_with(&format!(
+            "{} **1 blocking finding open**\n",
+            icon_md("error")
+        )));
+        assert!(!carried_summary.contains("new finding"));
 
         let mut resolved_singular = envelope_with_findings(vec![finding()]);
         resolved_singular.resolved = vec![finding()];
@@ -1323,6 +1364,16 @@ mod tests {
             icon_md("info")
         )));
         assert!(!detail_summary.contains("earlier finding"));
+    }
+
+    #[test]
+    fn evidence_excerpt_marks_truncation_at_a_word_boundary() {
+        let evidence = "A claim with enough detail to exceed the publication limit. ".repeat(8);
+        let excerpt = safe_evidence_text(&evidence);
+
+        assert!(excerpt.ends_with('…'));
+        assert!(excerpt.chars().count() <= 240);
+        assert!(!excerpt.ends_with(" …"));
     }
 
     #[test]

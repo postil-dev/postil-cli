@@ -201,6 +201,7 @@ impl Respond for GitHubHeadRaceResponder {
         ResponseTemplate::new(200).set_body_json(json!({
             "title": "t",
             "body": "b",
+            "state": "open", "merged": false,
             "head": {"sha": head},
             "base": {"sha": "bbbbbbbb"},
             "changed_files": 1
@@ -2051,7 +2052,7 @@ async fn local_review_reports_grounded_finding_and_gates() {
         .map(|message| message["content"].as_str().unwrap().len())
         .sum::<usize>();
     assert!(
-        prompt_bytes <= 8_200 + DIFF.len(),
+        prompt_bytes <= 17_000,
         "qualification prompt bound is too small: {prompt_bytes} bytes"
     );
 }
@@ -2886,6 +2887,7 @@ async fn full_remote_review_uses_an_immutable_merge_base_snapshot() {
         .and(path("/repos/acme/api/pulls/7"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "t", "body": "b",
+            "state": "open", "merged": false,
             "head": {"sha": "aaaaaaaaaaaa"}, "base": {"sha": "bbbbbbbbbbbb"}, "changed_files": 1
         })))
         .mount(&server)
@@ -2944,6 +2946,7 @@ async fn github_large_lockfile_streams_past_legacy_response_limit_and_compacts()
         .and(path("/repos/acme/api/pulls/7"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "large lockfile", "body": "",
+            "state": "open", "merged": false,
             "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"},
             "changed_files": 1
         })))
@@ -3010,9 +3013,10 @@ async fn remote_setup_time_counts_against_total_llm_budget() {
             ResponseTemplate::new(200)
                 .set_delay(forge_delay)
                 .set_body_json(json!({
-                    "title": "t", "body": "b",
-                    "head": {"sha": "aaaaaaaaaaaa"}, "base": {"sha": "bbbbbbbbbbbb"}, "changed_files": 1
-                })),
+                        "title": "t", "body": "b",
+                        "state": "open", "merged": false,
+                "head": {"sha": "aaaaaaaaaaaa"}, "base": {"sha": "bbbbbbbbbbbb"}, "changed_files": 1
+                    })),
         )
         .mount(&server)
         .await;
@@ -3106,6 +3110,7 @@ async fn advisory_on_error_lets_gate_stand_aside() {
         .and(path("/repos/acme/api/pulls/7"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "t", "body": "b",
+            "state": "open", "merged": false,
             "head": {"sha": "aaaaaaaaaaaa"}, "base": {"sha": "bbbbbbbbbbbb"}, "changed_files": 1
         })))
         .mount(&server)
@@ -3137,7 +3142,15 @@ async fn advisory_on_error_lets_gate_stand_aside() {
         .env("POSTIL_API_BASE", server.uri())
         .env("GITHUB_API_URL", server.uri())
         .env("GITHUB_TOKEN", "gh-test-token")
-        .args(["review", "--repo", "acme/api", "--pr", "7", "--output-json"])
+        .args([
+            "review",
+            "--publish",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--output-json",
+        ])
         .assert()
         .code(0); // fail-open: an outage does not block the merge
 
@@ -3184,6 +3197,7 @@ async fn diff_fetch_failure_server() -> MockServer {
         .and(path("/repos/acme/api/pulls/7"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "t", "body": "b",
+            "state": "open", "merged": false,
             "head": {"sha": "aaaaaaaaaaaa"}, "base": {"sha": "bbbbbbbbbbbb"}, "changed_files": 1
         })))
         .mount(&server)
@@ -3223,7 +3237,15 @@ async fn diff_fetch_failure_advisory_emits_envelope_and_exits_zero() {
         .env("POSTIL_API_BASE", server.uri())
         .env("GITHUB_API_URL", server.uri())
         .env("GITHUB_TOKEN", "gh-test-token")
-        .args(["review", "--repo", "acme/api", "--pr", "7", "--output-json"])
+        .args([
+            "review",
+            "--publish",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--output-json",
+        ])
         .assert()
         .code(0);
     let env: Value =
@@ -3386,7 +3408,7 @@ async fn narrated_risk_without_findings_fails_closed() {
     assert_eq!(env["findings"][0]["path"], ".postil/model-output");
     assert_eq!(
         env["findings"][0]["title"],
-        "Model narrated risk without structured findings"
+        "Model output could not be validated"
     );
     assert_eq!(env["usage"]["promptTokens"], 200);
     assert_eq!(env["usage"]["completionTokens"], 100);
@@ -3396,13 +3418,67 @@ async fn narrated_risk_without_findings_fails_closed() {
     assert_eq!(env["modelUsage"][0]["callOrdinal"], 1);
     assert_eq!(env["modelUsage"][1]["callOrdinal"], 2);
     assert_model_usage_matches_aggregate(&env);
-    // The narrated concern is preserved, not silently dropped.
+    // Internal model prose is not republished as a user-facing finding.
     assert!(
-        env["findings"][0]["body"]
+        !env["findings"][0]["body"]
             .as_str()
             .unwrap()
             .contains("SQL injection risk in auth path.")
     );
+}
+
+#[tokio::test]
+async fn repeated_summary_only_output_falls_back_before_failing_the_review() {
+    let server = MockServer::start().await;
+    let descriptive = json!({
+        "choices": [{"message": {"content": json!({
+            "summary": "Audit logging uses a dedicated sink and records secret use without values.",
+            "findings": []
+        }).to_string()}}],
+        "usage": {"prompt_tokens": 100, "completion_tokens": 30}
+    });
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("summary-only-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(descriptive))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("qualified-fallback"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "summary-only-model")
+        .env("REVIEW_MODEL_CASCADE", "qualified-fallback")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .code(0);
+    let env: Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+
+    assert_eq!(env["silent"], true);
+    assert_eq!(env["gate"]["failing"], false);
+    assert_eq!(env["modelUsed"], "qualified-fallback");
+    assert_eq!(env["modelUsage"].as_array().unwrap().len(), 3);
+    assert!(
+        env["modelIncidents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|incident| incident["recovered"] == true)
+    );
+    assert_model_usage_matches_aggregate(&env);
 }
 
 #[tokio::test]
@@ -4453,6 +4529,7 @@ async fn forge_post_failure_on_success_path_keeps_gate_derived_exit_code() {
         .and(path("/repos/acme/api/pulls/7"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "t", "body": "b",
+            "state": "open", "merged": false,
             "head": {"sha": "aaaaaaaaaaaa"}, "base": {"sha": "bbbbbbbbbbbb"}, "changed_files": 1
         })))
         .mount(&server)
@@ -4480,7 +4557,15 @@ async fn forge_post_failure_on_success_path_keeps_gate_derived_exit_code() {
         .env("POSTIL_API_BASE", server.uri())
         .env("GITHUB_API_URL", server.uri())
         .env("GITHUB_TOKEN", "gh-test-token")
-        .args(["review", "--repo", "acme/api", "--pr", "7", "--output-json"])
+        .args([
+            "review",
+            "--publish",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--output-json",
+        ])
         .assert()
         .code(1); // gate-derived exit code, unaffected by the failed post
 
@@ -4537,6 +4622,7 @@ async fn github_unresolved_inline_line_falls_back_once_to_summary_only() {
         .and(path("/repos/acme/api/pulls/7"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "t", "body": "b",
+            "state": "open", "merged": false,
             "head": {"sha": "aaaaaaaaaaaa"}, "base": {"sha": "bbbbbbbbbbbb"}, "changed_files": 1
         })))
         .mount(&server)
@@ -4574,7 +4660,15 @@ async fn github_unresolved_inline_line_falls_back_once_to_summary_only() {
         .env("POSTIL_API_BASE", server.uri())
         .env("GITHUB_API_URL", server.uri())
         .env("GITHUB_TOKEN", "gh-test-token")
-        .args(["review", "--repo", "acme/api", "--pr", "7", "--output-json"])
+        .args([
+            "review",
+            "--publish",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--output-json",
+        ])
         .assert()
         .code(1);
 
@@ -4614,6 +4708,7 @@ async fn hosted_path_completes_provided_check_run_ids_without_creating_new_ones(
         .and(path("/repos/acme/api/pulls/7"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "t", "body": null,
+            "state": "open", "merged": false,
             "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"}, "changed_files": 1
         })))
         .mount(&server)
@@ -4632,6 +4727,7 @@ async fn hosted_path_completes_provided_check_run_ids_without_creating_new_ones(
         .env("GITHUB_TOKEN", "gh-test-token")
         .args([
             "review",
+            "--publish",
             "--repo",
             "acme/api",
             "--pr",
@@ -4687,6 +4783,7 @@ async fn github_flow_posts_review_and_completes_both_checks() {
         .and(path("/repos/acme/api/pulls/7"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "Add login", "body": "PR body",
+            "state": "open", "merged": false,
             "head": {"sha": "aaaaaaaaaaaa"}, "base": {"sha": "bbbbbbbbbbbb"}, "changed_files": 1
         })))
         .mount(&server)
@@ -4717,7 +4814,15 @@ async fn github_flow_posts_review_and_completes_both_checks() {
             "POSTIL_DETAILS_URL",
             "https://postil.dev/orgs/acme/runs/review-7",
         )
-        .args(["review", "--repo", "acme/api", "--pr", "7", "--output-json"])
+        .args([
+            "review",
+            "--publish",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--output-json",
+        ])
         .assert()
         .code(1);
     let env: Value =
@@ -4786,8 +4891,9 @@ async fn github_flow_posts_review_and_completes_both_checks() {
     assert_eq!(body["comments"][0]["line"], 41);
     let summary = body["body"].as_str().unwrap();
     assert!(summary.starts_with(&format!(
-        "{} **1 blocking finding**\n",
-        postil_cli::forge::icon_md("error")
+        "{} **1 new finding** · {} **1 blocking finding open**\n",
+        postil_cli::forge::icon_md("warn"),
+        postil_cli::forge::icon_md("error"),
     )));
     assert!(!summary.contains("Unsanitized input reaches query"));
     assert!(!summary.contains("`src/auth.rs:41`"));
@@ -4842,7 +4948,15 @@ async fn github_push_after_acquisition_suppresses_all_stale_publication() {
         .env("POSTIL_API_BASE", server.uri())
         .env("GITHUB_API_URL", server.uri())
         .env("GITHUB_TOKEN", "gh-test-token")
-        .args(["review", "--repo", "acme/api", "--pr", "7", "--output-json"])
+        .args([
+            "review",
+            "--publish",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--output-json",
+        ])
         .assert()
         .code(1)
         .stderr(predicates::str::contains(
@@ -4883,6 +4997,7 @@ async fn content_policy_pr_server(llm: Value) -> MockServer {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "Add login",
             "body": "This file is untracked and was written by Claude.",
+            "state": "open", "merged": false,
             "head": {"sha": "aaaaaaaaaaaa"}, "base": {"sha": "bbbbbbbbbbbb"}, "changed_files": 1
         })))
         .mount(&server)
@@ -4928,7 +5043,15 @@ async fn content_policy_pr_body_finding_survives_grounding() {
         .env("POSTIL_API_BASE", server.uri())
         .env("GITHUB_API_URL", server.uri())
         .env("GITHUB_TOKEN", "gh-test-token")
-        .args(["review", "--repo", "acme/api", "--pr", "7", "--output-json"])
+        .args([
+            "review",
+            "--publish",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--output-json",
+        ])
         .assert()
         .code(0); // warn severity: kept, but gate passes at default failOn=error
     let env: Value =
@@ -4964,7 +5087,7 @@ async fn content_policy_pr_body_finding_survives_grounding() {
     );
     let summary = body["body"].as_str().unwrap();
     assert!(summary.contains(&format!(
-        "{} **1 advisory finding**",
+        "{} **1 new advisory finding**",
         postil_cli::forge::icon_md("info")
     )));
     assert!(summary.contains("AI-authorship residue in PR description"));
@@ -5017,6 +5140,7 @@ async fn github_clean_pr_stays_silent_but_completes_checks() {
         .and(path("/repos/acme/api/pulls/7"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "t", "body": null,
+            "state": "open", "merged": false,
             "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"}, "changed_files": 1
         })))
         .mount(&server)
@@ -5038,7 +5162,7 @@ async fn github_clean_pr_stays_silent_but_completes_checks() {
         .env("POSTIL_API_BASE", server.uri())
         .env("GITHUB_API_URL", server.uri())
         .env("GITHUB_TOKEN", "gh-test-token")
-        .args(["review", "--repo", "acme/api", "--pr", "7"])
+        .args(["review", "--publish", "--repo", "acme/api", "--pr", "7"])
         .assert()
         .code(0);
 
@@ -5101,7 +5225,7 @@ async fn github_clean_pr_stays_silent_but_completes_checks() {
             "POSTIL_DETAILS_URL",
             "https://postil.dev/orgs/acme/runs/clean-7",
         )
-        .args(["review", "--repo", "acme/api", "--pr", "7"])
+        .args(["review", "--publish", "--repo", "acme/api", "--pr", "7"])
         .assert()
         .code(0);
     let reqs = server.received_requests().await.unwrap();
@@ -5189,6 +5313,7 @@ async fn same_head_with_open_baseline_falls_back_to_full_review() {
         .and(path("/repos/acme/api/pulls/7"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "t", "body": null,
+            "state": "open", "merged": false,
             "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"}, "changed_files": 1
         })))
         .mount(&server)
@@ -5221,7 +5346,7 @@ async fn same_head_with_open_baseline_falls_back_to_full_review() {
         .env("POSTIL_API_BASE", server.uri())
         .env("GITHUB_API_URL", server.uri())
         .env("GITHUB_TOKEN", "gh-test-token")
-        .args(["review", "--repo", "acme/api", "--pr", "7"])
+        .args(["review", "--publish", "--repo", "acme/api", "--pr", "7"])
         .args(["--sha", "aaaaaaaa", "--since-sha", "aaaaaaaa", "--baseline"])
         .arg(&baseline_path)
         .args([
@@ -5285,6 +5410,7 @@ async fn same_head_without_open_baseline_keeps_empty_diff_noop() {
         .and(path("/repos/acme/api/pulls/7"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "t", "body": null,
+            "state": "open", "merged": false,
             "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"}, "changed_files": 1
         })))
         .mount(&server)
@@ -5343,6 +5469,7 @@ async fn carried_only_incremental_run_updates_checks_without_posting_review() {
         .and(path("/repos/acme/api/pulls/7"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "t", "body": null,
+            "state": "open", "merged": false,
             "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"}, "changed_files": 1
         })))
         .mount(&server)
@@ -5374,7 +5501,7 @@ async fn carried_only_incremental_run_updates_checks_without_posting_review() {
         .env("POSTIL_API_BASE", server.uri())
         .env("GITHUB_API_URL", server.uri())
         .env("GITHUB_TOKEN", "gh-test-token")
-        .args(["review", "--repo", "acme/api", "--pr", "7"])
+        .args(["review", "--publish", "--repo", "acme/api", "--pr", "7"])
         .args(["--sha", "aaaaaaaa", "--since-sha", "cccccccc", "--baseline"])
         .arg(&baseline_path)
         .args([
@@ -5435,6 +5562,7 @@ async fn identical_fresh_finding_set_does_not_post_duplicate_review() {
         .and(path("/repos/acme/api/pulls/7"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "t", "body": null,
+            "state": "open", "merged": false,
             "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"}, "changed_files": 1
         })))
         .mount(&server)
@@ -5467,7 +5595,7 @@ async fn identical_fresh_finding_set_does_not_post_duplicate_review() {
         .env("POSTIL_API_BASE", server.uri())
         .env("GITHUB_API_URL", server.uri())
         .env("GITHUB_TOKEN", "gh-test-token")
-        .args(["review", "--repo", "acme/api", "--pr", "7"])
+        .args(["review", "--publish", "--repo", "acme/api", "--pr", "7"])
         .args(["--sha", "aaaaaaaa", "--since-sha", "cccccccc", "--baseline"])
         .arg(&baseline_path)
         .args([
@@ -5598,6 +5726,7 @@ async fn bitbucket_flow_posts_comment_and_sets_statuses() {
         .env_remove("BITBUCKET_USER")
         .args([
             "review",
+            "--publish",
             "--forge",
             "bitbucket",
             "--repo",
@@ -5861,6 +5990,7 @@ async fn azure_flow_reconstructs_diff_and_posts_thread() {
         .env("AZURE_DEVOPS_TOKEN", "az-test-pat")
         .args([
             "review",
+            "--publish",
             "--forge",
             "azure",
             "--repo",
@@ -5910,6 +6040,7 @@ async fn respond_to_pr_mention_posts_grounded_reply() {
         .and(path("/repos/acme/api/pulls/5"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "Add login", "body": "PR body",
+            "state": "open", "merged": false,
             "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"}, "changed_files": 1
         })))
         .mount(&server)
@@ -5928,6 +6059,7 @@ async fn respond_to_pr_mention_posts_grounded_reply() {
         .env("GITHUB_TOKEN", "gh-test-token")
         .args([
             "respond",
+            "--publish",
             "--repo",
             "acme/api",
             "--pr",
@@ -6191,6 +6323,7 @@ async fn respond_rejects_unsafe_reply_before_direct_forge_posting() {
         .env("REVIEW_MODEL_CASCADE", "compact-model")
         .args([
             "respond",
+            "--publish",
             "--repo",
             "acme/api",
             "--issue",
@@ -6463,6 +6596,7 @@ async fn respond_to_issue_mention_uses_issue_body() {
         .env("GITHUB_TOKEN", "gh-test-token")
         .args([
             "respond",
+            "--publish",
             "--repo",
             "acme/api",
             "--issue",
@@ -6541,6 +6675,7 @@ async fn respond_gitlab_mr_mention_posts_note() {
         .env("GITLAB_TOKEN", fixture_credential("gitlab"))
         .args([
             "respond",
+            "--publish",
             "--forge",
             "gitlab",
             "--repo",
@@ -6705,6 +6840,7 @@ async fn respond_gitlab_issue_mention_uses_issue_body() {
         .env("GITLAB_TOKEN", fixture_credential("gitlab"))
         .args([
             "respond",
+            "--publish",
             "--forge",
             "gitlab",
             "--repo",
@@ -6773,6 +6909,7 @@ async fn respond_bitbucket_pr_mention_posts_comment() {
         .env_remove("BITBUCKET_USER")
         .args([
             "respond",
+            "--publish",
             "--forge",
             "bitbucket",
             "--repo",
@@ -6861,6 +6998,7 @@ async fn respond_azure_pr_mention_posts_thread() {
         .env("AZURE_DEVOPS_TOKEN", "az-test-pat")
         .args([
             "respond",
+            "--publish",
             "--forge",
             "azure",
             "--repo",

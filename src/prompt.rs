@@ -25,7 +25,10 @@ pub fn review_contract(cfg: &Config) -> String {
          - a bug, logic error, or regression introduced by this diff\n\
          - a security vulnerability or unsafe handling of untrusted input\n\
          - data loss, corruption, or breaking API/contract changes\n\
+         - public schema, status, configuration, or default changes whose callers or consumers no longer match; in particular, treat a removed or renamed response field as breaking unless the diff shows versioning or every consumer moving with it\n\
+         - production safety controls disabled by configuration (authentication, validation, timeouts, or audit logging)\n\
          - concurrency hazards (races, deadlocks, unguarded shared state)\n\
+         - user-facing accessibility regressions that remove an accessible name, keyboard access, assistive-technology state, or readable contrast\n\
          - a consequential decision that an accountable human must confirm\n\
          \n\
          NEVER report: style, formatting, naming, missing docs/comments/tests, alternative \
@@ -405,6 +408,10 @@ mod tests {
         cfg.tone = "representative tone".into();
 
         let p = system_prompt(&cfg);
+        assert!(p.contains("public schema, status, configuration, or default changes"));
+        assert!(p.contains("removed or renamed response field as breaking"));
+        assert!(p.contains("production safety controls disabled by configuration"));
+        assert!(p.contains("user-facing accessibility regressions"));
         let focus = p.find("representative focus").unwrap();
         let guardrail = p.find("Representative guardrail.").unwrap();
         let policy = p.find("1. Representative content rule.").unwrap();

@@ -44,6 +44,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
             config,
             model,
             bounded,
+            publish,
             no_post,
         } => {
             let local_mode = staged || base.is_some() || diff_file.is_some();
@@ -77,7 +78,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
                 config,
                 model,
                 bounded,
-                no_post,
+                no_post: no_post || !publish,
             })
             .await
         }
@@ -89,6 +90,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
             comment,
             config,
             model,
+            publish,
             no_post,
         } => {
             let kind = match forge {
@@ -106,7 +108,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
                 comment,
                 config,
                 model,
-                no_post,
+                no_post: no_post || !publish,
             })
             .await
         }

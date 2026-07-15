@@ -189,11 +189,11 @@ describe("parseModels", () => {
     expect(parseModels(" a/model, ,b/model,a/model ", [])).toEqual(["a/model", "b/model"]);
   });
 
-  test("keeps the embedded scorer roster empty until qualification admits a model", async () => {
+  test("exposes the embedded scorer qualification candidate", async () => {
     const defaults = await loadEmbeddedScorerDefaults();
     expect(defaults.enabled).toBe(false);
-    expect(defaults.qualification_candidates).toEqual([]);
-    expect(parseModels(undefined, defaults.qualification_candidates)).toEqual([]);
+    expect(defaults.qualification_candidates).toEqual(["z-ai/glm-5.2"]);
+    expect(parseModels(undefined, defaults.qualification_candidates)).toEqual(["z-ai/glm-5.2"]);
   });
 });
 

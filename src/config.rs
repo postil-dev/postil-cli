@@ -704,10 +704,8 @@ fn parse_model_defaults(raw: &str) -> Result<ModelDefaults> {
         validate_model_id("scorer.defaultModel", &file.scorer.default_model)?;
     } else {
         anyhow::ensure!(
-            !file.scorer.enabled
-                && file.scorer.fallback.is_empty()
-                && file.scorer.qualification_candidates.is_empty(),
-            "scorer configuration must be empty when scorer.defaultModel is empty"
+            !file.scorer.enabled && file.scorer.fallback.is_empty(),
+            "runtime scorer configuration must be empty when scorer.defaultModel is empty"
         );
     }
     if !file.scorer.fallback.is_empty() {
@@ -1909,7 +1907,7 @@ qualification_candidates = ["example/scorer"]
                  api_base = \"https://openrouter.ai/api/v1\"\n\
                  api_format = \"openai-compatible\"\n\
                  scorer = { enabled = false, default_model = \"\", fallback = \"example/scorer-fallback\", qualification_candidates = [\"example/scorer\"] }\n",
-                "scorer configuration must be empty when scorer.defaultModel is empty",
+                "runtime scorer configuration must be empty when scorer.defaultModel is empty",
             ),
         ];
         for (raw, expected) in cases {
@@ -2140,7 +2138,7 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
 
         assert_eq!(config.model_chain(), expected.model_chain());
         assert_eq!(config.scorer, expected.scorer);
-        assert!(!config.scorer_enabled());
+        assert_eq!(config.scorer_chain(), expected.scorer_chain());
         assert_eq!(config.api_base, DEFAULT_API_BASE);
         assert_eq!(config.api_format, ApiFormat::OpenaiCompatible);
         assert_eq!(config.consensus, 1);
@@ -2148,7 +2146,14 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
 
     #[test]
     fn empty_and_hosted_model_admission_fail_closed() {
-        let empty = Config::default();
+        let empty = Config {
+            model: String::new(),
+            cascade: Vec::new(),
+            scorer: String::new(),
+            scorer_fallback: String::new(),
+            scorer_enabled: false,
+            ..Config::default()
+        };
         assert!(empty.require_model_for(false).is_err());
 
         let explicit = Config {
@@ -2675,7 +2680,10 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
         assert!(defaults.cascade.is_empty());
         assert!(defaults.scorer_model.is_empty());
         assert!(defaults.scorer_fallback.is_empty());
-        assert!(defaults.scorer_qualification_candidates.is_empty());
+        assert_eq!(
+            defaults.scorer_qualification_candidates,
+            vec!["z-ai/glm-5.2".to_string()]
+        );
     }
 
     #[test]
