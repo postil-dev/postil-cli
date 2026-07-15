@@ -572,7 +572,7 @@ impl Forge for Bitbucket {
         _advisory_id: &str,
         _gate_id: &str,
         advisory: CheckState,
-        gate: CheckState,
+        gate: Option<CheckState>,
         envelope: &Envelope,
         snapshot: &PrMeta,
     ) -> Result<()> {
@@ -605,8 +605,10 @@ impl Forge for Bitbucket {
         } else {
             format!("passing (failOn: {})", envelope.gate.fail_on)
         };
-        self.set_status(&head, "postil/gate", map(gate), &gate_desc)
-            .await?;
+        if let Some(gate) = gate {
+            self.set_status(&head, "postil/gate", map(gate), &gate_desc)
+                .await?;
+        }
         Ok(())
     }
 

@@ -5220,7 +5220,7 @@ async fn github_flow_posts_review_and_completes_both_checks() {
         .args([
             "review",
             "--publish",
-            "--neutral-gate-check",
+            "--defer-gate-check",
             "--repo",
             "acme/api",
             "--pr",
@@ -5245,7 +5245,7 @@ async fn github_flow_posts_review_and_completes_both_checks() {
                 .to_string()
         })
         .collect();
-    assert_eq!(conclusions, vec!["success", "neutral"]);
+    assert_eq!(conclusions, vec!["success"]);
 }
 
 #[tokio::test]

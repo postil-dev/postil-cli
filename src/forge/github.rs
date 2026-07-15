@@ -1135,7 +1135,7 @@ impl Forge for GitHub {
         advisory_id: &str,
         gate_id: &str,
         advisory: CheckState,
-        gate: CheckState,
+        gate: Option<CheckState>,
         envelope: &Envelope,
         snapshot: &PrMeta,
     ) -> Result<()> {
@@ -1177,10 +1177,11 @@ impl Forge for GitHub {
                 })
             })
             .collect();
-        for (id, state, name, with_annotations) in [
-            (advisory_id, advisory, "postil/review", true),
-            (gate_id, gate, "postil/gate", false),
-        ] {
+        let mut checks = vec![(advisory_id, advisory, "postil/review", true)];
+        if let Some(gate) = gate {
+            checks.push((gate_id, gate, "postil/gate", false));
+        }
+        for (id, state, name, with_annotations) in checks {
             let gate_note = if name == "postil/gate" {
                 gate_summary(envelope)
             } else {
@@ -1764,7 +1765,7 @@ mod tests {
                 "11",
                 "12",
                 CheckState::Success,
-                CheckState::Success,
+                Some(CheckState::Success),
                 &delivery_envelope("aaaaaaaaaaaa", "cccccccccccc"),
                 &snapshot,
             )
@@ -1837,7 +1838,7 @@ mod tests {
                 "11",
                 "12",
                 CheckState::Success,
-                CheckState::Success,
+                Some(CheckState::Success),
                 &envelope,
                 &snapshot,
             )
@@ -2035,7 +2036,7 @@ mod tests {
                 "11",
                 "12",
                 CheckState::Failure,
-                CheckState::Failure,
+                Some(CheckState::Failure),
                 &envelope,
                 &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
             )

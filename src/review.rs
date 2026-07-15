@@ -129,7 +129,7 @@ pub struct ReviewArgs {
     pub model: Option<String>,
     pub bounded: bool,
     pub no_post: bool,
-    pub neutral_gate_check: bool,
+    pub defer_gate_check: bool,
 }
 
 impl ReviewArgs {
@@ -323,9 +323,7 @@ async fn run_remote<F: Forge>(
             if let Some((a, g)) = &checks
                 && snapshot_is_current(forge, &meta, review_started).await
             {
-                let gate_state = if args.neutral_gate_check {
-                    CheckState::Neutral
-                } else if envelope.gate.failing {
+                let gate_state = if envelope.gate.failing {
                     CheckState::Failure
                 } else {
                     CheckState::Success
@@ -350,7 +348,14 @@ async fn run_remote<F: Forge>(
                 let completed = run_with_hosted_budget(
                     Some(review_started),
                     CHECK_COMPLETION_TIMEOUT_SECS,
-                    forge.complete_checks(a, g, advisory_state, gate_state, &envelope, &meta),
+                    forge.complete_checks(
+                        a,
+                        g,
+                        advisory_state,
+                        (!args.defer_gate_check).then_some(gate_state),
+                        &envelope,
+                        &meta,
+                    ),
                     "completing check runs",
                 )
                 .await;
@@ -390,9 +395,7 @@ async fn run_remote<F: Forge>(
             if let Some((a, g)) = &checks
                 && snapshot_is_current(forge, &meta, review_started).await
             {
-                let gate_state = if args.neutral_gate_check {
-                    CheckState::Neutral
-                } else if envelope.gate.failing {
+                let gate_state = if envelope.gate.failing {
                     CheckState::Failure
                 } else {
                     CheckState::Success
@@ -400,7 +403,14 @@ async fn run_remote<F: Forge>(
                 let _ = run_with_hosted_budget(
                     Some(review_started),
                     CHECK_COMPLETION_TIMEOUT_SECS,
-                    forge.complete_checks(a, g, CheckState::Neutral, gate_state, &envelope, &meta),
+                    forge.complete_checks(
+                        a,
+                        g,
+                        CheckState::Neutral,
+                        (!args.defer_gate_check).then_some(gate_state),
+                        &envelope,
+                        &meta,
+                    ),
                     "completing check runs",
                 )
                 .await;

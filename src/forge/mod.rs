@@ -394,14 +394,14 @@ pub trait Forge {
     ) -> Result<()>;
     /// Ensure both check runs exist (in_progress); returns (advisory_id, gate_id).
     async fn start_checks(&self, head_sha: &str) -> Result<(String, String)>;
-    /// Complete both checks with the envelope's outcome.
-    /// Complete both checks only while the acquired snapshot remains current.
+    /// Complete the advisory check and, when supplied, the gate check only
+    /// while the acquired snapshot remains current.
     async fn complete_checks(
         &self,
         advisory_id: &str,
         gate_id: &str,
         advisory: CheckState,
-        gate: CheckState,
+        gate: Option<CheckState>,
         envelope: &Envelope,
         snapshot: &PrMeta,
     ) -> Result<()>;
