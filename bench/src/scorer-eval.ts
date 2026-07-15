@@ -775,13 +775,24 @@ export async function startScorerProxy(
       }
       generatorRequests.push(bodyText);
       const user = body.messages?.find((message) => message.role === "user")?.content ?? "";
-      generatorRequestKinds.push(
-        user.includes("This bounded synthesis window joins semantic evidence") ? "synthesis" : "source",
+      const isSynthesis = user.includes(
+        "This bounded synthesis window joins semantic evidence",
       );
+      generatorRequestKinds.push(
+        isSynthesis ? "synthesis" : "source",
+      );
+      const targetPath = c.primaryChange?.path;
+      const containsTarget =
+        user.length === 0 ||
+        targetPath === undefined ||
+        (!isSynthesis && user.includes(`### ${targetPath}\n`));
+      const output = containsTarget
+        ? generatorOutput(c, scenario)
+        : { summary: "", findings: [] };
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
         JSON.stringify({
-          choices: [{ message: { content: JSON.stringify(generatorOutput(c, scenario)) } }],
+          choices: [{ message: { content: JSON.stringify(output) } }],
           usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
         }),
       );
