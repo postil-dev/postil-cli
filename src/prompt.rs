@@ -207,6 +207,19 @@ pub fn scorer_user_prompt(findings: &[ScorerPromptFinding]) -> String {
     )
 }
 
+pub(crate) fn sanitize_scorer_input(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() && !matches!(character, '\n' | '\r' | '\t') {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
 /// System prompt for the interactive bot answering a maintainer's mention.
 /// The small JSON envelope keeps generated prose behind a deterministic
 /// publication check before it can reach a forge.
@@ -373,6 +386,11 @@ mod tests {
             "at most {SCORER_REASON_PROMPT_MAX_BYTES} UTF-8 bytes"
         )));
         assert!(!prompt.contains(&format!("at most {SCORER_REASON_MAX_BYTES} UTF-8 bytes")));
+    }
+
+    #[test]
+    fn scorer_input_removes_high_expansion_control_characters() {
+        assert_eq!(sanitize_scorer_input("a\0b\u{001f}c\n\t"), "a b c\n\t");
     }
 
     #[test]

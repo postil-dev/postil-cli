@@ -30,7 +30,7 @@ const MAX_REVIEW_MANIFEST_BYTES: usize = 24_000;
 pub(crate) const MAX_HOSTED_SELECTED_BATCHES: usize = 5;
 const MAX_HOSTED_PLANNER_CANDIDATES: usize = 96;
 pub(crate) const MAX_MODELS_PER_REQUEST: usize = 3;
-const MAX_SCORER_INPUT_TOKENS: usize = 64_000;
+pub(crate) const MAX_SCORER_PROMPT_BYTES: usize = 56_000;
 const MAX_STREAMED_CANDIDATE_MULTIPLIER: usize = 8;
 const MAX_STREAMED_SUMMARY_BYTES: usize = 64_000;
 const HOSTED_WORKER_WATCHDOG_SECS: u64 = 600;
@@ -567,26 +567,28 @@ fn scorer_inputs(
         .enumerate()
         .map(|(index, finding)| prompt::ScorerPromptFinding {
             index,
-            path: finding.path.clone(),
+            path: prompt::sanitize_scorer_input(&finding.path),
             line: finding.line,
             severity: finding.severity.as_str().to_string(),
-            title: finding.title.clone(),
-            body: finding.body.clone(),
-            diff_hunk: diff::render_hunk_context(parsed, &finding.path, finding.line, 20)
-                .or_else(|| {
-                    review_batches.iter().find_map(|batch| {
-                        diff::render_review_batch_context(
-                            batch,
-                            &finding.path,
-                            finding.line,
-                            8,
-                            24_000,
-                        )
+            title: prompt::sanitize_scorer_input(&finding.title),
+            body: prompt::sanitize_scorer_input(&finding.body),
+            diff_hunk: prompt::sanitize_scorer_input(
+                &diff::render_hunk_context(parsed, &finding.path, finding.line, 20)
+                    .or_else(|| {
+                        review_batches.iter().find_map(|batch| {
+                            diff::render_review_batch_context(
+                                batch,
+                                &finding.path,
+                                finding.line,
+                                8,
+                                24_000,
+                            )
+                        })
                     })
-                })
-                .unwrap_or_else(|| {
-                    "No diff evidence is available for this cited location.".to_string()
-                }),
+                    .unwrap_or_else(|| {
+                        "No diff evidence is available for this cited location.".to_string()
+                    }),
+            ),
         })
         .collect()
 }
@@ -1174,7 +1176,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                             let scorer_system = prompt::scorer_system_prompt(cfg);
                             let scorer_user = prompt::scorer_user_prompt(&inputs);
                             if scorer_system.len().saturating_add(scorer_user.len())
-                                > MAX_SCORER_INPUT_TOKENS
+                                > MAX_SCORER_PROMPT_BYTES
                             {
                                 scorer_error = Some(
                                     "scorer skipped because its bounded input budget was exceeded"

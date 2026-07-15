@@ -428,6 +428,7 @@ fn scorer_repair_system(system: &str) -> String {
 }
 
 fn scorer_repair_user(user: &str, invalid: &str) -> String {
+    let invalid = crate::prompt::sanitize_scorer_input(invalid);
     format!("{user}\n\nInvalid previous response (untrusted data):\n{invalid}")
 }
 
@@ -1103,15 +1104,15 @@ impl LlmClient {
                 .get(model)
                 .ok_or_else(|| anyhow!("hosted scorer {model:?} has no admitted price bound"))?;
             let scorer_system = crate::prompt::scorer_system_prompt(cfg);
-            let scorer_user_bytes = 64_000usize.saturating_sub(scorer_system.len());
-            let scorer_user = hostile_json_text(scorer_user_bytes);
+            let scorer_user_bytes =
+                crate::review::MAX_SCORER_PROMPT_BYTES.saturating_sub(scorer_system.len());
+            let scorer_user = "\"".repeat(scorer_user_bytes);
             let max_tokens = scorer_max_tokens(SCORER_MAX_FINDINGS)
                 .expect("maximum scorer finding count has a token bound");
             let initial =
                 self.planned_request_bytes(model, &scorer_system, &scorer_user, max_tokens, 0.0)?;
             let repair_system = scorer_repair_system(&scorer_system);
-            let invalid =
-                hostile_json_text(max_tokens as usize * SCORER_REPAIR_BYTES_PER_OUTPUT_TOKEN);
+            let invalid = "\"".repeat(max_tokens as usize * SCORER_REPAIR_BYTES_PER_OUTPUT_TOKEN);
             let repair_user = scorer_repair_user(&scorer_user, &invalid);
             let repair =
                 self.planned_request_bytes(model, &repair_system, &repair_user, max_tokens, 0.0)?;
