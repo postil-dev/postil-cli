@@ -1305,13 +1305,16 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
     // induce it via prompt injection.
     let advisory_on_error = cfg.gate_on_error == OnError::Advisory;
     let gate_fail_on = cfg.gate_fail_on.as_str();
+    let gate_disabled = gate_fail_on.eq_ignore_ascii_case("never");
     let gate_block_on_kinds: Vec<String> = cfg
         .block_on_kinds
         .iter()
         .map(|kind| kind.as_str().to_string())
         .collect();
     let gate_failing = findings.iter().any(|f| {
-        if f.path == crate::envelope::OPERATIONAL_PATH {
+        if gate_disabled {
+            false
+        } else if f.path == crate::envelope::OPERATIONAL_PATH {
             true
         } else if f.path == crate::envelope::PROVIDER_PATH {
             !advisory_on_error

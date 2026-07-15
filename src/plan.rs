@@ -85,7 +85,9 @@ fn replay(path: &Path, env: &Envelope, cfg: &Config) -> Result<PlanRow> {
         .map(|kind| kind.as_str().to_string())
         .collect();
     let gate_after = kept.iter().any(|finding| {
-        if finding.path == crate::envelope::OPERATIONAL_PATH {
+        if cfg.gate_fail_on.as_str().eq_ignore_ascii_case("never") {
+            false
+        } else if finding.path == crate::envelope::OPERATIONAL_PATH {
             true
         } else if finding.path == crate::envelope::PROVIDER_PATH {
             cfg.gate_on_error == crate::config::OnError::Block
@@ -265,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_applies_candidate_error_policy() {
+    fn replay_never_blocks_provider_errors() {
         let dir = tempfile::tempdir().unwrap();
         let mut provider = f(crate::envelope::PROVIDER_PATH, Severity::Error, 1.0);
         provider.kind = Kind::Uncertainty;
@@ -282,11 +284,11 @@ mod tests {
         assert!(!run(dir.path(), &cfg).unwrap()[0].gate_after);
 
         cfg.gate_on_error = crate::config::OnError::Block;
-        assert!(run(dir.path(), &cfg).unwrap()[0].gate_after);
+        assert!(!run(dir.path(), &cfg).unwrap()[0].gate_after);
     }
 
     #[test]
-    fn replay_always_blocks_unusable_model_output() {
+    fn replay_never_blocks_unusable_model_output() {
         let dir = tempfile::tempdir().unwrap();
         let env = envelope_with(vec![crate::envelope::fail_closed_finding("invalid")], true);
         std::fs::write(
@@ -298,7 +300,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.gate_fail_on = crate::config::GateLevel::Never;
         cfg.gate_on_error = crate::config::OnError::Advisory;
-        assert!(run(dir.path(), &cfg).unwrap()[0].gate_after);
+        assert!(!run(dir.path(), &cfg).unwrap()[0].gate_after);
     }
 
     #[test]

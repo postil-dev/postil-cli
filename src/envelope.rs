@@ -752,13 +752,16 @@ pub fn finding_blocks_gate(
     block_on_kinds: &[String],
     provider_error_is_advisory: bool,
 ) -> bool {
+    if fail_on.eq_ignore_ascii_case("never") {
+        return false;
+    }
     if finding.kind == Kind::HumanEscalation
         && finding.confidence < HUMAN_ESCALATION_GATE_MIN_CONFIDENCE
     {
         return false;
     }
 
-    let severity_blocks = if provider_error_is_advisory || fail_on.eq_ignore_ascii_case("never") {
+    let severity_blocks = if provider_error_is_advisory {
         false
     } else {
         Severity::parse(fail_on).is_some_and(|threshold| finding.severity >= threshold)
@@ -1051,6 +1054,12 @@ mod tests {
         assert!(finding_blocks_gate(
             &escalation,
             "error",
+            &block_on_kinds,
+            false
+        ));
+        assert!(!finding_blocks_gate(
+            &escalation,
+            "never",
             &block_on_kinds,
             false
         ));
