@@ -32,7 +32,7 @@ pub struct Azure {
     pr: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct MergeCommit {
     #[serde(rename = "commitId")]
     commit_id: String,
@@ -49,6 +49,19 @@ struct PrResponse {
     // Absent on PRs with merge conflicts; surfaced as an actionable error.
     last_merge_source_commit: Option<MergeCommit>,
     last_merge_target_commit: Option<MergeCommit>,
+}
+
+fn pr_matches_snapshot(
+    pr: &PrResponse,
+    source: &MergeCommit,
+    target: &MergeCommit,
+    expected: &PrMeta,
+) -> bool {
+    pr.status == "active"
+        && pr.title == expected.title
+        && pr.description == expected.body
+        && source.commit_id == expected.head_sha
+        && Some(target.commit_id.as_str()) == expected.target_sha.as_deref()
 }
 
 #[derive(Deserialize)]
@@ -550,18 +563,13 @@ impl Forge for Azure {
     async fn snapshot_is_current(&self, expected: &PrMeta) -> Result<bool> {
         let current = self.pr().await?;
         let (source, target) = match merge_commits(
-            current.last_merge_source_commit,
-            current.last_merge_target_commit,
+            current.last_merge_source_commit.clone(),
+            current.last_merge_target_commit.clone(),
         ) {
             Ok(commits) => commits,
             Err(_) => return Ok(false),
         };
-        if current.status != "active"
-            || current.title != expected.title
-            || current.description != expected.body
-            || source.commit_id != expected.head_sha
-            || Some(target.commit_id.as_str()) != expected.target_sha.as_deref()
-        {
+        if !pr_matches_snapshot(&current, &source, &target, expected) {
             return Ok(false);
         }
         Ok(self
@@ -824,6 +832,81 @@ fn urlencode(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::diff;
+
+    fn snapshot() -> PrMeta {
+        PrMeta {
+            title: "title".into(),
+            body: "body".into(),
+            head_sha: "head".into(),
+            base_sha: "merge-base".into(),
+            target_sha: Some("target".into()),
+            changed_files: None,
+        }
+    }
+
+    fn pull_request(status: &str) -> PrResponse {
+        PrResponse {
+            title: "title".into(),
+            description: "body".into(),
+            status: status.into(),
+            last_merge_source_commit: None,
+            last_merge_target_commit: None,
+        }
+    }
+
+    #[test]
+    fn delivery_snapshot_rejects_closed_pull_request() {
+        assert!(!pr_matches_snapshot(
+            &pull_request("completed"),
+            &MergeCommit {
+                commit_id: "head".into(),
+            },
+            &MergeCommit {
+                commit_id: "target".into(),
+            },
+            &snapshot()
+        ));
+    }
+
+    #[test]
+    fn delivery_snapshot_rejects_changed_target() {
+        assert!(!pr_matches_snapshot(
+            &pull_request("active"),
+            &MergeCommit {
+                commit_id: "head".into(),
+            },
+            &MergeCommit {
+                commit_id: "advanced-target".into(),
+            },
+            &snapshot()
+        ));
+    }
+
+    #[test]
+    fn delivery_snapshot_rejects_changed_head_and_metadata() {
+        let mut current = pull_request("active");
+        assert!(!pr_matches_snapshot(
+            &current,
+            &MergeCommit {
+                commit_id: "advanced-head".into(),
+            },
+            &MergeCommit {
+                commit_id: "target".into(),
+            },
+            &snapshot()
+        ));
+        current.title = "edited title".into();
+        assert!(!pr_matches_snapshot(
+            &current,
+            &MergeCommit {
+                commit_id: "head".into(),
+            },
+            &MergeCommit {
+                commit_id: "target".into(),
+            },
+            &snapshot()
+        ));
+    }
 
     #[test]
     fn reconstructed_diff_parses_and_grounds() {

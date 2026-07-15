@@ -68,6 +68,19 @@ struct PrResponse {
     destination: Endpoint,
 }
 
+fn pr_matches_snapshot(pr: &PrResponse, expected: &PrMeta) -> bool {
+    let body = pr
+        .summary
+        .as_ref()
+        .map(|summary| summary.raw.as_str())
+        .unwrap_or_default();
+    pr.state == "OPEN"
+        && pr.title == expected.title
+        && body == expected.body
+        && pr.source.commit.hash == expected.head_sha
+        && Some(pr.destination.commit.hash.as_str()) == expected.target_sha.as_deref()
+}
+
 #[derive(Deserialize)]
 struct DiffStatPage {
     values: Vec<DiffStat>,
@@ -599,17 +612,7 @@ impl Forge for Bitbucket {
 
     async fn snapshot_is_current(&self, expected: &PrMeta) -> Result<bool> {
         let current = self.pr_meta().await?;
-        let body = current
-            .summary
-            .as_ref()
-            .map(|summary| summary.raw.as_str())
-            .unwrap_or_default();
-        if current.state != "OPEN"
-            || current.title != expected.title
-            || body != expected.body
-            || current.source.commit.hash != expected.head_sha
-            || Some(current.destination.commit.hash.as_str()) != expected.target_sha.as_deref()
-        {
+        if !pr_matches_snapshot(&current, expected) {
             return Ok(false);
         }
         validate_commit(&current.source.commit.hash)?;
@@ -657,5 +660,65 @@ impl Forge for Bitbucket {
             .context("posting comment")?;
         Self::check_ok(resp, "comment post").await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot() -> PrMeta {
+        PrMeta {
+            title: "title".into(),
+            body: "body".into(),
+            head_sha: "head".into(),
+            base_sha: "merge-base".into(),
+            target_sha: Some("target".into()),
+            changed_files: None,
+        }
+    }
+
+    fn pull_request(state: &str, target: &str) -> PrResponse {
+        PrResponse {
+            title: "title".into(),
+            summary: Some(Rendered { raw: "body".into() }),
+            state: state.into(),
+            source: Endpoint {
+                commit: Commit {
+                    hash: "head".into(),
+                },
+            },
+            destination: Endpoint {
+                commit: Commit {
+                    hash: target.into(),
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn delivery_snapshot_rejects_closed_pull_request() {
+        assert!(!pr_matches_snapshot(
+            &pull_request("MERGED", "target"),
+            &snapshot()
+        ));
+    }
+
+    #[test]
+    fn delivery_snapshot_rejects_changed_target() {
+        assert!(!pr_matches_snapshot(
+            &pull_request("OPEN", "advanced-target"),
+            &snapshot()
+        ));
+    }
+
+    #[test]
+    fn delivery_snapshot_rejects_changed_head_and_metadata() {
+        let mut current = pull_request("OPEN", "target");
+        current.source.commit.hash = "advanced-head".into();
+        assert!(!pr_matches_snapshot(&current, &snapshot()));
+        current.source.commit.hash = "head".into();
+        current.title = "edited title".into();
+        assert!(!pr_matches_snapshot(&current, &snapshot()));
     }
 }

@@ -43,6 +43,7 @@ fn mr_matches_snapshot(mr: &MrResponse, expected: &PrMeta) -> bool {
         && mr.description.as_deref().unwrap_or_default() == expected.body
         && mr.diff_refs.head_sha == expected.head_sha
         && mr.diff_refs.base_sha == expected.base_sha
+        && Some(mr.diff_refs.start_sha.as_str()) == expected.target_sha.as_deref()
 }
 
 #[derive(Deserialize)]
@@ -365,7 +366,7 @@ impl Forge for GitLab {
             body: mr.description.unwrap_or_default(),
             head_sha: mr.diff_refs.head_sha,
             base_sha: mr.diff_refs.base_sha,
-            target_sha: None,
+            target_sha: Some(mr.diff_refs.start_sha),
             changed_files: None,
         })
     }
@@ -638,6 +639,56 @@ impl Forge for GitLab {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snapshot() -> PrMeta {
+        PrMeta {
+            title: "title".into(),
+            body: "body".into(),
+            head_sha: "head".into(),
+            base_sha: "merge-base".into(),
+            target_sha: Some("target".into()),
+            changed_files: None,
+        }
+    }
+
+    fn merge_request(state: &str, target: &str) -> MrResponse {
+        MrResponse {
+            title: "title".into(),
+            description: Some("body".into()),
+            state: state.into(),
+            diff_refs: DiffRefs {
+                base_sha: "merge-base".into(),
+                start_sha: target.into(),
+                head_sha: "head".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn delivery_snapshot_rejects_closed_merge_request() {
+        assert!(!mr_matches_snapshot(
+            &merge_request("merged", "target"),
+            &snapshot()
+        ));
+    }
+
+    #[test]
+    fn delivery_snapshot_rejects_changed_target() {
+        assert!(!mr_matches_snapshot(
+            &merge_request("opened", "advanced-target"),
+            &snapshot()
+        ));
+    }
+
+    #[test]
+    fn delivery_snapshot_rejects_changed_head_and_metadata() {
+        let mut current = merge_request("opened", "target");
+        current.diff_refs.head_sha = "advanced-head".into();
+        assert!(!mr_matches_snapshot(&current, &snapshot()));
+        current.diff_refs.head_sha = "head".into();
+        current.title = "edited title".into();
+        assert!(!mr_matches_snapshot(&current, &snapshot()));
+    }
 
     #[test]
     fn incomplete_versions_fail_closed() {
