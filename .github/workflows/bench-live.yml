@@ -11,7 +11,7 @@ on:
       cost_cap_usd:
         description: Abort when projected qualification spend exceeds this amount
         required: true
-        default: "15"
+        default: "35"
 
 concurrency:
   group: bench-live-admission

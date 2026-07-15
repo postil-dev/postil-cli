@@ -863,7 +863,7 @@ export function pricingFromZdrCatalog(
   return out;
 }
 
-export const MAX_GENERATOR_COST_CAP_USD = 25;
+export const MAX_GENERATOR_COST_CAP_USD = 35;
 export const MAX_GENERATOR_CANDIDATES = 6;
 
 /** Normalize candidate ids once before pricing, job creation, or aggregation. */

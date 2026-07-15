@@ -234,8 +234,8 @@ describe("pair qualification configuration", () => {
       binary: "/missing/postil",
       pairs: [pair],
       pricing: new Map(),
-      costCapUsd: 26,
-    })).rejects.toThrow("cost cap must be greater than zero and at most $25");
+      costCapUsd: 36,
+    })).rejects.toThrow("cost cap must be greater than zero and at most $35");
 
     const pairs = Array.from({ length: 7 }, (_, index) => ({
       generatorModel: `generator/${index}`,
