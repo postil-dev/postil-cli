@@ -1061,13 +1061,7 @@ impl LlmClient {
                 .get(model)
                 .ok_or_else(|| anyhow!("hosted model {model:?} has no admitted price bound"))?;
             let request_for = |user: &str| -> Result<usize> {
-                self.planned_request_bytes(
-                    model,
-                    system,
-                    user,
-                    EXHAUSTED_OUTPUT_RETRY_MAX_TOKENS,
-                    0.1,
-                )
+                self.planned_request_bytes(model, system, user, REVIEW_MAX_TOKENS, 0.1)
             };
             let first_requests = candidate_first_users
                 .iter()
@@ -1100,11 +1094,7 @@ impl LlmClient {
                 }
             }
             for request in worst_requests {
-                exposure.add_primary_request(
-                    request,
-                    EXHAUSTED_OUTPUT_RETRY_MAX_TOKENS as usize,
-                    price,
-                )?;
+                exposure.add_primary_request(request, REVIEW_MAX_TOKENS as usize, price)?;
             }
         }
 
@@ -3994,7 +3984,7 @@ mod tests {
                 output_micros_per_million_tokens: 1,
             },
         )])));
-        client
+        let admission = client
             .preflight_review_plan(
                 &config,
                 crate::review::MAX_HOSTED_SELECTED_BATCHES,
@@ -4004,6 +3994,11 @@ mod tests {
                 Some((&"m".repeat(96_000), 1)),
             )
             .unwrap();
+        assert_eq!(
+            admission.output_tokens,
+            u64::from(REVIEW_MAX_TOKENS) * crate::review::MAX_HOSTED_SELECTED_BATCHES as u64
+                + u64::from(PLANNER_MAX_TOKENS)
+        );
         assert_eq!(client.admission.lock().unwrap().attempts, 0);
     }
 
