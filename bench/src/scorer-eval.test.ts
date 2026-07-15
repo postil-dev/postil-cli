@@ -191,7 +191,7 @@ describe("parseModels", () => {
 
   test("exposes the embedded scorer qualification candidate", async () => {
     const defaults = await loadEmbeddedScorerDefaults();
-    expect(defaults.enabled).toBe(false);
+    expect(defaults.enabled).toBe(true);
     expect(defaults.qualification_candidates).toEqual(["z-ai/glm-5.2"]);
     expect(parseModels(undefined, defaults.qualification_candidates)).toEqual(["z-ai/glm-5.2"]);
   });

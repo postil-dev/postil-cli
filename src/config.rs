@@ -704,8 +704,10 @@ fn parse_model_defaults(raw: &str) -> Result<ModelDefaults> {
         validate_model_id("scorer.defaultModel", &file.scorer.default_model)?;
     } else {
         anyhow::ensure!(
-            !file.scorer.enabled && file.scorer.fallback.is_empty(),
-            "runtime scorer configuration must be empty when scorer.defaultModel is empty"
+            !file.scorer.enabled
+                && file.scorer.fallback.is_empty()
+                && file.scorer.qualification_candidates.is_empty(),
+            "scorer configuration must be empty when scorer.defaultModel is empty"
         );
     }
     if !file.scorer.fallback.is_empty() {
@@ -895,11 +897,11 @@ impl Default for Config {
             gate_fail_on: GateLevel::Severity(Severity::Error),
             gate_on_error: OnError::Block,
             block_on_kinds: vec![Kind::HumanEscalation],
-            model: defaults.default_model.clone(),
-            cascade: defaults.cascade.clone(),
-            scorer: defaults.scorer_model.clone(),
-            scorer_fallback: defaults.scorer_fallback.clone(),
-            scorer_enabled: defaults.scorer_enabled,
+            model: String::new(),
+            cascade: Vec::new(),
+            scorer: String::new(),
+            scorer_fallback: String::new(),
+            scorer_enabled: false,
             api_base: defaults.api_base.clone(),
             api_format: defaults.api_format,
             consensus: defaults.consensus,
@@ -1206,6 +1208,17 @@ impl Config {
 
     fn apply_env(&mut self) -> Result<()> {
         if hosted_mode() {
+            if let Some(profile) = admitted_profile_for(model_defaults(), qualification_manifest())
+            {
+                self.model = profile.generator_chain[0].clone();
+                self.cascade = profile.generator_chain[1..].to_vec();
+                self.consensus = profile.consensus;
+                self.scorer = profile.scorer_chain[0].clone();
+                self.scorer_fallback = profile.scorer_chain.get(1).cloned().unwrap_or_default();
+                self.scorer_enabled = true;
+                self.api_base = profile.api_base;
+                self.api_format = profile.api_format;
+            }
             return Ok(());
         }
         if qualification_candidate_mode() {
@@ -1660,14 +1673,14 @@ __DEFAULT_CASCADE__  # scorer: provider/model  # explicit BYOK opt-in; embedded 
 pub fn starter_config() -> &'static str {
     static STARTER_CONFIG: OnceLock<String> = OnceLock::new();
     STARTER_CONFIG.get_or_init(|| {
-        let defaults = model_defaults();
+        let defaults = Config::default();
         let cascade = defaults
             .cascade
             .iter()
             .map(|model| format!("    - {}\n", yaml_scalar(model)))
             .collect::<String>();
         STARTER_CONFIG_TEMPLATE
-            .replace("__DEFAULT_MODEL__", &yaml_scalar(&defaults.default_model))
+            .replace("__DEFAULT_MODEL__", &yaml_scalar(&defaults.model))
             .replace("__DEFAULT_CASCADE__", &cascade)
     })
 }
@@ -1737,10 +1750,6 @@ mod tests {
     fn write(dir: &Path, name: &str, content: &str) {
         let mut f = std::fs::File::create(dir.join(name)).unwrap();
         f.write_all(content.as_bytes()).unwrap();
-    }
-
-    fn default_cascade() -> Vec<String> {
-        model_defaults().cascade.clone()
     }
 
     fn valid_qualification_manifest_json() -> serde_json::Value {
@@ -1907,7 +1916,7 @@ qualification_candidates = ["example/scorer"]
                  api_base = \"https://openrouter.ai/api/v1\"\n\
                  api_format = \"openai-compatible\"\n\
                  scorer = { enabled = false, default_model = \"\", fallback = \"example/scorer-fallback\", qualification_candidates = [\"example/scorer\"] }\n",
-                "runtime scorer configuration must be empty when scorer.defaultModel is empty",
+                "scorer configuration must be empty when scorer.defaultModel is empty",
             ),
         ];
         for (raw, expected) in cases {
@@ -2060,12 +2069,13 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
     fn defaults_require_an_explicit_model_roster() {
         let c = Config::default();
         let defaults = model_defaults();
-        assert_eq!(c.model, defaults.default_model);
-        assert_eq!(c.cascade, default_cascade());
-        assert_eq!(c.scorer, defaults.scorer_model);
+        assert!(c.model.is_empty());
+        assert!(c.cascade.is_empty());
+        assert!(c.scorer.is_empty());
         assert!(!c.scorer_enabled);
         assert!(c.scorer_chain().is_empty());
         assert!(c.model_chain().is_empty());
+        assert_eq!(c.api_base, defaults.api_base);
     }
 
     #[test]
@@ -2108,11 +2118,10 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
         let f: FileConfig = serde_yaml::from_str(starter_config()).unwrap();
         let mut c = Config::default();
         c.apply_file(f).unwrap();
-        let defaults = model_defaults();
         assert_eq!(c.max_findings, 20);
-        assert_eq!(c.model, defaults.default_model);
-        assert_eq!(c.cascade, default_cascade());
-        assert_eq!(c.scorer, defaults.scorer_model);
+        assert!(c.model.is_empty());
+        assert!(c.cascade.is_empty());
+        assert!(c.scorer.is_empty());
     }
 
     #[test]
@@ -2650,7 +2659,7 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
     }
 
     #[test]
-    fn native_anthropic_skips_implicit_openrouter_scorers() {
+    fn native_anthropic_has_no_implicit_scorer_and_honors_explicit_byok_models() {
         let mut config = Config {
             api_format: ApiFormat::Anthropic,
             ..Config::default()
@@ -2658,13 +2667,10 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
         assert!(!config.scorer_enabled());
         assert!(config.scorer_chain().is_empty());
 
-        let generated_default: FileConfig = serde_yaml::from_str(&format!(
-            "model:\n  scorer: {}\n",
-            model_defaults().scorer_model
-        ))
-        .unwrap();
-        config.apply_file(generated_default).unwrap();
-        assert!(config.scorer_chain().is_empty());
+        let explicit_provider_model: FileConfig =
+            serde_yaml::from_str("model:\n  scorer: z-ai/glm-5.2\n").unwrap();
+        config.apply_file(explicit_provider_model).unwrap();
+        assert_eq!(config.scorer_chain(), vec!["z-ai/glm-5.2"]);
 
         let file: FileConfig =
             serde_yaml::from_str("model:\n  scorer: claude-haiku-4-5\n").unwrap();
@@ -2674,11 +2680,11 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
     }
 
     #[test]
-    fn hosted_roster_is_empty_until_qualification_admits_models() {
+    fn hosted_candidate_matches_the_qualification_profile() {
         let defaults = model_defaults();
-        assert!(defaults.default_model.is_empty());
+        assert_eq!(defaults.default_model, "deepseek/deepseek-v4-pro");
         assert!(defaults.cascade.is_empty());
-        assert!(defaults.scorer_model.is_empty());
+        assert_eq!(defaults.scorer_model, "z-ai/glm-5.2");
         assert!(defaults.scorer_fallback.is_empty());
         assert_eq!(
             defaults.scorer_qualification_candidates,
