@@ -332,6 +332,9 @@ pub struct PrMeta {
     /// Exact merge base selected for this review snapshot. This is never the
     /// moving target-branch tip when the forge exposes a distinct merge base.
     pub base_sha: String,
+    /// Target branch commit observed with this snapshot. This is distinct from
+    /// `base_sha`, which is the merge base used to construct the review diff.
+    pub target_sha: Option<String>,
     /// Authoritative changed-file count when the forge exposes one cheaply.
     /// It is used only to size a bounded acquisition deadline.
     pub changed_files: Option<usize>,
@@ -381,11 +384,18 @@ pub trait Forge {
     /// `head_sha` is the SHA the caller is reviewing, not whatever the PR's
     /// head happens to be at fetch time. A later push must not widen the diff.
     async fn fetch_diff_since(&self, since_sha: &str, head_sha: &str) -> Result<DiffSnapshot>;
-    /// Post the batched review: one summary plus inline comments per finding.
-    async fn post_review(&self, summary: &str, findings: &[Finding], head_sha: &str) -> Result<()>;
+    /// Post the batched review against the acquired snapshot. Implementations
+    /// revalidate the snapshot immediately before writing to the forge.
+    async fn post_review(
+        &self,
+        summary: &str,
+        findings: &[Finding],
+        snapshot: &PrMeta,
+    ) -> Result<()>;
     /// Ensure both check runs exist (in_progress); returns (advisory_id, gate_id).
     async fn start_checks(&self, head_sha: &str) -> Result<(String, String)>;
     /// Complete both checks with the envelope's outcome.
+    /// Complete both checks only while the acquired snapshot remains current.
     async fn complete_checks(
         &self,
         advisory_id: &str,
@@ -393,12 +403,16 @@ pub trait Forge {
         advisory: CheckState,
         gate: CheckState,
         envelope: &Envelope,
+        snapshot: &PrMeta,
     ) -> Result<()>;
 
     /// Confirm that publication still targets the snapshot that was reviewed.
     /// The caller checks this before publishing either comments or conclusions.
-    async fn head_is_current(&self, expected_head_sha: &str) -> Result<bool> {
-        Ok(self.fetch_pr_meta().await?.head_sha == expected_head_sha)
+    async fn snapshot_is_current(&self, expected: &PrMeta) -> Result<bool> {
+        let current = self.fetch_pr_meta().await?;
+        Ok(current.head_sha == expected.head_sha
+            && current.base_sha == expected.base_sha
+            && current.target_sha == expected.target_sha)
     }
 
     /// Title and body of the issue/PR/MR a maintainer mentioned Postil on, used

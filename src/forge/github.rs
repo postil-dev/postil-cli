@@ -69,10 +69,6 @@ impl GitHub {
         }
     }
 
-    async fn fetch_pr_head_sha(&self) -> Result<String> {
-        Ok(self.fetch_pr_state().await?.head.sha)
-    }
-
     async fn fetch_pr_state(&self) -> Result<PrResponse> {
         let response = self
             .send_retryable(
@@ -912,6 +908,7 @@ impl Forge for GitHub {
             body: pr.body.unwrap_or_default(),
             head_sha: pr.head.sha,
             base_sha: compare.merge_base_commit.sha,
+            target_sha: Some(pr.base.sha),
             changed_files: Some(pr.changed_files),
         })
     }
@@ -926,6 +923,7 @@ impl Forge for GitHub {
         ensure!(
             current.head_sha == snapshot.head_sha
                 && current.base_sha == snapshot.base_sha
+                && current.target_sha == snapshot.target_sha
                 && current.changed_files == snapshot.changed_files,
             "GitHub PR changed while its file list was being acquired"
         );
@@ -980,7 +978,13 @@ impl Forge for GitHub {
         .await
     }
 
-    async fn post_review(&self, summary: &str, findings: &[Finding], head_sha: &str) -> Result<()> {
+    async fn post_review(
+        &self,
+        summary: &str,
+        findings: &[Finding],
+        snapshot: &PrMeta,
+    ) -> Result<()> {
+        let head_sha = snapshot.head_sha.as_str();
         if only_operational_findings(findings) {
             return Ok(());
         }
@@ -990,15 +994,12 @@ impl Forge for GitHub {
         if !findings.is_empty() && findings.iter().all(filter::is_carried) {
             return Ok(());
         }
-        if !self.head_is_current(head_sha).await? {
-            let current_head = self
-                .fetch_pr_head_sha()
-                .await
-                .unwrap_or_else(|_| "unknown".to_string());
+        if !self.snapshot_is_current(snapshot).await? {
             eprintln!(
-                "postil: github review delivery skipped because PR head changed reviewed_head={} current_head={}",
+                "postil: github review delivery skipped because the PR snapshot changed reviewed_head={} reviewed_target={} reviewed_merge_base={}",
                 short_sha(head_sha),
-                short_sha(&current_head),
+                short_sha(snapshot.target_sha.as_deref().unwrap_or("unknown")),
+                short_sha(&snapshot.base_sha),
             );
             return Ok(());
         }
@@ -1097,9 +1098,34 @@ impl Forge for GitHub {
         Ok((ids[0].clone(), ids[1].clone()))
     }
 
-    async fn head_is_current(&self, expected_head_sha: &str) -> Result<bool> {
+    async fn snapshot_is_current(&self, expected: &PrMeta) -> Result<bool> {
         let pr = self.fetch_pr_state().await?;
-        Ok(pr.state == "open" && !pr.merged && pr.head.sha == expected_head_sha)
+        if pr.state != "open"
+            || pr.merged
+            || pr.head.sha != expected.head_sha
+            || Some(pr.base.sha.as_str()) != expected.target_sha.as_deref()
+        {
+            return Ok(false);
+        }
+        ensure!(
+            valid_object_id(&pr.base.sha) && valid_object_id(&pr.head.sha),
+            "GitHub PR refs must be hexadecimal object ids"
+        );
+        let response = self
+            .send_retryable(
+                self.request(
+                    reqwest::Method::GET,
+                    self.url(&format!("/compare/{}...{}", pr.base.sha, pr.head.sha)),
+                ),
+                "PR merge-base freshness fetch",
+            )
+            .await?;
+        let compare: CompareResponse = super::bounded_response_json(
+            Self::check_ok(response, "PR merge-base freshness fetch").await?,
+            "GitHub PR merge-base freshness response",
+        )
+        .await?;
+        Ok(compare.merge_base_commit.sha == expected.base_sha)
     }
 
     async fn complete_checks(
@@ -1109,7 +1135,17 @@ impl Forge for GitHub {
         advisory: CheckState,
         gate: CheckState,
         envelope: &Envelope,
+        snapshot: &PrMeta,
     ) -> Result<()> {
+        if !self.snapshot_is_current(snapshot).await? {
+            eprintln!(
+                "postil: github check delivery skipped because the PR snapshot changed reviewed_head={} reviewed_target={} reviewed_merge_base={}",
+                short_sha(&snapshot.head_sha),
+                short_sha(snapshot.target_sha.as_deref().unwrap_or("unknown")),
+                short_sha(&snapshot.base_sha),
+            );
+            return Ok(());
+        }
         let conclusion = |s: CheckState| match s {
             CheckState::Success => "success",
             CheckState::Failure => "failure",
@@ -1265,11 +1301,54 @@ mod tests {
         validate_pull_file,
     };
     use crate::envelope::{Envelope, Finding, Gate, Kind, Severity, Usage};
-    use crate::forge::{CheckState, Forge};
+    use crate::forge::{CheckState, Forge, PrMeta};
     use reqwest::header::{HeaderMap, HeaderValue};
     use std::time::Duration;
-    use wiremock::matchers::{method, path, query_param};
+    use wiremock::matchers::{method, path, path_regex, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn delivery_envelope(head_sha: &str, base_sha: &str) -> Envelope {
+        Envelope {
+            version: 1,
+            summary: String::new(),
+            silent: true,
+            findings: vec![],
+            suppressed_findings: vec![],
+            resolved: vec![],
+            counts: Envelope::counts_of(&[], 0),
+            confidence_buckets: Envelope::buckets_of(&[]),
+            gate: Gate {
+                fail_on: "error".into(),
+                failing: false,
+                block_on_kinds: vec![],
+            },
+            model_used: "model".into(),
+            scorer_model: None,
+            scorer_error: None,
+            scorer_disagreements: None,
+            usage: Usage::default(),
+            model_usage: vec![],
+            model_incidents: vec![],
+            review_coverage: None,
+            review_admission: None,
+            usage_accounting_complete: true,
+            duration_ms: 0,
+            base_sha: Some(base_sha.into()),
+            head_sha: Some(head_sha.into()),
+            since_sha: None,
+        }
+    }
+
+    fn delivery_snapshot(head_sha: &str, target_sha: &str, merge_base_sha: &str) -> PrMeta {
+        PrMeta {
+            title: "t".into(),
+            body: "b".into(),
+            head_sha: head_sha.into(),
+            base_sha: merge_base_sha.into(),
+            target_sha: Some(target_sha.into()),
+            changed_files: Some(1),
+        }
+    }
 
     #[test]
     fn github_retry_delays_honor_headers_with_a_hard_cap() {
@@ -1613,7 +1692,153 @@ mod tests {
         };
 
         github
-            .post_review("Summary", &[finding], "aaaaaaaaaaaa")
+            .post_review(
+                "Summary",
+                &[finding],
+                &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn github_review_is_not_posted_after_the_target_branch_changes() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "title": "t", "body": "b", "state": "open", "merged": false,
+                "head": {"sha": "aaaaaaaaaaaa"},
+                "base": {"sha": "dddddddddddd"},
+                "changed_files": 1
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/repos/owner/repo/compare/"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        for id in ["11", "12"] {
+            Mock::given(method("PATCH"))
+                .and(path(format!("/repos/owner/repo/check-runs/{id}")))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&server)
+                .await;
+        }
+        let finding = Finding {
+            path: "src/lib.rs".into(),
+            line: 1,
+            end_line: None,
+            severity: Severity::Warn,
+            kind: Kind::Risk,
+            confidence: 0.9,
+            generator_confidence: None,
+            scorer_confidence: None,
+            generator_kind: None,
+            scorer_kind: None,
+            scorer_reason: None,
+            title: "Finding".into(),
+            body: "A concrete issue.".into(),
+            id: None,
+        };
+
+        let github = test_github(&server);
+        let snapshot = delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc");
+        github
+            .post_review("Summary", &[finding], &snapshot)
+            .await
+            .unwrap();
+        github
+            .complete_checks(
+                "11",
+                "12",
+                CheckState::Success,
+                CheckState::Success,
+                &delivery_envelope("aaaaaaaaaaaa", "cccccccccccc"),
+                &snapshot,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn github_review_and_checks_are_not_delivered_after_the_merge_base_changes() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "title": "t", "body": "b", "state": "open", "merged": false,
+                "head": {"sha": "aaaaaaaaaaaa"},
+                "base": {"sha": "bbbbbbbbbbbb"},
+                "changed_files": 1
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/repos/owner/repo/compare/bbbbbbbbbbbb...aaaaaaaaaaaa",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "merge_base_commit": {"sha": "dddddddddddd"}, "files": []
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        for id in ["11", "12"] {
+            Mock::given(method("PATCH"))
+                .and(path(format!("/repos/owner/repo/check-runs/{id}")))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&server)
+                .await;
+        }
+        let github = test_github(&server);
+        let finding = Finding {
+            path: "src/lib.rs".into(),
+            line: 1,
+            end_line: None,
+            severity: Severity::Warn,
+            kind: Kind::Risk,
+            confidence: 0.9,
+            generator_confidence: None,
+            scorer_confidence: None,
+            generator_kind: None,
+            scorer_kind: None,
+            scorer_reason: None,
+            title: "Finding".into(),
+            body: "A concrete issue.".into(),
+            id: None,
+        };
+        let envelope = delivery_envelope("aaaaaaaaaaaa", "cccccccccccc");
+        let snapshot = delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc");
+
+        github
+            .post_review("Summary", &[finding], &snapshot)
+            .await
+            .unwrap();
+        github
+            .complete_checks(
+                "11",
+                "12",
+                CheckState::Success,
+                CheckState::Success,
+                &envelope,
+                &snapshot,
+            )
             .await
             .unwrap();
     }
@@ -1662,7 +1887,11 @@ mod tests {
         };
 
         github
-            .post_review("Summary", &[finding], "aaaaaaaaaaaa")
+            .post_review(
+                "Summary",
+                &[finding],
+                &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+            )
             .await
             .unwrap();
     }
@@ -1675,7 +1904,16 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "title": "t", "body": "b",
                 "state": "open", "merged": false,
-                "head": {"sha": "aaaaaaaaaaaa"}, "base": {"sha": "base"}, "changed_files": 0
+                "head": {"sha": "aaaaaaaaaaaa"}, "base": {"sha": "bbbbbbbbbbbb"}, "changed_files": 0
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/repos/owner/repo/compare/bbbbbbbbbbbb...aaaaaaaaaaaa",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "merge_base_commit": {"sha": "cccccccccccc"}, "files": []
             })))
             .mount(&server)
             .await;
@@ -1744,7 +1982,7 @@ mod tests {
             review_admission: None,
             usage_accounting_complete: true,
             duration_ms: 0,
-            base_sha: Some("base".into()),
+            base_sha: Some("cccccccccccc".into()),
             head_sha: Some("aaaaaaaaaaaa".into()),
             since_sha: None,
         };
@@ -1753,7 +1991,7 @@ mod tests {
             .post_review(
                 "One finding needs attention.",
                 std::slice::from_ref(&finding),
-                "aaaaaaaaaaaa",
+                &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
             )
             .await
             .unwrap();
@@ -1764,6 +2002,7 @@ mod tests {
                 CheckState::Failure,
                 CheckState::Failure,
                 &envelope,
+                &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
             )
             .await
             .unwrap();

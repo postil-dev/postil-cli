@@ -441,6 +441,7 @@ impl Forge for Bitbucket {
             body: pr.summary.map(|s| s.raw).unwrap_or_default(),
             head_sha: pr.source.commit.hash,
             base_sha: merge_base.hash,
+            target_sha: None,
             changed_files: None,
         })
     }
@@ -487,7 +488,7 @@ impl Forge for Bitbucket {
         &self,
         summary: &str,
         findings: &[Finding],
-        _head_sha: &str,
+        _snapshot: &PrMeta,
     ) -> Result<()> {
         if super::only_operational_findings(findings) {
             return Ok(());
@@ -550,6 +551,7 @@ impl Forge for Bitbucket {
         advisory: CheckState,
         gate: CheckState,
         envelope: &Envelope,
+        _snapshot: &PrMeta,
     ) -> Result<()> {
         let head = envelope
             .head_sha

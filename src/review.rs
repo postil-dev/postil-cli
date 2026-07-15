@@ -57,27 +57,27 @@ fn full_diff_timeout_secs(snapshot: &PrMeta) -> u64 {
 
 async fn snapshot_is_current<F: Forge>(
     forge: &F,
-    expected_head_sha: &str,
+    expected: &PrMeta,
     review_started: Instant,
 ) -> bool {
     match run_with_hosted_budget(
         Some(review_started),
         FORGE_READ_TIMEOUT_SECS,
-        forge.head_is_current(expected_head_sha),
-        "verifying pull request head before publication",
+        forge.snapshot_is_current(expected),
+        "verifying pull request snapshot before publication",
     )
     .await
     {
         Ok(true) => true,
         Ok(false) => {
             eprintln!(
-                "postil: publication skipped because the pull request head changed after review"
+                "postil: publication skipped because the pull request snapshot changed after review"
             );
             false
         }
         Err(error) => {
             eprintln!(
-                "postil: publication skipped because head freshness could not be verified ({error:#})"
+                "postil: publication skipped because snapshot freshness could not be verified ({error:#})"
             );
             false
         }
@@ -112,6 +112,7 @@ pub struct ReviewArgs {
     pub repo: Option<String>,
     pub pr: Option<u64>,
     pub sha: Option<String>,
+    pub base_sha: Option<String>,
     pub staged: bool,
     pub base: Option<String>,
     pub diff_file: Option<PathBuf>,
@@ -246,7 +247,7 @@ async fn run_local(args: &ReviewArgs, cfg: &Config) -> Result<i32> {
         },
     )
     .await?;
-    finish(args, cfg, envelope, None::<&GitHub>, None).await
+    finish(args, cfg, envelope, None::<&GitHub>, None, None).await
 }
 
 async fn run_remote<F: Forge>(
@@ -268,6 +269,16 @@ async fn run_remote<F: Forge>(
             event_sha == meta.head_sha,
             "requested review head {event_sha} is no longer the pull request head {}",
             meta.head_sha
+        );
+    }
+    if let Some(event_base_sha) = args.base_sha.as_deref() {
+        let target_sha = meta
+            .target_sha
+            .as_deref()
+            .ok_or_else(|| anyhow!("--base-sha is not supported for the selected forge"))?;
+        anyhow::ensure!(
+            event_base_sha == target_sha,
+            "requested review target {event_base_sha} is no longer the pull request target {target_sha}"
         );
     }
     let head_sha = meta.head_sha.clone();
@@ -309,7 +320,7 @@ async fn run_remote<F: Forge>(
     match result {
         Ok(envelope) => {
             if let Some((a, g)) = &checks
-                && snapshot_is_current(forge, &head_sha, review_started).await
+                && snapshot_is_current(forge, &meta, review_started).await
             {
                 let gate_state = if envelope.gate.failing {
                     CheckState::Failure
@@ -336,7 +347,7 @@ async fn run_remote<F: Forge>(
                 let completed = run_with_hosted_budget(
                     Some(review_started),
                     CHECK_COMPLETION_TIMEOUT_SECS,
-                    forge.complete_checks(a, g, advisory_state, gate_state, &envelope),
+                    forge.complete_checks(a, g, advisory_state, gate_state, &envelope, &meta),
                     "completing check runs",
                 )
                 .await;
@@ -344,7 +355,15 @@ async fn run_remote<F: Forge>(
                     eprintln!("postil: could not update check runs ({e:#})");
                 }
             }
-            finish(args, cfg, envelope, Some(forge), Some(review_started)).await
+            finish(
+                args,
+                cfg,
+                envelope,
+                Some(forge),
+                Some(review_started),
+                Some(&meta),
+            )
+            .await
         }
         Err(e) => {
             eprintln!("postil: review failed before completion ({e:#})");
@@ -366,7 +385,7 @@ async fn run_remote<F: Forge>(
                 review_started.elapsed().as_millis() as u64,
             );
             if let Some((a, g)) = &checks
-                && snapshot_is_current(forge, &head_sha, review_started).await
+                && snapshot_is_current(forge, &meta, review_started).await
             {
                 let gate_state = if envelope.gate.failing {
                     CheckState::Failure
@@ -376,7 +395,7 @@ async fn run_remote<F: Forge>(
                 let _ = run_with_hosted_budget(
                     Some(review_started),
                     CHECK_COMPLETION_TIMEOUT_SECS,
-                    forge.complete_checks(a, g, CheckState::Neutral, gate_state, &envelope),
+                    forge.complete_checks(a, g, CheckState::Neutral, gate_state, &envelope, &meta),
                     "completing check runs",
                 )
                 .await;
@@ -390,7 +409,16 @@ async fn run_remote<F: Forge>(
             // exit code, so it is downgraded to the gate-derived code rather
             // than propagated as exit 2.
             let code = if envelope.gate.failing { 1 } else { 0 };
-            match finish(args, cfg, envelope, Some(forge), Some(review_started)).await {
+            match finish(
+                args,
+                cfg,
+                envelope,
+                Some(forge),
+                Some(review_started),
+                Some(&meta),
+            )
+            .await
+            {
                 Ok(c) => Ok(c),
                 Err(post_err) => {
                     eprintln!("postil: could not post the error review ({post_err:#})");
@@ -1386,6 +1414,7 @@ async fn finish<F: Forge>(
     envelope: Envelope,
     forge: Option<&F>,
     hosted_budget_started_at: Option<Instant>,
+    expected_snapshot: Option<&PrMeta>,
 ) -> Result<i32> {
     // Persist artifacts before any forge I/O: a posting hiccup must not
     // discard the completed review's SARIF or envelope output.
@@ -1405,11 +1434,15 @@ async fn finish<F: Forge>(
     if let Some(forge) = forge
         && !args.no_post
     {
-        let head = envelope.head_sha.clone().unwrap_or_default();
+        let expected_snapshot =
+            expected_snapshot.context("remote publication is missing its immutable PR snapshot")?;
         let current = if let Some(started_at) = hosted_budget_started_at {
-            snapshot_is_current(forge, &head, started_at).await
+            snapshot_is_current(forge, expected_snapshot, started_at).await
         } else {
-            forge.head_is_current(&head).await.unwrap_or(false)
+            forge
+                .snapshot_is_current(expected_snapshot)
+                .await
+                .unwrap_or(false)
         };
         if !current {
             eprintln!("postil: review comment skipped because freshness is not proven");
@@ -1431,7 +1464,7 @@ async fn finish<F: Forge>(
             let posted = run_with_hosted_budget(
                 hosted_budget_started_at,
                 REVIEW_POST_TIMEOUT_SECS,
-                forge.post_review(&summary, &envelope.findings, &head),
+                forge.post_review(&summary, &envelope.findings, expected_snapshot),
                 "posting review comment",
             )
             .await;

@@ -4760,6 +4760,61 @@ async fn hosted_path_completes_provided_check_run_ids_without_creating_new_ones(
 }
 
 #[tokio::test]
+async fn hosted_path_rejects_a_changed_target_before_review_or_delivery() {
+    let server = MockServer::start().await;
+    mount_github_complete_diff(&server, 7).await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "t", "body": null,
+            "state": "open", "merged": false,
+            "head": {"sha": "aaaaaaaa"},
+            "base": {"sha": "bbbbbbbb"},
+            "changed_files": 1
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/api/check-runs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": 1})))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .args([
+            "review",
+            "--publish",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--sha",
+            "aaaaaaaa",
+            "--base-sha",
+            "cccccccc",
+        ])
+        .assert()
+        .code(2);
+
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(stderr.contains(
+        "requested review target cccccccc is no longer the pull request target bbbbbbbb"
+    ));
+}
+
+#[tokio::test]
 async fn github_flow_posts_review_and_completes_both_checks() {
     let server = MockServer::start().await;
     mount_github_complete_diff(&server, 7).await;
@@ -4960,7 +5015,7 @@ async fn github_push_after_acquisition_suppresses_all_stale_publication() {
         .assert()
         .code(1)
         .stderr(predicates::str::contains(
-            "publication skipped because the pull request head changed",
+            "publication skipped because the pull request snapshot changed",
         ));
 }
 

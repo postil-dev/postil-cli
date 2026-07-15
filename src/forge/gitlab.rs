@@ -355,6 +355,7 @@ impl Forge for GitLab {
             body: mr.description.unwrap_or_default(),
             head_sha: mr.diff_refs.head_sha,
             base_sha: mr.diff_refs.base_sha,
+            target_sha: None,
             changed_files: None,
         })
     }
@@ -470,7 +471,7 @@ impl Forge for GitLab {
         &self,
         summary: &str,
         findings: &[Finding],
-        _head_sha: &str,
+        _snapshot: &PrMeta,
     ) -> Result<()> {
         if super::only_operational_findings(findings) {
             return Ok(());
@@ -531,6 +532,7 @@ impl Forge for GitLab {
         advisory: CheckState,
         gate: CheckState,
         envelope: &Envelope,
+        _snapshot: &PrMeta,
     ) -> Result<()> {
         let head = envelope
             .head_sha

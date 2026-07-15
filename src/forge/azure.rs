@@ -413,6 +413,7 @@ impl Forge for Azure {
             body: pr.description,
             head_sha: source.commit_id,
             base_sha: merge_bases[0].commit_id.clone(),
+            target_sha: None,
             changed_files: None,
         })
     }
@@ -439,7 +440,7 @@ impl Forge for Azure {
         &self,
         summary: &str,
         findings: &[Finding],
-        _head_sha: &str,
+        _snapshot: &PrMeta,
     ) -> Result<()> {
         if super::only_operational_findings(findings) {
             return Ok(());
@@ -500,6 +501,7 @@ impl Forge for Azure {
         advisory: CheckState,
         gate: CheckState,
         envelope: &Envelope,
+        _snapshot: &PrMeta,
     ) -> Result<()> {
         let head = envelope.head_sha.clone().unwrap_or_default();
         let map = |s: CheckState| match s {

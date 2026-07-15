@@ -75,7 +75,9 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   metadata has aggregate byte and changed-file bounds. Source responses stream to
   successful transport EOF without the metadata page-size ceiling. A declared length
   must match the received byte count. Authoritative forge size and SHA-256 metadata are
-  verified when available, including GitLab source headers. Truncated transports and
+  verified when available, including GitLab source headers. Delivery revalidates the
+  complete acquired snapshot immediately before every write. GitHub snapshots retain
+  the head commit, target-branch commit, and computed merge base separately. Truncated transports and
   metadata mismatches fail closed. GitHub
   reconstructs full reviews from merge-base/head file content after exhausting the declared
   changed-file count, and rejects an ambiguous 300-file incremental compare. Bitbucket exhausts
