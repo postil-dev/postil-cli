@@ -16,6 +16,76 @@ import {
 
 const execFile = promisify(execFileCallback);
 
+const TERMINAL_DIAGNOSTIC_PREFIX = "postil:atomic-attribution-terminal:v1:";
+
+export const atomicAttributionTerminalCategories = [
+  "response-identity-missing",
+  "response-identity-mismatch",
+  "usage-accounting-incomplete",
+  "output-invalid-after-schema-repair",
+  "output-nonterminal-length",
+  "invalid-output",
+  "provider-request-too-large",
+  "provider-timeout",
+  "provider-deadline",
+  "provider-transport",
+  "provider-unclassified",
+] as const;
+
+const subprocessFailureCategories = [
+  "subprocess-timeout",
+  "subprocess-signal",
+  "subprocess-exit",
+] as const;
+
+const terminalDiagnostic = z.object({
+  version: z.literal(1),
+  category: z.union([
+    z.enum(atomicAttributionTerminalCategories),
+    z.string().regex(/^provider-http-[1-5][0-9]{2}$/u),
+  ]),
+  phase: z.enum(["attribution", "unknown"]),
+  providerAttemptCount: z.number().int().nonnegative().nullable(),
+  identityPresent: z.boolean().nullable(),
+  identityMatched: z.boolean().nullable(),
+  usagePresent: z.boolean().nullable(),
+  usageAccountingComplete: z.boolean().nullable(),
+}).strict().superRefine((diagnostic, context) => {
+  if (diagnostic.identityMatched === true && diagnostic.identityPresent !== true) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["identityMatched"], message: "matched identity requires present identity" });
+  }
+  if (diagnostic.usageAccountingComplete === true && diagnostic.usagePresent !== true) {
+    context.addIssue({ code: z.ZodIssueCode.custom, path: ["usageAccountingComplete"], message: "complete accounting requires present usage" });
+  }
+});
+
+export type AtomicAttributionTerminalDiagnostic = z.infer<typeof terminalDiagnostic>;
+export type AtomicAttributionProcessDiagnostic = Omit<AtomicAttributionTerminalDiagnostic, "category"> & {
+  category: AtomicAttributionTerminalDiagnostic["category"] | typeof subprocessFailureCategories[number];
+};
+
+const atomicAttributionErrorBrand = Symbol("atomic-attribution-transport-error");
+
+export class AtomicAttributionTransportError extends Error {
+  readonly [atomicAttributionErrorBrand] = true;
+
+  constructor(
+    readonly diagnostic: AtomicAttributionProcessDiagnostic,
+    readonly exitCode: number | null,
+    readonly signal: string | null,
+    readonly killed: boolean | null,
+  ) {
+    super(`atomic attribution subprocess failed (${diagnostic.category})`);
+    this.name = "AtomicAttributionTransportError";
+  }
+}
+
+export function atomicAttributionTransportFailure(error: unknown): AtomicAttributionTransportError | null {
+  return error instanceof AtomicAttributionTransportError && error[atomicAttributionErrorBrand] === true
+    ? error
+    : null;
+}
+
 export const ATTRIBUTION_CONTRACT_VERSION = 2;
 export const ATTRIBUTION_MAX_CONCURRENCY = 4;
 export const ATTRIBUTION_CALL_TIMEOUT_MS = 60_000;
@@ -475,7 +545,7 @@ async function runAtomicAttribution(
         );
         stdout = result.stdout;
       } catch (error) {
-        throw new Error(`atomic attribution transport failed: ${atomicAttributionProcessFailure(error)}`);
+        throw atomicAttributionProcessFailure(error);
       }
       const output = transportOutput.parse(JSON.parse(stdout));
       if (output.model !== options.evaluatorModel || output.provider !== options.expectedProvider ||
@@ -596,54 +666,44 @@ function boundedError(error: unknown): string {
   return value.replace(/[\r\n\p{Cc}]+/gu, " ").slice(0, 500);
 }
 
-function atomicAttributionProcessFailure(error: unknown): string {
+function atomicAttributionProcessFailure(error: unknown): AtomicAttributionTransportError {
   const failure = error !== null && typeof error === "object"
     ? error as Record<string, unknown>
     : {};
-  const stderr = typeof failure.stderr === "string"
-    ? failure.stderr.slice(-16 * 1024)
-    : "";
-  const terminalDiagnostic = stderr
-    .split(/\r?\n/u)
-    .findLast((line) => line.startsWith("postil: error:")) ?? "";
-  const category = classifyAtomicAttributionStderr(terminalDiagnostic, error);
-  const exitCode = typeof failure.code === "number" && Number.isSafeInteger(failure.code)
-    ? String(failure.code)
-    : "unknown";
+  const exitCode = typeof failure.code === "number" && Number.isSafeInteger(failure.code) && failure.code >= 0
+    ? failure.code
+    : null;
   const signal = typeof failure.signal === "string" && /^[A-Z0-9]+$/u.test(failure.signal)
     ? failure.signal
-    : "none";
-  const killed = failure.killed === true ? "true" : "false";
-  return `category=${category} exit=${exitCode} signal=${signal} killed=${killed}`;
+    : null;
+  const killed = typeof failure.killed === "boolean" ? failure.killed : null;
+  const diagnostic = parseTerminalDiagnostic(typeof failure.stderr === "string" ? failure.stderr : "") ?? {
+    version: 1,
+    category: failureWasTimedOut(error)
+      ? "subprocess-timeout"
+      : signal !== null
+        ? "subprocess-signal"
+        : "subprocess-exit",
+    phase: "unknown",
+    providerAttemptCount: null,
+    identityPresent: null,
+    identityMatched: null,
+    usagePresent: null,
+    usageAccountingComplete: null,
+  };
+  return new AtomicAttributionTransportError(diagnostic, exitCode, signal, killed);
 }
 
-function classifyAtomicAttributionStderr(stderr: string, error: unknown): string {
-  if (/atomic attribution output invalid after schema repair/iu.test(stderr)) {
-    return "output-invalid-after-schema-repair";
+export function parseTerminalDiagnostic(stderr: string): AtomicAttributionTerminalDiagnostic | null {
+  const framed = stderr
+    .split(/\r?\n/u)
+    .filter((line) => line.startsWith(TERMINAL_DIAGNOSTIC_PREFIX));
+  if (framed.length !== 1) return null;
+  try {
+    return terminalDiagnostic.parse(JSON.parse(framed[0]!.slice(TERMINAL_DIAGNOSTIC_PREFIX.length)));
+  } catch {
+    return null;
   }
-  if (/atomic attribution response omitted (?:model|provider) identity/iu.test(stderr)) {
-    return "response-identity-missing";
-  }
-  if (/atomic attribution response (?:model|provider) identity mismatch/iu.test(stderr)) {
-    return "response-identity-mismatch";
-  }
-  if (/atomic attribution usage (?:accounting|evidence) is incomplete/iu.test(stderr)) {
-    return "usage-accounting-incomplete";
-  }
-  if (/atomic attribution provider request exceeds/iu.test(stderr)) {
-    return "provider-request-too-large";
-  }
-  const httpStatus = stderr.match(/(?:HTTP |status=)([45][0-9]{2})/iu)?.[1];
-  if (httpStatus !== undefined) return `provider-http-${httpStatus}`;
-  if (/request timed out|request timeout|deadline exceeded/iu.test(stderr)) {
-    return "provider-timeout";
-  }
-  if (/request to model endpoint failed|connection error/iu.test(stderr)) {
-    return "provider-transport";
-  }
-  if (/atomic attribution failed/iu.test(stderr)) return "attribution-failed";
-  if (failureWasTimedOut(error)) return "subprocess-timeout";
-  return "subprocess-failed";
 }
 
 function failureWasTimedOut(error: unknown): boolean {

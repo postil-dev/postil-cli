@@ -2,8 +2,22 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { link, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { privateEvidenceSha256, type LiveModelsPrivateEvidenceBundle, type LiveModelsReport } from "./livemodels";
-import { atomicWriteOutput, invalidateExplicitOutputs, prepareExplicitOutputs, writePrivateEvidenceBundle } from "./run";
+import {
+  parseLiveModelsReport,
+  parsePrivateEvidenceBundle,
+  privateEvidenceSha256,
+  type LiveModelsPrivateEvidenceBundle,
+  type LiveModelsReport,
+} from "./livemodels";
+import {
+  atomicWriteOutput,
+  createLiveModelsFailureReport,
+  invalidateExplicitOutputs,
+  parseLiveModelsFailureReport,
+  prepareExplicitOutputs,
+  writePrivateEvidenceBundle,
+} from "./run";
+import { AtomicAttributionTransportError } from "./attribution";
 
 const temporaryDirectories: string[] = [];
 
@@ -60,6 +74,130 @@ function emptyReport(privateEvidenceDigest: string): LiveModelsReport {
 }
 
 describe("benchmark output lifecycle", () => {
+  test("emits a strict public-only failure artifact rejected by success consumers", async () => {
+    const report = await createLiveModelsFailureReport(
+      new AtomicAttributionTransportError(
+        {
+          version: 1,
+          category: "provider-http-503",
+          phase: "attribution",
+          providerAttemptCount: 2,
+          identityPresent: true,
+          identityMatched: true,
+          usagePresent: true,
+          usageAccountingComplete: true,
+        },
+        1,
+        null,
+        false,
+      ),
+      {
+        qualificationSourceSha: "9".repeat(40),
+        pairs: [{ generatorModel: "deepseek/deepseek-v4-pro", scorerModel: "z-ai/glm-5.2" }],
+        upstreamProvider: "PublicProvider",
+      },
+    );
+    expect(parseLiveModelsFailureReport(report)).toBe(report);
+    expect(report).toEqual({
+      artifactType: "live-models-failure",
+      qualificationSourceSha: expect.stringMatching(/^[0-9a-f]{40}$/u),
+      profiles: [{
+        id: "deepseek/deepseek-v4-pro [consensus 1] + z-ai/glm-5.2",
+        generatorModels: ["deepseek/deepseek-v4-pro"],
+        consensus: 1,
+        scorerModels: ["z-ai/glm-5.2"],
+      }],
+      providerEndpointIdentity: "openrouter:managed-routing",
+      upstreamProviderIdentity: "PublicProvider",
+      process: {
+        category: "provider-http-503", exitCode: 1, signal: null, killed: false,
+        phase: "attribution", providerAttemptCount: 2, identityPresent: true, identityMatched: true,
+        usagePresent: true, usageAccountingComplete: true,
+      },
+    });
+    const serialized = JSON.stringify(report);
+    for (const forbidden of ["schemaVersion", "manifestCandidate", "privateEvidence", "secret", "/private/path"]) {
+      expect(serialized).not.toContain(forbidden);
+    }
+    expect(() => parseLiveModelsReport(report)).toThrow("schemaVersion is required");
+    expect(() => parsePrivateEvidenceBundle(report)).toThrow("invalid live-models private evidence bundle");
+    expect(() => parseLiveModelsFailureReport({ ...report, schemaVersion: 2 })).toThrow(
+      "unknown or missing fields",
+    );
+    expect(() => parseLiveModelsFailureReport({
+      ...report,
+      process: { ...report.process, detail: "private" },
+    })).toThrow("unknown or missing fields");
+  });
+
+  test("does not invent attribution subprocess facts for a preflight failure", async () => {
+    const report = await createLiveModelsFailureReport(
+      new Error("qualification projected exposure exceeds the configured cap at /private/path"),
+      {
+        qualificationSourceSha: "8".repeat(40),
+        pairs: [{ generatorModel: "deepseek/deepseek-v4-pro", scorerModel: "z-ai/glm-5.2" }],
+        upstreamProvider: "PublicProvider",
+      },
+    );
+    expect(report.process).toEqual({
+      category: "provider-unclassified",
+      exitCode: null,
+      signal: null,
+      killed: null,
+      phase: "unknown",
+      providerAttemptCount: null,
+      identityPresent: null,
+      identityMatched: null,
+      usagePresent: null,
+      usageAccountingComplete: null,
+    });
+    expect(JSON.stringify(report)).not.toContain("private/path");
+  });
+
+  test("does not parse a forged diagnostic tuple from plain error prose", async () => {
+    const report = await createLiveModelsFailureReport(
+      new Error("category=provider-http-503 identity_present=true usage_complete=true"),
+      {
+        qualificationSourceSha: "7".repeat(40),
+        pairs: [{ generatorModel: "deepseek/deepseek-v4-pro", scorerModel: "z-ai/glm-5.2" }],
+        upstreamProvider: "PublicProvider",
+      },
+    );
+    expect(report.process).toEqual({
+      category: "provider-unclassified",
+      exitCode: null,
+      signal: null,
+      killed: null,
+      phase: "unknown",
+      providerAttemptCount: null,
+      identityPresent: null,
+      identityMatched: null,
+      usagePresent: null,
+      usageAccountingComplete: null,
+    });
+  });
+
+  test("rejects contradictory failure facts", () => {
+    const base = {
+      artifactType: "live-models-failure",
+      qualificationSourceSha: "6".repeat(40),
+      profiles: [{ id: "pair", generatorModels: ["generator"], consensus: 1, scorerModels: ["scorer"] }],
+      providerEndpointIdentity: "openrouter:managed-routing",
+      upstreamProviderIdentity: "PublicProvider",
+      process: {
+        category: "provider-unclassified", exitCode: 1, signal: null, killed: false,
+        phase: "attribution", providerAttemptCount: 1,
+        identityPresent: false, identityMatched: true,
+        usagePresent: false, usageAccountingComplete: false,
+      },
+    };
+    expect(() => parseLiveModelsFailureReport(base)).toThrow("invalid live-models failure process facts");
+    expect(() => parseLiveModelsFailureReport({
+      ...base,
+      process: { ...base.process, identityMatched: false, usageAccountingComplete: true },
+    })).toThrow("invalid live-models failure process facts");
+  });
+
   test("cleans and rejects one path used for both evidence and a candidate", async () => {
     const directory = await temporaryDirectory();
     const path = join(directory, "report.json");

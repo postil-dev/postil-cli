@@ -11,6 +11,115 @@ use serde::{Deserialize, Serialize};
 use crate::config::Config;
 use crate::llm::LlmClient;
 
+pub(crate) const TERMINAL_DIAGNOSTIC_PREFIX: &str = "postil:atomic-attribution-terminal:v1:";
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum AttributionTerminalCategory {
+    ResponseIdentityMissing,
+    ResponseIdentityMismatch,
+    UsageAccountingIncomplete,
+    OutputInvalidAfterSchemaRepair,
+    OutputNonterminalLength,
+    InvalidOutput,
+    ProviderRequestTooLarge,
+    ProviderHttp { status: u16 },
+    ProviderTimeout,
+    ProviderDeadline,
+    ProviderTransport,
+    ProviderUnclassified,
+}
+
+impl AttributionTerminalCategory {
+    fn as_str(self) -> String {
+        match self {
+            Self::ResponseIdentityMissing => "response-identity-missing".to_string(),
+            Self::ResponseIdentityMismatch => "response-identity-mismatch".to_string(),
+            Self::UsageAccountingIncomplete => "usage-accounting-incomplete".to_string(),
+            Self::OutputInvalidAfterSchemaRepair => {
+                "output-invalid-after-schema-repair".to_string()
+            }
+            Self::OutputNonterminalLength => "output-nonterminal-length".to_string(),
+            Self::InvalidOutput => "invalid-output".to_string(),
+            Self::ProviderRequestTooLarge => "provider-request-too-large".to_string(),
+            Self::ProviderHttp { status } => format!("provider-http-{status}"),
+            Self::ProviderTimeout => "provider-timeout".to_string(),
+            Self::ProviderDeadline => "provider-deadline".to_string(),
+            Self::ProviderTransport => "provider-transport".to_string(),
+            Self::ProviderUnclassified => "provider-unclassified".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum AttributionTerminalPhase {
+    Attribution,
+    Unknown,
+}
+
+impl AttributionTerminalPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Attribution => "attribution",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AttributionTerminalDiagnostic {
+    pub version: u8,
+    pub category: AttributionTerminalCategory,
+    pub phase: AttributionTerminalPhase,
+    pub provider_attempt_count: Option<usize>,
+    pub identity_present: Option<bool>,
+    pub identity_matched: Option<bool>,
+    pub usage_present: Option<bool>,
+    pub usage_accounting_complete: Option<bool>,
+}
+
+impl AttributionTerminalDiagnostic {
+    fn unknown() -> Self {
+        Self {
+            version: 1,
+            category: AttributionTerminalCategory::ProviderUnclassified,
+            phase: AttributionTerminalPhase::Unknown,
+            provider_attempt_count: None,
+            identity_present: None,
+            identity_matched: None,
+            usage_present: None,
+            usage_accounting_complete: None,
+        }
+    }
+
+    fn emit(&self) {
+        let record = serde_json::json!({
+            "version": self.version,
+            "category": self.category.as_str(),
+            "phase": self.phase.as_str(),
+            "providerAttemptCount": self.provider_attempt_count,
+            "identityPresent": self.identity_present,
+            "identityMatched": self.identity_matched,
+            "usagePresent": self.usage_present,
+            "usageAccountingComplete": self.usage_accounting_complete,
+        });
+        eprintln!("{TERMINAL_DIAGNOSTIC_PREFIX}{record}");
+    }
+}
+
+#[derive(Debug)]
+struct AttributionTerminalError {
+    message: &'static str,
+    diagnostic: AttributionTerminalDiagnostic,
+}
+
+impl std::fmt::Display for AttributionTerminalError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.message)
+    }
+}
+
+impl std::error::Error for AttributionTerminalError {}
+
 pub use crate::config::{
     ATTRIBUTION_MAX_INPUT_BYTES as MAX_INPUT_BYTES,
     ATTRIBUTION_MAX_PROVIDER_REQUEST_BYTES as MAX_PROVIDER_REQUEST_BYTES,
@@ -72,6 +181,16 @@ struct AttributionSettings {
 }
 
 pub async fn run(input_path: &Path, config_path: Option<&Path>) -> Result<i32> {
+    match run_inner(input_path, config_path).await {
+        Ok(code) => Ok(code),
+        Err(error) => {
+            terminal_diagnostic(&error).emit();
+            Err(error)
+        }
+    }
+}
+
+async fn run_inner(input_path: &Path, config_path: Option<&Path>) -> Result<i32> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -136,33 +255,53 @@ pub async fn run(input_path: &Path, config_path: Option<&Path>) -> Result<i32> {
             Duration::from_secs(ATTRIBUTION_TIMEOUT_SECS),
         )
         .await
-        .map_err(|error| anyhow::anyhow!("atomic attribution failed: {error}"))?;
-    ensure!(
-        review.model_used == input.model,
-        "atomic attribution returned an unexpected model identity"
-    );
-    ensure!(
-        review.provider_used == input.expected_provider,
-        "atomic attribution returned an unexpected provider identity"
-    );
-    ensure!(
-        review.usage_accounting_complete,
-        "atomic attribution usage accounting is incomplete"
-    );
-    ensure!(
-        review.model_usage.len() == review.raw_responses.len()
-            && review.model_usage.iter().all(|usage| {
-                usage.model == input.model
-                    && usage.accounting_complete
-                    && usage.cost_provider_decimal.is_some()
-                    && matches!(
-                        usage.cost_source,
-                        Some(crate::envelope::ModelUsageCostSource::ProviderReported)
-                    )
-                    && (usage.prompt_tokens > 0 || usage.completion_tokens > 0)
-            }),
-        "atomic attribution usage evidence is incomplete or inconsistent"
-    );
+        .map_err(anyhow::Error::new)?;
+    if review.model_used != input.model || review.provider_used != input.expected_provider {
+        return Err(terminal_failure(
+            "atomic attribution returned an unexpected response identity",
+            AttributionTerminalDiagnostic {
+                version: 1,
+                category: AttributionTerminalCategory::ResponseIdentityMismatch,
+                phase: AttributionTerminalPhase::Attribution,
+                provider_attempt_count: Some(review.model_usage.len()),
+                identity_present: Some(true),
+                identity_matched: Some(false),
+                usage_present: None,
+                usage_accounting_complete: None,
+            },
+        ));
+    }
+    let usage_present = review.model_usage.last().map(|usage| {
+        usage.prompt_tokens > 0
+            || usage.completion_tokens > 0
+            || usage.cost_provider_decimal.is_some()
+    });
+    let usage_evidence_complete = review.model_usage.len() == review.raw_responses.len()
+        && review.model_usage.iter().all(|usage| {
+            usage.model == input.model
+                && usage.accounting_complete
+                && usage.cost_provider_decimal.is_some()
+                && matches!(
+                    usage.cost_source,
+                    Some(crate::envelope::ModelUsageCostSource::ProviderReported)
+                )
+                && (usage.prompt_tokens > 0 || usage.completion_tokens > 0)
+        });
+    if !review.usage_accounting_complete || !usage_evidence_complete {
+        return Err(terminal_failure(
+            "atomic attribution usage accounting is incomplete",
+            AttributionTerminalDiagnostic {
+                version: 1,
+                category: AttributionTerminalCategory::UsageAccountingIncomplete,
+                phase: AttributionTerminalPhase::Attribution,
+                provider_attempt_count: Some(review.model_usage.len()),
+                identity_present: Some(true),
+                identity_matched: Some(true),
+                usage_present,
+                usage_accounting_complete: Some(false),
+            },
+        ));
+    }
     let output = AttributionOutput {
         same_defect: review.same_defect,
         reason: review.reason,
@@ -181,6 +320,26 @@ pub async fn run(input_path: &Path, config_path: Option<&Path>) -> Result<i32> {
     };
     println!("{}", serde_json::to_string(&output)?);
     Ok(0)
+}
+
+fn terminal_failure(
+    message: &'static str,
+    diagnostic: AttributionTerminalDiagnostic,
+) -> anyhow::Error {
+    anyhow::Error::new(AttributionTerminalError {
+        message,
+        diagnostic,
+    })
+}
+
+fn terminal_diagnostic(error: &anyhow::Error) -> AttributionTerminalDiagnostic {
+    if let Some(terminal) = error.downcast_ref::<AttributionTerminalError>() {
+        return terminal.diagnostic.clone();
+    }
+    if let Some(model_error) = error.downcast_ref::<crate::llm::ModelError>() {
+        return model_error.atomic_attribution_terminal_diagnostic();
+    }
+    AttributionTerminalDiagnostic::unknown()
 }
 
 fn validate_input(input: &AttributionInput) -> Result<()> {

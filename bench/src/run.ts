@@ -52,16 +52,69 @@ import {
   DEFAULT_LIVE_CONCURRENCY as DEFAULT_LIVE_MODELS_CONCURRENCY,
   formatLiveModelsReport,
   liveModelsQualificationExitCode,
+  MANAGED_OPENROUTER_PROVIDER_IDENTITY,
   parseLiveModelsReport,
   parsePrivateEvidenceBundle,
   parseQualificationPairs,
   serializePrivateEvidenceBundle,
   runLiveModels,
+  resolveQualificationSourceSha,
   pricingFromFile,
   verifyPrivateEvidenceBundle,
   type LiveModelsPrivateEvidenceBundle,
   type LiveModelsReport,
 } from "./livemodels";
+import {
+  qualificationGeneratorModels,
+  qualificationPairId,
+  qualificationScorerModels,
+  type QualificationPair,
+} from "./livemodels-score";
+import { atomicAttributionTransportFailure } from "./attribution";
+
+const LIVE_MODELS_FAILURE_CATEGORIES = [
+  "response-identity-missing",
+  "response-identity-mismatch",
+  "usage-accounting-incomplete",
+  "output-invalid-after-schema-repair",
+  "output-nonterminal-length",
+  "invalid-output",
+  "provider-request-too-large",
+  "provider-timeout",
+  "provider-deadline",
+  "provider-transport",
+  "provider-unclassified",
+  "subprocess-timeout",
+  "subprocess-signal",
+  "subprocess-exit",
+] as const;
+
+type LiveModelsFailureCategory = typeof LIVE_MODELS_FAILURE_CATEGORIES[number] | `provider-http-${number}`;
+
+export interface LiveModelsFailureReport {
+  artifactType: "live-models-failure";
+  qualificationSourceSha: string;
+  profiles: Array<{
+    id: string;
+    generatorModels: string[];
+    consensus: number;
+    scorerModels: string[];
+  }>;
+  providerEndpointIdentity: typeof MANAGED_OPENROUTER_PROVIDER_IDENTITY;
+  upstreamProviderIdentity: string;
+  process: {
+    category: LiveModelsFailureCategory;
+    exitCode: number | null;
+    signal: string | null;
+    killed: boolean | null;
+    phase: "attribution" | "unknown";
+    providerAttemptCount: number | null;
+    identityPresent: boolean | null;
+    identityMatched: boolean | null;
+    usagePresent: boolean | null;
+    usageAccountingComplete: boolean | null;
+  };
+}
 
 function flagValue(args: string[], flag: string): string | undefined {
   const index = args.indexOf(flag);
@@ -118,17 +171,33 @@ async function main() {
     if (!upstreamProvider?.trim()) {
       throw new Error("live-models admission needs POSTIL_BENCH_UPSTREAM_PROVIDER or --upstream-provider");
     }
-    const { report, privateEvidence } = await runLiveModels(cases, {
-      binary,
-      pairs,
-      repeats: repeatsRaw === undefined ? undefined : Number.parseInt(repeatsRaw, 10),
-      apiBase: process.env.POSTIL_API_BASE,
-      apiFormat,
-      upstreamProvider,
-      pricing: pricingFile === undefined ? undefined : await pricingFromFile(pricingFile),
-      concurrency,
-      costCapUsd: costCapRaw,
-    });
+    const qualificationSourceSha = await resolveQualificationSourceSha(
+      resolve(import.meta.dir, "..", ".."),
+    );
+    let report: LiveModelsReport;
+    let privateEvidence: LiveModelsPrivateEvidenceBundle;
+    try {
+      ({ report, privateEvidence } = await runLiveModels(cases, {
+        binary,
+        pairs,
+        repeats: repeatsRaw === undefined ? undefined : Number.parseInt(repeatsRaw, 10),
+        apiBase: process.env.POSTIL_API_BASE,
+        apiFormat,
+        upstreamProvider,
+        pricing: pricingFile === undefined ? undefined : await pricingFromFile(pricingFile),
+        concurrency,
+        costCapUsd: costCapRaw,
+      }));
+    } catch (error) {
+      await invalidateExplicitOutputs([manifestOut, privateEvidenceOut]);
+      const failureReport = await createLiveModelsFailureReport(error, {
+        qualificationSourceSha,
+        pairs,
+        upstreamProvider,
+      });
+      await writeLiveModelsReport(jsonOut, JSON.stringify(failureReport, null, 2));
+      throw error;
+    }
     await writePrivateEvidenceBundle(privateEvidenceOut, privateEvidence, report);
     await writeLiveModelsReport(jsonOut, JSON.stringify(report, null, 2));
     if (manifestOut) {
@@ -171,6 +240,124 @@ async function main() {
 
   if (!report.ok) {
     process.exitCode = 1;
+  }
+}
+
+export async function createLiveModelsFailureReport(
+  error: unknown,
+  options: {
+    qualificationSourceSha: string;
+    pairs: QualificationPair[];
+    upstreamProvider: string;
+  },
+): Promise<LiveModelsFailureReport> {
+  const failure = fixedLiveModelsFailure(error);
+  return Object.freeze(parseLiveModelsFailureReport({
+    artifactType: "live-models-failure",
+    qualificationSourceSha: options.qualificationSourceSha,
+    profiles: options.pairs.map((pair) => ({
+      id: qualificationPairId(pair),
+      generatorModels: qualificationGeneratorModels(pair),
+      consensus: pair.consensus ?? qualificationGeneratorModels(pair).length,
+      scorerModels: qualificationScorerModels(pair),
+    })),
+    providerEndpointIdentity: MANAGED_OPENROUTER_PROVIDER_IDENTITY,
+    upstreamProviderIdentity: options.upstreamProvider,
+    process: failure,
+  }));
+}
+
+export function parseLiveModelsFailureReport(value: unknown): LiveModelsFailureReport {
+  if (!isRecord(value)) throw new Error("invalid live-models failure artifact");
+  assertExactKeys(value, [
+    "artifactType", "qualificationSourceSha", "profiles", "providerEndpointIdentity",
+    "upstreamProviderIdentity", "process",
+  ]);
+  if (value.artifactType !== "live-models-failure" ||
+      typeof value.qualificationSourceSha !== "string" ||
+      !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(value.qualificationSourceSha) ||
+      value.providerEndpointIdentity !== MANAGED_OPENROUTER_PROVIDER_IDENTITY ||
+      typeof value.upstreamProviderIdentity !== "string" || value.upstreamProviderIdentity.trim() === "" ||
+      !Array.isArray(value.profiles) || value.profiles.length === 0 ||
+      !isRecord(value.process)) {
+    throw new Error("invalid live-models failure artifact");
+  }
+  for (const profile of value.profiles) {
+    if (!isRecord(profile)) throw new Error("invalid live-models failure profile");
+    assertExactKeys(profile, ["id", "generatorModels", "consensus", "scorerModels"]);
+    if (typeof profile.id !== "string" || profile.id.trim() === "" ||
+        !Array.isArray(profile.generatorModels) || profile.generatorModels.length === 0 ||
+        !profile.generatorModels.every((model) => typeof model === "string" && model.trim() !== "") ||
+        !Number.isSafeInteger(profile.consensus) || (profile.consensus as number) < 1 ||
+        !Array.isArray(profile.scorerModels) || profile.scorerModels.length === 0 ||
+        !profile.scorerModels.every((model) => typeof model === "string" && model.trim() !== "")) {
+      throw new Error("invalid live-models failure profile");
+    }
+  }
+  assertExactKeys(value.process, [
+    "category", "exitCode", "signal", "killed", "phase", "providerAttemptCount",
+    "identityPresent", "identityMatched", "usagePresent", "usageAccountingComplete",
+  ]);
+  const category = value.process.category;
+  const validCategory = typeof category === "string" && (
+    (LIVE_MODELS_FAILURE_CATEGORIES as readonly string[]).includes(category) ||
+    /^provider-http-[1-5][0-9]{2}$/u.test(category)
+  );
+  if (!validCategory ||
+      !(value.process.exitCode === null || (Number.isSafeInteger(value.process.exitCode) && (value.process.exitCode as number) >= 0)) ||
+      !(value.process.signal === null || (typeof value.process.signal === "string" && /^[A-Z0-9]+$/u.test(value.process.signal))) ||
+      !isOptionalBoolean(value.process.killed) ||
+      (value.process.phase !== "attribution" && value.process.phase !== "unknown") ||
+      !(value.process.providerAttemptCount === null ||
+        (Number.isSafeInteger(value.process.providerAttemptCount) && (value.process.providerAttemptCount as number) >= 0)) ||
+      !isOptionalBoolean(value.process.identityPresent) || !isOptionalBoolean(value.process.identityMatched) ||
+      !isOptionalBoolean(value.process.usagePresent) || !isOptionalBoolean(value.process.usageAccountingComplete)) {
+    throw new Error("invalid live-models failure process facts");
+  }
+  if (value.process.identityMatched === true && value.process.identityPresent !== true) {
+    throw new Error("invalid live-models failure process facts");
+  }
+  if (value.process.usageAccountingComplete === true && value.process.usagePresent !== true) {
+    throw new Error("invalid live-models failure process facts");
+  }
+  return value as unknown as LiveModelsFailureReport;
+}
+
+function fixedLiveModelsFailure(error: unknown): LiveModelsFailureReport["process"] {
+  const transport = atomicAttributionTransportFailure(error);
+  if (transport === null) {
+    return {
+      category: "provider-unclassified", exitCode: null, signal: null, killed: null,
+      phase: "unknown", providerAttemptCount: null, identityPresent: null, identityMatched: null,
+      usagePresent: null, usageAccountingComplete: null,
+    };
+  }
+  return {
+    category: transport.diagnostic.category as LiveModelsFailureCategory,
+    exitCode: transport.exitCode,
+    signal: transport.signal,
+    killed: transport.killed,
+    phase: transport.diagnostic.phase,
+    providerAttemptCount: transport.diagnostic.providerAttemptCount,
+    identityPresent: transport.diagnostic.identityPresent,
+    identityMatched: transport.diagnostic.identityMatched,
+    usagePresent: transport.diagnostic.usagePresent,
+    usageAccountingComplete: transport.diagnostic.usageAccountingComplete,
+  };
+}
+
+function isOptionalBoolean(value: unknown): value is boolean | null {
+  return value === null || typeof value === "boolean";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function assertExactKeys(value: Record<string, unknown>, fields: readonly string[]): void {
+  const expected = new Set(fields);
+  if (Object.keys(value).length !== expected.size || Object.keys(value).some((field) => !expected.has(field))) {
+    throw new Error("live-models failure artifact has unknown or missing fields");
   }
 }
 

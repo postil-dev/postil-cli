@@ -838,7 +838,12 @@ describe("managed admission workflow", () => {
     expect(workflow).toContain('rm -f "$POSTIL_REPORT_OUT" "$POSTIL_MANIFEST_OUT" "$POSTIL_PRIVATE_EVIDENCE_OUT" "$POSTIL_PRIVATE_EVIDENCE_ENCRYPTED_OUT" "$POSTIL_ATTESTATION_BUNDLE_OUT"');
     expect(workflow).toContain('--manifest-out "$POSTIL_MANIFEST_OUT"');
     expect(workflow).toContain('--private-evidence-out "$POSTIL_PRIVATE_EVIDENCE_OUT"');
-    expect(workflow).toContain('const r = parseLiveModelsReport(await Bun.file(process.env.POSTIL_REPORT_OUT).json());');
+    expect(workflow).toContain('const { parseLiveModelsFailureReport } = await import("./src/run.ts");');
+    expect(workflow).toContain('if (raw?.artifactType === "live-models-failure")');
+    expect(workflow).toContain("const failure = parseLiveModelsFailureReport(raw);");
+    expect(workflow).toContain('console.log("category " + failure.process.category);');
+    expect(workflow).toContain('console.log("provider attempts " + fact(failure.process.providerAttemptCount));');
+    expect(workflow).toContain("const r = parseLiveModelsReport(raw);");
     expect(workflow).toContain("secrets.POSTIL_PRIVATE_EVIDENCE_PASSPHRASE");
     expect(workflow).toContain("--symmetric --cipher-algo AES256");
     expect(workflow).toContain('cmp "$POSTIL_PRIVATE_EVIDENCE_OUT" "$verify_path"');
