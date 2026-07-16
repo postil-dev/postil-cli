@@ -33,7 +33,17 @@ struct DiffRefs {
 struct MrResponse {
     title: String,
     description: Option<String>,
+    state: String,
     diff_refs: DiffRefs,
+}
+
+fn mr_matches_snapshot(mr: &MrResponse, expected: &PrMeta) -> bool {
+    mr.state == "opened"
+        && mr.title == expected.title
+        && mr.description.as_deref().unwrap_or_default() == expected.body
+        && mr.diff_refs.head_sha == expected.head_sha
+        && mr.diff_refs.base_sha == expected.base_sha
+        && Some(mr.diff_refs.start_sha.as_str()) == expected.target_sha.as_deref()
 }
 
 #[derive(Deserialize)]
@@ -350,11 +360,13 @@ impl Forge for GitLab {
 
     async fn fetch_pr_meta(&self) -> Result<PrMeta> {
         let mr = self.mr().await?;
+        ensure!(mr.state == "opened", "GitLab merge request is not open");
         Ok(PrMeta {
             title: mr.title,
             body: mr.description.unwrap_or_default(),
             head_sha: mr.diff_refs.head_sha,
             base_sha: mr.diff_refs.base_sha,
+            target_sha: Some(mr.diff_refs.start_sha),
             changed_files: None,
         })
     }
@@ -470,12 +482,16 @@ impl Forge for GitLab {
         &self,
         summary: &str,
         findings: &[Finding],
-        _head_sha: &str,
+        snapshot: &PrMeta,
     ) -> Result<()> {
         if super::only_operational_findings(findings) {
             return Ok(());
         }
         let mr = self.mr().await?;
+        if !mr_matches_snapshot(&mr, snapshot) {
+            eprintln!("postil: gitlab review delivery skipped because the merge request changed");
+            return Ok(());
+        }
         // One failed comment must not drop the rest: post everything we can,
         // then report the failures together.
         let mut failures: Vec<String> = Vec::new();
@@ -529,9 +545,15 @@ impl Forge for GitLab {
         _advisory_id: &str,
         _gate_id: &str,
         advisory: CheckState,
-        gate: CheckState,
+        gate: Option<CheckState>,
         envelope: &Envelope,
+        snapshot: &PrMeta,
     ) -> Result<()> {
+        let current = self.mr().await?;
+        if !mr_matches_snapshot(&current, snapshot) {
+            eprintln!("postil: gitlab status delivery skipped because the merge request changed");
+            return Ok(());
+        }
         let head = envelope
             .head_sha
             .clone()
@@ -557,9 +579,16 @@ impl Forge for GitLab {
         } else {
             format!("passing (failOn: {})", envelope.gate.fail_on)
         };
-        self.set_status(&head, "postil/gate", map(gate), &gate_desc)
-            .await?;
+        if let Some(gate) = gate {
+            self.set_status(&head, "postil/gate", map(gate), &gate_desc)
+                .await?;
+        }
         Ok(())
+    }
+
+    async fn snapshot_is_current(&self, expected: &PrMeta) -> Result<bool> {
+        let current = self.mr().await?;
+        Ok(mr_matches_snapshot(&current, expected))
     }
 
     /// Title and description of an issue or MR. GitLab's issue and merge-request
@@ -612,6 +641,56 @@ impl Forge for GitLab {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snapshot() -> PrMeta {
+        PrMeta {
+            title: "title".into(),
+            body: "body".into(),
+            head_sha: "head".into(),
+            base_sha: "merge-base".into(),
+            target_sha: Some("target".into()),
+            changed_files: None,
+        }
+    }
+
+    fn merge_request(state: &str, target: &str) -> MrResponse {
+        MrResponse {
+            title: "title".into(),
+            description: Some("body".into()),
+            state: state.into(),
+            diff_refs: DiffRefs {
+                base_sha: "merge-base".into(),
+                start_sha: target.into(),
+                head_sha: "head".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn delivery_snapshot_rejects_closed_merge_request() {
+        assert!(!mr_matches_snapshot(
+            &merge_request("merged", "target"),
+            &snapshot()
+        ));
+    }
+
+    #[test]
+    fn delivery_snapshot_rejects_changed_target() {
+        assert!(!mr_matches_snapshot(
+            &merge_request("opened", "advanced-target"),
+            &snapshot()
+        ));
+    }
+
+    #[test]
+    fn delivery_snapshot_rejects_changed_head_and_metadata() {
+        let mut current = merge_request("opened", "target");
+        current.diff_refs.head_sha = "advanced-head".into();
+        assert!(!mr_matches_snapshot(&current, &snapshot()));
+        current.diff_refs.head_sha = "head".into();
+        current.title = "edited title".into();
+        assert!(!mr_matches_snapshot(&current, &snapshot()));
+    }
 
     #[test]
     fn incomplete_versions_fail_closed() {

@@ -9,7 +9,7 @@ forge interactions against ground truth.
 
 ## What it measures
 
-Pipeline fidelity, not seeded-region finding hit rate: grounding (no
+Pipeline fidelity, not authored-target detection rate: grounding (no
 ungrounded findings, `counts.ungrounded == 0`), gating (gate fails exactly on
 error-severity findings, exit codes match), statusline correctness
 (`postil/review` and `postil/gate` check-runs created and completed with the
@@ -18,7 +18,7 @@ prompt-leakage guardrails (fixture metadata such as policy phrasing must never
 appear in the prompt or any pipeline output).
 
 The mock model returns recorded findings generated from the fixture specs, so
-mock mode measures pipeline fidelity rather than seeded-region finding hit
+mock mode measures pipeline fidelity rather than authored-target detection
 rate. Comparative claims require peer runs on the identical fixture set; site
 comparisons stay qualitative and sourced until then.
 
@@ -27,11 +27,6 @@ off-by-one boundaries, prompt-injection text with rejected-source assertions,
 misleading comments, huge low-signal multi-hunk diffs, near-duplicate clean and
 defect pairs, Unicode homoglyphs, subtle races, and clean changes where silence
 is the expected review.
-
-Seeded findings match a fixture-owned, signed proposition corpus. Detection
-credit requires full normalized equality with a listed positive or
-failed-remediation proposition. Signed negatives and all unlisted wording are
-rejected.
 
 ## Running (mock mode: default, CI)
 
@@ -56,8 +51,9 @@ entire matrix at least three times.
 
 The manual `Bench (managed OpenRouter admission)` workflow is fixed to the
 managed OpenRouter endpoint and its OpenAI-compatible interface. The local
-command below supports operator-owned OpenAI-compatible and Anthropic BYOK
-endpoints; those endpoints are not candidates for the managed workflow.
+pair-qualification command enforces the same endpoint and interface. The
+separate diff-file live benchmark supports operator-owned OpenAI-compatible
+and Anthropic BYOK endpoints.
 
 The managed workflow runs only from the exact `refs/heads/main` ref, includes
 that immutable source SHA and a 30-day authority window in every candidate
@@ -99,9 +95,33 @@ export MODEL_API_KEY=... # or POSTIL_API_KEY, OPENROUTER_API_KEY, or LLM_API_KEY
 export POSTIL_BENCH_MODE=live
 export POSTIL_BENCH_PAIRS=provider/generator::provider/scorer+provider/scorer-fallback
 export POSTIL_BENCH_REPEATS=3
-export POSTIL_API_FORMAT=openai-compatible # or anthropic
+export POSTIL_API_BASE=https://openrouter.ai/api/v1
+export POSTIL_API_FORMAT=openai-compatible
+export POSTIL_BENCH_UPSTREAM_PROVIDER='Exact upstream provider name'
 bun run bench --json-out report.json --manifest-out ../qualified-models.json
 ```
+
+Live admission emits public report schema version 2. Consumers must call
+`parseLiveModelsReport`; unversioned reports and unknown schema versions are
+rejected. Public case diagnostics contain counts and SHA-256 digests only.
+Finding prose, target contracts, raw evaluator responses, evaluator reasons,
+and diagnostic text are absent.
+
+The same invocation writes a separate private replay bundle. Use
+`--private-evidence-out <path>` or `POSTIL_BENCH_PRIVATE_EVIDENCE_OUT` to select
+its location. Without either, the mode-0600 file stays under the gitignored
+`bench/.runs/` directory. The runner reads the file back, checks its exact-byte
+digest against `privateEvidenceSha256` in the public report, and replays every
+attribution record before writing the report or admission candidate. This file
+contains model requests, finding prose, target contracts, raw responses, and
+evaluator reasons. Store it as sensitive qualification evidence and remove it
+when the applicable evidence-retention period ends. The managed workflow keeps
+plaintext in runner temporary storage and requires the
+`POSTIL_PRIVATE_EVIDENCE_PASSPHRASE` repository or environment secret before
+inference. It encrypts the bundle with GnuPG AES-256, decrypts and byte-compares
+the result, uploads only the encrypted artifact, and removes both runner files
+in an `always()` cleanup step. GitHub's configured artifact retention policy
+owns the encrypted bundle lifetime. The workflow publishes no raw-run artifact.
 
 The release binary must embed the exact profile under test. Set the intended
 generator, cascade, consensus width, scorer, API base, and interface in
@@ -111,12 +131,14 @@ binary's embedded metadata with the worktree before inference. Environment
 model variables select that same profile for the isolated run; they do not
 define a different candidate.
 
-Native Anthropic and authenticated private endpoints can use an operator-owned
-pricing file instead of a public model catalog:
+Managed qualification uses the canonical OpenRouter endpoint and one exact
+upstream provider route. An operator-owned pricing file can replace the
+OpenRouter endpoint catalog response for that same route:
 
 ```json
 {
   "provider/model": {
+    "providerIdentity": "Exact upstream provider name",
     "promptUsdPerToken": "0.000001",
     "completionUsdPerToken": "0.000005"
   }
@@ -126,16 +148,15 @@ pricing file instead of a public model catalog:
 Pass it with `--pricing-file prices.json` or
 `POSTIL_BENCH_PRICING_FILE=prices.json`. Prices are positive canonical decimal
 strings that must be exactly representable as integer micros per million
-tokens. Each admitted profile carries immutable input and output price bounds
+tokens. Every row names the exact upstream provider passed with
+`--upstream-provider`; a mismatch fails before inference. Each admitted profile carries immutable input and output price bounds
 for its exact generator and scorer model set. The catalog request uses the
 inference credential when no file is supplied and fails closed when any model
 is unpriced. Catalog redirects are rejected so credentials remain bound to the
 configured endpoint origin.
 
-Private gateways may set `POSTIL_ENDPOINT_AUTH_HEADER` and
-`POSTIL_ENDPOINT_AUTH_VALUE`. The harness validates and forwards the pair to
-both catalog and inference requests. Provider-managed headers cannot be
-overridden.
+Native Anthropic and authenticated private endpoints remain available to BYOK
+runtime configurations. They are outside managed hosted qualification.
 
 Pair syntax is `generators::scorer+fallback` or
 `generators::consensus::scorer+fallback`. For example,
@@ -146,7 +167,7 @@ is tried after the primary scorer.
 
 Admission requires all of these in every repeat:
 
-- 100% must-block detection and final blocking by the seeded finding itself
+- 100% must-block detection and final blocking by the attributed finding itself
 - at least 90% advisory detection and at most 10% advisory overblocking
 - no clean false blocks and at most 5% clean cases with any finding
 - no execution, structured-output, grounding, statusline, or usage-accounting failure
@@ -155,9 +176,13 @@ Admission requires all of these in every repeat:
 - per-repeat p95 latency at most 30 seconds and maximum latency at most 60 seconds
 
 Findings suppressed by the scorer count as detector evidence but cannot satisfy
-final blocking. An unrelated error cannot substitute for the seeded finding.
+final blocking. An unrelated error cannot substitute for the attributed finding.
 The report stores only attributable finding coordinates and labels, never model
-finding titles or bodies. It records separate fixture, review-contract source,
+finding titles or bodies. Per-case attribution records retain the verdict and
+immutable request, response, usage, and evidence hashes. Evaluator-bank records
+retain eligibility, call count, and their aggregate evidence hash. Requests,
+raw responses, target contracts, and evaluator reasons stay out of the report.
+The report records separate fixture, review-contract source,
 configuration, evaluator contract, and CLI binary SHA-256 hashes; the canonical API base and
 provider interface; the ordered generator chain and consensus width; the
 ordered scorer chain; repeat number; and provider-exact or catalog-estimate
@@ -189,17 +214,22 @@ plan for every fixture before inference. It includes bounded planner, selected
 source and synthesis requests, scoring, consensus, fallback, repair, and
 transport retries. It rejects missing prices, more than six models, a review
 above the $1 hosted operation cap, a total above the configured qualification
-cap, or a cap outside `(0, $25]`. A single model used for more than one role is
+cap, or a cap outside `(0, $55]`. A single model used for more than one role is
 priced for each planned invocation.
+Atomic attribution accepts at most three findings anchored in one authored
+region. More is a fidelity failure. Each decision is limited to a 4 KiB input,
+a 5,000-byte serialized provider request whose size conservatively caps prompt
+tokens, and six possibly billed attempts across the initial request and one
+schema repair.
 The inference key stays in the child environment and is never printed or placed
 on an argument list.
 
 These fixtures are internal evidence, not a competitor comparison. Inference is
 nondeterministic, so one successful matrix is insufficient for admission.
-OpenRouter's endpoint identity is recorded, but its dynamic upstream route is
-not described as pinned. A pinned-provider claim requires request and response
-evidence for that exact route. Hosted OpenRouter qualification uses the same
-non-collection and ZDR request preferences as production.
+OpenRouter's endpoint identity and the selected ZDR provider route are pinned.
+Pricing, requests, responses, attribution evidence, and the emitted candidate
+must all identify that exact route. Hosted OpenRouter qualification uses the
+same non-collection and ZDR request preferences as production.
 
 ## Scorer qualification (opt-in, mocked generator + real scorer)
 
@@ -223,9 +253,9 @@ POSTIL_SCORER_EVAL_REPEATS=5 \
 
 The default candidates come from `config.toml`; the workflow input may override
 them explicitly. Qualification repeats 12 fixtures five times: six unambiguous
-seeded risks and six injected false findings. Admission requires a complete
+authored target risks and six injected false findings. Admission requires a complete
 matrix, no malformed, repaired, fallback, or reason-contract failures, all
-seeded risks preserved as published gate failures, at least 80% of false
+target risks preserved as published gate failures, at least 80% of false
 findings actually suppressed overall and per fixture, p50/p95/max scorer latency
 at or below 5/10/20 seconds, known live
 catalog pricing, and mean scorer cost at or below $0.005 per case. A failed
@@ -235,11 +265,13 @@ evaluator rejects more than six candidates, more than ten repeats, missing
 prices, or a conservative projected total above $10. The projection prices the
 runtime retry graph: three transport attempts for the initial request and three
 for at most one schema-repair request. A one-finding qualification request uses
-a 17,000-byte prompt bound, an 896-token output bound, and at most 3,584 bytes
+a 17,000-byte prompt bound, a 400-token output bound, and at most 1,600 bytes
 of repair context. Scorer responses also fail
 admission when provider usage is missing or malformed, runtime accounting is
-incomplete, or the assessment is not trimmed single-line text of at most
-240 UTF-8 bytes ending in sentence punctuation. Each case is killed one second
+incomplete, or the assessment is not trimmed single-line text ending in
+sentence punctuation. The prompt targets at most 180 UTF-8 bytes, and the
+parser rejects more than 240 UTF-8 bytes. Each
+case is killed one second
 after the 20-second admission limit, and teardown aborts outstanding provider
 requests. A timeout rejects that candidate immediately rather than running the
 rest of its matrix. Any other admission-fatal structural result, including an
@@ -256,15 +288,17 @@ from the same output limit.
 ## Diff-file live mode (opt-in, single model, no forge)
 
 This live mode runs the real release binary against the same fixtures with a
-real model and **no mocked model server**, so it measures seeded-region finding
+real model and **no mocked model server**, so it measures authored-target detection
 hit rate rather than pipeline fidelity. Each case runs in local diff-file mode
-(`postil review --diff-file <fixture.diff> --no-post --output-json`), which does
+(`postil review --diff-file <fixture.diff> --output-json`), which does
 no forge I/O at all, so no GitHub server, mock or real, is involved and nothing
 is written to any repo.
 
 ```sh
 export MODEL_API_KEY=...         # required; never logged or printed
 REVIEW_MODEL=provider/qualified-model bun run bench:live
+# Exercise the production large-review selection and synthesis path.
+REVIEW_MODEL=provider/qualified-model bun run bench:live -- --bounded
 # --model <id> is the equivalent command-line override
 # --concurrency <n> or BENCH_CONCURRENCY sets case parallelism (default 6)
 ```
@@ -274,7 +308,16 @@ or `LLM_API_KEY` and never logs or prints the key value. Live mode is
 **not run in CI**: it spends real tokens and depends on an
 external provider. Every live run writes a timestamped JSON report under
 `.runs/` (gitignored); `--json-out <path>` writes an additional copy and
-`--json` prints the report as JSON.
+`--json` prints the report as JSON. `--bounded` (or
+`POSTIL_BENCH_BOUNDED=1`) qualifies the deterministic risk-selection and
+synthesis path used when a review exceeds five source batches. Every report
+records `reviewMode` as `exhaustive` or `bounded` so admission tooling can
+reject evidence from the wrong execution path. It also records the release
+binary's SHA-256 digest so the report cannot be paired with a different
+executable during admission. Fixture-corpus and evaluator-source digests bind
+the results to the benchmark inputs and scoring code. Live admission runs use
+OpenRouter's managed route and explicitly disable the second-pass scorer so
+the measured model is the only inference model involved.
 
 ### Concurrency and retries
 
@@ -291,23 +334,23 @@ HTTP 5xx/429, rate-limit, timeout, or connection signature, or a run that
 produced no valid v1 envelope at all (empty/garbled output, typically a dropped
 response). A valid envelope is always treated as a normal result and is never
 retried, including a gate-failing exit (exit 1 with a scored envelope) or one
-that merely reports findings or non-seeded-region findings. A case that fails on both
+that merely reports findings unrelated to the authored target. A case that fails on both
 attempts is recorded as an error and excluded from scoring, exactly as before.
 
 ### What live mode scores
 
-- **Seeded-region finding hit rate**: a seeded region counts as found when a
-  finding matches the ground-truth path with line within +/-3.
-- **Severity match (exact)** among seeded-region hits: strict equality between the found
+- **Authored-target detection rate**: a finding counts only when its path and anchor line
+  match the authored target region and the atomic evaluator attributes the same defect.
+- **Severity match (exact)** among attributed findings: strict equality between the found
   severity and the fixture's ground-truth severity.
-- **Severity match (+/-1 tier)** among seeded-region hits: a wider band that treats
+- **Severity match (+/-1 tier)** among attributed findings: a wider band that treats
   adjacent tiers on the `info < warn < error` scale (i.e. `info`<->`warn` and
   `warn`<->`error`) as a match, counting only the two-tier `info`<->`error` gap
   as a real mismatch.
 - **Silence on clean PRs**: a clean case should produce no findings.
-- **Non-seeded-region finding count**: any finding in a clean case, and any
+- **Unrelated finding count**: any finding in a clean case, and any
   non-matching finding in a defect case.
-- **Confidence distribution** of seeded-region hits, and per-case duration / token
+- **Confidence distribution** of attributed findings, and per-case duration / token
   usage.
 
 Both severity numbers are reported, and the per-case detail always shows the

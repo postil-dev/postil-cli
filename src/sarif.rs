@@ -174,6 +174,7 @@ mod tests {
             scorer_reason: None,
             title: "Bug".into(),
             body: "details".into(),
+            evidence: None,
             id: None,
         };
         let s = to_sarif(&env_with(vec![f]));

@@ -70,6 +70,7 @@ export interface AdmissionVerificationOptions {
   runGh?: RunGh;
   runGit?: RunGit;
   nowUnixSeconds?: number;
+  requireQualifiedProfile?: boolean;
 }
 
 async function runGitHubCli(args: string[]): Promise<string> {
@@ -112,6 +113,9 @@ export async function verifyAdmissionManifest(
       parsed.qualificationMaxAgeDays !== null
     ) {
       throw new Error("empty qualification manifest must not claim qualification authority");
+    }
+    if (options.requireQualifiedProfile) {
+      throw new Error("release requires at least one attested qualified model profile");
     }
     return "empty";
   }
@@ -224,11 +228,13 @@ function verifyAttestationFreshness(
 
 if (import.meta.main) {
   const repositoryRoot = resolve(import.meta.dir, "..", "..");
-  const manifestPath = resolve(process.argv[2] ?? resolve(repositoryRoot, "qualified-models.json"));
+  const requireQualifiedProfile = process.argv.includes("--require-qualified");
+  const positional = process.argv.slice(2).filter((argument) => argument !== "--require-qualified");
+  const manifestPath = resolve(positional[0] ?? resolve(repositoryRoot, "qualified-models.json"));
   const bundlePath = resolve(
-    process.argv[3] ?? resolve(repositoryRoot, "qualified-models.attestation.json"),
+    positional[1] ?? resolve(repositoryRoot, "qualified-models.attestation.json"),
   );
-  verifyAdmissionManifest(manifestPath, bundlePath)
+  verifyAdmissionManifest(manifestPath, bundlePath, { requireQualifiedProfile })
     .then((result) => console.log(
       result === "empty"
         ? "Qualification manifest is empty; no model is admitted."

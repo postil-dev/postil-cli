@@ -38,6 +38,7 @@ const REVIEW_CONTRACT_SOURCES: &[(&str, &str)] = &[
     ("src/output.rs", include_str!("output.rs")),
     ("src/plan.rs", include_str!("plan.rs")),
     ("src/prompt.rs", include_str!("prompt.rs")),
+    ("src/attribution.rs", include_str!("attribution.rs")),
     ("src/llm.rs", include_str!("llm.rs")),
     ("src/envelope.rs", include_str!("envelope.rs")),
     ("src/respond.rs", include_str!("respond.rs")),
@@ -62,10 +63,18 @@ const EVALUATOR_CONTRACT_SOURCES: &[(&str, &str)] = &[
     ),
     ("bench/package.json", BENCH_PACKAGE_JSON),
     ("bench/bun.lock", BENCH_BUN_LOCK),
+    (
+        "bench/fixtures/attribution-bank.ts",
+        include_str!("../bench/fixtures/attribution-bank.ts"),
+    ),
     ("bench/fixtures/cases.ts", BENCH_FIXTURES_SOURCE),
     (
         "bench/src/api-key.ts",
         include_str!("../bench/src/api-key.ts"),
+    ),
+    (
+        "bench/src/attribution.ts",
+        include_str!("../bench/src/attribution.ts"),
     ),
     (
         "bench/src/harness.ts",
@@ -152,6 +161,7 @@ pub struct QualificationProfile {
     pub api_base: String,
     #[serde(default)]
     pub benchmark_provider_identity: Option<String>,
+    pub upstream_provider_identity: String,
     pub generator_chain: Vec<String>,
     pub consensus: usize,
     pub scorer_chain: Vec<String>,
@@ -160,6 +170,7 @@ pub struct QualificationProfile {
     pub fixture_set_sha256: String,
     pub evaluator_contract_sha256: String,
     pub evaluator_runtime_identity: String,
+    pub evaluator_evidence_sha256: String,
     pub report_sha256: String,
     pub repeated_runs: u32,
 }
@@ -176,6 +187,7 @@ pub struct ModelPriceBound {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct QualificationCandidateProfile {
     pub benchmark_provider_identity: String,
+    pub upstream_provider_identity: String,
     pub api_base: String,
     pub api_format: ApiFormat,
     pub generator_chain: Vec<String>,
@@ -190,6 +202,7 @@ struct QualificationProfileDigestMaterial<'a> {
     qualification_source_sha: &'a str,
     model_defaults_sha256: &'a str,
     benchmark_provider_identity: &'a Option<String>,
+    upstream_provider_identity: &'a str,
     api_base: &'a str,
     api_format: ApiFormat,
     generator_chain: &'a [String],
@@ -200,6 +213,7 @@ struct QualificationProfileDigestMaterial<'a> {
     fixture_set_sha256: &'a str,
     evaluator_contract_sha256: &'a str,
     evaluator_runtime_identity: &'a str,
+    evaluator_evidence_sha256: &'a str,
     report_sha256: &'a str,
     repeated_runs: u32,
 }
@@ -296,6 +310,8 @@ pub struct QualificationMetadata {
     pub consensus: usize,
     pub scorer_chain: Vec<String>,
     pub hosted_operation_cost_cap_micros: u64,
+    pub attribution_max_input_bytes: u64,
+    pub attribution_max_provider_request_bytes: usize,
     pub admitted_profile: Option<QualificationProfile>,
 }
 
@@ -305,6 +321,9 @@ pub fn qualification_metadata() -> QualificationMetadata {
     let manifest = qualification_manifest();
     qualification_metadata_for(defaults, manifest)
 }
+
+pub const ATTRIBUTION_MAX_INPUT_BYTES: u64 = 4 * 1024;
+pub const ATTRIBUTION_MAX_PROVIDER_REQUEST_BYTES: usize = 5_000;
 
 fn qualification_metadata_for(
     defaults: &ModelDefaults,
@@ -327,6 +346,8 @@ fn qualification_metadata_for(
         consensus: defaults.consensus,
         scorer_chain,
         hosted_operation_cost_cap_micros: HOSTED_OPERATION_COST_CAP_MICROS,
+        attribution_max_input_bytes: ATTRIBUTION_MAX_INPUT_BYTES,
+        attribution_max_provider_request_bytes: ATTRIBUTION_MAX_PROVIDER_REQUEST_BYTES,
         admitted_profile,
     }
 }
@@ -506,6 +527,10 @@ fn parse_qualification_manifest(raw: &str) -> Result<QualificationManifest> {
             "qualification profile scorer chain must not be empty"
         );
         anyhow::ensure!(
+            !profile.upstream_provider_identity.trim().is_empty(),
+            "qualification profile upstream provider identity must not be empty"
+        );
+        anyhow::ensure!(
             (1..=profile.generator_chain.len()).contains(&profile.consensus),
             "qualification profile consensus must fit its generator chain"
         );
@@ -546,6 +571,10 @@ fn parse_qualification_manifest(raw: &str) -> Result<QualificationManifest> {
             (
                 "evaluatorContractSha256",
                 &profile.evaluator_contract_sha256,
+            ),
+            (
+                "evaluatorEvidenceSha256",
+                &profile.evaluator_evidence_sha256,
             ),
             ("reportSha256", &profile.report_sha256),
         ] {
@@ -759,6 +788,7 @@ fn qualification_profile_digest(profile: &QualificationProfile) -> String {
         qualification_source_sha: &profile.qualification_source_sha,
         model_defaults_sha256: &profile.model_defaults_sha256,
         benchmark_provider_identity: &profile.benchmark_provider_identity,
+        upstream_provider_identity: &profile.upstream_provider_identity,
         api_base: &profile.api_base,
         api_format: profile.api_format,
         generator_chain: &profile.generator_chain,
@@ -769,6 +799,7 @@ fn qualification_profile_digest(profile: &QualificationProfile) -> String {
         fixture_set_sha256: &profile.fixture_set_sha256,
         evaluator_contract_sha256: &profile.evaluator_contract_sha256,
         evaluator_runtime_identity: &profile.evaluator_runtime_identity,
+        evaluator_evidence_sha256: &profile.evaluator_evidence_sha256,
         report_sha256: &profile.report_sha256,
         repeated_runs: profile.repeated_runs,
     };
@@ -897,11 +928,11 @@ impl Default for Config {
             gate_fail_on: GateLevel::Severity(Severity::Error),
             gate_on_error: OnError::Block,
             block_on_kinds: vec![Kind::HumanEscalation],
-            model: defaults.default_model.clone(),
-            cascade: defaults.cascade.clone(),
-            scorer: defaults.scorer_model.clone(),
-            scorer_fallback: defaults.scorer_fallback.clone(),
-            scorer_enabled: defaults.scorer_enabled,
+            model: String::new(),
+            cascade: Vec::new(),
+            scorer: String::new(),
+            scorer_fallback: String::new(),
+            scorer_enabled: false,
             api_base: defaults.api_base.clone(),
             api_format: defaults.api_format,
             consensus: defaults.consensus,
@@ -1208,6 +1239,17 @@ impl Config {
 
     fn apply_env(&mut self) -> Result<()> {
         if hosted_mode() {
+            if let Some(profile) = admitted_profile_for(model_defaults(), qualification_manifest())
+            {
+                self.model = profile.generator_chain[0].clone();
+                self.cascade = profile.generator_chain[1..].to_vec();
+                self.consensus = profile.consensus;
+                self.scorer = profile.scorer_chain[0].clone();
+                self.scorer_fallback = profile.scorer_chain.get(1).cloned().unwrap_or_default();
+                self.scorer_enabled = true;
+                self.api_base = profile.api_base;
+                self.api_format = profile.api_format;
+            }
             return Ok(());
         }
         if qualification_candidate_mode() {
@@ -1504,6 +1546,10 @@ fn qualification_candidate_profile() -> Result<Option<QualificationCandidateProf
         profile.benchmark_provider_identity == MANAGED_OPENROUTER_PROVIDER_IDENTITY,
         "qualification candidate profile must use the managed provider identity"
     );
+    validate_model_id(
+        "qualification candidate upstreamProviderIdentity",
+        &profile.upstream_provider_identity,
+    )?;
     anyhow::ensure!(
         normalize_api_base(&profile.api_base)? == MANAGED_OPENROUTER_API_BASE
             && profile.api_base == MANAGED_OPENROUTER_API_BASE
@@ -1662,14 +1708,14 @@ __DEFAULT_CASCADE__  # scorer: provider/model  # explicit BYOK opt-in; embedded 
 pub fn starter_config() -> &'static str {
     static STARTER_CONFIG: OnceLock<String> = OnceLock::new();
     STARTER_CONFIG.get_or_init(|| {
-        let defaults = model_defaults();
+        let defaults = Config::default();
         let cascade = defaults
             .cascade
             .iter()
             .map(|model| format!("    - {}\n", yaml_scalar(model)))
             .collect::<String>();
         STARTER_CONFIG_TEMPLATE
-            .replace("__DEFAULT_MODEL__", &yaml_scalar(&defaults.default_model))
+            .replace("__DEFAULT_MODEL__", &yaml_scalar(&defaults.model))
             .replace("__DEFAULT_CASCADE__", &cascade)
     })
 }
@@ -1741,10 +1787,6 @@ mod tests {
         f.write_all(content.as_bytes()).unwrap();
     }
 
-    fn default_cascade() -> Vec<String> {
-        model_defaults().cascade.clone()
-    }
-
     fn valid_qualification_manifest_json() -> serde_json::Value {
         let issued = current_unix_seconds().unwrap();
         let mut manifest = serde_json::json!({
@@ -1761,6 +1803,7 @@ mod tests {
                 "apiFormat": "openai-compatible",
                 "apiBase": "https://openrouter.ai:443/api/v1",
                 "benchmarkProviderIdentity": MANAGED_OPENROUTER_PROVIDER_IDENTITY,
+                "upstreamProviderIdentity": "test-provider",
                 "generatorChain": ["provider/model"],
                 "consensus": 1,
                 "scorerChain": ["provider/scorer"],
@@ -1780,6 +1823,7 @@ mod tests {
                 "fixtureSetSha256": fixture_set_sha256(),
                 "evaluatorContractSha256": evaluator_contract_sha256(),
                 "evaluatorRuntimeIdentity": evaluator_runtime_identity(),
+                "evaluatorEvidenceSha256": "2".repeat(64),
                 "reportSha256": "1".repeat(64),
                 "repeatedRuns": 3
             }]
@@ -2062,12 +2106,13 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
     fn defaults_require_an_explicit_model_roster() {
         let c = Config::default();
         let defaults = model_defaults();
-        assert_eq!(c.model, defaults.default_model);
-        assert_eq!(c.cascade, default_cascade());
-        assert_eq!(c.scorer, defaults.scorer_model);
+        assert!(c.model.is_empty());
+        assert!(c.cascade.is_empty());
+        assert!(c.scorer.is_empty());
         assert!(!c.scorer_enabled);
         assert!(c.scorer_chain().is_empty());
         assert!(c.model_chain().is_empty());
+        assert_eq!(c.api_base, defaults.api_base);
     }
 
     #[test]
@@ -2110,11 +2155,10 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
         let f: FileConfig = serde_yaml::from_str(starter_config()).unwrap();
         let mut c = Config::default();
         c.apply_file(f).unwrap();
-        let defaults = model_defaults();
         assert_eq!(c.max_findings, 20);
-        assert_eq!(c.model, defaults.default_model);
-        assert_eq!(c.cascade, default_cascade());
-        assert_eq!(c.scorer, defaults.scorer_model);
+        assert!(c.model.is_empty());
+        assert!(c.cascade.is_empty());
+        assert!(c.scorer.is_empty());
     }
 
     #[test]
@@ -2140,7 +2184,7 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
 
         assert_eq!(config.model_chain(), expected.model_chain());
         assert_eq!(config.scorer, expected.scorer);
-        assert!(!config.scorer_enabled());
+        assert_eq!(config.scorer_chain(), expected.scorer_chain());
         assert_eq!(config.api_base, DEFAULT_API_BASE);
         assert_eq!(config.api_format, ApiFormat::OpenaiCompatible);
         assert_eq!(config.consensus, 1);
@@ -2148,7 +2192,14 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
 
     #[test]
     fn empty_and_hosted_model_admission_fail_closed() {
-        let empty = Config::default();
+        let empty = Config {
+            model: String::new(),
+            cascade: Vec::new(),
+            scorer: String::new(),
+            scorer_fallback: String::new(),
+            scorer_enabled: false,
+            ..Config::default()
+        };
         assert!(empty.require_model_for(false).is_err());
 
         let explicit = Config {
@@ -2459,6 +2510,7 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
             qualification_source_sha: "9".repeat(40),
             model_defaults_sha256: "c".repeat(64),
             benchmark_provider_identity: Some(MANAGED_OPENROUTER_PROVIDER_IDENTITY.into()),
+            upstream_provider_identity: "test-provider".into(),
             api_base: "https://openrouter.ai:443/api/v1".into(),
             api_format: ApiFormat::OpenaiCompatible,
             generator_chain: vec!["provider/one".into(), "provider/two".into()],
@@ -2485,12 +2537,13 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
             fixture_set_sha256: "a".repeat(64),
             evaluator_contract_sha256: "f".repeat(64),
             evaluator_runtime_identity: "bun@1.3.14".into(),
+            evaluator_evidence_sha256: "e".repeat(64),
             report_sha256: "e".repeat(64),
             repeated_runs: 3,
         };
         assert_eq!(
             qualification_profile_digest(&profile),
-            "e050df18c0f82fe6758eafd91c0c8d5b9eaccfe4a6cd0d01ca2edb8fc0a91d09"
+            "24cd24ba19e6125b6c1b152c77c0860efffdc87c2f3db3bc9fb6fb70768e35ce"
         );
     }
 
@@ -2553,6 +2606,7 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
             api_format: ApiFormat::OpenaiCompatible,
             api_base: "https://models.example:443/v1".into(),
             benchmark_provider_identity: Some("provider-route".into()),
+            upstream_provider_identity: "test-provider".into(),
             generator_chain: vec!["provider/generator".into(), "provider/fallback".into()],
             consensus: 1,
             scorer_chain: vec!["provider/scorer".into(), "provider/scorer-fallback".into()],
@@ -2582,6 +2636,7 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
             fixture_set_sha256: "c".repeat(64),
             evaluator_contract_sha256: "d".repeat(64),
             evaluator_runtime_identity: "bun@1.3.14".into(),
+            evaluator_evidence_sha256: "f".repeat(64),
             report_sha256: "e".repeat(64),
             repeated_runs: 3,
         };
@@ -2645,7 +2700,7 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
     }
 
     #[test]
-    fn native_anthropic_skips_implicit_openrouter_scorers() {
+    fn native_anthropic_has_no_implicit_scorer_and_honors_explicit_byok_models() {
         let mut config = Config {
             api_format: ApiFormat::Anthropic,
             ..Config::default()
@@ -2653,13 +2708,10 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
         assert!(!config.scorer_enabled());
         assert!(config.scorer_chain().is_empty());
 
-        let generated_default: FileConfig = serde_yaml::from_str(&format!(
-            "model:\n  scorer: {}\n",
-            model_defaults().scorer_model
-        ))
-        .unwrap();
-        config.apply_file(generated_default).unwrap();
-        assert!(config.scorer_chain().is_empty());
+        let explicit_provider_model: FileConfig =
+            serde_yaml::from_str("model:\n  scorer: z-ai/glm-5.2\n").unwrap();
+        config.apply_file(explicit_provider_model).unwrap();
+        assert_eq!(config.scorer_chain(), vec!["z-ai/glm-5.2"]);
 
         let file: FileConfig =
             serde_yaml::from_str("model:\n  scorer: claude-haiku-4-5\n").unwrap();
@@ -2669,13 +2721,16 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
     }
 
     #[test]
-    fn hosted_roster_is_empty_until_qualification_admits_models() {
+    fn hosted_candidate_matches_the_qualification_profile() {
         let defaults = model_defaults();
-        assert!(defaults.default_model.is_empty());
+        assert_eq!(defaults.default_model, "deepseek/deepseek-v4-pro");
         assert!(defaults.cascade.is_empty());
-        assert!(defaults.scorer_model.is_empty());
+        assert_eq!(defaults.scorer_model, "z-ai/glm-5.2");
         assert!(defaults.scorer_fallback.is_empty());
-        assert!(defaults.scorer_qualification_candidates.is_empty());
+        assert_eq!(
+            defaults.scorer_qualification_candidates,
+            vec!["z-ai/glm-5.2".to_string()]
+        );
     }
 
     #[test]

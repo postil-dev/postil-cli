@@ -1,5 +1,7 @@
 use clap::Parser;
 
+#[cfg(feature = "qualification-candidate")]
+use postil_cli::attribution;
 use postil_cli::cli::{Cli, Command, ForgeArg, HookAction};
 use postil_cli::config::{Config, qualification_metadata, starter_config};
 use postil_cli::review::{ForgeKind, ReviewArgs};
@@ -24,11 +26,16 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
             println!("{}", serde_json::to_string(&qualification_metadata())?);
             Ok(0)
         }
+        #[cfg(feature = "qualification-candidate")]
+        Command::AtomicAttribution { input, config } => {
+            attribution::run(&input, config.as_deref()).await
+        }
         Command::Review {
             forge,
             repo,
             pr,
             sha,
+            base_sha,
             staged,
             base,
             diff_file,
@@ -44,7 +51,9 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
             config,
             model,
             bounded,
+            publish,
             no_post,
+            defer_gate_check,
         } => {
             let local_mode = staged || base.is_some() || diff_file.is_some();
             let kind = match forge {
@@ -62,6 +71,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
                 repo,
                 pr,
                 sha,
+                base_sha,
                 staged,
                 base,
                 diff_file,
@@ -77,7 +87,8 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
                 config,
                 model,
                 bounded,
-                no_post,
+                no_post: no_post || !publish,
+                defer_gate_check,
             })
             .await
         }
@@ -89,6 +100,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
             comment,
             config,
             model,
+            publish,
             no_post,
         } => {
             let kind = match forge {
@@ -106,7 +118,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
                 comment,
                 config,
                 model,
-                no_post,
+                no_post: no_post || !publish,
             })
             .await
         }

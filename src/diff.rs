@@ -394,7 +394,7 @@ impl Diff {
 }
 
 /// Index answering "does (path, line) fall inside a changed hunk's new side?"
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DiffIndex {
     ranges: HashMap<String, Vec<RangeInclusive<u32>>>,
     old_ranges: HashMap<String, Vec<RangeInclusive<u32>>>,
@@ -404,6 +404,10 @@ pub struct DiffIndex {
     /// ground against (e.g. the rendered PR title/description). Kept separate
     /// from `ranges` so a non-content-policy finding cannot exploit them.
     content_policy_ranges: HashMap<String, RangeInclusive<u32>>,
+    new_evidence: HashMap<(String, u32), String>,
+    old_evidence: HashMap<(String, u32), String>,
+    content_policy_evidence: HashMap<(String, u32), String>,
+    rendered_evidence: HashMap<(String, u32), Vec<String>>,
 }
 
 impl Default for DiffIndex {
@@ -414,6 +418,10 @@ impl Default for DiffIndex {
             range_count: 0,
             complete: true,
             content_policy_ranges: HashMap::new(),
+            new_evidence: HashMap::new(),
+            old_evidence: HashMap::new(),
+            content_policy_evidence: HashMap::new(),
+            rendered_evidence: HashMap::new(),
         }
     }
 }
@@ -430,12 +438,42 @@ impl DiffIndex {
                     index.insert_range(file.old_path.clone(), hunk.old_range(), true);
                 }
             }
-            if file.deleted {
-                continue;
+            if !file.deleted {
+                for hunk in &file.hunks {
+                    if hunk.new_count > 0 {
+                        index.insert_range(file.path.clone(), hunk.new_range(), false);
+                    }
+                }
             }
             for hunk in &file.hunks {
-                if hunk.new_count > 0 {
-                    index.insert_range(file.path.clone(), hunk.new_range(), false);
+                let mut old_line = hunk.old_start;
+                let mut new_line = hunk.new_start;
+                for raw in &hunk.lines {
+                    let (marker, content) = raw.split_at(if raw.is_empty() { 0 } else { 1 });
+                    match marker {
+                        "+" => {
+                            index
+                                .new_evidence
+                                .insert((file.path.clone(), new_line), content.to_string());
+                            new_line = new_line.saturating_add(1);
+                        }
+                        "-" => {
+                            index
+                                .old_evidence
+                                .insert((file.old_path.clone(), old_line), content.to_string());
+                            old_line = old_line.saturating_add(1);
+                        }
+                        _ => {
+                            index
+                                .new_evidence
+                                .insert((file.path.clone(), new_line), content.to_string());
+                            index
+                                .old_evidence
+                                .insert((file.old_path.clone(), old_line), content.to_string());
+                            old_line = old_line.saturating_add(1);
+                            new_line = new_line.saturating_add(1);
+                        }
+                    }
                 }
             }
         }
@@ -454,6 +492,8 @@ impl DiffIndex {
                 self.insert_range(path.clone(), range, true);
             }
         }
+        self.new_evidence.extend(next.new_evidence);
+        self.old_evidence.extend(next.old_evidence);
     }
 
     fn insert_range(&mut self, path: String, range: RangeInclusive<u32>, old: bool) {
@@ -506,6 +546,55 @@ impl DiffIndex {
         }
     }
 
+    pub fn add_content_policy_evidence(&mut self, path: &str, rendered: &str) {
+        self.add_content_policy_path(path, rendered.lines().count() as u32);
+        for line in rendered.lines() {
+            let Some((number, marked)) = line.trim_start().split_once(' ') else {
+                continue;
+            };
+            let Ok(number) = number.parse::<u32>() else {
+                continue;
+            };
+            if let Some(content) = marked.strip_prefix("  ") {
+                self.content_policy_evidence
+                    .insert((path.to_string(), number), content.to_string());
+            }
+        }
+    }
+
+    pub fn add_rendered_evidence(&mut self, rendered: &str) {
+        let mut current_path = None::<String>;
+        for line in rendered.lines() {
+            if let Some(header) = line.strip_prefix("### ") {
+                current_path = Some(prompt_header_path(header).to_string());
+                continue;
+            }
+            let Some(path) = current_path.as_ref() else {
+                continue;
+            };
+            let Some((number, marked)) = line.trim_start().split_once(' ') else {
+                continue;
+            };
+            let Ok(number) = number.parse::<u32>() else {
+                continue;
+            };
+            let Some(content) = marked
+                .strip_prefix("+ ")
+                .or_else(|| marked.strip_prefix("  "))
+                .filter(|content| !content.trim().is_empty())
+            else {
+                continue;
+            };
+            let evidence = self
+                .rendered_evidence
+                .entry((path.clone(), number))
+                .or_default();
+            if !evidence.iter().any(|existing| existing == content) {
+                evidence.push(content.to_string());
+            }
+        }
+    }
+
     pub fn add_change_metadata(&mut self, count: u32) {
         if count > 0 {
             self.ranges.insert(
@@ -522,6 +611,46 @@ impl DiffIndex {
         self.content_policy_ranges
             .get(path)
             .is_some_and(|r| r.contains(&line))
+    }
+
+    pub fn contains_exact_evidence(&self, finding: &crate::envelope::Finding) -> bool {
+        let Some(evidence) = finding
+            .evidence
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            return false;
+        };
+        self.rendered_evidence
+            .get(&(finding.path.clone(), finding.line))
+            .is_some_and(|values| values.iter().any(|actual| actual == evidence))
+            || self
+                .new_evidence
+                .get(&(finding.path.clone(), finding.line))
+                .or_else(|| {
+                    (finding.kind == crate::envelope::Kind::ContentPolicy)
+                        .then(|| {
+                            self.content_policy_evidence
+                                .get(&(finding.path.clone(), finding.line))
+                        })
+                        .flatten()
+                })
+                .is_some_and(|actual| actual == evidence)
+    }
+
+    pub fn old_evidence_matches(&self, finding: &crate::envelope::Finding) -> bool {
+        finding.evidence.as_ref().is_some_and(|evidence| {
+            self.old_evidence
+                .get(&(finding.path.clone(), finding.line))
+                .is_some_and(|actual| actual == evidence)
+        })
+    }
+
+    pub fn remap_evidence(&self, finding: &crate::envelope::Finding) -> Option<u32> {
+        let evidence = finding.evidence.as_ref()?;
+        self.new_evidence.iter().find_map(|((path, line), actual)| {
+            (path == &finding.path && actual == evidence).then_some(*line)
+        })
     }
 
     pub fn contains(&self, path: &str, line: u32) -> bool {
@@ -627,6 +756,23 @@ pub struct HostedBatchCandidates {
     pub source_batch_count: usize,
 }
 
+const MAX_HOSTED_PLANNER_MANIFEST_BYTES: usize = 80 * 1024;
+
+fn sanitize_planner_evidence(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\n' => output.push('\n'),
+            '\t' | '\r' => output.push(' '),
+            '"' => output.push('\''),
+            '\\' => output.push('/'),
+            character if character.is_control() => output.push(' '),
+            character => output.push(character),
+        }
+    }
+    output
+}
+
 impl ModelBatchSpool {
     pub fn next_batch(&mut self) -> Result<Option<String>> {
         read_length_prefixed(&mut self.file, "model batch")
@@ -637,10 +783,15 @@ impl ModelBatchSpool {
         selected_limit: usize,
         candidate_limit: usize,
     ) -> Result<HostedBatchCandidates> {
+        anyhow::ensure!(
+            selected_limit >= 5 && candidate_limit >= selected_limit,
+            "hosted planning needs capacity for boundary, synthesis, and independent risk evidence"
+        );
         #[derive(Clone)]
         struct Candidate {
             id: usize,
             score: usize,
+            removal_score: usize,
             digest: String,
             synthesis: bool,
         }
@@ -652,6 +803,7 @@ impl ModelBatchSpool {
         let mut first_source = None;
         let mut last_source = None;
         let mut final_synthesis = None;
+        let mut highest_removal = None::<Candidate>;
         let mut id = 0usize;
         while let Some(batch) = read_length_prefixed(&mut self.file, "hosted planner batch")? {
             id = id
@@ -670,12 +822,25 @@ impl ModelBatchSpool {
             } else {
                 digest = truncate_owned_utf8(digest, 1_200);
             }
-            candidates.push(Candidate {
+            digest = sanitize_planner_evidence(&digest);
+            let candidate = Candidate {
                 id,
                 score: hosted_risk_score(&batch),
+                removal_score: hosted_removal_risk_score(&batch),
                 digest,
                 synthesis,
-            });
+            };
+            if !candidate.synthesis
+                && candidate.removal_score > 0
+                && highest_removal.as_ref().is_none_or(|current| {
+                    candidate.removal_score > current.removal_score
+                        || (candidate.removal_score == current.removal_score
+                            && candidate.id < current.id)
+                })
+            {
+                highest_removal = Some(candidate.clone());
+            }
+            candidates.push(candidate);
             candidates.sort_by(|left, right| {
                 right
                     .score
@@ -688,6 +853,25 @@ impl ModelBatchSpool {
             .seek(SeekFrom::Start(0))
             .context("rewinding model batches after hosted planning")?;
 
+        if let Some(candidate) = highest_removal.as_ref()
+            && !candidates.iter().any(|current| current.id == candidate.id)
+        {
+            candidates.push(candidate.clone());
+            candidates.sort_by(|left, right| {
+                right
+                    .score
+                    .cmp(&left.score)
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+            if candidates.len() > candidate_limit {
+                let removable = candidates
+                    .iter()
+                    .rposition(|current| current.id != candidate.id)
+                    .expect("candidate limit retains the highest-risk removal");
+                candidates.remove(removable);
+            }
+        }
+
         let mut mandatory = BTreeSet::new();
         if let Some(id) = first_source {
             mandatory.insert(id);
@@ -698,29 +882,21 @@ impl ModelBatchSpool {
         if let Some(id) = final_synthesis {
             mandatory.insert(id);
         }
-        for candidate in candidates.iter().filter(|candidate| !candidate.synthesis) {
-            if mandatory.len() >= selected_limit.min(4) {
-                break;
-            }
+        if let Some(candidate) = candidates.iter().find(|candidate| !candidate.synthesis) {
             mandatory.insert(candidate.id);
         }
-        while mandatory.len() > selected_limit {
-            let removable = mandatory
-                .iter()
-                .copied()
-                .find(|id| Some(*id) != final_synthesis && Some(*id) != first_source)
-                .or_else(|| mandatory.iter().next_back().copied())
-                .expect("non-empty mandatory selection");
-            mandatory.remove(&removable);
+        if let Some(candidate) = highest_removal {
+            mandatory.insert(candidate.id);
         }
+        debug_assert!(mandatory.len() <= selected_limit);
 
-        candidates.sort_by_key(|candidate| candidate.id);
         let mut manifest = format!(
             "The complete diff was normalized into {id} bounded batches. Select only batch IDs from this candidate set. Boundary, highest-risk, and global-synthesis batches are already mandatory.\nMandatory IDs: {:?}\n",
             mandatory.iter().copied().collect::<Vec<_>>()
         );
+        let mut candidate_ids = BTreeSet::new();
         for candidate in &candidates {
-            manifest.push_str(&format!(
+            let entry = format!(
                 "\nBatch {} risk={} kind={}\n{}",
                 candidate.id,
                 candidate.score,
@@ -730,19 +906,21 @@ impl ModelBatchSpool {
                     "source"
                 },
                 candidate.digest
-            ));
+            );
+            if manifest.len().saturating_add(entry.len()) > MAX_HOSTED_PLANNER_MANIFEST_BYTES {
+                continue;
+            }
+            manifest.push_str(&entry);
+            candidate_ids.insert(candidate.id);
         }
         anyhow::ensure!(
-            manifest.len() <= 120_000,
+            manifest.len() <= MAX_HOSTED_PLANNER_MANIFEST_BYTES,
             "hosted planner manifest exceeded its fixed bound"
         );
         Ok(HostedBatchCandidates {
             manifest,
             mandatory_ids: mandatory.into_iter().collect(),
-            candidate_ids: candidates
-                .into_iter()
-                .map(|candidate| candidate.id)
-                .collect(),
+            candidate_ids,
             source_batch_count: self.source_count,
         })
     }
@@ -788,28 +966,99 @@ fn truncate_owned_utf8(mut value: String, max_bytes: usize) -> String {
     value
 }
 
+const HOSTED_RISK_MARKERS: [(&str, usize); 19] = [
+    ("unsafe", 12),
+    ("eval", 12),
+    ("exec", 10),
+    ("authoriz", 10),
+    ("permission", 10),
+    ("forbidden", 10),
+    ("denied", 10),
+    ("secret", 9),
+    ("password", 9),
+    ("token", 7),
+    ("query", 7),
+    ("delete", 6),
+    ("timeout", 5),
+    ("retry", 4),
+    ("validate", 4),
+    ("guard", 4),
+    ("unwrap", 2),
+    ("privileged", 10),
+    ("access", 8),
+];
+
+fn hosted_token_risk_score(tokens: &[String]) -> usize {
+    HOSTED_RISK_MARKERS
+        .into_iter()
+        .map(|(marker, weight)| {
+            tokens
+                .iter()
+                .filter(|token| token.starts_with(marker))
+                .count()
+                .min(8)
+                * weight
+        })
+        .sum()
+}
+
 fn hosted_risk_score(batch: &str) -> usize {
-    let lower = batch.to_ascii_lowercase();
-    [
-        ("unsafe", 12usize),
-        ("eval", 12),
-        ("exec", 10),
-        ("authoriz", 10),
-        ("permission", 10),
-        ("secret", 9),
-        ("password", 9),
-        ("token", 7),
-        ("query", 7),
-        ("delete", 6),
-        ("timeout", 5),
-        ("retry", 4),
-        ("validate", 4),
-        ("guard", 4),
-        ("unwrap", 2),
-    ]
-    .into_iter()
-    .map(|(marker, weight)| lower.matches(marker).count().min(8) * weight)
-    .sum()
+    let tokens = batch
+        .lines()
+        .filter(|line| is_changed_evidence_line(line))
+        .flat_map(hosted_risk_tokens)
+        .collect::<Vec<_>>();
+    hosted_token_risk_score(&tokens)
+}
+
+fn hosted_removal_risk_score(batch: &str) -> usize {
+    let tokens = batch
+        .lines()
+        .filter(|line| line.trim_start().starts_with("old "))
+        .filter(|line| is_changed_evidence_line(line))
+        .flat_map(hosted_risk_tokens)
+        .collect::<Vec<_>>();
+    hosted_token_risk_score(&tokens)
+}
+
+fn is_changed_evidence_line(line: &str) -> bool {
+    let mut fields = line.split_whitespace();
+    match fields.next() {
+        Some("old") => fields.next().is_some() && fields.next() == Some("-"),
+        Some(number) if number.parse::<u32>().is_ok() => fields.next() == Some("+"),
+        _ => false,
+    }
+}
+
+fn hosted_risk_tokens(line: &str) -> Vec<String> {
+    let chars = line.chars().collect::<Vec<_>>();
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    for (index, character) in chars.iter().copied().enumerate() {
+        if !character.is_ascii_alphanumeric() {
+            if !token.is_empty() {
+                tokens.push(std::mem::take(&mut token));
+            }
+            continue;
+        }
+        let camel_boundary = !token.is_empty()
+            && character.is_ascii_uppercase()
+            && chars[index.saturating_sub(1)].is_ascii_lowercase();
+        let acronym_boundary = !token.is_empty()
+            && character.is_ascii_uppercase()
+            && chars[index.saturating_sub(1)].is_ascii_uppercase()
+            && chars
+                .get(index + 1)
+                .is_some_and(|next| next.is_ascii_lowercase());
+        if camel_boundary || acronym_boundary {
+            tokens.push(std::mem::take(&mut token));
+        }
+        token.push(character.to_ascii_lowercase());
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    tokens
 }
 
 /// Build one bounded, line-grounded context for an interactive answer. Every
@@ -1123,6 +1372,7 @@ struct SemanticEvidence<'a> {
     path: &'a str,
     category: &'static str,
     evidence: &'a str,
+    changed: bool,
 }
 
 const SEMANTIC_CATEGORIES: [(&str, &[&str]); 6] = [
@@ -1134,7 +1384,18 @@ const SEMANTIC_CATEGORIES: [(&str, &[&str]); 6] = [
     ),
     (
         "validation",
-        &["validate", "sanitize", "authoriz", "check", "guard"],
+        &[
+            "validate",
+            "sanitize",
+            "authoriz",
+            "permission",
+            "forbidden",
+            "denied",
+            "privileged",
+            "access",
+            "check",
+            "guard",
+        ],
     ),
     (
         "sources",
@@ -1167,6 +1428,12 @@ fn compact_semantic_digest(digest: String, max_bytes: usize) -> Result<String> {
     );
 
     let mut selected = BTreeSet::from([0, records.len() - 1]);
+    if let Some(index) = records.iter().position(|record| record.changed) {
+        selected.insert(index);
+    }
+    if let Some(index) = records.iter().rposition(|record| record.changed) {
+        selected.insert(index);
+    }
     for (category, _) in SEMANTIC_CATEGORIES {
         if let Some(index) = records
             .iter()
@@ -1207,20 +1474,40 @@ fn parse_semantic_evidence(digest: &str) -> Vec<SemanticEvidence<'_>> {
                 .map(|(candidate, _)| *candidate)
                 .find(|candidate| *candidate == value)
                 .unwrap_or("uncategorized");
-        } else if line
-            .trim_start()
-            .split_once(' ')
-            .is_some_and(|(number, _)| number.parse::<u32>().is_ok())
-        {
+        } else if is_rendered_semantic_evidence(line) {
             records.push(SemanticEvidence {
                 source_ordinal,
                 path,
                 category,
                 evidence: line,
+                changed: is_changed_rendered_semantic_evidence(line),
             });
         }
     }
     records
+}
+
+fn is_changed_rendered_semantic_evidence(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("old ") {
+        return true;
+    }
+    trimmed.split_once(' ').is_some_and(|(number, rest)| {
+        number.parse::<u32>().is_ok() && rest.trim_start().starts_with("+ ")
+    })
+}
+
+fn is_rendered_semantic_evidence(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if let Some(deletion) = trimmed.strip_prefix("old ") {
+        return deletion
+            .trim_start()
+            .split_once(' ')
+            .is_some_and(|(number, rest)| number.parse::<u32>().is_ok() && rest.starts_with("- "));
+    }
+    trimmed
+        .split_once(' ')
+        .is_some_and(|(number, _)| number.parse::<u32>().is_ok())
 }
 
 fn render_semantic_evidence(records: &[SemanticEvidence<'_>], max_bytes: usize) -> Result<String> {
@@ -1938,6 +2225,9 @@ fn prompt_paths_equal(left: &str, right: &str) -> bool {
 }
 
 fn lockfile_evidence(path: &str, section: &str) -> Option<LockfileEvidence> {
+    if !lockfile_changed_lines_are_represented(path, section) {
+        return None;
+    }
     let mut added = 0;
     let mut removed = 0;
     for line in section.lines() {
@@ -1991,6 +2281,79 @@ fn lockfile_evidence(path: &str, section: &str) -> Option<LockfileEvidence> {
         removed,
         changes,
     })
+}
+
+fn lockfile_changed_lines_are_represented(path: &str, section: &str) -> bool {
+    let name = path
+        .replace('\\', "/")
+        .rsplit('/')
+        .next()
+        .unwrap_or(path)
+        .to_ascii_lowercase();
+    let represented = |content: &str| {
+        let trimmed = content.trim().trim_end_matches(',');
+        if trimmed.is_empty() {
+            return true;
+        }
+        match name.as_str() {
+            "cargo.lock" => {
+                trimmed == "[[package]]"
+                    || parse_assignment(trimmed, "name").is_some()
+                    || parse_assignment(trimmed, "version").is_some()
+            }
+            "package-lock.json" | "npm-shrinkwrap.json" => {
+                matches!(trimmed, "{" | "}" | "[" | "]")
+                    || json_string_field(trimmed, "version").is_some()
+                    || trimmed
+                        .strip_prefix('"')
+                        .and_then(|value| value.strip_suffix("\": {"))
+                        .is_some()
+            }
+            "yarn.lock" => {
+                (!content.chars().next().is_some_and(char::is_whitespace) && trimmed.ends_with(':'))
+                    || trimmed.strip_prefix("version ").is_some()
+                    || trimmed.strip_prefix("version:").is_some()
+            }
+            "pnpm-lock.yaml" => {
+                let value = trimmed.trim_end_matches(':').trim_matches(['\'', '"']);
+                value.rsplit_once('@').is_some_and(|(package, version)| {
+                    !package.is_empty()
+                        && version
+                            .chars()
+                            .next()
+                            .is_some_and(|character| character.is_ascii_digit())
+                })
+            }
+            // A go.sum record includes a checksum that the compact package
+            // identity does not reproduce. Keep the raw bounded diff.
+            "go.sum" => false,
+            _ => false,
+        }
+    };
+    let mut old_unrepresented = Vec::new();
+    let mut new_unrepresented = Vec::new();
+    for line in section.lines() {
+        let target = if let Some(content) =
+            line.strip_prefix('+').filter(|_| !line.starts_with("+++"))
+        {
+            if represented(content) {
+                continue;
+            }
+            &mut new_unrepresented
+        } else if let Some(content) = line.strip_prefix('-').filter(|_| !line.starts_with("---")) {
+            if represented(content) {
+                continue;
+            }
+            &mut old_unrepresented
+        } else {
+            continue;
+        };
+        target.push(&line[1..]);
+    }
+    // Complete-source reconstruction can express unchanged fields as one
+    // removal plus one addition. Exact side equality proves those fields did
+    // not change; any partial, reordered, or modified unknown remains raw.
+    old_unrepresented == new_unrepresented
 }
 
 fn parse_lockfile_packages<'a>(
@@ -2918,12 +3281,27 @@ fn semantic_digest(batch: &str) -> String {
             continue;
         };
         let trimmed = rendered.trim_start();
-        let Some((number, content)) = trimmed.split_once(' ') else {
-            continue;
+        let content = if let Some(deletion) = trimmed.strip_prefix("old ") {
+            let deletion = deletion.trim_start();
+            let Some((number, deletion)) = deletion.split_once(' ') else {
+                continue;
+            };
+            if number.parse::<u32>().is_err() {
+                continue;
+            }
+            let Some(content) = deletion.strip_prefix("- ") else {
+                continue;
+            };
+            content
+        } else {
+            let Some((number, content)) = trimmed.split_once(' ') else {
+                continue;
+            };
+            if number.parse::<u32>().is_err() {
+                continue;
+            }
+            content
         };
-        if number.parse::<u32>().is_err() {
-            continue;
-        }
         let region = current_region.get_or_insert_with(|| Region {
             path: path.clone(),
             label: "source region".to_string(),
@@ -3030,6 +3408,44 @@ pub fn review_batch_contains_range(annotated: &str, path: &str, start: u32, end:
             .any(|start_segment| {
                 review_batch_segments(annotated, path, end).contains(start_segment)
             })
+}
+
+/// Require the model to copy the exact, non-empty new-side text it cited.
+/// Number-only grounding accepts blank anchors and cannot distinguish an old
+/// deletion from its replacement; this proof binds the finding to what the
+/// model actually saw after the new-side marker.
+pub fn review_batch_contains_exact_evidence(
+    annotated: &str,
+    path: &str,
+    line: u32,
+    evidence: Option<&str>,
+) -> bool {
+    let Some(evidence) = evidence.filter(|value| !value.trim().is_empty()) else {
+        return false;
+    };
+    let mut current_path: Option<&str> = None;
+    for rendered in annotated.lines() {
+        if let Some(header) = rendered.strip_prefix("### ") {
+            current_path = Some(prompt_header_path(header));
+            continue;
+        }
+        if !current_path.is_some_and(|current| prompt_paths_equal(current, path)) {
+            continue;
+        }
+        let Some((number, marked)) = rendered.trim_start().split_once(' ') else {
+            continue;
+        };
+        if number.parse::<u32>().ok() != Some(line) {
+            continue;
+        }
+        let payload = marked
+            .strip_prefix("+ ")
+            .or_else(|| marked.strip_prefix("  "));
+        if payload == Some(evidence) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Render a bounded local window around a citation from the exact evidence a
@@ -3459,6 +3875,19 @@ Binary files a/img.png and b/img.png differ
     }
 
     #[test]
+    fn semantic_compaction_retains_uncategorized_changed_boundaries() {
+        let digest = format!(
+            "### src/late.rs\n@@ semantic category=uncategorized @@\n     1   context {}\n     2 + let AUTHORITATIVE_LAST_PAGE = true;\n     3   trailing {}\n",
+            "a".repeat(2_000),
+            "b".repeat(2_000),
+        );
+        let compacted = compact_semantic_digest(digest, 700).unwrap();
+        assert!(compacted.contains("AUTHORITATIVE_LAST_PAGE"));
+        assert!(compacted.contains("context"));
+        assert!(compacted.contains("trailing"));
+    }
+
+    #[test]
     fn semantic_compaction_rejects_deterministically_too_small_capacity() {
         let digest = format!(
             "### src/tiny.rs\n@@ semantic category=sinks @@\n1 + dangerous_sink(input); {}\n",
@@ -3537,20 +3966,72 @@ Binary files a/img.png and b/img.png differ
     }
 
     #[test]
-    fn malformed_and_unsupported_lockfiles_fall_back_to_source_review() {
-        let malformed = "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1 +1 @@\n-checksum = \"old\"\n+checksum = \"new\"\n";
+    fn malformed_and_unsupported_lockfiles_use_bounded_source_review() {
+        let malformed = "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1,5 +1,5 @@\n-checksum = \"old-one\"\n-source = \"old-two\"\n-checksum = \"old-interior\"\n-source = \"old-four\"\n-checksum = \"old-five\"\n+checksum = \"new-one\"\n+source = \"new-two\"\n+checksum = \"new-interior\"\n+source = \"new-four\"\n+checksum = \"new-five\"\n";
         let malformed = prepare_diff(malformed);
         assert!(!malformed.incomplete);
-        assert!(malformed.source.as_deref().unwrap().contains("checksum"));
+        assert!(malformed.lockfiles.is_empty());
+        assert!(
+            malformed
+                .source
+                .as_deref()
+                .unwrap()
+                .contains("new-interior")
+        );
         let unsupported = "diff --git a/composer.lock b/composer.lock\n--- a/composer.lock\n+++ b/composer.lock\n@@ -1 +1 @@\n-old\n+new\n";
         let unsupported = prepare_diff(unsupported);
         assert!(!unsupported.incomplete);
+        assert!(unsupported.lockfiles.is_empty());
         assert!(
             unsupported
                 .source
                 .as_deref()
                 .unwrap()
                 .contains("composer.lock")
+        );
+    }
+
+    #[test]
+    fn partial_lockfile_records_and_unrepresented_security_fields_stay_raw() {
+        for source in [
+            "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1,4 +1,4 @@\n name = \"package-one\"\n-version = \"1.0.0\"\n+version = \"2.0.0\"\n-source = \"registry+https://trusted.example/index\"\n+source = \"registry+https://attacker.example/index\"\n",
+            "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1,4 +1,4 @@\n name = \"package-one\"\n version = \"1.0.0\"\n-checksum = \"trusted\"\n+checksum = \"attacker\"\n",
+            "diff --git a/package-lock.json b/package-lock.json\n--- a/package-lock.json\n+++ b/package-lock.json\n@@ -1,4 +1,4 @@\n \"left-pad\": {\n \"version\": \"1.0.0\",\n-\"resolved\": \"https://trusted.example/pkg.tgz\"\n+\"resolved\": \"https://attacker.example/pkg.tgz\"\n",
+            "diff --git a/package-lock.json b/package-lock.json\n--- a/package-lock.json\n+++ b/package-lock.json\n@@ -1,4 +1,4 @@\n \"left-pad\": {\n \"version\": \"1.0.0\",\n-\"integrity\": \"sha512-trusted\"\n+\"integrity\": \"sha512-attacker\"\n",
+            "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1,4 +1,4 @@\n name = \"package-one\"\n version = \"1.0.0\"\n-custom = \"trusted\"\n+custom = \"attacker\"\n",
+        ] {
+            let prepared = prepare_diff(source);
+            assert!(prepared.lockfiles.is_empty());
+            assert_eq!(prepared.source.as_deref(), Some(source));
+        }
+    }
+
+    #[test]
+    fn full_file_lockfile_reconstruction_compacts_exactly_unchanged_unknown_fields() {
+        let source = "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1,3 +1,3 @@ bounded full-file reconstruction\n-name = \"large-dependency\"\n-version = \"1.2.2\"\n-checksum = \"same-large-hash\"\n+name = \"large-dependency\"\n+version = \"1.2.3\"\n+checksum = \"same-large-hash\"\n";
+        let prepared = prepare_diff(source);
+        assert_eq!(prepared.source.as_deref(), Some(""));
+        assert_eq!(
+            prepared.lockfiles[0].changes,
+            [
+                "removed large-dependency@1.2.2",
+                "added large-dependency@1.2.3"
+            ]
+        );
+    }
+
+    #[test]
+    fn vendor_source_is_reviewed_unless_generation_is_proven() {
+        let source = "diff --git a/vendor/security.js b/vendor/security.js\n--- a/vendor/security.js\n+++ b/vendor/security.js\n@@ -0,0 +1 @@\n+eval(userInput);\n";
+        let prepared = prepare_diff(source);
+        assert!(prepared.lockfiles.is_empty());
+        assert!(prepared.compacted_artifacts.is_empty());
+        assert!(
+            prepared
+                .source
+                .as_deref()
+                .unwrap()
+                .contains("eval(userInput)")
         );
     }
 
@@ -3604,6 +4085,35 @@ Binary files a/img.png and b/img.png differ
         assert!(!review_batch_contains_range(batch, "src/a.rs", 10, 20));
         assert!(!review_batch_contains_range(batch, "src/a.rs", 10, 21));
         assert!(!review_batch_contains_range(batch, "src/b.rs", 10, 10));
+    }
+
+    #[test]
+    fn exact_evidence_rejects_blank_and_deleted_anchors() {
+        let batch = "### src/a.rs\n@@ first @@\n    10 - removed command\n    10 + replacement command\n    11 + \n    12   context\n";
+        assert!(review_batch_contains_exact_evidence(
+            batch,
+            "src/a.rs",
+            10,
+            Some("replacement command")
+        ));
+        assert!(!review_batch_contains_exact_evidence(
+            batch,
+            "src/a.rs",
+            10,
+            Some("removed command")
+        ));
+        assert!(!review_batch_contains_exact_evidence(
+            batch,
+            "src/a.rs",
+            11,
+            Some("")
+        ));
+        assert!(review_batch_contains_exact_evidence(
+            batch,
+            "src/a.rs",
+            12,
+            Some("context")
+        ));
     }
 
     #[test]
@@ -3784,6 +4294,267 @@ diff --git a/two.rs b/two.rs
                 .iter()
                 .any(|batch| batch.contains("Cross-window semantic digests"))
         );
+    }
+
+    #[test]
+    fn hosted_planner_sanitizes_hostile_multibatch_evidence_within_json_bound() {
+        use std::fmt::Write as _;
+
+        let hostile = format!(
+            "{}{}{}",
+            "\0".repeat(900),
+            "\"".repeat(900),
+            "\\".repeat(900)
+        );
+        let mut source = String::new();
+        for file in 0..24 {
+            let path = format!("src/hostile-{file}.rs");
+            writeln!(
+                source,
+                "diff --git a/{path} b/{path}\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1 @@\n+const VALUE_{file}: &str = {hostile};"
+            )
+            .unwrap();
+        }
+        let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+        let mut prepared = prepare_review(&snapshot).unwrap();
+        let mut batches = spool_model_batches(&mut prepared, 4_096, 1_024, false).unwrap();
+        assert!(batches.source_count > 1);
+        let candidates = batches.hosted_candidates(5, 96).unwrap();
+
+        assert!(candidates.manifest.len() <= MAX_HOSTED_PLANNER_MANIFEST_BYTES);
+        assert!(!candidates.manifest.contains(['\0', '\r', '\t', '"', '\\']));
+        let serialized = serde_json::to_vec(&serde_json::json!({
+            "messages": [{"role": "user", "content": candidates.manifest}]
+        }))
+        .unwrap();
+        assert!(serialized.len() < crate::llm::MAX_PROVIDER_REQUEST_BYTES);
+    }
+
+    #[test]
+    fn hosted_planner_keeps_fixture_51_permission_change_in_mandatory_evidence() {
+        use std::fmt::Write as _;
+
+        fn push_churn(source: &mut String, side: &str, file: usize) {
+            let path = format!("src/churn/{side}-{file}.ts");
+            writeln!(
+                source,
+                "diff --git a/{path} b/{path}\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,131 @@"
+            )
+            .unwrap();
+            writeln!(
+                source,
+                "+export function ordinary_{side}_{file}(actor: Actor) {{"
+            )
+            .unwrap();
+            for line in 2..130 {
+                writeln!(
+                    source,
+                    "+  const ordinary_{side}_{file}_{line} = actor.id; // {}",
+                    "x".repeat(900)
+                )
+                .unwrap();
+            }
+            writeln!(source, "+  return actor.id;\n+}}").unwrap();
+        }
+
+        fn push_change(source: &mut String, line: usize, before: &str, after: &str) {
+            writeln!(source, "@@ -{line},1 +{line},1 @@\n- {before}\n+ {after}").unwrap();
+        }
+
+        let mut source = String::new();
+        for file in 0..3 {
+            push_churn(&mut source, "prefix", file);
+        }
+        source.push_str("diff --git a/src/admin/bulk-edit.ts b/src/admin/bulk-edit.ts\nindex 1111111..2222222 100644\n--- a/src/admin/bulk-edit.ts\n+++ b/src/admin/bulk-edit.ts\n");
+        push_change(
+            &mut source,
+            6,
+            "const title = 'Bulk edit';",
+            "const title = 'Bulk edit ';",
+        );
+        push_change(
+            &mut source,
+            18,
+            "const batchSize=50;",
+            "const batchSize = 50;",
+        );
+        push_change(
+            &mut source,
+            33,
+            "logger.debug('bulk edit start');",
+            "logger.debug('bulk edit started');",
+        );
+        push_change(
+            &mut source,
+            57,
+            "const summary = buildSummary(changeSet);",
+            "const editSummary = buildSummary(changeSet);",
+        );
+        push_change(
+            &mut source,
+            88,
+            "if (!actor.can('bulkEdit')) throw new Error('Forbidden');",
+            "await applyBulkEdit(changeSet);",
+        );
+        push_change(
+            &mut source,
+            122,
+            "return { ok: true, summary };",
+            "return { ok: true, summary: editSummary };",
+        );
+        push_change(
+            &mut source,
+            147,
+            "metrics.increment('bulk_edit.done');",
+            "metrics.increment('bulk_edit.completed');",
+        );
+        for file in 0..3 {
+            push_churn(&mut source, "suffix", file);
+        }
+        assert_eq!(source.len(), 728_616);
+        assert_eq!(
+            Sha256::digest(source.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            "21abd4b0305bb11f3314dbc68725ba2373a00848094fe94fbf842461718e3b2d"
+        );
+
+        let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+        let mut prepared = prepare_review(&snapshot).unwrap();
+        let mut batches = spool_model_batches(
+            &mut prepared,
+            crate::review::MAX_HOSTED_REVIEW_BATCH_BYTES,
+            crate::review::MAX_REVIEW_MANIFEST_BYTES
+                .min(crate::review::MAX_HOSTED_REVIEW_BATCH_BYTES / 3),
+            false,
+        )
+        .unwrap();
+        assert!(batches.source_count > crate::review::MAX_HOSTED_SELECTED_BATCHES);
+        let candidates = batches
+            .hosted_candidates(
+                crate::review::MAX_HOSTED_SELECTED_BATCHES,
+                crate::review::MAX_HOSTED_PLANNER_CANDIDATES,
+            )
+            .unwrap();
+        let mandatory = candidates
+            .mandatory_ids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let selected = batches.selected_batches(&mandatory).unwrap();
+        assert!(
+            selected.iter().any(|batch| {
+                batch.contains("src/admin/bulk-edit.ts")
+                    && batch.contains("actor.can('bulkEdit')")
+                    && batch.contains("applyBulkEdit")
+            }),
+            "permission-removal batch was not mandatory; mandatory={mandatory:?}"
+        );
+        assert!(selected.iter().any(|batch| {
+            batch.contains("Cross-window semantic digests")
+                && batch.contains("actor.can('bulkEdit')")
+                && batch.contains("Forbidden")
+        }));
+    }
+
+    #[test]
+    fn hosted_risk_scoring_ignores_keywords_inside_opaque_tokens() {
+        fn noise(mut state: u64) -> String {
+            const ALPHABET: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
+            let mut out = String::with_capacity(2_000);
+            for _ in 0..2_000 {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                out.push(ALPHABET[(state as usize) % ALPHABET.len()] as char);
+            }
+            out
+        }
+
+        let opaque = format!(
+            "### src/churn.ts\n     1 + const payload = \"{}start{}delete{}permission{}\";",
+            noise(1),
+            noise(2),
+            noise(3),
+            noise(4)
+        );
+        let permission_removal = "### src/admin/bulk-edit.ts\nold     88 - if (!actor.can('bulkEdit')) throw new Error('Forbidden');\n    88 + await applyBulkEdit(changeSet);";
+
+        assert_eq!(hosted_risk_score(&opaque), 0);
+        assert!(hosted_risk_score(permission_removal) >= 10);
+
+        let noisy_manifest = "Changed-file manifest:\n- src/admin/permission/authorization.ts [source]\n### src/admin/permission/authorization.ts\n     1   permission authorization forbidden context\n     2 + ordinary_change();";
+        assert_eq!(hosted_risk_score(noisy_manifest), 0);
+    }
+
+    #[test]
+    fn planner_fallback_keeps_highest_risk_removal_beside_keyword_decoy() {
+        use std::fmt::Write as _;
+
+        fn push_padding_file(source: &mut String, path: &str) {
+            writeln!(
+                source,
+                "diff --git a/{path} b/{path}\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,1 @@\n+const ordinary = \"{}\";",
+                "x".repeat(20_000)
+            )
+            .unwrap();
+        }
+
+        let mut source = String::new();
+        for index in 0..3 {
+            push_padding_file(&mut source, &format!("src/prefix-{index}.ts"));
+        }
+        writeln!(
+            source,
+            "diff --git a/src/decoy.ts b/src/decoy.ts\n--- /dev/null\n+++ b/src/decoy.ts\n@@ -0,0 +1,1 @@\n+unsafe eval exec authorization permission secret password token query delete timeout retry validate guard unwrap {}",
+            "x".repeat(20_000)
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "diff --git a/src/admin/bulk-edit.ts b/src/admin/bulk-edit.ts\n--- a/src/admin/bulk-edit.ts\n+++ b/src/admin/bulk-edit.ts\n@@ -88,2 +88,2 @@\n-if (!actor.can('bulkEdit')) throw new Error('Forbidden');\n+await applyBulkEdit(changeSet);\n {}",
+            "x".repeat(20_000)
+        )
+        .unwrap();
+        for index in 0..3 {
+            push_padding_file(&mut source, &format!("src/suffix-{index}.ts"));
+        }
+
+        let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+        let mut prepared = prepare_review(&snapshot).unwrap();
+        let mut batches = spool_model_batches(
+            &mut prepared,
+            crate::review::MAX_HOSTED_REVIEW_BATCH_BYTES,
+            crate::review::MAX_REVIEW_MANIFEST_BYTES
+                .min(crate::review::MAX_HOSTED_REVIEW_BATCH_BYTES / 3),
+            false,
+        )
+        .unwrap();
+        let candidates = batches
+            .hosted_candidates(
+                crate::review::MAX_HOSTED_SELECTED_BATCHES,
+                crate::review::MAX_HOSTED_PLANNER_CANDIDATES,
+            )
+            .unwrap();
+        let mandatory = candidates
+            .mandatory_ids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let selected = batches.selected_batches(&mandatory).unwrap();
+
+        assert!(selected.iter().any(|batch| batch.contains("src/decoy.ts")));
+        assert!(selected.iter().any(|batch| {
+            batch.contains("src/admin/bulk-edit.ts")
+                && batch.contains("actor.can('bulkEdit')")
+                && batch.contains("Forbidden")
+        }));
+        assert!(selected.iter().any(|batch| {
+            batch.contains("Cross-window semantic digests")
+                && batch.contains("actor.can('bulkEdit')")
+                && batch.contains("Forbidden")
+        }));
     }
 
     #[test]

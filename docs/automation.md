@@ -33,10 +33,11 @@ The report shows which findings become visible or suppressed and which gate resu
 ## Interactive replies
 
 `postil respond` answers a mention on a pull request. GitHub and GitLab also support issue mentions. It does not open pull requests or push commits.
+Posting the reply requires `--publish`; without it, the reply is printed locally.
 
 ```sh
 POSTIL_COMMENT='@postil is this safe?' \
-postil respond --repo owner/repository --pr 123
+postil respond --repo owner/repository --pr 123 --publish
 ```
 
 Pass comment text through `POSTIL_COMMENT` in automation because command-line arguments are visible to other local processes.

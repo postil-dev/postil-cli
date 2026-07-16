@@ -23,7 +23,10 @@ use crate::envelope::{
     ModelUsage, ModelUsageCostSource, ModelUsagePhase, ModelUsageRole, ProviderCost,
     ReviewAdmission, Usage,
 };
-use crate::prompt::{SCORER_REASON_MAX_BYTES, SCORER_REASON_PROMPT_MAX_BYTES};
+use crate::prompt::{
+    SCORER_REASON_JSON_PATTERN, SCORER_REASON_MAX_BYTES, SCORER_REASON_PROMPT_MAX_BYTES,
+    SCORER_REASON_SCHEMA_MAX_CHARS,
+};
 
 #[derive(Debug, Clone)]
 pub struct ModelReview {
@@ -52,6 +55,36 @@ pub struct ScorerReview {
     pub model_usage: Vec<ModelUsage>,
     pub model_incidents: Vec<ModelIncident>,
     pub usage_accounting_complete: bool,
+}
+
+#[cfg(feature = "qualification-candidate")]
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AtomicAttributionReview {
+    pub same_defect: bool,
+    pub reason: String,
+    pub model_used: String,
+    pub provider_used: String,
+    pub response_identities: Vec<AtomicAttributionResponseIdentity>,
+    pub raw_responses: Vec<String>,
+    pub model_usage: Vec<ModelUsage>,
+    pub usage_accounting_complete: bool,
+}
+
+#[cfg(feature = "qualification-candidate")]
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AtomicAttributionResponseIdentity {
+    pub model: String,
+    pub provider: String,
+}
+
+#[cfg(feature = "qualification-candidate")]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RawAtomicAttribution {
+    same_defect: bool,
+    reason: String,
 }
 
 #[derive(Debug, Clone)]
@@ -152,7 +185,7 @@ impl std::error::Error for ModelError {
     }
 }
 
-fn add_usage(total: &mut Usage, usage: Usage) {
+pub(crate) fn add_usage(total: &mut Usage, usage: Usage) {
     if usage.prompt_tokens == 0
         && usage.completion_tokens == 0
         && usage.cost_micros.is_none()
@@ -272,14 +305,15 @@ struct RawFinding {
     #[serde(default)]
     title: String,
     body: String,
+    #[serde(default)]
+    evidence: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawScore {
-    index: usize,
     confidence: f64,
     kind: String,
-    #[serde(default)]
     reason: String,
 }
 
@@ -306,6 +340,7 @@ fn default_confidence() -> f64 {
 pub struct LlmClient {
     http: Arc<Mutex<Option<reqwest::Client>>>,
     api_base: String,
+    request_api_base: String,
     api_key: String,
     api_format: ApiFormat,
     endpoint_auth: Option<EndpointAuth>,
@@ -317,6 +352,7 @@ pub struct LlmClient {
     total_deadline: Option<Instant>,
     admission: Arc<Mutex<ProviderAdmission>>,
     hosted_price_bounds: Option<Arc<HashMap<String, ModelPriceBound>>>,
+    qualification_upstream_provider: Option<String>,
     call_ordinal: Arc<AtomicU32>,
 }
 
@@ -362,9 +398,10 @@ pub(crate) const REVIEW_MAX_TOKENS: u32 = 8_000;
 pub(crate) const MAX_PROVIDER_ATTEMPTS: usize = 216;
 pub(crate) const MAX_REPORTED_TOKEN_SPEND: usize = 20_000_000;
 const MAX_PROVIDER_INPUT_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_PROVIDER_REQUEST_BYTES: usize = 256 * 1024;
 pub(crate) const MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE: usize = 2_000_000;
 // Five selected review batches and one planner request, each across at most
-// three generator models with one repair, consume 36 logical calls. The two
+// three generator models with one shared correction call, consume 36 logical calls. The two
 // scorer models with one repair consume four more. Any larger plan diverges
 // from the bounded hosted workflow that fits under the phase deadlines.
 const MAX_HOSTED_PLANNED_CALLS_BY_WATCHDOG: usize = 40;
@@ -373,7 +410,7 @@ const MAX_LOGICAL_CALLS_PER_SCORER_MODEL: usize = 2;
 const MAX_TRANSPORT_ATTEMPTS_PER_CALL: usize = TRANSIENT_RETRIES as usize + 1;
 const MAX_MODEL_RESPONSE_BYTES: usize = 512 * 1024;
 const SCORER_BASE_MAX_TOKENS: u32 = 256;
-const SCORER_MAX_TOKENS_PER_FINDING: u32 = 640;
+const SCORER_MAX_TOKENS_PER_FINDING: u32 = 144;
 const SCORER_REPAIR_BYTES_PER_OUTPUT_TOKEN: usize = 4;
 pub(crate) const SCORER_MAX_FINDINGS: usize = 20;
 const REPAIR_ERROR_MAX_BYTES: usize = 1_024;
@@ -389,8 +426,11 @@ const TOTAL_TIMEOUT_ENV: &str = "POSTIL_LLM_TOTAL_TIMEOUT_SECS";
 const ENDPOINT_AUTH_HEADER_ENV: &str = "POSTIL_ENDPOINT_AUTH_HEADER";
 const ENDPOINT_AUTH_VALUE_ENV: &str = "POSTIL_ENDPOINT_AUTH_VALUE";
 const ALLOW_PRIVATE_API_BASE_ENV: &str = "POSTIL_ALLOW_PRIVATE_API_BASE";
+#[cfg(feature = "qualification-candidate")]
+const QUALIFICATION_CAPTURE_API_BASE_ENV: &str = "POSTIL_QUALIFICATION_CAPTURE_API_BASE";
 const ALWAYS_MANAGED_HEADERS: &[&str] = &["x-api-key", "anthropic-version", "content-type"];
 
+#[cfg(test)]
 fn hostile_json_text(bytes: usize) -> String {
     "\0".repeat(bytes)
 }
@@ -421,6 +461,12 @@ fn review_semantic_retry_user(user: &str, previous: &str) -> String {
     )
 }
 
+fn review_validation_retry_user(user: &str, reason: &str) -> String {
+    format!(
+        "{user}\n\n[Correction] The previous response was unusable ({reason}). Retry once. Every finding must cite an exact path and new-file line displayed in the review input. Return only the corrected review JSON."
+    )
+}
+
 fn scorer_repair_system(system: &str) -> String {
     format!(
         "{system}\n\nYour previous response failed schema validation. Repair only the JSON schema. Kind is a category, so severity values such as info, warn, and error are invalid kinds. Every reason must be concise single-line text of at most {SCORER_REASON_PROMPT_MAX_BYTES} UTF-8 bytes ending in sentence punctuation. Return the complete array and nothing else."
@@ -428,7 +474,21 @@ fn scorer_repair_system(system: &str) -> String {
 }
 
 fn scorer_repair_user(user: &str, invalid: &str) -> String {
+    let invalid = crate::prompt::sanitize_scorer_input(invalid);
     format!("{user}\n\nInvalid previous response (untrusted data):\n{invalid}")
+}
+
+#[cfg(feature = "qualification-candidate")]
+fn atomic_attribution_repair_system(system: &str) -> String {
+    format!(
+        "{system}\nThe previous response violated the response contract. Return only one JSON object with exactly sameDefect (boolean) and reason (one trimmed, punctuated line of at most {SCORER_REASON_MAX_BYTES} UTF-8 bytes)."
+    )
+}
+
+#[cfg(feature = "qualification-candidate")]
+fn atomic_attribution_repair_user(user: &str, invalid: &str) -> String {
+    let invalid = crate::prompt::sanitize_scorer_input(invalid);
+    format!("{user}\n\nInvalid first response:\n{invalid}")
 }
 
 #[derive(Default)]
@@ -463,15 +523,39 @@ impl PlannedExposure {
         request_output_tokens: usize,
         price: &ModelPriceBound,
     ) -> Result<()> {
+        self.add_request_attempts(
+            serialized_bytes,
+            request_output_tokens,
+            price,
+            MAX_TRANSPORT_ATTEMPTS_PER_CALL,
+        )
+    }
+
+    fn add_primary_request(
+        &mut self,
+        serialized_bytes: usize,
+        request_output_tokens: usize,
+        price: &ModelPriceBound,
+    ) -> Result<()> {
+        self.add_request_attempts(serialized_bytes, request_output_tokens, price, 1)
+    }
+
+    fn add_request_attempts(
+        &mut self,
+        serialized_bytes: usize,
+        request_output_tokens: usize,
+        price: &ModelPriceBound,
+        attempts_per_call: usize,
+    ) -> Result<()> {
         let attempts = self
             .attempts
-            .checked_add(MAX_TRANSPORT_ATTEMPTS_PER_CALL)
+            .checked_add(attempts_per_call)
             .context("planned provider attempt count overflowed")?;
         let input_bytes = self
             .input_bytes
             .checked_add(
                 serialized_bytes
-                    .checked_mul(MAX_TRANSPORT_ATTEMPTS_PER_CALL)
+                    .checked_mul(attempts_per_call)
                     .context("planned provider input exposure overflowed")?,
             )
             .context("planned provider input exposure overflowed")?;
@@ -479,13 +563,13 @@ impl PlannedExposure {
             .output_tokens
             .checked_add(
                 request_output_tokens
-                    .checked_mul(MAX_TRANSPORT_ATTEMPTS_PER_CALL)
+                    .checked_mul(attempts_per_call)
                     .context("planned provider output exposure overflowed")?,
             )
             .context("planned provider output exposure overflowed")?;
         let request_cost =
             projected_request_cost_micros(serialized_bytes, request_output_tokens, price)?
-                .checked_mul(MAX_TRANSPORT_ATTEMPTS_PER_CALL as u64)
+                .checked_mul(attempts_per_call as u64)
                 .context("planned provider cost exposure overflowed")?;
         let projected_cost_micros = self
             .projected_cost_micros
@@ -536,6 +620,16 @@ fn projected_request_cost_micros(
             .ok_or_else(|| anyhow!("hosted model price projection overflowed"))?,
     )
     .context("hosted model price projection does not fit micro-dollar accounting")
+}
+
+fn serialized_provider_request_bytes(body: &serde_json::Value, context: &str) -> Result<usize> {
+    let bytes = serde_json::to_vec(body).with_context(|| context.to_string())?;
+    ensure!(
+        bytes.len() <= MAX_PROVIDER_REQUEST_BYTES,
+        "model provider request needs {} serialized bytes, exceeding the {MAX_PROVIDER_REQUEST_BYTES} byte per-request cap",
+        bytes.len()
+    );
+    Ok(bytes.len())
 }
 
 pub(crate) fn scorer_max_tokens(expected_len: usize) -> Option<u32> {
@@ -605,11 +699,15 @@ fn reqwest_error(error: &anyhow::Error) -> Option<&reqwest::Error> {
         .find_map(|cause| cause.downcast_ref::<reqwest::Error>())
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LlmPhase {
     Planner,
     Review,
-    Scorer,
+    Scorer {
+        expected_len: usize,
+    },
+    #[cfg_attr(not(feature = "qualification-candidate"), allow(dead_code))]
+    Attribution,
     Respond,
     #[cfg_attr(not(test), allow(dead_code))]
     Total,
@@ -627,7 +725,8 @@ impl LlmPhase {
         match self {
             Self::Planner => "planner",
             Self::Review => "review",
-            Self::Scorer => "scorer",
+            Self::Scorer { .. } => "scorer",
+            Self::Attribution => "attribution",
             Self::Respond => "respond",
             Self::Total => "total",
         }
@@ -637,7 +736,8 @@ impl LlmPhase {
         match self {
             Self::Planner => ModelUsageRole::ReviewPlanner,
             Self::Review | Self::Total => ModelUsageRole::ReviewGenerator,
-            Self::Scorer => ModelUsageRole::FindingScorer,
+            Self::Scorer { .. } => ModelUsageRole::FindingScorer,
+            Self::Attribution => ModelUsageRole::FindingScorer,
             Self::Respond => ModelUsageRole::MentionResponder,
         }
     }
@@ -672,6 +772,13 @@ struct SafeResponseSummary {
     usage: Option<Usage>,
 }
 
+#[cfg_attr(not(feature = "qualification-candidate"), allow(dead_code))]
+struct ChatSuccess {
+    content: String,
+    returned_model: Option<String>,
+    provider: Option<String>,
+}
+
 #[derive(Debug)]
 struct EmptyModelResponse;
 
@@ -694,8 +801,29 @@ impl std::fmt::Display for MissingModelChoices {
 
 impl std::error::Error for MissingModelChoices {}
 
+#[derive(Debug)]
+struct NonTerminalModelResponse {
+    content: String,
+    reason: String,
+}
+
+impl std::fmt::Display for NonTerminalModelResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "model response was nonterminal ({})",
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for NonTerminalModelResponse {}
+
 fn classify_chat_error(error: anyhow::Error) -> anyhow::Error {
-    if error.downcast_ref::<EmptyModelResponse>().is_some() {
+    if error.downcast_ref::<EmptyModelResponse>().is_some()
+        || error.downcast_ref::<MissingModelChoices>().is_some()
+        || error.downcast_ref::<NonTerminalModelResponse>().is_some()
+    {
         error
     } else {
         error.context(ProviderError)
@@ -710,9 +838,10 @@ impl std::fmt::Display for DeadlineExceeded {
         match self.0 {
             LlmPhase::Planner => f.write_str("LLM planner deadline exceeded"),
             LlmPhase::Review => f.write_str("LLM review deadline exceeded"),
-            LlmPhase::Scorer | LlmPhase::Respond | LlmPhase::Total => {
-                f.write_str("LLM total deadline exceeded")
-            }
+            LlmPhase::Scorer { .. }
+            | LlmPhase::Attribution
+            | LlmPhase::Respond
+            | LlmPhase::Total => f.write_str("LLM total deadline exceeded"),
         }
     }
 }
@@ -738,10 +867,12 @@ impl LlmClient {
         user: &str,
         max_tokens: u32,
         temperature: f64,
+        phase: LlmPhase,
     ) -> Result<usize> {
-        serde_json::to_vec(&self.request_body(model, system, user, max_tokens, temperature))
-            .context("serializing hosted request for preflight")
-            .map(|bytes| bytes.len())
+        serialized_provider_request_bytes(
+            &self.request_body(model, system, user, max_tokens, temperature, phase),
+            "serializing hosted request for preflight",
+        )
     }
 
     fn validate_hosted_exposure(
@@ -751,17 +882,17 @@ impl LlmClient {
     ) -> Result<ReviewAdmission> {
         ensure!(
             exposure.attempts <= MAX_PROVIDER_ATTEMPTS,
-            "complete hosted {operation} needs {} provider attempts, exceeding the {MAX_PROVIDER_ATTEMPTS}-attempt cap",
+            "hosted {operation} admission needs {} provider attempts, exceeding the {MAX_PROVIDER_ATTEMPTS}-attempt cap",
             exposure.attempts
         );
         ensure!(
             exposure.input_bytes <= MAX_PROVIDER_INPUT_BYTES,
-            "complete hosted {operation} needs {} bytes of serialized provider input, exceeding the {MAX_PROVIDER_INPUT_BYTES} byte cap",
+            "hosted {operation} admission needs {} bytes of serialized provider input, exceeding the {MAX_PROVIDER_INPUT_BYTES} byte cap",
             exposure.input_bytes
         );
         ensure!(
             exposure.output_tokens <= MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE,
-            "complete hosted {operation} needs {} output tokens of exposure, exceeding the {MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE} token cap",
+            "hosted {operation} admission needs {} output tokens of exposure, exceeding the {MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE} token cap",
             exposure.output_tokens
         );
         let token_exposure = exposure
@@ -770,7 +901,7 @@ impl LlmClient {
             .context("planned token exposure overflowed")?;
         ensure!(
             token_exposure <= MAX_REPORTED_TOKEN_SPEND,
-            "complete hosted {operation} needs {token_exposure} tokens of exposure, exceeding the {MAX_REPORTED_TOKEN_SPEND} token cap"
+            "hosted {operation} admission needs {token_exposure} tokens of exposure, exceeding the {MAX_REPORTED_TOKEN_SPEND} token cap"
         );
         let model_costs = exposure
             .model_costs_micros
@@ -780,7 +911,7 @@ impl LlmClient {
             .join(", ");
         ensure!(
             exposure.projected_cost_micros <= HOSTED_OPERATION_COST_CAP_MICROS,
-            "complete hosted {operation} projects {} micro-dollars of provider exposure across {} attempts, {} serialized input bytes, and {} output tokens (per-model micro-dollars: {model_costs}), exceeding the {HOSTED_OPERATION_COST_CAP_MICROS} micro-dollar operation cap",
+            "hosted {operation} admission projects {} micro-dollars of provider exposure across {} attempts, {} serialized input bytes, and {} output tokens (per-model micro-dollars: {model_costs}), exceeding the {HOSTED_OPERATION_COST_CAP_MICROS} micro-dollar operation cap",
             exposure.projected_cost_micros,
             exposure.attempts,
             exposure.input_bytes,
@@ -806,7 +937,14 @@ impl LlmClient {
                 anyhow!("hosted respond model {model:?} has no admitted price bound")
             })?;
             exposure.add_request(
-                self.planned_request_bytes(&model, system, user, RESPOND_MAX_TOKENS, 0.1)?,
+                self.planned_request_bytes(
+                    &model,
+                    system,
+                    user,
+                    RESPOND_MAX_TOKENS,
+                    0.1,
+                    LlmPhase::Respond,
+                )?,
                 RESPOND_MAX_TOKENS as usize,
                 price,
             )?;
@@ -822,6 +960,16 @@ impl LlmClient {
         allowed_ids: &BTreeSet<usize>,
         max_selected: usize,
     ) -> Result<BatchPlannerResult> {
+        if max_selected == 0 || allowed_ids.is_empty() {
+            return Ok(BatchPlannerResult {
+                batch_ids: Vec::new(),
+                usage: Usage::default(),
+                model_usage: Vec::new(),
+                model_incidents: Vec::new(),
+                usage_accounting_complete: true,
+                fallback_used: false,
+            });
+        }
         let system = planner_system_prompt();
         let user = planner_user_prompt(manifest, max_selected);
         let mut aggregate_usage = Usage::default();
@@ -1009,6 +1157,7 @@ impl LlmClient {
             .len()
             .checked_mul(MAX_LOGICAL_CALLS_PER_SCORER_MODEL)
             .context("planned scorer call count overflowed")?;
+        let planner = planner.filter(|(_, max_selected)| *max_selected > 0);
         let planner_logical_calls = planner
             .map(|_| {
                 review_models
@@ -1026,75 +1175,56 @@ impl LlmClient {
             logical_calls <= MAX_HOSTED_PLANNED_CALLS_BY_WATCHDOG,
             "complete hosted review needs {logical_calls} logical model calls, exceeding the {MAX_HOSTED_PLANNED_CALLS_BY_WATCHDOG}-call watchdog plan"
         );
+        // Admission proves that the normal path can finish within the operation
+        // cap. Repairs and transport retries reserve their actual request cost
+        // atomically before each network call and stop at the same hard cap.
         let mut exposure = PlannedExposure::default();
-        let hostile_review_output = hostile_json_text(16_384);
-        let hostile_error = hostile_json_text(REPAIR_ERROR_MAX_BYTES);
         for model in &review_models {
             let price = bounds
                 .get(model)
                 .ok_or_else(|| anyhow!("hosted model {model:?} has no admitted price bound"))?;
-            let path_for = |user: &str| -> Result<(usize, usize)> {
-                let initial = self.planned_request_bytes(
+            let request_for = |user: &str| -> Result<usize> {
+                self.planned_request_bytes(
                     model,
                     system,
                     user,
-                    EXHAUSTED_OUTPUT_RETRY_MAX_TOKENS,
+                    REVIEW_MAX_TOKENS,
                     0.1,
-                )?;
-                let schema_user = review_schema_repair_user(&hostile_review_output, &hostile_error);
-                let schema = self.planned_request_bytes(
-                    model,
-                    "You repair malformed JSON. Output only valid JSON.",
-                    &schema_user,
-                    EXHAUSTED_OUTPUT_RETRY_MAX_TOKENS,
-                    0.1,
-                )?;
-                let semantic_user = review_semantic_retry_user(user, &hostile_review_output);
-                let semantic = self.planned_request_bytes(
-                    model,
-                    system,
-                    &semantic_user,
-                    EXHAUSTED_OUTPUT_RETRY_MAX_TOKENS,
-                    0.1,
-                )?;
-                Ok((initial, schema.max(semantic)))
+                    LlmPhase::Review,
+                )
             };
-            let first_paths = candidate_first_users
+            let first_requests = candidate_first_users
                 .iter()
-                .map(|user| path_for(user))
+                .map(|user| request_for(user))
                 .collect::<Result<Vec<_>>>()?;
-            let later_paths = candidate_later_users
+            let later_requests = candidate_later_users
                 .iter()
-                .map(|user| path_for(user))
+                .map(|user| request_for(user))
                 .collect::<Result<Vec<_>>>()?;
-            let mut worst_paths = Vec::new();
+            let mut worst_requests = Vec::new();
             let mut worst_bytes = 0usize;
-            for (first_index, first) in first_paths.iter().copied().enumerate() {
-                let mut paths = later_paths
+            for (first_index, first) in first_requests.iter().copied().enumerate() {
+                let mut requests = later_requests
                     .iter()
                     .copied()
                     .enumerate()
                     .filter(|(index, _)| *index != first_index)
-                    .map(|(_, path)| path)
+                    .map(|(_, request)| request)
                     .collect::<Vec<_>>();
-                paths.sort_unstable_by_key(|(initial, repair)| {
-                    std::cmp::Reverse(initial.saturating_add(*repair))
-                });
-                paths.truncate(batch_count.saturating_sub(1));
-                paths.push(first);
-                let bytes = paths.iter().try_fold(0usize, |sum, (initial, repair)| {
-                    sum.checked_add(*initial)
-                        .and_then(|value| value.checked_add(*repair))
+                requests.sort_unstable_by_key(|request| std::cmp::Reverse(*request));
+                requests.truncate(batch_count.saturating_sub(1));
+                requests.push(first);
+                let bytes = requests.iter().try_fold(0usize, |sum, request| {
+                    sum.checked_add(*request)
                         .context("planned review path size overflowed")
                 })?;
                 if bytes > worst_bytes {
                     worst_bytes = bytes;
-                    worst_paths = paths;
+                    worst_requests = requests;
                 }
             }
-            for (initial, repair) in worst_paths {
-                exposure.add_request(initial, EXHAUSTED_OUTPUT_RETRY_MAX_TOKENS as usize, price)?;
-                exposure.add_request(repair, EXHAUSTED_OUTPUT_RETRY_MAX_TOKENS as usize, price)?;
+            for request in worst_requests {
+                exposure.add_primary_request(request, REVIEW_MAX_TOKENS as usize, price)?;
             }
         }
 
@@ -1103,27 +1233,26 @@ impl LlmClient {
                 .get(model)
                 .ok_or_else(|| anyhow!("hosted scorer {model:?} has no admitted price bound"))?;
             let scorer_system = crate::prompt::scorer_system_prompt(cfg);
-            let scorer_user_bytes = 64_000usize.saturating_sub(scorer_system.len());
-            let scorer_user = hostile_json_text(scorer_user_bytes);
+            let scorer_user_bytes =
+                crate::review::MAX_SCORER_PROMPT_BYTES.saturating_sub(scorer_system.len());
+            let scorer_user = "\"".repeat(scorer_user_bytes);
             let max_tokens = scorer_max_tokens(SCORER_MAX_FINDINGS)
                 .expect("maximum scorer finding count has a token bound");
-            let initial =
-                self.planned_request_bytes(model, &scorer_system, &scorer_user, max_tokens, 0.0)?;
-            let repair_system = scorer_repair_system(&scorer_system);
-            let invalid =
-                hostile_json_text(max_tokens as usize * SCORER_REPAIR_BYTES_PER_OUTPUT_TOKEN);
-            let repair_user = scorer_repair_user(&scorer_user, &invalid);
-            let repair =
-                self.planned_request_bytes(model, &repair_system, &repair_user, max_tokens, 0.0)?;
-            exposure.add_request(initial, max_tokens as usize, price)?;
-            exposure.add_request(repair, max_tokens as usize, price)?;
+            let initial = self.planned_request_bytes(
+                model,
+                &scorer_system,
+                &scorer_user,
+                max_tokens,
+                0.0,
+                LlmPhase::Scorer {
+                    expected_len: SCORER_MAX_FINDINGS,
+                },
+            )?;
+            exposure.add_primary_request(initial, max_tokens as usize, price)?;
         }
 
         if let Some((manifest, max_selected)) = planner {
             let user = planner_user_prompt(manifest, max_selected);
-            let invalid = hostile_json_text(8_192);
-            let error = hostile_json_text(REPAIR_ERROR_MAX_BYTES);
-            let repair_user = planner_repair_user(&user, &invalid, &error);
             for model in &review_models {
                 let price = bounds.get(model).ok_or_else(|| {
                     anyhow!("hosted planner model {model:?} has no admitted price bound")
@@ -1134,16 +1263,9 @@ impl LlmClient {
                     &user,
                     PLANNER_MAX_TOKENS,
                     0.1,
+                    LlmPhase::Planner,
                 )?;
-                let repair = self.planned_request_bytes(
-                    model,
-                    "Repair the batch-selection JSON. Return only {\"batchIds\":[integer,...]}.",
-                    &repair_user,
-                    PLANNER_MAX_TOKENS,
-                    0.1,
-                )?;
-                exposure.add_request(initial, PLANNER_MAX_TOKENS as usize, price)?;
-                exposure.add_request(repair, PLANNER_MAX_TOKENS as usize, price)?;
+                exposure.add_primary_request(initial, PLANNER_MAX_TOKENS as usize, price)?;
             }
         }
         self.validate_hosted_exposure("review", &exposure)
@@ -1151,7 +1273,7 @@ impl LlmClient {
 
     pub(crate) async fn doctor_probe(cfg: &Config, api_key: String) -> Result<()> {
         let client = Self::build(cfg, api_key, Duration::from_secs(30), None, None)?;
-        let body = client.request_body(&cfg.model, "", "ping", 1, 0.0);
+        let body = client.request_body(&cfg.model, "", "ping", 1, 0.0, LlmPhase::Review);
         let response = tokio::time::timeout(Duration::from_secs(30), client.request_once(&body))
             .await
             .map_err(|_| RequestTimedOut)??;
@@ -1232,12 +1354,23 @@ impl LlmClient {
         } else {
             None
         };
+        let qualification_upstream_provider = if crate::config::qualification_candidate_mode() {
+            Some(
+                crate::config::qualification_candidate_profile_for_config(cfg)?
+                    .ok_or_else(|| anyhow!("qualification provider profile is unavailable"))?
+                    .upstream_provider_identity,
+            )
+        } else {
+            None
+        };
+        let request_api_base = qualification_request_api_base(&cfg.api_base)?;
         Ok(LlmClient {
             // The attempt timeout wraps both sending the request and consuming
             // the complete response body, so header and body stalls take the
             // same retry path.
             http: Arc::new(Mutex::new(None)),
             api_base: cfg.api_base.trim_end_matches('/').to_string(),
+            request_api_base,
             api_key,
             api_format: cfg.api_format,
             endpoint_auth,
@@ -1251,6 +1384,7 @@ impl LlmClient {
             total_deadline,
             admission: Arc::new(Mutex::new(ProviderAdmission::default())),
             hosted_price_bounds,
+            qualification_upstream_provider,
             call_ordinal: Arc::new(AtomicU32::new(0)),
         })
     }
@@ -1294,6 +1428,23 @@ impl LlmClient {
         system: &str,
         user: &str,
     ) -> std::result::Result<ModelReview, ModelError> {
+        self.review_validated(cfg, system, user, |_| Ok(())).await
+    }
+
+    /// Run a review while treating caller-rejected content as invalid model
+    /// output. Each model gets one bounded semantic correction before the
+    /// configured cascade advances, and every consumed call remains in usage.
+    pub async fn review_validated<F>(
+        &self,
+        cfg: &Config,
+        system: &str,
+        user: &str,
+        validate: F,
+    ) -> std::result::Result<ModelReview, ModelError>
+    where
+        F: Fn(&ModelReview) -> std::result::Result<(), String> + Send + Sync + 'static,
+    {
+        let validate = Arc::new(validate);
         let chain = cfg.model_chain();
         if cfg.consensus > 1 && chain.len() > 1 {
             let n = cfg.consensus.min(chain.len());
@@ -1302,12 +1453,15 @@ impl LlmClient {
                 .map(|m| {
                     let client = self.clone();
                     let (model, system, user) = (m.clone(), system.to_string(), user.to_string());
+                    let validate = Arc::clone(&validate);
                     let task_model = model.clone();
                     let handle = tokio::spawn(async move {
                         let model_log = log_text(&task_model);
                         eprintln!("postil: attempting consensus model: {model_log}");
                         let started_at = Instant::now();
-                        let result = client.review_with_model(&task_model, &system, &user).await;
+                        let result = client
+                            .review_with_model(&task_model, &system, &user, validate.as_ref())
+                            .await;
                         let elapsed = elapsed_text(started_at.elapsed());
                         match &result {
                             Ok(_) => eprintln!(
@@ -1433,7 +1587,10 @@ impl LlmClient {
                     chain.len()
                 );
                 let started_at = Instant::now();
-                match self.review_with_model(model, system, user).await {
+                match self
+                    .review_with_model(model, system, user, validate.as_ref())
+                    .await
+                {
                     Ok(mut r) => {
                         eprintln!(
                             "postil: model {model_log} responded in {}",
@@ -1703,17 +1860,126 @@ impl LlmClient {
             }))
     }
 
+    /// Qualification-only transport for one atomic same-defect judgment.
+    /// This deliberately accepts one exact model and has no evaluator fallback.
+    #[cfg(feature = "qualification-candidate")]
+    pub async fn attribute_same_defect(
+        &self,
+        model: &str,
+        expected_provider: &str,
+        system: &str,
+        user: &str,
+        timeout: Duration,
+    ) -> std::result::Result<AtomicAttributionReview, ModelError> {
+        let mut client = self.clone();
+        let deadline = Instant::now() + timeout;
+        client.scorer_deadline = Some(
+            self.total_deadline
+                .map_or(deadline, |total| deadline.min(total)),
+        );
+        let mut usage = Usage::default();
+        let mut model_usage = Vec::new();
+        let mut usage_accounting_complete = true;
+        let first = client
+            .chat_attribution_with_temperature(
+                model,
+                expected_provider,
+                system,
+                user,
+                &mut usage,
+                &mut model_usage,
+                &mut usage_accounting_complete,
+                180,
+                0.0,
+                LlmPhase::Attribution,
+                LlmCallPhase::Initial,
+            )
+            .await
+            .map_err(|error| {
+                let complete = usage_accounting_complete
+                    && (usage.prompt_tokens > 0
+                        || usage.completion_tokens > 0
+                        || usage.provider_cost.is_some());
+                let mut result = ModelError::new(error, usage, complete);
+                result.model_usage = model_usage.clone();
+                result
+            })?;
+        let first_identity = require_attribution_identity(&first, model, expected_provider)
+            .map_err(|error| ModelError::new(error, usage, usage_accounting_complete))?;
+        let mut raw_responses = vec![first.content.clone()];
+        let mut response_identities = vec![first_identity];
+        let verdict = match parse_atomic_attribution(&first.content) {
+            Ok(verdict) => verdict,
+            Err(first_error) => {
+                let repair_system = atomic_attribution_repair_system(system);
+                let repair_user = atomic_attribution_repair_user(user, &first.content);
+                let second = client
+                    .chat_attribution_with_temperature(
+                        model,
+                        expected_provider,
+                        &repair_system,
+                        &repair_user,
+                        &mut usage,
+                        &mut model_usage,
+                        &mut usage_accounting_complete,
+                        180,
+                        0.0,
+                        LlmPhase::Attribution,
+                        LlmCallPhase::SchemaRepair,
+                    )
+                    .await
+                    .map_err(|error| {
+                        let complete = usage_accounting_complete
+                            && (usage.prompt_tokens > 0
+                                || usage.completion_tokens > 0
+                                || usage.provider_cost.is_some());
+                        let mut result = ModelError::new(error, usage, complete);
+                        result.model_usage = model_usage.clone();
+                        result
+                    })?;
+                let second_identity =
+                    require_attribution_identity(&second, model, expected_provider).map_err(
+                        |error| ModelError::new(error, usage, usage_accounting_complete),
+                    )?;
+                raw_responses.push(second.content.clone());
+                response_identities.push(second_identity);
+                parse_atomic_attribution(&second.content).map_err(|second_error| {
+                    let mut result = ModelError::new(
+                        anyhow!(
+                            "atomic attribution output invalid after schema repair: {second_error} (first response: {first_error})"
+                        ),
+                        usage,
+                        usage_accounting_complete,
+                    );
+                    result.model_usage = model_usage.clone();
+                    result
+                })?
+            }
+        };
+        Ok(AtomicAttributionReview {
+            same_defect: verdict.same_defect,
+            reason: verdict.reason,
+            model_used: model.to_string(),
+            provider_used: expected_provider.to_string(),
+            response_identities,
+            raw_responses,
+            model_usage,
+            usage_accounting_complete,
+        })
+    }
+
     async fn review_with_model(
         &self,
         model: &str,
         system: &str,
         user: &str,
+        validate: &(dyn Fn(&ModelReview) -> std::result::Result<(), String> + Send + Sync),
     ) -> std::result::Result<ModelReview, ModelError> {
         let mut usage = Usage::default();
         let mut call_usage = Vec::new();
         let mut usage_accounting_complete = true;
         let mut model_incidents = Vec::new();
-        let content = self
+        let initial = self
             .chat(
                 model,
                 system,
@@ -1725,16 +1991,30 @@ impl LlmClient {
                 LlmPhase::Review,
                 LlmCallPhase::Initial,
             )
-            .await
-            .map_err(|e| {
+            .await;
+        let (content, nonterminal_reason) = match initial {
+            Ok(content) => (content, None),
+            Err(error) if error.downcast_ref::<NonTerminalModelResponse>().is_some() => {
+                let response = error
+                    .downcast_ref::<NonTerminalModelResponse>()
+                    .expect("checked nonterminal response");
+                (response.content.clone(), Some(response.reason.clone()))
+            }
+            Err(e) => {
                 let complete = usage_accounting_complete
                     && (usage.prompt_tokens > 0 || usage.completion_tokens > 0);
                 let mut error = ModelError::new(e, usage, complete);
                 error.model_usage = call_usage.clone();
-                error
-            })?;
+                return Err(error);
+            }
+        };
         let mut repaired_schema = false;
-        let raw = match parse_review(&content) {
+        let parsed_initial = if let Some(reason) = nonterminal_reason {
+            Err(format!("response ended before completion: {reason}"))
+        } else {
+            parse_review(&content)
+        };
+        let raw = match parsed_initial {
             Ok(raw) => raw,
             Err(parse_err) => {
                 let incident = ModelIncident {
@@ -1796,6 +2076,7 @@ impl LlmClient {
         review.model_usage = call_usage.clone();
         review.model_incidents.append(&mut model_incidents);
         review.usage_accounting_complete = usage_accounting_complete;
+        let mut correction_used = repaired_schema;
         if repaired_schema && review.findings.is_empty() && !review.summary.is_empty() {
             let mut error = ModelError::new(
                 anyhow!("model output remained semantically contradictory after schema repair"),
@@ -1813,6 +2094,7 @@ impl LlmClient {
         // the risk or retract it; if the contradiction survives, the caller
         // fails the review closed.
         if !repaired_schema && review.findings.is_empty() && !review.summary.is_empty() {
+            correction_used = true;
             let incident_index = review.model_incidents.len();
             review.model_incidents.push(ModelIncident {
                 phase: ModelIncidentPhase::Review,
@@ -1869,6 +2151,99 @@ impl LlmClient {
                     }
                 }
             }
+
+            // A model that repeats the contradiction is not a usable review.
+            // Return an ordinary model failure so the configured cascade gets
+            // a chance to recover before the caller emits an operational
+            // result. Returning Ok here stopped the cascade at its weakest
+            // model and turned harmless descriptive summaries into red gates.
+            if review.findings.is_empty() && !review.summary.is_empty() {
+                let mut error = ModelError::new(
+                    anyhow!("model output remained semantically contradictory after retry"),
+                    review.usage,
+                    review.usage_accounting_complete,
+                );
+                error.model_incidents = review.model_incidents;
+                error.model_usage = review.model_usage;
+                return Err(error);
+            }
+        }
+
+        if let Err(reason) = validate(&review) {
+            if correction_used {
+                let mut error = ModelError::new(
+                    anyhow!("model output remained unusable after its correction call"),
+                    review.usage,
+                    review.usage_accounting_complete,
+                );
+                error.model_usage = review.model_usage;
+                error.model_incidents = review.model_incidents;
+                return Err(error);
+            }
+            eprintln!(
+                "postil: model {} returned unusable review content; requesting one semantic retry",
+                log_text(model),
+            );
+            let retry_user = review_validation_retry_user(user, &reason);
+            let mut retry_usage = review.usage;
+            let mut retry_accounting_complete = review.usage_accounting_complete;
+            let retry = self
+                .chat(
+                    model,
+                    system,
+                    &retry_user,
+                    &mut retry_usage,
+                    &mut call_usage,
+                    &mut retry_accounting_complete,
+                    REVIEW_MAX_TOKENS,
+                    LlmPhase::Review,
+                    LlmCallPhase::SemanticRetry,
+                )
+                .await;
+            match retry {
+                Ok(content) => {
+                    if let Ok(raw) = parse_review(&content) {
+                        let mut candidate = into_review(raw, model, retry_usage);
+                        candidate.model_usage = call_usage.clone();
+                        candidate.model_incidents = review.model_incidents.clone();
+                        candidate.usage_accounting_complete = retry_accounting_complete;
+                        if validate(&candidate).is_ok() {
+                            candidate.model_incidents.push(ModelIncident {
+                                phase: ModelIncidentPhase::Review,
+                                category: ModelIncidentCategory::InvalidOutput,
+                                recovered: true,
+                                recovery: Some(ModelIncidentRecovery::Repair),
+                            });
+                            return Ok(candidate);
+                        }
+                    }
+                }
+                Err(error) => {
+                    let mut error = ModelError::new(
+                        error.context("review validation retry failed"),
+                        retry_usage,
+                        false,
+                    );
+                    error.model_usage = call_usage;
+                    error.model_incidents = review.model_incidents;
+                    error.model_incidents.push(ModelIncident {
+                        phase: ModelIncidentPhase::Review,
+                        category: ModelIncidentCategory::InvalidOutput,
+                        recovered: false,
+                        recovery: None,
+                    });
+                    return Err(error);
+                }
+            }
+
+            let mut error = ModelError::new(
+                anyhow!("model output remained unusable after semantic retry"),
+                retry_usage,
+                retry_accounting_complete,
+            );
+            error.model_usage = call_usage;
+            error.model_incidents = review.model_incidents;
+            return Err(error);
         }
         Ok(review)
     }
@@ -1903,7 +2278,7 @@ impl LlmClient {
                 &mut usage_accounting_complete,
                 max_tokens,
                 0.0,
-                LlmPhase::Scorer,
+                LlmPhase::Scorer { expected_len },
                 LlmCallPhase::Initial,
             )
             .await
@@ -1940,7 +2315,7 @@ impl LlmClient {
                         &mut usage_accounting_complete,
                         max_tokens,
                         0.0,
-                        LlmPhase::Scorer,
+                        LlmPhase::Scorer { expected_len },
                         LlmCallPhase::SchemaRepair,
                     )
                     .await
@@ -2026,6 +2401,47 @@ impl LlmClient {
     ) -> Result<String> {
         self.chat_inner(
             model,
+            None,
+            system,
+            user,
+            usage,
+            call_usage,
+            usage_accounting_complete,
+            max_tokens,
+            temperature,
+            phase,
+            call_phase,
+        )
+        .await
+        .map(|success| success.content)
+        .map_err(classify_chat_error)
+    }
+
+    #[cfg(feature = "qualification-candidate")]
+    #[allow(clippy::too_many_arguments)]
+    async fn chat_attribution_with_temperature(
+        &self,
+        model: &str,
+        expected_provider: &str,
+        system: &str,
+        user: &str,
+        usage: &mut Usage,
+        call_usage: &mut Vec<ModelUsage>,
+        usage_accounting_complete: &mut bool,
+        max_tokens: u32,
+        temperature: f64,
+        phase: LlmPhase,
+        call_phase: LlmCallPhase,
+    ) -> Result<ChatSuccess> {
+        if let Some(global) = self.qualification_upstream_provider.as_deref() {
+            ensure!(
+                global == expected_provider,
+                "qualification provider identity mismatch"
+            );
+        }
+        self.chat_inner(
+            model,
+            Some(expected_provider),
             system,
             user,
             usage,
@@ -2047,6 +2463,7 @@ impl LlmClient {
     async fn chat_inner(
         &self,
         model: &str,
+        expected_provider: Option<&str>,
         system: &str,
         user: &str,
         usage: &mut Usage,
@@ -2056,12 +2473,25 @@ impl LlmClient {
         temperature: f64,
         phase: LlmPhase,
         call_phase: LlmCallPhase,
-    ) -> Result<String> {
+    ) -> Result<ChatSuccess> {
+        let route_provider = expected_provider.or(self.qualification_upstream_provider.as_deref());
         // This mutable flag is stack-local state held through one exclusively
         // borrowed async call. Request retries run sequentially in this loop,
         // so updating it before continuing or returning needs no atomic type.
         let mut request_max_tokens = max_tokens;
-        let mut body = self.request_body(model, system, user, request_max_tokens, temperature);
+        let mut body = self.request_body_with_provider(
+            model,
+            system,
+            user,
+            request_max_tokens,
+            temperature,
+            phase,
+            expected_provider,
+        );
+        #[cfg(feature = "qualification-candidate")]
+        if matches!(phase, LlmPhase::Attribution) {
+            Self::ensure_atomic_attribution_request_size(&body)?;
+        }
         let mut retries = 0u32;
         let mut timeout_retries = 0u32;
         let mut empty_response_retries = 0u32;
@@ -2095,9 +2525,6 @@ impl LlmClient {
                     *usage_accounting_complete = false;
                     call_usage
                         .push(self.model_usage_event(model, phase, call_phase, attempt, None));
-                    if empty_response_retries > 0 {
-                        return Err(RequestTimedOut.into());
-                    }
                     if timeout_retries < TIMEOUT_RETRIES && retries < TRANSIENT_RETRIES {
                         retries += 1;
                         timeout_retries += 1;
@@ -2121,7 +2548,8 @@ impl LlmClient {
                     let summary = safe_response_summary(
                         &response.text,
                         self.api_format,
-                        is_canonical_openrouter_base(&self.api_base),
+                        is_canonical_openrouter_base(&self.api_base)
+                            || matches!(phase, LlmPhase::Attribution),
                     );
                     let elapsed = elapsed_text(attempt_started_at.elapsed());
                     call_usage.push(self.model_usage_event(
@@ -2138,6 +2566,30 @@ impl LlmClient {
                         return Err(error);
                     }
                     if response.status.is_success() {
+                        let actual_identity =
+                            route_provider.map(|_| actual_response_identity(&response.text));
+                        if let Some(expected_provider) = route_provider {
+                            let returned_model = actual_identity
+                                .as_ref()
+                                .and_then(|identity| identity.0.as_deref())
+                                .ok_or_else(|| {
+                                    anyhow!("qualification response omitted model identity")
+                                })?;
+                            let returned_provider = actual_identity
+                                .as_ref()
+                                .and_then(|identity| identity.1.as_deref())
+                                .ok_or_else(|| {
+                                    anyhow!("qualification response omitted provider identity")
+                                })?;
+                            ensure!(
+                                returned_model == model,
+                                "qualification response model identity mismatch"
+                            );
+                            ensure!(
+                                returned_provider == expected_provider,
+                                "qualification response provider identity mismatch"
+                            );
+                        }
                         eprintln!(
                             "postil: llm response phase={} model={} attempt={} status={} elapsed={} bytes={} request_id={} response_id={} returned_model={} provider={} choices={} finish={} usage={} prompt_tokens={} completion_tokens={} reasoning_tokens={} category={}",
                             phase.as_str(),
@@ -2179,7 +2631,16 @@ impl LlmClient {
                                         retries + 1,
                                     );
                                 }
-                                return Ok(content);
+                                return Ok(ChatSuccess {
+                                    content,
+                                    returned_model: actual_identity
+                                        .as_ref()
+                                        .and_then(|identity| identity.0.clone())
+                                        .or(summary.returned_model),
+                                    provider: actual_identity
+                                        .and_then(|identity| identity.1)
+                                        .or(summary.provider),
+                                });
                             }
                             Err(error) => {
                                 let parse_added_usage = usage.prompt_tokens
@@ -2203,6 +2664,10 @@ impl LlmClient {
                                     let wait = Duration::from_secs(2 * retries as u64);
                                     let exhausted_output_budget = summary.finish_reason.as_deref()
                                         == Some("length")
+                                        && !matches!(
+                                            phase,
+                                            LlmPhase::Scorer { .. } | LlmPhase::Attribution
+                                        )
                                         && summary.usage.is_some_and(|value| {
                                             value.completion_tokens >= u64::from(request_max_tokens)
                                         })
@@ -2217,12 +2682,14 @@ impl LlmClient {
                                             wait.as_secs(),
                                         );
                                         request_max_tokens = expanded_max_tokens;
-                                        body = self.request_body(
+                                        body = self.request_body_with_provider(
                                             model,
                                             system,
                                             user,
                                             request_max_tokens,
                                             temperature,
+                                            phase,
+                                            expected_provider,
                                         );
                                     } else {
                                         eprintln!(
@@ -2262,18 +2729,6 @@ impl LlmClient {
                         *usage_accounting_complete = false;
                     }
                     let status = response.status;
-                    if empty_response_retries > 0 {
-                        let detail = provider_http_status_detail(
-                            status,
-                            &summary,
-                            response.request_id.as_deref(),
-                        );
-                        if timeout_status(status.as_u16()) {
-                            return Err(anyhow::Error::new(RequestTimedOut)
-                                .context(format!("{detail} after empty-response retry")));
-                        }
-                        return Err(anyhow!("{detail} after empty-response retry"));
-                    }
                     if timeout_status(status.as_u16())
                         && timeout_retries < TIMEOUT_RETRIES
                         && retries < TRANSIENT_RETRIES
@@ -2326,24 +2781,6 @@ impl LlmClient {
                 }
                 Err(error)
                     if reqwest_error(&error).is_some_and(reqwest::Error::is_timeout)
-                        && empty_response_retries > 0 =>
-                {
-                    *usage_accounting_complete = false;
-                    call_usage
-                        .push(self.model_usage_event(model, phase, call_phase, attempt, None));
-                    return Err(RequestTimedOut.into());
-                }
-                Err(error)
-                    if reqwest_error(&error).is_some_and(reqwest::Error::is_connect)
-                        && empty_response_retries > 0 =>
-                {
-                    *usage_accounting_complete = false;
-                    call_usage
-                        .push(self.model_usage_event(model, phase, call_phase, attempt, None));
-                    return Err(error.context("connection failed after empty-response retry"));
-                }
-                Err(error)
-                    if reqwest_error(&error).is_some_and(reqwest::Error::is_timeout)
                         && timeout_retries < TIMEOUT_RETRIES
                         && retries < TRANSIENT_RETRIES =>
                 {
@@ -2392,6 +2829,18 @@ impl LlmClient {
         }
     }
 
+    #[cfg(feature = "qualification-candidate")]
+    fn ensure_atomic_attribution_request_size(body: &serde_json::Value) -> Result<()> {
+        let bytes =
+            serde_json::to_vec(body).context("serialize atomic attribution provider request")?;
+        ensure!(
+            bytes.len() <= crate::attribution::MAX_PROVIDER_REQUEST_BYTES,
+            "atomic attribution provider request exceeds {} bytes",
+            crate::attribution::MAX_PROVIDER_REQUEST_BYTES,
+        );
+        Ok(())
+    }
+
     fn request_body(
         &self,
         model: &str,
@@ -2399,6 +2848,21 @@ impl LlmClient {
         user: &str,
         max_tokens: u32,
         temperature: f64,
+        phase: LlmPhase,
+    ) -> serde_json::Value {
+        self.request_body_with_provider(model, system, user, max_tokens, temperature, phase, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn request_body_with_provider(
+        &self,
+        model: &str,
+        system: &str,
+        user: &str,
+        max_tokens: u32,
+        temperature: f64,
+        phase: LlmPhase,
+        _expected_provider: Option<&str>,
     ) -> serde_json::Value {
         match self.api_format {
             ApiFormat::OpenaiCompatible => {
@@ -2412,7 +2876,18 @@ impl LlmClient {
                 });
                 body["max_tokens"] = json!(max_tokens);
                 apply_openrouter_privacy(&mut body, self.require_openrouter_privacy);
-                if is_canonical_openrouter_base(&self.api_base)
+                let canonical_openrouter = is_canonical_openrouter_base(&self.api_base);
+                if let Some(expected_provider) = self.qualification_upstream_provider.as_deref() {
+                    apply_openrouter_provider_pin(&mut body, expected_provider);
+                }
+                if canonical_openrouter && let LlmPhase::Scorer { expected_len } = phase {
+                    apply_openrouter_scorer_contract(&mut body, expected_len);
+                }
+                #[cfg(feature = "qualification-candidate")]
+                if matches!(phase, LlmPhase::Attribution) {
+                    apply_openrouter_atomic_attribution_contract(&mut body, _expected_provider);
+                }
+                if canonical_openrouter
                     && let Some(bound) = self
                         .hosted_price_bounds
                         .as_ref()
@@ -2450,11 +2925,21 @@ impl LlmClient {
                     .into_iter()
                     .next()
                     .ok_or_else(|| anyhow::Error::new(MissingModelChoices))?;
-                choice
+                let content = choice
                     .message
                     .content
                     .filter(|content| !content.trim().is_empty())
-                    .ok_or_else(|| anyhow::Error::new(EmptyModelResponse))
+                    .ok_or_else(|| anyhow::Error::new(EmptyModelResponse))?;
+                let reason = choice
+                    .finish_reason
+                    .unwrap_or_else(|| "missing finish_reason".to_string());
+                if reason != "stop" {
+                    return Err(anyhow::Error::new(NonTerminalModelResponse {
+                        content,
+                        reason,
+                    }));
+                }
+                Ok(content)
             }
             ApiFormat::Anthropic => {
                 let parsed: AnthropicResponse = serde_json::from_str(text)
@@ -2463,6 +2948,10 @@ impl LlmClient {
                     usage.prompt_tokens += u.input_tokens.unwrap_or(0);
                     usage.completion_tokens += u.output_tokens.unwrap_or(0);
                 }
+                let stop_reason = parsed
+                    .stop_reason
+                    .clone()
+                    .unwrap_or_else(|| "missing stop_reason".to_string());
                 let content = parsed
                     .content
                     .into_iter()
@@ -2472,6 +2961,11 @@ impl LlmClient {
                     .join("\n");
                 if content.is_empty() {
                     Err(anyhow::Error::new(EmptyModelResponse))
+                } else if !matches!(stop_reason.as_str(), "end_turn" | "stop_sequence") {
+                    Err(anyhow::Error::new(NonTerminalModelResponse {
+                        content,
+                        reason: stop_reason,
+                    }))
                 } else {
                     Ok(content)
                 }
@@ -2484,14 +2978,14 @@ impl LlmClient {
         let http = self.http_client()?;
         let mut request = match self.api_format {
             ApiFormat::OpenaiCompatible => {
-                let url = format!("{}/chat/completions", self.api_base);
+                let url = format!("{}/chat/completions", self.request_api_base);
                 http.post(&url)
                     .bearer_auth(&self.api_key)
                     .header("HTTP-Referer", "https://postil.dev")
                     .header("X-Title", "Postil")
             }
             ApiFormat::Anthropic => {
-                let url = format!("{}/messages", self.api_base);
+                let url = format!("{}/messages", self.request_api_base);
                 http.post(&url)
                     .header("x-api-key", &self.api_key)
                     .header("anthropic-version", ANTHROPIC_VERSION)
@@ -2526,9 +3020,10 @@ impl LlmClient {
     }
 
     fn reserve_provider_attempt(&self, body: &serde_json::Value) -> Result<()> {
-        let input_bytes = serde_json::to_vec(body)
-            .context("serializing model request for admission")?
-            .len();
+        let input_bytes = serialized_provider_request_bytes(
+            body,
+            "serializing model request immediately before provider contact",
+        )?;
         let output_tokens = body
             .get("max_tokens")
             .and_then(serde_json::Value::as_u64)
@@ -2657,7 +3152,7 @@ impl LlmClient {
         if let Some(client) = client.as_ref() {
             return Ok(client.clone());
         }
-        let built = secure_http_client(&self.api_base)?;
+        let built = secure_http_client(&self.request_api_base)?;
         *client = Some(built.clone());
         Ok(built)
     }
@@ -2665,7 +3160,9 @@ impl LlmClient {
     fn remaining_budget(&self, phase: LlmPhase) -> Result<Option<Duration>> {
         let deadline = match phase {
             LlmPhase::Planner | LlmPhase::Review => self.review_deadline,
-            LlmPhase::Scorer => self.scorer_deadline.or(self.total_deadline),
+            LlmPhase::Scorer { .. } | LlmPhase::Attribution => {
+                self.scorer_deadline.or(self.total_deadline)
+            }
             LlmPhase::Respond | LlmPhase::Total => self.total_deadline,
         };
         let Some(deadline) = deadline else {
@@ -2697,6 +3194,34 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn qualification_request_api_base(canonical_api_base: &str) -> Result<String> {
+    #[cfg(feature = "qualification-candidate")]
+    if crate::config::qualification_candidate_mode()
+        && let Some(raw) = std::env::var_os(QUALIFICATION_CAPTURE_API_BASE_ENV)
+    {
+        let raw = raw
+            .into_string()
+            .map_err(|_| anyhow!("qualification capture API base must be UTF-8"))?;
+        let url = reqwest::Url::parse(&raw)
+            .context("qualification capture API base must be an absolute URL")?;
+        let loopback = url
+            .host_str()
+            .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+            .is_some_and(|address| address.is_loopback());
+        ensure!(
+            url.scheme() == "http"
+                && loopback
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.query().is_none()
+                && url.fragment().is_none(),
+            "qualification capture API base must be an HTTP loopback URL without credentials, query, or fragment"
+        );
+        return Ok(raw.trim_end_matches('/').to_string());
+    }
+    Ok(canonical_api_base.trim_end_matches('/').to_string())
+}
+
 fn consensus_is_incomplete(hosted: bool, completed: usize, required: usize) -> bool {
     hosted && completed != required
 }
@@ -2708,6 +3233,19 @@ fn apply_openrouter_privacy(body: &mut serde_json::Value, required: bool) {
             "zdr": true,
         });
     }
+}
+
+fn apply_openrouter_provider_pin(body: &mut serde_json::Value, expected_provider: &str) {
+    let provider = body
+        .as_object_mut()
+        .expect("model request body is an object")
+        .entry("provider")
+        .or_insert_with(|| json!({}));
+    let provider = provider
+        .as_object_mut()
+        .expect("provider routing configuration is an object");
+    provider.insert("order".to_string(), json!([expected_provider]));
+    provider.insert("allow_fallbacks".to_string(), json!(false));
 }
 
 fn apply_openrouter_price_ceiling(body: &mut serde_json::Value, bound: &ModelPriceBound) {
@@ -2726,6 +3264,132 @@ fn apply_openrouter_price_ceiling(body: &mut serde_json::Value, bound: &ModelPri
             "completion": bound.output_micros_per_million_tokens as f64 / 1_000_000.0,
         }),
     );
+}
+
+fn apply_openrouter_scorer_contract(body: &mut serde_json::Value, expected_len: usize) {
+    debug_assert!(expected_len <= SCORER_MAX_FINDINGS);
+    let provider = body
+        .as_object_mut()
+        .expect("model request body is an object")
+        .entry("provider")
+        .or_insert_with(|| json!({}));
+    provider
+        .as_object_mut()
+        .expect("provider routing configuration is an object")
+        .insert("require_parameters".to_string(), json!(true));
+    body["reasoning"] = json!({
+        "effort": "none",
+        "exclude": true,
+    });
+    body["response_format"] = json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": "postil_finding_scores",
+            "strict": true,
+            "schema": {
+                "type": "array",
+                "minItems": expected_len,
+                "maxItems": expected_len,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "confidence": {
+                            "type": "number",
+                            "minimum": 0,
+                            "maximum": 1,
+                        },
+                        "kind": {
+                            "type": "string",
+                            "enum": [
+                                "risk",
+                                "humanEscalation",
+                                "guardrail",
+                                "uncertainty",
+                                "contentPolicy",
+                            ],
+                        },
+                        "reason": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": SCORER_REASON_SCHEMA_MAX_CHARS,
+                            "pattern": SCORER_REASON_JSON_PATTERN,
+                        },
+                    },
+                    "required": ["confidence", "kind", "reason"],
+                    "additionalProperties": false,
+                },
+            },
+        },
+    });
+}
+
+#[cfg(feature = "qualification-candidate")]
+fn apply_openrouter_atomic_attribution_contract(
+    body: &mut serde_json::Value,
+    expected_provider: Option<&str>,
+) {
+    if let Some(expected_provider) = expected_provider {
+        apply_openrouter_provider_pin(body, expected_provider);
+    }
+    let provider = body
+        .as_object_mut()
+        .expect("model request body is an object")
+        .entry("provider")
+        .or_insert_with(|| json!({}));
+    let provider = provider
+        .as_object_mut()
+        .expect("provider routing configuration is an object");
+    provider.insert("require_parameters".to_string(), json!(true));
+    body["reasoning"] = json!({ "effort": "none", "exclude": true });
+    body["response_format"] = json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": "postil_atomic_attribution",
+            "strict": true,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "sameDefect": { "type": "boolean" },
+                    "reason": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": SCORER_REASON_SCHEMA_MAX_CHARS,
+                        "pattern": SCORER_REASON_JSON_PATTERN,
+                    },
+                },
+                "required": ["sameDefect", "reason"],
+                "additionalProperties": false,
+            },
+        },
+    });
+}
+
+#[cfg(feature = "qualification-candidate")]
+fn require_attribution_identity(
+    success: &ChatSuccess,
+    expected_model: &str,
+    expected_provider: &str,
+) -> Result<AtomicAttributionResponseIdentity> {
+    let returned_model = success
+        .returned_model
+        .as_deref()
+        .ok_or_else(|| anyhow!("atomic attribution response omitted model identity"))?;
+    let returned_provider = success
+        .provider
+        .as_deref()
+        .ok_or_else(|| anyhow!("atomic attribution response omitted provider identity"))?;
+    ensure!(
+        returned_model == expected_model,
+        "atomic attribution response model identity mismatch"
+    );
+    ensure!(
+        returned_provider == expected_provider,
+        "atomic attribution response provider identity mismatch"
+    );
+    Ok(AtomicAttributionResponseIdentity {
+        model: returned_model.to_string(),
+        provider: returned_provider.to_string(),
+    })
 }
 
 fn is_canonical_openrouter_base(api_base: &str) -> bool {
@@ -2799,6 +3463,25 @@ fn safe_response_identifier(value: &str) -> Option<String> {
         return None;
     }
     Some(opaque_identifier(value))
+}
+
+fn actual_response_identity(text: &str) -> (Option<String>, Option<String>) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return (None, None);
+    };
+    let identifier = |key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|raw| {
+                let trimmed = raw.trim();
+                (!trimmed.is_empty()
+                    && trimmed.len() <= 256
+                    && !trimmed.chars().any(char::is_control))
+                .then(|| trimmed.to_string())
+            })
+    };
+    (identifier("model"), identifier("provider"))
 }
 
 fn opaque_identifier(value: &str) -> String {
@@ -2995,6 +3678,7 @@ struct ChatResponse {
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: Message,
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3014,6 +3698,7 @@ struct AnthropicResponse {
     #[serde(default)]
     content: Vec<AnthropicContentBlock>,
     usage: Option<AnthropicUsage>,
+    stop_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3205,15 +3890,15 @@ fn parse_scores(content: &str, expected_len: usize) -> Result<Vec<FindingScore>,
             raw.len()
         ));
     }
-    let mut seen = vec![false; expected_len];
-    let mut scores = raw
+    raw
         .into_iter()
-        .map(|score| {
-            if score.index >= expected_len {
-                return Err(format!("score index {} out of range", score.index));
-            }
-            if std::mem::replace(&mut seen[score.index], true) {
-                return Err(format!("duplicate score index {}", score.index));
+        .enumerate()
+        .map(|(index, score)| {
+            if !score.confidence.is_finite() || !(0.0..=1.0).contains(&score.confidence) {
+                return Err(format!(
+                    "score confidence must be a finite number from 0 through 1 (got {:?})",
+                    score.confidence
+                ));
             }
             let kind = Kind::parse(&score.kind).ok_or_else(|| {
                 format!(
@@ -3223,27 +3908,41 @@ fn parse_scores(content: &str, expected_len: usize) -> Result<Vec<FindingScore>,
             })?;
             let reason = validate_scorer_reason(&score.reason)?;
             Ok(FindingScore {
-                index: score.index,
-                confidence: score.confidence.clamp(0.0, 1.0),
+                index,
+                confidence: score.confidence,
                 kind,
                 reason,
             })
         })
-        .collect::<Result<Vec<_>, String>>()?;
-    scores.sort_by_key(|score| score.index);
-    Ok(scores)
+        .collect::<Result<Vec<_>, String>>()
+}
+
+#[cfg(feature = "qualification-candidate")]
+fn parse_atomic_attribution(content: &str) -> Result<RawAtomicAttribution, String> {
+    let json = extract_json_object(content).ok_or("no JSON object found")?;
+    let mut verdict =
+        serde_json::from_str::<RawAtomicAttribution>(json).map_err(|error| error.to_string())?;
+    verdict.reason = validate_scorer_reason(&verdict.reason)?;
+    Ok(verdict)
 }
 
 fn validate_scorer_reason(value: &str) -> Result<String, String> {
-    let reason = value.trim();
-    if value != reason {
+    if value.chars().next().is_some_and(is_json_schema_whitespace)
+        || value.chars().last().is_some_and(is_json_schema_whitespace)
+    {
         return Err("score reason must not have leading or trailing whitespace".to_string());
     }
+    let reason = value;
     if reason.is_empty() {
         return Err("score reason must not be empty".to_string());
     }
-    if reason.chars().any(char::is_control) {
-        return Err("score reason must not contain control characters".to_string());
+    if reason
+        .chars()
+        .any(|character| character.is_control() || matches!(character, '\u{2028}' | '\u{2029}'))
+    {
+        return Err(
+            "score reason must not contain control characters or line separators".to_string(),
+        );
     }
     let byte_count = reason.len();
     if byte_count > SCORER_REASON_MAX_BYTES {
@@ -3261,6 +3960,24 @@ fn validate_scorer_reason(value: &str) -> Result<String, String> {
         return Err("score reason must end with sentence punctuation".to_string());
     }
     Ok(reason.to_string())
+}
+
+fn is_json_schema_whitespace(character: char) -> bool {
+    matches!(
+        character,
+        '\u{0009}'
+            ..='\u{000d}'
+                | '\u{0020}'
+                | '\u{00a0}'
+                | '\u{1680}'
+                | '\u{2000}'..='\u{200a}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202f}'
+                | '\u{205f}'
+                | '\u{3000}'
+                | '\u{feff}'
+    )
 }
 
 fn extract_json_object(text: &str) -> Option<&str> {
@@ -3347,13 +4064,7 @@ fn into_review(raw: RawReview, model: &str, usage: Usage) -> ModelReview {
                 Some("contentPolicy") | Some("content_policy") => Kind::ContentPolicy,
                 _ => Kind::Risk,
             };
-            let title = if f.title.trim().is_empty() {
-                let body_head: String = f.body.chars().take(80).collect();
-                body_head
-            } else {
-                f.title
-            };
-            let mut finding = Finding {
+            Finding {
                 path: f.path.trim_start_matches("./").to_string(),
                 line: f.line,
                 end_line: f.end_line.filter(|e| *e >= f.line),
@@ -3365,12 +4076,11 @@ fn into_review(raw: RawReview, model: &str, usage: Usage) -> ModelReview {
                 generator_kind: None,
                 scorer_kind: None,
                 scorer_reason: None,
-                title,
+                title: f.title,
                 body: f.body,
+                evidence: f.evidence,
                 id: None,
-            };
-            crate::envelope::normalize_finding_publication(&mut finding);
-            finding
+            }
         })
         .collect();
     ModelReview {
@@ -3713,6 +4423,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn zero_capacity_planner_has_no_preflight_exposure_or_provider_call() {
+        let server = MockServer::start().await;
+        let config = Config {
+            api_base: server.uri(),
+            api_format: ApiFormat::OpenaiCompatible,
+            model: "provider/model".into(),
+            scorer_enabled: false,
+            ..Config::default()
+        };
+        let mut client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        client.hosted_price_bounds = Some(Arc::new(HashMap::from([(
+            "provider/model".into(),
+            ModelPriceBound {
+                model: "provider/model".into(),
+                input_micros_per_million_tokens: 1,
+                output_micros_per_million_tokens: 1,
+            },
+        )])));
+
+        let admission = client
+            .preflight_review_plan(
+                &config,
+                1,
+                "system",
+                &["candidate".to_string()],
+                &["candidate".to_string()],
+                Some(("hostile planner manifest", 0)),
+            )
+            .unwrap();
+        assert_eq!(admission.output_tokens, u64::from(REVIEW_MAX_TOKENS));
+        let plan = client
+            .plan_review_batches(
+                &config,
+                "hostile planner manifest",
+                &BTreeSet::from([2usize]),
+                0,
+            )
+            .await
+            .unwrap();
+        assert!(plan.batch_ids.is_empty());
+        assert!(plan.model_usage.is_empty());
+        assert_eq!(plan.usage.prompt_tokens, 0);
+        assert_eq!(plan.usage.completion_tokens, 0);
+        assert!(plan.usage.provider_cost.is_none());
+        assert_eq!(client.admission.lock().unwrap().attempts, 0);
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn planner_failure_falls_back_and_preserves_usage_cost_and_incidents() {
         let server = MockServer::start().await;
         for (model, prompt_tokens, completion_tokens, cost) in [
@@ -3723,7 +4489,7 @@ mod tests {
                 .and(path("/chat/completions"))
                 .and(body_string_contains(model))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "choices": [{"message": {"content": "not valid planner json"}}],
+                    "choices": [{"finish_reason": "stop", "message": {"content": "not valid planner json"}}],
                     "usage": {
                         "prompt_tokens": prompt_tokens,
                         "completion_tokens": completion_tokens,
@@ -3791,7 +4557,7 @@ mod tests {
             .and(path("/chat/completions"))
             .and(body_string_contains("The previous response was invalid"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "choices": [{"message": {"content": "{\"batchIds\":[2]}"}}],
+                "choices": [{"finish_reason": "stop", "message": {"content": "{\"batchIds\":[2]}"}}],
                 "usage": {
                     "prompt_tokens": 20,
                     "completion_tokens": 3,
@@ -3805,7 +4571,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "choices": [{"message": {"content": "not valid planner json"}}],
+                "choices": [{"finish_reason": "stop", "message": {"content": "not valid planner json"}}],
                 "usage": {
                     "prompt_tokens": 10,
                     "completion_tokens": 2,
@@ -3859,13 +4625,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nonterminal_review_uses_one_bounded_repair_before_acceptance() {
+        let server = MockServer::start().await;
+        let review = r#"{"summary":"","findings":[]}"#;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("You repair malformed JSON"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"finish_reason": "stop", "message": {"content": review}}],
+                "usage": {"prompt_tokens": 20, "completion_tokens": 3}
+            })))
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"finish_reason": "length", "message": {"content": review}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+            })))
+            .with_priority(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let config = Config {
+            api_base: server.uri(),
+            api_format: ApiFormat::OpenaiCompatible,
+            model: "provider/model".into(),
+            scorer_enabled: false,
+            ..Config::default()
+        };
+        let client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(2),
+            None,
+            None,
+        )
+        .unwrap();
+        *client.http.lock().unwrap() = Some(reqwest::Client::new());
+
+        let result = client.review(&config, "system", "user").await.unwrap();
+        assert!(result.findings.is_empty());
+        assert_eq!(result.model_usage.len(), 2);
+        assert_eq!(result.model_incidents.len(), 1);
+        assert!(result.model_incidents[0].recovered);
+        assert_eq!(
+            result.model_incidents[0].recovery,
+            Some(ModelIncidentRecovery::Repair)
+        );
+    }
+
+    #[tokio::test]
+    async fn over_limit_finding_fails_after_one_bounded_semantic_repair() {
+        let server = MockServer::start().await;
+        let body = format!("{}.", "word ".repeat(250));
+        let review = serde_json::json!({
+            "summary": "A merge-relevant issue.",
+            "findings": [{
+                "path": "src/lib.rs",
+                "line": 1,
+                "severity": "warn",
+                "kind": "risk",
+                "confidence": 0.9,
+                "title": "Keep the complete finding",
+                "body": body,
+                "evidence": "changed();"
+            }]
+        })
+        .to_string();
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"finish_reason": "stop", "message": {"content": review}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let config = Config {
+            api_base: server.uri(),
+            api_format: ApiFormat::OpenaiCompatible,
+            model: "provider/model".into(),
+            scorer_enabled: false,
+            ..Config::default()
+        };
+        let client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(2),
+            None,
+            None,
+        )
+        .unwrap();
+        *client.http.lock().unwrap() = Some(reqwest::Client::new());
+
+        let result = client
+            .review_validated(&config, "system", "user", |review| {
+                review
+                    .findings
+                    .iter()
+                    .try_for_each(crate::envelope::validate_finding_publication)
+            })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
     async fn planner_model_cascade_marks_fallback_and_preserves_incidents() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(body_string_contains("provider/primary"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "choices": [{"message": {"content": "invalid"}}],
+                "choices": [{"finish_reason": "stop", "message": {"content": "invalid"}}],
                 "usage": {"prompt_tokens": 10, "completion_tokens": 2}
             })))
             .expect(2)
@@ -3875,7 +4750,7 @@ mod tests {
             .and(path("/chat/completions"))
             .and(body_string_contains("provider/fallback"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "choices": [{"message": {"content": "{\"batchIds\":[2]}"}}],
+                "choices": [{"finish_reason": "stop", "message": {"content": "{\"batchIds\":[2]}"}}],
                 "usage": {"prompt_tokens": 20, "completion_tokens": 3}
             })))
             .expect(1)
@@ -3985,7 +4860,7 @@ mod tests {
                 output_micros_per_million_tokens: 1,
             },
         )])));
-        client
+        let admission = client
             .preflight_review_plan(
                 &config,
                 crate::review::MAX_HOSTED_SELECTED_BATCHES,
@@ -3995,6 +4870,11 @@ mod tests {
                 Some((&"m".repeat(96_000), 1)),
             )
             .unwrap();
+        assert_eq!(
+            admission.output_tokens,
+            u64::from(REVIEW_MAX_TOKENS) * crate::review::MAX_HOSTED_SELECTED_BATCHES as u64
+                + u64::from(PLANNER_MAX_TOKENS)
+        );
         assert_eq!(client.admission.lock().unwrap().attempts, 0);
     }
 
@@ -4039,8 +4919,8 @@ mod tests {
             "provider/model".into(),
             ModelPriceBound {
                 model: "provider/model".into(),
-                input_micros_per_million_tokens: 1,
-                output_micros_per_million_tokens: 1,
+                input_micros_per_million_tokens: 1_000_000,
+                output_micros_per_million_tokens: 1_000_000,
             },
         )])));
 
@@ -4055,7 +4935,7 @@ mod tests {
             )
             .unwrap_err();
 
-        assert!(error.to_string().contains("complete hosted review"));
+        assert!(error.to_string().contains("per-request cap"));
         assert_eq!(client.admission.lock().unwrap().attempts, 0);
         assert!(server.received_requests().await.unwrap().is_empty());
     }
@@ -4104,6 +4984,13 @@ mod tests {
             input_micros_per_million_tokens: 2_000_000,
             output_micros_per_million_tokens: 3_000_000,
         };
+        let mut exposure = PlannedExposure::default();
+        exposure.add_primary_request(100, 10, &first).unwrap();
+        assert_eq!(exposure.attempts, 1);
+        assert_eq!(exposure.input_bytes, 100);
+        assert_eq!(exposure.output_tokens, 10);
+        assert_eq!(exposure.projected_cost_micros, 120);
+
         let mut exposure = PlannedExposure::default();
         exposure.add_request(100, 10, &first).unwrap();
         exposure.add_request(100, 10, &first).unwrap();
@@ -4167,7 +5054,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let hostile = "\0".repeat(64 * 1_024);
+        let hostile = "\0".repeat(32 * 1_024);
 
         let exact = client
             .planned_request_bytes(
@@ -4176,6 +5063,7 @@ mod tests {
                 &hostile,
                 REVIEW_MAX_TOKENS,
                 0.0,
+                LlmPhase::Review,
             )
             .unwrap();
         let actual = serde_json::to_vec(&client.request_body(
@@ -4184,12 +5072,68 @@ mod tests {
             &hostile,
             REVIEW_MAX_TOKENS,
             0.0,
+            LlmPhase::Review,
         ))
         .unwrap()
         .len();
 
         assert_eq!(exact, actual);
         assert!(exact > hostile.len() * 5);
+    }
+
+    #[test]
+    fn openai_and_anthropic_request_shapes_enforce_the_hostile_serialized_limit() {
+        for api_format in [ApiFormat::OpenaiCompatible, ApiFormat::Anthropic] {
+            let config = Config {
+                api_format,
+                model: "provider/model".into(),
+                ..Config::default()
+            };
+            let client = LlmClient::build(
+                &config,
+                "test-key".into(),
+                Duration::from_secs(1),
+                None,
+                None,
+            )
+            .unwrap();
+            let body_for = |hostile_bytes: usize| {
+                client.request_body(
+                    "provider/model",
+                    "system",
+                    &hostile_json_text(hostile_bytes),
+                    REVIEW_MAX_TOKENS,
+                    0.1,
+                    LlmPhase::Review,
+                )
+            };
+            let mut low = 0usize;
+            let mut high = MAX_PROVIDER_REQUEST_BYTES;
+            while low < high {
+                let middle = low + (high - low).div_ceil(2);
+                if serde_json::to_vec(&body_for(middle)).unwrap().len()
+                    <= MAX_PROVIDER_REQUEST_BYTES
+                {
+                    low = middle;
+                } else {
+                    high = middle - 1;
+                }
+            }
+            assert!(
+                crate::review::MAX_REVIEW_BATCH_BYTES <= low,
+                "{api_format:?} cannot carry the configured review batch under the serialized cap"
+            );
+            let accepted = body_for(low);
+            let rejected = body_for(low + 1);
+            assert!(
+                serialized_provider_request_bytes(&accepted, "hostile request").is_ok(),
+                "{api_format:?} rejected its largest fitting hostile request"
+            );
+            assert!(
+                serialized_provider_request_bytes(&rejected, "hostile request").is_err(),
+                "{api_format:?} admitted a hostile request over the serialized cap"
+            );
+        }
     }
 
     #[test]
@@ -4285,21 +5229,44 @@ mod tests {
     }
 
     #[test]
-    fn scorer_scores_parse_clamp_and_validate_kind() {
+    fn scorer_scores_use_array_order_and_validate_kind() {
         let scores = parse_scores(
-            r#"[{"index":0,"confidence":1.2,"kind":"humanEscalation","reason":"This needs an owner decision."}]"#,
-            1,
+            r#"[{"confidence":0.8,"kind":"humanEscalation","reason":"This needs an owner decision."},{"confidence":0.6,"kind":"risk","reason":"This follows the second input."}]"#,
+            2,
         )
         .unwrap();
         assert_eq!(scores[0].index, 0);
-        assert_eq!(scores[0].confidence, 1.0);
+        assert_eq!(scores[0].confidence, 0.8);
         assert_eq!(scores[0].kind, Kind::HumanEscalation);
+        assert_eq!(scores[1].index, 1);
+        assert_eq!(scores[1].confidence, 0.6);
+        assert_eq!(scores[1].kind, Kind::Risk);
+    }
+
+    #[test]
+    fn scorer_rejects_unknown_fields_and_invalid_confidence() {
+        let unknown = parse_scores(
+            r#"[{"index":0,"confidence":0.8,"kind":"risk","reason":"This field is not admitted."}]"#,
+            1,
+        )
+        .unwrap_err();
+        assert!(unknown.contains("unknown field `index`"));
+
+        for confidence in ["-1", "5", "1e999", "\"NaN\""] {
+            let input = format!(
+                r#"[{{"confidence":{confidence},"kind":"risk","reason":"This confidence is invalid."}}]"#
+            );
+            assert!(
+                parse_scores(&input, 1).is_err(),
+                "accepted malformed confidence {confidence}"
+            );
+        }
     }
 
     #[test]
     fn scorer_rejects_severity_label_as_kind() {
         let error = parse_scores(
-            r#"[{"index":0,"confidence":0.7,"kind":"warn","reason":"The response used the wrong field."}]"#,
+            r#"[{"confidence":0.7,"kind":"warn","reason":"The response used the wrong field."}]"#,
             1,
         )
         .unwrap_err();
@@ -4308,40 +5275,62 @@ mod tests {
 
     #[test]
     fn scorer_rejects_missing_entries() {
-        assert!(parse_scores(r#"[{"index":0,"confidence":0.5,"kind":"risk"}]"#, 2).is_err());
+        assert!(
+            parse_scores(
+                r#"[{"confidence":0.5,"kind":"risk","reason":"Only one score is present."}]"#,
+                2
+            )
+            .is_err()
+        );
     }
 
     #[test]
-    fn scorer_repair_prompt_keeps_reason_length_headroom() {
+    fn scorer_repair_prompt_states_the_exact_reason_limits() {
         let prompt = scorer_repair_system("base scorer contract");
         assert!(prompt.contains(&format!(
             "at most {SCORER_REASON_PROMPT_MAX_BYTES} UTF-8 bytes"
         )));
-        assert!(!prompt.contains(&format!("at most {SCORER_REASON_MAX_BYTES} UTF-8 bytes")));
     }
 
     #[test]
     fn scorer_rejects_incomplete_and_overlength_reasons() {
         let incomplete = parse_scores(
-            r#"[{"index":0,"confidence":0.7,"kind":"risk","reason":"This has no sentence terminator"}]"#,
+            r#"[{"confidence":0.7,"kind":"risk","reason":"This has no sentence terminator"}]"#,
             1,
         )
         .unwrap_err();
         assert!(incomplete.contains("sentence punctuation"));
 
-        let overlength = format!(
-            r#"[{{"index":0,"confidence":0.7,"kind":"risk","reason":"{}."}}]"#,
-            "x".repeat(SCORER_REASON_MAX_BYTES)
-        );
-        let error = parse_scores(&overlength, 1).unwrap_err();
+        let overlength = serde_json::json!([{
+            "confidence": 0.7,
+            "kind": "risk",
+            "reason": format!("{}.", "x".repeat(SCORER_REASON_MAX_BYTES)),
+        }]);
+        let error = parse_scores(&overlength.to_string(), 1).unwrap_err();
         assert!(error.contains("exceeds 240 UTF-8 bytes"));
+
+        for reason in [
+            " Leading whitespace is invalid.",
+            "Trailing whitespace is invalid. ",
+            "A tab\tis invalid.",
+            "A line\u{2028}separator is invalid.",
+        ] {
+            let input = serde_json::json!([{
+                "confidence": 0.7,
+                "kind": "risk",
+                "reason": reason,
+            }]);
+            assert!(
+                parse_scores(&input.to_string(), 1).is_err(),
+                "accepted malformed reason {reason:?}"
+            );
+        }
     }
 
     #[test]
-    fn scorer_reason_limit_counts_utf8_bytes() {
+    fn scorer_reason_limits_match_json_schema_unicode_length() {
         let reason = format!("{}.", "x".repeat(SCORER_REASON_MAX_BYTES - 1));
         let input = serde_json::json!([{
-            "index": 0,
             "confidence": 0.7,
             "kind": "risk",
             "reason": reason,
@@ -4349,52 +5338,58 @@ mod tests {
         let scores = parse_scores(&input.to_string(), 1).unwrap();
         assert_eq!(scores[0].reason.len(), SCORER_REASON_MAX_BYTES);
 
-        let multibyte = format!("{}.", "界".repeat(80));
+        let multibyte = format!("{}。", "界".repeat((SCORER_REASON_MAX_BYTES / 3) - 1));
         let input = serde_json::json!([{
-            "index": 0,
             "confidence": 0.7,
             "kind": "risk",
             "reason": multibyte,
         }]);
-        assert!(
-            parse_scores(&input.to_string(), 1)
-                .unwrap_err()
-                .contains("exceeds 240 UTF-8 bytes")
-        );
+        let scores = parse_scores(&input.to_string(), 1).unwrap();
+        assert_eq!(scores[0].reason.len(), SCORER_REASON_MAX_BYTES);
     }
 
     #[test]
     fn scorer_reason_accepts_bounded_single_line_text() {
         let scores = parse_scores(
-            r#"[{"index":0,"confidence":0.7,"kind":"risk","reason":"The U.S. service affects retries, e.g. this call, i.e. the idempotent path."}]"#,
+            r#"[{"confidence":0.7,"kind":"risk","reason":"The U.S. retry path is not idempotent, e.g. on timeout."}]"#,
             1,
         )
         .unwrap();
         assert_eq!(scores.len(), 1);
 
         let multiple_sentences = parse_scores(
-            r#"[{"index":0,"confidence":0.7,"kind":"risk","reason":"The first condition fails. The second condition also fails."}]"#,
+            r#"[{"confidence":0.7,"kind":"risk","reason":"The first condition fails. The second condition also fails."}]"#,
             1,
         )
         .unwrap();
         assert_eq!(multiple_sentences.len(), 1);
 
+        let natural_long_reason =
+            "The authorization check is bypassed when the cached administrator flag is stale.";
+        assert!(natural_long_reason.chars().count() > 60);
+        let input = serde_json::json!([{
+            "confidence": 0.7,
+            "kind": "risk",
+            "reason": natural_long_reason,
+        }]);
+        assert_eq!(parse_scores(&input.to_string(), 1).unwrap().len(), 1);
+
         let lowercase = parse_scores(
-            r#"[{"index":0,"confidence":0.7,"kind":"risk","reason":"The first condition fails. the second condition also fails."}]"#,
+            r#"[{"confidence":0.7,"kind":"risk","reason":"The first condition fails. the second condition also fails."}]"#,
             1,
         )
         .unwrap();
         assert_eq!(lowercase.len(), 1);
 
         let no_space = parse_scores(
-            r#"[{"index":0,"confidence":0.7,"kind":"risk","reason":"The first condition fails.The second condition also fails."}]"#,
+            r#"[{"confidence":0.7,"kind":"risk","reason":"The first condition fails.The second condition also fails."}]"#,
             1,
         )
         .unwrap();
         assert_eq!(no_space.len(), 1);
 
         let file_and_version = parse_scores(
-            r#"[{"index":0,"confidence":0.7,"kind":"risk","reason":"The src/lib.rs behavior changed in version 4.2."}]"#,
+            r#"[{"confidence":0.7,"kind":"risk","reason":"The src/lib.rs behavior changed in version 4.2."}]"#,
             1,
         )
         .unwrap();
@@ -4608,6 +5603,7 @@ mod tests {
                     confidence: 0.9,
                     title: "real issue".into(),
                     body: "still grounded".into(),
+                    evidence: None,
                 }],
             };
             let r = into_review(raw, "m", Usage::default());
@@ -4631,6 +5627,7 @@ mod tests {
                 confidence: 1.7,
                 title: "".into(),
                 body: "a body".into(),
+                evidence: None,
             }],
         };
         let r = into_review(raw, "m", Usage::default());
@@ -4640,7 +5637,7 @@ mod tests {
         assert_eq!(f.kind, Kind::HumanEscalation);
         assert_eq!(f.confidence, 1.0);
         assert_eq!(f.end_line, None);
-        assert_eq!(f.title, "a body");
+        assert_eq!(f.title, "");
     }
 
     #[test]
@@ -4656,6 +5653,7 @@ mod tests {
                 confidence: 0.8,
                 title: "Stale temporal residue".into(),
                 body: "b".into(),
+                evidence: None,
             }],
         };
         let r = into_review(raw, "m", Usage::default());
@@ -4663,7 +5661,7 @@ mod tests {
     }
 
     #[test]
-    fn into_review_normalizes_finding_prose_before_storage() {
+    fn into_review_preserves_finding_prose_for_contract_validation() {
         let raw = RawReview {
             summary: String::new(),
             findings: vec![RawFinding {
@@ -4678,23 +5676,14 @@ mod tests {
                     "# Summary\n@octocat <details>hidden</details> ![pixel](https://bad.test/x)\n{}",
                     "line\n".repeat(30),
                 ),
+                evidence: None,
             }],
         };
 
         let review = into_review(raw, "m", Usage::default());
         let finding = &review.findings[0];
-        assert!(!finding.title.contains('@'));
-        assert!(!finding.title.contains('<'));
-        assert!(!finding.body.contains("@octocat"));
-        assert!(!finding.body.contains("<details>"));
-        assert!(
-            !finding
-                .body
-                .lines()
-                .any(|line| line.trim_start().starts_with("!["))
-        );
-        assert!(finding.body.chars().count() <= crate::envelope::FINDING_PUBLIC_BODY_MAX_CHARS);
-        assert!(finding.body.lines().count() <= crate::envelope::FINDING_PUBLIC_BODY_MAX_LINES);
+        assert_eq!(finding.title, "@octocat <img> **unsafe**");
+        assert!(finding.body.contains("@octocat <details>"));
     }
 
     fn mk(model: &str, path: &str, line: u32, conf: f64) -> ModelReview {
@@ -4714,6 +5703,7 @@ mod tests {
                 scorer_reason: None,
                 title: "t".into(),
                 body: "b".into(),
+                evidence: None,
                 id: None,
             }],
             model_used: model.into(),
@@ -4746,6 +5736,7 @@ mod tests {
             scorer_reason: None,
             title: "solo".into(),
             body: "b".into(),
+            evidence: None,
             id: None,
         });
         let merged = consensus_merge(vec![a, b]);
@@ -4788,6 +5779,7 @@ mod tests {
             scorer_reason: None,
             title: "t2".into(),
             body: "b2".into(),
+            evidence: None,
             id: None,
         });
         let merged = consensus_merge(vec![a, b]);
@@ -4815,6 +5807,84 @@ mod tests {
     }
 
     #[test]
+    fn canonical_openrouter_scorer_uses_no_reasoning_effort_and_requires_strict_schema() {
+        let client = LlmClient::build(
+            &Config::default(),
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        let scorer = client.request_body(
+            "provider/scorer",
+            "system",
+            "user",
+            400,
+            0.0,
+            LlmPhase::Scorer { expected_len: 1 },
+        );
+        assert_eq!(
+            scorer["reasoning"],
+            json!({"effort": "none", "exclude": true})
+        );
+        assert!(scorer["reasoning"].get("enabled").is_none());
+        assert_eq!(scorer["provider"]["require_parameters"], true);
+        assert_eq!(scorer["response_format"]["type"], "json_schema");
+        assert_eq!(scorer["response_format"]["json_schema"]["strict"], true);
+        assert_eq!(
+            scorer["response_format"]["json_schema"]["schema"]["items"]["additionalProperties"],
+            false
+        );
+        let schema = &scorer["response_format"]["json_schema"]["schema"];
+        assert_eq!(schema["minItems"], 1);
+        assert_eq!(schema["maxItems"], 1);
+        assert!(schema["items"]["properties"].get("index").is_none());
+        assert_eq!(
+            schema["items"]["required"],
+            json!(["confidence", "kind", "reason"])
+        );
+        assert_eq!(schema["items"]["properties"]["reason"]["minLength"], 1);
+        assert_eq!(
+            schema["items"]["properties"]["reason"]["maxLength"],
+            SCORER_REASON_SCHEMA_MAX_CHARS
+        );
+        assert_eq!(
+            schema["items"]["properties"]["reason"]["pattern"],
+            SCORER_REASON_JSON_PATTERN
+        );
+
+        let multiple = client.request_body(
+            "provider/scorer",
+            "system",
+            "user",
+            400,
+            0.0,
+            LlmPhase::Scorer { expected_len: 7 },
+        );
+        let multiple_schema = &multiple["response_format"]["json_schema"]["schema"];
+        assert_eq!(multiple_schema["minItems"], 7);
+        assert_eq!(multiple_schema["maxItems"], 7);
+        assert!(
+            multiple_schema["items"]["properties"]
+                .get("index")
+                .is_none()
+        );
+
+        let generator = client.request_body(
+            "provider/generator",
+            "system",
+            "user",
+            REVIEW_MAX_TOKENS,
+            0.1,
+            LlmPhase::Review,
+        );
+        assert!(generator.get("reasoning").is_none());
+        assert!(generator.get("response_format").is_none());
+        assert!(generator["provider"].get("require_parameters").is_none());
+    }
+
+    #[test]
     fn hosted_openrouter_request_pins_the_admitted_price_ceiling() {
         let mut body = json!({"model": "provider/model"});
         apply_openrouter_privacy(&mut body, true);
@@ -4822,14 +5892,61 @@ mod tests {
             &mut body,
             &ModelPriceBound {
                 model: "provider/model".into(),
-                input_micros_per_million_tokens: 80_000,
-                output_micros_per_million_tokens: 400_000,
+                input_micros_per_million_tokens: 435_000,
+                output_micros_per_million_tokens: 870_000,
             },
         );
-        assert_eq!(body["provider"]["max_price"]["prompt"], 0.08);
-        assert_eq!(body["provider"]["max_price"]["completion"], 0.4);
-        assert_eq!(body["provider"]["data_collection"], "deny");
-        assert_eq!(body["provider"]["zdr"], true);
+        assert_eq!(
+            body["provider"],
+            json!({
+                "data_collection": "deny",
+                "zdr": true,
+                "max_price": { "prompt": 0.435, "completion": 0.87 },
+            })
+        );
+    }
+
+    #[cfg(feature = "qualification-candidate")]
+    #[test]
+    fn qualification_route_is_pinned_for_generator_scorer_repair_and_attribution_requests() {
+        let mut client = LlmClient::build(
+            &Config::default(),
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        client.qualification_upstream_provider = Some("PinnedProvider".into());
+        client.hosted_price_bounds = Some(Arc::new(HashMap::from([(
+            "provider/model".into(),
+            ModelPriceBound {
+                model: "provider/model".into(),
+                input_micros_per_million_tokens: 435_000,
+                output_micros_per_million_tokens: 870_000,
+            },
+        )])));
+        for phase in [
+            LlmPhase::Review,
+            LlmPhase::Scorer { expected_len: 1 },
+            LlmPhase::Attribution,
+        ] {
+            let body = client.request_body_with_provider(
+                "provider/model",
+                "system",
+                "user",
+                180,
+                0.0,
+                phase,
+                matches!(phase, LlmPhase::Attribution).then_some("PinnedProvider"),
+            );
+            assert_eq!(body["provider"]["order"], json!(["PinnedProvider"]));
+            assert_eq!(body["provider"]["allow_fallbacks"], false);
+            assert_eq!(
+                body["provider"]["max_price"],
+                json!({ "prompt": 0.435, "completion": 0.87 })
+            );
+        }
     }
 
     #[test]
@@ -4841,6 +5958,7 @@ mod tests {
         let openai = LlmClient::build(
             &Config {
                 model: "provider/model".into(),
+                api_base: "https://models.example.test/v1".into(),
                 ..Config::default()
             },
             "test-key".into(),
@@ -4849,8 +5967,17 @@ mod tests {
             None,
         )
         .unwrap();
-        let openai_body = openai.request_body("provider/model", "system", "user", 100, 0.0);
+        let openai_body = openai.request_body(
+            "provider/model",
+            "system",
+            "user",
+            100,
+            0.0,
+            LlmPhase::Scorer { expected_len: 1 },
+        );
         assert!(openai_body.get("provider").is_none());
+        assert!(openai_body.get("reasoning").is_none());
+        assert!(openai_body.get("response_format").is_none());
 
         let anthropic = LlmClient::build(
             &Config {
@@ -4865,8 +5992,17 @@ mod tests {
             None,
         )
         .unwrap();
-        let anthropic_body = anthropic.request_body("provider/model", "system", "user", 100, 0.0);
+        let anthropic_body = anthropic.request_body(
+            "provider/model",
+            "system",
+            "user",
+            100,
+            0.0,
+            LlmPhase::Scorer { expected_len: 1 },
+        );
         assert!(anthropic_body.get("provider").is_none());
+        assert!(anthropic_body.get("reasoning").is_none());
+        assert!(anthropic_body.get("response_format").is_none());
         assert_eq!(anthropic_body["system"], "system");
     }
 
@@ -4929,11 +6065,165 @@ mod tests {
         assert_eq!(projected, 108_001);
     }
 
+    #[cfg(feature = "qualification-candidate")]
+    #[test]
+    fn atomic_attribution_provider_request_bound_is_exact() {
+        let empty = json!({"payload": ""});
+        let overhead = serde_json::to_vec(&empty).unwrap().len();
+        let accepted = json!({
+            "payload": "x".repeat(crate::attribution::MAX_PROVIDER_REQUEST_BYTES - overhead),
+        });
+        assert_eq!(
+            serde_json::to_vec(&accepted).unwrap().len(),
+            crate::attribution::MAX_PROVIDER_REQUEST_BYTES,
+        );
+        LlmClient::ensure_atomic_attribution_request_size(&accepted).unwrap();
+
+        let rejected = json!({
+            "payload": "x".repeat(crate::attribution::MAX_PROVIDER_REQUEST_BYTES - overhead + 1),
+        });
+        let error = LlmClient::ensure_atomic_attribution_request_size(&rejected).unwrap_err();
+        assert!(error.to_string().contains("exceeds 5000 bytes"));
+    }
+
+    fn provider_request_with_exact_serialized_size(target: usize) -> serde_json::Value {
+        let empty = json!({
+            "model": "provider/model",
+            "max_tokens": 1,
+            "payload": ""
+        });
+        let overhead = serde_json::to_vec(&empty).unwrap().len();
+        assert!(target >= overhead);
+        let remaining = target - overhead;
+        let quote_count = remaining / 2;
+        let plain_count = remaining % 2;
+        let mut payload = "\"".repeat(quote_count);
+        payload.push_str(&"x".repeat(plain_count));
+        let body = json!({
+            "model": "provider/model",
+            "max_tokens": 1,
+            "payload": payload
+        });
+        assert_eq!(serde_json::to_vec(&body).unwrap().len(), target);
+        body
+    }
+
+    #[test]
+    fn provider_request_bound_counts_exact_json_escaping_at_n_and_n_plus_one() {
+        let accepted = provider_request_with_exact_serialized_size(MAX_PROVIDER_REQUEST_BYTES);
+        assert_eq!(
+            serialized_provider_request_bytes(&accepted, "test request").unwrap(),
+            MAX_PROVIDER_REQUEST_BYTES
+        );
+
+        let rejected = provider_request_with_exact_serialized_size(MAX_PROVIDER_REQUEST_BYTES + 1);
+        let error = serialized_provider_request_bytes(&rejected, "test request").unwrap_err();
+        assert!(error.to_string().contains("per-request cap"));
+        assert!(
+            error
+                .to_string()
+                .contains(&(MAX_PROVIDER_REQUEST_BYTES + 1).to_string())
+        );
+    }
+
+    #[test]
+    fn openai_length_finish_reason_rejects_complete_looking_partial_content() {
+        let config = Config {
+            api_base: "http://127.0.0.1:1".into(),
+            api_format: ApiFormat::OpenaiCompatible,
+            ..Config::default()
+        };
+        let client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        for (body, expected) in [
+            (
+                r#"{"choices":[{"finish_reason":"length","message":{"content":"{\"summary\":\"\",\"findings\":[]}"}}]}"#,
+                "length",
+            ),
+            (
+                r#"{"choices":[{"message":{"content":"{\"summary\":\"\",\"findings\":[]}"}}]}"#,
+                "missing finish_reason",
+            ),
+        ] {
+            let error = client
+                .parse_response(body, &mut Usage::default())
+                .unwrap_err();
+            let partial = error.downcast_ref::<NonTerminalModelResponse>().unwrap();
+            assert_eq!(partial.reason, expected);
+            assert!(partial.content.contains("findings"));
+        }
+    }
+
+    #[test]
+    fn anthropic_max_tokens_stop_reason_rejects_complete_looking_partial_content() {
+        let config = Config {
+            api_base: "http://127.0.0.1:1".into(),
+            api_format: ApiFormat::Anthropic,
+            ..Config::default()
+        };
+        let client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        for (body, expected) in [
+            (
+                r#"{"stop_reason":"max_tokens","content":[{"type":"text","text":"{\"summary\":\"\",\"findings\":[]}"}]}"#,
+                "max_tokens",
+            ),
+            (
+                r#"{"content":[{"type":"text","text":"{\"summary\":\"\",\"findings\":[]}"}]}"#,
+                "missing stop_reason",
+            ),
+        ] {
+            let error = client
+                .parse_response(body, &mut Usage::default())
+                .unwrap_err();
+            let partial = error.downcast_ref::<NonTerminalModelResponse>().unwrap();
+            assert_eq!(partial.reason, expected);
+            assert!(partial.content.contains("findings"));
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_provider_request_is_rejected_before_network_contact() {
+        let server = MockServer::start().await;
+        let config = Config {
+            api_base: server.uri(),
+            model: "provider/model".into(),
+            ..Config::default()
+        };
+        let client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        let oversized = provider_request_with_exact_serialized_size(MAX_PROVIDER_REQUEST_BYTES + 1);
+        let error = match client.request_once(&oversized).await {
+            Ok(_) => panic!("oversized request reached the provider transport"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("per-request cap"));
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
     #[test]
     fn scorer_budget_matches_the_qualified_finding_bound() {
         assert_eq!(scorer_max_tokens(0), Some(256));
-        assert_eq!(scorer_max_tokens(1), Some(896));
-        assert_eq!(scorer_max_tokens(20), Some(13_056));
+        assert_eq!(scorer_max_tokens(1), Some(400));
+        assert_eq!(scorer_max_tokens(20), Some(3_136));
         assert_eq!(scorer_max_tokens(21), None);
         assert_eq!(scorer_max_tokens(usize::MAX), None);
     }

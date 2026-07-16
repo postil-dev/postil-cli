@@ -29,7 +29,7 @@ fn llm_content(findings: Value) -> Value {
         "SQL injection risk in auth path."
     };
     json!({
-        "choices": [{"message": {"content": json!({
+        "choices": [{"finish_reason": "stop", "message": {"content": json!({
             "summary": summary,
             "findings": findings
         }).to_string()}}],
@@ -38,15 +38,75 @@ fn llm_content(findings: Value) -> Value {
 }
 
 fn scorer_content(scores: Value) -> Value {
+    scorer_text(&scores.to_string())
+}
+
+fn scorer_text(scores: &str) -> Value {
     json!({
-        "choices": [{"message": {"content": scores.to_string()}}],
+        "choices": [{"finish_reason": "stop", "message": {"content": scores}}],
         "usage": {"prompt_tokens": 30, "completion_tokens": 10, "cost": 0.000045}
     })
 }
 
+#[cfg(feature = "qualification-candidate")]
+fn attribution_text(content: &str) -> Value {
+    json!({
+        "model": "provider/scorer",
+        "provider": "test-provider",
+        "choices": [{"finish_reason": "stop", "message": {"content": content}}],
+        "usage": {"prompt_tokens": 30, "completion_tokens": 10, "cost": 0.000045}
+    })
+}
+
+#[cfg(feature = "qualification-candidate")]
+fn write_atomic_attribution_inputs(
+    directory: &std::path::Path,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let profile = directory.join("candidate.json");
+    std::fs::write(
+        &profile,
+        json!({
+            "benchmarkProviderIdentity": postil_cli::config::MANAGED_OPENROUTER_PROVIDER_IDENTITY,
+            "upstreamProviderIdentity": "test-provider",
+            "apiBase": postil_cli::config::MANAGED_OPENROUTER_API_BASE,
+            "apiFormat": "openai-compatible",
+            "generatorChain": ["openai/gpt-5-mini"],
+            "consensus": 1,
+            "scorerChain": ["provider/scorer"],
+            "modelPriceBounds": [
+                {"model": "openai/gpt-5-mini", "inputMicrosPerMillionTokens": 435000, "outputMicrosPerMillionTokens": 870000},
+                {"model": "provider/scorer", "inputMicrosPerMillionTokens": 435000, "outputMicrosPerMillionTokens": 870000}
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let input = directory.join("attribution.json");
+    std::fs::write(
+        &input,
+        json!({
+            "model": "provider/scorer",
+            "expectedProvider": "test-provider",
+            "target": {
+                "path": "src/payments.ts", "startLine": 41, "endLine": 41,
+                "contract": "A retry posts a second debit because the idempotency guard is bypassed."
+            },
+            "candidate": {
+                "path": "src/payments.ts", "line": 41, "endLine": 41,
+                "severity": "error", "kind": "risk",
+                "title": "Retry duplicates the debit",
+                "body": "The retry skips idempotency and charges the payment again."
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    (profile, input)
+}
+
 fn llm_contradictory() -> Value {
     json!({
-        "choices": [{"message": {"content": json!({
+        "choices": [{"finish_reason": "stop", "message": {"content": json!({
             "summary": "SQL injection risk in auth path.",
             "findings": []
         }).to_string()}}],
@@ -56,7 +116,7 @@ fn llm_contradictory() -> Value {
 
 fn llm_text(text: &str) -> Value {
     json!({
-        "choices": [{"message": {"content": text}}],
+        "choices": [{"finish_reason": "stop", "message": {"content": text}}],
         "usage": {"prompt_tokens": 80, "completion_tokens": 30}
     })
 }
@@ -95,6 +155,7 @@ fn anthropic_content(findings: Value, input_tokens: u64, output_tokens: u64) -> 
                 "findings": findings
             }).to_string()}
         ],
+        "stop_reason": "end_turn",
         "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
     })
 }
@@ -102,6 +163,7 @@ fn anthropic_content(findings: Value, input_tokens: u64, output_tokens: u64) -> 
 fn anthropic_text(text: &str, input_tokens: u64, output_tokens: u64) -> Value {
     json!({
         "content": [{"type": "text", "text": text}],
+        "stop_reason": "end_turn",
         "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
     })
 }
@@ -114,7 +176,8 @@ fn finding_at(line: u32, severity: &str, confidence: f64) -> Value {
         "kind": "risk",
         "confidence": confidence,
         "title": "Unsanitized input reaches query",
-        "body": "user_input flows into exec_query without sanitization."
+        "body": "user_input flows into exec_query without sanitization.",
+        "evidence": finding_evidence(line)
     })
 }
 
@@ -126,7 +189,8 @@ fn finding_at_with_kind(line: u32, severity: &str, kind: &str, confidence: f64) 
         "kind": kind,
         "confidence": confidence,
         "title": "Unsanitized input reaches query",
-        "body": "user_input flows into exec_query without sanitization."
+        "body": "user_input flows into exec_query without sanitization.",
+        "evidence": finding_evidence(line)
     })
 }
 
@@ -138,8 +202,51 @@ fn finding_with_text(line: u32, severity: &str, confidence: f64, title: &str, bo
         "kind": "risk",
         "confidence": confidence,
         "title": title,
-        "body": body
+        "body": body,
+        "evidence": finding_evidence(line)
     })
+}
+
+fn finding_evidence(line: u32) -> &'static str {
+    match line {
+        40 => "context line",
+        41 => "let token = format!(\"{}\", user_input);",
+        42 => "exec_query(&token);",
+        43 => "trailing context",
+        _ => "outside supplied evidence",
+    }
+}
+
+fn prompt_evidence(request: &Request, path: &str, line: u32, needle: &str) -> String {
+    let payload: Value = serde_json::from_slice(&request.body).unwrap();
+    let prompt = payload["messages"]
+        .as_array()
+        .and_then(|messages| messages.last())
+        .and_then(|message| message["content"].as_str())
+        .expect("review request contains a user prompt");
+    let mut current_path = None;
+    for rendered in prompt.lines() {
+        if let Some(header) = rendered.strip_prefix("### ") {
+            current_path = Some(header.trim());
+            continue;
+        }
+        if current_path != Some(path) || !rendered.contains(needle) {
+            continue;
+        }
+        let Some((number, marked)) = rendered.trim_start().split_once(' ') else {
+            continue;
+        };
+        if number.parse::<u32>().ok() != Some(line) {
+            continue;
+        }
+        if let Some(evidence) = marked
+            .strip_prefix("+ ")
+            .or_else(|| marked.strip_prefix("  "))
+        {
+            return evidence.to_string();
+        }
+    }
+    panic!("prompt did not contain exact evidence for {path}:{line}");
 }
 
 fn fixture_credential(label: &str) -> String {
@@ -173,6 +280,29 @@ struct GitHubHeadRaceResponder {
 
 struct OutputBudgetResponder;
 
+#[derive(Clone)]
+struct OutputThenRateLimitResponder {
+    calls: Arc<AtomicUsize>,
+}
+
+#[derive(Clone)]
+struct SequentialReviewResponder {
+    calls: Arc<AtomicUsize>,
+    responses: Arc<Vec<Value>>,
+}
+
+impl Respond for SequentialReviewResponder {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        let index = self.calls.fetch_add(1, Ordering::SeqCst);
+        let response = self
+            .responses
+            .get(index)
+            .or_else(|| self.responses.last())
+            .expect("sequential responder requires at least one response");
+        ResponseTemplate::new(200).set_body_json(response)
+    }
+}
+
 impl Respond for OutputBudgetResponder {
     fn respond(&self, request: &Request) -> ResponseTemplate {
         let body: Value = serde_json::from_slice(&request.body).unwrap();
@@ -194,6 +324,28 @@ impl Respond for OutputBudgetResponder {
     }
 }
 
+impl Respond for OutputThenRateLimitResponder {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        match self.calls.fetch_add(1, Ordering::SeqCst) {
+            0 => ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{
+                    "finish_reason": "length",
+                    "message": {"content": null, "reasoning": "budget exhausted"}
+                }],
+                "usage": {
+                    "prompt_tokens": 30_745,
+                    "completion_tokens": 8_000,
+                    "completion_tokens_details": {"reasoning_tokens": 8_000}
+                }
+            })),
+            1 => ResponseTemplate::new(429)
+                .insert_header("Retry-After", "0")
+                .set_body_json(json!({"error": {"error_type": "rate_limit_error"}})),
+            _ => ResponseTemplate::new(200).set_body_json(llm_content(json!([]))),
+        }
+    }
+}
+
 impl Respond for GitHubHeadRaceResponder {
     fn respond(&self, _request: &Request) -> ResponseTemplate {
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
@@ -201,6 +353,7 @@ impl Respond for GitHubHeadRaceResponder {
         ResponseTemplate::new(200).set_body_json(json!({
             "title": "t",
             "body": "b",
+            "state": "open", "merged": false,
             "head": {"sha": head},
             "base": {"sha": "bbbbbbbb"},
             "changed_files": 1
@@ -350,6 +503,7 @@ fn postil() -> Command {
         .env_remove("REVIEW_SCORER_MODEL_CASCADE")
         .env_remove("POSTIL_DISABLE_SCORER")
         .env_remove("POSTIL_HOSTED_MODE")
+        .env_remove("POSTIL_EXPECTED_GITHUB_REPO_ID")
         .env_remove("POSTIL_QUALIFICATION_CANDIDATE_PROFILE")
         .env_remove("POSTIL_QUALIFICATION_PLAN_ONLY")
         .env_remove("POSTIL_BENCH_FORCE_BOUNDED_SELECTION")
@@ -503,7 +657,6 @@ async fn native_anthropic_findings_use_explicit_native_scorer() {
         .respond_with(
             ResponseTemplate::new(200).set_body_json(anthropic_text(
                 &json!([{
-                    "index": 0,
                     "confidence": 0.82,
                     "kind": "risk",
                     "reason": "The changed line contains the reported flow."
@@ -584,8 +737,7 @@ async fn openai_successful_scorer_with_zero_usage_marks_accounting_incomplete() 
     )
     .await;
     let scorer_response = json!({
-        "choices": [{"message": {"content": json!([{
-            "index": 0,
+        "choices": [{"finish_reason": "stop", "message": {"content": json!([{
             "confidence": 0.82,
             "kind": "risk",
             "reason": "The changed line contains the reported flow."
@@ -676,7 +828,6 @@ async fn anthropic_successful_scorer_with_zero_usage_marks_accounting_incomplete
         .respond_with(
             ResponseTemplate::new(200).set_body_json(anthropic_text(
                 &json!([{
-                    "index": 0,
                     "confidence": 0.82,
                     "kind": "risk",
                     "reason": "The changed line contains the reported flow."
@@ -863,7 +1014,7 @@ async fn byok_reported_spend_is_not_subject_to_the_hosted_operation_cap() {
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [{"message": {"content": "{\"summary\":\"\",\"findings\":[]}"}}],
+            "choices": [{"finish_reason": "stop", "message": {"content": "{\"summary\":\"\",\"findings\":[]}"}}],
             "usage": {"prompt_tokens": 20_000_001_u64, "completion_tokens": 1}
         })))
         .mount(&server)
@@ -916,6 +1067,7 @@ fn qualification_candidate_preflights_the_bounded_hosted_path_without_provider_c
         &profile_path,
         serde_json::to_vec(&json!({
             "benchmarkProviderIdentity": postil_cli::config::MANAGED_OPENROUTER_PROVIDER_IDENTITY,
+            "upstreamProviderIdentity": "test-provider",
             "apiBase": metadata.default_api_base,
             "apiFormat": metadata.default_api_format,
             "generatorChain": generator_chain,
@@ -958,6 +1110,214 @@ fn qualification_candidate_preflights_the_bounded_hosted_path_without_provider_c
             <= 1_000_000
     );
     assert!(envelope.get("modelUsage").is_none());
+}
+
+#[cfg(feature = "qualification-candidate")]
+#[test]
+fn qualification_candidate_admits_worst_case_json_escaped_hosted_batches() {
+    let dir = tempfile::tempdir().unwrap();
+    let diff_path = dir.path().join("escaped.diff");
+    let mut diff = b"diff --git a/src/payload.rs b/src/payload.rs\n--- /dev/null\n+++ b/src/payload.rs\n@@ -0,0 +1,1 @@\n+const PAYLOAD: &str = \"".to_vec();
+    diff.extend(std::iter::repeat_n(0, 31 * 1024));
+    diff.extend_from_slice(b"\";\n");
+    std::fs::write(&diff_path, diff).unwrap();
+
+    let metadata = postil_cli::config::qualification_metadata();
+    let profile_path = dir.path().join("candidate.json");
+    std::fs::write(
+        &profile_path,
+        serde_json::to_vec(&json!({
+            "benchmarkProviderIdentity": postil_cli::config::MANAGED_OPENROUTER_PROVIDER_IDENTITY,
+            "upstreamProviderIdentity": "test-provider",
+            "apiBase": metadata.default_api_base,
+            "apiFormat": metadata.default_api_format,
+            "generatorChain": ["openai/gpt-5-mini"],
+            "consensus": 1,
+            "scorerChain": ["openai/gpt-5-mini"],
+            "modelPriceBounds": [{
+                "model": "openai/gpt-5-mini",
+                "inputMicrosPerMillionTokens": 1,
+                "outputMicrosPerMillionTokens": 1
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let out = postil()
+        .current_dir(dir.path())
+        .env("CI", "true")
+        .env("GITHUB_API_URL", "http://127.0.0.1:9")
+        .env("POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY", "1")
+        .env("POSTIL_QUALIFICATION_CANDIDATE_PROFILE", &profile_path)
+        .env("POSTIL_QUALIFICATION_PLAN_ONLY", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff_path)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert!(
+        envelope["reviewAdmission"]["serializedInputBytes"]
+            .as_u64()
+            .unwrap()
+            > 31 * 1024 * 5
+    );
+    assert!(envelope.get("modelUsage").is_none());
+}
+
+#[cfg(feature = "qualification-candidate")]
+#[test]
+fn qualification_candidate_admits_fixture_51_shape_at_fireworks_price_bounds() {
+    use sha2::Digest as _;
+    use std::fmt::Write as _;
+
+    fn push_churn(diff: &mut String, side: &str, file: usize) {
+        let path = format!("src/churn/{side}-{file}.ts");
+        writeln!(
+            diff,
+            "diff --git a/{path} b/{path}\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,131 @@"
+        )
+        .unwrap();
+        writeln!(
+            diff,
+            "+export function ordinary_{side}_{file}(actor: Actor) {{"
+        )
+        .unwrap();
+        for line in 2..130 {
+            writeln!(
+                diff,
+                "+  const ordinary_{side}_{file}_{line} = actor.id; // {}",
+                "x".repeat(900)
+            )
+            .unwrap();
+        }
+        writeln!(diff, "+  return actor.id;\n+}}").unwrap();
+    }
+
+    fn push_change(diff: &mut String, line: usize, before: &str, after: &str) {
+        writeln!(diff, "@@ -{line},1 +{line},1 @@\n- {before}\n+ {after}").unwrap();
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff_path = dir.path().join("fixture-51.diff");
+    let mut diff = String::new();
+    for file in 0..3 {
+        push_churn(&mut diff, "prefix", file);
+    }
+    diff.push_str("diff --git a/src/admin/bulk-edit.ts b/src/admin/bulk-edit.ts\nindex 1111111..2222222 100644\n--- a/src/admin/bulk-edit.ts\n+++ b/src/admin/bulk-edit.ts\n");
+    push_change(
+        &mut diff,
+        6,
+        "const title = 'Bulk edit';",
+        "const title = 'Bulk edit ';",
+    );
+    push_change(
+        &mut diff,
+        18,
+        "const batchSize=50;",
+        "const batchSize = 50;",
+    );
+    push_change(
+        &mut diff,
+        33,
+        "logger.debug('bulk edit start');",
+        "logger.debug('bulk edit started');",
+    );
+    push_change(
+        &mut diff,
+        57,
+        "const summary = buildSummary(changeSet);",
+        "const editSummary = buildSummary(changeSet);",
+    );
+    push_change(
+        &mut diff,
+        88,
+        "if (!actor.can('bulkEdit')) throw new Error('Forbidden');",
+        "await applyBulkEdit(changeSet);",
+    );
+    push_change(
+        &mut diff,
+        122,
+        "return { ok: true, summary };",
+        "return { ok: true, summary: editSummary };",
+    );
+    push_change(
+        &mut diff,
+        147,
+        "metrics.increment('bulk_edit.done');",
+        "metrics.increment('bulk_edit.completed');",
+    );
+    for file in 0..3 {
+        push_churn(&mut diff, "suffix", file);
+    }
+    assert_eq!(diff.len(), 728_616);
+    assert_eq!(
+        sha2::Sha256::digest(diff.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+        "21abd4b0305bb11f3314dbc68725ba2373a00848094fe94fbf842461718e3b2d"
+    );
+    std::fs::write(&diff_path, diff).unwrap();
+
+    let metadata = postil_cli::config::qualification_metadata();
+    let profile_path = dir.path().join("candidate.json");
+    std::fs::write(
+        &profile_path,
+        serde_json::to_vec(&json!({
+            "benchmarkProviderIdentity": postil_cli::config::MANAGED_OPENROUTER_PROVIDER_IDENTITY,
+            "upstreamProviderIdentity": "Fireworks",
+            "apiBase": metadata.default_api_base,
+            "apiFormat": metadata.default_api_format,
+            "generatorChain": ["deepseek/deepseek-v4-pro"],
+            "consensus": 1,
+            "scorerChain": ["z-ai/glm-5.2"],
+            "modelPriceBounds": [
+                {
+                    "model": "deepseek/deepseek-v4-pro",
+                    "inputMicrosPerMillionTokens": 1_740_000,
+                    "outputMicrosPerMillionTokens": 3_480_000
+                },
+                {
+                    "model": "z-ai/glm-5.2",
+                    "inputMicrosPerMillionTokens": 2_100_000,
+                    "outputMicrosPerMillionTokens": 6_600_000
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let out = postil()
+        .current_dir(dir.path())
+        .env("CI", "true")
+        .env("GITHUB_API_URL", "http://127.0.0.1:9")
+        .env("POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY", "1")
+        .env("POSTIL_QUALIFICATION_CANDIDATE_PROFILE", &profile_path)
+        .env("POSTIL_QUALIFICATION_PLAN_ONLY", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff_path)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["reviewCoverage"]["mode"], "bounded");
+    assert_eq!(envelope["reviewAdmission"]["providerAttempts"], 7);
+    assert_eq!(envelope["reviewAdmission"]["outputTokens"], 44_160);
+    assert!(
+        envelope["reviewAdmission"]["serializedInputBytes"]
+            .as_u64()
+            .unwrap()
+            < 699_617
+    );
+    assert!(
+        envelope["reviewAdmission"]["projectedCostMicros"]
+            .as_u64()
+            .unwrap()
+            <= 1_000_000
+    );
 }
 
 #[tokio::test]
@@ -1039,6 +1399,7 @@ async fn doctor_probes_native_anthropic_format() {
         .and(path("/messages"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "content": [{"type": "text", "text": "p"}],
+            "stop_reason": "end_turn",
             "usage": {"input_tokens": 1, "output_tokens": 1}
         })))
         .mount(&server)
@@ -1235,7 +1596,8 @@ async fn generated_named_source_is_not_omitted_from_review() {
         "kind": "risk",
         "confidence": 0.99,
         "title": "Remove code execution",
-        "body": "Untrusted input reaches eval. Parse the input without executing it."
+        "body": "Untrusted input reaches eval. Parse the input without executing it.",
+        "evidence": "eval(userInput);"
     });
     mock_review(&server, json!([finding])).await;
 
@@ -1277,7 +1639,18 @@ async fn large_source_diff_reviews_every_bounded_batch_and_aggregates_findings()
         .respond_with(|request: &wiremock::Request| {
             let body = String::from_utf8_lossy(&request.body);
             let findings = if body.contains("dangerous_final_call") {
-                json!([finding_at(10_000, "warn", 0.95)])
+                let evidence =
+                    prompt_evidence(request, "src/auth.rs", 10_000, "dangerous_final_call");
+                json!([{
+                    "path": "src/auth.rs",
+                    "line": 10_000,
+                    "severity": "warn",
+                    "kind": "risk",
+                    "confidence": 0.95,
+                    "title": "Validate the final call",
+                    "body": "The final call receives untrusted input. Validate it before use.",
+                    "evidence": evidence
+                }])
             } else {
                 json!([])
             };
@@ -1483,18 +1856,140 @@ async fn local_bounded_is_explicit_and_default_local_review_remains_exhaustive()
 }
 
 #[tokio::test]
+async fn bounded_reviews_carry_changed_prior_findings_from_non_direct_source_batches() {
+    use std::fmt::Write as _;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(|request: &wiremock::Request| {
+            let body = String::from_utf8_lossy(&request.body);
+            if body.contains("select bounded code-review batches") {
+                ResponseTemplate::new(200).set_body_json(llm_text(r#"{"batchIds":[]}"#))
+            } else {
+                ResponseTemplate::new(200).set_body_json(llm_content(json!([])))
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff_path = dir.path().join("bounded-baseline.diff");
+    let mut diff = String::new();
+    for file in 0..7 {
+        let path = format!("src/churn-{file}.rs");
+        writeln!(
+            diff,
+            "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1,130 @@\n-const ORIGINAL_{file}: &str = \"old\";\n+const UPDATED_{file}: &str = \"new\";"
+        )
+        .unwrap();
+        for line in 1..130 {
+            writeln!(
+                diff,
+                "+const ORDINARY_{file}_{line}: &str = \"{}\";",
+                "x".repeat(900)
+            )
+            .unwrap();
+        }
+    }
+    std::fs::write(&diff_path, diff).unwrap();
+
+    let baseline = json!({
+        "version": 1, "summary": "", "silent": false,
+        "findings": [{
+            "path": "src/churn-3.rs", "line": 1, "severity": "error", "kind": "risk",
+            "confidence": 0.9, "title": "prior middle finding", "body": "requires direct re-review",
+            "evidence": "const ORIGINAL_3: &str = \"old\";"
+        }],
+        "resolved": [], "counts": {"info": 0, "warn": 0, "error": 1, "suppressed": 0},
+        "confidenceBuckets": [0,0,0,0,1],
+        "gate": {"failOn": "error", "failing": true},
+        "modelUsed": "model", "usage": {"promptTokens": 0, "completionTokens": 0},
+        "baseSha": null, "headSha": null, "sinceSha": null
+    });
+    let baseline_path = dir.path().join("baseline.json");
+    std::fs::write(&baseline_path, baseline.to_string()).unwrap();
+
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--bounded", "--diff-file"])
+        .arg(&diff_path)
+        .arg("--baseline")
+        .arg(&baseline_path)
+        .args(["--output", "json"])
+        .assert()
+        .code(1);
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["reviewCoverage"]["mode"], "bounded");
+    assert!(
+        envelope["reviewCoverage"]["selectedBatches"]
+            .as_u64()
+            .unwrap()
+            < envelope["reviewCoverage"]["totalBatches"].as_u64().unwrap()
+    );
+    assert_eq!(envelope["resolved"], json!([]));
+    assert_eq!(envelope["findings"][0]["title"], "prior middle finding");
+    assert!(
+        envelope["findings"][0]["body"]
+            .as_str()
+            .unwrap()
+            .starts_with("[carried")
+    );
+
+    let incremental = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--bounded", "--diff-file"])
+        .arg(&diff_path)
+        .args(["--since-sha", "abc123", "--baseline"])
+        .arg(&baseline_path)
+        .args(["--output", "json"])
+        .assert()
+        .code(1);
+    let incremental_envelope: Value =
+        serde_json::from_slice(&incremental.get_output().stdout).unwrap();
+    assert_eq!(incremental_envelope["reviewCoverage"]["mode"], "bounded");
+    assert_eq!(incremental_envelope["resolved"], json!([]));
+    assert_eq!(
+        incremental_envelope["findings"][0]["title"],
+        "prior middle finding"
+    );
+    let carried_body = incremental_envelope["findings"][0]["body"]
+        .as_str()
+        .unwrap();
+    assert!(carried_body.starts_with("[carried from previous review]"));
+    assert_eq!(
+        carried_body
+            .matches("[carried from previous review]")
+            .count(),
+        1
+    );
+    assert_eq!(incremental_envelope["gate"]["failing"], true);
+}
+
+#[tokio::test]
 async fn deletion_only_auth_change_is_reviewed_through_numbered_metadata() {
     let server = MockServer::start().await;
-    let finding = json!({
-        "path": ".postil/change-metadata",
-        "line": 1,
-        "severity": "error",
-        "kind": "risk",
-        "confidence": 0.99,
-        "title": "Restore the authorization check",
-        "body": "The deleted file enforced administrator access. Preserve the check in the replacement path."
-    });
-    mock_review(&server, json!([finding])).await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(|request: &Request| {
+            let evidence = prompt_evidence(request, ".postil/change-metadata", 1, "deleted");
+            ResponseTemplate::new(200).set_body_json(llm_content(json!([{
+                "path": ".postil/change-metadata",
+                "line": 1,
+                "severity": "error",
+                "kind": "risk",
+                "confidence": 0.99,
+                "title": "Restore the authorization check",
+                "body": "The deleted file enforced administrator access. Preserve the check in the replacement path.",
+                "evidence": evidence
+            }])))
+        })
+        .mount(&server)
+        .await;
 
     let dir = tempfile::tempdir().unwrap();
     let diff = dir.path().join("deleted-auth.diff");
@@ -1532,6 +2027,7 @@ async fn final_synthesis_detects_cross_batch_validation_sink_relationship() {
         .respond_with(|request: &wiremock::Request| {
             let body = String::from_utf8_lossy(&request.body);
             let findings = if body.contains("validate_pair") && body.contains("dangerous_sink") {
+                let evidence = prompt_evidence(request, "src/sink.rs", 1100, "dangerous_sink");
                 json!([{
                     "path": "src/sink.rs",
                     "line": 1100,
@@ -1539,7 +2035,8 @@ async fn final_synthesis_detects_cross_batch_validation_sink_relationship() {
                     "kind": "risk",
                     "confidence": 0.95,
                     "title": "Keep the validated value",
-                    "body": "The sink uses the original input instead of the validated pair. Pass the validated value to dangerous_sink."
+                    "body": "The sink uses the original input instead of the validated pair. Pass the validated value to dangerous_sink.",
+                    "evidence": evidence
                 }])
             } else {
                 json!([])
@@ -1625,6 +2122,7 @@ async fn oversized_line_tail_remains_reviewable() {
         .respond_with(|request: &wiremock::Request| {
             let body = String::from_utf8_lossy(&request.body);
             let findings = if body.contains("TAIL_DEFECT_eval") {
+                let evidence = prompt_evidence(request, "src/packed.js", 1, "TAIL_DEFECT_eval");
                 json!([{
                     "path": "src/packed.js",
                     "line": 1,
@@ -1632,7 +2130,8 @@ async fn oversized_line_tail_remains_reviewable() {
                     "kind": "risk",
                     "confidence": 0.99,
                     "title": "Remove tail code execution",
-                    "body": "The packed line executes untrusted input at its tail. Replace eval with a parser."
+                    "body": "The packed line executes untrusted input at its tail. Replace eval with a parser.",
+                    "evidence": evidence
                 }])
             } else {
                 json!([])
@@ -1673,6 +2172,7 @@ async fn multiline_finding_range_is_collapsed_when_endpoint_is_not_in_same_segme
         .respond_with(|request: &wiremock::Request| {
             let body = String::from_utf8_lossy(&request.body);
             let findings = if body.contains("range_start_marker") {
+                let evidence = prompt_evidence(request, "src/range.rs", 1, "range_start_marker");
                 json!([{
                     "path": "src/range.rs",
                     "line": 1,
@@ -1681,7 +2181,8 @@ async fn multiline_finding_range_is_collapsed_when_endpoint_is_not_in_same_segme
                     "kind": "risk",
                     "confidence": 0.95,
                     "title": "Keep the comment range local",
-                    "body": "The first changed line is risky. Fix that line."
+                    "body": "The first changed line is risky. Fix that line.",
+                    "evidence": evidence
                 }])
             } else {
                 json!([])
@@ -1747,6 +2248,7 @@ async fn staged_diff_compacts_large_generated_noise_and_reviews_late_source() {
         .respond_with(|request: &wiremock::Request| {
             let body = String::from_utf8_lossy(&request.body);
             let findings = if body.contains("late_dangerous_call") {
+                let evidence = prompt_evidence(request, "late.rs", 1, "late_dangerous_call");
                 json!([{
                     "path": "late.rs",
                     "line": 1,
@@ -1754,7 +2256,8 @@ async fn staged_diff_compacts_large_generated_noise_and_reviews_late_source() {
                     "kind": "risk",
                     "confidence": 0.99,
                     "title": "Validate the late call",
-                    "body": "The late call receives untrusted input without validation."
+                    "body": "The late call receives untrusted input without validation. Add validation before the call.",
+                    "evidence": evidence
                 }])
             } else {
                 json!([])
@@ -1891,7 +2394,8 @@ async fn c_quoted_prompt_path_round_trips_into_canonical_finding_path() {
             "kind": "risk",
             "confidence": 0.9,
             "title": "Hostile path remains grounded",
-            "body": "The changed call is unsafe. Replace it with a checked operation."
+            "body": "The changed call is unsafe. Replace it with a checked operation.",
+            "evidence": "dangerous_call();"
         }]),
     )
     .await;
@@ -1920,14 +2424,14 @@ async fn c_quoted_prompt_path_round_trips_into_canonical_finding_path() {
 }
 
 #[tokio::test]
-async fn malformed_lockfile_falls_back_to_source_review() {
+async fn malformed_known_lockfile_uses_bounded_source_review() {
     let server = MockServer::start().await;
     mock_review(&server, json!([])).await;
     let dir = tempfile::tempdir().unwrap();
     let diff = dir.path().join("malformed-lockfile.diff");
     std::fs::write(
         &diff,
-        "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1 +1 @@\n-checksum = \"old\"\n+checksum = \"new\"\n",
+        "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1,5 +1,5 @@\n-checksum = \"old-one\"\n-source = \"old-two\"\n-checksum = \"old-interior\"\n-source = \"old-four\"\n-checksum = \"old-five\"\n+checksum = \"new-one\"\n+source = \"new-two\"\n+checksum = \"new-interior\"\n+source = \"new-four\"\n+checksum = \"new-five\"\n",
     )
     .unwrap();
     let out = postil()
@@ -1944,7 +2448,8 @@ async fn malformed_lockfile_falls_back_to_source_review() {
     let requests = server.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
     let body = String::from_utf8_lossy(&requests[0].body);
-    assert!(body.contains(r#"checksum = \"new\""#));
+    assert!(body.contains(r#"checksum = \"new-interior\""#));
+    assert!(body.contains(r#"source = \"new-four\""#));
 }
 
 async fn mock_review_model(server: &MockServer, model: &str, findings: Value) {
@@ -2051,7 +2556,7 @@ async fn local_review_reports_grounded_finding_and_gates() {
         .map(|message| message["content"].as_str().unwrap().len())
         .sum::<usize>();
     assert!(
-        prompt_bytes <= 8_200 + DIFF.len(),
+        prompt_bytes <= 17_000,
         "qualification prompt bound is too small: {prompt_bytes} bytes"
     );
 }
@@ -2138,17 +2643,16 @@ async fn scorer_lowers_confidence_and_stores_both_values() {
         )
         .mount(&server)
         .await;
+    let mut scorer_response = scorer_content(json!([{
+        "confidence": 0.7,
+        "kind": "risk",
+        "reason": "Impact depends on the query behavior shown here."
+    }]));
+    scorer_response["usage"]["completion_tokens_details"] = json!({"reasoning_tokens": 0});
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .and(body_string_contains("anthropic/claude-haiku-4.5"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(scorer_content(json!([{
-                "index": 0,
-                "confidence": 0.7,
-                "kind": "risk",
-                "reason": "The finding is plausible, but its impact depends on query behavior."
-            }]))),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(scorer_response))
         .mount(&server)
         .await;
 
@@ -2187,6 +2691,7 @@ async fn scorer_lowers_confidence_and_stores_both_values() {
     assert!(stderr.contains("postil: model generator-model responded in"));
     assert!(stderr.contains("postil: running scorer with anthropic/claude-haiku-4.5"));
     assert!(stderr.contains("postil: scorer anthropic/claude-haiku-4.5 completed successfully in"));
+    assert!(stderr.contains("reasoning_tokens=0"));
 
     let requests = server.received_requests().await.unwrap();
     let scorer_request: Value = requests
@@ -2195,7 +2700,7 @@ async fn scorer_lowers_confidence_and_stores_both_values() {
         .find(|body| body["model"] == "anthropic/claude-haiku-4.5")
         .unwrap();
     assert_eq!(scorer_request["temperature"], 0.0);
-    assert_eq!(scorer_request["max_tokens"], 896);
+    assert_eq!(scorer_request["max_tokens"], 400);
     let scorer_prompt_bytes = scorer_request["messages"]
         .as_array()
         .unwrap()
@@ -2212,6 +2717,362 @@ async fn scorer_lowers_confidence_and_stores_both_values() {
     assert!(scorer_user.contains("diffHunk"));
 }
 
+#[cfg(feature = "qualification-candidate")]
+#[tokio::test]
+async fn hidden_atomic_attribution_repairs_once_with_same_model_and_preserves_raw_evidence() {
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("provider/scorer"))
+        .respond_with(SequentialReviewResponder {
+            calls: calls.clone(),
+            responses: Arc::new(vec![
+                attribution_text("{\"sameDefect\":\"yes\",\"reason\":\"Wrong type.\"}"),
+                attribution_text("{\"sameDefect\":true,\"reason\":\"Both describe a retry that bypasses idempotency.\"}"),
+            ]),
+        })
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let profile = dir.path().join("candidate.json");
+    std::fs::write(
+        &profile,
+        json!({
+            "benchmarkProviderIdentity": postil_cli::config::MANAGED_OPENROUTER_PROVIDER_IDENTITY,
+            "upstreamProviderIdentity": "test-provider",
+            "apiBase": postil_cli::config::MANAGED_OPENROUTER_API_BASE,
+            "apiFormat": "openai-compatible",
+            "generatorChain": ["openai/gpt-5-mini"],
+            "consensus": 1,
+            "scorerChain": ["provider/scorer"],
+            "modelPriceBounds": [
+                {"model": "openai/gpt-5-mini", "inputMicrosPerMillionTokens": 435000, "outputMicrosPerMillionTokens": 870000},
+                {"model": "provider/scorer", "inputMicrosPerMillionTokens": 435000, "outputMicrosPerMillionTokens": 870000}
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let input = dir.path().join("attribution.json");
+    std::fs::write(&input, json!({
+        "model": "provider/scorer",
+        "expectedProvider": "test-provider",
+        "target": {
+            "path": "src/payments.ts", "startLine": 41, "endLine": 41,
+            "contract": "A retry posts a second debit because the idempotency guard is bypassed."
+        },
+        "candidate": {
+            "path": "src/payments.ts", "line": 41, "endLine": 41,
+            "severity": "error", "kind": "risk",
+            "title": "Retry duplicates the debit",
+            "body": "The retry skips idempotency and charges the payment again."
+        }
+    }).to_string()).unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env(
+            "POSTIL_API_BASE",
+            postil_cli::config::MANAGED_OPENROUTER_API_BASE,
+        )
+        .env("CI", "true")
+        .env("GITHUB_API_URL", "http://127.0.0.1:9")
+        .env("POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY", "1")
+        .env("POSTIL_QUALIFICATION_CANDIDATE_PROFILE", &profile)
+        .env("POSTIL_QUALIFICATION_CAPTURE_API_BASE", server.uri())
+        .env("POSTIL_ALLOW_PRIVATE_API_BASE", "1")
+        .env("REVIEW_SCORER_MODEL", "provider/scorer")
+        .args(["atomic-attribution", "--input"])
+        .arg(&input)
+        .assert()
+        .success();
+    let output: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(output["sameDefect"], true);
+    assert_eq!(output["model"], "provider/scorer");
+    assert_eq!(output["provider"], "test-provider");
+    assert_eq!(output["responseIdentities"].as_array().unwrap().len(), 2);
+    assert_eq!(output["rawResponses"].as_array().unwrap().len(), 2);
+    assert_eq!(output["modelUsage"].as_array().unwrap().len(), 2);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests.iter().all(|request| {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        body["model"] == "provider/scorer"
+            && body["temperature"] == 0.0
+            && body["provider"]["order"] == json!(["test-provider"])
+            && body["provider"]["allow_fallbacks"] == false
+            && body["provider"]["max_price"] == json!({"prompt": 0.435, "completion": 0.87})
+    }));
+}
+
+#[cfg(feature = "qualification-candidate")]
+#[tokio::test]
+async fn hidden_atomic_attribution_never_expands_an_empty_length_retry() {
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("provider/scorer"))
+        .respond_with(SequentialReviewResponder {
+            calls: calls.clone(),
+            responses: Arc::new(vec![
+                json!({
+                    "model": "provider/scorer",
+                    "provider": "test-provider",
+                    "choices": [{
+                        "finish_reason": "length",
+                        "message": {"content": null, "reasoning": "budget exhausted"}
+                    }],
+                    "usage": {
+                        "prompt_tokens": 30,
+                        "completion_tokens": 180,
+                        "cost": 0.000045
+                    }
+                }),
+                attribution_text(
+                    "{\"sameDefect\":true,\"reason\":\"Both describe a retry that bypasses idempotency.\"}",
+                ),
+            ]),
+        })
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let (profile, input) = write_atomic_attribution_inputs(dir.path());
+    postil()
+        .current_dir(dir.path())
+        .env(
+            "POSTIL_API_BASE",
+            postil_cli::config::MANAGED_OPENROUTER_API_BASE,
+        )
+        .env("CI", "true")
+        .env("GITHUB_API_URL", "http://127.0.0.1:9")
+        .env("POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY", "1")
+        .env("POSTIL_QUALIFICATION_CANDIDATE_PROFILE", &profile)
+        .env("POSTIL_QUALIFICATION_CAPTURE_API_BASE", server.uri())
+        .env("POSTIL_ALLOW_PRIVATE_API_BASE", "1")
+        .env("REVIEW_SCORER_MODEL", "provider/scorer")
+        .args(["atomic-attribution", "--input"])
+        .arg(&input)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "atomic attribution usage evidence is incomplete or inconsistent",
+        ));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in requests {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["max_tokens"], 180);
+        assert!(
+            serde_json::to_vec(&body).unwrap().len()
+                <= postil_cli::attribution::MAX_PROVIDER_REQUEST_BYTES
+        );
+    }
+}
+
+#[cfg(feature = "qualification-candidate")]
+#[tokio::test]
+async fn hidden_atomic_attribution_rejects_oversized_repair_before_second_provider_call() {
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("provider/scorer"))
+        .respond_with(SequentialReviewResponder {
+            calls: calls.clone(),
+            responses: Arc::new(vec![attribution_text(&format!(
+                "{{\"sameDefect\":\"yes\",\"reason\":\"{}\"}}",
+                "x".repeat(4_000),
+            ))]),
+        })
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let profile = dir.path().join("candidate.json");
+    std::fs::write(
+        &profile,
+        json!({
+            "benchmarkProviderIdentity": postil_cli::config::MANAGED_OPENROUTER_PROVIDER_IDENTITY,
+            "upstreamProviderIdentity": "test-provider",
+            "apiBase": postil_cli::config::MANAGED_OPENROUTER_API_BASE,
+            "apiFormat": "openai-compatible",
+            "generatorChain": ["openai/gpt-5-mini"],
+            "consensus": 1,
+            "scorerChain": ["provider/scorer"],
+            "modelPriceBounds": [
+                {"model": "openai/gpt-5-mini", "inputMicrosPerMillionTokens": 435000, "outputMicrosPerMillionTokens": 870000},
+                {"model": "provider/scorer", "inputMicrosPerMillionTokens": 435000, "outputMicrosPerMillionTokens": 870000}
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let input = dir.path().join("attribution.json");
+    std::fs::write(
+        &input,
+        json!({
+            "model": "provider/scorer",
+            "expectedProvider": "test-provider",
+            "target": {
+                "path": "src/payments.ts", "startLine": 41, "endLine": 41,
+                "contract": "A retry posts a second debit because the idempotency guard is bypassed."
+            },
+            "candidate": {
+                "path": "src/payments.ts", "line": 41, "endLine": 41,
+                "severity": "error", "kind": "risk",
+                "title": "Retry duplicates the debit",
+                "body": "The retry skips idempotency and charges the payment again."
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    postil()
+        .current_dir(dir.path())
+        .env(
+            "POSTIL_API_BASE",
+            postil_cli::config::MANAGED_OPENROUTER_API_BASE,
+        )
+        .env("CI", "true")
+        .env("GITHUB_API_URL", "http://127.0.0.1:9")
+        .env("POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY", "1")
+        .env("POSTIL_QUALIFICATION_CANDIDATE_PROFILE", &profile)
+        .env("POSTIL_QUALIFICATION_CAPTURE_API_BASE", server.uri())
+        .env("POSTIL_ALLOW_PRIVATE_API_BASE", "1")
+        .env("REVIEW_SCORER_MODEL", "provider/scorer")
+        .args(["atomic-attribution", "--input"])
+        .arg(&input)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("model provider request failed"));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[cfg(feature = "qualification-candidate")]
+#[tokio::test]
+async fn hidden_atomic_attribution_rejects_off_region_without_provider_call() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("attribution.json");
+    std::fs::write(&input, json!({
+        "model": "provider/scorer",
+        "expectedProvider": "test-provider",
+        "target": {"path": "src/payments.ts", "startLine": 41, "endLine": 41, "contract": "A retry posts a second debit."},
+        "candidate": {"path": "src/payments.ts", "line": 42, "endLine": 42, "severity": "error", "kind": "risk", "title": "Other issue", "body": "A nearby line has another defect."}
+    }).to_string()).unwrap();
+    postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_SCORER_MODEL", "provider/scorer")
+        .args(["atomic-attribution", "--input"])
+        .arg(&input)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "candidate anchor inside the exact authored region",
+        ));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[cfg(all(feature = "qualification-candidate", unix))]
+#[test]
+fn hidden_atomic_attribution_does_not_follow_input_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target.json");
+    let link = dir.path().join("attribution.json");
+    std::fs::write(&target, "{}").unwrap();
+    symlink(&target, &link).unwrap();
+    postil()
+        .current_dir(dir.path())
+        .args(["atomic-attribution", "--input"])
+        .arg(&link)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "open atomic attribution input without following links",
+        ));
+}
+
+#[cfg(feature = "qualification-candidate")]
+#[test]
+fn hidden_atomic_attribution_rejects_non_regular_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("input-directory");
+    std::fs::create_dir(&input).unwrap();
+    postil()
+        .current_dir(dir.path())
+        .args(["atomic-attribution", "--input"])
+        .arg(&input)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "atomic attribution input must be a regular file",
+        ));
+}
+
+#[cfg(feature = "qualification-candidate")]
+#[test]
+fn hidden_atomic_attribution_rejects_oversized_input_before_parsing() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("attribution.json");
+    std::fs::write(&input, vec![b' '; 4 * 1024 + 1]).unwrap();
+    postil()
+        .current_dir(dir.path())
+        .args(["atomic-attribution", "--input"])
+        .arg(&input)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "atomic attribution input exceeds 4096 bytes",
+        ));
+}
+
+#[cfg(feature = "qualification-candidate")]
+#[tokio::test]
+async fn hidden_atomic_attribution_rejects_provider_substitution() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "model": "provider/scorer",
+            "provider": "substituted-provider",
+            "choices": [{"finish_reason": "stop", "message": {"content": "{\"sameDefect\":true,\"reason\":\"Same defect.\"}"}}],
+            "usage": {"prompt_tokens": 30, "completion_tokens": 10, "cost": 0.000045}
+        })))
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("attribution.json");
+    std::fs::write(
+        &input,
+        json!({
+            "model": "provider/scorer",
+            "expectedProvider": "test-provider",
+            "target": {"path": "src/payments.ts", "startLine": 41, "endLine": 41, "contract": "A retry posts a second debit."},
+            "candidate": {"path": "src/payments.ts", "line": 41, "endLine": 41, "severity": "error", "kind": "risk", "title": "Duplicate debit", "body": "The retry posts another debit."}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_SCORER_MODEL", "provider/scorer")
+        .args(["atomic-attribution", "--input"])
+        .arg(&input)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "atomic attribution failed: model provider request failed",
+        ));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
 #[tokio::test]
 async fn same_model_generator_and_scorer_emit_separate_balanced_usage_rows() {
     let server = MockServer::start().await;
@@ -2223,7 +3084,6 @@ async fn same_model_generator_and_scorer_emit_separate_balanced_usage_rows() {
         ))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(scorer_content(json!([{
-                "index": 0,
                 "confidence": 0.8,
                 "kind": "risk",
                 "reason": "The changed line contains the reported unsafe data flow."
@@ -2293,7 +3153,6 @@ async fn scorer_confidence_below_minimum_is_suppressed_and_nonblocking() {
         .and(body_string_contains("anthropic/claude-haiku-4.5"))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(scorer_content(json!([{
-                "index": 0,
                 "confidence": 0.1,
                 "kind": "risk",
                 "reason": "Independent evidence does not support the generator claim."
@@ -2349,7 +3208,6 @@ async fn malformed_scorer_reason_gets_one_same_model_schema_repair() {
         .and(body_string_contains("failed schema validation"))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(scorer_content(json!([{
-                "index": 0,
                 "confidence": 0.75,
                 "kind": "risk",
                 "reason": "This is a concrete defect."
@@ -2364,7 +3222,6 @@ async fn malformed_scorer_reason_gets_one_same_model_schema_repair() {
         .and(body_string_contains("anthropic/claude-haiku-4.5"))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(scorer_content(json!([{
-                "index": 0,
                 "confidence": 0.75,
                 "kind": "risk",
                 "reason": "This reason is incomplete"
@@ -2406,6 +3263,121 @@ async fn malformed_scorer_reason_gets_one_same_model_schema_repair() {
     assert_eq!(envelope["modelUsage"][2]["callOrdinal"], 3);
     assert_model_usage_matches_aggregate(&envelope);
     assert!(stderr.contains("requesting one schema repair"));
+}
+
+#[tokio::test]
+async fn generic_provider_repairs_each_malformed_ordered_scorer_shape() {
+    let valid = json!([{
+        "confidence": 0.75,
+        "kind": "risk",
+        "reason": "This is a concrete defect."
+    }]);
+    let byte_overflow = json!([{
+        "confidence": 0.75,
+        "kind": "risk",
+        "reason": format!("{}。", "界".repeat(80))
+    }])
+    .to_string();
+    let cases = [
+        (
+            "unknown-field",
+            r#"[{"index":0,"confidence":0.75,"kind":"risk","reason":"This is a concrete defect."}]"#.to_string(),
+        ),
+        (
+            "negative-confidence",
+            r#"[{"confidence":-1,"kind":"risk","reason":"This is a concrete defect."}]"#.to_string(),
+        ),
+        (
+            "high-confidence",
+            r#"[{"confidence":5,"kind":"risk","reason":"This is a concrete defect."}]"#.to_string(),
+        ),
+        (
+            "raw-nan",
+            r#"[{"confidence":NaN,"kind":"risk","reason":"This is a concrete defect."}]"#.to_string(),
+        ),
+        (
+            "string-nan",
+            r#"[{"confidence":"NaN","kind":"risk","reason":"This is a concrete defect."}]"#.to_string(),
+        ),
+        ("missing-entry", "[]".to_string()),
+        (
+            "duplicate-entry",
+            r#"[{"confidence":0.75,"kind":"risk","reason":"This is a concrete defect."},{"confidence":0.75,"kind":"risk","reason":"This repeats the same input."}]"#.to_string(),
+        ),
+        (
+            "edge-whitespace",
+            r#"[{"confidence":0.75,"kind":"risk","reason":" Leading whitespace is invalid."}]"#.to_string(),
+        ),
+        (
+            "control-character",
+            r#"[{"confidence":0.75,"kind":"risk","reason":"A control\u0000character is invalid."}]"#.to_string(),
+        ),
+        (
+            "missing-punctuation",
+            r#"[{"confidence":0.75,"kind":"risk","reason":"This reason is incomplete"}]"#.to_string(),
+        ),
+        ("byte-overflow", byte_overflow),
+    ];
+
+    for (label, malformed) in cases {
+        let server = MockServer::start().await;
+        mock_review_model(
+            &server,
+            "generator-model",
+            json!([finding_at(41, "warn", 0.92)]),
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("scorer-model"))
+            .and(body_string_contains("failed schema validation"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(scorer_content(valid.clone())))
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("scorer-model"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(scorer_text(&malformed)))
+            .with_priority(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let diff = write_diff(dir.path());
+        let out = postil()
+            .current_dir(dir.path())
+            .env("POSTIL_API_BASE", server.uri())
+            .env("REVIEW_MODEL", "generator-model")
+            .env("REVIEW_SCORER_MODEL", "scorer-model")
+            .args(["review", "--diff-file"])
+            .arg(&diff)
+            .args(["--output", "json"])
+            .assert()
+            .code(0);
+
+        let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+        assert_eq!(envelope["scorerModel"], "scorer-model", "case {label}");
+        assert_eq!(
+            envelope["findings"][0]["scorerConfidence"], 0.75,
+            "case {label}"
+        );
+        assert_eq!(
+            envelope["modelIncidents"][0]["category"], "invalidOutput",
+            "case {label}"
+        );
+        assert_eq!(
+            envelope["modelIncidents"][0]["recovery"], "repair",
+            "case {label}"
+        );
+        assert_eq!(
+            envelope["modelUsage"].as_array().unwrap().len(),
+            3,
+            "case {label}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2479,7 +3451,6 @@ async fn scorer_kind_escalation_into_configured_blocking_kind_takes_effect() {
         &server,
         "anthropic/claude-haiku-4.5",
         json!([{
-            "index": 0,
             "confidence": 0.88,
             "kind": "guardrail",
             "reason": "The finding violates the configured rule."
@@ -2526,7 +3497,6 @@ async fn scorer_kind_deescalation_from_blocking_kind_is_ignored() {
         &server,
         "anthropic/claude-haiku-4.5",
         json!([{
-            "index": 0,
             "confidence": 0.88,
             "kind": "risk",
             "reason": "The finding is not a guardrail violation."
@@ -2573,7 +3543,6 @@ async fn large_confidence_disagreement_escalates_to_uncertainty_with_default_gat
         &server,
         "anthropic/claude-haiku-4.5",
         json!([{
-            "index": 0,
             "confidence": 0.6,
             "kind": "risk",
             "reason": "The finding has weak supporting evidence."
@@ -2664,6 +3633,74 @@ async fn scorer_error_fails_open_and_preserves_generator_values() {
 }
 
 #[tokio::test]
+async fn reasoning_only_scorer_response_is_invalid_output_not_a_provider_outage() {
+    let server = MockServer::start().await;
+    mock_review_model(
+        &server,
+        "generator-model",
+        json!([finding_at(41, "warn", 0.92)]),
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("scorer-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "finish_reason": "length",
+                "message": {"content": null, "reasoning": "internal reasoning only"}
+            }],
+            "usage": {
+                "prompt_tokens": 30,
+                "completion_tokens": 400,
+                "completion_tokens_details": {"reasoning_tokens": 400},
+                "cost": 0.000045
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "generator-model")
+        .env("REVIEW_SCORER_MODEL", "scorer-model")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .code(0);
+
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["findings"][0]["path"], "src/auth.rs");
+    assert!(
+        envelope["scorerError"]
+            .as_str()
+            .unwrap()
+            .contains("no choices/content")
+    );
+    assert!(
+        envelope["modelIncidents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(
+                |incident| incident["phase"] == "scorer" && incident["category"] == "invalidOutput"
+            )
+    );
+    let requests = server.received_requests().await.unwrap();
+    let scorer_max_tokens = requests
+        .iter()
+        .filter_map(|request| {
+            let body = request.body_json::<Value>().ok()?;
+            (body["model"] == "scorer-model").then(|| body["max_tokens"].as_u64().unwrap())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(scorer_max_tokens, vec![400, 400]);
+}
+
+#[tokio::test]
 async fn scorer_provider_error_cannot_inject_stderr_lines() {
     let server = MockServer::start().await;
     mock_review_model(
@@ -2733,7 +3770,7 @@ async fn local_review_writes_csv_output_file_with_multiple_escaped_findings() {
                 41,
                 "warn",
                 0.88,
-                "Comma, quote \"and\" newline\nin title",
+                "Comma, quote \"and\" newline in title",
                 "First body has a comma, a \"quote\", and a newline\nsecond line."
             ),
             finding_with_text(
@@ -2741,7 +3778,7 @@ async fn local_review_writes_csv_output_file_with_multiple_escaped_findings() {
                 "info",
                 0.77,
                 "Second finding",
-                "Body without CSV punctuation"
+                "Body without CSV punctuation."
             )
         ]),
     )
@@ -2787,7 +3824,7 @@ async fn local_review_writes_csv_output_file_with_multiple_escaped_findings() {
     assert_eq!(rows[1]["line"], "42");
     assert_eq!(rows[1]["severity"], "info");
     assert_eq!(rows[1]["title"], "Second finding");
-    assert_eq!(rows[1]["body"], "Body without CSV punctuation");
+    assert_eq!(rows[1]["body"], "Body without CSV punctuation.");
 }
 
 #[tokio::test]
@@ -2886,6 +3923,7 @@ async fn full_remote_review_uses_an_immutable_merge_base_snapshot() {
         .and(path("/repos/acme/api/pulls/7"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "t", "body": "b",
+            "state": "open", "merged": false,
             "head": {"sha": "aaaaaaaaaaaa"}, "base": {"sha": "bbbbbbbbbbbb"}, "changed_files": 1
         })))
         .mount(&server)
@@ -2944,6 +3982,7 @@ async fn github_large_lockfile_streams_past_legacy_response_limit_and_compacts()
         .and(path("/repos/acme/api/pulls/7"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "large lockfile", "body": "",
+            "state": "open", "merged": false,
             "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"},
             "changed_files": 1
         })))
@@ -3010,9 +4049,10 @@ async fn remote_setup_time_counts_against_total_llm_budget() {
             ResponseTemplate::new(200)
                 .set_delay(forge_delay)
                 .set_body_json(json!({
-                    "title": "t", "body": "b",
-                    "head": {"sha": "aaaaaaaaaaaa"}, "base": {"sha": "bbbbbbbbbbbb"}, "changed_files": 1
-                })),
+                        "title": "t", "body": "b",
+                        "state": "open", "merged": false,
+                "head": {"sha": "aaaaaaaaaaaa"}, "base": {"sha": "bbbbbbbbbbbb"}, "changed_files": 1
+                    })),
         )
         .mount(&server)
         .await;
@@ -3106,6 +4146,7 @@ async fn advisory_on_error_lets_gate_stand_aside() {
         .and(path("/repos/acme/api/pulls/7"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "t", "body": "b",
+            "state": "open", "merged": false,
             "head": {"sha": "aaaaaaaaaaaa"}, "base": {"sha": "bbbbbbbbbbbb"}, "changed_files": 1
         })))
         .mount(&server)
@@ -3137,7 +4178,15 @@ async fn advisory_on_error_lets_gate_stand_aside() {
         .env("POSTIL_API_BASE", server.uri())
         .env("GITHUB_API_URL", server.uri())
         .env("GITHUB_TOKEN", "gh-test-token")
-        .args(["review", "--repo", "acme/api", "--pr", "7", "--output-json"])
+        .args([
+            "review",
+            "--publish",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--output-json",
+        ])
         .assert()
         .code(0); // fail-open: an outage does not block the merge
 
@@ -3184,6 +4233,7 @@ async fn diff_fetch_failure_server() -> MockServer {
         .and(path("/repos/acme/api/pulls/7"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "t", "body": "b",
+            "state": "open", "merged": false,
             "head": {"sha": "aaaaaaaaaaaa"}, "base": {"sha": "bbbbbbbbbbbb"}, "changed_files": 1
         })))
         .mount(&server)
@@ -3223,7 +4273,15 @@ async fn diff_fetch_failure_advisory_emits_envelope_and_exits_zero() {
         .env("POSTIL_API_BASE", server.uri())
         .env("GITHUB_API_URL", server.uri())
         .env("GITHUB_TOKEN", "gh-test-token")
-        .args(["review", "--repo", "acme/api", "--pr", "7", "--output-json"])
+        .args([
+            "review",
+            "--publish",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--output-json",
+        ])
         .assert()
         .code(0);
     let env: Value =
@@ -3277,7 +4335,7 @@ async fn advisory_does_not_bypass_unusable_output() {
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [{"message": {"content": "I cannot review this diff, sorry."}}]
+            "choices": [{"finish_reason": "stop", "message": {"content": "I cannot review this diff, sorry."}}]
         })))
         .mount(&server)
         .await;
@@ -3386,7 +4444,7 @@ async fn narrated_risk_without_findings_fails_closed() {
     assert_eq!(env["findings"][0]["path"], ".postil/model-output");
     assert_eq!(
         env["findings"][0]["title"],
-        "Model narrated risk without structured findings"
+        "Model output could not be validated"
     );
     assert_eq!(env["usage"]["promptTokens"], 200);
     assert_eq!(env["usage"]["completionTokens"], 100);
@@ -3396,13 +4454,67 @@ async fn narrated_risk_without_findings_fails_closed() {
     assert_eq!(env["modelUsage"][0]["callOrdinal"], 1);
     assert_eq!(env["modelUsage"][1]["callOrdinal"], 2);
     assert_model_usage_matches_aggregate(&env);
-    // The narrated concern is preserved, not silently dropped.
+    // Internal model prose is not republished as a user-facing finding.
     assert!(
-        env["findings"][0]["body"]
+        !env["findings"][0]["body"]
             .as_str()
             .unwrap()
             .contains("SQL injection risk in auth path.")
     );
+}
+
+#[tokio::test]
+async fn repeated_summary_only_output_falls_back_before_failing_the_review() {
+    let server = MockServer::start().await;
+    let descriptive = json!({
+        "choices": [{"finish_reason": "stop", "message": {"content": json!({
+            "summary": "Audit logging uses a dedicated sink and records secret use without values.",
+            "findings": []
+        }).to_string()}}],
+        "usage": {"prompt_tokens": 100, "completion_tokens": 30}
+    });
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("summary-only-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(descriptive))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("qualified-fallback"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "summary-only-model")
+        .env("REVIEW_MODEL_CASCADE", "qualified-fallback")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .code(0);
+    let env: Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+
+    assert_eq!(env["silent"], true);
+    assert_eq!(env["gate"]["failing"], false);
+    assert_eq!(env["modelUsed"], "qualified-fallback");
+    assert_eq!(env["modelUsage"].as_array().unwrap().len(), 3);
+    assert!(
+        env["modelIncidents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|incident| incident["recovered"] == true)
+    );
+    assert_model_usage_matches_aggregate(&env);
 }
 
 #[tokio::test]
@@ -3537,14 +4649,13 @@ async fn low_confidence_only_finding_with_risk_summary_fails_closed() {
 #[tokio::test]
 async fn ungrounded_output_fails_closed() {
     let server = MockServer::start().await;
-    // Model cites line 999 which is not in the diff. Twice (initial + repair is
-    // not triggered for valid-but-ungrounded JSON), so one mock suffices.
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(llm_content(json!([finding_at(999, "error", 0.9)]))),
         )
+        .expect(2)
         .mount(&server)
         .await;
 
@@ -3562,6 +4673,242 @@ async fn ungrounded_output_fails_closed() {
         serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
     assert_eq!(env["findings"][0]["path"], ".postil/model-output");
     assert_eq!(env["gate"]["failing"], true);
+    assert_eq!(env["usage"]["promptTokens"], 200);
+    assert_eq!(env["usage"]["completionTokens"], 100);
+    assert_eq!(env["modelUsage"].as_array().unwrap().len(), 2);
+    assert_eq!(env["modelUsage"][0]["phase"], "initial");
+    assert_eq!(env["modelUsage"][1]["phase"], "semanticRetry");
+    assert_eq!(env["modelIncidents"][0]["category"], "invalidOutput");
+    assert_eq!(env["modelIncidents"][0]["recovered"], false);
+}
+
+#[tokio::test]
+async fn all_ungrounded_output_retries_before_accepting_grounded_success() {
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(SequentialReviewResponder {
+            calls: Arc::clone(&calls),
+            responses: Arc::new(vec![
+                llm_content(json!([finding_at(999, "error", 0.9)])),
+                llm_content(json!([finding_at(41, "error", 0.9)])),
+            ]),
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .code(1);
+    let env: Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(env["findings"][0]["path"], "src/auth.rs");
+    assert_eq!(env["findings"][0]["line"], 41);
+    assert_eq!(env["counts"]["ungrounded"], 0);
+    assert_eq!(env["usage"]["promptTokens"], 200);
+    assert_eq!(env["usage"]["completionTokens"], 100);
+    assert_eq!(env["modelUsage"].as_array().unwrap().len(), 2);
+    assert_eq!(env["modelUsage"][0]["phase"], "initial");
+    assert_eq!(env["modelUsage"][1]["phase"], "semanticRetry");
+    assert_eq!(env["modelIncidents"][0]["category"], "invalidOutput");
+    assert_eq!(env["modelIncidents"][0]["recovered"], true);
+    assert_eq!(env["modelIncidents"][0]["recovery"], "repair");
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("returned unusable review content; requesting one semantic retry"));
+}
+
+#[tokio::test]
+async fn schema_repair_then_all_ungrounded_uses_no_second_correction() {
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(SequentialReviewResponder {
+            calls: Arc::clone(&calls),
+            responses: Arc::new(vec![
+                llm_text("not review JSON"),
+                llm_content(json!([finding_at(999, "error", 0.9)])),
+            ]),
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .code(1);
+    let env: Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(env["findings"][0]["path"], ".postil/model-output");
+    assert_eq!(env["usage"]["promptTokens"], 180);
+    assert_eq!(env["usage"]["completionTokens"], 80);
+    assert_eq!(env["modelUsage"].as_array().unwrap().len(), 2);
+    assert_eq!(env["modelUsage"][0]["phase"], "initial");
+    assert_eq!(env["modelUsage"][1]["phase"], "schemaRepair");
+}
+
+#[tokio::test]
+async fn narration_retry_then_all_ungrounded_uses_no_second_correction() {
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(SequentialReviewResponder {
+            calls: Arc::clone(&calls),
+            responses: Arc::new(vec![
+                llm_contradictory(),
+                llm_content(json!([finding_at(999, "error", 0.9)])),
+            ]),
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .code(1);
+    let env: Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(env["findings"][0]["path"], ".postil/model-output");
+    assert_eq!(env["usage"]["promptTokens"], 200);
+    assert_eq!(env["usage"]["completionTokens"], 100);
+    assert_eq!(env["modelUsage"].as_array().unwrap().len(), 2);
+    assert_eq!(env["modelUsage"][0]["phase"], "initial");
+    assert_eq!(env["modelUsage"][1]["phase"], "semanticRetry");
+}
+
+#[tokio::test]
+async fn all_ungrounded_primary_exhausts_one_retry_then_cascades_before_forge_writes() {
+    let server = MockServer::start().await;
+    mount_github_complete_diff(&server, 7).await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("primary-model"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(llm_content(json!([finding_at(999, "error", 0.9)]))),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("backup-model"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(llm_content(json!([finding_at(41, "error", 0.9)]))),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "t", "body": "b", "state": "open", "merged": false,
+            "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"}, "changed_files": 1
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/api/check-runs"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": 11})))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path_regex(r"^/repos/acme/api/check-runs/\d+$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/api/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .env("REVIEW_MODEL", "primary-model")
+        .env("REVIEW_MODEL_CASCADE", "backup-model")
+        .args([
+            "review",
+            "--publish",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--output-json",
+        ])
+        .assert()
+        .code(1);
+    let env: Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+    assert_eq!(env["findings"][0]["path"], "src/auth.rs");
+    assert_eq!(env["modelUsed"], "backup-model");
+    assert_eq!(env["usage"]["promptTokens"], 300);
+    assert_eq!(env["usage"]["completionTokens"], 150);
+    assert_eq!(env["modelUsage"].as_array().unwrap().len(), 3);
+    assert_eq!(env["modelIncidents"][0]["category"], "invalidOutput");
+    assert_eq!(env["modelIncidents"][0]["recovered"], true);
+    assert_eq!(env["modelIncidents"][0]["recovery"], "fallback");
+
+    let requests = server.received_requests().await.unwrap();
+    let llm_positions = requests
+        .iter()
+        .enumerate()
+        .filter_map(|(index, request)| (request.url.path() == "/chat/completions").then_some(index))
+        .collect::<Vec<_>>();
+    let first_forge_result_write = requests
+        .iter()
+        .enumerate()
+        .find_map(|(index, request)| {
+            (request.method == wiremock::http::Method::PATCH
+                || (request.method == wiremock::http::Method::POST
+                    && request.url.path() == "/repos/acme/api/pulls/7/reviews"))
+                .then_some(index)
+        })
+        .expect("forge result publication write");
+    assert_eq!(llm_positions.len(), 3);
+    assert!(
+        llm_positions
+            .into_iter()
+            .all(|index| index < first_forge_result_write)
+    );
 }
 
 #[tokio::test]
@@ -3864,6 +5211,42 @@ async fn exhausted_reasoning_budget_expands_the_same_model_retry() {
 }
 
 #[tokio::test]
+async fn rate_limit_after_exhausted_output_uses_the_remaining_attempt_and_retry_after() {
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("primary-model"))
+        .respond_with(OutputThenRateLimitResponder {
+            calls: calls.clone(),
+        })
+        .expect(3)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "primary-model")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .code(0);
+
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["silent"], true);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(envelope["modelUsage"].as_array().unwrap().len(), 3);
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(stderr.contains("returned retryable HTTP 429"));
+    assert!(stderr.contains("retrying in 0ms"));
+    assert!(stderr.contains("attempt=3/3"));
+}
+
+#[tokio::test]
 async fn empty_success_without_usage_marks_accounting_incomplete() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -3974,14 +5357,21 @@ async fn malformed_success_with_usage_records_the_attempt_exactly_once() {
 }
 
 #[tokio::test]
-async fn slow_empty_response_retry_times_out_then_preserves_the_cascade() {
+async fn timeout_after_exhausted_output_uses_remaining_attempt_then_preserves_cascade() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .and(body_string_contains("primary-model"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [],
-            "usage": {"prompt_tokens": 12, "completion_tokens": 0}
+            "choices": [{
+                "finish_reason": "length",
+                "message": {"content": null, "reasoning": "budget exhausted"}
+            }],
+            "usage": {
+                "prompt_tokens": 12,
+                "completion_tokens": 8_000,
+                "completion_tokens_details": {"reasoning_tokens": 8_000}
+            }
         })))
         .up_to_n_times(1)
         .mount(&server)
@@ -4032,12 +5422,17 @@ async fn slow_empty_response_retry_times_out_then_preserves_the_cascade() {
         .collect::<Vec<_>>();
     assert_eq!(
         models,
-        vec!["primary-model", "primary-model", "backup-model"]
+        vec![
+            "primary-model",
+            "primary-model",
+            "primary-model",
+            "backup-model"
+        ]
     );
 }
 
 #[tokio::test]
-async fn empty_response_retry_http_failure_falls_back_without_a_third_primary_request() {
+async fn empty_response_retry_http_failure_uses_the_third_primary_request_before_fallback() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
@@ -4093,12 +5488,17 @@ async fn empty_response_retry_http_failure_falls_back_without_a_third_primary_re
         .collect::<Vec<_>>();
     assert_eq!(
         models,
-        vec!["primary-model", "primary-model", "backup-model"]
+        vec![
+            "primary-model",
+            "primary-model",
+            "primary-model",
+            "backup-model"
+        ]
     );
 }
 
 #[test]
-fn empty_response_retry_connection_failure_stops_without_a_third_request() {
+fn connection_failure_after_exhausted_output_uses_the_remaining_third_request() {
     use std::io::{Read, Write};
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -4107,7 +5507,7 @@ fn empty_response_retry_connection_failure_stops_without_a_third_request() {
         let (mut stream, _) = listener.accept().unwrap();
         let mut request = [0_u8; 16_384];
         let _ = stream.read(&mut request).unwrap();
-        let body = r#"{"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":0}}"#;
+        let body = r#"{"choices":[{"finish_reason":"length","message":{"content":null,"reasoning":"budget exhausted"}}],"usage":{"prompt_tokens":12,"completion_tokens":8000,"completion_tokens_details":{"reasoning_tokens":8000}}}"#;
         write!(
             stream,
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -4143,7 +5543,7 @@ fn empty_response_retry_connection_failure_stops_without_a_third_request() {
         stderr.contains("model=primary-model attempt=2/3"),
         "unexpected log: {stderr}"
     );
-    assert!(!stderr.contains("model=primary-model attempt=3/3"));
+    assert!(stderr.contains("model=primary-model attempt=3/3"));
     assert!(!stderr.contains("127.0.0.1"));
 }
 
@@ -4453,6 +5853,7 @@ async fn forge_post_failure_on_success_path_keeps_gate_derived_exit_code() {
         .and(path("/repos/acme/api/pulls/7"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "t", "body": "b",
+            "state": "open", "merged": false,
             "head": {"sha": "aaaaaaaaaaaa"}, "base": {"sha": "bbbbbbbbbbbb"}, "changed_files": 1
         })))
         .mount(&server)
@@ -4480,7 +5881,15 @@ async fn forge_post_failure_on_success_path_keeps_gate_derived_exit_code() {
         .env("POSTIL_API_BASE", server.uri())
         .env("GITHUB_API_URL", server.uri())
         .env("GITHUB_TOKEN", "gh-test-token")
-        .args(["review", "--repo", "acme/api", "--pr", "7", "--output-json"])
+        .args([
+            "review",
+            "--publish",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--output-json",
+        ])
         .assert()
         .code(1); // gate-derived exit code, unaffected by the failed post
 
@@ -4537,6 +5946,7 @@ async fn github_unresolved_inline_line_falls_back_once_to_summary_only() {
         .and(path("/repos/acme/api/pulls/7"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "t", "body": "b",
+            "state": "open", "merged": false,
             "head": {"sha": "aaaaaaaaaaaa"}, "base": {"sha": "bbbbbbbbbbbb"}, "changed_files": 1
         })))
         .mount(&server)
@@ -4574,7 +5984,15 @@ async fn github_unresolved_inline_line_falls_back_once_to_summary_only() {
         .env("POSTIL_API_BASE", server.uri())
         .env("GITHUB_API_URL", server.uri())
         .env("GITHUB_TOKEN", "gh-test-token")
-        .args(["review", "--repo", "acme/api", "--pr", "7", "--output-json"])
+        .args([
+            "review",
+            "--publish",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--output-json",
+        ])
         .assert()
         .code(1);
 
@@ -4614,6 +6032,7 @@ async fn hosted_path_completes_provided_check_run_ids_without_creating_new_ones(
         .and(path("/repos/acme/api/pulls/7"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "t", "body": null,
+            "state": "open", "merged": false,
             "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"}, "changed_files": 1
         })))
         .mount(&server)
@@ -4632,6 +6051,7 @@ async fn hosted_path_completes_provided_check_run_ids_without_creating_new_ones(
         .env("GITHUB_TOKEN", "gh-test-token")
         .args([
             "review",
+            "--publish",
             "--repo",
             "acme/api",
             "--pr",
@@ -4664,6 +6084,61 @@ async fn hosted_path_completes_provided_check_run_ids_without_creating_new_ones(
 }
 
 #[tokio::test]
+async fn hosted_path_rejects_a_changed_target_before_review_or_delivery() {
+    let server = MockServer::start().await;
+    mount_github_complete_diff(&server, 7).await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "t", "body": null,
+            "state": "open", "merged": false,
+            "head": {"sha": "aaaaaaaa"},
+            "base": {"sha": "bbbbbbbb"},
+            "changed_files": 1
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/api/check-runs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": 1})))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .args([
+            "review",
+            "--publish",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--sha",
+            "aaaaaaaa",
+            "--base-sha",
+            "cccccccc",
+        ])
+        .assert()
+        .code(2);
+
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(stderr.contains(
+        "requested review target cccccccc is no longer the pull request target bbbbbbbb"
+    ));
+}
+
+#[tokio::test]
 async fn github_flow_posts_review_and_completes_both_checks() {
     let server = MockServer::start().await;
     mount_github_complete_diff(&server, 7).await;
@@ -4687,6 +6162,7 @@ async fn github_flow_posts_review_and_completes_both_checks() {
         .and(path("/repos/acme/api/pulls/7"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "Add login", "body": "PR body",
+            "state": "open", "merged": false,
             "head": {"sha": "aaaaaaaaaaaa"}, "base": {"sha": "bbbbbbbbbbbb"}, "changed_files": 1
         })))
         .mount(&server)
@@ -4717,7 +6193,15 @@ async fn github_flow_posts_review_and_completes_both_checks() {
             "POSTIL_DETAILS_URL",
             "https://postil.dev/orgs/acme/runs/review-7",
         )
-        .args(["review", "--repo", "acme/api", "--pr", "7", "--output-json"])
+        .args([
+            "review",
+            "--publish",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--output-json",
+        ])
         .assert()
         .code(1);
     let env: Value =
@@ -4786,8 +6270,9 @@ async fn github_flow_posts_review_and_completes_both_checks() {
     assert_eq!(body["comments"][0]["line"], 41);
     let summary = body["body"].as_str().unwrap();
     assert!(summary.starts_with(&format!(
-        "{} **1 blocking finding**\n",
-        postil_cli::forge::icon_md("error")
+        "{} **1 new finding** · {} **1 blocking finding open**\n",
+        postil_cli::forge::icon_md("warn"),
+        postil_cli::forge::icon_md("error"),
     )));
     assert!(!summary.contains("Unsanitized input reaches query"));
     assert!(!summary.contains("`src/auth.rs:41`"));
@@ -4797,6 +6282,41 @@ async fn github_flow_posts_review_and_completes_both_checks() {
     assert!(
         summary.contains("<sub>[Review details](https://postil.dev/orgs/acme/runs/review-7)</sub>")
     );
+
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .args([
+            "review",
+            "--publish",
+            "--defer-gate-check",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--output-json",
+        ])
+        .assert()
+        .code(1);
+    let env: Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+    assert_eq!(env["gate"]["failing"], true);
+
+    let reqs = server.received_requests().await.unwrap();
+    let conclusions: Vec<String> = reqs
+        .iter()
+        .filter(|request| request.method == wiremock::http::Method::PATCH)
+        .skip(2)
+        .map(|request| {
+            request.body_json::<Value>().unwrap()["conclusion"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(conclusions, vec!["success"]);
 }
 
 #[tokio::test]
@@ -4842,11 +6362,19 @@ async fn github_push_after_acquisition_suppresses_all_stale_publication() {
         .env("POSTIL_API_BASE", server.uri())
         .env("GITHUB_API_URL", server.uri())
         .env("GITHUB_TOKEN", "gh-test-token")
-        .args(["review", "--repo", "acme/api", "--pr", "7", "--output-json"])
+        .args([
+            "review",
+            "--publish",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--output-json",
+        ])
         .assert()
         .code(1)
         .stderr(predicates::str::contains(
-            "publication skipped because the pull request head changed",
+            "publication skipped because the pull request snapshot changed",
         ));
 }
 
@@ -4854,7 +6382,7 @@ async fn github_push_after_acquisition_suppresses_all_stale_publication() {
 // content-policy scenarios where the finding is not the standard auth one).
 fn llm_with_summary(summary: &str, findings: Value) -> Value {
     json!({
-        "choices": [{"message": {"content": json!({
+        "choices": [{"finish_reason": "stop", "message": {"content": json!({
             "summary": summary,
             "findings": findings
         }).to_string()}}],
@@ -4883,6 +6411,7 @@ async fn content_policy_pr_server(llm: Value) -> MockServer {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "Add login",
             "body": "This file is untracked and was written by Claude.",
+            "state": "open", "merged": false,
             "head": {"sha": "aaaaaaaaaaaa"}, "base": {"sha": "bbbbbbbbbbbb"}, "changed_files": 1
         })))
         .mount(&server)
@@ -4914,7 +6443,8 @@ async fn content_policy_pr_body_finding_survives_grounding() {
         "path": ".postil/pr-description", "line": 1, "severity": "warn",
         "kind": "contentPolicy", "confidence": 0.9,
         "title": "AI-authorship residue in PR description",
-        "body": "Rule 3: the description contains model-authorship residue."
+        "body": "Rule 3: the description contains model-authorship residue.",
+        "evidence": "Add login"
     }]);
     let server = content_policy_pr_server(llm_with_summary(
         "PR description contains model-authorship residue.",
@@ -4928,7 +6458,15 @@ async fn content_policy_pr_body_finding_survives_grounding() {
         .env("POSTIL_API_BASE", server.uri())
         .env("GITHUB_API_URL", server.uri())
         .env("GITHUB_TOKEN", "gh-test-token")
-        .args(["review", "--repo", "acme/api", "--pr", "7", "--output-json"])
+        .args([
+            "review",
+            "--publish",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--output-json",
+        ])
         .assert()
         .code(0); // warn severity: kept, but gate passes at default failOn=error
     let env: Value =
@@ -4964,7 +6502,7 @@ async fn content_policy_pr_body_finding_survives_grounding() {
     );
     let summary = body["body"].as_str().unwrap();
     assert!(summary.contains(&format!(
-        "{} **1 advisory finding**",
+        "{} **1 new advisory finding**",
         postil_cli::forge::icon_md("info")
     )));
     assert!(summary.contains("AI-authorship residue in PR description"));
@@ -5017,6 +6555,7 @@ async fn github_clean_pr_stays_silent_but_completes_checks() {
         .and(path("/repos/acme/api/pulls/7"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "t", "body": null,
+            "state": "open", "merged": false,
             "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"}, "changed_files": 1
         })))
         .mount(&server)
@@ -5038,7 +6577,7 @@ async fn github_clean_pr_stays_silent_but_completes_checks() {
         .env("POSTIL_API_BASE", server.uri())
         .env("GITHUB_API_URL", server.uri())
         .env("GITHUB_TOKEN", "gh-test-token")
-        .args(["review", "--repo", "acme/api", "--pr", "7"])
+        .args(["review", "--publish", "--repo", "acme/api", "--pr", "7"])
         .assert()
         .code(0);
 
@@ -5101,7 +6640,7 @@ async fn github_clean_pr_stays_silent_but_completes_checks() {
             "POSTIL_DETAILS_URL",
             "https://postil.dev/orgs/acme/runs/clean-7",
         )
-        .args(["review", "--repo", "acme/api", "--pr", "7"])
+        .args(["review", "--publish", "--repo", "acme/api", "--pr", "7"])
         .assert()
         .code(0);
     let reqs = server.received_requests().await.unwrap();
@@ -5189,6 +6728,7 @@ async fn same_head_with_open_baseline_falls_back_to_full_review() {
         .and(path("/repos/acme/api/pulls/7"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "t", "body": null,
+            "state": "open", "merged": false,
             "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"}, "changed_files": 1
         })))
         .mount(&server)
@@ -5221,7 +6761,7 @@ async fn same_head_with_open_baseline_falls_back_to_full_review() {
         .env("POSTIL_API_BASE", server.uri())
         .env("GITHUB_API_URL", server.uri())
         .env("GITHUB_TOKEN", "gh-test-token")
-        .args(["review", "--repo", "acme/api", "--pr", "7"])
+        .args(["review", "--publish", "--repo", "acme/api", "--pr", "7"])
         .args(["--sha", "aaaaaaaa", "--since-sha", "aaaaaaaa", "--baseline"])
         .arg(&baseline_path)
         .args([
@@ -5285,6 +6825,7 @@ async fn same_head_without_open_baseline_keeps_empty_diff_noop() {
         .and(path("/repos/acme/api/pulls/7"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "t", "body": null,
+            "state": "open", "merged": false,
             "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"}, "changed_files": 1
         })))
         .mount(&server)
@@ -5343,6 +6884,7 @@ async fn carried_only_incremental_run_updates_checks_without_posting_review() {
         .and(path("/repos/acme/api/pulls/7"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "t", "body": null,
+            "state": "open", "merged": false,
             "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"}, "changed_files": 1
         })))
         .mount(&server)
@@ -5374,7 +6916,7 @@ async fn carried_only_incremental_run_updates_checks_without_posting_review() {
         .env("POSTIL_API_BASE", server.uri())
         .env("GITHUB_API_URL", server.uri())
         .env("GITHUB_TOKEN", "gh-test-token")
-        .args(["review", "--repo", "acme/api", "--pr", "7"])
+        .args(["review", "--publish", "--repo", "acme/api", "--pr", "7"])
         .args(["--sha", "aaaaaaaa", "--since-sha", "cccccccc", "--baseline"])
         .arg(&baseline_path)
         .args([
@@ -5435,6 +6977,7 @@ async fn identical_fresh_finding_set_does_not_post_duplicate_review() {
         .and(path("/repos/acme/api/pulls/7"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "t", "body": null,
+            "state": "open", "merged": false,
             "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"}, "changed_files": 1
         })))
         .mount(&server)
@@ -5467,7 +7010,7 @@ async fn identical_fresh_finding_set_does_not_post_duplicate_review() {
         .env("POSTIL_API_BASE", server.uri())
         .env("GITHUB_API_URL", server.uri())
         .env("GITHUB_TOKEN", "gh-test-token")
-        .args(["review", "--repo", "acme/api", "--pr", "7"])
+        .args(["review", "--publish", "--repo", "acme/api", "--pr", "7"])
         .args(["--sha", "aaaaaaaa", "--since-sha", "cccccccc", "--baseline"])
         .arg(&baseline_path)
         .args([
@@ -5566,7 +7109,7 @@ async fn bitbucket_flow_posts_comment_and_sets_statuses() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "Add login",
             "summary": {"raw": "PR body"},
-            "source": {"commit": {"hash": "aaaaaaaa"}},
+            "state": "OPEN", "source": {"commit": {"hash": "aaaaaaaa"}},
             "destination": {"commit": {"hash": "bbbbbbbb"}}
         })))
         .mount(&server)
@@ -5598,6 +7141,7 @@ async fn bitbucket_flow_posts_comment_and_sets_statuses() {
         .env_remove("BITBUCKET_USER")
         .args([
             "review",
+            "--publish",
             "--forge",
             "bitbucket",
             "--repo",
@@ -5663,7 +7207,7 @@ async fn bitbucket_incremental_is_disabled_without_verification_gate() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "Add login",
             "summary": {"raw": "PR body"},
-            "source": {"commit": {"hash": "aaaaaaaa"}},
+            "state": "OPEN", "source": {"commit": {"hash": "aaaaaaaa"}},
             "destination": {"commit": {"hash": "bbbbbbbb"}}
         })))
         .mount(&server)
@@ -5725,7 +7269,7 @@ async fn bitbucket_incremental_fetches_documented_compare_when_enabled() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "Add login",
             "summary": {"raw": "PR body"},
-            "source": {"commit": {"hash": "aaaaaaaa"}},
+            "state": "OPEN", "source": {"commit": {"hash": "aaaaaaaa"}},
             "destination": {"commit": {"hash": "bbbbbbbb"}}
         })))
         .mount(&server)
@@ -5798,7 +7342,8 @@ async fn azure_flow_reconstructs_diff_and_posts_thread() {
     let az_finding = json!([{
         "path": "src/auth.rs", "line": 2, "severity": "error", "kind": "risk",
         "confidence": 0.95, "title": "Unsanitized input reaches query",
-        "body": "user_input flows into the token without sanitization."
+        "body": "user_input flows into the token without sanitization.",
+        "evidence": "    let token = user_input;"
     }]);
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
@@ -5810,7 +7355,7 @@ async fn azure_flow_reconstructs_diff_and_posts_thread() {
         .and(path(pr_path))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "Add login", "description": "PR body",
-            "lastMergeSourceCommit": {"commitId": "HEAD"},
+            "status": "active", "lastMergeSourceCommit": {"commitId": "HEAD"},
             "lastMergeTargetCommit": {"commitId": "BASE"}
         })))
         .mount(&server)
@@ -5861,6 +7406,7 @@ async fn azure_flow_reconstructs_diff_and_posts_thread() {
         .env("AZURE_DEVOPS_TOKEN", "az-test-pat")
         .args([
             "review",
+            "--publish",
             "--forge",
             "azure",
             "--repo",
@@ -5910,6 +7456,7 @@ async fn respond_to_pr_mention_posts_grounded_reply() {
         .and(path("/repos/acme/api/pulls/5"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "Add login", "body": "PR body",
+            "state": "open", "merged": false,
             "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"}, "changed_files": 1
         })))
         .mount(&server)
@@ -5928,6 +7475,7 @@ async fn respond_to_pr_mention_posts_grounded_reply() {
         .env("GITHUB_TOKEN", "gh-test-token")
         .args([
             "respond",
+            "--publish",
             "--repo",
             "acme/api",
             "--pr",
@@ -5960,7 +7508,7 @@ async fn respond_rejects_article_shape_and_preserves_usage_across_fallback() {
         .and(path("/chat/completions"))
         .and(body_string_contains("article-model"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [{"message": {"content": slop}}],
+            "choices": [{"finish_reason": "stop", "message": {"content": slop}}],
             "usage": {"prompt_tokens": 30, "completion_tokens": 900}
         })))
         .expect(1)
@@ -5970,7 +7518,7 @@ async fn respond_rejects_article_shape_and_preserves_usage_across_fallback() {
         .and(path("/chat/completions"))
         .and(body_string_contains("compact-model"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [{"message": {"content": respond_payload(
+            "choices": [{"finish_reason": "stop", "message": {"content": respond_payload(
                 "`src/queue.rs:18` retries forever. Add a terminal state before merge.",
                 None,
             )}}],
@@ -6191,6 +7739,7 @@ async fn respond_rejects_unsafe_reply_before_direct_forge_posting() {
         .env("REVIEW_MODEL_CASCADE", "compact-model")
         .args([
             "respond",
+            "--publish",
             "--repo",
             "acme/api",
             "--issue",
@@ -6232,7 +7781,7 @@ async fn respond_writes_private_usage_receipt_across_model_fallback() {
         .and(path("/chat/completions"))
         .and(body_string_contains("backup-model"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [{"message": {"content": respond_payload("Use a bounded worker pool.", None)}}],
+            "choices": [{"finish_reason": "stop", "message": {"content": respond_payload("Use a bounded worker pool.", None)}}],
             "usage": {"prompt_tokens": 20, "completion_tokens": 3, "cost": 0.00000049}
         })))
         .expect(1)
@@ -6323,7 +7872,7 @@ async fn respond_marks_receipt_incomplete_after_ambiguous_fallback() {
         .and(path("/chat/completions"))
         .and(body_string_contains("backup-model"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [{"message": {"content": respond_payload("Retry with a bounded backoff.", None)}}],
+            "choices": [{"finish_reason": "stop", "message": {"content": respond_payload("Retry with a bounded backoff.", None)}}],
             "usage": {"prompt_tokens": 20, "completion_tokens": 3}
         })))
         .mount(&server)
@@ -6379,7 +7928,7 @@ async fn respond_marks_receipt_incomplete_after_internal_retry_succeeds() {
         .and(path("/chat/completions"))
         .and(body_string_contains("primary-model"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [{"message": {"content": respond_payload("Use a bounded retry.", None)}}],
+            "choices": [{"finish_reason": "stop", "message": {"content": respond_payload("Use a bounded retry.", None)}}],
             "usage": {"prompt_tokens": 20, "completion_tokens": 3}
         })))
         .mount(&server)
@@ -6463,6 +8012,7 @@ async fn respond_to_issue_mention_uses_issue_body() {
         .env("GITHUB_TOKEN", "gh-test-token")
         .args([
             "respond",
+            "--publish",
             "--repo",
             "acme/api",
             "--issue",
@@ -6505,7 +8055,7 @@ async fn respond_gitlab_mr_mention_posts_note() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "Add login",
             "description": "MR body",
-            "diff_refs": {"base_sha": "b", "start_sha": "s", "head_sha": "h"}
+            "state": "opened", "diff_refs": {"base_sha": "b", "start_sha": "s", "head_sha": "h"}
         })))
         .mount(&server)
         .await;
@@ -6541,6 +8091,7 @@ async fn respond_gitlab_mr_mention_posts_note() {
         .env("GITLAB_TOKEN", fixture_credential("gitlab"))
         .args([
             "respond",
+            "--publish",
             "--forge",
             "gitlab",
             "--repo",
@@ -6583,7 +8134,7 @@ async fn gitlab_diff_pagination_follows_authoritative_next_page_to_exhaustion() 
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "Paginated change",
             "description": "",
-            "diff_refs": {"base_sha": "b", "start_sha": "s", "head_sha": "h"}
+            "state": "opened", "diff_refs": {"base_sha": "b", "start_sha": "s", "head_sha": "h"}
         })))
         .mount(&server)
         .await;
@@ -6705,6 +8256,7 @@ async fn respond_gitlab_issue_mention_uses_issue_body() {
         .env("GITLAB_TOKEN", fixture_credential("gitlab"))
         .args([
             "respond",
+            "--publish",
             "--forge",
             "gitlab",
             "--repo",
@@ -6748,7 +8300,7 @@ async fn respond_bitbucket_pr_mention_posts_comment() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "Add login",
             "summary": {"raw": "PR body"},
-            "source": {"commit": {"hash": "aaaaaaaa"}},
+            "state": "OPEN", "source": {"commit": {"hash": "aaaaaaaa"}},
             "destination": {"commit": {"hash": "bbbbbbbb"}}
         })))
         .mount(&server)
@@ -6773,6 +8325,7 @@ async fn respond_bitbucket_pr_mention_posts_comment() {
         .env_remove("BITBUCKET_USER")
         .args([
             "respond",
+            "--publish",
             "--forge",
             "bitbucket",
             "--repo",
@@ -6817,7 +8370,7 @@ async fn respond_azure_pr_mention_posts_thread() {
         .and(path(pr_path))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "Add login", "description": "PR body",
-            "lastMergeSourceCommit": {"commitId": "HEAD"},
+            "status": "active", "lastMergeSourceCommit": {"commitId": "HEAD"},
             "lastMergeTargetCommit": {"commitId": "BASE"}
         })))
         .mount(&server)
@@ -6861,6 +8414,7 @@ async fn respond_azure_pr_mention_posts_thread() {
         .env("AZURE_DEVOPS_TOKEN", "az-test-pat")
         .args([
             "respond",
+            "--publish",
             "--forge",
             "azure",
             "--repo",
@@ -6934,6 +8488,8 @@ fn qualification_metadata_cli_emits_service_authority_fields() {
     assert_eq!(metadata["qualificationExpiresAtUnixSeconds"], Value::Null);
     assert_eq!(metadata["qualificationMaxAgeDays"], Value::Null);
     assert!(metadata["admittedProfile"].is_null());
+    assert_eq!(metadata["attributionMaxInputBytes"], 4096);
+    assert_eq!(metadata["attributionMaxProviderRequestBytes"], 5000);
 }
 
 #[test]

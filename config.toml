@@ -1,12 +1,12 @@
 version = 3
-default_model = ""
+default_model = "deepseek/deepseek-v4-pro"
 cascade = []
 consensus = 1
 api_base = "https://openrouter.ai/api/v1"
 api_format = "openai-compatible"
 
 [scorer]
-enabled = false
-default_model = ""
+enabled = true
+default_model = "z-ai/glm-5.2"
 fallback = ""
-qualification_candidates = []
+qualification_candidates = ["z-ai/glm-5.2"]

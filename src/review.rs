@@ -8,14 +8,14 @@ use anyhow::{Context, Result, anyhow};
 use crate::config::{Config, GateLevel, OnError};
 use crate::diff;
 use crate::envelope::{
-    Envelope, Finding, Gate, Kind, ModelUsage, ReviewAdmission, ReviewCoverage, ReviewCoverageMode,
-    Usage, fail_closed_finding,
+    Envelope, Finding, Gate, Kind, ModelIncident, ModelIncidentCategory, ModelUsage,
+    ReviewAdmission, ReviewCoverage, ReviewCoverageMode, Usage, fail_closed_finding,
 };
 use crate::filter;
 use crate::forge::{
     CheckState, Forge, PrMeta, azure::Azure, bitbucket::Bitbucket, github::GitHub, gitlab::GitLab,
 };
-use crate::llm::{FindingScore, LlmClient};
+use crate::llm::{FindingScore, LlmClient, add_usage};
 use crate::local::{self, LocalSource};
 use crate::output::{self, OutputFormat};
 use crate::prompt::{self, PrContext};
@@ -25,12 +25,17 @@ use std::collections::HashMap;
 /// Each model request stays bounded. Large reviews continue through sequential
 /// source windows; actual provider-attempt, deadline, and spend guards remain
 /// enforced by `LlmClient` while raw diff size never decides reviewability.
-const MAX_REVIEW_BATCH_BYTES: usize = 120_000;
-const MAX_REVIEW_MANIFEST_BYTES: usize = 24_000;
+// JSON can expand one control byte to a six-byte escape. Reserving two more
+// factors leaves fixed room for the system prompt and request shape across
+// OpenAI-compatible and native Anthropic providers.
+pub(crate) const MAX_REVIEW_BATCH_BYTES: usize = crate::llm::MAX_PROVIDER_REQUEST_BYTES / 8;
+#[cfg(test)]
+pub(crate) const MAX_HOSTED_REVIEW_BATCH_BYTES: usize = MAX_REVIEW_BATCH_BYTES;
+pub(crate) const MAX_REVIEW_MANIFEST_BYTES: usize = 24_000;
 pub(crate) const MAX_HOSTED_SELECTED_BATCHES: usize = 5;
-const MAX_HOSTED_PLANNER_CANDIDATES: usize = 96;
+pub(crate) const MAX_HOSTED_PLANNER_CANDIDATES: usize = 96;
 pub(crate) const MAX_MODELS_PER_REQUEST: usize = 3;
-const MAX_SCORER_INPUT_TOKENS: usize = 64_000;
+pub(crate) const MAX_SCORER_PROMPT_BYTES: usize = 56_000;
 const MAX_STREAMED_CANDIDATE_MULTIPLIER: usize = 8;
 const MAX_STREAMED_SUMMARY_BYTES: usize = 64_000;
 const HOSTED_WORKER_WATCHDOG_SECS: u64 = 600;
@@ -57,27 +62,27 @@ fn full_diff_timeout_secs(snapshot: &PrMeta) -> u64 {
 
 async fn snapshot_is_current<F: Forge>(
     forge: &F,
-    expected_head_sha: &str,
+    expected: &PrMeta,
     review_started: Instant,
 ) -> bool {
     match run_with_hosted_budget(
         Some(review_started),
         FORGE_READ_TIMEOUT_SECS,
-        forge.head_is_current(expected_head_sha),
-        "verifying pull request head before publication",
+        forge.snapshot_is_current(expected),
+        "verifying pull request snapshot before publication",
     )
     .await
     {
         Ok(true) => true,
         Ok(false) => {
             eprintln!(
-                "postil: publication skipped because the pull request head changed after review"
+                "postil: publication skipped because the pull request snapshot changed after review"
             );
             false
         }
         Err(error) => {
             eprintln!(
-                "postil: publication skipped because head freshness could not be verified ({error:#})"
+                "postil: publication skipped because snapshot freshness could not be verified ({error:#})"
             );
             false
         }
@@ -112,6 +117,7 @@ pub struct ReviewArgs {
     pub repo: Option<String>,
     pub pr: Option<u64>,
     pub sha: Option<String>,
+    pub base_sha: Option<String>,
     pub staged: bool,
     pub base: Option<String>,
     pub diff_file: Option<PathBuf>,
@@ -128,6 +134,7 @@ pub struct ReviewArgs {
     pub model: Option<String>,
     pub bounded: bool,
     pub no_post: bool,
+    pub defer_gate_check: bool,
 }
 
 impl ReviewArgs {
@@ -155,6 +162,50 @@ struct RemoteReviewInput<'a> {
     meta: &'a PrMeta,
     review_started: Instant,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewFailureKind {
+    Provider,
+    InvalidOutput,
+}
+
+fn classify_exhausted_scorer_failure(
+    incidents: &[ModelIncident],
+    final_error_is_provider: bool,
+) -> ReviewFailureKind {
+    if incidents.iter().any(|incident| {
+        !incident.recovered && incident.category == ModelIncidentCategory::InvalidOutput
+    }) {
+        ReviewFailureKind::InvalidOutput
+    } else if final_error_is_provider {
+        ReviewFailureKind::Provider
+    } else {
+        ReviewFailureKind::InvalidOutput
+    }
+}
+
+#[derive(Debug)]
+struct ReviewFailure {
+    kind: ReviewFailureKind,
+    detail: String,
+    model_used: String,
+    scorer_model: Option<String>,
+    scorer_error: Option<String>,
+    usage: Usage,
+    model_usage: Vec<ModelUsage>,
+    model_incidents: Vec<ModelIncident>,
+    review_coverage: Option<ReviewCoverage>,
+    review_admission: Option<ReviewAdmission>,
+    usage_accounting_complete: bool,
+}
+
+impl std::fmt::Display for ReviewFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for ReviewFailure {}
 
 pub async fn run(args: ReviewArgs) -> Result<i32> {
     let cwd = std::env::current_dir()?;
@@ -227,7 +278,7 @@ async fn run_local(args: &ReviewArgs, cfg: &Config) -> Result<i32> {
     let head_sha = local::head_sha().await;
     let baseline = load_baseline(args)?;
     let scope = if args.since_sha.is_some() {
-        filter::ReconcileScope::Incremental
+        filter::ReconcileScope::Incremental { trustworthy: false }
     } else {
         filter::ReconcileScope::Full { trustworthy: false }
     };
@@ -246,7 +297,7 @@ async fn run_local(args: &ReviewArgs, cfg: &Config) -> Result<i32> {
         },
     )
     .await?;
-    finish(args, cfg, envelope, None::<&GitHub>, None).await
+    finish(args, cfg, envelope, None::<&GitHub>, None, None).await
 }
 
 async fn run_remote<F: Forge>(
@@ -270,6 +321,16 @@ async fn run_remote<F: Forge>(
             meta.head_sha
         );
     }
+    if let Some(event_base_sha) = args.base_sha.as_deref() {
+        let target_sha = meta
+            .target_sha
+            .as_deref()
+            .ok_or_else(|| anyhow!("--base-sha is not supported for the selected forge"))?;
+        anyhow::ensure!(
+            event_base_sha == target_sha,
+            "requested review target {event_base_sha} is no longer the pull request target {target_sha}"
+        );
+    }
     let head_sha = meta.head_sha.clone();
 
     // Own the check-runs early so a crash can still be reported against them.
@@ -288,6 +349,9 @@ async fn run_remote<F: Forge>(
         {
             Ok(ids) => Some(ids),
             Err(e) => {
+                if crate::forge::is_repository_identity_failure(&e) {
+                    return Err(e).context("creating check runs");
+                }
                 // CI tokens without checks:write still get review + exit code.
                 eprintln!("postil: cannot create check runs ({e:#}); continuing without");
                 None
@@ -309,7 +373,7 @@ async fn run_remote<F: Forge>(
     match result {
         Ok(envelope) => {
             if let Some((a, g)) = &checks
-                && snapshot_is_current(forge, &head_sha, review_started).await
+                && snapshot_is_current(forge, &meta, review_started).await
             {
                 let gate_state = if envelope.gate.failing {
                     CheckState::Failure
@@ -336,15 +400,33 @@ async fn run_remote<F: Forge>(
                 let completed = run_with_hosted_budget(
                     Some(review_started),
                     CHECK_COMPLETION_TIMEOUT_SECS,
-                    forge.complete_checks(a, g, advisory_state, gate_state, &envelope),
+                    forge.complete_checks(
+                        a,
+                        g,
+                        advisory_state,
+                        (!args.defer_gate_check).then_some(gate_state),
+                        &envelope,
+                        &meta,
+                    ),
                     "completing check runs",
                 )
                 .await;
                 if let Err(e) = completed {
+                    if crate::forge::is_repository_identity_failure(&e) {
+                        return Err(e);
+                    }
                     eprintln!("postil: could not update check runs ({e:#})");
                 }
             }
-            finish(args, cfg, envelope, Some(forge), Some(review_started)).await
+            finish(
+                args,
+                cfg,
+                envelope,
+                Some(forge),
+                Some(review_started),
+                Some(&meta),
+            )
+            .await
         }
         Err(e) => {
             eprintln!("postil: review failed before completion ({e:#})");
@@ -366,20 +448,32 @@ async fn run_remote<F: Forge>(
                 review_started.elapsed().as_millis() as u64,
             );
             if let Some((a, g)) = &checks
-                && snapshot_is_current(forge, &head_sha, review_started).await
+                && snapshot_is_current(forge, &meta, review_started).await
             {
                 let gate_state = if envelope.gate.failing {
                     CheckState::Failure
                 } else {
                     CheckState::Success
                 };
-                let _ = run_with_hosted_budget(
+                let completion = run_with_hosted_budget(
                     Some(review_started),
                     CHECK_COMPLETION_TIMEOUT_SECS,
-                    forge.complete_checks(a, g, CheckState::Neutral, gate_state, &envelope),
+                    forge.complete_checks(
+                        a,
+                        g,
+                        CheckState::Neutral,
+                        (!args.defer_gate_check).then_some(gate_state),
+                        &envelope,
+                        &meta,
+                    ),
                     "completing check runs",
                 )
                 .await;
+                if let Err(error) = completion
+                    && crate::forge::is_repository_identity_failure(&error)
+                {
+                    return Err(error);
+                }
             }
             // Emit envelope/SARIF and derive the exit code from the gate.
             // `finish` itself already downgrades forge posting failures
@@ -390,9 +484,21 @@ async fn run_remote<F: Forge>(
             // exit code, so it is downgraded to the gate-derived code rather
             // than propagated as exit 2.
             let code = if envelope.gate.failing { 1 } else { 0 };
-            match finish(args, cfg, envelope, Some(forge), Some(review_started)).await {
+            match finish(
+                args,
+                cfg,
+                envelope,
+                Some(forge),
+                Some(review_started),
+                Some(&meta),
+            )
+            .await
+            {
                 Ok(c) => Ok(c),
                 Err(post_err) => {
+                    if crate::forge::is_repository_identity_failure(&post_err) {
+                        return Err(post_err);
+                    }
                     eprintln!("postil: could not post the error review ({post_err:#})");
                     Ok(code)
                 }
@@ -426,10 +532,16 @@ async fn remote_review<F: Forge>(
         .await
         .map_err(crate::forge::classify_review_input_error)
         .context("incremental diff fetch")
-        .map(|diff| (diff, filter::ReconcileScope::Incremental, false))?,
+        .map(|diff| {
+            (
+                diff,
+                filter::ReconcileScope::Incremental { trustworthy: false },
+                false,
+            )
+        })?,
         Some(_) => (
             diff::DiffSnapshot::from_bytes(b"")?,
-            filter::ReconcileScope::Incremental,
+            filter::ReconcileScope::Incremental { trustworthy: false },
             false,
         ),
         None => (
@@ -452,7 +564,7 @@ async fn remote_review<F: Forge>(
     // Empty incremental runs without carryable findings remain model-free.
     let (diff_snapshot, scope, force_model) = if cfg.enabled
         && has_carryable_baseline
-        && matches!(scope, filter::ReconcileScope::Incremental)
+        && matches!(scope, filter::ReconcileScope::Incremental { .. })
         && diff_snapshot.as_str().trim().is_empty()
     {
         (
@@ -505,17 +617,22 @@ fn load_baseline(args: &ReviewArgs) -> Result<Vec<Finding>> {
 /// change-metadata findings use their exact semantic content so an unrelated
 /// metadata entry reusing the same synthetic line cannot supersede them.
 fn generate_finding_ids(findings: &mut [Finding], head_sha: Option<&str>) {
-    let mut id_map: HashMap<String, usize> = HashMap::new();
-
     for finding in findings.iter_mut() {
         if finding.id.is_some() {
             continue;
         }
         // Normalize the finding data
         let normalized_path = finding.path.to_lowercase();
-        let normalized_line = finding.line.to_string();
         let normalized_title = finding.title.trim().to_lowercase();
-        let identity = if finding.path == crate::envelope::CHANGE_METADATA_PATH {
+        let identity = if let Some(evidence) = finding.evidence.as_deref() {
+            format!(
+                "evidence\x00{}\x00{}\x00{}\x00{}",
+                finding.kind.as_str(),
+                normalized_path,
+                normalized_title,
+                evidence
+            )
+        } else if finding.path == crate::envelope::CHANGE_METADATA_PATH {
             format!(
                 "change-metadata\x00{}\x00{}\x00{}\x00{}",
                 finding.kind.as_str(),
@@ -529,24 +646,14 @@ fn generate_finding_ids(findings: &mut [Finding], head_sha: Option<&str>) {
                 "{head_sha}\x00{}\x00{}\x00{}\x00{}",
                 finding.kind.as_str(),
                 normalized_path,
-                normalized_line,
+                finding.line,
                 normalized_title
             )
         };
 
-        // Create a pre-hash key to track duplicates.
-        let prehash_key = identity.clone();
-        let duplicate_index = id_map
-            .entry(prehash_key)
-            .and_modify(|count| *count += 1)
-            .or_insert(0);
-
-        // Build the hash input
-        let hash_input = format!("{identity}\x00{duplicate_index}");
-
         // Generate SHA256 hash
         let mut hasher = Sha256::new();
-        hasher.update(hash_input.as_bytes());
+        hasher.update(identity.as_bytes());
         let result = hasher.finalize();
         let hex_id = result
             .iter()
@@ -567,26 +674,28 @@ fn scorer_inputs(
         .enumerate()
         .map(|(index, finding)| prompt::ScorerPromptFinding {
             index,
-            path: finding.path.clone(),
+            path: prompt::sanitize_scorer_input(&finding.path),
             line: finding.line,
             severity: finding.severity.as_str().to_string(),
-            title: finding.title.clone(),
-            body: finding.body.clone(),
-            diff_hunk: diff::render_hunk_context(parsed, &finding.path, finding.line, 20)
-                .or_else(|| {
-                    review_batches.iter().find_map(|batch| {
-                        diff::render_review_batch_context(
-                            batch,
-                            &finding.path,
-                            finding.line,
-                            8,
-                            24_000,
-                        )
+            title: prompt::sanitize_scorer_input(&finding.title),
+            body: prompt::sanitize_scorer_input(&finding.body),
+            diff_hunk: prompt::sanitize_scorer_input(
+                &diff::render_hunk_context(parsed, &finding.path, finding.line, 20)
+                    .or_else(|| {
+                        review_batches.iter().find_map(|batch| {
+                            diff::render_review_batch_context(
+                                batch,
+                                &finding.path,
+                                finding.line,
+                                8,
+                                24_000,
+                            )
+                        })
                     })
-                })
-                .unwrap_or_else(|| {
-                    "No diff evidence is available for this cited location.".to_string()
-                }),
+                    .unwrap_or_else(|| {
+                        "No diff evidence is available for this cited location.".to_string()
+                    }),
+            ),
         })
         .collect()
 }
@@ -720,24 +829,23 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
     let mut prepared = diff::prepare_review(diff_snapshot)?;
     let input_incomplete = prepared.reserved_anchor;
     let mut index = std::mem::take(&mut prepared.index);
-    let incremental = matches!(scope, filter::ReconcileScope::Incremental);
+    let incremental = matches!(scope, filter::ReconcileScope::Incremental { .. });
 
     // When content policy is active, render the PR title/description as a
     // numbered, groundable block and register its line range so a title/body
     // content-policy finding can ground against the reserved path. Only meaningful
     // for full reviews with a body; incremental reviews scope to the pushed diff.
     let content_policy_active = cfg.enabled && cfg.content_policy.is_some() && !incremental;
-    let pr_desc_lines = if content_policy_active {
-        let (_, count) = prompt::render_pr_description(
+    let (pr_description, pr_desc_lines) = if content_policy_active {
+        prompt::render_pr_description(
             meta.map(|m| m.title.as_str()),
             meta.map(|m| m.body.as_str()),
-        );
-        count
+        )
     } else {
-        0
+        (String::new(), 0)
     };
     if pr_desc_lines > 0 {
-        index.add_content_policy_path(crate::envelope::PR_DESCRIPTION_PATH, pr_desc_lines);
+        index.add_content_policy_evidence(crate::envelope::PR_DESCRIPTION_PATH, &pr_description);
     }
 
     let mut summary = String::new();
@@ -756,6 +864,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
     let mut scorer_model: Option<String> = None;
     let mut scorer_error: Option<String> = None;
     let mut scorer_disagreements: Option<u32> = None;
+    let mut scorer_failure_kind: Option<ReviewFailureKind> = None;
 
     // Run the model when there is a diff to review, or when content policy is
     // active and there is a PR title/description to review (an empty diff should
@@ -879,12 +988,15 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                         .into_iter()
                         .map(|(_, later)| later)
                         .collect::<Vec<_>>();
-                    let planner = bounded_candidates.as_ref().map(|candidates| {
-                        (
-                            candidates.manifest.as_str(),
-                            MAX_HOSTED_SELECTED_BATCHES
-                                .saturating_sub(candidates.mandatory_ids.len()),
-                        )
+                    let planner = bounded_candidates.as_ref().and_then(|candidates| {
+                        let remaining = MAX_HOSTED_SELECTED_BATCHES
+                            .saturating_sub(candidates.mandatory_ids.len());
+                        (remaining > 0
+                            && candidates
+                                .candidate_ids
+                                .iter()
+                                .any(|id| !candidates.mandatory_ids.contains(id)))
+                        .then_some((candidates.manifest.as_str(), remaining))
                     });
                     let admission = client.preflight_review_plan(
                         cfg,
@@ -943,32 +1055,34 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                     for id in &candidates.mandatory_ids {
                         additional_candidates.remove(id);
                     }
-                    let plan = client
-                        .plan_review_batches(
-                            cfg,
-                            &candidates.manifest,
-                            &additional_candidates,
-                            remaining,
-                        )
-                        .await?;
-                    usage.prompt_tokens =
-                        usage.prompt_tokens.saturating_add(plan.usage.prompt_tokens);
-                    usage.completion_tokens = usage
-                        .completion_tokens
-                        .saturating_add(plan.usage.completion_tokens);
-                    model_usage.extend(plan.model_usage);
-                    model_incidents.extend(plan.model_incidents);
-                    usage_accounting_complete &= plan.usage_accounting_complete;
-                    planner_fallback = plan.fallback_used;
                     let mut ids = candidates
                         .mandatory_ids
                         .into_iter()
                         .collect::<std::collections::BTreeSet<_>>();
-                    for id in plan.batch_ids {
-                        if ids.len() >= MAX_HOSTED_SELECTED_BATCHES {
-                            break;
+                    if remaining > 0 && !additional_candidates.is_empty() {
+                        let plan = client
+                            .plan_review_batches(
+                                cfg,
+                                &candidates.manifest,
+                                &additional_candidates,
+                                remaining,
+                            )
+                            .await?;
+                        usage.prompt_tokens =
+                            usage.prompt_tokens.saturating_add(plan.usage.prompt_tokens);
+                        usage.completion_tokens = usage
+                            .completion_tokens
+                            .saturating_add(plan.usage.completion_tokens);
+                        model_usage.extend(plan.model_usage);
+                        model_incidents.extend(plan.model_incidents);
+                        usage_accounting_complete &= plan.usage_accounting_complete;
+                        planner_fallback = plan.fallback_used;
+                        for id in plan.batch_ids {
+                            if ids.len() >= MAX_HOSTED_SELECTED_BATCHES {
+                                break;
+                            }
+                            ids.insert(id);
                         }
-                        ids.insert(id);
                     }
                     selected_source_batches = batches.selected_source_count(&ids);
                     let selected = batches.selected_batches(&ids)?;
@@ -1017,6 +1131,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                     let first = request_index == 0;
                     let (annotated, user, cross_window_synthesis) =
                         review_batch_prompt(&runtime_prompt_context, batch, first);
+                    index.add_rendered_evidence(&annotated);
                     eprintln!(
                         "postil: reviewing {} request {}/{} ({} bytes)",
                         if cross_window_synthesis {
@@ -1028,10 +1143,40 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                         total_requests,
                         annotated.len()
                     );
-                    match client.review(cfg, &system, &user).await {
+                    let validation_annotated = annotated.clone();
+                    let validation_user = user.clone();
+                    match client
+                        .review_validated(cfg, &system, &user, move |review| {
+                            let invalid = review.findings.iter().find(|finding| {
+                                let grounded = diff::review_batch_contains_exact_evidence(
+                                    &validation_annotated,
+                                    &finding.path,
+                                    finding.line,
+                                    finding.evidence.as_deref(),
+                                ) || (first
+                                    && finding.kind == crate::envelope::Kind::ContentPolicy
+                                    && diff::review_batch_contains_exact_evidence(
+                                        &validation_user,
+                                        &finding.path,
+                                        finding.line,
+                                        finding.evidence.as_deref(),
+                                    ));
+                                crate::envelope::validate_finding_publication(finding).is_err()
+                                    || !grounded
+                            });
+                            if let Some(finding) = invalid {
+                                Err(format!(
+                                    "finding at {}:{} has invalid publication text or lacks exact new-side evidence",
+                                    finding.path, finding.line
+                                ))
+                            } else {
+                                Ok(())
+                            }
+                        })
+                        .await
+                    {
                         Ok(mut model_review) => {
-                            usage.prompt_tokens += model_review.usage.prompt_tokens;
-                            usage.completion_tokens += model_review.usage.completion_tokens;
+                            add_usage(&mut usage, model_review.usage);
                             model_usage.extend(model_review.model_usage);
                             model_incidents.extend(model_review.model_incidents);
                             usage_accounting_complete &= model_review.usage_accounting_complete;
@@ -1058,14 +1203,19 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                             }
                             let before = model_review.findings.len();
                             model_review.findings.retain(|finding| {
-                                diff::review_batch_contains_range(
+                                diff::review_batch_contains_exact_evidence(
                                     &annotated,
                                     &finding.path,
                                     finding.line,
-                                    finding.line,
+                                    finding.evidence.as_deref(),
                                 ) || (first
                                     && finding.kind == crate::envelope::Kind::ContentPolicy
-                                    && index.contains_content_policy(&finding.path, finding.line))
+                                    && diff::review_batch_contains_exact_evidence(
+                                        &user,
+                                        &finding.path,
+                                        finding.line,
+                                        finding.evidence.as_deref(),
+                                    ))
                             });
                             for finding in &mut model_review.findings {
                                 finding.path = diff::canonical_prompt_path(&finding.path)
@@ -1088,8 +1238,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                             }
                         }
                         Err(e) => {
-                            usage.prompt_tokens += e.usage().prompt_tokens;
-                            usage.completion_tokens += e.usage().completion_tokens;
+                            add_usage(&mut usage, e.usage());
                             model_usage.extend_from_slice(e.model_usage());
                             model_incidents.extend_from_slice(e.model_incidents());
                             usage_accounting_complete &= e.usage_accounting_complete();
@@ -1117,10 +1266,9 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                     for finding in raw_findings {
                         let key = (
                             finding.path.clone(),
-                            finding.line,
-                            finding.end_line,
                             finding.kind.as_str().to_string(),
-                            finding.title.clone(),
+                            finding.title.trim().to_ascii_lowercase(),
+                            finding.evidence.clone(),
                         );
                         if let Some(position) = positions.get(&key).copied() {
                             let existing = &mut deduplicated[position];
@@ -1165,7 +1313,11 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                             &summary_parts.join("\n\n"),
                         )];
                     } else {
-                        full_review_trustworthy = !batch_failed;
+                        // Bounded mode reviews deterministic direct evidence and
+                        // lossy synthesis, not every source batch. It may add new
+                        // findings, but it cannot prove that an unseen baseline
+                        // finding is resolved.
+                        full_review_trustworthy = !batch_failed && !risk_selected_review;
                         summary = summary_parts.join("\n\n");
                         let mut kept = outcome.kept;
                         if !kept.is_empty() && cfg.scorer_enabled() {
@@ -1174,12 +1326,13 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                             let scorer_system = prompt::scorer_system_prompt(cfg);
                             let scorer_user = prompt::scorer_user_prompt(&inputs);
                             if scorer_system.len().saturating_add(scorer_user.len())
-                                > MAX_SCORER_INPUT_TOKENS
+                                > MAX_SCORER_PROMPT_BYTES
                             {
                                 scorer_error = Some(
                                     "scorer skipped because its bounded input budget was exceeded"
                                         .to_string(),
                                 );
+                                scorer_failure_kind = Some(ReviewFailureKind::InvalidOutput);
                             } else {
                                 let scored = client
                                     .score_findings(
@@ -1199,8 +1352,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                                         suppressed += scorer_suppressed.len() as u32;
                                         suppressed_findings.extend(scorer_suppressed);
                                         scorer_model = Some(scored.model_used);
-                                        usage.prompt_tokens += scored.usage.prompt_tokens;
-                                        usage.completion_tokens += scored.usage.completion_tokens;
+                                        add_usage(&mut usage, scored.usage);
                                         model_usage.extend(scored.model_usage);
                                         model_incidents.extend(scored.model_incidents);
                                         usage_accounting_complete &=
@@ -1214,11 +1366,15 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                                             "postil: scorer failed open after all scorer models failed"
                                         );
                                         let scorer_usage = e.usage();
-                                        usage.prompt_tokens += scorer_usage.prompt_tokens;
-                                        usage.completion_tokens += scorer_usage.completion_tokens;
+                                        add_usage(&mut usage, scorer_usage);
                                         model_usage.extend_from_slice(e.model_usage());
                                         model_incidents.extend_from_slice(e.model_incidents());
                                         usage_accounting_complete &= e.usage_accounting_complete();
+                                        scorer_failure_kind =
+                                            Some(classify_exhausted_scorer_failure(
+                                                e.model_incidents(),
+                                                e.is_provider(),
+                                            ));
                                         scorer_error = Some(detail);
                                     }
                                 }
@@ -1227,9 +1383,22 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                                 crate::config::hosted_runtime_mode(),
                                 scorer_error.is_some(),
                             ) {
-                                anyhow::bail!(
-                                    "hosted scorer could not complete the admitted profile"
-                                );
+                                return Err(ReviewFailure {
+                                    kind: scorer_failure_kind
+                                        .unwrap_or(ReviewFailureKind::InvalidOutput),
+                                    detail: "hosted scorer could not complete the admitted profile"
+                                        .to_string(),
+                                    model_used: model_used.clone(),
+                                    scorer_model: Some(cfg.scorer_chain().join(" -> ")),
+                                    scorer_error: scorer_error.clone(),
+                                    usage,
+                                    model_usage,
+                                    model_incidents,
+                                    review_coverage,
+                                    review_admission,
+                                    usage_accounting_complete,
+                                }
+                                .into());
                             }
                         }
                         findings = kept;
@@ -1253,7 +1422,9 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
     // disable means dropping the baseline carry-forward too.
     let rec = if cfg.enabled {
         let scope = match scope {
-            filter::ReconcileScope::Incremental => filter::ReconcileScope::Incremental,
+            filter::ReconcileScope::Incremental { .. } => filter::ReconcileScope::Incremental {
+                trustworthy: full_review_trustworthy,
+            },
             filter::ReconcileScope::Full { .. } => filter::ReconcileScope::Full {
                 trustworthy: full_review_trustworthy,
             },
@@ -1265,6 +1436,10 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
             carried: vec![],
         }
     };
+    // Carried findings are durable historical state and are excluded from all
+    // forge publication sinks. They may predate the current prose contract, so
+    // keep them open without revalidating them as fresh model output. Fresh
+    // findings are validated before they can reach reconciliation.
     findings.extend(rec.carried);
 
     // Operational findings (model unreachable/unusable) fail the gate by default
@@ -1275,13 +1450,16 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
     // induce it via prompt injection.
     let advisory_on_error = cfg.gate_on_error == OnError::Advisory;
     let gate_fail_on = cfg.gate_fail_on.as_str();
+    let gate_disabled = gate_fail_on.eq_ignore_ascii_case("never");
     let gate_block_on_kinds: Vec<String> = cfg
         .block_on_kinds
         .iter()
         .map(|kind| kind.as_str().to_string())
         .collect();
     let gate_failing = findings.iter().any(|f| {
-        if f.path == crate::envelope::OPERATIONAL_PATH {
+        if gate_disabled {
+            false
+        } else if f.path == crate::envelope::OPERATIONAL_PATH {
             true
         } else if f.path == crate::envelope::PROVIDER_PATH {
             !advisory_on_error
@@ -1384,6 +1562,7 @@ async fn finish<F: Forge>(
     envelope: Envelope,
     forge: Option<&F>,
     hosted_budget_started_at: Option<Instant>,
+    expected_snapshot: Option<&PrMeta>,
 ) -> Result<i32> {
     // Persist artifacts before any forge I/O: a posting hiccup must not
     // discard the completed review's SARIF or envelope output.
@@ -1403,11 +1582,15 @@ async fn finish<F: Forge>(
     if let Some(forge) = forge
         && !args.no_post
     {
-        let head = envelope.head_sha.clone().unwrap_or_default();
+        let expected_snapshot =
+            expected_snapshot.context("remote publication is missing its immutable PR snapshot")?;
         let current = if let Some(started_at) = hosted_budget_started_at {
-            snapshot_is_current(forge, &head, started_at).await
+            snapshot_is_current(forge, expected_snapshot, started_at).await
         } else {
-            forge.head_is_current(&head).await.unwrap_or(false)
+            forge
+                .snapshot_is_current(expected_snapshot)
+                .await
+                .unwrap_or(false)
         };
         if !current {
             eprintln!("postil: review comment skipped because freshness is not proven");
@@ -1429,11 +1612,14 @@ async fn finish<F: Forge>(
             let posted = run_with_hosted_budget(
                 hosted_budget_started_at,
                 REVIEW_POST_TIMEOUT_SECS,
-                forge.post_review(&summary, &envelope.findings, &head),
+                forge.post_review(&summary, &envelope.findings, expected_snapshot),
                 "posting review comment",
             )
             .await;
             if let Err(e) = posted {
+                if crate::forge::is_repository_identity_failure(&e) {
+                    return Err(e);
+                }
                 eprintln!("postil: could not post review comment ({e:#})");
             }
         }
@@ -1530,18 +1716,36 @@ fn error_envelope(
     duration_ms: u64,
 ) -> Envelope {
     let incomplete_input = crate::forge::is_incomplete_review_input(err);
+    let review_failure = err.downcast_ref::<ReviewFailure>();
+    let invalid_output =
+        review_failure.is_some_and(|failure| failure.kind == ReviewFailureKind::InvalidOutput);
     let findings = vec![if incomplete_input {
         crate::envelope::incomplete_review_finding()
+    } else if invalid_output {
+        fail_closed_finding(
+            review_failure
+                .and_then(|failure| failure.scorer_error.as_deref())
+                .unwrap_or("scorer output did not satisfy the admitted contract"),
+        )
     } else {
         crate::envelope::provider_error_finding(&format!("{err:#}"))
     }];
     let counts = Envelope::counts_of(&findings, 0);
     let buckets = Envelope::buckets_of(&findings);
-    let blocking = incomplete_input || cfg.gate_on_error == OnError::Block;
+    let gate_disabled = cfg.gate_fail_on.as_str().eq_ignore_ascii_case("never");
+    let blocking = !gate_disabled
+        && (incomplete_input || invalid_output || cfg.gate_on_error == OnError::Block);
+    let mut model_usage = review_failure
+        .map(|failure| failure.model_usage.clone())
+        .unwrap_or_default();
+    model_usage.sort_by_key(|entry| entry.call_ordinal.unwrap_or(u32::MAX));
     Envelope {
         version: 1,
         summary: if blocking {
             "Postil could not complete this review and is failing closed.".to_string()
+        } else if gate_disabled {
+            "Postil could not complete this review. The merge gate is disabled; the error is shown on postil/review."
+                .to_string()
         } else {
             "Postil could not complete this review. The gate is passing because this \
              repository sets gate.onError: advisory; the error is shown on postil/review."
@@ -1562,16 +1766,22 @@ fn error_envelope(
                 .map(|k| k.as_str().to_string())
                 .collect(),
         },
-        model_used: cfg.model_chain().join(" -> "),
-        scorer_model: None,
-        scorer_error: None,
+        model_used: review_failure.map_or_else(
+            || cfg.model_chain().join(" -> "),
+            |failure| failure.model_used.clone(),
+        ),
+        scorer_model: review_failure.and_then(|failure| failure.scorer_model.clone()),
+        scorer_error: review_failure.and_then(|failure| failure.scorer_error.clone()),
         scorer_disagreements: None,
-        usage: Usage::default(),
-        model_usage: vec![],
-        model_incidents: vec![],
-        review_coverage: None,
-        review_admission: None,
-        usage_accounting_complete: true,
+        usage: review_failure.map_or_else(Usage::default, |failure| failure.usage),
+        model_usage,
+        model_incidents: review_failure
+            .map(|failure| failure.model_incidents.clone())
+            .unwrap_or_default(),
+        review_coverage: review_failure.and_then(|failure| failure.review_coverage.clone()),
+        review_admission: review_failure.and_then(|failure| failure.review_admission),
+        usage_accounting_complete: review_failure
+            .is_none_or(|failure| failure.usage_accounting_complete),
         duration_ms,
         base_sha: Some(meta.base_sha.clone()),
         head_sha: Some(head_sha.to_string()),
@@ -1590,6 +1800,203 @@ mod tests {
         assert!(!scorer_failure_blocks_hosted(false, true));
     }
     use crate::envelope::{Kind, Severity};
+
+    fn pr_meta() -> PrMeta {
+        PrMeta {
+            title: "Fixture".to_string(),
+            body: String::new(),
+            head_sha: "head".to_string(),
+            base_sha: "base".to_string(),
+            target_sha: Some("target".to_string()),
+            changed_files: Some(1),
+        }
+    }
+
+    #[test]
+    fn disabled_gate_keeps_provider_error_envelopes_nonblocking() {
+        let cfg = Config {
+            gate_fail_on: crate::config::GateLevel::Never,
+            gate_on_error: OnError::Block,
+            ..Config::default()
+        };
+        let envelope = error_envelope(
+            &cfg,
+            &anyhow::anyhow!("provider unavailable"),
+            "head",
+            &pr_meta(),
+            1,
+        );
+        assert!(!envelope.gate.failing);
+        assert!(envelope.summary.contains("merge gate is disabled"));
+    }
+
+    fn rich_scorer_failure(kind: ReviewFailureKind) -> anyhow::Error {
+        ReviewFailure {
+            kind,
+            detail: "hosted scorer could not complete the admitted profile".to_string(),
+            model_used: "generator-model".to_string(),
+            scorer_model: Some("scorer-model".to_string()),
+            scorer_error: Some("scorer output invalid after schema repair".to_string()),
+            usage: Usage {
+                prompt_tokens: 130,
+                completion_tokens: 60,
+                cost_micros: Some(168),
+                provider_cost: crate::envelope::ProviderCost::parse("0.000168"),
+            },
+            model_usage: vec![
+                serde_json::from_value(serde_json::json!({
+                    "model": "scorer-model",
+                    "role": "findingScorer",
+                    "phase": "initial",
+                    "callOrdinal": 2,
+                    "attempt": 1,
+                    "promptTokens": 30,
+                    "completionTokens": 10,
+                    "costMicros": 45,
+                    "costProviderDecimal": "0.000045",
+                    "costSource": "providerReported",
+                    "accountingComplete": true
+                }))
+                .unwrap(),
+                serde_json::from_value(serde_json::json!({
+                    "model": "generator-model",
+                    "role": "reviewGenerator",
+                    "phase": "initial",
+                    "callOrdinal": 1,
+                    "attempt": 1,
+                    "promptTokens": 100,
+                    "completionTokens": 50,
+                    "costMicros": 123,
+                    "costProviderDecimal": "0.000123",
+                    "costSource": "providerReported",
+                    "accountingComplete": true
+                }))
+                .unwrap(),
+            ],
+            model_incidents: vec![ModelIncident {
+                phase: crate::envelope::ModelIncidentPhase::Scorer,
+                category: if kind == ReviewFailureKind::Provider {
+                    crate::envelope::ModelIncidentCategory::ProviderError
+                } else {
+                    crate::envelope::ModelIncidentCategory::InvalidOutput
+                },
+                recovered: false,
+                recovery: None,
+            }],
+            review_coverage: Some(ReviewCoverage {
+                mode: ReviewCoverageMode::Bounded,
+                selected_batches: 5,
+                total_batches: 9,
+                planner_fallback: false,
+            }),
+            review_admission: Some(ReviewAdmission {
+                provider_attempts: 12,
+                serialized_input_bytes: 34_000,
+                output_tokens: 8_800,
+                projected_cost_micros: 900_000,
+            }),
+            usage_accounting_complete: true,
+        }
+        .into()
+    }
+
+    #[test]
+    fn invalid_scorer_failure_is_blocking_under_advisory_and_preserves_audit_state() {
+        let cfg = Config {
+            gate_on_error: OnError::Advisory,
+            ..Config::default()
+        };
+        let error = rich_scorer_failure(ReviewFailureKind::InvalidOutput);
+        let envelope = error_envelope(&cfg, &error, "head", &pr_meta(), 99);
+        assert_eq!(envelope.findings[0].path, crate::envelope::OPERATIONAL_PATH);
+        assert!(envelope.gate.failing);
+        assert_eq!(envelope.model_used, "generator-model");
+        assert_eq!(envelope.scorer_model.as_deref(), Some("scorer-model"));
+        assert_eq!(
+            envelope.scorer_error.as_deref(),
+            Some("scorer output invalid after schema repair")
+        );
+        assert_eq!(
+            envelope.usage.provider_cost.unwrap().to_string(),
+            "0.000168"
+        );
+        assert_eq!(envelope.model_usage.len(), 2);
+        assert_eq!(envelope.model_usage[0].model, "generator-model");
+        assert_eq!(
+            envelope.model_usage[1].cost_provider_decimal.as_deref(),
+            Some("0.000045")
+        );
+        assert_eq!(envelope.model_incidents.len(), 1);
+        assert_eq!(envelope.review_coverage.unwrap().total_batches, 9);
+        assert_eq!(envelope.review_admission.unwrap().provider_attempts, 12);
+        assert!(envelope.usage_accounting_complete);
+    }
+
+    #[test]
+    fn provider_scorer_failure_uses_provider_path_and_advisory_gate() {
+        let cfg = Config {
+            gate_on_error: OnError::Advisory,
+            ..Config::default()
+        };
+        let error = rich_scorer_failure(ReviewFailureKind::Provider);
+        let envelope = error_envelope(&cfg, &error, "head", &pr_meta(), 99);
+        assert_eq!(envelope.findings[0].path, crate::envelope::PROVIDER_PATH);
+        assert!(!envelope.gate.failing);
+        assert_eq!(envelope.model_usage.len(), 2);
+        assert_eq!(envelope.review_admission.unwrap().provider_attempts, 12);
+    }
+
+    #[test]
+    fn invalid_output_anywhere_in_exhausted_scorer_chain_dominates_provider_failure() {
+        let incidents = vec![
+            ModelIncident {
+                phase: crate::envelope::ModelIncidentPhase::Scorer,
+                category: ModelIncidentCategory::InvalidOutput,
+                recovered: false,
+                recovery: None,
+            },
+            ModelIncident {
+                phase: crate::envelope::ModelIncidentPhase::Scorer,
+                category: ModelIncidentCategory::ProviderError,
+                recovered: false,
+                recovery: None,
+            },
+        ];
+        let kind = classify_exhausted_scorer_failure(&incidents, true);
+        assert_eq!(kind, ReviewFailureKind::InvalidOutput);
+        let cfg = Config {
+            gate_on_error: OnError::Advisory,
+            ..Config::default()
+        };
+        let envelope = error_envelope(&cfg, &rich_scorer_failure(kind), "head", &pr_meta(), 99);
+        assert_eq!(envelope.findings[0].path, crate::envelope::OPERATIONAL_PATH);
+        assert!(envelope.gate.failing);
+
+        let recovered_invalid = vec![
+            ModelIncident {
+                recovered: true,
+                recovery: Some(crate::envelope::ModelIncidentRecovery::Fallback),
+                ..incidents[0].clone()
+            },
+            incidents[1].clone(),
+        ];
+        assert_eq!(
+            classify_exhausted_scorer_failure(&recovered_invalid, true),
+            ReviewFailureKind::Provider
+        );
+    }
+
+    #[test]
+    fn disabled_gate_keeps_incomplete_input_envelopes_nonblocking() {
+        let cfg = Config {
+            gate_fail_on: crate::config::GateLevel::Never,
+            ..Config::default()
+        };
+        let error = crate::forge::classify_review_input_error(anyhow::anyhow!("invalid diff"));
+        let envelope = error_envelope(&cfg, &error, "head", &pr_meta(), 1);
+        assert!(!envelope.gate.failing);
+        assert!(envelope.summary.contains("merge gate is disabled"));
+    }
 
     fn finding(path: &str, line: u32, body: &str) -> Finding {
         finding_with_title(path, line, "Finding", body)
@@ -1610,19 +2017,19 @@ mod tests {
             scorer_reason: None,
             title: title.to_string(),
             body: body.to_string(),
+            evidence: None,
             id: None,
         }
     }
 
-    fn expected_finding_id(finding: &Finding, head_sha: &str, duplicate_index: usize) -> String {
+    fn expected_finding_id(finding: &Finding, head_sha: &str, _duplicate_index: usize) -> String {
         let hash_input = format!(
-            "{}\x00{}\x00{}\x00{}\x00{}\x00{}",
+            "{}\x00{}\x00{}\x00{}\x00{}",
             head_sha,
             finding.kind.as_str(),
             finding.path.to_lowercase(),
             finding.line,
-            finding.title.trim().to_lowercase(),
-            duplicate_index
+            finding.title.trim().to_lowercase()
         );
         let mut hasher = Sha256::new();
         hasher.update(hash_input.as_bytes());

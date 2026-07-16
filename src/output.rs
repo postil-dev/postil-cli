@@ -212,17 +212,23 @@ pub fn print_pretty(envelope: &Envelope) {
 }
 
 fn render_review_coverage(coverage: &ReviewCoverage) -> String {
-    format!(
-        "coverage: {}/{} source batches ({}; planner fallback: {})\n",
-        coverage.selected_batches,
-        coverage.total_batches,
-        coverage.mode.as_str(),
-        if coverage.planner_fallback {
-            "yes"
-        } else {
-            "no"
-        },
-    )
+    let fallback = if coverage.planner_fallback {
+        "yes"
+    } else {
+        "no"
+    };
+    match coverage.mode {
+        crate::envelope::ReviewCoverageMode::Bounded => format!(
+            "coverage: {} source batches reviewed directly; {} not reviewed directly ({} total; planner fallback: {fallback})\n",
+            coverage.selected_batches,
+            coverage.not_reviewed_directly_batches(),
+            coverage.total_batches,
+        ),
+        crate::envelope::ReviewCoverageMode::Exhaustive => format!(
+            "coverage: {} source batches reviewed directly (exhaustive; planner fallback: {fallback})\n",
+            coverage.total_batches,
+        ),
+    }
 }
 
 /// Neutralize control characters in model-authored text before it reaches the
@@ -292,6 +298,7 @@ mod tests {
             scorer_reason: None,
             title: "\x1b[2Jhijacked title".into(),
             body: "line one\n\x1b[31mFAKE ALL CLEAR\x1b[0m\nline three".into(),
+            evidence: None,
             id: None,
         };
         let env = Envelope {
@@ -408,7 +415,7 @@ mod tests {
                 total_batches: 21,
                 planner_fallback: true,
             }),
-            "coverage: 5/21 source batches (bounded; planner fallback: yes)\n"
+            "coverage: 5 source batches reviewed directly; 16 not reviewed directly (21 total; planner fallback: yes)\n"
         );
         assert_eq!(
             render_review_coverage(&ReviewCoverage {
@@ -417,7 +424,7 @@ mod tests {
                 total_batches: 7,
                 planner_fallback: false,
             }),
-            "coverage: 7/7 source batches (exhaustive; planner fallback: no)\n"
+            "coverage: 7 source batches reviewed directly (exhaustive; planner fallback: no)\n"
         );
     }
 }

@@ -3,12 +3,12 @@
 // Unlike the default mock mode (mock forge + mock model, measuring pipeline
 // fidelity), live mode runs the real release binary against the real fixtures
 // with a real model and no mocked model server. It measures detection ability:
-// detection rate on seeded defects, silence on clean PRs, false positives, the
+// detection rate on authored target defects, silence on clean PRs, false positives, the
 // confidence distribution of true detections, and duration.
 //
 // Each case is run in local diff-file mode:
 //
-//   postil review --diff-file <fixture.diff> --no-post --output-json
+//   postil review --diff-file <fixture.diff> --output-json
 //
 // Local diff-file mode does no forge I/O at all (see src/review.rs run_local),
 // so no GitHub server, mock or real, is needed. MODEL_API_KEY, LLM_API_KEY,
@@ -17,7 +17,7 @@
 // REVIEW_MODEL or --model is required.
 //
 // Scoring uses fixture ground truth: a defect counts as detected when a finding
-// matches the ground-truth path with line within +/-3; severity match is tracked
+// matches the authored ground-truth region; severity match is tracked
 // among detections; clean cases should be silent; any finding in a clean case
 // and any non-matching finding in a defect case is a false positive.
 //
@@ -29,11 +29,13 @@ import { execFile as execFileCb } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { API_KEY_ENV_NAMES_TEXT, forwardApiKey, resolveApiKeyName } from "./api-key";
 import { benchmarkCase, type BenchmarkCaseInput, envelopeV1, type Envelope } from "./harness";
 
 const execFile = promisify(execFileCb);
+const ADMISSION_API_BASE = "https://openrouter.ai:443/api/v1";
 
 /** Default number of cases run concurrently. Live inference is I/O-bound on the
  * provider, so a small pool cuts wall-clock time without overloading the API.
@@ -46,10 +48,6 @@ const DEFAULT_LIVE_RETRIES = 1;
 
 /** Backoff before the single retry of a transiently-failed case. */
 const RETRY_BACKOFF_MS = 2_000;
-
-/** A defect is detected when a finding hits the right file and is within this
- * many lines of the ground-truth line. */
-const LINE_TOLERANCE = 3;
 
 /** Severity tiers, ordered low to high (mirrors src/envelope.rs: info < warn <
  * error). Used to compute the +/-1-tier adjacency tolerance below. */
@@ -89,12 +87,25 @@ export interface LiveOptions {
   concurrency?: number;
   /** Extra attempts on a transient/provider failure (default 1 = one retry). */
   retries?: number;
+  /** Exercise deterministic risk selection and synthesis for large reviews. */
+  bounded?: boolean;
+}
+
+export function liveReviewArguments(diffPath: string, bounded = false): string[] {
+  return [
+    "review",
+    ...(bounded ? ["--bounded"] : []),
+    "--diff-file",
+    diffPath,
+    "--output-json",
+  ];
 }
 
 interface GroundTruth {
   clean: boolean;
   path: string | null;
-  line: number | null;
+  startLine: number | null;
+  endLine: number | null;
   severity: string | null;
 }
 
@@ -104,7 +115,7 @@ export interface LiveCaseResult {
   type: "defect" | "clean";
   /** A valid v1 envelope was produced and scored. */
   scored: boolean;
-  /** Defect: detected within tolerance. Clean: silent (no findings). */
+  /** Defect: detected at the exact authored region. Clean: silent. */
   detected: boolean | null;
   silent: boolean | null;
   truthSeverity: string | null;
@@ -119,6 +130,7 @@ export interface LiveCaseResult {
   durationMs: number | null;
   promptTokens: number;
   completionTokens: number;
+  reviewCoverage: Envelope["reviewCoverage"] | null;
   exitCode: number | undefined;
   error?: string;
   /** Captured stderr of the binary run. Used internally to classify transient
@@ -129,6 +141,14 @@ export interface LiveCaseResult {
 export interface LiveSummary {
   model: string;
   binary: string;
+  binarySha256: string;
+  fixtureCorpusSha256: string;
+  evaluatorSha256: string;
+  reviewMode: "exhaustive" | "bounded";
+  providerIdentity: "openrouter:managed-routing" | "custom";
+  apiBase: string;
+  apiFormat: string;
+  scorerMode: "disabled";
   ranAt: string;
   totalCases: number;
   defectCases: number;
@@ -174,7 +194,15 @@ export async function runLive(
     );
   }
   const cases = inputs.map((input) => benchmarkCase.parse(input));
+  const provider = liveProvider();
   await assertBinary(options.binary);
+  const binarySha256 = createHash("sha256")
+    .update(await readFile(options.binary))
+    .digest("hex");
+  const fixtureCorpusSha256 = createHash("sha256")
+    .update(JSON.stringify(cases))
+    .digest("hex");
+  const evaluatorSha256 = await evaluatorSourceSha256();
 
   const rootDir = options.rootDir ?? resolve(import.meta.dir, "..", ".runs");
 
@@ -203,7 +231,34 @@ export async function runLive(
       const { stderr: _stderr, ...rest } = result;
       return rest;
     });
-  return { summary: summarize(ordered, options), results: ordered };
+  return {
+    summary: summarize(
+      ordered,
+      options,
+      binarySha256,
+      fixtureCorpusSha256,
+      evaluatorSha256,
+      provider,
+    ),
+    results: ordered,
+  };
+}
+
+async function evaluatorSourceSha256(): Promise<string> {
+  const benchRoot = resolve(fileURLToPath(import.meta.url), "..", "..");
+  const sources = [
+    "fixtures/cases.ts",
+    "src/api-key.ts",
+    "src/harness.ts",
+    "src/live.ts",
+  ];
+  const hash = createHash("sha256");
+  for (const source of sources) {
+    hash.update(`${source}\0`);
+    hash.update(await readFile(join(benchRoot, source)));
+    hash.update("\0");
+  }
+  return hash.digest("hex");
 }
 
 /**
@@ -316,6 +371,7 @@ async function runLiveCase(
     durationMs: null,
     promptTokens: 0,
     completionTokens: 0,
+    reviewCoverage: null,
     exitCode: undefined,
   };
 
@@ -334,10 +390,10 @@ async function runLiveCase(
   try {
     const out = await execFile(
       options.binary,
-      ["review", "--diff-file", diffPath, "--no-post", "--output-json"],
+      liveReviewArguments(diffPath, options.bounded),
       {
         cwd: runDir,
-        env: liveEnv(options.model, homeDir, tmpDir),
+        env: liveEnv(options.model, homeDir, tmpDir, liveProvider()),
         timeout: options.timeoutMs ?? 180_000,
         maxBuffer: 8 * 1024 * 1024,
       },
@@ -363,10 +419,65 @@ async function runLiveCase(
     base.error = `no valid v1 envelope (exit ${exitCode ?? "unknown"})`;
     return base;
   }
+  base.durationMs = parsed.data.durationMs;
+  base.promptTokens = parsed.data.usage.promptTokens;
+  base.completionTokens = parsed.data.usage.completionTokens;
+  const operationalFailure = envelopeOperationalFailure(parsed.data);
+  if (operationalFailure) {
+    base.error = operationalFailure;
+    return base;
+  }
+  base.reviewCoverage = parsed.data.reviewCoverage ?? null;
+  if (options.bounded && c.admission.expectedCoverage !== undefined) {
+    const coverageError = boundedCoverageFailure(c.admission.expectedCoverage, parsed.data);
+    if (coverageError) {
+      base.error = coverageError;
+      return base;
+    }
+  }
   return scoreCase(base, truth, parsed.data);
 }
 
-function liveEnv(model: string, homeDir: string, tmpDir: string): NodeJS.ProcessEnv {
+export function envelopeOperationalFailure(env: Envelope): string | null {
+  const incident = env.modelIncidents.find((candidate) => !candidate.recovered);
+  if (incident) {
+    return `operational envelope: ${incident.phase}/${incident.category}`;
+  }
+  const sentinel = env.findings.find((finding) =>
+    [".postil/provider", ".postil/model-output", ".postil/operational"].includes(finding.path),
+  );
+  if (sentinel) return `operational envelope: sentinel ${sentinel.path}`;
+  if (env.usageAccountingComplete !== true) {
+    return "operational envelope: usage accounting incomplete";
+  }
+  const generatorUsage = env.modelUsage?.some((usage) => usage.role === "reviewGenerator");
+  if (env.modelUsed !== "none (disabled by config)" && !generatorUsage) {
+    return "operational envelope: review generator usage missing";
+  }
+  return null;
+}
+
+interface LiveProvider {
+  identity: "openrouter:managed-routing" | "custom";
+  apiBase: string;
+  apiFormat: string;
+}
+
+function liveProvider(): LiveProvider {
+  const apiBase = process.env.POSTIL_API_BASE ?? ADMISSION_API_BASE;
+  return {
+    identity: apiBase === ADMISSION_API_BASE ? "openrouter:managed-routing" : "custom",
+    apiBase,
+    apiFormat: process.env.POSTIL_API_FORMAT ?? "openai-compatible",
+  };
+}
+
+function liveEnv(
+  model: string,
+  homeDir: string,
+  tmpDir: string,
+  provider: LiveProvider,
+): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     PATH: process.env.PATH,
     CI: "true",
@@ -379,14 +490,49 @@ function liveEnv(model: string, homeDir: string, tmpDir: string): NodeJS.Process
     GIT_CONFIG_NOSYSTEM: "1",
     GIT_TERMINAL_PROMPT: "0",
     REVIEW_MODEL: model,
+    POSTIL_DISABLE_SCORER: "1",
+    POSTIL_API_BASE: provider.apiBase,
+    POSTIL_API_FORMAT: provider.apiFormat,
   };
-  if (process.env.POSTIL_API_BASE) env.POSTIL_API_BASE = process.env.POSTIL_API_BASE;
   forwardApiKey(env);
   return env;
 }
 
 // ---------------------------------------------------------------------------
 // Scoring
+
+export function boundedCoverageFailure(
+  expected: "exhaustive" | "bounded",
+  envelope: Pick<Envelope, "modelUsage" | "reviewCoverage">,
+): string | null {
+  const coverage = envelope.reviewCoverage;
+  if (coverage?.mode !== expected) {
+    return `review coverage mode ${coverage?.mode ?? "missing"} does not match ${expected}`;
+  }
+  if (
+    coverage.totalBatches < 1 ||
+    coverage.selectedBatches < 1 ||
+    coverage.selectedBatches > coverage.totalBatches
+  ) {
+    return "review coverage batch counts are invalid";
+  }
+  const plannerUsage =
+    envelope.modelUsage?.filter((usage) => usage.role === "reviewPlanner").length ?? 0;
+  if (expected === "bounded") {
+    if (coverage.selectedBatches >= coverage.totalBatches) {
+      return "bounded review did not select fewer batches than the full source set";
+    }
+    if (coverage.plannerFallback) {
+      return "bounded review used planner fallback";
+    }
+    if (plannerUsage !== 1) {
+      return `bounded review recorded ${plannerUsage} planner usage event(s), expected 1`;
+    }
+  } else if (coverage.selectedBatches !== coverage.totalBatches || plannerUsage !== 0) {
+    return "exhaustive review did not cover every batch without planner usage";
+  }
+  return null;
+}
 
 function scoreCase(base: LiveCaseResult, truth: GroundTruth, env: Envelope): LiveCaseResult {
   const findings = env.findings;
@@ -401,9 +547,10 @@ function scoreCase(base: LiveCaseResult, truth: GroundTruth, env: Envelope): Liv
     return base;
   }
 
-  const match = findings.find(
-    (f) => f.path === truth.path && Math.abs(f.line - (truth.line as number)) <= LINE_TOLERANCE,
-  );
+  const match = findings.find((finding) =>
+    finding.path === truth.path &&
+    Math.min(finding.line, finding.endLine ?? finding.line) <= truth.endLine! &&
+    Math.max(finding.line, finding.endLine ?? finding.line) >= truth.startLine!);
   base.detected = Boolean(match);
   if (match) {
     base.foundSeverity = match.severity;
@@ -420,11 +567,12 @@ function scoreCase(base: LiveCaseResult, truth: GroundTruth, env: Envelope): Liv
 
 function groundTruthOf(c: ReturnType<typeof benchmarkCase.parse>): GroundTruth {
   const gt = c.groundTruth.findings[0];
-  if (!gt) return { clean: true, path: null, line: null, severity: null };
+  if (!gt) return { clean: true, path: null, startLine: null, endLine: null, severity: null };
   return {
     clean: false,
     path: gt.path,
-    line: gt.line ?? null,
+    startLine: gt.line,
+    endLine: gt.endLine,
     severity: gt.severity ?? null,
   };
 }
@@ -432,7 +580,14 @@ function groundTruthOf(c: ReturnType<typeof benchmarkCase.parse>): GroundTruth {
 // ---------------------------------------------------------------------------
 // Aggregation
 
-function summarize(results: LiveCaseResult[], options: LiveOptions): LiveSummary {
+function summarize(
+  results: LiveCaseResult[],
+  options: LiveOptions,
+  binarySha256: string,
+  fixtureCorpusSha256: string,
+  evaluatorSha256: string,
+  provider: LiveProvider,
+): LiveSummary {
   const defects = results.filter((r) => r.type === "defect");
   const cleans = results.filter((r) => r.type === "clean");
   const scored = results.filter((r) => r.scored);
@@ -458,6 +613,14 @@ function summarize(results: LiveCaseResult[], options: LiveOptions): LiveSummary
   return {
     model: options.model,
     binary: options.binary,
+    binarySha256,
+    fixtureCorpusSha256,
+    evaluatorSha256,
+    reviewMode: options.bounded ? "bounded" : "exhaustive",
+    providerIdentity: provider.identity,
+    apiBase: provider.apiBase,
+    apiFormat: provider.apiFormat,
+    scorerMode: "disabled",
     ranAt: new Date().toISOString(),
     totalCases: results.length,
     defectCases: defects.length,
@@ -502,7 +665,7 @@ function median(sorted: number[]): number | null {
 export function formatLiveReport(report: LiveReport): string {
   const s = report.summary;
   const lines: string[] = [
-    `postil bench (LIVE mode): model ${s.model}`,
+    `postil bench (LIVE ${s.reviewMode} mode): model ${s.model}`,
     `Detection ${s.detectionRate} defects | severity match (exact) ${s.severityMatchExact} | ` +
       `severity match (+/-1 tier) ${s.severityMatchWithinOneTier} | ` +
       `silent-on-clean ${s.silentOnClean} | false-positives ${s.falsePositives}`,

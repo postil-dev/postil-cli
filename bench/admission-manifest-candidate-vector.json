@@ -7,11 +7,12 @@
   "qualificationMaxAgeDays": 30,
   "profiles": [
     {
-      "id": "e050df18c0f82fe6758eafd91c0c8d5b9eaccfe4a6cd0d01ca2edb8fc0a91d09",
+      "id": "24cd24ba19e6125b6c1b152c77c0860efffdc87c2f3db3bc9fb6fb70768e35ce",
       "qualificationSourceSha": "9999999999999999999999999999999999999999",
       "modelDefaultsSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
       "apiBase": "https://openrouter.ai:443/api/v1",
       "benchmarkProviderIdentity": "openrouter:managed-routing",
+      "upstreamProviderIdentity": "test-provider",
       "generatorChain": [
         "provider/one",
         "provider/two"
@@ -42,6 +43,7 @@
       "fixtureSetSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "evaluatorContractSha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "evaluatorRuntimeIdentity": "bun@1.3.14",
+      "evaluatorEvidenceSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
       "reportSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
       "repeatedRuns": 3
     }

@@ -36,6 +36,17 @@ pub enum Command {
     /// Print immutable qualification metadata embedded in this binary.
     #[command(hide = true)]
     QualificationMetadata,
+    /// Run one atomic attribution judgment for candidate qualification.
+    #[cfg(feature = "qualification-candidate")]
+    #[command(hide = true)]
+    AtomicAttribution {
+        /// JSON request file. Sensitive evaluator input is never accepted on argv.
+        #[arg(long)]
+        input: PathBuf,
+        /// Explicit config file for provider selection.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     /// Review a diff: a PR/MR on a forge, or local changes.
     Review {
         /// Code host for remote review. Inferred as github when --repo is set.
@@ -47,9 +58,12 @@ pub enum Command {
         /// Pull/merge request number.
         #[arg(long)]
         pr: Option<u64>,
-        /// Head SHA to report checks against (defaults to the PR head).
+        /// Expected PR head SHA. Publication stops if the head differs.
         #[arg(long)]
         sha: Option<String>,
+        /// Expected target-branch SHA. Publication stops if the target differs.
+        #[arg(long)]
+        base_sha: Option<String>,
         /// Review staged changes (git diff --cached).
         #[arg(long)]
         staged: bool,
@@ -95,9 +109,15 @@ pub enum Command {
         /// Use deterministic semantic synthesis and model-assisted risk selection to cap large reviews at five source batches; report bounded coverage.
         #[arg(long)]
         bounded: bool,
-        /// Do not post comments or checks to the forge; report locally only.
-        #[arg(long)]
+        /// Post review comments and checks to the selected forge. Reviews are local-only by default.
+        #[arg(long, conflicts_with = "no_post")]
+        publish: bool,
+        /// Deprecated compatibility flag. Reviews are local-only by default.
+        #[arg(long, hide = true, conflicts_with = "publish")]
         no_post: bool,
+        /// Leave the merge-gate check pending for a controlling service to complete.
+        #[arg(long, requires = "publish")]
+        defer_gate_check: bool,
     },
     /// Reply to an @postil mention on a pull request or issue (interactive bot).
     Respond {
@@ -123,8 +143,11 @@ pub enum Command {
         config: Option<PathBuf>,
         #[arg(long)]
         model: Option<String>,
-        /// Print the reply instead of posting it.
-        #[arg(long)]
+        /// Post the reply to the selected forge. Replies are printed locally by default.
+        #[arg(long, conflicts_with = "no_post")]
+        publish: bool,
+        /// Deprecated compatibility flag. Replies are local-only by default.
+        #[arg(long, hide = true, conflicts_with = "publish")]
         no_post: bool,
     },
     /// Replay stored envelopes under a candidate config: what would change?
@@ -191,5 +214,113 @@ mod tests {
         assert!(help.contains(
             "Use deterministic semantic synthesis and model-assisted risk selection to cap large reviews at five source batches; report bounded coverage"
         ));
+    }
+
+    #[test]
+    fn review_publication_requires_an_explicit_flag() {
+        let parsed = Cli::try_parse_from([
+            "postil",
+            "review",
+            "--repo",
+            "postil-dev/postil",
+            "--pr",
+            "1",
+        ])
+        .unwrap();
+        let Command::Review { publish, .. } = parsed.command else {
+            panic!("expected review command");
+        };
+        assert!(!publish);
+
+        let parsed = Cli::try_parse_from([
+            "postil",
+            "review",
+            "--repo",
+            "postil-dev/postil",
+            "--pr",
+            "1",
+            "--publish",
+        ])
+        .unwrap();
+        let Command::Review { publish, .. } = parsed.command else {
+            panic!("expected review command");
+        };
+        assert!(publish);
+    }
+
+    #[test]
+    fn deferred_gate_check_is_an_explicit_publication_option() {
+        let parsed = Cli::try_parse_from([
+            "postil",
+            "review",
+            "--repo",
+            "postil-dev/postil",
+            "--pr",
+            "1",
+            "--publish",
+            "--defer-gate-check",
+        ])
+        .unwrap();
+        let Command::Review {
+            defer_gate_check, ..
+        } = parsed.command
+        else {
+            panic!("expected review command");
+        };
+        assert!(defer_gate_check);
+
+        let help = Cli::command()
+            .find_subcommand_mut("review")
+            .expect("review subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--defer-gate-check"));
+    }
+
+    #[test]
+    fn review_accepts_an_expected_target_snapshot() {
+        let parsed = Cli::try_parse_from([
+            "postil",
+            "review",
+            "--repo",
+            "postil-dev/postil",
+            "--pr",
+            "1",
+            "--sha",
+            "aaaaaaaa",
+            "--base-sha",
+            "bbbbbbbb",
+        ])
+        .unwrap();
+        let Command::Review { sha, base_sha, .. } = parsed.command else {
+            panic!("expected review command");
+        };
+        assert_eq!(sha.as_deref(), Some("aaaaaaaa"));
+        assert_eq!(base_sha.as_deref(), Some("bbbbbbbb"));
+
+        let help = Cli::command()
+            .find_subcommand_mut("review")
+            .expect("review subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--base-sha"));
+        assert!(help.contains("Expected target-branch SHA"));
+    }
+
+    #[test]
+    fn publication_flags_are_mutually_exclusive() {
+        assert!(
+            Cli::try_parse_from([
+                "postil",
+                "review",
+                "--repo",
+                "postil-dev/postil",
+                "--pr",
+                "1",
+                "--publish",
+                "--no-post",
+            ])
+            .is_err()
+        );
     }
 }

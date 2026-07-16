@@ -1,12 +1,17 @@
 import { describe, expect, test } from "bun:test";
 import { benchmarkCase, type BenchmarkCase, type Envelope } from "./harness";
+import type { AttributionCallEvidence, AttributionCaseEvidence } from "./attribution";
+import { HOSTED_OPERATION_COST_CAP_MICROS } from "./livemodels";
 import {
   aggregateModel,
   calculateTotalRunCostUsd,
   canonicalPriceMicrosPerMillion,
-  findingHitsSeededRegion,
+  diagnosticEvidence,
+  formatCanonicalDecimal,
   groundTruthOf,
+  parseCanonicalDecimal,
   pricingFromCatalog,
+  pricingFromZdrCatalog,
   qualificationPairId,
   scoreLiveCase,
   toSiteModelAggregate,
@@ -16,6 +21,21 @@ import {
 } from "./livemodels-score";
 
 const pair: QualificationPair = { generatorModel: "provider/generator", scorerModel: "provider/scorer" };
+
+test("canonical decimal formatting normalizes zero at every scale", () => {
+  expect(formatCanonicalDecimal({ coefficient: 0n, scale: 0 })).toBe("0");
+  expect(formatCanonicalDecimal({ coefficient: 0n, scale: 18 })).toBe("0");
+  expect(formatCanonicalDecimal({ coefficient: 289314000n, scale: 6 })).toBe("289.314");
+  expect(parseCanonicalDecimal(formatCanonicalDecimal({ coefficient: 289314000n, scale: 6 }))).toEqual({
+    coefficient: 289314n,
+    scale: 3,
+  });
+});
+
+test("canonical decimal errors include bounded diagnostic context", () => {
+  expect(() => parseCanonicalDecimal("0.000000")).toThrow('received "0.000000"');
+  expect(() => parseCanonicalDecimal("x".repeat(100))).toThrow(`received "${"x".repeat(80)}..."`);
+});
 const prices = new Map<string, ModelPricing>([
   [pair.generatorModel, {
     promptUsdPerToken: 0.000001, completionUsdPerToken: 0.000002,
@@ -44,12 +64,9 @@ function fixture(
       findings: severity === null ? [] : [{
         path: "src/x.ts",
         line: 20,
+        endLine: 20,
         severity,
-        semantics: {
-          positive: ["generated detail must not persist"],
-          negative: ["no generated detail"],
-          failedRemediation: ["the fix does not prevent generated detail"],
-        },
+        targetContract: "generated detail must not persist",
       }],
     },
     modelOutput: { summary: "", findings: [] },
@@ -122,6 +139,7 @@ function envelope(args: {
       completionTokens: modelUsage.reduce((sum, entry) => sum + entry.completionTokens, 0),
     },
     modelUsage,
+    modelIncidents: [],
     reviewCoverage: args.bounded
       ? { mode: "bounded", selectedBatches: 5, totalBatches: 8, plannerFallback: false }
       : { mode: "exhaustive", selectedBatches: 1, totalBatches: 1, plannerFallback: false },
@@ -139,6 +157,27 @@ function score(
   env: Envelope,
   id?: string,
 ): LiveModelCaseResult {
+  const candidates = [...env.findings, ...env.suppressedFindings.map((entry) => entry.finding)];
+  const calls = classification === "clean" ? [] : candidates.flatMap((entry, candidateOrdinal) =>
+    entry.path === "src/x.ts" && entry.line === 20 && entry.body === "generated detail must not persist"
+      ? [{
+          candidateOrdinal: candidateOrdinal + 1,
+          sameDefect: true,
+          requestSha256: "1".repeat(64),
+          responseSha256: ["2".repeat(64)],
+          usageSha256: "3".repeat(64),
+          evidenceSha256: "4".repeat(64),
+        }]
+      : entry.path === "src/x.ts" && entry.line === 20
+        ? [{
+            candidateOrdinal: candidateOrdinal + 1,
+            sameDefect: false,
+            requestSha256: "5".repeat(64),
+            responseSha256: ["6".repeat(64)],
+            usageSha256: "7".repeat(64),
+            evidenceSha256: "8".repeat(64),
+          }]
+        : []);
   return scoreLiveCase({
     case: fixture(classification, id),
     pair,
@@ -147,6 +186,11 @@ function score(
     pricing: prices,
     exitCode: env.gate.failing ? 1 : 0,
     fidelityFailures: [],
+    attribution: {
+      scored: true,
+      detected: calls.some((entry) => entry.sameDefect),
+      calls,
+    } as AttributionCaseEvidence,
   });
 }
 
@@ -173,10 +217,6 @@ describe("fixture contract", () => {
     expect(groundTruthOf(fixture("clean"))).toMatchObject({ classification: "clean", path: null });
   });
 
-  test("attributes only overlapping findings to the seeded defect", () => {
-    expect(findingHitsSeededRegion({ path: "src/x.ts", line: 17 }, 20)).toBe(true);
-    expect(findingHitsSeededRegion({ path: "src/x.ts", line: 16 }, 20)).toBe(false);
-  });
 });
 
 describe("pair scoring", () => {
@@ -199,32 +239,93 @@ describe("pair scoring", () => {
     expect(score("clean", 1, unexpectedPlanner).usageValid).toBe(false);
   });
 
-  test("records final and suppressed detector evidence without generated prose", () => {
+  test("records canonical final and suppressed attribution evidence", () => {
     const result = score("advisory", 1, envelope({
       suppressed: [{ finding: finding("warn"), reason: "confidence" }],
     }));
     expect(result.detected).toBe(true);
     expect(result.findingEvidence).toEqual([{
-      detectorAttribution: "seeded",
+      atomicAttribution: "targetDefect",
       disposition: "suppressed",
       path: "src/x.ts",
       line: 20,
       severity: "warn",
       kind: "risk",
       confidence: 0.9,
-      semanticMatch: true,
     }]);
-    expect(JSON.stringify(result.findingEvidence)).not.toContain("generated prose");
-    expect(JSON.stringify(result.findingEvidence)).not.toContain("generated detail");
   });
 
-  test("requires the seeded detector itself to block and rejects unrelated substitute blockers", () => {
+  test("serializes attribution hashes and metrics without finding or evaluator prose", () => {
+    const input = envelope({ findings: [finding("warn")] });
+    const call = {
+      candidateOrdinal: 1,
+      sameDefect: true,
+      requestSha256: "1".repeat(64),
+      responseSha256: ["2".repeat(64)],
+      usageSha256: "3".repeat(64),
+      evidenceSha256: "4".repeat(64),
+      request: {
+        candidate: {
+          title: "private generated title sentinel",
+          body: "private generated body sentinel",
+        },
+        target: { contract: "private authored target sentinel" },
+      },
+      rawResponses: ["private raw evaluator response sentinel"],
+      reason: "private evaluator reason sentinel",
+    } as unknown as AttributionCallEvidence;
+    const result = scoreLiveCase({
+      case: fixture("advisory"),
+      pair,
+      repeat: 1,
+      envelope: input,
+      pricing: prices,
+      exitCode: 0,
+      fidelityFailures: ["private synthetic path sentinel .postil/model-output:1 generated prose must not persist"],
+      structuredOutputFailures: ["private structured output sentinel generated detail must not persist"],
+      attribution: {
+        scored: true,
+        detected: true,
+        calls: [call],
+        error: "private attribution error sentinel generated detail must not persist",
+      },
+    });
+
+    const serialized = JSON.stringify(result);
+    for (const secretProse of [
+      "generated prose must not persist",
+      "generated detail must not persist",
+      "private generated title sentinel",
+      "private generated body sentinel",
+      "private authored target sentinel",
+      "private raw evaluator response sentinel",
+      "private evaluator reason sentinel",
+      "private synthetic path sentinel",
+      "private structured output sentinel",
+      "private attribution error sentinel",
+    ]) {
+      expect(serialized).not.toContain(secretProse);
+    }
+    expect(result.attributionEvidence).toEqual([{
+      candidateOrdinal: 1,
+      sameDefect: true,
+      requestSha256: "1".repeat(64),
+      responseSha256: ["2".repeat(64)],
+      usageSha256: "3".repeat(64),
+      evidenceSha256: "4".repeat(64),
+    }]);
+    expect(result.fidelityDiagnostics).toMatchObject({ count: 1 });
+    expect(result.structuredOutputDiagnostics).toMatchObject({ count: 1 });
+    expect(result.errorSha256).toMatch(/^[0-9a-f]{64}$/u);
+  });
+
+  test("requires the attributed finding itself to block and rejects unrelated substitute blockers", () => {
     const result = score("mustBlock", 1, envelope({
       findings: [finding("warn"), finding("error", "src/other.ts", 8)],
       gateFailing: true,
     }));
     expect(result.detected).toBe(true);
-    expect(result.seededFinalBlocker).toBe(false);
+    expect(result.attributedFinalBlocker).toBe(false);
     expect(result.unrelatedFinalBlockers).toBe(1);
     expect(result.finalBlocking).toBe(false);
   });
@@ -233,7 +334,7 @@ describe("pair scoring", () => {
     const unrelated = { ...finding("error"), body: "This nearby line only changes formatting." };
     const result = score("mustBlock", 1, envelope({ findings: [unrelated], gateFailing: true }));
     expect(result.detected).toBe(false);
-    expect(result.findingEvidence[0]?.semanticMatch).toBe(false);
+    expect(result.findingEvidence[0]?.atomicAttribution).toBe("unrelated");
   });
 
   test("preserves provider-exact and catalog fallback cost provenance", () => {
@@ -247,11 +348,23 @@ describe("pair scoring", () => {
     expect(catalog.costProvenance).toBe("catalogEstimate");
     expect(catalog.costUsd).toBeCloseTo(0.00028, 8);
   });
+
+  test("normalizes a provider-exact sum whose aligned coefficient ends in zero", () => {
+    const input = envelope({ findings: [finding("warn")] });
+    input.modelUsage![0]!.costProviderDecimal = "0.00011";
+    input.modelUsage![1]!.costProviderDecimal = "0.00019";
+
+    const result = score("advisory", 1, input);
+
+    expect(result.costProvenance).toBe("providerExact");
+    expect(result.costProviderDecimal).toBe("0.0003");
+    expect(result.costUsd).toBeCloseTo(0.0003, 8);
+  });
 });
 
 describe("pair admission", () => {
   test("passes only a repeated complete exact-pair matrix", () => {
-    const aggregate = aggregateModel(pair, passingMatrix(), 3);
+    const aggregate = aggregateModel(pair, passingMatrix(), 3, HOSTED_OPERATION_COST_CAP_MICROS);
     expect(aggregate).toMatchObject({
       id: qualificationPairId(pair),
       casesRun: 183,
@@ -273,15 +386,35 @@ describe("pair admission", () => {
   test("rejects a latency outlier that the mean could hide", () => {
     const matrix = passingMatrix();
     matrix[0]!.durationMs = 187_000;
-    const aggregate = aggregateModel(pair, matrix, 3);
+    const aggregate = aggregateModel(pair, matrix, 3, HOSTED_OPERATION_COST_CAP_MICROS);
     expect(aggregate.passed).toBe(false);
     expect(aggregate.admissionFailures.some((failure) => failure.includes("max latency"))).toBe(true);
+  });
+
+  test("uses the canonical runtime micro-dollar ceiling for every review", () => {
+    const atCap = passingMatrix();
+    atCap[0]!.costUsd = HOSTED_OPERATION_COST_CAP_MICROS / 1_000_000;
+    expect(aggregateModel(
+      pair,
+      atCap,
+      3,
+      HOSTED_OPERATION_COST_CAP_MICROS,
+    ).admissionFailures.some((failure) => failure.includes("hosted operation cap"))).toBe(false);
+
+    const overCap = passingMatrix();
+    overCap[0]!.costUsd = (HOSTED_OPERATION_COST_CAP_MICROS + 1) / 1_000_000;
+    expect(aggregateModel(
+      pair,
+      overCap,
+      3,
+      HOSTED_OPERATION_COST_CAP_MICROS,
+    ).admissionFailures).toContain("1 review(s) exceed the $1.00 hosted operation cap");
   });
 
   test("rejects a complete matrix with the wrong process exit status", () => {
     const matrix = passingMatrix();
     for (const result of matrix) result.exitCode = 2;
-    const aggregate = aggregateModel(pair, matrix, 3);
+    const aggregate = aggregateModel(pair, matrix, 3, HOSTED_OPERATION_COST_CAP_MICROS);
     expect(aggregate.passed).toBe(false);
     expect(aggregate.admissionFailures).toContain("183 process exit fidelity failure(s)");
   });
@@ -289,57 +422,62 @@ describe("pair admission", () => {
   test("fails every attributable quality boundary independently", () => {
     const missedBlock = passingMatrix();
     missedBlock[0] = score("mustBlock", 1, envelope(), "m-0");
-    expect(aggregateModel(pair, missedBlock, 3).admissionFailures.join("\n")).toContain("must-block recall");
+    expect(aggregateModel(pair, missedBlock, 3, HOSTED_OPERATION_COST_CAP_MICROS).admissionFailures.join("\n")).toContain("must-block recall");
 
     const substituteBlock = passingMatrix();
     substituteBlock[0] = score("mustBlock", 1, envelope({
       findings: [finding("warn"), finding("error", "src/other.ts", 1)], gateFailing: true,
     }), "m-0");
-    expect(aggregateModel(pair, substituteBlock, 3).admissionFailures.join("\n")).toContain("final seeded blocking");
+    expect(aggregateModel(pair, substituteBlock, 3, HOSTED_OPERATION_COST_CAP_MICROS).admissionFailures.join("\n")).toContain("final attributed blocking");
 
     const advisoryMisses = passingMatrix();
     advisoryMisses[34] = score("advisory", 1, envelope(), "a-0");
     advisoryMisses[35] = score("advisory", 1, envelope(), "a-1");
-    expect(aggregateModel(pair, advisoryMisses, 3).admissionFailures.join("\n")).toContain("advisory detection");
+    expect(aggregateModel(pair, advisoryMisses, 3, HOSTED_OPERATION_COST_CAP_MICROS).admissionFailures.join("\n")).toContain("advisory detection");
 
     const advisoryBlocks = passingMatrix();
     advisoryBlocks[34] = score("advisory", 1, envelope({ findings: [finding("error")], gateFailing: true }), "a-0");
     advisoryBlocks[35] = score("advisory", 1, envelope({ findings: [finding("error")], gateFailing: true }), "a-1");
-    expect(aggregateModel(pair, advisoryBlocks, 3).admissionFailures.join("\n")).toContain("advisory overblocking");
+    expect(aggregateModel(pair, advisoryBlocks, 3, HOSTED_OPERATION_COST_CAP_MICROS).admissionFailures.join("\n")).toContain("advisory overblocking");
 
     const cleanNoise = passingMatrix();
     cleanNoise[49] = score("clean", 1, envelope({ findings: [finding("warn", "src/other.ts", 1)] }), "c-0");
-    expect(aggregateModel(pair, cleanNoise, 3).admissionFailures.join("\n")).toContain("clean finding false-positive");
+    expect(aggregateModel(pair, cleanNoise, 3, HOSTED_OPERATION_COST_CAP_MICROS).admissionFailures.join("\n")).toContain("clean finding false-positive");
 
     const cleanBlock = passingMatrix();
     cleanBlock[49] = score("clean", 1, envelope({ findings: [finding("error", "src/other.ts", 1)], gateFailing: true }), "c-0");
-    expect(aggregateModel(pair, cleanBlock, 3).admissionFailures.join("\n")).toContain("clean false block");
+    expect(aggregateModel(pair, cleanBlock, 3, HOSTED_OPERATION_COST_CAP_MICROS).admissionFailures.join("\n")).toContain("clean false block");
   });
 
   test("fails incomplete, single-run, fidelity, structured-output, and accounting results", () => {
-    expect(aggregateModel(pair, passingMatrix(1), 1).admissionFailures.join("\n")).toContain("at least 3");
+    expect(aggregateModel(pair, passingMatrix(1), 1, HOSTED_OPERATION_COST_CAP_MICROS).admissionFailures.join("\n")).toContain("at least 3");
 
     const incomplete = passingMatrix();
     incomplete.pop();
-    expect(aggregateModel(pair, incomplete, 3).admissionFailures.join("\n")).toContain("matrix is");
+    expect(aggregateModel(pair, incomplete, 3, HOSTED_OPERATION_COST_CAP_MICROS).admissionFailures.join("\n")).toContain("matrix is");
 
     const fidelity = passingMatrix();
-    fidelity[0]!.fidelityFailures.push("statusline mismatch");
-    expect(aggregateModel(pair, fidelity, 3).admissionFailures.join("\n")).toContain("pipeline fidelity");
+    fidelity[0]!.fidelityDiagnostics = diagnosticEvidence(["statusline mismatch"]);
+    expect(aggregateModel(pair, fidelity, 3, HOSTED_OPERATION_COST_CAP_MICROS).admissionFailures.join("\n")).toContain("pipeline fidelity");
 
     const structured = passingMatrix();
-    structured[0]!.structuredOutputFailures.push("scorer mismatch");
-    expect(aggregateModel(pair, structured, 3).admissionFailures.join("\n")).toContain("structured-output");
+    structured[0]!.structuredOutputDiagnostics = diagnosticEvidence(["scorer mismatch"]);
+    expect(aggregateModel(pair, structured, 3, HOSTED_OPERATION_COST_CAP_MICROS).admissionFailures.join("\n")).toContain("structured-output");
 
     const usageFailure = passingMatrix();
     usageFailure[0]!.usageValid = false;
-    expect(aggregateModel(pair, usageFailure, 3).admissionFailures.join("\n")).toContain("usage accounting");
+    expect(aggregateModel(pair, usageFailure, 3, HOSTED_OPERATION_COST_CAP_MICROS).admissionFailures.join("\n")).toContain("usage accounting");
   });
 });
 
 describe("report and pricing utilities", () => {
   test("site aggregate identifies the exact pair and attributable metrics", () => {
-    const site = toSiteModelAggregate(aggregateModel(pair, passingMatrix(), 3));
+    const site = toSiteModelAggregate(aggregateModel(
+      pair,
+      passingMatrix(),
+      3,
+      HOSTED_OPERATION_COST_CAP_MICROS,
+    ));
     expect(site).toEqual({
       id: qualificationPairId(pair),
       generatorModel: pair.generatorModel,
@@ -365,6 +503,43 @@ describe("report and pricing utilities", () => {
       pricing: { prompt: "0.000001", completion: "0.000002" },
     }] }, [pair.generatorModel]);
     expect(catalog.get(pair.generatorModel)).toEqual(prices.get(pair.generatorModel));
+  });
+
+  test("selects only the exact pinned live ZDR provider for each managed model", () => {
+    const catalog = pricingFromZdrCatalog({ data: [
+      {
+        model_id: pair.generatorModel,
+        provider_name: "Offline cheapest",
+        status: -2,
+        pricing: { prompt: "0.000000435", completion: "0.00000087" },
+      },
+      {
+        model_id: pair.generatorModel,
+        provider_name: "Prompt cheap",
+        status: 0,
+        pricing: { prompt: "0.000001", completion: "0.000004" },
+      },
+      {
+        model_id: pair.generatorModel,
+        provider_name: "DeepInfra",
+        status: 0,
+        pricing: { prompt: "0.0000013", completion: "0.0000026" },
+      },
+      {
+        model_id: pair.generatorModel,
+        provider_name: "Completion cheap",
+        status: 0,
+        pricing: { prompt: "0.000003", completion: "0.000001" },
+      },
+    ] }, [pair.generatorModel], "DeepInfra");
+
+    expect(catalog.get(pair.generatorModel)).toEqual({
+      providerIdentity: "DeepInfra",
+      promptUsdPerToken: 0.0000013,
+      completionUsdPerToken: 0.0000026,
+      inputMicrosPerMillionTokens: 1_300_000,
+      outputMicrosPerMillionTokens: 2_600_000,
+    });
   });
 
   test("rejects duplicate requested catalog ids and canonical aliases before pricing", () => {
