@@ -91,7 +91,8 @@ jobs:
           # Keyless Sigstore signature + certificate (provenance / authenticity).
           # Verify later with:
           #   cosign verify-blob "$art" --signature "$art.sig" --certificate "$art.pem" \
-          #     --certificate-identity-regexp 'https://github.com/postil-dev/postil-cli/\.github/workflows/release\.yml@refs/tags/.*' \
+          #     --certificate-identity "https://github.com/postil-dev/postil-cli/.github/workflows/release.yml@refs/tags/$RELEASE" \
+          #     --certificate-github-workflow-sha "$CLI_REF" \
           #     --certificate-oidc-issuer https://token.actions.githubusercontent.com
           cosign sign-blob --yes \
             --output-signature "$art.sig" \
