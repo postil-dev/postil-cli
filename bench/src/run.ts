@@ -53,6 +53,8 @@ import {
   formatLiveModelsReport,
   liveModelsQualificationExitCode,
   MANAGED_OPENROUTER_PROVIDER_IDENTITY,
+  managedAdmissionCapacityFailure,
+  managedAdmissionCapacityFailureCategories,
   parseLiveModelsReport,
   parsePrivateEvidenceBundle,
   parseQualificationPairs,
@@ -87,6 +89,7 @@ const LIVE_MODELS_FAILURE_CATEGORIES = [
   "subprocess-timeout",
   "subprocess-signal",
   "subprocess-exit",
+  ...managedAdmissionCapacityFailureCategories,
 ] as const;
 
 type LiveModelsFailureCategory = typeof LIVE_MODELS_FAILURE_CATEGORIES[number] | `provider-http-${number}`;
@@ -107,7 +110,7 @@ export interface LiveModelsFailureReport {
     exitCode: number | null;
     signal: string | null;
     killed: boolean | null;
-    phase: "attribution" | "unknown";
+    phase: "attribution" | "preflight" | "unknown";
     providerAttemptCount: number | null;
     identityPresent: boolean | null;
     identityMatched: boolean | null;
@@ -307,7 +310,8 @@ export function parseLiveModelsFailureReport(value: unknown): LiveModelsFailureR
       !(value.process.exitCode === null || (Number.isSafeInteger(value.process.exitCode) && (value.process.exitCode as number) >= 0)) ||
       !(value.process.signal === null || (typeof value.process.signal === "string" && /^[A-Z0-9]+$/u.test(value.process.signal))) ||
       !isOptionalBoolean(value.process.killed) ||
-      (value.process.phase !== "attribution" && value.process.phase !== "unknown") ||
+      (value.process.phase !== "attribution" && value.process.phase !== "preflight" &&
+        value.process.phase !== "unknown") ||
       !(value.process.providerAttemptCount === null ||
         (Number.isSafeInteger(value.process.providerAttemptCount) && (value.process.providerAttemptCount as number) >= 0)) ||
       !isOptionalBoolean(value.process.identityPresent) || !isOptionalBoolean(value.process.identityMatched) ||
@@ -320,10 +324,36 @@ export function parseLiveModelsFailureReport(value: unknown): LiveModelsFailureR
   if (value.process.usageAccountingComplete === true && value.process.usagePresent !== true) {
     throw new Error("invalid live-models failure process facts");
   }
+  const managedAdmissionCategory =
+    (managedAdmissionCapacityFailureCategories as readonly string[]).includes(category as string);
+  const hasSubprocessFacts = value.process.exitCode !== null || value.process.signal !== null ||
+    value.process.killed !== null || value.process.providerAttemptCount !== null ||
+    value.process.identityPresent !== null || value.process.identityMatched !== null ||
+    value.process.usagePresent !== null || value.process.usageAccountingComplete !== null;
+  if ((managedAdmissionCategory && (value.process.phase !== "preflight" || hasSubprocessFacts)) ||
+      (value.process.phase === "preflight" && !managedAdmissionCategory) ||
+      (value.process.phase === "unknown" && hasSubprocessFacts)) {
+    throw new Error("invalid live-models failure process facts");
+  }
   return value as unknown as LiveModelsFailureReport;
 }
 
 function fixedLiveModelsFailure(error: unknown): LiveModelsFailureReport["process"] {
+  const capacity = managedAdmissionCapacityFailure(error);
+  if (capacity !== null) {
+    return {
+      category: capacity.category,
+      exitCode: null,
+      signal: null,
+      killed: null,
+      phase: "preflight",
+      providerAttemptCount: null,
+      identityPresent: null,
+      identityMatched: null,
+      usagePresent: null,
+      usageAccountingComplete: null,
+    };
+  }
   const transport = atomicAttributionTransportFailure(error);
   if (transport === null) {
     return {

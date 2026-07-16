@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { chmod, link, lstat, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
@@ -9,6 +10,7 @@ import { benchmarkCase, type BenchmarkCase } from "./harness";
 import type { AttributionCallEvidence } from "./attribution";
 import {
   admissionManifestCandidate,
+  assertManagedAdmissionCapacityPreflight,
   assertGitTreeSourceAuthority,
   assertPricingProviderIdentity,
   assertExactQualificationFixtures,
@@ -50,6 +52,10 @@ import {
 } from "./livemodels-score";
 
 const pair: QualificationPair = { generatorModel: "test/generator", scorerModel: "test/scorer" };
+
+function sha256(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
 
 function git(cwd: string, args: string[]): string {
   const result = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
@@ -815,6 +821,127 @@ describe("pricing transport isolation", () => {
   });
 });
 
+describe("managed admission capacity preflight", () => {
+  const completionApiKey = "completion-secret";
+  const managementApiKey = "management-secret";
+  const expectedCompletionKeySha256 = sha256(completionApiKey);
+
+  test("requires both the completion-key limit and account credits to cover exposure", async () => {
+    const requests: Array<{ url: string; authorization: string | null }> = [];
+    const fetchImpl = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const url = String(input);
+      requests.push({
+        url,
+        authorization: new Headers(init?.headers).get("authorization"),
+      });
+      const data = url.endsWith("/key")
+        ? { data: { is_free_tier: false, limit_remaining: 70 } }
+        : { data: { total_credits: 100, total_usage: 30 } };
+      return Response.json(data);
+    };
+    await expect(assertManagedAdmissionCapacityPreflight({
+      projectedExposureUsdDecimal: "63.907341",
+      completionApiKey,
+      managementApiKey,
+      expectedCompletionKeySha256,
+      fetchImpl,
+    })).resolves.toBeUndefined();
+    expect(requests).toEqual([
+      {
+        url: "https://openrouter.ai/api/v1/key",
+        authorization: `Bearer ${completionApiKey}`,
+      },
+      {
+        url: "https://openrouter.ai/api/v1/credits",
+        authorization: `Bearer ${managementApiKey}`,
+      },
+    ]);
+  });
+
+  test("rejects the wrong completion key before any network request", async () => {
+    let requests = 0;
+    await expect(assertManagedAdmissionCapacityPreflight({
+      projectedExposureUsdDecimal: "1",
+      completionApiKey,
+      managementApiKey,
+      expectedCompletionKeySha256: "0".repeat(64),
+      fetchImpl: async () => {
+        requests += 1;
+        return Response.json({});
+      },
+    })).rejects.toThrow("managed admission completion key fingerprint mismatch");
+    expect(requests).toBe(0);
+  });
+
+  test("fails closed on free, limited, underfunded, and malformed authorities", async () => {
+    const scenarios: Array<{
+      key: unknown;
+      credits: unknown;
+      expected: string;
+    }> = [
+      {
+        key: { data: { is_free_tier: true, limit_remaining: 100 } },
+        credits: { data: { total_credits: 100, total_usage: 0 } },
+        expected: "managed admission completion key is not an enabled paid key",
+      },
+      {
+        key: { data: { is_free_tier: false, limit_remaining: 1 } },
+        credits: { data: { total_credits: 100, total_usage: 0 } },
+        expected: "managed admission completion key limit cannot cover projected exposure",
+      },
+      {
+        key: { data: { is_free_tier: false, limit_remaining: null } },
+        credits: { data: { total_credits: 60, total_usage: 0 } },
+        expected: "managed admission account credits cannot cover projected exposure",
+      },
+      {
+        key: { data: { is_free_tier: false, limit_remaining: null } },
+        credits: { data: { total_credits: "secret", total_usage: 0 } },
+        expected: "managed admission account-credit preflight returned an invalid contract",
+      },
+    ];
+    for (const scenario of scenarios) {
+      const fetchImpl = async (input: string | URL | Request): Promise<Response> =>
+        Response.json(String(input).endsWith("/key") ? scenario.key : scenario.credits);
+      await expect(assertManagedAdmissionCapacityPreflight({
+        projectedExposureUsdDecimal: "63.907341",
+        completionApiKey,
+        managementApiKey,
+        expectedCompletionKeySha256,
+        fetchImpl,
+      })).rejects.toThrow(scenario.expected);
+    }
+  });
+
+  test("reports only bounded authority and status for rejected requests", async () => {
+    let responseCancelled = false;
+    const fetchImpl = async (): Promise<Response> => new Response(
+      new ReadableStream({
+        cancel() {
+          responseCancelled = true;
+        },
+      }),
+      { status: 403 },
+    );
+    let error: Error | undefined;
+    try {
+      await assertManagedAdmissionCapacityPreflight({
+        projectedExposureUsdDecimal: "1",
+        completionApiKey,
+        managementApiKey,
+        expectedCompletionKeySha256,
+        fetchImpl,
+      });
+    } catch (caught) {
+      error = caught as Error;
+    }
+    expect(error?.message).toBe("managed admission completion-key preflight returned HTTP 403");
+    expect(error?.message).not.toContain(completionApiKey);
+    expect(error?.message).not.toContain(managementApiKey);
+    expect(responseCancelled).toBe(true);
+  });
+});
+
 describe("managed admission workflow", () => {
   test("pins OpenRouter and isolates candidate output from the checkout", async () => {
     const workflow = await Bun.file(
@@ -830,6 +957,12 @@ describe("managed admission workflow", () => {
     ));
     expect(workflow).toContain("upstream_provider:");
     expect(workflow).toContain("POSTIL_BENCH_UPSTREAM_PROVIDER: ${{ inputs.upstream_provider }}");
+    expect(workflow).toContain("OPENROUTER_MANAGEMENT_API_KEY: ${{ secrets.OPENROUTER_MANAGEMENT_API_KEY }}");
+    expect(workflow).toContain("OPENROUTER_QUALIFICATION_KEY_SHA256: ${{ secrets.OPENROUTER_QUALIFICATION_KEY_SHA256 }}");
+    expect(workflow).toContain("COMPLETION_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}");
+    expect(workflow.indexOf("Require managed admission capacity secrets")).toBeLessThan(
+      workflow.indexOf("Build release binary"),
+    );
     expect(workflow).toContain('echo "POSTIL_MANIFEST_OUT=${RUNNER_TEMP}/postil-qualified-models-${suffix}.json"');
     expect(workflow).toContain('>> "$GITHUB_ENV"');
     expect(workflow).toContain('test "$GITHUB_REF" = "refs/heads/main"');
