@@ -182,6 +182,7 @@ function buildCase(spec: FixtureSpec): BenchmarkCaseInput {
               confidence: 0.9,
               title: spec.name,
               body: spec.finding.body,
+              evidence: ` ${spec.after}`,
             },
           ]
         : [],

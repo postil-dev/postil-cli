@@ -63,6 +63,7 @@ const modelFinding = z.object({
   confidence: z.number().min(0).max(1),
   title: z.string(),
   body: z.string(),
+  evidence: z.string().min(1),
 });
 
 const modelOutput = z
@@ -411,7 +412,7 @@ async function runCase(
     ...model.requestBodies.flatMap((body, i) =>
       scanForForbidden(c, `model request #${i + 1}`, body, "prompt"),
     ),
-    ...scanForForbidden(c, "envelope output", stdout, "output"),
+    ...scanForForbidden(c, "envelope review prose", modelAuthoredEnvelopeText(envelope), "output"),
     ...github.requests
       .filter((r) => r.body.length > 0)
       .flatMap((r) => scanForForbidden(c, `forge ${r.method} ${r.path}`, r.body, "output")),
@@ -436,6 +437,23 @@ async function runCase(
     failures,
     envelope,
   };
+}
+
+function modelAuthoredEnvelopeText(envelope: Envelope): string {
+  const findingProse = (finding: Envelope["findings"][number]) => ({
+    title: finding.title,
+    body: finding.body,
+    scorerReason: finding.scorerReason,
+  });
+  return JSON.stringify({
+    summary: envelope.summary,
+    findings: envelope.findings.map(findingProse),
+    suppressedFindings: envelope.suppressedFindings.map(({ finding, reason }) => ({
+      finding: findingProse(finding),
+      reason,
+    })),
+    resolved: envelope.resolved.map(findingProse),
+  });
 }
 
 function failedCase(c: BenchmarkCase, runDir: string, failures: string[]): CaseResult {
@@ -723,7 +741,10 @@ async function startMockModel(c: BenchmarkCase, artifactsDir: string) {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(
           JSON.stringify({
-            choices: [{ message: { content: JSON.stringify({ batchIds }) } }],
+            choices: [{
+              finish_reason: "stop",
+              message: { content: JSON.stringify({ batchIds }) },
+            }],
             usage: { prompt_tokens: 20, completion_tokens: 4, total_tokens: 24 },
           }),
         );
@@ -740,7 +761,10 @@ async function startMockModel(c: BenchmarkCase, artifactsDir: string) {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
         JSON.stringify({
-          choices: [{ message: { content: JSON.stringify(output) } }],
+          choices: [{
+            finish_reason: "stop",
+            message: { content: JSON.stringify(output) },
+          }],
           usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
         }),
       );
