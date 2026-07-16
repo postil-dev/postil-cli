@@ -801,6 +801,7 @@ export interface OpenRouterZdrEndpointsResponse {
     provider_name?: string;
     status?: number;
     pricing?: { prompt?: string; completion?: string };
+    supported_parameters?: string[];
   }>;
 }
 
@@ -866,11 +867,20 @@ export function pricingFromZdrCatalog(
   catalog: OpenRouterZdrEndpointsResponse,
   wantedModels: string[],
   expectedProvider: string,
+  requiredParametersByModel: ReadonlyMap<string, readonly string[]> = new Map(),
 ): Map<string, ModelPricing> {
   const wanted = new Set(wantedModels);
   const candidates = new Map<string, Array<ModelPricing & { provider: string }>>();
   for (const endpoint of catalog.data ?? []) {
     if (!wanted.has(endpoint.model_id) || endpoint.status !== 0 || endpoint.provider_name !== expectedProvider) continue;
+    const supportedParameters = endpoint.supported_parameters;
+    const requiredParameters = requiredParametersByModel.get(endpoint.model_id) ?? [];
+    if (requiredParameters.length > 0 &&
+        (!Array.isArray(supportedParameters) ||
+          supportedParameters.some((parameter) => typeof parameter !== "string") ||
+          requiredParameters.some((parameter) => !supportedParameters.includes(parameter)))) {
+      continue;
+    }
     try {
       const promptText = endpoint.pricing?.prompt ?? "";
       const completionText = endpoint.pricing?.completion ?? "";

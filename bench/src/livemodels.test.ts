@@ -36,6 +36,7 @@ import {
   pricingFromFile,
   privateEvidenceSha256,
   qualificationCandidateDocument,
+  qualificationRequiredParameters,
   qualificationProfileDigest,
   readPinnedQualificationWorktreeFile,
   runLiveModels,
@@ -82,6 +83,34 @@ async function close(server: Server): Promise<void> {
 }
 
 describe("pair qualification configuration", () => {
+  test("derives role-specific provider parameters for every model in a profile", () => {
+    expect(qualificationRequiredParameters([{
+      generatorModel: "provider/shared",
+      generatorCascade: ["provider/generator-fallback"],
+      consensus: 2,
+      scorerModel: "provider/shared",
+      scorerCascade: ["provider/scorer-fallback"],
+    }])).toEqual(new Map([
+      ["provider/shared", [
+        "max_tokens",
+        "reasoning",
+        "reasoning_effort",
+        "response_format",
+        "structured_outputs",
+        "temperature",
+      ]],
+      ["provider/generator-fallback", ["max_tokens", "temperature"]],
+      ["provider/scorer-fallback", [
+        "max_tokens",
+        "reasoning",
+        "reasoning_effort",
+        "response_format",
+        "structured_outputs",
+        "temperature",
+      ]],
+    ]));
+  });
+
   test("requires and normalizes exact generator/scorer pairs", () => {
     expect(parseQualificationPairs(" a/generator::b/scorer ")).toEqual([
       {

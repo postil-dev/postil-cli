@@ -131,6 +131,8 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   fixture before inference and records conservative operation exposure in the envelope.
   The completion key must match its pinned fingerprint. Its key limit and the account
   credit authority must each cover the exact projected exposure.
+  The pinned ZDR provider must advertise every request parameter required by each
+  generator and scorer role before its endpoint pricing can enter the exposure plan.
   The qualification metadata exposes the complete admitted profile only when
   the embedded defaults match it exactly. Hosted consensus and scoring reject
   degraded subsets rather than publishing output from an unqualified path.

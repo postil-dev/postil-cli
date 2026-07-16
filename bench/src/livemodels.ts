@@ -597,7 +597,13 @@ export async function runLiveModels(
     evaluatorRuntimeIdentity,
     configHash, apiBase, apiFormat, pairs,
   });
-  const pricing = suppliedPricing ?? (await fetchPricing(apiBase, apiFormat, models, upstreamProvider));
+  const pricing = suppliedPricing ?? (await fetchPricing(
+    apiBase,
+    apiFormat,
+    models,
+    upstreamProvider,
+    qualificationRequiredParameters(pairs),
+  ));
   assertPricingProviderIdentity(pricing, models, upstreamProvider);
   const attributionGovernor = new AttributionGovernor(
     ATTRIBUTION_MAX_CONCURRENCY,
@@ -2153,6 +2159,7 @@ export async function fetchPricing(
   apiFormat: "openai-compatible" | "anthropic",
   models: string[],
   upstreamProvider: string,
+  requiredParametersByModel: ReadonlyMap<string, readonly string[]> = new Map(),
 ): Promise<Map<string, ModelPricing>> {
   const managedOpenRouter = benchmarkProviderIdentityFor(apiBase, apiFormat) !== null;
   const url = `${apiBase.replace(/\/$/, "")}/${managedOpenRouter ? "endpoints/zdr" : "models"}`;
@@ -2174,8 +2181,40 @@ export async function fetchPricing(
   }
   const catalog = await res.json();
   return managedOpenRouter
-    ? pricingFromZdrCatalog(catalog as OpenRouterZdrEndpointsResponse, models, upstreamProvider)
+    ? pricingFromZdrCatalog(
+      catalog as OpenRouterZdrEndpointsResponse,
+      models,
+      upstreamProvider,
+      requiredParametersByModel,
+    )
     : pricingFromCatalog(catalog as OpenRouterModelsResponse, models);
+}
+
+export function qualificationRequiredParameters(
+  pairs: QualificationPair[],
+): ReadonlyMap<string, readonly string[]> {
+  const parameters = new Map<string, Set<string>>();
+  const add = (model: string, required: readonly string[]): void => {
+    const modelParameters = parameters.get(model) ?? new Set<string>();
+    for (const parameter of required) modelParameters.add(parameter);
+    parameters.set(model, modelParameters);
+  };
+  for (const pair of pairs) {
+    for (const model of qualificationGeneratorModels(pair)) {
+      add(model, ["max_tokens", "temperature"]);
+    }
+    for (const model of qualificationScorerModels(pair)) {
+      add(model, [
+        "max_tokens",
+        "reasoning",
+        "reasoning_effort",
+        "response_format",
+        "structured_outputs",
+        "temperature",
+      ]);
+    }
+  }
+  return new Map([...parameters].map(([model, required]) => [model, [...required].sort()]));
 }
 
 export function endpointAuthFromEnvironment(
