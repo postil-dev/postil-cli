@@ -59,6 +59,16 @@ jobs:
             echo "POSTIL_ATTESTATION_BUNDLE_OUT=${RUNNER_TEMP}/postil-qualified-models-${suffix}.attestation.json"
           } >> "$GITHUB_ENV"
 
+      - name: Require managed admission capacity secrets
+        env:
+          COMPLETION_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          MANAGEMENT_API_KEY: ${{ secrets.OPENROUTER_MANAGEMENT_API_KEY }}
+          COMPLETION_KEY_SHA256: ${{ secrets.OPENROUTER_QUALIFICATION_KEY_SHA256 }}
+        run: >-
+          test -n "$COMPLETION_API_KEY" &&
+          test -n "$MANAGEMENT_API_KEY" &&
+          test -n "$COMPLETION_KEY_SHA256"
+
       - name: Build release binary
         run: cargo build --quiet --release --features qualification-candidate
 
@@ -78,6 +88,8 @@ jobs:
         working-directory: bench
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_MANAGEMENT_API_KEY: ${{ secrets.OPENROUTER_MANAGEMENT_API_KEY }}
+          OPENROUTER_QUALIFICATION_KEY_SHA256: ${{ secrets.OPENROUTER_QUALIFICATION_KEY_SHA256 }}
         run: >-
           bun run src/run.ts
           --json-out "$POSTIL_REPORT_OUT"

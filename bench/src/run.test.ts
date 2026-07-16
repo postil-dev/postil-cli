@@ -6,6 +6,7 @@ import {
   parseLiveModelsReport,
   parsePrivateEvidenceBundle,
   privateEvidenceSha256,
+  ManagedAdmissionCapacityError,
   type LiveModelsPrivateEvidenceBundle,
   type LiveModelsReport,
 } from "./livemodels";
@@ -154,6 +155,36 @@ describe("benchmark output lifecycle", () => {
     expect(JSON.stringify(report)).not.toContain("private/path");
   });
 
+  test("reports a fixed managed-admission preflight category without private capacity facts", async () => {
+    const report = await createLiveModelsFailureReport(
+      new ManagedAdmissionCapacityError(
+        "account-preflight-credit-capacity",
+        "managed admission account credits cannot cover projected exposure",
+      ),
+      {
+        qualificationSourceSha: "8".repeat(40),
+        pairs: [{ generatorModel: "deepseek/deepseek-v4-pro", scorerModel: "z-ai/glm-5.2" }],
+        upstreamProvider: "PublicProvider",
+      },
+    );
+    expect(report.process).toEqual({
+      category: "account-preflight-credit-capacity",
+      exitCode: null,
+      signal: null,
+      killed: null,
+      phase: "preflight",
+      providerAttemptCount: null,
+      identityPresent: null,
+      identityMatched: null,
+      usagePresent: null,
+      usageAccountingComplete: null,
+    });
+    const serialized = JSON.stringify(report);
+    for (const forbidden of ["credits", "exposure", "balance", "key", "/private/path"]) {
+      expect(serialized).not.toContain(forbidden);
+    }
+  });
+
   test("does not parse a forged diagnostic tuple from plain error prose", async () => {
     const report = await createLiveModelsFailureReport(
       new Error("category=provider-http-503 identity_present=true usage_complete=true"),
@@ -195,6 +226,25 @@ describe("benchmark output lifecycle", () => {
     expect(() => parseLiveModelsFailureReport({
       ...base,
       process: { ...base.process, identityMatched: false, usageAccountingComplete: true },
+    })).toThrow("invalid live-models failure process facts");
+    expect(() => parseLiveModelsFailureReport({
+      ...base,
+      process: {
+        ...base.process,
+        category: "account-preflight-credit-capacity",
+      },
+    })).toThrow("invalid live-models failure process facts");
+    expect(() => parseLiveModelsFailureReport({
+      ...base,
+      process: {
+        ...base.process,
+        phase: "preflight",
+        providerAttemptCount: null,
+        identityPresent: null,
+        identityMatched: null,
+        usagePresent: null,
+        usageAccountingComplete: null,
+      },
     })).toThrow("invalid live-models failure process facts");
   });
 

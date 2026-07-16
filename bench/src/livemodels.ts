@@ -18,7 +18,7 @@
 // https://openrouter.ai/api/v1.
 
 import { execFile as execFileCb } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { chmod, lstat, mkdir, mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
@@ -95,6 +95,39 @@ const MANAGED_OPENROUTER_API_BASE = "https://openrouter.ai:443/api/v1";
 export const MANAGED_OPENROUTER_PROVIDER_IDENTITY = "openrouter:managed-routing";
 export const LIVE_MODELS_REPORT_SCHEMA_VERSION = 2;
 export const LIVE_MODELS_PRIVATE_EVIDENCE_SCHEMA_VERSION = 1;
+
+export const managedAdmissionCapacityFailureCategories = [
+  "account-preflight-credentials",
+  "account-preflight-key-fingerprint",
+  "account-preflight-key-ineligible",
+  "account-preflight-key-capacity",
+  "account-preflight-credit-capacity",
+  "account-preflight-transport",
+  "account-preflight-contract",
+] as const;
+
+export type ManagedAdmissionCapacityFailureCategory =
+  typeof managedAdmissionCapacityFailureCategories[number];
+
+const managedAdmissionCapacityErrorBrand = Symbol("managed-admission-capacity-error");
+
+export class ManagedAdmissionCapacityError extends Error {
+  readonly [managedAdmissionCapacityErrorBrand] = true;
+
+  constructor(readonly category: ManagedAdmissionCapacityFailureCategory, message: string) {
+    super(message);
+    this.name = "ManagedAdmissionCapacityError";
+  }
+}
+
+export function managedAdmissionCapacityFailure(
+  error: unknown,
+): ManagedAdmissionCapacityError | null {
+  return error instanceof ManagedAdmissionCapacityError &&
+    error[managedAdmissionCapacityErrorBrand] === true
+    ? error
+    : null;
+}
 
 export const REVIEW_CONTRACT_SOURCE_PATHS = [
   "Cargo.toml", "Cargo.lock",
@@ -582,6 +615,14 @@ export async function runLiveModels(
     apiFormat,
     costCapUsdDecimal,
     upstreamProvider,
+  });
+  const keyName = resolveApiKeyName();
+  const completionApiKey = keyName === undefined ? undefined : process.env[keyName];
+  await assertManagedAdmissionCapacityPreflight({
+    projectedExposureUsdDecimal: reservedQualificationExposureUsdDecimal,
+    completionApiKey,
+    managementApiKey: process.env.OPENROUTER_MANAGEMENT_API_KEY,
+    expectedCompletionKeySha256: process.env.OPENROUTER_QUALIFICATION_KEY_SHA256,
   });
 
   const attributionSourceSha256 = hashSanitizedEvidence({
@@ -1367,6 +1408,155 @@ export async function assertRuntimeShapedQualificationPreflight(args: {
     );
   }
   return combinedProjectedUsd;
+}
+
+type ManagedAdmissionFetch = (
+  input: string | URL | Request,
+  init?: RequestInit,
+) => Promise<Response>;
+
+export async function assertManagedAdmissionCapacityPreflight(args: {
+  projectedExposureUsdDecimal: string;
+  completionApiKey: string | undefined;
+  managementApiKey: string | undefined;
+  expectedCompletionKeySha256: string | undefined;
+  fetchImpl?: ManagedAdmissionFetch;
+}): Promise<void> {
+  const completionApiKey = args.completionApiKey;
+  const managementApiKey = args.managementApiKey;
+  const expectedFingerprint = args.expectedCompletionKeySha256?.trim().toLowerCase();
+  if (!completionApiKey || completionApiKey.trim() === "" ||
+      !managementApiKey || managementApiKey.trim() === "" ||
+      expectedFingerprint === undefined || !/^[0-9a-f]{64}$/u.test(expectedFingerprint)) {
+    throw new ManagedAdmissionCapacityError(
+      "account-preflight-credentials",
+      "managed admission capacity credentials are incomplete",
+    );
+  }
+  const actualFingerprint = hashText(completionApiKey);
+  if (!timingSafeEqual(
+    Buffer.from(actualFingerprint, "hex"),
+    Buffer.from(expectedFingerprint, "hex"),
+  )) {
+    throw new ManagedAdmissionCapacityError(
+      "account-preflight-key-fingerprint",
+      "managed admission completion key fingerprint mismatch",
+    );
+  }
+
+  const projectedExposure = parseCanonicalDecimal(args.projectedExposureUsdDecimal);
+  const fetchImpl = args.fetchImpl ?? fetch;
+  const keyResponse = await managedAdmissionJson(
+    fetchImpl,
+    "https://openrouter.ai/api/v1/key",
+    completionApiKey,
+    "completion-key",
+  );
+  const keyData = exactObject(keyResponse, "data", "completion-key");
+  if (keyData.is_free_tier !== false) {
+    throw new ManagedAdmissionCapacityError(
+      "account-preflight-key-ineligible",
+      "managed admission completion key is not an enabled paid key",
+    );
+  }
+  if (keyData.limit_remaining !== null) {
+    const keyRemaining = managedAdmissionCredit(keyData.limit_remaining, "completion-key");
+    if (compareCanonicalDecimals(keyRemaining, projectedExposure) < 0) {
+      throw new ManagedAdmissionCapacityError(
+        "account-preflight-key-capacity",
+        "managed admission completion key limit cannot cover projected exposure",
+      );
+    }
+  }
+
+  const creditsResponse = await managedAdmissionJson(
+    fetchImpl,
+    "https://openrouter.ai/api/v1/credits",
+    managementApiKey,
+    "account-credit",
+  );
+  const creditsData = exactObject(creditsResponse, "data", "account-credit");
+  const totalCredits = managedAdmissionCredit(creditsData.total_credits, "account-credit");
+  const totalUsage = managedAdmissionCredit(creditsData.total_usage, "account-credit");
+  if (compareCanonicalDecimals(totalCredits, totalUsage) < 0) {
+    throw new ManagedAdmissionCapacityError(
+      "account-preflight-credit-capacity",
+      "managed admission account credits cannot cover projected exposure",
+    );
+  }
+  const accountRemaining = subtractCanonicalDecimal(totalCredits, totalUsage);
+  if (compareCanonicalDecimals(accountRemaining, projectedExposure) < 0) {
+    throw new ManagedAdmissionCapacityError(
+      "account-preflight-credit-capacity",
+      "managed admission account credits cannot cover projected exposure",
+    );
+  }
+}
+
+async function managedAdmissionJson(
+  fetchImpl: ManagedAdmissionFetch,
+  url: string,
+  apiKey: string,
+  authority: string,
+): Promise<Record<string, unknown>> {
+  let response: Response;
+  try {
+    response = await fetchImpl(url, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${apiKey}` },
+      redirect: "error",
+      signal: AbortSignal.timeout(15_000),
+    });
+  } catch {
+    throw new ManagedAdmissionCapacityError(
+      "account-preflight-transport",
+      `managed admission ${authority} preflight request failed`,
+    );
+  }
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => undefined);
+    throw new ManagedAdmissionCapacityError(
+      "account-preflight-transport",
+      `managed admission ${authority} preflight returned HTTP ${response.status}`,
+    );
+  }
+  try {
+    const value: unknown = await response.json();
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error("invalid response");
+    }
+    return value as Record<string, unknown>;
+  } catch {
+    throw new ManagedAdmissionCapacityError(
+      "account-preflight-contract",
+      `managed admission ${authority} preflight returned invalid JSON`,
+    );
+  }
+}
+
+function exactObject(
+  value: Record<string, unknown>,
+  field: string,
+  authority: string,
+): Record<string, unknown> {
+  const nested = value[field];
+  if (nested === null || typeof nested !== "object" || Array.isArray(nested)) {
+    throw new ManagedAdmissionCapacityError(
+      "account-preflight-contract",
+      `managed admission ${authority} preflight returned an invalid contract`,
+    );
+  }
+  return nested as Record<string, unknown>;
+}
+
+function managedAdmissionCredit(value: unknown, authority: string): CanonicalDecimal {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new ManagedAdmissionCapacityError(
+      "account-preflight-contract",
+      `managed admission ${authority} preflight returned an invalid contract`,
+    );
+  }
+  return parseCanonicalDecimal(String(value));
 }
 
 /** Environment for a live-models run: an isolated HOME/TMPDIR/XDG so the binary

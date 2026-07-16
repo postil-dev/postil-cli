@@ -129,6 +129,8 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   planner, exact serialized-request preflight, price ceilings, consensus, and scorer
   code as a deployed admitted profile. Runtime-shaped preflight evidence covers every
   fixture before inference and records conservative operation exposure in the envelope.
+  The completion key must match its pinned fingerprint. Its key limit and the account
+  credit authority must each cover the exact projected exposure.
   The qualification metadata exposes the complete admitted profile only when
   the embedded defaults match it exactly. Hosted consensus and scoring reject
   degraded subsets rather than publishing output from an unqualified path.
