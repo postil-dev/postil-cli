@@ -1,5 +1,7 @@
 use clap::Parser;
 
+#[cfg(feature = "qualification-candidate")]
+use postil_cli::attribution;
 use postil_cli::cli::{Cli, Command, ForgeArg, HookAction};
 use postil_cli::config::{Config, qualification_metadata, starter_config};
 use postil_cli::review::{ForgeKind, ReviewArgs};
@@ -23,6 +25,10 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
         Command::QualificationMetadata => {
             println!("{}", serde_json::to_string(&qualification_metadata())?);
             Ok(0)
+        }
+        #[cfg(feature = "qualification-candidate")]
+        Command::AtomicAttribution { input, config } => {
+            attribution::run(&input, config.as_deref()).await
         }
         Command::Review {
             forge,

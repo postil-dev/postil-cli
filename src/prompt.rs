@@ -2,11 +2,11 @@
 
 use crate::config::Config;
 
-/// Hard validator boundary for scorer assessment text.
+/// Hard validator boundaries for scorer assessment text.
+pub(crate) const SCORER_REASON_MAX_CHARS: usize = 60;
 pub(crate) const SCORER_REASON_MAX_BYTES: usize = 240;
-/// Lower prompt target that leaves room for modest model overshoot.
-pub(crate) const SCORER_REASON_PROMPT_MAX_BYTES: usize = 180;
-const _: () = assert!(SCORER_REASON_PROMPT_MAX_BYTES < SCORER_REASON_MAX_BYTES);
+pub(crate) const SCORER_REASON_JSON_PATTERN: &str = r"^(?:[.!?。！？]|[^\s\u0000-\u001F\u007F-\u009F\u2028\u2029](?:[^\u0000-\u001F\u007F-\u009F\u2028\u2029]*[.!?。！？]))$";
+const _: () = assert!(SCORER_REASON_MAX_BYTES >= SCORER_REASON_MAX_CHARS * 4);
 
 pub struct PrContext<'a> {
     pub repo: Option<&'a str>,
@@ -167,18 +167,21 @@ pub fn scorer_system_prompt(cfg: &Config) -> String {
         "--- END POSTIL REVIEW CONTRACT ---\n\
          \n\
          Return ONLY a JSON array, no markdown fences, no prose. The array MUST contain \
-         exactly one object per supplied finding:\n\
-         [{{\"index\": <number>, \"confidence\": <0..1>, \
+         exactly one object per supplied finding, in the same order as the input:\n\
+         [{{\"confidence\": <0..1>, \
          \"kind\": \"risk|humanEscalation|guardrail|uncertainty|contentPolicy\", \
-         \"reason\": \"concise single-line text of at most {SCORER_REASON_PROMPT_MAX_BYTES} UTF-8 bytes\"}}]\n\
+         \"reason\": \"concise single-line text of at most {SCORER_REASON_MAX_CHARS} Unicode characters and {SCORER_REASON_MAX_BYTES} UTF-8 bytes\"}}]\n\
          \n\
-         The `kind` value is a finding category. `info`, `warn`, and `error` are \
+         Array position is the finding index. Do not emit an `index` field. The `kind` \
+         value is a finding category. `info`, `warn`, and `error` are \
          severities and are NEVER valid kind values. An ordinary concrete defect is \
          `risk`, even when a focused test is needed to confirm it. Use \
          `humanEscalation` only when multiple valid outcomes remain and an accountable \
          owner must choose among them. Every `reason` must be concise single-line text, \
-         end with sentence punctuation, contain no line breaks, and contain \
-         at most {SCORER_REASON_PROMPT_MAX_BYTES} UTF-8 bytes.\n\
+         start with a non-whitespace character, end with sentence punctuation, \
+         contain no control characters or line separators, and contain \
+         at most {SCORER_REASON_MAX_CHARS} Unicode characters and \
+         {SCORER_REASON_MAX_BYTES} UTF-8 bytes.\n\
          \n\
          The input intentionally omits the generator's original confidence and kind. Do \
          not infer them from absence; score independently from the finding text and local \
@@ -380,12 +383,12 @@ mod tests {
     }
 
     #[test]
-    fn scorer_prompt_targets_headroom_below_the_hard_reason_limit() {
+    fn scorer_prompt_states_the_exact_reason_limits() {
         let prompt = scorer_system_prompt(&Config::default());
         assert!(prompt.contains(&format!(
-            "at most {SCORER_REASON_PROMPT_MAX_BYTES} UTF-8 bytes"
+            "at most {SCORER_REASON_MAX_CHARS} Unicode characters and \
+             {SCORER_REASON_MAX_BYTES} UTF-8 bytes"
         )));
-        assert!(!prompt.contains(&format!("at most {SCORER_REASON_MAX_BYTES} UTF-8 bytes")));
     }
 
     #[test]

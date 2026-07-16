@@ -52,6 +52,27 @@ impl std::fmt::Display for IncompleteReviewInput {
 
 impl std::error::Error for IncompleteReviewInput {}
 
+#[derive(Debug)]
+pub struct RepositoryIdentityFailure(pub String);
+
+impl std::fmt::Display for RepositoryIdentityFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RepositoryIdentityFailure {}
+
+pub fn repository_identity_failure(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(RepositoryIdentityFailure(message.into()))
+}
+
+pub fn is_repository_identity_failure(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<RepositoryIdentityFailure>().is_some())
+}
+
 pub fn service_failure(message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(ForgeServiceFailure(message.into()))
 }

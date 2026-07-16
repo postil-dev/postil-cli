@@ -38,6 +38,7 @@ const REVIEW_CONTRACT_SOURCES: &[(&str, &str)] = &[
     ("src/output.rs", include_str!("output.rs")),
     ("src/plan.rs", include_str!("plan.rs")),
     ("src/prompt.rs", include_str!("prompt.rs")),
+    ("src/attribution.rs", include_str!("attribution.rs")),
     ("src/llm.rs", include_str!("llm.rs")),
     ("src/envelope.rs", include_str!("envelope.rs")),
     ("src/respond.rs", include_str!("respond.rs")),
@@ -62,10 +63,18 @@ const EVALUATOR_CONTRACT_SOURCES: &[(&str, &str)] = &[
     ),
     ("bench/package.json", BENCH_PACKAGE_JSON),
     ("bench/bun.lock", BENCH_BUN_LOCK),
+    (
+        "bench/fixtures/attribution-bank.ts",
+        include_str!("../bench/fixtures/attribution-bank.ts"),
+    ),
     ("bench/fixtures/cases.ts", BENCH_FIXTURES_SOURCE),
     (
         "bench/src/api-key.ts",
         include_str!("../bench/src/api-key.ts"),
+    ),
+    (
+        "bench/src/attribution.ts",
+        include_str!("../bench/src/attribution.ts"),
     ),
     (
         "bench/src/harness.ts",
@@ -152,6 +161,7 @@ pub struct QualificationProfile {
     pub api_base: String,
     #[serde(default)]
     pub benchmark_provider_identity: Option<String>,
+    pub upstream_provider_identity: String,
     pub generator_chain: Vec<String>,
     pub consensus: usize,
     pub scorer_chain: Vec<String>,
@@ -160,6 +170,7 @@ pub struct QualificationProfile {
     pub fixture_set_sha256: String,
     pub evaluator_contract_sha256: String,
     pub evaluator_runtime_identity: String,
+    pub evaluator_evidence_sha256: String,
     pub report_sha256: String,
     pub repeated_runs: u32,
 }
@@ -176,6 +187,7 @@ pub struct ModelPriceBound {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct QualificationCandidateProfile {
     pub benchmark_provider_identity: String,
+    pub upstream_provider_identity: String,
     pub api_base: String,
     pub api_format: ApiFormat,
     pub generator_chain: Vec<String>,
@@ -190,6 +202,7 @@ struct QualificationProfileDigestMaterial<'a> {
     qualification_source_sha: &'a str,
     model_defaults_sha256: &'a str,
     benchmark_provider_identity: &'a Option<String>,
+    upstream_provider_identity: &'a str,
     api_base: &'a str,
     api_format: ApiFormat,
     generator_chain: &'a [String],
@@ -200,6 +213,7 @@ struct QualificationProfileDigestMaterial<'a> {
     fixture_set_sha256: &'a str,
     evaluator_contract_sha256: &'a str,
     evaluator_runtime_identity: &'a str,
+    evaluator_evidence_sha256: &'a str,
     report_sha256: &'a str,
     repeated_runs: u32,
 }
@@ -506,6 +520,10 @@ fn parse_qualification_manifest(raw: &str) -> Result<QualificationManifest> {
             "qualification profile scorer chain must not be empty"
         );
         anyhow::ensure!(
+            !profile.upstream_provider_identity.trim().is_empty(),
+            "qualification profile upstream provider identity must not be empty"
+        );
+        anyhow::ensure!(
             (1..=profile.generator_chain.len()).contains(&profile.consensus),
             "qualification profile consensus must fit its generator chain"
         );
@@ -546,6 +564,10 @@ fn parse_qualification_manifest(raw: &str) -> Result<QualificationManifest> {
             (
                 "evaluatorContractSha256",
                 &profile.evaluator_contract_sha256,
+            ),
+            (
+                "evaluatorEvidenceSha256",
+                &profile.evaluator_evidence_sha256,
             ),
             ("reportSha256", &profile.report_sha256),
         ] {
@@ -759,6 +781,7 @@ fn qualification_profile_digest(profile: &QualificationProfile) -> String {
         qualification_source_sha: &profile.qualification_source_sha,
         model_defaults_sha256: &profile.model_defaults_sha256,
         benchmark_provider_identity: &profile.benchmark_provider_identity,
+        upstream_provider_identity: &profile.upstream_provider_identity,
         api_base: &profile.api_base,
         api_format: profile.api_format,
         generator_chain: &profile.generator_chain,
@@ -769,6 +792,7 @@ fn qualification_profile_digest(profile: &QualificationProfile) -> String {
         fixture_set_sha256: &profile.fixture_set_sha256,
         evaluator_contract_sha256: &profile.evaluator_contract_sha256,
         evaluator_runtime_identity: &profile.evaluator_runtime_identity,
+        evaluator_evidence_sha256: &profile.evaluator_evidence_sha256,
         report_sha256: &profile.report_sha256,
         repeated_runs: profile.repeated_runs,
     };
@@ -1515,6 +1539,10 @@ fn qualification_candidate_profile() -> Result<Option<QualificationCandidateProf
         profile.benchmark_provider_identity == MANAGED_OPENROUTER_PROVIDER_IDENTITY,
         "qualification candidate profile must use the managed provider identity"
     );
+    validate_model_id(
+        "qualification candidate upstreamProviderIdentity",
+        &profile.upstream_provider_identity,
+    )?;
     anyhow::ensure!(
         normalize_api_base(&profile.api_base)? == MANAGED_OPENROUTER_API_BASE
             && profile.api_base == MANAGED_OPENROUTER_API_BASE
@@ -1768,6 +1796,7 @@ mod tests {
                 "apiFormat": "openai-compatible",
                 "apiBase": "https://openrouter.ai:443/api/v1",
                 "benchmarkProviderIdentity": MANAGED_OPENROUTER_PROVIDER_IDENTITY,
+                "upstreamProviderIdentity": "test-provider",
                 "generatorChain": ["provider/model"],
                 "consensus": 1,
                 "scorerChain": ["provider/scorer"],
@@ -1787,6 +1816,7 @@ mod tests {
                 "fixtureSetSha256": fixture_set_sha256(),
                 "evaluatorContractSha256": evaluator_contract_sha256(),
                 "evaluatorRuntimeIdentity": evaluator_runtime_identity(),
+                "evaluatorEvidenceSha256": "2".repeat(64),
                 "reportSha256": "1".repeat(64),
                 "repeatedRuns": 3
             }]
@@ -2473,6 +2503,7 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
             qualification_source_sha: "9".repeat(40),
             model_defaults_sha256: "c".repeat(64),
             benchmark_provider_identity: Some(MANAGED_OPENROUTER_PROVIDER_IDENTITY.into()),
+            upstream_provider_identity: "test-provider".into(),
             api_base: "https://openrouter.ai:443/api/v1".into(),
             api_format: ApiFormat::OpenaiCompatible,
             generator_chain: vec!["provider/one".into(), "provider/two".into()],
@@ -2499,12 +2530,13 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
             fixture_set_sha256: "a".repeat(64),
             evaluator_contract_sha256: "f".repeat(64),
             evaluator_runtime_identity: "bun@1.3.14".into(),
+            evaluator_evidence_sha256: "e".repeat(64),
             report_sha256: "e".repeat(64),
             repeated_runs: 3,
         };
         assert_eq!(
             qualification_profile_digest(&profile),
-            "e050df18c0f82fe6758eafd91c0c8d5b9eaccfe4a6cd0d01ca2edb8fc0a91d09"
+            "24cd24ba19e6125b6c1b152c77c0860efffdc87c2f3db3bc9fb6fb70768e35ce"
         );
     }
 
@@ -2567,6 +2599,7 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
             api_format: ApiFormat::OpenaiCompatible,
             api_base: "https://models.example:443/v1".into(),
             benchmark_provider_identity: Some("provider-route".into()),
+            upstream_provider_identity: "test-provider".into(),
             generator_chain: vec!["provider/generator".into(), "provider/fallback".into()],
             consensus: 1,
             scorer_chain: vec!["provider/scorer".into(), "provider/scorer-fallback".into()],
@@ -2596,6 +2629,7 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
             fixture_set_sha256: "c".repeat(64),
             evaluator_contract_sha256: "d".repeat(64),
             evaluator_runtime_identity: "bun@1.3.14".into(),
+            evaluator_evidence_sha256: "f".repeat(64),
             report_sha256: "e".repeat(64),
             repeated_runs: 3,
         };

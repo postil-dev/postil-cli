@@ -25,20 +25,12 @@ const execFile = promisify(execFileCb);
 
 export const severity = z.enum(["info", "warn", "error"]);
 
-export const semanticPropositions = z.object({
-  // These fixture-owned phrases are part of the signed evaluator contract.
-  // Matching is intentionally conservative: unlisted wording may be rejected,
-  // while a known inverse or remediation always takes precedence.
-  positive: z.array(z.string().trim().min(2)).min(1),
-  negative: z.array(z.string().trim().min(2)).min(1),
-  failedRemediation: z.array(z.string().trim().min(2)).min(1),
-});
-
 const expectedFinding = z.object({
   path: z.string(),
-  line: z.number().int().positive().optional(),
+  line: z.number().int().positive(),
+  endLine: z.number().int().positive(),
   severity: severity.optional(),
-  semantics: semanticPropositions.optional(),
+  targetContract: z.string().trim().min(8),
 });
 
 const fixtureFile = z.object({
@@ -529,7 +521,7 @@ export async function startMockGithub(c: BenchmarkCase) {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(
           JSON.stringify({
-            title: c.name,
+            title: "Benchmark pull request",
             body: "",
             state: "open",
             merged: false,
@@ -649,7 +641,6 @@ export function parseUnifiedDiffFiles(diff: string): ParsedUnifiedDiffFile[] {
       path,
       status: oldHeader === "--- /dev/null" ? "added" : newHeader === "+++ /dev/null" ? "removed" : "modified",
       patch,
-      changes: versions.changes,
       ...versions,
     };
   });
@@ -1135,9 +1126,9 @@ function evaluateExpectations(
   for (const required of expectations.requiredFindings) {
     const match = env.findings.some((finding) => {
       if (finding.path !== required.path) return false;
-      if (required.line !== undefined && finding.line !== required.line) return false;
+      if (finding.line !== required.line) return false;
       if (required.severity !== undefined && finding.severity !== required.severity) return false;
-      return commentMatchesExpectation(finding.body, required.semantics);
+      return finding.body === required.targetContract;
     });
     if (!match) {
       failures.push(`missing required finding in ${required.path}`);
@@ -1180,7 +1171,7 @@ function scoreFindings(
     if (want.line !== undefined && finding.line === want.line) {
       fileLineMatches += 1;
     }
-    if (commentMatchesExpectation(finding.body, want.semantics)) {
+    if (finding.body === want.targetContract) {
       commentUsefulness += 1;
     }
   }
@@ -1193,31 +1184,6 @@ function scoreFindings(
     fileLineMatches,
     commentUsefulness,
   };
-}
-
-export type SemanticPropositions = z.infer<typeof semanticPropositions>;
-
-export function commentMatchesExpectation(
-  comment: string,
-  semantics: SemanticPropositions | undefined,
-): boolean {
-  if (semantics === undefined) return true;
-  const tokens = propositionTokens(comment);
-  return [...semantics.failedRemediation, ...semantics.positive].some((phrase) => {
-    const candidate = propositionTokens(phrase);
-    return candidate.length === tokens.length && candidate.every((token, index) => tokens[index] === token);
-  });
-}
-
-function propositionTokens(value: string): string[] {
-  return value
-    .replace(/([a-z0-9])([A-Z])/gu, "$1 $2")
-    .replace(/(?<=[a-z0-9])\.(?=[a-z0-9])/giu, " ")
-    .replace(/\bwon['’]t\b/giu, "will not")
-    .replace(/\bcan['’]t\b/giu, "cannot")
-    .replace(/\b([a-z]+)n['’]t\b/giu, "$1 not")
-    .toLowerCase()
-    .match(/[a-z0-9]+/gu) ?? [];
 }
 
 function sumMetrics(metrics: BenchmarkMetrics[]): BenchmarkMetrics {

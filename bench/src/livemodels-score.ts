@@ -5,21 +5,16 @@
 // Scoring differs from mock mode: mock mode replays recorded output and checks
 // exact fidelity, so it measures pipeline fidelity, not detection. Live-models
 // mode sends the fixture to a real model and measures whether the model's own
-// findings detect the seeded defect, plus the false-positive rate, gate-verdict
+// findings detect the authored target defect, plus the false-positive rate, gate-verdict
 // correctness, and the measured cost/latency per review.
 
-import { commentMatchesExpectation, type BenchmarkCase, type Envelope } from "./harness";
-
-/** A finding is treated as detecting the seeded defect when it hits the right
- * file and its line range comes within this many lines of the seeded region.
- * The tolerance absorbs the off-by-a-few line drift between where a model
- * anchors a comment and the exact seeded line. */
-export const LINE_TOLERANCE = 3;
+import type { AttributionCallEvidence, AttributionCaseEvidence } from "./attribution";
+import type { BenchmarkCase, Envelope } from "./harness";
 export const ADVISORY_MIN_DETECTION_RATE = 0.9;
 export const ADVISORY_MAX_OVERBLOCK_RATE = 0.1;
 export const CLEAN_MAX_FINDING_FALSE_POSITIVE_RATE = 0.05;
 export const GENERATOR_MAX_MEAN_COST_USD = 0.04;
-export const HOSTED_OPERATION_COST_CAP_USD = 1;
+export const HOSTED_OPERATION_COST_CAP_USD = 25;
 export const GENERATOR_MAX_MEAN_DURATION_MS = 15_000;
 export const GENERATOR_MAX_REPEAT_P95_DURATION_MS = 30_000;
 export const GENERATOR_MAX_REPEAT_DURATION_MS = 60_000;
@@ -50,6 +45,8 @@ export function qualificationScorerModels(pair: QualificationPair): string[] {
 /** OpenRouter per-token prices for one model (USD per token, as returned by
  * GET /api/v1/models under `pricing`). */
 export interface ModelPricing {
+  /** Exact upstream route that supplied this endpoint price. */
+  providerIdentity?: string;
   /** USD per prompt (input) token. */
   promptUsdPerToken: number;
   /** USD per completion (output) token. */
@@ -60,19 +57,18 @@ export interface ModelPricing {
   outputMicrosPerMillionTokens: number;
 }
 
-/** Ground truth distilled from a fixture: the seeded defect's file and line, or
+/** Ground truth distilled from a fixture: the authored target defect's file and line, or
  * a clean fixture where the correct review is silence. */
 export interface GroundTruth {
   classification: "mustBlock" | "advisory" | "clean";
   path: string | null;
-  /** Seeded defect line (the region is [line, line], widened by LINE_TOLERANCE
-   * when testing overlap). */
-  line: number | null;
+  startLine: number | null;
+  endLine: number | null;
   severity: string | null;
 }
 
 export interface FindingEvidence {
-  detectorAttribution: "seeded" | "unrelated";
+  atomicAttribution: "targetDefect" | "unrelated";
   disposition: "final" | "suppressed";
   path: string;
   line: number;
@@ -80,7 +76,8 @@ export interface FindingEvidence {
   severity: string;
   kind: string;
   confidence: number;
-  semanticMatch: boolean;
+  title: string;
+  body: string;
 }
 
 export interface UsageCostEvidence {
@@ -109,13 +106,13 @@ export interface LiveModelCaseResult {
   classification: "mustBlock" | "advisory" | "clean";
   /** A valid v1 envelope was produced and scored. */
   scored: boolean;
-  /** Defect: at least one non-carried finding detected the seeded defect.
+  /** Defect: at least one non-carried finding detected the authored target defect.
    * Clean: null (detection is undefined for clean fixtures). */
   detected: boolean | null;
-  /** Findings that do not detect the seeded defect (defect case) or any finding
+  /** Findings that do not detect the authored target defect (defect case) or any finding
    * at all (clean case). */
   unrelatedFindings: number;
-  seededFinalBlocker: boolean;
+  attributedFinalBlocker: boolean;
   unrelatedFinalBlockers: number;
   finalBlocking: boolean;
   gateFailingActual: boolean | null;
@@ -135,6 +132,7 @@ export interface LiveModelCaseResult {
    * pipeline regression under a live model is still visible. */
   fidelityFailures: string[];
   structuredOutputFailures: string[];
+  attributionEvidence: AttributionCallEvidence[];
   error?: string;
 }
 
@@ -212,44 +210,30 @@ export function toSiteModelAggregate(a: LiveModelAggregate): SiteModelAggregate 
   };
 }
 
-/** Distill a fixture into its ground truth. Fixtures carry at most one seeded
- * finding; absence of a seeded finding means a clean fixture. */
+/** Distill a fixture into its ground truth. Fixtures carry at most one authored
+ * target finding; absence of a target means a clean fixture. */
 export function groundTruthOf(c: BenchmarkCase): GroundTruth {
   const gt = c.groundTruth.findings[0];
   if (!gt) {
-    return { classification: c.admission.classification, path: null, line: null, severity: null };
+    return { classification: c.admission.classification, path: null, startLine: null, endLine: null, severity: null };
   }
   return {
     classification: c.admission.classification,
     path: gt.path,
-    line: gt.line ?? null,
+    startLine: gt.line,
+    endLine: gt.endLine,
     severity: gt.severity ?? null,
   };
-}
-
-interface EnvelopeFinding {
-  path: string;
-  line: number;
-  endLine?: number;
-}
-
-/** True when a finding's line range [line, endLine ?? line], widened by
- * LINE_TOLERANCE, overlaps the seeded line. A single seeded line is treated as
- * the region [seededLine, seededLine]. */
-export function findingHitsSeededRegion(finding: EnvelopeFinding, seededLine: number): boolean {
-  const lo = Math.min(finding.line, finding.endLine ?? finding.line) - LINE_TOLERANCE;
-  const hi = Math.max(finding.line, finding.endLine ?? finding.line) + LINE_TOLERANCE;
-  return seededLine >= lo && seededLine <= hi;
 }
 
 /**
  * Score one case's envelope against its ground truth for live-models mode.
  *
  * Detection (defect case): at least one non-carried finding whose path matches
- * the seeded file and whose line range overlaps the seeded region. Non-carried
+ * the authored target file and whose anchor is inside the authored region. Non-carried
  * findings are `env.findings` (carried/resolved findings live in `env.resolved`
  * and are excluded). False positives (defect case): every non-carried finding
- * that does not detect the seeded defect. False positives (clean case): every
+ * that does not detect the authored target defect. False positives (clean case): every
  * non-carried finding. Gate correctness: `env.gate.failing` matches the ground
  * truth. Cost: computed from token usage and the model's pricing (null when
  * pricing is unknown).
@@ -263,6 +247,7 @@ export function scoreLiveCase(args: {
   exitCode: number | undefined;
   fidelityFailures: string[];
   structuredOutputFailures?: string[];
+  attribution: AttributionCaseEvidence;
 }): LiveModelCaseResult {
   const { case: c, pair, repeat, envelope: env, pricing, exitCode, fidelityFailures } = args;
   const truth = groundTruthOf(c);
@@ -363,22 +348,23 @@ export function scoreLiveCase(args: {
     };
   });
 
-  const seededLine = truth.line;
-  const semantics = c.groundTruth.findings[0]?.semantics;
-  const isSemanticMatch = (finding: Envelope["findings"][number]) =>
-    commentMatchesExpectation(finding.body, semantics);
-  const isSeeded = (finding: Envelope["findings"][number]) =>
-    seededLine !== null && finding.path === truth.path && findingHitsSeededRegion(finding, seededLine) &&
-    isSemanticMatch(finding);
-  const detectorFindings = allFindings.filter(isSeeded);
-  const unrelatedFindings = allFindings.length - detectorFindings.length;
+  const attributableOrdinals = new Set(args.attribution.calls
+    .filter((call) => call.sameDefect)
+    .map((call) => call.candidateOrdinal - 1));
+  const isAttributedToTarget = (_finding: Envelope["findings"][number], ordinal: number) =>
+    attributableOrdinals.has(ordinal);
+  const attributedFindings = allFindings.filter((finding, ordinal) => isAttributedToTarget(finding, ordinal));
+  const unrelatedFindings = allFindings.length - attributedFindings.length;
   const blocks = (finding: Envelope["findings"][number]) =>
     finding.severity === "error" || env.gate.blockOnKinds.includes(finding.kind);
-  const seededFinalBlocker = finalFindings.some((finding) => isSeeded(finding) && blocks(finding));
-  const unrelatedFinalBlockers = finalFindings.filter((finding) => !isSeeded(finding) && blocks(finding)).length;
+  const attributedFinalBlocker = finalFindings.some((finding, ordinal) => isAttributedToTarget(finding, ordinal) && blocks(finding));
+  const unrelatedFinalBlockers = finalFindings.filter((finding, ordinal) => !isAttributedToTarget(finding, ordinal) && blocks(finding)).length;
   const findingEvidence: FindingEvidence[] = [
-    ...finalFindings.map((finding) => evidenceFor(finding, isSeeded(finding), isSemanticMatch(finding), "final")),
-    ...suppressedFindings.map((finding) => evidenceFor(finding, isSeeded(finding), isSemanticMatch(finding), "suppressed")),
+    ...finalFindings.map((finding, ordinal) => evidenceFor(finding, isAttributedToTarget(finding, ordinal), "final")),
+    ...suppressedFindings.map((finding, index) => {
+      const ordinal = finalFindings.length + index;
+      return evidenceFor(finding, isAttributedToTarget(finding, ordinal), "suppressed");
+    }),
   ];
 
   const base: LiveModelCaseResult = {
@@ -390,15 +376,15 @@ export function scoreLiveCase(args: {
     scorerModel: pair.scorerModel,
     repeat,
     classification: truth.classification,
-    scored: true,
+    scored: args.attribution.scored,
     detected: null,
     unrelatedFindings,
-    seededFinalBlocker,
+    attributedFinalBlocker,
     unrelatedFinalBlockers,
     finalBlocking:
       truth.classification === "mustBlock" &&
       env.gate.failing &&
-      seededFinalBlocker &&
+      attributedFinalBlocker &&
       unrelatedFinalBlockers === 0,
     gateFailingActual: env.gate.failing,
     findingEvidence,
@@ -414,20 +400,21 @@ export function scoreLiveCase(args: {
     exitCode,
     fidelityFailures,
     structuredOutputFailures: args.structuredOutputFailures ?? [],
+    attributionEvidence: args.attribution.calls,
+    ...(args.attribution.error === undefined ? {} : { error: args.attribution.error }),
   };
 
-  base.detected = truth.classification === "clean" ? null : detectorFindings.length > 0;
+  base.detected = truth.classification === "clean" ? null : attributedFindings.length > 0;
   return base;
 }
 
 function evidenceFor(
   finding: Envelope["findings"][number],
-  seeded: boolean,
-  semanticMatch: boolean,
+  attributedToTarget: boolean,
   disposition: "final" | "suppressed",
 ): FindingEvidence {
   return {
-    detectorAttribution: seeded ? "seeded" : "unrelated",
+    atomicAttribution: attributedToTarget ? "targetDefect" : "unrelated",
     disposition,
     path: finding.path,
     line: finding.line,
@@ -435,7 +422,8 @@ function evidenceFor(
     severity: finding.severity,
     kind: finding.kind,
     confidence: finding.confidence,
-    semanticMatch,
+    title: finding.title,
+    body: finding.body,
   };
 }
 
@@ -462,7 +450,7 @@ export function erroredLiveCase(args: {
     scored: false,
     detected: null,
     unrelatedFindings: 0,
-    seededFinalBlocker: false,
+    attributedFinalBlocker: false,
     unrelatedFinalBlockers: 0,
     finalBlocking: false,
     gateFailingActual: null,
@@ -479,6 +467,7 @@ export function erroredLiveCase(args: {
     exitCode: args.exitCode,
     fidelityFailures: [],
     structuredOutputFailures: [],
+    attributionEvidence: [],
     error: args.error,
   };
 }
@@ -568,7 +557,7 @@ export function aggregateModel(
       admissionFailures.push(`repeat ${repeat} must-block recall is below 100%`);
     }
     if (repeatMustBlocks.some((result) => !result.finalBlocking)) {
-      admissionFailures.push(`repeat ${repeat} final seeded blocking is below 100%`);
+      admissionFailures.push(`repeat ${repeat} final attributed blocking is below 100%`);
     }
     const repeatAdvisoryDetection = repeatAdvisories.filter((result) => result.detected).length /
       repeatAdvisories.length;
@@ -666,7 +655,7 @@ export function calculateTotalRunCostUsd(results: LiveModelCaseResult[]): number
   return results.reduce((sum, r) => sum + (r.costUsd ?? 0), 0);
 }
 
-interface CanonicalDecimal {
+export interface CanonicalDecimal {
   coefficient: bigint;
   scale: number;
 }
@@ -685,7 +674,7 @@ export function parseCanonicalDecimal(value: string): CanonicalDecimal {
   return { coefficient, scale };
 }
 
-function sumCanonicalDecimals(values: CanonicalDecimal[]): CanonicalDecimal {
+export function sumCanonicalDecimals(values: CanonicalDecimal[]): CanonicalDecimal {
   const scale = Math.max(0, ...values.map((value) => value.scale));
   let coefficient = values.reduce(
     (sum, value) => sum + value.coefficient * 10n ** BigInt(scale - value.scale),
@@ -699,7 +688,7 @@ function sumCanonicalDecimals(values: CanonicalDecimal[]): CanonicalDecimal {
   return { coefficient, scale: normalizedScale };
 }
 
-function formatCanonicalDecimal(value: CanonicalDecimal): string {
+export function formatCanonicalDecimal(value: CanonicalDecimal): string {
   if (value.scale === 0) return value.coefficient.toString();
   const digits = value.coefficient.toString().padStart(value.scale + 1, "0");
   const split = digits.length - value.scale;
@@ -710,6 +699,13 @@ function canonicalDecimalToNumber(value: CanonicalDecimal): number {
   const number = Number(formatCanonicalDecimal(value));
   if (!Number.isFinite(number)) throw new Error("provider cost is outside the supported numeric range");
   return number;
+}
+
+export function compareCanonicalDecimals(left: CanonicalDecimal, right: CanonicalDecimal): number {
+  const scale = Math.max(left.scale, right.scale);
+  const leftCoefficient = left.coefficient * 10n ** BigInt(scale - left.scale);
+  const rightCoefficient = right.coefficient * 10n ** BigInt(scale - right.scale);
+  return leftCoefficient < rightCoefficient ? -1 : leftCoefficient > rightCoefficient ? 1 : 0;
 }
 
 export function canonicalPriceMicrosPerMillion(value: string): number {
@@ -818,11 +814,12 @@ export function pricingFromCatalog(
 export function pricingFromZdrCatalog(
   catalog: OpenRouterZdrEndpointsResponse,
   wantedModels: string[],
+  expectedProvider: string,
 ): Map<string, ModelPricing> {
   const wanted = new Set(wantedModels);
   const candidates = new Map<string, Array<ModelPricing & { provider: string }>>();
   for (const endpoint of catalog.data ?? []) {
-    if (!wanted.has(endpoint.model_id) || endpoint.status !== 0) continue;
+    if (!wanted.has(endpoint.model_id) || endpoint.status !== 0 || endpoint.provider_name !== expectedProvider) continue;
     try {
       const promptText = endpoint.pricing?.prompt ?? "";
       const completionText = endpoint.pricing?.completion ?? "";
@@ -858,6 +855,7 @@ export function pricingFromZdrCatalog(
     const selected = modelCandidates[0];
     if (selected !== undefined) {
       out.set(model, {
+        providerIdentity: selected.provider,
         promptUsdPerToken: selected.promptUsdPerToken,
         completionUsdPerToken: selected.completionUsdPerToken,
         inputMicrosPerMillionTokens: selected.inputMicrosPerMillionTokens,

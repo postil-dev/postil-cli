@@ -1059,6 +1059,7 @@ dependencies = [
  "futures",
  "globset",
  "httpdate",
+ "libc",
  "memmap2",
  "owo-colors",
  "predicates",

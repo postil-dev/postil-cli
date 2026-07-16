@@ -19,11 +19,26 @@
 
 import { execFile as execFileCb } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { chmod, lstat, mkdir, mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import evaluatorContractSourcePaths from "../evaluator-contract-sources.json";
+import { ATTRIBUTION_BANK } from "../fixtures/attribution-bank";
 import { API_KEY_ENV_NAMES_TEXT, forwardApiKey, resolveApiKeyName } from "./api-key";
+import {
+  attributeCandidates,
+  AttributionGovernor,
+  ATTRIBUTION_MAX_CONCURRENCY,
+  ATTRIBUTION_MAX_CALLS_PER_FINDING_SET,
+  attributionBankSha256,
+  attributionContractSha256,
+  qualifyAttributionEvaluator,
+  projectedAttributionDecisionCostUsd,
+  type AttributionCallEvidence,
+  type AttributionTarget,
+} from "./attribution";
 import { cases as admissionFixtureInputs } from "../fixtures/cases";
 import {
   benchmarkCase,
@@ -38,14 +53,18 @@ import {
 } from "./harness";
 import {
   aggregateModel,
-  calculateTotalRunCostUsd,
   canonicalPriceMicrosPerMillion,
+  compareCanonicalDecimals,
   erroredLiveCase,
   MAX_GENERATOR_COST_CAP_USD,
   MIN_QUALIFICATION_REPEATS,
   normalizeGeneratorModels,
+  parseCanonicalDecimal,
   pricingFromCatalog,
   pricingFromZdrCatalog,
+  formatCanonicalDecimal,
+  sumCanonicalDecimals,
+  type CanonicalDecimal,
   scoreLiveCase,
   qualificationPairId,
   qualificationGeneratorModels,
@@ -67,6 +86,7 @@ export const DEFAULT_API_BASE = "https://openrouter.ai/api/v1";
 export const HOSTED_OPERATION_COST_CAP_MICROS = 1_000_000;
 export const QUALIFICATION_MAX_AGE_DAYS = 30;
 export const QUALIFICATION_MAX_AGE_SECONDS = QUALIFICATION_MAX_AGE_DAYS * 24 * 60 * 60;
+const MAX_QUALIFICATION_SOURCE_BYTES = 16 * 1024 * 1024;
 const MANAGED_OPENROUTER_API_BASE = "https://openrouter.ai:443/api/v1";
 export const MANAGED_OPENROUTER_PROVIDER_IDENTITY = "openrouter:managed-routing";
 
@@ -77,6 +97,7 @@ export const REVIEW_CONTRACT_SOURCE_PATHS = [
   "src/forge/gitlab.rs", "src/forge/mod.rs", "src/hook.rs", "src/lib.rs", "src/local.rs", "src/main.rs",
   "src/output.rs", "src/plan.rs",
   "src/prompt.rs",
+  "src/attribution.rs",
   "src/llm.rs",
   "src/envelope.rs",
   "src/respond.rs", "src/review.rs", "src/sarif.rs",
@@ -85,6 +106,15 @@ export const REVIEW_CONTRACT_SOURCE_PATHS = [
 ] as const;
 export const FIXTURE_SET_SOURCE_PATHS = ["bench/fixtures/cases.ts"] as const;
 export const EVALUATOR_CONTRACT_SOURCE_PATHS = evaluatorContractSourcePaths as readonly string[];
+export const BINARY_SOURCE_PATHS = REVIEW_CONTRACT_SOURCE_PATHS;
+
+export interface QualificationSourceAuthority {
+  sourceSha: string;
+  fixtureHash: string;
+  reviewContractHash: string;
+  evaluatorContractHash: string;
+  configHash: string;
+}
 
 /** Cases in flight at once. Live inference is provider-I/O-bound; a modest pool
  * cuts wall-clock time without hammering the API. */
@@ -104,6 +134,8 @@ export interface LiveModelsOptions {
   apiBase?: string;
   /** Provider interface used by the exact profile. */
   apiFormat?: "openai-compatible" | "anthropic";
+  /** Exact OpenRouter upstream provider name, pinned without fallback. */
+  upstreamProvider: string;
   /** Root directory for per-case run dirs. Defaults to bench/.runs/live-models. */
   rootDir?: string;
   /** Per-case timeout (default DEFAULT_TIMEOUT_MS). */
@@ -115,7 +147,7 @@ export interface LiveModelsOptions {
   /** Injected pricing (per-model). When omitted, the catalog is fetched once. */
   pricing?: Map<string, ModelPricing>;
   /** Projected-spend cap. It cannot exceed MAX_GENERATOR_COST_CAP_USD. */
-  costCapUsd?: number;
+  costCapUsd?: string | number;
 }
 
 export interface LiveModelsReport {
@@ -125,8 +157,8 @@ export interface LiveModelsReport {
   apiBase: string;
   apiFormat: "openai-compatible" | "anthropic";
   providerEndpointIdentity: string;
-  upstreamProviderPinned: false;
-  upstreamProviderIdentity: null;
+  upstreamProviderPinned: true;
+  upstreamProviderIdentity: string;
   fixtureHash: string;
   reviewContractHash: string;
   evaluatorContractHash: string;
@@ -134,6 +166,14 @@ export interface LiveModelsReport {
   configHash: string;
   cliBinaryHash: string;
   evidenceHash: string;
+  attributionContractHash: string;
+  attributionBankHash: string;
+  attributionEvaluators: Array<{
+    pairId: string;
+    eligible: boolean;
+    evidenceSha256: string;
+    evidence: AttributionCallEvidence[];
+  }>;
   hostedOperationCostCapMicros: number;
   repeats: number;
   profiles: QualificationProfile[];
@@ -144,8 +184,19 @@ export interface LiveModelsReport {
   /** Full per-model aggregates (superset of `models`) for the human table and
    * diagnostics. */
   modelAggregates: LiveModelAggregate[];
-  /** Total measured spend across all scored cases with known pricing. */
+  /** Conservative qualification exposure, exact when accounting completes. */
   totalRunCostUsd: number;
+  totalRunCostUsdDecimal: string;
+  exactSuccessfulCostUsdDecimal: string;
+  failedOrUnknownExposureUsdDecimal: string;
+  costAccountingComplete: boolean;
+  reservedQualificationExposureUsdDecimal: string;
+  /** Exact provider-reported spend for atomic attribution calls. */
+  attributionRunCostUsd: number;
+  attributionRunCostUsdDecimal: string;
+  attributionFailedExposureUsdDecimal: string;
+  /** Provider calls with exact attribution usage evidence. */
+  attributionProviderCalls: number;
   /** Per-case detail across every (model, case) pair. */
   cases: LiveModelCaseResult[];
 }
@@ -182,6 +233,7 @@ export interface QualificationProfile {
   apiBase: string;
   apiFormat: "openai-compatible" | "anthropic";
   benchmarkProviderIdentity: string | null;
+  upstreamProviderIdentity: string;
   generatorModels: string[];
   consensus: number;
   scorerModels: string[];
@@ -190,6 +242,7 @@ export interface QualificationProfile {
   reviewContractHash: string;
   evaluatorContractHash: string;
   evaluatorRuntimeIdentity: string;
+  evaluatorEvidenceSha256: string;
   configHash: string;
   cliBinaryHash: string;
   repeats: number;
@@ -208,6 +261,7 @@ export interface AdmissionManifestCandidate {
     modelDefaultsSha256: string;
     apiBase: string;
     benchmarkProviderIdentity: string | null;
+    upstreamProviderIdentity: string;
     generatorChain: string[];
     consensus: number;
     scorerChain: string[];
@@ -217,6 +271,7 @@ export interface AdmissionManifestCandidate {
     fixtureSetSha256: string;
     evaluatorContractSha256: string;
     evaluatorRuntimeIdentity: string;
+    evaluatorEvidenceSha256: string;
     reportSha256: string;
     repeatedRuns: number;
   }>;
@@ -226,6 +281,7 @@ export interface QualificationProfileDigestMaterial {
   qualificationSourceSha: string;
   modelDefaultsSha256: string;
   benchmarkProviderIdentity: string | null;
+  upstreamProviderIdentity: string;
   apiBase: string;
   apiFormat: "openai-compatible" | "anthropic";
   generatorChain: string[];
@@ -236,6 +292,7 @@ export interface QualificationProfileDigestMaterial {
   fixtureSetSha256: string;
   evaluatorContractSha256: string;
   evaluatorRuntimeIdentity: string;
+  evaluatorEvidenceSha256: string;
   reportSha256: string;
   repeatedRuns: number;
 }
@@ -263,7 +320,10 @@ export async function runLiveModels(
   if (!Number.isSafeInteger(repeats) || repeats < 1 || repeats > 10) {
     throw new Error("qualification repeats must be an integer in 1..10");
   }
-  const costCapUsd = options.costCapUsd ?? MAX_GENERATOR_COST_CAP_USD;
+  const costCapUsdDecimal = canonicalQualificationCostCap(
+    options.costCapUsd ?? String(MAX_GENERATOR_COST_CAP_USD),
+  );
+  const costCapUsd = Number(costCapUsdDecimal);
   validateGeneratorQualificationBounds(models, costCapUsd);
   const cases = inputs.map((input) => benchmarkCase.parse(input));
   assertExactQualificationFixtures(cases);
@@ -275,17 +335,27 @@ export async function runLiveModels(
   }
   const apiBase = normalizeApiBase(options.apiBase ?? DEFAULT_API_BASE);
   const apiFormat = options.apiFormat ?? "openai-compatible";
+  if (benchmarkProviderIdentityFor(apiBase, apiFormat) !== MANAGED_OPENROUTER_PROVIDER_IDENTITY) {
+    throw new Error("live qualification requires the canonical managed OpenRouter endpoint");
+  }
+  const upstreamProvider = options.upstreamProvider.trim();
+  if (upstreamProvider.length === 0) {
+    throw new Error("live qualification requires an exact pinned upstream provider identity");
+  }
   const rootDir = options.rootDir ?? resolve(import.meta.dir, "..", ".runs", "live-models");
   const suppliedPricing = options.pricing;
+  return withImmutableQualificationBinary(options.binary, rootDir, async (immutableBinary) => {
+    options = { ...options, binary: immutableBinary.path };
   await assertBinary(options.binary);
   const repositoryRoot = resolve(import.meta.dir, "..", "..");
-  const qualificationSourceSha = await resolveQualificationSourceSha(repositoryRoot);
+  const sourceAuthority = await resolveQualificationSourceAuthority(repositoryRoot);
+  const qualificationSourceSha = sourceAuthority.sourceSha;
+  const fixtureHash = sourceAuthority.fixtureHash;
+  const reviewContractHash = sourceAuthority.reviewContractHash;
+  const evaluatorContractHash = sourceAuthority.evaluatorContractHash;
+  const configHash = sourceAuthority.configHash;
   const evaluatorRuntimeIdentity = await assertEvaluatorRuntime(repositoryRoot);
-  const [fixtureHash, reviewContractHash, evaluatorContractHash, configHash, cliBinaryHash, binaryMetadata] = await Promise.all([
-    hashRepositorySources(repositoryRoot, FIXTURE_SET_SOURCE_PATHS),
-    hashRepositorySources(repositoryRoot, REVIEW_CONTRACT_SOURCE_PATHS),
-    hashRepositorySources(repositoryRoot, EVALUATOR_CONTRACT_SOURCE_PATHS),
-    hashFile(resolve(import.meta.dir, "..", "..", "config.toml")),
+  const [cliBinaryHash, binaryMetadata] = await Promise.all([
     hashFile(options.binary),
     resolveBinaryQualificationMetadata(options.binary),
   ]);
@@ -294,20 +364,61 @@ export async function runLiveModels(
     evaluatorRuntimeIdentity,
     configHash, apiBase, apiFormat, pairs,
   });
-  const pricing = suppliedPricing ?? (await fetchPricing(apiBase, apiFormat, models));
-  if (benchmarkProviderIdentityFor(apiBase, apiFormat) !== null) {
-    await assertRuntimeShapedQualificationPreflight({
-      binary: options.binary,
-      rootDir,
-      cases,
-      pairs,
-      repeats,
+  const pricing = suppliedPricing ?? (await fetchPricing(apiBase, apiFormat, models, upstreamProvider));
+  assertPricingProviderIdentity(pricing, models, upstreamProvider);
+  const attributionGovernor = new AttributionGovernor(
+    ATTRIBUTION_MAX_CONCURRENCY,
+    undefined,
+    costCapUsdDecimal,
+  );
+  const reservedQualificationExposureUsdDecimal = await assertRuntimeShapedQualificationPreflight({
+    binary: options.binary,
+    rootDir,
+    cases,
+    pairs,
+    repeats,
+    pricing,
+    apiBase,
+    apiFormat,
+    costCapUsdDecimal,
+    upstreamProvider,
+  });
+
+  const attributionSourceSha256 = hashSanitizedEvidence({
+    qualificationSourceSha,
+    reviewContractHash,
+    evaluatorContractHash,
+    attributionContractHash: attributionContractSha256(),
+    attributionBankHash: attributionBankSha256(),
+  });
+  const attributionEvaluators = await Promise.all(pairs.map(async (pair) => {
+    const pairRoot = join(rootDir, "attribution-evaluator", safeSegment(qualificationPairId(pair)));
+    const evaluatorEnv = await prepareAttributionEvaluatorEnvironment(
+      pairRoot,
+      pair,
       pricing,
       apiBase,
       apiFormat,
-      costCapUsd,
+      upstreamProvider,
+    );
+    const result = await qualifyAttributionEvaluator({
+      binary: options.binary,
+      rootDir: pairRoot,
+      env: evaluatorEnv,
+      sourceSha256: attributionSourceSha256,
+      binarySha256: cliBinaryHash,
+      evaluatorModel: pair.scorerModel,
+      expectedProvider: upstreamProvider,
+      apiFormat,
+      repeats,
+      governor: attributionGovernor,
+      projectedCostUsdDecimal: projectedAttributionDecisionCostUsd(requiredPricing(pricing, pair.scorerModel)),
     });
-  }
+    return { pairId: qualificationPairId(pair), ...result };
+  }));
+  const evaluatorEvidenceByPair = new Map(
+    attributionEvaluators.map((result) => [result.pairId, result.evidenceSha256]),
+  );
 
   // Task queue: one job per (profile, repeat, case). A bounded worker pool drains it so at
   // most `concurrency` binary runs are in flight regardless of model count.
@@ -340,6 +451,9 @@ export async function runLiveModels(
         pricing,
         rootDir,
         { ...options, apiBase, apiFormat },
+        attributionSourceSha256,
+        cliBinaryHash,
+        attributionGovernor,
       );
     }
   };
@@ -363,29 +477,63 @@ export async function runLiveModels(
     reviewContractHash,
     evaluatorContractHash,
     evaluatorRuntimeIdentity,
+    evaluatorEvidenceSha256: evaluatorEvidenceByPair.get(qualificationPairId(pair))!,
     configHash,
     cliBinaryHash,
     repeats,
     modelPriceBounds: modelPriceBoundsFor(pair, pricing),
+    upstreamProviderIdentity: upstreamProvider,
   }));
+  const exactGeneratorCosts = results
+    .map((result) => result.costProviderDecimal)
+    .filter((value): value is string => value !== null)
+    .map(parseCanonicalDecimal);
+  const exactSuccessfulCost = sumCanonicalDecimals([
+    ...exactGeneratorCosts,
+    parseCanonicalDecimal(attributionGovernor.actualSpendUsdDecimal),
+  ]);
+  const exactSuccessfulCostUsdDecimal = formatCanonicalDecimal(exactSuccessfulCost);
+  const costAccountingComplete = results.every((result) =>
+    result.scored && result.usageAccountingComplete === true && result.costProvenance === "providerExact") &&
+    attributionGovernor.failedExposureUsdDecimal === "0";
+  const reservedExposure = parseCanonicalDecimal(reservedQualificationExposureUsdDecimal);
+  const failedOrUnknownExposure = costAccountingComplete
+    ? parseCanonicalDecimal("0")
+    : subtractCanonicalDecimal(reservedExposure, exactSuccessfulCost);
+  const failedOrUnknownExposureUsdDecimal = formatCanonicalDecimal(failedOrUnknownExposure);
+  const conservativeTotal = sumCanonicalDecimals([exactSuccessfulCost, failedOrUnknownExposure]);
+  const totalRunCostUsdDecimal = formatCanonicalDecimal(conservativeTotal);
+  const totalRunCostUsd = Number(totalRunCostUsdDecimal);
   const evidence = {
     cliVersion,
     qualificationSourceSha,
     apiBase,
     apiFormat,
     providerEndpointIdentity: identity,
-    upstreamProviderPinned: false,
-    upstreamProviderIdentity: null,
+    upstreamProviderPinned: true,
+    upstreamProviderIdentity: upstreamProvider,
     fixtureHash,
     reviewContractHash,
     evaluatorContractHash,
     evaluatorRuntimeIdentity,
+    attributionContractHash: attributionContractSha256(),
+    attributionBankHash: attributionBankSha256(),
+    attributionEvaluators,
     configHash,
     cliBinaryHash,
     hostedOperationCostCapMicros: HOSTED_OPERATION_COST_CAP_MICROS,
     repeats,
     profiles: profileEvidence,
     cases: results,
+    attributionRunCostUsd: attributionGovernor.actualSpendUsd,
+    attributionRunCostUsdDecimal: attributionGovernor.actualSpendUsdDecimal,
+    attributionFailedExposureUsdDecimal: attributionGovernor.failedExposureUsdDecimal,
+    attributionProviderCalls: attributionGovernor.actualCalls,
+    totalRunCostUsdDecimal,
+    exactSuccessfulCostUsdDecimal,
+    failedOrUnknownExposureUsdDecimal,
+    costAccountingComplete,
+    reservedQualificationExposureUsdDecimal,
   };
   const evidenceHash = hashSanitizedEvidence(evidence);
   const profiles = profileEvidence.map((profile) => finalizeQualificationProfile(
@@ -394,7 +542,10 @@ export async function runLiveModels(
     evidenceHash,
   ));
   const passed = repeats >= MIN_QUALIFICATION_REPEATS && aggregates.length > 0 &&
-    aggregates.every((aggregate) => aggregate.passed);
+    attributionEvaluators.every((evaluator) => evaluator.eligible) &&
+    aggregates.every((aggregate) => aggregate.passed) &&
+    costAccountingComplete &&
+    compareCanonicalDecimals(conservativeTotal, parseCanonicalDecimal(costCapUsdDecimal)) <= 0;
   const report: LiveModelsReport = {
     generatedAt: new Date().toISOString(),
     qualificationSourceSha,
@@ -402,12 +553,15 @@ export async function runLiveModels(
     apiBase,
     apiFormat,
     providerEndpointIdentity: identity,
-    upstreamProviderPinned: false,
-    upstreamProviderIdentity: null,
+    upstreamProviderPinned: true,
+    upstreamProviderIdentity: upstreamProvider,
     fixtureHash,
     reviewContractHash,
     evaluatorContractHash,
     evaluatorRuntimeIdentity,
+    attributionContractHash: attributionContractSha256(),
+    attributionBankHash: attributionBankSha256(),
+    attributionEvaluators,
     configHash,
     cliBinaryHash,
     evidenceHash,
@@ -417,10 +571,31 @@ export async function runLiveModels(
     passed,
     models: aggregates.map(toSiteModelAggregate),
     modelAggregates: aggregates,
-    totalRunCostUsd: calculateTotalRunCostUsd(results),
+    totalRunCostUsd,
+    totalRunCostUsdDecimal,
+    exactSuccessfulCostUsdDecimal,
+    failedOrUnknownExposureUsdDecimal,
+    costAccountingComplete,
+    reservedQualificationExposureUsdDecimal,
+    attributionRunCostUsd: attributionGovernor.actualSpendUsd,
+    attributionRunCostUsdDecimal: attributionGovernor.actualSpendUsdDecimal,
+    attributionFailedExposureUsdDecimal: attributionGovernor.failedExposureUsdDecimal,
+    attributionProviderCalls: attributionGovernor.actualCalls,
     cases: results,
   };
   if (passed && profiles.every(isManagedAdmissionProfile)) {
+    const [currentSourceAuthority, currentCliBinaryHash] = await Promise.all([
+      resolveQualificationSourceAuthority(repositoryRoot),
+      hashFile(options.binary),
+    ]);
+    assertQualificationInputsUnchanged([
+      ["qualification source", qualificationSourceSha, currentSourceAuthority.sourceSha],
+      ["fixture set", fixtureHash, currentSourceAuthority.fixtureHash],
+      ["review contract", reviewContractHash, currentSourceAuthority.reviewContractHash],
+      ["evaluator contract", evaluatorContractHash, currentSourceAuthority.evaluatorContractHash],
+      ["model defaults config", configHash, currentSourceAuthority.configHash],
+      ["immutable qualification binary", cliBinaryHash, currentCliBinaryHash],
+    ]);
     const qualificationIssuedAtUnixSeconds = Math.floor(Date.now() / 1_000);
     report.manifestCandidate = admissionManifestCandidate(
       qualificationSourceSha,
@@ -429,16 +604,153 @@ export async function runLiveModels(
       qualificationIssuedAtUnixSeconds,
     );
   }
-  return report;
+    return report;
+  });
+}
+
+export function assertQualificationInputsUnchanged(
+  hashes: Array<readonly [label: string, expected: string, actual: string]>,
+): void {
+  for (const [label, expected, actual] of hashes) {
+    if (actual !== expected) {
+      throw new Error(`${label} changed before manifest candidate emission`);
+    }
+  }
+}
+
+export async function prepareImmutableQualificationBinary(
+  sourcePath: string,
+  rootDir: string,
+): Promise<{ path: string; directory: string; sha256: string }> {
+  const sourceMetadata = await lstat(sourcePath).catch(() => null);
+  if (sourceMetadata === null || !sourceMetadata.isFile() || sourceMetadata.isSymbolicLink()) {
+    throw new Error("qualification binary must be an existing regular file, not a symbolic link");
+  }
+  await mkdir(rootDir, { recursive: true, mode: 0o700 });
+  const directory = await mkdtemp(join(rootDir, ".immutable-binary-"));
+  await chmod(directory, 0o700);
+  const destination = join(directory, "postil");
+  const handle = await open(
+    sourcePath,
+    fsConstants.O_RDONLY |
+      ((fsConstants as unknown as Record<string, number>).O_NOFOLLOW ?? 0) |
+      ((fsConstants as unknown as Record<string, number>).O_CLOEXEC ?? 0),
+  );
+  try {
+    const descriptorMetadata = await handle.stat();
+    if (!descriptorMetadata.isFile() || descriptorMetadata.dev !== sourceMetadata.dev ||
+        descriptorMetadata.ino !== sourceMetadata.ino) {
+      throw new Error("qualification binary changed before immutable copy");
+    }
+    const bytes = await handle.readFile();
+    const sha256 = hashText(bytes);
+    await writeFile(destination, bytes, { mode: 0o500, flag: "wx" });
+    await chmod(destination, 0o500);
+    const copiedMetadata = await lstat(destination);
+    if (!copiedMetadata.isFile() || copiedMetadata.isSymbolicLink() || copiedMetadata.nlink !== 1) {
+      throw new Error("immutable qualification binary copy is not a private regular file");
+    }
+    if (await hashFile(destination) !== sha256) {
+      throw new Error("immutable qualification binary copy hash mismatch");
+    }
+    return { path: resolve(destination), directory, sha256 };
+  } catch (error) {
+    await rm(directory, { recursive: true, force: true });
+    throw error;
+  } finally {
+    await handle.close();
+  }
+}
+
+export async function withImmutableQualificationBinary<T>(
+  sourcePath: string,
+  rootDir: string,
+  work: (binary: { path: string; directory: string; sha256: string }) => Promise<T>,
+): Promise<T> {
+  const binary = await prepareImmutableQualificationBinary(sourcePath, rootDir);
+  try {
+    return await work(binary);
+  } finally {
+    await rm(binary.directory, { recursive: true, force: true });
+  }
+}
+
+function requiredPricing(pricing: Map<string, ModelPricing>, model: string): ModelPricing {
+  const value = pricing.get(model);
+  if (value === undefined) throw new Error(`missing attribution evaluator pricing for ${model}`);
+  return value;
+}
+
+export function assertPricingProviderIdentity(
+  pricing: Map<string, ModelPricing>,
+  models: string[],
+  upstreamProvider: string,
+): void {
+  for (const model of models) {
+    if (requiredPricing(pricing, model).providerIdentity !== upstreamProvider) {
+      throw new Error(`qualification pricing for ${model} is not bound to upstream provider ${upstreamProvider}`);
+    }
+  }
+}
+
+export function canonicalQualificationCostCap(value: string | number): string {
+  const raw = String(value);
+  const fraction = raw.split(".")[1];
+  if (fraction !== undefined && fraction.length > 6) {
+    throw new Error("cost cap supports at most 6 fractional decimal places");
+  }
+  let cap: CanonicalDecimal;
+  try {
+    cap = parseCanonicalDecimal(raw);
+  } catch {
+    throw new Error("cost cap must be a canonical decimal string");
+  }
+  if (compareCanonicalDecimals(cap, parseCanonicalDecimal("0")) <= 0 ||
+      compareCanonicalDecimals(cap, parseCanonicalDecimal(String(MAX_GENERATOR_COST_CAP_USD))) > 0) {
+    throw new Error(`cost cap must be greater than zero and at most $${MAX_GENERATOR_COST_CAP_USD}`);
+  }
+  return formatCanonicalDecimal(cap);
+}
+
+function multiplyCanonicalDecimal(value: CanonicalDecimal, multiplier: bigint): CanonicalDecimal {
+  if (multiplier < 0n) throw new Error("canonical decimal multiplier must be nonnegative");
+  if (value.coefficient === 0n || multiplier === 0n) return parseCanonicalDecimal("0");
+  return parseCanonicalDecimal(formatCanonicalDecimal({
+    coefficient: value.coefficient * multiplier,
+    scale: value.scale,
+  }));
+}
+
+function canonicalUsdFromMicros(micros: bigint): string {
+  const whole = micros / 1_000_000n;
+  const fraction = (micros % 1_000_000n).toString().padStart(6, "0").replace(/0+$/u, "");
+  return formatCanonicalDecimal(parseCanonicalDecimal(fraction.length === 0 ? whole.toString() : `${whole}.${fraction}`));
+}
+
+function subtractCanonicalDecimal(left: CanonicalDecimal, right: CanonicalDecimal): CanonicalDecimal {
+  const scale = Math.max(left.scale, right.scale);
+  const coefficient = left.coefficient * 10n ** BigInt(scale - left.scale) -
+    right.coefficient * 10n ** BigInt(scale - right.scale);
+  if (coefficient < 0n) throw new Error("exact provider cost exceeded reserved qualification exposure");
+  return parseCanonicalDecimal(formatCanonicalDecimal({ coefficient, scale }));
 }
 
 export function assertExactQualificationFixtures(actual: BenchmarkCase[]): void {
   validateUniqueCaseIds(actual);
-  const expected = admissionFixtureInputs.map((input) => benchmarkCase.parse(input));
-  validateUniqueCaseIds(expected);
-  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+  if (JSON.stringify(actual) !== embeddedQualificationFixtureJson) {
     throw new Error("live qualification must run the exact embedded fixture matrix once per repeat");
   }
+}
+
+// runLiveModels validates the supplied matrix before this comparison. Cache
+// the complete fixture bytes without repeating full Zod validation at import.
+const embeddedQualificationFixtureJson = JSON.stringify(admissionFixtureInputs);
+const embeddedQualificationFixtureIds = new Set<string>();
+for (const fixture of admissionFixtureInputs) {
+  if (embeddedQualificationFixtureIds.has(fixture.id)) {
+    throw new Error(`duplicate benchmark case id: ${fixture.id}`);
+  }
+  embeddedQualificationFixtureIds.add(fixture.id);
 }
 
 export function hashSanitizedEvidence(value: object): string {
@@ -489,6 +801,9 @@ async function runLiveModelCase(
   pricing: Map<string, ModelPricing>,
   rootDir: string,
   options: LiveModelsOptions,
+  attributionSourceSha256: string,
+  cliBinaryHash: string,
+  attributionGovernor: AttributionGovernor,
 ): Promise<LiveModelCaseResult> {
   const runDir = join(
     rootDir,
@@ -511,7 +826,7 @@ async function runLiveModelCase(
   if (candidateProfilePath !== undefined) {
     await writeFile(
       candidateProfilePath,
-      JSON.stringify(qualificationCandidateDocument(pair, pricing, apiBase, apiFormat)),
+      JSON.stringify(qualificationCandidateDocument(pair, pricing, apiBase, apiFormat, options.upstreamProvider)),
       { mode: 0o600 },
     );
   }
@@ -595,6 +910,47 @@ async function runLiveModelCase(
     );
   }
 
+  const targetFinding = c.groundTruth.findings[0];
+  const target: AttributionTarget | null = targetFinding === undefined ? null : {
+    path: targetFinding.path,
+    startLine: targetFinding.line,
+    endLine: targetFinding.endLine,
+    contract: targetFinding.targetContract,
+  };
+  const candidates = [
+    ...envelope.findings,
+    ...envelope.suppressedFindings.map((entry) => entry.finding),
+  ].map((finding) => ({
+    path: finding.path,
+    line: finding.line,
+    endLine: finding.endLine ?? finding.line,
+    severity: finding.severity,
+    kind: finding.kind,
+    title: finding.title,
+    body: finding.body,
+  }));
+  const attribution = await attributeCandidates(target, candidates, {
+    binary: options.binary,
+    runDir: join(runDir, "attribution"),
+    env: liveEnv(
+      homeDir,
+      tmpDir,
+      "http://127.0.0.1:9",
+      pair,
+      apiBase,
+      apiFormat,
+      candidateProfilePath,
+    ),
+    sourceSha256: attributionSourceSha256,
+    binarySha256: cliBinaryHash,
+    evaluatorModel: pair.scorerModel,
+    expectedProvider: options.upstreamProvider,
+    apiFormat,
+    repeat,
+    governor: attributionGovernor,
+    projectedCostUsdDecimal: projectedAttributionDecisionCostUsd(requiredPricing(pricing, pair.scorerModel)),
+  });
+
   return scoreLiveCase({
     case: c,
     pair,
@@ -604,6 +960,7 @@ async function runLiveModelCase(
     exitCode,
     fidelityFailures,
     structuredOutputFailures,
+    attribution,
   });
 }
 
@@ -612,16 +969,47 @@ export function qualificationCandidateDocument(
   pricing: Map<string, ModelPricing>,
   apiBase: string,
   apiFormat: "openai-compatible" | "anthropic",
+  upstreamProvider: string,
 ) {
   return {
     benchmarkProviderIdentity: benchmarkProviderIdentityFor(apiBase, apiFormat),
     apiBase,
     apiFormat,
+    upstreamProviderIdentity: upstreamProvider,
     generatorChain: qualificationGeneratorModels(pair),
     consensus: pair.consensus,
     scorerChain: qualificationScorerModels(pair),
     modelPriceBounds: modelPriceBoundsFor(pair, pricing),
   };
+}
+
+export async function prepareAttributionEvaluatorEnvironment(
+  pairRoot: string,
+  pair: QualificationPair,
+  pricing: Map<string, ModelPricing>,
+  apiBase: string,
+  apiFormat: "openai-compatible" | "anthropic",
+  upstreamProvider: string,
+): Promise<NodeJS.ProcessEnv> {
+  const homeDir = join(pairRoot, "home");
+  const tmpDir = join(pairRoot, "tmp");
+  await mkdir(homeDir, { recursive: true, mode: 0o700 });
+  await mkdir(tmpDir, { recursive: true, mode: 0o700 });
+  const candidateProfilePath = join(pairRoot, "qualification-candidate.json");
+  await writeFile(
+    candidateProfilePath,
+    JSON.stringify(qualificationCandidateDocument(pair, pricing, apiBase, apiFormat, upstreamProvider)),
+    { mode: 0o600 },
+  );
+  return liveEnv(
+    homeDir,
+    tmpDir,
+    "http://127.0.0.1:9",
+    pair,
+    apiBase,
+    apiFormat,
+    candidateProfilePath,
+  );
 }
 
 async function assertRuntimeShapedQualificationPreflight(args: {
@@ -633,9 +1021,10 @@ async function assertRuntimeShapedQualificationPreflight(args: {
   pricing: Map<string, ModelPricing>;
   apiBase: string;
   apiFormat: "openai-compatible" | "anthropic";
-  costCapUsd: number;
-}): Promise<number> {
-  let projectedMicros = 0;
+  costCapUsdDecimal: string;
+  upstreamProvider: string;
+}): Promise<string> {
+  let projectedMicros = 0n;
   const planRoot = join(args.rootDir, "preflight");
   await rm(planRoot, { recursive: true, force: true });
   try {
@@ -653,7 +1042,7 @@ async function assertRuntimeShapedQualificationPreflight(args: {
         const profilePath = join(runDir, "qualification-candidate.json");
         await writeFile(
           profilePath,
-          JSON.stringify(qualificationCandidateDocument(pair, args.pricing, args.apiBase, args.apiFormat)),
+          JSON.stringify(qualificationCandidateDocument(pair, args.pricing, args.apiBase, args.apiFormat, args.upstreamProvider)),
           { mode: 0o600 },
         );
         const github = await startMockGithub(c);
@@ -682,7 +1071,7 @@ async function assertRuntimeShapedQualificationPreflight(args: {
             (c.admission.expectedCoverage !== undefined && coverage.mode !== c.admission.expectedCoverage)) {
             throw new Error(`runtime preflight emitted the wrong coverage mode for ${c.id}`);
           }
-          projectedMicros += parsed.data.reviewAdmission.projectedCostMicros * args.repeats;
+          projectedMicros += BigInt(parsed.data.reviewAdmission.projectedCostMicros) * BigInt(args.repeats);
         } finally {
           await github.close();
         }
@@ -691,13 +1080,24 @@ async function assertRuntimeShapedQualificationPreflight(args: {
   } finally {
     await rm(planRoot, { recursive: true, force: true });
   }
-  const projectedUsd = projectedMicros / 1_000_000;
-  if (!Number.isFinite(projectedUsd) || projectedUsd > args.costCapUsd) {
+  const projectedUsd = canonicalUsdFromMicros(projectedMicros);
+  const projectedAttribution = args.pairs.map((pair) => {
+    const decisionsPerRepeat = ATTRIBUTION_BANK.length +
+      args.cases.filter((c) => c.groundTruth.findings.length > 0).length * ATTRIBUTION_MAX_CALLS_PER_FINDING_SET;
+    const oneDecision = parseCanonicalDecimal(projectedAttributionDecisionCostUsd(requiredPricing(args.pricing, pair.scorerModel)));
+    return multiplyCanonicalDecimal(oneDecision, BigInt(decisionsPerRepeat * args.repeats));
+  });
+  const combinedProjected = sumCanonicalDecimals([
+    parseCanonicalDecimal(projectedUsd),
+    ...projectedAttribution,
+  ]);
+  const combinedProjectedUsd = formatCanonicalDecimal(combinedProjected);
+  if (compareCanonicalDecimals(combinedProjected, parseCanonicalDecimal(args.costCapUsdDecimal)) > 0) {
     throw new Error(
-      `runtime-shaped qualification spend $${projectedUsd.toFixed(4)} exceeds the $${args.costCapUsd.toFixed(2)} cap`,
+      `runtime-shaped qualification spend $${combinedProjectedUsd} exceeds the $${args.costCapUsdDecimal} cap`,
     );
   }
-  return projectedUsd;
+  return combinedProjectedUsd;
 }
 
 /** Environment for a live-models run: an isolated HOME/TMPDIR/XDG so the binary
@@ -949,6 +1349,7 @@ function qualificationProfileEvidence(args: Omit<
     apiBase: args.apiBase,
     apiFormat: args.apiFormat,
     benchmarkProviderIdentity: benchmarkProviderIdentityFor(args.apiBase, args.apiFormat),
+    upstreamProviderIdentity: args.upstreamProviderIdentity,
     generatorModels,
     consensus,
     scorerModels: qualificationScorerModels(args.pair),
@@ -957,6 +1358,7 @@ function qualificationProfileEvidence(args: Omit<
     reviewContractHash: args.reviewContractHash,
     evaluatorContractHash: args.evaluatorContractHash,
     evaluatorRuntimeIdentity: args.evaluatorRuntimeIdentity,
+    evaluatorEvidenceSha256: args.evaluatorEvidenceSha256,
     configHash: args.configHash,
     cliBinaryHash: args.cliBinaryHash,
     repeats: args.repeats,
@@ -979,6 +1381,7 @@ export function qualificationProfileDigestMaterial(
     qualificationSourceSha: profile.qualificationSourceSha,
     modelDefaultsSha256: profile.modelDefaultsSha256,
     benchmarkProviderIdentity: profile.benchmarkProviderIdentity,
+    upstreamProviderIdentity: profile.upstreamProviderIdentity,
     apiBase: profile.apiBase,
     apiFormat: profile.apiFormat,
     generatorChain: profile.generatorModels,
@@ -989,24 +1392,13 @@ export function qualificationProfileDigestMaterial(
     fixtureSetSha256: profile.fixtureHash,
     evaluatorContractSha256: profile.evaluatorContractHash,
     evaluatorRuntimeIdentity: profile.evaluatorRuntimeIdentity,
+    evaluatorEvidenceSha256: profile.evaluatorEvidenceSha256,
     reportSha256: profile.reportSha256,
     repeatedRuns: profile.repeats,
   };
 }
 
-export async function resolveQualificationSourceSha(repositoryRoot: string): Promise<string> {
-  try {
-    await execFile("git", ["diff", "--quiet", "HEAD", "--"], {
-      cwd: repositoryRoot,
-      timeout: 15_000,
-    });
-    await execFile("git", ["diff", "--cached", "--quiet", "HEAD", "--"], {
-      cwd: repositoryRoot,
-      timeout: 15_000,
-    });
-  } catch {
-    throw new Error("live qualification requires a clean tracked worktree");
-  }
+async function resolveNamedQualificationCommit(repositoryRoot: string): Promise<string> {
   const { stdout } = await execFile("git", ["rev-parse", "--verify", "HEAD^{commit}"], {
     cwd: repositoryRoot,
     timeout: 15_000,
@@ -1020,6 +1412,247 @@ export async function resolveQualificationSourceSha(repositoryRoot: string): Pro
     throw new Error("checked-out qualification source does not match POSTIL_QUALIFICATION_SOURCE_SHA");
   }
   return sourceSha;
+}
+
+export async function assertGitTreeSourceAuthority(
+  repositoryRoot: string,
+  sourceSha: string,
+  paths: readonly string[],
+): Promise<void> {
+  const uniquePaths = [...new Set(paths)];
+  uniquePaths.forEach(qualificationPathComponents);
+  const repositoryHandle = await openQualificationRepositoryRoot(repositoryRoot);
+  try {
+    await Promise.all(uniquePaths.map(async (path) => {
+      const [{ stdout: treeStdout }, { stdout: indexStdout }] = await Promise.all([
+        execFile("git", ["ls-tree", "-z", sourceSha, "--", path], {
+          cwd: repositoryRoot,
+          timeout: 15_000,
+          maxBuffer: 1024 * 1024,
+        }),
+        execFile("git", ["ls-files", "--stage", "-z", "--", path], {
+          cwd: repositoryRoot,
+          timeout: 15_000,
+          maxBuffer: 1024 * 1024,
+        }),
+      ]);
+      const treeEntry = /^(100644|100755) blob ([0-9a-f]+)\t(.+)$/u.exec(
+        treeStdout.replace(/\0$/u, ""),
+      );
+      if (treeEntry === null || treeEntry[3] !== path) {
+        throw new Error(`qualification source ${sourceSha} does not track regular file ${path}`);
+      }
+      const indexEntry = /^(100644|100755) ([0-9a-f]+) 0\t(.+)$/u.exec(
+        indexStdout.replace(/\0$/u, ""),
+      );
+      if (indexEntry === null || indexEntry[3] !== path ||
+          indexEntry[1] !== treeEntry[1] || indexEntry[2] !== treeEntry[2]) {
+        throw new Error(`qualification index path ${path} differs from the named Git source`);
+      }
+      const treeBytes = await readGitBlob(repositoryRoot, treeEntry[2]!);
+      await readQualificationWorktreeFile(repositoryHandle, path, {
+        bytes: treeBytes,
+        executable: treeEntry[1] === "100755",
+      });
+    }));
+  } finally {
+    await repositoryHandle.close();
+  }
+}
+
+async function readGitBlob(repositoryRoot: string, objectId: string): Promise<Buffer> {
+  const { stdout } = await execFile("git", ["cat-file", "blob", objectId], {
+    cwd: repositoryRoot,
+    timeout: 15_000,
+    maxBuffer: MAX_QUALIFICATION_SOURCE_BYTES + 1,
+    encoding: "buffer",
+  });
+  const bytes = Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout);
+  if (bytes.length > MAX_QUALIFICATION_SOURCE_BYTES) {
+    throw new Error("qualification Git source blob exceeds the bounded source size");
+  }
+  return bytes;
+}
+
+function requiredFsFlag(name: "O_NOFOLLOW" | "O_DIRECTORY"): number {
+  const flag = (fsConstants as unknown as Record<string, unknown>)[name];
+  if (typeof flag !== "number") {
+    throw new Error(`qualification source authority requires Linux ${name} support`);
+  }
+  return flag;
+}
+
+function qualificationPathComponents(path: string): string[] {
+  if (path.length === 0 || path.startsWith("/") || path.includes("\\") || path.includes("\0")) {
+    throw new Error(`qualification source path is not a safe relative Git path: ${path}`);
+  }
+  const components = path.split("/");
+  if (components.some((component) => component.length === 0 || component === "." || component === "..")) {
+    throw new Error(`qualification source path is not normalized: ${path}`);
+  }
+  return components;
+}
+
+async function openQualificationRepositoryRoot(repositoryRoot: string): Promise<FileHandle> {
+  const handle = await open(
+    repositoryRoot,
+    fsConstants.O_RDONLY |
+      requiredFsFlag("O_DIRECTORY") |
+      requiredFsFlag("O_NOFOLLOW") |
+      ((fsConstants as unknown as Record<string, number>).O_CLOEXEC ?? 0),
+  ).catch(() => null);
+  if (handle === null) {
+    throw new Error("qualification repository root could not be opened without following symbolic links");
+  }
+  const metadata = await handle.stat().catch(() => null);
+  if (metadata === null || !metadata.isDirectory()) {
+    await handle.close();
+    throw new Error("qualification repository root descriptor is not a directory");
+  }
+  return handle;
+}
+
+async function readQualificationWorktreeFile(
+  repositoryHandle: FileHandle,
+  path: string,
+  expected?: { bytes: Buffer; executable: boolean },
+): Promise<{ bytes: Buffer; executable: boolean }> {
+  const components = qualificationPathComponents(path);
+  const noFollow = requiredFsFlag("O_NOFOLLOW");
+  const directory = requiredFsFlag("O_DIRECTORY");
+  const closeOnExec = (fsConstants as unknown as Record<string, number>).O_CLOEXEC ?? 0;
+  const nonBlock = (fsConstants as unknown as Record<string, number>).O_NONBLOCK ?? 0;
+  const directories: FileHandle[] = [];
+  let parent = repositoryHandle;
+  let handle: FileHandle | null = null;
+  try {
+    for (const component of components.slice(0, -1)) {
+      const child = await open(
+        `/proc/self/fd/${parent.fd}/${component}`,
+        fsConstants.O_RDONLY | directory | noFollow | closeOnExec | nonBlock,
+      ).catch(() => null);
+      if (child === null) {
+        throw new Error(`qualification worktree directory for ${path} could not be opened safely`);
+      }
+      const metadata = await child.stat().catch(() => null);
+      if (metadata === null || !metadata.isDirectory()) {
+        await child.close();
+        throw new Error(`qualification worktree directory for ${path} is not a directory`);
+      }
+      directories.push(child);
+      parent = child;
+    }
+    handle = await open(
+      `/proc/self/fd/${parent.fd}/${components.at(-1)!}`,
+      fsConstants.O_RDONLY | noFollow | closeOnExec | nonBlock,
+    ).catch(() => null);
+    if (handle === null) {
+      throw new Error(`qualification worktree path ${path} is missing or could not be opened safely`);
+    }
+    const before = await handle.stat({ bigint: true });
+    if (!before.isFile() || before.nlink !== 1n || before.size < 0n ||
+        before.size > BigInt(MAX_QUALIFICATION_SOURCE_BYTES)) {
+      throw new Error(`qualification worktree path ${path} is not a bounded single-link regular file`);
+    }
+    const length = Number(before.size);
+    const bytes = Buffer.allocUnsafe(length);
+    let offset = 0;
+    while (offset < length) {
+      const { bytesRead } = await handle.read(bytes, offset, length - offset, offset);
+      if (bytesRead === 0) {
+        throw new Error(`qualification worktree path ${path} changed during descriptor read`);
+      }
+      offset += bytesRead;
+    }
+    const extra = Buffer.allocUnsafe(1);
+    if ((await handle.read(extra, 0, 1, length)).bytesRead !== 0) {
+      throw new Error(`qualification worktree path ${path} exceeded its bounded descriptor read`);
+    }
+    const after = await handle.stat({ bigint: true });
+    if (after.dev !== before.dev || after.ino !== before.ino || after.nlink !== before.nlink ||
+        after.mode !== before.mode || after.size !== before.size || after.mtimeNs !== before.mtimeNs ||
+        after.ctimeNs !== before.ctimeNs) {
+      throw new Error(`qualification worktree path ${path} changed during descriptor read`);
+    }
+    const executable = (before.mode & 0o111n) !== 0n;
+    if (expected !== undefined && !expected.bytes.equals(bytes)) {
+      throw new Error(`qualification worktree path ${path} differs from the named Git source`);
+    }
+    if (expected !== undefined && expected.executable !== executable) {
+      throw new Error(`qualification worktree path ${path} executable mode differs from the named Git source`);
+    }
+    return { bytes, executable };
+  } finally {
+    if (handle !== null) await handle.close();
+    for (const directoryHandle of directories.reverse()) await directoryHandle.close();
+  }
+}
+
+export async function readPinnedQualificationWorktreeFile(
+  repositoryRoot: string,
+  path: string,
+): Promise<{ bytes: Buffer; executable: boolean }> {
+  const repositoryHandle = await openQualificationRepositoryRoot(repositoryRoot);
+  try {
+    return await readQualificationWorktreeFile(repositoryHandle, path);
+  } finally {
+    await repositoryHandle.close();
+  }
+}
+
+async function readGitTreeSource(
+  repositoryRoot: string,
+  sourceSha: string,
+  path: string,
+): Promise<Buffer> {
+  const { stdout } = await execFile("git", ["show", `${sourceSha}:${path}`], {
+    cwd: repositoryRoot,
+    timeout: 15_000,
+    maxBuffer: 16 * 1024 * 1024,
+    encoding: "buffer",
+  });
+  return Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout);
+}
+
+async function hashGitTreeSources(
+  repositoryRoot: string,
+  sourceSha: string,
+  paths: readonly string[],
+): Promise<string> {
+  const sources = await Promise.all(paths.map(async (path) =>
+    [path, await readGitTreeSource(repositoryRoot, sourceSha, path)] as const));
+  return hashNamedSources(sources);
+}
+
+export async function resolveQualificationSourceAuthority(
+  repositoryRoot: string,
+): Promise<QualificationSourceAuthority> {
+  const sourceSha = await resolveNamedQualificationCommit(repositoryRoot);
+  const authorityPaths = [
+    ...FIXTURE_SET_SOURCE_PATHS,
+    ...REVIEW_CONTRACT_SOURCE_PATHS,
+    ...EVALUATOR_CONTRACT_SOURCE_PATHS,
+    ...BINARY_SOURCE_PATHS,
+    "config.toml",
+  ];
+  await assertGitTreeSourceAuthority(repositoryRoot, sourceSha, authorityPaths);
+  const [fixtureHash, reviewContractHash, evaluatorContractHash, configBytes] = await Promise.all([
+    hashGitTreeSources(repositoryRoot, sourceSha, FIXTURE_SET_SOURCE_PATHS),
+    hashGitTreeSources(repositoryRoot, sourceSha, REVIEW_CONTRACT_SOURCE_PATHS),
+    hashGitTreeSources(repositoryRoot, sourceSha, EVALUATOR_CONTRACT_SOURCE_PATHS),
+    readGitTreeSource(repositoryRoot, sourceSha, "config.toml"),
+  ]);
+  return {
+    sourceSha,
+    fixtureHash,
+    reviewContractHash,
+    evaluatorContractHash,
+    configHash: hashText(configBytes),
+  };
+}
+
+export async function resolveQualificationSourceSha(repositoryRoot: string): Promise<string> {
+  return (await resolveQualificationSourceAuthority(repositoryRoot)).sourceSha;
 }
 
 export function qualificationProfileDigest(profile: Omit<QualificationProfile, "id">): string {
@@ -1060,6 +1693,7 @@ export async function fetchPricing(
   apiBase: string,
   apiFormat: "openai-compatible" | "anthropic",
   models: string[],
+  upstreamProvider: string,
 ): Promise<Map<string, ModelPricing>> {
   const managedOpenRouter = benchmarkProviderIdentityFor(apiBase, apiFormat) !== null;
   const url = `${apiBase.replace(/\/$/, "")}/${managedOpenRouter ? "endpoints/zdr" : "models"}`;
@@ -1081,7 +1715,7 @@ export async function fetchPricing(
   }
   const catalog = await res.json();
   return managedOpenRouter
-    ? pricingFromZdrCatalog(catalog as OpenRouterZdrEndpointsResponse, models)
+    ? pricingFromZdrCatalog(catalog as OpenRouterZdrEndpointsResponse, models, upstreamProvider)
     : pricingFromCatalog(catalog as OpenRouterModelsResponse, models);
 }
 
@@ -1124,9 +1758,19 @@ export async function pricingFromFile(path: string): Promise<Map<string, ModelPr
       throw new Error(`qualification pricing for ${model} must be an object`);
     }
     const record = value as Record<string, unknown>;
+    const allowed = new Set(["providerIdentity", "promptUsdPerToken", "completionUsdPerToken"]);
+    const unknown = Object.keys(record).filter((key) => !allowed.has(key));
+    if (unknown.length > 0) {
+      throw new Error(`qualification pricing for ${model} has unknown field ${unknown[0]}`);
+    }
+    if (typeof record.providerIdentity !== "string" || record.providerIdentity.trim() === "" ||
+        record.providerIdentity !== record.providerIdentity.trim()) {
+      throw new Error(`${model}.providerIdentity must be a nonempty exact provider name`);
+    }
     const prompt = strictPrice(record.promptUsdPerToken, `${model}.promptUsdPerToken`);
     const completion = strictPrice(record.completionUsdPerToken, `${model}.completionUsdPerToken`);
     out.set(model, {
+      providerIdentity: record.providerIdentity,
       promptUsdPerToken: prompt.usdPerToken,
       completionUsdPerToken: completion.usdPerToken,
       inputMicrosPerMillionTokens: prompt.microsPerMillionTokens,
@@ -1194,12 +1838,12 @@ export function formatLiveModelsReport(report: LiveModelsReport): string {
   }
   lines.push(
     "",
-    `Total run cost: ${usd(report.totalRunCostUsd)}`,
+    `Conservative run cost: $${report.totalRunCostUsdDecimal} (exact successful $${report.exactSuccessfulCostUsdDecimal}; failed or unknown exposure $${report.failedOrUnknownExposureUsdDecimal})`,
+    `Atomic attribution: $${report.attributionRunCostUsdDecimal} exact across ${report.attributionProviderCalls} provider calls`,
     "",
     `Fixture ${report.fixtureHash}; review contract ${report.reviewContractHash}.`,
-    `Provider endpoint ${report.providerEndpointIdentity}; ${report.repeats} complete repeats.`,
-    "Upstream provider route: dynamic and unpinned.",
-    "block = must-block seeded-defect recall; adv = advisory seeded-defect recall;",
+    `Provider endpoint ${report.providerEndpointIdentity}; upstream ${report.upstreamProviderIdentity} pinned for every qualification call; ${report.repeats} complete repeats.`,
+    "block = must-block authored-target recall; adv = advisory authored-target recall;",
     "clean FP = clean cases with any final or suppressed finding. Costs retain provider-exact",
     "or catalog-estimate provenance in the per-case report.",
   );

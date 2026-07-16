@@ -36,6 +36,17 @@ pub enum Command {
     /// Print immutable qualification metadata embedded in this binary.
     #[command(hide = true)]
     QualificationMetadata,
+    /// Run one atomic attribution judgment for candidate qualification.
+    #[cfg(feature = "qualification-candidate")]
+    #[command(hide = true)]
+    AtomicAttribution {
+        /// JSON request file. Sensitive evaluator input is never accepted on argv.
+        #[arg(long)]
+        input: PathBuf,
+        /// Explicit config file for provider selection.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     /// Review a diff: a PR/MR on a forge, or local changes.
     Review {
         /// Code host for remote review. Inferred as github when --repo is set.

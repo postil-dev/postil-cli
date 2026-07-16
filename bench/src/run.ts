@@ -29,7 +29,7 @@
 //   POSTIL_BENCH_REPEATS    complete matrix repetitions (admission requires at least 3)
 //   POSTIL_API_BASE         provider API base (default https://openrouter.ai/api/v1)
 //   POSTIL_API_FORMAT       provider interface (openai-compatible or anthropic)
-//   POSTIL_BENCH_PRICING_FILE  JSON pricing for endpoints without catalog prices
+//   POSTIL_BENCH_PRICING_FILE  exact-provider pricing for managed qualification
 //   POSTIL_ENDPOINT_AUTH_HEADER additional private-gateway authentication header
 //   POSTIL_ENDPOINT_AUTH_VALUE  value paired with POSTIL_ENDPOINT_AUTH_HEADER
 //   MODEL_API_KEY           inference key for live modes; never printed
@@ -102,15 +102,20 @@ async function main() {
     const repeatsRaw = process.env.POSTIL_BENCH_REPEATS ?? flagValue(args, "--repeats");
     const apiFormat = qualificationApiFormat(process.env.POSTIL_API_FORMAT);
     const pricingFile = process.env.POSTIL_BENCH_PRICING_FILE ?? flagValue(args, "--pricing-file");
+    const upstreamProvider = process.env.POSTIL_BENCH_UPSTREAM_PROVIDER ?? flagValue(args, "--upstream-provider");
+    if (!upstreamProvider?.trim()) {
+      throw new Error("live-models admission needs POSTIL_BENCH_UPSTREAM_PROVIDER or --upstream-provider");
+    }
     const report = await runLiveModels(cases, {
       binary,
       pairs,
       repeats: repeatsRaw === undefined ? undefined : Number.parseInt(repeatsRaw, 10),
       apiBase: process.env.POSTIL_API_BASE,
       apiFormat,
+      upstreamProvider,
       pricing: pricingFile === undefined ? undefined : await pricingFromFile(pricingFile),
       concurrency,
-      costCapUsd: costCapRaw === undefined ? undefined : Number.parseFloat(costCapRaw),
+      costCapUsd: costCapRaw,
     });
     await writeLiveModelsReport(jsonOut, JSON.stringify(report, null, 2));
     if (manifestOut) {

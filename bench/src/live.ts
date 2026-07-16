@@ -3,7 +3,7 @@
 // Unlike the default mock mode (mock forge + mock model, measuring pipeline
 // fidelity), live mode runs the real release binary against the real fixtures
 // with a real model and no mocked model server. It measures detection ability:
-// detection rate on seeded defects, silence on clean PRs, false positives, the
+// detection rate on authored target defects, silence on clean PRs, false positives, the
 // confidence distribution of true detections, and duration.
 //
 // Each case is run in local diff-file mode:
@@ -17,7 +17,7 @@
 // REVIEW_MODEL or --model is required.
 //
 // Scoring uses fixture ground truth: a defect counts as detected when a finding
-// matches the ground-truth path with line within +/-3; severity match is tracked
+// matches the authored ground-truth region; severity match is tracked
 // among detections; clean cases should be silent; any finding in a clean case
 // and any non-matching finding in a defect case is a false positive.
 //
@@ -48,10 +48,6 @@ const DEFAULT_LIVE_RETRIES = 1;
 
 /** Backoff before the single retry of a transiently-failed case. */
 const RETRY_BACKOFF_MS = 2_000;
-
-/** A defect is detected when a finding hits the right file and is within this
- * many lines of the ground-truth line. */
-const LINE_TOLERANCE = 3;
 
 /** Severity tiers, ordered low to high (mirrors src/envelope.rs: info < warn <
  * error). Used to compute the +/-1-tier adjacency tolerance below. */
@@ -108,7 +104,8 @@ export function liveReviewArguments(diffPath: string, bounded = false): string[]
 interface GroundTruth {
   clean: boolean;
   path: string | null;
-  line: number | null;
+  startLine: number | null;
+  endLine: number | null;
   severity: string | null;
 }
 
@@ -118,7 +115,7 @@ export interface LiveCaseResult {
   type: "defect" | "clean";
   /** A valid v1 envelope was produced and scored. */
   scored: boolean;
-  /** Defect: detected within tolerance. Clean: silent (no findings). */
+  /** Defect: detected at the exact authored region. Clean: silent. */
   detected: boolean | null;
   silent: boolean | null;
   truthSeverity: string | null;
@@ -550,9 +547,10 @@ function scoreCase(base: LiveCaseResult, truth: GroundTruth, env: Envelope): Liv
     return base;
   }
 
-  const match = findings.find(
-    (f) => f.path === truth.path && Math.abs(f.line - (truth.line as number)) <= LINE_TOLERANCE,
-  );
+  const match = findings.find((finding) =>
+    finding.path === truth.path &&
+    Math.min(finding.line, finding.endLine ?? finding.line) <= truth.endLine! &&
+    Math.max(finding.line, finding.endLine ?? finding.line) >= truth.startLine!);
   base.detected = Boolean(match);
   if (match) {
     base.foundSeverity = match.severity;
@@ -569,11 +567,12 @@ function scoreCase(base: LiveCaseResult, truth: GroundTruth, env: Envelope): Liv
 
 function groundTruthOf(c: ReturnType<typeof benchmarkCase.parse>): GroundTruth {
   const gt = c.groundTruth.findings[0];
-  if (!gt) return { clean: true, path: null, line: null, severity: null };
+  if (!gt) return { clean: true, path: null, startLine: null, endLine: null, severity: null };
   return {
     clean: false,
     path: gt.path,
-    line: gt.line ?? null,
+    startLine: gt.line,
+    endLine: gt.endLine,
     severity: gt.severity ?? null,
   };
 }

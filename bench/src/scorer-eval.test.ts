@@ -419,10 +419,9 @@ describe("scorer proxy and isolated runtime", () => {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({
         choices: [{ message: { content: JSON.stringify([{
-          index: 0,
           confidence: 0.2,
           kind: "uncertainty",
-          reason: "The claimed runtime break is not supported by the changed behavior.",
+          reason: "The claimed runtime break is unsupported by the change.",
         }]) } }],
         usage: { prompt_tokens: 30, completion_tokens: 10, cost: 0.000045 },
       }));
@@ -470,6 +469,9 @@ describe("scorer proxy and isolated runtime", () => {
       expect(scorerPrompt).toContain('"line": 44');
       const runArtifacts = join(root, "scorer_model", "repeat-1", calibration.id, "artifacts");
       const envelope = envelopeV1.parse(JSON.parse(await readFile(join(runArtifacts, "stdout.json"), "utf8")));
+      expect(envelope.findings).toHaveLength(0);
+      expect(envelope.silent).toBe(true);
+      expect(envelope.gate.failing).toBe(false);
       expect(envelope.reviewCoverage?.mode).toBe("bounded");
       expect(envelope.reviewCoverage?.selectedBatches).toBeLessThan(envelope.reviewCoverage!.totalBatches);
       expect(envelope.reviewCoverage?.plannerFallback).toBe(false);
@@ -501,9 +503,13 @@ describe("scorer proxy and isolated runtime", () => {
         .toHaveLength(1);
       expect(proxyTelemetry.plannerSelections).toHaveLength(1);
       expect(proxyTelemetry.plannerSelections[0]?.targetWasMandatory).toBe(false);
-      expect(proxyTelemetry.plannerSelections[0]?.targetBatchId).toBeGreaterThan(0);
+      const targetBatchId = proxyTelemetry.plannerSelections[0]?.targetBatchId;
+      expect(targetBatchId).toBeGreaterThan(0);
+      if (targetBatchId === null || targetBatchId === undefined) {
+        throw new Error("planner target batch id is missing");
+      }
       expect(proxyTelemetry.plannerSelections[0]?.returnedBatchIds).toEqual([
-        proxyTelemetry.plannerSelections[0]?.targetBatchId,
+        targetBatchId,
       ]);
       const stderr = await readFile(
         join(runArtifacts, "stderr.log"),

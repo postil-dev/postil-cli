@@ -18,6 +18,8 @@ use crate::diff::{DiffSnapshot, DiffSpool, WorkspaceBudget};
 use crate::envelope::{Envelope, Finding, Severity};
 use crate::filter;
 
+pub const EXPECTED_REPOSITORY_ID_ENV: &str = "POSTIL_EXPECTED_GITHUB_REPO_ID";
+
 pub struct GitHub {
     http: reqwest::Client,
     api_base: String,
@@ -26,6 +28,7 @@ pub struct GitHub {
     owner: String,
     repo: String,
     pr: u64,
+    expected_repository_id: Option<u64>,
 }
 
 impl GitHub {
@@ -38,6 +41,24 @@ impl GitHub {
         let api_base = std::env::var("GITHUB_API_URL")
             .unwrap_or_else(|_| "https://api.github.com".to_string());
         let details_url = valid_details_url(std::env::var("POSTIL_DETAILS_URL").ok());
+        let expected_repository_id = match std::env::var(EXPECTED_REPOSITORY_ID_ENV) {
+            Ok(value) => {
+                let parsed = value.parse::<u64>().with_context(|| {
+                    format!("{EXPECTED_REPOSITORY_ID_ENV} must be a positive integer")
+                })?;
+                ensure!(
+                    parsed > 0,
+                    "{EXPECTED_REPOSITORY_ID_ENV} must be a positive integer"
+                );
+                Some(parsed)
+            }
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(anyhow!(
+                    "{EXPECTED_REPOSITORY_ID_ENV} must be valid Unicode"
+                ));
+            }
+        };
         Ok(GitHub {
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(60))
@@ -48,6 +69,7 @@ impl GitHub {
             owner: owner.to_string(),
             repo: repo.to_string(),
             pr,
+            expected_repository_id,
         })
     }
 
@@ -67,6 +89,49 @@ impl GitHub {
         if let Some(details_url) = &self.details_url {
             body["details_url"] = json!(details_url);
         }
+    }
+
+    async fn verify_repository_identity_before_write(&self) -> Result<()> {
+        let Some(expected_id) = self.expected_repository_id else {
+            if crate::config::hosted_runtime_mode() {
+                return Err(super::repository_identity_failure(format!(
+                    "hosted GitHub publication requires {EXPECTED_REPOSITORY_ID_ENV}"
+                )));
+            }
+            return Ok(());
+        };
+        let response = self
+            .request(reqwest::Method::GET, self.url(""))
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(|error| {
+                super::repository_identity_failure(format!(
+                    "GitHub repository identity could not be verified: {error}"
+                ))
+            })?;
+        let response = Self::check_ok(response, "repository identity fence")
+            .await
+            .map_err(|error| {
+                super::repository_identity_failure(format!(
+                    "GitHub repository identity could not be verified: {error:#}"
+                ))
+            })?;
+        let identity: RepositoryIdentity =
+            super::bounded_response_json(response, "GitHub repository identity")
+                .await
+                .map_err(|error| {
+                    super::repository_identity_failure(format!(
+                        "GitHub repository identity could not be verified: {error:#}"
+                    ))
+                })?;
+        let expected_name = format!("{}/{}", self.owner, self.repo);
+        if identity.id != expected_id || !identity.full_name.eq_ignore_ascii_case(&expected_name) {
+            return Err(super::repository_identity_failure(
+                "GitHub repository identity changed; refusing publication",
+            ));
+        }
+        Ok(())
     }
 
     async fn fetch_pr_state(&self) -> Result<PrResponse> {
@@ -104,10 +169,30 @@ impl GitHub {
         request: reqwest::RequestBuilder,
         what: &str,
     ) -> Result<reqwest::Response> {
+        self.send_retryable_inner(request, what, false).await
+    }
+
+    async fn send_write_retryable(
+        &self,
+        request: reqwest::RequestBuilder,
+        what: &str,
+    ) -> Result<reqwest::Response> {
+        self.send_retryable_inner(request, what, true).await
+    }
+
+    async fn send_retryable_inner(
+        &self,
+        request: reqwest::RequestBuilder,
+        what: &str,
+        fence_each_attempt: bool,
+    ) -> Result<reqwest::Response> {
         const RETRIES: u32 = 2;
         const TOTAL_BUDGET: Duration = Duration::from_secs(55);
         let operation_started_at = std::time::Instant::now();
         for retry in 0..=RETRIES {
+            if fence_each_attempt {
+                self.verify_repository_identity_before_write().await?;
+            }
             let attempt = retry + 1;
             let started_at = std::time::Instant::now();
             let remaining = TOTAL_BUDGET.saturating_sub(operation_started_at.elapsed());
@@ -220,6 +305,7 @@ impl GitHub {
     ) -> Result<CheckRun> {
         const RETRIES: u32 = 2;
         for retry in 0..=RETRIES {
+            self.verify_repository_identity_before_write().await?;
             let response = self
                 .request(reqwest::Method::POST, self.url("/check-runs"))
                 .json(body)
@@ -316,6 +402,7 @@ impl GitHub {
     ) -> Result<Option<reqwest::Response>> {
         const RETRIES: u32 = 2;
         for retry in 0..=RETRIES {
+            self.verify_repository_identity_before_write().await?;
             let response = self
                 .request(
                     reqwest::Method::POST,
@@ -392,6 +479,7 @@ impl GitHub {
     async fn post_comment_reconciled(&self, number: u64, body: &str, marker: &str) -> Result<()> {
         const RETRIES: u32 = 2;
         for retry in 0..=RETRIES {
+            self.verify_repository_identity_before_write().await?;
             let response = self
                 .request(
                     reqwest::Method::POST,
@@ -847,6 +935,12 @@ struct PublishedComment {
     body: String,
 }
 
+#[derive(Deserialize)]
+struct RepositoryIdentity {
+    id: u64,
+    full_name: String,
+}
+
 impl Forge for GitHub {
     fn rich_markdown(&self) -> bool {
         true
@@ -1216,7 +1310,7 @@ impl Forge for GitHub {
             });
             self.add_details_url(&mut body);
             let resp = self
-                .send_retryable(
+                .send_write_retryable(
                     self.request(
                         reqwest::Method::PATCH,
                         self.url(&format!("/check-runs/{id}")),
@@ -1299,9 +1393,9 @@ fn comment_marker(number: u64, body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        GitHub, PullFile, gate_summary, github_retry_delay_at, github_retryable_response,
-        github_transport_retry_delay, only_operational_findings, valid_details_url,
-        validate_pull_file,
+        EXPECTED_REPOSITORY_ID_ENV, GitHub, PullFile, gate_summary, github_retry_delay_at,
+        github_retryable_response, github_transport_retry_delay, only_operational_findings,
+        valid_details_url, validate_pull_file,
     };
     use crate::envelope::{Envelope, Finding, Gate, Kind, Severity, Usage};
     use crate::forge::{CheckState, Forge, PrMeta};
@@ -1340,6 +1434,11 @@ mod tests {
             head_sha: Some(head_sha.into()),
             since_sha: None,
         }
+    }
+
+    #[test]
+    fn hosted_repository_identity_environment_contract_is_stable() {
+        assert_eq!(EXPECTED_REPOSITORY_ID_ENV, "POSTIL_EXPECTED_GITHUB_REPO_ID");
     }
 
     fn delivery_snapshot(head_sha: &str, target_sha: &str, merge_base_sha: &str) -> PrMeta {
@@ -1389,6 +1488,7 @@ mod tests {
             owner: "owner".into(),
             repo: "repo".into(),
             pr: 1,
+            expected_repository_id: None,
         };
         let started_at = std::time::Instant::now();
         let error = github
@@ -1518,7 +1618,108 @@ mod tests {
             owner: "owner".into(),
             repo: "repo".into(),
             pr: 1,
+            expected_repository_id: None,
         }
+    }
+
+    fn fenced_test_github(server: &MockServer, expected_repository_id: u64) -> GitHub {
+        GitHub {
+            expected_repository_id: Some(expected_repository_id),
+            ..test_github(server)
+        }
+    }
+
+    #[tokio::test]
+    async fn github_repository_identity_fence_rejects_a_renamed_repository() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 42,
+                "full_name": "owner/renamed"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/issues/9/comments"))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let error = fenced_test_github(&server, 42)
+            .post_comment_reconciled(9, "reply", "marker")
+            .await
+            .unwrap_err();
+        assert!(crate::forge::is_repository_identity_failure(&error));
+    }
+
+    #[tokio::test]
+    async fn github_repository_identity_fence_rejects_a_fork_id_for_base_publication() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 42,
+                "full_name": "owner/repo"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/issues/9/comments"))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let error = fenced_test_github(&server, 99)
+            .post_comment_reconciled(9, "reply", "marker")
+            .await
+            .unwrap_err();
+        assert!(crate::forge::is_repository_identity_failure(&error));
+    }
+
+    #[tokio::test]
+    async fn github_repository_identity_fence_publishes_only_for_the_same_pr_snapshot() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "title": "t", "body": "b", "state": "open", "merged": false,
+                "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"}, "changed_files": 1
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/compare/bbbbbbbb...aaaaaaaa"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "merge_base_commit": {"sha": "cccccccc"}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 42,
+                "full_name": "owner/repo"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        fenced_test_github(&server, 42)
+            .post_review(
+                "Review complete.",
+                &[],
+                &delivery_snapshot("aaaaaaaa", "bbbbbbbb", "cccccccc"),
+            )
+            .await
+            .unwrap();
     }
 
     fn pull_file_page(start: usize, count: usize) -> Vec<serde_json::Value> {
@@ -1676,6 +1877,7 @@ mod tests {
             owner: "owner".into(),
             repo: "repo".into(),
             pr: 1,
+            expected_repository_id: None,
         };
         let finding = Finding {
             path: "src/lib.rs".into(),
@@ -1904,6 +2106,7 @@ mod tests {
             owner: "owner".into(),
             repo: "repo".into(),
             pr: 1,
+            expected_repository_id: None,
         };
         let finding = Finding {
             path: "src/lib.rs".into(),
@@ -1973,6 +2176,7 @@ mod tests {
             owner: "owner".into(),
             repo: "repo".into(),
             pr: 1,
+            expected_repository_id: None,
         };
         let finding = Finding {
             path: "src/lib.rs".into(),

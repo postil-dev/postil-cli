@@ -1,10 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { benchmarkCase, type BenchmarkCase, type Envelope } from "./harness";
+import type { AttributionCaseEvidence } from "./attribution";
 import {
   aggregateModel,
   calculateTotalRunCostUsd,
   canonicalPriceMicrosPerMillion,
-  findingHitsSeededRegion,
   groundTruthOf,
   pricingFromCatalog,
   pricingFromZdrCatalog,
@@ -45,12 +45,9 @@ function fixture(
       findings: severity === null ? [] : [{
         path: "src/x.ts",
         line: 20,
+        endLine: 20,
         severity,
-        semantics: {
-          positive: ["generated detail must not persist"],
-          negative: ["no generated detail"],
-          failedRemediation: ["the fix does not prevent generated detail"],
-        },
+        targetContract: "generated detail must not persist",
       }],
     },
     modelOutput: { summary: "", findings: [] },
@@ -123,6 +120,7 @@ function envelope(args: {
       completionTokens: modelUsage.reduce((sum, entry) => sum + entry.completionTokens, 0),
     },
     modelUsage,
+    modelIncidents: [],
     reviewCoverage: args.bounded
       ? { mode: "bounded", selectedBatches: 5, totalBatches: 8, plannerFallback: false }
       : { mode: "exhaustive", selectedBatches: 1, totalBatches: 1, plannerFallback: false },
@@ -140,6 +138,13 @@ function score(
   env: Envelope,
   id?: string,
 ): LiveModelCaseResult {
+  const candidates = [...env.findings, ...env.suppressedFindings.map((entry) => entry.finding)];
+  const calls = classification === "clean" ? [] : candidates.flatMap((entry, candidateOrdinal) =>
+    entry.path === "src/x.ts" && entry.line === 20 && entry.body === "generated detail must not persist"
+      ? [{ candidateOrdinal: candidateOrdinal + 1, sameDefect: true }]
+      : entry.path === "src/x.ts" && entry.line === 20
+        ? [{ candidateOrdinal: candidateOrdinal + 1, sameDefect: false }]
+        : []);
   return scoreLiveCase({
     case: fixture(classification, id),
     pair,
@@ -148,6 +153,11 @@ function score(
     pricing: prices,
     exitCode: env.gate.failing ? 1 : 0,
     fidelityFailures: [],
+    attribution: {
+      scored: true,
+      detected: calls.some((entry) => entry.sameDefect),
+      calls,
+    } as AttributionCaseEvidence,
   });
 }
 
@@ -174,10 +184,6 @@ describe("fixture contract", () => {
     expect(groundTruthOf(fixture("clean"))).toMatchObject({ classification: "clean", path: null });
   });
 
-  test("attributes only overlapping findings to the seeded defect", () => {
-    expect(findingHitsSeededRegion({ path: "src/x.ts", line: 17 }, 20)).toBe(true);
-    expect(findingHitsSeededRegion({ path: "src/x.ts", line: 16 }, 20)).toBe(false);
-  });
 });
 
 describe("pair scoring", () => {
@@ -200,32 +206,31 @@ describe("pair scoring", () => {
     expect(score("clean", 1, unexpectedPlanner).usageValid).toBe(false);
   });
 
-  test("records final and suppressed detector evidence without generated prose", () => {
+  test("records canonical final and suppressed attribution evidence", () => {
     const result = score("advisory", 1, envelope({
       suppressed: [{ finding: finding("warn"), reason: "confidence" }],
     }));
     expect(result.detected).toBe(true);
     expect(result.findingEvidence).toEqual([{
-      detectorAttribution: "seeded",
+      atomicAttribution: "targetDefect",
       disposition: "suppressed",
       path: "src/x.ts",
       line: 20,
       severity: "warn",
       kind: "risk",
       confidence: 0.9,
-      semanticMatch: true,
+      title: "generated prose must not persist",
+      body: "generated detail must not persist",
     }]);
-    expect(JSON.stringify(result.findingEvidence)).not.toContain("generated prose");
-    expect(JSON.stringify(result.findingEvidence)).not.toContain("generated detail");
   });
 
-  test("requires the seeded detector itself to block and rejects unrelated substitute blockers", () => {
+  test("requires the attributed finding itself to block and rejects unrelated substitute blockers", () => {
     const result = score("mustBlock", 1, envelope({
       findings: [finding("warn"), finding("error", "src/other.ts", 8)],
       gateFailing: true,
     }));
     expect(result.detected).toBe(true);
-    expect(result.seededFinalBlocker).toBe(false);
+    expect(result.attributedFinalBlocker).toBe(false);
     expect(result.unrelatedFinalBlockers).toBe(1);
     expect(result.finalBlocking).toBe(false);
   });
@@ -234,7 +239,7 @@ describe("pair scoring", () => {
     const unrelated = { ...finding("error"), body: "This nearby line only changes formatting." };
     const result = score("mustBlock", 1, envelope({ findings: [unrelated], gateFailing: true }));
     expect(result.detected).toBe(false);
-    expect(result.findingEvidence[0]?.semanticMatch).toBe(false);
+    expect(result.findingEvidence[0]?.atomicAttribution).toBe("unrelated");
   });
 
   test("preserves provider-exact and catalog fallback cost provenance", () => {
@@ -308,7 +313,7 @@ describe("pair admission", () => {
     substituteBlock[0] = score("mustBlock", 1, envelope({
       findings: [finding("warn"), finding("error", "src/other.ts", 1)], gateFailing: true,
     }), "m-0");
-    expect(aggregateModel(pair, substituteBlock, 3).admissionFailures.join("\n")).toContain("final seeded blocking");
+    expect(aggregateModel(pair, substituteBlock, 3).admissionFailures.join("\n")).toContain("final attributed blocking");
 
     const advisoryMisses = passingMatrix();
     advisoryMisses[34] = score("advisory", 1, envelope(), "a-0");
@@ -380,7 +385,7 @@ describe("report and pricing utilities", () => {
     expect(catalog.get(pair.generatorModel)).toEqual(prices.get(pair.generatorModel));
   });
 
-  test("selects a single cheapest live ZDR endpoint for each managed model", () => {
+  test("selects only the exact pinned live ZDR provider for each managed model", () => {
     const catalog = pricingFromZdrCatalog({ data: [
       {
         model_id: pair.generatorModel,
@@ -406,9 +411,10 @@ describe("report and pricing utilities", () => {
         status: 0,
         pricing: { prompt: "0.000003", completion: "0.000001" },
       },
-    ] }, [pair.generatorModel]);
+    ] }, [pair.generatorModel], "DeepInfra");
 
     expect(catalog.get(pair.generatorModel)).toEqual({
+      providerIdentity: "DeepInfra",
       promptUsdPerToken: 0.0000013,
       completionUsdPerToken: 0.0000026,
       inputMicrosPerMillionTokens: 1_300_000,

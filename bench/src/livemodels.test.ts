@@ -1,13 +1,19 @@
 import { describe, expect, test } from "bun:test";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { chmod, link, lstat, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { cases as fixtureInputs } from "../fixtures/cases";
-import { benchmarkCase } from "./harness";
+import { benchmarkCase, type BenchmarkCase } from "./harness";
 import {
   admissionManifestCandidate,
+  assertGitTreeSourceAuthority,
+  assertPricingProviderIdentity,
   assertExactQualificationFixtures,
+  assertQualificationInputsUnchanged,
   benchmarkProviderIdentityFor,
+  canonicalQualificationCostCap,
   endpointAuthFromEnvironment,
   EVALUATOR_CONTRACT_SOURCE_PATHS,
   fetchPricing,
@@ -20,14 +26,27 @@ import {
   normalizeApiBase,
   normalizeQualificationPairs,
   parseQualificationPairs,
+  prepareImmutableQualificationBinary,
+  prepareAttributionEvaluatorEnvironment,
+  pricingFromFile,
   qualificationCandidateDocument,
   qualificationProfileDigest,
+  readPinnedQualificationWorktreeFile,
   runLiveModels,
+  withImmutableQualificationBinary,
   type LiveModelsReport,
 } from "./livemodels";
 import type { QualificationPair } from "./livemodels-score";
 
 const pair: QualificationPair = { generatorModel: "test/generator", scorerModel: "test/scorer" };
+
+function git(cwd: string, args: string[]): string {
+  const result = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+  if (result.exitCode !== 0) {
+    throw new Error(new TextDecoder().decode(result.stderr));
+  }
+  return new TextDecoder().decode(result.stdout).trim();
+}
 
 async function listen(
   handler: (request: IncomingMessage, response: ServerResponse) => void,
@@ -161,7 +180,7 @@ describe("pair qualification configuration", () => {
       }],
     ]);
     const apiBase = normalizeApiBase("https://openrouter.ai/api/v1");
-    expect(qualificationCandidateDocument(pair, pricing, apiBase, "openai-compatible"))
+    expect(qualificationCandidateDocument(pair, pricing, apiBase, "openai-compatible", "PinnedProvider"))
       .toMatchObject({
         benchmarkProviderIdentity: MANAGED_OPENROUTER_PROVIDER_IDENTITY,
         apiBase,
@@ -177,6 +196,48 @@ describe("pair qualification configuration", () => {
       "openai-compatible",
       "/tmp/candidate.json",
     ).POSTIL_QUALIFICATION_CANDIDATE_PROFILE).toBe("/tmp/candidate.json");
+  });
+
+  test("activates the exact candidate profile for evaluator-bank calls", async () => {
+    const root = await mkdtemp(resolve(tmpdir(), "postil-evaluator-profile-"));
+    const pricing = new Map([
+      [pair.generatorModel, {
+        providerIdentity: "PinnedProvider",
+        promptUsdPerToken: 0.000001,
+        completionUsdPerToken: 0.000002,
+        inputMicrosPerMillionTokens: 1_000_000,
+        outputMicrosPerMillionTokens: 2_000_000,
+      }],
+      [pair.scorerModel, {
+        providerIdentity: "PinnedProvider",
+        promptUsdPerToken: 0.000003,
+        completionUsdPerToken: 0.000004,
+        inputMicrosPerMillionTokens: 3_000_000,
+        outputMicrosPerMillionTokens: 4_000_000,
+      }],
+    ]);
+    try {
+      const env = await prepareAttributionEvaluatorEnvironment(
+        root,
+        pair,
+        pricing,
+        normalizeApiBase("https://openrouter.ai/api/v1"),
+        "openai-compatible",
+        "PinnedProvider",
+      );
+      const profilePath = env.POSTIL_QUALIFICATION_CANDIDATE_PROFILE;
+      expect(profilePath).toBe(resolve(root, "qualification-candidate.json"));
+      expect(await Bun.file(profilePath!).json()).toMatchObject({
+        upstreamProviderIdentity: "PinnedProvider",
+        scorerChain: [pair.scorerModel],
+        modelPriceBounds: [
+          { model: pair.generatorModel, inputMicrosPerMillionTokens: 1_000_000, outputMicrosPerMillionTokens: 2_000_000 },
+          { model: pair.scorerModel, inputMicrosPerMillionTokens: 3_000_000, outputMicrosPerMillionTokens: 4_000_000 },
+        ],
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   test("forwards validated endpoint authentication without exposing managed headers", () => {
@@ -235,6 +296,7 @@ describe("pair qualification configuration", () => {
       pairs: [pair],
       pricing: new Map(),
       costCapUsd: 36,
+      upstreamProvider: "PinnedProvider",
     })).rejects.toThrow("cost cap must be greater than zero and at most $35");
 
     const pairs = Array.from({ length: 7 }, (_, index) => ({
@@ -245,8 +307,314 @@ describe("pair qualification configuration", () => {
       binary: "/missing/postil",
       pairs,
       pricing: new Map(),
+      upstreamProvider: "PinnedProvider",
     })).rejects.toThrow("at most 6 candidates");
 
+  });
+
+  test("validates the raw cost cap as a bounded canonical decimal", () => {
+    expect(canonicalQualificationCostCap("34.123456")).toBe("34.123456");
+    for (const invalid of ["1junk", "1e0", "-1", "0", "01", "1.0000000", "0.0000001"]) {
+      expect(() => canonicalQualificationCostCap(invalid)).toThrow();
+    }
+  });
+
+  test("requires pricing-file rows to name the exact upstream provider", async () => {
+    const root = await mkdtemp(resolve(tmpdir(), "postil-pricing-file-"));
+    const pricingPath = resolve(root, "pricing.json");
+    try {
+      await writeFile(pricingPath, JSON.stringify({
+        "provider/model": {
+          providerIdentity: "PinnedProvider",
+          promptUsdPerToken: "0.000001",
+          completionUsdPerToken: "0.000005",
+        },
+      }));
+      expect((await pricingFromFile(pricingPath)).get("provider/model")).toMatchObject({
+        providerIdentity: "PinnedProvider",
+        inputMicrosPerMillionTokens: 1_000_000,
+        outputMicrosPerMillionTokens: 5_000_000,
+      });
+      const exactPricing = await pricingFromFile(pricingPath);
+      expect(() => assertPricingProviderIdentity(exactPricing, ["provider/model"], "PinnedProvider"))
+        .not.toThrow();
+      expect(() => assertPricingProviderIdentity(exactPricing, ["provider/model"], "OtherProvider"))
+        .toThrow("not bound to upstream provider OtherProvider");
+
+      for (const row of [
+        { promptUsdPerToken: "0.000001", completionUsdPerToken: "0.000005" },
+        { providerIdentity: " ", promptUsdPerToken: "0.000001", completionUsdPerToken: "0.000005" },
+        { providerIdentity: "PinnedProvider", promptUsdPerToken: "0.000001", completionUsdPerToken: "0.000005", extra: true },
+      ]) {
+        await writeFile(pricingPath, JSON.stringify({ "provider/model": row }));
+        await expect(pricingFromFile(pricingPath)).rejects.toThrow();
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("qualification Git source authority", () => {
+  test("rejects relevant untracked sources missing from the named commit", async () => {
+    const root = await mkdtemp(resolve(tmpdir(), "postil-source-authority-"));
+    try {
+      git(root, ["init", "--quiet"]);
+      await writeFile(resolve(root, "README.md"), "authority fixture\n");
+      git(root, ["add", "README.md"]);
+      const sourceSha = git(root, ["write-tree"]);
+
+      await mkdir(resolve(root, "src"), { recursive: true });
+      await mkdir(resolve(root, "bench", "src"), { recursive: true });
+      await writeFile(resolve(root, "src", "attribution.rs"), "pub fn attribute() {}\n");
+      await writeFile(resolve(root, "bench", "src", "attribution.ts"), "export const attribute = true;\n");
+      await expect(assertGitTreeSourceAuthority(root, sourceSha, [
+        "src/attribution.rs",
+        "bench/src/attribution.ts",
+      ])).rejects.toThrow("does not track regular file");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("allows unrelated untracked files without changing relevant authority", async () => {
+    const root = await mkdtemp(resolve(tmpdir(), "postil-source-authority-unrelated-"));
+    try {
+      git(root, ["init", "--quiet"]);
+      await mkdir(resolve(root, "src"), { recursive: true });
+      await writeFile(resolve(root, "src", "required.ts"), "export const required = true;\n");
+      git(root, ["add", "src/required.ts"]);
+      const sourceSha = git(root, ["write-tree"]);
+      await writeFile(resolve(root, "notes.tmp"), "unrelated\n");
+      await expect(assertGitTreeSourceAuthority(root, sourceSha, ["src/required.ts"]))
+        .resolves.toBeUndefined();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a staged index blob that differs from the named source", async () => {
+    const root = await mkdtemp(resolve(tmpdir(), "postil-source-authority-index-"));
+    try {
+      git(root, ["init", "--quiet"]);
+      await mkdir(resolve(root, "src"), { recursive: true });
+      const path = resolve(root, "src", "required.ts");
+      await writeFile(path, "export const value = 1;\n");
+      git(root, ["add", "src/required.ts"]);
+      const sourceSha = git(root, ["write-tree"]);
+      await writeFile(path, "export const value = 2;\n");
+      git(root, ["add", "src/required.ts"]);
+      await expect(assertGitTreeSourceAuthority(root, sourceSha, ["src/required.ts"]))
+        .rejects.toThrow("index path src/required.ts differs");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects missing and symbolic-link worktree sources", async () => {
+    const root = await mkdtemp(resolve(tmpdir(), "postil-source-authority-type-"));
+    try {
+      git(root, ["init", "--quiet"]);
+      await mkdir(resolve(root, "src"), { recursive: true });
+      const path = resolve(root, "src", "required.ts");
+      await writeFile(path, "export const required = true;\n");
+      git(root, ["add", "src/required.ts"]);
+      const sourceSha = git(root, ["write-tree"]);
+      await rm(path);
+      await expect(assertGitTreeSourceAuthority(root, sourceSha, ["src/required.ts"]))
+        .rejects.toThrow("missing or could not be opened safely");
+      const target = resolve(root, "target.ts");
+      await writeFile(target, "export const required = true;\n");
+      await symlink(target, path);
+      await expect(assertGitTreeSourceAuthority(root, sourceSha, ["src/required.ts"]))
+        .rejects.toThrow("missing or could not be opened safely");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  for (const flag of ["--assume-unchanged", "--skip-worktree"]) {
+    test(`rejects worktree changes hidden by ${flag}`, async () => {
+      const root = await mkdtemp(resolve(tmpdir(), "postil-source-authority-index-flag-"));
+      try {
+        git(root, ["init", "--quiet"]);
+        await mkdir(resolve(root, "src"), { recursive: true });
+        await writeFile(resolve(root, "src", "required.ts"), "export const value = 1;\n");
+        git(root, ["add", "src/required.ts"]);
+        const sourceSha = git(root, ["write-tree"]);
+        git(root, ["update-index", flag, "src/required.ts"]);
+        await writeFile(resolve(root, "src", "required.ts"), "export const value = 2;\n");
+        await expect(assertGitTreeSourceAuthority(root, sourceSha, ["src/required.ts"]))
+          .rejects.toThrow("worktree path src/required.ts differs");
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+  }
+
+  test("rejects executable mode changes hidden from content comparison", async () => {
+    const root = await mkdtemp(resolve(tmpdir(), "postil-source-authority-mode-"));
+    try {
+      git(root, ["init", "--quiet"]);
+      await mkdir(resolve(root, "src"), { recursive: true });
+      const path = resolve(root, "src", "required.ts");
+      await writeFile(path, "export const required = true;\n", { mode: 0o644 });
+      git(root, ["add", "src/required.ts"]);
+      const sourceSha = git(root, ["write-tree"]);
+      git(root, ["update-index", "--assume-unchanged", "src/required.ts"]);
+      await chmod(path, 0o755);
+      await expect(assertGitTreeSourceAuthority(root, sourceSha, ["src/required.ts"]))
+        .rejects.toThrow("executable mode differs");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a hard-linked qualification source", async () => {
+    const root = await mkdtemp(resolve(tmpdir(), "postil-source-authority-hardlink-"));
+    try {
+      await mkdir(resolve(root, "src"), { recursive: true });
+      const path = resolve(root, "src", "required.ts");
+      await writeFile(path, "export const required = true;\n");
+      await link(path, resolve(root, "alias.ts"));
+      await expect(readPinnedQualificationWorktreeFile(root, "src/required.ts"))
+        .rejects.toThrow("not a bounded single-link regular file");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a qualification source beyond the descriptor-read bound", async () => {
+    const root = await mkdtemp(resolve(tmpdir(), "postil-source-authority-size-"));
+    try {
+      await mkdir(resolve(root, "src"), { recursive: true });
+      await writeFile(resolve(root, "src", "required.ts"), Buffer.alloc(16 * 1024 * 1024 + 1));
+      await expect(readPinnedQualificationWorktreeFile(root, "src/required.ts"))
+        .rejects.toThrow("not a bounded single-link regular file");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a symbolic-link parent directory", async () => {
+    const root = await mkdtemp(resolve(tmpdir(), "postil-source-authority-parent-link-"));
+    const external = await mkdtemp(resolve(tmpdir(), "postil-source-authority-external-"));
+    try {
+      await writeFile(resolve(external, "required.ts"), "external replacement\n");
+      await symlink(external, resolve(root, "src"), "dir");
+      await expect(readPinnedQualificationWorktreeFile(root, "src/required.ts"))
+        .rejects.toThrow("directory for src/required.ts could not be opened safely");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+      await rm(external, { recursive: true, force: true });
+    }
+  });
+
+  test("a parent-directory swap reads only the pinned original or fails", async () => {
+    const root = await mkdtemp(resolve(tmpdir(), "postil-source-authority-parent-race-"));
+    const external = await mkdtemp(resolve(tmpdir(), "postil-source-authority-race-external-"));
+    const original = Buffer.from("pinned original\n");
+    const sourceDirectory = resolve(root, "src");
+    const parkedDirectory = resolve(root, "src-pinned");
+    try {
+      await mkdir(sourceDirectory);
+      await writeFile(resolve(sourceDirectory, "required.ts"), original);
+      await writeFile(resolve(external, "required.ts"), "external replacement\n");
+      expect((await readPinnedQualificationWorktreeFile(root, "src/required.ts")).bytes)
+        .toEqual(original);
+      const swapper = (async () => {
+        for (let attempt = 0; attempt < 100; attempt += 1) {
+          await rename(sourceDirectory, parkedDirectory);
+          await symlink(external, sourceDirectory, "dir");
+          await rm(sourceDirectory);
+          await rename(parkedDirectory, sourceDirectory);
+        }
+      })();
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        const result = await readPinnedQualificationWorktreeFile(root, "src/required.ts")
+          .then((value) => value.bytes, () => null);
+        if (result !== null) expect(result).toEqual(original);
+      }
+      await swapper;
+    } finally {
+      await rm(root, { recursive: true, force: true });
+      await rm(external, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("immutable qualification binary", () => {
+  test("rejects a qualification contract input changed before candidate emission", async () => {
+    const root = await mkdtemp(resolve(tmpdir(), "postil-qualification-input-"));
+    const config = resolve(root, "config.toml");
+    try {
+      await writeFile(config, "model = \"one\"");
+      const initial = hashNamedSources([["config.toml", await readFile(config)]]);
+      await writeFile(config, "model = \"two\"");
+      const current = hashNamedSources([["config.toml", await readFile(config)]]);
+      expect(() => assertQualificationInputsUnchanged([
+        ["model defaults config", initial, current],
+      ])).toThrow("model defaults config changed before manifest candidate emission");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("copies one opened regular file into a private executable and isolates later source changes", async () => {
+    const root = await mkdtemp(resolve(tmpdir(), "postil-immutable-binary-"));
+    const source = resolve(root, "source");
+    try {
+      await writeFile(source, "first", { mode: 0o700 });
+      const copy = await prepareImmutableQualificationBinary(source, root);
+      expect(await readFile(copy.path, "utf8")).toBe("first");
+      await writeFile(source, "second", { mode: 0o700 });
+      expect(await readFile(copy.path, "utf8")).toBe("first");
+      const metadata = await lstat(copy.path);
+      expect(metadata.isFile()).toBe(true);
+      expect(metadata.isSymbolicLink()).toBe(false);
+      expect(metadata.nlink).toBe(1);
+      expect(metadata.mode & 0o777).toBe(0o500);
+      await rm(copy.directory, { recursive: true, force: true });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a symbolic-link source", async () => {
+    const root = await mkdtemp(resolve(tmpdir(), "postil-immutable-binary-link-"));
+    const source = resolve(root, "source");
+    const link = resolve(root, "link");
+    try {
+      await writeFile(source, "binary", { mode: 0o700 });
+      await symlink(source, link);
+      await expect(prepareImmutableQualificationBinary(link, root)).rejects.toThrow("not a symbolic link");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("removes the private copy after successful and failed work", async () => {
+    const root = await mkdtemp(resolve(tmpdir(), "postil-immutable-binary-cleanup-"));
+    const source = resolve(root, "source");
+    try {
+      await writeFile(source, "binary", { mode: 0o700 });
+      let successfulDirectory = "";
+      expect(await withImmutableQualificationBinary(source, root, async (copy) => {
+        successfulDirectory = copy.directory;
+        expect(await readFile(copy.path, "utf8")).toBe("binary");
+        return "complete";
+      })).toBe("complete");
+      await expect(lstat(successfulDirectory)).rejects.toThrow();
+
+      let failedDirectory = "";
+      await expect(withImmutableQualificationBinary(source, root, async (copy) => {
+        failedDirectory = copy.directory;
+        throw new Error("work failed");
+      })).rejects.toThrow("work failed");
+      await expect(lstat(failedDirectory)).rejects.toThrow();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
 
@@ -281,7 +649,7 @@ describe("pricing transport isolation", () => {
           response.end();
         });
         try {
-          await expect(fetchPricing(`${source.origin}/v1`, scenario.format, ["provider/model"]))
+          await expect(fetchPricing(`${source.origin}/v1`, scenario.format, ["provider/model"], "PinnedProvider"))
             .rejects.toThrow("pricing redirects are not allowed");
           expect(sourceHeaders?.[scenario.providerHeader]).toBe(
             scenario.format === "openai-compatible"
@@ -360,7 +728,8 @@ describe("managed admission workflow", () => {
 
 describe("qualification report", () => {
   test("binds the exact fixture matrix and evaluator toolchain sources", () => {
-    const exact = fixtureInputs.map((input) => benchmarkCase.parse(input));
+    // livemodels validates and snapshots these inputs at module initialization.
+    const exact = fixtureInputs as BenchmarkCase[];
     expect(() => assertExactQualificationFixtures(exact)).not.toThrow();
     const changed = exact.map((candidate, index) => index === 0
       ? { ...candidate, name: `${candidate.name} substituted` }
@@ -384,6 +753,7 @@ describe("qualification report", () => {
       apiBase: "https://openrouter.ai:443/api/v1",
       apiFormat: "openai-compatible" as const,
       benchmarkProviderIdentity: MANAGED_OPENROUTER_PROVIDER_IDENTITY,
+      upstreamProviderIdentity: "test-provider",
       generatorModels: ["provider/one", "provider/two"],
       consensus: 2,
       scorerModels: ["provider/scorer"],
@@ -408,12 +778,13 @@ describe("qualification report", () => {
       reviewContractHash: "b".repeat(64),
       evaluatorContractHash: "f".repeat(64),
       evaluatorRuntimeIdentity: "bun@1.3.14",
+      evaluatorEvidenceSha256: "e".repeat(64),
       configHash: "c".repeat(64),
       cliBinaryHash: "d".repeat(64),
       repeats: 3,
     };
     const profile = { id: qualificationProfileDigest(profileMaterial), ...profileMaterial };
-    expect(profile.id).toBe("e050df18c0f82fe6758eafd91c0c8d5b9eaccfe4a6cd0d01ca2edb8fc0a91d09");
+    expect(profile.id).toBe("24cd24ba19e6125b6c1b152c77c0860efffdc87c2f3db3bc9fb6fb70768e35ce");
     const vector = await Bun.file(
       resolve(import.meta.dir, "..", "admission-manifest-candidate-vector.json"),
     ).json();
@@ -440,12 +811,15 @@ describe("qualification report", () => {
       apiBase: "https://example.test/v1",
       apiFormat: "openai-compatible",
       providerEndpointIdentity: "https://example.test:443/v1",
-      upstreamProviderPinned: false,
-      upstreamProviderIdentity: null,
+      upstreamProviderPinned: true,
+      upstreamProviderIdentity: "PinnedProvider",
       fixtureHash: "a".repeat(64),
       reviewContractHash: "b".repeat(64),
       evaluatorContractHash: "f".repeat(64),
       evaluatorRuntimeIdentity: "bun@1.3.14",
+      attributionContractHash: "1".repeat(64),
+      attributionBankHash: "2".repeat(64),
+      attributionEvaluators: [],
       configHash: "d".repeat(64),
       cliBinaryHash: "c".repeat(64),
       evidenceHash: "e".repeat(64),
@@ -500,6 +874,15 @@ describe("qualification report", () => {
         passed: false,
       }],
       totalRunCostUsd: cost,
+      totalRunCostUsdDecimal: "0.123456",
+      exactSuccessfulCostUsdDecimal: "0.123456",
+      failedOrUnknownExposureUsdDecimal: "0",
+      costAccountingComplete: true,
+      reservedQualificationExposureUsdDecimal: "0.123456",
+      attributionRunCostUsdDecimal: "0",
+      attributionFailedExposureUsdDecimal: "0",
+      attributionRunCostUsd: 0.001,
+      attributionProviderCalls: 2,
       cases: [],
     };
 
@@ -507,9 +890,9 @@ describe("qualification report", () => {
     expect(output).toContain("block");
     expect(output).toContain("adv");
     expect(output).toContain("Fixture aaaa");
-    expect(output).toContain("Provider endpoint https://example.test:443/v1; 3 complete repeats");
+    expect(output).toContain("Provider endpoint https://example.test:443/v1; upstream PinnedProvider pinned for every qualification call; 3 complete repeats");
     expect(output).toContain("$0.1235");
-    expect(output).not.toContain("$0.123456");
+    expect(output).toContain("exact successful $0.123456");
     expect(output).toContain("FAIL: mean cost exceeds admission limit");
     expect(liveModelsQualificationExitCode(report)).toBe(1);
   });

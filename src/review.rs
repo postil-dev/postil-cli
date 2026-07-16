@@ -8,14 +8,14 @@ use anyhow::{Context, Result, anyhow};
 use crate::config::{Config, GateLevel, OnError};
 use crate::diff;
 use crate::envelope::{
-    Envelope, Finding, Gate, Kind, ModelUsage, ReviewAdmission, ReviewCoverage, ReviewCoverageMode,
-    Usage, fail_closed_finding,
+    Envelope, Finding, Gate, Kind, ModelIncident, ModelIncidentCategory, ModelUsage,
+    ReviewAdmission, ReviewCoverage, ReviewCoverageMode, Usage, fail_closed_finding,
 };
 use crate::filter;
 use crate::forge::{
     CheckState, Forge, PrMeta, azure::Azure, bitbucket::Bitbucket, github::GitHub, gitlab::GitLab,
 };
-use crate::llm::{FindingScore, LlmClient};
+use crate::llm::{FindingScore, LlmClient, add_usage};
 use crate::local::{self, LocalSource};
 use crate::output::{self, OutputFormat};
 use crate::prompt::{self, PrContext};
@@ -157,6 +157,50 @@ struct RemoteReviewInput<'a> {
     meta: &'a PrMeta,
     review_started: Instant,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewFailureKind {
+    Provider,
+    InvalidOutput,
+}
+
+fn classify_exhausted_scorer_failure(
+    incidents: &[ModelIncident],
+    final_error_is_provider: bool,
+) -> ReviewFailureKind {
+    if incidents.iter().any(|incident| {
+        !incident.recovered && incident.category == ModelIncidentCategory::InvalidOutput
+    }) {
+        ReviewFailureKind::InvalidOutput
+    } else if final_error_is_provider {
+        ReviewFailureKind::Provider
+    } else {
+        ReviewFailureKind::InvalidOutput
+    }
+}
+
+#[derive(Debug)]
+struct ReviewFailure {
+    kind: ReviewFailureKind,
+    detail: String,
+    model_used: String,
+    scorer_model: Option<String>,
+    scorer_error: Option<String>,
+    usage: Usage,
+    model_usage: Vec<ModelUsage>,
+    model_incidents: Vec<ModelIncident>,
+    review_coverage: Option<ReviewCoverage>,
+    review_admission: Option<ReviewAdmission>,
+    usage_accounting_complete: bool,
+}
+
+impl std::fmt::Display for ReviewFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for ReviewFailure {}
 
 pub async fn run(args: ReviewArgs) -> Result<i32> {
     let cwd = std::env::current_dir()?;
@@ -300,6 +344,9 @@ async fn run_remote<F: Forge>(
         {
             Ok(ids) => Some(ids),
             Err(e) => {
+                if crate::forge::is_repository_identity_failure(&e) {
+                    return Err(e).context("creating check runs");
+                }
                 // CI tokens without checks:write still get review + exit code.
                 eprintln!("postil: cannot create check runs ({e:#}); continuing without");
                 None
@@ -360,6 +407,9 @@ async fn run_remote<F: Forge>(
                 )
                 .await;
                 if let Err(e) = completed {
+                    if crate::forge::is_repository_identity_failure(&e) {
+                        return Err(e);
+                    }
                     eprintln!("postil: could not update check runs ({e:#})");
                 }
             }
@@ -400,7 +450,7 @@ async fn run_remote<F: Forge>(
                 } else {
                     CheckState::Success
                 };
-                let _ = run_with_hosted_budget(
+                let completion = run_with_hosted_budget(
                     Some(review_started),
                     CHECK_COMPLETION_TIMEOUT_SECS,
                     forge.complete_checks(
@@ -414,6 +464,11 @@ async fn run_remote<F: Forge>(
                     "completing check runs",
                 )
                 .await;
+                if let Err(error) = completion
+                    && crate::forge::is_repository_identity_failure(&error)
+                {
+                    return Err(error);
+                }
             }
             // Emit envelope/SARIF and derive the exit code from the gate.
             // `finish` itself already downgrades forge posting failures
@@ -436,6 +491,9 @@ async fn run_remote<F: Forge>(
             {
                 Ok(c) => Ok(c),
                 Err(post_err) => {
+                    if crate::forge::is_repository_identity_failure(&post_err) {
+                        return Err(post_err);
+                    }
                     eprintln!("postil: could not post the error review ({post_err:#})");
                     Ok(code)
                 }
@@ -801,6 +859,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
     let mut scorer_model: Option<String> = None;
     let mut scorer_error: Option<String> = None;
     let mut scorer_disagreements: Option<u32> = None;
+    let mut scorer_failure_kind: Option<ReviewFailureKind> = None;
 
     // Run the model when there is a diff to review, or when content policy is
     // active and there is a PR title/description to review (an empty diff should
@@ -1098,8 +1157,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                         .await
                     {
                         Ok(mut model_review) => {
-                            usage.prompt_tokens += model_review.usage.prompt_tokens;
-                            usage.completion_tokens += model_review.usage.completion_tokens;
+                            add_usage(&mut usage, model_review.usage);
                             model_usage.extend(model_review.model_usage);
                             model_incidents.extend(model_review.model_incidents);
                             usage_accounting_complete &= model_review.usage_accounting_complete;
@@ -1156,8 +1214,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                             }
                         }
                         Err(e) => {
-                            usage.prompt_tokens += e.usage().prompt_tokens;
-                            usage.completion_tokens += e.usage().completion_tokens;
+                            add_usage(&mut usage, e.usage());
                             model_usage.extend_from_slice(e.model_usage());
                             model_incidents.extend_from_slice(e.model_incidents());
                             usage_accounting_complete &= e.usage_accounting_complete();
@@ -1248,6 +1305,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                                     "scorer skipped because its bounded input budget was exceeded"
                                         .to_string(),
                                 );
+                                scorer_failure_kind = Some(ReviewFailureKind::InvalidOutput);
                             } else {
                                 let scored = client
                                     .score_findings(
@@ -1267,8 +1325,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                                         suppressed += scorer_suppressed.len() as u32;
                                         suppressed_findings.extend(scorer_suppressed);
                                         scorer_model = Some(scored.model_used);
-                                        usage.prompt_tokens += scored.usage.prompt_tokens;
-                                        usage.completion_tokens += scored.usage.completion_tokens;
+                                        add_usage(&mut usage, scored.usage);
                                         model_usage.extend(scored.model_usage);
                                         model_incidents.extend(scored.model_incidents);
                                         usage_accounting_complete &=
@@ -1282,11 +1339,15 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                                             "postil: scorer failed open after all scorer models failed"
                                         );
                                         let scorer_usage = e.usage();
-                                        usage.prompt_tokens += scorer_usage.prompt_tokens;
-                                        usage.completion_tokens += scorer_usage.completion_tokens;
+                                        add_usage(&mut usage, scorer_usage);
                                         model_usage.extend_from_slice(e.model_usage());
                                         model_incidents.extend_from_slice(e.model_incidents());
                                         usage_accounting_complete &= e.usage_accounting_complete();
+                                        scorer_failure_kind =
+                                            Some(classify_exhausted_scorer_failure(
+                                                e.model_incidents(),
+                                                e.is_provider(),
+                                            ));
                                         scorer_error = Some(detail);
                                     }
                                 }
@@ -1295,9 +1356,22 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                                 crate::config::hosted_runtime_mode(),
                                 scorer_error.is_some(),
                             ) {
-                                anyhow::bail!(
-                                    "hosted scorer could not complete the admitted profile"
-                                );
+                                return Err(ReviewFailure {
+                                    kind: scorer_failure_kind
+                                        .unwrap_or(ReviewFailureKind::InvalidOutput),
+                                    detail: "hosted scorer could not complete the admitted profile"
+                                        .to_string(),
+                                    model_used: model_used.clone(),
+                                    scorer_model: Some(cfg.scorer_chain().join(" -> ")),
+                                    scorer_error: scorer_error.clone(),
+                                    usage,
+                                    model_usage,
+                                    model_incidents,
+                                    review_coverage,
+                                    review_admission,
+                                    usage_accounting_complete,
+                                }
+                                .into());
                             }
                         }
                         findings = kept;
@@ -1510,6 +1584,9 @@ async fn finish<F: Forge>(
             )
             .await;
             if let Err(e) = posted {
+                if crate::forge::is_repository_identity_failure(&e) {
+                    return Err(e);
+                }
                 eprintln!("postil: could not post review comment ({e:#})");
             }
         }
@@ -1606,15 +1683,29 @@ fn error_envelope(
     duration_ms: u64,
 ) -> Envelope {
     let incomplete_input = crate::forge::is_incomplete_review_input(err);
+    let review_failure = err.downcast_ref::<ReviewFailure>();
+    let invalid_output =
+        review_failure.is_some_and(|failure| failure.kind == ReviewFailureKind::InvalidOutput);
     let findings = vec![if incomplete_input {
         crate::envelope::incomplete_review_finding()
+    } else if invalid_output {
+        fail_closed_finding(
+            review_failure
+                .and_then(|failure| failure.scorer_error.as_deref())
+                .unwrap_or("scorer output did not satisfy the admitted contract"),
+        )
     } else {
         crate::envelope::provider_error_finding(&format!("{err:#}"))
     }];
     let counts = Envelope::counts_of(&findings, 0);
     let buckets = Envelope::buckets_of(&findings);
     let gate_disabled = cfg.gate_fail_on.as_str().eq_ignore_ascii_case("never");
-    let blocking = !gate_disabled && (incomplete_input || cfg.gate_on_error == OnError::Block);
+    let blocking = !gate_disabled
+        && (incomplete_input || invalid_output || cfg.gate_on_error == OnError::Block);
+    let mut model_usage = review_failure
+        .map(|failure| failure.model_usage.clone())
+        .unwrap_or_default();
+    model_usage.sort_by_key(|entry| entry.call_ordinal.unwrap_or(u32::MAX));
     Envelope {
         version: 1,
         summary: if blocking {
@@ -1642,16 +1733,22 @@ fn error_envelope(
                 .map(|k| k.as_str().to_string())
                 .collect(),
         },
-        model_used: cfg.model_chain().join(" -> "),
-        scorer_model: None,
-        scorer_error: None,
+        model_used: review_failure.map_or_else(
+            || cfg.model_chain().join(" -> "),
+            |failure| failure.model_used.clone(),
+        ),
+        scorer_model: review_failure.and_then(|failure| failure.scorer_model.clone()),
+        scorer_error: review_failure.and_then(|failure| failure.scorer_error.clone()),
         scorer_disagreements: None,
-        usage: Usage::default(),
-        model_usage: vec![],
-        model_incidents: vec![],
-        review_coverage: None,
-        review_admission: None,
-        usage_accounting_complete: true,
+        usage: review_failure.map_or_else(Usage::default, |failure| failure.usage),
+        model_usage,
+        model_incidents: review_failure
+            .map(|failure| failure.model_incidents.clone())
+            .unwrap_or_default(),
+        review_coverage: review_failure.and_then(|failure| failure.review_coverage.clone()),
+        review_admission: review_failure.and_then(|failure| failure.review_admission),
+        usage_accounting_complete: review_failure
+            .is_none_or(|failure| failure.usage_accounting_complete),
         duration_ms,
         base_sha: Some(meta.base_sha.clone()),
         head_sha: Some(head_sha.to_string()),
@@ -1698,6 +1795,162 @@ mod tests {
         );
         assert!(!envelope.gate.failing);
         assert!(envelope.summary.contains("merge gate is disabled"));
+    }
+
+    fn rich_scorer_failure(kind: ReviewFailureKind) -> anyhow::Error {
+        ReviewFailure {
+            kind,
+            detail: "hosted scorer could not complete the admitted profile".to_string(),
+            model_used: "generator-model".to_string(),
+            scorer_model: Some("scorer-model".to_string()),
+            scorer_error: Some("scorer output invalid after schema repair".to_string()),
+            usage: Usage {
+                prompt_tokens: 130,
+                completion_tokens: 60,
+                cost_micros: Some(168),
+                provider_cost: crate::envelope::ProviderCost::parse("0.000168"),
+            },
+            model_usage: vec![
+                serde_json::from_value(serde_json::json!({
+                    "model": "scorer-model",
+                    "role": "findingScorer",
+                    "phase": "initial",
+                    "callOrdinal": 2,
+                    "attempt": 1,
+                    "promptTokens": 30,
+                    "completionTokens": 10,
+                    "costMicros": 45,
+                    "costProviderDecimal": "0.000045",
+                    "costSource": "providerReported",
+                    "accountingComplete": true
+                }))
+                .unwrap(),
+                serde_json::from_value(serde_json::json!({
+                    "model": "generator-model",
+                    "role": "reviewGenerator",
+                    "phase": "initial",
+                    "callOrdinal": 1,
+                    "attempt": 1,
+                    "promptTokens": 100,
+                    "completionTokens": 50,
+                    "costMicros": 123,
+                    "costProviderDecimal": "0.000123",
+                    "costSource": "providerReported",
+                    "accountingComplete": true
+                }))
+                .unwrap(),
+            ],
+            model_incidents: vec![ModelIncident {
+                phase: crate::envelope::ModelIncidentPhase::Scorer,
+                category: if kind == ReviewFailureKind::Provider {
+                    crate::envelope::ModelIncidentCategory::ProviderError
+                } else {
+                    crate::envelope::ModelIncidentCategory::InvalidOutput
+                },
+                recovered: false,
+                recovery: None,
+            }],
+            review_coverage: Some(ReviewCoverage {
+                mode: ReviewCoverageMode::Bounded,
+                selected_batches: 5,
+                total_batches: 9,
+                planner_fallback: false,
+            }),
+            review_admission: Some(ReviewAdmission {
+                provider_attempts: 12,
+                serialized_input_bytes: 34_000,
+                output_tokens: 8_800,
+                projected_cost_micros: 900_000,
+            }),
+            usage_accounting_complete: true,
+        }
+        .into()
+    }
+
+    #[test]
+    fn invalid_scorer_failure_is_blocking_under_advisory_and_preserves_audit_state() {
+        let cfg = Config {
+            gate_on_error: OnError::Advisory,
+            ..Config::default()
+        };
+        let error = rich_scorer_failure(ReviewFailureKind::InvalidOutput);
+        let envelope = error_envelope(&cfg, &error, "head", &pr_meta(), 99);
+        assert_eq!(envelope.findings[0].path, crate::envelope::OPERATIONAL_PATH);
+        assert!(envelope.gate.failing);
+        assert_eq!(envelope.model_used, "generator-model");
+        assert_eq!(envelope.scorer_model.as_deref(), Some("scorer-model"));
+        assert_eq!(
+            envelope.scorer_error.as_deref(),
+            Some("scorer output invalid after schema repair")
+        );
+        assert_eq!(
+            envelope.usage.provider_cost.unwrap().to_string(),
+            "0.000168"
+        );
+        assert_eq!(envelope.model_usage.len(), 2);
+        assert_eq!(envelope.model_usage[0].model, "generator-model");
+        assert_eq!(
+            envelope.model_usage[1].cost_provider_decimal.as_deref(),
+            Some("0.000045")
+        );
+        assert_eq!(envelope.model_incidents.len(), 1);
+        assert_eq!(envelope.review_coverage.unwrap().total_batches, 9);
+        assert_eq!(envelope.review_admission.unwrap().provider_attempts, 12);
+        assert!(envelope.usage_accounting_complete);
+    }
+
+    #[test]
+    fn provider_scorer_failure_uses_provider_path_and_advisory_gate() {
+        let cfg = Config {
+            gate_on_error: OnError::Advisory,
+            ..Config::default()
+        };
+        let error = rich_scorer_failure(ReviewFailureKind::Provider);
+        let envelope = error_envelope(&cfg, &error, "head", &pr_meta(), 99);
+        assert_eq!(envelope.findings[0].path, crate::envelope::PROVIDER_PATH);
+        assert!(!envelope.gate.failing);
+        assert_eq!(envelope.model_usage.len(), 2);
+        assert_eq!(envelope.review_admission.unwrap().provider_attempts, 12);
+    }
+
+    #[test]
+    fn invalid_output_anywhere_in_exhausted_scorer_chain_dominates_provider_failure() {
+        let incidents = vec![
+            ModelIncident {
+                phase: crate::envelope::ModelIncidentPhase::Scorer,
+                category: ModelIncidentCategory::InvalidOutput,
+                recovered: false,
+                recovery: None,
+            },
+            ModelIncident {
+                phase: crate::envelope::ModelIncidentPhase::Scorer,
+                category: ModelIncidentCategory::ProviderError,
+                recovered: false,
+                recovery: None,
+            },
+        ];
+        let kind = classify_exhausted_scorer_failure(&incidents, true);
+        assert_eq!(kind, ReviewFailureKind::InvalidOutput);
+        let cfg = Config {
+            gate_on_error: OnError::Advisory,
+            ..Config::default()
+        };
+        let envelope = error_envelope(&cfg, &rich_scorer_failure(kind), "head", &pr_meta(), 99);
+        assert_eq!(envelope.findings[0].path, crate::envelope::OPERATIONAL_PATH);
+        assert!(envelope.gate.failing);
+
+        let recovered_invalid = vec![
+            ModelIncident {
+                recovered: true,
+                recovery: Some(crate::envelope::ModelIncidentRecovery::Fallback),
+                ..incidents[0].clone()
+            },
+            incidents[1].clone(),
+        ];
+        assert_eq!(
+            classify_exhausted_scorer_failure(&recovered_invalid, true),
+            ReviewFailureKind::Provider
+        );
     }
 
     #[test]

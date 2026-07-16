@@ -9,7 +9,7 @@ forge interactions against ground truth.
 
 ## What it measures
 
-Pipeline fidelity, not seeded-region finding hit rate: grounding (no
+Pipeline fidelity, not authored-target detection rate: grounding (no
 ungrounded findings, `counts.ungrounded == 0`), gating (gate fails exactly on
 error-severity findings, exit codes match), statusline correctness
 (`postil/review` and `postil/gate` check-runs created and completed with the
@@ -18,7 +18,7 @@ prompt-leakage guardrails (fixture metadata such as policy phrasing must never
 appear in the prompt or any pipeline output).
 
 The mock model returns recorded findings generated from the fixture specs, so
-mock mode measures pipeline fidelity rather than seeded-region finding hit
+mock mode measures pipeline fidelity rather than authored-target detection
 rate. Comparative claims require peer runs on the identical fixture set; site
 comparisons stay qualitative and sourced until then.
 
@@ -27,11 +27,6 @@ off-by-one boundaries, prompt-injection text with rejected-source assertions,
 misleading comments, huge low-signal multi-hunk diffs, near-duplicate clean and
 defect pairs, Unicode homoglyphs, subtle races, and clean changes where silence
 is the expected review.
-
-Seeded findings match a fixture-owned, signed proposition corpus. Detection
-credit requires full normalized equality with a listed positive or
-failed-remediation proposition. Signed negatives and all unlisted wording are
-rejected.
 
 ## Running (mock mode: default, CI)
 
@@ -56,8 +51,9 @@ entire matrix at least three times.
 
 The manual `Bench (managed OpenRouter admission)` workflow is fixed to the
 managed OpenRouter endpoint and its OpenAI-compatible interface. The local
-command below supports operator-owned OpenAI-compatible and Anthropic BYOK
-endpoints; those endpoints are not candidates for the managed workflow.
+pair-qualification command enforces the same endpoint and interface. The
+separate diff-file live benchmark supports operator-owned OpenAI-compatible
+and Anthropic BYOK endpoints.
 
 The managed workflow runs only from the exact `refs/heads/main` ref, includes
 that immutable source SHA and a 30-day authority window in every candidate
@@ -99,7 +95,9 @@ export MODEL_API_KEY=... # or POSTIL_API_KEY, OPENROUTER_API_KEY, or LLM_API_KEY
 export POSTIL_BENCH_MODE=live
 export POSTIL_BENCH_PAIRS=provider/generator::provider/scorer+provider/scorer-fallback
 export POSTIL_BENCH_REPEATS=3
-export POSTIL_API_FORMAT=openai-compatible # or anthropic
+export POSTIL_API_BASE=https://openrouter.ai/api/v1
+export POSTIL_API_FORMAT=openai-compatible
+export POSTIL_BENCH_UPSTREAM_PROVIDER='Exact upstream provider name'
 bun run bench --json-out report.json --manifest-out ../qualified-models.json
 ```
 
@@ -111,12 +109,14 @@ binary's embedded metadata with the worktree before inference. Environment
 model variables select that same profile for the isolated run; they do not
 define a different candidate.
 
-Native Anthropic and authenticated private endpoints can use an operator-owned
-pricing file instead of a public model catalog:
+Managed qualification uses the canonical OpenRouter endpoint and one exact
+upstream provider route. An operator-owned pricing file can replace the
+OpenRouter endpoint catalog response for that same route:
 
 ```json
 {
   "provider/model": {
+    "providerIdentity": "Exact upstream provider name",
     "promptUsdPerToken": "0.000001",
     "completionUsdPerToken": "0.000005"
   }
@@ -126,16 +126,15 @@ pricing file instead of a public model catalog:
 Pass it with `--pricing-file prices.json` or
 `POSTIL_BENCH_PRICING_FILE=prices.json`. Prices are positive canonical decimal
 strings that must be exactly representable as integer micros per million
-tokens. Each admitted profile carries immutable input and output price bounds
+tokens. Every row names the exact upstream provider passed with
+`--upstream-provider`; a mismatch fails before inference. Each admitted profile carries immutable input and output price bounds
 for its exact generator and scorer model set. The catalog request uses the
 inference credential when no file is supplied and fails closed when any model
 is unpriced. Catalog redirects are rejected so credentials remain bound to the
 configured endpoint origin.
 
-Private gateways may set `POSTIL_ENDPOINT_AUTH_HEADER` and
-`POSTIL_ENDPOINT_AUTH_VALUE`. The harness validates and forwards the pair to
-both catalog and inference requests. Provider-managed headers cannot be
-overridden.
+Native Anthropic and authenticated private endpoints remain available to BYOK
+runtime configurations. They are outside managed hosted qualification.
 
 Pair syntax is `generators::scorer+fallback` or
 `generators::consensus::scorer+fallback`. For example,
@@ -146,7 +145,7 @@ is tried after the primary scorer.
 
 Admission requires all of these in every repeat:
 
-- 100% must-block detection and final blocking by the seeded finding itself
+- 100% must-block detection and final blocking by the attributed finding itself
 - at least 90% advisory detection and at most 10% advisory overblocking
 - no clean false blocks and at most 5% clean cases with any finding
 - no execution, structured-output, grounding, statusline, or usage-accounting failure
@@ -155,7 +154,7 @@ Admission requires all of these in every repeat:
 - per-repeat p95 latency at most 30 seconds and maximum latency at most 60 seconds
 
 Findings suppressed by the scorer count as detector evidence but cannot satisfy
-final blocking. An unrelated error cannot substitute for the seeded finding.
+final blocking. An unrelated error cannot substitute for the attributed finding.
 The report stores only attributable finding coordinates and labels, never model
 finding titles or bodies. It records separate fixture, review-contract source,
 configuration, evaluator contract, and CLI binary SHA-256 hashes; the canonical API base and
@@ -223,9 +222,9 @@ POSTIL_SCORER_EVAL_REPEATS=5 \
 
 The default candidates come from `config.toml`; the workflow input may override
 them explicitly. Qualification repeats 12 fixtures five times: six unambiguous
-seeded risks and six injected false findings. Admission requires a complete
+authored target risks and six injected false findings. Admission requires a complete
 matrix, no malformed, repaired, fallback, or reason-contract failures, all
-seeded risks preserved as published gate failures, at least 80% of false
+target risks preserved as published gate failures, at least 80% of false
 findings actually suppressed overall and per fixture, p50/p95/max scorer latency
 at or below 5/10/20 seconds, known live
 catalog pricing, and mean scorer cost at or below $0.005 per case. A failed
@@ -256,7 +255,7 @@ from the same output limit.
 ## Diff-file live mode (opt-in, single model, no forge)
 
 This live mode runs the real release binary against the same fixtures with a
-real model and **no mocked model server**, so it measures seeded-region finding
+real model and **no mocked model server**, so it measures authored-target detection
 hit rate rather than pipeline fidelity. Each case runs in local diff-file mode
 (`postil review --diff-file <fixture.diff> --output-json`), which does
 no forge I/O at all, so no GitHub server, mock or real, is involved and nothing
@@ -302,23 +301,23 @@ HTTP 5xx/429, rate-limit, timeout, or connection signature, or a run that
 produced no valid v1 envelope at all (empty/garbled output, typically a dropped
 response). A valid envelope is always treated as a normal result and is never
 retried, including a gate-failing exit (exit 1 with a scored envelope) or one
-that merely reports findings or non-seeded-region findings. A case that fails on both
+that merely reports findings unrelated to the authored target. A case that fails on both
 attempts is recorded as an error and excluded from scoring, exactly as before.
 
 ### What live mode scores
 
-- **Seeded-region finding hit rate**: a seeded region counts as found when a
-  finding matches the ground-truth path with line within +/-3.
-- **Severity match (exact)** among seeded-region hits: strict equality between the found
+- **Authored-target detection rate**: a finding counts only when its path and anchor line
+  match the authored target region and the atomic evaluator attributes the same defect.
+- **Severity match (exact)** among attributed findings: strict equality between the found
   severity and the fixture's ground-truth severity.
-- **Severity match (+/-1 tier)** among seeded-region hits: a wider band that treats
+- **Severity match (+/-1 tier)** among attributed findings: a wider band that treats
   adjacent tiers on the `info < warn < error` scale (i.e. `info`<->`warn` and
   `warn`<->`error`) as a match, counting only the two-tier `info`<->`error` gap
   as a real mismatch.
 - **Silence on clean PRs**: a clean case should produce no findings.
-- **Non-seeded-region finding count**: any finding in a clean case, and any
+- **Unrelated finding count**: any finding in a clean case, and any
   non-matching finding in a defect case.
-- **Confidence distribution** of seeded-region hits, and per-case duration / token
+- **Confidence distribution** of attributed findings, and per-case duration / token
   usage.
 
 Both severity numbers are reported, and the per-case detail always shows the

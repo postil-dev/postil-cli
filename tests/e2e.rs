@@ -38,8 +38,22 @@ fn llm_content(findings: Value) -> Value {
 }
 
 fn scorer_content(scores: Value) -> Value {
+    scorer_text(&scores.to_string())
+}
+
+fn scorer_text(scores: &str) -> Value {
     json!({
-        "choices": [{"message": {"content": scores.to_string()}}],
+        "choices": [{"message": {"content": scores}}],
+        "usage": {"prompt_tokens": 30, "completion_tokens": 10, "cost": 0.000045}
+    })
+}
+
+#[cfg(feature = "qualification-candidate")]
+fn attribution_text(content: &str) -> Value {
+    json!({
+        "model": "provider/scorer",
+        "provider": "test-provider",
+        "choices": [{"message": {"content": content}}],
         "usage": {"prompt_tokens": 30, "completion_tokens": 10, "cost": 0.000045}
     })
 }
@@ -174,6 +188,11 @@ struct GitHubHeadRaceResponder {
 struct OutputBudgetResponder;
 
 #[derive(Clone)]
+struct OutputThenRateLimitResponder {
+    calls: Arc<AtomicUsize>,
+}
+
+#[derive(Clone)]
 struct SequentialReviewResponder {
     calls: Arc<AtomicUsize>,
     responses: Arc<Vec<Value>>,
@@ -208,6 +227,28 @@ impl Respond for OutputBudgetResponder {
             }))
         } else {
             ResponseTemplate::new(200).set_body_json(llm_content(json!([])))
+        }
+    }
+}
+
+impl Respond for OutputThenRateLimitResponder {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        match self.calls.fetch_add(1, Ordering::SeqCst) {
+            0 => ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{
+                    "finish_reason": "length",
+                    "message": {"content": null, "reasoning": "budget exhausted"}
+                }],
+                "usage": {
+                    "prompt_tokens": 30_745,
+                    "completion_tokens": 8_000,
+                    "completion_tokens_details": {"reasoning_tokens": 8_000}
+                }
+            })),
+            1 => ResponseTemplate::new(429)
+                .insert_header("Retry-After", "0")
+                .set_body_json(json!({"error": {"error_type": "rate_limit_error"}})),
+            _ => ResponseTemplate::new(200).set_body_json(llm_content(json!([]))),
         }
     }
 }
@@ -369,6 +410,7 @@ fn postil() -> Command {
         .env_remove("REVIEW_SCORER_MODEL_CASCADE")
         .env_remove("POSTIL_DISABLE_SCORER")
         .env_remove("POSTIL_HOSTED_MODE")
+        .env_remove("POSTIL_EXPECTED_GITHUB_REPO_ID")
         .env_remove("POSTIL_QUALIFICATION_CANDIDATE_PROFILE")
         .env_remove("POSTIL_QUALIFICATION_PLAN_ONLY")
         .env_remove("POSTIL_BENCH_FORCE_BOUNDED_SELECTION")
@@ -522,7 +564,6 @@ async fn native_anthropic_findings_use_explicit_native_scorer() {
         .respond_with(
             ResponseTemplate::new(200).set_body_json(anthropic_text(
                 &json!([{
-                    "index": 0,
                     "confidence": 0.82,
                     "kind": "risk",
                     "reason": "The changed line contains the reported flow."
@@ -604,7 +645,6 @@ async fn openai_successful_scorer_with_zero_usage_marks_accounting_incomplete() 
     .await;
     let scorer_response = json!({
         "choices": [{"message": {"content": json!([{
-            "index": 0,
             "confidence": 0.82,
             "kind": "risk",
             "reason": "The changed line contains the reported flow."
@@ -695,7 +735,6 @@ async fn anthropic_successful_scorer_with_zero_usage_marks_accounting_incomplete
         .respond_with(
             ResponseTemplate::new(200).set_body_json(anthropic_text(
                 &json!([{
-                    "index": 0,
                     "confidence": 0.82,
                     "kind": "risk",
                     "reason": "The changed line contains the reported flow."
@@ -935,6 +974,7 @@ fn qualification_candidate_preflights_the_bounded_hosted_path_without_provider_c
         &profile_path,
         serde_json::to_vec(&json!({
             "benchmarkProviderIdentity": postil_cli::config::MANAGED_OPENROUTER_PROVIDER_IDENTITY,
+            "upstreamProviderIdentity": "test-provider",
             "apiBase": metadata.default_api_base,
             "apiFormat": metadata.default_api_format,
             "generatorChain": generator_chain,
@@ -2157,17 +2197,16 @@ async fn scorer_lowers_confidence_and_stores_both_values() {
         )
         .mount(&server)
         .await;
+    let mut scorer_response = scorer_content(json!([{
+        "confidence": 0.7,
+        "kind": "risk",
+        "reason": "Impact depends on the query behavior shown here."
+    }]));
+    scorer_response["usage"]["completion_tokens_details"] = json!({"reasoning_tokens": 0});
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .and(body_string_contains("anthropic/claude-haiku-4.5"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(scorer_content(json!([{
-                "index": 0,
-                "confidence": 0.7,
-                "kind": "risk",
-                "reason": "The finding is plausible, but its impact depends on query behavior."
-            }]))),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(scorer_response))
         .mount(&server)
         .await;
 
@@ -2206,6 +2245,7 @@ async fn scorer_lowers_confidence_and_stores_both_values() {
     assert!(stderr.contains("postil: model generator-model responded in"));
     assert!(stderr.contains("postil: running scorer with anthropic/claude-haiku-4.5"));
     assert!(stderr.contains("postil: scorer anthropic/claude-haiku-4.5 completed successfully in"));
+    assert!(stderr.contains("reasoning_tokens=0"));
 
     let requests = server.received_requests().await.unwrap();
     let scorer_request: Value = requests
@@ -2231,6 +2271,217 @@ async fn scorer_lowers_confidence_and_stores_both_values() {
     assert!(scorer_user.contains("diffHunk"));
 }
 
+#[cfg(feature = "qualification-candidate")]
+#[tokio::test]
+async fn hidden_atomic_attribution_repairs_once_with_same_model_and_preserves_raw_evidence() {
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("provider/scorer"))
+        .respond_with(SequentialReviewResponder {
+            calls: calls.clone(),
+            responses: Arc::new(vec![
+                attribution_text("{\"sameDefect\":\"yes\",\"reason\":\"Wrong type.\"}"),
+                attribution_text("{\"sameDefect\":true,\"reason\":\"Both describe a retry that bypasses idempotency.\"}"),
+            ]),
+        })
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let profile = dir.path().join("candidate.json");
+    std::fs::write(
+        &profile,
+        json!({
+            "benchmarkProviderIdentity": postil_cli::config::MANAGED_OPENROUTER_PROVIDER_IDENTITY,
+            "upstreamProviderIdentity": "test-provider",
+            "apiBase": postil_cli::config::MANAGED_OPENROUTER_API_BASE,
+            "apiFormat": "openai-compatible",
+            "generatorChain": ["openai/gpt-5-mini"],
+            "consensus": 1,
+            "scorerChain": ["provider/scorer"],
+            "modelPriceBounds": [
+                {"model": "openai/gpt-5-mini", "inputMicrosPerMillionTokens": 435000, "outputMicrosPerMillionTokens": 870000},
+                {"model": "provider/scorer", "inputMicrosPerMillionTokens": 435000, "outputMicrosPerMillionTokens": 870000}
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let input = dir.path().join("attribution.json");
+    std::fs::write(&input, json!({
+        "model": "provider/scorer",
+        "expectedProvider": "test-provider",
+        "target": {
+            "path": "src/payments.ts", "startLine": 41, "endLine": 41,
+            "contract": "A retry posts a second debit because the idempotency guard is bypassed."
+        },
+        "candidate": {
+            "path": "src/payments.ts", "line": 41, "endLine": 41,
+            "severity": "error", "kind": "risk",
+            "title": "Retry duplicates the debit",
+            "body": "The retry skips idempotency and charges the payment again."
+        }
+    }).to_string()).unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env(
+            "POSTIL_API_BASE",
+            postil_cli::config::MANAGED_OPENROUTER_API_BASE,
+        )
+        .env("CI", "true")
+        .env("GITHUB_API_URL", "http://127.0.0.1:9")
+        .env("POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY", "1")
+        .env("POSTIL_QUALIFICATION_CANDIDATE_PROFILE", &profile)
+        .env("POSTIL_QUALIFICATION_CAPTURE_API_BASE", server.uri())
+        .env("POSTIL_ALLOW_PRIVATE_API_BASE", "1")
+        .env("REVIEW_SCORER_MODEL", "provider/scorer")
+        .args(["atomic-attribution", "--input"])
+        .arg(&input)
+        .assert()
+        .success();
+    let output: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(output["sameDefect"], true);
+    assert_eq!(output["model"], "provider/scorer");
+    assert_eq!(output["provider"], "test-provider");
+    assert_eq!(output["responseIdentities"].as_array().unwrap().len(), 2);
+    assert_eq!(output["rawResponses"].as_array().unwrap().len(), 2);
+    assert_eq!(output["modelUsage"].as_array().unwrap().len(), 2);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests.iter().all(|request| {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        body["model"] == "provider/scorer"
+            && body["temperature"] == 0.0
+            && body["provider"]["order"] == json!(["test-provider"])
+            && body["provider"]["allow_fallbacks"] == false
+            && body["provider"]["max_price"] == json!({"prompt": 0.435, "completion": 0.87})
+    }));
+}
+
+#[cfg(feature = "qualification-candidate")]
+#[tokio::test]
+async fn hidden_atomic_attribution_rejects_off_region_without_provider_call() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("attribution.json");
+    std::fs::write(&input, json!({
+        "model": "provider/scorer",
+        "expectedProvider": "test-provider",
+        "target": {"path": "src/payments.ts", "startLine": 41, "endLine": 41, "contract": "A retry posts a second debit."},
+        "candidate": {"path": "src/payments.ts", "line": 42, "endLine": 42, "severity": "error", "kind": "risk", "title": "Other issue", "body": "A nearby line has another defect."}
+    }).to_string()).unwrap();
+    postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_SCORER_MODEL", "provider/scorer")
+        .args(["atomic-attribution", "--input"])
+        .arg(&input)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "candidate anchor inside the exact authored region",
+        ));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[cfg(all(feature = "qualification-candidate", unix))]
+#[test]
+fn hidden_atomic_attribution_does_not_follow_input_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target.json");
+    let link = dir.path().join("attribution.json");
+    std::fs::write(&target, "{}").unwrap();
+    symlink(&target, &link).unwrap();
+    postil()
+        .current_dir(dir.path())
+        .args(["atomic-attribution", "--input"])
+        .arg(&link)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "open atomic attribution input without following links",
+        ));
+}
+
+#[cfg(feature = "qualification-candidate")]
+#[test]
+fn hidden_atomic_attribution_rejects_non_regular_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("input-directory");
+    std::fs::create_dir(&input).unwrap();
+    postil()
+        .current_dir(dir.path())
+        .args(["atomic-attribution", "--input"])
+        .arg(&input)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "atomic attribution input must be a regular file",
+        ));
+}
+
+#[cfg(feature = "qualification-candidate")]
+#[test]
+fn hidden_atomic_attribution_rejects_oversized_input_before_parsing() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("attribution.json");
+    std::fs::write(&input, vec![b' '; 16 * 1024 + 1]).unwrap();
+    postil()
+        .current_dir(dir.path())
+        .args(["atomic-attribution", "--input"])
+        .arg(&input)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "atomic attribution input exceeds 16384 bytes",
+        ));
+}
+
+#[cfg(feature = "qualification-candidate")]
+#[tokio::test]
+async fn hidden_atomic_attribution_rejects_provider_substitution() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "model": "provider/scorer",
+            "provider": "substituted-provider",
+            "choices": [{"message": {"content": "{\"sameDefect\":true,\"reason\":\"Same defect.\"}"}}],
+            "usage": {"prompt_tokens": 30, "completion_tokens": 10, "cost": 0.000045}
+        })))
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("attribution.json");
+    std::fs::write(
+        &input,
+        json!({
+            "model": "provider/scorer",
+            "expectedProvider": "test-provider",
+            "target": {"path": "src/payments.ts", "startLine": 41, "endLine": 41, "contract": "A retry posts a second debit."},
+            "candidate": {"path": "src/payments.ts", "line": 41, "endLine": 41, "severity": "error", "kind": "risk", "title": "Duplicate debit", "body": "The retry posts another debit."}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_SCORER_MODEL", "provider/scorer")
+        .args(["atomic-attribution", "--input"])
+        .arg(&input)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "atomic attribution failed: model provider request failed",
+        ));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
 #[tokio::test]
 async fn same_model_generator_and_scorer_emit_separate_balanced_usage_rows() {
     let server = MockServer::start().await;
@@ -2242,7 +2493,6 @@ async fn same_model_generator_and_scorer_emit_separate_balanced_usage_rows() {
         ))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(scorer_content(json!([{
-                "index": 0,
                 "confidence": 0.8,
                 "kind": "risk",
                 "reason": "The changed line contains the reported unsafe data flow."
@@ -2312,7 +2562,6 @@ async fn scorer_confidence_below_minimum_is_suppressed_and_nonblocking() {
         .and(body_string_contains("anthropic/claude-haiku-4.5"))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(scorer_content(json!([{
-                "index": 0,
                 "confidence": 0.1,
                 "kind": "risk",
                 "reason": "Independent evidence does not support the generator claim."
@@ -2368,7 +2617,6 @@ async fn malformed_scorer_reason_gets_one_same_model_schema_repair() {
         .and(body_string_contains("failed schema validation"))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(scorer_content(json!([{
-                "index": 0,
                 "confidence": 0.75,
                 "kind": "risk",
                 "reason": "This is a concrete defect."
@@ -2383,7 +2631,6 @@ async fn malformed_scorer_reason_gets_one_same_model_schema_repair() {
         .and(body_string_contains("anthropic/claude-haiku-4.5"))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(scorer_content(json!([{
-                "index": 0,
                 "confidence": 0.75,
                 "kind": "risk",
                 "reason": "This reason is incomplete"
@@ -2425,6 +2672,121 @@ async fn malformed_scorer_reason_gets_one_same_model_schema_repair() {
     assert_eq!(envelope["modelUsage"][2]["callOrdinal"], 3);
     assert_model_usage_matches_aggregate(&envelope);
     assert!(stderr.contains("requesting one schema repair"));
+}
+
+#[tokio::test]
+async fn generic_provider_repairs_each_malformed_ordered_scorer_shape() {
+    let valid = json!([{
+        "confidence": 0.75,
+        "kind": "risk",
+        "reason": "This is a concrete defect."
+    }]);
+    let unicode_overflow = json!([{
+        "confidence": 0.75,
+        "kind": "risk",
+        "reason": format!("{}。", "界".repeat(60))
+    }])
+    .to_string();
+    let cases = [
+        (
+            "unknown-field",
+            r#"[{"index":0,"confidence":0.75,"kind":"risk","reason":"This is a concrete defect."}]"#.to_string(),
+        ),
+        (
+            "negative-confidence",
+            r#"[{"confidence":-1,"kind":"risk","reason":"This is a concrete defect."}]"#.to_string(),
+        ),
+        (
+            "high-confidence",
+            r#"[{"confidence":5,"kind":"risk","reason":"This is a concrete defect."}]"#.to_string(),
+        ),
+        (
+            "raw-nan",
+            r#"[{"confidence":NaN,"kind":"risk","reason":"This is a concrete defect."}]"#.to_string(),
+        ),
+        (
+            "string-nan",
+            r#"[{"confidence":"NaN","kind":"risk","reason":"This is a concrete defect."}]"#.to_string(),
+        ),
+        ("missing-entry", "[]".to_string()),
+        (
+            "duplicate-entry",
+            r#"[{"confidence":0.75,"kind":"risk","reason":"This is a concrete defect."},{"confidence":0.75,"kind":"risk","reason":"This repeats the same input."}]"#.to_string(),
+        ),
+        (
+            "edge-whitespace",
+            r#"[{"confidence":0.75,"kind":"risk","reason":" Leading whitespace is invalid."}]"#.to_string(),
+        ),
+        (
+            "control-character",
+            r#"[{"confidence":0.75,"kind":"risk","reason":"A control\u0000character is invalid."}]"#.to_string(),
+        ),
+        (
+            "missing-punctuation",
+            r#"[{"confidence":0.75,"kind":"risk","reason":"This reason is incomplete"}]"#.to_string(),
+        ),
+        ("unicode-overflow", unicode_overflow),
+    ];
+
+    for (label, malformed) in cases {
+        let server = MockServer::start().await;
+        mock_review_model(
+            &server,
+            "generator-model",
+            json!([finding_at(41, "warn", 0.92)]),
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("scorer-model"))
+            .and(body_string_contains("failed schema validation"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(scorer_content(valid.clone())))
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("scorer-model"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(scorer_text(&malformed)))
+            .with_priority(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let diff = write_diff(dir.path());
+        let out = postil()
+            .current_dir(dir.path())
+            .env("POSTIL_API_BASE", server.uri())
+            .env("REVIEW_MODEL", "generator-model")
+            .env("REVIEW_SCORER_MODEL", "scorer-model")
+            .args(["review", "--diff-file"])
+            .arg(&diff)
+            .args(["--output", "json"])
+            .assert()
+            .code(0);
+
+        let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+        assert_eq!(envelope["scorerModel"], "scorer-model", "case {label}");
+        assert_eq!(
+            envelope["findings"][0]["scorerConfidence"], 0.75,
+            "case {label}"
+        );
+        assert_eq!(
+            envelope["modelIncidents"][0]["category"], "invalidOutput",
+            "case {label}"
+        );
+        assert_eq!(
+            envelope["modelIncidents"][0]["recovery"], "repair",
+            "case {label}"
+        );
+        assert_eq!(
+            envelope["modelUsage"].as_array().unwrap().len(),
+            3,
+            "case {label}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2498,7 +2860,6 @@ async fn scorer_kind_escalation_into_configured_blocking_kind_takes_effect() {
         &server,
         "anthropic/claude-haiku-4.5",
         json!([{
-            "index": 0,
             "confidence": 0.88,
             "kind": "guardrail",
             "reason": "The finding violates the configured rule."
@@ -2545,7 +2906,6 @@ async fn scorer_kind_deescalation_from_blocking_kind_is_ignored() {
         &server,
         "anthropic/claude-haiku-4.5",
         json!([{
-            "index": 0,
             "confidence": 0.88,
             "kind": "risk",
             "reason": "The finding is not a guardrail violation."
@@ -2592,7 +2952,6 @@ async fn large_confidence_disagreement_escalates_to_uncertainty_with_default_gat
         &server,
         "anthropic/claude-haiku-4.5",
         json!([{
-            "index": 0,
             "confidence": 0.6,
             "kind": "risk",
             "reason": "The finding has weak supporting evidence."
@@ -2680,6 +3039,74 @@ async fn scorer_error_fails_open_and_preserves_generator_values() {
     assert!(stderr.contains("postil: scorer anthropic/claude-haiku-4.5 failed after"));
     assert!(stderr.contains("no fallback scorers remain"));
     assert!(!stderr.contains("openai/gpt-5-mini"));
+}
+
+#[tokio::test]
+async fn reasoning_only_scorer_response_is_invalid_output_not_a_provider_outage() {
+    let server = MockServer::start().await;
+    mock_review_model(
+        &server,
+        "generator-model",
+        json!([finding_at(41, "warn", 0.92)]),
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("scorer-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "finish_reason": "length",
+                "message": {"content": null, "reasoning": "internal reasoning only"}
+            }],
+            "usage": {
+                "prompt_tokens": 30,
+                "completion_tokens": 400,
+                "completion_tokens_details": {"reasoning_tokens": 400},
+                "cost": 0.000045
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "generator-model")
+        .env("REVIEW_SCORER_MODEL", "scorer-model")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .code(0);
+
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["findings"][0]["path"], "src/auth.rs");
+    assert!(
+        envelope["scorerError"]
+            .as_str()
+            .unwrap()
+            .contains("no choices/content")
+    );
+    assert!(
+        envelope["modelIncidents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(
+                |incident| incident["phase"] == "scorer" && incident["category"] == "invalidOutput"
+            )
+    );
+    let requests = server.received_requests().await.unwrap();
+    let scorer_max_tokens = requests
+        .iter()
+        .filter_map(|request| {
+            let body = request.body_json::<Value>().ok()?;
+            (body["model"] == "scorer-model").then(|| body["max_tokens"].as_u64().unwrap())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(scorer_max_tokens, vec![400, 400]);
 }
 
 #[tokio::test]
@@ -4193,6 +4620,42 @@ async fn exhausted_reasoning_budget_expands_the_same_model_retry() {
 }
 
 #[tokio::test]
+async fn rate_limit_after_exhausted_output_uses_the_remaining_attempt_and_retry_after() {
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("primary-model"))
+        .respond_with(OutputThenRateLimitResponder {
+            calls: calls.clone(),
+        })
+        .expect(3)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "primary-model")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .code(0);
+
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["silent"], true);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(envelope["modelUsage"].as_array().unwrap().len(), 3);
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(stderr.contains("returned retryable HTTP 429"));
+    assert!(stderr.contains("retrying in 0ms"));
+    assert!(stderr.contains("attempt=3/3"));
+}
+
+#[tokio::test]
 async fn empty_success_without_usage_marks_accounting_incomplete() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -4303,14 +4766,21 @@ async fn malformed_success_with_usage_records_the_attempt_exactly_once() {
 }
 
 #[tokio::test]
-async fn slow_empty_response_retry_times_out_then_preserves_the_cascade() {
+async fn timeout_after_exhausted_output_uses_remaining_attempt_then_preserves_cascade() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .and(body_string_contains("primary-model"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [],
-            "usage": {"prompt_tokens": 12, "completion_tokens": 0}
+            "choices": [{
+                "finish_reason": "length",
+                "message": {"content": null, "reasoning": "budget exhausted"}
+            }],
+            "usage": {
+                "prompt_tokens": 12,
+                "completion_tokens": 8_000,
+                "completion_tokens_details": {"reasoning_tokens": 8_000}
+            }
         })))
         .up_to_n_times(1)
         .mount(&server)
@@ -4361,12 +4831,17 @@ async fn slow_empty_response_retry_times_out_then_preserves_the_cascade() {
         .collect::<Vec<_>>();
     assert_eq!(
         models,
-        vec!["primary-model", "primary-model", "backup-model"]
+        vec![
+            "primary-model",
+            "primary-model",
+            "primary-model",
+            "backup-model"
+        ]
     );
 }
 
 #[tokio::test]
-async fn empty_response_retry_http_failure_falls_back_without_a_third_primary_request() {
+async fn empty_response_retry_http_failure_uses_the_third_primary_request_before_fallback() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
@@ -4422,12 +4897,17 @@ async fn empty_response_retry_http_failure_falls_back_without_a_third_primary_re
         .collect::<Vec<_>>();
     assert_eq!(
         models,
-        vec!["primary-model", "primary-model", "backup-model"]
+        vec![
+            "primary-model",
+            "primary-model",
+            "primary-model",
+            "backup-model"
+        ]
     );
 }
 
 #[test]
-fn empty_response_retry_connection_failure_stops_without_a_third_request() {
+fn connection_failure_after_exhausted_output_uses_the_remaining_third_request() {
     use std::io::{Read, Write};
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -4436,7 +4916,7 @@ fn empty_response_retry_connection_failure_stops_without_a_third_request() {
         let (mut stream, _) = listener.accept().unwrap();
         let mut request = [0_u8; 16_384];
         let _ = stream.read(&mut request).unwrap();
-        let body = r#"{"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":0}}"#;
+        let body = r#"{"choices":[{"finish_reason":"length","message":{"content":null,"reasoning":"budget exhausted"}}],"usage":{"prompt_tokens":12,"completion_tokens":8000,"completion_tokens_details":{"reasoning_tokens":8000}}}"#;
         write!(
             stream,
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -4472,7 +4952,7 @@ fn empty_response_retry_connection_failure_stops_without_a_third_request() {
         stderr.contains("model=primary-model attempt=2/3"),
         "unexpected log: {stderr}"
     );
-    assert!(!stderr.contains("model=primary-model attempt=3/3"));
+    assert!(stderr.contains("model=primary-model attempt=3/3"));
     assert!(!stderr.contains("127.0.0.1"));
 }
 
