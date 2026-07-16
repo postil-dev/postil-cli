@@ -278,7 +278,7 @@ async fn run_local(args: &ReviewArgs, cfg: &Config) -> Result<i32> {
     let head_sha = local::head_sha().await;
     let baseline = load_baseline(args)?;
     let scope = if args.since_sha.is_some() {
-        filter::ReconcileScope::Incremental
+        filter::ReconcileScope::Incremental { trustworthy: false }
     } else {
         filter::ReconcileScope::Full { trustworthy: false }
     };
@@ -532,10 +532,16 @@ async fn remote_review<F: Forge>(
         .await
         .map_err(crate::forge::classify_review_input_error)
         .context("incremental diff fetch")
-        .map(|diff| (diff, filter::ReconcileScope::Incremental, false))?,
+        .map(|diff| {
+            (
+                diff,
+                filter::ReconcileScope::Incremental { trustworthy: false },
+                false,
+            )
+        })?,
         Some(_) => (
             diff::DiffSnapshot::from_bytes(b"")?,
-            filter::ReconcileScope::Incremental,
+            filter::ReconcileScope::Incremental { trustworthy: false },
             false,
         ),
         None => (
@@ -558,7 +564,7 @@ async fn remote_review<F: Forge>(
     // Empty incremental runs without carryable findings remain model-free.
     let (diff_snapshot, scope, force_model) = if cfg.enabled
         && has_carryable_baseline
-        && matches!(scope, filter::ReconcileScope::Incremental)
+        && matches!(scope, filter::ReconcileScope::Incremental { .. })
         && diff_snapshot.as_str().trim().is_empty()
     {
         (
@@ -823,7 +829,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
     let mut prepared = diff::prepare_review(diff_snapshot)?;
     let input_incomplete = prepared.reserved_anchor;
     let mut index = std::mem::take(&mut prepared.index);
-    let incremental = matches!(scope, filter::ReconcileScope::Incremental);
+    let incremental = matches!(scope, filter::ReconcileScope::Incremental { .. });
 
     // When content policy is active, render the PR title/description as a
     // numbered, groundable block and register its line range so a title/body
@@ -1416,7 +1422,9 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
     // disable means dropping the baseline carry-forward too.
     let rec = if cfg.enabled {
         let scope = match scope {
-            filter::ReconcileScope::Incremental => filter::ReconcileScope::Incremental,
+            filter::ReconcileScope::Incremental { .. } => filter::ReconcileScope::Incremental {
+                trustworthy: full_review_trustworthy,
+            },
             filter::ReconcileScope::Full { .. } => filter::ReconcileScope::Full {
                 trustworthy: full_review_trustworthy,
             },

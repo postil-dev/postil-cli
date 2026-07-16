@@ -252,10 +252,10 @@ interface OutputPathIdentity {
 async function inspectOutputPath(path: string): Promise<OutputPathIdentity> {
   const absolute = resolve(path);
   try {
-    const canonicalParent = await realpath(dirname(absolute));
+    const canonicalPath = await canonicalProspectivePath(absolute);
     const identity: OutputPathIdentity = {
       path,
-      canonicalPath: resolve(canonicalParent, basename(absolute)),
+      canonicalPath,
     };
     try {
       const metadata = await stat(absolute);
@@ -267,6 +267,25 @@ async function inspectOutputPath(path: string): Promise<OutputPathIdentity> {
     return identity;
   } catch (inspectionError) {
     return { path, inspectionError };
+  }
+}
+
+/** Resolve a prospective output through the nearest existing ancestor.
+ * Missing output directories remain side-effect free while existing symlink
+ * aliases still collapse to the same canonical identity. */
+async function canonicalProspectivePath(path: string): Promise<string> {
+  let ancestor = dirname(path);
+  const missingSegments = [basename(path)];
+  for (;;) {
+    try {
+      return resolve(await realpath(ancestor), ...missingSegments.reverse());
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      const parent = dirname(ancestor);
+      if (parent === ancestor) throw error;
+      missingSegments.push(basename(ancestor));
+      ancestor = parent;
+    }
   }
 }
 

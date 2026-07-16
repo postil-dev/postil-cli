@@ -17,6 +17,7 @@ import { API_KEY_ENV_NAMES_TEXT, resolveApiKeyName } from "./api-key";
 import {
   benchmarkCase,
   envelopeV1,
+  evaluateStatusline,
   parseUnifiedDiffFiles,
   safeJson,
   startMockGithub,
@@ -91,6 +92,7 @@ export interface ScorerEvalCase {
   usageAccountingComplete: boolean | null;
   usageValid: boolean;
   coverageValid: boolean;
+  publicationValid: boolean;
   upstreamRequests: number;
   durationMs: number | null;
   promptTokens: number;
@@ -400,6 +402,7 @@ export function isAdmissionFatalStructuralResult(
     result.usageAccountingComplete !== true ||
     !result.usageValid ||
     !result.coverageValid ||
+    !result.publicationValid ||
     result.gateFailing === null ||
     result.upstreamRequests !== 1
   );
@@ -536,7 +539,62 @@ export async function runScorerEvalCase(
       ...telemetry,
     };
   }
-  const envelope = parsedEnvelope.data as Record<string, any>;
+  const parsed = parsedEnvelope.data;
+  const publicationFailures = evaluateStatusline(parsed, github);
+  const publicationFailureCodes: string[] = publicationFailures.length > 0
+    ? ["check-run-state"]
+    : [];
+  const postedReviews = github.requests.filter(
+    (request) => request.method === "POST" && request.path === `${github.pullPath}/reviews`,
+  );
+  const expectedPostedReviews = parsed.findings.length > 0 ? 1 : 0;
+  if (postedReviews.length !== expectedPostedReviews) {
+    publicationFailures.push(
+      `posted ${postedReviews.length} review(s), expected ${expectedPostedReviews}`,
+    );
+    publicationFailureCodes.push("review-count");
+  }
+  const postedComments = postedReviews.flatMap((request) =>
+    (safeJson(request.body) as {
+      comments?: Array<{ path?: string; line?: number }>;
+    } | undefined)?.comments ?? []
+  );
+  if (expectedPostedReviews === 1) {
+    if (postedComments.length !== parsed.findings.length) {
+      publicationFailures.push(
+        `posted ${postedComments.length} inline comment(s), expected ${parsed.findings.length}`,
+      );
+      publicationFailureCodes.push("comment-count");
+    }
+    for (const finding of parsed.findings) {
+      if (!postedComments.some((comment) =>
+        comment.path === finding.path && comment.line === finding.line
+      )) {
+        publicationFailures.push("posted review omitted a final finding anchor");
+        publicationFailureCodes.push("missing-anchor");
+        break;
+      }
+    }
+  }
+  const publicationValid = publicationFailures.length === 0;
+  await writeFile(
+    join(artifactsDir, "publication-telemetry.json"),
+    JSON.stringify({
+      checkRunCreates: github.requests.filter(
+        (request) => request.method === "POST" && request.path === github.checkRunsPath,
+      ).length,
+      checkRunCompletions: github.requests.filter(
+        (request) => request.method === "PATCH" && /\/check-runs\/\d+$/u.test(request.path),
+      ).length,
+      postedReviews: postedReviews.length,
+      postedComments: postedComments.length,
+      finalFindings: parsed.findings.length,
+      publicationValid,
+      failureCodes: [...new Set(publicationFailureCodes)],
+    }),
+    { mode: 0o600 },
+  );
+  const envelope = parsed as Record<string, any>;
   const finding = scoredFinding(envelope);
   const scorerError = typeof envelope.scorerError === "string" ? envelope.scorerError : null;
   const actualScorer = typeof envelope.scorerModel === "string" ? envelope.scorerModel : null;
@@ -563,13 +621,15 @@ export async function runScorerEvalCase(
     usageAccountingComplete === true &&
     usageValid &&
     coverageValid &&
+    publicationValid &&
     proxy.attempts.length === 1;
   let passed = false;
   let reason = "";
   if (caseTimedOut) {
     reason = `case exceeded the ${SCORER_MAX_CASE_MS}ms admission limit`;
   } else if (!structuredOk) {
-    reason = coverageFailure ?? scorerStructuralFailureReason(scorerError, proxy.attempts.length, actualScorer);
+    reason = publicationFailures[0] ?? coverageFailure ??
+      scorerStructuralFailureReason(scorerError, proxy.attempts.length, actualScorer);
   } else if (scenario === "trueFinding") {
     passed = scorerCasePasses({
       scenario,
@@ -620,6 +680,7 @@ export async function runScorerEvalCase(
     usageAccountingComplete,
     usageValid,
     coverageValid,
+    publicationValid,
     ...telemetry,
   };
 }
@@ -655,6 +716,7 @@ function baseResult(
     usageAccountingComplete: null,
     usageValid: false,
     coverageValid: false,
+    publicationValid: false,
     upstreamRequests: 0,
     durationMs: null,
     promptTokens: 0,
@@ -768,7 +830,7 @@ export async function startScorerProxy(
         });
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({
-          choices: [{ message: { content: JSON.stringify({ batchIds }) } }],
+          choices: [{ finish_reason: "stop", message: { content: JSON.stringify({ batchIds }) } }],
           usage: { prompt_tokens: 20, completion_tokens: 4, total_tokens: 24 },
         }));
         return;
@@ -792,7 +854,7 @@ export async function startScorerProxy(
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
         JSON.stringify({
-          choices: [{ message: { content: JSON.stringify(output) } }],
+          choices: [{ finish_reason: "stop", message: { content: JSON.stringify(output) } }],
           usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
         }),
       );
@@ -888,14 +950,32 @@ function plannerMandatoryIds(prompt: string): Set<number> {
   );
 }
 
-function plannerBatchIdForPath(prompt: string, path: string | undefined): number | null {
+export function plannerBatchIdForPath(prompt: string, path: string | undefined): number | null {
   if (path === undefined) return null;
-  for (const block of prompt.split("\nBatch ").slice(1)) {
-    if (!block.includes(path)) continue;
-    const id = Number.parseInt(block, 10);
-    if (Number.isSafeInteger(id) && id > 0) return id;
+  const matches = new Set<number>();
+  let sourceBatchId: number | null = null;
+  for (const line of prompt.split("\n")) {
+    const header = /^Batch (\d+) risk=\d+ kind=(source|synthesis)$/u.exec(line);
+    if (header) {
+      const id = Number.parseInt(header[1]!, 10);
+      sourceBatchId = header[2] === "source" && Number.isSafeInteger(id) && id > 0
+        ? id
+        : null;
+      continue;
+    }
+    if (/^\S+ \d+ risk=/u.test(line)) {
+      sourceBatchId = null;
+      continue;
+    }
+    if (sourceBatchId !== null && line === `### ${path}`) {
+      matches.add(sourceBatchId);
+    }
   }
-  return null;
+  if (matches.size === 1) return matches.values().next().value!;
+  if (matches.size > 1) {
+    throw new Error(`planner manifest contains duplicate source batches for ${path}`);
+  }
+  throw new Error(`planner manifest does not contain the expected path ${path}`);
 }
 
 function scoredFinding(envelope: Record<string, any>): Record<string, any> | undefined {
@@ -975,11 +1055,19 @@ function generatorOutput(c: BenchmarkCase, scenario: Scenario) {
 export function trueFinding(c: BenchmarkCase) {
   const finding = c.modelOutput.findings[0];
   if (!finding) throw new Error(`fixture ${c.id} has no recorded finding`);
+  const changedFile = parseUnifiedDiffFiles(c.diff).find((file) => file.path === finding.path);
+  const evidence = changedFile?.addedLines.includes(finding.line)
+    ? changedFile.after.split("\n")[finding.line - 1]
+    : undefined;
+  if (!evidence) {
+    throw new Error(`fixture ${c.id} has no exact added evidence at ${finding.path}:${finding.line}`);
+  }
   // The scorer should preserve real, grounded defects as confident risks.
   return {
     ...finding,
     kind: "risk",
     confidence: 0.95,
+    evidence,
   };
 }
 
@@ -988,6 +1076,13 @@ export function falseFinding(c: BenchmarkCase) {
   const line = c.primaryChange?.line ?? firstAddedLineForPath(c.diff, path);
   if (path === undefined || line === null) {
     throw new Error(`fixture ${c.id} has no added coordinate for scorer false-finding calibration`);
+  }
+  const changedFile = parseUnifiedDiffFiles(c.diff).find((file) => file.path === path);
+  const evidence = changedFile?.addedLines.includes(line)
+    ? changedFile.after.split("\n")[line - 1]
+    : undefined;
+  if (!evidence) {
+    throw new Error(`fixture ${c.id} has no exact added evidence at ${path}:${line}`);
   }
   // The injected false positive is intentionally plausible and overconfident:
   // calibration succeeds only when the scorer pushes it below gate relevance.
@@ -1000,6 +1095,7 @@ export function falseFinding(c: BenchmarkCase) {
     title: "Clean change breaks runtime behavior",
     body:
       "This change removes required runtime behavior and will break callers after merge.",
+    evidence,
   };
 }
 

@@ -131,8 +131,7 @@ fn deterministically_non_actionable(finding: &Finding) -> bool {
     let generic_remedy = title.contains("without justification")
         || body.contains("add a comment explaining")
         || body.contains("add an explanation for")
-        || body.contains("add documentation for")
-        || body.contains("add a test for");
+        || body.contains("add documentation for");
     if generic_remedy && !concrete_impact {
         return true;
     }
@@ -215,12 +214,14 @@ pub struct Reconciliation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReconcileScope {
-    Incremental,
-    /// A complete full review replaces the previous review's signal. When the
-    /// model run is not trustworthy, baseline findings remain carried.
-    Full {
+    Incremental {
+        /// A complete incremental review may resolve a changed baseline anchor.
+        /// Bounded selection cannot prove that an unselected anchor is fixed.
         trustworthy: bool,
     },
+    /// A complete full review replaces the previous review's signal. When the
+    /// model run is not trustworthy, baseline findings remain carried.
+    Full { trustworthy: bool },
 }
 
 pub const CARRIED_MARKER: &str = "[carried from previous review]";
@@ -282,8 +283,27 @@ fn defect_identity(finding: &Finding) -> (String, crate::envelope::Kind, String,
 /// fresh model run did not reproduce.
 fn touch_addresses(index: &DiffIndex, f: &Finding, scope: ReconcileScope) -> bool {
     match scope {
-        ReconcileScope::Incremental => index.contains_old(&f.path, f.line),
+        ReconcileScope::Incremental { .. } => index.contains_old(&f.path, f.line),
         ReconcileScope::Full { trustworthy } => trustworthy,
+    }
+}
+
+fn push_carried(
+    carried: &mut Vec<Finding>,
+    identities: &mut std::collections::HashSet<(
+        String,
+        crate::envelope::Kind,
+        String,
+        Option<String>,
+    )>,
+    mut finding: Finding,
+) {
+    if !is_carried(&finding) {
+        finding.body = format!("{CARRIED_MARKER}\n\n{}", finding.body);
+    }
+    let identity = defect_identity(&finding);
+    if identities.insert(identity) {
+        carried.push(finding);
     }
 }
 
@@ -310,19 +330,20 @@ pub fn reconcile(
             // copy is already in `new_findings` and will reach the gate.
             continue;
         }
-        if matches!(scope, ReconcileScope::Incremental) && index.contains_old(&f.path, f.line) {
+        if let ReconcileScope::Incremental { trustworthy } = scope
+            && index.contains_old(&f.path, f.line)
+        {
             if index.old_evidence_matches(f)
                 && let Some(line) = index.remap_evidence(f)
             {
                 let mut carry = f.clone();
                 carry.line = line;
                 carry.end_line = None;
-                let identity = defect_identity(&carry);
-                if carried_identities.insert(identity) {
-                    carried.push(carry);
-                }
-            } else {
+                push_carried(&mut carried, &mut carried_identities, carry);
+            } else if trustworthy {
                 resolved.push(f.clone());
+            } else {
+                push_carried(&mut carried, &mut carried_identities, f.clone());
             }
         } else if touch_addresses(index, f, scope) {
             // An incremental edit touched the old-head anchor, or a trustworthy
@@ -334,14 +355,7 @@ pub fn reconcile(
             // Not superseded and the anchor line was not touched: the issue
             // persists. Carry it forward (fail-closed) so an unrelated nearby
             // finding or a distant in-span edit cannot clear the gate.
-            let mut carry = f.clone();
-            if !is_carried(&carry) {
-                carry.body = format!("{CARRIED_MARKER}\n\n{}", carry.body);
-            }
-            let identity = defect_identity(&carry);
-            if carried_identities.insert(identity) {
-                carried.push(carry);
-            }
+            push_carried(&mut carried, &mut carried_identities, f.clone());
         }
     }
     Reconciliation { resolved, carried }
@@ -502,6 +516,30 @@ mod tests {
     }
 
     #[test]
+    fn test_requests_are_not_suppressed_from_prose_alone() {
+        let parsed = diff::parse(
+            "diff --git a/src/client.rs b/src/client.rs\n--- a/src/client.rs\n+++ b/src/client.rs\n@@ -1 +1 @@\n+let timeout_ms = 0;\n",
+        );
+        let idx = DiffIndex::build(&parsed);
+
+        let mut generic = f("src/client.rs", 1, Severity::Warn, 0.9);
+        generic.title = "Add a test for the timeout setting".into();
+        generic.body = "The new setting has no dedicated coverage.".into();
+        generic.evidence = Some("let timeout_ms = 0;".into());
+        let generic_outcome = apply(&Config::default(), &idx, vec![generic]).unwrap();
+        assert_eq!(generic_outcome.kept.len(), 1);
+        assert!(generic_outcome.suppressed_findings.is_empty());
+
+        let mut concrete = f("src/client.rs", 1, Severity::Error, 0.9);
+        concrete.title = "Zero timeout disables the request deadline".into();
+        concrete.body = "This lets a stalled provider request hang indefinitely. Add a test for the zero-value path.".into();
+        concrete.evidence = Some("let timeout_ms = 0;".into());
+        let concrete_outcome = apply(&Config::default(), &idx, vec![concrete]).unwrap();
+        assert_eq!(concrete_outcome.kept.len(), 1);
+        assert!(concrete_outcome.suppressed_findings.is_empty());
+    }
+
+    #[test]
     fn guard_69_inert_test_token_without_production_reachability_is_suppressed() {
         let parsed = diff::parse(
             "diff --git a/tests/auth_test.rs b/tests/auth_test.rs\n--- a/tests/auth_test.rs\n+++ b/tests/auth_test.rs\n@@ -1 +1 @@\n+let token = \"test-token\";\n",
@@ -600,7 +638,12 @@ mod tests {
             f(".postil/content-policy.md", 7, Severity::Warn, 0.8),
             f(".postil/model-output", 1, Severity::Error, 1.0), // synthetic → dropped
         ];
-        let rec = reconcile(&baseline, &idx, &[], ReconcileScope::Incremental);
+        let rec = reconcile(
+            &baseline,
+            &idx,
+            &[],
+            ReconcileScope::Incremental { trustworthy: true },
+        );
         assert_eq!(rec.resolved.len(), 1);
         assert_eq!(rec.resolved[0].path, "a.rs");
         assert_eq!(rec.carried.len(), 2);
@@ -624,7 +667,12 @@ mod tests {
             f(crate::envelope::OPERATIONAL_PATH, 1, Severity::Error, 1.0),
             f(crate::envelope::PROVIDER_PATH, 1, Severity::Error, 1.0),
         ];
-        let rec = reconcile(&baseline, &idx, &[], ReconcileScope::Incremental);
+        let rec = reconcile(
+            &baseline,
+            &idx,
+            &[],
+            ReconcileScope::Incremental { trustworthy: true },
+        );
         assert!(rec.resolved.is_empty());
         assert_eq!(rec.carried.len(), 2);
         assert_eq!(rec.carried[0].path, crate::envelope::CHANGE_METADATA_PATH);
@@ -648,7 +696,12 @@ mod tests {
             0.9,
         );
         fresh.id = Some("dependency-b".into());
-        let rec = reconcile(&[baseline], &idx, &[fresh], ReconcileScope::Incremental);
+        let rec = reconcile(
+            &[baseline],
+            &idx,
+            &[fresh],
+            ReconcileScope::Incremental { trustworthy: true },
+        );
         assert_eq!(rec.carried.len(), 1);
         assert!(rec.resolved.is_empty());
     }
@@ -658,7 +711,12 @@ mod tests {
         let idx = index_for("a.rs", 10, 3);
         let baseline = vec![f("a.rs", 11, Severity::Error, 0.9)];
         let new = vec![f("a.rs", 12, Severity::Error, 0.95)];
-        let rec = reconcile(&baseline, &idx, &new, ReconcileScope::Incremental);
+        let rec = reconcile(
+            &baseline,
+            &idx,
+            &new,
+            ReconcileScope::Incremental { trustworthy: true },
+        );
         assert!(rec.resolved.is_empty());
         assert!(rec.carried.is_empty());
     }
@@ -671,7 +729,12 @@ mod tests {
         let idx = index_for("z.rs", 100, 1); // incremental diff is elsewhere
         let baseline = vec![f("a.rs", 10, Severity::Error, 0.9)];
         let new = vec![f("a.rs", 12, Severity::Info, 0.9)]; // unrelated, lower sev
-        let rec = reconcile(&baseline, &idx, &new, ReconcileScope::Incremental);
+        let rec = reconcile(
+            &baseline,
+            &idx,
+            &new,
+            ReconcileScope::Incremental { trustworthy: true },
+        );
         assert_eq!(rec.resolved.len(), 0);
         assert_eq!(rec.carried.len(), 1, "baseline Error was dropped");
         assert_eq!(rec.carried[0].severity, Severity::Error);
@@ -685,7 +748,12 @@ mod tests {
         let idx = index_for("z.rs", 100, 1);
         let baseline = vec![f("a.rs", 10, Severity::Warn, 0.9)];
         let new = vec![f("a.rs", 11, Severity::Error, 0.9)];
-        let rec = reconcile(&baseline, &idx, &new, ReconcileScope::Incremental);
+        let rec = reconcile(
+            &baseline,
+            &idx,
+            &new,
+            ReconcileScope::Incremental { trustworthy: true },
+        );
         assert!(rec.resolved.is_empty());
         assert!(rec.carried.is_empty(), "same-issue reflag should supersede");
     }
@@ -698,7 +766,12 @@ mod tests {
         let idx = index_for("a.rs", 30, 1); // touches only a.rs:30
         let mut wide = f("a.rs", 5, Severity::Error, 0.9);
         wide.end_line = Some(40);
-        let rec = reconcile(&[wide], &idx, &[], ReconcileScope::Incremental);
+        let rec = reconcile(
+            &[wide],
+            &idx,
+            &[],
+            ReconcileScope::Incremental { trustworthy: true },
+        );
         assert_eq!(rec.resolved.len(), 0, "wide-span finding falsely resolved");
         assert_eq!(rec.carried.len(), 1);
         assert_eq!(rec.carried[0].severity, Severity::Error);
@@ -728,13 +801,18 @@ mod tests {
             Severity::Error,
             0.9,
         );
-        let rec = reconcile(&[baseline], &idx, &[], ReconcileScope::Incremental);
+        let rec = reconcile(
+            &[baseline],
+            &idx,
+            &[],
+            ReconcileScope::Incremental { trustworthy: true },
+        );
         assert_eq!(rec.resolved.len(), 1);
         assert!(rec.carried.is_empty());
     }
 
     #[test]
-    fn reconcile_remaps_unchanged_evidence_and_expires_changed_anchor() {
+    fn reconcile_remaps_unchanged_evidence_and_respects_incremental_coverage() {
         let shifted = DiffIndex::build(&diff::parse(
             "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -10 +11 @@\n x\n",
         ));
@@ -743,17 +821,33 @@ mod tests {
             std::slice::from_ref(&baseline),
             &shifted,
             &[],
-            ReconcileScope::Incremental,
+            ReconcileScope::Incremental { trustworthy: true },
         );
         assert_eq!(remapped.carried.len(), 1);
         assert_eq!(remapped.carried[0].line, 11);
+        assert!(is_carried(&remapped.carried[0]));
 
         let changed = DiffIndex::build(&diff::parse(
             "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -10 +10 @@\n-x\n+y\n",
         ));
-        let expired = reconcile(&[baseline], &changed, &[], ReconcileScope::Incremental);
+        let expired = reconcile(
+            &[baseline],
+            &changed,
+            &[],
+            ReconcileScope::Incremental { trustworthy: true },
+        );
         assert!(expired.carried.is_empty());
         assert_eq!(expired.resolved.len(), 1);
+
+        let bounded = reconcile(
+            &[f("a.rs", 10, Severity::Error, 0.9)],
+            &changed,
+            &[],
+            ReconcileScope::Incremental { trustworthy: false },
+        );
+        assert!(bounded.resolved.is_empty());
+        assert_eq!(bounded.carried.len(), 1);
+        assert!(is_carried(&bounded.carried[0]));
     }
 
     #[test]

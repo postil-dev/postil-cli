@@ -81,6 +81,28 @@ describe("benchmark output lifecycle", () => {
     ).rejects.toThrow("--json-out and --manifest-out must use different paths");
   });
 
+  test("accepts distinct prospective outputs below a missing parent", async () => {
+    const directory = await temporaryDirectory();
+    const missing = join(directory, "missing", "nested");
+    await expect(prepareExplicitOutputs(
+      join(missing, "report.json"),
+      join(missing, "candidate.json"),
+      join(missing, "private.json"),
+    )).resolves.toBeUndefined();
+  });
+
+  test("rejects prospective outputs below aliased missing parents", async () => {
+    const directory = await temporaryDirectory();
+    const realDirectory = join(directory, "real");
+    const aliasDirectory = join(directory, "alias");
+    await mkdir(realDirectory);
+    await symlink(realDirectory, aliasDirectory, "dir");
+    await expect(prepareExplicitOutputs(
+      join(realDirectory, "missing", "artifact.json"),
+      join(aliasDirectory, "missing", "artifact.json"),
+    )).rejects.toThrow("--json-out and --manifest-out must use different paths");
+  });
+
   test("cleans and rejects existing hardlinked output aliases", async () => {
     const directory = await temporaryDirectory();
     const report = join(directory, "report.json");

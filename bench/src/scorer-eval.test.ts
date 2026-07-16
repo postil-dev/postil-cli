@@ -5,7 +5,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { cases as fixtureInputs } from "../fixtures/cases";
-import { benchmarkCase, envelopeV1 } from "./harness";
+import { benchmarkCase, envelopeV1, parseUnifiedDiffFiles } from "./harness";
 import {
   FALSE_FINDING_CASES,
   GENERATOR_MODEL,
@@ -25,6 +25,7 @@ import {
   parseModels,
   parseRepeatCount,
   percentile,
+  plannerBatchIdForPath,
   qualificationExitCode,
   projectedQualificationSpendUsd,
   runBoundedChild,
@@ -55,7 +56,9 @@ function boundedScorerFixture() {
     const path = `src/ordinary/segment-${ordinal}.ts`;
     const lines = Array.from(
       { length: 2_200 },
-      (_, line) => `+export const ordinary_${ordinal}_${line} = ${ordinal + line}; // ordinary source behavior`,
+      (_, line) => ordinal === 0 && line === 0
+        ? "+export const accessPermissionLabel = 'Account access'; // ordinary display copy"
+        : `+export const ordinary_${ordinal}_${line} = ${ordinal + line}; // ordinary source behavior`,
     );
     return [
       `diff --git a/${path} b/${path}`,
@@ -73,7 +76,7 @@ function boundedScorerFixture() {
     "@@ -42,3 +42,4 @@",
     " export const heading = 'Account';",
     " export const description = 'Manage your account';",
-    "+export const hint = 'Changes save automatically';",
+    "+export const validatedHint = 'Changes save automatically';",
     " export const action = 'Save';",
     "",
   ].join("\n");
@@ -118,6 +121,7 @@ function result(overrides: Partial<ScorerEvalCase>): ScorerEvalCase {
     usageAccountingComplete: true,
     usageValid: true,
     coverageValid: true,
+    publicationValid: true,
     upstreamRequests: 1,
     durationMs: 1000,
     promptTokens: 10,
@@ -223,6 +227,7 @@ describe("scorer calibration findings", () => {
       path: "src/billing/charge.ts",
       kind: "risk",
       confidence: 0.95,
+      evidence: " return amount + amount;",
     });
     expect(finding.body).toContain("bill the customer twice");
   });
@@ -238,6 +243,15 @@ describe("scorer calibration findings", () => {
       confidence: 0.95,
     });
     expect(finding.body).toContain("break callers");
+    const changedFile = parseUnifiedDiffFiles(clean.diff).find(
+      (file) => file.path === clean.primaryChange?.path,
+    );
+    if (!changedFile || clean.primaryChange === undefined) {
+      throw new Error("clean scorer fixture has no declared changed file");
+    }
+    expect(finding.evidence).toBe(
+      changedFile.after.split("\n")[clean.primaryChange.line - 1]!,
+    );
   });
 
   test("anchors a large clean fixture to its declared interior change rather than prefix noise", () => {
@@ -291,7 +305,10 @@ describe("scorer proxy and isolated runtime", () => {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
         JSON.stringify({
-          choices: [{ message: { content: JSON.stringify({ confidence: 0.2, kind: "uncertainty" }) } }],
+          choices: [{
+            finish_reason: "stop",
+            message: { content: JSON.stringify({ confidence: 0.2, kind: "uncertainty" }) },
+          }],
           usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
         }),
       );
@@ -306,6 +323,7 @@ describe("scorer proxy and isolated runtime", () => {
       });
       expect(generatorResponse.status).toBe(200);
       const generatorJson = await generatorResponse.json();
+      expect(generatorJson.choices[0].finish_reason).toBe("stop");
       const generatorPayload = JSON.parse(generatorJson.choices[0].message.content);
       expect(generatorPayload.findings[0]).toMatchObject({
         kind: "risk",
@@ -418,11 +436,14 @@ describe("scorer proxy and isolated runtime", () => {
       scorerRequests.push(await requestBody(req));
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({
-        choices: [{ message: { content: JSON.stringify([{
-          confidence: 0.2,
-          kind: "uncertainty",
-          reason: "The claimed runtime break is unsupported by the change.",
-        }]) } }],
+        choices: [{
+          finish_reason: "stop",
+          message: { content: JSON.stringify([{
+            confidence: 0.2,
+            kind: "uncertainty",
+            reason: "The claimed runtime break is unsupported by the change.",
+          }]) },
+        }],
         usage: { prompt_tokens: 30, completion_tokens: 10, cost: 0.000045 },
       }));
     });
@@ -456,6 +477,7 @@ describe("scorer proxy and isolated runtime", () => {
         scorerError: null,
         upstreamRequests: 1,
         usageValid: true,
+        publicationValid: true,
         passed: true,
         findingPublished: false,
         gateFailing: false,
@@ -496,11 +518,17 @@ describe("scorer proxy and isolated runtime", () => {
         }>;
       };
       expect(proxyTelemetry.plannerRequests).toBe(1);
-      expect(proxyTelemetry.generatorRequests).toBe(5);
-      expect(proxyTelemetry.generatorRequestKinds.filter((kind) => kind === "source"))
-        .toHaveLength(envelope.reviewCoverage!.selectedBatches);
-      expect(proxyTelemetry.generatorRequestKinds.filter((kind) => kind === "synthesis"))
-        .toHaveLength(1);
+      const sourceRequests = proxyTelemetry.generatorRequestKinds.filter(
+        (kind) => kind === "source",
+      );
+      const synthesisRequests = proxyTelemetry.generatorRequestKinds.filter(
+        (kind) => kind === "synthesis",
+      );
+      expect(proxyTelemetry.generatorRequests).toBe(
+        envelope.reviewCoverage!.selectedBatches + 1,
+      );
+      expect(sourceRequests).toHaveLength(envelope.reviewCoverage!.selectedBatches);
+      expect(synthesisRequests).toHaveLength(1);
       expect(proxyTelemetry.plannerSelections).toHaveLength(1);
       expect(proxyTelemetry.plannerSelections[0]?.targetWasMandatory).toBe(false);
       const targetBatchId = proxyTelemetry.plannerSelections[0]?.targetBatchId;
@@ -511,6 +539,17 @@ describe("scorer proxy and isolated runtime", () => {
       expect(proxyTelemetry.plannerSelections[0]?.returnedBatchIds).toEqual([
         targetBatchId,
       ]);
+      expect(JSON.parse(
+        await readFile(join(runArtifacts, "publication-telemetry.json"), "utf8"),
+      )).toEqual({
+        checkRunCreates: 2,
+        checkRunCompletions: 2,
+        postedReviews: 0,
+        postedComments: 0,
+        finalFindings: 0,
+        publicationValid: true,
+        failureCodes: [],
+      });
       const stderr = await readFile(
         join(runArtifacts, "stderr.log"),
         "utf8",
@@ -524,6 +563,111 @@ describe("scorer proxy and isolated runtime", () => {
       await rm(root, { recursive: true, force: true });
       await close(upstream);
     }
+  });
+
+  test("keeps scorer quality misses separate from publication transport validity", async () => {
+    const confidences = [0.2, 0.9];
+    const upstream = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+      await requestBody(req);
+      const confidence = confidences.shift();
+      if (confidence === undefined) throw new Error("unexpected scorer request");
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        choices: [{
+          finish_reason: "stop",
+          message: { content: JSON.stringify([{
+            confidence,
+            kind: "risk",
+            reason: "The finding receives the deliberately wrong calibration verdict.",
+          }]) },
+        }],
+        usage: { prompt_tokens: 30, completion_tokens: 10, cost: 0.000045 },
+      }));
+    });
+    const upstreamBase = await listen(upstream);
+    const root = await mkdtemp(join(tmpdir(), "postil-scorer-quality-publication-"));
+    const keyName = "POSTIL_SCORER_EVAL_TEST_KEY";
+    const previousKey = process.env[keyName];
+    process.env[keyName] = "local-test-key";
+    const pricing = {
+      promptUsdPerToken: 0.000001,
+      completionUsdPerToken: 0.000002,
+      inputMicrosPerMillionTokens: 1_000_000,
+      outputMicrosPerMillionTokens: 2_000_000,
+    };
+    try {
+      const trueMiss = await runScorerEvalCase(
+        fixture(TRUE_FINDING_CASES[0]!),
+        "trueFinding",
+        "scorer/model",
+        1,
+        resolve(import.meta.dir, "..", "..", "target", "release", "postil"),
+        root,
+        upstreamBase,
+        keyName,
+        pricing,
+      );
+      expect(trueMiss).toMatchObject({
+        findingPublished: false,
+        passed: false,
+        publicationValid: true,
+      });
+      expect(isAdmissionFatalStructuralResult(trueMiss, "scorer/model")).toBe(false);
+
+      const falseMiss = await runScorerEvalCase(
+        fixture(FALSE_FINDING_CASES[0]!),
+        "falseFinding",
+        "scorer/model",
+        1,
+        resolve(import.meta.dir, "..", "..", "target", "release", "postil"),
+        root,
+        upstreamBase,
+        keyName,
+        pricing,
+      );
+      expect(falseMiss).toMatchObject({
+        findingPublished: true,
+        passed: false,
+        publicationValid: true,
+      });
+      expect(isAdmissionFatalStructuralResult(falseMiss, "scorer/model")).toBe(false);
+      expect(confidences).toHaveLength(0);
+    } finally {
+      if (previousKey === undefined) delete process.env[keyName];
+      else process.env[keyName] = previousKey;
+      await rm(root, { recursive: true, force: true });
+      await close(upstream);
+    }
+  });
+
+  test("parses the current bounded planner manifest and rejects format drift", () => {
+    const prompt = [
+      "The complete diff was normalized into 9 bounded batches.",
+      "Mandatory IDs: [1, 9]",
+      "",
+      "Batch 4 risk=4 kind=synthesis",
+      "### src/ui/copy.ts",
+      "44 + export const validatedHint = 'Changes save automatically';",
+      "",
+      "Batch 5 risk=0 kind=source",
+      "### src/ui/copy.tsx",
+      "44 + export const adjacent = 'src/ui/copy.ts';",
+      "",
+      "Batch 6 risk=0 kind=source",
+      "### src/ui/copy.ts",
+      "44 + export const validatedHint = 'Changes save automatically';",
+      "### src/ui/copy.ts",
+      "81 + export const secondRegion = 'same file, same batch';",
+    ].join("\n");
+    expect(plannerBatchIdForPath(prompt, "src/ui/copy.ts")).toBe(6);
+    expect(() => plannerBatchIdForPath(
+      prompt.replace("\nBatch 6", "\nCandidate 6"),
+      "src/ui/copy.ts",
+    )).toThrow("planner manifest does not contain the expected path src/ui/copy.ts");
+    expect(() => plannerBatchIdForPath(
+      `${prompt}\nBatch 7 risk=1 kind=source\n### src/ui/copy.ts`,
+      "src/ui/copy.ts",
+    )).toThrow("planner manifest contains duplicate source batches for src/ui/copy.ts");
   });
 
   test("kills child execution just beyond the admission latency bound", async () => {
@@ -596,6 +740,7 @@ describe("scorer evaluation checkpoints", () => {
         matrixComplete: false,
       });
       expect(first.cases).toHaveLength(1);
+      expect(first.cases[0]?.publicationValid).toBe(true);
       expect(firstRaw).not.toContain("MODEL_BODY_MARKER");
       expect(firstRaw).not.toContain("API_SECRET_MARKER");
       expect(firstRaw).not.toContain("UPSTREAM_RESPONSE_MARKER");
@@ -629,6 +774,7 @@ describe("candidate matrix execution", () => {
       result({ usageAccountingComplete: false }),
       result({ usageValid: false }),
       result({ coverageValid: false }),
+      result({ publicationValid: false }),
       result({ gateFailing: null }),
       result({ upstreamRequests: 2 }),
     ];
