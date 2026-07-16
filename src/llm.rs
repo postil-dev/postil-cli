@@ -884,6 +884,18 @@ impl LlmPhase {
             Self::Respond => ModelUsageRole::MentionResponder,
         }
     }
+
+    fn exhausted_output_retry_max_tokens(self, initial_max_tokens: u32) -> u32 {
+        if matches!(self, Self::Scorer { .. } | Self::Attribution)
+            || initial_max_tokens >= EXHAUSTED_OUTPUT_RETRY_MAX_TOKENS
+        {
+            initial_max_tokens
+        } else {
+            initial_max_tokens
+                .saturating_mul(2)
+                .min(EXHAUSTED_OUTPUT_RETRY_MAX_TOKENS)
+        }
+    }
 }
 
 impl LlmCallPhase {
@@ -1012,6 +1024,22 @@ impl LlmClient {
         )
     }
 
+    fn planned_request_exposure(
+        &self,
+        model: &str,
+        system: &str,
+        user: &str,
+        initial_max_tokens: u32,
+        temperature: f64,
+        phase: LlmPhase,
+    ) -> Result<(usize, usize)> {
+        let output_tokens = phase.exhausted_output_retry_max_tokens(initial_max_tokens);
+        Ok((
+            self.planned_request_bytes(model, system, user, output_tokens, temperature, phase)?,
+            output_tokens as usize,
+        ))
+    }
+
     fn validate_hosted_exposure(
         &self,
         operation: &str,
@@ -1062,9 +1090,9 @@ impl LlmClient {
         cfg: &Config,
         system: &str,
         user: &str,
-    ) -> Result<()> {
+    ) -> Result<ReviewAdmission> {
         let Some(bounds) = &self.hosted_price_bounds else {
-            return Ok(());
+            return Ok(ReviewAdmission::default());
         };
         let models = cfg.model_chain();
         ensure!(!models.is_empty(), "hosted respond has no admitted model");
@@ -1073,21 +1101,17 @@ impl LlmClient {
             let price = bounds.get(&model).ok_or_else(|| {
                 anyhow!("hosted respond model {model:?} has no admitted price bound")
             })?;
-            exposure.add_request(
-                self.planned_request_bytes(
-                    &model,
-                    system,
-                    user,
-                    RESPOND_MAX_TOKENS,
-                    0.1,
-                    LlmPhase::Respond,
-                )?,
-                RESPOND_MAX_TOKENS as usize,
-                price,
+            let (request, output_tokens) = self.planned_request_exposure(
+                &model,
+                system,
+                user,
+                RESPOND_MAX_TOKENS,
+                0.1,
+                LlmPhase::Respond,
             )?;
+            exposure.add_request(request, output_tokens, price)?;
         }
         self.validate_hosted_exposure("respond", &exposure)
-            .map(|_| ())
     }
 
     pub async fn plan_review_batches(
@@ -1320,8 +1344,8 @@ impl LlmClient {
             let price = bounds
                 .get(model)
                 .ok_or_else(|| anyhow!("hosted model {model:?} has no admitted price bound"))?;
-            let request_for = |user: &str| -> Result<usize> {
-                self.planned_request_bytes(
+            let request_for = |user: &str| -> Result<(usize, usize)> {
+                self.planned_request_exposure(
                     model,
                     system,
                     user,
@@ -1348,10 +1372,10 @@ impl LlmClient {
                     .filter(|(index, _)| *index != first_index)
                     .map(|(_, request)| request)
                     .collect::<Vec<_>>();
-                requests.sort_unstable_by_key(|request| std::cmp::Reverse(*request));
+                requests.sort_unstable_by_key(|(bytes, _)| std::cmp::Reverse(*bytes));
                 requests.truncate(batch_count.saturating_sub(1));
                 requests.push(first);
-                let bytes = requests.iter().try_fold(0usize, |sum, request| {
+                let bytes = requests.iter().try_fold(0usize, |sum, (request, _)| {
                     sum.checked_add(*request)
                         .context("planned review path size overflowed")
                 })?;
@@ -1360,8 +1384,8 @@ impl LlmClient {
                     worst_requests = requests;
                 }
             }
-            for request in worst_requests {
-                exposure.add_primary_request(request, REVIEW_MAX_TOKENS as usize, price)?;
+            for (request, output_tokens) in worst_requests {
+                exposure.add_primary_request(request, output_tokens, price)?;
             }
         }
 
@@ -1375,7 +1399,7 @@ impl LlmClient {
             let scorer_user = "\"".repeat(scorer_user_bytes);
             let max_tokens = scorer_max_tokens(SCORER_MAX_FINDINGS)
                 .expect("maximum scorer finding count has a token bound");
-            let initial = self.planned_request_bytes(
+            let (initial, output_tokens) = self.planned_request_exposure(
                 model,
                 &scorer_system,
                 &scorer_user,
@@ -1385,7 +1409,7 @@ impl LlmClient {
                     expected_len: SCORER_MAX_FINDINGS,
                 },
             )?;
-            exposure.add_primary_request(initial, max_tokens as usize, price)?;
+            exposure.add_primary_request(initial, output_tokens, price)?;
         }
 
         if let Some((manifest, max_selected)) = planner {
@@ -1394,7 +1418,7 @@ impl LlmClient {
                 let price = bounds.get(model).ok_or_else(|| {
                     anyhow!("hosted planner model {model:?} has no admitted price bound")
                 })?;
-                let initial = self.planned_request_bytes(
+                let (initial, output_tokens) = self.planned_request_exposure(
                     model,
                     planner_system_prompt(),
                     &user,
@@ -1402,7 +1426,7 @@ impl LlmClient {
                     0.1,
                     LlmPhase::Planner,
                 )?;
-                exposure.add_primary_request(initial, PLANNER_MAX_TOKENS as usize, price)?;
+                exposure.add_primary_request(initial, output_tokens, price)?;
             }
         }
         self.validate_hosted_exposure("review", &exposure)
@@ -2802,20 +2826,15 @@ impl LlmClient {
                                     retries += 1;
                                     empty_response_retries += 1;
                                     let wait = Duration::from_secs(2 * retries as u64);
+                                    let expanded_max_tokens =
+                                        phase.exhausted_output_retry_max_tokens(request_max_tokens);
                                     let exhausted_output_budget = summary.finish_reason.as_deref()
                                         == Some("length")
-                                        && !matches!(
-                                            phase,
-                                            LlmPhase::Scorer { .. } | LlmPhase::Attribution
-                                        )
                                         && summary.usage.is_some_and(|value| {
                                             value.completion_tokens >= u64::from(request_max_tokens)
                                         })
-                                        && request_max_tokens < EXHAUSTED_OUTPUT_RETRY_MAX_TOKENS;
+                                        && expanded_max_tokens > request_max_tokens;
                                     if exhausted_output_budget {
-                                        let expanded_max_tokens = request_max_tokens
-                                            .saturating_mul(2)
-                                            .min(EXHAUSTED_OUTPUT_RETRY_MAX_TOKENS);
                                         eprintln!(
                                             "postil: model {} exhausted {request_max_tokens} output tokens before content after {elapsed}, expanding the retry to {expanded_max_tokens} tokens in {}s (empty retry {empty_response_retries}/{EMPTY_RESPONSE_RETRIES}; retry {retries}/{TRANSIENT_RETRIES})",
                                             log_text(model),
@@ -4625,7 +4644,10 @@ mod tests {
                 Some(("hostile planner manifest", 0)),
             )
             .unwrap();
-        assert_eq!(admission.output_tokens, u64::from(REVIEW_MAX_TOKENS));
+        assert_eq!(
+            admission.output_tokens,
+            u64::from(LlmPhase::Review.exhausted_output_retry_max_tokens(REVIEW_MAX_TOKENS))
+        );
         let plan = client
             .plan_review_batches(
                 &config,
@@ -4997,10 +5019,100 @@ mod tests {
                 },
             ),
         ])));
-        client
+        let admission = client
             .preflight_respond_plan(&config, "system", "bounded user context")
             .unwrap();
+        assert_eq!(admission.provider_attempts, 6);
+        assert_eq!(
+            admission.output_tokens,
+            u64::from(LlmPhase::Respond.exhausted_output_retry_max_tokens(RESPOND_MAX_TOKENS)) * 6
+        );
         assert_eq!(client.admission.lock().unwrap().attempts, 0);
+    }
+
+    #[test]
+    fn exhausted_output_retry_ceiling_is_phase_aware() {
+        assert_eq!(
+            LlmPhase::Review.exhausted_output_retry_max_tokens(REVIEW_MAX_TOKENS),
+            EXHAUSTED_OUTPUT_RETRY_MAX_TOKENS
+        );
+        assert_eq!(
+            LlmPhase::Planner.exhausted_output_retry_max_tokens(PLANNER_MAX_TOKENS),
+            PLANNER_MAX_TOKENS * 2
+        );
+        assert_eq!(
+            LlmPhase::Respond.exhausted_output_retry_max_tokens(RESPOND_MAX_TOKENS),
+            RESPOND_MAX_TOKENS * 2
+        );
+        let scorer_tokens = scorer_max_tokens(SCORER_MAX_FINDINGS).unwrap();
+        assert_eq!(
+            LlmPhase::Scorer {
+                expected_len: SCORER_MAX_FINDINGS,
+            }
+            .exhausted_output_retry_max_tokens(scorer_tokens),
+            scorer_tokens
+        );
+        assert_eq!(
+            LlmPhase::Attribution.exhausted_output_retry_max_tokens(1_000),
+            1_000
+        );
+        assert_eq!(
+            LlmPhase::Review
+                .exhausted_output_retry_max_tokens(EXHAUSTED_OUTPUT_RETRY_MAX_TOKENS + 1),
+            EXHAUSTED_OUTPUT_RETRY_MAX_TOKENS + 1
+        );
+    }
+
+    #[test]
+    fn hosted_review_preflight_keeps_scorer_at_its_runtime_ceiling() {
+        let config = Config {
+            model: "provider/generator".into(),
+            scorer: "provider/scorer".into(),
+            scorer_enabled: true,
+            ..Config::default()
+        };
+        let mut client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        client.hosted_price_bounds = Some(Arc::new(HashMap::from([
+            (
+                "provider/generator".into(),
+                ModelPriceBound {
+                    model: "provider/generator".into(),
+                    input_micros_per_million_tokens: 1,
+                    output_micros_per_million_tokens: 1,
+                },
+            ),
+            (
+                "provider/scorer".into(),
+                ModelPriceBound {
+                    model: "provider/scorer".into(),
+                    input_micros_per_million_tokens: 1,
+                    output_micros_per_million_tokens: 1,
+                },
+            ),
+        ])));
+
+        let admission = client
+            .preflight_review_plan(
+                &config,
+                1,
+                "system",
+                &["candidate".to_string()],
+                &["candidate".to_string()],
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            admission.output_tokens,
+            u64::from(LlmPhase::Review.exhausted_output_retry_max_tokens(REVIEW_MAX_TOKENS))
+                + u64::from(scorer_max_tokens(SCORER_MAX_FINDINGS).unwrap())
+        );
     }
 
     #[test]
@@ -5038,8 +5150,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             admission.output_tokens,
-            u64::from(REVIEW_MAX_TOKENS) * crate::review::MAX_HOSTED_SELECTED_BATCHES as u64
-                + u64::from(PLANNER_MAX_TOKENS)
+            u64::from(LlmPhase::Review.exhausted_output_retry_max_tokens(REVIEW_MAX_TOKENS))
+                * crate::review::MAX_HOSTED_SELECTED_BATCHES as u64
+                + u64::from(
+                    LlmPhase::Planner.exhausted_output_retry_max_tokens(PLANNER_MAX_TOKENS)
+                )
         );
         assert_eq!(client.admission.lock().unwrap().attempts, 0);
     }
