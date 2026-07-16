@@ -44,6 +44,7 @@ import {
 } from "./livemodels";
 import {
   compareCanonicalDecimals,
+  MAX_GENERATOR_COST_CAP_USD,
   parseCanonicalDecimal,
   type QualificationPair,
 } from "./livemodels-score";
@@ -305,9 +306,9 @@ describe("pair qualification configuration", () => {
       binary: "/missing/postil",
       pairs: [pair],
       pricing: new Map(),
-      costCapUsd: 56,
+      costCapUsd: 71,
       upstreamProvider: "PinnedProvider",
-    })).rejects.toThrow("cost cap must be greater than zero and at most $55");
+    })).rejects.toThrow("cost cap must be greater than zero and at most $70");
 
     const pairs = Array.from({ length: 7 }, (_, index) => ({
       generatorModel: `generator/${index}`,
@@ -357,7 +358,7 @@ describe("pair qualification configuration", () => {
         pricing,
         apiBase: normalizeApiBase("https://openrouter.ai/api/v1"),
         apiFormat: "openai-compatible",
-        costCapUsdDecimal: "55",
+        costCapUsdDecimal: "70",
         upstreamProvider: "PinnedProvider",
       });
       expect(compareCanonicalDecimals(
@@ -366,7 +367,7 @@ describe("pair qualification configuration", () => {
       )).toBeGreaterThan(0);
       expect(compareCanonicalDecimals(
         parseCanonicalDecimal(projected),
-        parseCanonicalDecimal("55"),
+        parseCanonicalDecimal("70"),
       )).toBeLessThanOrEqual(0);
     } finally {
       if (inheritedModelKey === undefined) delete process.env.MODEL_API_KEY;
@@ -823,6 +824,10 @@ describe("managed admission workflow", () => {
     expect(workflow).toContain("POSTIL_API_FORMAT: openai-compatible");
     expect(workflow).toContain("POSTIL_BENCH_REPEATS: \"3\"");
     expect(workflow).toContain("POSTIL_BENCH_PAIRS: ${{ inputs.pairs }}");
+    expect(workflow).toMatch(new RegExp(
+      `^ {6}cost_cap_usd:\\n(?: {8}.*\\n){2} {8}default: "${MAX_GENERATOR_COST_CAP_USD}"$`,
+      "mu",
+    ));
     expect(workflow).toContain("upstream_provider:");
     expect(workflow).toContain("POSTIL_BENCH_UPSTREAM_PROVIDER: ${{ inputs.upstream_provider }}");
     expect(workflow).toContain('echo "POSTIL_MANIFEST_OUT=${RUNNER_TEMP}/postil-qualified-models-${suffix}.json"');

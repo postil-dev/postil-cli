@@ -214,7 +214,7 @@ plan for every fixture before inference. It includes bounded planner, selected
 source and synthesis requests, scoring, consensus, fallback, repair, and
 transport retries. It rejects missing prices, more than six models, a review
 above the $1 hosted operation cap, a total above the configured qualification
-cap, or a cap outside `(0, $55]`. A single model used for more than one role is
+cap, or a cap outside `(0, $70]`. A single model used for more than one role is
 priced for each planned invocation.
 Atomic attribution accepts at most three findings anchored in one authored
 region. More is a fidelity failure. Each decision is limited to a 4 KiB input,
