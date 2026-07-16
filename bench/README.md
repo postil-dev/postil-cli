@@ -188,7 +188,7 @@ plan for every fixture before inference. It includes bounded planner, selected
 source and synthesis requests, scoring, consensus, fallback, repair, and
 transport retries. It rejects missing prices, more than six models, a review
 above the $1 hosted operation cap, a total above the configured qualification
-cap, or a cap outside `(0, $25]`. A single model used for more than one role is
+cap, or a cap outside `(0, $35]`. A single model used for more than one role is
 priced for each planned invocation.
 The inference key stays in the child environment and is never printed or placed
 on an argument list.
@@ -238,7 +238,8 @@ a 17,000-byte prompt bound, a 400-token output bound, and at most 1,600 bytes
 of repair context. Scorer responses also fail
 admission when provider usage is missing or malformed, runtime accounting is
 incomplete, or the assessment is not trimmed single-line text of at most 60
-Unicode characters and 240 UTF-8 bytes ending in sentence punctuation. Each case is killed one second
+Unicode characters and 240 UTF-8 bytes ending in sentence punctuation. Each
+case is killed one second
 after the 20-second admission limit, and teardown aborts outstanding provider
 requests. A timeout rejects that candidate immediately rather than running the
 rest of its matrix. Any other admission-fatal structural result, including an
