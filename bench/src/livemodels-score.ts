@@ -8,13 +8,13 @@
 // findings detect the authored target defect, plus the false-positive rate, gate-verdict
 // correctness, and the measured cost/latency per review.
 
+import { createHash } from "node:crypto";
 import type { AttributionCallEvidence, AttributionCaseEvidence } from "./attribution";
 import type { BenchmarkCase, Envelope } from "./harness";
 export const ADVISORY_MIN_DETECTION_RATE = 0.9;
 export const ADVISORY_MAX_OVERBLOCK_RATE = 0.1;
 export const CLEAN_MAX_FINDING_FALSE_POSITIVE_RATE = 0.05;
 export const GENERATOR_MAX_MEAN_COST_USD = 0.04;
-export const HOSTED_OPERATION_COST_CAP_USD = 25;
 export const GENERATOR_MAX_MEAN_DURATION_MS = 15_000;
 export const GENERATOR_MAX_REPEAT_P95_DURATION_MS = 30_000;
 export const GENERATOR_MAX_REPEAT_DURATION_MS = 60_000;
@@ -76,8 +76,17 @@ export interface FindingEvidence {
   severity: string;
   kind: string;
   confidence: number;
-  title: string;
-  body: string;
+}
+
+/** Public reference to one independently replayed attribution decision.
+ * Request text, raw responses, and evaluator prose remain out of the report. */
+export interface AttributionEvidenceReference {
+  candidateOrdinal: number;
+  sameDefect: boolean;
+  requestSha256: string;
+  responseSha256: string[];
+  usageSha256: string;
+  evidenceSha256: string;
 }
 
 export interface UsageCostEvidence {
@@ -92,6 +101,21 @@ export interface UsageCostEvidence {
   costProvenance: "providerExact" | "catalogEstimate" | "unavailable";
   costProviderDecimal: string | null;
   costCatalogEstimateDecimal: string | null;
+}
+
+/** Hash-only diagnostic material safe for the public qualification report. */
+export interface DiagnosticEvidence {
+  count: number;
+  sha256: string | null;
+}
+
+export function diagnosticEvidence(messages: readonly string[]): DiagnosticEvidence {
+  return {
+    count: messages.length,
+    sha256: messages.length === 0
+      ? null
+      : createHash("sha256").update(JSON.stringify(messages)).digest("hex"),
+  };
 }
 
 /** Per-case detail emitted in the report's `cases` array. */
@@ -127,13 +151,12 @@ export interface LiveModelCaseResult {
   costUsd: number | null;
   durationMs: number | null;
   exitCode: number | undefined;
-  /** Model-independent fidelity failures (grounding/statusline). Non-empty does
-   * not exclude the case from detection/cost scoring; it is surfaced so a
-   * pipeline regression under a live model is still visible. */
-  fidelityFailures: string[];
-  structuredOutputFailures: string[];
-  attributionEvidence: AttributionCallEvidence[];
-  error?: string;
+  /** Counts and digests only. Failure prose can contain model output and stays
+   * in the private runner evidence. */
+  fidelityDiagnostics: DiagnosticEvidence;
+  structuredOutputDiagnostics: DiagnosticEvidence;
+  attributionEvidence: AttributionEvidenceReference[];
+  errorSha256?: string;
 }
 
 /** Per-model aggregate. The `site` subset of these fields is the exact schema
@@ -398,10 +421,12 @@ export function scoreLiveCase(args: {
     costUsd: cost,
     durationMs: env.durationMs,
     exitCode,
-    fidelityFailures,
-    structuredOutputFailures: args.structuredOutputFailures ?? [],
-    attributionEvidence: args.attribution.calls,
-    ...(args.attribution.error === undefined ? {} : { error: args.attribution.error }),
+    fidelityDiagnostics: diagnosticEvidence(fidelityFailures),
+    structuredOutputDiagnostics: diagnosticEvidence(args.structuredOutputFailures ?? []),
+    attributionEvidence: args.attribution.calls.map(attributionEvidenceReference),
+    ...(args.attribution.error === undefined
+      ? {}
+      : { errorSha256: diagnosticEvidence([args.attribution.error]).sha256! }),
   };
 
   base.detected = truth.classification === "clean" ? null : attributedFindings.length > 0;
@@ -422,8 +447,19 @@ function evidenceFor(
     severity: finding.severity,
     kind: finding.kind,
     confidence: finding.confidence,
-    title: finding.title,
-    body: finding.body,
+  };
+}
+
+function attributionEvidenceReference(
+  evidence: AttributionCallEvidence,
+): AttributionEvidenceReference {
+  return {
+    candidateOrdinal: evidence.candidateOrdinal,
+    sameDefect: evidence.sameDefect,
+    requestSha256: evidence.requestSha256,
+    responseSha256: [...evidence.responseSha256],
+    usageSha256: evidence.usageSha256,
+    evidenceSha256: evidence.evidenceSha256,
   };
 }
 
@@ -465,10 +501,10 @@ export function erroredLiveCase(args: {
     costUsd: null,
     durationMs: null,
     exitCode: args.exitCode,
-    fidelityFailures: [],
-    structuredOutputFailures: [],
+    fidelityDiagnostics: diagnosticEvidence([]),
+    structuredOutputDiagnostics: diagnosticEvidence([]),
     attributionEvidence: [],
-    error: args.error,
+    errorSha256: diagnosticEvidence([args.error]).sha256!,
   };
 }
 
@@ -479,7 +515,12 @@ export function aggregateModel(
   pair: QualificationPair,
   results: LiveModelCaseResult[],
   expectedRepeats: number,
+  hostedOperationCostCapMicros: number,
 ): LiveModelAggregate {
+  if (!Number.isSafeInteger(hostedOperationCostCapMicros) || hostedOperationCostCapMicros <= 0) {
+    throw new Error("hosted operation cost cap must be a positive integer number of micro-dollars");
+  }
+  const hostedOperationCostCapUsd = hostedOperationCostCapMicros / 1_000_000;
   const scored = results.filter((r) => r.scored);
   const mustBlocks = scored.filter((r) => r.classification === "mustBlock");
   const advisories = scored.filter((r) => r.classification === "advisory");
@@ -497,11 +538,11 @@ export function aggregateModel(
   const maxDurationMs = durations.length ? Math.max(...durations) : 0;
 
   const unrelatedFindings = results.reduce((sum, r) => sum + r.unrelatedFindings, 0);
-  const errors = results.filter((r) => r.error !== undefined).length;
+  const errors = results.filter((r) => r.errorSha256 !== undefined).length;
   const pricingKnown = scored.length > 0 && costs.length === scored.length;
-  const fidelityFailures = results.reduce((sum, result) => sum + result.fidelityFailures.length, 0);
+  const fidelityFailures = results.reduce((sum, result) => sum + result.fidelityDiagnostics.count, 0);
   const structuredOutputFailures = results.reduce(
-    (sum, result) => sum + result.structuredOutputFailures.length,
+    (sum, result) => sum + result.structuredOutputDiagnostics.count,
     0,
   );
   const usageFailures = scored.filter(
@@ -593,11 +634,11 @@ export function aggregateModel(
   }
   if (!pricingKnown) admissionFailures.push("pricing or usage missing for one or more cases");
   const overCapCases = scored.filter((result) =>
-    result.costUsd !== null && result.costUsd > HOSTED_OPERATION_COST_CAP_USD
+    result.costUsd !== null && result.costUsd > hostedOperationCostCapUsd
   );
   if (overCapCases.length > 0) {
     admissionFailures.push(
-      `${overCapCases.length} review(s) exceed the $${HOSTED_OPERATION_COST_CAP_USD.toFixed(2)} hosted operation cap`,
+      `${overCapCases.length} review(s) exceed the $${hostedOperationCostCapUsd.toFixed(2)} hosted operation cap`,
     );
   }
   if (meanCostUsdPerReview > GENERATOR_MAX_MEAN_COST_USD) {

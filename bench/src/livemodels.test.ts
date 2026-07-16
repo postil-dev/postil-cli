@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { cases as fixtureInputs } from "../fixtures/cases";
 import { benchmarkCase, type BenchmarkCase } from "./harness";
+import type { AttributionCallEvidence } from "./attribution";
 import {
   admissionManifestCandidate,
   assertGitTreeSourceAuthority,
@@ -26,14 +27,18 @@ import {
   modelPriceBoundsFor,
   normalizeApiBase,
   normalizeQualificationPairs,
+  parseLiveModelsReport,
   parseQualificationPairs,
   prepareImmutableQualificationBinary,
   prepareAttributionEvaluatorEnvironment,
   pricingFromFile,
+  privateEvidenceSha256,
   qualificationCandidateDocument,
   qualificationProfileDigest,
   readPinnedQualificationWorktreeFile,
   runLiveModels,
+  summarizeAttributionEvaluator,
+  verifyPrivateEvidenceBundle,
   withImmutableQualificationBinary,
   type LiveModelsReport,
 } from "./livemodels";
@@ -823,8 +828,20 @@ describe("managed admission workflow", () => {
     expect(workflow).toContain('echo "POSTIL_MANIFEST_OUT=${RUNNER_TEMP}/postil-qualified-models-${suffix}.json"');
     expect(workflow).toContain('>> "$GITHUB_ENV"');
     expect(workflow).toContain('test "$GITHUB_REF" = "refs/heads/main"');
-    expect(workflow).toContain('rm -f "$POSTIL_REPORT_OUT" "$POSTIL_MANIFEST_OUT" "$POSTIL_ATTESTATION_BUNDLE_OUT"');
+    expect(workflow).toContain('echo "POSTIL_PRIVATE_EVIDENCE_OUT=${RUNNER_TEMP}/postil-private-evidence-${suffix}.json"');
+    expect(workflow).toContain('echo "POSTIL_PRIVATE_EVIDENCE_ENCRYPTED_OUT=${RUNNER_TEMP}/postil-private-evidence-${suffix}.json.gpg"');
+    expect(workflow).toContain('rm -f "$POSTIL_REPORT_OUT" "$POSTIL_MANIFEST_OUT" "$POSTIL_PRIVATE_EVIDENCE_OUT" "$POSTIL_PRIVATE_EVIDENCE_ENCRYPTED_OUT" "$POSTIL_ATTESTATION_BUNDLE_OUT"');
     expect(workflow).toContain('--manifest-out "$POSTIL_MANIFEST_OUT"');
+    expect(workflow).toContain('--private-evidence-out "$POSTIL_PRIVATE_EVIDENCE_OUT"');
+    expect(workflow).toContain('const r = parseLiveModelsReport(await Bun.file(process.env.POSTIL_REPORT_OUT).json());');
+    expect(workflow).toContain("secrets.POSTIL_PRIVATE_EVIDENCE_PASSPHRASE");
+    expect(workflow).toContain("--symmetric --cipher-algo AES256");
+    expect(workflow).toContain('cmp "$POSTIL_PRIVATE_EVIDENCE_OUT" "$verify_path"');
+    expect(workflow).toMatch(/name: Upload encrypted private replay evidence[\s\S]*path: \$\{\{ env\.POSTIL_PRIVATE_EVIDENCE_ENCRYPTED_OUT \}\}/u);
+    expect(workflow).toMatch(/name: Remove private replay evidence\n\s+if: always\(\)\n\s+run: rm -f "\$POSTIL_PRIVATE_EVIDENCE_OUT" "\$POSTIL_PRIVATE_EVIDENCE_ENCRYPTED_OUT"/u);
+    expect(workflow).not.toContain("path: ${{ env.POSTIL_PRIVATE_EVIDENCE_OUT }}");
+    expect(workflow).not.toContain("bench-live-raw-runs");
+    expect(workflow).not.toContain("path: bench/.runs/live-models");
     expect(workflow).toContain("POSTIL_QUALIFICATION_SOURCE_SHA: ${{ github.sha }}");
     expect(workflow).toContain("uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4");
     expect(workflow).toContain("subject-path: ${{ env.POSTIL_MANIFEST_OUT }}");
@@ -866,6 +883,32 @@ describe("managed admission workflow", () => {
 });
 
 describe("qualification report", () => {
+  test("summarizes evaluator evidence without request, response, or verdict prose", () => {
+    const evidence = [{
+      request: { candidate: { body: "private evaluator request sentinel" } },
+      rawResponses: ["private evaluator response sentinel"],
+      reason: "private evaluator verdict sentinel",
+    }] as unknown as AttributionCallEvidence[];
+
+    const summary = summarizeAttributionEvaluator({
+      pairId: "generator + scorer",
+      eligible: true,
+      evidenceSha256: "a".repeat(64),
+      evidence,
+    });
+    const serialized = JSON.stringify(summary);
+
+    expect(summary).toEqual({
+      pairId: "generator + scorer",
+      eligible: true,
+      evidenceSha256: "a".repeat(64),
+      calls: 1,
+    });
+    expect(serialized).not.toContain("private evaluator request sentinel");
+    expect(serialized).not.toContain("private evaluator response sentinel");
+    expect(serialized).not.toContain("private evaluator verdict sentinel");
+  });
+
   test("binds the exact fixture matrix and evaluator toolchain sources", () => {
     // livemodels validates and snapshots these inputs at module initialization.
     const exact = fixtureInputs as BenchmarkCase[];
@@ -944,6 +987,7 @@ describe("qualification report", () => {
   test("prints attributable metrics, hashes, provider, and bounded costs", () => {
     const cost = 0.123456;
     const report: LiveModelsReport = {
+      schemaVersion: 2,
       generatedAt: "2026-07-11T00:00:00.000Z",
       qualificationSourceSha: "9".repeat(40),
       cliVersion: "postil 0.6.1",
@@ -962,6 +1006,7 @@ describe("qualification report", () => {
       configHash: "d".repeat(64),
       cliBinaryHash: "c".repeat(64),
       evidenceHash: "e".repeat(64),
+      privateEvidenceSha256: "3".repeat(64),
       hostedOperationCostCapMicros: 1_000_000,
       repeats: 3,
       profiles: [],
@@ -1024,6 +1069,31 @@ describe("qualification report", () => {
       attributionProviderCalls: 2,
       cases: [],
     };
+
+    const privateBundle = {
+      schemaVersion: 1 as const,
+      qualificationSourceSha: report.qualificationSourceSha,
+      cliBinaryHash: report.cliBinaryHash,
+      attributionEvaluators: [],
+      cases: [],
+    };
+    report.privateEvidenceSha256 = privateEvidenceSha256(privateBundle);
+    expect(parseLiveModelsReport(report)).toBe(report);
+    expect(() => verifyPrivateEvidenceBundle(privateBundle, report)).not.toThrow();
+    const legacy = structuredClone(report) as unknown as Record<string, unknown>;
+    delete legacy.schemaVersion;
+    expect(() => parseLiveModelsReport(legacy)).toThrow(
+      "schemaVersion is required; legacy unversioned reports are not accepted",
+    );
+    const contaminated = structuredClone(report) as unknown as Record<string, unknown>;
+    contaminated.cases = [{
+      id: "synthetic",
+      fidelityFailures: ["full report private title sentinel at .postil/model-output:1"],
+      error: "full report private body sentinel",
+    }];
+    expect(() => parseLiveModelsReport(contaminated)).toThrow("contains private field");
+    expect(JSON.stringify(report)).not.toContain("full report private title sentinel");
+    expect(JSON.stringify(report)).not.toContain("full report private body sentinel");
 
     const output = formatLiveModelsReport(report);
     expect(output).toContain("block");

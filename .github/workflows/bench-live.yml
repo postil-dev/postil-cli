@@ -54,6 +54,8 @@ jobs:
           {
             echo "POSTIL_REPORT_OUT=${RUNNER_TEMP}/postil-live-report-${suffix}.json"
             echo "POSTIL_MANIFEST_OUT=${RUNNER_TEMP}/postil-qualified-models-${suffix}.json"
+            echo "POSTIL_PRIVATE_EVIDENCE_OUT=${RUNNER_TEMP}/postil-private-evidence-${suffix}.json"
+            echo "POSTIL_PRIVATE_EVIDENCE_ENCRYPTED_OUT=${RUNNER_TEMP}/postil-private-evidence-${suffix}.json.gpg"
             echo "POSTIL_ATTESTATION_BUNDLE_OUT=${RUNNER_TEMP}/postil-qualified-models-${suffix}.attestation.json"
           } >> "$GITHUB_ENV"
 
@@ -65,7 +67,12 @@ jobs:
         run: bun install --frozen-lockfile
 
       - name: Prepare unique evidence paths
-        run: rm -f "$POSTIL_REPORT_OUT" "$POSTIL_MANIFEST_OUT" "$POSTIL_ATTESTATION_BUNDLE_OUT"
+        run: rm -f "$POSTIL_REPORT_OUT" "$POSTIL_MANIFEST_OUT" "$POSTIL_PRIVATE_EVIDENCE_OUT" "$POSTIL_PRIVATE_EVIDENCE_ENCRYPTED_OUT" "$POSTIL_ATTESTATION_BUNDLE_OUT"
+
+      - name: Require private evidence encryption secret
+        env:
+          EVIDENCE_PASSPHRASE: ${{ secrets.POSTIL_PRIVATE_EVIDENCE_PASSPHRASE }}
+        run: test -n "$EVIDENCE_PASSPHRASE"
 
       - name: Run exact admission profile
         working-directory: bench
@@ -75,6 +82,21 @@ jobs:
           bun run src/run.ts
           --json-out "$POSTIL_REPORT_OUT"
           --manifest-out "$POSTIL_MANIFEST_OUT"
+          --private-evidence-out "$POSTIL_PRIVATE_EVIDENCE_OUT"
+
+      - name: Encrypt and verify private replay evidence
+        id: encrypt-private-evidence
+        env:
+          EVIDENCE_PASSPHRASE: ${{ secrets.POSTIL_PRIVATE_EVIDENCE_PASSPHRASE }}
+        run: |
+          verify_path="${RUNNER_TEMP}/postil-private-evidence-verify-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+          printf '%s' "$EVIDENCE_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
+            --symmetric --cipher-algo AES256 --output "$POSTIL_PRIVATE_EVIDENCE_ENCRYPTED_OUT" \
+            "$POSTIL_PRIVATE_EVIDENCE_OUT"
+          printf '%s' "$EVIDENCE_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
+            --decrypt "$POSTIL_PRIVATE_EVIDENCE_ENCRYPTED_OUT" > "$verify_path"
+          cmp "$POSTIL_PRIVATE_EVIDENCE_OUT" "$verify_path"
+          rm -f "$verify_path"
 
       - name: Attest admitted candidate
         id: attest-candidate
@@ -101,7 +123,8 @@ jobs:
             fi
             echo '```'
             bun -e '
-              const r = await Bun.file(process.env.POSTIL_REPORT_OUT).json();
+              const { parseLiveModelsReport } = await import("./src/livemodels.ts");
+              const r = parseLiveModelsReport(await Bun.file(process.env.POSTIL_REPORT_OUT).json());
               const pct = (value) => (value * 100).toFixed(1) + "%";
               const pad = (value, width) => String(value).length >= width
                 ? String(value)
@@ -150,10 +173,14 @@ jobs:
             ${{ env.POSTIL_ATTESTATION_BUNDLE_OUT }}
           if-no-files-found: error
 
-      - name: Upload raw runs
-        if: always()
+      - name: Upload encrypted private replay evidence
+        if: always() && steps.encrypt-private-evidence.outcome == 'success'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: bench-live-raw-runs
-          path: bench/.runs/live-models
-          if-no-files-found: warn
+          name: bench-live-private-evidence
+          path: ${{ env.POSTIL_PRIVATE_EVIDENCE_ENCRYPTED_OUT }}
+          if-no-files-found: error
+
+      - name: Remove private replay evidence
+        if: always()
+        run: rm -f "$POSTIL_PRIVATE_EVIDENCE_OUT" "$POSTIL_PRIVATE_EVIDENCE_ENCRYPTED_OUT"

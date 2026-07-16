@@ -468,6 +468,7 @@ pub fn cap_text(s: &str, max: usize, marker: &str) -> String {
     out
 }
 
+#[cfg(test)]
 pub(crate) fn wrap_plain_text(text: &str, width: usize) -> String {
     if width == 0 {
         return text.to_string();
@@ -480,6 +481,7 @@ pub(crate) fn wrap_plain_text(text: &str, width: usize) -> String {
     wrapped.join("\n")
 }
 
+#[cfg(test)]
 fn wrap_plain_line(mut line: &str, width: usize, wrapped: &mut Vec<String>) {
     if line.is_empty() {
         wrapped.push(String::new());
@@ -508,6 +510,7 @@ fn wrap_plain_line(mut line: &str, width: usize, wrapped: &mut Vec<String>) {
     wrapped.push(line.to_string());
 }
 
+#[cfg(test)]
 fn wrap_break(line: &str, width: usize) -> (usize, bool) {
     let mut hard_break = line.len();
     let mut last_space = None;
@@ -583,7 +586,15 @@ pub fn valid_details_url(value: Option<String>) -> Option<String> {
 
 pub fn check_title(envelope: &Envelope) -> String {
     if envelope.silent {
-        "No merge-relevant findings".to_string()
+        if envelope
+            .review_coverage
+            .as_ref()
+            .is_some_and(|coverage| coverage.mode == crate::envelope::ReviewCoverageMode::Bounded)
+        {
+            "No findings in risk-selected changes".to_string()
+        } else {
+            "No merge-relevant findings".to_string()
+        }
     } else {
         let c = &envelope.counts;
         format!("{} error, {} warn, {} info", c.error, c.warn, c.info)
@@ -592,11 +603,18 @@ pub fn check_title(envelope: &Envelope) -> String {
 
 /// Truthful clean-result wording for review comments and check summaries.
 /// Some silent runs intentionally make no model call.
-pub fn clean_review_message(envelope: &Envelope) -> &'static str {
+pub fn clean_review_message(envelope: &Envelope) -> String {
     match envelope.model_used.as_str() {
-        "none (disabled by config)" => "Review disabled by configuration.",
-        "none (empty diff)" => "No reviewable diff; no model call was made.",
-        _ => "Postil reviewed this change and found nothing that affects the merge decision.",
+        "none (disabled by config)" => "Review disabled by configuration.".to_string(),
+        "none (empty diff)" => "No reviewable diff; no model call was made.".to_string(),
+        _ if envelope.review_coverage.as_ref().is_some_and(|coverage| {
+            coverage.mode == crate::envelope::ReviewCoverageMode::Bounded
+        }) =>
+        {
+            "No issues were found in the risk-selected changes reviewed.".to_string()
+        }
+        _ => "Postil reviewed this change and found nothing that affects the merge decision."
+            .to_string(),
     }
 }
 
@@ -679,7 +697,7 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
         }
         s.push('\n');
     } else if envelope.silent {
-        s.push_str(clean_review_message(envelope));
+        s.push_str(&clean_review_message(envelope));
         s.push('\n');
     } else {
         let open_visible = envelope
@@ -771,6 +789,7 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
     if !synthetic_findings.is_empty() {
         s.push('\n');
         for finding in &synthetic_findings {
+            let publication = crate::envelope::forge_safe_finding_publication_text(finding);
             let location = if finding.path == crate::envelope::PR_DESCRIPTION_PATH {
                 "pull request description".to_string()
             } else {
@@ -778,9 +797,7 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
             };
             s.push_str(&format!(
                 "- **{}** in {}: {}\n",
-                safe_markdown_text(&finding.title),
-                location,
-                safe_evidence_text(&finding.body),
+                publication.title, location, publication.body,
             ));
         }
         let undisclosed = envelope
@@ -840,42 +857,21 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
             ));
         }
         for suppressed in disclosed {
+            let publication =
+                crate::envelope::forge_safe_finding_publication_text(&suppressed.finding);
             s.push_str(&format!(
                 "- **{}** at `{}`:{}: {}; severity {}, confidence {}. {}\n",
-                safe_markdown_text(&suppressed.finding.title),
+                publication.title,
                 safe_code_text(&suppressed.finding.path),
                 suppressed.finding.line,
                 suppression_reason(suppressed.reason),
                 suppressed.finding.severity.as_str(),
                 format_confidence(suppressed.finding.confidence),
-                safe_evidence_text(&suppressed.finding.body),
+                publication.body,
             ));
         }
         if rich {
             s.push_str("\n</details>\n");
-        }
-    }
-
-    if let Some(coverage) = &envelope.review_coverage {
-        let fallback = if coverage.planner_fallback {
-            "yes"
-        } else {
-            "no"
-        };
-        if rich {
-            s.push_str(&format!(
-                "\n<sub>{}/{} source batches · {} · planner fallback: {fallback}</sub>\n",
-                coverage.selected_batches,
-                coverage.total_batches,
-                coverage.mode.as_str(),
-            ));
-        } else {
-            s.push_str(&format!(
-                "\n{}/{} source batches ({}; planner fallback: {fallback}).\n",
-                coverage.selected_batches,
-                coverage.total_batches,
-                coverage.mode.as_str(),
-            ));
         }
     }
 
@@ -908,43 +904,18 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
     s
 }
 
-fn safe_evidence_text(value: &str) -> String {
-    let sanitized = sanitize_markdown_text(value);
-    if sanitized.chars().count() <= 240 {
-        return sanitized;
-    }
-    let prefix: String = sanitized.chars().take(239).collect();
-    let boundary = prefix
-        .char_indices()
-        .rev()
-        .find(|(_, ch)| ch.is_whitespace())
-        .map(|(index, _)| index)
-        .unwrap_or(prefix.len());
-    format!("{}…", prefix[..boundary].trim_end())
-}
-
 fn plural<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
     if count == 1 { singular } else { plural }
 }
 
 fn suppression_reason(reason: SuppressionReason) -> &'static str {
     match reason {
+        SuppressionReason::NonActionable => "deterministically non-actionable",
         SuppressionReason::Ignored => "ignored by repository policy",
         SuppressionReason::BelowSeverity => "below the configured severity threshold",
         SuppressionReason::BelowConfidence => "below the configured confidence threshold",
         SuppressionReason::MaxFindings => "outside the configured finding cap",
     }
-}
-
-fn safe_markdown_text(value: &str) -> String {
-    sanitize_markdown_text(value).chars().take(160).collect()
-}
-
-fn sanitize_markdown_text(value: &str) -> String {
-    value
-        .replace(['\r', '\n'], " ")
-        .replace('@', "＠")
-        .replace(['[', ']', '*', '_', '<', '>'], "")
 }
 
 fn safe_code_text(value: &str) -> String {
@@ -958,7 +929,7 @@ fn safe_code_text(value: &str) -> String {
 /// The body of one inline finding comment: icon (rich forges), bold title,
 /// severity / confidence / kind statusline, then the finding body.
 pub fn finding_comment_body(f: &Finding, rich: bool) -> String {
-    let publication = crate::envelope::finding_publication_text(&f.title, &f.body);
+    let publication = crate::envelope::forge_safe_finding_publication_text(f);
     let icon = if rich {
         format!("{} ", severity_icon(f.severity))
     } else {
@@ -1174,6 +1145,7 @@ mod tests {
             scorer_reason: None,
             title: "Unsanitized input reaches query".into(),
             body: "user_input flows into exec_query.".into(),
+            evidence: None,
             id: None,
         }
     }
@@ -1218,17 +1190,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_finding_title_cannot_break_the_comment_wrapper() {
+    fn unsafe_finding_text_is_rejected_before_the_comment_wrapper() {
         let mut unsafe_finding = finding();
         unsafe_finding.title.clear();
         unsafe_finding.body = "**@octocat <img> [`code`]**\n\nKeep `useful()` formatting.".into();
 
-        let body = finding_comment_body(&unsafe_finding, true);
-
-        assert!(!body.contains("@octocat"));
-        assert!(!body.contains("<img>"));
-        assert!(!body.contains("****"));
-        assert!(body.contains("`useful()`"));
+        assert!(crate::envelope::validate_finding_publication(&unsafe_finding).is_err());
     }
 
     #[test]
@@ -1404,13 +1371,13 @@ mod tests {
     }
 
     #[test]
-    fn evidence_excerpt_marks_truncation_at_a_word_boundary() {
-        let evidence = "A claim with enough detail to exceed the publication limit. ".repeat(8);
-        let excerpt = safe_evidence_text(&evidence);
-
-        assert!(excerpt.ends_with('…'));
-        assert!(excerpt.chars().count() <= 240);
-        assert!(!excerpt.ends_with(" …"));
+    fn publication_text_preserves_exact_227_character_finding_body() {
+        let evidence = format!("{}.", "a".repeat(226));
+        let mut finding = finding();
+        finding.body = evidence.clone();
+        let publication = crate::envelope::forge_safe_finding_publication_text(&finding);
+        assert_eq!(publication.body, evidence);
+        assert_eq!(publication.body.chars().count(), 227);
     }
 
     #[test]
@@ -1436,7 +1403,7 @@ mod tests {
     }
 
     #[test]
-    fn review_coverage_is_compact_and_auditable_in_every_mode() {
+    fn review_coverage_stays_out_of_compact_pull_request_summaries() {
         let mut env = envelope_with_findings(vec![finding()]);
         env.review_coverage = Some(crate::envelope::ReviewCoverage {
             mode: crate::envelope::ReviewCoverageMode::Bounded,
@@ -1446,23 +1413,11 @@ mod tests {
         });
 
         let rich = check_summary(&env, true, Default::default());
-        assert!(rich.contains("<sub>5/19 source batches · bounded · planner fallback: yes</sub>"));
-
         let plain = check_summary(&env, false, Default::default());
-        assert!(plain.contains("5/19 source batches (bounded; planner fallback: yes)."));
-
-        env.review_coverage = Some(crate::envelope::ReviewCoverage {
-            mode: crate::envelope::ReviewCoverageMode::Exhaustive,
-            selected_batches: 19,
-            total_batches: 19,
-            planner_fallback: false,
-        });
-        let rich = check_summary(&env, true, Default::default());
-        assert!(
-            rich.contains("<sub>19/19 source batches · exhaustive · planner fallback: no</sub>")
-        );
-        let plain = check_summary(&env, false, Default::default());
-        assert!(plain.contains("19/19 source batches (exhaustive; planner fallback: no)."));
+        for summary in [rich, plain] {
+            assert!(!summary.contains("source batches"));
+            assert!(!summary.contains("planner fallback"));
+        }
     }
 
     #[test]
@@ -1565,7 +1520,7 @@ mod tests {
 
     #[test]
     fn silent_summary_is_plain_and_compact_for_all_forges() {
-        let env = Envelope {
+        let mut env = Envelope {
             version: 1,
             summary: String::new(),
             silent: true,
@@ -1596,6 +1551,18 @@ mod tests {
         };
         assert!(!check_summary(&env, true, Default::default()).contains("status/pass.svg"));
         assert!(!check_summary(&env, false, Default::default()).contains("<img"));
+
+        env.review_coverage = Some(crate::envelope::ReviewCoverage {
+            mode: crate::envelope::ReviewCoverageMode::Bounded,
+            selected_batches: 5,
+            total_batches: 19,
+            planner_fallback: false,
+        });
+        let summary = check_summary(&env, true, Default::default());
+        assert!(summary.starts_with("No issues were found in the risk-selected changes reviewed."));
+        assert_eq!(check_title(&env), "No findings in risk-selected changes");
+        assert!(!summary.contains("source batches"));
+        assert!(!summary.contains("planner"));
     }
 
     #[test]

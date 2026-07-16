@@ -25,10 +25,15 @@ use std::collections::HashMap;
 /// Each model request stays bounded. Large reviews continue through sequential
 /// source windows; actual provider-attempt, deadline, and spend guards remain
 /// enforced by `LlmClient` while raw diff size never decides reviewability.
-const MAX_REVIEW_BATCH_BYTES: usize = 120_000;
-const MAX_REVIEW_MANIFEST_BYTES: usize = 24_000;
+// JSON can expand one control byte to a six-byte escape. Reserving two more
+// factors leaves fixed room for the system prompt and request shape across
+// OpenAI-compatible and native Anthropic providers.
+pub(crate) const MAX_REVIEW_BATCH_BYTES: usize = crate::llm::MAX_PROVIDER_REQUEST_BYTES / 8;
+#[cfg(test)]
+pub(crate) const MAX_HOSTED_REVIEW_BATCH_BYTES: usize = MAX_REVIEW_BATCH_BYTES;
+pub(crate) const MAX_REVIEW_MANIFEST_BYTES: usize = 24_000;
 pub(crate) const MAX_HOSTED_SELECTED_BATCHES: usize = 5;
-const MAX_HOSTED_PLANNER_CANDIDATES: usize = 96;
+pub(crate) const MAX_HOSTED_PLANNER_CANDIDATES: usize = 96;
 pub(crate) const MAX_MODELS_PER_REQUEST: usize = 3;
 pub(crate) const MAX_SCORER_PROMPT_BYTES: usize = 56_000;
 const MAX_STREAMED_CANDIDATE_MULTIPLIER: usize = 8;
@@ -606,17 +611,22 @@ fn load_baseline(args: &ReviewArgs) -> Result<Vec<Finding>> {
 /// change-metadata findings use their exact semantic content so an unrelated
 /// metadata entry reusing the same synthetic line cannot supersede them.
 fn generate_finding_ids(findings: &mut [Finding], head_sha: Option<&str>) {
-    let mut id_map: HashMap<String, usize> = HashMap::new();
-
     for finding in findings.iter_mut() {
         if finding.id.is_some() {
             continue;
         }
         // Normalize the finding data
         let normalized_path = finding.path.to_lowercase();
-        let normalized_line = finding.line.to_string();
         let normalized_title = finding.title.trim().to_lowercase();
-        let identity = if finding.path == crate::envelope::CHANGE_METADATA_PATH {
+        let identity = if let Some(evidence) = finding.evidence.as_deref() {
+            format!(
+                "evidence\x00{}\x00{}\x00{}\x00{}",
+                finding.kind.as_str(),
+                normalized_path,
+                normalized_title,
+                evidence
+            )
+        } else if finding.path == crate::envelope::CHANGE_METADATA_PATH {
             format!(
                 "change-metadata\x00{}\x00{}\x00{}\x00{}",
                 finding.kind.as_str(),
@@ -630,24 +640,14 @@ fn generate_finding_ids(findings: &mut [Finding], head_sha: Option<&str>) {
                 "{head_sha}\x00{}\x00{}\x00{}\x00{}",
                 finding.kind.as_str(),
                 normalized_path,
-                normalized_line,
+                finding.line,
                 normalized_title
             )
         };
 
-        // Create a pre-hash key to track duplicates.
-        let prehash_key = identity.clone();
-        let duplicate_index = id_map
-            .entry(prehash_key)
-            .and_modify(|count| *count += 1)
-            .or_insert(0);
-
-        // Build the hash input
-        let hash_input = format!("{identity}\x00{duplicate_index}");
-
         // Generate SHA256 hash
         let mut hasher = Sha256::new();
-        hasher.update(hash_input.as_bytes());
+        hasher.update(identity.as_bytes());
         let result = hasher.finalize();
         let hex_id = result
             .iter()
@@ -830,17 +830,16 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
     // content-policy finding can ground against the reserved path. Only meaningful
     // for full reviews with a body; incremental reviews scope to the pushed diff.
     let content_policy_active = cfg.enabled && cfg.content_policy.is_some() && !incremental;
-    let pr_desc_lines = if content_policy_active {
-        let (_, count) = prompt::render_pr_description(
+    let (pr_description, pr_desc_lines) = if content_policy_active {
+        prompt::render_pr_description(
             meta.map(|m| m.title.as_str()),
             meta.map(|m| m.body.as_str()),
-        );
-        count
+        )
     } else {
-        0
+        (String::new(), 0)
     };
     if pr_desc_lines > 0 {
-        index.add_content_policy_path(crate::envelope::PR_DESCRIPTION_PATH, pr_desc_lines);
+        index.add_content_policy_evidence(crate::envelope::PR_DESCRIPTION_PATH, &pr_description);
     }
 
     let mut summary = String::new();
@@ -983,12 +982,15 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                         .into_iter()
                         .map(|(_, later)| later)
                         .collect::<Vec<_>>();
-                    let planner = bounded_candidates.as_ref().map(|candidates| {
-                        (
-                            candidates.manifest.as_str(),
-                            MAX_HOSTED_SELECTED_BATCHES
-                                .saturating_sub(candidates.mandatory_ids.len()),
-                        )
+                    let planner = bounded_candidates.as_ref().and_then(|candidates| {
+                        let remaining = MAX_HOSTED_SELECTED_BATCHES
+                            .saturating_sub(candidates.mandatory_ids.len());
+                        (remaining > 0
+                            && candidates
+                                .candidate_ids
+                                .iter()
+                                .any(|id| !candidates.mandatory_ids.contains(id)))
+                        .then_some((candidates.manifest.as_str(), remaining))
                     });
                     let admission = client.preflight_review_plan(
                         cfg,
@@ -1047,32 +1049,34 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                     for id in &candidates.mandatory_ids {
                         additional_candidates.remove(id);
                     }
-                    let plan = client
-                        .plan_review_batches(
-                            cfg,
-                            &candidates.manifest,
-                            &additional_candidates,
-                            remaining,
-                        )
-                        .await?;
-                    usage.prompt_tokens =
-                        usage.prompt_tokens.saturating_add(plan.usage.prompt_tokens);
-                    usage.completion_tokens = usage
-                        .completion_tokens
-                        .saturating_add(plan.usage.completion_tokens);
-                    model_usage.extend(plan.model_usage);
-                    model_incidents.extend(plan.model_incidents);
-                    usage_accounting_complete &= plan.usage_accounting_complete;
-                    planner_fallback = plan.fallback_used;
                     let mut ids = candidates
                         .mandatory_ids
                         .into_iter()
                         .collect::<std::collections::BTreeSet<_>>();
-                    for id in plan.batch_ids {
-                        if ids.len() >= MAX_HOSTED_SELECTED_BATCHES {
-                            break;
+                    if remaining > 0 && !additional_candidates.is_empty() {
+                        let plan = client
+                            .plan_review_batches(
+                                cfg,
+                                &candidates.manifest,
+                                &additional_candidates,
+                                remaining,
+                            )
+                            .await?;
+                        usage.prompt_tokens =
+                            usage.prompt_tokens.saturating_add(plan.usage.prompt_tokens);
+                        usage.completion_tokens = usage
+                            .completion_tokens
+                            .saturating_add(plan.usage.completion_tokens);
+                        model_usage.extend(plan.model_usage);
+                        model_incidents.extend(plan.model_incidents);
+                        usage_accounting_complete &= plan.usage_accounting_complete;
+                        planner_fallback = plan.fallback_used;
+                        for id in plan.batch_ids {
+                            if ids.len() >= MAX_HOSTED_SELECTED_BATCHES {
+                                break;
+                            }
+                            ids.insert(id);
                         }
-                        ids.insert(id);
                     }
                     selected_source_batches = batches.selected_source_count(&ids);
                     let selected = batches.selected_batches(&ids)?;
@@ -1121,6 +1125,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                     let first = request_index == 0;
                     let (annotated, user, cross_window_synthesis) =
                         review_batch_prompt(&runtime_prompt_context, batch, first);
+                    index.add_rendered_evidence(&annotated);
                     eprintln!(
                         "postil: reviewing {} request {}/{} ({} bytes)",
                         if cross_window_synthesis {
@@ -1133,23 +1138,31 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                         annotated.len()
                     );
                     let validation_annotated = annotated.clone();
-                    let validation_index = index.clone();
+                    let validation_user = user.clone();
                     match client
                         .review_validated(cfg, &system, &user, move |review| {
-                            let has_grounded = review.findings.iter().any(|finding| {
-                                diff::review_batch_contains_range(
+                            let invalid = review.findings.iter().find(|finding| {
+                                let grounded = diff::review_batch_contains_exact_evidence(
                                     &validation_annotated,
                                     &finding.path,
                                     finding.line,
-                                    finding.line,
+                                    finding.evidence.as_deref(),
                                 ) || (first
                                     && finding.kind == crate::envelope::Kind::ContentPolicy
-                                    && validation_index
-                                        .contains_content_policy(&finding.path, finding.line))
+                                    && diff::review_batch_contains_exact_evidence(
+                                        &validation_user,
+                                        &finding.path,
+                                        finding.line,
+                                        finding.evidence.as_deref(),
+                                    ));
+                                crate::envelope::validate_finding_publication(finding).is_err()
+                                    || !grounded
                             });
-                            if !review.findings.is_empty() && !has_grounded {
-                                Err("every finding cited a location outside the review input"
-                                    .to_string())
+                            if let Some(finding) = invalid {
+                                Err(format!(
+                                    "finding at {}:{} has invalid publication text or lacks exact new-side evidence",
+                                    finding.path, finding.line
+                                ))
                             } else {
                                 Ok(())
                             }
@@ -1184,14 +1197,19 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                             }
                             let before = model_review.findings.len();
                             model_review.findings.retain(|finding| {
-                                diff::review_batch_contains_range(
+                                diff::review_batch_contains_exact_evidence(
                                     &annotated,
                                     &finding.path,
                                     finding.line,
-                                    finding.line,
+                                    finding.evidence.as_deref(),
                                 ) || (first
                                     && finding.kind == crate::envelope::Kind::ContentPolicy
-                                    && index.contains_content_policy(&finding.path, finding.line))
+                                    && diff::review_batch_contains_exact_evidence(
+                                        &user,
+                                        &finding.path,
+                                        finding.line,
+                                        finding.evidence.as_deref(),
+                                    ))
                             });
                             for finding in &mut model_review.findings {
                                 finding.path = diff::canonical_prompt_path(&finding.path)
@@ -1242,10 +1260,9 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                     for finding in raw_findings {
                         let key = (
                             finding.path.clone(),
-                            finding.line,
-                            finding.end_line,
                             finding.kind.as_str().to_string(),
-                            finding.title.clone(),
+                            finding.title.trim().to_ascii_lowercase(),
+                            finding.evidence.clone(),
                         );
                         if let Some(position) = positions.get(&key).copied() {
                             let existing = &mut deduplicated[position];
@@ -1290,7 +1307,11 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                             &summary_parts.join("\n\n"),
                         )];
                     } else {
-                        full_review_trustworthy = !batch_failed;
+                        // Bounded mode reviews deterministic direct evidence and
+                        // lossy synthesis, not every source batch. It may add new
+                        // findings, but it cannot prove that an unseen baseline
+                        // finding is resolved.
+                        full_review_trustworthy = !batch_failed && !risk_selected_review;
                         summary = summary_parts.join("\n\n");
                         let mut kept = outcome.kept;
                         if !kept.is_empty() && cfg.scorer_enabled() {
@@ -1407,6 +1428,10 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
             carried: vec![],
         }
     };
+    // Carried findings are durable historical state and are excluded from all
+    // forge publication sinks. They may predate the current prose contract, so
+    // keep them open without revalidating them as fresh model output. Fresh
+    // findings are validated before they can reach reconciliation.
     findings.extend(rec.carried);
 
     // Operational findings (model unreachable/unusable) fail the gate by default
@@ -1984,19 +2009,19 @@ mod tests {
             scorer_reason: None,
             title: title.to_string(),
             body: body.to_string(),
+            evidence: None,
             id: None,
         }
     }
 
-    fn expected_finding_id(finding: &Finding, head_sha: &str, duplicate_index: usize) -> String {
+    fn expected_finding_id(finding: &Finding, head_sha: &str, _duplicate_index: usize) -> String {
         let hash_input = format!(
-            "{}\x00{}\x00{}\x00{}\x00{}\x00{}",
+            "{}\x00{}\x00{}\x00{}\x00{}",
             head_sha,
             finding.kind.as_str(),
             finding.path.to_lowercase(),
             finding.line,
-            finding.title.trim().to_lowercase(),
-            duplicate_index
+            finding.title.trim().to_lowercase()
         );
         let mut hasher = Sha256::new();
         hasher.update(hash_input.as_bytes());

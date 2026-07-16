@@ -322,6 +322,9 @@ pub fn qualification_metadata() -> QualificationMetadata {
     qualification_metadata_for(defaults, manifest)
 }
 
+pub const ATTRIBUTION_MAX_INPUT_BYTES: u64 = 4 * 1024;
+pub const ATTRIBUTION_MAX_PROVIDER_REQUEST_BYTES: usize = 5_000;
+
 fn qualification_metadata_for(
     defaults: &ModelDefaults,
     manifest: &QualificationManifest,
@@ -343,8 +346,8 @@ fn qualification_metadata_for(
         consensus: defaults.consensus,
         scorer_chain,
         hosted_operation_cost_cap_micros: HOSTED_OPERATION_COST_CAP_MICROS,
-        attribution_max_input_bytes: crate::attribution::MAX_INPUT_BYTES,
-        attribution_max_provider_request_bytes: crate::attribution::MAX_PROVIDER_REQUEST_BYTES,
+        attribution_max_input_bytes: ATTRIBUTION_MAX_INPUT_BYTES,
+        attribution_max_provider_request_bytes: ATTRIBUTION_MAX_PROVIDER_REQUEST_BYTES,
         admitted_profile,
     }
 }

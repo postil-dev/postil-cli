@@ -41,8 +41,15 @@ pub struct RespondArgs {
     pub no_post: bool,
 }
 
-const MAX_RESPOND_DIFF_CONTEXT_BYTES: usize = 120_000;
+// Leave enough transport headroom for JSON escaping, the system prompt, PR
+// metadata, and the maintainer message under either supported API shape.
+const MAX_RESPOND_DIFF_CONTEXT_BYTES: usize = crate::llm::MAX_PROVIDER_REQUEST_BYTES / 12;
 const MAX_RESPOND_MANIFEST_BYTES: usize = 24_000;
+const MAX_RESPOND_REPO_BYTES: usize = 512;
+const MAX_RESPOND_TITLE_BYTES: usize = 2 * 1024;
+const MAX_RESPOND_DESCRIPTION_BYTES: usize = 4 * 1024;
+const MAX_RESPOND_COMMENT_BYTES: usize = 8 * 1024;
+const MAX_RESPOND_ISSUE_BODY_BYTES: usize = 8 * 1024;
 const USAGE_RECEIPT_PATH_ENV: &str = "POSTIL_USAGE_RECEIPT_PATH";
 const RESPOND_MAX_CHARS: usize = 2_400;
 const RESPOND_MAX_NONBLANK_LINES: usize = 24;
@@ -287,10 +294,7 @@ async fn respond_with<F: Forge>(
     let context = build_context(&forge, repo, number, kind).await?;
 
     let system = prompt::respond_system_prompt(cfg);
-    let user = format!(
-        "{context}\n--- Maintainer's message to you ---\n{}\n\nReply to the message above.",
-        comment.trim()
-    );
+    let user = respond_user_prompt(&context, comment);
     let client = LlmClient::from_env(cfg)?;
     client.preflight_respond_plan(cfg, &system, &user)?;
     let answer = client
@@ -314,6 +318,13 @@ async fn respond_with<F: Forge>(
         eprintln!("postil: replied on {repo}#{number}");
     }
     Ok(0)
+}
+
+fn respond_user_prompt(context: &str, comment: &str) -> String {
+    let comment = prompt::bounded_untrusted_prompt_text(comment.trim(), MAX_RESPOND_COMMENT_BYTES);
+    format!(
+        "{context}\n--- Maintainer's message to you ---\n{comment}\n\nReply to the message above."
+    )
 }
 
 fn validate_respond_output(raw: &str) -> Result<String> {
@@ -729,21 +740,31 @@ async fn build_context<F: Forge>(
                 !reserved_anchor,
                 "pull request contains a path reserved for Postil's virtual review evidence"
             );
+            let repo = prompt::bounded_untrusted_prompt_text(repo, MAX_RESPOND_REPO_BYTES);
+            let title = prompt::bounded_untrusted_prompt_text(&meta.title, MAX_RESPOND_TITLE_BYTES);
             let mut ctx = format!(
                 "Context: pull request #{number} in {repo}\nTitle: {}\n",
-                meta.title
+                title
             );
             if !meta.body.trim().is_empty() {
-                let body: String = meta.body.chars().take(1500).collect();
+                let body = prompt::bounded_untrusted_prompt_text(
+                    meta.body.trim(),
+                    MAX_RESPOND_DESCRIPTION_BYTES,
+                );
                 ctx.push_str(&format!("Description:\n{body}\n"));
             }
             ctx.push_str("\nDiff (left-margin numbers are new-file lines):\n\n");
-            ctx.push_str(&annotated);
+            ctx.push_str(&prompt::bounded_untrusted_prompt_text(
+                &annotated,
+                MAX_RESPOND_DIFF_CONTEXT_BYTES,
+            ));
             Ok(ctx)
         }
         ThreadKind::Issue => {
             let (title, body) = forge.fetch_thread(number, kind).await?;
-            let body: String = body.chars().take(4000).collect();
+            let repo = prompt::bounded_untrusted_prompt_text(repo, MAX_RESPOND_REPO_BYTES);
+            let title = prompt::bounded_untrusted_prompt_text(&title, MAX_RESPOND_TITLE_BYTES);
+            let body = prompt::bounded_untrusted_prompt_text(&body, MAX_RESPOND_ISSUE_BODY_BYTES);
             Ok(format!(
                 "Context: issue #{number} in {repo}\nTitle: {title}\n\nIssue body:\n{body}\n"
             ))
@@ -758,6 +779,44 @@ mod tests {
 
     fn structured(answer: &str, diagram: Option<&str>) -> String {
         json!({"answer": answer, "diagram": diagram}).to_string()
+    }
+
+    #[test]
+    fn hostile_respond_context_and_comment_fit_both_provider_shapes() {
+        let hostile = format!(
+            "{}{}{}",
+            "\0".repeat(MAX_RESPOND_DIFF_CONTEXT_BYTES),
+            "\"".repeat(MAX_RESPOND_DIFF_CONTEXT_BYTES),
+            "\\".repeat(MAX_RESPOND_DIFF_CONTEXT_BYTES)
+        );
+        let diff = prompt::bounded_untrusted_prompt_text(&hostile, MAX_RESPOND_DIFF_CONTEXT_BYTES);
+        let title = prompt::bounded_untrusted_prompt_text(&hostile, MAX_RESPOND_TITLE_BYTES);
+        let description =
+            prompt::bounded_untrusted_prompt_text(&hostile, MAX_RESPOND_DESCRIPTION_BYTES);
+        let context = format!(
+            "Context: pull request #1 in repository\nTitle: {title}\nDescription:\n{description}\nDiff:\n{diff}"
+        );
+        let user = respond_user_prompt(&context, &hostile);
+        assert!(!user.contains('\0'));
+        let system = prompt::respond_system_prompt(&Config::default());
+        for body in [
+            serde_json::json!({
+                "model": "provider/model",
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user}
+                ]
+            }),
+            serde_json::json!({
+                "model": "provider/model",
+                "system": system,
+                "messages": [{"role": "user", "content": user}]
+            }),
+        ] {
+            assert!(
+                serde_json::to_vec(&body).unwrap().len() < crate::llm::MAX_PROVIDER_REQUEST_BYTES
+            );
+        }
     }
 
     fn article_shaped_slop() -> String {

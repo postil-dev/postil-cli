@@ -38,6 +38,7 @@ import {
   attributionContractSha256,
   qualifyAttributionEvaluator,
   projectedAttributionDecisionCostUsd,
+  replayAttributionEvidence,
   type AttributionCallEvidence,
   type AttributionTarget,
 } from "./attribution";
@@ -57,6 +58,7 @@ import {
   aggregateModel,
   canonicalPriceMicrosPerMillion,
   compareCanonicalDecimals,
+  diagnosticEvidence,
   erroredLiveCase,
   MAX_GENERATOR_COST_CAP_USD,
   MIN_QUALIFICATION_REPEATS,
@@ -91,6 +93,8 @@ export const QUALIFICATION_MAX_AGE_SECONDS = QUALIFICATION_MAX_AGE_DAYS * 24 * 6
 const MAX_QUALIFICATION_SOURCE_BYTES = 16 * 1024 * 1024;
 const MANAGED_OPENROUTER_API_BASE = "https://openrouter.ai:443/api/v1";
 export const MANAGED_OPENROUTER_PROVIDER_IDENTITY = "openrouter:managed-routing";
+export const LIVE_MODELS_REPORT_SCHEMA_VERSION = 2;
+export const LIVE_MODELS_PRIVATE_EVIDENCE_SCHEMA_VERSION = 1;
 
 export const REVIEW_CONTRACT_SOURCE_PATHS = [
   "Cargo.toml", "Cargo.lock",
@@ -153,6 +157,7 @@ export interface LiveModelsOptions {
 }
 
 export interface LiveModelsReport {
+  schemaVersion: typeof LIVE_MODELS_REPORT_SCHEMA_VERSION;
   generatedAt: string;
   qualificationSourceSha: string;
   cliVersion: string;
@@ -168,14 +173,11 @@ export interface LiveModelsReport {
   configHash: string;
   cliBinaryHash: string;
   evidenceHash: string;
+  /** Digest of the separately persisted private replay bundle. */
+  privateEvidenceSha256: string;
   attributionContractHash: string;
   attributionBankHash: string;
-  attributionEvaluators: Array<{
-    pairId: string;
-    eligible: boolean;
-    evidenceSha256: string;
-    evidence: AttributionCallEvidence[];
-  }>;
+  attributionEvaluators: AttributionEvaluatorSummary[];
   hostedOperationCostCapMicros: number;
   repeats: number;
   profiles: QualificationProfile[];
@@ -201,6 +203,200 @@ export interface LiveModelsReport {
   attributionProviderCalls: number;
   /** Per-case detail across every (model, case) pair. */
   cases: LiveModelCaseResult[];
+}
+
+export interface LiveModelsPrivateCaseEvidence {
+  id: string;
+  pairId: string;
+  repeat: number;
+  attributionEvidence: AttributionCallEvidence[];
+  fidelityFailures: string[];
+  structuredOutputFailures: string[];
+  error?: string;
+}
+
+export interface LiveModelsPrivateEvidenceBundle {
+  schemaVersion: typeof LIVE_MODELS_PRIVATE_EVIDENCE_SCHEMA_VERSION;
+  qualificationSourceSha: string;
+  cliBinaryHash: string;
+  attributionEvaluators: Array<{
+    pairId: string;
+    eligible: boolean;
+    evidenceSha256: string;
+    evidence: AttributionCallEvidence[];
+  }>;
+  cases: LiveModelsPrivateCaseEvidence[];
+}
+
+export interface LiveModelsRunResult {
+  report: LiveModelsReport;
+  privateEvidence: LiveModelsPrivateEvidenceBundle;
+}
+
+export interface AttributionEvaluatorSummary {
+  pairId: string;
+  eligible: boolean;
+  evidenceSha256: string;
+  calls: number;
+}
+
+export function summarizeAttributionEvaluator(result: {
+  pairId: string;
+  eligible: boolean;
+  evidenceSha256: string;
+  evidence: AttributionCallEvidence[];
+}): AttributionEvaluatorSummary {
+  return {
+    pairId: result.pairId,
+    eligible: result.eligible,
+    evidenceSha256: result.evidenceSha256,
+    calls: result.evidence.length,
+  };
+}
+
+const LIVE_MODELS_REPORT_FIELDS = new Set([
+  "schemaVersion", "generatedAt", "qualificationSourceSha", "cliVersion", "apiBase", "apiFormat",
+  "providerEndpointIdentity", "upstreamProviderPinned", "upstreamProviderIdentity", "fixtureHash",
+  "reviewContractHash", "evaluatorContractHash", "evaluatorRuntimeIdentity", "configHash", "cliBinaryHash",
+  "evidenceHash", "privateEvidenceSha256", "attributionContractHash", "attributionBankHash",
+  "attributionEvaluators", "hostedOperationCostCapMicros", "repeats", "profiles", "manifestCandidate",
+  "passed", "models", "modelAggregates", "totalRunCostUsd", "totalRunCostUsdDecimal",
+  "exactSuccessfulCostUsdDecimal", "failedOrUnknownExposureUsdDecimal", "costAccountingComplete",
+  "reservedQualificationExposureUsdDecimal", "attributionRunCostUsd", "attributionRunCostUsdDecimal",
+  "attributionFailedExposureUsdDecimal", "attributionProviderCalls", "cases",
+]);
+const LIVE_MODELS_REQUIRED_REPORT_FIELDS = [...LIVE_MODELS_REPORT_FIELDS]
+  .filter((field) => field !== "manifestCandidate");
+const PRIVATE_REPORT_KEYS = new Set([
+  "title", "body", "request", "rawResponses", "reason", "targetContract", "error",
+  "fidelityFailures", "structuredOutputFailures",
+]);
+
+/** Parse the only supported public report shape. Unversioned reports are
+ * rejected rather than guessed because their diagnostics may contain prose. */
+export function parseLiveModelsReport(value: unknown): LiveModelsReport {
+  if (!isRecord(value)) throw new Error("live-models report must be a JSON object");
+  if (!("schemaVersion" in value)) {
+    throw new Error("live-models report schemaVersion is required; legacy unversioned reports are not accepted");
+  }
+  if (value.schemaVersion !== LIVE_MODELS_REPORT_SCHEMA_VERSION) {
+    throw new Error(`unsupported live-models report schemaVersion ${String(value.schemaVersion)}`);
+  }
+  const unknown = Object.keys(value).filter((field) => !LIVE_MODELS_REPORT_FIELDS.has(field));
+  if (unknown.length > 0) throw new Error(`live-models report has unknown field ${unknown[0]}`);
+  const missing = LIVE_MODELS_REQUIRED_REPORT_FIELDS.filter((field) => !(field in value));
+  if (missing.length > 0) throw new Error(`live-models report is missing field ${missing[0]}`);
+  if (!Array.isArray(value.cases) || !Array.isArray(value.models) ||
+      !Array.isArray(value.modelAggregates) || !Array.isArray(value.profiles) ||
+      !Array.isArray(value.attributionEvaluators)) {
+    throw new Error("live-models report collection fields must be arrays");
+  }
+  if (typeof value.privateEvidenceSha256 !== "string" || !isSha256(value.privateEvidenceSha256)) {
+    throw new Error("live-models report privateEvidenceSha256 must be a SHA-256 digest");
+  }
+  assertPublicReportValue(value, "report");
+  return value as unknown as LiveModelsReport;
+}
+
+function assertPublicReportValue(value: unknown, path: string): void {
+  if (Array.isArray(value)) {
+    value.forEach((entry, index) => assertPublicReportValue(entry, `${path}[${index}]`));
+    return;
+  }
+  if (!isRecord(value)) return;
+  for (const [key, entry] of Object.entries(value)) {
+    if (PRIVATE_REPORT_KEYS.has(key) &&
+        !((key === "fidelityFailures" || key === "structuredOutputFailures") && typeof entry === "number")) {
+      throw new Error(`live-models public report contains private field ${path}.${key}`);
+    }
+    assertPublicReportValue(entry, `${path}.${key}`);
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isSha256(value: string): boolean {
+  return /^[0-9a-f]{64}$/u.test(value);
+}
+
+export function serializePrivateEvidenceBundle(bundle: LiveModelsPrivateEvidenceBundle): string {
+  return `${JSON.stringify(bundle, null, 2)}\n`;
+}
+
+export function privateEvidenceSha256(bundle: LiveModelsPrivateEvidenceBundle): string {
+  return hashText(serializePrivateEvidenceBundle(bundle));
+}
+
+export function parsePrivateEvidenceBundle(value: unknown): LiveModelsPrivateEvidenceBundle {
+  if (!isRecord(value) || value.schemaVersion !== LIVE_MODELS_PRIVATE_EVIDENCE_SCHEMA_VERSION ||
+      typeof value.qualificationSourceSha !== "string" || typeof value.cliBinaryHash !== "string" ||
+      !Array.isArray(value.attributionEvaluators) || !Array.isArray(value.cases)) {
+    throw new Error("invalid live-models private evidence bundle");
+  }
+  return value as unknown as LiveModelsPrivateEvidenceBundle;
+}
+
+/** Verify persisted replay material and its exact public references. */
+export function verifyPrivateEvidenceBundle(
+  bundle: LiveModelsPrivateEvidenceBundle,
+  report: LiveModelsReport,
+): void {
+  if (privateEvidenceSha256(bundle) !== report.privateEvidenceSha256) {
+    throw new Error("private evidence bundle digest does not match the public report");
+  }
+  if (bundle.qualificationSourceSha !== report.qualificationSourceSha ||
+      bundle.cliBinaryHash !== report.cliBinaryHash) {
+    throw new Error("private evidence bundle source identity does not match the public report");
+  }
+  if (bundle.attributionEvaluators.length !== report.attributionEvaluators.length ||
+      bundle.cases.length !== report.cases.length) {
+    throw new Error("private evidence bundle cardinality does not match the public report");
+  }
+  for (const [index, evaluator] of bundle.attributionEvaluators.entries()) {
+    const summary = report.attributionEvaluators[index];
+    if (summary === undefined || summary.pairId !== evaluator.pairId ||
+        summary.eligible !== evaluator.eligible || summary.calls !== evaluator.evidence.length ||
+        summary.evidenceSha256 !== evaluator.evidenceSha256 ||
+        evaluator.evidenceSha256 !== hashSanitizedEvidence(
+          evaluator.evidence.map((entry) => entry.evidenceSha256),
+        ) ||
+        evaluator.evidence.some((entry) => !replayAttributionEvidence(entry))) {
+      throw new Error(`private evaluator evidence ${evaluator.pairId} failed replay or public binding`);
+    }
+  }
+  for (const [index, privateCase] of bundle.cases.entries()) {
+    const publicCase = report.cases[index];
+    if (publicCase === undefined || publicCase.id !== privateCase.id ||
+        publicCase.pairId !== privateCase.pairId || publicCase.repeat !== privateCase.repeat ||
+        privateCase.attributionEvidence.some((entry) => !replayAttributionEvidence(entry)) ||
+        JSON.stringify(publicCase.fidelityDiagnostics) !== JSON.stringify(
+          diagnosticEvidence(privateCase.fidelityFailures),
+        ) ||
+        JSON.stringify(publicCase.structuredOutputDiagnostics) !== JSON.stringify(
+          diagnosticEvidence(privateCase.structuredOutputFailures),
+        ) ||
+        publicCase.errorSha256 !== (privateCase.error === undefined
+          ? undefined
+          : diagnosticEvidence([privateCase.error]).sha256) ||
+        JSON.stringify(publicCase.attributionEvidence) !== JSON.stringify(
+          privateCase.attributionEvidence.map(attributionEvidencePublicReference),
+        )) {
+      throw new Error(`private case evidence ${privateCase.id} failed replay or public binding`);
+    }
+  }
+}
+
+function attributionEvidencePublicReference(evidence: AttributionCallEvidence) {
+  return {
+    candidateOrdinal: evidence.candidateOrdinal,
+    sameDefect: evidence.sameDefect,
+    requestSha256: evidence.requestSha256,
+    responseSha256: [...evidence.responseSha256],
+    usageSha256: evidence.usageSha256,
+    evidenceSha256: evidence.evidenceSha256,
+  };
 }
 
 export interface BinaryQualificationMetadata {
@@ -312,7 +508,7 @@ type QualificationProfileEvidence = Omit<
 export async function runLiveModels(
   inputs: BenchmarkCaseInput[],
   options: LiveModelsOptions,
-): Promise<LiveModelsReport> {
+): Promise<LiveModelsRunResult> {
   const pairs = normalizeQualificationPairs(options.pairs);
   const models = normalizeGeneratorModels(
     pairs.flatMap((pair) => [
@@ -395,7 +591,7 @@ export async function runLiveModels(
     attributionContractHash: attributionContractSha256(),
     attributionBankHash: attributionBankSha256(),
   });
-  const attributionEvaluators = await Promise.all(pairs.map(async (pair) => {
+  const attributionEvaluatorResults = await Promise.all(pairs.map(async (pair) => {
     const pairRoot = join(rootDir, "attribution-evaluator", safeSegment(qualificationPairId(pair)));
     const evaluatorEnv = await prepareAttributionEvaluatorEnvironment(
       pairRoot,
@@ -421,8 +617,9 @@ export async function runLiveModels(
     return { pairId: qualificationPairId(pair), ...result };
   }));
   const evaluatorEvidenceByPair = new Map(
-    attributionEvaluators.map((result) => [result.pairId, result.evidenceSha256]),
+    attributionEvaluatorResults.map((result) => [result.pairId, result.evidenceSha256]),
   );
+  const attributionEvaluators = attributionEvaluatorResults.map(summarizeAttributionEvaluator);
 
   // Task queue: one job per (profile, repeat, case). A bounded worker pool drains it so at
   // most `concurrency` binary runs are in flight regardless of model count.
@@ -440,6 +637,7 @@ export async function runLiveModels(
   }
 
   const results = new Array<LiveModelCaseResult>(jobs.length);
+  const privateCases = new Array<LiveModelsPrivateCaseEvidence>(jobs.length);
   const concurrency = Math.max(1, Math.min(options.concurrency ?? DEFAULT_LIVE_CONCURRENCY, jobs.length || 1));
   let cursor = 0;
   const worker = async (): Promise<void> => {
@@ -447,7 +645,7 @@ export async function runLiveModels(
       const index = cursor++;
       if (index >= jobs.length) return;
       const job = jobs[index]!;
-      results[index] = await runLiveModelCase(
+      const completed = await runLiveModelCase(
         job.case,
         job.caseIndex,
         job.pair,
@@ -459,6 +657,8 @@ export async function runLiveModels(
         cliBinaryHash,
         attributionGovernor,
       );
+      results[index] = completed.result;
+      privateCases[index] = completed.privateEvidence;
     }
   };
   await Promise.all(Array.from({ length: concurrency }, () => worker()));
@@ -469,6 +669,7 @@ export async function runLiveModels(
       pair,
       results.filter((r) => r.pairId === qualificationPairId(pair)),
       repeats,
+      HOSTED_OPERATION_COST_CAP_MICROS,
     ),
   );
   const identity = apiBase;
@@ -508,7 +709,21 @@ export async function runLiveModels(
   const conservativeTotal = sumCanonicalDecimals([exactSuccessfulCost, failedOrUnknownExposure]);
   const totalRunCostUsdDecimal = formatCanonicalDecimal(conservativeTotal);
   const totalRunCostUsd = Number(totalRunCostUsdDecimal);
+  const privateEvidence: LiveModelsPrivateEvidenceBundle = {
+    schemaVersion: LIVE_MODELS_PRIVATE_EVIDENCE_SCHEMA_VERSION,
+    qualificationSourceSha,
+    cliBinaryHash,
+    attributionEvaluators: attributionEvaluatorResults.map((result) => ({
+      pairId: result.pairId,
+      eligible: result.eligible,
+      evidenceSha256: result.evidenceSha256,
+      evidence: result.evidence,
+    })),
+    cases: privateCases,
+  };
+  const privateEvidenceDigest = privateEvidenceSha256(privateEvidence);
   const evidence = {
+    schemaVersion: LIVE_MODELS_REPORT_SCHEMA_VERSION,
     cliVersion,
     qualificationSourceSha,
     apiBase,
@@ -525,6 +740,7 @@ export async function runLiveModels(
     attributionEvaluators,
     configHash,
     cliBinaryHash,
+    privateEvidenceSha256: privateEvidenceDigest,
     hostedOperationCostCapMicros: HOSTED_OPERATION_COST_CAP_MICROS,
     repeats,
     profiles: profileEvidence,
@@ -546,11 +762,12 @@ export async function runLiveModels(
     evidenceHash,
   ));
   const passed = repeats >= MIN_QUALIFICATION_REPEATS && aggregates.length > 0 &&
-    attributionEvaluators.every((evaluator) => evaluator.eligible) &&
+    attributionEvaluatorResults.every((evaluator) => evaluator.eligible) &&
     aggregates.every((aggregate) => aggregate.passed) &&
     costAccountingComplete &&
     compareCanonicalDecimals(conservativeTotal, parseCanonicalDecimal(costCapUsdDecimal)) <= 0;
   const report: LiveModelsReport = {
+    schemaVersion: LIVE_MODELS_REPORT_SCHEMA_VERSION,
     generatedAt: new Date().toISOString(),
     qualificationSourceSha,
     cliVersion,
@@ -569,6 +786,7 @@ export async function runLiveModels(
     configHash,
     cliBinaryHash,
     evidenceHash,
+    privateEvidenceSha256: privateEvidenceDigest,
     hostedOperationCostCapMicros: HOSTED_OPERATION_COST_CAP_MICROS,
     repeats,
     profiles,
@@ -608,7 +826,9 @@ export async function runLiveModels(
       qualificationIssuedAtUnixSeconds,
     );
   }
-    return report;
+    parseLiveModelsReport(report);
+    verifyPrivateEvidenceBundle(privateEvidence, report);
+    return { report, privateEvidence };
   });
 }
 
@@ -808,7 +1028,7 @@ async function runLiveModelCase(
   attributionSourceSha256: string,
   cliBinaryHash: string,
   attributionGovernor: AttributionGovernor,
-): Promise<LiveModelCaseResult> {
+): Promise<{ result: LiveModelCaseResult; privateEvidence: LiveModelsPrivateCaseEvidence }> {
   const runDir = join(
     rootDir,
     safeSegment(qualificationPairId(pair)),
@@ -875,13 +1095,22 @@ async function runLiveModelCase(
 
   const parsed = envelopeV1.safeParse(safeJson(stdout));
   if (!parsed.success) {
-    return erroredLiveCase({
+    const error = `no valid v1 envelope (exit ${exitCode ?? "unknown"})`;
+    return { result: erroredLiveCase({
       case: c,
       pair,
       repeat,
       exitCode,
-      error: `no valid v1 envelope (exit ${exitCode ?? "unknown"})`,
-    });
+      error,
+    }), privateEvidence: {
+      id: c.id,
+      pairId: qualificationPairId(pair),
+      repeat,
+      attributionEvidence: [],
+      fidelityFailures: [],
+      structuredOutputFailures: [],
+      error,
+    } };
   }
   const envelope = parsed.data;
 
@@ -955,7 +1184,7 @@ async function runLiveModelCase(
     projectedCostUsdDecimal: projectedAttributionDecisionCostUsd(requiredPricing(pricing, pair.scorerModel)),
   });
 
-  return scoreLiveCase({
+  const result = scoreLiveCase({
     case: c,
     pair,
     repeat,
@@ -966,6 +1195,15 @@ async function runLiveModelCase(
     structuredOutputFailures,
     attribution,
   });
+  return { result, privateEvidence: {
+    id: c.id,
+    pairId: qualificationPairId(pair),
+    repeat,
+    attributionEvidence: attribution.calls,
+    fidelityFailures,
+    structuredOutputFailures,
+    ...(attribution.error === undefined ? {} : { error: attribution.error }),
+  } };
 }
 
 export function qualificationCandidateDocument(
@@ -1831,6 +2069,7 @@ function strictPrice(
 // Reporting
 
 export function formatLiveModelsReport(report: LiveModelsReport): string {
+  report = parseLiveModelsReport(report);
   const lines: string[] = [
     `postil bench (LIVE-MODELS mode): CLI ${report.cliVersion}, endpoint ${report.apiBase}`,
     "",
@@ -1882,6 +2121,7 @@ export function formatLiveModelsReport(report: LiveModelsReport): string {
 }
 
 export function liveModelsQualificationExitCode(report: LiveModelsReport): number {
+  report = parseLiveModelsReport(report);
   return report.passed && report.modelAggregates.length > 0 ? 0 : 1;
 }
 

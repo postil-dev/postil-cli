@@ -29,7 +29,7 @@ fn llm_content(findings: Value) -> Value {
         "SQL injection risk in auth path."
     };
     json!({
-        "choices": [{"message": {"content": json!({
+        "choices": [{"finish_reason": "stop", "message": {"content": json!({
             "summary": summary,
             "findings": findings
         }).to_string()}}],
@@ -43,7 +43,7 @@ fn scorer_content(scores: Value) -> Value {
 
 fn scorer_text(scores: &str) -> Value {
     json!({
-        "choices": [{"message": {"content": scores}}],
+        "choices": [{"finish_reason": "stop", "message": {"content": scores}}],
         "usage": {"prompt_tokens": 30, "completion_tokens": 10, "cost": 0.000045}
     })
 }
@@ -53,7 +53,7 @@ fn attribution_text(content: &str) -> Value {
     json!({
         "model": "provider/scorer",
         "provider": "test-provider",
-        "choices": [{"message": {"content": content}}],
+        "choices": [{"finish_reason": "stop", "message": {"content": content}}],
         "usage": {"prompt_tokens": 30, "completion_tokens": 10, "cost": 0.000045}
     })
 }
@@ -106,7 +106,7 @@ fn write_atomic_attribution_inputs(
 
 fn llm_contradictory() -> Value {
     json!({
-        "choices": [{"message": {"content": json!({
+        "choices": [{"finish_reason": "stop", "message": {"content": json!({
             "summary": "SQL injection risk in auth path.",
             "findings": []
         }).to_string()}}],
@@ -116,7 +116,7 @@ fn llm_contradictory() -> Value {
 
 fn llm_text(text: &str) -> Value {
     json!({
-        "choices": [{"message": {"content": text}}],
+        "choices": [{"finish_reason": "stop", "message": {"content": text}}],
         "usage": {"prompt_tokens": 80, "completion_tokens": 30}
     })
 }
@@ -155,6 +155,7 @@ fn anthropic_content(findings: Value, input_tokens: u64, output_tokens: u64) -> 
                 "findings": findings
             }).to_string()}
         ],
+        "stop_reason": "end_turn",
         "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
     })
 }
@@ -162,6 +163,7 @@ fn anthropic_content(findings: Value, input_tokens: u64, output_tokens: u64) -> 
 fn anthropic_text(text: &str, input_tokens: u64, output_tokens: u64) -> Value {
     json!({
         "content": [{"type": "text", "text": text}],
+        "stop_reason": "end_turn",
         "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
     })
 }
@@ -174,7 +176,8 @@ fn finding_at(line: u32, severity: &str, confidence: f64) -> Value {
         "kind": "risk",
         "confidence": confidence,
         "title": "Unsanitized input reaches query",
-        "body": "user_input flows into exec_query without sanitization."
+        "body": "user_input flows into exec_query without sanitization.",
+        "evidence": finding_evidence(line)
     })
 }
 
@@ -186,7 +189,8 @@ fn finding_at_with_kind(line: u32, severity: &str, kind: &str, confidence: f64) 
         "kind": kind,
         "confidence": confidence,
         "title": "Unsanitized input reaches query",
-        "body": "user_input flows into exec_query without sanitization."
+        "body": "user_input flows into exec_query without sanitization.",
+        "evidence": finding_evidence(line)
     })
 }
 
@@ -198,8 +202,51 @@ fn finding_with_text(line: u32, severity: &str, confidence: f64, title: &str, bo
         "kind": "risk",
         "confidence": confidence,
         "title": title,
-        "body": body
+        "body": body,
+        "evidence": finding_evidence(line)
     })
+}
+
+fn finding_evidence(line: u32) -> &'static str {
+    match line {
+        40 => "context line",
+        41 => "let token = format!(\"{}\", user_input);",
+        42 => "exec_query(&token);",
+        43 => "trailing context",
+        _ => "outside supplied evidence",
+    }
+}
+
+fn prompt_evidence(request: &Request, path: &str, line: u32, needle: &str) -> String {
+    let payload: Value = serde_json::from_slice(&request.body).unwrap();
+    let prompt = payload["messages"]
+        .as_array()
+        .and_then(|messages| messages.last())
+        .and_then(|message| message["content"].as_str())
+        .expect("review request contains a user prompt");
+    let mut current_path = None;
+    for rendered in prompt.lines() {
+        if let Some(header) = rendered.strip_prefix("### ") {
+            current_path = Some(header.trim());
+            continue;
+        }
+        if current_path != Some(path) || !rendered.contains(needle) {
+            continue;
+        }
+        let Some((number, marked)) = rendered.trim_start().split_once(' ') else {
+            continue;
+        };
+        if number.parse::<u32>().ok() != Some(line) {
+            continue;
+        }
+        if let Some(evidence) = marked
+            .strip_prefix("+ ")
+            .or_else(|| marked.strip_prefix("  "))
+        {
+            return evidence.to_string();
+        }
+    }
+    panic!("prompt did not contain exact evidence for {path}:{line}");
 }
 
 fn fixture_credential(label: &str) -> String {
@@ -690,7 +737,7 @@ async fn openai_successful_scorer_with_zero_usage_marks_accounting_incomplete() 
     )
     .await;
     let scorer_response = json!({
-        "choices": [{"message": {"content": json!([{
+        "choices": [{"finish_reason": "stop", "message": {"content": json!([{
             "confidence": 0.82,
             "kind": "risk",
             "reason": "The changed line contains the reported flow."
@@ -967,7 +1014,7 @@ async fn byok_reported_spend_is_not_subject_to_the_hosted_operation_cap() {
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [{"message": {"content": "{\"summary\":\"\",\"findings\":[]}"}}],
+            "choices": [{"finish_reason": "stop", "message": {"content": "{\"summary\":\"\",\"findings\":[]}"}}],
             "usage": {"prompt_tokens": 20_000_001_u64, "completion_tokens": 1}
         })))
         .mount(&server)
@@ -1065,6 +1112,214 @@ fn qualification_candidate_preflights_the_bounded_hosted_path_without_provider_c
     assert!(envelope.get("modelUsage").is_none());
 }
 
+#[cfg(feature = "qualification-candidate")]
+#[test]
+fn qualification_candidate_admits_worst_case_json_escaped_hosted_batches() {
+    let dir = tempfile::tempdir().unwrap();
+    let diff_path = dir.path().join("escaped.diff");
+    let mut diff = b"diff --git a/src/payload.rs b/src/payload.rs\n--- /dev/null\n+++ b/src/payload.rs\n@@ -0,0 +1,1 @@\n+const PAYLOAD: &str = \"".to_vec();
+    diff.extend(std::iter::repeat_n(0, 31 * 1024));
+    diff.extend_from_slice(b"\";\n");
+    std::fs::write(&diff_path, diff).unwrap();
+
+    let metadata = postil_cli::config::qualification_metadata();
+    let profile_path = dir.path().join("candidate.json");
+    std::fs::write(
+        &profile_path,
+        serde_json::to_vec(&json!({
+            "benchmarkProviderIdentity": postil_cli::config::MANAGED_OPENROUTER_PROVIDER_IDENTITY,
+            "upstreamProviderIdentity": "test-provider",
+            "apiBase": metadata.default_api_base,
+            "apiFormat": metadata.default_api_format,
+            "generatorChain": ["openai/gpt-5-mini"],
+            "consensus": 1,
+            "scorerChain": ["openai/gpt-5-mini"],
+            "modelPriceBounds": [{
+                "model": "openai/gpt-5-mini",
+                "inputMicrosPerMillionTokens": 1,
+                "outputMicrosPerMillionTokens": 1
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let out = postil()
+        .current_dir(dir.path())
+        .env("CI", "true")
+        .env("GITHUB_API_URL", "http://127.0.0.1:9")
+        .env("POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY", "1")
+        .env("POSTIL_QUALIFICATION_CANDIDATE_PROFILE", &profile_path)
+        .env("POSTIL_QUALIFICATION_PLAN_ONLY", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff_path)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert!(
+        envelope["reviewAdmission"]["serializedInputBytes"]
+            .as_u64()
+            .unwrap()
+            > 31 * 1024 * 5
+    );
+    assert!(envelope.get("modelUsage").is_none());
+}
+
+#[cfg(feature = "qualification-candidate")]
+#[test]
+fn qualification_candidate_admits_fixture_51_shape_at_fireworks_price_bounds() {
+    use sha2::Digest as _;
+    use std::fmt::Write as _;
+
+    fn push_churn(diff: &mut String, side: &str, file: usize) {
+        let path = format!("src/churn/{side}-{file}.ts");
+        writeln!(
+            diff,
+            "diff --git a/{path} b/{path}\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,131 @@"
+        )
+        .unwrap();
+        writeln!(
+            diff,
+            "+export function ordinary_{side}_{file}(actor: Actor) {{"
+        )
+        .unwrap();
+        for line in 2..130 {
+            writeln!(
+                diff,
+                "+  const ordinary_{side}_{file}_{line} = actor.id; // {}",
+                "x".repeat(900)
+            )
+            .unwrap();
+        }
+        writeln!(diff, "+  return actor.id;\n+}}").unwrap();
+    }
+
+    fn push_change(diff: &mut String, line: usize, before: &str, after: &str) {
+        writeln!(diff, "@@ -{line},1 +{line},1 @@\n- {before}\n+ {after}").unwrap();
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff_path = dir.path().join("fixture-51.diff");
+    let mut diff = String::new();
+    for file in 0..3 {
+        push_churn(&mut diff, "prefix", file);
+    }
+    diff.push_str("diff --git a/src/admin/bulk-edit.ts b/src/admin/bulk-edit.ts\nindex 1111111..2222222 100644\n--- a/src/admin/bulk-edit.ts\n+++ b/src/admin/bulk-edit.ts\n");
+    push_change(
+        &mut diff,
+        6,
+        "const title = 'Bulk edit';",
+        "const title = 'Bulk edit ';",
+    );
+    push_change(
+        &mut diff,
+        18,
+        "const batchSize=50;",
+        "const batchSize = 50;",
+    );
+    push_change(
+        &mut diff,
+        33,
+        "logger.debug('bulk edit start');",
+        "logger.debug('bulk edit started');",
+    );
+    push_change(
+        &mut diff,
+        57,
+        "const summary = buildSummary(changeSet);",
+        "const editSummary = buildSummary(changeSet);",
+    );
+    push_change(
+        &mut diff,
+        88,
+        "if (!actor.can('bulkEdit')) throw new Error('Forbidden');",
+        "await applyBulkEdit(changeSet);",
+    );
+    push_change(
+        &mut diff,
+        122,
+        "return { ok: true, summary };",
+        "return { ok: true, summary: editSummary };",
+    );
+    push_change(
+        &mut diff,
+        147,
+        "metrics.increment('bulk_edit.done');",
+        "metrics.increment('bulk_edit.completed');",
+    );
+    for file in 0..3 {
+        push_churn(&mut diff, "suffix", file);
+    }
+    assert_eq!(diff.len(), 728_616);
+    assert_eq!(
+        sha2::Sha256::digest(diff.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+        "21abd4b0305bb11f3314dbc68725ba2373a00848094fe94fbf842461718e3b2d"
+    );
+    std::fs::write(&diff_path, diff).unwrap();
+
+    let metadata = postil_cli::config::qualification_metadata();
+    let profile_path = dir.path().join("candidate.json");
+    std::fs::write(
+        &profile_path,
+        serde_json::to_vec(&json!({
+            "benchmarkProviderIdentity": postil_cli::config::MANAGED_OPENROUTER_PROVIDER_IDENTITY,
+            "upstreamProviderIdentity": "Fireworks",
+            "apiBase": metadata.default_api_base,
+            "apiFormat": metadata.default_api_format,
+            "generatorChain": ["deepseek/deepseek-v4-pro"],
+            "consensus": 1,
+            "scorerChain": ["z-ai/glm-5.2"],
+            "modelPriceBounds": [
+                {
+                    "model": "deepseek/deepseek-v4-pro",
+                    "inputMicrosPerMillionTokens": 1_740_000,
+                    "outputMicrosPerMillionTokens": 3_480_000
+                },
+                {
+                    "model": "z-ai/glm-5.2",
+                    "inputMicrosPerMillionTokens": 2_100_000,
+                    "outputMicrosPerMillionTokens": 6_600_000
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let out = postil()
+        .current_dir(dir.path())
+        .env("CI", "true")
+        .env("GITHUB_API_URL", "http://127.0.0.1:9")
+        .env("POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY", "1")
+        .env("POSTIL_QUALIFICATION_CANDIDATE_PROFILE", &profile_path)
+        .env("POSTIL_QUALIFICATION_PLAN_ONLY", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff_path)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["reviewCoverage"]["mode"], "bounded");
+    assert_eq!(envelope["reviewAdmission"]["providerAttempts"], 7);
+    assert_eq!(envelope["reviewAdmission"]["outputTokens"], 44_160);
+    assert!(
+        envelope["reviewAdmission"]["serializedInputBytes"]
+            .as_u64()
+            .unwrap()
+            < 699_617
+    );
+    assert!(
+        envelope["reviewAdmission"]["projectedCostMicros"]
+            .as_u64()
+            .unwrap()
+            <= 1_000_000
+    );
+}
+
 #[tokio::test]
 async fn provider_response_body_above_hard_cap_fails_closed() {
     let server = MockServer::start().await;
@@ -1144,6 +1399,7 @@ async fn doctor_probes_native_anthropic_format() {
         .and(path("/messages"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "content": [{"type": "text", "text": "p"}],
+            "stop_reason": "end_turn",
             "usage": {"input_tokens": 1, "output_tokens": 1}
         })))
         .mount(&server)
@@ -1340,7 +1596,8 @@ async fn generated_named_source_is_not_omitted_from_review() {
         "kind": "risk",
         "confidence": 0.99,
         "title": "Remove code execution",
-        "body": "Untrusted input reaches eval. Parse the input without executing it."
+        "body": "Untrusted input reaches eval. Parse the input without executing it.",
+        "evidence": "eval(userInput);"
     });
     mock_review(&server, json!([finding])).await;
 
@@ -1382,7 +1639,18 @@ async fn large_source_diff_reviews_every_bounded_batch_and_aggregates_findings()
         .respond_with(|request: &wiremock::Request| {
             let body = String::from_utf8_lossy(&request.body);
             let findings = if body.contains("dangerous_final_call") {
-                json!([finding_at(10_000, "warn", 0.95)])
+                let evidence =
+                    prompt_evidence(request, "src/auth.rs", 10_000, "dangerous_final_call");
+                json!([{
+                    "path": "src/auth.rs",
+                    "line": 10_000,
+                    "severity": "warn",
+                    "kind": "risk",
+                    "confidence": 0.95,
+                    "title": "Validate the final call",
+                    "body": "The final call receives untrusted input. Validate it before use.",
+                    "evidence": evidence
+                }])
             } else {
                 json!([])
             };
@@ -1588,18 +1856,108 @@ async fn local_bounded_is_explicit_and_default_local_review_remains_exhaustive()
 }
 
 #[tokio::test]
+async fn bounded_full_review_carries_prior_findings_from_non_direct_source_batches() {
+    use std::fmt::Write as _;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(|request: &wiremock::Request| {
+            let body = String::from_utf8_lossy(&request.body);
+            if body.contains("select bounded code-review batches") {
+                ResponseTemplate::new(200).set_body_json(llm_text(r#"{"batchIds":[]}"#))
+            } else {
+                ResponseTemplate::new(200).set_body_json(llm_content(json!([])))
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff_path = dir.path().join("bounded-baseline.diff");
+    let mut diff = String::new();
+    for file in 0..7 {
+        let path = format!("src/churn-{file}.rs");
+        writeln!(
+            diff,
+            "diff --git a/{path} b/{path}\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,130 @@"
+        )
+        .unwrap();
+        for line in 0..130 {
+            writeln!(
+                diff,
+                "+const ORDINARY_{file}_{line}: &str = \"{}\";",
+                "x".repeat(900)
+            )
+            .unwrap();
+        }
+    }
+    std::fs::write(&diff_path, diff).unwrap();
+
+    let baseline = json!({
+        "version": 1, "summary": "", "silent": false,
+        "findings": [{
+            "path": "src/churn-3.rs", "line": 1, "severity": "error", "kind": "risk",
+            "confidence": 0.9, "title": "prior middle finding", "body": "requires direct re-review"
+        }],
+        "resolved": [], "counts": {"info": 0, "warn": 0, "error": 1, "suppressed": 0},
+        "confidenceBuckets": [0,0,0,0,1],
+        "gate": {"failOn": "error", "failing": true},
+        "modelUsed": "model", "usage": {"promptTokens": 0, "completionTokens": 0},
+        "baseSha": null, "headSha": null, "sinceSha": null
+    });
+    let baseline_path = dir.path().join("baseline.json");
+    std::fs::write(&baseline_path, baseline.to_string()).unwrap();
+
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--bounded", "--diff-file"])
+        .arg(&diff_path)
+        .arg("--baseline")
+        .arg(&baseline_path)
+        .args(["--output", "json"])
+        .assert()
+        .code(1);
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["reviewCoverage"]["mode"], "bounded");
+    assert!(
+        envelope["reviewCoverage"]["selectedBatches"]
+            .as_u64()
+            .unwrap()
+            < envelope["reviewCoverage"]["totalBatches"].as_u64().unwrap()
+    );
+    assert_eq!(envelope["resolved"], json!([]));
+    assert_eq!(envelope["findings"][0]["title"], "prior middle finding");
+    assert!(
+        envelope["findings"][0]["body"]
+            .as_str()
+            .unwrap()
+            .starts_with("[carried")
+    );
+}
+
+#[tokio::test]
 async fn deletion_only_auth_change_is_reviewed_through_numbered_metadata() {
     let server = MockServer::start().await;
-    let finding = json!({
-        "path": ".postil/change-metadata",
-        "line": 1,
-        "severity": "error",
-        "kind": "risk",
-        "confidence": 0.99,
-        "title": "Restore the authorization check",
-        "body": "The deleted file enforced administrator access. Preserve the check in the replacement path."
-    });
-    mock_review(&server, json!([finding])).await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(|request: &Request| {
+            let evidence = prompt_evidence(request, ".postil/change-metadata", 1, "deleted");
+            ResponseTemplate::new(200).set_body_json(llm_content(json!([{
+                "path": ".postil/change-metadata",
+                "line": 1,
+                "severity": "error",
+                "kind": "risk",
+                "confidence": 0.99,
+                "title": "Restore the authorization check",
+                "body": "The deleted file enforced administrator access. Preserve the check in the replacement path.",
+                "evidence": evidence
+            }])))
+        })
+        .mount(&server)
+        .await;
 
     let dir = tempfile::tempdir().unwrap();
     let diff = dir.path().join("deleted-auth.diff");
@@ -1637,6 +1995,7 @@ async fn final_synthesis_detects_cross_batch_validation_sink_relationship() {
         .respond_with(|request: &wiremock::Request| {
             let body = String::from_utf8_lossy(&request.body);
             let findings = if body.contains("validate_pair") && body.contains("dangerous_sink") {
+                let evidence = prompt_evidence(request, "src/sink.rs", 1100, "dangerous_sink");
                 json!([{
                     "path": "src/sink.rs",
                     "line": 1100,
@@ -1644,7 +2003,8 @@ async fn final_synthesis_detects_cross_batch_validation_sink_relationship() {
                     "kind": "risk",
                     "confidence": 0.95,
                     "title": "Keep the validated value",
-                    "body": "The sink uses the original input instead of the validated pair. Pass the validated value to dangerous_sink."
+                    "body": "The sink uses the original input instead of the validated pair. Pass the validated value to dangerous_sink.",
+                    "evidence": evidence
                 }])
             } else {
                 json!([])
@@ -1730,6 +2090,7 @@ async fn oversized_line_tail_remains_reviewable() {
         .respond_with(|request: &wiremock::Request| {
             let body = String::from_utf8_lossy(&request.body);
             let findings = if body.contains("TAIL_DEFECT_eval") {
+                let evidence = prompt_evidence(request, "src/packed.js", 1, "TAIL_DEFECT_eval");
                 json!([{
                     "path": "src/packed.js",
                     "line": 1,
@@ -1737,7 +2098,8 @@ async fn oversized_line_tail_remains_reviewable() {
                     "kind": "risk",
                     "confidence": 0.99,
                     "title": "Remove tail code execution",
-                    "body": "The packed line executes untrusted input at its tail. Replace eval with a parser."
+                    "body": "The packed line executes untrusted input at its tail. Replace eval with a parser.",
+                    "evidence": evidence
                 }])
             } else {
                 json!([])
@@ -1778,6 +2140,7 @@ async fn multiline_finding_range_is_collapsed_when_endpoint_is_not_in_same_segme
         .respond_with(|request: &wiremock::Request| {
             let body = String::from_utf8_lossy(&request.body);
             let findings = if body.contains("range_start_marker") {
+                let evidence = prompt_evidence(request, "src/range.rs", 1, "range_start_marker");
                 json!([{
                     "path": "src/range.rs",
                     "line": 1,
@@ -1786,7 +2149,8 @@ async fn multiline_finding_range_is_collapsed_when_endpoint_is_not_in_same_segme
                     "kind": "risk",
                     "confidence": 0.95,
                     "title": "Keep the comment range local",
-                    "body": "The first changed line is risky. Fix that line."
+                    "body": "The first changed line is risky. Fix that line.",
+                    "evidence": evidence
                 }])
             } else {
                 json!([])
@@ -1852,6 +2216,7 @@ async fn staged_diff_compacts_large_generated_noise_and_reviews_late_source() {
         .respond_with(|request: &wiremock::Request| {
             let body = String::from_utf8_lossy(&request.body);
             let findings = if body.contains("late_dangerous_call") {
+                let evidence = prompt_evidence(request, "late.rs", 1, "late_dangerous_call");
                 json!([{
                     "path": "late.rs",
                     "line": 1,
@@ -1859,7 +2224,8 @@ async fn staged_diff_compacts_large_generated_noise_and_reviews_late_source() {
                     "kind": "risk",
                     "confidence": 0.99,
                     "title": "Validate the late call",
-                    "body": "The late call receives untrusted input without validation."
+                    "body": "The late call receives untrusted input without validation. Add validation before the call.",
+                    "evidence": evidence
                 }])
             } else {
                 json!([])
@@ -1996,7 +2362,8 @@ async fn c_quoted_prompt_path_round_trips_into_canonical_finding_path() {
             "kind": "risk",
             "confidence": 0.9,
             "title": "Hostile path remains grounded",
-            "body": "The changed call is unsafe. Replace it with a checked operation."
+            "body": "The changed call is unsafe. Replace it with a checked operation.",
+            "evidence": "dangerous_call();"
         }]),
     )
     .await;
@@ -2025,14 +2392,14 @@ async fn c_quoted_prompt_path_round_trips_into_canonical_finding_path() {
 }
 
 #[tokio::test]
-async fn malformed_lockfile_falls_back_to_source_review() {
+async fn malformed_known_lockfile_uses_bounded_source_review() {
     let server = MockServer::start().await;
     mock_review(&server, json!([])).await;
     let dir = tempfile::tempdir().unwrap();
     let diff = dir.path().join("malformed-lockfile.diff");
     std::fs::write(
         &diff,
-        "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1 +1 @@\n-checksum = \"old\"\n+checksum = \"new\"\n",
+        "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1,5 +1,5 @@\n-checksum = \"old-one\"\n-source = \"old-two\"\n-checksum = \"old-interior\"\n-source = \"old-four\"\n-checksum = \"old-five\"\n+checksum = \"new-one\"\n+source = \"new-two\"\n+checksum = \"new-interior\"\n+source = \"new-four\"\n+checksum = \"new-five\"\n",
     )
     .unwrap();
     let out = postil()
@@ -2049,7 +2416,8 @@ async fn malformed_lockfile_falls_back_to_source_review() {
     let requests = server.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
     let body = String::from_utf8_lossy(&requests[0].body);
-    assert!(body.contains(r#"checksum = \"new\""#));
+    assert!(body.contains(r#"checksum = \"new-interior\""#));
+    assert!(body.contains(r#"source = \"new-four\""#));
 }
 
 async fn mock_review_model(server: &MockServer, model: &str, findings: Value) {
@@ -2641,7 +3009,7 @@ async fn hidden_atomic_attribution_rejects_provider_substitution() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "model": "provider/scorer",
             "provider": "substituted-provider",
-            "choices": [{"message": {"content": "{\"sameDefect\":true,\"reason\":\"Same defect.\"}"}}],
+            "choices": [{"finish_reason": "stop", "message": {"content": "{\"sameDefect\":true,\"reason\":\"Same defect.\"}"}}],
             "usage": {"prompt_tokens": 30, "completion_tokens": 10, "cost": 0.000045}
         })))
         .mount(&server)
@@ -3370,7 +3738,7 @@ async fn local_review_writes_csv_output_file_with_multiple_escaped_findings() {
                 41,
                 "warn",
                 0.88,
-                "Comma, quote \"and\" newline\nin title",
+                "Comma, quote \"and\" newline in title",
                 "First body has a comma, a \"quote\", and a newline\nsecond line."
             ),
             finding_with_text(
@@ -3378,7 +3746,7 @@ async fn local_review_writes_csv_output_file_with_multiple_escaped_findings() {
                 "info",
                 0.77,
                 "Second finding",
-                "Body without CSV punctuation"
+                "Body without CSV punctuation."
             )
         ]),
     )
@@ -3424,7 +3792,7 @@ async fn local_review_writes_csv_output_file_with_multiple_escaped_findings() {
     assert_eq!(rows[1]["line"], "42");
     assert_eq!(rows[1]["severity"], "info");
     assert_eq!(rows[1]["title"], "Second finding");
-    assert_eq!(rows[1]["body"], "Body without CSV punctuation");
+    assert_eq!(rows[1]["body"], "Body without CSV punctuation.");
 }
 
 #[tokio::test]
@@ -3935,7 +4303,7 @@ async fn advisory_does_not_bypass_unusable_output() {
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [{"message": {"content": "I cannot review this diff, sorry."}}]
+            "choices": [{"finish_reason": "stop", "message": {"content": "I cannot review this diff, sorry."}}]
         })))
         .mount(&server)
         .await;
@@ -4067,7 +4435,7 @@ async fn narrated_risk_without_findings_fails_closed() {
 async fn repeated_summary_only_output_falls_back_before_failing_the_review() {
     let server = MockServer::start().await;
     let descriptive = json!({
-        "choices": [{"message": {"content": json!({
+        "choices": [{"finish_reason": "stop", "message": {"content": json!({
             "summary": "Audit logging uses a dedicated sink and records secret use without values.",
             "findings": []
         }).to_string()}}],
@@ -5982,7 +6350,7 @@ async fn github_push_after_acquisition_suppresses_all_stale_publication() {
 // content-policy scenarios where the finding is not the standard auth one).
 fn llm_with_summary(summary: &str, findings: Value) -> Value {
     json!({
-        "choices": [{"message": {"content": json!({
+        "choices": [{"finish_reason": "stop", "message": {"content": json!({
             "summary": summary,
             "findings": findings
         }).to_string()}}],
@@ -6043,7 +6411,8 @@ async fn content_policy_pr_body_finding_survives_grounding() {
         "path": ".postil/pr-description", "line": 1, "severity": "warn",
         "kind": "contentPolicy", "confidence": 0.9,
         "title": "AI-authorship residue in PR description",
-        "body": "Rule 3: the description contains model-authorship residue."
+        "body": "Rule 3: the description contains model-authorship residue.",
+        "evidence": "Add login"
     }]);
     let server = content_policy_pr_server(llm_with_summary(
         "PR description contains model-authorship residue.",
@@ -6941,7 +7310,8 @@ async fn azure_flow_reconstructs_diff_and_posts_thread() {
     let az_finding = json!([{
         "path": "src/auth.rs", "line": 2, "severity": "error", "kind": "risk",
         "confidence": 0.95, "title": "Unsanitized input reaches query",
-        "body": "user_input flows into the token without sanitization."
+        "body": "user_input flows into the token without sanitization.",
+        "evidence": "    let token = user_input;"
     }]);
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
@@ -7106,7 +7476,7 @@ async fn respond_rejects_article_shape_and_preserves_usage_across_fallback() {
         .and(path("/chat/completions"))
         .and(body_string_contains("article-model"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [{"message": {"content": slop}}],
+            "choices": [{"finish_reason": "stop", "message": {"content": slop}}],
             "usage": {"prompt_tokens": 30, "completion_tokens": 900}
         })))
         .expect(1)
@@ -7116,7 +7486,7 @@ async fn respond_rejects_article_shape_and_preserves_usage_across_fallback() {
         .and(path("/chat/completions"))
         .and(body_string_contains("compact-model"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [{"message": {"content": respond_payload(
+            "choices": [{"finish_reason": "stop", "message": {"content": respond_payload(
                 "`src/queue.rs:18` retries forever. Add a terminal state before merge.",
                 None,
             )}}],
@@ -7379,7 +7749,7 @@ async fn respond_writes_private_usage_receipt_across_model_fallback() {
         .and(path("/chat/completions"))
         .and(body_string_contains("backup-model"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [{"message": {"content": respond_payload("Use a bounded worker pool.", None)}}],
+            "choices": [{"finish_reason": "stop", "message": {"content": respond_payload("Use a bounded worker pool.", None)}}],
             "usage": {"prompt_tokens": 20, "completion_tokens": 3, "cost": 0.00000049}
         })))
         .expect(1)
@@ -7470,7 +7840,7 @@ async fn respond_marks_receipt_incomplete_after_ambiguous_fallback() {
         .and(path("/chat/completions"))
         .and(body_string_contains("backup-model"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [{"message": {"content": respond_payload("Retry with a bounded backoff.", None)}}],
+            "choices": [{"finish_reason": "stop", "message": {"content": respond_payload("Retry with a bounded backoff.", None)}}],
             "usage": {"prompt_tokens": 20, "completion_tokens": 3}
         })))
         .mount(&server)
@@ -7526,7 +7896,7 @@ async fn respond_marks_receipt_incomplete_after_internal_retry_succeeds() {
         .and(path("/chat/completions"))
         .and(body_string_contains("primary-model"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [{"message": {"content": respond_payload("Use a bounded retry.", None)}}],
+            "choices": [{"finish_reason": "stop", "message": {"content": respond_payload("Use a bounded retry.", None)}}],
             "usage": {"prompt_tokens": 20, "completion_tokens": 3}
         })))
         .mount(&server)

@@ -32,7 +32,7 @@ impl Severity {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Kind {
     Risk,
@@ -107,6 +107,10 @@ pub struct Finding {
     pub scorer_reason: Option<String>,
     pub title: String,
     pub body: String,
+    /// Exact new-side text copied from the cited prompt line. This is both the
+    /// grounding proof and the durable fingerprint used across incremental runs.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub evidence: Option<String>,
     /// Stable, engine-generated finding ID for deduplication and approval tracking.
     /// Hash of (head_sha, kind, normalized_path, normalized_line, normalized_title, duplicate_index).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -123,86 +127,110 @@ pub struct FindingPublicationText {
     pub body: String,
 }
 
-/// Deterministic publication boundary for model-authored finding prose.
+/// Lossless publication projection for already-validated finding prose.
 ///
-/// Findings keep useful inline-code, lists, and links, but cannot turn a code
-/// review into an article, ping GitHub users, inject HTML/images, or open a
-/// Markdown block that consumes the rest of the review. Callers normalize at
-/// ingestion and again at forge sinks so imported/baseline envelopes receive
-/// the same protection.
+/// Validation happens before a finding is accepted. Publication sinks must not
+/// repair, rewrite, or truncate model text because doing so can turn a complete
+/// finding into misleading partial prose.
 pub fn finding_publication_text(title: &str, body: &str) -> FindingPublicationText {
-    let normalized_body = body.replace("\r\n", "\n").replace('\r', "\n");
-    let source_lines: Vec<&str> = normalized_body.lines().collect();
-    let mut lines = Vec::new();
-    let mut omitted = source_lines.len() > FINDING_PUBLIC_BODY_MAX_LINES;
-    for (index, source) in source_lines
-        .iter()
-        .take(FINDING_PUBLIC_BODY_MAX_LINES)
-        .enumerate()
-    {
-        let mut line = sanitize_publication_line(source);
-        let trimmed = line.trim();
-        if markdown_fence_line(trimmed) {
-            if let Some(position) = line.find(['`', '~']) {
-                line.insert(position, '\\');
-            }
-        } else if markdown_atx_heading(trimmed) {
-            line = trimmed
-                .trim_start_matches('#')
-                .trim_start()
-                .trim_end_matches('#')
-                .trim_end()
-                .to_string();
-        } else if index > 0 && markdown_setext_delimiter(trimmed) {
-            line = "…".to_string();
-        } else if markdown_table_delimiter(trimmed) {
-            line = line.replace('|', "\\|");
-        }
-        lines.push(neutralize_unmatched_backticks(&line));
+    FindingPublicationText {
+        title: title.to_string(),
+        body: body.to_string(),
     }
-    if lines.is_empty() {
-        lines.push("Inspect the cited line and verify this finding before merging.".to_string());
-    } else if omitted {
-        if lines.len() == FINDING_PUBLIC_BODY_MAX_LINES {
-            lines.pop();
-        }
-        lines.push("…".to_string());
+}
+
+/// Forge-safe publication text for envelopes created under an older contract.
+///
+/// Fresh model findings are validated before they enter an envelope, so this
+/// returns their text unchanged. Historical carried findings can predate that
+/// validation. Those findings are neutralized at the publication boundary,
+/// without shortening a sentence or changing the stored review record.
+pub fn forge_safe_finding_publication_text(finding: &Finding) -> FindingPublicationText {
+    if validate_finding_publication(finding).is_ok() {
+        return finding_publication_text(&finding.title, &finding.body);
     }
 
-    let joined = lines.join("\n");
-    let (body, body_truncated) = cap_publication_text(&joined, FINDING_PUBLIC_BODY_MAX_CHARS);
-    omitted |= body_truncated;
-    let body = if omitted && !body.ends_with('…') {
-        let reserve = FINDING_PUBLIC_BODY_MAX_CHARS.saturating_sub(1);
-        format!(
-            "{}…",
-            body.chars().take(reserve).collect::<String>().trim_end()
-        )
+    let title = sanitize_publication_title(&finding.title);
+    let title = if title.is_empty() || title.chars().count() > FINDING_PUBLIC_TITLE_MAX_CHARS {
+        "Review finding".to_string()
     } else {
+        title
+    };
+    let body = finding
+        .body
+        .lines()
+        .map(sanitize_publication_line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body_is_publishable = !body.is_empty()
+        && body.trim() == body
+        && body.chars().count() <= FINDING_PUBLIC_BODY_MAX_CHARS
+        && body.lines().count() <= FINDING_PUBLIC_BODY_MAX_LINES
+        && body
+            .chars()
+            .last()
+            .is_some_and(|character| matches!(character, '.' | '!' | '?' | '。' | '！' | '？'));
+    let body = if body_is_publishable {
         body
-    };
-    let body = neutralize_unmatched_backticks(body.trim());
-    let body = if body.is_empty() {
-        "Inspect the cited line and verify this finding before merging.".to_string()
     } else {
-        body
+        "This carried finding does not satisfy the publication contract. Open Review details for the complete record.".to_string()
     };
-
-    let requested_title = sanitize_publication_title(title);
-    let title = if requested_title.is_empty() {
-        sanitize_publication_title(body.lines().next().unwrap_or("Finding"))
-    } else {
-        requested_title
-    };
-    let (title, _) = cap_publication_text(&title, FINDING_PUBLIC_TITLE_MAX_CHARS);
 
     FindingPublicationText { title, body }
 }
 
-pub fn normalize_finding_publication(finding: &mut Finding) {
-    let publication = finding_publication_text(&finding.title, &finding.body);
-    finding.title = publication.title;
-    finding.body = publication.body;
+pub fn validate_finding_publication(finding: &Finding) -> Result<(), String> {
+    let title = &finding.title;
+    if title.is_empty() || title.trim() != title {
+        return Err("finding title must be non-empty without surrounding whitespace".to_string());
+    }
+    if title.chars().count() > FINDING_PUBLIC_TITLE_MAX_CHARS {
+        return Err(format!(
+            "finding title exceeds {FINDING_PUBLIC_TITLE_MAX_CHARS} characters"
+        ));
+    }
+    if title.contains(['\r', '\n']) || sanitize_publication_title(title) != *title {
+        return Err("finding title must be safe single-line plain text".to_string());
+    }
+
+    let body = &finding.body;
+    if body.is_empty() || body.trim() != body {
+        return Err("finding body must be non-empty without surrounding whitespace".to_string());
+    }
+    if body.contains('\r') {
+        return Err("finding body must use LF line endings".to_string());
+    }
+    if body.chars().count() > FINDING_PUBLIC_BODY_MAX_CHARS {
+        return Err(format!(
+            "finding body exceeds {FINDING_PUBLIC_BODY_MAX_CHARS} characters"
+        ));
+    }
+    if body.lines().count() > FINDING_PUBLIC_BODY_MAX_LINES {
+        return Err(format!(
+            "finding body exceeds {FINDING_PUBLIC_BODY_MAX_LINES} lines"
+        ));
+    }
+    if !body
+        .chars()
+        .last()
+        .is_some_and(|character| matches!(character, '.' | '!' | '?' | '。' | '！' | '？'))
+    {
+        return Err("finding body must end with sentence punctuation".to_string());
+    }
+    for (index, line) in body.lines().enumerate() {
+        let trimmed = line.trim();
+        if line.chars().any(char::is_control)
+            || sanitize_publication_line(line) != line
+            || neutralize_unmatched_backticks(line) != line
+            || markdown_fence_line(trimmed)
+            || markdown_atx_heading(trimmed)
+            || (index > 0 && markdown_setext_delimiter(trimmed))
+            || markdown_table_delimiter(trimmed)
+        {
+            return Err("finding body contains unsafe publication markup".to_string());
+        }
+    }
+    Ok(())
 }
 
 fn sanitize_publication_title(value: &str) -> String {
@@ -248,14 +276,6 @@ fn neutralize_markdown_images(value: &str) -> String {
         output.push(*character);
     }
     output
-}
-
-fn cap_publication_text(value: &str, max: usize) -> (String, bool) {
-    if value.chars().count() <= max {
-        return (value.to_string(), false);
-    }
-    let prefix: String = value.chars().take(max.saturating_sub(1)).collect();
-    (format!("{}…", prefix.trim_end()), true)
 }
 
 fn markdown_fence_line(value: &str) -> bool {
@@ -347,6 +367,7 @@ fn neutralize_unmatched_backticks(value: &str) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SuppressionReason {
+    NonActionable,
     Ignored,
     BelowSeverity,
     BelowConfidence,
@@ -663,6 +684,16 @@ pub struct ReviewCoverage {
     pub planner_fallback: bool,
 }
 
+impl ReviewCoverage {
+    pub fn not_reviewed_directly_batches(&self) -> u32 {
+        if self.mode == ReviewCoverageMode::Bounded {
+            self.total_batches.saturating_sub(self.selected_batches)
+        } else {
+            0
+        }
+    }
+}
+
 /// Conservative hosted-provider exposure reserved before the first model call.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -843,6 +874,7 @@ pub fn incomplete_review_finding() -> Finding {
         confidence: 1.0,
         title: "Review incomplete".to_string(),
         body: "The complete change did not fit within Postil's bounded review budget. No clean verdict was issued. Split the change or run focused local reviews before retrying.".to_string(),
+        evidence: None,
         id: None,
         generator_confidence: None,
         scorer_confidence: None,
@@ -867,6 +899,7 @@ pub fn fail_closed_finding(detail: &str) -> Finding {
             "Postil could not obtain a valid, diff-grounded review from the configured \
              model(s) and is failing closed rather than passing unreviewed code.\n\nDetail: {detail}"
         ),
+        evidence: None,
         id: None,
         generator_confidence: None,
         scorer_confidence: None,
@@ -900,6 +933,7 @@ pub fn narrated_risk_finding(summary: &str) -> Finding {
              Re-run the review; if the contradiction persists, inspect the areas the \
              summary names and address them or record findings manually."
         ),
+        evidence: None,
         id: None,
         generator_confidence: None,
         scorer_confidence: None,
@@ -922,6 +956,7 @@ pub fn provider_error_finding(_detail: &str) -> Finding {
         body: "Postil could not complete the model request and is failing closed rather \
              than passing unreviewed code. The failure is available to Postil operators."
             .to_string(),
+        evidence: None,
         id: None,
         generator_confidence: None,
         scorer_confidence: None,
@@ -950,6 +985,7 @@ mod tests {
             scorer_reason: None,
             title: "t".into(),
             body: "b".into(),
+            evidence: None,
             id: None,
         }
     }
@@ -987,69 +1023,58 @@ mod tests {
     }
 
     #[test]
-    fn finding_publication_is_bounded_and_neutralizes_unsafe_markdown() {
-        let body = [
-            "# Summary",
-            "Ping @octocat and open <details>hidden</details>.",
-            "![remote](https://attacker.invalid/pixel.png)",
-            "```mermaid",
-            "flowchart LR",
-            "```",
-            "A | B",
-            "--- | ---",
-            "Keep `useful_code()` and [the docs](https://example.test).",
-        ]
-        .into_iter()
-        .chain(std::iter::repeat_n("extra line", 20))
-        .collect::<Vec<_>>()
-        .join("\n");
-        let publication = finding_publication_text(
-            "**Huge** @octocat <img> title that must remain plain",
-            &body,
-        );
+    fn finding_publication_preserves_exact_227_character_body() {
+        let body = format!("{}.", "a".repeat(226));
+        let publication = finding_publication_text("Exact evidence", &body);
+        assert_eq!(publication.body, body);
+        assert_eq!(publication.body.chars().count(), 227);
 
-        assert!(publication.title.chars().count() <= FINDING_PUBLIC_TITLE_MAX_CHARS);
-        assert!(publication.body.chars().count() <= FINDING_PUBLIC_BODY_MAX_CHARS);
-        assert!(publication.body.lines().count() <= FINDING_PUBLIC_BODY_MAX_LINES);
-        assert!(!publication.title.contains('@'));
-        assert!(!publication.title.contains('<'));
-        assert!(!publication.body.contains("@octocat"));
-        assert!(!publication.body.contains("<details>"));
-        assert!(
-            !publication
-                .body
-                .lines()
-                .any(|line| line.trim_start().starts_with("!["))
-        );
-        assert!(!publication.body.lines().any(|line| line.starts_with('#')));
-        assert!(!publication.body.lines().any(|line| line.starts_with("```")));
-        assert!(!publication.body.contains("--- | ---"));
-        assert!(publication.body.contains("`useful_code()`"));
-        assert!(
-            publication
-                .body
-                .contains("[the docs](https://example.test)")
-        );
-        assert!(publication.body.ends_with('…'));
-        assert_eq!(
-            finding_publication_text(&publication.title, &publication.body),
-            publication,
-        );
-        assert!(!finding_publication_text("", "\n\n").body.is_empty());
+        let mut finding = finding(Severity::Warn, 0.9);
+        finding.title = publication.title;
+        finding.body = publication.body;
+        assert_eq!(validate_finding_publication(&finding), Ok(()));
     }
 
     #[test]
-    fn finding_publication_title_replaces_line_breaks_and_control_whitespace() {
-        let publication = finding_publication_text(
-            "First\r\nsecond\rthird\nfourth\tfifth\u{000B}sixth\0seventh",
-            "Body",
-        );
+    fn over_limit_body_fails_without_word_boundary_truncation() {
+        let body = format!("word {}.", "complete ".repeat(150));
+        assert!(body.chars().count() > FINDING_PUBLIC_BODY_MAX_CHARS);
+        let publication = finding_publication_text("Keep complete prose", &body);
+        assert_eq!(publication.body, body);
+        assert!(!publication.body.ends_with('…'));
 
+        let mut finding = finding(Severity::Warn, 0.9);
+        finding.title = publication.title;
+        finding.body = publication.body;
+        assert!(validate_finding_publication(&finding).is_err());
+    }
+
+    #[test]
+    fn forge_projection_neutralizes_legacy_markup_without_cutting_valid_prose() {
+        let mut legacy = finding(Severity::Warn, 0.9);
+        legacy.title = "@octocat <img> Unsafe finding".into();
+        legacy.body = "@octocat <details>Inspect this complete sentence.</details>.".into();
+
+        let publication = forge_safe_finding_publication_text(&legacy);
+        assert!(!publication.title.contains('@'));
+        assert!(!publication.title.contains('<'));
+        assert!(!publication.body.contains('@'));
+        assert!(!publication.body.contains("<details>"));
+        assert!(publication.body.ends_with("&lt;/details&gt;."));
+    }
+
+    #[test]
+    fn forge_projection_replaces_over_limit_legacy_body_with_complete_notice() {
+        let mut legacy = finding(Severity::Warn, 0.9);
+        legacy.body = format!("{}.", "complete ".repeat(10_000));
+
+        let publication = forge_safe_finding_publication_text(&legacy);
         assert_eq!(
-            publication.title,
-            "First second third fourth fifth sixth seventh"
+            publication.body,
+            "This carried finding does not satisfy the publication contract. Open Review details for the complete record."
         );
-        assert!(!publication.title.chars().any(char::is_control));
+        assert!(publication.body.ends_with('.'));
+        assert!(!publication.body.ends_with('…'));
     }
 
     #[test]

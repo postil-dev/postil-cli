@@ -30,6 +30,7 @@
 //   POSTIL_API_BASE         provider API base (default https://openrouter.ai/api/v1)
 //   POSTIL_API_FORMAT       provider interface (openai-compatible or anthropic)
 //   POSTIL_BENCH_PRICING_FILE  exact-provider pricing for managed qualification
+//   POSTIL_BENCH_PRIVATE_EVIDENCE_OUT  mode-0600 private replay bundle path
 //   POSTIL_ENDPOINT_AUTH_HEADER additional private-gateway authentication header
 //   POSTIL_ENDPOINT_AUTH_VALUE  value paired with POSTIL_ENDPOINT_AUTH_HEADER
 //   MODEL_API_KEY           inference key for live modes; never printed
@@ -41,8 +42,8 @@
 //   BENCH_CONCURRENCY       live-mode case parallelism (else --concurrency, else default)
 //   POSTIL_BENCH_BOUNDED    set to 1 to qualify the bounded large-review path
 
-import { randomUUID } from "node:crypto";
-import { mkdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 import { cases } from "../fixtures/cases";
 import { formatReport, runBenchmark } from "./harness";
@@ -51,9 +52,15 @@ import {
   DEFAULT_LIVE_CONCURRENCY as DEFAULT_LIVE_MODELS_CONCURRENCY,
   formatLiveModelsReport,
   liveModelsQualificationExitCode,
+  parseLiveModelsReport,
+  parsePrivateEvidenceBundle,
   parseQualificationPairs,
+  serializePrivateEvidenceBundle,
   runLiveModels,
   pricingFromFile,
+  verifyPrivateEvidenceBundle,
+  type LiveModelsPrivateEvidenceBundle,
+  type LiveModelsReport,
 } from "./livemodels";
 
 function flagValue(args: string[], flag: string): string | undefined {
@@ -76,18 +83,23 @@ async function main() {
   const json = args.includes("--json");
   const jsonOut = flagValue(args, "--json-out");
   const manifestOut = flagValue(args, "--manifest-out");
+  const privateEvidenceOut = process.env.POSTIL_BENCH_PRIVATE_EVIDENCE_OUT ??
+    flagValue(args, "--private-evidence-out") ?? defaultPrivateEvidencePath();
   const binary =
     process.env.POSTIL_BIN ??
     resolve(import.meta.dir, "..", "..", "target", "release", "postil");
   const liveModels =
     process.env.POSTIL_BENCH_MODE === "live" || args.includes("--live-models");
 
-  await prepareExplicitOutputs(jsonOut, manifestOut);
+  await prepareExplicitOutputs(jsonOut, manifestOut, liveModels ? privateEvidenceOut : undefined);
   if (args.includes("--json-out") && jsonOut === undefined) {
     throw new Error("--json-out requires a path");
   }
   if (args.includes("--manifest-out") && manifestOut === undefined) {
     throw new Error("--manifest-out requires a path");
+  }
+  if (args.includes("--private-evidence-out") && flagValue(args, "--private-evidence-out") === undefined) {
+    throw new Error("--private-evidence-out requires a path");
   }
   if (manifestOut !== undefined && !liveModels) {
     throw new Error("--manifest-out is available only in live-models admission mode");
@@ -106,7 +118,7 @@ async function main() {
     if (!upstreamProvider?.trim()) {
       throw new Error("live-models admission needs POSTIL_BENCH_UPSTREAM_PROVIDER or --upstream-provider");
     }
-    const report = await runLiveModels(cases, {
+    const { report, privateEvidence } = await runLiveModels(cases, {
       binary,
       pairs,
       repeats: repeatsRaw === undefined ? undefined : Number.parseInt(repeatsRaw, 10),
@@ -117,6 +129,7 @@ async function main() {
       concurrency,
       costCapUsd: costCapRaw,
     });
+    await writePrivateEvidenceBundle(privateEvidenceOut, privateEvidence, report);
     await writeLiveModelsReport(jsonOut, JSON.stringify(report, null, 2));
     if (manifestOut) {
       if (!report.manifestCandidate) {
@@ -190,6 +203,32 @@ async function writeLiveModelsReport(jsonOut: string | undefined, jsonReport: st
   }
 }
 
+function defaultPrivateEvidencePath(): string {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return resolve(import.meta.dir, "..", ".runs", `live-models-private-${stamp}.json`);
+}
+
+/** Persist sensitive replay material as a private regular file, then re-read
+ * and replay it before any public report or candidate is emitted. */
+export async function writePrivateEvidenceBundle(
+  path: string,
+  bundle: LiveModelsPrivateEvidenceBundle,
+  report: LiveModelsReport,
+): Promise<void> {
+  await mkdir(dirname(resolve(path)), { recursive: true, mode: 0o700 });
+  await atomicWriteOutput(path, serializePrivateEvidenceBundle(bundle));
+  const metadata = await stat(path);
+  if (!metadata.isFile() || (metadata.mode & 0o777) !== 0o600) {
+    throw new Error("private evidence bundle must be a mode-0600 regular file");
+  }
+  const bytes = await readFile(path);
+  if (createHash("sha256").update(bytes).digest("hex") !== report.privateEvidenceSha256) {
+    throw new Error("persisted private evidence bundle digest does not match the public report");
+  }
+  const persisted = parsePrivateEvidenceBundle(JSON.parse(bytes.toString("utf8")));
+  verifyPrivateEvidenceBundle(persisted, parseLiveModelsReport(report));
+}
+
 /** Live mode always writes a JSON report under bench/.runs (gitignored), plus
  * the optional explicit --json-out path. */
 async function writeReport(jsonOut: string | undefined, jsonReport: string) {
@@ -237,27 +276,30 @@ async function inspectOutputPath(path: string): Promise<OutputPathIdentity> {
 export async function prepareExplicitOutputs(
   jsonOut: string | undefined,
   manifestOut: string | undefined,
+  privateEvidenceOut?: string,
 ): Promise<void> {
   const identities = await Promise.all(
-    [jsonOut, manifestOut]
+    [jsonOut, manifestOut, privateEvidenceOut]
       .filter((path): path is string => path !== undefined)
       .map(inspectOutputPath),
   );
-  await invalidateExplicitOutputs([jsonOut, manifestOut]);
+  await invalidateExplicitOutputs([jsonOut, manifestOut, privateEvidenceOut]);
   for (const identity of identities) {
     if (identity.inspectionError !== undefined) throw identity.inspectionError;
   }
-  if (identities.length !== 2) return;
-  const report = identities[0]!;
-  const manifest = identities[1]!;
-  const sameCanonicalPath = report.canonicalPath === manifest.canonicalPath;
-  const sameExistingFile =
-    report.device !== undefined &&
-    manifest.device !== undefined &&
-    report.device === manifest.device &&
-    report.inode === manifest.inode;
-  if (sameCanonicalPath || sameExistingFile) {
-    throw new Error("--json-out and --manifest-out must use different paths");
+  for (let left = 0; left < identities.length; left += 1) {
+    for (let right = left + 1; right < identities.length; right += 1) {
+      const a = identities[left]!;
+      const b = identities[right]!;
+      const sameCanonicalPath = a.canonicalPath === b.canonicalPath;
+      const sameExistingFile = a.device !== undefined && b.device !== undefined &&
+        a.device === b.device && a.inode === b.inode;
+      if (sameCanonicalPath || sameExistingFile) {
+        throw new Error(privateEvidenceOut === undefined
+          ? "--json-out and --manifest-out must use different paths"
+          : "report, manifest, and private evidence outputs must use different paths");
+      }
+    }
   }
 }
 

@@ -305,6 +305,8 @@ struct RawFinding {
     #[serde(default)]
     title: String,
     body: String,
+    #[serde(default)]
+    evidence: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -396,6 +398,7 @@ pub(crate) const REVIEW_MAX_TOKENS: u32 = 8_000;
 pub(crate) const MAX_PROVIDER_ATTEMPTS: usize = 216;
 pub(crate) const MAX_REPORTED_TOKEN_SPEND: usize = 20_000_000;
 const MAX_PROVIDER_INPUT_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_PROVIDER_REQUEST_BYTES: usize = 256 * 1024;
 pub(crate) const MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE: usize = 2_000_000;
 // Five selected review batches and one planner request, each across at most
 // three generator models with one shared correction call, consume 36 logical calls. The two
@@ -619,6 +622,16 @@ fn projected_request_cost_micros(
     .context("hosted model price projection does not fit micro-dollar accounting")
 }
 
+fn serialized_provider_request_bytes(body: &serde_json::Value, context: &str) -> Result<usize> {
+    let bytes = serde_json::to_vec(body).with_context(|| context.to_string())?;
+    ensure!(
+        bytes.len() <= MAX_PROVIDER_REQUEST_BYTES,
+        "model provider request needs {} serialized bytes, exceeding the {MAX_PROVIDER_REQUEST_BYTES} byte per-request cap",
+        bytes.len()
+    );
+    Ok(bytes.len())
+}
+
 pub(crate) fn scorer_max_tokens(expected_len: usize) -> Option<u32> {
     (expected_len <= SCORER_MAX_FINDINGS)
         .then(|| SCORER_BASE_MAX_TOKENS + expected_len as u32 * SCORER_MAX_TOKENS_PER_FINDING)
@@ -788,9 +801,28 @@ impl std::fmt::Display for MissingModelChoices {
 
 impl std::error::Error for MissingModelChoices {}
 
+#[derive(Debug)]
+struct NonTerminalModelResponse {
+    content: String,
+    reason: String,
+}
+
+impl std::fmt::Display for NonTerminalModelResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "model response was nonterminal ({})",
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for NonTerminalModelResponse {}
+
 fn classify_chat_error(error: anyhow::Error) -> anyhow::Error {
     if error.downcast_ref::<EmptyModelResponse>().is_some()
         || error.downcast_ref::<MissingModelChoices>().is_some()
+        || error.downcast_ref::<NonTerminalModelResponse>().is_some()
     {
         error
     } else {
@@ -837,9 +869,10 @@ impl LlmClient {
         temperature: f64,
         phase: LlmPhase,
     ) -> Result<usize> {
-        serde_json::to_vec(&self.request_body(model, system, user, max_tokens, temperature, phase))
-            .context("serializing hosted request for preflight")
-            .map(|bytes| bytes.len())
+        serialized_provider_request_bytes(
+            &self.request_body(model, system, user, max_tokens, temperature, phase),
+            "serializing hosted request for preflight",
+        )
     }
 
     fn validate_hosted_exposure(
@@ -927,6 +960,16 @@ impl LlmClient {
         allowed_ids: &BTreeSet<usize>,
         max_selected: usize,
     ) -> Result<BatchPlannerResult> {
+        if max_selected == 0 || allowed_ids.is_empty() {
+            return Ok(BatchPlannerResult {
+                batch_ids: Vec::new(),
+                usage: Usage::default(),
+                model_usage: Vec::new(),
+                model_incidents: Vec::new(),
+                usage_accounting_complete: true,
+                fallback_used: false,
+            });
+        }
         let system = planner_system_prompt();
         let user = planner_user_prompt(manifest, max_selected);
         let mut aggregate_usage = Usage::default();
@@ -1114,6 +1157,7 @@ impl LlmClient {
             .len()
             .checked_mul(MAX_LOGICAL_CALLS_PER_SCORER_MODEL)
             .context("planned scorer call count overflowed")?;
+        let planner = planner.filter(|(_, max_selected)| *max_selected > 0);
         let planner_logical_calls = planner
             .map(|_| {
                 review_models
@@ -1935,7 +1979,7 @@ impl LlmClient {
         let mut call_usage = Vec::new();
         let mut usage_accounting_complete = true;
         let mut model_incidents = Vec::new();
-        let content = self
+        let initial = self
             .chat(
                 model,
                 system,
@@ -1947,16 +1991,30 @@ impl LlmClient {
                 LlmPhase::Review,
                 LlmCallPhase::Initial,
             )
-            .await
-            .map_err(|e| {
+            .await;
+        let (content, nonterminal_reason) = match initial {
+            Ok(content) => (content, None),
+            Err(error) if error.downcast_ref::<NonTerminalModelResponse>().is_some() => {
+                let response = error
+                    .downcast_ref::<NonTerminalModelResponse>()
+                    .expect("checked nonterminal response");
+                (response.content.clone(), Some(response.reason.clone()))
+            }
+            Err(e) => {
                 let complete = usage_accounting_complete
                     && (usage.prompt_tokens > 0 || usage.completion_tokens > 0);
                 let mut error = ModelError::new(e, usage, complete);
                 error.model_usage = call_usage.clone();
-                error
-            })?;
+                return Err(error);
+            }
+        };
         let mut repaired_schema = false;
-        let raw = match parse_review(&content) {
+        let parsed_initial = if let Some(reason) = nonterminal_reason {
+            Err(format!("response ended before completion: {reason}"))
+        } else {
+            parse_review(&content)
+        };
+        let raw = match parsed_initial {
             Ok(raw) => raw,
             Err(parse_err) => {
                 let incident = ModelIncident {
@@ -2867,11 +2925,21 @@ impl LlmClient {
                     .into_iter()
                     .next()
                     .ok_or_else(|| anyhow::Error::new(MissingModelChoices))?;
-                choice
+                let content = choice
                     .message
                     .content
                     .filter(|content| !content.trim().is_empty())
-                    .ok_or_else(|| anyhow::Error::new(EmptyModelResponse))
+                    .ok_or_else(|| anyhow::Error::new(EmptyModelResponse))?;
+                let reason = choice
+                    .finish_reason
+                    .unwrap_or_else(|| "missing finish_reason".to_string());
+                if reason != "stop" {
+                    return Err(anyhow::Error::new(NonTerminalModelResponse {
+                        content,
+                        reason,
+                    }));
+                }
+                Ok(content)
             }
             ApiFormat::Anthropic => {
                 let parsed: AnthropicResponse = serde_json::from_str(text)
@@ -2880,6 +2948,10 @@ impl LlmClient {
                     usage.prompt_tokens += u.input_tokens.unwrap_or(0);
                     usage.completion_tokens += u.output_tokens.unwrap_or(0);
                 }
+                let stop_reason = parsed
+                    .stop_reason
+                    .clone()
+                    .unwrap_or_else(|| "missing stop_reason".to_string());
                 let content = parsed
                     .content
                     .into_iter()
@@ -2889,6 +2961,11 @@ impl LlmClient {
                     .join("\n");
                 if content.is_empty() {
                     Err(anyhow::Error::new(EmptyModelResponse))
+                } else if !matches!(stop_reason.as_str(), "end_turn" | "stop_sequence") {
+                    Err(anyhow::Error::new(NonTerminalModelResponse {
+                        content,
+                        reason: stop_reason,
+                    }))
                 } else {
                     Ok(content)
                 }
@@ -2943,9 +3020,10 @@ impl LlmClient {
     }
 
     fn reserve_provider_attempt(&self, body: &serde_json::Value) -> Result<()> {
-        let input_bytes = serde_json::to_vec(body)
-            .context("serializing model request for admission")?
-            .len();
+        let input_bytes = serialized_provider_request_bytes(
+            body,
+            "serializing model request immediately before provider contact",
+        )?;
         let output_tokens = body
             .get("max_tokens")
             .and_then(serde_json::Value::as_u64)
@@ -3600,6 +3678,7 @@ struct ChatResponse {
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: Message,
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3619,6 +3698,7 @@ struct AnthropicResponse {
     #[serde(default)]
     content: Vec<AnthropicContentBlock>,
     usage: Option<AnthropicUsage>,
+    stop_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3984,13 +4064,7 @@ fn into_review(raw: RawReview, model: &str, usage: Usage) -> ModelReview {
                 Some("contentPolicy") | Some("content_policy") => Kind::ContentPolicy,
                 _ => Kind::Risk,
             };
-            let title = if f.title.trim().is_empty() {
-                let body_head: String = f.body.chars().take(80).collect();
-                body_head
-            } else {
-                f.title
-            };
-            let mut finding = Finding {
+            Finding {
                 path: f.path.trim_start_matches("./").to_string(),
                 line: f.line,
                 end_line: f.end_line.filter(|e| *e >= f.line),
@@ -4002,12 +4076,11 @@ fn into_review(raw: RawReview, model: &str, usage: Usage) -> ModelReview {
                 generator_kind: None,
                 scorer_kind: None,
                 scorer_reason: None,
-                title,
+                title: f.title,
                 body: f.body,
+                evidence: f.evidence,
                 id: None,
-            };
-            crate::envelope::normalize_finding_publication(&mut finding);
-            finding
+            }
         })
         .collect();
     ModelReview {
@@ -4350,6 +4423,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn zero_capacity_planner_has_no_preflight_exposure_or_provider_call() {
+        let server = MockServer::start().await;
+        let config = Config {
+            api_base: server.uri(),
+            api_format: ApiFormat::OpenaiCompatible,
+            model: "provider/model".into(),
+            scorer_enabled: false,
+            ..Config::default()
+        };
+        let mut client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        client.hosted_price_bounds = Some(Arc::new(HashMap::from([(
+            "provider/model".into(),
+            ModelPriceBound {
+                model: "provider/model".into(),
+                input_micros_per_million_tokens: 1,
+                output_micros_per_million_tokens: 1,
+            },
+        )])));
+
+        let admission = client
+            .preflight_review_plan(
+                &config,
+                1,
+                "system",
+                &["candidate".to_string()],
+                &["candidate".to_string()],
+                Some(("hostile planner manifest", 0)),
+            )
+            .unwrap();
+        assert_eq!(admission.output_tokens, u64::from(REVIEW_MAX_TOKENS));
+        let plan = client
+            .plan_review_batches(
+                &config,
+                "hostile planner manifest",
+                &BTreeSet::from([2usize]),
+                0,
+            )
+            .await
+            .unwrap();
+        assert!(plan.batch_ids.is_empty());
+        assert!(plan.model_usage.is_empty());
+        assert_eq!(plan.usage.prompt_tokens, 0);
+        assert_eq!(plan.usage.completion_tokens, 0);
+        assert!(plan.usage.provider_cost.is_none());
+        assert_eq!(client.admission.lock().unwrap().attempts, 0);
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn planner_failure_falls_back_and_preserves_usage_cost_and_incidents() {
         let server = MockServer::start().await;
         for (model, prompt_tokens, completion_tokens, cost) in [
@@ -4360,7 +4489,7 @@ mod tests {
                 .and(path("/chat/completions"))
                 .and(body_string_contains(model))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "choices": [{"message": {"content": "not valid planner json"}}],
+                    "choices": [{"finish_reason": "stop", "message": {"content": "not valid planner json"}}],
                     "usage": {
                         "prompt_tokens": prompt_tokens,
                         "completion_tokens": completion_tokens,
@@ -4428,7 +4557,7 @@ mod tests {
             .and(path("/chat/completions"))
             .and(body_string_contains("The previous response was invalid"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "choices": [{"message": {"content": "{\"batchIds\":[2]}"}}],
+                "choices": [{"finish_reason": "stop", "message": {"content": "{\"batchIds\":[2]}"}}],
                 "usage": {
                     "prompt_tokens": 20,
                     "completion_tokens": 3,
@@ -4442,7 +4571,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "choices": [{"message": {"content": "not valid planner json"}}],
+                "choices": [{"finish_reason": "stop", "message": {"content": "not valid planner json"}}],
                 "usage": {
                     "prompt_tokens": 10,
                     "completion_tokens": 2,
@@ -4496,13 +4625,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nonterminal_review_uses_one_bounded_repair_before_acceptance() {
+        let server = MockServer::start().await;
+        let review = r#"{"summary":"","findings":[]}"#;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("You repair malformed JSON"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"finish_reason": "stop", "message": {"content": review}}],
+                "usage": {"prompt_tokens": 20, "completion_tokens": 3}
+            })))
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"finish_reason": "length", "message": {"content": review}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+            })))
+            .with_priority(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let config = Config {
+            api_base: server.uri(),
+            api_format: ApiFormat::OpenaiCompatible,
+            model: "provider/model".into(),
+            scorer_enabled: false,
+            ..Config::default()
+        };
+        let client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(2),
+            None,
+            None,
+        )
+        .unwrap();
+        *client.http.lock().unwrap() = Some(reqwest::Client::new());
+
+        let result = client.review(&config, "system", "user").await.unwrap();
+        assert!(result.findings.is_empty());
+        assert_eq!(result.model_usage.len(), 2);
+        assert_eq!(result.model_incidents.len(), 1);
+        assert!(result.model_incidents[0].recovered);
+        assert_eq!(
+            result.model_incidents[0].recovery,
+            Some(ModelIncidentRecovery::Repair)
+        );
+    }
+
+    #[tokio::test]
+    async fn over_limit_finding_fails_after_one_bounded_semantic_repair() {
+        let server = MockServer::start().await;
+        let body = format!("{}.", "word ".repeat(250));
+        let review = serde_json::json!({
+            "summary": "A merge-relevant issue.",
+            "findings": [{
+                "path": "src/lib.rs",
+                "line": 1,
+                "severity": "warn",
+                "kind": "risk",
+                "confidence": 0.9,
+                "title": "Keep the complete finding",
+                "body": body,
+                "evidence": "changed();"
+            }]
+        })
+        .to_string();
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"finish_reason": "stop", "message": {"content": review}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let config = Config {
+            api_base: server.uri(),
+            api_format: ApiFormat::OpenaiCompatible,
+            model: "provider/model".into(),
+            scorer_enabled: false,
+            ..Config::default()
+        };
+        let client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(2),
+            None,
+            None,
+        )
+        .unwrap();
+        *client.http.lock().unwrap() = Some(reqwest::Client::new());
+
+        let result = client
+            .review_validated(&config, "system", "user", |review| {
+                review
+                    .findings
+                    .iter()
+                    .try_for_each(crate::envelope::validate_finding_publication)
+            })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
     async fn planner_model_cascade_marks_fallback_and_preserves_incidents() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .and(body_string_contains("provider/primary"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "choices": [{"message": {"content": "invalid"}}],
+                "choices": [{"finish_reason": "stop", "message": {"content": "invalid"}}],
                 "usage": {"prompt_tokens": 10, "completion_tokens": 2}
             })))
             .expect(2)
@@ -4512,7 +4750,7 @@ mod tests {
             .and(path("/chat/completions"))
             .and(body_string_contains("provider/fallback"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "choices": [{"message": {"content": "{\"batchIds\":[2]}"}}],
+                "choices": [{"finish_reason": "stop", "message": {"content": "{\"batchIds\":[2]}"}}],
                 "usage": {"prompt_tokens": 20, "completion_tokens": 3}
             })))
             .expect(1)
@@ -4697,7 +4935,7 @@ mod tests {
             )
             .unwrap_err();
 
-        assert!(error.to_string().contains("hosted review admission"));
+        assert!(error.to_string().contains("per-request cap"));
         assert_eq!(client.admission.lock().unwrap().attempts, 0);
         assert!(server.received_requests().await.unwrap().is_empty());
     }
@@ -4816,7 +5054,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let hostile = "\0".repeat(64 * 1_024);
+        let hostile = "\0".repeat(32 * 1_024);
 
         let exact = client
             .planned_request_bytes(
@@ -4841,6 +5079,61 @@ mod tests {
 
         assert_eq!(exact, actual);
         assert!(exact > hostile.len() * 5);
+    }
+
+    #[test]
+    fn openai_and_anthropic_request_shapes_enforce_the_hostile_serialized_limit() {
+        for api_format in [ApiFormat::OpenaiCompatible, ApiFormat::Anthropic] {
+            let config = Config {
+                api_format,
+                model: "provider/model".into(),
+                ..Config::default()
+            };
+            let client = LlmClient::build(
+                &config,
+                "test-key".into(),
+                Duration::from_secs(1),
+                None,
+                None,
+            )
+            .unwrap();
+            let body_for = |hostile_bytes: usize| {
+                client.request_body(
+                    "provider/model",
+                    "system",
+                    &hostile_json_text(hostile_bytes),
+                    REVIEW_MAX_TOKENS,
+                    0.1,
+                    LlmPhase::Review,
+                )
+            };
+            let mut low = 0usize;
+            let mut high = MAX_PROVIDER_REQUEST_BYTES;
+            while low < high {
+                let middle = low + (high - low).div_ceil(2);
+                if serde_json::to_vec(&body_for(middle)).unwrap().len()
+                    <= MAX_PROVIDER_REQUEST_BYTES
+                {
+                    low = middle;
+                } else {
+                    high = middle - 1;
+                }
+            }
+            assert!(
+                crate::review::MAX_REVIEW_BATCH_BYTES <= low,
+                "{api_format:?} cannot carry the configured review batch under the serialized cap"
+            );
+            let accepted = body_for(low);
+            let rejected = body_for(low + 1);
+            assert!(
+                serialized_provider_request_bytes(&accepted, "hostile request").is_ok(),
+                "{api_format:?} rejected its largest fitting hostile request"
+            );
+            assert!(
+                serialized_provider_request_bytes(&rejected, "hostile request").is_err(),
+                "{api_format:?} admitted a hostile request over the serialized cap"
+            );
+        }
     }
 
     #[test]
@@ -5310,6 +5603,7 @@ mod tests {
                     confidence: 0.9,
                     title: "real issue".into(),
                     body: "still grounded".into(),
+                    evidence: None,
                 }],
             };
             let r = into_review(raw, "m", Usage::default());
@@ -5333,6 +5627,7 @@ mod tests {
                 confidence: 1.7,
                 title: "".into(),
                 body: "a body".into(),
+                evidence: None,
             }],
         };
         let r = into_review(raw, "m", Usage::default());
@@ -5342,7 +5637,7 @@ mod tests {
         assert_eq!(f.kind, Kind::HumanEscalation);
         assert_eq!(f.confidence, 1.0);
         assert_eq!(f.end_line, None);
-        assert_eq!(f.title, "a body");
+        assert_eq!(f.title, "");
     }
 
     #[test]
@@ -5358,6 +5653,7 @@ mod tests {
                 confidence: 0.8,
                 title: "Stale temporal residue".into(),
                 body: "b".into(),
+                evidence: None,
             }],
         };
         let r = into_review(raw, "m", Usage::default());
@@ -5365,7 +5661,7 @@ mod tests {
     }
 
     #[test]
-    fn into_review_normalizes_finding_prose_before_storage() {
+    fn into_review_preserves_finding_prose_for_contract_validation() {
         let raw = RawReview {
             summary: String::new(),
             findings: vec![RawFinding {
@@ -5380,23 +5676,14 @@ mod tests {
                     "# Summary\n@octocat <details>hidden</details> ![pixel](https://bad.test/x)\n{}",
                     "line\n".repeat(30),
                 ),
+                evidence: None,
             }],
         };
 
         let review = into_review(raw, "m", Usage::default());
         let finding = &review.findings[0];
-        assert!(!finding.title.contains('@'));
-        assert!(!finding.title.contains('<'));
-        assert!(!finding.body.contains("@octocat"));
-        assert!(!finding.body.contains("<details>"));
-        assert!(
-            !finding
-                .body
-                .lines()
-                .any(|line| line.trim_start().starts_with("!["))
-        );
-        assert!(finding.body.chars().count() <= crate::envelope::FINDING_PUBLIC_BODY_MAX_CHARS);
-        assert!(finding.body.lines().count() <= crate::envelope::FINDING_PUBLIC_BODY_MAX_LINES);
+        assert_eq!(finding.title, "@octocat <img> **unsafe**");
+        assert!(finding.body.contains("@octocat <details>"));
     }
 
     fn mk(model: &str, path: &str, line: u32, conf: f64) -> ModelReview {
@@ -5416,6 +5703,7 @@ mod tests {
                 scorer_reason: None,
                 title: "t".into(),
                 body: "b".into(),
+                evidence: None,
                 id: None,
             }],
             model_used: model.into(),
@@ -5448,6 +5736,7 @@ mod tests {
             scorer_reason: None,
             title: "solo".into(),
             body: "b".into(),
+            evidence: None,
             id: None,
         });
         let merged = consensus_merge(vec![a, b]);
@@ -5490,6 +5779,7 @@ mod tests {
             scorer_reason: None,
             title: "t2".into(),
             body: "b2".into(),
+            evidence: None,
             id: None,
         });
         let merged = consensus_merge(vec![a, b]);
@@ -5794,6 +6084,139 @@ mod tests {
         });
         let error = LlmClient::ensure_atomic_attribution_request_size(&rejected).unwrap_err();
         assert!(error.to_string().contains("exceeds 5000 bytes"));
+    }
+
+    fn provider_request_with_exact_serialized_size(target: usize) -> serde_json::Value {
+        let empty = json!({
+            "model": "provider/model",
+            "max_tokens": 1,
+            "payload": ""
+        });
+        let overhead = serde_json::to_vec(&empty).unwrap().len();
+        assert!(target >= overhead);
+        let remaining = target - overhead;
+        let quote_count = remaining / 2;
+        let plain_count = remaining % 2;
+        let mut payload = "\"".repeat(quote_count);
+        payload.push_str(&"x".repeat(plain_count));
+        let body = json!({
+            "model": "provider/model",
+            "max_tokens": 1,
+            "payload": payload
+        });
+        assert_eq!(serde_json::to_vec(&body).unwrap().len(), target);
+        body
+    }
+
+    #[test]
+    fn provider_request_bound_counts_exact_json_escaping_at_n_and_n_plus_one() {
+        let accepted = provider_request_with_exact_serialized_size(MAX_PROVIDER_REQUEST_BYTES);
+        assert_eq!(
+            serialized_provider_request_bytes(&accepted, "test request").unwrap(),
+            MAX_PROVIDER_REQUEST_BYTES
+        );
+
+        let rejected = provider_request_with_exact_serialized_size(MAX_PROVIDER_REQUEST_BYTES + 1);
+        let error = serialized_provider_request_bytes(&rejected, "test request").unwrap_err();
+        assert!(error.to_string().contains("per-request cap"));
+        assert!(
+            error
+                .to_string()
+                .contains(&(MAX_PROVIDER_REQUEST_BYTES + 1).to_string())
+        );
+    }
+
+    #[test]
+    fn openai_length_finish_reason_rejects_complete_looking_partial_content() {
+        let config = Config {
+            api_base: "http://127.0.0.1:1".into(),
+            api_format: ApiFormat::OpenaiCompatible,
+            ..Config::default()
+        };
+        let client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        for (body, expected) in [
+            (
+                r#"{"choices":[{"finish_reason":"length","message":{"content":"{\"summary\":\"\",\"findings\":[]}"}}]}"#,
+                "length",
+            ),
+            (
+                r#"{"choices":[{"message":{"content":"{\"summary\":\"\",\"findings\":[]}"}}]}"#,
+                "missing finish_reason",
+            ),
+        ] {
+            let error = client
+                .parse_response(body, &mut Usage::default())
+                .unwrap_err();
+            let partial = error.downcast_ref::<NonTerminalModelResponse>().unwrap();
+            assert_eq!(partial.reason, expected);
+            assert!(partial.content.contains("findings"));
+        }
+    }
+
+    #[test]
+    fn anthropic_max_tokens_stop_reason_rejects_complete_looking_partial_content() {
+        let config = Config {
+            api_base: "http://127.0.0.1:1".into(),
+            api_format: ApiFormat::Anthropic,
+            ..Config::default()
+        };
+        let client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        for (body, expected) in [
+            (
+                r#"{"stop_reason":"max_tokens","content":[{"type":"text","text":"{\"summary\":\"\",\"findings\":[]}"}]}"#,
+                "max_tokens",
+            ),
+            (
+                r#"{"content":[{"type":"text","text":"{\"summary\":\"\",\"findings\":[]}"}]}"#,
+                "missing stop_reason",
+            ),
+        ] {
+            let error = client
+                .parse_response(body, &mut Usage::default())
+                .unwrap_err();
+            let partial = error.downcast_ref::<NonTerminalModelResponse>().unwrap();
+            assert_eq!(partial.reason, expected);
+            assert!(partial.content.contains("findings"));
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_provider_request_is_rejected_before_network_contact() {
+        let server = MockServer::start().await;
+        let config = Config {
+            api_base: server.uri(),
+            model: "provider/model".into(),
+            ..Config::default()
+        };
+        let client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        let oversized = provider_request_with_exact_serialized_size(MAX_PROVIDER_REQUEST_BYTES + 1);
+        let error = match client.request_once(&oversized).await {
+            Ok(_) => panic!("oversized request reached the provider transport"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("per-request cap"));
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[test]

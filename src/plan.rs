@@ -213,6 +213,7 @@ mod tests {
             scorer_reason: None,
             title: "t".into(),
             body: "b".into(),
+            evidence: None,
             id: None,
         }
     }

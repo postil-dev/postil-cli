@@ -101,6 +101,28 @@ export POSTIL_BENCH_UPSTREAM_PROVIDER='Exact upstream provider name'
 bun run bench --json-out report.json --manifest-out ../qualified-models.json
 ```
 
+Live admission emits public report schema version 2. Consumers must call
+`parseLiveModelsReport`; unversioned reports and unknown schema versions are
+rejected. Public case diagnostics contain counts and SHA-256 digests only.
+Finding prose, target contracts, raw evaluator responses, evaluator reasons,
+and diagnostic text are absent.
+
+The same invocation writes a separate private replay bundle. Use
+`--private-evidence-out <path>` or `POSTIL_BENCH_PRIVATE_EVIDENCE_OUT` to select
+its location. Without either, the mode-0600 file stays under the gitignored
+`bench/.runs/` directory. The runner reads the file back, checks its exact-byte
+digest against `privateEvidenceSha256` in the public report, and replays every
+attribution record before writing the report or admission candidate. This file
+contains model requests, finding prose, target contracts, raw responses, and
+evaluator reasons. Store it as sensitive qualification evidence and remove it
+when the applicable evidence-retention period ends. The managed workflow keeps
+plaintext in runner temporary storage and requires the
+`POSTIL_PRIVATE_EVIDENCE_PASSPHRASE` repository or environment secret before
+inference. It encrypts the bundle with GnuPG AES-256, decrypts and byte-compares
+the result, uploads only the encrypted artifact, and removes both runner files
+in an `always()` cleanup step. GitHub's configured artifact retention policy
+owns the encrypted bundle lifetime. The workflow publishes no raw-run artifact.
+
 The release binary must embed the exact profile under test. Set the intended
 generator, cascade, consensus width, scorer, API base, and interface in
 `config.toml`, leave the
@@ -156,7 +178,11 @@ Admission requires all of these in every repeat:
 Findings suppressed by the scorer count as detector evidence but cannot satisfy
 final blocking. An unrelated error cannot substitute for the attributed finding.
 The report stores only attributable finding coordinates and labels, never model
-finding titles or bodies. It records separate fixture, review-contract source,
+finding titles or bodies. Per-case attribution records retain the verdict and
+immutable request, response, usage, and evidence hashes. Evaluator-bank records
+retain eligibility, call count, and their aggregate evidence hash. Requests,
+raw responses, target contracts, and evaluator reasons stay out of the report.
+The report records separate fixture, review-contract source,
 configuration, evaluator contract, and CLI binary SHA-256 hashes; the canonical API base and
 provider interface; the ordered generator chain and consensus width; the
 ordered scorer chain; repeat number; and provider-exact or catalog-estimate

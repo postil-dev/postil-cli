@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { benchmarkCase, type BenchmarkCase, type Envelope } from "./harness";
-import type { AttributionCaseEvidence } from "./attribution";
+import type { AttributionCallEvidence, AttributionCaseEvidence } from "./attribution";
+import { HOSTED_OPERATION_COST_CAP_MICROS } from "./livemodels";
 import {
   aggregateModel,
   calculateTotalRunCostUsd,
   canonicalPriceMicrosPerMillion,
+  diagnosticEvidence,
   formatCanonicalDecimal,
   groundTruthOf,
   parseCanonicalDecimal,
@@ -158,9 +160,23 @@ function score(
   const candidates = [...env.findings, ...env.suppressedFindings.map((entry) => entry.finding)];
   const calls = classification === "clean" ? [] : candidates.flatMap((entry, candidateOrdinal) =>
     entry.path === "src/x.ts" && entry.line === 20 && entry.body === "generated detail must not persist"
-      ? [{ candidateOrdinal: candidateOrdinal + 1, sameDefect: true }]
+      ? [{
+          candidateOrdinal: candidateOrdinal + 1,
+          sameDefect: true,
+          requestSha256: "1".repeat(64),
+          responseSha256: ["2".repeat(64)],
+          usageSha256: "3".repeat(64),
+          evidenceSha256: "4".repeat(64),
+        }]
       : entry.path === "src/x.ts" && entry.line === 20
-        ? [{ candidateOrdinal: candidateOrdinal + 1, sameDefect: false }]
+        ? [{
+            candidateOrdinal: candidateOrdinal + 1,
+            sameDefect: false,
+            requestSha256: "5".repeat(64),
+            responseSha256: ["6".repeat(64)],
+            usageSha256: "7".repeat(64),
+            evidenceSha256: "8".repeat(64),
+          }]
         : []);
   return scoreLiveCase({
     case: fixture(classification, id),
@@ -236,9 +252,71 @@ describe("pair scoring", () => {
       severity: "warn",
       kind: "risk",
       confidence: 0.9,
-      title: "generated prose must not persist",
-      body: "generated detail must not persist",
     }]);
+  });
+
+  test("serializes attribution hashes and metrics without finding or evaluator prose", () => {
+    const input = envelope({ findings: [finding("warn")] });
+    const call = {
+      candidateOrdinal: 1,
+      sameDefect: true,
+      requestSha256: "1".repeat(64),
+      responseSha256: ["2".repeat(64)],
+      usageSha256: "3".repeat(64),
+      evidenceSha256: "4".repeat(64),
+      request: {
+        candidate: {
+          title: "private generated title sentinel",
+          body: "private generated body sentinel",
+        },
+        target: { contract: "private authored target sentinel" },
+      },
+      rawResponses: ["private raw evaluator response sentinel"],
+      reason: "private evaluator reason sentinel",
+    } as unknown as AttributionCallEvidence;
+    const result = scoreLiveCase({
+      case: fixture("advisory"),
+      pair,
+      repeat: 1,
+      envelope: input,
+      pricing: prices,
+      exitCode: 0,
+      fidelityFailures: ["private synthetic path sentinel .postil/model-output:1 generated prose must not persist"],
+      structuredOutputFailures: ["private structured output sentinel generated detail must not persist"],
+      attribution: {
+        scored: true,
+        detected: true,
+        calls: [call],
+        error: "private attribution error sentinel generated detail must not persist",
+      },
+    });
+
+    const serialized = JSON.stringify(result);
+    for (const secretProse of [
+      "generated prose must not persist",
+      "generated detail must not persist",
+      "private generated title sentinel",
+      "private generated body sentinel",
+      "private authored target sentinel",
+      "private raw evaluator response sentinel",
+      "private evaluator reason sentinel",
+      "private synthetic path sentinel",
+      "private structured output sentinel",
+      "private attribution error sentinel",
+    ]) {
+      expect(serialized).not.toContain(secretProse);
+    }
+    expect(result.attributionEvidence).toEqual([{
+      candidateOrdinal: 1,
+      sameDefect: true,
+      requestSha256: "1".repeat(64),
+      responseSha256: ["2".repeat(64)],
+      usageSha256: "3".repeat(64),
+      evidenceSha256: "4".repeat(64),
+    }]);
+    expect(result.fidelityDiagnostics).toMatchObject({ count: 1 });
+    expect(result.structuredOutputDiagnostics).toMatchObject({ count: 1 });
+    expect(result.errorSha256).toMatch(/^[0-9a-f]{64}$/u);
   });
 
   test("requires the attributed finding itself to block and rejects unrelated substitute blockers", () => {
@@ -286,7 +364,7 @@ describe("pair scoring", () => {
 
 describe("pair admission", () => {
   test("passes only a repeated complete exact-pair matrix", () => {
-    const aggregate = aggregateModel(pair, passingMatrix(), 3);
+    const aggregate = aggregateModel(pair, passingMatrix(), 3, HOSTED_OPERATION_COST_CAP_MICROS);
     expect(aggregate).toMatchObject({
       id: qualificationPairId(pair),
       casesRun: 183,
@@ -308,15 +386,35 @@ describe("pair admission", () => {
   test("rejects a latency outlier that the mean could hide", () => {
     const matrix = passingMatrix();
     matrix[0]!.durationMs = 187_000;
-    const aggregate = aggregateModel(pair, matrix, 3);
+    const aggregate = aggregateModel(pair, matrix, 3, HOSTED_OPERATION_COST_CAP_MICROS);
     expect(aggregate.passed).toBe(false);
     expect(aggregate.admissionFailures.some((failure) => failure.includes("max latency"))).toBe(true);
+  });
+
+  test("uses the canonical runtime micro-dollar ceiling for every review", () => {
+    const atCap = passingMatrix();
+    atCap[0]!.costUsd = HOSTED_OPERATION_COST_CAP_MICROS / 1_000_000;
+    expect(aggregateModel(
+      pair,
+      atCap,
+      3,
+      HOSTED_OPERATION_COST_CAP_MICROS,
+    ).admissionFailures.some((failure) => failure.includes("hosted operation cap"))).toBe(false);
+
+    const overCap = passingMatrix();
+    overCap[0]!.costUsd = (HOSTED_OPERATION_COST_CAP_MICROS + 1) / 1_000_000;
+    expect(aggregateModel(
+      pair,
+      overCap,
+      3,
+      HOSTED_OPERATION_COST_CAP_MICROS,
+    ).admissionFailures).toContain("1 review(s) exceed the $1.00 hosted operation cap");
   });
 
   test("rejects a complete matrix with the wrong process exit status", () => {
     const matrix = passingMatrix();
     for (const result of matrix) result.exitCode = 2;
-    const aggregate = aggregateModel(pair, matrix, 3);
+    const aggregate = aggregateModel(pair, matrix, 3, HOSTED_OPERATION_COST_CAP_MICROS);
     expect(aggregate.passed).toBe(false);
     expect(aggregate.admissionFailures).toContain("183 process exit fidelity failure(s)");
   });
@@ -324,57 +422,62 @@ describe("pair admission", () => {
   test("fails every attributable quality boundary independently", () => {
     const missedBlock = passingMatrix();
     missedBlock[0] = score("mustBlock", 1, envelope(), "m-0");
-    expect(aggregateModel(pair, missedBlock, 3).admissionFailures.join("\n")).toContain("must-block recall");
+    expect(aggregateModel(pair, missedBlock, 3, HOSTED_OPERATION_COST_CAP_MICROS).admissionFailures.join("\n")).toContain("must-block recall");
 
     const substituteBlock = passingMatrix();
     substituteBlock[0] = score("mustBlock", 1, envelope({
       findings: [finding("warn"), finding("error", "src/other.ts", 1)], gateFailing: true,
     }), "m-0");
-    expect(aggregateModel(pair, substituteBlock, 3).admissionFailures.join("\n")).toContain("final attributed blocking");
+    expect(aggregateModel(pair, substituteBlock, 3, HOSTED_OPERATION_COST_CAP_MICROS).admissionFailures.join("\n")).toContain("final attributed blocking");
 
     const advisoryMisses = passingMatrix();
     advisoryMisses[34] = score("advisory", 1, envelope(), "a-0");
     advisoryMisses[35] = score("advisory", 1, envelope(), "a-1");
-    expect(aggregateModel(pair, advisoryMisses, 3).admissionFailures.join("\n")).toContain("advisory detection");
+    expect(aggregateModel(pair, advisoryMisses, 3, HOSTED_OPERATION_COST_CAP_MICROS).admissionFailures.join("\n")).toContain("advisory detection");
 
     const advisoryBlocks = passingMatrix();
     advisoryBlocks[34] = score("advisory", 1, envelope({ findings: [finding("error")], gateFailing: true }), "a-0");
     advisoryBlocks[35] = score("advisory", 1, envelope({ findings: [finding("error")], gateFailing: true }), "a-1");
-    expect(aggregateModel(pair, advisoryBlocks, 3).admissionFailures.join("\n")).toContain("advisory overblocking");
+    expect(aggregateModel(pair, advisoryBlocks, 3, HOSTED_OPERATION_COST_CAP_MICROS).admissionFailures.join("\n")).toContain("advisory overblocking");
 
     const cleanNoise = passingMatrix();
     cleanNoise[49] = score("clean", 1, envelope({ findings: [finding("warn", "src/other.ts", 1)] }), "c-0");
-    expect(aggregateModel(pair, cleanNoise, 3).admissionFailures.join("\n")).toContain("clean finding false-positive");
+    expect(aggregateModel(pair, cleanNoise, 3, HOSTED_OPERATION_COST_CAP_MICROS).admissionFailures.join("\n")).toContain("clean finding false-positive");
 
     const cleanBlock = passingMatrix();
     cleanBlock[49] = score("clean", 1, envelope({ findings: [finding("error", "src/other.ts", 1)], gateFailing: true }), "c-0");
-    expect(aggregateModel(pair, cleanBlock, 3).admissionFailures.join("\n")).toContain("clean false block");
+    expect(aggregateModel(pair, cleanBlock, 3, HOSTED_OPERATION_COST_CAP_MICROS).admissionFailures.join("\n")).toContain("clean false block");
   });
 
   test("fails incomplete, single-run, fidelity, structured-output, and accounting results", () => {
-    expect(aggregateModel(pair, passingMatrix(1), 1).admissionFailures.join("\n")).toContain("at least 3");
+    expect(aggregateModel(pair, passingMatrix(1), 1, HOSTED_OPERATION_COST_CAP_MICROS).admissionFailures.join("\n")).toContain("at least 3");
 
     const incomplete = passingMatrix();
     incomplete.pop();
-    expect(aggregateModel(pair, incomplete, 3).admissionFailures.join("\n")).toContain("matrix is");
+    expect(aggregateModel(pair, incomplete, 3, HOSTED_OPERATION_COST_CAP_MICROS).admissionFailures.join("\n")).toContain("matrix is");
 
     const fidelity = passingMatrix();
-    fidelity[0]!.fidelityFailures.push("statusline mismatch");
-    expect(aggregateModel(pair, fidelity, 3).admissionFailures.join("\n")).toContain("pipeline fidelity");
+    fidelity[0]!.fidelityDiagnostics = diagnosticEvidence(["statusline mismatch"]);
+    expect(aggregateModel(pair, fidelity, 3, HOSTED_OPERATION_COST_CAP_MICROS).admissionFailures.join("\n")).toContain("pipeline fidelity");
 
     const structured = passingMatrix();
-    structured[0]!.structuredOutputFailures.push("scorer mismatch");
-    expect(aggregateModel(pair, structured, 3).admissionFailures.join("\n")).toContain("structured-output");
+    structured[0]!.structuredOutputDiagnostics = diagnosticEvidence(["scorer mismatch"]);
+    expect(aggregateModel(pair, structured, 3, HOSTED_OPERATION_COST_CAP_MICROS).admissionFailures.join("\n")).toContain("structured-output");
 
     const usageFailure = passingMatrix();
     usageFailure[0]!.usageValid = false;
-    expect(aggregateModel(pair, usageFailure, 3).admissionFailures.join("\n")).toContain("usage accounting");
+    expect(aggregateModel(pair, usageFailure, 3, HOSTED_OPERATION_COST_CAP_MICROS).admissionFailures.join("\n")).toContain("usage accounting");
   });
 });
 
 describe("report and pricing utilities", () => {
   test("site aggregate identifies the exact pair and attributable metrics", () => {
-    const site = toSiteModelAggregate(aggregateModel(pair, passingMatrix(), 3));
+    const site = toSiteModelAggregate(aggregateModel(
+      pair,
+      passingMatrix(),
+      3,
+      HOSTED_OPERATION_COST_CAP_MICROS,
+    ));
     expect(site).toEqual({
       id: qualificationPairId(pair),
       generatorModel: pair.generatorModel,

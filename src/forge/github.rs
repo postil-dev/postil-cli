@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{
     CheckState, Forge, PrMeta, SummaryContext, ThreadKind, check_summary, check_title,
-    only_operational_findings, valid_details_url, wrap_plain_text,
+    only_operational_findings, valid_details_url,
 };
 use crate::diff::{DiffSnapshot, DiffSpool, WorkspaceBudget};
 use crate::envelope::{Envelope, Finding, Severity};
@@ -89,6 +89,26 @@ impl GitHub {
         if let Some(details_url) = &self.details_url {
             body["details_url"] = json!(details_url);
         }
+    }
+
+    fn check_external_id(&self, name: &str, head_sha: &str) -> String {
+        let run_id = self.details_url.as_deref().and_then(|details_url| {
+            reqwest::Url::parse(details_url)
+                .ok()?
+                .path_segments()?
+                .rfind(|segment| !segment.is_empty())
+                .filter(|segment| {
+                    segment.len() <= 80
+                        && segment.chars().all(|character| {
+                            character.is_ascii_alphanumeric() || "-_".contains(character)
+                        })
+                })
+                .map(str::to_string)
+        });
+        run_id.map_or_else(
+            || format!("postil:{name}:{head_sha}"),
+            |run_id| format!("postil:{run_id}:{name}:{head_sha}"),
+        )
     }
 
     async fn verify_repository_identity_before_write(&self) -> Result<()> {
@@ -837,7 +857,7 @@ fn gate_summary(envelope: &Envelope) -> String {
             )
         })
         .map(|f| {
-            let publication = crate::envelope::finding_publication_text(&f.title, &f.body);
+            let publication = crate::envelope::forge_safe_finding_publication_text(f);
             format!(
                 "- `{}:{}` {}",
                 super::safe_code_text(&f.path),
@@ -1175,7 +1195,7 @@ impl Forge for GitHub {
     async fn start_checks(&self, head_sha: &str) -> Result<(String, String)> {
         let mut ids = Vec::with_capacity(2);
         for name in ["postil/review", "postil/gate"] {
-            let external_id = format!("postil:{name}:{head_sha}");
+            let external_id = self.check_external_id(name, head_sha);
             let mut body = json!({
                 "name": name,
                 "head_sha": head_sha,
@@ -1255,8 +1275,7 @@ impl Forge for GitHub {
             .filter(|f| !super::is_synthetic_path(&f.path))
             .take(50) // GitHub caps annotations per request at 50.
             .map(|f| {
-                let publication = crate::envelope::finding_publication_text(&f.title, &f.body);
-                let message: String = publication.body.chars().take(800).collect();
+                let publication = crate::envelope::forge_safe_finding_publication_text(f);
                 json!({
                     "path": f.path,
                     "start_line": f.line,
@@ -1267,7 +1286,7 @@ impl Forge for GitHub {
                         Severity::Error => "failure",
                     },
                     "title": publication.title,
-                    "message": wrap_plain_text(&message, 100),
+                    "message": publication.body,
                 })
             })
             .collect();
@@ -1893,6 +1912,7 @@ mod tests {
             scorer_reason: None,
             title: "Finding".into(),
             body: "A concrete issue.".into(),
+            evidence: None,
             id: None,
         };
 
@@ -1953,6 +1973,7 @@ mod tests {
             scorer_reason: None,
             title: "Finding".into(),
             body: "A concrete issue.".into(),
+            evidence: None,
             id: None,
         };
 
@@ -2026,6 +2047,7 @@ mod tests {
             scorer_reason: None,
             title: "Finding".into(),
             body: "A concrete issue.".into(),
+            evidence: None,
             id: None,
         };
         let envelope = delivery_envelope("aaaaaaaaaaaa", "cccccccccccc");
@@ -2122,6 +2144,7 @@ mod tests {
             scorer_reason: None,
             title: "Finding".into(),
             body: "A concrete issue.".into(),
+            evidence: None,
             id: None,
         };
 
@@ -2136,7 +2159,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn github_review_and_check_annotations_revalidate_model_prose() {
+    async fn github_review_and_check_annotations_preserve_valid_model_prose() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/repos/owner/repo/pulls/1"))
@@ -2190,11 +2213,9 @@ mod tests {
             generator_kind: None,
             scorer_kind: None,
             scorer_reason: None,
-            title: format!("@octocat <img> {}", "oversized ".repeat(100)),
-            body: format!(
-                "# Summary\n@octocat <details>hidden</details> ![pixel](https://attacker.invalid/x)\n{}",
-                "article line\n".repeat(100),
-            ),
+            title: "Preserve the complete finding".into(),
+            body: format!("{}.", "a".repeat(226)),
+            evidence: Some("let vulnerable = true;".into()),
             id: None,
         };
         let envelope = Envelope {
@@ -2257,15 +2278,7 @@ mod tests {
             .unwrap();
         let review_body: serde_json::Value = serde_json::from_slice(&review.body).unwrap();
         let inline = review_body["comments"][0]["body"].as_str().unwrap();
-        assert!(inline.chars().count() < 1_600);
-        assert!(!inline.contains("@octocat"));
-        assert!(!inline.contains("<details>"));
-        assert!(
-            !inline
-                .lines()
-                .any(|line| line.trim_start().starts_with("!["))
-        );
-        assert!(!inline.contains("# Summary"));
+        assert!(inline.contains(&finding.body));
 
         let advisory = requests
             .iter()
@@ -2275,11 +2288,8 @@ mod tests {
         let annotation = &check_body["output"]["annotations"][0];
         let title = annotation["title"].as_str().unwrap();
         let message = annotation["message"].as_str().unwrap();
-        assert!(title.chars().count() <= crate::envelope::FINDING_PUBLIC_TITLE_MAX_CHARS);
-        assert!(message.chars().count() <= 800);
-        assert!(!title.contains('@'));
-        assert!(!message.contains("@octocat"));
-        assert!(!message.contains("<details>"));
+        assert_eq!(title, finding.title);
+        assert_eq!(message, finding.body);
     }
 
     #[test]
@@ -2296,6 +2306,24 @@ mod tests {
         assert_eq!(valid_details_url(Some("https://".into())), None);
         assert_eq!(valid_details_url(Some("not a URL".into())), None);
         assert_eq!(valid_details_url(None), None);
+    }
+
+    #[test]
+    fn check_external_id_links_the_hosted_run() {
+        let github = GitHub {
+            http: reqwest::Client::new(),
+            api_base: "https://api.github.test".into(),
+            details_url: Some("https://postil.dev/orgs/acme/runs/review-380".into()),
+            token: "unused".into(),
+            owner: "owner".into(),
+            repo: "repo".into(),
+            pr: 1,
+            expected_repository_id: None,
+        };
+        assert_eq!(
+            github.check_external_id("postil/review", "abcdef12"),
+            "postil:review-380:postil/review:abcdef12"
+        );
     }
 
     #[test]
@@ -2325,6 +2353,7 @@ mod tests {
             scorer_reason: None,
             title: "Human judgment required".into(),
             body: "Concrete compatibility concern.".into(),
+            evidence: None,
             id: None,
         };
         let env = Envelope {
