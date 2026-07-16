@@ -4452,6 +4452,40 @@ async fn advisory_does_not_bypass_unusable_output() {
 }
 
 #[tokio::test]
+async fn advisory_does_not_bypass_missing_choices() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 0}
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    std::fs::write(
+        dir.path().join(".postil.yaml"),
+        "gate:\n  onError: advisory\n",
+    )
+    .unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .code(1);
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["findings"][0]["path"], ".postil/model-output");
+    assert_eq!(envelope["gate"]["failing"], true);
+    assert_eq!(envelope["modelUsage"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn error_default_fails_closed_and_blocks() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
