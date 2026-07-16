@@ -237,8 +237,8 @@ for at most one schema-repair request. A one-finding qualification request uses
 a 17,000-byte prompt bound, a 400-token output bound, and at most 1,600 bytes
 of repair context. Scorer responses also fail
 admission when provider usage is missing or malformed, runtime accounting is
-incomplete, or the assessment is not trimmed single-line text of at most
-240 UTF-8 bytes ending in sentence punctuation. Each case is killed one second
+incomplete, or the assessment is not trimmed single-line text of at most 60
+Unicode characters and 240 UTF-8 bytes ending in sentence punctuation. Each case is killed one second
 after the 20-second admission limit, and teardown aborts outstanding provider
 requests. A timeout rejects that candidate immediately rather than running the
 rest of its matrix. Any other admission-fatal structural result, including an
