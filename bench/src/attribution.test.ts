@@ -186,7 +186,7 @@ describe("atomic attribution contract", () => {
 import { readFile } from "node:fs/promises";
 const request = JSON.parse(await readFile(process.argv.at(-1), "utf8"));
 const raw = JSON.stringify({ sameDefect: true, reason: "Both identify the same retry bypass." });
-console.log(JSON.stringify({ sameDefect: true, reason: "Both identify the same retry bypass.", model: request.model, provider: request.expectedProvider, responseIdentities: [{ model: request.model, provider: request.expectedProvider }], apiFormat: "openai-compatible", settings: { temperature: 0, maxTokens: 180, schemaRepairs: 1 }, rawResponses: [raw], modelUsage: [{ model: request.model, role: "findingScorer", phase: "initial", callOrdinal: 1, attempt: 1, promptTokens: 10, completionTokens: 5, costProviderDecimal: "0.0001", costSource: "providerReported", accountingComplete: true }], usageAccountingComplete: true }));
+console.log(JSON.stringify({ sameDefect: true, reason: "Both identify the same retry bypass.", model: request.model, provider: request.expectedProvider, responseIdentities: [{ model: request.model, provider: request.expectedProvider }], apiFormat: "openai-compatible", settings: { temperature: 0, maxTokens: 180, schemaRepairs: 1 }, rawResponses: [raw], modelUsage: [{ model: request.model, role: "findingScorer", phase: "initial", callOrdinal: 1, attempt: 1, promptTokens: 10, completionTokens: 5, costMicros: 100, costProviderDecimal: "0.0001", costSource: "providerReported", accountingComplete: true }], usageAccountingComplete: true }));
 `);
       await chmod(binary, 0o700);
       const options = {
@@ -279,6 +279,7 @@ console.log(JSON.stringify({ sameDefect: true, reason: "Both identify the same r
       attempt: 1,
       promptTokens: 100,
       completionTokens: 20,
+      costMicros: 100,
       costProviderDecimal: "0.0001",
       costSource: "providerReported" as const,
       accountingComplete: true as const,
@@ -337,6 +338,7 @@ console.log(JSON.stringify({ sameDefect: true, reason: "Both identify the same r
       rehash((copy) => { copy.modelUsage[0]!.callOrdinal = 0; }),
       rehash((copy) => { copy.modelUsage[0]!.attempt = 0; }),
       rehash((copy) => { copy.modelUsage[0]!.promptTokens = -1; }),
+      rehash((copy) => { copy.modelUsage[0]!.costMicros = 101; }),
       rehash((copy) => { copy.modelUsage[0]!.costProviderDecimal = "0.00010"; }),
       rehash((copy) => {
         (copy.modelUsage[0]! as { costSource: string }).costSource = "catalogEstimate";
