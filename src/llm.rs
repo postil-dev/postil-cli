@@ -756,6 +756,7 @@ struct SafeResponseSummary {
     usage: Option<Usage>,
 }
 
+#[cfg_attr(not(feature = "qualification-candidate"), allow(dead_code))]
 struct ChatSuccess {
     content: String,
     returned_model: Option<String>,
@@ -2781,7 +2782,7 @@ impl LlmClient {
         max_tokens: u32,
         temperature: f64,
         phase: LlmPhase,
-        expected_provider: Option<&str>,
+        _expected_provider: Option<&str>,
     ) -> serde_json::Value {
         match self.api_format {
             ApiFormat::OpenaiCompatible => {
@@ -2804,7 +2805,7 @@ impl LlmClient {
                 }
                 #[cfg(feature = "qualification-candidate")]
                 if matches!(phase, LlmPhase::Attribution) {
-                    apply_openrouter_atomic_attribution_contract(&mut body, expected_provider);
+                    apply_openrouter_atomic_attribution_contract(&mut body, _expected_provider);
                 }
                 if canonical_openrouter
                     && let Some(bound) = self
