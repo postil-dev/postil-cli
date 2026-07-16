@@ -512,26 +512,32 @@ describe("report and pricing utilities", () => {
         provider_name: "Offline cheapest",
         status: -2,
         pricing: { prompt: "0.000000435", completion: "0.00000087" },
+        supported_parameters: ["max_tokens", "temperature"],
       },
       {
         model_id: pair.generatorModel,
         provider_name: "Prompt cheap",
         status: 0,
         pricing: { prompt: "0.000001", completion: "0.000004" },
+        supported_parameters: ["max_tokens", "temperature"],
       },
       {
         model_id: pair.generatorModel,
         provider_name: "DeepInfra",
         status: 0,
         pricing: { prompt: "0.0000013", completion: "0.0000026" },
+        supported_parameters: ["max_tokens", "temperature"],
       },
       {
         model_id: pair.generatorModel,
         provider_name: "Completion cheap",
         status: 0,
         pricing: { prompt: "0.000003", completion: "0.000001" },
+        supported_parameters: ["max_tokens", "temperature"],
       },
-    ] }, [pair.generatorModel], "DeepInfra");
+    ] }, [pair.generatorModel], "DeepInfra", new Map([
+      [pair.generatorModel, ["max_tokens", "temperature"]],
+    ]));
 
     expect(catalog.get(pair.generatorModel)).toEqual({
       providerIdentity: "DeepInfra",
@@ -540,6 +546,19 @@ describe("report and pricing utilities", () => {
       inputMicrosPerMillionTokens: 1_300_000,
       outputMicrosPerMillionTokens: 2_600_000,
     });
+  });
+
+  test("rejects a ZDR endpoint that omits a role-required parameter", () => {
+    const catalog = pricingFromZdrCatalog({ data: [{
+      model_id: pair.scorerModel,
+      provider_name: "Together",
+      status: 0,
+      pricing: { prompt: "0.000001", completion: "0.000002" },
+      supported_parameters: ["max_tokens", "temperature"],
+    }] }, [pair.scorerModel], "Together", new Map([
+      [pair.scorerModel, ["max_tokens", "response_format", "temperature"]],
+    ]));
+    expect(catalog.has(pair.scorerModel)).toBe(false);
   });
 
   test("rejects duplicate requested catalog ids and canonical aliases before pricing", () => {
