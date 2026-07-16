@@ -475,7 +475,7 @@ async function runAtomicAttribution(
         );
         stdout = result.stdout;
       } catch (error) {
-        throw new Error(`atomic attribution transport failed: ${boundedError(error)}`);
+        throw new Error(`atomic attribution transport failed: ${atomicAttributionProcessFailure(error)}`);
       }
       const output = transportOutput.parse(JSON.parse(stdout));
       if (output.model !== options.evaluatorModel || output.provider !== options.expectedProvider ||
@@ -594,6 +594,62 @@ function canonicalJson(value: unknown): string {
 function boundedError(error: unknown): string {
   const value = error instanceof Error ? error.message : String(error);
   return value.replace(/[\r\n\p{Cc}]+/gu, " ").slice(0, 500);
+}
+
+function atomicAttributionProcessFailure(error: unknown): string {
+  const failure = error !== null && typeof error === "object"
+    ? error as Record<string, unknown>
+    : {};
+  const stderr = typeof failure.stderr === "string"
+    ? failure.stderr.slice(-16 * 1024)
+    : "";
+  const terminalDiagnostic = stderr
+    .split(/\r?\n/u)
+    .findLast((line) => line.startsWith("postil: error:")) ?? "";
+  const category = classifyAtomicAttributionStderr(terminalDiagnostic, error);
+  const exitCode = typeof failure.code === "number" && Number.isSafeInteger(failure.code)
+    ? String(failure.code)
+    : "unknown";
+  const signal = typeof failure.signal === "string" && /^[A-Z0-9]+$/u.test(failure.signal)
+    ? failure.signal
+    : "none";
+  const killed = failure.killed === true ? "true" : "false";
+  return `category=${category} exit=${exitCode} signal=${signal} killed=${killed}`;
+}
+
+function classifyAtomicAttributionStderr(stderr: string, error: unknown): string {
+  if (/atomic attribution output invalid after schema repair/iu.test(stderr)) {
+    return "output-invalid-after-schema-repair";
+  }
+  if (/atomic attribution response omitted (?:model|provider) identity/iu.test(stderr)) {
+    return "response-identity-missing";
+  }
+  if (/atomic attribution response (?:model|provider) identity mismatch/iu.test(stderr)) {
+    return "response-identity-mismatch";
+  }
+  if (/atomic attribution usage (?:accounting|evidence) is incomplete/iu.test(stderr)) {
+    return "usage-accounting-incomplete";
+  }
+  if (/atomic attribution provider request exceeds/iu.test(stderr)) {
+    return "provider-request-too-large";
+  }
+  const httpStatus = stderr.match(/(?:HTTP |status=)([45][0-9]{2})/iu)?.[1];
+  if (httpStatus !== undefined) return `provider-http-${httpStatus}`;
+  if (/request timed out|request timeout|deadline exceeded/iu.test(stderr)) {
+    return "provider-timeout";
+  }
+  if (/request to model endpoint failed|connection error/iu.test(stderr)) {
+    return "provider-transport";
+  }
+  if (/atomic attribution failed/iu.test(stderr)) return "attribution-failed";
+  if (failureWasTimedOut(error)) return "subprocess-timeout";
+  return "subprocess-failed";
+}
+
+function failureWasTimedOut(error: unknown): boolean {
+  if (error === null || typeof error !== "object") return false;
+  const failure = error as Record<string, unknown>;
+  return failure.killed === true || failure.code === "ETIMEDOUT";
 }
 
 function safeSegment(value: string): string {

@@ -221,6 +221,40 @@ console.log(JSON.stringify({ sameDefect: true, reason: "Both identify the same r
     }
   });
 
+  test("reports a bounded subprocess category without exposing stderr", async () => {
+    const root = await mkdtemp(join(tmpdir(), "postil-attribution-diagnostic-"));
+    const binary = join(root, "fake-failed-attribution.ts");
+    try {
+      await writeFile(binary, `#!/usr/bin/env bun
+process.stderr.write("private-prompt-and-response ".repeat(100));
+process.stderr.write("\\npostil: llm response phase=attribution status=200\\n");
+process.stderr.write("postil: error: atomic attribution failed: atomic attribution output invalid after schema repair: invalid reason\\n");
+process.exit(1);
+`);
+      await chmod(binary, 0o700);
+      const result = await attributeCandidates(target, [candidate], {
+        binary,
+        runDir: join(root, "run"),
+        env: process.env,
+        sourceSha256: "a".repeat(64),
+        binarySha256: "b".repeat(64),
+        evaluatorModel: "provider/scorer",
+        expectedProvider: "PinnedProvider",
+        apiFormat: "openai-compatible",
+        repeat: 1,
+        governor: new AttributionGovernor(),
+        projectedCostUsdDecimal: "0.01",
+      });
+      expect(result.error).toBe(
+        "atomic attribution transport failed: category=output-invalid-after-schema-repair exit=1 signal=none killed=false",
+      );
+      expect(result.error).not.toContain("private-prompt-and-response");
+      expect(result.error).not.toContain("invalid reason");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("enforces one global concurrency, provider-call, and spend budget", async () => {
     const governor = new AttributionGovernor(2, 100, 0.02);
     let active = 0;
