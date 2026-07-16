@@ -23,7 +23,10 @@ use crate::envelope::{
     ModelUsage, ModelUsageCostSource, ModelUsagePhase, ModelUsageRole, ProviderCost,
     ReviewAdmission, Usage,
 };
-use crate::prompt::{SCORER_REASON_JSON_PATTERN, SCORER_REASON_MAX_BYTES, SCORER_REASON_MAX_CHARS};
+use crate::prompt::{
+    SCORER_REASON_JSON_PATTERN, SCORER_REASON_MAX_BYTES, SCORER_REASON_PROMPT_MAX_BYTES,
+    SCORER_REASON_SCHEMA_MAX_CHARS,
+};
 
 #[derive(Debug, Clone)]
 pub struct ModelReview {
@@ -463,7 +466,7 @@ fn review_validation_retry_user(user: &str, reason: &str) -> String {
 
 fn scorer_repair_system(system: &str) -> String {
     format!(
-        "{system}\n\nYour previous response failed schema validation. Repair only the JSON schema. Kind is a category, so severity values such as info, warn, and error are invalid kinds. Every reason must be concise single-line text of at most {SCORER_REASON_MAX_CHARS} Unicode characters and {SCORER_REASON_MAX_BYTES} UTF-8 bytes ending in sentence punctuation. Return the complete array and nothing else."
+        "{system}\n\nYour previous response failed schema validation. Repair only the JSON schema. Kind is a category, so severity values such as info, warn, and error are invalid kinds. Every reason must be concise single-line text of at most {SCORER_REASON_PROMPT_MAX_BYTES} UTF-8 bytes ending in sentence punctuation. Return the complete array and nothing else."
     )
 }
 
@@ -3211,7 +3214,7 @@ fn apply_openrouter_scorer_contract(body: &mut serde_json::Value, expected_len: 
                         "reason": {
                             "type": "string",
                             "minLength": 1,
-                            "maxLength": SCORER_REASON_MAX_CHARS,
+                            "maxLength": SCORER_REASON_SCHEMA_MAX_CHARS,
                             "pattern": SCORER_REASON_JSON_PATTERN,
                         },
                     },
@@ -3253,7 +3256,7 @@ fn apply_openrouter_atomic_attribution_contract(
                     "reason": {
                         "type": "string",
                         "minLength": 1,
-                        "maxLength": SCORER_REASON_MAX_CHARS,
+                        "maxLength": SCORER_REASON_SCHEMA_MAX_CHARS,
                         "pattern": SCORER_REASON_JSON_PATTERN,
                     },
                 },
@@ -3846,12 +3849,6 @@ fn validate_scorer_reason(value: &str) -> Result<String, String> {
     if byte_count > SCORER_REASON_MAX_BYTES {
         return Err(format!(
             "score reason exceeds {SCORER_REASON_MAX_BYTES} UTF-8 bytes (got {byte_count})"
-        ));
-    }
-    let character_count = reason.chars().count();
-    if character_count > SCORER_REASON_MAX_CHARS {
-        return Err(format!(
-            "score reason exceeds {SCORER_REASON_MAX_CHARS} Unicode characters (got {character_count})"
         ));
     }
     let is_terminator = |character: char| {
@@ -4979,8 +4976,7 @@ mod tests {
     fn scorer_repair_prompt_states_the_exact_reason_limits() {
         let prompt = scorer_repair_system("base scorer contract");
         assert!(prompt.contains(&format!(
-            "at most {SCORER_REASON_MAX_CHARS} Unicode characters and \
-             {SCORER_REASON_MAX_BYTES} UTF-8 bytes"
+            "at most {SCORER_REASON_PROMPT_MAX_BYTES} UTF-8 bytes"
         )));
     }
 
@@ -4996,10 +4992,10 @@ mod tests {
         let overlength = serde_json::json!([{
             "confidence": 0.7,
             "kind": "risk",
-            "reason": format!("{}.", "x".repeat(SCORER_REASON_MAX_CHARS)),
+            "reason": format!("{}.", "x".repeat(SCORER_REASON_MAX_BYTES)),
         }]);
         let error = parse_scores(&overlength.to_string(), 1).unwrap_err();
-        assert!(error.contains("exceeds 60 Unicode characters"));
+        assert!(error.contains("exceeds 240 UTF-8 bytes"));
 
         for reason in [
             " Leading whitespace is invalid.",
@@ -5021,24 +5017,23 @@ mod tests {
 
     #[test]
     fn scorer_reason_limits_match_json_schema_unicode_length() {
-        let reason = format!("{}.", "x".repeat(SCORER_REASON_MAX_CHARS - 1));
+        let reason = format!("{}.", "x".repeat(SCORER_REASON_MAX_BYTES - 1));
         let input = serde_json::json!([{
             "confidence": 0.7,
             "kind": "risk",
             "reason": reason,
         }]);
         let scores = parse_scores(&input.to_string(), 1).unwrap();
-        assert_eq!(scores[0].reason.chars().count(), SCORER_REASON_MAX_CHARS);
+        assert_eq!(scores[0].reason.len(), SCORER_REASON_MAX_BYTES);
 
-        let multibyte = format!("{}。", "界".repeat(SCORER_REASON_MAX_CHARS - 1));
+        let multibyte = format!("{}。", "界".repeat((SCORER_REASON_MAX_BYTES / 3) - 1));
         let input = serde_json::json!([{
             "confidence": 0.7,
             "kind": "risk",
             "reason": multibyte,
         }]);
         let scores = parse_scores(&input.to_string(), 1).unwrap();
-        assert_eq!(scores[0].reason.chars().count(), SCORER_REASON_MAX_CHARS);
-        assert!(scores[0].reason.len() <= SCORER_REASON_MAX_BYTES);
+        assert_eq!(scores[0].reason.len(), SCORER_REASON_MAX_BYTES);
     }
 
     #[test]
@@ -5056,6 +5051,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(multiple_sentences.len(), 1);
+
+        let natural_long_reason =
+            "The authorization check is bypassed when the cached administrator flag is stale.";
+        assert!(natural_long_reason.chars().count() > 60);
+        let input = serde_json::json!([{
+            "confidence": 0.7,
+            "kind": "risk",
+            "reason": natural_long_reason,
+        }]);
+        assert_eq!(parse_scores(&input.to_string(), 1).unwrap().len(), 1);
 
         let lowercase = parse_scores(
             r#"[{"confidence":0.7,"kind":"risk","reason":"The first condition fails. the second condition also fails."}]"#,
@@ -5533,7 +5538,7 @@ mod tests {
         assert_eq!(schema["items"]["properties"]["reason"]["minLength"], 1);
         assert_eq!(
             schema["items"]["properties"]["reason"]["maxLength"],
-            SCORER_REASON_MAX_CHARS
+            SCORER_REASON_SCHEMA_MAX_CHARS
         );
         assert_eq!(
             schema["items"]["properties"]["reason"]["pattern"],

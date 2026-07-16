@@ -2,11 +2,14 @@
 
 use crate::config::Config;
 
-/// Hard validator boundaries for scorer assessment text.
-pub(crate) const SCORER_REASON_MAX_CHARS: usize = 60;
+/// Prompt target leaves headroom below the hard parser boundary.
+pub(crate) const SCORER_REASON_PROMPT_MAX_BYTES: usize = 180;
+/// Hard validator boundary for scorer assessment text.
 pub(crate) const SCORER_REASON_MAX_BYTES: usize = 240;
+/// JSON Schema counts code points, so runtime byte validation remains authoritative.
+pub(crate) const SCORER_REASON_SCHEMA_MAX_CHARS: usize = 240;
 pub(crate) const SCORER_REASON_JSON_PATTERN: &str = r"^(?:[.!?。！？]|[^\s\u0000-\u001F\u007F-\u009F\u2028\u2029](?:[^\u0000-\u001F\u007F-\u009F\u2028\u2029]*[.!?。！？]))$";
-const _: () = assert!(SCORER_REASON_MAX_BYTES >= SCORER_REASON_MAX_CHARS * 4);
+const _: () = assert!(SCORER_REASON_PROMPT_MAX_BYTES < SCORER_REASON_MAX_BYTES);
 
 pub struct PrContext<'a> {
     pub repo: Option<&'a str>,
@@ -170,7 +173,7 @@ pub fn scorer_system_prompt(cfg: &Config) -> String {
          exactly one object per supplied finding, in the same order as the input:\n\
          [{{\"confidence\": <0..1>, \
          \"kind\": \"risk|humanEscalation|guardrail|uncertainty|contentPolicy\", \
-         \"reason\": \"concise single-line text of at most {SCORER_REASON_MAX_CHARS} Unicode characters and {SCORER_REASON_MAX_BYTES} UTF-8 bytes\"}}]\n\
+         \"reason\": \"concise single-line text of at most {SCORER_REASON_PROMPT_MAX_BYTES} UTF-8 bytes\"}}]\n\
          \n\
          Array position is the finding index. Do not emit an `index` field. The `kind` \
          value is a finding category. `info`, `warn`, and `error` are \
@@ -179,9 +182,8 @@ pub fn scorer_system_prompt(cfg: &Config) -> String {
          `humanEscalation` only when multiple valid outcomes remain and an accountable \
          owner must choose among them. Every `reason` must be concise single-line text, \
          start with a non-whitespace character, end with sentence punctuation, \
-         contain no control characters or line separators, and contain \
-         at most {SCORER_REASON_MAX_CHARS} Unicode characters and \
-         {SCORER_REASON_MAX_BYTES} UTF-8 bytes.\n\
+         contain no control characters or line separators, and contain at most \
+         {SCORER_REASON_PROMPT_MAX_BYTES} UTF-8 bytes.\n\
          \n\
          The input intentionally omits the generator's original confidence and kind. Do \
          not infer them from absence; score independently from the finding text and local \
@@ -386,8 +388,7 @@ mod tests {
     fn scorer_prompt_states_the_exact_reason_limits() {
         let prompt = scorer_system_prompt(&Config::default());
         assert!(prompt.contains(&format!(
-            "at most {SCORER_REASON_MAX_CHARS} Unicode characters and \
-             {SCORER_REASON_MAX_BYTES} UTF-8 bytes"
+            "at most {SCORER_REASON_PROMPT_MAX_BYTES} UTF-8 bytes"
         )));
     }
 

@@ -2681,10 +2681,10 @@ async fn generic_provider_repairs_each_malformed_ordered_scorer_shape() {
         "kind": "risk",
         "reason": "This is a concrete defect."
     }]);
-    let unicode_overflow = json!([{
+    let byte_overflow = json!([{
         "confidence": 0.75,
         "kind": "risk",
-        "reason": format!("{}。", "界".repeat(60))
+        "reason": format!("{}。", "界".repeat(80))
     }])
     .to_string();
     let cases = [
@@ -2725,7 +2725,7 @@ async fn generic_provider_repairs_each_malformed_ordered_scorer_shape() {
             "missing-punctuation",
             r#"[{"confidence":0.75,"kind":"risk","reason":"This reason is incomplete"}]"#.to_string(),
         ),
-        ("unicode-overflow", unicode_overflow),
+        ("byte-overflow", byte_overflow),
     ];
 
     for (label, malformed) in cases {
