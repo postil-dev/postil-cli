@@ -267,8 +267,9 @@ impl ModelError {
             Category::OutputInvalidAfterSchemaRepair
         } else if self.error.chain().any(|cause| {
             cause
-                .downcast_ref::<NonTerminalModelResponse>()
-                .is_some_and(|response| response.reason == "length")
+                .downcast_ref::<ModelContentFailure>()
+                .and_then(ModelContentFailure::nonterminal)
+                .is_some_and(|(_, reason)| reason == "length")
         }) {
             Category::OutputNonterminalLength
         } else if self.is_deadline_exceeded() {
@@ -281,13 +282,7 @@ impl ModelError {
                 .is_some_and(reqwest::Error::is_connect)
         }) {
             Category::ProviderTransport
-        } else if self.error.downcast_ref::<EmptyModelResponse>().is_some()
-            || self.error.downcast_ref::<MissingModelChoices>().is_some()
-            || self
-                .error
-                .downcast_ref::<NonTerminalModelResponse>()
-                .is_some()
-        {
+        } else if self.error.downcast_ref::<ModelContentFailure>().is_some() {
             Category::InvalidOutput
         } else {
             Category::ProviderUnclassified
@@ -928,50 +923,44 @@ struct ChatSuccess {
 }
 
 #[derive(Debug)]
-struct EmptyModelResponse;
+// Every failure derived from assistant content in a successful provider
+// response belongs here. The classifier treats this enum as operational and
+// treats every other unmarked chat error as a provider failure.
+enum ModelContentFailure {
+    Empty,
+    MissingChoices,
+    NonTerminal { content: String, reason: String },
+}
 
-impl std::fmt::Display for EmptyModelResponse {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("model response had no choices/content")
+impl ModelContentFailure {
+    fn nonterminal(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::NonTerminal { content, reason } => Some((content, reason)),
+            Self::Empty | Self::MissingChoices => None,
+        }
+    }
+
+    fn retryable_empty(&self) -> bool {
+        matches!(self, Self::Empty | Self::MissingChoices)
     }
 }
 
-impl std::error::Error for EmptyModelResponse {}
-
-#[derive(Debug)]
-struct MissingModelChoices;
-
-impl std::fmt::Display for MissingModelChoices {
+impl std::fmt::Display for ModelContentFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("model response had no choices")
+        match self {
+            Self::Empty => formatter.write_str("model response had no choices/content"),
+            Self::MissingChoices => formatter.write_str("model response had no choices"),
+            Self::NonTerminal { reason, .. } => {
+                write!(formatter, "model response was nonterminal ({reason})")
+            }
+        }
     }
 }
 
-impl std::error::Error for MissingModelChoices {}
-
-#[derive(Debug)]
-struct NonTerminalModelResponse {
-    content: String,
-    reason: String,
-}
-
-impl std::fmt::Display for NonTerminalModelResponse {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "model response was nonterminal ({})",
-            self.reason
-        )
-    }
-}
-
-impl std::error::Error for NonTerminalModelResponse {}
+impl std::error::Error for ModelContentFailure {}
 
 fn classify_chat_error(error: anyhow::Error) -> anyhow::Error {
-    if error.downcast_ref::<EmptyModelResponse>().is_some()
-        || error.downcast_ref::<MissingModelChoices>().is_some()
-        || error.downcast_ref::<NonTerminalModelResponse>().is_some()
-    {
+    if error.downcast_ref::<ModelContentFailure>().is_some() {
         error
     } else {
         error.context(ProviderError)
@@ -2140,11 +2129,18 @@ impl LlmClient {
             .await;
         let (content, nonterminal_reason) = match initial {
             Ok(content) => (content, None),
-            Err(error) if error.downcast_ref::<NonTerminalModelResponse>().is_some() => {
+            Err(error)
+                if error
+                    .downcast_ref::<ModelContentFailure>()
+                    .is_some_and(|failure| failure.nonterminal().is_some()) =>
+            {
                 let response = error
-                    .downcast_ref::<NonTerminalModelResponse>()
+                    .downcast_ref::<ModelContentFailure>()
                     .expect("checked nonterminal response");
-                (response.content.clone(), Some(response.reason.clone()))
+                let (content, reason) = response
+                    .nonterminal()
+                    .expect("checked nonterminal response");
+                (content.to_string(), Some(reason.to_string()))
             }
             Err(e) => {
                 let complete = usage_accounting_complete
@@ -2797,8 +2793,9 @@ impl LlmClient {
                                 if summary.usage.is_none() {
                                     *usage_accounting_complete = false;
                                 }
-                                if (error.downcast_ref::<EmptyModelResponse>().is_some()
-                                    || error.downcast_ref::<MissingModelChoices>().is_some())
+                                if error
+                                    .downcast_ref::<ModelContentFailure>()
+                                    .is_some_and(ModelContentFailure::retryable_empty)
                                     && empty_response_retries < EMPTY_RESPONSE_RETRIES
                                     && retries < TRANSIENT_RETRIES
                                 {
@@ -3067,17 +3064,17 @@ impl LlmClient {
                     .choices
                     .into_iter()
                     .next()
-                    .ok_or_else(|| anyhow::Error::new(MissingModelChoices))?;
+                    .ok_or_else(|| anyhow::Error::new(ModelContentFailure::MissingChoices))?;
                 let content = choice
                     .message
                     .content
                     .filter(|content| !content.trim().is_empty())
-                    .ok_or_else(|| anyhow::Error::new(EmptyModelResponse))?;
+                    .ok_or_else(|| anyhow::Error::new(ModelContentFailure::Empty))?;
                 let reason = choice
                     .finish_reason
                     .unwrap_or_else(|| "missing finish_reason".to_string());
                 if reason != "stop" {
-                    return Err(anyhow::Error::new(NonTerminalModelResponse {
+                    return Err(anyhow::Error::new(ModelContentFailure::NonTerminal {
                         content,
                         reason,
                     }));
@@ -3103,9 +3100,9 @@ impl LlmClient {
                     .collect::<Vec<_>>()
                     .join("\n");
                 if content.is_empty() {
-                    Err(anyhow::Error::new(EmptyModelResponse))
+                    Err(anyhow::Error::new(ModelContentFailure::Empty))
                 } else if !matches!(stop_reason.as_str(), "end_turn" | "stop_sequence") {
-                    Err(anyhow::Error::new(NonTerminalModelResponse {
+                    Err(anyhow::Error::new(ModelContentFailure::NonTerminal {
                         content,
                         reason: stop_reason,
                     }))
@@ -4339,6 +4336,35 @@ mod tests {
                 std::env::set_var(name, value);
             }
         }
+    }
+
+    #[test]
+    fn every_model_content_failure_is_operational_and_never_advisory_bypassable() {
+        let failures = [
+            ModelContentFailure::Empty,
+            ModelContentFailure::MissingChoices,
+            ModelContentFailure::NonTerminal {
+                content: "partial".to_string(),
+                reason: "length".to_string(),
+            },
+        ];
+        for failure in failures {
+            let error = ModelError::new(
+                classify_chat_error(anyhow::Error::new(failure)),
+                Usage::default(),
+                false,
+            );
+            assert!(!error.is_provider());
+            assert_eq!(safe_model_error_category(&error), "invalid-output");
+        }
+
+        let provider = ModelError::new(
+            classify_chat_error(anyhow!("provider transport failed")),
+            Usage::default(),
+            false,
+        );
+        assert!(provider.is_provider());
+        assert_eq!(safe_model_error_category(&provider), "provider");
     }
 
     #[test]
@@ -6294,9 +6320,10 @@ mod tests {
             let error = client
                 .parse_response(body, &mut Usage::default())
                 .unwrap_err();
-            let partial = error.downcast_ref::<NonTerminalModelResponse>().unwrap();
-            assert_eq!(partial.reason, expected);
-            assert!(partial.content.contains("findings"));
+            let partial = error.downcast_ref::<ModelContentFailure>().unwrap();
+            let (content, reason) = partial.nonterminal().unwrap();
+            assert_eq!(reason, expected);
+            assert!(content.contains("findings"));
         }
     }
 
@@ -6328,9 +6355,10 @@ mod tests {
             let error = client
                 .parse_response(body, &mut Usage::default())
                 .unwrap_err();
-            let partial = error.downcast_ref::<NonTerminalModelResponse>().unwrap();
-            assert_eq!(partial.reason, expected);
-            assert!(partial.content.contains("findings"));
+            let partial = error.downcast_ref::<ModelContentFailure>().unwrap();
+            let (content, reason) = partial.nonterminal().unwrap();
+            assert_eq!(reason, expected);
+            assert!(content.contains("findings"));
         }
     }
 
