@@ -105,6 +105,64 @@ pub struct ModelError {
     usage_accounting_complete: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum AtomicAttributionIdentityFailure {
+    Missing,
+    Mismatch,
+}
+
+impl std::fmt::Display for AtomicAttributionIdentityFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing => formatter.write_str("atomic attribution response identity is missing"),
+            Self::Mismatch => {
+                formatter.write_str("atomic attribution response identity does not match")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AtomicAttributionIdentityFailure {}
+
+#[cfg(feature = "qualification-candidate")]
+#[derive(Debug)]
+struct AtomicAttributionInvalidOutput;
+
+#[cfg(feature = "qualification-candidate")]
+impl std::fmt::Display for AtomicAttributionInvalidOutput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("atomic attribution output is invalid after schema repair")
+    }
+}
+
+#[cfg(feature = "qualification-candidate")]
+impl std::error::Error for AtomicAttributionInvalidOutput {}
+
+#[cfg(feature = "qualification-candidate")]
+#[derive(Debug)]
+struct AtomicAttributionRequestTooLarge;
+
+#[cfg(feature = "qualification-candidate")]
+impl std::fmt::Display for AtomicAttributionRequestTooLarge {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("atomic attribution provider request is too large")
+    }
+}
+
+#[cfg(feature = "qualification-candidate")]
+impl std::error::Error for AtomicAttributionRequestTooLarge {}
+
+#[derive(Debug)]
+struct ProviderHttpFailure(reqwest::StatusCode);
+
+impl std::fmt::Display for ProviderHttpFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "model endpoint returned {}", self.0)
+    }
+}
+
+impl std::error::Error for ProviderHttpFailure {}
+
 impl ModelError {
     fn new(error: anyhow::Error, usage: Usage, usage_accounting_complete: bool) -> Self {
         Self {
@@ -152,6 +210,10 @@ impl ModelError {
 
     pub fn is_provider(&self) -> bool {
         self.error.downcast_ref::<ProviderError>().is_some()
+            || self
+                .error
+                .chain()
+                .any(|cause| cause.downcast_ref::<ProviderHttpFailure>().is_some())
     }
 
     fn is_timeout(&self) -> bool {
@@ -161,11 +223,97 @@ impl ModelError {
                 .is_some_and(reqwest::Error::is_timeout)
                 || cause.downcast_ref::<RequestTimedOut>().is_some()
                 || cause.downcast_ref::<DeadlineExceeded>().is_some()
+                || cause
+                    .downcast_ref::<ProviderHttpFailure>()
+                    .is_some_and(|failure| timeout_status(failure.0.as_u16()))
         })
     }
 
     fn is_deadline_exceeded(&self) -> bool {
         self.error.downcast_ref::<DeadlineExceeded>().is_some()
+    }
+
+    #[cfg(feature = "qualification-candidate")]
+    pub(crate) fn atomic_attribution_terminal_diagnostic(
+        &self,
+    ) -> crate::attribution::AttributionTerminalDiagnostic {
+        use crate::attribution::{
+            AttributionTerminalCategory as Category, AttributionTerminalDiagnostic,
+        };
+
+        let category = if let Some(status) = self.error.downcast_ref::<ProviderHttpFailure>() {
+            Category::ProviderHttp {
+                status: status.0.as_u16(),
+            }
+        } else if self
+            .error
+            .downcast_ref::<AtomicAttributionRequestTooLarge>()
+            .is_some()
+        {
+            Category::ProviderRequestTooLarge
+        } else if let Some(identity) = self
+            .error
+            .downcast_ref::<AtomicAttributionIdentityFailure>()
+        {
+            match identity {
+                AtomicAttributionIdentityFailure::Missing => Category::ResponseIdentityMissing,
+                AtomicAttributionIdentityFailure::Mismatch => Category::ResponseIdentityMismatch,
+            }
+        } else if self
+            .error
+            .downcast_ref::<AtomicAttributionInvalidOutput>()
+            .is_some()
+        {
+            Category::OutputInvalidAfterSchemaRepair
+        } else if self.error.chain().any(|cause| {
+            cause
+                .downcast_ref::<NonTerminalModelResponse>()
+                .is_some_and(|response| response.reason == "length")
+        }) {
+            Category::OutputNonterminalLength
+        } else if self.is_deadline_exceeded() {
+            Category::ProviderDeadline
+        } else if self.is_timeout() {
+            Category::ProviderTimeout
+        } else if self.error.chain().any(|cause| {
+            cause
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(reqwest::Error::is_connect)
+        }) {
+            Category::ProviderTransport
+        } else if self.error.downcast_ref::<EmptyModelResponse>().is_some()
+            || self.error.downcast_ref::<MissingModelChoices>().is_some()
+            || self
+                .error
+                .downcast_ref::<NonTerminalModelResponse>()
+                .is_some()
+        {
+            Category::InvalidOutput
+        } else {
+            Category::ProviderUnclassified
+        };
+        let identity = self
+            .error
+            .downcast_ref::<AtomicAttributionIdentityFailure>();
+        let terminal_usage = self.model_usage.last();
+        AttributionTerminalDiagnostic {
+            version: 1,
+            category,
+            phase: crate::attribution::AttributionTerminalPhase::Attribution,
+            provider_attempt_count: Some(self.model_usage.len()),
+            identity_present: identity
+                .map(|failure| matches!(failure, AtomicAttributionIdentityFailure::Mismatch)),
+            identity_matched: identity.and_then(|failure| match failure {
+                AtomicAttributionIdentityFailure::Missing => None,
+                AtomicAttributionIdentityFailure::Mismatch => Some(false),
+            }),
+            usage_present: terminal_usage.map(|usage| {
+                usage.prompt_tokens > 0
+                    || usage.completion_tokens > 0
+                    || usage.cost_provider_decimal.is_some()
+            }),
+            usage_accounting_complete: terminal_usage.map(|usage| usage.accounting_complete),
+        }
     }
 }
 
@@ -1910,7 +2058,7 @@ impl LlmClient {
         let mut response_identities = vec![first_identity];
         let verdict = match parse_atomic_attribution(&first.content) {
             Ok(verdict) => verdict,
-            Err(first_error) => {
+            Err(_) => {
                 let repair_system = atomic_attribution_repair_system(system);
                 let repair_user = atomic_attribution_repair_user(user, &first.content);
                 let second = client
@@ -1943,11 +2091,9 @@ impl LlmClient {
                     )?;
                 raw_responses.push(second.content.clone());
                 response_identities.push(second_identity);
-                parse_atomic_attribution(&second.content).map_err(|second_error| {
+                parse_atomic_attribution(&second.content).map_err(|_| {
                     let mut result = ModelError::new(
-                        anyhow!(
-                            "atomic attribution output invalid after schema repair: {second_error} (first response: {first_error})"
-                        ),
+                        anyhow::Error::new(AtomicAttributionInvalidOutput),
                         usage,
                         usage_accounting_complete,
                     );
@@ -2573,22 +2719,19 @@ impl LlmClient {
                                 .as_ref()
                                 .and_then(|identity| identity.0.as_deref())
                                 .ok_or_else(|| {
-                                    anyhow!("qualification response omitted model identity")
+                                    anyhow::Error::new(AtomicAttributionIdentityFailure::Missing)
                                 })?;
                             let returned_provider = actual_identity
                                 .as_ref()
                                 .and_then(|identity| identity.1.as_deref())
                                 .ok_or_else(|| {
-                                    anyhow!("qualification response omitted provider identity")
+                                    anyhow::Error::new(AtomicAttributionIdentityFailure::Missing)
                                 })?;
-                            ensure!(
-                                returned_model == model,
-                                "qualification response model identity mismatch"
-                            );
-                            ensure!(
-                                returned_provider == expected_provider,
-                                "qualification response provider identity mismatch"
-                            );
+                            if returned_model != model || returned_provider != expected_provider {
+                                return Err(anyhow::Error::new(
+                                    AtomicAttributionIdentityFailure::Mismatch,
+                                ));
+                            }
                         }
                         eprintln!(
                             "postil: llm response phase={} model={} attempt={} status={} elapsed={} bytes={} request_id={} response_id={} returned_model={} provider={} choices={} finish={} usage={} prompt_tokens={} completion_tokens={} reasoning_tokens={} category={}",
@@ -2755,7 +2898,7 @@ impl LlmClient {
                             &summary,
                             response.request_id.as_deref(),
                         );
-                        return Err(anyhow::Error::new(RequestTimedOut).context(detail));
+                        return Err(anyhow::Error::new(ProviderHttpFailure(status)).context(detail));
                     }
                     if retryable_status(status.as_u16()) && retries < TRANSIENT_RETRIES {
                         retries += 1;
@@ -2773,11 +2916,13 @@ impl LlmClient {
                         attempt_timeout = self.request_timeout;
                         continue;
                     }
-                    return Err(anyhow!(provider_http_status_detail(
-                        status,
-                        &summary,
-                        response.request_id.as_deref(),
-                    )));
+                    return Err(anyhow::Error::new(ProviderHttpFailure(status)).context(
+                        provider_http_status_detail(
+                            status,
+                            &summary,
+                            response.request_id.as_deref(),
+                        ),
+                    ));
                 }
                 Err(error)
                     if reqwest_error(&error).is_some_and(reqwest::Error::is_timeout)
@@ -2833,11 +2978,9 @@ impl LlmClient {
     fn ensure_atomic_attribution_request_size(body: &serde_json::Value) -> Result<()> {
         let bytes =
             serde_json::to_vec(body).context("serialize atomic attribution provider request")?;
-        ensure!(
-            bytes.len() <= crate::attribution::MAX_PROVIDER_REQUEST_BYTES,
-            "atomic attribution provider request exceeds {} bytes",
-            crate::attribution::MAX_PROVIDER_REQUEST_BYTES,
-        );
+        if bytes.len() > crate::attribution::MAX_PROVIDER_REQUEST_BYTES {
+            return Err(anyhow::Error::new(AtomicAttributionRequestTooLarge));
+        }
         Ok(())
     }
 
@@ -3373,19 +3516,16 @@ fn require_attribution_identity(
     let returned_model = success
         .returned_model
         .as_deref()
-        .ok_or_else(|| anyhow!("atomic attribution response omitted model identity"))?;
+        .ok_or_else(|| anyhow::Error::new(AtomicAttributionIdentityFailure::Missing))?;
     let returned_provider = success
         .provider
         .as_deref()
-        .ok_or_else(|| anyhow!("atomic attribution response omitted provider identity"))?;
-    ensure!(
-        returned_model == expected_model,
-        "atomic attribution response model identity mismatch"
-    );
-    ensure!(
-        returned_provider == expected_provider,
-        "atomic attribution response provider identity mismatch"
-    );
+        .ok_or_else(|| anyhow::Error::new(AtomicAttributionIdentityFailure::Missing))?;
+    if returned_model != expected_model || returned_provider != expected_provider {
+        return Err(anyhow::Error::new(
+            AtomicAttributionIdentityFailure::Mismatch,
+        ));
+    }
     Ok(AtomicAttributionResponseIdentity {
         model: returned_model.to_string(),
         provider: returned_provider.to_string(),

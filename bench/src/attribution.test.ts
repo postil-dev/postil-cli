@@ -15,6 +15,7 @@ import {
   attributionContractSha256,
   attributionEvidenceSha256,
   exactRegionOverlap,
+  parseTerminalDiagnostic,
   projectedAttributionDecisionCostUsd,
   replayAttributionEvidence,
   type AttributionCallEvidence,
@@ -228,7 +229,8 @@ console.log(JSON.stringify({ sameDefect: true, reason: "Both identify the same r
       await writeFile(binary, `#!/usr/bin/env bun
 process.stderr.write("private-prompt-and-response ".repeat(100));
 process.stderr.write("\\npostil: llm response phase=attribution status=200\\n");
-process.stderr.write("postil: error: atomic attribution failed: atomic attribution output invalid after schema repair: invalid reason\\n");
+process.stderr.write('postil:atomic-attribution-terminal:v1:{"version":1,"category":"output-invalid-after-schema-repair","phase":"attribution","providerAttemptCount":1,"identityPresent":null,"identityMatched":null,"usagePresent":null,"usageAccountingComplete":null}\\n');
+process.stderr.write("postil: error: atomic attribution output is invalid after schema repair\\n");
 process.exit(1);
 `);
       await chmod(binary, 0o700);
@@ -246,13 +248,57 @@ process.exit(1);
         projectedCostUsdDecimal: "0.01",
       });
       expect(result.error).toBe(
-        "atomic attribution transport failed: category=output-invalid-after-schema-repair exit=1 signal=none killed=false",
+        "atomic attribution subprocess failed (output-invalid-after-schema-repair)",
       );
       expect(result.error).not.toContain("private-prompt-and-response");
       expect(result.error).not.toContain("invalid reason");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  });
+
+  test("accepts exactly one strict terminal diagnostic record", () => {
+    const record = "postil:atomic-attribution-terminal:v1:" + JSON.stringify({
+      version: 1,
+      category: "provider-http-429",
+      phase: "attribution",
+      providerAttemptCount: 3,
+      identityPresent: false,
+      identityMatched: null,
+      usagePresent: false,
+      usageAccountingComplete: false,
+    });
+    expect(parseTerminalDiagnostic(`ordinary log\n${record}\nordinary error`)).toEqual({
+      version: 1,
+      category: "provider-http-429",
+      phase: "attribution",
+      providerAttemptCount: 3,
+      identityPresent: false,
+      identityMatched: null,
+      usagePresent: false,
+      usageAccountingComplete: false,
+    });
+    expect(parseTerminalDiagnostic(`${record}\n${record}`)).toBeNull();
+    expect(parseTerminalDiagnostic(`${record} forged-suffix`)).toBeNull();
+    expect(parseTerminalDiagnostic(`forged-prefix ${record}`)).toBeNull();
+  });
+
+  test("rejects contradictory or prose-derived terminal facts", () => {
+    const invalid = (overrides: Record<string, unknown>) =>
+      "postil:atomic-attribution-terminal:v1:" + JSON.stringify({
+        version: 1,
+        category: "provider-unclassified",
+        phase: "attribution",
+        providerAttemptCount: null,
+        identityPresent: null,
+        identityMatched: null,
+        usagePresent: null,
+        usageAccountingComplete: null,
+        ...overrides,
+      });
+    expect(parseTerminalDiagnostic(invalid({ identityPresent: false, identityMatched: true }))).toBeNull();
+    expect(parseTerminalDiagnostic(invalid({ usagePresent: false, usageAccountingComplete: true }))).toBeNull();
+    expect(parseTerminalDiagnostic("postil: error: provider returned 429 with private detail")).toBeNull();
   });
 
   test("enforces one global concurrency, provider-call, and spend budget", async () => {

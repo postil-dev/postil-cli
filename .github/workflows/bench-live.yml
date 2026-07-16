@@ -124,33 +124,50 @@ jobs:
             echo '```'
             bun -e '
               const { parseLiveModelsReport } = await import("./src/livemodels.ts");
-              const r = parseLiveModelsReport(await Bun.file(process.env.POSTIL_REPORT_OUT).json());
-              const pct = (value) => (value * 100).toFixed(1) + "%";
-              const pad = (value, width) => String(value).length >= width
-                ? String(value)
-                : String(value) + " ".repeat(width - String(value).length);
-              console.log([
-                pad("profile", 52), pad("block", 8), pad("final", 8),
-                pad("advisory", 9), pad("overblock", 10), pad("clean FP", 9),
-                pad("$/review", 12), pad("p95 ms", 8), pad("pass", 5),
-              ].join(" "));
-              for (const a of r.modelAggregates) {
+              const { parseLiveModelsFailureReport } = await import("./src/run.ts");
+              const raw = await Bun.file(process.env.POSTIL_REPORT_OUT).json();
+              if (raw?.artifactType === "live-models-failure") {
+                const failure = parseLiveModelsFailureReport(raw);
+                const fact = (value) => value === null ? "unknown" : String(value);
+                console.log("category " + failure.process.category);
+                console.log("phase " + failure.process.phase);
+                console.log("provider attempts " + fact(failure.process.providerAttemptCount));
+                console.log("identity present " + fact(failure.process.identityPresent));
+                console.log("identity matched " + fact(failure.process.identityMatched));
+                console.log("usage present " + fact(failure.process.usagePresent));
+                console.log("usage complete " + fact(failure.process.usageAccountingComplete));
+                console.log("exit " + fact(failure.process.exitCode));
+                console.log("signal " + fact(failure.process.signal));
+                console.log("killed " + fact(failure.process.killed));
+              } else {
+                const r = parseLiveModelsReport(raw);
+                const pct = (value) => (value * 100).toFixed(1) + "%";
+                const pad = (value, width) => String(value).length >= width
+                  ? String(value)
+                  : String(value) + " ".repeat(width - String(value).length);
                 console.log([
-                  pad(a.id, 52), pad(pct(a.mustBlockRecall), 8),
-                  pad(pct(a.mustBlockFinalBlockingRate), 8),
-                  pad(pct(a.advisoryDetectionRate), 9),
-                  pad(pct(a.advisoryOverblockRate), 10),
-                  pad(pct(a.cleanFindingFalsePositiveRate), 9),
-                  pad(a.pricingKnown ? "$" + a.meanCostUsdPerReview.toFixed(6) : "unknown", 12),
-                  pad(a.p95DurationMs.toFixed(0), 8), pad(a.passed ? "yes" : "no", 5),
+                  pad("profile", 52), pad("block", 8), pad("final", 8),
+                  pad("advisory", 9), pad("overblock", 10), pad("clean FP", 9),
+                  pad("$/review", 12), pad("p95 ms", 8), pad("pass", 5),
                 ].join(" "));
-                for (const failure of a.admissionFailures) console.log("  FAIL: " + failure);
+                for (const a of r.modelAggregates) {
+                  console.log([
+                    pad(a.id, 52), pad(pct(a.mustBlockRecall), 8),
+                    pad(pct(a.mustBlockFinalBlockingRate), 8),
+                    pad(pct(a.advisoryDetectionRate), 9),
+                    pad(pct(a.advisoryOverblockRate), 10),
+                    pad(pct(a.cleanFindingFalsePositiveRate), 9),
+                    pad(a.pricingKnown ? "$" + a.meanCostUsdPerReview.toFixed(6) : "unknown", 12),
+                    pad(a.p95DurationMs.toFixed(0), 8), pad(a.passed ? "yes" : "no", 5),
+                  ].join(" "));
+                  for (const failure of a.admissionFailures) console.log("  FAIL: " + failure);
+                }
+                console.log("");
+                console.log("Repeats " + r.repeats + " | total $" + r.totalRunCostUsd.toFixed(6));
+                console.log("CLI " + r.cliVersion + " | " + r.evaluatorRuntimeIdentity);
+                console.log("Endpoint " + r.providerEndpointIdentity + " | " + r.apiFormat);
+                console.log("Manifest " + (r.manifestCandidate ? "emitted" : "not admitted"));
               }
-              console.log("");
-              console.log("Repeats " + r.repeats + " | total $" + r.totalRunCostUsd.toFixed(6));
-              console.log("CLI " + r.cliVersion + " | " + r.evaluatorRuntimeIdentity);
-              console.log("Endpoint " + r.providerEndpointIdentity + " | " + r.apiFormat);
-              console.log("Manifest " + (r.manifestCandidate ? "emitted" : "not admitted"));
             '
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

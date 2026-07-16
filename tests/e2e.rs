@@ -5,6 +5,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use assert_cmd::Command;
+#[cfg(feature = "qualification-candidate")]
+use predicates::prelude::PredicateBooleanExt;
 use serde_json::{Value, json};
 use wiremock::matchers::{body_string_contains, header, method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
@@ -2856,9 +2858,13 @@ async fn hidden_atomic_attribution_never_expands_an_empty_length_retry() {
         .arg(&input)
         .assert()
         .failure()
-        .stderr(predicates::str::contains(
-            "atomic attribution usage evidence is incomplete or inconsistent",
-        ));
+        .stderr(
+            predicates::str::contains("atomic attribution usage accounting is incomplete").and(
+                predicates::str::contains(
+                    "postil:atomic-attribution-terminal:v1:{\"category\":\"usage-accounting-incomplete\"",
+                ),
+            ),
+        );
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     let requests = server.received_requests().await.unwrap();
     assert_eq!(requests.len(), 2);
@@ -2870,6 +2876,82 @@ async fn hidden_atomic_attribution_never_expands_an_empty_length_retry() {
                 <= postil_cli::attribution::MAX_PROVIDER_REQUEST_BYTES
         );
     }
+}
+
+#[cfg(feature = "qualification-candidate")]
+#[tokio::test]
+async fn hidden_atomic_attribution_reports_terminal_length_response() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "model": "provider/scorer",
+            "provider": "test-provider",
+            "choices": [{
+                "finish_reason": "length",
+                "message": {"content": "{\"sameDefect\":true"}
+            }],
+            "usage": {"prompt_tokens": 30, "completion_tokens": 180, "cost": 0.000045}
+        })))
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let (profile, input) = write_atomic_attribution_inputs(dir.path());
+    postil()
+        .current_dir(dir.path())
+        .env(
+            "POSTIL_API_BASE",
+            postil_cli::config::MANAGED_OPENROUTER_API_BASE,
+        )
+        .env("CI", "true")
+        .env("GITHUB_API_URL", "http://127.0.0.1:9")
+        .env("POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY", "1")
+        .env("POSTIL_QUALIFICATION_CANDIDATE_PROFILE", &profile)
+        .env("POSTIL_QUALIFICATION_CAPTURE_API_BASE", server.uri())
+        .env("POSTIL_ALLOW_PRIVATE_API_BASE", "1")
+        .env("REVIEW_SCORER_MODEL", "provider/scorer")
+        .args(["atomic-attribution", "--input"])
+        .arg(&input)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "postil:atomic-attribution-terminal:v1:{\"category\":\"output-nonterminal-length\"",
+        ));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[cfg(feature = "qualification-candidate")]
+#[tokio::test]
+async fn hidden_atomic_attribution_reports_terminal_provider_http_status() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "0"))
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let (profile, input) = write_atomic_attribution_inputs(dir.path());
+    postil()
+        .current_dir(dir.path())
+        .env(
+            "POSTIL_API_BASE",
+            postil_cli::config::MANAGED_OPENROUTER_API_BASE,
+        )
+        .env("CI", "true")
+        .env("GITHUB_API_URL", "http://127.0.0.1:9")
+        .env("POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY", "1")
+        .env("POSTIL_QUALIFICATION_CANDIDATE_PROFILE", &profile)
+        .env("POSTIL_QUALIFICATION_CAPTURE_API_BASE", server.uri())
+        .env("POSTIL_ALLOW_PRIVATE_API_BASE", "1")
+        .env("REVIEW_SCORER_MODEL", "provider/scorer")
+        .args(["atomic-attribution", "--input"])
+        .arg(&input)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "postil:atomic-attribution-terminal:v1:{\"category\":\"provider-http-429\"",
+        ));
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
 }
 
 #[cfg(feature = "qualification-candidate")]
@@ -2946,7 +3028,13 @@ async fn hidden_atomic_attribution_rejects_oversized_repair_before_second_provid
         .arg(&input)
         .assert()
         .failure()
-        .stderr(predicates::str::contains("model provider request failed"));
+        .stderr(
+            predicates::str::contains("model provider request failed").and(
+                predicates::str::contains(
+                    "postil:atomic-attribution-terminal:v1:{\"category\":\"provider-request-too-large\"",
+                ),
+            ),
+        );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
@@ -3067,9 +3155,11 @@ async fn hidden_atomic_attribution_rejects_provider_substitution() {
         .arg(&input)
         .assert()
         .failure()
-        .stderr(predicates::str::contains(
-            "atomic attribution failed: model provider request failed",
-        ));
+        .stderr(
+            predicates::str::contains("atomic attribution response identity does not match").and(
+                predicates::str::contains("postil:atomic-attribution-terminal:v1:"),
+            ),
+        );
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
