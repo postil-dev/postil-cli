@@ -310,6 +310,8 @@ pub struct QualificationMetadata {
     pub consensus: usize,
     pub scorer_chain: Vec<String>,
     pub hosted_operation_cost_cap_micros: u64,
+    pub attribution_max_input_bytes: u64,
+    pub attribution_max_provider_request_bytes: usize,
     pub admitted_profile: Option<QualificationProfile>,
 }
 
@@ -341,6 +343,8 @@ fn qualification_metadata_for(
         consensus: defaults.consensus,
         scorer_chain,
         hosted_operation_cost_cap_micros: HOSTED_OPERATION_COST_CAP_MICROS,
+        attribution_max_input_bytes: crate::attribution::MAX_INPUT_BYTES,
+        attribution_max_provider_request_bytes: crate::attribution::MAX_PROVIDER_REQUEST_BYTES,
         admitted_profile,
     }
 }

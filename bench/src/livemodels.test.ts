@@ -12,6 +12,7 @@ import {
   assertPricingProviderIdentity,
   assertExactQualificationFixtures,
   assertQualificationInputsUnchanged,
+  assertRuntimeShapedQualificationPreflight,
   benchmarkProviderIdentityFor,
   canonicalQualificationCostCap,
   endpointAuthFromEnvironment,
@@ -36,7 +37,11 @@ import {
   withImmutableQualificationBinary,
   type LiveModelsReport,
 } from "./livemodels";
-import type { QualificationPair } from "./livemodels-score";
+import {
+  compareCanonicalDecimals,
+  parseCanonicalDecimal,
+  type QualificationPair,
+} from "./livemodels-score";
 
 const pair: QualificationPair = { generatorModel: "test/generator", scorerModel: "test/scorer" };
 
@@ -295,9 +300,9 @@ describe("pair qualification configuration", () => {
       binary: "/missing/postil",
       pairs: [pair],
       pricing: new Map(),
-      costCapUsd: 36,
+      costCapUsd: 56,
       upstreamProvider: "PinnedProvider",
-    })).rejects.toThrow("cost cap must be greater than zero and at most $35");
+    })).rejects.toThrow("cost cap must be greater than zero and at most $55");
 
     const pairs = Array.from({ length: 7 }, (_, index) => ({
       generatorModel: `generator/${index}`,
@@ -311,6 +316,138 @@ describe("pair qualification configuration", () => {
     })).rejects.toThrow("at most 6 candidates");
 
   });
+
+  test("keeps runtime-shaped exact pair exposure inside the hard cap", async () => {
+    const root = await mkdtemp(resolve(tmpdir(), "postil-runtime-preflight-"));
+    const cases = fixtureInputs.map((input) => benchmarkCase.parse(input));
+    const inheritedModelKey = process.env.MODEL_API_KEY;
+    const pricing = new Map([
+      [pair.generatorModel, {
+        providerIdentity: "PinnedProvider",
+        promptUsdPerToken: 0.0009478,
+        completionUsdPerToken: 0.0029788,
+        inputMicrosPerMillionTokens: 947_800,
+        outputMicrosPerMillionTokens: 2_978_800,
+      }],
+      [pair.scorerModel, {
+        providerIdentity: "PinnedProvider",
+        promptUsdPerToken: 0.0009478,
+        completionUsdPerToken: 0.0029788,
+        inputMicrosPerMillionTokens: 947_800,
+        outputMicrosPerMillionTokens: 2_978_800,
+      }],
+    ]);
+    try {
+      process.env.MODEL_API_KEY = "postil-plan-only-fixture";
+      const binary = process.env.POSTIL_BIN === undefined
+        ? resolve(import.meta.dir, "..", "..", "target", "release", "postil")
+        : resolve(process.env.POSTIL_BIN);
+      const normalizedPair = normalizeQualificationPairs([pair])[0]!;
+      const projected = await assertRuntimeShapedQualificationPreflight({
+        binary,
+        rootDir: root,
+        cases,
+        pairs: [normalizedPair],
+        repeats: 3,
+        pricing,
+        apiBase: normalizeApiBase("https://openrouter.ai/api/v1"),
+        apiFormat: "openai-compatible",
+        costCapUsdDecimal: "55",
+        upstreamProvider: "PinnedProvider",
+      });
+      expect(compareCanonicalDecimals(
+        parseCanonicalDecimal(projected),
+        parseCanonicalDecimal("35"),
+      )).toBeGreaterThan(0);
+      expect(compareCanonicalDecimals(
+        parseCanonicalDecimal(projected),
+        parseCanonicalDecimal("55"),
+      )).toBeLessThanOrEqual(0);
+    } finally {
+      if (inheritedModelKey === undefined) delete process.env.MODEL_API_KEY;
+      else process.env.MODEL_API_KEY = inheritedModelKey;
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("settles every started preflight worker before cleaning a failed workspace", async () => {
+    const root = await mkdtemp(resolve(tmpdir(), "postil-runtime-preflight-failure-"));
+    const binary = resolve(root, "fixture-postil");
+    const startsPath = resolve(root, "starts.log");
+    const inheritedModelKey = process.env.MODEL_API_KEY;
+    await writeFile(binary, `#!/usr/bin/env node
+import { appendFileSync, closeSync, openSync } from "node:fs";
+import { resolve } from "node:path";
+const root = resolve(process.cwd(), "../../..");
+const identity = process.cwd();
+appendFileSync(resolve(root, "starts.log"), identity + "\\n");
+try {
+  closeSync(openSync(resolve(root, "fail-once"), "wx"));
+  console.error("deliberate preflight failure");
+  process.exit(17);
+} catch {}
+Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250);
+appendFileSync(resolve(root, "finishes.log"), identity + "\\n");
+console.log(JSON.stringify({
+  version: 1, summary: "", silent: true, findings: [], resolved: [],
+  counts: { info: 0, warn: 0, error: 0, suppressed: 0, ungrounded: 0 },
+  confidenceBuckets: [0, 0, 0, 0, 0],
+  gate: { failOn: "error", failing: false, blockOnKinds: [] },
+  modelUsed: "test/generator", usage: { promptTokens: 0, completionTokens: 0 },
+  reviewCoverage: { mode: "exhaustive", selectedBatches: 1, totalBatches: 1 },
+  reviewAdmission: { providerAttempts: 6, serializedInputBytes: 5000, outputTokens: 180, projectedCostMicros: 1 },
+  durationMs: 0, baseSha: null, headSha: null, sinceSha: null
+}));
+process.exit(0);
+`);
+    await chmod(binary, 0o700);
+    try {
+      process.env.MODEL_API_KEY = "postil-plan-only-fixture";
+      const cases = fixtureInputs.slice(0, 8).map((input) => benchmarkCase.parse(input));
+      const pricing = new Map([
+        [pair.generatorModel, {
+          providerIdentity: "PinnedProvider",
+          promptUsdPerToken: 0.0009478,
+          completionUsdPerToken: 0.0029788,
+          inputMicrosPerMillionTokens: 947_800,
+          outputMicrosPerMillionTokens: 2_978_800,
+        }],
+        [pair.scorerModel, {
+          providerIdentity: "PinnedProvider",
+          promptUsdPerToken: 0.0009478,
+          completionUsdPerToken: 0.0029788,
+          inputMicrosPerMillionTokens: 947_800,
+          outputMicrosPerMillionTokens: 2_978_800,
+        }],
+      ]);
+      await expect(assertRuntimeShapedQualificationPreflight({
+        binary,
+        rootDir: root,
+        cases,
+        pairs: normalizeQualificationPairs([pair]),
+        repeats: 3,
+        pricing,
+        apiBase: normalizeApiBase("https://openrouter.ai/api/v1"),
+        apiFormat: "openai-compatible",
+        costCapUsdDecimal: "55",
+        upstreamProvider: "PinnedProvider",
+      })).rejects.toThrow("deliberate preflight failure");
+      const starts = (await readFile(startsPath, "utf8")).trim().split("\n");
+      const finishes = (await readFile(resolve(root, "finishes.log"), "utf8"))
+        .trim()
+        .split("\n");
+      expect(starts.length).toBeGreaterThan(0);
+      expect(starts.length).toBeLessThanOrEqual(4);
+      expect(finishes).toHaveLength(starts.length - 1);
+      expect(new Set(finishes).size).toBe(finishes.length);
+      expect(finishes.every((identity) => starts.includes(identity))).toBe(true);
+      await expect(lstat(resolve(root, "preflight"))).rejects.toThrow();
+    } finally {
+      if (inheritedModelKey === undefined) delete process.env.MODEL_API_KEY;
+      else process.env.MODEL_API_KEY = inheritedModelKey;
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 20_000);
 
   test("validates the raw cost cap as a bounded canonical decimal", () => {
     expect(canonicalQualificationCostCap("34.123456")).toBe("34.123456");

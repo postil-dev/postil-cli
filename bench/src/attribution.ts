@@ -8,6 +8,7 @@ import { ATTRIBUTION_BANK, ATTRIBUTION_BANK_VERSION, type AttributionBankCase } 
 import {
   compareCanonicalDecimals,
   formatCanonicalDecimal,
+  MAX_GENERATOR_COST_CAP_USD,
   parseCanonicalDecimal,
   sumCanonicalDecimals,
   type CanonicalDecimal,
@@ -15,12 +16,14 @@ import {
 
 const execFile = promisify(execFileCallback);
 
-export const ATTRIBUTION_CONTRACT_VERSION = 1;
+export const ATTRIBUTION_CONTRACT_VERSION = 2;
 export const ATTRIBUTION_MAX_CONCURRENCY = 4;
 export const ATTRIBUTION_CALL_TIMEOUT_MS = 60_000;
-export const ATTRIBUTION_MAX_CALLS_PER_FINDING_SET = 20;
+export const ATTRIBUTION_MAX_CALLS_PER_FINDING_SET = 3;
 export const ATTRIBUTION_MAX_PROVIDER_CALLS = 5_000;
 export const ATTRIBUTION_MAX_PROVIDER_ATTEMPTS_PER_DECISION = 6;
+export const ATTRIBUTION_MAX_INPUT_BYTES = 4 * 1024;
+export const ATTRIBUTION_MAX_PROVIDER_REQUEST_BYTES = 5_000;
 export const ATTRIBUTION_SETTINGS = Object.freeze({ temperature: 0, maxTokens: 180, schemaRepairs: 1 });
 
 export interface AttributionTarget {
@@ -203,7 +206,7 @@ export class AttributionGovernor {
   constructor(
     readonly concurrency = ATTRIBUTION_MAX_CONCURRENCY,
     callCap = ATTRIBUTION_MAX_PROVIDER_CALLS,
-    spendCapUsd: string | number = "35",
+    spendCapUsd: string | number = String(MAX_GENERATOR_COST_CAP_USD),
   ) {
     if (!Number.isSafeInteger(concurrency) || concurrency < 1) throw new Error("invalid attribution concurrency cap");
     if (!Number.isSafeInteger(callCap) || callCap < 1) throw new Error("invalid attribution provider-call cap");
@@ -279,9 +282,8 @@ export class AttributionGovernor {
 }
 
 export function projectedAttributionDecisionCostUsd(pricing: { inputMicrosPerMillionTokens: number; outputMicrosPerMillionTokens: number }): string {
-  const maximumPromptTokens = 16_000;
   const micros = BigInt(ATTRIBUTION_MAX_PROVIDER_ATTEMPTS_PER_DECISION) * (
-    divideCeiling(BigInt(maximumPromptTokens) * BigInt(pricing.inputMicrosPerMillionTokens), 1_000_000n) +
+    divideCeiling(BigInt(ATTRIBUTION_MAX_PROVIDER_REQUEST_BYTES) * BigInt(pricing.inputMicrosPerMillionTokens), 1_000_000n) +
     divideCeiling(BigInt(ATTRIBUTION_SETTINGS.maxTokens) * BigInt(pricing.outputMicrosPerMillionTokens), 1_000_000n)
   );
   return canonicalUsdFromMicros(micros);
@@ -312,6 +314,10 @@ export function attributionContractSha256(): string {
     question: "same underlying faulty mechanism and material consequence",
     negatives: ["unrelated", "contradiction", "successful remediation", "hypothetical", "counterfactual", "metadata", "unsupported broad claim"],
     settings: ATTRIBUTION_SETTINGS,
+    maxCallsPerFindingSet: ATTRIBUTION_MAX_CALLS_PER_FINDING_SET,
+    maxProviderAttemptsPerDecision: ATTRIBUTION_MAX_PROVIDER_ATTEMPTS_PER_DECISION,
+    maxInputBytes: ATTRIBUTION_MAX_INPUT_BYTES,
+    maxProviderRequestBytes: ATTRIBUTION_MAX_PROVIDER_REQUEST_BYTES,
   });
 }
 

@@ -32,6 +32,8 @@ import {
   AttributionGovernor,
   ATTRIBUTION_MAX_CONCURRENCY,
   ATTRIBUTION_MAX_CALLS_PER_FINDING_SET,
+  ATTRIBUTION_MAX_INPUT_BYTES,
+  ATTRIBUTION_MAX_PROVIDER_REQUEST_BYTES,
   attributionBankSha256,
   attributionContractSha256,
   qualifyAttributionEvaluator,
@@ -216,6 +218,8 @@ export interface BinaryQualificationMetadata {
   consensus: number;
   scorerChain: string[];
   hostedOperationCostCapMicros: number;
+  attributionMaxInputBytes: number;
+  attributionMaxProviderRequestBytes: number;
   admittedProfile: AdmissionManifestCandidate["profiles"][number] | null;
 }
 
@@ -1012,7 +1016,7 @@ export async function prepareAttributionEvaluatorEnvironment(
   );
 }
 
-async function assertRuntimeShapedQualificationPreflight(args: {
+export async function assertRuntimeShapedQualificationPreflight(args: {
   binary: string;
   rootDir: string;
   cases: BenchmarkCase[];
@@ -1028,55 +1032,82 @@ async function assertRuntimeShapedQualificationPreflight(args: {
   const planRoot = join(args.rootDir, "preflight");
   await rm(planRoot, { recursive: true, force: true });
   try {
-    for (const pair of args.pairs) {
-      for (const [caseIndex, c] of args.cases.entries()) {
-        const runDir = join(
-          planRoot,
-          safeSegment(qualificationPairId(pair)),
-          caseRunDirName(caseIndex, c.id),
-        );
-        const homeDir = join(runDir, "home");
-        const tmpDir = join(runDir, "tmp");
-        await mkdir(homeDir, { recursive: true, mode: 0o700 });
-        await mkdir(tmpDir, { recursive: true, mode: 0o700 });
-        const profilePath = join(runDir, "qualification-candidate.json");
-        await writeFile(
-          profilePath,
-          JSON.stringify(qualificationCandidateDocument(pair, args.pricing, args.apiBase, args.apiFormat, args.upstreamProvider)),
-          { mode: 0o600 },
-        );
-        const github = await startMockGithub(c);
+    const jobs = args.pairs.flatMap((pair) =>
+      args.cases.map((c, caseIndex) => ({ pair, c, caseIndex }))
+    );
+    const projectedByJob = new Array<bigint>(jobs.length);
+    let cursor = 0;
+    let firstError: unknown;
+    let stopDispatch = false;
+    const worker = async (): Promise<void> => {
+      for (;;) {
+        if (stopDispatch) return;
+        const index = cursor++;
+        if (index >= jobs.length) return;
+        const { pair, c, caseIndex } = jobs[index]!;
         try {
-          const env = liveEnv(
-            homeDir,
-            tmpDir,
-            github.baseUrl,
-            pair,
-            args.apiBase,
-            args.apiFormat,
+          const runDir = join(
+            planRoot,
+            safeSegment(qualificationPairId(pair)),
+            caseRunDirName(caseIndex, c.id),
+          );
+          const homeDir = join(runDir, "home");
+          const tmpDir = join(runDir, "tmp");
+          await mkdir(homeDir, { recursive: true, mode: 0o700 });
+          await mkdir(tmpDir, { recursive: true, mode: 0o700 });
+          const profilePath = join(runDir, "qualification-candidate.json");
+          await writeFile(
             profilePath,
+            JSON.stringify(qualificationCandidateDocument(pair, args.pricing, args.apiBase, args.apiFormat, args.upstreamProvider)),
+            { mode: 0o600 },
           );
-          env.POSTIL_QUALIFICATION_PLAN_ONLY = "1";
-          const { stdout } = await execFile(
-            args.binary,
-            ["review", "--repo", c.repo, "--pr", String(c.pullNumber), "--output-json"],
-            { cwd: runDir, env, timeout: 60_000, maxBuffer: 2 * 1024 * 1024 },
-          );
-          const parsed = envelopeV1.safeParse(safeJson(stdout));
-          if (!parsed.success || parsed.data.reviewAdmission === undefined) {
-            throw new Error(`runtime preflight did not emit review admission for ${c.id}`);
+          const github = await startMockGithub(c);
+          try {
+            const env = liveEnv(
+              homeDir,
+              tmpDir,
+              github.baseUrl,
+              pair,
+              args.apiBase,
+              args.apiFormat,
+              profilePath,
+            );
+            env.POSTIL_QUALIFICATION_PLAN_ONLY = "1";
+            const { stdout } = await execFile(
+              args.binary,
+              ["review", "--repo", c.repo, "--pr", String(c.pullNumber), "--output-json"],
+              { cwd: runDir, env, timeout: 60_000, maxBuffer: 2 * 1024 * 1024 },
+            );
+            const parsed = envelopeV1.safeParse(safeJson(stdout));
+            if (!parsed.success || parsed.data.reviewAdmission === undefined) {
+              throw new Error(`runtime preflight did not emit review admission for ${c.id}`);
+            }
+            const coverage = parsed.data.reviewCoverage;
+            if (coverage === undefined ||
+              (c.admission.expectedCoverage !== undefined && coverage.mode !== c.admission.expectedCoverage)) {
+              throw new Error(`runtime preflight emitted the wrong coverage mode for ${c.id}`);
+            }
+            projectedByJob[index] =
+              BigInt(parsed.data.reviewAdmission.projectedCostMicros) * BigInt(args.repeats);
+          } finally {
+            await github.close();
           }
-          const coverage = parsed.data.reviewCoverage;
-          if (coverage === undefined ||
-            (c.admission.expectedCoverage !== undefined && coverage.mode !== c.admission.expectedCoverage)) {
-            throw new Error(`runtime preflight emitted the wrong coverage mode for ${c.id}`);
-          }
-          projectedMicros += BigInt(parsed.data.reviewAdmission.projectedCostMicros) * BigInt(args.repeats);
-        } finally {
-          await github.close();
+        } catch (error) {
+          if (firstError === undefined) firstError = error;
+          stopDispatch = true;
+          return;
         }
       }
+    };
+    const concurrency = Math.max(1, Math.min(DEFAULT_LIVE_CONCURRENCY, jobs.length || 1));
+    const workers = await Promise.allSettled(
+      Array.from({ length: concurrency }, () => worker()),
+    );
+    for (const result of workers) {
+      if (result.status === "rejected" && firstError === undefined) firstError = result.reason;
     }
+    if (firstError !== undefined) throw firstError;
+    projectedMicros = projectedByJob.reduce((sum, value) => sum + value, 0n);
   } finally {
     await rm(planRoot, { recursive: true, force: true });
   }
@@ -1922,6 +1953,10 @@ function assertBinaryMatchesQualificationWorktree(args: {
   }
   if (metadata.hostedOperationCostCapMicros !== HOSTED_OPERATION_COST_CAP_MICROS) {
     throw new Error("supplied binary hosted operation cost cap does not match the admission contract");
+  }
+  if (metadata.attributionMaxInputBytes !== ATTRIBUTION_MAX_INPUT_BYTES ||
+      metadata.attributionMaxProviderRequestBytes !== ATTRIBUTION_MAX_PROVIDER_REQUEST_BYTES) {
+    throw new Error("supplied binary attribution bounds do not match the admission contract");
   }
   if (metadata.defaultApiBase !== args.apiBase || metadata.defaultApiFormat !== args.apiFormat) {
     throw new Error("qualification endpoint does not match the supplied binary defaults");

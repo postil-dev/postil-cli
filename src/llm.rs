@@ -2430,6 +2430,10 @@ impl LlmClient {
             phase,
             expected_provider,
         );
+        #[cfg(feature = "qualification-candidate")]
+        if matches!(phase, LlmPhase::Attribution) {
+            Self::ensure_atomic_attribution_request_size(&body)?;
+        }
         let mut retries = 0u32;
         let mut timeout_retries = 0u32;
         let mut empty_response_retries = 0u32;
@@ -2602,7 +2606,10 @@ impl LlmClient {
                                     let wait = Duration::from_secs(2 * retries as u64);
                                     let exhausted_output_budget = summary.finish_reason.as_deref()
                                         == Some("length")
-                                        && !matches!(phase, LlmPhase::Scorer { .. })
+                                        && !matches!(
+                                            phase,
+                                            LlmPhase::Scorer { .. } | LlmPhase::Attribution
+                                        )
                                         && summary.usage.is_some_and(|value| {
                                             value.completion_tokens >= u64::from(request_max_tokens)
                                         })
@@ -2762,6 +2769,18 @@ impl LlmClient {
                 }
             }
         }
+    }
+
+    #[cfg(feature = "qualification-candidate")]
+    fn ensure_atomic_attribution_request_size(body: &serde_json::Value) -> Result<()> {
+        let bytes =
+            serde_json::to_vec(body).context("serialize atomic attribution provider request")?;
+        ensure!(
+            bytes.len() <= crate::attribution::MAX_PROVIDER_REQUEST_BYTES,
+            "atomic attribution provider request exceeds {} bytes",
+            crate::attribution::MAX_PROVIDER_REQUEST_BYTES,
+        );
+        Ok(())
     }
 
     fn request_body(
@@ -5754,6 +5773,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(projected, 108_001);
+    }
+
+    #[cfg(feature = "qualification-candidate")]
+    #[test]
+    fn atomic_attribution_provider_request_bound_is_exact() {
+        let empty = json!({"payload": ""});
+        let overhead = serde_json::to_vec(&empty).unwrap().len();
+        let accepted = json!({
+            "payload": "x".repeat(crate::attribution::MAX_PROVIDER_REQUEST_BYTES - overhead),
+        });
+        assert_eq!(
+            serde_json::to_vec(&accepted).unwrap().len(),
+            crate::attribution::MAX_PROVIDER_REQUEST_BYTES,
+        );
+        LlmClient::ensure_atomic_attribution_request_size(&accepted).unwrap();
+
+        let rejected = json!({
+            "payload": "x".repeat(crate::attribution::MAX_PROVIDER_REQUEST_BYTES - overhead + 1),
+        });
+        let error = LlmClient::ensure_atomic_attribution_request_size(&rejected).unwrap_err();
+        assert!(error.to_string().contains("exceeds 5000 bytes"));
     }
 
     #[test]

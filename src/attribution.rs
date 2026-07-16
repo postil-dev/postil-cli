@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use crate::config::Config;
 use crate::llm::LlmClient;
 
-const MAX_INPUT_BYTES: u64 = 16 * 1024;
+pub const MAX_INPUT_BYTES: u64 = 4 * 1024;
+pub const MAX_PROVIDER_REQUEST_BYTES: usize = 5_000;
 const MAX_TEXT_CHARS: usize = 4_000;
 const ATTRIBUTION_TIMEOUT_SECS: u64 = 45;
 

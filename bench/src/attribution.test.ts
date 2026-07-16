@@ -4,8 +4,10 @@ import { access, chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ATTRIBUTION_BANK, type AttributionBankCase } from "../fixtures/attribution-bank";
+import { cases as qualificationCases } from "../fixtures/cases";
 import {
   ATTRIBUTION_CONTRACT_VERSION,
+  ATTRIBUTION_MAX_CALLS_PER_FINDING_SET,
   ATTRIBUTION_SETTINGS,
   AttributionGovernor,
   attributeCandidates,
@@ -13,6 +15,7 @@ import {
   attributionContractSha256,
   attributionEvidenceSha256,
   exactRegionOverlap,
+  projectedAttributionDecisionCostUsd,
   replayAttributionEvidence,
   type AttributionCallEvidence,
   type AttributionCandidate,
@@ -65,6 +68,51 @@ describe("atomic attribution contract", () => {
       },
     );
     expect(result).toEqual({ scored: true, detected: false, calls: [] });
+  });
+
+  test("rejects same-region finding spam before transport", async () => {
+    const result = await attributeCandidates(
+      target,
+      Array.from({ length: ATTRIBUTION_MAX_CALLS_PER_FINDING_SET + 1 }, (_, index) => ({
+        ...candidate,
+        title: `Candidate ${index}`,
+      })),
+      {
+        binary: "/binary-that-must-not-run",
+        runDir: "/tmp/postil-attribution-spam-test-that-must-not-exist",
+        env: {},
+        sourceSha256: "a".repeat(64),
+        binarySha256: "b".repeat(64),
+        evaluatorModel: "provider/scorer",
+        expectedProvider: "PinnedProvider",
+        apiFormat: "openai-compatible",
+        repeat: 1,
+        governor: new AttributionGovernor(),
+        projectedCostUsdDecimal: "0.01",
+      },
+    );
+    expect(result).toEqual({
+      scored: false,
+      detected: false,
+      calls: [],
+      error: "attribution candidate count exceeds the fixed call cap",
+    });
+  });
+
+  test("projects every possibly billed attempt from the enforced prompt ceiling", () => {
+    const perDecision = projectedAttributionDecisionCostUsd({
+      inputMicrosPerMillionTokens: 947_800,
+      outputMicrosPerMillionTokens: 2_978_800,
+    });
+    expect(perDecision).toBe("0.031656");
+    const positiveCases = qualificationCases.filter(
+      (entry) => (entry.groundTruth?.findings?.length ?? 0) > 0,
+    ).length;
+    const decisions = (ATTRIBUTION_BANK.length +
+      positiveCases * ATTRIBUTION_MAX_CALLS_PER_FINDING_SET) * 3;
+    expect(decisions).toBe(501);
+    expect(decisions * 6).toBeLessThanOrEqual(5_000);
+    expect(Number(perDecision) * decisions).toBeCloseTo(15.859656, 9);
   });
 
   test("keeps evaluator labels and bank identifiers out of model requests", () => {
@@ -156,6 +204,16 @@ console.log(JSON.stringify({ sameDefect: true, reason: "Both identify the same r
       };
       expect((await attributeCandidates(target, [candidate], options)).scored).toBe(true);
       await expect(access(join(runDir, "candidate-0", "request.json"))).rejects.toThrow();
+      const capped = await attributeCandidates(
+        target,
+        Array.from({ length: ATTRIBUTION_MAX_CALLS_PER_FINDING_SET }, (_, index) => ({
+          ...candidate,
+          title: `Candidate ${index}`,
+        })),
+        options,
+      );
+      expect(capped.scored).toBe(true);
+      expect(capped.calls).toHaveLength(ATTRIBUTION_MAX_CALLS_PER_FINDING_SET);
       expect((await attributeCandidates(target, [candidate], { ...options, binary: join(root, "missing") })).scored).toBe(false);
       await expect(access(join(runDir, "candidate-0", "request.json"))).rejects.toThrow();
     } finally {

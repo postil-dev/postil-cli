@@ -58,6 +58,52 @@ fn attribution_text(content: &str) -> Value {
     })
 }
 
+#[cfg(feature = "qualification-candidate")]
+fn write_atomic_attribution_inputs(
+    directory: &std::path::Path,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let profile = directory.join("candidate.json");
+    std::fs::write(
+        &profile,
+        json!({
+            "benchmarkProviderIdentity": postil_cli::config::MANAGED_OPENROUTER_PROVIDER_IDENTITY,
+            "upstreamProviderIdentity": "test-provider",
+            "apiBase": postil_cli::config::MANAGED_OPENROUTER_API_BASE,
+            "apiFormat": "openai-compatible",
+            "generatorChain": ["openai/gpt-5-mini"],
+            "consensus": 1,
+            "scorerChain": ["provider/scorer"],
+            "modelPriceBounds": [
+                {"model": "openai/gpt-5-mini", "inputMicrosPerMillionTokens": 435000, "outputMicrosPerMillionTokens": 870000},
+                {"model": "provider/scorer", "inputMicrosPerMillionTokens": 435000, "outputMicrosPerMillionTokens": 870000}
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let input = directory.join("attribution.json");
+    std::fs::write(
+        &input,
+        json!({
+            "model": "provider/scorer",
+            "expectedProvider": "test-provider",
+            "target": {
+                "path": "src/payments.ts", "startLine": 41, "endLine": 41,
+                "contract": "A retry posts a second debit because the idempotency guard is bypassed."
+            },
+            "candidate": {
+                "path": "src/payments.ts", "line": 41, "endLine": 41,
+                "severity": "error", "kind": "risk",
+                "title": "Retry duplicates the debit",
+                "body": "The retry skips idempotency and charges the payment again."
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    (profile, input)
+}
+
 fn llm_contradictory() -> Value {
     json!({
         "choices": [{"message": {"content": json!({
@@ -2362,6 +2408,151 @@ async fn hidden_atomic_attribution_repairs_once_with_same_model_and_preserves_ra
 
 #[cfg(feature = "qualification-candidate")]
 #[tokio::test]
+async fn hidden_atomic_attribution_never_expands_an_empty_length_retry() {
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("provider/scorer"))
+        .respond_with(SequentialReviewResponder {
+            calls: calls.clone(),
+            responses: Arc::new(vec![
+                json!({
+                    "model": "provider/scorer",
+                    "provider": "test-provider",
+                    "choices": [{
+                        "finish_reason": "length",
+                        "message": {"content": null, "reasoning": "budget exhausted"}
+                    }],
+                    "usage": {
+                        "prompt_tokens": 30,
+                        "completion_tokens": 180,
+                        "cost": 0.000045
+                    }
+                }),
+                attribution_text(
+                    "{\"sameDefect\":true,\"reason\":\"Both describe a retry that bypasses idempotency.\"}",
+                ),
+            ]),
+        })
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let (profile, input) = write_atomic_attribution_inputs(dir.path());
+    postil()
+        .current_dir(dir.path())
+        .env(
+            "POSTIL_API_BASE",
+            postil_cli::config::MANAGED_OPENROUTER_API_BASE,
+        )
+        .env("CI", "true")
+        .env("GITHUB_API_URL", "http://127.0.0.1:9")
+        .env("POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY", "1")
+        .env("POSTIL_QUALIFICATION_CANDIDATE_PROFILE", &profile)
+        .env("POSTIL_QUALIFICATION_CAPTURE_API_BASE", server.uri())
+        .env("POSTIL_ALLOW_PRIVATE_API_BASE", "1")
+        .env("REVIEW_SCORER_MODEL", "provider/scorer")
+        .args(["atomic-attribution", "--input"])
+        .arg(&input)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "atomic attribution usage evidence is incomplete or inconsistent",
+        ));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in requests {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["max_tokens"], 180);
+        assert!(
+            serde_json::to_vec(&body).unwrap().len()
+                <= postil_cli::attribution::MAX_PROVIDER_REQUEST_BYTES
+        );
+    }
+}
+
+#[cfg(feature = "qualification-candidate")]
+#[tokio::test]
+async fn hidden_atomic_attribution_rejects_oversized_repair_before_second_provider_call() {
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("provider/scorer"))
+        .respond_with(SequentialReviewResponder {
+            calls: calls.clone(),
+            responses: Arc::new(vec![attribution_text(&format!(
+                "{{\"sameDefect\":\"yes\",\"reason\":\"{}\"}}",
+                "x".repeat(4_000),
+            ))]),
+        })
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let profile = dir.path().join("candidate.json");
+    std::fs::write(
+        &profile,
+        json!({
+            "benchmarkProviderIdentity": postil_cli::config::MANAGED_OPENROUTER_PROVIDER_IDENTITY,
+            "upstreamProviderIdentity": "test-provider",
+            "apiBase": postil_cli::config::MANAGED_OPENROUTER_API_BASE,
+            "apiFormat": "openai-compatible",
+            "generatorChain": ["openai/gpt-5-mini"],
+            "consensus": 1,
+            "scorerChain": ["provider/scorer"],
+            "modelPriceBounds": [
+                {"model": "openai/gpt-5-mini", "inputMicrosPerMillionTokens": 435000, "outputMicrosPerMillionTokens": 870000},
+                {"model": "provider/scorer", "inputMicrosPerMillionTokens": 435000, "outputMicrosPerMillionTokens": 870000}
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let input = dir.path().join("attribution.json");
+    std::fs::write(
+        &input,
+        json!({
+            "model": "provider/scorer",
+            "expectedProvider": "test-provider",
+            "target": {
+                "path": "src/payments.ts", "startLine": 41, "endLine": 41,
+                "contract": "A retry posts a second debit because the idempotency guard is bypassed."
+            },
+            "candidate": {
+                "path": "src/payments.ts", "line": 41, "endLine": 41,
+                "severity": "error", "kind": "risk",
+                "title": "Retry duplicates the debit",
+                "body": "The retry skips idempotency and charges the payment again."
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    postil()
+        .current_dir(dir.path())
+        .env(
+            "POSTIL_API_BASE",
+            postil_cli::config::MANAGED_OPENROUTER_API_BASE,
+        )
+        .env("CI", "true")
+        .env("GITHUB_API_URL", "http://127.0.0.1:9")
+        .env("POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY", "1")
+        .env("POSTIL_QUALIFICATION_CANDIDATE_PROFILE", &profile)
+        .env("POSTIL_QUALIFICATION_CAPTURE_API_BASE", server.uri())
+        .env("POSTIL_ALLOW_PRIVATE_API_BASE", "1")
+        .env("REVIEW_SCORER_MODEL", "provider/scorer")
+        .args(["atomic-attribution", "--input"])
+        .arg(&input)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("model provider request failed"));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[cfg(feature = "qualification-candidate")]
+#[tokio::test]
 async fn hidden_atomic_attribution_rejects_off_region_without_provider_call() {
     let server = MockServer::start().await;
     let dir = tempfile::tempdir().unwrap();
@@ -2429,7 +2620,7 @@ fn hidden_atomic_attribution_rejects_non_regular_input() {
 fn hidden_atomic_attribution_rejects_oversized_input_before_parsing() {
     let dir = tempfile::tempdir().unwrap();
     let input = dir.path().join("attribution.json");
-    std::fs::write(&input, vec![b' '; 16 * 1024 + 1]).unwrap();
+    std::fs::write(&input, vec![b' '; 4 * 1024 + 1]).unwrap();
     postil()
         .current_dir(dir.path())
         .args(["atomic-attribution", "--input"])
@@ -2437,7 +2628,7 @@ fn hidden_atomic_attribution_rejects_oversized_input_before_parsing() {
         .assert()
         .failure()
         .stderr(predicates::str::contains(
-            "atomic attribution input exceeds 16384 bytes",
+            "atomic attribution input exceeds 4096 bytes",
         ));
 }
 
@@ -7895,6 +8086,8 @@ fn qualification_metadata_cli_emits_service_authority_fields() {
     assert_eq!(metadata["qualificationExpiresAtUnixSeconds"], Value::Null);
     assert_eq!(metadata["qualificationMaxAgeDays"], Value::Null);
     assert!(metadata["admittedProfile"].is_null());
+    assert_eq!(metadata["attributionMaxInputBytes"], 4096);
+    assert_eq!(metadata["attributionMaxProviderRequestBytes"], 5000);
 }
 
 #[test]
