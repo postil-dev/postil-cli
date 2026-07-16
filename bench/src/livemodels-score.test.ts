@@ -23,6 +23,11 @@ const pair: QualificationPair = { generatorModel: "provider/generator", scorerMo
 test("canonical decimal formatting normalizes zero at every scale", () => {
   expect(formatCanonicalDecimal({ coefficient: 0n, scale: 0 })).toBe("0");
   expect(formatCanonicalDecimal({ coefficient: 0n, scale: 18 })).toBe("0");
+  expect(formatCanonicalDecimal({ coefficient: 289314000n, scale: 6 })).toBe("289.314");
+  expect(parseCanonicalDecimal(formatCanonicalDecimal({ coefficient: 289314000n, scale: 6 }))).toEqual({
+    coefficient: 289314n,
+    scale: 3,
+  });
 });
 
 test("canonical decimal errors include bounded diagnostic context", () => {

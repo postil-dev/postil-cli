@@ -692,10 +692,16 @@ export function sumCanonicalDecimals(values: CanonicalDecimal[]): CanonicalDecim
 }
 
 export function formatCanonicalDecimal(value: CanonicalDecimal): string {
-  if (value.coefficient === 0n) return "0";
-  if (value.scale === 0) return value.coefficient.toString();
-  const digits = value.coefficient.toString().padStart(value.scale + 1, "0");
-  const split = digits.length - value.scale;
+  let coefficient = value.coefficient;
+  let scale = value.scale;
+  if (coefficient === 0n) return "0";
+  while (scale > 0 && coefficient % 10n === 0n) {
+    coefficient /= 10n;
+    scale -= 1;
+  }
+  if (scale === 0) return coefficient.toString();
+  const digits = coefficient.toString().padStart(scale + 1, "0");
+  const split = digits.length - scale;
   return `${digits.slice(0, split)}.${digits.slice(split)}`;
 }
 
