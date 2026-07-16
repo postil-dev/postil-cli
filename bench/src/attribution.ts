@@ -58,6 +58,7 @@ const modelUsage = z.object({
   attempt: z.number().int().positive(),
   promptTokens: z.number().int().nonnegative(),
   completionTokens: z.number().int().nonnegative(),
+  costMicros: z.number().int().nonnegative().optional(),
   costProviderDecimal: z.string().refine((value) => {
     try {
       parseCanonicalDecimal(value);
@@ -68,7 +69,36 @@ const modelUsage = z.object({
   }, "provider cost must be canonical"),
   costSource: z.literal("providerReported"),
   accountingComplete: z.literal(true),
-}).strict();
+}).strict().superRefine((usage, context) => {
+  const rounded = providerCostMicrosRounded(usage.costProviderDecimal);
+  if (
+    usage.costMicros !== undefined &&
+    rounded !== null &&
+    BigInt(usage.costMicros) !== rounded
+  ) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["costMicros"],
+      message: "rounded provider cost does not match exact provider cost",
+    });
+  }
+});
+
+function providerCostMicrosRounded(value: string): bigint | null {
+  let parsed: CanonicalDecimal;
+  try {
+    parsed = parseCanonicalDecimal(value);
+  } catch {
+    return null;
+  }
+  if (parsed.scale <= 6) {
+    return parsed.coefficient * 10n ** BigInt(6 - parsed.scale);
+  }
+  const divisor = 10n ** BigInt(parsed.scale - 6);
+  const quotient = parsed.coefficient / divisor;
+  const remainder = parsed.coefficient % divisor;
+  return quotient + (remainder * 2n >= divisor ? 1n : 0n);
+}
 
 const transportOutput = z.object({
   sameDefect: z.boolean(),
