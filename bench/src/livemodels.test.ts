@@ -681,6 +681,8 @@ describe("managed admission workflow", () => {
     expect(workflow).toContain("POSTIL_API_FORMAT: openai-compatible");
     expect(workflow).toContain("POSTIL_BENCH_REPEATS: \"3\"");
     expect(workflow).toContain("POSTIL_BENCH_PAIRS: ${{ inputs.pairs }}");
+    expect(workflow).toContain("upstream_provider:");
+    expect(workflow).toContain("POSTIL_BENCH_UPSTREAM_PROVIDER: ${{ inputs.upstream_provider }}");
     expect(workflow).toContain('echo "POSTIL_MANIFEST_OUT=${RUNNER_TEMP}/postil-qualified-models-${suffix}.json"');
     expect(workflow).toContain('>> "$GITHUB_ENV"');
     expect(workflow).toContain('test "$GITHUB_REF" = "refs/heads/main"');

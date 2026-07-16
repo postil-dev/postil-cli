@@ -195,10 +195,10 @@ on an argument list.
 
 These fixtures are internal evidence, not a competitor comparison. Inference is
 nondeterministic, so one successful matrix is insufficient for admission.
-OpenRouter's endpoint identity is recorded, but its dynamic upstream route is
-not described as pinned. A pinned-provider claim requires request and response
-evidence for that exact route. Hosted OpenRouter qualification uses the same
-non-collection and ZDR request preferences as production.
+OpenRouter's endpoint identity and the selected ZDR provider route are pinned.
+Pricing, requests, responses, attribution evidence, and the emitted candidate
+must all identify that exact route. Hosted OpenRouter qualification uses the
+same non-collection and ZDR request preferences as production.
 
 ## Scorer qualification (opt-in, mocked generator + real scorer)
 

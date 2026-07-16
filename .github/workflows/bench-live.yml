@@ -8,6 +8,9 @@ on:
       pairs:
         description: Exact generators::consensus::scorer+fallback profile
         required: true
+      upstream_provider:
+        description: Exact ZDR provider identity serving every model in the profile
+        required: true
       cost_cap_usd:
         description: Abort when projected qualification spend exceeds this amount
         required: true
@@ -28,6 +31,7 @@ jobs:
     env:
       POSTIL_BENCH_MODE: live
       POSTIL_BENCH_PAIRS: ${{ inputs.pairs }}
+      POSTIL_BENCH_UPSTREAM_PROVIDER: ${{ inputs.upstream_provider }}
       POSTIL_BENCH_REPEATS: "3"
       POSTIL_BENCH_COST_CAP_USD: ${{ inputs.cost_cap_usd }}
       POSTIL_API_BASE: https://openrouter.ai/api/v1

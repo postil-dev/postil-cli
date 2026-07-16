@@ -5,6 +5,7 @@ import {
   aggregateModel,
   calculateTotalRunCostUsd,
   canonicalPriceMicrosPerMillion,
+  formatCanonicalDecimal,
   groundTruthOf,
   pricingFromCatalog,
   pricingFromZdrCatalog,
@@ -17,6 +18,11 @@ import {
 } from "./livemodels-score";
 
 const pair: QualificationPair = { generatorModel: "provider/generator", scorerModel: "provider/scorer" };
+
+test("canonical decimal formatting normalizes zero at every scale", () => {
+  expect(formatCanonicalDecimal({ coefficient: 0n, scale: 0 })).toBe("0");
+  expect(formatCanonicalDecimal({ coefficient: 0n, scale: 18 })).toBe("0");
+});
 const prices = new Map<string, ModelPricing>([
   [pair.generatorModel, {
     promptUsdPerToken: 0.000001, completionUsdPerToken: 0.000002,
