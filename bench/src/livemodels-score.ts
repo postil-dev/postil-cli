@@ -662,7 +662,10 @@ export interface CanonicalDecimal {
 
 export function parseCanonicalDecimal(value: string): CanonicalDecimal {
   if (!/^(?:0|[1-9][0-9]*|(?:0|[1-9][0-9]*)\.[0-9]*[1-9])$/u.test(value)) {
-    throw new Error("provider cost must be a canonical nonnegative decimal");
+    const diagnostic = value.length <= 80 ? value : `${value.slice(0, 80)}...`;
+    throw new Error(
+      `provider cost must be a canonical nonnegative decimal; received ${JSON.stringify(diagnostic)}`,
+    );
   }
   const [whole, fraction = ""] = value.split(".");
   let coefficient = BigInt(`${whole}${fraction}`);

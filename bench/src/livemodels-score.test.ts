@@ -7,6 +7,7 @@ import {
   canonicalPriceMicrosPerMillion,
   formatCanonicalDecimal,
   groundTruthOf,
+  parseCanonicalDecimal,
   pricingFromCatalog,
   pricingFromZdrCatalog,
   qualificationPairId,
@@ -22,6 +23,11 @@ const pair: QualificationPair = { generatorModel: "provider/generator", scorerMo
 test("canonical decimal formatting normalizes zero at every scale", () => {
   expect(formatCanonicalDecimal({ coefficient: 0n, scale: 0 })).toBe("0");
   expect(formatCanonicalDecimal({ coefficient: 0n, scale: 18 })).toBe("0");
+});
+
+test("canonical decimal errors include bounded diagnostic context", () => {
+  expect(() => parseCanonicalDecimal("0.000000")).toThrow('received "0.000000"');
+  expect(() => parseCanonicalDecimal("x".repeat(100))).toThrow(`received "${"x".repeat(80)}..."`);
 });
 const prices = new Map<string, ModelPricing>([
   [pair.generatorModel, {
