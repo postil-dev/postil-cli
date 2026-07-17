@@ -6,6 +6,11 @@ import {
   scanForForbidden,
   startMockGithub,
 } from "./harness";
+import {
+  ADVISORY_FIXTURE_COUNT,
+  CLEAN_FIXTURE_COUNT,
+  MUST_BLOCK_FIXTURE_COUNT,
+} from "./livemodels-score";
 
 function minimalFixture(diff: string, primaryChange?: { path: string; line: number }) {
   return {
@@ -26,7 +31,7 @@ function minimalFixture(diff: string, primaryChange?: { path: string; line: numb
 describe("benchmark fixtures", () => {
   test("every canonical fixture declares a real added coordinate", () => {
     const parsed = cases.map((candidate) => benchmarkCase.parse(candidate));
-    expect(parsed).toHaveLength(61);
+    expect(parsed).toHaveLength(70);
     for (const candidate of parsed) {
       expect(candidate.primaryChange).toBeDefined();
       const changedFile = parseUnifiedDiffFiles(candidate.diff).find(
@@ -134,7 +139,7 @@ describe("benchmark fixtures", () => {
 
   test("cover the expanded saturated-case categories", () => {
     const parsed = cases.map((c) => benchmarkCase.parse(c));
-    expect(parsed).toHaveLength(61);
+    expect(parsed).toHaveLength(70);
 
     const labels = new Set(parsed.flatMap((c) => c.scoringLabels));
     for (const label of [
@@ -151,10 +156,26 @@ describe("benchmark fixtures", () => {
     }
 
     const byClass = Object.groupBy(parsed, (candidate) => candidate.admission.classification);
-    expect(byClass.mustBlock).toHaveLength(34);
-    expect(byClass.advisory).toHaveLength(15);
-    expect(byClass.clean).toHaveLength(12);
-    expect(parsed.filter((candidate) => candidate.groundTruth.findings.length > 0)).toHaveLength(49);
+    expect(byClass.mustBlock).toHaveLength(MUST_BLOCK_FIXTURE_COUNT);
+    expect(byClass.advisory).toHaveLength(ADVISORY_FIXTURE_COUNT);
+    expect(byClass.clean).toHaveLength(CLEAN_FIXTURE_COUNT);
+    expect(parsed.filter((candidate) => candidate.groundTruth.findings.length > 0)).toHaveLength(57);
+
+    for (const id of [
+      "race-non-atomic-counter",
+      "ui-button-missing-label",
+      "ui-input-missing-label",
+      "a11y-low-contrast-status",
+      "race-check-then-insert",
+      "race-lock-release-before-write",
+      "race-non-atomic-file-write",
+    ]) {
+      const candidate = parsed.find((entry) => entry.id === id);
+      expect(candidate?.admission.classification).toBe("mustBlock");
+      expect(candidate?.groundTruth.findings[0]?.severity).toBe("error");
+      expect(candidate?.scoringLabels).toContain("error");
+      expect(candidate?.scoringLabels).not.toContain("warn");
+    }
 
     expect(parsed.map((candidate) => candidate.id)).not.toContain("migration-drop-column");
     expect(parsed.map((candidate) => candidate.id)).not.toContain("migration-nullability-tighten");

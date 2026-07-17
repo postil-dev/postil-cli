@@ -3,12 +3,15 @@ import { benchmarkCase, type BenchmarkCase, type Envelope } from "./harness";
 import type { AttributionCallEvidence, AttributionCaseEvidence } from "./attribution";
 import { HOSTED_OPERATION_COST_CAP_MICROS } from "./livemodels";
 import {
+  ADVISORY_FIXTURE_COUNT,
   aggregateModel,
   calculateTotalRunCostUsd,
   canonicalPriceMicrosPerMillion,
+  CLEAN_FIXTURE_COUNT,
   diagnosticEvidence,
   formatCanonicalDecimal,
   groundTruthOf,
+  MUST_BLOCK_FIXTURE_COUNT,
   parseCanonicalDecimal,
   pricingFromCatalog,
   pricingFromZdrCatalog,
@@ -21,6 +24,9 @@ import {
 } from "./livemodels-score";
 
 const pair: QualificationPair = { generatorModel: "provider/generator", scorerModel: "provider/scorer" };
+const QUALIFICATION_REPEATS = 3;
+const REPEATED_MATRIX_CASE_COUNT =
+  (MUST_BLOCK_FIXTURE_COUNT + ADVISORY_FIXTURE_COUNT + CLEAN_FIXTURE_COUNT) * QUALIFICATION_REPEATS;
 
 test("canonical decimal formatting normalizes zero at every scale", () => {
   expect(formatCanonicalDecimal({ coefficient: 0n, scale: 0 })).toBe("0");
@@ -197,13 +203,13 @@ function score(
 function passingMatrix(repeats = 3): LiveModelCaseResult[] {
   const results: LiveModelCaseResult[] = [];
   for (let repeat = 1; repeat <= repeats; repeat += 1) {
-    for (let i = 0; i < 34; i += 1) {
+    for (let i = 0; i < MUST_BLOCK_FIXTURE_COUNT; i += 1) {
       results.push(score("mustBlock", repeat, envelope({ findings: [finding("error")], gateFailing: true }), `m-${i}`));
     }
-    for (let i = 0; i < 15; i += 1) {
+    for (let i = 0; i < ADVISORY_FIXTURE_COUNT; i += 1) {
       results.push(score("advisory", repeat, envelope({ findings: [finding("warn")] }), `a-${i}`));
     }
-    for (let i = 0; i < 12; i += 1) {
+    for (let i = 0; i < CLEAN_FIXTURE_COUNT; i += 1) {
       results.push(score("clean", repeat, envelope(), `c-${i}`));
     }
   }
@@ -367,7 +373,7 @@ describe("pair admission", () => {
     const aggregate = aggregateModel(pair, passingMatrix(), 3, HOSTED_OPERATION_COST_CAP_MICROS);
     expect(aggregate).toMatchObject({
       id: qualificationPairId(pair),
-      casesRun: 183,
+      casesRun: REPEATED_MATRIX_CASE_COUNT,
       mustBlockRecall: 1,
       mustBlockFinalBlockingRate: 1,
       advisoryDetectionRate: 1,
@@ -416,7 +422,9 @@ describe("pair admission", () => {
     for (const result of matrix) result.exitCode = 2;
     const aggregate = aggregateModel(pair, matrix, 3, HOSTED_OPERATION_COST_CAP_MICROS);
     expect(aggregate.passed).toBe(false);
-    expect(aggregate.admissionFailures).toContain("183 process exit fidelity failure(s)");
+    expect(aggregate.admissionFailures).toContain(
+      `${REPEATED_MATRIX_CASE_COUNT} process exit fidelity failure(s)`,
+    );
   });
 
   test("fails every attributable quality boundary independently", () => {
@@ -431,21 +439,22 @@ describe("pair admission", () => {
     expect(aggregateModel(pair, substituteBlock, 3, HOSTED_OPERATION_COST_CAP_MICROS).admissionFailures.join("\n")).toContain("final attributed blocking");
 
     const advisoryMisses = passingMatrix();
-    advisoryMisses[34] = score("advisory", 1, envelope(), "a-0");
-    advisoryMisses[35] = score("advisory", 1, envelope(), "a-1");
+    advisoryMisses[MUST_BLOCK_FIXTURE_COUNT] = score("advisory", 1, envelope(), "a-0");
+    advisoryMisses[MUST_BLOCK_FIXTURE_COUNT + 1] = score("advisory", 1, envelope(), "a-1");
     expect(aggregateModel(pair, advisoryMisses, 3, HOSTED_OPERATION_COST_CAP_MICROS).admissionFailures.join("\n")).toContain("advisory detection");
 
     const advisoryBlocks = passingMatrix();
-    advisoryBlocks[34] = score("advisory", 1, envelope({ findings: [finding("error")], gateFailing: true }), "a-0");
-    advisoryBlocks[35] = score("advisory", 1, envelope({ findings: [finding("error")], gateFailing: true }), "a-1");
+    advisoryBlocks[MUST_BLOCK_FIXTURE_COUNT] = score("advisory", 1, envelope({ findings: [finding("error")], gateFailing: true }), "a-0");
+    advisoryBlocks[MUST_BLOCK_FIXTURE_COUNT + 1] = score("advisory", 1, envelope({ findings: [finding("error")], gateFailing: true }), "a-1");
     expect(aggregateModel(pair, advisoryBlocks, 3, HOSTED_OPERATION_COST_CAP_MICROS).admissionFailures.join("\n")).toContain("advisory overblocking");
 
+    const firstCleanIndex = MUST_BLOCK_FIXTURE_COUNT + ADVISORY_FIXTURE_COUNT;
     const cleanNoise = passingMatrix();
-    cleanNoise[49] = score("clean", 1, envelope({ findings: [finding("warn", "src/other.ts", 1)] }), "c-0");
+    cleanNoise[firstCleanIndex] = score("clean", 1, envelope({ findings: [finding("warn", "src/other.ts", 1)] }), "c-0");
     expect(aggregateModel(pair, cleanNoise, 3, HOSTED_OPERATION_COST_CAP_MICROS).admissionFailures.join("\n")).toContain("clean finding false-positive");
 
     const cleanBlock = passingMatrix();
-    cleanBlock[49] = score("clean", 1, envelope({ findings: [finding("error", "src/other.ts", 1)], gateFailing: true }), "c-0");
+    cleanBlock[firstCleanIndex] = score("clean", 1, envelope({ findings: [finding("error", "src/other.ts", 1)], gateFailing: true }), "c-0");
     expect(aggregateModel(pair, cleanBlock, 3, HOSTED_OPERATION_COST_CAP_MICROS).admissionFailures.join("\n")).toContain("clean false block");
   });
 
@@ -486,8 +495,8 @@ describe("report and pricing utilities", () => {
       mustBlockRecall: 1,
       advisoryDetectionRate: 1,
       cleanFindingFalsePositiveRate: 0,
-      casesRun: 183,
-      meanCostUsdPerReview: 0.0001803278688524587,
+      casesRun: REPEATED_MATRIX_CASE_COUNT,
+      meanCostUsdPerReview: 0.00018142857142857102,
       meanDurationMs: 1000,
       p95DurationMs: 1000,
       maxDurationMs: 1000,
@@ -496,7 +505,7 @@ describe("report and pricing utilities", () => {
 
   test("sums case costs and matches canonical catalog ids", () => {
     const results = passingMatrix();
-    expect(calculateTotalRunCostUsd(results)).toBeCloseTo(0.033, 8);
+    expect(calculateTotalRunCostUsd(results)).toBeCloseTo(0.0381, 8);
     const catalog = pricingFromCatalog({ data: [{
       id: "alias",
       canonical_slug: pair.generatorModel,

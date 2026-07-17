@@ -1,7 +1,7 @@
 # postil bench
 
-Hermetic PR-review regression suite for the `postil` CLI. The 61-fixture
-admission matrix contains 34 must-block defects, 15 advisory defects, and 12
+Hermetic PR-review regression suite for the `postil` CLI. The 70-fixture
+admission matrix contains 47 must-block defects, 10 advisory defects, and 13
 clean PRs where the correct review is silence. Each fixture runs the release
 binary against a per-case mock GitHub API and a mock OpenAI-compatible model
 endpoint in an isolated run directory, then scores the v1 envelope and the
