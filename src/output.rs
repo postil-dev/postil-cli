@@ -268,6 +268,117 @@ mod tests {
     use super::*;
 
     #[test]
+    fn yaml_round_trips_complete_envelope_contract() {
+        use crate::envelope::{
+            Finding, Gate, Kind, ModelIncident, ModelIncidentCategory, ModelIncidentPhase,
+            ModelIncidentRecovery, ModelUsage, ModelUsageCostSource, ModelUsagePhase,
+            ModelUsageRole, ReviewAdmission, ReviewCoverageMode, SuppressedFinding,
+            SuppressionReason, Usage,
+        };
+
+        let finding = Finding {
+            path: "src/lib.rs".into(),
+            line: 7,
+            end_line: Some(9),
+            severity: Severity::Error,
+            kind: Kind::Risk,
+            confidence: 0.87,
+            generator_confidence: Some(0.92),
+            scorer_confidence: Some(0.87),
+            generator_kind: Some(Kind::Risk),
+            scorer_kind: Some(Kind::HumanEscalation),
+            scorer_reason: Some("The changed branch can skip authorization.".into()),
+            title: "Authorization branch can be skipped".into(),
+            body: "The fallback path returns before the policy check.".into(),
+            evidence: Some("return Ok(response);".into()),
+            id: Some("finding-1".into()),
+        };
+        let envelope = Envelope {
+            version: 1,
+            summary: "One merge-blocking finding.".into(),
+            silent: false,
+            findings: vec![finding.clone()],
+            suppressed_findings: vec![SuppressedFinding {
+                finding: Finding {
+                    id: Some("finding-2".into()),
+                    ..finding.clone()
+                },
+                reason: SuppressionReason::BelowConfidence,
+            }],
+            resolved: vec![Finding {
+                id: Some("finding-3".into()),
+                ..finding
+            }],
+            counts: crate::envelope::Counts {
+                info: 0,
+                warn: 0,
+                error: 1,
+                suppressed: 1,
+                ungrounded: 2,
+            },
+            confidence_buckets: [0, 0, 0, 0, 1],
+            gate: Gate {
+                fail_on: "error".into(),
+                failing: true,
+                block_on_kinds: vec!["humanEscalation".into()],
+            },
+            model_used: "provider/reviewer".into(),
+            scorer_model: Some("provider/scorer".into()),
+            scorer_error: Some("fallback scorer unavailable".into()),
+            scorer_disagreements: Some(1),
+            usage: Usage {
+                prompt_tokens: 123,
+                completion_tokens: 45,
+                ..Usage::default()
+            },
+            model_usage: vec![ModelUsage {
+                model: "provider/reviewer".into(),
+                role: Some(ModelUsageRole::ReviewGenerator),
+                phase: Some(ModelUsagePhase::SemanticRetry),
+                call_ordinal: Some(2),
+                attempt: Some(1),
+                prompt_tokens: 123,
+                completion_tokens: 45,
+                cost_micros: Some(67),
+                cost_provider_decimal: Some("0.000067".into()),
+                cost_source: Some(ModelUsageCostSource::ProviderReported),
+                accounting_complete: true,
+            }],
+            model_incidents: vec![ModelIncident {
+                phase: ModelIncidentPhase::Review,
+                category: ModelIncidentCategory::InvalidOutput,
+                recovered: true,
+                recovery: Some(ModelIncidentRecovery::Repair),
+            }],
+            review_coverage: Some(ReviewCoverage {
+                mode: ReviewCoverageMode::Bounded,
+                selected_batches: 5,
+                total_batches: 8,
+                planner_fallback: true,
+            }),
+            review_admission: Some(ReviewAdmission {
+                provider_attempts: 3,
+                serialized_input_bytes: 4096,
+                output_tokens: 2048,
+                projected_cost_micros: 900,
+            }),
+            usage_accounting_complete: true,
+            duration_ms: 4567,
+            base_sha: Some("base".into()),
+            head_sha: Some("head".into()),
+            since_sha: Some("since".into()),
+        };
+
+        let rendered = render_envelope(&envelope, OutputFormat::Yaml).unwrap();
+        let decoded: Envelope = yaml_serde::from_str(&rendered).unwrap();
+
+        assert_eq!(
+            serde_json::to_value(decoded).unwrap(),
+            serde_json::to_value(envelope).unwrap()
+        );
+    }
+
+    #[test]
     fn sanitize_strips_esc_and_c0_c1_keeps_newline_tab() {
         // ESC-based CSI (color), a C0 control, and a C1 control, around plain text.
         let raw = "\x1b[31mred\x1b[0m\x07bell\u{0085}nel";
