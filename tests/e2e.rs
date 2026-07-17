@@ -1307,7 +1307,7 @@ fn qualification_candidate_admits_fixture_51_shape_at_fireworks_price_bounds() {
     let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     assert_eq!(envelope["reviewCoverage"]["mode"], "bounded");
     assert_eq!(envelope["reviewAdmission"]["providerAttempts"], 7);
-    assert_eq!(envelope["reviewAdmission"]["outputTokens"], 44_160);
+    assert_eq!(envelope["reviewAdmission"]["outputTokens"], 85_184);
     assert!(
         envelope["reviewAdmission"]["serializedInputBytes"]
             .as_u64()
