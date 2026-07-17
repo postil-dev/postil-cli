@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -569,6 +569,7 @@ const TOTAL_TIMEOUT_ENV: &str = "POSTIL_LLM_TOTAL_TIMEOUT_SECS";
 const ENDPOINT_AUTH_HEADER_ENV: &str = "POSTIL_ENDPOINT_AUTH_HEADER";
 const ENDPOINT_AUTH_VALUE_ENV: &str = "POSTIL_ENDPOINT_AUTH_VALUE";
 const ALLOW_PRIVATE_API_BASE_ENV: &str = "POSTIL_ALLOW_PRIVATE_API_BASE";
+static PROVIDER_RETRY_JITTER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "qualification-candidate")]
 const QUALIFICATION_CAPTURE_API_BASE_ENV: &str = "POSTIL_QUALIFICATION_CAPTURE_API_BASE";
 const ALWAYS_MANAGED_HEADERS: &[&str] = &["x-api-key", "anthropic-version", "content-type"];
@@ -830,6 +831,25 @@ impl std::fmt::Display for ProviderError {
 
 fn retryable_status(status: u16) -> bool {
     matches!(status, 429 | 500 | 502 | 503 | 529)
+}
+
+fn provider_retry_delay(retry: u32) -> Duration {
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let sequence = PROVIDER_RETRY_JITTER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let sample = elapsed.as_secs().rotate_left(17)
+        ^ u64::from(elapsed.subsec_nanos())
+        ^ u64::from(std::process::id()).rotate_left(32)
+        ^ sequence.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    provider_retry_delay_with_sample(retry, sample)
+}
+
+fn provider_retry_delay_with_sample(retry: u32, sample: u64) -> Duration {
+    let ceiling_ms = 2_000_u64.saturating_mul(u64::from(retry.max(1)));
+    let floor_ms = ceiling_ms / 2;
+    let jitter_ms = sample % (ceiling_ms - floor_ms + 1);
+    Duration::from_millis(floor_ms + jitter_ms)
 }
 
 fn timeout_status(status: u16) -> bool {
@@ -2694,13 +2714,13 @@ impl LlmClient {
                     if timeout_retries < TIMEOUT_RETRIES && retries < TRANSIENT_RETRIES {
                         retries += 1;
                         timeout_retries += 1;
-                        let wait = Duration::from_secs(2 * retries as u64);
+                        let wait = provider_retry_delay(retries);
                         eprintln!(
-                            "postil: model {} hit a request timeout after {}, retrying in {}s \
+                            "postil: model {} hit a request timeout after {}, retrying in {} \
                              (timeout retry {timeout_retries}/{TIMEOUT_RETRIES}; retry {retries}/{TRANSIENT_RETRIES})",
                             log_text(model),
                             elapsed_text(attempt_started_at.elapsed()),
-                            wait.as_secs()
+                            elapsed_text(wait)
                         );
                         self.sleep_with_budget(phase, wait).await?;
                         attempt_timeout = self.timeout_retry_timeout;
@@ -2825,7 +2845,7 @@ impl LlmClient {
                                 {
                                     retries += 1;
                                     empty_response_retries += 1;
-                                    let wait = Duration::from_secs(2 * retries as u64);
+                                    let wait = provider_retry_delay(retries);
                                     let expanded_max_tokens =
                                         phase.exhausted_output_retry_max_tokens(request_max_tokens);
                                     let exhausted_output_budget = summary.finish_reason.as_deref()
@@ -2836,9 +2856,9 @@ impl LlmClient {
                                         && expanded_max_tokens > request_max_tokens;
                                     if exhausted_output_budget {
                                         eprintln!(
-                                            "postil: model {} exhausted {request_max_tokens} output tokens before content after {elapsed}, expanding the retry to {expanded_max_tokens} tokens in {}s (empty retry {empty_response_retries}/{EMPTY_RESPONSE_RETRIES}; retry {retries}/{TRANSIENT_RETRIES})",
+                                            "postil: model {} exhausted {request_max_tokens} output tokens before content after {elapsed}, expanding the retry to {expanded_max_tokens} tokens in {} (empty retry {empty_response_retries}/{EMPTY_RESPONSE_RETRIES}; retry {retries}/{TRANSIENT_RETRIES})",
                                             log_text(model),
-                                            wait.as_secs(),
+                                            elapsed_text(wait),
                                         );
                                         request_max_tokens = expanded_max_tokens;
                                         body = self.request_body_with_provider(
@@ -2852,9 +2872,9 @@ impl LlmClient {
                                         );
                                     } else {
                                         eprintln!(
-                                            "postil: model {} returned empty content after {elapsed}, retrying in {}s (empty retry {empty_response_retries}/{EMPTY_RESPONSE_RETRIES}; retry {retries}/{TRANSIENT_RETRIES})",
+                                            "postil: model {} returned empty content after {elapsed}, retrying in {} (empty retry {empty_response_retries}/{EMPTY_RESPONSE_RETRIES}; retry {retries}/{TRANSIENT_RETRIES})",
                                             log_text(model),
-                                            wait.as_secs(),
+                                            elapsed_text(wait),
                                         );
                                     }
                                     self.sleep_with_budget(phase, wait).await?;
@@ -2896,7 +2916,7 @@ impl LlmClient {
                         timeout_retries += 1;
                         let wait = response
                             .retry_after
-                            .unwrap_or_else(|| Duration::from_secs(2 * retries as u64));
+                            .unwrap_or_else(|| provider_retry_delay(retries));
                         eprintln!(
                             "postil: model {} returned timeout HTTP {status} after {}, retrying in {} \
                              (timeout retry {timeout_retries}/{TIMEOUT_RETRIES}; retry {retries}/{TRANSIENT_RETRIES})",
@@ -2920,7 +2940,7 @@ impl LlmClient {
                         retries += 1;
                         let wait = response
                             .retry_after
-                            .unwrap_or_else(|| Duration::from_secs(2 * retries as u64));
+                            .unwrap_or_else(|| provider_retry_delay(retries));
                         eprintln!(
                             "postil: model {} returned retryable HTTP {status} after {}, retrying in {} \
                              (retry {retries}/{TRANSIENT_RETRIES})",
@@ -2950,13 +2970,13 @@ impl LlmClient {
                         .push(self.model_usage_event(model, phase, call_phase, attempt, None));
                     retries += 1;
                     timeout_retries += 1;
-                    let wait = Duration::from_secs(2 * retries as u64);
+                    let wait = provider_retry_delay(retries);
                     eprintln!(
-                        "postil: model {} hit a request timeout after {}, retrying in {}s \
+                        "postil: model {} hit a request timeout after {}, retrying in {} \
                          (timeout retry {timeout_retries}/{TIMEOUT_RETRIES}; retry {retries}/{TRANSIENT_RETRIES})",
                         log_text(model),
                         elapsed_text(attempt_started_at.elapsed()),
-                        wait.as_secs()
+                        elapsed_text(wait)
                     );
                     self.sleep_with_budget(phase, wait).await?;
                     attempt_timeout = self.timeout_retry_timeout;
@@ -2969,13 +2989,13 @@ impl LlmClient {
                     call_usage
                         .push(self.model_usage_event(model, phase, call_phase, attempt, None));
                     retries += 1;
-                    let wait = Duration::from_secs(2 * retries as u64);
+                    let wait = provider_retry_delay(retries);
                     eprintln!(
-                        "postil: model {} hit a retryable connection error after {}, retrying in {}s \
+                        "postil: model {} hit a retryable connection error after {}, retrying in {} \
                          (retry {retries}/{TRANSIENT_RETRIES})",
                         log_text(model),
                         elapsed_text(attempt_started_at.elapsed()),
-                        wait.as_secs()
+                        elapsed_text(wait)
                     );
                     self.sleep_with_budget(phase, wait).await?;
                     attempt_timeout = self.request_timeout;
@@ -4324,6 +4344,26 @@ fn consensus_merge(runs: Vec<ModelReview>) -> ModelReview {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_retry_delay_uses_bounded_equal_jitter() {
+        assert_eq!(
+            provider_retry_delay_with_sample(1, 0),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            provider_retry_delay_with_sample(1, 1_000),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            provider_retry_delay_with_sample(2, 0),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            provider_retry_delay_with_sample(2, 2_000),
+            Duration::from_secs(4)
+        );
+    }
     use crate::config::Config;
     use crate::envelope::{Kind, Severity};
     use std::sync::{Mutex, OnceLock};

@@ -26,13 +26,13 @@
   cross-batch synthesis.
 - `.coderabbit.yaml` translation for zero-cost migration.
 - Model cascade + concurrent multi-model consensus over any OpenAI-compatible endpoint;
-  bounded retry with backoff on transient provider errors.
+  bounded retry with jittered backoff on transient provider errors.
 - Verified `curl | sh` install script with SHA-256 checksum verification; prebuilt
   release binaries for six targets, including x86_64 musl (Alpine) for static-libc
   systems.
 - Sigstore keyless signing of release artifacts (cosign, GitHub OIDC); the installer
-  verifies the signature when cosign is present and refuses a stripped signature
-  unless explicitly overridden.
+  verifies the signature when cosign is present, supports required-signature mode,
+  and refuses a stripped signature unless explicitly overridden.
 
 ## Next
 
