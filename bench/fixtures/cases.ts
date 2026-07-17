@@ -1,5 +1,5 @@
-// The admission matrix contains 34 must-block defects, 15 advisory defects,
-// and 12 clean PRs where the correct review is silence. Every included case
+// The admission matrix contains 47 must-block defects, 10 advisory defects,
+// and 13 clean PRs where the correct review is silence. Every included case
 // supplies model-visible evidence for its asserted contract classification.
 //
 // Each spec compiles into a hermetic case: a unified diff, the changed file as
@@ -300,9 +300,13 @@ const fixtureSpecs: FixtureSpec[] = [
     after: "stats.increment(key);",
     allowedFileContent: "export function bump(key: string) { stats.increment(key); }",
     policy: "Shared counters must stay protected by the lock to avoid lost updates.",
-    scoringLabels: ["race", "concurrency", "warn"],
+    scoringLabels: ["race", "concurrency", "error"],
+    admission: {
+      classification: "mustBlock",
+      contractRule: "lost-shared-counter-updates-are-data-loss",
+    },
     finding: {
-      severity: "warn",
+      severity: "error",
       body: "Removing the lock makes the counter update vulnerable to lost writes.",
       bodyIncludes: "lost writes",
     },
@@ -417,9 +421,13 @@ const fixtureSpecs: FixtureSpec[] = [
     after: "<button><Trash2 /></button>",
     allowedFileContent: "export function Settings() { return <button><Trash2 /></button>; }",
     policy: "Icon-only buttons need an accessible name for assistive technologies.",
-    scoringLabels: ["ui", "a11y", "warn"],
+    scoringLabels: ["ui", "a11y", "error"],
+    admission: {
+      classification: "mustBlock",
+      contractRule: "destructive-control-loses-accessible-name",
+    },
     finding: {
-      severity: "warn",
+      severity: "error",
       body: "The icon button has no accessible name for assistive tech.",
       bodyIncludes: "accessible name",
     },
@@ -435,9 +443,13 @@ const fixtureSpecs: FixtureSpec[] = [
     after: '<input id="email" />',
     allowedFileContent: 'export function Profile() { return <input id="email" />; }',
     policy: "Form fields should keep a visible or programmatic label.",
-    scoringLabels: ["ui", "a11y", "warn"],
+    scoringLabels: ["ui", "a11y", "error"],
+    admission: {
+      classification: "mustBlock",
+      contractRule: "form-control-loses-accessible-name",
+    },
     finding: {
-      severity: "warn",
+      severity: "error",
       body: "The input has no visible label or aria-label.",
       bodyIncludes: "visible label",
     },
@@ -449,18 +461,22 @@ const fixtureSpecs: FixtureSpec[] = [
     pullNumber: 17,
     path: "src/app/dashboard/status.tsx",
     line: 25,
-    before: 'className="text-zinc-700"',
-    after: 'className="text-zinc-400"',
+    before: 'className="bg-white text-sm text-zinc-700"',
+    after: 'className="bg-white text-sm text-zinc-400"',
     allowedFileContent:
-      'export function Status() { return <span className="text-zinc-400">Ready</span>; }',
-    policy: "Text must stay readable against the page background.",
-    scoringLabels: ["a11y", "contrast", "warn"],
+      'export function Status() { return <span className="bg-white text-sm text-zinc-400">Ready</span>; }',
+    policy: "Small status text on white must meet the 4.5:1 WCAG AA contrast floor.",
+    scoringLabels: ["a11y", "contrast", "error"],
+    admission: {
+      classification: "mustBlock",
+      contractRule: "status-text-breaches-required-contrast-floor",
+    },
     finding: {
-      severity: "warn",
-      body: "The status text falls below the contrast floor against the page background.",
+      severity: "error",
+      body: "Zinc 400 on white has 2.56:1 contrast, below the 4.5:1 contrast floor for this small text.",
       bodyIncludes: "contrast floor",
     },
-    disallowedSources: ["stay readable against the page background"],
+    disallowedSources: ["must meet the 4.5:1 WCAG AA contrast floor"],
   },
   {
     id: "a11y-icon-only-action",
@@ -1287,9 +1303,13 @@ const fixtureSpecs: FixtureSpec[] = [
     allowedFileContent:
       "export async function invite(email: string) { if (!(await db.invite.findFirst({ where: { email } }))) await db.invite.create({ data: { email } }); }",
     policy: "Uniqueness checks should remain atomic under concurrent requests.",
-    scoringLabels: ["subtle-races", "race", "database", "warn"],
+    scoringLabels: ["subtle-races", "race", "database", "error"],
+    admission: {
+      classification: "mustBlock",
+      contractRule: "non-atomic-uniqueness-check-allows-duplicate-records",
+    },
     finding: {
-      severity: "warn",
+      severity: "error",
       body: "The separate read and create can race under concurrent requests and create duplicate invites.",
       bodyIncludes: "separate read and create can race",
     },
@@ -1306,9 +1326,13 @@ const fixtureSpecs: FixtureSpec[] = [
     allowedFileContent:
       "export async function update(key: string, next: number) { const release = await lock.acquire(); release(); await store.write(key, next); }",
     policy: "Shared writes should stay inside the lock until the write completes.",
-    scoringLabels: ["subtle-races", "race", "concurrency", "warn"],
+    scoringLabels: ["subtle-races", "race", "concurrency", "error"],
+    admission: {
+      classification: "mustBlock",
+      contractRule: "shared-write-occurs-outside-required-lock",
+    },
     finding: {
-      severity: "warn",
+      severity: "error",
       body: "The lock is released before the awaited write, so concurrent writers can interleave.",
       bodyIncludes: "released before the awaited write",
     },
@@ -1344,13 +1368,218 @@ const fixtureSpecs: FixtureSpec[] = [
     allowedFileContent:
       "export async function save(destination: string, data: Uint8Array) { await writeFile(destination, data); }",
     policy: "Published files should be written atomically so readers never observe partial content.",
-    scoringLabels: ["subtle-races", "filesystem", "warn"],
+    scoringLabels: ["subtle-races", "filesystem", "error"],
+    admission: {
+      classification: "mustBlock",
+      contractRule: "non-atomic-publication-exposes-partial-content",
+    },
     finding: {
-      severity: "warn",
+      severity: "error",
       body: "Writing directly to the destination lets concurrent readers observe a partial file.",
       bodyIncludes: "partial file",
     },
     disallowedSources: ["written atomically"],
+  },
+  {
+    id: "async-transaction-not-awaited",
+    name: "Transaction returns after the caller has already succeeded",
+    pullNumber: 65,
+    path: "src/orders/create.ts",
+    line: 28,
+    before: "return await db.transaction(async (tx) => await tx.order.create({ data: order }));",
+    after: "db.transaction(async (tx) => await tx.order.create({ data: order })); return order.id;",
+    allowedFileContent:
+      "export async function createOrder(order: Order) { db.transaction(async (tx) => await tx.order.create({ data: order })); return order.id; }",
+    policy: "Order creation should report success only after its transaction commits.",
+    scoringLabels: ["async-lifecycle", "transactions", "error"],
+    admission: {
+      classification: "mustBlock",
+      contractRule: "success-returned-before-transaction-completes",
+    },
+    finding: {
+      severity: "error",
+      body: "The transaction promise is not awaited, so the caller receives success before the order commit completes or fails.",
+      bodyIncludes: "not awaited",
+    },
+    disallowedSources: ["report success only after its transaction commits"],
+  },
+  {
+    id: "authorization-before-path-decoding",
+    name: "Authorization checks a different path from the file read",
+    pullNumber: 66,
+    path: "src/files/read.ts",
+    line: 19,
+    before: "const path = decodeURIComponent(rawPath); authorize(path); return readFile(path);",
+    after: "authorize(rawPath); return readFile(decodeURIComponent(rawPath));",
+    allowedFileContent:
+      "export function readAuthorized(rawPath: string) { authorize(rawPath); return readFile(decodeURIComponent(rawPath)); }",
+    policy: "Authorization must evaluate the canonical path used for the file operation.",
+    scoringLabels: ["authorization", "canonicalization", "error"],
+    admission: {
+      classification: "mustBlock",
+      contractRule: "authorization-and-use-operate-on-different-paths",
+    },
+    finding: {
+      severity: "error",
+      body: "Authorization sees the encoded path while readFile receives the decoded path, so encoded traversal can bypass the path decision.",
+      bodyIncludes: "encoded path",
+    },
+    disallowedSources: ["canonical path used for the file operation"],
+  },
+  {
+    id: "webhook-signature-reserialized-body",
+    name: "Webhook verification hashes reserialized JSON",
+    pullNumber: 67,
+    path: "src/webhooks/verify.ts",
+    line: 23,
+    before: "verifySignature(rawBody, signature); return JSON.parse(rawBody);",
+    after: "const event = JSON.parse(rawBody); verifySignature(JSON.stringify(event), signature); return event;",
+    allowedFileContent:
+      "export function acceptWebhook(rawBody: string, signature: string) { const event = JSON.parse(rawBody); verifySignature(JSON.stringify(event), signature); return event; }",
+    policy: "Webhook signatures should be verified against the exact bytes sent by the provider.",
+    scoringLabels: ["webhooks", "integrity", "error"],
+    admission: {
+      classification: "mustBlock",
+      contractRule: "signature-verification-does-not-use-received-bytes",
+    },
+    finding: {
+      severity: "error",
+      body: "JSON.parse and JSON.stringify can change the signed bytes, so valid webhook deliveries fail signature verification.",
+      bodyIncludes: "change the signed bytes",
+    },
+    disallowedSources: ["exact bytes sent by the provider"],
+  },
+  {
+    id: "async-foreach-drops-invite-failures",
+    name: "Async forEach returns before invitations finish",
+    pullNumber: 68,
+    path: "src/invites/send.ts",
+    line: 31,
+    before: "await Promise.all(users.map((user) => sendInvite(user)));",
+    after: "users.forEach(async (user) => await sendInvite(user)); return;",
+    allowedFileContent:
+      "export async function sendAll(users: User[]) { users.forEach(async (user) => await sendInvite(user)); return; }",
+    policy: "Bulk invitation completion should include every invitation attempt and failure.",
+    scoringLabels: ["async-lifecycle", "error-propagation", "error"],
+    admission: {
+      classification: "mustBlock",
+      contractRule: "bulk-operation-returns-before-child-promises-settle",
+    },
+    finding: {
+      severity: "error",
+      body: "forEach ignores the async callback promises, so sendAll returns early and invitation failures are not propagated.",
+      bodyIncludes: "ignores the async callback promises",
+    },
+    disallowedSources: ["include every invitation attempt and failure"],
+  },
+  {
+    id: "lease-release-drops-generation-token",
+    name: "Stale worker can release a reassigned lease",
+    pullNumber: 69,
+    path: "src/leases/release.ts",
+    line: 37,
+    before: "await leases.delete({ where: { id_generation: { id, generation } } });",
+    after: "await leases.delete({ where: { id } });",
+    allowedFileContent:
+      "export async function release(id: string, generation: number) { await leases.delete({ where: { id } }); }",
+    policy: "Lease mutation should retain the generation token that proves ownership.",
+    scoringLabels: ["concurrency", "leases", "error"],
+    admission: {
+      classification: "mustBlock",
+      contractRule: "stale-owner-can-delete-reassigned-lease",
+    },
+    finding: {
+      severity: "error",
+      body: "Deleting by id alone lets a stale worker remove a lease that has been reassigned with a newer generation.",
+      bodyIncludes: "stale worker",
+    },
+    disallowedSources: ["generation token that proves ownership"],
+  },
+  {
+    id: "lease-renewal-seconds-used-as-milliseconds",
+    name: "Lease renewal mixes seconds with milliseconds",
+    pullNumber: 70,
+    path: "src/leases/renew.ts",
+    line: 44,
+    before: "lease.expiresAt = Date.now() + ttlSeconds * 1000;",
+    after: "lease.expiresAt = Date.now() + ttlSeconds;",
+    allowedFileContent:
+      "export function renew(lease: Lease, ttlSeconds: number) { lease.expiresAt = Date.now() + ttlSeconds; }",
+    policy: "Lease expiration arithmetic should convert configured seconds to timestamp milliseconds.",
+    scoringLabels: ["units", "leases", "error"],
+    admission: {
+      classification: "mustBlock",
+      contractRule: "lease-expiration-unit-mismatch-breaks-ownership-window",
+    },
+    finding: {
+      severity: "error",
+      body: "ttlSeconds is added directly to a millisecond timestamp, so renewed leases expire about one thousand times too early.",
+      bodyIncludes: "millisecond timestamp",
+    },
+    disallowedSources: ["convert configured seconds to timestamp milliseconds"],
+  },
+  {
+    id: "retry-backoff-removes-jitter",
+    name: "Provider retries lose jitter",
+    pullNumber: 71,
+    path: "src/providers/retry.ts",
+    line: 26,
+    before: "await sleep(baseDelayMs * attempt + randomJitterMs());",
+    after: "await sleep(baseDelayMs * attempt);",
+    allowedFileContent:
+      "export async function waitBeforeRetry(baseDelayMs: number, attempt: number) { await sleep(baseDelayMs * attempt); }",
+    policy: "Concurrent provider retries should spread their retry times to avoid synchronized load.",
+    scoringLabels: ["retries", "coordination", "warn"],
+    admission: {
+      classification: "advisory",
+      contractRule: "fixed-retry-schedule-can-synchronize-concurrent-clients",
+    },
+    finding: {
+      severity: "warn",
+      body: "Removing jitter gives concurrent failures the same retry schedule, which can concentrate load during an outage.",
+      bodyIncludes: "same retry schedule",
+    },
+    disallowedSources: ["spread their retry times"],
+  },
+  {
+    id: "streaming-response-buffered-in-memory",
+    name: "Streaming proxy buffers the full upstream response",
+    pullNumber: 72,
+    path: "src/proxy/forward.ts",
+    line: 52,
+    before: "return new Response(upstream.body, { headers: upstream.headers });",
+    after: "const body = await upstream.arrayBuffer(); return new Response(body, { headers: upstream.headers });",
+    allowedFileContent:
+      "export async function forward(upstream: Response) { const body = await upstream.arrayBuffer(); return new Response(body, { headers: upstream.headers }); }",
+    policy: "The proxy should preserve streaming for upstream responses that may be large.",
+    scoringLabels: ["streaming", "resource-bounds", "warn"],
+    admission: {
+      classification: "advisory",
+      contractRule: "full-response-buffering-is-conditional-on-payload-size",
+    },
+    finding: {
+      severity: "warn",
+      body: "arrayBuffer reads the full upstream response into memory, so large responses can exhaust a worker instead of streaming.",
+      bodyIncludes: "full upstream response into memory",
+    },
+    disallowedSources: ["preserve streaming"],
+  },
+  {
+    id: "independent-prefetch-concurrency-clean",
+    name: "Independent reads are prefetched concurrently",
+    pullNumber: 73,
+    path: "src/dashboard/load.ts",
+    line: 18,
+    before: "const profile = await loadProfile(userId); const preferences = await loadPreferences(userId);",
+    after: "const [profile, preferences] = await Promise.all([loadProfile(userId), loadPreferences(userId)]);",
+    allowedFileContent:
+      "export async function loadDashboard(userId: string) { const [profile, preferences] = await Promise.all([loadProfile(userId), loadPreferences(userId)]); return { profile, preferences }; }",
+    policy: "Profile and preference reads are independent and may run concurrently.",
+    scoringLabels: ["async-lifecycle", "concurrency", "clean"],
+    admission: {
+      classification: "clean",
+      contractRule: "independent-read-prefetch-preserves-results",
+    },
   },
 ];
 

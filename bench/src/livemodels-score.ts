@@ -19,6 +19,9 @@ export const GENERATOR_MAX_MEAN_DURATION_MS = 15_000;
 export const GENERATOR_MAX_REPEAT_P95_DURATION_MS = 30_000;
 export const GENERATOR_MAX_REPEAT_DURATION_MS = 60_000;
 export const MIN_QUALIFICATION_REPEATS = 3;
+export const MUST_BLOCK_FIXTURE_COUNT = 47;
+export const ADVISORY_FIXTURE_COUNT = 10;
+export const CLEAN_FIXTURE_COUNT = 13;
 
 export interface QualificationPair {
   generatorModel: string;
@@ -587,10 +590,15 @@ export function aggregateModel(
     const repeatMustBlocks = matrix.filter((result) => result.classification === "mustBlock");
     const repeatAdvisories = matrix.filter((result) => result.classification === "advisory");
     const repeatCleans = matrix.filter((result) => result.classification === "clean");
-    if (repeatMustBlocks.length !== 34 || repeatAdvisories.length !== 15 || repeatCleans.length !== 12) {
+    if (
+      repeatMustBlocks.length !== MUST_BLOCK_FIXTURE_COUNT ||
+      repeatAdvisories.length !== ADVISORY_FIXTURE_COUNT ||
+      repeatCleans.length !== CLEAN_FIXTURE_COUNT
+    ) {
       admissionFailures.push(
-        `repeat ${repeat} matrix is ${repeatMustBlocks.length}/34 must-block, ` +
-        `${repeatAdvisories.length}/15 advisory, ${repeatCleans.length}/12 clean`,
+        `repeat ${repeat} matrix is ${repeatMustBlocks.length}/${MUST_BLOCK_FIXTURE_COUNT} must-block, ` +
+        `${repeatAdvisories.length}/${ADVISORY_FIXTURE_COUNT} advisory, ` +
+        `${repeatCleans.length}/${CLEAN_FIXTURE_COUNT} clean`,
       );
       continue;
     }

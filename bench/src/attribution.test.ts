@@ -111,9 +111,9 @@ describe("atomic attribution contract", () => {
     ).length;
     const decisions = (ATTRIBUTION_BANK.length +
       positiveCases * ATTRIBUTION_MAX_CALLS_PER_FINDING_SET) * 3;
-    expect(decisions).toBe(501);
+    expect(decisions).toBe(573);
     expect(decisions * 6).toBeLessThanOrEqual(5_000);
-    expect(Number(perDecision) * decisions).toBeCloseTo(15.859656, 9);
+    expect(Number(perDecision) * decisions).toBeCloseTo(18.138888, 9);
   });
 
   test("keeps evaluator labels and bank identifiers out of model requests", () => {
