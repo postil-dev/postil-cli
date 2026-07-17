@@ -50,8 +50,10 @@ Place organization-specific merge rules in `.postil/guardrails.md`. Place additi
 | `POSTIL_IGNORE_REPOSITORY_MODEL_CONFIG` | Keep trusted local/hosted model selection independent of repository model fields |
 | `REVIEW_MODEL` | Primary model override |
 | `REVIEW_MODEL_CASCADE` | Comma-separated fallback models |
+| `REVIEW_MODEL_CONSENSUS` | Number of models from the generator chain to run concurrently; agreeing findings are retained |
 | `REVIEW_SCORER_MODEL` | Scorer model override |
 | `REVIEW_SCORER_MODEL_CASCADE` | One scorer fallback model |
+| `POSTIL_LLM_REQUEST_TIMEOUT_SECS` | Per-attempt model request timeout; defaults to 480 seconds |
 | `POSTIL_LLM_TOTAL_TIMEOUT_SECS` | Optional total local-review model deadline |
 | `POSTIL_DETAILS_URL` | HTTP(S) details link for forge check runs |
 

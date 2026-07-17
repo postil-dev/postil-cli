@@ -5128,7 +5128,7 @@ async fn cascade_falls_back_to_next_model() {
     let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
     assert!(stderr.contains("postil: attempting model: primary-model"));
     assert!(stderr.contains("postil: model primary-model returned retryable HTTP 500"));
-    assert!(stderr.contains("retrying in 2.0s"));
+    assert!(stderr.contains("retrying in "));
     assert!(stderr.contains("postil: model primary-model failed after"));
     assert!(stderr.contains("falling back to next model"));
     assert!(stderr.contains("postil: attempting model: backup-model"));

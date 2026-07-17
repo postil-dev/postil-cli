@@ -4,11 +4,11 @@
 #   curl -fsSL https://postil.dev/install.sh | sh
 #   curl -fsSL https://postil.dev/install.sh | sh -s -- --version v0.1.0 --bin-dir ~/.local/bin
 #
-# Verification: the archive's SHA-256 is checked against the published checksum
-# (transit integrity), and when cosign is installed the Sigstore keyless
-# signature is verified too (proves the artifact came from this project's
-# release workflow). With cosign present, a missing signature aborts the
-# install unless POSTIL_SKIP_SIG=1 is set. No build toolchain required.
+# Verification: the archive's SHA-256 is checked against the published checksum.
+# When cosign is installed, the Sigstore keyless signature is verified too.
+# Pass --require-cosign to refuse checksum-only installation. With cosign
+# present, a missing signature aborts the install unless POSTIL_SKIP_SIG=1 is
+# set. No build toolchain required.
 # Inspect this script before piping it to a shell.
 
 set -eu
@@ -17,13 +17,15 @@ REPO="postil-dev/postil-cli"
 VERSION="${POSTIL_VERSION:-latest}"
 # Default to a no-sudo user path; override with POSTIL_INSTALL_DIR or --bin-dir.
 BIN_DIR="${POSTIL_INSTALL_DIR:-$HOME/.local/bin}"
+REQUIRE_COSIGN=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --version) VERSION="$2"; shift 2 ;;
         --bin-dir) BIN_DIR="$2"; shift 2 ;;
+        --require-cosign) REQUIRE_COSIGN=1; shift ;;
         -h|--help)
-            echo "usage: install.sh [--version <tag>] [--bin-dir <path>]"
+            echo "usage: install.sh [--version <tag>] [--bin-dir <path>] [--require-cosign]"
             exit 0 ;;
         *) echo "install.sh: unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -31,6 +33,12 @@ done
 
 err() { echo "install.sh: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+if [ "$REQUIRE_COSIGN" = "1" ]; then
+    [ "${POSTIL_SKIP_SIG:-0}" != "1" ] \
+        || err "--require-cosign conflicts with POSTIL_SKIP_SIG=1"
+    have cosign || err "--require-cosign requires cosign in PATH"
+fi
 
 FROM_SOURCE="build from source with: cargo install --git https://github.com/${REPO}"
 
@@ -126,7 +134,12 @@ if have cosign && [ "${POSTIL_SKIP_SIG:-0}" != "1" ]; then
         err "signature verification failed; refusing to install"
     fi
 else
-    echo "Note: install cosign to additionally verify the Sigstore signature."
+    if [ "${POSTIL_SKIP_SIG:-0}" = "1" ]; then
+        echo "WARNING: POSTIL_SKIP_SIG=1 disabled signature verification." >&2
+    else
+        echo "WARNING: cosign was not found; the release signature was not verified." >&2
+    fi
+    echo "WARNING: checksum-only verification cannot prove who published the archive." >&2
 fi
 
 tar -xzf "$tmp/$archive" -C "$tmp"

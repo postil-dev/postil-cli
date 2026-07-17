@@ -10,7 +10,7 @@ One binary reviews local changes, pull requests, and merge requests. It supports
 curl -fsSL https://postil.dev/install.sh | sh
 ```
 
-The installer verifies the release checksum and, when `cosign` is available, its Sigstore signature. You can also build from source:
+The installer verifies the release checksum and, when `cosign` is available, its Sigstore signature. Pass `--require-cosign` to refuse checksum-only installation. You can also build from source:
 
 ```sh
 cargo install --git https://github.com/postil-dev/postil-cli --locked
