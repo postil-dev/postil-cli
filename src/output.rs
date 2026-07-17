@@ -46,7 +46,7 @@ impl OutputFormat {
 fn render_envelope(envelope: &Envelope, format: OutputFormat) -> anyhow::Result<String> {
     Ok(match format {
         OutputFormat::Json => format!("{}\n", serde_json::to_string_pretty(envelope)?),
-        OutputFormat::Yaml => serde_yaml::to_string(envelope)?,
+        OutputFormat::Yaml => yaml_serde::to_string(envelope)?,
         OutputFormat::Csv => render_csv(envelope),
     })
 }
