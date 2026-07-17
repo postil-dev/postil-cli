@@ -1202,20 +1202,33 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                                 }
                             }
                             let before = model_review.findings.len();
-                            model_review.findings.retain(|finding| {
-                                diff::review_batch_contains_exact_evidence(
+                            model_review.findings.retain_mut(|finding| {
+                                let canonical_evidence = diff::review_batch_canonical_evidence(
                                     &annotated,
                                     &finding.path,
                                     finding.line,
                                     finding.evidence.as_deref(),
-                                ) || (first
-                                    && finding.kind == crate::envelope::Kind::ContentPolicy
-                                    && diff::review_batch_contains_exact_evidence(
+                                )
+                                .or_else(|| {
+                                    (first
+                                        && finding.kind
+                                            == crate::envelope::Kind::ContentPolicy)
+                                        .then(|| {
+                                            diff::review_batch_canonical_evidence(
                                         &user,
                                         &finding.path,
                                         finding.line,
                                         finding.evidence.as_deref(),
-                                    ))
+                                            )
+                                        })
+                                        .flatten()
+                                });
+                                if let Some(evidence) = canonical_evidence {
+                                    finding.evidence = Some(evidence);
+                                    true
+                                } else {
+                                    false
+                                }
                             });
                             for finding in &mut model_review.findings {
                                 finding.path = diff::canonical_prompt_path(&finding.path)

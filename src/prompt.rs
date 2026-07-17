@@ -134,8 +134,10 @@ pub fn review_contract(cfg: &Config) -> String {
          credential, (2) purge it from git history (the commit is permanent otherwise), \
          and (3) move it to an environment variable or secrets store.\n\
          \n\
-         Cite ONLY line numbers printed in the left margin of the supplied evidence. Copy \
-         the exact non-empty new-side text printed after that line marker into the finding's \
+         Cite ONLY line numbers printed in the left margin of the supplied evidence. Each \
+         rendered line starts with the line number, one separator space, and a two-character \
+         marker: `+ ` for an added line or `  ` for context. Copy the exact non-empty \
+         new-side text after that two-character marker into the finding's \
          `evidence` field. Never cite a blank line or a deleted old-side line. For \
          ordinary source, cite the new-file line. For deletion, binary, rename, mode, or \
          compact lockfile evidence, cite the matching numbered line under \

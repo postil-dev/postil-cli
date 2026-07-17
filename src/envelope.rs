@@ -107,8 +107,9 @@ pub struct Finding {
     pub scorer_reason: Option<String>,
     pub title: String,
     pub body: String,
-    /// Exact new-side text copied from the cited prompt line. This is both the
-    /// grounding proof and the durable fingerprint used across incremental runs.
+    /// Exact new-side text canonicalized from the cited prompt line. This is
+    /// both the grounding proof and the durable fingerprint used across
+    /// incremental runs.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub evidence: Option<String>,
     /// Stable, engine-generated finding ID for deduplication and approval tracking.
