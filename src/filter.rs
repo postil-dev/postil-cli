@@ -851,6 +851,25 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_treats_indentation_changes_as_changed_evidence() {
+        let whitespace_change = DiffIndex::build(&diff::parse(
+            "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -10 +10 @@\n- value = 1\n+  value = 1\n",
+        ));
+        let mut baseline = f("a.py", 10, Severity::Error, 0.9);
+        baseline.evidence = Some(" value = 1".into());
+
+        let result = reconcile(
+            &[baseline],
+            &whitespace_change,
+            &[],
+            ReconcileScope::Incremental { trustworthy: true },
+        );
+
+        assert!(result.carried.is_empty());
+        assert_eq!(result.resolved.len(), 1);
+    }
+
+    #[test]
     fn trustworthy_full_review_resolves_findings_it_does_not_reproduce() {
         let idx = index_for("other.rs", 1, 1);
         let baseline = vec![f("a.rs", 99, Severity::Error, 0.9)];

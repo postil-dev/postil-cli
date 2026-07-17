@@ -3420,9 +3420,19 @@ pub fn review_batch_contains_exact_evidence(
     line: u32,
     evidence: Option<&str>,
 ) -> bool {
-    let Some(evidence) = evidence.filter(|value| !value.trim().is_empty()) else {
-        return false;
-    };
+    review_batch_canonical_evidence(annotated, path, line, evidence).is_some()
+}
+
+/// Resolve a prompt citation to the exact new-side text Postil rendered. The
+/// model may omit outer presentation whitespace, but durable evidence remains
+/// byte-exact after this ingestion boundary.
+pub fn review_batch_canonical_evidence(
+    annotated: &str,
+    path: &str,
+    line: u32,
+    evidence: Option<&str>,
+) -> Option<String> {
+    let evidence = evidence.filter(|value| !value.trim().is_empty())?;
     let mut current_path: Option<&str> = None;
     for rendered in annotated.lines() {
         if let Some(header) = rendered.strip_prefix("### ") {
@@ -3441,11 +3451,11 @@ pub fn review_batch_contains_exact_evidence(
         let payload = marked
             .strip_prefix("+ ")
             .or_else(|| marked.strip_prefix("  "));
-        if payload == Some(evidence) {
-            return true;
+        if let Some(payload) = payload.filter(|value| value.trim() == evidence.trim()) {
+            return Some(payload.to_string());
         }
     }
-    false
+    None
 }
 
 /// Render a bounded local window around a citation from the exact evidence a
@@ -4089,7 +4099,7 @@ Binary files a/img.png and b/img.png differ
 
     #[test]
     fn exact_evidence_rejects_blank_and_deleted_anchors() {
-        let batch = "### src/a.rs\n@@ first @@\n    10 - removed command\n    10 + replacement command\n    11 + \n    12   context\n";
+        let batch = "### src/a.rs\n@@ first @@\n    10 - removed command\n    10 + replacement command\n    11 + \n    12   context\n    13 +   indented replacement\n";
         assert!(review_batch_contains_exact_evidence(
             batch,
             "src/a.rs",
@@ -4113,6 +4123,23 @@ Binary files a/img.png and b/img.png differ
             "src/a.rs",
             12,
             Some("context")
+        ));
+        assert!(review_batch_contains_exact_evidence(
+            batch,
+            "src/a.rs",
+            13,
+            Some("indented replacement")
+        ));
+        assert_eq!(
+            review_batch_canonical_evidence(batch, "src/a.rs", 13, Some("indented replacement"))
+                .as_deref(),
+            Some("  indented replacement")
+        );
+        assert!(!review_batch_contains_exact_evidence(
+            batch,
+            "src/a.rs",
+            13,
+            Some("indented  replacement")
         ));
     }
 
