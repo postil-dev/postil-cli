@@ -810,12 +810,39 @@ fn qualification_profile_digest(profile: &QualificationProfile) -> String {
 }
 
 fn yaml_scalar(value: &str) -> String {
-    serde_yaml::to_string(value)
+    yaml_serde::to_string(value)
         .expect("model default scalar must serialize")
         .lines()
         .filter(|line| *line != "...")
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn parse_yaml_value(raw: &str) -> Result<yaml_serde::Value> {
+    let value = yaml_serde::from_str(raw)?;
+    reject_yaml_tags(&value)?;
+    Ok(value)
+}
+
+fn reject_yaml_tags(value: &yaml_serde::Value) -> Result<()> {
+    match value {
+        yaml_serde::Value::Tagged(_) => {
+            anyhow::bail!("YAML tags are not supported in review configuration")
+        }
+        yaml_serde::Value::Sequence(values) => {
+            for value in values {
+                reject_yaml_tags(value)?;
+            }
+        }
+        yaml_serde::Value::Mapping(mapping) => {
+            for (key, value) in mapping {
+                reject_yaml_tags(key)?;
+                reject_yaml_tags(value)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1064,7 +1091,8 @@ impl Config {
         let file: FileConfig = if path.extension().is_some_and(|e| e == "json") {
             serde_json::from_str(&raw)?
         } else {
-            serde_yaml::from_str(&raw)?
+            parse_yaml_value(&raw)?;
+            yaml_serde::from_str(&raw)?
         };
         let mut cfg = Config::default();
         cfg.apply_file(file)?;
@@ -1202,7 +1230,7 @@ impl Config {
     /// Mapped: reviews.path_filters (exclusions), reviews.profile, enabled flags.
     fn from_coderabbit(path: &Path) -> Result<Config> {
         let raw = std::fs::read_to_string(path)?;
-        let doc: serde_yaml::Value = serde_yaml::from_str(&raw)?;
+        let doc = parse_yaml_value(&raw)?;
         let mut cfg = Config::default();
         let reviews = doc.get("reviews");
         if let Some(filters) = reviews
@@ -2002,7 +2030,7 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
     fn starter_config_yaml_quotes_model_defaults_when_needed() {
         assert_eq!(yaml_scalar("plain/model"), "plain/model");
         assert_eq!(
-            serde_yaml::from_str::<String>(&yaml_scalar("model: with # yaml")).unwrap(),
+            yaml_serde::from_str::<String>(&yaml_scalar("model: with # yaml")).unwrap(),
             "model: with # yaml"
         );
     }
@@ -2090,14 +2118,14 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
     #[test]
     fn max_findings_is_bounded_for_scorer_admission() {
         let mut accepted = Config::default();
-        let file: FileConfig = serde_yaml::from_str("maxFindings: 20\n").unwrap();
+        let file: FileConfig = yaml_serde::from_str("maxFindings: 20\n").unwrap();
         accepted.apply_file(file).unwrap();
         assert_eq!(accepted.max_findings, MAX_FINDINGS);
 
         for value in [0, 21, usize::MAX] {
             let mut rejected = Config::default();
             let file: FileConfig =
-                serde_yaml::from_str(&format!("maxFindings: {value}\n")).unwrap();
+                yaml_serde::from_str(&format!("maxFindings: {value}\n")).unwrap();
             assert!(rejected.apply_file(file).is_err());
         }
     }
@@ -2151,8 +2179,55 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
     }
 
     #[test]
+    fn duplicate_yaml_keys_fail_loudly() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            ".postil.yaml",
+            "minConfidence: 0.6\nminConfidence: 0.9\n",
+        );
+        assert!(Config::load(dir.path(), None).is_err());
+
+        write(
+            dir.path(),
+            ".postil.yaml",
+            "gate:\n  failOn: warn\n  failOn: error\n",
+        );
+        assert!(Config::load(dir.path(), None).is_err());
+    }
+
+    #[test]
+    fn multiple_yaml_documents_fail_loudly() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            ".postil.yaml",
+            "minConfidence: 0.6\n---\nminConfidence: 0.9\n",
+        );
+        assert!(Config::load(dir.path(), None).is_err());
+    }
+
+    #[test]
+    fn tagged_config_values_fail_loudly() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), ".postil.yaml", "minConfidence: !custom 0.9\n");
+        assert!(Config::load(dir.path(), None).is_err());
+    }
+
+    #[test]
+    fn duplicate_coderabbit_keys_fail_loudly() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            ".coderabbit.yaml",
+            "reviews:\n  profile: chill\n  profile: assertive\n",
+        );
+        assert!(Config::load(dir.path(), None).is_err());
+    }
+
+    #[test]
     fn starter_config_parses() {
-        let f: FileConfig = serde_yaml::from_str(starter_config()).unwrap();
+        let f: FileConfig = yaml_serde::from_str(starter_config()).unwrap();
         let mut c = Config::default();
         c.apply_file(f).unwrap();
         assert_eq!(c.max_findings, 20);
@@ -2163,7 +2238,7 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
 
     #[test]
     fn model_scorer_parses_from_postil_config() {
-        let f: FileConfig = serde_yaml::from_str("model:\n  scorer: custom/scorer\n").unwrap();
+        let f: FileConfig = yaml_serde::from_str("model:\n  scorer: custom/scorer\n").unwrap();
         let mut c = Config::default();
         c.apply_file(f).unwrap();
         assert_eq!(c.scorer, "custom/scorer");
@@ -2173,7 +2248,7 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
 
     #[test]
     fn trusted_runtime_can_ignore_the_complete_repository_model_section() {
-        let f: FileConfig = serde_yaml::from_str(
+        let f: FileConfig = yaml_serde::from_str(
             "model:\n  name: anthropic/claude-opus-4.1\n  cascade:\n    - attacker/fallback\n  scorer: anthropic/claude-haiku-4.5\n  apiBase: https://attacker.invalid/v1\n  apiFormat: anthropic\n  consensus: 3\n",
         )
         .unwrap();
@@ -2709,12 +2784,12 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
         assert!(config.scorer_chain().is_empty());
 
         let explicit_provider_model: FileConfig =
-            serde_yaml::from_str("model:\n  scorer: z-ai/glm-5.2\n").unwrap();
+            yaml_serde::from_str("model:\n  scorer: z-ai/glm-5.2\n").unwrap();
         config.apply_file(explicit_provider_model).unwrap();
         assert_eq!(config.scorer_chain(), vec!["z-ai/glm-5.2"]);
 
         let file: FileConfig =
-            serde_yaml::from_str("model:\n  scorer: claude-haiku-4-5\n").unwrap();
+            yaml_serde::from_str("model:\n  scorer: claude-haiku-4-5\n").unwrap();
         config.apply_file(file).unwrap();
         assert!(config.scorer_enabled());
         assert_eq!(config.scorer_chain(), vec!["claude-haiku-4-5"]);
@@ -2735,7 +2810,7 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
 
     #[test]
     fn anthropic_api_format_parses_from_postil_config() {
-        let f: FileConfig = serde_yaml::from_str("model:\n  apiFormat: anthropic\n").unwrap();
+        let f: FileConfig = yaml_serde::from_str("model:\n  apiFormat: anthropic\n").unwrap();
         let mut config = Config::default();
         config.apply_file(f).unwrap();
         assert_eq!(config.api_format, ApiFormat::Anthropic);
@@ -2831,7 +2906,7 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
         // credential unless explicitly opted in. Driven through the inner
         // helper so the test is deterministic and touches no process env.
         let f: FileConfig =
-            serde_yaml::from_str("model:\n  apiBase: https://untrusted.example/v1\n").unwrap();
+            yaml_serde::from_str("model:\n  apiBase: https://untrusted.example/v1\n").unwrap();
         let mut c = Config::default();
         c.apply_file_inner(f, false, false).unwrap();
         assert_eq!(c.api_base, DEFAULT_API_BASE);
@@ -2840,7 +2915,7 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
     #[test]
     fn config_api_base_honored_when_opted_in() {
         let f: FileConfig =
-            serde_yaml::from_str("model:\n  apiBase: https://trusted.local/v1\n").unwrap();
+            yaml_serde::from_str("model:\n  apiBase: https://trusted.local/v1\n").unwrap();
         let mut c = Config::default();
         c.apply_file_inner(f, true, false).unwrap();
         assert_eq!(c.api_base, "https://trusted.local/v1");

@@ -3845,9 +3845,9 @@ async fn local_review_prints_yaml_output() {
         .success();
 
     let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
-    let env: serde_yaml::Value = serde_yaml::from_str(&stdout).unwrap();
-    assert_eq!(env["silent"], true);
-    assert_eq!(env["gate"]["failing"], false);
+    let env: postil_cli::envelope::Envelope = yaml_serde::from_str(&stdout).unwrap();
+    assert!(env.silent);
+    assert!(!env.gate.failing);
 }
 
 #[tokio::test]
