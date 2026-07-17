@@ -10,6 +10,16 @@ import { BINEVAL_EVALUATION_DEVELOPMENT_FIXTURE } from "./bineval-evaluation-dev
 export const BINEVAL_BANK_VERSION = 4;
 export const BINEVAL_CONTRACT_VERSION = 4;
 export const SCALAR_PUBLICATION_THRESHOLD = 0.6;
+export const MAX_SCORER_EXPERIMENT_REPEATS = 10;
+export const DEFAULT_SCORER_CALL_TIMEOUT_MS = 30_000;
+export const MAX_SCORER_CALL_TIMEOUT_MS = 120_000;
+export const MAX_SCORER_RESPONSE_BYTES = 65_536;
+export const MAX_SCORER_PROVIDER_FIELD_BYTES = 512;
+export const MAX_SCORER_TOKENS_PER_CALL = 10_000_000;
+export const MAX_SCORER_COST_USD_PER_CALL = 1_000;
+const MAX_SCORER_RUN_ID_BYTES = 256;
+const MAX_SCORER_ERROR_NAME_BYTES = 128;
+const MAX_SCORER_ERROR_MESSAGE_BYTES = 2_048;
 
 export const BINARY_GATES = [
   "grounding",
@@ -180,6 +190,11 @@ export const BINEVAL_EVALUATION_DEVELOPMENT_BANK: ScorerBank = deepFreeze(
   structuredClone(BINEVAL_EVALUATION_DEVELOPMENT_FIXTURE),
 );
 
+export const BINEVAL_CANONICAL_DEVELOPMENT_BANKS: readonly ScorerBank[] = deepFreeze([
+  BINEVAL_DEVELOPMENT_BANK,
+  BINEVAL_EVALUATION_DEVELOPMENT_BANK,
+]);
+
 export const BINARY_QUESTIONS: Record<BinaryGate, string> = {
   grounding: "Does the cited changed line contain concrete evidence for the claimed behavior?",
   causality: "Can the resulting code produce the claimed behavior under a plausible execution?",
@@ -275,11 +290,19 @@ const PROMPT_CONTRACT = {
   binaryIndependentUserTemplate: "Candidate finding:\n{finding}\n\nNamed gate:\n{gate}\n\nResponse contract:\n{contract}",
 } as const;
 
+export interface ScorerExperimentSettings {
+  temperature?: number;
+  topP?: number;
+  seed?: number;
+  maxOutputTokens?: number;
+  reasoningEffort?: "low" | "medium" | "high";
+}
+
 export interface ExperimentProvenance {
   runId: string;
   model: string;
   provider: string;
-  settings: Readonly<Record<string, unknown>>;
+  settings: Readonly<ScorerExperimentSettings>;
   sourceSha: string;
   repeatCount: number;
 }
@@ -318,9 +341,63 @@ export interface ProviderUsageReceipt {
   costUsd: number;
 }
 
+const nullableElapsedMetric = z.number().finite().nonnegative().max(MAX_SCORER_CALL_TIMEOUT_MS).nullable();
+const nullableCostMetric = z.number().finite().nonnegative().max(MAX_SCORER_COST_USD_PER_CALL).nullable();
+const nullableIntegerMetric = z.number().int().safe().nonnegative().max(MAX_SCORER_TOKENS_PER_CALL).nullable();
+const boundedString = (maxBytes: number) => z.string().min(1).refine(
+  (value) => utf8ByteLength(value) <= maxBytes,
+  `must not exceed ${maxBytes} UTF-8 bytes`,
+);
+const scorerExperimentSettingsSchema = z.object({
+  temperature: z.number().finite().min(0).max(2).optional(),
+  topP: z.number().finite().min(0).max(1).optional(),
+  seed: z.number().int().safe().optional(),
+  maxOutputTokens: z.number().int().min(1).max(65_536).optional(),
+  reasoningEffort: z.enum(["low", "medium", "high"]).optional(),
+}).strict();
+const experimentProvenanceSchema = z.object({
+  runId: boundedString(MAX_SCORER_RUN_ID_BYTES),
+  model: boundedString(MAX_SCORER_PROVIDER_FIELD_BYTES),
+  provider: boundedString(MAX_SCORER_PROVIDER_FIELD_BYTES),
+  settings: scorerExperimentSettingsSchema,
+  sourceSha: z.string().regex(/^[0-9a-f]{64}$/),
+  repeatCount: z.number().finite(),
+}).strict();
+const providerUsageReceiptSchema = z.object({
+  receiptId: boundedString(MAX_SCORER_PROVIDER_FIELD_BYTES),
+  generationId: boundedString(MAX_SCORER_PROVIDER_FIELD_BYTES),
+  provider: boundedString(MAX_SCORER_PROVIDER_FIELD_BYTES),
+  model: boundedString(MAX_SCORER_PROVIDER_FIELD_BYTES),
+  requestDigest: z.string().regex(/^[0-9a-f]{64}$/),
+  promptTokens: z.number().int().safe().nonnegative().max(MAX_SCORER_TOKENS_PER_CALL),
+  completionTokens: z.number().int().safe().nonnegative().max(MAX_SCORER_TOKENS_PER_CALL),
+  costUsd: z.number().finite().nonnegative().max(MAX_SCORER_COST_USD_PER_CALL),
+}).strict();
+const transportResponseEnvelopeSchema = z.object({
+  content: boundedString(MAX_SCORER_RESPONSE_BYTES),
+  elapsedMs: nullableElapsedMetric,
+  promptTokens: nullableIntegerMetric,
+  completionTokens: nullableIntegerMetric,
+  costUsd: nullableCostMetric,
+  providerGenerationId: boundedString(MAX_SCORER_PROVIDER_FIELD_BYTES).nullable(),
+  providerReceipt: z.unknown(),
+}).strict();
+const evaluationResponseSchema = transportResponseEnvelopeSchema.extend({
+  providerReceipt: providerUsageReceiptSchema.nullable(),
+}).strict();
+
+type ProviderReceiptCaptureState = "absent" | "valid" | "invalid";
+
+interface NormalizedEvaluationResponse {
+  response: EvaluationResponse;
+  providerReceiptState: ProviderReceiptCaptureState;
+}
+
 export interface EvaluationOptions {
   /** Test-only clocks remain distinguishable from the untrusted process clock. */
   testOnlyNow?: () => number;
+  /** Per-call deadline. The transport receives an AbortSignal for cancellation. */
+  transportTimeoutMs?: number;
 }
 
 export class EvaluationTransportError extends Error {
@@ -330,7 +407,7 @@ export class EvaluationTransportError extends Error {
   }
 }
 
-export type EvaluationTransport = (request: EvaluationRequest) => Promise<EvaluationResponse>;
+export type EvaluationTransport = (request: EvaluationRequest, signal: AbortSignal) => Promise<unknown>;
 
 export interface CapturedTransportError {
   name: string;
@@ -349,7 +426,7 @@ export interface EvaluationCallEvidence {
   providerReceiptId: string | null;
   providerReceiptDigest: string | null;
   providerReceiptTrusted: false;
-  providerReceiptBinding: "absent" | "bound" | "inconsistent";
+  providerReceiptBinding: "absent" | "bound" | "inconsistent" | "invalid";
   providerReceipt: ProviderUsageReceipt | null;
   reportedTelemetry: CallTelemetry;
   measuredElapsedMs: number;
@@ -461,6 +538,14 @@ export interface ScorerExperimentReport {
   sourceInputDigest: string;
   evidenceDigest: string;
   repeats: ScorerExperimentRepeatReport[];
+}
+
+export interface CompleteDevelopmentScorerExperimentReport {
+  evidenceScope: "developmentOnly";
+  validationEligible: false;
+  totalCanonicalCases: number;
+  bankDigests: string[];
+  reports: ScorerExperimentReport[];
 }
 
 // Captured evidence is accepted only in the process that measured it. This
@@ -625,6 +710,7 @@ async function captureScorerCase(
   const snapshot = snapshotProvenance(provenance);
   validateMethods([method]);
   validateBank(bank);
+  const transportTimeoutMs = normalizeTransportTimeout(options.transportTimeoutMs);
   const requests = buildEvaluationRequests(method, c, repeat, snapshot);
   const now = options.testOnlyNow ?? PROCESS_MONOTONIC_NOW;
   const latencySource = options.testOnlyNow === undefined
@@ -633,9 +719,16 @@ async function captureScorerCase(
   const measured = await Promise.all(requests.map(async (request) => {
     const started = untrustedClockReading(now);
     try {
-      const value = deepFreeze(structuredClone(await transport(request)));
+      const value = normalizeTransportResponse(await invokeTransport(
+        transport,
+        request,
+        transportTimeoutMs,
+      ));
+      if (value === null) {
+        throw new EvaluationTransportError("transport returned an invalid response envelope");
+      }
       return {
-        result: { status: "fulfilled", value } as const,
+        result: { status: "fulfilled", value: deepFreeze(value) } as const,
         measuredElapsedMs: untrustedElapsed(started, now),
       };
     } catch (reason) {
@@ -664,6 +757,43 @@ async function captureScorerCase(
   CAPTURE_OWNERS.set(capture, executionOwner);
   CAPTURE_SEQUENCE.set(capture, sequence);
   return capture;
+}
+
+async function invokeTransport(
+  transport: EvaluationTransport,
+  request: EvaluationRequest,
+  timeoutMs: number,
+): Promise<unknown> {
+  const controller = new AbortController();
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timeout = setTimeout(() => {
+      reject(new EvaluationTransportError(`transport exceeded the ${timeoutMs} ms deadline`));
+      controller.abort();
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([
+      Promise.resolve().then(() => transport(request, controller.signal)),
+      deadline,
+    ]);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
+}
+
+function normalizeTransportTimeout(value: number | undefined): number {
+  const timeoutMs = value ?? DEFAULT_SCORER_CALL_TIMEOUT_MS;
+  if (
+    !Number.isInteger(timeoutMs)
+    || timeoutMs < 1
+    || timeoutMs > MAX_SCORER_CALL_TIMEOUT_MS
+  ) {
+    throw new Error(
+      `transportTimeoutMs must be an integer from 1 through ${MAX_SCORER_CALL_TIMEOUT_MS}`,
+    );
+  }
+  return timeoutMs;
 }
 
 interface BankCaseContext {
@@ -722,7 +852,6 @@ function deriveCaseResult(
   if (callEvidence.some((entry) => (
     entry.outcome === "rejected"
     || !validResponse(entry.response)
-    || entry.providerReceiptBinding === "inconsistent"
   ))) {
     return failedEvaluation(method, c, repeat, "transportFailure", requests.length, telemetry, context, provenance, evidence);
   }
@@ -782,30 +911,42 @@ function failedEvaluation(
   });
 }
 
-function validResponse(value: EvaluationResponse | null): value is EvaluationResponse {
-  return typeof value === "object"
-    && value !== null
-    && typeof value.content === "string"
-    && (value.providerGenerationId === null || (typeof value.providerGenerationId === "string" && value.providerGenerationId.length > 0))
-    && (value.providerReceipt === null || validProviderReceipt(value.providerReceipt))
-    && validTelemetry(value);
+function normalizeTransportResponse(value: unknown): NormalizedEvaluationResponse | null {
+  try {
+    const envelope = transportResponseEnvelopeSchema.safeParse(value);
+    if (!envelope.success) return null;
+    if (envelope.data.providerReceipt === null) {
+      return {
+        response: { ...envelope.data, providerReceipt: null },
+        providerReceiptState: "absent",
+      };
+    }
+    const receipt = providerUsageReceiptSchema.safeParse(envelope.data.providerReceipt);
+    return {
+      response: {
+        ...envelope.data,
+        providerReceipt: receipt.success ? receipt.data : null,
+      },
+      providerReceiptState: receipt.success ? "valid" : "invalid",
+    };
+  } catch {
+    return null;
+  }
 }
 
-function validProviderReceipt(value: ProviderUsageReceipt): boolean {
-  return typeof value === "object"
-    && value !== null
-    && [value.receiptId, value.generationId, value.provider, value.model, value.requestDigest].every((field) => typeof field === "string" && field.length > 0)
-    && /^(?:[0-9a-f]{64})$/.test(value.requestDigest)
-    && validMetric(value.promptTokens, true) !== null
-    && validMetric(value.completionTokens, true) !== null
-    && validMetric(value.costUsd, false) !== null;
+function validResponse(value: EvaluationResponse | null): value is EvaluationResponse {
+  try {
+    return evaluationResponseSchema.safeParse(value).success;
+  } catch {
+    return false;
+  }
 }
 
 function callEvidenceFor(
   request: EvaluationRequest,
   call: {
     result:
-      | { status: "fulfilled"; value: EvaluationResponse }
+      | { status: "fulfilled"; value: NormalizedEvaluationResponse }
       | { status: "rejected"; reason: CapturedTransportError };
     measuredElapsedMs: number;
   },
@@ -837,13 +978,15 @@ function callEvidenceFor(
     CAPTURED_EVIDENCE_OWNERS.set(evidence, executionOwner);
     return evidence;
   }
-  const response = call.result.value;
-  const receipt = validResponse(response) ? response.providerReceipt : null;
-  const providerReceiptBinding = receipt === null
-    ? "absent" as const
-    : providerReceiptMatchesRequest(receipt, request, response)
-      ? "bound" as const
-      : "inconsistent" as const;
+  const { response, providerReceiptState } = call.result.value;
+  const receipt = response.providerReceipt;
+  const providerReceiptBinding = providerReceiptState === "invalid"
+    ? "invalid" as const
+    : receipt === null
+      ? "absent" as const
+      : providerReceiptMatchesRequest(receipt, request, response)
+        ? "bound" as const
+        : "inconsistent" as const;
   const evidence = deepFreeze({
     request: rawRequest,
     requestDigest,
@@ -857,7 +1000,7 @@ function callEvidenceFor(
     providerReceiptTrusted: false as const,
     providerReceiptBinding,
     providerReceipt: receipt === null ? null : structuredClone(receipt),
-    reportedTelemetry: telemetryFromSettled(call.result),
+    reportedTelemetry: telemetryFromPartial(response),
     measuredElapsedMs: call.measuredElapsedMs,
     latencySource,
   });
@@ -906,10 +1049,18 @@ function safelyReadErrorString(
   try {
     if (!(reason instanceof Error)) return fallback;
     const value = reason[field];
-    return typeof value === "string" && value.length > 0 ? value : fallback;
+    if (typeof value !== "string" || value.length === 0) return fallback;
+    const maxBytes = field === "name"
+      ? MAX_SCORER_ERROR_NAME_BYTES
+      : MAX_SCORER_ERROR_MESSAGE_BYTES;
+    return utf8ByteLength(value) <= maxBytes ? value : fallback;
   } catch {
     return fallback;
   }
+}
+
+function utf8ByteLength(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
 }
 
 function safelyReadTelemetry(value: unknown): CallTelemetry {
@@ -933,7 +1084,9 @@ function untrustedClockReading(now: () => number): number | null {
 function untrustedElapsed(started: number | null, now: () => number): number {
   const finished = untrustedClockReading(now);
   if (started === null || finished === null) return 0;
-  return Math.max(0, finished - started);
+  const elapsed = finished - started;
+  if (!Number.isFinite(elapsed)) return MAX_SCORER_CALL_TIMEOUT_MS;
+  return Math.min(MAX_SCORER_CALL_TIMEOUT_MS, Math.max(0, elapsed));
 }
 
 function reportableTelemetryFor(evidence: EvaluationCallEvidence): CallTelemetry {
@@ -946,30 +1099,29 @@ function reportableTelemetryFor(evidence: EvaluationCallEvidence): CallTelemetry
 }
 
 function validTelemetry(value: Partial<CallTelemetry>): boolean {
-  return [value.elapsedMs, value.promptTokens, value.completionTokens, value.costUsd].every((field) =>
-    field === null || (typeof field === "number" && Number.isFinite(field) && field >= 0)
-  ) && (value.promptTokens === null || Number.isInteger(value.promptTokens)) && (value.completionTokens === null || Number.isInteger(value.completionTokens));
-}
-
-function telemetryFromSettled(result: PromiseSettledResult<EvaluationResponse>): CallTelemetry {
-  if (result.status === "fulfilled") {
-    return telemetryFromPartial(result.value);
-  }
-  const supplied = result.reason instanceof EvaluationTransportError ? result.reason.telemetry : {};
-  return telemetryFromPartial(supplied);
+  return validMetric(value.elapsedMs, false, MAX_SCORER_CALL_TIMEOUT_MS) === value.elapsedMs
+    && validMetric(value.promptTokens, true, MAX_SCORER_TOKENS_PER_CALL) === value.promptTokens
+    && validMetric(value.completionTokens, true, MAX_SCORER_TOKENS_PER_CALL) === value.completionTokens
+    && validMetric(value.costUsd, false, MAX_SCORER_COST_USD_PER_CALL) === value.costUsd;
 }
 
 function telemetryFromPartial(supplied: Partial<CallTelemetry>): CallTelemetry {
   return {
-    elapsedMs: validMetric(supplied.elapsedMs ?? null, false),
-    promptTokens: validMetric(supplied.promptTokens ?? null, true),
-    completionTokens: validMetric(supplied.completionTokens ?? null, true),
-    costUsd: validMetric(supplied.costUsd ?? null, false),
+    elapsedMs: validMetric(supplied.elapsedMs ?? null, false, MAX_SCORER_CALL_TIMEOUT_MS),
+    promptTokens: validMetric(supplied.promptTokens ?? null, true, MAX_SCORER_TOKENS_PER_CALL),
+    completionTokens: validMetric(supplied.completionTokens ?? null, true, MAX_SCORER_TOKENS_PER_CALL),
+    costUsd: validMetric(supplied.costUsd ?? null, false, MAX_SCORER_COST_USD_PER_CALL),
   };
 }
 
-function validMetric(value: unknown, integer: boolean): number | null {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0 && (!integer || Number.isInteger(value)) ? value : null;
+function validMetric(value: unknown, integer: boolean, maximum: number): number | null {
+  return typeof value === "number"
+    && Number.isFinite(value)
+    && value >= 0
+    && value <= maximum
+    && (!integer || Number.isSafeInteger(value))
+    ? value
+    : null;
 }
 
 function aggregateTelemetry(reportableCalls: CallTelemetry[], reportedCalls: CallTelemetry[]): TelemetrySummary {
@@ -985,13 +1137,13 @@ function aggregateTelemetry(reportableCalls: CallTelemetry[], reportedCalls: Cal
   return {
     telemetryComplete: complete,
     elapsedMs: processObservedElapsed.every(notNull) ? Math.max(...processObservedElapsed) : null,
-    promptTokens: prompt.every(notNull) ? sum(prompt) : null,
-    completionTokens: completion.every(notNull) ? sum(completion) : null,
-    costUsd: cost.every(notNull) ? sum(cost) : null,
+    promptTokens: prompt.every(notNull) ? safeMetricSum(prompt, true) : null,
+    completionTokens: completion.every(notNull) ? safeMetricSum(completion, true) : null,
+    costUsd: cost.every(notNull) ? safeMetricSum(cost, false) : null,
     observedElapsedMs: reportedElapsed.length === 0 ? null : Math.max(...reportedElapsed),
-    observedPromptTokens: reportedPrompt.length === 0 ? null : sum(reportedPrompt),
-    observedCompletionTokens: reportedCompletion.length === 0 ? null : sum(reportedCompletion),
-    observedCostUsd: reportedCost.length === 0 ? null : sum(reportedCost),
+    observedPromptTokens: reportedPrompt.length === 0 ? null : safeMetricSum(reportedPrompt, true),
+    observedCompletionTokens: reportedCompletion.length === 0 ? null : safeMetricSum(reportedCompletion, true),
+    observedCostUsd: reportedCost.length === 0 ? null : safeMetricSum(reportedCost, false),
   };
 }
 
@@ -1049,6 +1201,35 @@ export async function runScorerExperiment(
   return deepFreeze(captures);
 }
 
+/** Run both canonical development banks so the experiment covers all 20 cases. */
+export async function runCompleteDevelopmentScorerExperiment(
+  methods: EvaluationMethod[],
+  transport: EvaluationTransport,
+  provenance: ExperimentProvenance,
+  options: EvaluationOptions = {},
+): Promise<CompleteDevelopmentScorerExperimentReport> {
+  const snapshot = snapshotProvenance(provenance);
+  const methodPlan = snapshotMethods(methods);
+  const reports: ScorerExperimentReport[] = [];
+  for (const bank of BINEVAL_CANONICAL_DEVELOPMENT_BANKS) {
+    const captures = await runScorerExperiment(
+      bank,
+      methodPlan,
+      transport,
+      snapshot,
+      options,
+    );
+    reports.push(buildScorerExperimentReport(bank, methodPlan, captures, snapshot));
+  }
+  return deepFreeze({
+    evidenceScope: EVIDENCE_POLICY.scope,
+    validationEligible: EVIDENCE_POLICY.validationEligible,
+    totalCanonicalCases: sum(BINEVAL_CANONICAL_DEVELOPMENT_BANKS.map((bank) => bank.cases.length)),
+    bankDigests: BINEVAL_CANONICAL_DEVELOPMENT_BANKS.map((bank) => scorerBankDigest(bank)),
+    reports,
+  });
+}
+
 export function aggregateScorerExperiment(method: EvaluationMethod, results: ScorerExperimentCaseResult[]): ScorerExperimentAggregate {
   validateMethods([method]);
   for (const result of results) validateStandaloneResult(result);
@@ -1073,12 +1254,12 @@ export function aggregateScorerExperiment(method: EvaluationMethod, results: Sco
     gateConfusion: method === "scalar" ? null : Object.fromEntries(BINARY_GATES.map((gate) => [gate, confusion(selected.map((result) => ({ expected: result.expectedGates[gate], actual: result.gates[gate] ?? null })))])) as Record<BinaryGate, Confusion>,
     meanElapsedMs: elapsed.every(notNull) ? mean(elapsed) : null,
     p95ElapsedMs: elapsed.every(notNull) ? percentile(elapsed, 0.95) : null,
-    promptTokens: promptTokens.every(notNull) ? sum(promptTokens) : null,
-    completionTokens: completionTokens.every(notNull) ? sum(completionTokens) : null,
-    totalCostUsd: costs.every(notNull) ? sum(costs) : null,
-    observedPromptTokens: sumKnown(selected.map((result) => result.observedPromptTokens)),
-    observedCompletionTokens: sumKnown(selected.map((result) => result.observedCompletionTokens)),
-    observedCostUsd: sumKnown(selected.map((result) => result.observedCostUsd)),
+    promptTokens: promptTokens.every(notNull) ? safeMetricSum(promptTokens, true) : null,
+    completionTokens: completionTokens.every(notNull) ? safeMetricSum(completionTokens, true) : null,
+    totalCostUsd: costs.every(notNull) ? safeMetricSum(costs, false) : null,
+    observedPromptTokens: sumKnown(selected.map((result) => result.observedPromptTokens), true),
+    observedCompletionTokens: sumKnown(selected.map((result) => result.observedCompletionTokens), true),
+    observedCostUsd: sumKnown(selected.map((result) => result.observedCostUsd), false),
     meanCalls: mean(selected.map((result) => result.calls)),
   });
 }
@@ -1294,7 +1475,12 @@ function validateCallEvidence(
   if (evidence.requestDigest !== expectedRequestDigest || digest(evidence.request) !== expectedRequestDigest) {
     throw new Error(`call evidence request does not match the rebuilt request: ${expectedRequest.caseId}/${expectedRequest.method}`);
   }
-  if (!Number.isFinite(evidence.measuredElapsedMs) || evidence.measuredElapsedMs < 0 || !validTelemetry(evidence.reportedTelemetry)) {
+  if (
+    !Number.isFinite(evidence.measuredElapsedMs)
+    || evidence.measuredElapsedMs < 0
+    || evidence.measuredElapsedMs > MAX_SCORER_CALL_TIMEOUT_MS
+    || !validTelemetry(evidence.reportedTelemetry)
+  ) {
     throw new Error(`call evidence telemetry is invalid: ${expectedRequest.caseId}/${expectedRequest.method}`);
   }
   if (evidence.latencySource !== "processMonotonicUntrusted" && evidence.latencySource !== "testInjectedUntrusted") {
@@ -1333,7 +1519,7 @@ function validateCallEvidence(
       evidence.providerReceipt !== null
       || evidence.providerReceiptId !== null
       || evidence.providerReceiptDigest !== null
-      || evidence.providerReceiptBinding !== "absent"
+      || (evidence.providerReceiptBinding !== "absent" && evidence.providerReceiptBinding !== "invalid")
     ) {
       throw new Error(`receipt evidence is inconsistent: ${expectedRequest.caseId}/${expectedRequest.method}`);
     }
@@ -1352,51 +1538,41 @@ function validateCallEvidence(
   }
 }
 
-function validateProvenance(provenance: ExperimentProvenance): void {
-  if (!provenance.runId.trim() || !provenance.model.trim() || !provenance.provider.trim()) {
+function snapshotProvenance(provenance: ExperimentProvenance): ExperimentProvenance {
+  let parsed: z.infer<typeof experimentProvenanceSchema>;
+  try {
+    const result = experimentProvenanceSchema.safeParse(provenance);
+    if (!result.success) {
+      throw new Error("provenance must contain only bounded scorer experiment fields");
+    }
+    parsed = result.data;
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("provenance must")) throw error;
+    throw new Error("provenance must contain only bounded scorer experiment fields");
+  }
+  if (!parsed.runId.trim() || !parsed.model.trim() || !parsed.provider.trim()) {
     throw new Error("runId, model, and provider are required");
   }
-  if (provenance.sourceSha !== scorerSourceDigest()) {
+  if (parsed.sourceSha !== scorerSourceDigest()) {
     throw new Error("sourceSha must equal the digest of the scorer source inputs");
   }
-  if (!Number.isInteger(provenance.repeatCount) || provenance.repeatCount < 1) {
-    throw new Error("repeatCount must be a positive integer");
+  if (
+    !Number.isInteger(parsed.repeatCount)
+    || parsed.repeatCount < 1
+    || parsed.repeatCount > MAX_SCORER_EXPERIMENT_REPEATS
+  ) {
+    throw new Error(
+      `repeatCount must be an integer from 1 through ${MAX_SCORER_EXPERIMENT_REPEATS}`,
+    );
   }
-  if (typeof provenance.settings !== "object" || provenance.settings === null || Array.isArray(provenance.settings)) {
-    throw new Error("settings must be an object");
-  }
-  validateJsonValue(provenance.settings, "settings", new Set());
-}
-
-function snapshotProvenance(provenance: ExperimentProvenance): ExperimentProvenance {
-  validateProvenance(provenance);
   return deepFreeze({
-    runId: provenance.runId,
-    model: provenance.model,
-    provider: provenance.provider,
-    settings: structuredClone(provenance.settings),
-    sourceSha: provenance.sourceSha,
-    repeatCount: provenance.repeatCount,
+    runId: parsed.runId,
+    model: parsed.model,
+    provider: parsed.provider,
+    settings: structuredClone(parsed.settings),
+    sourceSha: parsed.sourceSha,
+    repeatCount: parsed.repeatCount,
   });
-}
-
-function validateJsonValue(value: unknown, path: string, ancestors: Set<object>): void {
-  if (value === null || typeof value === "string" || typeof value === "boolean") return;
-  if (typeof value === "number") {
-    if (!Number.isFinite(value)) throw new Error(`${path} must contain finite JSON values`);
-    return;
-  }
-  if (typeof value !== "object") throw new Error(`${path} must contain only JSON values`);
-  if (ancestors.has(value)) throw new Error(`${path} must not contain cycles`);
-  ancestors.add(value);
-  if (Array.isArray(value)) {
-    value.forEach((entry, index) => validateJsonValue(entry, `${path}[${index}]`, ancestors));
-  } else {
-    const prototype = Object.getPrototypeOf(value);
-    if (prototype !== Object.prototype && prototype !== null) throw new Error(`${path} must contain plain JSON objects`);
-    for (const [key, entry] of Object.entries(value)) validateJsonValue(entry, `${path}.${key}`, ancestors);
-  }
-  ancestors.delete(value);
 }
 
 function resultProvenance(provenance: ExperimentProvenance): Omit<ExperimentProvenance, "repeatCount"> {
@@ -1411,8 +1587,7 @@ function resultProvenance(provenance: ExperimentProvenance): Omit<ExperimentProv
 
 function canonicalBankForCase(c: ScorerCase): ScorerBank {
   for (const bank of [BINEVAL_DEVELOPMENT_BANK, BINEVAL_EVALUATION_DEVELOPMENT_BANK]) {
-    const canonical = bank.cases.find((candidate) => candidate.id === c.id);
-    if (canonical && digest(canonical) === digest(c)) return bank;
+    if (bank.cases.some((candidate) => candidate === c)) return bank;
   }
   throw new Error(`case is not part of a canonical scorer bank: ${c.id}`);
 }
@@ -1430,6 +1605,9 @@ function assertCanonicalBankCase(bank: ScorerBank, c: ScorerCase): void {
 }
 
 function validateBank(bank: ScorerBank): void {
+  if (!BINEVAL_CANONICAL_DEVELOPMENT_BANKS.includes(bank)) {
+    throw new Error("bank must be an exact canonical development bank");
+  }
   if (bank.version !== BINEVAL_BANK_VERSION || bank.cases.length === 0) throw new Error("bank version or case set is invalid");
   if (new Set(bank.cases.map((c) => c.id)).size !== bank.cases.length) throw new Error("bank case IDs must be unique");
   for (const c of bank.cases) {
@@ -1524,9 +1702,14 @@ function sum(values: number[]): number {
   return values.reduce((total, value) => total + value, 0);
 }
 
-function sumKnown(values: Array<number | null>): number | null {
+function sumKnown(values: Array<number | null>, integer: boolean): number | null {
   const known = values.filter(notNull);
-  return known.length === 0 ? null : sum(known);
+  return known.length === 0 ? null : safeMetricSum(known, integer);
+}
+
+function safeMetricSum(values: number[], integer: boolean): number | null {
+  const total = sum(values);
+  return Number.isFinite(total) && (!integer || Number.isSafeInteger(total)) ? total : null;
 }
 
 function rate(numerator: number, denominator: number): number {

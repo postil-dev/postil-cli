@@ -5,15 +5,23 @@ import {
   BINARY_GATES,
   BINARY_QUESTIONS,
   BINEVAL_BANK_VERSION,
+  BINEVAL_CANONICAL_DEVELOPMENT_BANKS,
   BINEVAL_CONTRACT_VERSION,
   BINEVAL_DEVELOPMENT_BANK,
   BINEVAL_EVALUATION_DEVELOPMENT_BANK,
   EvaluationTransportError,
+  MAX_SCORER_CALL_TIMEOUT_MS,
+  MAX_SCORER_COST_USD_PER_CALL,
+  MAX_SCORER_EXPERIMENT_REPEATS,
+  MAX_SCORER_PROVIDER_FIELD_BYTES,
+  MAX_SCORER_RESPONSE_BYTES,
+  MAX_SCORER_TOKENS_PER_CALL,
   aggregateScorerExperiment,
   buildEvaluationRequests,
   buildScorerExperimentReport,
   evaluateScorerCase,
   evaluationRequestDigest,
+  runCompleteDevelopmentScorerExperiment,
   runScorerExperiment,
   scorerBankDigest,
   scorerEvaluationContractDigest,
@@ -40,7 +48,9 @@ const provenance: ExperimentProvenance = {
 };
 
 function scorerCase(id: string): ScorerCase {
-  const candidate = BINEVAL_EVALUATION_DEVELOPMENT_BANK.cases.find((entry) => entry.id === id);
+  const candidate = BINEVAL_CANONICAL_DEVELOPMENT_BANKS
+    .flatMap((bank) => bank.cases)
+    .find((entry) => entry.id === id);
   if (!candidate) throw new Error(`missing development evaluation case ${id}`);
   return candidate;
 }
@@ -131,6 +141,11 @@ describe("development-only evidence banks", () => {
     expect(BINEVAL_DEVELOPMENT_BANK.phase).toBe("development");
     expect(BINEVAL_EVALUATION_DEVELOPMENT_BANK.phase).toBe("evaluationDevelopment");
     expect(BINEVAL_EVALUATION_DEVELOPMENT_BANK.cases).toHaveLength(10);
+    expect(BINEVAL_CANONICAL_DEVELOPMENT_BANKS).toHaveLength(2);
+    expect(BINEVAL_CANONICAL_DEVELOPMENT_BANKS.reduce(
+      (count, bank) => count + bank.cases.length,
+      0,
+    )).toBe(20);
     const implementation = readFileSync(new URL("./bineval-scorer.ts", import.meta.url), "utf8");
     const fixture = readFileSync(new URL("./bineval-evaluation-development.fixture.ts", import.meta.url), "utf8");
     expect(implementation).toContain("cannot support validation");
@@ -254,9 +269,9 @@ describe("request contracts", () => {
     const candidate = scorerCase("evaluationDevelopment-ledger-units");
     let calls = 0;
     const transport = accurateTransport();
-    const countedTransport: EvaluationTransport = async (request) => {
+    const countedTransport: EvaluationTransport = async (request, signal) => {
       calls += 1;
-      return transport(request);
+      return transport(request, signal);
     };
     await expect(evaluateScorerCase(
       "scalar",
@@ -265,10 +280,16 @@ describe("request contracts", () => {
       1,
       provenance,
       BINEVAL_DEVELOPMENT_BANK,
-    )).rejects.toThrow("exact canonical scorer bank");
+    )).rejects.toThrow("canonical scorer bank");
 
     const clonedBank = structuredClone(BINEVAL_EVALUATION_DEVELOPMENT_BANK);
     const clonedCase = clonedBank.cases.find((entry) => entry.id === candidate.id)!;
+    expect(() => buildEvaluationRequests(
+      "scalar",
+      clonedCase,
+      1,
+      provenance,
+    )).toThrow("canonical scorer bank");
     await expect(evaluateScorerCase(
       "scalar",
       clonedCase,
@@ -276,12 +297,80 @@ describe("request contracts", () => {
       1,
       provenance,
       clonedBank,
-    )).rejects.toThrow("exact canonical scorer bank");
+    )).rejects.toThrow("canonical scorer bank");
+    expect(calls).toBe(0);
+  });
+
+  test("accepts only bounded scorer parameters in provenance", () => {
+    const candidate = scorerCase("evaluationDevelopment-ledger-units");
+    expect(() => buildEvaluationRequests("scalar", candidate, 1, {
+      ...provenance,
+      settings: {
+        temperature: 0.25,
+        topP: 0.9,
+        seed: 42,
+        maxOutputTokens: 1_024,
+        reasoningEffort: "low",
+      },
+    })).not.toThrow();
+    expect(() => buildEvaluationRequests("scalar", candidate, 1, {
+      ...provenance,
+      settings: { apiKey: "must-not-be-retained" },
+    } as unknown as ExperimentProvenance)).toThrow("bounded scorer experiment fields");
+    expect(() => buildEvaluationRequests("scalar", candidate, 1, {
+      ...provenance,
+      model: "m".repeat(MAX_SCORER_PROVIDER_FIELD_BYTES + 1),
+    })).toThrow("bounded scorer experiment fields");
+  });
+
+  test("rejects noncanonical experiment banks and excessive repeats before transport", async () => {
+    const clonedBank = structuredClone(BINEVAL_EVALUATION_DEVELOPMENT_BANK);
+    let calls = 0;
+    const countedTransport: EvaluationTransport = async (request, signal) => {
+      calls += 1;
+      return accurateTransport()(request, signal);
+    };
+    await expect(runScorerExperiment(
+      clonedBank,
+      ["scalar"],
+      countedTransport,
+      { ...provenance, repeatCount: 1 },
+    )).rejects.toThrow("exact canonical development bank");
+    await expect(runScorerExperiment(
+      BINEVAL_EVALUATION_DEVELOPMENT_BANK,
+      ["scalar"],
+      countedTransport,
+      { ...provenance, repeatCount: MAX_SCORER_EXPERIMENT_REPEATS + 1 },
+    )).rejects.toThrow(`1 through ${MAX_SCORER_EXPERIMENT_REPEATS}`);
     expect(calls).toBe(0);
   });
 });
 
 describe("raw evidence derivation", () => {
+  test("runs all 20 canonical development cases through every method", async () => {
+    const methods: EvaluationMethod[] = ["scalar", "binaryBatch", "binaryIndependent"];
+    const oneRepeat = { ...provenance, repeatCount: 1 };
+    const suite = await runCompleteDevelopmentScorerExperiment(
+      methods,
+      accurateTransport(),
+      oneRepeat,
+    );
+    const caseIds = new Set(suite.reports.flatMap((report) =>
+      report.repeats[0]!.cases.map((result) => result.caseId)
+    ));
+    expect(suite).toMatchObject({
+      evidenceScope: "developmentOnly",
+      validationEligible: false,
+      totalCanonicalCases: 20,
+    });
+    expect(suite.reports).toHaveLength(2);
+    expect(suite.bankDigests).toEqual(
+      BINEVAL_CANONICAL_DEVELOPMENT_BANKS.map((bank) => scorerBankDigest(bank)),
+    );
+    expect(caseIds.size).toBe(20);
+    expect(suite.reports.every((report) => report.validationEligible === false)).toBe(true);
+  });
+
   test("snapshots the exact method plan before transport can mutate caller input", async () => {
     const methods: EvaluationMethod[] = ["scalar", "binaryBatch"];
     const expectedMethods = [...methods];
@@ -291,12 +380,12 @@ describe("raw evidence derivation", () => {
     const captures = await runScorerExperiment(
       BINEVAL_EVALUATION_DEVELOPMENT_BANK,
       methods,
-      async (request) => {
+      async (request, signal) => {
         if (!mutated) {
           methods.reverse();
           mutated = true;
         }
-        return accurate(request);
+        return accurate(request, signal);
       },
       oneRepeat,
     );
@@ -758,7 +847,7 @@ describe("raw evidence derivation", () => {
     });
   });
 
-  test("fails closed on receipts inconsistent with request provenance", async () => {
+  test("keeps inconsistent receipts untrusted without changing evaluator correctness", async () => {
     const candidate = scorerCase("evaluationDevelopment-ledger-units");
     const mutations: Array<[string, (receipt: NonNullable<EvaluationResponse["providerReceipt"]>, responseValue: EvaluationResponse) => void]> = [
       ["request digest", (receipt) => { receipt.requestDigest = "0".repeat(64); }],
@@ -784,12 +873,212 @@ describe("raw evidence derivation", () => {
         1,
         provenance,
       );
-      expect(result.evaluationStatus, name).toBe("transportFailure");
-      expect(result.evaluatedPublish, name).toBeNull();
-      expect(result.preserveCandidate, name).toBe(true);
+      expect(result.evaluationStatus, name).toBe("complete");
+      expect(result.evaluatedPublish, name).toBe(true);
+      expect(result.preserveCandidate, name).toBe(false);
+      expect(result.evaluatorPassed, name).toBe(true);
       expect(result.callEvidence[0]?.providerReceiptBinding, name).toBe("inconsistent");
       expect(result.callEvidence[0]?.providerReceiptTrusted, name).toBe(false);
     }
+  });
+
+  test("strips malformed provider receipts before storing evidence", async () => {
+    const candidate = scorerCase("evaluationDevelopment-ledger-units");
+    const marker = "provider-only-field-must-not-be-stored";
+    const result = await evaluateScorerCase(
+      "scalar",
+      candidate,
+      async (request) => {
+        const value = receiptResponse(request, [{
+          index: 0,
+          confidence: 0.9,
+          kind: "risk",
+          reason: "Supported.",
+        }]);
+        value.providerReceipt = {
+          ...value.providerReceipt!,
+          providerOnlyField: marker,
+        } as unknown as NonNullable<EvaluationResponse["providerReceipt"]>;
+        return value;
+      },
+      1,
+      provenance,
+    );
+    expect(result).toMatchObject({
+      evaluationStatus: "complete",
+      evaluatedPublish: true,
+      evaluatorPassed: true,
+    });
+    expect(result.callEvidence[0]).toMatchObject({
+      providerReceiptBinding: "invalid",
+      providerReceipt: null,
+      providerReceiptId: null,
+      providerReceiptDigest: null,
+    });
+    expect(JSON.stringify(result)).not.toContain(marker);
+  });
+
+  test("rejects response extras without retaining provider data", async () => {
+    const candidate = scorerCase("evaluationDevelopment-ledger-units");
+    const cases: Array<[string, unknown]> = [
+      ["plain object", { marker: "plain-provider-extra" }],
+      ["map", new Map([["marker", "map-provider-extra"]])],
+      ["bigint", 123n],
+    ];
+    for (const [name, providerExtra] of cases) {
+      const result = await evaluateScorerCase(
+        "scalar",
+        candidate,
+        async () => ({
+          ...response([{
+            index: 0,
+            confidence: 0.9,
+            kind: "risk",
+            reason: "Supported.",
+          }]),
+          providerExtra,
+        }) as unknown as EvaluationResponse,
+        1,
+        provenance,
+      );
+      expect(result.evaluationStatus, name).toBe("transportFailure");
+      expect(result.evaluatedPublish, name).toBeNull();
+      expect(result.callEvidence[0]?.response, name).toBeNull();
+      expect(result.callEvidence[0]?.transportError?.message, name).toBe(
+        "transport returned an invalid response envelope",
+      );
+      expect(JSON.stringify(result), name).not.toContain("provider-extra");
+    }
+  });
+
+  test("bounds transport duration, response bytes, and captured errors", async () => {
+    const candidate = scorerCase("evaluationDevelopment-ledger-units");
+    let aborted = false;
+    const timedOut = await evaluateScorerCase(
+      "scalar",
+      candidate,
+      async (_request, signal) => new Promise((_resolve, reject) => {
+        signal.addEventListener("abort", () => {
+          aborted = true;
+          reject(new Error("transport observed abort"));
+        }, { once: true });
+      }),
+      1,
+      provenance,
+      BINEVAL_EVALUATION_DEVELOPMENT_BANK,
+      { transportTimeoutMs: 5 },
+    );
+    expect(aborted).toBe(true);
+    expect(timedOut).toMatchObject({
+      evaluationStatus: "transportFailure",
+      evaluatedPublish: null,
+      preserveCandidate: true,
+    });
+    expect(timedOut.callEvidence[0]?.transportError?.message).toContain("5 ms deadline");
+
+    const waitStarted = performance.now();
+    let ignoredSignalObserved = false;
+    const ignoredAbort = await evaluateScorerCase(
+      "scalar",
+      candidate,
+      async (_request, signal) => {
+        ignoredSignalObserved = signal instanceof AbortSignal;
+        return new Promise(() => {});
+      },
+      1,
+      provenance,
+      BINEVAL_EVALUATION_DEVELOPMENT_BANK,
+      { transportTimeoutMs: 5 },
+    );
+    expect(ignoredSignalObserved).toBe(true);
+    expect(performance.now() - waitStarted).toBeLessThan(500);
+    expect(ignoredAbort.evaluationStatus).toBe("transportFailure");
+
+    const oversized = await evaluateScorerCase(
+      "scalar",
+      candidate,
+      async () => response("x".repeat(MAX_SCORER_RESPONSE_BYTES + 1)),
+      1,
+      provenance,
+    );
+    expect(oversized.callEvidence[0]).toMatchObject({
+      outcome: "rejected",
+      response: null,
+      transportError: {
+        message: "transport returned an invalid response envelope",
+      },
+    });
+
+    const oversizedError = await evaluateScorerCase(
+      "scalar",
+      candidate,
+      async () => {
+        throw new Error("e".repeat(MAX_SCORER_RESPONSE_BYTES));
+      },
+      1,
+      provenance,
+    );
+    expect(oversizedError.callEvidence[0]?.transportError?.message).toBe(
+      "transport rejected with an unreadable or non-Error value",
+    );
+
+    let calls = 0;
+    await expect(evaluateScorerCase(
+      "scalar",
+      candidate,
+      async () => {
+        calls += 1;
+        return response("not reached");
+      },
+      1,
+      provenance,
+      BINEVAL_EVALUATION_DEVELOPMENT_BANK,
+      { transportTimeoutMs: MAX_SCORER_CALL_TIMEOUT_MS + 1 },
+    )).rejects.toThrow(`1 through ${MAX_SCORER_CALL_TIMEOUT_MS}`);
+    expect(calls).toBe(0);
+  });
+
+  test("rejects or nulls provider telemetry outside safe bounds", async () => {
+    const candidate = scorerCase("evaluationDevelopment-ledger-units");
+    const oversizedResponseTelemetry = await evaluateScorerCase(
+      "scalar",
+      candidate,
+      async () => response([{
+        index: 0,
+        confidence: 0.9,
+        kind: "risk",
+        reason: "Supported.",
+      }], {
+        promptTokens: MAX_SCORER_TOKENS_PER_CALL + 1,
+      }),
+      1,
+      provenance,
+    );
+    expect(oversizedResponseTelemetry.callEvidence[0]).toMatchObject({
+      outcome: "rejected",
+      response: null,
+    });
+
+    const oversizedErrorTelemetry = await evaluateScorerCase(
+      "scalar",
+      candidate,
+      async () => {
+        throw new EvaluationTransportError("provider unavailable", {
+          elapsedMs: MAX_SCORER_CALL_TIMEOUT_MS + 1,
+          promptTokens: Number.MAX_SAFE_INTEGER,
+          completionTokens: MAX_SCORER_TOKENS_PER_CALL + 1,
+          costUsd: MAX_SCORER_COST_USD_PER_CALL + 1,
+        });
+      },
+      1,
+      provenance,
+    );
+    expect(oversizedErrorTelemetry).toMatchObject({
+      observedElapsedMs: null,
+      observedPromptTokens: null,
+      observedCompletionTokens: null,
+      observedCostUsd: null,
+    });
   });
 
   test("excludes mutable same-process timing after later clock replacement", async () => {
@@ -860,7 +1149,7 @@ describe("raw evidence derivation", () => {
     expect(JSON.parse(stdout)).toEqual({
       elapsedMs: null,
       latencySource: "processMonotonicUntrusted",
-      measuredElapsedMs: 500_000,
+      measuredElapsedMs: MAX_SCORER_CALL_TIMEOUT_MS,
     });
   });
 
@@ -879,7 +1168,7 @@ describe("raw evidence derivation", () => {
     expect(result.elapsedMs).toBeNull();
     expect(result.callEvidence[0]).toMatchObject({
       latencySource: "testInjectedUntrusted",
-      measuredElapsedMs: 500_000,
+      measuredElapsedMs: MAX_SCORER_CALL_TIMEOUT_MS,
     });
   });
 

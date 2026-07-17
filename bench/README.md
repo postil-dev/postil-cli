@@ -28,6 +28,24 @@ misleading comments, huge low-signal multi-hunk diffs, near-duplicate clean and
 defect pairs, Unicode homoglyphs, subtle races, and clean changes where silence
 is the expected review.
 
+## Atomic scorer experiment
+
+`bineval-scorer.ts` compares scalar, batched binary, and independent binary
+scoring contracts across two canonical development banks containing 20 cases.
+`runCompleteDevelopmentScorerExperiment` runs every case through each selected
+method and returns frozen reports derived from normalized request and response
+evidence. The caller supplies the transport, model identity, provider identity,
+bounded scorer settings, and repeat count. Each transport call has a bounded
+evaluator wait and receives an abort signal. The caller-supplied transport is
+trusted executable code and must honor that signal to stop its underlying
+work. Provider receipts and telemetry remain bounded, untrusted observations
+and cannot change evaluator correctness.
+
+The experiment is development evidence. Its fixtures do not provide an
+independently held-out validation set and cannot qualify a production scorer.
+Reports contain full prompts and normalized provider responses. Treat them as
+sensitive development evidence and keep them out of public artifacts.
+
 ## Running (mock mode: default, CI)
 
 ```sh
