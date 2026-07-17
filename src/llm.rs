@@ -6364,7 +6364,11 @@ mod tests {
             "payload": "x".repeat(crate::attribution::MAX_PROVIDER_REQUEST_BYTES - overhead + 1),
         });
         let error = LlmClient::ensure_atomic_attribution_request_size(&rejected).unwrap_err();
-        assert!(error.to_string().contains("exceeds 5000 bytes"));
+        assert!(
+            error
+                .downcast_ref::<AtomicAttributionRequestTooLarge>()
+                .is_some()
+        );
     }
 
     fn provider_request_with_exact_serialized_size(target: usize) -> serde_json::Value {
