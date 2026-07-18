@@ -18,16 +18,21 @@ import {
   benchmarkCase,
   envelopeV1,
   evaluateStatusline,
+  MOCK_GITHUB_REPOSITORY_ID,
   parseUnifiedDiffFiles,
   safeJson,
   startMockGithub,
   type BenchmarkCase,
 } from "./harness";
 import {
-  pricingFromCatalog,
   type ModelPricing,
-  type OpenRouterModelsResponse,
+  type QualificationPair,
 } from "./livemodels-score";
+import {
+  fetchPricing as fetchQualificationPricing,
+  normalizeApiBase,
+  qualificationCandidateDocument,
+} from "./livemodels";
 
 const execFile = promisify(execFileCb);
 
@@ -91,6 +96,7 @@ export interface ScorerEvalCase {
   reasonContractValid: boolean;
   usageAccountingComplete: boolean | null;
   usageValid: boolean;
+  routingValid: boolean;
   coverageValid: boolean;
   publicationValid: boolean;
   upstreamRequests: number;
@@ -126,6 +132,7 @@ export interface ScorerEvalAggregate {
 export interface ScorerEvalReport {
   generatedAt: string;
   apiBase: string;
+  upstreamProvider: string;
   repeats: number;
   completedCases: number;
   totalCases: number;
@@ -305,7 +312,17 @@ async function main() {
   if (args.includes("--json-out") && jsonOut === undefined) {
     throw new Error("--json-out requires a path");
   }
-  const apiBase = process.env.POSTIL_API_BASE ?? DEFAULT_API_BASE;
+  const apiBase = normalizeApiBase(process.env.POSTIL_API_BASE ?? DEFAULT_API_BASE);
+  const upstreamProvider = (
+    process.env.POSTIL_SCORER_EVAL_UPSTREAM_PROVIDER ??
+    flagValue(args, "--upstream-provider") ??
+    ""
+  ).trim();
+  if (upstreamProvider.length === 0) {
+    throw new Error(
+      "scorer eval needs POSTIL_SCORER_EVAL_UPSTREAM_PROVIDER or --upstream-provider",
+    );
+  }
   const keyName = resolveApiKeyName();
   if (!keyName) {
     throw new Error(`scorer eval needs a real model key: set ${API_KEY_ENV_NAMES_TEXT}`);
@@ -325,7 +342,21 @@ async function main() {
   const repeats = parseRepeatCount(
     process.env.POSTIL_SCORER_EVAL_REPEATS ?? flagValue(args, "--repeats"),
   );
-  const pricing = await fetchPricing(apiBase, models);
+  const requiredScorerParameters = new Map(models.map((model) => [model, [
+    "max_tokens",
+    "reasoning",
+    "reasoning_effort",
+    "response_format",
+    "structured_outputs",
+    "temperature",
+  ] as const]));
+  const pricing = await fetchQualificationPricing(
+    apiBase,
+    "openai-compatible",
+    models,
+    upstreamProvider,
+    requiredScorerParameters,
+  );
   assertQualificationPreflight(models, repeats, pricing);
   const rootDir = resolve(import.meta.dir, "..", ".runs", "scorer-eval");
   await mkdir(rootDir, { recursive: true });
@@ -352,6 +383,8 @@ async function main() {
       apiBase,
       keyName,
       pricing.get(model) ?? null,
+      SCORER_CASE_EXEC_TIMEOUT_MS,
+      upstreamProvider,
     ),
     jsonOut
       ? (completed) => writeScorerEvalCheckpoint(jsonOut, models, repeats, totalCases, completed)
@@ -364,6 +397,7 @@ async function main() {
   const report: ScorerEvalReport = {
     generatedAt: new Date().toISOString(),
     apiBase,
+    upstreamProvider,
     repeats,
     completedCases: results.length,
     totalCases,
@@ -401,6 +435,7 @@ export function isAdmissionFatalStructuralResult(
     !result.reasonContractValid ||
     result.usageAccountingComplete !== true ||
     !result.usageValid ||
+    !result.routingValid ||
     !result.coverageValid ||
     !result.publicationValid ||
     result.gateFailing === null ||
@@ -455,6 +490,7 @@ export async function runScorerEvalCase(
   keyName: string,
   pricing: ModelPricing | null,
   executionTimeoutMs = SCORER_CASE_EXEC_TIMEOUT_MS,
+  upstreamProvider?: string,
 ): Promise<ScorerEvalCase> {
   const runDir = join(rootDir, safeSegment(scorerModel), `repeat-${repeat}`, c.id);
   await rm(runDir, { recursive: true, force: true });
@@ -465,8 +501,52 @@ export async function runScorerEvalCase(
   await mkdir(tmpDir, { recursive: true, mode: 0o700 });
   await mkdir(artifactsDir, { recursive: true, mode: 0o700 });
 
+  const canonicalApiBase = normalizeApiBase(apiBase);
+  const candidateProfilePath = upstreamProvider === undefined
+    ? undefined
+    : join(runDir, "qualification-candidate.json");
+  if (candidateProfilePath !== undefined) {
+    const exactProvider = upstreamProvider;
+    if (exactProvider === undefined) {
+      throw new Error("source-exact scorer eval needs an upstream provider");
+    }
+    if (pricing === null) {
+      throw new Error(`source-exact scorer eval needs pricing for ${scorerModel}`);
+    }
+    const pair: QualificationPair = {
+      generatorModel: GENERATOR_MODEL,
+      generatorCascade: [],
+      consensus: 1,
+      scorerModel,
+      scorerCascade: [],
+    };
+    const candidatePricing = new Map<string, ModelPricing>([
+      [GENERATOR_MODEL, { ...pricing, providerIdentity: exactProvider }],
+      [scorerModel, { ...pricing, providerIdentity: exactProvider }],
+    ]);
+    await writeFile(
+      candidateProfilePath,
+      JSON.stringify(qualificationCandidateDocument(
+        pair,
+        candidatePricing,
+        canonicalApiBase,
+        "openai-compatible",
+        exactProvider,
+      )),
+      { mode: 0o600 },
+    );
+  }
+
   const github = await startMockGithub(c);
-  const proxy = await startScorerProxy(c, scenario, apiBase, process.env[keyName] as string);
+  const proxy = await startScorerProxy(
+    c,
+    scenario,
+    canonicalApiBase,
+    process.env[keyName] as string,
+    SCORER_PROXY_UPSTREAM_TIMEOUT_MS,
+    upstreamProvider,
+    pricing,
+  );
   let child: BoundedChildResult;
   try {
     child = await runBoundedChild(binary, ["review", "--publish", "--repo", c.repo, "--pr", String(c.pullNumber), "--output-json"], {
@@ -478,6 +558,8 @@ export async function runScorerEvalCase(
         proxy.baseUrl,
         scorerModel,
         c.admission.expectedCoverage === "bounded",
+        candidateProfilePath,
+        canonicalApiBase,
       ),
       timeoutMs: executionTimeoutMs,
       maxBuffer: 8 * 1024 * 1024,
@@ -500,6 +582,7 @@ export async function runScorerEvalCase(
       generatorRequests: proxy.generatorRequests.length,
       generatorRequestKinds: proxy.generatorRequestKinds,
       plannerSelections: proxy.plannerSelections,
+      unexpectedRequests: proxy.unexpectedRequests,
     }),
     { mode: 0o600 },
   );
@@ -608,7 +691,13 @@ export async function runScorerEvalCase(
   const reasonContractValid = isValidReason(scorerReason);
   const usageAccountingComplete =
     typeof envelope.usageAccountingComplete === "boolean" ? envelope.usageAccountingComplete : null;
-  const usageValid = proxy.attempts.length === 1 && proxy.attempts[0]!.usageValid;
+  const usageValid = sourceExactUsageValid(
+    envelope,
+    scorerModel,
+    proxy.attempts[0],
+    proxy.generatorRequests.length + proxy.plannerRequests.length,
+  );
+  const routingValid = proxy.unexpectedRequests.length === 0;
   const coverageFailure = reviewCoverageFailure(c, envelope);
   const coverageValid = coverageFailure === null;
   const structuredOk =
@@ -620,6 +709,7 @@ export async function runScorerEvalCase(
     reasonContractValid &&
     usageAccountingComplete === true &&
     usageValid &&
+    routingValid &&
     coverageValid &&
     publicationValid &&
     proxy.attempts.length === 1;
@@ -629,6 +719,7 @@ export async function runScorerEvalCase(
     reason = `case exceeded the ${SCORER_MAX_CASE_MS}ms admission limit`;
   } else if (!structuredOk) {
     reason = publicationFailures[0] ?? coverageFailure ??
+      (!routingValid ? "capture proxy received an unexpected request route" : undefined) ??
       scorerStructuralFailureReason(scorerError, proxy.attempts.length, actualScorer);
   } else if (scenario === "trueFinding") {
     passed = scorerCasePasses({
@@ -679,6 +770,7 @@ export async function runScorerEvalCase(
     reasonContractValid,
     usageAccountingComplete,
     usageValid,
+    routingValid,
     coverageValid,
     publicationValid,
     ...telemetry,
@@ -715,6 +807,7 @@ function baseResult(
     reasonContractValid: false,
     usageAccountingComplete: null,
     usageValid: false,
+    routingValid: false,
     coverageValid: false,
     publicationValid: false,
     upstreamRequests: 0,
@@ -792,11 +885,16 @@ export async function startScorerProxy(
   apiBase: string,
   apiKey: string,
   upstreamTimeoutMs = SCORER_PROXY_UPSTREAM_TIMEOUT_MS,
+  upstreamProvider?: string,
+  pricing: ModelPricing | null = null,
 ) {
   const attempts: ScorerAttempt[] = [];
   const plannerRequests: string[] = [];
   const generatorRequests: string[] = [];
   const generatorRequestKinds: Array<"source" | "synthesis"> = [];
+  const unexpectedRequests: Array<{ method: string; path: string }> = [];
+  let falseFindingOutputSent = false;
+  let plannedTargetAvailable = false;
   const plannerSelections: Array<{
     targetBatchId: number | null;
     targetWasMandatory: boolean;
@@ -806,6 +904,13 @@ export async function startScorerProxy(
   let closing = false;
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     if (req.method !== "POST" || req.url !== "/chat/completions") {
+      let path = "unknown";
+      try {
+        path = new URL(req.url ?? "", "http://loopback.invalid").pathname;
+      } catch {
+        // Keep the safe sentinel. Query strings are never persisted.
+      }
+      unexpectedRequests.push({ method: req.method ?? "unknown", path });
       res.writeHead(404, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: "not found" }));
       return;
@@ -821,6 +926,7 @@ export async function startScorerProxy(
         plannerRequests.push(bodyText);
         const user = body.messages?.find((message) => message.role === "user")?.content ?? "";
         const targetId = plannerBatchIdForPath(user, c.primaryChange?.path);
+        plannedTargetAvailable = targetId !== null;
         const mandatoryIds = plannerMandatoryIds(user);
         const batchIds = targetId !== null && !mandatoryIds.has(targetId) ? [targetId] : [];
         plannerSelections.push({
@@ -830,8 +936,11 @@ export async function startScorerProxy(
         });
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({
+          id: `postil-scorer-eval-planner-${crypto.randomUUID()}`,
+          model: GENERATOR_MODEL,
+          ...(upstreamProvider === undefined ? {} : { provider: upstreamProvider }),
           choices: [{ finish_reason: "stop", message: { content: JSON.stringify({ batchIds }) } }],
-          usage: { prompt_tokens: 20, completion_tokens: 4, total_tokens: 24 },
+          usage: mockUsage(20, 4),
         }));
         return;
       }
@@ -848,14 +957,34 @@ export async function startScorerProxy(
         user.length === 0 ||
         targetPath === undefined ||
         (!isSynthesis && user.includes(`### ${targetPath}\n`));
-      const output = containsTarget
-        ? generatorOutput(c, scenario)
-        : { summary: "", findings: [] };
+      let output = { summary: "", findings: [] as ReturnType<typeof falseFinding>[] };
+      if (scenario === "trueFinding" && containsTarget) {
+        output = generatorOutput(c, scenario);
+      } else if (
+        scenario === "falseFinding" &&
+        !isSynthesis &&
+        !falseFindingOutputSent &&
+        (containsTarget || !plannedTargetAvailable)
+      ) {
+        const finding = containsTarget
+          ? falseFinding(c)
+          : falseFindingFromSourceRequest(user);
+        if (finding !== null) {
+          output = {
+            summary: `${scenario} scorer calibration case for ${c.id}.`,
+            findings: [finding],
+          };
+          falseFindingOutputSent = true;
+        }
+      }
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
         JSON.stringify({
+          id: `postil-scorer-eval-generator-${crypto.randomUUID()}`,
+          model: GENERATOR_MODEL,
+          ...(upstreamProvider === undefined ? {} : { provider: upstreamProvider }),
           choices: [{ finish_reason: "stop", message: { content: JSON.stringify(output) } }],
-          usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+          usage: mockUsage(10, 5),
         }),
       );
       return;
@@ -926,6 +1055,7 @@ export async function startScorerProxy(
     generatorRequests,
     generatorRequestKinds,
     plannerSelections,
+    unexpectedRequests,
     close: () => {
       closePromise ??= (async () => {
         closing = true;
@@ -975,7 +1105,10 @@ export function plannerBatchIdForPath(prompt: string, path: string | undefined):
   if (matches.size > 1) {
     throw new Error(`planner manifest contains duplicate source batches for ${path}`);
   }
-  throw new Error(`planner manifest does not contain the expected path ${path}`);
+  if (prompt.includes(`### ${path}\n`) || prompt.endsWith(`### ${path}`)) {
+    throw new Error(`planner manifest contains the expected path ${path} outside a source batch`);
+  }
+  return null;
 }
 
 function scoredFinding(envelope: Record<string, any>): Record<string, any> | undefined {
@@ -1000,6 +1133,59 @@ function isValidUsage(usage: { prompt_tokens?: number; completion_tokens?: numbe
     Number.isSafeInteger(usage.completion_tokens) &&
     (usage.completion_tokens ?? 0) > 0
   );
+}
+
+function sourceExactUsageValid(
+  envelope: Record<string, any>,
+  scorerModel: string,
+  attempt: ScorerAttempt | undefined,
+  expectedMockCalls: number,
+): boolean {
+  if (attempt === undefined || !attempt.usageValid || attempt.costUsd === null) return false;
+  const events = Array.isArray(envelope.modelUsage) ? envelope.modelUsage : [];
+  const scorerEvents = events.filter((event: Record<string, any>) =>
+    event.model === scorerModel && event.role === "findingScorer"
+  );
+  const mockEvents = events.filter((event: Record<string, any>) =>
+    event.model === GENERATOR_MODEL &&
+    (event.role === "reviewGenerator" || event.role === "reviewPlanner")
+  );
+  if (
+    scorerEvents.length !== 1 ||
+    mockEvents.length !== expectedMockCalls ||
+    scorerEvents.length + mockEvents.length !== events.length
+  ) return false;
+
+  const scorer = scorerEvents[0] as Record<string, any>;
+  const reportedCost = typeof scorer.costProviderDecimal === "string"
+    ? Number(scorer.costProviderDecimal)
+    : Number.NaN;
+  const scorerValid =
+    scorer.accountingComplete === true &&
+    scorer.costSource === "providerReported" &&
+    scorer.promptTokens === attempt.promptTokens &&
+    scorer.completionTokens === attempt.completionTokens &&
+    Number.isFinite(reportedCost) &&
+    Math.abs(reportedCost - attempt.costUsd) < 1e-12 &&
+    scorer.costMicros === Math.round(attempt.costUsd * 1_000_000);
+  const mocksValid = mockEvents.every((event: Record<string, any>) =>
+    event.accountingComplete === true &&
+    event.costSource === "unavailable" &&
+    event.costMicros === undefined &&
+    event.costProviderDecimal === undefined
+  );
+  return scorerValid && mocksValid;
+}
+
+function mockUsage(
+  promptTokens: number,
+  completionTokens: number,
+) {
+  return {
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    total_tokens: promptTokens + completionTokens,
+  };
 }
 
 export function projectedQualificationSpendUsd(
@@ -1084,6 +1270,30 @@ export function falseFinding(c: BenchmarkCase) {
   if (!evidence) {
     throw new Error(`fixture ${c.id} has no exact added evidence at ${path}:${line}`);
   }
+  return falseFindingAt(path, line, evidence);
+}
+
+export function falseFindingFromSourceRequest(request: string) {
+  let path: string | null = null;
+  for (const line of request.split("\n")) {
+    const header = /^### (\S.*)$/u.exec(line);
+    if (header) {
+      path = header[1]!;
+      continue;
+    }
+    const added = /^\s*(\d+) \+ (.+)$/u.exec(line);
+    if (path !== null && added) {
+      const lineNumber = Number.parseInt(added[1]!, 10);
+      const evidence = added[2]!;
+      if (Number.isSafeInteger(lineNumber) && lineNumber > 0 && evidence.trim().length > 0) {
+        return falseFindingAt(path, lineNumber, evidence);
+      }
+    }
+  }
+  return null;
+}
+
+function falseFindingAt(path: string, line: number, evidence: string) {
   // The injected false positive is intentionally plausible and overconfident:
   // calibration succeeds only when the scorer pushes it below gate relevance.
   return {
@@ -1123,7 +1333,10 @@ export function isolatedEnv(
   modelBaseUrl: string,
   scorerModel: string,
   forceBoundedSelection = false,
+  candidateProfilePath?: string,
+  canonicalApiBase?: string,
 ): NodeJS.ProcessEnv {
+  const candidateMode = candidateProfilePath !== undefined;
   return {
     PATH: process.env.PATH,
     CI: "true",
@@ -1135,25 +1348,26 @@ export function isolatedEnv(
     XDG_DATA_HOME: join(homeDir, ".local", "share"),
     GIT_CONFIG_NOSYSTEM: "1",
     GIT_TERMINAL_PROMPT: "0",
-    POSTIL_API_BASE: modelBaseUrl,
-    POSTIL_ALLOW_PRIVATE_API_BASE: "1",
+    POSTIL_API_BASE: candidateMode ? (canonicalApiBase ?? modelBaseUrl) : modelBaseUrl,
+    ...(candidateMode
+      ? {
+          POSTIL_QUALIFICATION_CAPTURE_API_BASE: modelBaseUrl,
+          POSTIL_QUALIFICATION_CANDIDATE_PROFILE: candidateProfilePath,
+          POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY: "1",
+          POSTIL_ALLOW_PRIVATE_API_BASE: "1",
+          POSTIL_EXPECTED_GITHUB_REPO_ID: String(MOCK_GITHUB_REPOSITORY_ID),
+        }
+      : { POSTIL_ALLOW_PRIVATE_API_BASE: "1" }),
     POSTIL_API_KEY: "scorer-eval-proxy-key",
     GITHUB_API_URL: githubBaseUrl,
     GITHUB_TOKEN: "benchmark-github-token",
     REVIEW_MODEL: GENERATOR_MODEL,
     REVIEW_MODEL_CASCADE: GENERATOR_MODEL,
     REVIEW_SCORER_MODEL: scorerModel,
-    ...(forceBoundedSelection ? { POSTIL_BENCH_FORCE_BOUNDED_SELECTION: "1" } : {}),
+    ...(forceBoundedSelection && !candidateMode
+      ? { POSTIL_BENCH_FORCE_BOUNDED_SELECTION: "1" }
+      : {}),
   };
-}
-
-async function fetchPricing(apiBase: string, models: string[]): Promise<Map<string, ModelPricing>> {
-  const url = `${apiBase.replace(/\/$/, "")}/models`;
-  const response = await fetch(url, { headers: { accept: "application/json" } });
-  if (!response.ok) {
-    throw new Error(`failed to fetch scorer pricing (${response.status}) from ${url}`);
-  }
-  return pricingFromCatalog((await response.json()) as OpenRouterModelsResponse, models);
 }
 
 export function aggregate(

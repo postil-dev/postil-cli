@@ -15,6 +15,7 @@ import {
   aggregate,
   assertQualificationPreflight,
   falseFinding,
+  falseFindingFromSourceRequest,
   firstAddedLineForPath,
   finalizeScorerEvalReport,
   formatReport,
@@ -120,6 +121,7 @@ function result(overrides: Partial<ScorerEvalCase>): ScorerEvalCase {
     reasonContractValid: true,
     usageAccountingComplete: true,
     usageValid: true,
+    routingValid: true,
     coverageValid: true,
     publicationValid: true,
     upstreamRequests: 1,
@@ -430,6 +432,27 @@ describe("scorer proxy and isolated runtime", () => {
     }
   });
 
+  test("records unexpected capture paths without query data", async () => {
+    const proxy = await startScorerProxy(
+      fixture("clean-docs-only"),
+      "falseFinding",
+      "http://127.0.0.1:9",
+      "proxy-test-key",
+    );
+    try {
+      const response = await fetch(`${proxy.baseUrl}/unexpected?credential=do-not-store`);
+      expect(response.status).toBe(404);
+      expect(proxy.unexpectedRequests).toEqual([{
+        method: "GET",
+        path: "/unexpected",
+      }]);
+      expect(isAdmissionFatalStructuralResult(result({ routingValid: false }), "scorer/model"))
+        .toBe(true);
+    } finally {
+      await proxy.close();
+    }
+  });
+
   test("selects an interior clean change through bounded planning and scores it exactly once", async () => {
     const scorerRequests: string[] = [];
     const upstream = createServer(async (req: IncomingMessage, res: ServerResponse) => {
@@ -516,8 +539,10 @@ describe("scorer proxy and isolated runtime", () => {
           targetWasMandatory: boolean;
           returnedBatchIds: number[];
         }>;
+        unexpectedRequests: Array<{ method: string; path: string }>;
       };
       expect(proxyTelemetry.plannerRequests).toBe(1);
+      expect(proxyTelemetry.unexpectedRequests).toEqual([]);
       const sourceRequests = proxyTelemetry.generatorRequestKinds.filter(
         (kind) => kind === "source",
       );
@@ -640,7 +665,7 @@ describe("scorer proxy and isolated runtime", () => {
     }
   });
 
-  test("parses the current bounded planner manifest and rejects format drift", () => {
+  test("parses the current bounded planner manifest and allows an omitted target", () => {
     const prompt = [
       "The complete diff was normalized into 9 bounded batches.",
       "Mandatory IDs: [1, 9]",
@@ -663,11 +688,28 @@ describe("scorer proxy and isolated runtime", () => {
     expect(() => plannerBatchIdForPath(
       prompt.replace("\nBatch 6", "\nCandidate 6"),
       "src/ui/copy.ts",
-    )).toThrow("planner manifest does not contain the expected path src/ui/copy.ts");
+    )).toThrow("planner manifest contains the expected path src/ui/copy.ts outside a source batch");
+    expect(plannerBatchIdForPath(prompt, "src/not-selected.ts")).toBeNull();
     expect(() => plannerBatchIdForPath(
       `${prompt}\nBatch 7 risk=1 kind=source\n### src/ui/copy.ts`,
       "src/ui/copy.ts",
     )).toThrow("planner manifest contains duplicate source batches for src/ui/copy.ts");
+  });
+
+  test("grounds a calibration false-positive in a selected source request", () => {
+    expect(falseFindingFromSourceRequest([
+      "Review this selected source batch independently.",
+      "### src/generated/prefix.ts",
+      "@@ semantic category=uncategorized @@",
+      "    18   unchanged context",
+      "    19 + const formatted = true;",
+    ].join("\n"))).toMatchObject({
+      path: "src/generated/prefix.ts",
+      line: 19,
+      confidence: 0.95,
+      evidence: "const formatted = true;",
+    });
+    expect(falseFindingFromSourceRequest("### src/empty.ts\n    1   context only")).toBeNull();
   });
 
   test("kills child execution just beyond the admission latency bound", async () => {
@@ -715,6 +757,25 @@ describe("scorer proxy and isolated runtime", () => {
     expect(env.OPENROUTER_API_KEY).toBeUndefined();
     expect(env.MODEL_API_KEY).toBeUndefined();
     expect(env.LLM_API_KEY).toBeUndefined();
+  });
+
+  test("opts the hermetic candidate capture proxy into loopback access", () => {
+    const env = isolatedEnv(
+      "/tmp/postil-home",
+      "/tmp/postil-tmp",
+      "http://127.0.0.1:3101",
+      "http://127.0.0.1:3102",
+      "scorer/model",
+      true,
+      "/tmp/qualification-candidate.json",
+      "https://openrouter.ai/api/v1",
+    );
+    expect(env).toMatchObject({
+      POSTIL_API_BASE: "https://openrouter.ai/api/v1",
+      POSTIL_QUALIFICATION_CAPTURE_API_BASE: "http://127.0.0.1:3102",
+      POSTIL_ALLOW_PRIVATE_API_BASE: "1",
+    });
+    expect(env.POSTIL_BENCH_FORCE_BOUNDED_SELECTION).toBeUndefined();
   });
 });
 
@@ -773,6 +834,7 @@ describe("candidate matrix execution", () => {
       result({ reasonContractValid: false }),
       result({ usageAccountingComplete: false }),
       result({ usageValid: false }),
+      result({ routingValid: false }),
       result({ coverageValid: false }),
       result({ publicationValid: false }),
       result({ gateFailing: null }),
@@ -1035,6 +1097,7 @@ describe("qualification utilities", () => {
     const report = (models: typeof passing[]): ScorerEvalReport => ({
       generatedAt: "2026-07-11T00:00:00.000Z",
       apiBase: "https://example.test/v1",
+      upstreamProvider: "test-provider",
       repeats: 1,
       completedCases: 12,
       totalCases: 12,
@@ -1055,6 +1118,7 @@ describe("formatReport", () => {
     const report: ScorerEvalReport = {
       generatedAt: "2026-07-11T00:00:00.000Z",
       apiBase: "https://example.test/v1",
+      upstreamProvider: "test-provider",
       repeats: 5,
       completedCases: 2,
       totalCases: 2,
