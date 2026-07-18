@@ -254,9 +254,11 @@ same non-collection and ZDR request preferences as production.
 The independent scorer has a different job from the primary review generator:
 it receives already-generated findings, without the generator's confidence or
 kind, and calibrates each finding's confidence and kind against local diff
-context. `bun run scorer-eval` qualifies that role directly by mocking the
-primary generator with fixed findings and proxying only scorer requests to the
-real OpenRouter endpoint.
+context. `bun run scorer-eval` screens that role directly by mocking the
+primary generator with fixed findings and proxying scorer requests through one
+named OpenRouter provider with fallback routing disabled.
+Mock generator and planner usage is identified separately and excluded from
+live scorer cost evidence.
 This diagnostic can reject a scorer but cannot admit a production pair; pair
 qualification above is the admission authority.
 
@@ -266,6 +268,7 @@ cd bench
 export MODEL_API_KEY=...          # or LLM_API_KEY / OPENROUTER_API_KEY
 POSTIL_SCORER_EVAL_MODELS=provider/candidate-a,provider/candidate-b \
 POSTIL_SCORER_EVAL_REPEATS=5 \
+POSTIL_SCORER_EVAL_UPSTREAM_PROVIDER=provider-name \
   bun run scorer-eval --json-out scorer-eval-report.json
 ```
 

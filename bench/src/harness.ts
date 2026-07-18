@@ -512,11 +512,14 @@ interface RecordedRequest {
   body: string;
 }
 
+export const MOCK_GITHUB_REPOSITORY_ID = 987_654_321;
+
 export async function startMockGithub(c: BenchmarkCase) {
   const requests: RecordedRequest[] = [];
   const checkRunNames = new Map<string, string>(); // id -> check name
   let nextCheckRunId = 1001;
   const pullPath = `/repos/${c.repo}/pulls/${c.pullNumber}`;
+  const repositoryPath = `/repos/${c.repo}`;
   const pullFilesPath = `${pullPath}/files`;
   const checkRunsPath = `/repos/${c.repo}/check-runs`;
   const contentsPrefix = `/repos/${c.repo}/contents/`;
@@ -530,6 +533,12 @@ export async function startMockGithub(c: BenchmarkCase) {
     const accept = String(req.headers.accept ?? "");
     const body = await readRequestBody(req);
     requests.push({ method: req.method ?? "", path: url.pathname, accept, body });
+
+    if (req.method === "GET" && url.pathname === repositoryPath) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: MOCK_GITHUB_REPOSITORY_ID, full_name: c.repo }));
+      return;
+    }
 
     if (req.method === "GET" && url.pathname === pullPath) {
       if (accept.includes("diff")) {

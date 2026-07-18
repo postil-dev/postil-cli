@@ -48,6 +48,7 @@ import {
   envelopeV1,
   evaluateGrounding,
   evaluateStatusline,
+  MOCK_GITHUB_REPOSITORY_ID,
   safeJson,
   startMockGithub,
   validateUniqueCaseIds,
@@ -1604,6 +1605,7 @@ export function liveEnv(
   };
   if (candidateProfilePath !== undefined) {
     env.POSTIL_QUALIFICATION_CANDIDATE_PROFILE = candidateProfilePath;
+    env.POSTIL_EXPECTED_GITHUB_REPO_ID = String(MOCK_GITHUB_REPOSITORY_ID);
   }
   const endpointAuth = endpointAuthFromEnvironment(apiFormat);
   if (endpointAuth) {
