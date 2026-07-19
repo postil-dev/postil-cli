@@ -268,8 +268,8 @@ impl ModelError {
         } else if self.error.chain().any(|cause| {
             cause
                 .downcast_ref::<ModelContentFailure>()
-                .and_then(ModelContentFailure::nonterminal)
-                .is_some_and(|(_, reason)| reason == "length")
+                .and_then(ModelContentFailure::nonterminal_reason)
+                .is_some_and(|reason| reason == "length")
         }) {
             Category::OutputNonterminalLength
         } else if self.is_deadline_exceeded() {
@@ -530,6 +530,7 @@ pub(crate) const TRANSIENT_RETRIES: u32 = 2;
 /// review beyond its worker budget.
 const TIMEOUT_RETRIES: u32 = 1;
 const EMPTY_RESPONSE_RETRIES: u32 = 1;
+const EXHAUSTED_OUTPUT_RETRIES: u32 = 1;
 const TIMEOUT_RETRY_CAP_SECS: u64 = 90;
 const EMPTY_RESPONSE_RETRY_TIMEOUT_SECS: u64 = 30;
 const EXHAUSTED_OUTPUT_RETRY_MAX_TOKENS: u32 = 16_000;
@@ -961,13 +962,14 @@ struct ChatSuccess {
 enum ModelContentFailure {
     Empty,
     MissingChoices,
-    NonTerminal { content: String, reason: String },
+    NonTerminal { reason: String },
 }
 
 impl ModelContentFailure {
-    fn nonterminal(&self) -> Option<(&str, &str)> {
+    #[cfg_attr(not(any(test, feature = "qualification-candidate")), allow(dead_code))]
+    fn nonterminal_reason(&self) -> Option<&str> {
         match self {
-            Self::NonTerminal { content, reason } => Some((content, reason)),
+            Self::NonTerminal { reason } => Some(reason),
             Self::Empty | Self::MissingChoices => None,
         }
     }
@@ -982,7 +984,7 @@ impl std::fmt::Display for ModelContentFailure {
         match self {
             Self::Empty => formatter.write_str("model response had no choices/content"),
             Self::MissingChoices => formatter.write_str("model response had no choices"),
-            Self::NonTerminal { reason, .. } => {
+            Self::NonTerminal { reason } => {
                 write!(formatter, "model response was nonterminal ({reason})")
             }
         }
@@ -2174,21 +2176,8 @@ impl LlmClient {
                 LlmCallPhase::Initial,
             )
             .await;
-        let (content, nonterminal_reason) = match initial {
-            Ok(content) => (content, None),
-            Err(error)
-                if error
-                    .downcast_ref::<ModelContentFailure>()
-                    .is_some_and(|failure| failure.nonterminal().is_some()) =>
-            {
-                let response = error
-                    .downcast_ref::<ModelContentFailure>()
-                    .expect("checked nonterminal response");
-                let (content, reason) = response
-                    .nonterminal()
-                    .expect("checked nonterminal response");
-                (content.to_string(), Some(reason.to_string()))
-            }
+        let content = match initial {
+            Ok(content) => content,
             Err(e) => {
                 let complete = usage_accounting_complete
                     && (usage.prompt_tokens > 0 || usage.completion_tokens > 0);
@@ -2198,11 +2187,7 @@ impl LlmClient {
             }
         };
         let mut repaired_schema = false;
-        let parsed_initial = if let Some(reason) = nonterminal_reason {
-            Err(format!("response ended before completion: {reason}"))
-        } else {
-            parse_review(&content)
-        };
+        let parsed_initial = parse_review(&content);
         let raw = match parsed_initial {
             Ok(raw) => raw,
             Err(parse_err) => {
@@ -2684,6 +2669,7 @@ impl LlmClient {
         let mut retries = 0u32;
         let mut timeout_retries = 0u32;
         let mut empty_response_retries = 0u32;
+        let mut exhausted_output_retries = 0u32;
         let mut attempt_timeout = self.request_timeout;
         loop {
             let attempt = retries.saturating_add(1);
@@ -2840,6 +2826,39 @@ impl LlmClient {
                                 if summary.usage.is_none() {
                                     *usage_accounting_complete = false;
                                 }
+                                let expanded_max_tokens =
+                                    phase.exhausted_output_retry_max_tokens(request_max_tokens);
+                                let exhausted_output_budget = summary.finish_reason.as_deref()
+                                    == Some("length")
+                                    && expanded_max_tokens > request_max_tokens;
+                                if exhausted_output_budget
+                                    && exhausted_output_retries < EXHAUSTED_OUTPUT_RETRIES
+                                    && retries < TRANSIENT_RETRIES
+                                {
+                                    retries += 1;
+                                    exhausted_output_retries += 1;
+                                    let wait = provider_retry_delay(retries);
+                                    eprintln!(
+                                        "postil: model {} exhausted {request_max_tokens} output tokens after {elapsed}, retrying the complete request with {expanded_max_tokens} tokens in {} (output retry {exhausted_output_retries}/{EXHAUSTED_OUTPUT_RETRIES}; retry {retries}/{TRANSIENT_RETRIES})",
+                                        log_text(model),
+                                        elapsed_text(wait),
+                                    );
+                                    request_max_tokens = expanded_max_tokens;
+                                    body = self.request_body_with_provider(
+                                        model,
+                                        system,
+                                        user,
+                                        request_max_tokens,
+                                        temperature,
+                                        phase,
+                                        expected_provider,
+                                    );
+                                    self.sleep_with_budget(phase, wait).await?;
+                                    attempt_timeout = self
+                                        .request_timeout
+                                        .min(Duration::from_secs(TIMEOUT_RETRY_CAP_SECS));
+                                    continue;
+                                }
                                 if error
                                     .downcast_ref::<ModelContentFailure>()
                                     .is_some_and(ModelContentFailure::retryable_empty)
@@ -2849,46 +2868,15 @@ impl LlmClient {
                                     retries += 1;
                                     empty_response_retries += 1;
                                     let wait = provider_retry_delay(retries);
-                                    let expanded_max_tokens =
-                                        phase.exhausted_output_retry_max_tokens(request_max_tokens);
-                                    let exhausted_output_budget = summary.finish_reason.as_deref()
-                                        == Some("length")
-                                        && summary.usage.is_some_and(|value| {
-                                            value.completion_tokens >= u64::from(request_max_tokens)
-                                        })
-                                        && expanded_max_tokens > request_max_tokens;
-                                    if exhausted_output_budget {
-                                        eprintln!(
-                                            "postil: model {} exhausted {request_max_tokens} output tokens before content after {elapsed}, expanding the retry to {expanded_max_tokens} tokens in {} (empty retry {empty_response_retries}/{EMPTY_RESPONSE_RETRIES}; retry {retries}/{TRANSIENT_RETRIES})",
-                                            log_text(model),
-                                            elapsed_text(wait),
-                                        );
-                                        request_max_tokens = expanded_max_tokens;
-                                        body = self.request_body_with_provider(
-                                            model,
-                                            system,
-                                            user,
-                                            request_max_tokens,
-                                            temperature,
-                                            phase,
-                                            expected_provider,
-                                        );
-                                    } else {
-                                        eprintln!(
-                                            "postil: model {} returned empty content after {elapsed}, retrying in {} (empty retry {empty_response_retries}/{EMPTY_RESPONSE_RETRIES}; retry {retries}/{TRANSIENT_RETRIES})",
-                                            log_text(model),
-                                            elapsed_text(wait),
-                                        );
-                                    }
+                                    eprintln!(
+                                        "postil: model {} returned empty content after {elapsed}, retrying in {} (empty retry {empty_response_retries}/{EMPTY_RESPONSE_RETRIES}; retry {retries}/{TRANSIENT_RETRIES})",
+                                        log_text(model),
+                                        elapsed_text(wait),
+                                    );
                                     self.sleep_with_budget(phase, wait).await?;
-                                    attempt_timeout = if exhausted_output_budget {
-                                        self.request_timeout
-                                            .min(Duration::from_secs(TIMEOUT_RETRY_CAP_SECS))
-                                    } else {
-                                        self.request_timeout.min(Duration::from_secs(
-                                            EMPTY_RESPONSE_RETRY_TIMEOUT_SECS,
-                                        ))
-                                    };
+                                    attempt_timeout = self.request_timeout.min(
+                                        Duration::from_secs(EMPTY_RESPONSE_RETRY_TIMEOUT_SECS),
+                                    );
                                     continue;
                                 }
                                 return Err(error);
@@ -3117,7 +3105,6 @@ impl LlmClient {
                     .unwrap_or_else(|| "missing finish_reason".to_string());
                 if reason != "stop" {
                     return Err(anyhow::Error::new(ModelContentFailure::NonTerminal {
-                        content,
                         reason,
                     }));
                 }
@@ -3145,7 +3132,6 @@ impl LlmClient {
                     Err(anyhow::Error::new(ModelContentFailure::Empty))
                 } else if !matches!(stop_reason.as_str(), "end_turn" | "stop_sequence") {
                     Err(anyhow::Error::new(ModelContentFailure::NonTerminal {
-                        content,
                         reason: stop_reason,
                     }))
                 } else {
@@ -4406,7 +4392,6 @@ mod tests {
             ModelContentFailure::Empty,
             ModelContentFailure::MissingChoices,
             ModelContentFailure::NonTerminal {
-                content: "partial".to_string(),
                 reason: "length".to_string(),
             },
         ];
@@ -4856,12 +4841,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nonterminal_review_uses_one_bounded_repair_before_acceptance() {
+    async fn output_exhausted_review_retries_complete_request_with_expanded_budget() {
         let server = MockServer::start().await;
         let review = r#"{"summary":"","findings":[]}"#;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .and(body_string_contains("You repair malformed JSON"))
+            .and(body_string_contains("\"max_tokens\":16000"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "choices": [{"finish_reason": "stop", "message": {"content": review}}],
                 "usage": {"prompt_tokens": 20, "completion_tokens": 3}
@@ -4872,9 +4857,10 @@ mod tests {
             .await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
+            .and(body_string_contains("\"max_tokens\":8000"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "choices": [{"finish_reason": "length", "message": {"content": review}}],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+                "choices": [{"finish_reason": "length", "message": {"content": "{\"summary\":\"partial"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 8000}
             })))
             .with_priority(2)
             .expect(1)
@@ -4900,12 +4886,52 @@ mod tests {
         let result = client.review(&config, "system", "user").await.unwrap();
         assert!(result.findings.is_empty());
         assert_eq!(result.model_usage.len(), 2);
-        assert_eq!(result.model_incidents.len(), 1);
-        assert!(result.model_incidents[0].recovered);
-        assert_eq!(
-            result.model_incidents[0].recovery,
-            Some(ModelIncidentRecovery::Repair)
-        );
+        assert!(result.model_incidents.is_empty());
+        assert_eq!(result.usage.prompt_tokens, 30);
+        assert_eq!(result.usage.completion_tokens, 8_003);
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| {
+            let body = String::from_utf8_lossy(&request.body);
+            body.contains("\"content\":\"user\"") && !body.contains("You repair malformed JSON")
+        }));
+    }
+
+    #[tokio::test]
+    async fn repeated_output_exhaustion_fails_without_repairing_partial_content() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"finish_reason": "length", "message": {"content": "{\"summary\":\"partial"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 8000}
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let config = Config {
+            api_base: server.uri(),
+            api_format: ApiFormat::OpenaiCompatible,
+            model: "provider/model".into(),
+            scorer_enabled: false,
+            ..Config::default()
+        };
+        let client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(2),
+            None,
+            None,
+        )
+        .unwrap();
+        *client.http.lock().unwrap() = Some(reqwest::Client::new());
+
+        let _error = client.review(&config, "system", "user").await.unwrap_err();
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| {
+            !String::from_utf8_lossy(&request.body).contains("You repair malformed JSON")
+        }));
     }
 
     #[tokio::test]
@@ -6483,9 +6509,7 @@ mod tests {
                 .parse_response(body, &mut Usage::default())
                 .unwrap_err();
             let partial = error.downcast_ref::<ModelContentFailure>().unwrap();
-            let (content, reason) = partial.nonterminal().unwrap();
-            assert_eq!(reason, expected);
-            assert!(content.contains("findings"));
+            assert_eq!(partial.nonterminal_reason(), Some(expected));
         }
     }
 
@@ -6518,9 +6542,7 @@ mod tests {
                 .parse_response(body, &mut Usage::default())
                 .unwrap_err();
             let partial = error.downcast_ref::<ModelContentFailure>().unwrap();
-            let (content, reason) = partial.nonterminal().unwrap();
-            assert_eq!(reason, expected);
-            assert!(content.contains("findings"));
+            assert_eq!(partial.nonterminal_reason(), Some(expected));
         }
     }
 

@@ -604,6 +604,134 @@ async fn native_anthropic_review_uses_messages_shape_auth_and_usage() {
 }
 
 #[tokio::test]
+async fn native_anthropic_truncation_retries_the_complete_original_request() {
+    let server = MockServer::start().await;
+    let partial_title = "Partial output must never publish";
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .respond_with(SequentialReviewResponder {
+            calls: Arc::new(AtomicUsize::new(0)),
+            responses: Arc::new(vec![
+                json!({
+                    "content": [{"type": "text", "text": json!({
+                        "summary": "Incomplete review.",
+                        "findings": [{
+                            "path": "src/auth.rs", "line": 42, "severity": "error",
+                            "kind": "risk", "confidence": 1.0,
+                            "title": partial_title, "body": "This text is incomplete.",
+                            "evidence": "exec_query(&token);"
+                        }]
+                    }).to_string()}],
+                    "stop_reason": "max_tokens",
+                    "usage": {"input_tokens": 100, "output_tokens": 8000}
+                }),
+                anthropic_content(json!([]), 100, 5),
+            ]),
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("MODEL_API_KEY", "anthropic-provider-key")
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_API_FORMAT", "anthropic")
+        .env("REVIEW_MODEL", "primary-model")
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(!stdout.contains(partial_title));
+    let envelope: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(envelope["silent"], true);
+    assert_eq!(envelope["usage"]["promptTokens"], 200);
+    assert_eq!(envelope["usage"]["completionTokens"], 8005);
+    assert_eq!(envelope["modelUsage"].as_array().unwrap().len(), 2);
+    assert_model_usage_matches_aggregate(&envelope);
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let first: Value = requests[0].body_json().unwrap();
+    let second: Value = requests[1].body_json().unwrap();
+    assert_eq!(first["max_tokens"], 8_000);
+    assert_eq!(second["max_tokens"], 16_000);
+    assert_eq!(first["system"], second["system"]);
+    assert_eq!(first["messages"], second["messages"]);
+    assert!(
+        !serde_json::to_string(&second)
+            .unwrap()
+            .contains(partial_title)
+    );
+}
+
+#[tokio::test]
+async fn repeated_native_anthropic_truncation_fails_closed_without_partial_text() {
+    let server = MockServer::start().await;
+    let partial_title = "Partial output must never publish";
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "content": [{"type": "text", "text": json!({
+                "summary": "Incomplete review.",
+                "findings": [{
+                    "path": "src/auth.rs", "line": 42, "severity": "error",
+                    "kind": "risk", "confidence": 1.0,
+                    "title": partial_title, "body": "This text is incomplete.",
+                    "evidence": "exec_query(&token);"
+                }]
+            }).to_string()}],
+            "stop_reason": "max_tokens",
+            "usage": {"input_tokens": 100, "output_tokens": 8000}
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("MODEL_API_KEY", "anthropic-provider-key")
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_API_FORMAT", "anthropic")
+        .env("REVIEW_MODEL", "primary-model")
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .code(1);
+
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(!stdout.contains(partial_title));
+    let envelope: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(envelope["gate"]["failing"], true);
+    assert_eq!(envelope["findings"][0]["path"], ".postil/model-output");
+    assert_eq!(envelope["modelUsage"].as_array().unwrap().len(), 2);
+    assert_model_usage_matches_aggregate(&envelope);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0].body_json::<Value>().unwrap()["max_tokens"],
+        8_000
+    );
+    assert_eq!(
+        requests[1].body_json::<Value>().unwrap()["max_tokens"],
+        16_000
+    );
+    assert!(requests.iter().all(|request| {
+        !String::from_utf8_lossy(&request.body).contains("You repair malformed JSON")
+    }));
+}
+
+#[tokio::test]
 async fn native_anthropic_findings_skip_incompatible_default_scorer() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -5349,8 +5477,8 @@ async fn exhausted_reasoning_budget_expands_the_same_model_retry() {
     assert_eq!(envelope["usage"]["promptTokens"], 30_845);
     assert_eq!(envelope["usage"]["completionTokens"], 8_050);
     let stderr = String::from_utf8_lossy(&out.get_output().stderr);
-    assert!(stderr.contains("exhausted 8000 output tokens before content"));
-    assert!(stderr.contains("expanding the retry to 16000 tokens"));
+    assert!(stderr.contains("exhausted 8000 output tokens"));
+    assert!(stderr.contains("retrying the complete request with 16000 tokens"));
     assert!(stderr.contains("reasoning_tokens=8000"));
 
     let requests = server.received_requests().await.unwrap();
@@ -5363,6 +5491,127 @@ async fn exhausted_reasoning_budget_expands_the_same_model_retry() {
         })
         .collect::<Vec<_>>();
     assert_eq!(max_tokens, vec![8_000, 16_000]);
+}
+
+#[tokio::test]
+async fn openai_truncation_retries_the_complete_original_request() {
+    let server = MockServer::start().await;
+    let partial_title = "Partial output must never publish";
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(SequentialReviewResponder {
+            calls: Arc::new(AtomicUsize::new(0)),
+            responses: Arc::new(vec![
+                json!({
+                    "choices": [{"finish_reason": "length", "message": {"content": json!({
+                        "summary": "Incomplete review.",
+                        "findings": [{
+                            "path": "src/auth.rs", "line": 42, "severity": "error",
+                            "kind": "risk", "confidence": 1.0,
+                            "title": partial_title, "body": "This text is incomplete.",
+                            "evidence": "exec_query(&token);"
+                        }]
+                    }).to_string()}}],
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 8000}
+                }),
+                llm_content(json!([])),
+            ]),
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "primary-model")
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(!stdout.contains(partial_title));
+    let envelope: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(envelope["silent"], true);
+    assert_eq!(envelope["usage"]["promptTokens"], 200);
+    assert_eq!(envelope["usage"]["completionTokens"], 8050);
+    assert_eq!(envelope["modelUsage"].as_array().unwrap().len(), 2);
+    assert_model_usage_matches_aggregate(&envelope);
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let first: Value = requests[0].body_json().unwrap();
+    let second: Value = requests[1].body_json().unwrap();
+    assert_eq!(first["max_tokens"], 8_000);
+    assert_eq!(second["max_tokens"], 16_000);
+    assert_eq!(first["messages"], second["messages"]);
+    assert!(
+        !serde_json::to_string(&second)
+            .unwrap()
+            .contains(partial_title)
+    );
+}
+
+#[tokio::test]
+async fn repeated_openai_truncation_fails_closed_without_partial_text() {
+    let server = MockServer::start().await;
+    let partial_title = "Partial output must never publish";
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"finish_reason": "length", "message": {"content": json!({
+                "summary": "Incomplete review.",
+                "findings": [{
+                    "path": "src/auth.rs", "line": 42, "severity": "error",
+                    "kind": "risk", "confidence": 1.0,
+                    "title": partial_title, "body": "This text is incomplete.",
+                    "evidence": "exec_query(&token);"
+                }]
+            }).to_string()}}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 8000}
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "primary-model")
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .code(1);
+
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(!stdout.contains(partial_title));
+    let envelope: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(envelope["gate"]["failing"], true);
+    assert_eq!(envelope["findings"][0]["path"], ".postil/model-output");
+    assert_eq!(envelope["modelUsage"].as_array().unwrap().len(), 2);
+    assert_model_usage_matches_aggregate(&envelope);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0].body_json::<Value>().unwrap()["max_tokens"],
+        8_000
+    );
+    assert_eq!(
+        requests[1].body_json::<Value>().unwrap()["max_tokens"],
+        16_000
+    );
+    assert!(requests.iter().all(|request| {
+        !String::from_utf8_lossy(&request.body).contains("You repair malformed JSON")
+    }));
 }
 
 #[tokio::test]
@@ -7650,6 +7899,151 @@ async fn respond_to_pr_mention_posts_grounded_reply() {
     let text = body["body"].as_str().unwrap();
     assert!(text.contains("injection risk"));
     assert!(!text.contains("Postil ·"));
+}
+
+#[tokio::test]
+async fn respond_truncation_retries_without_publishing_partial_text() {
+    let server = MockServer::start().await;
+    let partial_answer = "Partial answer must never publish.";
+    mount_github_complete_diff(&server, 5).await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(SequentialReviewResponder {
+            calls: Arc::new(AtomicUsize::new(0)),
+            responses: Arc::new(vec![
+                json!({
+                    "choices": [{"finish_reason": "length", "message": {"content":
+                        respond_payload(partial_answer, None)
+                    }}],
+                    "usage": {"prompt_tokens": 40, "completion_tokens": 1024}
+                }),
+                respond_text("Parameterize `user_input` before executing the query."),
+            ]),
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/5"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "Add login", "body": "PR body",
+            "state": "open", "merged": false,
+            "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"}, "changed_files": 1
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/api/issues/5/comments"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .env("REVIEW_MODEL", "primary-model")
+        .args([
+            "respond",
+            "--publish",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "5",
+            "--comment",
+            "@postil is this safe?",
+        ])
+        .assert()
+        .success();
+
+    let requests = server.received_requests().await.unwrap();
+    let model_requests = requests
+        .iter()
+        .filter(|request| request.url.path() == "/chat/completions")
+        .collect::<Vec<_>>();
+    assert_eq!(model_requests.len(), 2);
+    let first: Value = model_requests[0].body_json().unwrap();
+    let second: Value = model_requests[1].body_json().unwrap();
+    assert_eq!(first["max_tokens"], 1024);
+    assert_eq!(second["max_tokens"], 2048);
+    assert_eq!(first["messages"], second["messages"]);
+    assert!(
+        !serde_json::to_string(&second)
+            .unwrap()
+            .contains(partial_answer)
+    );
+    let comment = requests
+        .iter()
+        .find(|request| request.url.path() == "/repos/acme/api/issues/5/comments")
+        .expect("reply posted");
+    let body: Value = comment.body_json().unwrap();
+    assert!(body["body"].as_str().unwrap().contains("Parameterize"));
+    assert!(!body["body"].as_str().unwrap().contains(partial_answer));
+}
+
+#[tokio::test]
+async fn repeated_respond_truncation_fails_without_publishing() {
+    let server = MockServer::start().await;
+    let partial_answer = "Partial answer must never publish.";
+    mount_github_complete_diff(&server, 5).await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"finish_reason": "length", "message": {"content":
+                respond_payload(partial_answer, None)
+            }}],
+            "usage": {"prompt_tokens": 40, "completion_tokens": 1024}
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/5"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "Add login", "body": "PR body",
+            "state": "open", "merged": false,
+            "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"}, "changed_files": 1
+        })))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .env("REVIEW_MODEL", "primary-model")
+        .args([
+            "respond",
+            "--publish",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "5",
+            "--comment",
+            "@postil is this safe?",
+        ])
+        .assert()
+        .failure();
+
+    assert!(!String::from_utf8_lossy(&out.get_output().stdout).contains(partial_answer));
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url.path() == "/chat/completions")
+            .count(),
+        2
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.url.path() != "/repos/acme/api/issues/5/comments")
+    );
 }
 
 #[tokio::test]
