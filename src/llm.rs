@@ -608,7 +608,7 @@ fn review_semantic_retry_user(user: &str, previous: &str) -> String {
 
 fn review_validation_retry_user(user: &str, reason: &str) -> String {
     format!(
-        "{user}\n\n[Correction] The previous response was unusable ({reason}). Retry once. Every finding must cite an exact path and new-file line displayed in the review input. Return only the corrected review JSON."
+        "{user}\n\n[Correction] The previous response was unusable: {reason}. Correct that exact contract failure. Preserve a finding only when the review input supports it; otherwise retract it. Return only the corrected review JSON."
     )
 }
 

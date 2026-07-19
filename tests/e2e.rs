@@ -293,6 +293,57 @@ struct SequentialReviewResponder {
     responses: Arc<Vec<Value>>,
 }
 
+#[cfg(feature = "qualification-candidate")]
+#[derive(Clone)]
+struct ExactEvidenceRetryResponder {
+    calls: Arc<AtomicUsize>,
+    prompt_marker: &'static str,
+    path: &'static str,
+    line: u32,
+    evidence: &'static str,
+}
+
+#[cfg(feature = "qualification-candidate")]
+impl Respond for ExactEvidenceRetryResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: Value = request.body_json().unwrap();
+        let system = body["messages"][0]["content"].as_str().unwrap();
+        let user = body["messages"][1]["content"].as_str().unwrap();
+        if system.contains("select bounded code-review batches") {
+            return ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"finish_reason": "stop", "message": {"content": "{\"batchIds\":[]}"}}],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 10, "cost": 0.000001}
+            }));
+        }
+        if !user.contains(self.prompt_marker) {
+            return ResponseTemplate::new(200).set_body_json(llm_content(json!([])));
+        }
+
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let correction = user.contains("[Correction]");
+        if correction {
+            let expected = format!(
+                "must set `evidence` to the exact JSON string {}",
+                serde_json::to_string(self.evidence).unwrap()
+            );
+            assert!(
+                user.contains(&expected),
+                "correction did not include source-exact evidence: {user}"
+            );
+        }
+        ResponseTemplate::new(200).set_body_json(llm_content(json!([{
+            "path": self.path,
+            "line": self.line,
+            "severity": "warn",
+            "kind": "risk",
+            "confidence": 0.95,
+            "title": "Keep the validated value",
+            "body": "The sink uses the unvalidated input. Pass the validated value instead.",
+            "evidence": if correction { self.evidence } else { "approximate evidence" }
+        }])))
+    }
+}
+
 impl Respond for SequentialReviewResponder {
     fn respond(&self, _request: &Request) -> ResponseTemplate {
         let index = self.calls.fetch_add(1, Ordering::SeqCst);
@@ -2244,6 +2295,96 @@ async fn final_synthesis_detects_cross_batch_validation_sink_relationship() {
     );
 }
 
+#[cfg(feature = "qualification-candidate")]
+#[tokio::test]
+async fn bounded_synthesis_repairs_source_exact_evidence_without_relaxing_validation() {
+    use std::fmt::Write as _;
+
+    let server = MockServer::start().await;
+    let correction_calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ExactEvidenceRetryResponder {
+            calls: correction_calls.clone(),
+            prompt_marker: "dangerous_sink(original)",
+            path: "src/sink.rs",
+            line: 1100,
+            evidence: "dangerous_sink(original);",
+        })
+        .mount(&server)
+        .await;
+
+    let mut source = String::new();
+    for (path_name, marker) in [
+        (
+            "src/validate.rs",
+            "let validated = validate_pair(left, right);",
+        ),
+        ("src/sink.rs", "dangerous_sink(original);"),
+    ] {
+        writeln!(source, "diff --git a/{path_name} b/{path_name}").unwrap();
+        writeln!(
+            source,
+            "--- /dev/null\n+++ b/{path_name}\n@@ -0,0 +1,2201 @@"
+        )
+        .unwrap();
+        for line in 1..=2201 {
+            if line == 1100 {
+                writeln!(source, "+{marker}").unwrap();
+            } else {
+                writeln!(
+                    source,
+                    "+let padding_{line:04} = trusted; // {}",
+                    "x".repeat(1_000)
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = dir.path().join("bounded-synthesis.diff");
+    std::fs::write(&diff, source).unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_ALLOW_PRIVATE_API_BASE", "1")
+        .env("GITHUB_API_URL", server.uri())
+        .env("CI", "true")
+        .env("POSTIL_BENCH_FORCE_BOUNDED_SELECTION", "1")
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .env("REVIEW_MODEL", "fixture/model")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["reviewCoverage"]["mode"], "bounded");
+    assert_eq!(envelope["findings"][0]["path"], "src/sink.rs");
+    assert_eq!(
+        envelope["findings"][0]["evidence"],
+        "dangerous_sink(original);"
+    );
+    assert_eq!(correction_calls.load(Ordering::SeqCst), 2);
+
+    let requests = server.received_requests().await.unwrap();
+    let review_requests = requests
+        .iter()
+        .filter(|request| {
+            request.body_json::<Value>().unwrap()["messages"][0]["content"]
+                .as_str()
+                .is_some_and(|system| !system.contains("select bounded code-review batches"))
+        })
+        .collect::<Vec<_>>();
+    assert!(review_requests.len() >= 2);
+    assert!(review_requests.iter().all(|request| {
+        let body: Value = request.body_json().unwrap();
+        body["max_tokens"] == 8_000 && body.get("response_format").is_none()
+    }));
+}
+
 #[tokio::test]
 async fn oversized_line_tail_remains_reviewable() {
     let server = MockServer::start().await;
@@ -2444,6 +2585,83 @@ async fn staged_diff_compacts_large_generated_noise_and_reviews_late_source() {
             .iter()
             .all(|request| request.body.len() < 512 * 1024)
     );
+}
+
+#[tokio::test]
+async fn staged_review_cascades_after_bad_grounding_without_publishing() {
+    let server = MockServer::start().await;
+    let mut invalid = finding_at(41, "warn", 0.95);
+    invalid["evidence"] = json!("approximately the changed line");
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("primary-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([invalid]))))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("backup-model"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(llm_content(json!([finding_at(41, "warn", 0.95)]))),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/auth.rs"),
+        format!(
+            "{}let token = format!(\"{{}}\", user_input);\nexec_query(&token);\n",
+            "\n".repeat(40)
+        ),
+    )
+    .unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["add", "src/auth.rs"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .env("REVIEW_MODEL", "primary-model")
+        .env("REVIEW_MODEL_CASCADE", "backup-model")
+        .args(["review", "--staged", "--output", "json"])
+        .assert()
+        .success();
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["findings"][0]["path"], "src/auth.rs");
+    assert_eq!(envelope["modelUsed"], "backup-model");
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.url.path() == "/chat/completions")
+    );
+    assert!(requests.iter().all(|request| {
+        let body: Value = request.body_json().unwrap();
+        body["max_tokens"] == 8_000 && body.get("response_format").is_none()
+    }));
 }
 
 #[tokio::test]
