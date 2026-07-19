@@ -19,6 +19,7 @@ use crate::envelope::{Kind, Severity};
 
 const MODEL_DEFAULTS_TOML: &str = include_str!("../config.toml");
 const QUALIFIED_MODELS_JSON: &str = include_str!("../qualified-models.json");
+const PROVISIONAL_MODELS_JSON: &str = include_str!("../provisional-models.json");
 const REVIEW_CONTRACT_SOURCES: &[(&str, &str)] = &[
     ("Cargo.toml", include_str!("../Cargo.toml")),
     ("Cargo.lock", include_str!("../Cargo.lock")),
@@ -224,6 +225,7 @@ const QUALIFICATION_MAX_AGE_SECONDS: u64 = QUALIFICATION_MAX_AGE_DAYS as u64 * 2
 const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
 const QUALIFICATION_CANDIDATE_PROFILE_ENV: &str = "POSTIL_QUALIFICATION_CANDIDATE_PROFILE";
 const BENCH_FORCE_BOUNDED_SELECTION_ENV: &str = "POSTIL_BENCH_FORCE_BOUNDED_SELECTION";
+const PROVISIONAL_HOSTED_ROSTER_ENV: &str = "POSTIL_PROVISIONAL_HOSTED_ROSTER";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1272,10 +1274,20 @@ impl Config {
                 self.model = profile.generator_chain[0].clone();
                 self.cascade = profile.generator_chain[1..].to_vec();
                 self.consensus = profile.consensus;
-                self.scorer = profile.scorer_chain[0].clone();
+                self.scorer = profile.scorer_chain.first().cloned().unwrap_or_default();
                 self.scorer_fallback = profile.scorer_chain.get(1).cloned().unwrap_or_default();
-                self.scorer_enabled = true;
-                self.api_base = profile.api_base;
+                self.scorer_enabled = !profile.scorer_chain.is_empty();
+                self.api_base = profile.api_base.clone();
+                self.api_format = profile.api_format;
+            } else if provisional_hosted_roster_enabled() {
+                let profile = provisional_hosted_profile();
+                self.model = profile.generator_chain[0].clone();
+                self.cascade = profile.generator_chain[1..].to_vec();
+                self.consensus = profile.consensus;
+                self.scorer = profile.scorer_chain.first().cloned().unwrap_or_default();
+                self.scorer_fallback = profile.scorer_chain.get(1).cloned().unwrap_or_default();
+                self.scorer_enabled = !profile.scorer_chain.is_empty();
+                self.api_base = profile.api_base.clone();
                 self.api_format = profile.api_format;
             }
             return Ok(());
@@ -1370,7 +1382,7 @@ impl Config {
     }
 
     pub fn require_model(&self) -> Result<()> {
-        self.require_model_for(hosted_mode())?;
+        self.require_model_for(hosted_mode(), provisional_hosted_roster_enabled())?;
         if qualification_candidate_mode() {
             let profile = qualification_candidate_profile_for_config(self)?;
             anyhow::ensure!(
@@ -1381,7 +1393,7 @@ impl Config {
         Ok(())
     }
 
-    fn require_model_for(&self, hosted: bool) -> Result<()> {
+    fn require_model_for(&self, hosted: bool, provisional: bool) -> Result<()> {
         if !self.enabled {
             return Ok(());
         }
@@ -1401,7 +1413,7 @@ impl Config {
                         && profile.api_format == self.api_format
                         && normalize_api_base(&self.api_base).ok().as_deref()
                             == Some(profile.api_base.as_str())
-                }),
+                }) || (provisional && provisional_hosted_profile_for_config(self).is_some()),
                 "hosted inference configuration does not exactly match a deployed qualification profile"
             );
         }
@@ -1447,6 +1459,17 @@ pub(crate) fn hosted_mode() -> bool {
 
 pub(crate) fn hosted_runtime_mode() -> bool {
     hosted_mode() || qualification_candidate_mode()
+}
+
+fn provisional_hosted_roster_enabled() -> bool {
+    provisional_hosted_roster_allowed(
+        std::env::var(PROVISIONAL_HOSTED_ROSTER_ENV).as_deref() == Ok("1"),
+        qualification_manifest().profiles.is_empty(),
+    )
+}
+
+fn provisional_hosted_roster_allowed(requested: bool, qualification_manifest_empty: bool) -> bool {
+    requested && qualification_manifest_empty
 }
 
 pub(crate) fn bounded_review_selection_mode() -> bool {
@@ -1629,6 +1652,11 @@ pub(crate) fn hosted_price_bounds_for_config(
     config: &Config,
 ) -> Result<Option<Vec<ModelPriceBound>>> {
     if hosted_mode() {
+        if provisional_hosted_roster_enabled()
+            && let Some(profile) = provisional_hosted_profile_for_config(config)
+        {
+            return Ok(Some(profile.model_price_bounds));
+        }
         let profile = admitted_profile_for_config(config).ok_or_else(|| {
             anyhow::anyhow!("hosted inference has no exact admitted qualification profile")
         })?;
@@ -1636,6 +1664,74 @@ pub(crate) fn hosted_price_bounds_for_config(
     }
     Ok(qualification_candidate_profile_for_config(config)?
         .map(|profile| profile.model_price_bounds))
+}
+
+pub(crate) fn provisional_hosted_provider_for_config(config: &Config) -> Option<&'static str> {
+    (hosted_mode()
+        && provisional_hosted_roster_enabled()
+        && provisional_hosted_profile_for_config(config).is_some())
+    .then(|| {
+        provisional_hosted_profile()
+            .upstream_provider_identity
+            .as_str()
+    })
+}
+
+fn provisional_hosted_profile_for_config(config: &Config) -> Option<QualificationCandidateProfile> {
+    let profile = provisional_hosted_profile();
+    let generator_chain = config.model_chain();
+    let scorer_chain = config.scorer_chain();
+    let api_base = normalize_api_base(&config.api_base).ok()?;
+    if generator_chain != profile.generator_chain
+        || scorer_chain != profile.scorer_chain
+        || config.consensus != profile.consensus
+        || config.api_format != profile.api_format
+        || api_base != profile.api_base
+    {
+        return None;
+    }
+    Some(profile.clone())
+}
+
+fn provisional_hosted_profile() -> &'static QualificationCandidateProfile {
+    static PROFILE: OnceLock<QualificationCandidateProfile> = OnceLock::new();
+    PROFILE.get_or_init(|| {
+        parse_provisional_hosted_profile(PROVISIONAL_MODELS_JSON)
+            .expect("embedded provisional hosted profile must parse")
+    })
+}
+
+fn parse_provisional_hosted_profile(raw: &str) -> Result<QualificationCandidateProfile> {
+    let profile: QualificationCandidateProfile = serde_json::from_str(raw)?;
+    anyhow::ensure!(
+        profile.benchmark_provider_identity == MANAGED_OPENROUTER_PROVIDER_IDENTITY,
+        "provisional hosted profile must use managed OpenRouter routing"
+    );
+    validate_model_id(
+        "provisional hosted upstreamProviderIdentity",
+        &profile.upstream_provider_identity,
+    )?;
+    anyhow::ensure!(
+        profile.api_base == MANAGED_OPENROUTER_API_BASE
+            && profile.api_format == ApiFormat::OpenaiCompatible,
+        "provisional hosted profile must use the canonical managed OpenRouter endpoint"
+    );
+    anyhow::ensure!(
+        !profile.generator_chain.is_empty()
+            && (1..=profile.generator_chain.len()).contains(&profile.consensus),
+        "provisional hosted consensus must fit its generator chain"
+    );
+    anyhow::ensure!(
+        profile.scorer_chain.len() <= 2,
+        "provisional hosted scorer chain supports at most two models"
+    );
+    validate_profile_model_price_bounds(
+        "provisional hosted profile",
+        &profile.generator_chain,
+        &profile.scorer_chain,
+        &profile.model_price_bounds,
+    )?;
+    Ok(profile)
 }
 
 fn repository_model_config_locked() -> bool {
@@ -2275,20 +2371,20 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
             scorer_enabled: false,
             ..Config::default()
         };
-        assert!(empty.require_model_for(false).is_err());
+        assert!(empty.require_model_for(false, false).is_err());
 
         let explicit = Config {
             model: "provider/qualified-model".to_string(),
             ..Config::default()
         };
-        explicit.require_model_for(false).unwrap();
-        assert!(explicit.require_model_for(true).is_err());
+        explicit.require_model_for(false, false).unwrap();
+        assert!(explicit.require_model_for(true, false).is_err());
 
         let disabled = Config {
             enabled: false,
             ..Config::default()
         };
-        disabled.require_model_for(true).unwrap();
+        disabled.require_model_for(true, false).unwrap();
         assert!(qualification_manifest().profiles.is_empty());
     }
 
@@ -2798,14 +2894,73 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
     #[test]
     fn hosted_candidate_matches_the_qualification_profile() {
         let defaults = model_defaults();
-        assert_eq!(defaults.default_model, "deepseek/deepseek-v4-pro");
+        assert_eq!(defaults.default_model, "z-ai/glm-5.2");
         assert!(defaults.cascade.is_empty());
-        assert_eq!(defaults.scorer_model, "z-ai/glm-5.2");
+        assert!(defaults.scorer_model.is_empty());
         assert!(defaults.scorer_fallback.is_empty());
+        assert!(defaults.scorer_qualification_candidates.is_empty());
+    }
+
+    #[test]
+    fn provisional_hosted_roster_is_exact_and_price_bounded() {
+        let profile = provisional_hosted_profile();
+        let config = Config {
+            model: profile.generator_chain[0].clone(),
+            cascade: profile.generator_chain[1..].to_vec(),
+            scorer: String::new(),
+            scorer_fallback: String::new(),
+            scorer_enabled: false,
+            api_base: profile.api_base.clone(),
+            api_format: profile.api_format,
+            consensus: profile.consensus,
+            ..Config::default()
+        };
+
+        config.require_model_for(true, true).unwrap();
         assert_eq!(
-            defaults.scorer_qualification_candidates,
-            vec!["z-ai/glm-5.2".to_string()]
+            provisional_hosted_profile_for_config(&config),
+            Some(profile.clone())
         );
+        assert_eq!(profile.upstream_provider_identity, "Fireworks");
+        assert_eq!(profile.generator_chain, vec!["z-ai/glm-5.2"]);
+        assert!(profile.scorer_chain.is_empty());
+        assert_eq!(
+            profile.model_price_bounds,
+            vec![ModelPriceBound {
+                model: "z-ai/glm-5.2".to_string(),
+                input_micros_per_million_tokens: 1_400_000,
+                output_micros_per_million_tokens: 4_400_000,
+            }]
+        );
+
+        for altered in [
+            Config {
+                model: "other/model".into(),
+                ..Config::default()
+            },
+            Config {
+                scorer: "other/scorer".into(),
+                ..Config::default()
+            },
+            Config {
+                api_base: "https://example.invalid/v1".into(),
+                ..Config::default()
+            },
+            Config {
+                consensus: 2,
+                ..Config::default()
+            },
+        ] {
+            assert!(provisional_hosted_profile_for_config(&altered).is_none());
+            assert!(altered.require_model_for(true, true).is_err());
+        }
+    }
+
+    #[test]
+    fn provisional_hosted_roster_cannot_override_formal_admission() {
+        assert!(provisional_hosted_roster_allowed(true, true));
+        assert!(!provisional_hosted_roster_allowed(true, false));
+        assert!(!provisional_hosted_roster_allowed(false, true));
     }
 
     #[test]

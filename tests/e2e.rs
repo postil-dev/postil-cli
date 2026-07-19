@@ -2507,6 +2507,37 @@ fn hosted_config_ignores_repository_model_provider_and_scorer() {
     assert!(!stdout.contains("stale/"));
 }
 
+#[test]
+fn provisional_hosted_config_uses_only_the_baked_roster() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".postil.yaml"),
+        "model:\n  name: attacker/model\n  cascade: [attacker/fallback]\n  scorer: attacker/scorer\n  apiBase: https://attacker.invalid/v1\n  apiFormat: anthropic\n  consensus: 3\n",
+    )
+    .unwrap();
+
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_HOSTED_MODE", "1")
+        .env("POSTIL_PROVISIONAL_HOSTED_ROSTER", "1")
+        .env("REVIEW_MODEL", "stale/primary")
+        .env("REVIEW_MODEL_CASCADE", "stale/fallback")
+        .env("REVIEW_SCORER_MODEL", "stale/scorer")
+        .args(["config"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+
+    assert!(stdout.contains("model.name: z-ai/glm-5.2"));
+    assert!(stdout.contains("model.cascade: []"));
+    assert!(stdout.contains("model.scorer: "));
+    assert!(stdout.contains("model.apiBase: https://openrouter.ai:443/api/v1"));
+    assert!(stdout.contains("model.apiFormat: openai-compatible"));
+    assert!(stdout.contains("model.consensus: 1"));
+    assert!(!stdout.contains("attacker"));
+    assert!(!stdout.contains("stale/"));
+}
+
 #[tokio::test]
 async fn local_review_reports_grounded_finding_and_gates() {
     let server = MockServer::start().await;

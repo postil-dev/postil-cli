@@ -495,7 +495,7 @@ pub struct LlmClient {
     total_deadline: Option<Instant>,
     admission: Arc<Mutex<ProviderAdmission>>,
     hosted_price_bounds: Option<Arc<HashMap<String, ModelPriceBound>>>,
-    qualification_upstream_provider: Option<String>,
+    pinned_upstream_provider: Option<String>,
     call_ordinal: Arc<AtomicU32>,
 }
 
@@ -1535,15 +1535,18 @@ impl LlmClient {
         } else {
             None
         };
-        let qualification_upstream_provider = if crate::config::qualification_candidate_mode() {
-            Some(
-                crate::config::qualification_candidate_profile_for_config(cfg)?
-                    .ok_or_else(|| anyhow!("qualification provider profile is unavailable"))?
-                    .upstream_provider_identity,
-            )
-        } else {
-            None
-        };
+        let pinned_upstream_provider =
+            if let Some(provider) = crate::config::provisional_hosted_provider_for_config(cfg) {
+                Some(provider.to_string())
+            } else if crate::config::qualification_candidate_mode() {
+                Some(
+                    crate::config::qualification_candidate_profile_for_config(cfg)?
+                        .ok_or_else(|| anyhow!("qualification provider profile is unavailable"))?
+                        .upstream_provider_identity,
+                )
+            } else {
+                None
+            };
         let request_api_base = qualification_request_api_base(&cfg.api_base)?;
         Ok(LlmClient {
             // The attempt timeout wraps both sending the request and consuming
@@ -1565,7 +1568,7 @@ impl LlmClient {
             total_deadline,
             admission: Arc::new(Mutex::new(ProviderAdmission::default())),
             hosted_price_bounds,
-            qualification_upstream_provider,
+            pinned_upstream_provider,
             call_ordinal: Arc::new(AtomicU32::new(0)),
         })
     }
@@ -2619,7 +2622,7 @@ impl LlmClient {
         phase: LlmPhase,
         call_phase: LlmCallPhase,
     ) -> Result<ChatSuccess> {
-        if let Some(global) = self.qualification_upstream_provider.as_deref() {
+        if let Some(global) = self.pinned_upstream_provider.as_deref() {
             ensure!(
                 global == expected_provider,
                 "qualification provider identity mismatch"
@@ -2660,7 +2663,7 @@ impl LlmClient {
         phase: LlmPhase,
         call_phase: LlmCallPhase,
     ) -> Result<ChatSuccess> {
-        let route_provider = expected_provider.or(self.qualification_upstream_provider.as_deref());
+        let route_provider = expected_provider.or(self.pinned_upstream_provider.as_deref());
         // This mutable flag is stack-local state held through one exclusively
         // borrowed async call. Request retries run sequentially in this loop,
         // so updating it before continuing or returning needs no atomic type.
@@ -3056,7 +3059,7 @@ impl LlmClient {
                 body["max_tokens"] = json!(max_tokens);
                 apply_openrouter_privacy(&mut body, self.require_openrouter_privacy);
                 let canonical_openrouter = is_canonical_openrouter_base(&self.api_base);
-                if let Some(expected_provider) = self.qualification_upstream_provider.as_deref() {
+                if let Some(expected_provider) = self.pinned_upstream_provider.as_deref() {
                     apply_openrouter_provider_pin(&mut body, expected_provider);
                 }
                 if canonical_openrouter && let LlmPhase::Scorer { expected_len } = phase {
@@ -6238,7 +6241,7 @@ mod tests {
             None,
         )
         .unwrap();
-        client.qualification_upstream_provider = Some("PinnedProvider".into());
+        client.pinned_upstream_provider = Some("PinnedProvider".into());
         client.hosted_price_bounds = Some(Arc::new(HashMap::from([(
             "provider/model".into(),
             ModelPriceBound {

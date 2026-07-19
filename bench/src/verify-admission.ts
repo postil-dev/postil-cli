@@ -1,9 +1,11 @@
 #!/usr/bin/env bun
 
 import { execFile as execFileCallback } from "node:child_process";
+import { createHash } from "node:crypto";
 import { lstat, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { promisify } from "node:util";
+import { z } from "zod";
 
 const execFile = promisify(execFileCallback);
 const REPOSITORY = "postil-dev/postil-cli";
@@ -25,8 +27,45 @@ interface AdmissionManifest {
   qualificationIssuedAtUnixSeconds?: unknown;
   qualificationExpiresAtUnixSeconds?: unknown;
   qualificationMaxAgeDays?: unknown;
+  modelDefaultsSha256?: unknown;
   profiles?: unknown;
 }
+
+const boundedIdentifierSchema = z.string().trim().min(1).refine(
+  (value) => !/[\r\n]/u.test(value),
+  "identifier must not contain line breaks",
+);
+const optionalIdentifierSchema = z.union([z.literal(""), boundedIdentifierSchema]);
+
+const modelDefaultsSchema = z.object({
+  version: z.number().int().positive(),
+  default_model: optionalIdentifierSchema,
+  cascade: z.array(boundedIdentifierSchema),
+  consensus: z.number().int().positive(),
+  api_base: z.literal("https://openrouter.ai/api/v1"),
+  api_format: z.literal("openai-compatible"),
+  scorer: z.object({
+    enabled: z.boolean(),
+    default_model: optionalIdentifierSchema,
+    fallback: optionalIdentifierSchema,
+    qualification_candidates: z.array(boundedIdentifierSchema),
+  }).strict(),
+}).strict();
+
+const provisionalProfileSchema = z.object({
+  benchmarkProviderIdentity: z.literal("openrouter:managed-routing"),
+  upstreamProviderIdentity: boundedIdentifierSchema,
+  apiBase: z.literal("https://openrouter.ai:443/api/v1"),
+  apiFormat: z.literal("openai-compatible"),
+  generatorChain: z.array(boundedIdentifierSchema).min(1),
+  consensus: z.number().int().positive(),
+  scorerChain: z.array(boundedIdentifierSchema).max(2),
+  modelPriceBounds: z.array(z.object({
+    model: boundedIdentifierSchema,
+    inputMicrosPerMillionTokens: z.number().int().positive().safe(),
+    outputMicrosPerMillionTokens: z.number().int().positive().safe(),
+  }).strict()).min(1),
+}).strict();
 
 export function attestationVerificationArguments(
   manifestPath: string,
@@ -162,6 +201,91 @@ export async function verifyAdmissionManifest(
   return "verified";
 }
 
+export async function verifyProvisionalRelease(
+  manifestPath: string,
+  configPath: string,
+  provisionalProfilePath: string,
+): Promise<"provisional"> {
+  const result = await verifyAdmissionManifest(manifestPath, "", {});
+  if (result !== "empty") {
+    throw new Error("provisional release requires an empty qualification manifest");
+  }
+  await requireRegularFile(configPath, "model defaults");
+  await requireRegularFile(provisionalProfilePath, "provisional hosted profile");
+  const configSource = await readFile(configPath, "utf8");
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as AdmissionManifest;
+  const config = modelDefaultsSchema.parse(Bun.TOML.parse(configSource));
+  const profile = provisionalProfileSchema.parse(
+    JSON.parse(await readFile(provisionalProfilePath, "utf8")),
+  );
+  const expectedModels = [...profile.generatorChain, ...profile.scorerChain].sort();
+  const boundedModels = profile.modelPriceBounds.map((bound) => bound.model);
+  if (new Set(expectedModels).size !== expectedModels.length) {
+    throw new Error("provisional hosted model chains must be unique");
+  }
+  if (
+    boundedModels.length !== expectedModels.length ||
+    boundedModels.some((model, index) => model !== expectedModels[index])
+  ) {
+    throw new Error("provisional hosted price bounds must exactly cover sorted model chains");
+  }
+  if (profile.consensus > profile.generatorChain.length) {
+    throw new Error("provisional hosted consensus must fit its generator chain");
+  }
+  const generatorModels = [config.default_model, ...config.cascade].filter(
+    (model) => model.length > 0,
+  );
+  if (new Set(generatorModels).size !== generatorModels.length) {
+    throw new Error("embedded generator chain must not repeat models");
+  }
+  if (
+    (generatorModels.length === 0 && config.consensus !== 1) ||
+    (generatorModels.length > 0 && config.consensus > generatorModels.length)
+  ) {
+    throw new Error("consensus must fit the embedded generator chain");
+  }
+  const scorer = config.scorer;
+  if (
+    scorer.default_model.length === 0 &&
+    (scorer.enabled || scorer.fallback.length > 0 || scorer.qualification_candidates.length > 0)
+  ) {
+    throw new Error("scorer configuration must be empty when scorer.defaultModel is empty");
+  }
+  if (scorer.fallback.length > 0 && scorer.fallback === scorer.default_model) {
+    throw new Error("scorer fallback must differ from scorer.defaultModel");
+  }
+  if (
+    config.default_model !== profile.generatorChain[0] ||
+    JSON.stringify(config.cascade) !== JSON.stringify(profile.generatorChain.slice(1)) ||
+    config.consensus !== profile.consensus ||
+    config.api_base !== "https://openrouter.ai/api/v1" ||
+    config.api_format !== profile.apiFormat ||
+    scorer.enabled !== (profile.scorerChain.length > 0) ||
+    scorer.default_model !== (profile.scorerChain[0] ?? "") ||
+    scorer.fallback !== (profile.scorerChain[1] ?? "") ||
+    JSON.stringify(scorer.qualification_candidates) !== JSON.stringify(profile.scorerChain)
+  ) {
+    throw new Error("provisional hosted profile does not exactly match embedded model defaults");
+  }
+  const defaultsSha = createHash("sha256").update(configSource).digest("hex");
+  if (manifest.modelDefaultsSha256 !== defaultsSha) {
+    throw new Error("empty qualification manifest does not match embedded model defaults");
+  }
+  return "provisional";
+}
+
+export async function verifyReleaseAdmission(
+  manifestPath: string,
+  bundlePath: string,
+  configPath: string,
+  provisionalProfilePath: string,
+  options: AdmissionVerificationOptions = {},
+): Promise<"provisional" | "verified"> {
+  const result = await verifyAdmissionManifest(manifestPath, bundlePath, options);
+  if (result === "verified") return result;
+  return verifyProvisionalRelease(manifestPath, configPath, provisionalProfilePath);
+}
+
 function requireSafeUnixSeconds(value: unknown, label: string): number {
   if (!Number.isSafeInteger(value) || (value as number) <= 0) {
     throw new Error(`${label} must be a positive safe Unix timestamp`);
@@ -229,16 +353,32 @@ function verifyAttestationFreshness(
 if (import.meta.main) {
   const repositoryRoot = resolve(import.meta.dir, "..", "..");
   const requireQualifiedProfile = process.argv.includes("--require-qualified");
-  const positional = process.argv.slice(2).filter((argument) => argument !== "--require-qualified");
+  const allowProvisional = process.argv.includes("--allow-provisional");
+  if (requireQualifiedProfile && allowProvisional) {
+    throw new Error("--require-qualified and --allow-provisional are mutually exclusive");
+  }
+  const positional = process.argv.slice(2).filter((argument) =>
+    !["--require-qualified", "--allow-provisional"].includes(argument)
+  );
   const manifestPath = resolve(positional[0] ?? resolve(repositoryRoot, "qualified-models.json"));
   const bundlePath = resolve(
     positional[1] ?? resolve(repositoryRoot, "qualified-models.attestation.json"),
   );
-  verifyAdmissionManifest(manifestPath, bundlePath, { requireQualifiedProfile })
+  const verification = allowProvisional
+    ? verifyReleaseAdmission(
+        manifestPath,
+        bundlePath,
+        resolve(repositoryRoot, "config.toml"),
+        resolve(repositoryRoot, "provisional-models.json"),
+      )
+    : verifyAdmissionManifest(manifestPath, bundlePath, { requireQualifiedProfile });
+  verification
     .then((result) => console.log(
       result === "empty"
         ? "Qualification manifest is empty; no model is admitted."
-        : "Qualification manifest attestation verified.",
+        : result === "provisional"
+          ? "Provisional hosted release profile verified."
+          : "Qualification manifest attestation verified.",
     ))
     .catch((error) => {
       console.error(error instanceof Error ? error.message : String(error));

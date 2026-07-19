@@ -1,10 +1,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   attestationVerificationArguments,
   verifyAdmissionManifest,
+  verifyProvisionalRelease,
+  verifyReleaseAdmission,
 } from "./verify-admission";
 
 const temporaryDirectories: string[] = [];
@@ -42,6 +44,99 @@ async function temporaryDirectory(): Promise<string> {
 }
 
 describe("admission attestation verification", () => {
+  test("verifies the repository provisional hosted release profile", async () => {
+    const repositoryRoot = join(import.meta.dir, "..", "..");
+    expect(await verifyProvisionalRelease(
+      join(repositoryRoot, "qualified-models.json"),
+      join(repositoryRoot, "config.toml"),
+      join(repositoryRoot, "provisional-models.json"),
+    )).toBe("provisional");
+  });
+
+  test("keeps attestation verification active after a profile is formally admitted", async () => {
+    const directory = await temporaryDirectory();
+    const manifest = join(directory, "qualified-models.json");
+    const bundle = join(directory, "qualified-models.attestation.json");
+    const sourceSha = "9".repeat(40);
+    await writeFile(manifest, JSON.stringify({
+      version: 1,
+      qualificationSourceSha: sourceSha,
+      qualificationIssuedAtUnixSeconds: issued,
+      qualificationExpiresAtUnixSeconds: expires,
+      qualificationMaxAgeDays: 30,
+      profiles: [{ qualificationSourceSha: sourceSha }],
+    }));
+    await writeFile(bundle, "{}\n");
+
+    expect(await verifyReleaseAdmission(
+      manifest,
+      bundle,
+      join(directory, "unused-config.toml"),
+      join(directory, "unused-provisional.json"),
+      {
+        runGh: async () => verifiedOutput(),
+        runGit: admittedSourceGit,
+        nowUnixSeconds: issued + 60,
+      },
+    )).toBe("verified");
+  });
+
+  test("rejects a provisional profile that diverges from embedded defaults", async () => {
+    const repositoryRoot = join(import.meta.dir, "..", "..");
+    const directory = await temporaryDirectory();
+    const manifest = join(directory, "qualified-models.json");
+    const config = join(directory, "config.toml");
+    const profile = join(directory, "provisional-models.json");
+    await writeFile(manifest, await readFile(join(repositoryRoot, "qualified-models.json")));
+    await writeFile(config, await readFile(join(repositoryRoot, "config.toml")));
+    const altered = JSON.parse(
+      await readFile(join(repositoryRoot, "provisional-models.json"), "utf8"),
+    ) as { generatorChain: string[]; modelPriceBounds: Array<{ model: string }> };
+    altered.generatorChain = ["other/model"];
+    altered.modelPriceBounds[0]!.model = "other/model";
+    await writeFile(profile, JSON.stringify(altered));
+
+    await expect(verifyProvisionalRelease(manifest, config, profile)).rejects.toThrow(
+      "does not exactly match embedded model defaults",
+    );
+  });
+
+  test("rejects provisional identifiers the runtime cannot load", async () => {
+    const repositoryRoot = join(import.meta.dir, "..", "..");
+    const directory = await temporaryDirectory();
+    const manifest = join(directory, "qualified-models.json");
+    const config = join(directory, "config.toml");
+    const profile = join(directory, "provisional-models.json");
+    await writeFile(manifest, await readFile(join(repositoryRoot, "qualified-models.json")));
+    await writeFile(config, await readFile(join(repositoryRoot, "config.toml")));
+    const altered = JSON.parse(
+      await readFile(join(repositoryRoot, "provisional-models.json"), "utf8"),
+    ) as { upstreamProviderIdentity: string };
+    altered.upstreamProviderIdentity = "Fireworks\nFallback";
+    await writeFile(profile, JSON.stringify(altered));
+
+    await expect(verifyProvisionalRelease(manifest, config, profile)).rejects.toThrow(
+      "identifier must not contain line breaks",
+    );
+  });
+
+  test("rejects model defaults the runtime parser cannot load", async () => {
+    const repositoryRoot = join(import.meta.dir, "..", "..");
+    const directory = await temporaryDirectory();
+    const manifest = join(directory, "qualified-models.json");
+    const config = join(directory, "config.toml");
+    const profile = join(directory, "provisional-models.json");
+    await writeFile(manifest, await readFile(join(repositoryRoot, "qualified-models.json")));
+    const invalidConfig = (await readFile(join(repositoryRoot, "config.toml"), "utf8"))
+      .replace("version = 3", "version = 0");
+    await writeFile(config, invalidConfig);
+    await writeFile(profile, await readFile(join(repositoryRoot, "provisional-models.json")));
+
+    await expect(verifyProvisionalRelease(manifest, config, profile)).rejects.toThrow(
+      "Too small: expected number to be >0",
+    );
+  });
+
   test("exempts an empty manifest without granting model authority", async () => {
     const directory = await temporaryDirectory();
     const manifest = join(directory, "qualified-models.json");

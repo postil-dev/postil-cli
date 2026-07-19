@@ -136,6 +136,13 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   The qualification metadata exposes the complete admitted profile only when
   the embedded defaults match it exactly. Hosted consensus and scoring reject
   degraded subsets rather than publishing output from an unqualified path.
+  An operator can activate the embedded provisional roster with
+  `POSTIL_PROVISIONAL_HOSTED_ROSTER=1` while the formal admission manifest is
+  empty. `provisional-models.json` fixes the managed endpoint, upstream provider,
+  model chains, consensus, and price ceilings. The release verifier requires that
+  profile to match `config.toml`, and the runtime applies the same provider pin,
+  privacy policy, response-identity checks, and operation cost cap used by an
+  admitted roster. Removing the flag restores the attested-profile requirement.
 
 ## Prompt-injected policy sources
 
