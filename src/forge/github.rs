@@ -1109,13 +1109,12 @@ impl Forge for GitHub {
             return Ok(());
         }
         if !self.snapshot_is_current(snapshot).await? {
-            eprintln!(
-                "postil: github review delivery skipped because the PR snapshot changed reviewed_head={} reviewed_target={} reviewed_merge_base={}",
+            return Err(anyhow!(
+                "GitHub review delivery skipped because the PR snapshot changed reviewed_head={} reviewed_target={} reviewed_merge_base={}",
                 short_sha(head_sha),
                 short_sha(snapshot.target_sha.as_deref().unwrap_or("unknown")),
                 short_sha(&snapshot.base_sha),
-            );
-            return Ok(());
+            ));
         }
         let comments: Vec<_> = findings
             .iter()
@@ -1254,13 +1253,12 @@ impl Forge for GitHub {
         snapshot: &PrMeta,
     ) -> Result<()> {
         if !self.snapshot_is_current(snapshot).await? {
-            eprintln!(
-                "postil: github check delivery skipped because the PR snapshot changed reviewed_head={} reviewed_target={} reviewed_merge_base={}",
+            return Err(anyhow!(
+                "GitHub check delivery skipped because the PR snapshot changed reviewed_head={} reviewed_target={} reviewed_merge_base={}",
                 short_sha(&snapshot.head_sha),
                 short_sha(snapshot.target_sha.as_deref().unwrap_or("unknown")),
                 short_sha(&snapshot.base_sha),
-            );
-            return Ok(());
+            ));
         }
         let conclusion = |s: CheckState| match s {
             CheckState::Success => "success",
@@ -1294,51 +1292,82 @@ impl Forge for GitHub {
         if let Some(gate) = gate {
             checks.push((gate_id, gate, "postil/gate", false));
         }
-        for (id, state, name, with_annotations) in checks {
-            let gate_note = if name == "postil/gate" {
-                gate_summary(envelope)
-            } else {
-                check_summary(
-                    envelope,
-                    true,
-                    SummaryContext {
-                        details_url: self.details_url.clone(),
-                        prevention_hint: false,
-                        prevention_commands: vec![],
-                    },
-                )
-            };
-            let title = if name == "postil/gate" {
-                gate_title(envelope).to_string()
-            } else {
-                check_title(envelope)
-            };
-            let mut output = json!({
-                // GitHub rejects title >255 and summary >65535 with HTTP 422,
-                // which would abort posting both checks. Cap both defensively.
-                "title": super::cap_check_title(&title),
-                "summary": super::cap_check_summary(&gate_note),
-            });
-            if with_annotations && !annotations.is_empty() {
-                output["annotations"] = json!(annotations);
+        let mut results = stream::iter(checks.into_iter().enumerate().map(
+            |(index, (id, state, name, with_annotations))| {
+                let annotations = &annotations;
+                async move {
+                    let gate_note = if name == "postil/gate" {
+                        gate_summary(envelope)
+                    } else {
+                        check_summary(
+                            envelope,
+                            true,
+                            SummaryContext {
+                                details_url: self.details_url.clone(),
+                                prevention_hint: false,
+                                prevention_commands: vec![],
+                            },
+                        )
+                    };
+                    let title = if name == "postil/gate" {
+                        gate_title(envelope).to_string()
+                    } else {
+                        check_title(envelope)
+                    };
+                    let mut output = json!({
+                        // GitHub rejects title >255 and summary >65535 with HTTP 422,
+                        // which would abort posting both checks. Cap both defensively.
+                        "title": super::cap_check_title(&title),
+                        "summary": super::cap_check_summary(&gate_note),
+                    });
+                    if with_annotations && !annotations.is_empty() {
+                        output["annotations"] = json!(annotations);
+                    }
+                    let mut body = json!({
+                        "status": "completed",
+                        "conclusion": conclusion(state),
+                        "output": output,
+                    });
+                    self.add_details_url(&mut body);
+                    let result = match self
+                        .send_write_retryable(
+                            self.request(
+                                reqwest::Method::PATCH,
+                                self.url(&format!("/check-runs/{id}")),
+                            )
+                            .json(&body),
+                            &format!("complete {name}"),
+                        )
+                        .await
+                    {
+                        Ok(response) => Self::check_ok(response, "check-run complete")
+                            .await
+                            .map(|_| ()),
+                        Err(error) => Err(error),
+                    };
+                    (index, name, result)
+                }
+            },
+        ))
+        .buffer_unordered(2)
+        .collect::<Vec<_>>()
+        .await;
+        results.sort_by_key(|(index, _, _)| *index);
+        let mut failures = Vec::new();
+        for (_, name, result) in results {
+            if let Err(error) = result {
+                if super::is_repository_identity_failure(&error) {
+                    return Err(error);
+                }
+                failures.push(format!("{name}: {error:#}"));
             }
-            let mut body = json!({
-                "status": "completed",
-                "conclusion": conclusion(state),
-                "output": output,
-            });
-            self.add_details_url(&mut body);
-            let resp = self
-                .send_write_retryable(
-                    self.request(
-                        reqwest::Method::PATCH,
-                        self.url(&format!("/check-runs/{id}")),
-                    )
-                    .json(&body),
-                    &format!("complete {name}"),
-                )
-                .await?;
-            Self::check_ok(resp, "check-run complete").await?;
+        }
+        if !failures.is_empty() {
+            return Err(anyhow!(
+                "{} GitHub check completion(s) failed: {}",
+                failures.len(),
+                failures.join("; ")
+            ));
         }
         Ok(())
     }
@@ -1641,6 +1670,109 @@ mod tests {
         }
     }
 
+    async fn mount_current_delivery_snapshot(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "title": "t", "body": "b", "state": "open", "merged": false,
+                "head": {"sha": "aaaaaaaaaaaa"},
+                "base": {"sha": "bbbbbbbbbbbb"},
+                "changed_files": 1
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/repos/owner/repo/compare/bbbbbbbbbbbb...aaaaaaaaaaaa",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "merge_base_commit": {"sha": "cccccccccccc"},
+                "files": []
+            })))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn github_check_completion_attempts_the_gate_after_an_advisory_patch_fails() {
+        let server = MockServer::start().await;
+        mount_current_delivery_snapshot(&server).await;
+        Mock::given(method("PATCH"))
+            .and(path("/repos/owner/repo/check-runs/11"))
+            .respond_with(ResponseTemplate::new(422).set_body_string("invalid advisory patch"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/repos/owner/repo/check-runs/12"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let error = test_github(&server)
+            .complete_checks(
+                "11",
+                "12",
+                CheckState::Success,
+                Some(CheckState::Success),
+                &delivery_envelope("aaaaaaaaaaaa", "cccccccccccc"),
+                &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("postil/review"));
+        assert!(!error.to_string().contains("postil/gate"));
+    }
+
+    #[tokio::test]
+    async fn github_check_completion_starts_both_patches_before_an_outer_timeout() {
+        let server = MockServer::start().await;
+        mount_current_delivery_snapshot(&server).await;
+        Mock::given(method("PATCH"))
+            .and(path_regex(r"^/repos/owner/repo/check-runs/(11|12)$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(1))
+                    .set_body_json(serde_json::json!({})),
+            )
+            .mount(&server)
+            .await;
+        let github = test_github(&server);
+        let envelope = delivery_envelope("aaaaaaaaaaaa", "cccccccccccc");
+        let snapshot = delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc");
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            github.complete_checks(
+                "11",
+                "12",
+                CheckState::Success,
+                Some(CheckState::Success),
+                &envelope,
+                &snapshot,
+            ),
+        )
+        .await;
+        assert!(result.is_err());
+
+        let requests = server.received_requests().await.unwrap();
+        let mut patched = requests
+            .iter()
+            .filter(|request| request.method == reqwest::Method::PATCH)
+            .map(|request| request.url.path().to_string())
+            .collect::<Vec<_>>();
+        patched.sort();
+        assert_eq!(
+            patched,
+            vec![
+                "/repos/owner/repo/check-runs/11",
+                "/repos/owner/repo/check-runs/12"
+            ]
+        );
+    }
+
     fn fenced_test_github(server: &MockServer, expected_repository_id: u64) -> GitHub {
         GitHub {
             expected_repository_id: Some(expected_repository_id),
@@ -1916,14 +2048,15 @@ mod tests {
             id: None,
         };
 
-        github
+        let error = github
             .post_review(
                 "Summary",
                 &[finding],
                 &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
             )
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(error.to_string().contains("PR snapshot changed"));
     }
 
     #[tokio::test]
@@ -1979,11 +2112,12 @@ mod tests {
 
         let github = test_github(&server);
         let snapshot = delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc");
-        github
+        let review_error = github
             .post_review("Summary", &[finding], &snapshot)
             .await
-            .unwrap();
-        github
+            .unwrap_err();
+        assert!(review_error.to_string().contains("PR snapshot changed"));
+        let check_error = github
             .complete_checks(
                 "11",
                 "12",
@@ -1993,7 +2127,8 @@ mod tests {
                 &snapshot,
             )
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(check_error.to_string().contains("PR snapshot changed"));
     }
 
     #[tokio::test]
@@ -2053,11 +2188,12 @@ mod tests {
         let envelope = delivery_envelope("aaaaaaaaaaaa", "cccccccccccc");
         let snapshot = delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc");
 
-        github
+        let review_error = github
             .post_review("Summary", &[finding], &snapshot)
             .await
-            .unwrap();
-        github
+            .unwrap_err();
+        assert!(review_error.to_string().contains("PR snapshot changed"));
+        let check_error = github
             .complete_checks(
                 "11",
                 "12",
@@ -2067,7 +2203,8 @@ mod tests {
                 &snapshot,
             )
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(check_error.to_string().contains("PR snapshot changed"));
     }
 
     #[tokio::test]
@@ -2148,14 +2285,15 @@ mod tests {
             id: None,
         };
 
-        github
+        let error = github
             .post_review(
                 "Summary",
                 &[finding],
                 &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
             )
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(error.to_string().contains("PR snapshot changed"));
     }
 
     #[tokio::test]

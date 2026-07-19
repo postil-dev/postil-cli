@@ -1,8 +1,8 @@
 //! End-to-end tests: the real binary against mocked LLM and forge endpoints.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use assert_cmd::Command;
 #[cfg(feature = "qualification-candidate")]
@@ -280,6 +280,26 @@ struct GitHubHeadRaceResponder {
     calls: Arc<AtomicUsize>,
 }
 
+#[derive(Clone)]
+struct GitHubLateHeadRaceResponder {
+    calls: Arc<AtomicUsize>,
+}
+
+#[derive(Clone)]
+struct GitHubFreshnessFailureResponder {
+    calls: Arc<AtomicUsize>,
+}
+
+#[derive(Clone)]
+struct AmbiguousReviewPostResponder {
+    published_body: Arc<Mutex<Option<String>>>,
+}
+
+#[derive(Clone)]
+struct ReconciledReviewListResponder {
+    published_body: Arc<Mutex<Option<String>>>,
+}
+
 struct OutputBudgetResponder;
 
 #[derive(Clone)]
@@ -414,6 +434,64 @@ impl Respond for GitHubHeadRaceResponder {
     }
 }
 
+impl Respond for GitHubLateHeadRaceResponder {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let head = if call < 4 { "aaaaaaaa" } else { "cccccccc" };
+        ResponseTemplate::new(200).set_body_json(json!({
+            "title": "t",
+            "body": "b",
+            "state": "open", "merged": false,
+            "head": {"sha": head},
+            "base": {"sha": "bbbbbbbb"},
+            "changed_files": 1
+        }))
+    }
+}
+
+impl Respond for GitHubFreshnessFailureResponder {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        if self.calls.fetch_add(1, Ordering::SeqCst) < 2 {
+            ResponseTemplate::new(200).set_body_json(json!({
+                "title": "t",
+                "body": "b",
+                "state": "open", "merged": false,
+                "head": {"sha": "aaaaaaaa"},
+                "base": {"sha": "bbbbbbbb"},
+                "changed_files": 1
+            }))
+        } else {
+            ResponseTemplate::new(500).set_body_string("temporary PR lookup failure")
+        }
+    }
+}
+
+impl Respond for AmbiguousReviewPostResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body = request.body_json::<Value>().unwrap()["body"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        *self.published_body.lock().unwrap() = Some(body);
+        ResponseTemplate::new(500).set_body_string("ambiguous upstream response")
+    }
+}
+
+impl Respond for ReconciledReviewListResponder {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        let body = self
+            .published_body
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_default();
+        ResponseTemplate::new(200).set_body_json(json!([{
+            "body": body,
+            "commit_id": "aaaaaaaa"
+        }]))
+    }
+}
+
 async fn mount_github_complete_diff(server: &MockServer, pr: u64) {
     Mock::given(method("GET"))
         .and(path_regex(r"^/repos/acme/api/compare/b+\.\.\.a+$"))
@@ -435,6 +513,76 @@ async fn mount_github_complete_diff(server: &MockServer, pr: u64) {
     Mock::given(method("GET"))
         .and(path("/repos/acme/api/contents/src/auth.rs"))
         .respond_with(GitHubSourceResponder)
+        .mount(server)
+        .await;
+}
+
+fn hosted_publish_command(directory: &std::path::Path, server: &MockServer) -> Command {
+    let mut command = postil();
+    command
+        .current_dir(directory)
+        .env("POSTIL_HOSTED_MODE", "1")
+        .env("POSTIL_PROVISIONAL_HOSTED_ROSTER", "1")
+        .env("POSTIL_EXPECTED_GITHUB_REPO_ID", "42")
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .args([
+            "review",
+            "--publish",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--sha",
+            "aaaaaaaa",
+            "--check-run-id",
+            "901",
+            "--gate-check-run-id",
+            "902",
+            "--output-json",
+        ]);
+    command
+}
+
+fn disable_review_for_hosted_publication(directory: &std::path::Path, comment_on_clean: bool) {
+    let on_clean = if comment_on_clean {
+        "review:\n  onClean: comment\n"
+    } else {
+        ""
+    };
+    std::fs::write(
+        directory.join(".postil.yaml"),
+        format!("enabled: false\n{on_clean}"),
+    )
+    .unwrap();
+}
+
+async fn mount_static_github_pr(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "t", "body": "b",
+            "state": "open", "merged": false,
+            "head": {"sha": "aaaaaaaa"},
+            "base": {"sha": "bbbbbbbb"},
+            "changed_files": 1
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 42,
+            "full_name": "acme/api"
+        })))
+        .mount(server)
+        .await;
+}
+
+async fn mount_successful_hosted_check_patches(server: &MockServer) {
+    Mock::given(method("PATCH"))
+        .and(path_regex(r"^/repos/acme/api/check-runs/(901|902)$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .mount(server)
         .await;
 }
@@ -6543,6 +6691,246 @@ async fn forge_post_failure_on_success_path_keeps_gate_derived_exit_code() {
     assert_eq!(
         review_posts, 1,
         "ambiguous review POST must not be replayed"
+    );
+}
+
+#[tokio::test]
+async fn hosted_review_post_failure_is_operational_after_the_envelope_is_persisted() {
+    let server = MockServer::start().await;
+    mount_github_complete_diff(&server, 7).await;
+    mount_static_github_pr(&server).await;
+    mount_successful_hosted_check_patches(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/api/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("temporary review failure"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    disable_review_for_hosted_publication(dir.path(), true);
+    let output = hosted_publish_command(dir.path(), &server).assert().code(2);
+
+    let envelope: Value = serde_json::from_slice(&output.get_output().stdout).unwrap_or_else(|e| {
+        panic!(
+            "hosted review did not emit its envelope: {e}; stderr: {}",
+            String::from_utf8_lossy(&output.get_output().stderr)
+        )
+    });
+    assert_eq!(envelope["modelUsed"], "none (disabled by config)");
+    assert_eq!(envelope["gate"]["failing"], false);
+    let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+    assert!(stderr.contains("required hosted review publication failed"));
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == wiremock::http::Method::PATCH)
+            .count(),
+        2
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == wiremock::http::Method::POST
+                && request.url.path() == "/repos/acme/api/pulls/7/reviews")
+            .count(),
+        3,
+        "each ambiguous failure must be reconciled before the bounded retry"
+    );
+}
+
+#[tokio::test]
+async fn hosted_marker_reconciliation_accepts_an_ambiguous_review_post_without_a_duplicate() {
+    let server = MockServer::start().await;
+    mount_github_complete_diff(&server, 7).await;
+    mount_static_github_pr(&server).await;
+    mount_successful_hosted_check_patches(&server).await;
+    let published_body = Arc::new(Mutex::new(None));
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/api/pulls/7/reviews"))
+        .respond_with(AmbiguousReviewPostResponder {
+            published_body: published_body.clone(),
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7/reviews"))
+        .respond_with(ReconciledReviewListResponder { published_body })
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    disable_review_for_hosted_publication(dir.path(), true);
+    hosted_publish_command(dir.path(), &server).assert().code(0);
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == wiremock::http::Method::POST
+                && request.url.path() == "/repos/acme/api/pulls/7/reviews")
+            .count(),
+        1,
+        "marker reconciliation must prevent a duplicate review"
+    );
+}
+
+#[tokio::test]
+async fn hosted_check_patch_failures_are_operational_and_do_not_hide_the_envelope() {
+    let server = MockServer::start().await;
+    mount_github_complete_diff(&server, 7).await;
+    mount_static_github_pr(&server).await;
+    Mock::given(method("PATCH"))
+        .and(path_regex(r"^/repos/acme/api/check-runs/(901|902)$"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("temporary check failure"))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    disable_review_for_hosted_publication(dir.path(), false);
+    let output = hosted_publish_command(dir.path(), &server).assert().code(2);
+
+    let envelope: Value = serde_json::from_slice(&output.get_output().stdout).unwrap_or_else(|e| {
+        panic!(
+            "hosted review did not emit its envelope: {e}; stderr: {}",
+            String::from_utf8_lossy(&output.get_output().stderr)
+        )
+    });
+    assert_eq!(envelope["modelUsed"], "none (disabled by config)");
+    let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+    assert!(stderr.contains("required hosted check publication failed"));
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == wiremock::http::Method::PATCH)
+            .count(),
+        6,
+        "both required checks receive the complete bounded retry sequence"
+    );
+}
+
+#[tokio::test]
+async fn hosted_freshness_lookup_failure_is_operational_before_any_write() {
+    let server = MockServer::start().await;
+    mount_github_complete_diff(&server, 7).await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .respond_with(GitHubFreshnessFailureResponder {
+            calls: Arc::new(AtomicUsize::new(0)),
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path_regex(r"^/repos/acme/api/check-runs/(901|902)$"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/api/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    disable_review_for_hosted_publication(dir.path(), false);
+    let output = hosted_publish_command(dir.path(), &server).assert().code(2);
+    let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+    assert!(stderr.contains("snapshot freshness could not be verified"));
+}
+
+#[tokio::test]
+async fn hosted_stale_head_race_is_operational_and_suppresses_all_writes() {
+    let server = MockServer::start().await;
+    mount_github_complete_diff(&server, 7).await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .respond_with(GitHubHeadRaceResponder {
+            calls: Arc::new(AtomicUsize::new(0)),
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path_regex(r"^/repos/acme/api/check-runs/(901|902)$"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/api/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    disable_review_for_hosted_publication(dir.path(), false);
+    let output = hosted_publish_command(dir.path(), &server).assert().code(2);
+    let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+    assert!(stderr.contains("pull request snapshot changed after review"));
+}
+
+#[tokio::test]
+async fn hosted_silent_review_requires_checks_but_not_a_pr_comment() {
+    let server = MockServer::start().await;
+    mount_github_complete_diff(&server, 7).await;
+    mount_static_github_pr(&server).await;
+    mount_successful_hosted_check_patches(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/api/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    disable_review_for_hosted_publication(dir.path(), false);
+    hosted_publish_command(dir.path(), &server).assert().code(0);
+}
+
+#[tokio::test]
+async fn hosted_silent_review_does_not_require_a_later_comment_freshness_check() {
+    let server = MockServer::start().await;
+    mount_github_complete_diff(&server, 7).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .respond_with(GitHubLateHeadRaceResponder {
+            calls: calls.clone(),
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 42,
+            "full_name": "acme/api"
+        })))
+        .mount(&server)
+        .await;
+    mount_successful_hosted_check_patches(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/api/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    disable_review_for_hosted_publication(dir.path(), false);
+    hosted_publish_command(dir.path(), &server).assert().code(0);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        4,
+        "a no-comment result must stop after the required check delivery freshness reads"
     );
 }
 
