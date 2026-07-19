@@ -41,12 +41,15 @@
 //   BENCH_LIVE              set to 1 to select diff-file live mode
 //   BENCH_CONCURRENCY       live-mode case parallelism (else --concurrency, else default)
 //   POSTIL_BENCH_BOUNDED    set to 1 to qualify the bounded large-review path
+//   --case <fixture-id>     repeatable non-admission fixture selection
+//   --screen-profile <path> exact provider and price contract for selected cases
+//   --scorer-model <id>     optional scorer for non-admission diff-file screening
 
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 import { cases } from "../fixtures/cases";
-import { formatReport, runBenchmark } from "./harness";
+import { formatReport, runBenchmark, type BenchmarkCaseInput } from "./harness";
 import { DEFAULT_LIVE_CONCURRENCY, formatLiveReport, runLive } from "./live";
 import {
   DEFAULT_LIVE_CONCURRENCY as DEFAULT_LIVE_MODELS_CONCURRENCY,
@@ -125,6 +128,75 @@ function flagValue(args: string[], flag: string): string | undefined {
   return value?.startsWith("--") === true ? undefined : value;
 }
 
+function repeatedFlagValues(args: string[], flag: string): string[] {
+  const values: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    if (args[index] !== flag) continue;
+    const value = args[index + 1];
+    if (value === undefined || value.startsWith("--")) {
+      throw new Error(`${flag} requires a value`);
+    }
+    values.push(value);
+    index += 1;
+  }
+  return values;
+}
+
+export function selectLiveScreeningCases(
+  inputs: readonly BenchmarkCaseInput[],
+  requestedIds: readonly string[],
+): BenchmarkCaseInput[] {
+  if (requestedIds.length === 0) return [...inputs];
+  if (new Set(requestedIds).size !== requestedIds.length) {
+    throw new Error("--case fixture IDs must not repeat");
+  }
+  const byId = new Map(inputs.map((input) => [input.id, input]));
+  const unknown = requestedIds.filter((id) => !byId.has(id));
+  if (unknown.length > 0) {
+    throw new Error(`unknown --case fixture ID(s): ${unknown.join(", ")}`);
+  }
+  return requestedIds.map((id) => byId.get(id)!);
+}
+
+export function validateModeSpecificFlags(
+  args: readonly string[],
+  mode: "mock" | "live-screen" | "live-admission",
+): void {
+  for (const flag of ["--case", "--scorer-model", "--screen-profile"]) {
+    if (!args.includes(flag)) continue;
+    if (mode === "live-admission") {
+      throw new Error(`${flag} is a non-admission diff-file screen option and is unavailable in live-models admission mode`);
+    }
+    if (mode === "mock") {
+      throw new Error(`${flag} is available only with --live diff-file screening`);
+    }
+  }
+}
+
+export function validateScreeningEnvironment(screenProfileEnv: string | undefined): void {
+  if (screenProfileEnv !== undefined) {
+    throw new Error(
+      "POSTIL_BENCH_SCREEN_PROFILE is internal to a selected-case live screen; use --screen-profile with --live",
+    );
+  }
+}
+
+export function validateLiveScreenContract(
+  selectedCaseIds: readonly string[],
+  scorerModel: string | undefined,
+  screenProfilePath: string | undefined,
+): void {
+  if (selectedCaseIds.length > 0 && screenProfilePath === undefined) {
+    throw new Error("selected-case live screening requires --screen-profile with an exact provider and price contract");
+  }
+  if (scorerModel !== undefined && screenProfilePath === undefined) {
+    throw new Error("scorer live screening requires --screen-profile with an exact provider and price contract");
+  }
+  if (scorerModel !== undefined && selectedCaseIds.length === 0) {
+    throw new Error("scorer live screening requires at least one explicit --case fixture");
+  }
+}
+
 /** Resolve live-mode concurrency from BENCH_CONCURRENCY, then --concurrency,
  * then the default. Non-positive or non-numeric inputs fall back to the default. */
 function liveConcurrency(args: string[]): number {
@@ -146,6 +218,9 @@ async function main() {
     resolve(import.meta.dir, "..", "..", "target", "release", "postil");
   const liveModels =
     process.env.POSTIL_BENCH_MODE === "live" || args.includes("--live-models");
+  const live = args.includes("--live") || process.env.BENCH_LIVE === "1";
+  validateScreeningEnvironment(process.env.POSTIL_BENCH_SCREEN_PROFILE);
+  validateModeSpecificFlags(args, liveModels ? "live-admission" : live ? "live-screen" : "mock");
 
   await prepareExplicitOutputs(jsonOut, manifestOut, liveModels ? privateEvidenceOut : undefined);
   if (args.includes("--json-out") && jsonOut === undefined) {
@@ -214,17 +289,33 @@ async function main() {
     return;
   }
 
-  const live = args.includes("--live") || process.env.BENCH_LIVE === "1";
-
   if (live) {
     const model = process.env.REVIEW_MODEL ?? flagValue(args, "--model");
     if (!model?.trim()) {
-      throw new Error("live benchmark needs an explicitly qualified model: set REVIEW_MODEL or --model");
+      throw new Error("live benchmark needs an explicit model: set REVIEW_MODEL or --model");
     }
     const concurrency = liveConcurrency(args);
+    const scorerModel = flagValue(args, "--scorer-model");
+    if (args.includes("--scorer-model") && scorerModel === undefined) {
+      throw new Error("--scorer-model requires a value");
+    }
+    const screenProfilePath = flagValue(args, "--screen-profile");
+    if (args.includes("--screen-profile") && screenProfilePath === undefined) {
+      throw new Error("--screen-profile requires a path");
+    }
     const bounded =
       args.includes("--bounded") || process.env.POSTIL_BENCH_BOUNDED === "1";
-    const report = await runLive(cases, { binary, model, concurrency, bounded });
+    const selectedCaseIds = repeatedFlagValues(args, "--case");
+    validateLiveScreenContract(selectedCaseIds, scorerModel, screenProfilePath);
+    const report = await runLive(selectLiveScreeningCases(cases, selectedCaseIds), {
+      binary,
+      model,
+      scorerModel,
+      screenProfilePath,
+      concurrency,
+      bounded,
+      selectedCaseIds,
+    });
     await writeReport(jsonOut, JSON.stringify(report, null, 2));
     console.log(json ? JSON.stringify(report, null, 2) : formatLiveReport(report));
     return;

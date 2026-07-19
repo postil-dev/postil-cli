@@ -1525,12 +1525,23 @@ impl LlmClient {
         total_deadline: Option<Instant>,
     ) -> Result<Self> {
         let endpoint_auth = endpoint_auth_from_env(cfg.api_format)?;
+        let screening_profile = crate::config::benchmark_screening_profile_for_config(cfg)?;
         let hosted_price_bounds = if crate::config::hosted_runtime_mode() {
             ensure_hosted_provider_contract(cfg.api_format, &cfg.api_base)?;
             Some(Arc::new(
                 crate::config::hosted_price_bounds_for_config(cfg)?
                     .ok_or_else(|| anyhow!("hosted inference has no exact price-bound profile"))?
                     .into_iter()
+                    .map(|bound| (bound.model.clone(), bound))
+                    .collect(),
+            ))
+        } else if let Some(profile) = screening_profile.as_ref() {
+            ensure_hosted_provider_contract(cfg.api_format, &cfg.api_base)?;
+            Some(Arc::new(
+                profile
+                    .model_price_bounds
+                    .iter()
+                    .cloned()
                     .map(|bound| (bound.model.clone(), bound))
                     .collect(),
             ))
@@ -1546,6 +1557,8 @@ impl LlmClient {
                         .ok_or_else(|| anyhow!("qualification provider profile is unavailable"))?
                         .upstream_provider_identity,
                 )
+            } else if let Some(profile) = screening_profile {
+                Some(profile.upstream_provider_identity)
             } else {
                 None
             };
@@ -1562,6 +1575,7 @@ impl LlmClient {
             endpoint_auth,
             require_openrouter_privacy: is_canonical_openrouter_base(&cfg.api_base)
                 && (crate::config::hosted_runtime_mode()
+                    || crate::config::benchmark_screening_mode()
                     || env_flag("POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY")),
             request_timeout,
             timeout_retry_timeout: request_timeout.min(Duration::from_secs(TIMEOUT_RETRY_CAP_SECS)),
@@ -2744,23 +2758,11 @@ impl LlmClient {
                         let actual_identity =
                             route_provider.map(|_| actual_response_identity(&response.text));
                         if let Some(expected_provider) = route_provider {
-                            let returned_model = actual_identity
-                                .as_ref()
-                                .and_then(|identity| identity.0.as_deref())
-                                .ok_or_else(|| {
-                                    anyhow::Error::new(AtomicAttributionIdentityFailure::Missing)
-                                })?;
-                            let returned_provider = actual_identity
-                                .as_ref()
-                                .and_then(|identity| identity.1.as_deref())
-                                .ok_or_else(|| {
-                                    anyhow::Error::new(AtomicAttributionIdentityFailure::Missing)
-                                })?;
-                            if returned_model != model || returned_provider != expected_provider {
-                                return Err(anyhow::Error::new(
-                                    AtomicAttributionIdentityFailure::Mismatch,
-                                ));
-                            }
+                            validate_routed_response_identity(
+                                actual_identity.as_ref(),
+                                model,
+                                expected_provider,
+                            )?;
                         }
                         eprintln!(
                             "postil: llm response phase={} model={} attempt={} status={} elapsed={} bytes={} request_id={} response_id={} returned_model={} provider={} choices={} finish={} usage={} prompt_tokens={} completion_tokens={} reasoning_tokens={} category={}",
@@ -3647,6 +3649,24 @@ fn actual_response_identity(text: &str) -> (Option<String>, Option<String>) {
             })
     };
     (identifier("model"), identifier("provider"))
+}
+
+fn validate_routed_response_identity(
+    identity: Option<&(Option<String>, Option<String>)>,
+    expected_model: &str,
+    expected_provider: &str,
+) -> Result<()> {
+    let returned_model = identity
+        .and_then(|value| value.0.as_deref())
+        .ok_or_else(|| anyhow::Error::new(AtomicAttributionIdentityFailure::Missing))?;
+    let returned_provider = identity
+        .and_then(|value| value.1.as_deref())
+        .ok_or_else(|| anyhow::Error::new(AtomicAttributionIdentityFailure::Missing))?;
+    ensure!(
+        returned_model == expected_model && returned_provider == expected_provider,
+        AtomicAttributionIdentityFailure::Mismatch
+    );
+    Ok(())
 }
 
 fn opaque_identifier(value: &str) -> String {
@@ -6254,6 +6274,108 @@ mod tests {
                 "max_price": { "prompt": 0.435, "completion": 0.87 },
             })
         );
+    }
+
+    #[test]
+    fn pinned_routes_require_the_exact_returned_model_and_provider() {
+        let valid = (
+            Some("provider/model".to_string()),
+            Some("Fireworks".to_string()),
+        );
+        validate_routed_response_identity(Some(&valid), "provider/model", "Fireworks").unwrap();
+
+        let missing =
+            validate_routed_response_identity(None, "provider/model", "Fireworks").unwrap_err();
+        assert!(
+            missing
+                .downcast_ref::<AtomicAttributionIdentityFailure>()
+                .is_some_and(|failure| matches!(
+                    failure,
+                    AtomicAttributionIdentityFailure::Missing
+                ))
+        );
+
+        let wrong_provider = (
+            Some("provider/model".to_string()),
+            Some("AnotherProvider".to_string()),
+        );
+        let mismatch =
+            validate_routed_response_identity(Some(&wrong_provider), "provider/model", "Fireworks")
+                .unwrap_err();
+        assert!(
+            mismatch
+                .downcast_ref::<AtomicAttributionIdentityFailure>()
+                .is_some_and(|failure| {
+                    matches!(failure, AtomicAttributionIdentityFailure::Mismatch)
+                })
+        );
+    }
+
+    #[test]
+    fn benchmark_screening_enforces_the_exact_provisional_provider_contract() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvRestore::capture(&[
+            "POSTIL_HOSTED_MODE",
+            "POSTIL_QUALIFICATION_CANDIDATE_PROFILE",
+            "POSTIL_BENCH_SCREEN_PROFILE",
+            "POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY",
+        ]);
+        EnvRestore::remove("POSTIL_HOSTED_MODE");
+        EnvRestore::remove("POSTIL_QUALIFICATION_CANDIDATE_PROFILE");
+        let directory = tempfile::tempdir().unwrap();
+        let profile_path = directory.path().join("screen-profile.json");
+        std::fs::write(&profile_path, include_str!("../provisional-models.json")).unwrap();
+        EnvRestore::set(
+            "POSTIL_BENCH_SCREEN_PROFILE",
+            profile_path.to_str().unwrap(),
+        );
+        EnvRestore::set("POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY", "1");
+
+        let config = Config {
+            model: "z-ai/glm-5.2".into(),
+            cascade: Vec::new(),
+            consensus: 1,
+            scorer_enabled: false,
+            scorer: String::new(),
+            scorer_fallback: String::new(),
+            api_base: "https://openrouter.ai:443/api/v1".into(),
+            api_format: ApiFormat::OpenaiCompatible,
+            ..Config::default()
+        };
+        config.require_model().unwrap();
+        let client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        let body =
+            client.request_body("z-ai/glm-5.2", "system", "user", 100, 0.0, LlmPhase::Review);
+        assert_eq!(body["provider"]["order"], json!(["Fireworks"]));
+        assert_eq!(body["provider"]["allow_fallbacks"], false);
+        assert_eq!(body["provider"]["data_collection"], "deny");
+        assert_eq!(body["provider"]["zdr"], true);
+        assert_eq!(
+            body["provider"]["max_price"],
+            json!({ "prompt": 1.4, "completion": 4.4 })
+        );
+
+        let drifted = Config {
+            model: "another/model".into(),
+            ..config
+        };
+        let error = LlmClient::build(
+            &drifted,
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .err()
+        .expect("profile drift must fail");
+        assert!(error.to_string().contains("does not exactly match"));
     }
 
     #[cfg(feature = "qualification-candidate")]

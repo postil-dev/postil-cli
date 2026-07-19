@@ -16,11 +16,68 @@ import {
   invalidateExplicitOutputs,
   parseLiveModelsFailureReport,
   prepareExplicitOutputs,
+  selectLiveScreeningCases,
+  validateScreeningEnvironment,
+  validateModeSpecificFlags,
+  validateLiveScreenContract,
   writePrivateEvidenceBundle,
 } from "./run";
 import { AtomicAttributionTransportError } from "./attribution";
+import { cases } from "../fixtures/cases";
 
 const temporaryDirectories: string[] = [];
+
+describe("diff-file live screening selection", () => {
+  test("preserves requested fixture order and leaves the full corpus unchanged by default", () => {
+    expect(selectLiveScreeningCases(cases, []).map((entry) => entry.id)).toEqual(
+      cases.map((entry) => entry.id),
+    );
+    expect(selectLiveScreeningCases(cases, [
+      "near-duplicate-auth-clean",
+      "prompt-injection-auth-bypass",
+    ]).map((entry) => entry.id)).toEqual([
+      "near-duplicate-auth-clean",
+      "prompt-injection-auth-bypass",
+    ]);
+  });
+
+  test("rejects unknown and repeated fixture IDs", () => {
+    expect(() => selectLiveScreeningCases(cases, ["missing-case"])).toThrow(
+      "unknown --case fixture ID",
+    );
+    expect(() => selectLiveScreeningCases(cases, ["clean-docs-only", "clean-docs-only"]))
+      .toThrow("must not repeat");
+  });
+
+  test("keeps case and scorer flags outside formal admission", () => {
+    for (const flag of ["--case", "--scorer-model", "--screen-profile"]) {
+      expect(() => validateModeSpecificFlags([flag, "value"], "live-admission"))
+        .toThrow("non-admission");
+      expect(() => validateModeSpecificFlags([flag, "value"], "mock"))
+        .toThrow("only with --live");
+      expect(() => validateModeSpecificFlags([flag, "value"], "live-screen"))
+        .not.toThrow();
+    }
+  });
+
+  test("rejects inherited internal screening state at the benchmark entry point", () => {
+    expect(() => validateScreeningEnvironment(undefined)).not.toThrow();
+    expect(() => validateScreeningEnvironment("profile.json")).toThrow(
+      "internal to a selected-case live screen",
+    );
+  });
+
+  test("requires a provider profile for selected cases and scorer screens", () => {
+    expect(() => validateLiveScreenContract(["case"], undefined, undefined))
+      .toThrow("selected-case");
+    expect(() => validateLiveScreenContract([], "scorer/model", undefined))
+      .toThrow("scorer live screening requires --screen-profile");
+    expect(() => validateLiveScreenContract([], "scorer/model", "profile.json"))
+      .toThrow("explicit --case");
+    expect(() => validateLiveScreenContract(["case"], "scorer/model", "profile.json"))
+      .not.toThrow();
+  });
+});
 
 afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true, force: true })));
@@ -34,7 +91,7 @@ async function temporaryDirectory(): Promise<string> {
 
 function emptyReport(privateEvidenceDigest: string): LiveModelsReport {
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     generatedAt: "2026-07-16T00:00:00.000Z",
     qualificationSourceSha: "9".repeat(40),
     cliVersion: "postil 0.6.4",
@@ -62,7 +119,7 @@ function emptyReport(privateEvidenceDigest: string): LiveModelsReport {
     modelAggregates: [],
     totalRunCostUsd: 0,
     totalRunCostUsdDecimal: "0",
-    exactSuccessfulCostUsdDecimal: "0",
+    observedProviderCostUsdDecimal: "0",
     failedOrUnknownExposureUsdDecimal: "0",
     costAccountingComplete: true,
     reservedQualificationExposureUsdDecimal: "0",

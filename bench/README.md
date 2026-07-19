@@ -306,7 +306,7 @@ run completes. Scorer output is bounded from the supplied finding count, up to
 the supported maximum of 20 findings, and schema-repair context is byte-bounded
 from the same output limit.
 
-## Diff-file live mode (opt-in, single model, no forge)
+## Diff-file live mode (opt-in, no forge)
 
 This live mode runs the real release binary against the same fixtures with a
 real model and **no mocked model server**, so it measures authored-target detection
@@ -318,6 +318,16 @@ is written to any repo.
 ```sh
 export MODEL_API_KEY=...         # required; never logged or printed
 REVIEW_MODEL=provider/qualified-model bun run bench:live
+# Screen exact fixtures against the provisional GLM route. Repeat --case.
+REVIEW_MODEL=z-ai/glm-5.2 bun run bench:live -- \
+  --screen-profile ../provisional-models.json \
+  --case prompt-injection-auth-bypass \
+  --case near-duplicate-auth-clean
+# A profile with a scorerChain can exercise the production scorer path.
+REVIEW_MODEL=provider/generator bun run bench:live -- \
+  --screen-profile ./screen-profile.json \
+  --scorer-model provider/scorer \
+  --case prompt-injection-auth-bypass
 # Exercise the production large-review selection and synthesis path.
 REVIEW_MODEL=provider/qualified-model bun run bench:live -- --bounded
 # --model <id> is the equivalent command-line override
@@ -336,9 +346,16 @@ records `reviewMode` as `exhaustive` or `bounded` so admission tooling can
 reject evidence from the wrong execution path. It also records the release
 binary's SHA-256 digest so the report cannot be paired with a different
 executable during admission. Fixture-corpus and evaluator-source digests bind
-the results to the benchmark inputs and scoring code. Live admission runs use
-OpenRouter's managed route and explicitly disable the second-pass scorer so
-the measured model is the only inference model involved.
+the results to the benchmark inputs and scoring code.
+
+`--case <fixture-id>` selects one exact fixture and may be repeated. Selected
+cases require `--screen-profile <path>`. The profile binds the model chain,
+scorer chain, exact upstream provider, canonical managed endpoint, and price
+ceilings. Requests deny provider data collection, require zero-data retention,
+pin that provider without fallbacks, and enforce the profile prices. The report
+records the selected IDs and marks the evidence as non-admission screening.
+Formal admission rejects `--case`, `--scorer-model`, and `--screen-profile`.
+Every cost total says whether all calls supplied complete provider accounting.
 
 ### Concurrency and retries
 

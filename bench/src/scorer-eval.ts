@@ -25,6 +25,9 @@ import {
   type BenchmarkCase,
 } from "./harness";
 import {
+  formatCanonicalDecimal,
+  parseCanonicalDecimal,
+  sumCanonicalDecimals,
   type ModelPricing,
   type QualificationPair,
 } from "./livemodels-score";
@@ -104,6 +107,7 @@ export interface ScorerEvalCase {
   promptTokens: number;
   completionTokens: number;
   costUsd: number | null;
+  costProviderDecimal?: string | null;
 }
 
 export interface ScorerEvalAggregate {
@@ -148,6 +152,7 @@ interface ScorerAttempt {
   promptTokens: number;
   completionTokens: number;
   costUsd: number | null;
+  costProviderDecimal: string | null;
   usageValid: boolean;
 }
 
@@ -603,6 +608,7 @@ export async function runScorerEvalCase(
     promptTokens,
     completionTokens,
     costUsd,
+    costProviderDecimal: null as string | null,
   };
 
   const parsedEnvelope = envelopeV1.safeParse(safeJson(child.stdout));
@@ -697,6 +703,7 @@ export async function runScorerEvalCase(
     proxy.attempts[0],
     proxy.generatorRequests.length + proxy.plannerRequests.length,
   );
+  const costProviderDecimal = scorerCostProviderDecimal(envelope, scorerModel);
   const routingValid = proxy.unexpectedRequests.length === 0;
   const coverageFailure = reviewCoverageFailure(c, envelope);
   const coverageValid = coverageFailure === null;
@@ -774,6 +781,7 @@ export async function runScorerEvalCase(
     coverageValid,
     publicationValid,
     ...telemetry,
+    costProviderDecimal,
   };
 }
 
@@ -815,6 +823,7 @@ function baseResult(
     promptTokens: 0,
     completionTokens: 0,
     costUsd: null,
+    costProviderDecimal: null,
   };
 }
 
@@ -1020,9 +1029,11 @@ export async function startScorerProxy(
         durationMs: performance.now() - startedAt,
         promptTokens: Number(response?.usage?.prompt_tokens ?? 0),
         completionTokens: Number(response?.usage?.completion_tokens ?? 0),
-        costUsd: typeof response?.usage?.cost === "number" && Number.isFinite(response.usage.cost)
+        costUsd: typeof response?.usage?.cost === "number" &&
+          Number.isFinite(response.usage.cost) && response.usage.cost >= 0
           ? response.usage.cost
           : null,
+        costProviderDecimal: providerCostDecimalFromResponse(text),
         usageValid,
       });
       res.writeHead(upstream.status, { "content-type": upstream.headers.get("content-type") ?? "application/json" });
@@ -1034,6 +1045,7 @@ export async function startScorerProxy(
         promptTokens: 0,
         completionTokens: 0,
         costUsd: null,
+        costProviderDecimal: null,
         usageValid: false,
       });
       if (!res.destroyed && !res.headersSent) {
@@ -1141,7 +1153,7 @@ function sourceExactUsageValid(
   attempt: ScorerAttempt | undefined,
   expectedMockCalls: number,
 ): boolean {
-  if (attempt === undefined || !attempt.usageValid || attempt.costUsd === null) return false;
+  if (attempt === undefined || !attempt.usageValid || attempt.costProviderDecimal === null) return false;
   const events = Array.isArray(envelope.modelUsage) ? envelope.modelUsage : [];
   const scorerEvents = events.filter((event: Record<string, any>) =>
     event.model === scorerModel && event.role === "findingScorer"
@@ -1157,17 +1169,14 @@ function sourceExactUsageValid(
   ) return false;
 
   const scorer = scorerEvents[0] as Record<string, any>;
-  const reportedCost = typeof scorer.costProviderDecimal === "string"
-    ? Number(scorer.costProviderDecimal)
-    : Number.NaN;
   const scorerValid =
     scorer.accountingComplete === true &&
     scorer.costSource === "providerReported" &&
     scorer.promptTokens === attempt.promptTokens &&
     scorer.completionTokens === attempt.completionTokens &&
-    Number.isFinite(reportedCost) &&
-    Math.abs(reportedCost - attempt.costUsd) < 1e-12 &&
-    scorer.costMicros === Math.round(attempt.costUsd * 1_000_000);
+    typeof scorer.costProviderDecimal === "string" &&
+    canonicalDecimalEqual(scorer.costProviderDecimal, attempt.costProviderDecimal) &&
+    scorer.costMicros === providerCostMicros(attempt.costProviderDecimal);
   const mocksValid = mockEvents.every((event: Record<string, any>) =>
     event.accountingComplete === true &&
     event.costSource === "unavailable" &&
@@ -1175,6 +1184,108 @@ function sourceExactUsageValid(
     event.costProviderDecimal === undefined
   );
   return scorerValid && mocksValid;
+}
+
+function canonicalDecimalEqual(left: string, right: string): boolean {
+  try {
+    return formatCanonicalDecimal(parseCanonicalDecimal(left)) === left &&
+      formatCanonicalDecimal(parseCanonicalDecimal(right)) === right &&
+      left === right;
+  } catch {
+    return false;
+  }
+}
+
+export function canonicalProviderCost(raw: string): string | null {
+  if (raw.length === 0 || raw.length > 128 || raw.startsWith("-") || raw.startsWith("+")) return null;
+  const match = /^(0|[1-9][0-9]*)(?:\.([0-9]+))?(?:[eE]([+-]?[0-9]+))?$/u.exec(raw);
+  if (match === null) return null;
+  const fraction = match[2] ?? "";
+  const exponent = Number.parseInt(match[3] ?? "0", 10);
+  if (!Number.isSafeInteger(exponent) || Math.abs(exponent) > 128) return null;
+  let coefficient = BigInt(`${match[1]}${fraction}`);
+  let scale = fraction.length - exponent;
+  if (scale < 0) {
+    coefficient *= 10n ** BigInt(-scale);
+    scale = 0;
+  }
+  while (scale > 0 && coefficient % 10n === 0n) {
+    coefficient /= 10n;
+    scale -= 1;
+  }
+  if (scale > 18 || coefficient > (1n << 128n) - 1n) return null;
+  try {
+    return formatCanonicalDecimal({ coefficient, scale });
+  } catch {
+    return null;
+  }
+}
+
+export function providerCostDecimalFromResponse(text: string): string | null {
+  const sourceMarker = Symbol("provider-cost-source");
+  let parsed: { usage?: { cost?: number | { [sourceMarker]: string } } };
+  try {
+    const parseWithSource = JSON.parse as unknown as (
+      input: string,
+      reviver: (key: string, value: unknown, context?: { source?: string }) => unknown,
+    ) => unknown;
+    parsed = parseWithSource(text, (key, value, context) => {
+      if (key === "cost" && typeof value === "number" && typeof context?.source === "string") {
+        return { [sourceMarker]: context.source };
+      }
+      return value;
+    }) as { usage?: { cost?: number | { [sourceMarker]: string } } };
+  } catch {
+    return null;
+  }
+  const cost = parsed.usage?.cost;
+  if (typeof cost === "number") {
+    throw new Error("this Bun runtime does not expose raw JSON number source text");
+  }
+  const raw = cost?.[sourceMarker];
+  return typeof raw === "string" ? canonicalProviderCost(raw) : null;
+}
+
+function providerCostMicros(value: string): number | null {
+  try {
+    const parsed = parseCanonicalDecimal(value);
+    const micros = parsed.scale <= 6
+      ? parsed.coefficient * 10n ** BigInt(6 - parsed.scale)
+      : (() => {
+          const divisor = 10n ** BigInt(parsed.scale - 6);
+          const quotient = parsed.coefficient / divisor;
+          const remainder = parsed.coefficient % divisor;
+          return quotient + (remainder * 2n >= divisor ? 1n : 0n);
+        })();
+    return micros <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(micros) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function scorerCostProviderDecimal(
+  envelope: Record<string, any>,
+  scorerModel: string,
+): string | null {
+  const events = Array.isArray(envelope.modelUsage) ? envelope.modelUsage : [];
+  const scorerEvents = events.filter((event: Record<string, any>) =>
+    event.model === scorerModel && event.role === "findingScorer"
+  );
+  if (scorerEvents.length !== 1) return null;
+  const event = scorerEvents[0] as Record<string, any>;
+  if (
+    event.accountingComplete !== true ||
+    event.costSource !== "providerReported" ||
+    typeof event.costProviderDecimal !== "string"
+  ) return null;
+  try {
+    const parsed = parseCanonicalDecimal(event.costProviderDecimal);
+    return formatCanonicalDecimal(parsed) === event.costProviderDecimal
+      ? event.costProviderDecimal
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 function mockUsage(
@@ -1484,6 +1595,20 @@ export function formatReport(report: ScorerEvalReport): string {
       ].join(" "),
     );
     for (const failure of a.admissionFailures) lines.push(`  FAIL: ${failure}`);
+  }
+  const exactCosts = report.cases.map((item) => item.costProviderDecimal);
+  if (
+    exactCosts.length > 0 &&
+    exactCosts.every((cost): cost is string => typeof cost === "string")
+  ) {
+    lines.push(
+      "",
+      `Observed provider cost: $${formatCanonicalDecimal(
+        sumCanonicalDecimals(exactCosts.map(parseCanonicalDecimal)),
+      )} (complete accounting)`,
+    );
+  } else {
+    lines.push("", "Observed provider cost: incomplete accounting");
   }
   return lines.join("\n");
 }
