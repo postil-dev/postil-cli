@@ -64,29 +64,14 @@ async fn snapshot_is_current<F: Forge>(
     forge: &F,
     expected: &PrMeta,
     review_started: Instant,
-) -> bool {
-    match run_with_hosted_budget(
+) -> Result<bool> {
+    run_with_hosted_budget(
         Some(review_started),
         FORGE_READ_TIMEOUT_SECS,
         forge.snapshot_is_current(expected),
         "verifying pull request snapshot before publication",
     )
     .await
-    {
-        Ok(true) => true,
-        Ok(false) => {
-            eprintln!(
-                "postil: publication skipped because the pull request snapshot changed after review"
-            );
-            false
-        }
-        Err(error) => {
-            eprintln!(
-                "postil: publication skipped because snapshot freshness could not be verified ({error:#})"
-            );
-            false
-        }
-    }
 }
 
 fn conservative_context_tokens(model: &str) -> usize {
@@ -356,7 +341,7 @@ async fn run_local(args: &ReviewArgs, cfg: &Config) -> Result<i32> {
         },
     )
     .await?;
-    finish(args, cfg, envelope, None::<&GitHub>, None, None).await
+    finish(args, cfg, envelope, None::<&GitHub>, None, None, false).await
 }
 
 async fn run_remote<F: Forge>(
@@ -366,6 +351,7 @@ async fn run_remote<F: Forge>(
     repo: &str,
 ) -> Result<i32> {
     let review_started = std::time::Instant::now();
+    let strict_publication = strict_hosted_github_publication(args);
     let meta = run_with_hosted_budget(
         Some(review_started),
         FORGE_READ_TIMEOUT_SECS,
@@ -431,9 +417,7 @@ async fn run_remote<F: Forge>(
     .await;
     match result {
         Ok(envelope) => {
-            if let Some((a, g)) = &checks
-                && snapshot_is_current(forge, &meta, review_started).await
-            {
+            let check_completion = if let Some((a, g)) = &checks {
                 let gate_state = if envelope.gate.failing {
                     CheckState::Failure
                 } else {
@@ -452,40 +436,36 @@ async fn run_remote<F: Forge>(
                 } else {
                     CheckState::Success
                 };
-                // A transient forge outage here (rate limit, timeout) must not
-                // discard the review this far along: log and keep going so the
-                // envelope/SARIF output and exit code below still land. Mirrors
-                // the Err(e) arm below, which best-effort's this same call.
-                let completed = run_with_hosted_budget(
-                    Some(review_started),
-                    CHECK_COMPLETION_TIMEOUT_SECS,
-                    forge.complete_checks(
-                        a,
-                        g,
-                        advisory_state,
-                        (!args.defer_gate_check).then_some(gate_state),
-                        &envelope,
-                        &meta,
-                    ),
-                    "completing check runs",
+                complete_remote_checks(
+                    forge,
+                    a,
+                    g,
+                    advisory_state,
+                    (!args.defer_gate_check).then_some(gate_state),
+                    &envelope,
+                    &meta,
+                    review_started,
                 )
-                .await;
-                if let Err(e) = completed {
-                    if crate::forge::is_repository_identity_failure(&e) {
-                        return Err(e);
-                    }
-                    eprintln!("postil: could not update check runs ({e:#})");
-                }
-            }
-            finish(
+                .await
+            } else {
+                Ok(())
+            };
+            let check_failure = retain_publication_failure(
+                strict_publication,
+                check_completion,
+                "could not update check runs",
+            )?;
+            let finish_result = finish(
                 args,
                 cfg,
                 envelope,
                 Some(forge),
                 Some(review_started),
                 Some(&meta),
+                strict_publication,
             )
-            .await
+            .await;
+            combine_required_publication(check_failure, finish_result)
         }
         Err(e) => {
             eprintln!("postil: review failed before completion ({e:#})");
@@ -506,63 +486,134 @@ async fn run_remote<F: Forge>(
                 &meta,
                 review_started.elapsed().as_millis() as u64,
             );
-            if let Some((a, g)) = &checks
-                && snapshot_is_current(forge, &meta, review_started).await
-            {
+            let check_completion = if let Some((a, g)) = &checks {
                 let gate_state = if envelope.gate.failing {
                     CheckState::Failure
                 } else {
                     CheckState::Success
                 };
-                let completion = run_with_hosted_budget(
-                    Some(review_started),
-                    CHECK_COMPLETION_TIMEOUT_SECS,
-                    forge.complete_checks(
-                        a,
-                        g,
-                        CheckState::Neutral,
-                        (!args.defer_gate_check).then_some(gate_state),
-                        &envelope,
-                        &meta,
-                    ),
-                    "completing check runs",
+                complete_remote_checks(
+                    forge,
+                    a,
+                    g,
+                    CheckState::Neutral,
+                    (!args.defer_gate_check).then_some(gate_state),
+                    &envelope,
+                    &meta,
+                    review_started,
                 )
-                .await;
-                if let Err(error) = completion
-                    && crate::forge::is_repository_identity_failure(&error)
-                {
-                    return Err(error);
-                }
-            }
-            // Emit envelope/SARIF and derive the exit code from the gate.
-            // `finish` itself already downgrades forge posting failures
-            // (complete_checks/post_review) to warnings on stderr without
-            // touching its return value, so this only remains as a fallback
-            // for a local I/O failure inside `finish` (e.g. writing SARIF) on
-            // this already-errored path; even that must not mask the derived
-            // exit code, so it is downgraded to the gate-derived code rather
-            // than propagated as exit 2.
+                .await
+            } else {
+                Ok(())
+            };
+            let check_failure = retain_publication_failure(
+                strict_publication,
+                check_completion,
+                "could not update check runs",
+            )?;
+            // Emit the envelope and SARIF before delivery. Hosted GitHub runs
+            // require every applicable publication step; other invocations
+            // retain their gate-derived result when the forge is unavailable.
             let code = if envelope.gate.failing { 1 } else { 0 };
-            match finish(
+            let finish_result = finish(
                 args,
                 cfg,
                 envelope,
                 Some(forge),
                 Some(review_started),
                 Some(&meta),
+                strict_publication,
             )
-            .await
-            {
+            .await;
+            let finish_result = match finish_result {
                 Ok(c) => Ok(c),
                 Err(post_err) => {
                     if crate::forge::is_repository_identity_failure(&post_err) {
                         return Err(post_err);
                     }
-                    eprintln!("postil: could not post the error review ({post_err:#})");
-                    Ok(code)
+                    if strict_publication {
+                        Err(post_err)
+                    } else {
+                        eprintln!("postil: could not post the error review ({post_err:#})");
+                        Ok(code)
+                    }
                 }
-            }
+            };
+            combine_required_publication(check_failure, finish_result)
         }
+    }
+}
+
+fn strict_hosted_github_publication(args: &ReviewArgs) -> bool {
+    crate::config::hosted_mode() && args.forge == ForgeKind::GitHub && !args.no_post
+}
+
+async fn require_current_snapshot<F: Forge>(
+    forge: &F,
+    expected: &PrMeta,
+    review_started: Instant,
+    publication: &str,
+) -> Result<()> {
+    match snapshot_is_current(forge, expected, review_started).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(anyhow!(
+            "{publication} skipped because the pull request snapshot changed after review"
+        )),
+        Err(error) => Err(error).with_context(|| {
+            format!("{publication} skipped because snapshot freshness could not be verified")
+        }),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn complete_remote_checks<F: Forge>(
+    forge: &F,
+    advisory_id: &str,
+    gate_id: &str,
+    advisory: CheckState,
+    gate: Option<CheckState>,
+    envelope: &Envelope,
+    snapshot: &PrMeta,
+    review_started: Instant,
+) -> Result<()> {
+    require_current_snapshot(forge, snapshot, review_started, "check completion").await?;
+    run_with_hosted_budget(
+        Some(review_started),
+        CHECK_COMPLETION_TIMEOUT_SECS,
+        forge.complete_checks(advisory_id, gate_id, advisory, gate, envelope, snapshot),
+        "completing check runs",
+    )
+    .await
+}
+
+fn retain_publication_failure(
+    required: bool,
+    result: Result<()>,
+    warning: &str,
+) -> Result<Option<anyhow::Error>> {
+    match result {
+        Ok(()) => Ok(None),
+        Err(error) if required => Ok(Some(error)),
+        Err(error) if crate::forge::is_repository_identity_failure(&error) => Err(error),
+        Err(error) => {
+            eprintln!("postil: {warning} ({error:#})");
+            Ok(None)
+        }
+    }
+}
+
+fn combine_required_publication(
+    check_failure: Option<anyhow::Error>,
+    finish_result: Result<i32>,
+) -> Result<i32> {
+    match (check_failure, finish_result) {
+        (None, result) => result,
+        (Some(check_error), Ok(_)) => {
+            Err(check_error).context("required hosted check publication failed")
+        }
+        (Some(check_error), Err(review_error)) => Err(anyhow!(
+            "required hosted publication failed: check completion: {check_error:#}; review delivery: {review_error:#}"
+        )),
     }
 }
 
@@ -1622,6 +1673,7 @@ async fn finish<F: Forge>(
     forge: Option<&F>,
     hosted_budget_started_at: Option<Instant>,
     expected_snapshot: Option<&PrMeta>,
+    strict_publication: bool,
 ) -> Result<i32> {
     // Persist artifacts before any forge I/O: a posting hiccup must not
     // discard the completed review's SARIF or envelope output.
@@ -1643,44 +1695,64 @@ async fn finish<F: Forge>(
     {
         let expected_snapshot =
             expected_snapshot.context("remote publication is missing its immutable PR snapshot")?;
-        let current = if let Some(started_at) = hosted_budget_started_at {
-            snapshot_is_current(forge, expected_snapshot, started_at).await
-        } else {
-            forge
-                .snapshot_is_current(expected_snapshot)
-                .await
-                .unwrap_or(false)
-        };
-        if !current {
-            eprintln!("postil: review comment skipped because freshness is not proven");
-            return Ok(if envelope.gate.failing { 1 } else { 0 });
-        }
         let duplicate_of_baseline = load_baseline(args)
             .ok()
             .is_some_and(|baseline| visible_finding_sets_equal(&baseline, &envelope.findings));
+        let intentional_no_comment = crate::forge::only_operational_findings(&envelope.findings)
+            || (!envelope.findings.is_empty() && envelope.findings.iter().all(filter::is_carried));
         let should_comment = (!envelope.silent
             || matches!(cfg.on_clean, crate::config::OnClean::Comment))
-            && !duplicate_of_baseline;
-        if should_comment {
-            let summary = forge.review_summary(&envelope);
-            // A posting failure here (rate limit, transient 5xx, network blip)
-            // must not discard a review that already computed and persisted its
-            // envelope/SARIF/stdout output above. Log it and keep going because the
-            // exit code always derives from the gate below, never from whether
-            // the forge comment made it out.
-            let posted = run_with_hosted_budget(
-                hosted_budget_started_at,
-                REVIEW_POST_TIMEOUT_SECS,
-                forge.post_review(&summary, &envelope.findings, expected_snapshot),
-                "posting review comment",
-            )
-            .await;
-            if let Err(e) = posted {
-                if crate::forge::is_repository_identity_failure(&e) {
-                    return Err(e);
-                }
-                eprintln!("postil: could not post review comment ({e:#})");
+            && !duplicate_of_baseline
+            && !intentional_no_comment;
+        if !should_comment {
+            return Ok(if envelope.gate.failing { 1 } else { 0 });
+        }
+        let freshness = if let Some(started_at) = hosted_budget_started_at {
+            snapshot_is_current(forge, expected_snapshot, started_at).await
+        } else {
+            forge.snapshot_is_current(expected_snapshot).await
+        };
+        match freshness {
+            Ok(true) => {}
+            Ok(false) if strict_publication => {
+                return Err(anyhow!(
+                    "required review publication skipped because the pull request snapshot changed after review"
+                ));
             }
+            Ok(false) => {
+                eprintln!(
+                    "postil: publication skipped because the pull request snapshot changed after review"
+                );
+                return Ok(if envelope.gate.failing { 1 } else { 0 });
+            }
+            Err(error) if strict_publication => {
+                return Err(error).context(
+                    "required review publication skipped because snapshot freshness could not be verified",
+                );
+            }
+            Err(error) => {
+                eprintln!(
+                    "postil: publication skipped because snapshot freshness could not be verified ({error:#})"
+                );
+                return Ok(if envelope.gate.failing { 1 } else { 0 });
+            }
+        }
+        let summary = forge.review_summary(&envelope);
+        let posted = run_with_hosted_budget(
+            hosted_budget_started_at,
+            REVIEW_POST_TIMEOUT_SECS,
+            forge.post_review(&summary, &envelope.findings, expected_snapshot),
+            "posting review comment",
+        )
+        .await;
+        if let Err(e) = posted {
+            if crate::forge::is_repository_identity_failure(&e) {
+                return Err(e);
+            }
+            if strict_publication {
+                return Err(e).context("required hosted review publication failed");
+            }
+            eprintln!("postil: could not post review comment ({e:#})");
         }
     }
     Ok(if envelope.gate.failing { 1 } else { 0 })
@@ -2120,6 +2192,33 @@ mod tests {
         assert_eq!(
             HOSTED_WORKER_WATCHDOG_SECS - HOSTED_LLM_TOTAL_TIMEOUT_SECS,
             CHECK_COMPLETION_TIMEOUT_SECS + REVIEW_POST_TIMEOUT_SECS + PROCESS_OVERHEAD_SECS
+        );
+    }
+
+    #[tokio::test]
+    async fn required_check_completion_timeout_overrides_a_gate_derived_success() {
+        let started_at = Instant::now() - Duration::from_secs(HOSTED_WORKER_WATCHDOG_SECS)
+            + Duration::from_millis(20);
+        let completion = run_with_hosted_budget(
+            Some(started_at),
+            CHECK_COMPLETION_TIMEOUT_SECS,
+            async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Ok(())
+            },
+            "completing check runs",
+        )
+        .await;
+        let retained = retain_publication_failure(true, completion, "fixture warning")
+            .unwrap()
+            .expect("strict hosted publication retains the timeout");
+        let error = combine_required_publication(Some(retained), Ok(0)).unwrap_err();
+
+        assert!(format!("{error:#}").contains("completing check runs timed out"));
+        assert!(
+            error
+                .to_string()
+                .contains("required hosted check publication failed")
         );
     }
 
