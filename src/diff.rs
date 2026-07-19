@@ -3433,7 +3433,24 @@ pub fn review_batch_canonical_evidence(
     evidence: Option<&str>,
 ) -> Option<String> {
     let evidence = evidence.filter(|value| !value.trim().is_empty())?;
+    let payloads = review_batch_evidence_payloads(annotated, path, line);
+    if let Some(exact) = payloads.iter().find(|payload| **payload == evidence) {
+        return Some((*exact).to_string());
+    }
+    let trimmed_matches = payloads
+        .into_iter()
+        .filter(|payload| payload.trim() == evidence.trim())
+        .collect::<Vec<_>>();
+    let first = *trimmed_matches.first()?;
+    trimmed_matches
+        .iter()
+        .all(|payload| *payload == first)
+        .then(|| first.to_string())
+}
+
+fn review_batch_evidence_payloads<'a>(annotated: &'a str, path: &str, line: u32) -> Vec<&'a str> {
     let mut current_path: Option<&str> = None;
+    let mut payloads = Vec::new();
     for rendered in annotated.lines() {
         if let Some(header) = rendered.strip_prefix("### ") {
             current_path = Some(prompt_header_path(header));
@@ -3451,11 +3468,27 @@ pub fn review_batch_canonical_evidence(
         let payload = marked
             .strip_prefix("+ ")
             .or_else(|| marked.strip_prefix("  "));
-        if let Some(payload) = payload.filter(|value| value.trim() == evidence.trim()) {
-            return Some(payload.to_string());
+        if let Some(payload) = payload.filter(|value| !value.trim().is_empty()) {
+            payloads.push(payload);
         }
     }
-    None
+    payloads
+}
+
+/// Resolve a prompt citation to the exact non-empty new-side text the model
+/// must copy. This is exposed to the correction prompt, while final acceptance
+/// continues to require an exact match through `review_batch_canonical_evidence`.
+pub fn review_batch_expected_evidence(annotated: &str, path: &str, line: u32) -> Option<String> {
+    let payloads = review_batch_evidence_payloads(annotated, path, line);
+    let first = *payloads.first()?;
+    payloads
+        .iter()
+        .all(|payload| *payload == first)
+        .then(|| first.to_string())
+}
+
+pub fn review_batch_has_evidence_anchor(annotated: &str, path: &str, line: u32) -> bool {
+    !review_batch_evidence_payloads(annotated, path, line).is_empty()
 }
 
 /// Render a bounded local window around a citation from the exact evidence a
@@ -4135,12 +4168,59 @@ Binary files a/img.png and b/img.png differ
                 .as_deref(),
             Some("  indented replacement")
         );
+        assert_eq!(
+            review_batch_expected_evidence(batch, "src/a.rs", 10).as_deref(),
+            Some("replacement command")
+        );
+        assert_eq!(
+            review_batch_expected_evidence(batch, "src/a.rs", 13).as_deref(),
+            Some("  indented replacement")
+        );
+        assert_eq!(review_batch_expected_evidence(batch, "src/a.rs", 11), None);
+        assert_eq!(review_batch_expected_evidence(batch, "src/a.rs", 99), None);
         assert!(!review_batch_contains_exact_evidence(
             batch,
             "src/a.rs",
             13,
             Some("indented  replacement")
         ));
+
+        let repeated = "### src/a.rs\n@@ first @@\n    13 + first slice\n@@ second @@\n    13 + second slice\n";
+        assert_eq!(
+            review_batch_expected_evidence(repeated, "src/a.rs", 13),
+            None
+        );
+        assert!(review_batch_has_evidence_anchor(repeated, "src/a.rs", 13));
+        assert_eq!(
+            review_batch_canonical_evidence(repeated, "src/a.rs", 13, Some("second slice"))
+                .as_deref(),
+            Some("second slice")
+        );
+
+        let whitespace_distinct = "### src/a.rs\n@@ first @@\n    13 +  changed();\n@@ second @@\n    13 +   changed();\n";
+        assert_eq!(
+            review_batch_canonical_evidence(
+                whitespace_distinct,
+                "src/a.rs",
+                13,
+                Some("changed();")
+            ),
+            None
+        );
+        assert_eq!(
+            review_batch_canonical_evidence(
+                whitespace_distinct,
+                "src/a.rs",
+                13,
+                Some("  changed();")
+            )
+            .as_deref(),
+            Some("  changed();")
+        );
+        assert_eq!(
+            review_batch_expected_evidence(whitespace_distinct, "src/a.rs", 13),
+            None
+        );
     }
 
     #[test]

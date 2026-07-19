@@ -103,6 +103,65 @@ fn conservative_context_tokens(model: &str) -> usize {
     }
 }
 
+fn review_batch_validation_reason(
+    finding: &Finding,
+    annotated: &str,
+    content_policy_prompt: Option<&str>,
+) -> Option<String> {
+    if let Err(reason) = crate::envelope::validate_finding_publication(finding) {
+        return Some(format!(
+            "finding at {}:{} violates the publication contract: {reason}",
+            finding.path, finding.line
+        ));
+    }
+
+    if diff::review_batch_contains_exact_evidence(
+        annotated,
+        &finding.path,
+        finding.line,
+        finding.evidence.as_deref(),
+    ) || content_policy_prompt.is_some_and(|prompt| {
+        diff::review_batch_contains_exact_evidence(
+            prompt,
+            &finding.path,
+            finding.line,
+            finding.evidence.as_deref(),
+        )
+    }) {
+        return None;
+    }
+
+    let evidence_source = content_policy_prompt
+        .filter(|prompt| {
+            diff::review_batch_has_evidence_anchor(prompt, &finding.path, finding.line)
+        })
+        .or_else(|| {
+            diff::review_batch_has_evidence_anchor(annotated, &finding.path, finding.line)
+                .then_some(annotated)
+        });
+
+    let Some(evidence_source) = evidence_source else {
+        return Some(format!(
+            "finding at {}:{} does not cite a non-empty new-side line displayed in this review input; retract it or cite a displayed new-side line",
+            finding.path, finding.line
+        ));
+    };
+    let Some(expected) =
+        diff::review_batch_expected_evidence(evidence_source, &finding.path, finding.line)
+    else {
+        return Some(format!(
+            "finding at {}:{} has multiple displayed new-side evidence strings; copy the exact supporting string or retract it",
+            finding.path, finding.line
+        ));
+    };
+    Some(format!(
+        "finding at {}:{} must set `evidence` to the exact JSON string {}",
+        finding.path,
+        finding.line,
+        serde_json::to_string(&expected).expect("evidence string is JSON-serializable")
+    ))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForgeKind {
     GitHub,
@@ -1147,31 +1206,20 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                     let validation_user = user.clone();
                     match client
                         .review_validated(cfg, &system, &user, move |review| {
-                            let invalid = review.findings.iter().find(|finding| {
-                                let grounded = diff::review_batch_contains_exact_evidence(
-                                    &validation_annotated,
-                                    &finding.path,
-                                    finding.line,
-                                    finding.evidence.as_deref(),
-                                ) || (first
-                                    && finding.kind == crate::envelope::Kind::ContentPolicy
-                                    && diff::review_batch_contains_exact_evidence(
-                                        &validation_user,
-                                        &finding.path,
-                                        finding.line,
-                                        finding.evidence.as_deref(),
-                                    ));
-                                crate::envelope::validate_finding_publication(finding).is_err()
-                                    || !grounded
-                            });
-                            if let Some(finding) = invalid {
-                                Err(format!(
-                                    "finding at {}:{} has invalid publication text or lacks exact new-side evidence",
-                                    finding.path, finding.line
-                                ))
-                            } else {
-                                Ok(())
-                            }
+                            review
+                                .findings
+                                .iter()
+                                .find_map(|finding| {
+                                    review_batch_validation_reason(
+                                        finding,
+                                        &validation_annotated,
+                                        (first
+                                            && finding.kind
+                                                == crate::envelope::Kind::ContentPolicy)
+                                            .then_some(validation_user.as_str()),
+                                    )
+                                })
+                                .map_or(Ok(()), Err)
                         })
                         .await
                     {
@@ -1210,15 +1258,13 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                                     finding.evidence.as_deref(),
                                 )
                                 .or_else(|| {
-                                    (first
-                                        && finding.kind
-                                            == crate::envelope::Kind::ContentPolicy)
+                                    (first && finding.kind == crate::envelope::Kind::ContentPolicy)
                                         .then(|| {
                                             diff::review_batch_canonical_evidence(
-                                        &user,
-                                        &finding.path,
-                                        finding.line,
-                                        finding.evidence.as_deref(),
+                                                &user,
+                                                &finding.path,
+                                                finding.line,
+                                                finding.evidence.as_deref(),
                                             )
                                         })
                                         .flatten()
@@ -2278,5 +2324,70 @@ mod tests {
         assert_eq!(disagreements, 1);
         assert_eq!(findings[0].confidence, 0.49);
         assert_eq!(findings[0].kind, Kind::Uncertainty);
+    }
+
+    #[test]
+    fn batch_validation_exposes_exact_evidence_for_one_correction() {
+        let annotated = "### src/lib.rs\n@@ fixture @@\n    7 +   changed();\n";
+        let mut finding = finding("src/lib.rs", 7, "This change is unsafe.");
+        finding.evidence = Some("changed approximately".to_string());
+
+        let reason = review_batch_validation_reason(&finding, annotated, None).unwrap();
+        assert_eq!(
+            reason,
+            "finding at src/lib.rs:7 must set `evidence` to the exact JSON string \"  changed();\""
+        );
+
+        finding.evidence = Some("  changed();".to_string());
+        assert_eq!(
+            review_batch_validation_reason(&finding, annotated, None),
+            None
+        );
+    }
+
+    #[test]
+    fn batch_validation_reports_publication_failure_before_grounding() {
+        let annotated = "### src/lib.rs\n@@ fixture @@\n    7 + changed();\n";
+        let mut finding = finding("src/lib.rs", 7, "This sentence is cut off");
+        finding.evidence = Some("changed();".to_string());
+
+        assert_eq!(
+            review_batch_validation_reason(&finding, annotated, None).as_deref(),
+            Some(
+                "finding at src/lib.rs:7 violates the publication contract: finding body must end with sentence punctuation"
+            )
+        );
+    }
+
+    #[test]
+    fn content_policy_evidence_may_come_from_policy_prompt_on_an_overlapping_line() {
+        let annotated = "### .postil/content-policy.md\n@@ diff @@\n    7 + repository text\n";
+        let policy = "### .postil/content-policy.md\n@@ policy @@\n    7 + policy text\n";
+        let mut finding = finding(
+            ".postil/content-policy.md",
+            7,
+            "The proposed text violates the configured policy.",
+        );
+        finding.kind = Kind::ContentPolicy;
+        finding.evidence = Some("policy text".to_string());
+
+        assert_eq!(
+            review_batch_validation_reason(&finding, annotated, Some(policy)),
+            None
+        );
+    }
+
+    #[test]
+    fn batch_validation_does_not_choose_between_distinct_duplicate_slices() {
+        let annotated = "### src/lib.rs\n@@ first @@\n    7 + first slice\n@@ second @@\n    7 + second slice\n";
+        let mut finding = finding("src/lib.rs", 7, "This change is unsafe.");
+        finding.evidence = Some("approximate evidence".to_string());
+
+        assert_eq!(
+            review_batch_validation_reason(&finding, annotated, None).as_deref(),
+            Some(
+                "finding at src/lib.rs:7 has multiple displayed new-side evidence strings; copy the exact supporting string or retract it"
+            )
+        );
     }
 }
