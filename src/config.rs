@@ -224,6 +224,7 @@ pub const QUALIFICATION_MAX_AGE_DAYS: u32 = 30;
 const QUALIFICATION_MAX_AGE_SECONDS: u64 = QUALIFICATION_MAX_AGE_DAYS as u64 * 24 * 60 * 60;
 const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
 const QUALIFICATION_CANDIDATE_PROFILE_ENV: &str = "POSTIL_QUALIFICATION_CANDIDATE_PROFILE";
+const BENCH_SCREEN_PROFILE_ENV: &str = "POSTIL_BENCH_SCREEN_PROFILE";
 const BENCH_FORCE_BOUNDED_SELECTION_ENV: &str = "POSTIL_BENCH_FORCE_BOUNDED_SELECTION";
 const PROVISIONAL_HOSTED_ROSTER_ENV: &str = "POSTIL_PROVISIONAL_HOSTED_ROSTER";
 
@@ -767,6 +768,15 @@ fn parse_model_defaults(raw: &str) -> Result<ModelDefaults> {
 }
 
 fn validate_model_id(field: &str, value: &str) -> Result<()> {
+    anyhow::ensure!(!value.trim().is_empty(), "{field} must not be empty");
+    anyhow::ensure!(
+        !value.contains(['\n', '\r']),
+        "{field} must not contain line breaks"
+    );
+    Ok(())
+}
+
+fn validate_provider_identity(field: &str, value: &str) -> Result<()> {
     anyhow::ensure!(!value.trim().is_empty(), "{field} must not be empty");
     anyhow::ensure!(
         !value.contains(['\n', '\r']),
@@ -1390,6 +1400,13 @@ impl Config {
                 "qualification candidate profile does not exactly match the resolved review configuration"
             );
         }
+        if benchmark_screening_mode() {
+            let profile = benchmark_screening_profile_for_config(self)?;
+            anyhow::ensure!(
+                profile.is_some(),
+                "benchmark screening profile does not exactly match the resolved review configuration"
+            );
+        }
         Ok(())
     }
 
@@ -1547,6 +1564,80 @@ fn validate_benchmark_bounded_selection_values(
 pub(crate) fn qualification_candidate_mode() -> bool {
     cfg!(feature = "qualification-candidate")
         && std::env::var_os(QUALIFICATION_CANDIDATE_PROFILE_ENV).is_some()
+}
+
+pub(crate) fn benchmark_screening_mode() -> bool {
+    std::env::var_os(BENCH_SCREEN_PROFILE_ENV).is_some()
+}
+
+fn benchmark_screening_profile() -> Result<Option<QualificationCandidateProfile>> {
+    let Some(path) = std::env::var_os(BENCH_SCREEN_PROFILE_ENV) else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        !hosted_mode() && !qualification_candidate_mode(),
+        "benchmark screening cannot run as hosted inference or formal qualification"
+    );
+    anyhow::ensure!(
+        std::env::var("POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY").as_deref() == Ok("1"),
+        "benchmark screening requires managed provider privacy enforcement"
+    );
+    let raw = std::fs::read_to_string(&path).with_context(|| {
+        format!(
+            "reading benchmark screening profile {}",
+            Path::new(&path).display()
+        )
+    })?;
+    let profile: QualificationCandidateProfile =
+        serde_json::from_str(&raw).context("parsing benchmark screening profile")?;
+    anyhow::ensure!(
+        profile.benchmark_provider_identity == MANAGED_OPENROUTER_PROVIDER_IDENTITY,
+        "benchmark screening profile must use managed OpenRouter routing"
+    );
+    validate_provider_identity(
+        "benchmark screening upstreamProviderIdentity",
+        &profile.upstream_provider_identity,
+    )?;
+    anyhow::ensure!(
+        normalize_api_base(&profile.api_base)? == MANAGED_OPENROUTER_API_BASE
+            && profile.api_base == MANAGED_OPENROUTER_API_BASE
+            && profile.api_format == ApiFormat::OpenaiCompatible,
+        "benchmark screening profile must use the canonical managed OpenRouter endpoint"
+    );
+    anyhow::ensure!(
+        !profile.generator_chain.is_empty()
+            && (1..=profile.generator_chain.len()).contains(&profile.consensus),
+        "benchmark screening consensus must fit its generator chain"
+    );
+    anyhow::ensure!(
+        profile.scorer_chain.len() <= 2,
+        "benchmark screening scorer chain supports at most two models"
+    );
+    validate_profile_model_price_bounds(
+        "benchmark screening profile",
+        &profile.generator_chain,
+        &profile.scorer_chain,
+        &profile.model_price_bounds,
+    )?;
+    Ok(Some(profile))
+}
+
+pub(crate) fn benchmark_screening_profile_for_config(
+    config: &Config,
+) -> Result<Option<QualificationCandidateProfile>> {
+    let Some(profile) = benchmark_screening_profile()? else {
+        return Ok(None);
+    };
+    let api_base = normalize_api_base(&config.api_base)?;
+    anyhow::ensure!(
+        profile.generator_chain == config.model_chain()
+            && profile.consensus == config.consensus
+            && profile.scorer_chain == config.scorer_chain()
+            && profile.api_base == api_base
+            && profile.api_format == config.api_format,
+        "benchmark screening profile does not exactly match the resolved review configuration"
+    );
+    Ok(Some(profile))
 }
 
 pub(crate) fn qualification_plan_only() -> bool {
@@ -1736,6 +1827,7 @@ fn parse_provisional_hosted_profile(raw: &str) -> Result<QualificationCandidateP
 
 fn repository_model_config_locked() -> bool {
     hosted_runtime_mode()
+        || benchmark_screening_mode()
         || benchmark_force_bounded_selection_requested()
         || std::env::var("POSTIL_IGNORE_REPOSITORY_MODEL_CONFIG")
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))

@@ -94,7 +94,7 @@ export const QUALIFICATION_MAX_AGE_SECONDS = QUALIFICATION_MAX_AGE_DAYS * 24 * 6
 const MAX_QUALIFICATION_SOURCE_BYTES = 16 * 1024 * 1024;
 const MANAGED_OPENROUTER_API_BASE = "https://openrouter.ai:443/api/v1";
 export const MANAGED_OPENROUTER_PROVIDER_IDENTITY = "openrouter:managed-routing";
-export const LIVE_MODELS_REPORT_SCHEMA_VERSION = 2;
+export const LIVE_MODELS_REPORT_SCHEMA_VERSION = 3;
 export const LIVE_MODELS_PRIVATE_EVIDENCE_SCHEMA_VERSION = 1;
 
 export const managedAdmissionCapacityFailureCategories = [
@@ -225,7 +225,8 @@ export interface LiveModelsReport {
   /** Conservative qualification exposure, exact when accounting completes. */
   totalRunCostUsd: number;
   totalRunCostUsdDecimal: string;
-  exactSuccessfulCostUsdDecimal: string;
+  /** Sum of every exact provider-reported cost observed, including failed calls. */
+  observedProviderCostUsdDecimal: string;
   failedOrUnknownExposureUsdDecimal: string;
   costAccountingComplete: boolean;
   reservedQualificationExposureUsdDecimal: string;
@@ -295,7 +296,7 @@ const LIVE_MODELS_REPORT_FIELDS = new Set([
   "evidenceHash", "privateEvidenceSha256", "attributionContractHash", "attributionBankHash",
   "attributionEvaluators", "hostedOperationCostCapMicros", "repeats", "profiles", "manifestCandidate",
   "passed", "models", "modelAggregates", "totalRunCostUsd", "totalRunCostUsdDecimal",
-  "exactSuccessfulCostUsdDecimal", "failedOrUnknownExposureUsdDecimal", "costAccountingComplete",
+  "observedProviderCostUsdDecimal", "failedOrUnknownExposureUsdDecimal", "costAccountingComplete",
   "reservedQualificationExposureUsdDecimal", "attributionRunCostUsd", "attributionRunCostUsdDecimal",
   "attributionFailedExposureUsdDecimal", "attributionProviderCalls", "cases",
 ]);
@@ -741,20 +742,21 @@ export async function runLiveModels(
     .map((result) => result.costProviderDecimal)
     .filter((value): value is string => value !== null)
     .map(parseCanonicalDecimal);
-  const exactSuccessfulCost = sumCanonicalDecimals([
+  const observedProviderCost = sumCanonicalDecimals([
     ...exactGeneratorCosts,
     parseCanonicalDecimal(attributionGovernor.actualSpendUsdDecimal),
   ]);
-  const exactSuccessfulCostUsdDecimal = formatCanonicalDecimal(exactSuccessfulCost);
-  const costAccountingComplete = results.every((result) =>
-    result.scored && result.usageAccountingComplete === true && result.costProvenance === "providerExact") &&
-    attributionGovernor.failedExposureUsdDecimal === "0";
+  const observedProviderCostUsdDecimal = formatCanonicalDecimal(observedProviderCost);
+  const costAccountingComplete = liveModelsCostAccountingComplete(
+    results,
+    attributionGovernor.failedExposureUsdDecimal,
+  );
   const reservedExposure = parseCanonicalDecimal(reservedQualificationExposureUsdDecimal);
   const failedOrUnknownExposure = costAccountingComplete
     ? parseCanonicalDecimal("0")
-    : subtractCanonicalDecimal(reservedExposure, exactSuccessfulCost);
+    : subtractCanonicalDecimal(reservedExposure, observedProviderCost);
   const failedOrUnknownExposureUsdDecimal = formatCanonicalDecimal(failedOrUnknownExposure);
-  const conservativeTotal = sumCanonicalDecimals([exactSuccessfulCost, failedOrUnknownExposure]);
+  const conservativeTotal = sumCanonicalDecimals([observedProviderCost, failedOrUnknownExposure]);
   const totalRunCostUsdDecimal = formatCanonicalDecimal(conservativeTotal);
   const totalRunCostUsd = Number(totalRunCostUsdDecimal);
   const privateEvidence: LiveModelsPrivateEvidenceBundle = {
@@ -798,7 +800,7 @@ export async function runLiveModels(
     attributionFailedExposureUsdDecimal: attributionGovernor.failedExposureUsdDecimal,
     attributionProviderCalls: attributionGovernor.actualCalls,
     totalRunCostUsdDecimal,
-    exactSuccessfulCostUsdDecimal,
+    observedProviderCostUsdDecimal,
     failedOrUnknownExposureUsdDecimal,
     costAccountingComplete,
     reservedQualificationExposureUsdDecimal,
@@ -843,7 +845,7 @@ export async function runLiveModels(
     modelAggregates: aggregates,
     totalRunCostUsd,
     totalRunCostUsdDecimal,
-    exactSuccessfulCostUsdDecimal,
+    observedProviderCostUsdDecimal,
     failedOrUnknownExposureUsdDecimal,
     costAccountingComplete,
     reservedQualificationExposureUsdDecimal,
@@ -878,6 +880,15 @@ export async function runLiveModels(
     verifyPrivateEvidenceBundle(privateEvidence, report);
     return { report, privateEvidence };
   });
+}
+
+export function liveModelsCostAccountingComplete(
+  results: readonly Pick<LiveModelCaseResult, "usageAccountingComplete" | "costProvenance">[],
+  attributionFailedExposureUsdDecimal: string,
+): boolean {
+  return results.every((result) =>
+    result.usageAccountingComplete === true && result.costProvenance === "providerExact") &&
+    attributionFailedExposureUsdDecimal === "0";
 }
 
 export function assertQualificationInputsUnchanged(
@@ -2339,7 +2350,7 @@ export function formatLiveModelsReport(report: LiveModelsReport): string {
   }
   lines.push(
     "",
-    `Conservative run cost: $${report.totalRunCostUsdDecimal} (exact successful $${report.exactSuccessfulCostUsdDecimal}; failed or unknown exposure $${report.failedOrUnknownExposureUsdDecimal})`,
+    `Conservative run cost: $${report.totalRunCostUsdDecimal} (observed provider $${report.observedProviderCostUsdDecimal}; failed or unknown exposure $${report.failedOrUnknownExposureUsdDecimal})`,
     `Atomic attribution: $${report.attributionRunCostUsdDecimal} exact across ${report.attributionProviderCalls} provider calls`,
     "",
     `Fixture ${report.fixtureHash}; review contract ${report.reviewContractHash}.`,

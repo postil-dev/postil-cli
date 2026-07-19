@@ -33,6 +33,11 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { API_KEY_ENV_NAMES_TEXT, forwardApiKey, resolveApiKeyName } from "./api-key";
 import { benchmarkCase, type BenchmarkCaseInput, envelopeV1, type Envelope } from "./harness";
+import {
+  formatCanonicalDecimal,
+  parseCanonicalDecimal,
+  sumCanonicalDecimals,
+} from "./livemodels-score";
 
 const execFile = promisify(execFileCb);
 const ADMISSION_API_BASE = "https://openrouter.ai:443/api/v1";
@@ -79,6 +84,10 @@ export interface LiveOptions {
   binary: string;
   /** Explicit candidate model id passed via REVIEW_MODEL. */
   model: string;
+  /** Optional scorer candidate for a non-admission screen. */
+  scorerModel?: string;
+  /** Exact provider and price contract used only by non-admission screening. */
+  screenProfilePath?: string;
   /** Root directory for per-case run dirs. Defaults to bench/.runs. */
   rootDir?: string;
   /** Per-case timeout (default 180s; live inference is slow). */
@@ -89,6 +98,8 @@ export interface LiveOptions {
   retries?: number;
   /** Exercise deterministic risk selection and synthesis for large reviews. */
   bounded?: boolean;
+  /** Exact fixture IDs for a non-admission screening subset. */
+  selectedCaseIds?: string[];
 }
 
 export function liveReviewArguments(diffPath: string, bounded = false): string[] {
@@ -130,6 +141,8 @@ export interface LiveCaseResult {
   durationMs: number | null;
   promptTokens: number;
   completionTokens: number;
+  observedProviderCostUsdDecimal: string | null;
+  costAccountingComplete: boolean;
   reviewCoverage: Envelope["reviewCoverage"] | null;
   exitCode: number | undefined;
   error?: string;
@@ -148,7 +161,13 @@ export interface LiveSummary {
   providerIdentity: "openrouter:managed-routing" | "custom";
   apiBase: string;
   apiFormat: string;
-  scorerMode: "disabled";
+  scorerMode: "disabled" | "enabled";
+  scorerModel: string | null;
+  evidenceScope: "full-corpus" | "selected-cases";
+  selectedCaseIds: string[];
+  providerContractEnforced: boolean;
+  screeningProfileSha256: string | null;
+  upstreamProviderIdentity: string | null;
   ranAt: string;
   totalCases: number;
   defectCases: number;
@@ -171,6 +190,8 @@ export interface LiveSummary {
   };
   durationMs: { median: number | null; min: number | null; max: number | null };
   totalTokens: { prompt: number; completion: number; total: number };
+  observedProviderCostUsdDecimal: string;
+  costAccountingComplete: boolean;
   errors: number;
 }
 
@@ -195,6 +216,9 @@ export async function runLive(
   }
   const cases = inputs.map((input) => benchmarkCase.parse(input));
   const provider = liveProvider();
+  const screeningProfile = options.screenProfilePath === undefined
+    ? null
+    : await screeningProfileMetadata(options.screenProfilePath);
   await assertBinary(options.binary);
   const binarySha256 = createHash("sha256")
     .update(await readFile(options.binary))
@@ -239,8 +263,31 @@ export async function runLive(
       fixtureCorpusSha256,
       evaluatorSha256,
       provider,
+      screeningProfile,
     ),
     results: ordered,
+  };
+}
+
+async function screeningProfileMetadata(path: string): Promise<{
+  sha256: string;
+  upstreamProviderIdentity: string;
+}> {
+  const bytes = await readFile(resolve(path));
+  const parsed = safeJson(bytes.toString("utf8"));
+  const record = typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+    ? parsed as Record<string, unknown>
+    : null;
+  const upstreamProviderIdentity = record?.upstreamProviderIdentity;
+  if (
+    typeof upstreamProviderIdentity !== "string" ||
+    upstreamProviderIdentity.trim().length === 0
+  ) {
+    throw new Error("screening profile must declare a nonempty upstreamProviderIdentity");
+  }
+  return {
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+    upstreamProviderIdentity,
   };
 }
 
@@ -371,6 +418,8 @@ async function runLiveCase(
     durationMs: null,
     promptTokens: 0,
     completionTokens: 0,
+    observedProviderCostUsdDecimal: null,
+    costAccountingComplete: false,
     reviewCoverage: null,
     exitCode: undefined,
   };
@@ -393,7 +442,14 @@ async function runLiveCase(
       liveReviewArguments(diffPath, options.bounded),
       {
         cwd: runDir,
-        env: liveEnv(options.model, homeDir, tmpDir, liveProvider()),
+        env: liveEnv(
+          options.model,
+          options.scorerModel,
+          options.screenProfilePath,
+          homeDir,
+          tmpDir,
+          liveProvider(),
+        ),
         timeout: options.timeoutMs ?? 180_000,
         maxBuffer: 8 * 1024 * 1024,
       },
@@ -422,9 +478,17 @@ async function runLiveCase(
   base.durationMs = parsed.data.durationMs;
   base.promptTokens = parsed.data.usage.promptTokens;
   base.completionTokens = parsed.data.usage.completionTokens;
-  const operationalFailure = envelopeOperationalFailure(parsed.data);
+  const observedCost = exactProviderCost(parsed.data);
+  base.observedProviderCostUsdDecimal = observedCost.costUsdDecimal;
+  base.costAccountingComplete = observedCost.complete;
+  const operationalFailure = envelopeOperationalFailure(parsed.data, options.model);
   if (operationalFailure) {
     base.error = operationalFailure;
+    return base;
+  }
+  const scorerFailure = scorerOperationalFailure(parsed.data, options.scorerModel);
+  if (scorerFailure) {
+    base.error = scorerFailure;
     return base;
   }
   base.reviewCoverage = parsed.data.reviewCoverage ?? null;
@@ -438,7 +502,10 @@ async function runLiveCase(
   return scoreCase(base, truth, parsed.data);
 }
 
-export function envelopeOperationalFailure(env: Envelope): string | null {
+export function envelopeOperationalFailure(
+  env: Envelope,
+  expectedGenerator?: string,
+): string | null {
   const incident = env.modelIncidents.find((candidate) => !candidate.recovered);
   if (incident) {
     return `operational envelope: ${incident.phase}/${incident.category}`;
@@ -450,9 +517,61 @@ export function envelopeOperationalFailure(env: Envelope): string | null {
   if (env.usageAccountingComplete !== true) {
     return "operational envelope: usage accounting incomplete";
   }
-  const generatorUsage = env.modelUsage?.some((usage) => usage.role === "reviewGenerator");
-  if (env.modelUsed !== "none (disabled by config)" && !generatorUsage) {
+  const generatorUsage = (env.modelUsage ?? []).filter((usage) =>
+    usage.role === "reviewGenerator" || usage.role === "reviewPlanner"
+  );
+  if (env.modelUsed !== "none (disabled by config)" &&
+      !generatorUsage.some((usage) => usage.role === "reviewGenerator")) {
     return "operational envelope: review generator usage missing";
+  }
+  if (expectedGenerator !== undefined && env.modelUsed !== expectedGenerator) {
+    return `operational envelope: generator identity ${env.modelUsed} does not match ${expectedGenerator}`;
+  }
+  if (expectedGenerator !== undefined &&
+      generatorUsage.some((usage) => usage.model !== expectedGenerator)) {
+    return "operational envelope: generator usage identity mismatch";
+  }
+  return null;
+}
+
+export function exactProviderCost(env: Envelope): {
+  costUsdDecimal: string | null;
+  complete: boolean;
+} {
+  const usage = env.modelUsage ?? [];
+  if (usage.length === 0 || usage.some((event) =>
+    event.accountingComplete !== true ||
+    event.costSource !== "providerReported" ||
+    event.costProviderDecimal === undefined
+  )) {
+    return { costUsdDecimal: null, complete: false };
+  }
+  try {
+    return {
+      costUsdDecimal: formatCanonicalDecimal(sumCanonicalDecimals(
+        usage.map((event) => parseCanonicalDecimal(event.costProviderDecimal!)),
+      )),
+      complete: true,
+    };
+  } catch {
+    return { costUsdDecimal: null, complete: false };
+  }
+}
+
+export function scorerOperationalFailure(
+  env: Envelope,
+  expectedScorer: string | undefined,
+): string | null {
+  if (expectedScorer === undefined) return null;
+  const scorerUsage = (env.modelUsage ?? []).filter((event) => event.role === "findingScorer");
+  if (env.scorerModel !== expectedScorer) {
+    return `operational envelope: scorer identity ${env.scorerModel ?? "missing"} does not match ${expectedScorer}`;
+  }
+  if (scorerUsage.length === 0) {
+    return "operational envelope: configured scorer was not exercised";
+  }
+  if (scorerUsage.some((event) => event.model !== expectedScorer)) {
+    return "operational envelope: scorer usage identity mismatch";
   }
   return null;
 }
@@ -474,6 +593,8 @@ function liveProvider(): LiveProvider {
 
 function liveEnv(
   model: string,
+  scorerModel: string | undefined,
+  screenProfilePath: string | undefined,
   homeDir: string,
   tmpDir: string,
   provider: LiveProvider,
@@ -490,9 +611,17 @@ function liveEnv(
     GIT_CONFIG_NOSYSTEM: "1",
     GIT_TERMINAL_PROMPT: "0",
     REVIEW_MODEL: model,
-    POSTIL_DISABLE_SCORER: "1",
     POSTIL_API_BASE: provider.apiBase,
     POSTIL_API_FORMAT: provider.apiFormat,
+    ...(scorerModel === undefined
+      ? { POSTIL_DISABLE_SCORER: "1" }
+      : { REVIEW_SCORER_MODEL: scorerModel }),
+    ...(screenProfilePath === undefined
+      ? {}
+      : {
+          POSTIL_BENCH_SCREEN_PROFILE: resolve(screenProfilePath),
+          POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY: "1",
+        }),
   };
   forwardApiKey(env);
   return env;
@@ -587,6 +716,7 @@ function summarize(
   fixtureCorpusSha256: string,
   evaluatorSha256: string,
   provider: LiveProvider,
+  screeningProfile: { sha256: string; upstreamProviderIdentity: string } | null,
 ): LiveSummary {
   const defects = results.filter((r) => r.type === "defect");
   const cleans = results.filter((r) => r.type === "clean");
@@ -609,6 +739,10 @@ function summarize(
 
   const promptTokens = results.reduce((sum, r) => sum + r.promptTokens, 0);
   const completionTokens = results.reduce((sum, r) => sum + r.completionTokens, 0);
+  const observedProviderCost = sumCanonicalDecimals(results.flatMap((result) =>
+    result.observedProviderCostUsdDecimal === null
+      ? []
+      : [parseCanonicalDecimal(result.observedProviderCostUsdDecimal)]));
 
   return {
     model: options.model,
@@ -620,7 +754,13 @@ function summarize(
     providerIdentity: provider.identity,
     apiBase: provider.apiBase,
     apiFormat: provider.apiFormat,
-    scorerMode: "disabled",
+    scorerMode: options.scorerModel === undefined ? "disabled" : "enabled",
+    scorerModel: options.scorerModel ?? null,
+    evidenceScope: options.selectedCaseIds?.length ? "selected-cases" : "full-corpus",
+    selectedCaseIds: options.selectedCaseIds ?? [],
+    providerContractEnforced: options.screenProfilePath !== undefined,
+    screeningProfileSha256: screeningProfile?.sha256 ?? null,
+    upstreamProviderIdentity: screeningProfile?.upstreamProviderIdentity ?? null,
     ranAt: new Date().toISOString(),
     totalCases: results.length,
     defectCases: defects.length,
@@ -649,8 +789,16 @@ function summarize(
       completion: completionTokens,
       total: promptTokens + completionTokens,
     },
+    observedProviderCostUsdDecimal: formatCanonicalDecimal(observedProviderCost),
+    costAccountingComplete: liveCostAccountingComplete(results),
     errors: results.filter((r) => r.error !== undefined).length,
   };
+}
+
+export function liveCostAccountingComplete(
+  results: readonly Pick<LiveCaseResult, "costAccountingComplete">[],
+): boolean {
+  return results.every((result) => result.costAccountingComplete);
 }
 
 function median(sorted: number[]): number | null {
@@ -666,6 +814,14 @@ export function formatLiveReport(report: LiveReport): string {
   const s = report.summary;
   const lines: string[] = [
     `postil bench (LIVE ${s.reviewMode} mode): model ${s.model}`,
+    s.scorerModel === null ? "Scorer: disabled" : `Scorer: ${s.scorerModel}`,
+    s.evidenceScope === "selected-cases"
+      ? `Screening subset: ${s.selectedCaseIds.join(", ")} (not admission evidence)`
+      : "Evidence scope: full fixture corpus (development evidence only)",
+    `Provider contract: ${s.providerContractEnforced ? "enforced" : "not enforced"}`,
+    ...(s.upstreamProviderIdentity === null
+      ? []
+      : [`Upstream provider: ${s.upstreamProviderIdentity}; profile ${s.screeningProfileSha256}`]),
     `Detection ${s.detectionRate} defects | severity match (exact) ${s.severityMatchExact} | ` +
       `severity match (+/-1 tier) ${s.severityMatchWithinOneTier} | ` +
       `silent-on-clean ${s.silentOnClean} | false-positives ${s.falsePositives}`,
@@ -680,6 +836,8 @@ export function formatLiveReport(report: LiveReport): string {
     `Duration ms: median ${s.durationMs.median ?? "n/a"} ` +
       `(min ${s.durationMs.min ?? "n/a"}, max ${s.durationMs.max ?? "n/a"})`,
     `Tokens: ${s.totalTokens.total} (${s.totalTokens.prompt} prompt + ${s.totalTokens.completion} completion)`,
+    `Observed provider cost: $${s.observedProviderCostUsdDecimal} ` +
+      `(${s.costAccountingComplete ? "complete accounting" : "incomplete accounting"})`,
   );
   if (s.errors > 0) {
     lines.push(`Cases without a valid envelope: ${s.errors} (excluded from scoring)`);

@@ -7,6 +7,7 @@ import { join, resolve } from "node:path";
 import { cases as fixtureInputs } from "../fixtures/cases";
 import { benchmarkCase, envelopeV1, parseUnifiedDiffFiles } from "./harness";
 import {
+  canonicalProviderCost,
   FALSE_FINDING_CASES,
   GENERATOR_MODEL,
   SCORER_CASE_EXEC_TIMEOUT_MS,
@@ -34,6 +35,8 @@ import {
   runScorerEvalMatrix,
   reviewCoverageFailure,
   scorerCasePasses,
+  scorerCostProviderDecimal,
+  providerCostDecimalFromResponse,
   scorerCheckpointPath,
   selectEvalCases,
   startScorerProxy,
@@ -129,6 +132,7 @@ function result(overrides: Partial<ScorerEvalCase>): ScorerEvalCase {
     promptTokens: 10,
     completionTokens: 5,
     costUsd: 0.0001,
+    costProviderDecimal: "0.0001",
     ...overrides,
   };
 }
@@ -1157,5 +1161,50 @@ describe("formatReport", () => {
     expect(output).toContain("2/2");
     expect(output).toContain("1/1");
     expect(output).toContain("yes");
+  });
+
+  test("accepts one complete canonical scorer cost event", () => {
+    expect(scorerCostProviderDecimal({
+      modelUsage: [{
+        model: "scorer/model",
+        role: "findingScorer",
+        accountingComplete: true,
+        costSource: "providerReported",
+        costProviderDecimal: "0.00012",
+      }],
+    }, "scorer/model")).toBe("0.00012");
+    expect(scorerCostProviderDecimal({
+      modelUsage: [{
+        model: "scorer/model",
+        role: "findingScorer",
+        accountingComplete: false,
+        costSource: "providerReported",
+        costProviderDecimal: "0.00012",
+      }],
+    }, "scorer/model")).toBeNull();
+    expect(scorerCostProviderDecimal({
+      modelUsage: [{
+        model: "scorer/model",
+        role: "findingScorer",
+        accountingComplete: true,
+        costSource: "providerReported",
+        costProviderDecimal: "0.0001200",
+      }],
+    }, "scorer/model")).toBeNull();
+  });
+
+  test("preserves exact provider cost text without JavaScript number rounding", () => {
+    expect(canonicalProviderCost("1.2300e-7")).toBe("0.000000123");
+    expect(canonicalProviderCost("0.000000123456789123")).toBe("0.000000123456789123");
+    expect(providerCostDecimalFromResponse(JSON.stringify({
+      choices: [{ message: { content: "cost: 9" } }],
+      usage: { cost: 0.00012 },
+    }))).toBe("0.00012");
+    expect(providerCostDecimalFromResponse(
+      '{"choices":[],"usage":{"cost":0.000000123456789123}}',
+    )).toBe("0.000000123456789123");
+    expect(providerCostDecimalFromResponse(
+      '{"choices":[],"usage":{"cost":1.2300e-7}}',
+    )).toBe("0.000000123");
   });
 });

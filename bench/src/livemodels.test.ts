@@ -25,6 +25,7 @@ import {
   hashNamedSources,
   liveEnv,
   liveModelsQualificationExitCode,
+  liveModelsCostAccountingComplete,
   MANAGED_OPENROUTER_PROVIDER_IDENTITY,
   modelPriceBoundsFor,
   normalizeApiBase,
@@ -83,6 +84,21 @@ async function close(server: Server): Promise<void> {
 }
 
 describe("pair qualification configuration", () => {
+  test("keeps provider cost completeness independent from scoring outcome", () => {
+    expect(liveModelsCostAccountingComplete([{
+      usageAccountingComplete: true,
+      costProvenance: "providerExact",
+    }], "0")).toBe(true);
+    expect(liveModelsCostAccountingComplete([{
+      usageAccountingComplete: false,
+      costProvenance: "providerExact",
+    }], "0")).toBe(false);
+    expect(liveModelsCostAccountingComplete([{
+      usageAccountingComplete: true,
+      costProvenance: "providerExact",
+    }], "0.01")).toBe(false);
+  });
+
   test("derives role-specific provider parameters for every model in a profile", () => {
     expect(qualificationRequiredParameters([{
       generatorModel: "provider/shared",
@@ -1159,7 +1175,7 @@ describe("qualification report", () => {
   test("prints attributable metrics, hashes, provider, and bounded costs", () => {
     const cost = 0.123456;
     const report: LiveModelsReport = {
-      schemaVersion: 2,
+      schemaVersion: 3,
       generatedAt: "2026-07-11T00:00:00.000Z",
       qualificationSourceSha: "9".repeat(40),
       cliVersion: "postil 0.6.1",
@@ -1231,7 +1247,7 @@ describe("qualification report", () => {
       }],
       totalRunCostUsd: cost,
       totalRunCostUsdDecimal: "0.123456",
-      exactSuccessfulCostUsdDecimal: "0.123456",
+      observedProviderCostUsdDecimal: "0.123456",
       failedOrUnknownExposureUsdDecimal: "0",
       costAccountingComplete: true,
       reservedQualificationExposureUsdDecimal: "0.123456",
@@ -1273,7 +1289,7 @@ describe("qualification report", () => {
     expect(output).toContain("Fixture aaaa");
     expect(output).toContain("Provider endpoint https://example.test:443/v1; upstream PinnedProvider pinned for every qualification call; 3 complete repeats");
     expect(output).toContain("$0.1235");
-    expect(output).toContain("exact successful $0.123456");
+    expect(output).toContain("observed provider $0.123456");
     expect(output).toContain("FAIL: mean cost exceeds admission limit");
     expect(liveModelsQualificationExitCode(report)).toBe(1);
   });
