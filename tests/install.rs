@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
@@ -21,6 +21,44 @@ fn write_executable(path: &Path, contents: &str) {
     fs::set_permissions(path, permissions).unwrap();
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+const HOST_TARGET: &str = "x86_64-unknown-linux-gnu";
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "musl"))]
+const HOST_TARGET: &str = "x86_64-unknown-linux-musl";
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const MUSL_HOST_ARCH: &str = "x86_64";
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const MUSL_HOST_TARGET: &str = "x86_64-unknown-linux-musl";
+#[cfg(all(target_os = "linux", target_arch = "aarch64", target_env = "gnu"))]
+const HOST_TARGET: &str = "aarch64-unknown-linux-gnu";
+#[cfg(all(target_os = "linux", target_arch = "aarch64", target_env = "musl"))]
+const HOST_TARGET: &str = "aarch64-unknown-linux-musl";
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const MUSL_HOST_ARCH: &str = "aarch64";
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const MUSL_HOST_TARGET: &str = "aarch64-unknown-linux-musl";
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+const HOST_TARGET: &str = "x86_64-apple-darwin";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const HOST_TARGET: &str = "aarch64-apple-darwin";
+
+fn link_test_tools(tools: &Path) {
+    for command in [
+        "awk", "chmod", "cp", "grep", "gzip", "head", "ls", "mkdir", "mktemp", "mv", "rm", "tar",
+        "uname",
+    ] {
+        symlink(system_command(command), tools.join(command)).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    for command in ["ldd", "sha256sum"] {
+        symlink(system_command(command), tools.join(command)).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    symlink(system_command("shasum"), tools.join("shasum")).unwrap();
+}
+
 struct InstallerFixture {
     _root: tempfile::TempDir,
     tools: PathBuf,
@@ -30,6 +68,10 @@ struct InstallerFixture {
 
 impl InstallerFixture {
     fn new(with_cosign: bool) -> Self {
+        Self::for_target(with_cosign, HOST_TARGET)
+    }
+
+    fn for_target(with_cosign: bool, target: &str) -> Self {
         let root = tempfile::tempdir().unwrap();
         let tools = root.path().join("tools");
         let artifacts = root.path().join("artifacts");
@@ -39,31 +81,14 @@ impl InstallerFixture {
             fs::create_dir(directory).unwrap();
         }
 
-        for command in [
-            "awk",
-            "chmod",
-            "cp",
-            "grep",
-            "gzip",
-            "head",
-            "ldd",
-            "ls",
-            "mkdir",
-            "mktemp",
-            "mv",
-            "rm",
-            "sha256sum",
-            "tar",
-            "uname",
-        ] {
-            symlink(system_command(command), tools.join(command)).unwrap();
-        }
+        link_test_tools(&tools);
 
         write_executable(
             &payload.join("postil"),
             "#!/bin/sh\necho 'postil test-version'\n",
         );
-        let archive = artifacts.join("postil-x86_64-unknown-linux-gnu.tar.gz");
+        let archive_name = format!("postil-{target}.tar.gz");
+        let archive = artifacts.join(&archive_name);
         let status = Command::new(system_command("tar"))
             .args(["-czf"])
             .arg(&archive)
@@ -79,14 +104,16 @@ impl InstallerFixture {
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
         fs::write(
-            artifacts.join("postil-x86_64-unknown-linux-gnu.tar.gz.sha256"),
-            format!("{digest}  postil-x86_64-unknown-linux-gnu.tar.gz\n"),
+            artifacts.join(format!("{archive_name}.sha256")),
+            format!("{digest}  {archive_name}\n"),
         )
         .unwrap();
 
         write_executable(
             &tools.join("curl"),
-            "#!/bin/sh\ncase \"$2\" in\n  *.tar.gz.sha256) cp \"$POSTIL_TEST_ARTIFACTS/postil-x86_64-unknown-linux-gnu.tar.gz.sha256\" \"$4\" ;;\n  *.tar.gz.sig|*.tar.gz.pem) : > \"$4\" ;;\n  *.tar.gz) cp \"$POSTIL_TEST_ARTIFACTS/postil-x86_64-unknown-linux-gnu.tar.gz\" \"$4\" ;;\n  *) exit 1 ;;\nesac\n",
+            &format!(
+                "#!/bin/sh\ncase \"$2\" in\n  https://github.com/postil-dev/postil-cli/releases/download/v-test/{archive_name}.sha256) cp \"$POSTIL_TEST_ARTIFACTS/{archive_name}.sha256\" \"$4\" ;;\n  https://github.com/postil-dev/postil-cli/releases/download/v-test/{archive_name}.sig|https://github.com/postil-dev/postil-cli/releases/download/v-test/{archive_name}.pem) : > \"$4\" ;;\n  https://github.com/postil-dev/postil-cli/releases/download/v-test/{archive_name}) cp \"$POSTIL_TEST_ARTIFACTS/{archive_name}\" \"$4\" ;;\n  *) exit 1 ;;\nesac\n"
+            ),
         );
         if with_cosign {
             write_executable(&tools.join("cosign"), "#!/bin/sh\nexit 0\n");
@@ -111,6 +138,20 @@ impl InstallerFixture {
             .env("POSTIL_TEST_ARTIFACTS", &self.artifacts)
             .env_remove("POSTIL_SKIP_SIG");
         command.output().unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn simulate_musl_host(&self) {
+        for command in ["uname", "ldd"] {
+            fs::remove_file(self.tools.join(command)).unwrap();
+        }
+        write_executable(
+            &self.tools.join("uname"),
+            &format!(
+                "#!/bin/sh\ncase \"$1\" in\n  -s) echo Linux ;;\n  -m) echo {MUSL_HOST_ARCH} ;;\n  *) exit 1 ;;\nesac\n"
+            ),
+        );
+        write_executable(&self.tools.join("ldd"), "#!/bin/sh\necho 'musl libc'\n");
     }
 }
 
@@ -156,5 +197,16 @@ fn require_cosign_verifies_the_signature_before_installing() {
             .unwrap()
             .contains("WARNING")
     );
+    assert!(fixture.bin.join("postil").is_file());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn musl_host_downloads_the_musl_release_asset() {
+    let fixture = InstallerFixture::for_target(false, MUSL_HOST_TARGET);
+    fixture.simulate_musl_host();
+    let output = fixture.run(&[]);
+
+    assert!(output.status.success(), "{output:?}");
     assert!(fixture.bin.join("postil").is_file());
 }
