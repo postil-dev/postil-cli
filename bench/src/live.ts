@@ -564,6 +564,10 @@ export function scorerOperationalFailure(
 ): string | null {
   if (expectedScorer === undefined) return null;
   const scorerUsage = (env.modelUsage ?? []).filter((event) => event.role === "findingScorer");
+  const generatorWasSilent = env.findings.length === 0 && (env.suppressedFindings?.length ?? 0) === 0;
+  if (generatorWasSilent && env.scorerModel === undefined && scorerUsage.length === 0) {
+    return null;
+  }
   if (env.scorerModel !== expectedScorer) {
     return `operational envelope: scorer identity ${env.scorerModel ?? "missing"} does not match ${expectedScorer}`;
   }
