@@ -2034,6 +2034,121 @@ async fn large_source_diff_reviews_every_bounded_batch_and_aggregates_findings()
 }
 
 #[tokio::test]
+async fn irreparable_batch_keeps_later_batches_in_the_strict_failure_envelope() {
+    use std::fmt::Write as _;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(|request: &wiremock::Request| {
+            let body = String::from_utf8_lossy(&request.body);
+            if body.contains("bounded synthesis window") {
+                return ResponseTemplate::new(200).set_body_json(llm_content(json!([])));
+            }
+            if body.contains("invalid_batch_marker") {
+                return ResponseTemplate::new(200).set_body_json(llm_content(json!([{
+                    "path": "src/missing.rs",
+                    "line": 99_999,
+                    "severity": "error",
+                    "kind": "risk",
+                    "confidence": 0.99,
+                    "title": "Invalid fixture finding",
+                    "body": "This model output does not cite supplied evidence.",
+                    "evidence": "not supplied"
+                }])));
+            }
+            let findings = if body.contains("valid_later_batch_marker") {
+                let evidence =
+                    prompt_evidence(request, "src/z-valid.rs", 1, "valid_later_batch_marker");
+                json!([{
+                    "path": "src/z-valid.rs",
+                    "line": 1,
+                    "severity": "warn",
+                    "kind": "risk",
+                    "confidence": 0.95,
+                    "title": "Preserve the later batch finding",
+                    "body": "The later request remains represented even when an earlier request is unusable.",
+                    "evidence": evidence
+                }])
+            } else {
+                json!([])
+            };
+            ResponseTemplate::new(200).set_body_json(llm_content(findings))
+        })
+        .mount(&server)
+        .await;
+
+    let mut source = String::from(
+        "diff --git a/src/a-invalid.rs b/src/a-invalid.rs\n--- /dev/null\n+++ b/src/a-invalid.rs\n@@ -0,0 +1,700 @@\n+invalid_batch_marker();\n",
+    );
+    for line in 2..=700 {
+        writeln!(
+            source,
+            "+let padding_{line:04} = trusted; // {}",
+            "x".repeat(120)
+        )
+        .unwrap();
+    }
+    source.push_str(
+        "diff --git a/src/z-valid.rs b/src/z-valid.rs\n--- /dev/null\n+++ b/src/z-valid.rs\n@@ -0,0 +1 @@\n+valid_later_batch_marker();\n",
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = dir.path().join("continue-after-invalid.diff");
+    std::fs::write(&diff, source).unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .env("REVIEW_MODEL", "primary-model")
+        .env("REVIEW_MODEL_CASCADE", "backup-model")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .failure();
+
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let findings = envelope["findings"].as_array().unwrap();
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding["path"] == "src/z-valid.rs")
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding["path"] == ".postil/model-output")
+    );
+    assert!(envelope["reviewCoverage"]["totalBatches"].as_u64().unwrap() > 1);
+    assert!(
+        envelope["modelUsage"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|usage| usage["model"] == "backup-model")
+    );
+
+    let requests = server.received_requests().await.unwrap();
+    let failed_batch_fallback = requests
+        .iter()
+        .position(|request| {
+            let body = String::from_utf8_lossy(&request.body);
+            body.contains("invalid_batch_marker")
+                && !body.contains("valid_later_batch_marker")
+                && body.contains("backup-model")
+        })
+        .unwrap();
+    let later_valid = requests
+        .iter()
+        .position(|request| {
+            String::from_utf8_lossy(&request.body).contains("valid_later_batch_marker")
+        })
+        .unwrap();
+    assert!(later_valid > failed_batch_fallback);
+}
+
+#[tokio::test]
 async fn local_bounded_is_explicit_and_default_local_review_remains_exhaustive() {
     use std::fmt::Write as _;
 

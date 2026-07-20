@@ -606,9 +606,9 @@ fn review_semantic_retry_user(user: &str, previous: &str) -> String {
     )
 }
 
-fn review_validation_retry_user(user: &str, reason: &str) -> String {
+fn review_validation_retry_user(user: &str, previous: &str, reason: &str) -> String {
     format!(
-        "{user}\n\n[Correction] The previous response was unusable: {reason}. Correct that exact contract failure. Preserve a finding only when the review input supports it; otherwise retract it. Return only the corrected review JSON."
+        "{user}\n\n[Your previous response]\n{previous}\n\n[Correction] The previous response was unusable: {reason}. Correct every listed contract failure. Preserve a finding only when the review input supports it; otherwise retract it. Return only the corrected review JSON."
     )
 }
 
@@ -2372,7 +2372,8 @@ impl LlmClient {
                 "postil: model {} returned unusable review content; requesting one semantic retry",
                 log_text(model),
             );
-            let retry_user = review_validation_retry_user(user, &reason);
+            let previous = truncate_utf8_bytes(&content, 16_384);
+            let retry_user = review_validation_retry_user(user, previous, &reason);
             let mut retry_usage = review.usage;
             let mut retry_accounting_complete = review.usage_accounting_complete;
             let retry = self
@@ -4353,6 +4354,20 @@ fn consensus_merge(runs: Vec<ModelReview>) -> ModelReview {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validation_retry_includes_the_response_and_failure_to_repair() {
+        let prompt = review_validation_retry_user(
+            "review input",
+            r#"{"summary":"","findings":[{"path":"wrong.rs"}]}"#,
+            "finding at wrong.rs:7 is not grounded",
+        );
+
+        assert!(prompt.contains("[Your previous response]"));
+        assert!(prompt.contains(r#"{"summary":"","findings":[{"path":"wrong.rs"}]}"#));
+        assert!(prompt.contains("finding at wrong.rs:7 is not grounded"));
+        assert!(prompt.contains("Correct every listed contract failure"));
+    }
 
     #[test]
     fn provider_retry_delay_uses_bounded_equal_jitter() {

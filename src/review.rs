@@ -38,6 +38,7 @@ pub(crate) const MAX_MODELS_PER_REQUEST: usize = 3;
 pub(crate) const MAX_SCORER_PROMPT_BYTES: usize = 56_000;
 const MAX_STREAMED_CANDIDATE_MULTIPLIER: usize = 8;
 const MAX_STREAMED_SUMMARY_BYTES: usize = 64_000;
+const MAX_REVIEW_VALIDATION_REASON_BYTES: usize = 16_384;
 const HOSTED_WORKER_WATCHDOG_SECS: u64 = 600;
 pub(crate) const HOSTED_LLM_TOTAL_TIMEOUT_SECS: u64 = 540;
 /// Hosted reviews get a 240s primary attempt plus one timeout retry capped at
@@ -145,6 +146,44 @@ fn review_batch_validation_reason(
         finding.line,
         serde_json::to_string(&expected).expect("evidence string is JSON-serializable")
     ))
+}
+
+fn review_batch_validation_reasons(
+    findings: &[Finding],
+    annotated: &str,
+    content_policy_prompt: Option<&str>,
+) -> Option<String> {
+    let mut reasons = String::new();
+    for reason in findings.iter().filter_map(|finding| {
+        review_batch_validation_reason(
+            finding,
+            annotated,
+            (finding.kind == crate::envelope::Kind::ContentPolicy)
+                .then_some(content_policy_prompt)
+                .flatten(),
+        )
+    }) {
+        let separator = if reasons.is_empty() { "" } else { "; " };
+        let remaining = MAX_REVIEW_VALIDATION_REASON_BYTES.saturating_sub(reasons.len());
+        if separator.len().saturating_add(reason.len()) <= remaining {
+            reasons.push_str(separator);
+            reasons.push_str(&reason);
+            continue;
+        }
+        if remaining > separator.len() {
+            reasons.push_str(separator);
+            let available = remaining - separator.len();
+            let end = reason
+                .char_indices()
+                .map(|(index, _)| index)
+                .take_while(|index| *index <= available)
+                .last()
+                .unwrap_or(0);
+            reasons.push_str(&reason[..end]);
+        }
+        break;
+    }
+    (!reasons.is_empty()).then_some(reasons)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1257,20 +1296,12 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                     let validation_user = user.clone();
                     match client
                         .review_validated(cfg, &system, &user, move |review| {
-                            review
-                                .findings
-                                .iter()
-                                .find_map(|finding| {
-                                    review_batch_validation_reason(
-                                        finding,
-                                        &validation_annotated,
-                                        (first
-                                            && finding.kind
-                                                == crate::envelope::Kind::ContentPolicy)
-                                            .then_some(validation_user.as_str()),
-                                    )
-                                })
-                                .map_or(Ok(()), Err)
+                            review_batch_validation_reasons(
+                                &review.findings,
+                                &validation_annotated,
+                                first.then_some(validation_user.as_str()),
+                            )
+                            .map_or(Ok(()), Err)
                         })
                         .await
                     {
@@ -1353,16 +1384,17 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                             model_incidents.extend_from_slice(e.model_incidents());
                             usage_accounting_complete &= e.usage_accounting_complete();
                             let detail = format!("{e:#}");
-                            batch_failure = Some(if e.is_provider() {
-                                crate::envelope::provider_error_finding(&detail)
-                            } else {
-                                fail_closed_finding(&detail)
-                            });
+                            if batch_failure.is_none() {
+                                batch_failure = Some(if e.is_provider() {
+                                    crate::envelope::provider_error_finding(&detail)
+                                } else {
+                                    fail_closed_finding(&detail)
+                                });
+                            }
                             if batch_models.is_empty() {
                                 model_used = cfg.model_chain().join(" -> ");
                             }
                             batch_failed = true;
-                            break;
                         }
                     }
                     request_index += 1;
@@ -2456,6 +2488,22 @@ mod tests {
                 "finding at src/lib.rs:7 violates the publication contract: finding body must end with sentence punctuation"
             )
         );
+    }
+
+    #[test]
+    fn batch_validation_reports_every_invalid_finding_for_one_correction() {
+        let annotated = "### src/lib.rs\n@@ fixture @@\n    7 + first();\n    8 + second();\n";
+        let mut first = finding("src/lib.rs", 7, "The first change is unsafe.");
+        first.evidence = Some("approximate first".to_string());
+        let mut second = finding("src/lib.rs", 8, "The second change is unsafe.");
+        second.evidence = Some("approximate second".to_string());
+
+        let reason = review_batch_validation_reasons(&[first, second], annotated, None).unwrap();
+
+        assert!(reason.contains("src/lib.rs:7"));
+        assert!(reason.contains("exact JSON string \"first();\""));
+        assert!(reason.contains("src/lib.rs:8"));
+        assert!(reason.contains("exact JSON string \"second();\""));
     }
 
     #[test]
