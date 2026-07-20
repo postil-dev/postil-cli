@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -12,9 +12,34 @@ import {
   liveCostAccountingComplete,
   liveReviewArguments,
   runLive,
+  resolveLiveTimeoutOverrides,
   scorerOperationalFailure,
   validateLiveRunId,
 } from "./live";
+
+async function fakeEnvironmentBinary(root: string, markerPath?: string): Promise<string> {
+  const path = join(root, "fake-postil");
+  await writeFile(path, `#!/bin/sh
+${markerPath === undefined ? "" : `printf invoked > '${markerPath}'`}
+printf 'request=%s\\ntotal=%s\\nmodel_key=%s\\npostil_key=%s\\nunrelated=%s\\nendpoint_auth=%s\\naws_secret=%s\\n' \\
+  "\${POSTIL_LLM_REQUEST_TIMEOUT_SECS-absent}" \\
+  "\${POSTIL_LLM_TOTAL_TIMEOUT_SECS-absent}" \\
+  "\${MODEL_API_KEY:+set}" \\
+  "\${POSTIL_API_KEY:+set}" \\
+  "\${UNRELATED_BENCH_SECRET:+set}" \\
+  "\${POSTIL_ENDPOINT_AUTH_VALUE:+set}" \\
+  "\${AWS_SECRET_ACCESS_KEY:+set}" >&2
+`, { mode: 0o700 });
+  await chmod(path, 0o700);
+  return path;
+}
+
+function restoreEnvironment(previous: Record<string, string | undefined>): void {
+  for (const [name, value] of Object.entries(previous)) {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
+}
 
 async function onlyCaseAttempt(runRoot: string): Promise<string> {
   const caseDirectories = (await readdir(runRoot, { withFileTypes: true }))
@@ -24,6 +49,131 @@ async function onlyCaseAttempt(runRoot: string): Promise<string> {
 }
 
 describe("live benchmark review mode", () => {
+  test("forwards explicit timeout overrides to the isolated child and records them", async () => {
+    const root = await mkdtemp(join(tmpdir(), "postil-live-timeout-forwarding-"));
+    const names = [
+      "MODEL_API_KEY",
+      "POSTIL_LLM_REQUEST_TIMEOUT_SECS",
+      "POSTIL_LLM_TOTAL_TIMEOUT_SECS",
+      "UNRELATED_BENCH_SECRET",
+      "POSTIL_ENDPOINT_AUTH_VALUE",
+      "AWS_SECRET_ACCESS_KEY",
+    ];
+    const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+    try {
+      process.env.MODEL_API_KEY = "allowed-test-key";
+      process.env.POSTIL_LLM_REQUEST_TIMEOUT_SECS = "1";
+      process.env.POSTIL_LLM_TOTAL_TIMEOUT_SECS = "2";
+      process.env.UNRELATED_BENCH_SECRET = "must-not-arrive";
+      process.env.POSTIL_ENDPOINT_AUTH_VALUE = "must-not-arrive";
+      process.env.AWS_SECRET_ACCESS_KEY = "must-not-arrive";
+      const binary = await fakeEnvironmentBinary(root);
+      const report = await runLive([cases[0]!], {
+        binary,
+        model: "test/model",
+        rootDir: root,
+        runId: "explicit-timeouts",
+        timeoutMs: 3_000,
+        concurrency: 1,
+        retries: 1,
+      });
+
+      const runRoot = join(root, "live", "explicit-timeouts");
+      const attempt = await onlyCaseAttempt(runRoot);
+      expect(await readFile(join(attempt, "stderr.log"), "utf8")).toBe(
+        "request=1\ntotal=2\nmodel_key=set\npostil_key=set\n" +
+          "unrelated=\nendpoint_auth=\naws_secret=\n",
+      );
+      expect(await readFile(join(attempt, "..", "attempt-2", "stderr.log"), "utf8")).toBe(
+        await readFile(join(attempt, "stderr.log"), "utf8"),
+      );
+      expect(report.summary.timeoutOverrides).toEqual({
+        requestSeconds: "1",
+        totalSeconds: "2",
+        caseProcessMilliseconds: 3_000,
+      });
+      expect(JSON.parse(await readFile(join(runRoot, "run.json"), "utf8")).timeoutOverrides)
+        .toEqual(report.summary.timeoutOverrides);
+    } finally {
+      restoreEnvironment(previous);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("leaves absent timeout overrides absent so the CLI owns its defaults", async () => {
+    const root = await mkdtemp(join(tmpdir(), "postil-live-timeout-defaults-"));
+    const names = [
+      "MODEL_API_KEY",
+      "POSTIL_LLM_REQUEST_TIMEOUT_SECS",
+      "POSTIL_LLM_TOTAL_TIMEOUT_SECS",
+    ];
+    const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+    try {
+      process.env.MODEL_API_KEY = "allowed-test-key";
+      delete process.env.POSTIL_LLM_REQUEST_TIMEOUT_SECS;
+      delete process.env.POSTIL_LLM_TOTAL_TIMEOUT_SECS;
+      const binary = await fakeEnvironmentBinary(root);
+      const report = await runLive([cases[0]!], {
+        binary,
+        model: "test/model",
+        rootDir: root,
+        runId: "default-timeouts",
+        timeoutMs: 3_000,
+        concurrency: 1,
+        retries: 0,
+      });
+
+      const attempt = await onlyCaseAttempt(join(root, "live", "default-timeouts"));
+      expect(await readFile(join(attempt, "stderr.log"), "utf8")).toContain(
+        "request=absent\ntotal=absent\n",
+      );
+      expect(report.summary.timeoutOverrides).toEqual({
+        requestSeconds: null,
+        totalSeconds: null,
+        caseProcessMilliseconds: 3_000,
+      });
+    } finally {
+      restoreEnvironment(previous);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects malformed or unsafe timeout overrides before invoking the child", async () => {
+    const root = await mkdtemp(join(tmpdir(), "postil-live-timeout-rejection-"));
+    const marker = join(root, "invoked");
+    const names = [
+      "MODEL_API_KEY",
+      "POSTIL_LLM_REQUEST_TIMEOUT_SECS",
+      "POSTIL_LLM_TOTAL_TIMEOUT_SECS",
+    ];
+    const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+    try {
+      process.env.MODEL_API_KEY = "allowed-test-key";
+      const binary = await fakeEnvironmentBinary(root, marker);
+      for (const [index, raw] of ["", "0", "01", "1.5", " 1", "3"].entries()) {
+        process.env.POSTIL_LLM_REQUEST_TIMEOUT_SECS = raw;
+        delete process.env.POSTIL_LLM_TOTAL_TIMEOUT_SECS;
+        await expect(runLive([cases[0]!], {
+          binary,
+          model: "test/model",
+          rootDir: root,
+          runId: `invalid-timeout-${index}`,
+          timeoutMs: 3_000,
+          concurrency: 1,
+          retries: 0,
+        })).rejects.toThrow("POSTIL_LLM_REQUEST_TIMEOUT_SECS");
+      }
+      expect(() => resolveLiveTimeoutOverrides(5_000, {
+        POSTIL_LLM_REQUEST_TIMEOUT_SECS: "4",
+        POSTIL_LLM_TOTAL_TIMEOUT_SECS: "3",
+      })).toThrow("must not exceed");
+      await expect(readFile(marker, "utf8")).rejects.toThrow();
+    } finally {
+      restoreEnvironment(previous);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("keeps cost completeness independent from review outcome", () => {
     expect(liveCostAccountingComplete([{ costAccountingComplete: true }])).toBe(true);
     expect(liveCostAccountingComplete([

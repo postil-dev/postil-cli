@@ -42,6 +42,8 @@
 //   BENCH_CONCURRENCY       live-mode case parallelism (else --concurrency, else default)
 //   POSTIL_BENCH_BOUNDED    set to 1 to qualify the bounded large-review path
 //   POSTIL_BENCH_SCREEN_RUN_ID  optional live-screen artifact namespace
+//   POSTIL_LLM_REQUEST_TIMEOUT_SECS  explicit per-request live-screen timeout
+//   POSTIL_LLM_TOTAL_TIMEOUT_SECS    explicit total live-screen LLM timeout
 //   --case <fixture-id>     repeatable non-admission fixture selection
 //   --screen-profile <path> exact provider and price contract for selected cases
 //   --scorer-model <id>     optional scorer for non-admission diff-file screening

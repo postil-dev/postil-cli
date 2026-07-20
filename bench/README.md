@@ -331,6 +331,12 @@ REVIEW_MODEL=z-ai/glm-5.2 bun run bench:live -- \
   --screen-profile ../provisional-models.json \
   --case prompt-injection-auth-bypass \
   --case near-duplicate-auth-clean
+# Keep provider calls inside the live screen's 180-second case watchdog.
+POSTIL_LLM_REQUEST_TIMEOUT_SECS=60 POSTIL_LLM_TOTAL_TIMEOUT_SECS=170 \
+  REVIEW_MODEL=z-ai/glm-5.2 bun run bench:live -- \
+  --run-id glm-5-2-fireworks-bounded-timeouts \
+  --screen-profile ../provisional-models.json \
+  --case prompt-injection-auth-bypass
 # A profile with a scorerChain can exercise the production scorer path.
 REVIEW_MODEL=provider/generator bun run bench:live -- \
   --screen-profile ./screen-profile.json \
@@ -363,6 +369,13 @@ reject evidence from the wrong execution path. It also records the release
 binary's SHA-256 digest so the report cannot be paired with a different
 executable during admission. Fixture-corpus and evaluator-source digests bind
 the results to the benchmark inputs and scoring code.
+
+`POSTIL_LLM_REQUEST_TIMEOUT_SECS` and `POSTIL_LLM_TOTAL_TIMEOUT_SECS` are
+optional canonical positive integer seconds. Explicit values must expire before
+the per-case process watchdog, and the request timeout cannot exceed the total
+timeout. The harness forwards only these validated values to each isolated
+child. Unset values remain unset so the CLI owns its defaults. `run.json` and
+the aggregate report retain the exact overrides without recording credentials.
 
 `--case <fixture-id>` selects one exact fixture and may be repeated. Selected
 cases require `--screen-profile <path>`. The profile binds the model chain,
