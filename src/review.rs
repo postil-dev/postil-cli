@@ -405,9 +405,13 @@ async fn run_local(args: &ReviewArgs, cfg: &Config) -> Result<i32> {
     let head_sha = local::head_sha().await;
     let baseline = load_baseline(args)?;
     let scope = if args.since_sha.is_some() {
-        filter::ReconcileScope::Incremental { trustworthy: false }
+        filter::ReconcileScope::Incremental {
+            trust: filter::ReviewTrust::Failed,
+        }
     } else {
-        filter::ReconcileScope::Full { trustworthy: false }
+        filter::ReconcileScope::Full {
+            trust: filter::ReviewTrust::Failed,
+        }
     };
     let envelope = review_diff(
         cfg,
@@ -728,13 +732,17 @@ async fn remote_review<F: Forge>(
         .map(|diff| {
             (
                 diff,
-                filter::ReconcileScope::Incremental { trustworthy: false },
+                filter::ReconcileScope::Incremental {
+                    trust: filter::ReviewTrust::Failed,
+                },
                 false,
             )
         })?,
         Some(_) => (
             diff::DiffSnapshot::from_bytes(b"")?,
-            filter::ReconcileScope::Incremental { trustworthy: false },
+            filter::ReconcileScope::Incremental {
+                trust: filter::ReviewTrust::Failed,
+            },
             false,
         ),
         None => (
@@ -747,7 +755,9 @@ async fn remote_review<F: Forge>(
             .await
             .map_err(crate::forge::classify_review_input_error)
             .context("diff fetch")?,
-            filter::ReconcileScope::Full { trustworthy: false },
+            filter::ReconcileScope::Full {
+                trust: filter::ReviewTrust::Failed,
+            },
             false,
         ),
     };
@@ -770,7 +780,9 @@ async fn remote_review<F: Forge>(
             .await
             .map_err(crate::forge::classify_review_input_error)
             .context("full diff fallback fetch")?,
-            filter::ReconcileScope::Full { trustworthy: false },
+            filter::ReconcileScope::Full {
+                trust: filter::ReviewTrust::Failed,
+            },
             true,
         )
     } else {
@@ -1053,7 +1065,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
     let mut ungrounded = 0u32;
     let mut findings: Vec<Finding> = Vec::new();
     let mut suppressed_findings = Vec::new();
-    let mut full_review_trustworthy = false;
+    let mut review_trust = filter::ReviewTrust::Failed;
     let mut scorer_model: Option<String> = None;
     let mut scorer_error: Option<String> = None;
     let mut scorer_disagreements: Option<u32> = None;
@@ -1115,7 +1127,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
             index.add_change_metadata(batches.metadata_count);
             if batches.count == 0 {
                 model_used = "none (empty diff)".to_string();
-                full_review_trustworthy = true;
+                review_trust = filter::ReviewTrust::Exhaustive;
             } else {
                 let bounded_candidates = if (args.bounded
                     || crate::config::bounded_review_selection_mode())
@@ -1500,10 +1512,17 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                         )];
                     } else {
                         // Bounded mode reviews deterministic direct evidence and
-                        // lossy synthesis, not every source batch. It may add new
-                        // findings, but it cannot prove that an unseen baseline
-                        // finding is resolved.
-                        full_review_trustworthy = !batch_failed && !risk_selected_review;
+                        // lossy synthesis, not every source batch. Reconciliation
+                        // carries exact baseline evidence that remains outside the
+                        // selected input and expires citations absent from the
+                        // complete current diff.
+                        review_trust = if batch_failed {
+                            filter::ReviewTrust::Failed
+                        } else if risk_selected_review {
+                            filter::ReviewTrust::Bounded
+                        } else {
+                            filter::ReviewTrust::Exhaustive
+                        };
                         summary = summary_parts.join("\n\n");
                         let mut kept = outcome.kept;
                         if !kept.is_empty() && cfg.scorer_enabled() {
@@ -1609,10 +1628,10 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
     let rec = if cfg.enabled {
         let scope = match scope {
             filter::ReconcileScope::Incremental { .. } => filter::ReconcileScope::Incremental {
-                trustworthy: full_review_trustworthy,
+                trust: review_trust,
             },
             filter::ReconcileScope::Full { .. } => filter::ReconcileScope::Full {
-                trustworthy: full_review_trustworthy,
+                trust: review_trust,
             },
         };
         filter::reconcile(&baseline, &index, &findings, scope)

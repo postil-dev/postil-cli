@@ -213,15 +213,20 @@ pub struct Reconciliation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewTrust {
+    /// At least one required model request failed or returned unusable output.
+    Failed,
+    /// Every selected request completed, but the model saw only a bounded
+    /// subset of the complete review input.
+    Bounded,
+    /// Every source batch in the review input completed successfully.
+    Exhaustive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReconcileScope {
-    Incremental {
-        /// A complete incremental review may resolve a changed baseline anchor.
-        /// Bounded selection cannot prove that an unselected anchor is fixed.
-        trustworthy: bool,
-    },
-    /// A complete full review replaces the previous review's signal. When the
-    /// model run is not trustworthy, baseline findings remain carried.
-    Full { trustworthy: bool },
+    Incremental { trust: ReviewTrust },
+    Full { trust: ReviewTrust },
 }
 
 pub const CARRIED_MARKER: &str = "[carried from previous review]";
@@ -284,7 +289,7 @@ fn defect_identity(finding: &Finding) -> (String, crate::envelope::Kind, String,
 fn touch_addresses(index: &DiffIndex, f: &Finding, scope: ReconcileScope) -> bool {
     match scope {
         ReconcileScope::Incremental { .. } => index.contains_old(&f.path, f.line),
-        ReconcileScope::Full { trustworthy } => trustworthy,
+        ReconcileScope::Full { trust } => trust == ReviewTrust::Exhaustive,
     }
 }
 
@@ -330,19 +335,50 @@ pub fn reconcile(
             // copy is already in `new_findings` and will reach the gate.
             continue;
         }
-        if let ReconcileScope::Incremental { trustworthy } = scope
+        if let ReconcileScope::Incremental { trust } = scope
             && index.contains_old(&f.path, f.line)
         {
             if index.old_evidence_matches(f)
-                && let Some(line) = index.remap_evidence(f)
+                && let Some((path, line)) = index.remap_current_evidence(f)
             {
                 let mut carry = f.clone();
+                carry.path = path;
                 carry.line = line;
                 carry.end_line = None;
                 push_carried(&mut carried, &mut carried_identities, carry);
-            } else if trustworthy {
+            } else if trust == ReviewTrust::Exhaustive
+                || (trust == ReviewTrust::Bounded && f.evidence.is_some())
+            {
                 resolved.push(f.clone());
             } else {
+                push_carried(&mut carried, &mut carried_identities, f.clone());
+            }
+        } else if let ReconcileScope::Full {
+            trust: ReviewTrust::Bounded,
+        } = scope
+        {
+            if let Some((path, line)) = index.remap_current_evidence(f) {
+                if index.remap_reviewed_evidence(f).as_ref() == Some(&(path.clone(), line)) {
+                    // The selected model input contained this exact current
+                    // anchor and the model did not reproduce it.
+                    resolved.push(f.clone());
+                } else {
+                    // The issue's evidence remains in an unselected part of
+                    // the full diff. Keep it open at its current coordinate.
+                    let mut carry = f.clone();
+                    carry.path = path;
+                    carry.line = line;
+                    carry.end_line = None;
+                    push_carried(&mut carried, &mut carried_identities, carry);
+                }
+            } else if f.evidence.is_some() && f.path != crate::envelope::CHANGE_METADATA_PATH {
+                // The complete current diff or PR-description evidence no
+                // longer contains the exact citation. The historical finding
+                // cannot remain grounded, even when model coverage was bounded.
+                resolved.push(f.clone());
+            } else {
+                // Historical findings without canonical evidence, and virtual
+                // change metadata outside the selected input, remain open.
                 push_carried(&mut carried, &mut carried_identities, f.clone());
             }
         } else if touch_addresses(index, f, scope) {
@@ -642,7 +678,9 @@ mod tests {
             &baseline,
             &idx,
             &[],
-            ReconcileScope::Incremental { trustworthy: true },
+            ReconcileScope::Incremental {
+                trust: ReviewTrust::Exhaustive,
+            },
         );
         assert_eq!(rec.resolved.len(), 1);
         assert_eq!(rec.resolved[0].path, "a.rs");
@@ -671,7 +709,9 @@ mod tests {
             &baseline,
             &idx,
             &[],
-            ReconcileScope::Incremental { trustworthy: true },
+            ReconcileScope::Incremental {
+                trust: ReviewTrust::Exhaustive,
+            },
         );
         assert!(rec.resolved.is_empty());
         assert_eq!(rec.carried.len(), 2);
@@ -700,7 +740,9 @@ mod tests {
             &[baseline],
             &idx,
             &[fresh],
-            ReconcileScope::Incremental { trustworthy: true },
+            ReconcileScope::Incremental {
+                trust: ReviewTrust::Exhaustive,
+            },
         );
         assert_eq!(rec.carried.len(), 1);
         assert!(rec.resolved.is_empty());
@@ -715,7 +757,9 @@ mod tests {
             &baseline,
             &idx,
             &new,
-            ReconcileScope::Incremental { trustworthy: true },
+            ReconcileScope::Incremental {
+                trust: ReviewTrust::Exhaustive,
+            },
         );
         assert!(rec.resolved.is_empty());
         assert!(rec.carried.is_empty());
@@ -733,7 +777,9 @@ mod tests {
             &baseline,
             &idx,
             &new,
-            ReconcileScope::Incremental { trustworthy: true },
+            ReconcileScope::Incremental {
+                trust: ReviewTrust::Exhaustive,
+            },
         );
         assert_eq!(rec.resolved.len(), 0);
         assert_eq!(rec.carried.len(), 1, "baseline Error was dropped");
@@ -752,7 +798,9 @@ mod tests {
             &baseline,
             &idx,
             &new,
-            ReconcileScope::Incremental { trustworthy: true },
+            ReconcileScope::Incremental {
+                trust: ReviewTrust::Exhaustive,
+            },
         );
         assert!(rec.resolved.is_empty());
         assert!(rec.carried.is_empty(), "same-issue reflag should supersede");
@@ -770,7 +818,9 @@ mod tests {
             &[wide],
             &idx,
             &[],
-            ReconcileScope::Incremental { trustworthy: true },
+            ReconcileScope::Incremental {
+                trust: ReviewTrust::Exhaustive,
+            },
         );
         assert_eq!(rec.resolved.len(), 0, "wide-span finding falsely resolved");
         assert_eq!(rec.carried.len(), 1);
@@ -805,7 +855,9 @@ mod tests {
             &[baseline],
             &idx,
             &[],
-            ReconcileScope::Incremental { trustworthy: true },
+            ReconcileScope::Incremental {
+                trust: ReviewTrust::Exhaustive,
+            },
         );
         assert_eq!(rec.resolved.len(), 1);
         assert!(rec.carried.is_empty());
@@ -821,7 +873,9 @@ mod tests {
             std::slice::from_ref(&baseline),
             &shifted,
             &[],
-            ReconcileScope::Incremental { trustworthy: true },
+            ReconcileScope::Incremental {
+                trust: ReviewTrust::Exhaustive,
+            },
         );
         assert_eq!(remapped.carried.len(), 1);
         assert_eq!(remapped.carried[0].line, 11);
@@ -834,7 +888,9 @@ mod tests {
             &[baseline],
             &changed,
             &[],
-            ReconcileScope::Incremental { trustworthy: true },
+            ReconcileScope::Incremental {
+                trust: ReviewTrust::Exhaustive,
+            },
         );
         assert!(expired.carried.is_empty());
         assert_eq!(expired.resolved.len(), 1);
@@ -843,11 +899,12 @@ mod tests {
             &[f("a.rs", 10, Severity::Error, 0.9)],
             &changed,
             &[],
-            ReconcileScope::Incremental { trustworthy: false },
+            ReconcileScope::Incremental {
+                trust: ReviewTrust::Bounded,
+            },
         );
-        assert!(bounded.resolved.is_empty());
-        assert_eq!(bounded.carried.len(), 1);
-        assert!(is_carried(&bounded.carried[0]));
+        assert_eq!(bounded.resolved.len(), 1);
+        assert!(bounded.carried.is_empty());
     }
 
     #[test]
@@ -862,7 +919,9 @@ mod tests {
             &[baseline],
             &whitespace_change,
             &[],
-            ReconcileScope::Incremental { trustworthy: true },
+            ReconcileScope::Incremental {
+                trust: ReviewTrust::Exhaustive,
+            },
         );
 
         assert!(result.carried.is_empty());
@@ -877,10 +936,114 @@ mod tests {
             &baseline,
             &idx,
             &[],
-            ReconcileScope::Full { trustworthy: true },
+            ReconcileScope::Full {
+                trust: ReviewTrust::Exhaustive,
+            },
         );
         assert_eq!(rec.resolved.len(), 1);
         assert!(rec.carried.is_empty());
+    }
+
+    #[test]
+    fn bounded_full_review_resolves_removed_baseline_evidence() {
+        let changed = DiffIndex::build(&diff::parse(
+            "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -10 +10 @@\n-x\n+y\n",
+        ));
+        let baseline = f("a.rs", 10, Severity::Error, 0.9);
+        let rec = reconcile(
+            &[baseline],
+            &changed,
+            &[],
+            ReconcileScope::Full {
+                trust: ReviewTrust::Bounded,
+            },
+        );
+
+        assert_eq!(rec.resolved.len(), 1);
+        assert!(rec.carried.is_empty());
+    }
+
+    #[test]
+    fn bounded_full_review_carries_unselected_current_evidence() {
+        let shifted = DiffIndex::build(&diff::parse(
+            "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -10 +11 @@\n x\n",
+        ));
+        let baseline = f("a.rs", 10, Severity::Error, 0.9);
+        let rec = reconcile(
+            &[baseline],
+            &shifted,
+            &[],
+            ReconcileScope::Full {
+                trust: ReviewTrust::Bounded,
+            },
+        );
+
+        assert!(rec.resolved.is_empty());
+        assert_eq!(rec.carried.len(), 1);
+        assert_eq!(rec.carried[0].line, 11);
+        assert!(is_carried(&rec.carried[0]));
+    }
+
+    #[test]
+    fn bounded_full_review_resolves_selected_evidence_not_reproduced() {
+        let mut unchanged = DiffIndex::build(&diff::parse(
+            "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -10 +10 @@\n x\n",
+        ));
+        unchanged.add_rendered_evidence("### a.rs\n@@ starting at line 10 @@\n    10   x\n");
+        let baseline = f("a.rs", 10, Severity::Error, 0.9);
+        let rec = reconcile(
+            &[baseline],
+            &unchanged,
+            &[],
+            ReconcileScope::Full {
+                trust: ReviewTrust::Bounded,
+            },
+        );
+
+        assert_eq!(rec.resolved.len(), 1);
+        assert!(rec.carried.is_empty());
+    }
+
+    #[test]
+    fn bounded_full_review_does_not_confuse_duplicate_selected_evidence() {
+        let mut duplicate = DiffIndex::build(&diff::parse(
+            "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -10 +10 @@\n x\n@@ -20 +20 @@\n x\n",
+        ));
+        duplicate.add_rendered_evidence("### a.rs\n@@ starting at line 20 @@\n    20   x\n");
+        let baseline = f("a.rs", 10, Severity::Error, 0.9);
+        let rec = reconcile(
+            &[baseline],
+            &duplicate,
+            &[],
+            ReconcileScope::Full {
+                trust: ReviewTrust::Bounded,
+            },
+        );
+
+        assert!(rec.resolved.is_empty());
+        assert_eq!(rec.carried.len(), 1);
+        assert_eq!(rec.carried[0].line, 10);
+    }
+
+    #[test]
+    fn bounded_full_review_remaps_evidence_across_rename() {
+        let renamed = DiffIndex::build(&diff::parse(
+            "diff --git a/old.rs b/new.rs\n--- a/old.rs\n+++ b/new.rs\n@@ -10 +12 @@\n x\n",
+        ));
+        let baseline = f("old.rs", 10, Severity::Error, 0.9);
+        let rec = reconcile(
+            &[baseline],
+            &renamed,
+            &[],
+            ReconcileScope::Full {
+                trust: ReviewTrust::Bounded,
+            },
+        );
+
+        assert!(rec.resolved.is_empty());
+        assert_eq!(rec.carried.len(), 1);
+        assert_eq!(rec.carried[0].path, "new.rs");
+        assert_eq!(rec.carried[0].line, 12);
     }
 
     #[test]
@@ -891,7 +1054,9 @@ mod tests {
             &baseline,
             &idx,
             &[],
-            ReconcileScope::Full { trustworthy: false },
+            ReconcileScope::Full {
+                trust: ReviewTrust::Failed,
+            },
         );
         assert!(rec.resolved.is_empty());
         assert_eq!(rec.carried.len(), 1);

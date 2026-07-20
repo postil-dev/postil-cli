@@ -408,6 +408,11 @@ pub struct DiffIndex {
     old_evidence: HashMap<(String, u32), String>,
     content_policy_evidence: HashMap<(String, u32), String>,
     rendered_evidence: HashMap<(String, u32), Vec<String>>,
+    /// Old-to-new paths for files renamed by the reviewed change. Baseline
+    /// findings cite the old head, so reconciliation must follow an unchanged
+    /// evidence line represented in the diff across a rename instead of
+    /// expiring or misplacing it.
+    renamed_paths: HashMap<String, String>,
 }
 
 impl Default for DiffIndex {
@@ -422,6 +427,7 @@ impl Default for DiffIndex {
             old_evidence: HashMap::new(),
             content_policy_evidence: HashMap::new(),
             rendered_evidence: HashMap::new(),
+            renamed_paths: HashMap::new(),
         }
     }
 }
@@ -430,6 +436,11 @@ impl DiffIndex {
     pub fn build(diff: &Diff) -> Self {
         let mut index = Self::default();
         for file in &diff.files {
+            if !file.deleted && file.old_path != file.path {
+                index
+                    .renamed_paths
+                    .insert(file.old_path.clone(), file.path.clone());
+            }
             if file.binary {
                 continue;
             }
@@ -494,6 +505,7 @@ impl DiffIndex {
         }
         self.new_evidence.extend(next.new_evidence);
         self.old_evidence.extend(next.old_evidence);
+        self.renamed_paths.extend(next.renamed_paths);
     }
 
     fn insert_range(&mut self, path: String, range: RangeInclusive<u32>, old: bool) {
@@ -646,10 +658,79 @@ impl DiffIndex {
         })
     }
 
-    pub fn remap_evidence(&self, finding: &crate::envelope::Finding) -> Option<u32> {
-        let evidence = finding.evidence.as_ref()?;
-        self.new_evidence.iter().find_map(|((path, line), actual)| {
-            (path == &finding.path && actual == evidence).then_some(*line)
+    fn nearest_evidence_anchor<'a, I>(
+        finding: &crate::envelope::Finding,
+        candidates: I,
+    ) -> Option<(String, u32)>
+    where
+        I: IntoIterator<Item = (&'a (String, u32), &'a String)>,
+    {
+        let evidence = finding.evidence.as_deref()?;
+        candidates
+            .into_iter()
+            .filter(|((path, _), actual)| path == &finding.path && actual.as_str() == evidence)
+            .map(|((path, line), _)| (path.clone(), *line))
+            .min_by_key(|(path, line)| {
+                (
+                    (path != &finding.path) as u8,
+                    line.abs_diff(finding.line),
+                    *line,
+                )
+            })
+    }
+
+    /// Locate the baseline's exact evidence in the current reviewed head.
+    /// Duplicate text resolves deterministically to the nearest line, and a
+    /// pure rename follows the new path.
+    pub fn remap_current_evidence(
+        &self,
+        finding: &crate::envelope::Finding,
+    ) -> Option<(String, u32)> {
+        let current_path = self
+            .renamed_paths
+            .get(&finding.path)
+            .unwrap_or(&finding.path);
+        let mut candidate = finding.clone();
+        candidate.path.clone_from(current_path);
+        Self::nearest_evidence_anchor(&candidate, self.new_evidence.iter()).or_else(|| {
+            Self::nearest_evidence_anchor(&candidate, self.content_policy_evidence.iter())
+        })
+    }
+
+    /// Locate exact baseline evidence that a selected model request actually
+    /// contained. A bounded full review may resolve a reproduced anchor only
+    /// when that anchor was inside its reviewed evidence.
+    pub fn remap_reviewed_evidence(
+        &self,
+        finding: &crate::envelope::Finding,
+    ) -> Option<(String, u32)> {
+        let evidence = finding.evidence.as_deref()?;
+        let current_path = self
+            .renamed_paths
+            .get(&finding.path)
+            .unwrap_or(&finding.path);
+        let mut candidates = self
+            .rendered_evidence
+            .iter()
+            .filter(|((path, _), values)| {
+                path == current_path && values.iter().any(|actual| actual == evidence)
+            })
+            .map(|((path, line), _)| (path.clone(), *line))
+            .collect::<Vec<_>>();
+        if finding.kind == crate::envelope::Kind::ContentPolicy {
+            candidates.extend(
+                self.content_policy_evidence
+                    .iter()
+                    .filter(|((path, _), actual)| path == current_path && *actual == evidence)
+                    .map(|((path, line), _)| (path.clone(), *line)),
+            );
+        }
+        candidates.into_iter().min_by_key(|(path, line)| {
+            (
+                (path != &finding.path) as u8,
+                line.abs_diff(finding.line),
+                *line,
+            )
         })
     }
 

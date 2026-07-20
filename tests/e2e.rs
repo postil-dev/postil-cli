@@ -2390,7 +2390,7 @@ async fn local_bounded_is_explicit_and_default_local_review_remains_exhaustive()
 }
 
 #[tokio::test]
-async fn bounded_reviews_carry_changed_prior_findings_from_non_direct_source_batches() {
+async fn bounded_reviews_expire_changed_prior_evidence_outside_selected_batches() {
     use std::fmt::Write as _;
 
     let server = MockServer::start().await;
@@ -2432,7 +2432,7 @@ async fn bounded_reviews_carry_changed_prior_findings_from_non_direct_source_bat
         "version": 1, "summary": "", "silent": false,
         "findings": [{
             "path": "src/churn-3.rs", "line": 1, "severity": "error", "kind": "risk",
-            "confidence": 0.9, "title": "prior middle finding", "body": "requires direct re-review",
+            "confidence": 0.9, "title": "prior middle finding", "body": "the cited line must remain current",
             "evidence": "const ORIGINAL_3: &str = \"old\";"
         }],
         "resolved": [], "counts": {"info": 0, "warn": 0, "error": 1, "suppressed": 0},
@@ -2454,7 +2454,7 @@ async fn bounded_reviews_carry_changed_prior_findings_from_non_direct_source_bat
         .arg(&baseline_path)
         .args(["--output", "json"])
         .assert()
-        .code(1);
+        .code(0);
     let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     assert_eq!(envelope["reviewCoverage"]["mode"], "bounded");
     assert!(
@@ -2463,14 +2463,9 @@ async fn bounded_reviews_carry_changed_prior_findings_from_non_direct_source_bat
             .unwrap()
             < envelope["reviewCoverage"]["totalBatches"].as_u64().unwrap()
     );
-    assert_eq!(envelope["resolved"], json!([]));
-    assert_eq!(envelope["findings"][0]["title"], "prior middle finding");
-    assert!(
-        envelope["findings"][0]["body"]
-            .as_str()
-            .unwrap()
-            .starts_with("[carried")
-    );
+    assert_eq!(envelope["resolved"][0]["title"], "prior middle finding");
+    assert_eq!(envelope["findings"], json!([]));
+    assert_eq!(envelope["gate"]["failing"], false);
 
     let incremental = postil()
         .current_dir(dir.path())
@@ -2482,26 +2477,16 @@ async fn bounded_reviews_carry_changed_prior_findings_from_non_direct_source_bat
         .arg(&baseline_path)
         .args(["--output", "json"])
         .assert()
-        .code(1);
+        .code(0);
     let incremental_envelope: Value =
         serde_json::from_slice(&incremental.get_output().stdout).unwrap();
     assert_eq!(incremental_envelope["reviewCoverage"]["mode"], "bounded");
-    assert_eq!(incremental_envelope["resolved"], json!([]));
     assert_eq!(
-        incremental_envelope["findings"][0]["title"],
+        incremental_envelope["resolved"][0]["title"],
         "prior middle finding"
     );
-    let carried_body = incremental_envelope["findings"][0]["body"]
-        .as_str()
-        .unwrap();
-    assert!(carried_body.starts_with("[carried from previous review]"));
-    assert_eq!(
-        carried_body
-            .matches("[carried from previous review]")
-            .count(),
-        1
-    );
-    assert_eq!(incremental_envelope["gate"]["failing"], true);
+    assert_eq!(incremental_envelope["findings"], json!([]));
+    assert_eq!(incremental_envelope["gate"]["failing"], false);
 }
 
 #[tokio::test]
