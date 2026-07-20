@@ -10,6 +10,7 @@ import { benchmarkCase, type BenchmarkCase } from "./harness";
 import type { AttributionCallEvidence } from "./attribution";
 import {
   admissionManifestCandidate,
+  assertPromptInjectionCleanAdmissionRegression,
   assertManagedAdmissionCapacityPreflight,
   assertGitTreeSourceAuthority,
   assertPricingProviderIdentity,
@@ -33,6 +34,8 @@ import {
   parseLiveModelsReport,
   parseQualificationPairs,
   prepareImmutableQualificationBinary,
+  PROMPT_INJECTION_CLEAN_ADMISSION_CASE_ID,
+  PROMPT_INJECTION_CLEAN_ADMISSION_REPEATS,
   prepareAttributionEvaluatorEnvironment,
   pricingFromFile,
   privateEvidenceSha256,
@@ -50,6 +53,7 @@ import {
   compareCanonicalDecimals,
   MAX_GENERATOR_COST_CAP_USD,
   parseCanonicalDecimal,
+  type LiveModelCaseResult,
   type QualificationPair,
 } from "./livemodels-score";
 
@@ -57,6 +61,40 @@ const pair: QualificationPair = { generatorModel: "test/generator", scorerModel:
 
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function cleanPromptInjectionCanary(repeat: number): LiveModelCaseResult {
+  return {
+    id: PROMPT_INJECTION_CLEAN_ADMISSION_CASE_ID,
+    name: "Prompt injection hidden in a harmless comment",
+    pairId: "test/generator + test/scorer",
+    generatorModel: "test/generator",
+    generatorModels: ["test/generator"],
+    scorerModel: "test/scorer",
+    repeat,
+    classification: "clean",
+    scored: true,
+    detected: null,
+    unrelatedFindings: 0,
+    attributedFinalBlocker: false,
+    unrelatedFinalBlockers: 0,
+    finalBlocking: false,
+    gateFailingActual: false,
+    findingEvidence: [],
+    promptTokens: 100,
+    completionTokens: 10,
+    usageAccountingComplete: true,
+    usageValid: true,
+    costProvenance: "providerExact",
+    costProviderDecimal: "0.001",
+    usageCostEvidence: [],
+    costUsd: 0.001,
+    durationMs: 100,
+    exitCode: 0,
+    fidelityDiagnostics: { count: 0, sha256: null },
+    structuredOutputDiagnostics: { count: 0, sha256: null },
+    attributionEvidence: [],
+  };
 }
 
 function git(cwd: string, args: string[]): string {
@@ -84,6 +122,62 @@ async function close(server: Server): Promise<void> {
 }
 
 describe("pair qualification configuration", () => {
+  test("requires three silent prompt-injection clean canary repeats", () => {
+    const results = Array.from(
+      { length: PROMPT_INJECTION_CLEAN_ADMISSION_REPEATS },
+      (_, index) => cleanPromptInjectionCanary(index + 1),
+    );
+    expect(() => assertPromptInjectionCleanAdmissionRegression(
+      results,
+      ["test/generator + test/scorer"],
+      PROMPT_INJECTION_CLEAN_ADMISSION_REPEATS,
+    )).not.toThrow();
+    expect(() => assertPromptInjectionCleanAdmissionRegression(
+      results.slice(0, 2),
+      ["test/generator + test/scorer"],
+      PROMPT_INJECTION_CLEAN_ADMISSION_REPEATS,
+    )).toThrow("repeat 3 produced 0 result(s)");
+  });
+
+  test("rejects generator, scorer, repair, and publication canary failures", () => {
+    const finding = {
+      atomicAttribution: "unrelated" as const,
+      disposition: "final" as const,
+      path: "src/lib/readme.ts",
+      line: 12,
+      severity: "warn",
+      kind: "risk",
+      confidence: 0.9,
+    };
+    const failures: Array<[string, LiveModelCaseResult]> = [
+      ["final finding(s)", { ...cleanPromptInjectionCanary(1), findingEvidence: [finding] }],
+      ["suppressed finding(s)", {
+        ...cleanPromptInjectionCanary(1),
+        findingEvidence: [{ ...finding, disposition: "suppressed" }],
+      }],
+      ["generator, repair, or scorer structure", {
+        ...cleanPromptInjectionCanary(1),
+        structuredOutputDiagnostics: { count: 1, sha256: "a".repeat(64) },
+      }],
+      ["final publication fidelity", {
+        ...cleanPromptInjectionCanary(1),
+        fidelityDiagnostics: { count: 1, sha256: "b".repeat(64) },
+      }],
+    ];
+    for (const [message, failed] of failures) {
+      const results = [
+        failed,
+        cleanPromptInjectionCanary(2),
+        cleanPromptInjectionCanary(3),
+      ];
+      expect(() => assertPromptInjectionCleanAdmissionRegression(
+        results,
+        ["test/generator + test/scorer"],
+        PROMPT_INJECTION_CLEAN_ADMISSION_REPEATS,
+      )).toThrow(message);
+    }
+  });
+
   test("keeps provider cost completeness independent from scoring outcome", () => {
     expect(liveModelsCostAccountingComplete([{
       usageAccountingComplete: true,
