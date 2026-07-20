@@ -2034,6 +2034,74 @@ async fn large_source_diff_reviews_every_bounded_batch_and_aggregates_findings()
 }
 
 #[tokio::test]
+async fn presentation_markup_is_normalized_without_spending_a_semantic_retry() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(|request: &wiremock::Request| {
+            let evidence = prompt_evidence(
+                request,
+                ".env.example",
+                141,
+                "POSTIL_PRIVATE_MONITOR_DATABASE_URL=",
+            );
+            ResponseTemplate::new(200).set_body_json(llm_content(json!([{
+                "path": ".env.example",
+                "line": 141,
+                "endLine": 142,
+                "severity": "warn",
+                "kind": "risk",
+                "confidence": 0.9,
+                "title": "Require `POSTIL_PRIVATE_MONITOR_DATABASE_URL`",
+                "body": "# Impact\n@operator must configure <database-url> before startup.",
+                "evidence": evidence
+            }])))
+        })
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = dir.path().join("publication-markup.diff");
+    std::fs::write(
+        &diff,
+        "diff --git a/.env.example b/.env.example\n--- a/.env.example\n+++ b/.env.example\n@@ -140,0 +141,2 @@\n+POSTIL_PRIVATE_MONITOR_DATABASE_URL=\n+POSTIL_PRIVATE_MONITOR_ORIGIN=\n",
+    )
+    .unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let finding = &envelope["findings"][0];
+    assert_eq!(
+        finding["title"],
+        "Require POSTIL_PRIVATE_MONITOR_DATABASE_URL"
+    );
+    assert_eq!(
+        finding["body"],
+        "\\# Impact\n＠operator must configure &lt;database-url&gt; before startup."
+    );
+    assert_eq!(finding["path"], ".env.example");
+    assert_eq!(finding["line"], 141);
+    assert_eq!(finding["endLine"], 142);
+    assert_eq!(finding["evidence"], "POSTIL_PRIVATE_MONITOR_DATABASE_URL=");
+    assert_eq!(finding["confidence"], 0.9);
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        1,
+        "presentation cleanup must not call the model again"
+    );
+}
+
+#[tokio::test]
 async fn irreparable_batch_keeps_later_batches_in_the_strict_failure_envelope() {
     use std::fmt::Write as _;
 
@@ -2063,6 +2131,7 @@ async fn irreparable_batch_keeps_later_batches_in_the_strict_failure_envelope() 
                 json!([{
                     "path": "src/z-valid.rs",
                     "line": 1,
+                    "endLine": 1,
                     "severity": "warn",
                     "kind": "risk",
                     "confidence": 0.95,
@@ -2120,6 +2189,21 @@ async fn irreparable_batch_keeps_later_batches_in_the_strict_failure_envelope() 
             .iter()
             .any(|finding| finding["path"] == ".postil/model-output")
     );
+    let later = findings
+        .iter()
+        .find(|finding| finding["path"] == "src/z-valid.rs")
+        .unwrap();
+    assert_eq!(later["line"], 1);
+    assert_eq!(later["endLine"], 1);
+    assert_eq!(later["severity"], "warn");
+    assert_eq!(later["kind"], "risk");
+    assert_eq!(later["confidence"], 0.95);
+    assert_eq!(later["title"], "Preserve the later batch finding");
+    assert_eq!(
+        later["body"],
+        "The later request remains represented even when an earlier request is unusable."
+    );
+    assert_eq!(later["evidence"], "valid_later_batch_marker();");
     assert!(envelope["reviewCoverage"]["totalBatches"].as_u64().unwrap() > 1);
     assert!(
         envelope["modelUsage"]
@@ -2130,6 +2214,12 @@ async fn irreparable_batch_keeps_later_batches_in_the_strict_failure_envelope() 
     );
 
     let requests = server.received_requests().await.unwrap();
+    let total_batches = envelope["reviewCoverage"]["totalBatches"].as_u64().unwrap() as usize;
+    assert!(requests.len() <= total_batches * 4);
+    assert_eq!(
+        envelope["modelUsage"].as_array().unwrap().len(),
+        requests.len()
+    );
     let failed_batch_fallback = requests
         .iter()
         .position(|request| {
