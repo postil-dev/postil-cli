@@ -723,6 +723,8 @@ fn postil() -> Command {
         .env_remove("POSTIL_DETAILS_URL")
         .env_remove("POSTIL_PREVENTION_HINT")
         .env_remove("POSTIL_PREVENTION_COMMANDS_JSON")
+        .env_remove("POSTIL_PUBLISH")
+        .env_remove("POSTIL_NO_POST")
         .env_remove("GITHUB_SERVER_URL")
         .env_remove("POSTIL_ENABLE_BITBUCKET_INCREMENTAL")
         .env("REVIEW_MODEL", "openai/gpt-5-mini")
@@ -732,6 +734,86 @@ fn postil() -> Command {
         // hatch is set by the caller.
         .env("POSTIL_ALLOW_PRIVATE_API_BASE", "1");
     cmd
+}
+
+#[tokio::test]
+async fn local_review_stays_local_without_a_forge_token_in_ci() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    std::fs::write(dir.path().join(".postil.yaml"), "enabled: false\n").unwrap();
+
+    let output = postil()
+        .current_dir(dir.path())
+        .env("CI", "true")
+        .env("GITHUB_ACTIONS", "true")
+        .env("GITHUB_REPOSITORY", "acme/api")
+        .env("GITHUB_API_URL", server.uri())
+        .env_remove("GITHUB_TOKEN")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .code(0);
+
+    let envelope: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    assert_eq!(envelope["modelUsed"], "none (disabled by config)");
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "local review must not contact a forge even when CI metadata names a pull-request repository"
+    );
+}
+
+#[tokio::test]
+async fn remote_review_without_publish_never_mutates_github_even_in_hosted_ci() {
+    let server = MockServer::start().await;
+    mount_github_complete_diff(&server, 7).await;
+    mount_static_github_pr(&server).await;
+    let dir = tempfile::tempdir().unwrap();
+    disable_review_for_hosted_publication(dir.path(), true);
+
+    postil()
+        .current_dir(dir.path())
+        .env("CI", "true")
+        .env("GITHUB_ACTIONS", "true")
+        .env("POSTIL_HOSTED_MODE", "1")
+        .env("POSTIL_EXPECTED_GITHUB_REPO_ID", "42")
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .args([
+            "review", "--repo", "acme/api", "--pr", "7", "--output", "json",
+        ])
+        .assert()
+        .code(0);
+
+    let requests = server.received_requests().await.unwrap();
+    assert!(
+        requests.iter().all(|request| {
+            !matches!(
+                request.method,
+                wiremock::http::Method::POST
+                    | wiremock::http::Method::PATCH
+                    | wiremock::http::Method::PUT
+                    | wiremock::http::Method::DELETE
+            )
+        }),
+        "remote review without --publish attempted a GitHub mutation: {requests:?}"
+    );
+}
+
+#[test]
+fn publication_looking_environment_variables_are_rejected() {
+    for variable in ["POSTIL_PUBLISH", "POSTIL_NO_POST"] {
+        let output = postil()
+            .env(variable, "1")
+            .args(["review", "--diff-file", "missing.diff"])
+            .assert()
+            .code(2);
+        let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+        assert!(stderr.contains(&format!("{variable} cannot control forge publication")));
+        assert!(stderr.contains("pass --publish explicitly"));
+        assert!(!stderr.contains("reading diff file"));
+    }
 }
 
 fn assert_model_usage_matches_aggregate(envelope: &Value) {
@@ -8771,6 +8853,61 @@ async fn respond_to_pr_mention_posts_grounded_reply() {
     let text = body["body"].as_str().unwrap();
     assert!(text.contains("injection risk"));
     assert!(!text.contains("Postil ·"));
+}
+
+#[tokio::test]
+async fn respond_without_publish_prints_locally_and_never_comments() {
+    let server = MockServer::start().await;
+    mount_github_complete_diff(&server, 5).await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(respond_text(
+            "Line 41 passes untrusted input to the query. Parameterize it.",
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/5"))
+        .and(header("Accept", "application/vnd.github.v3.diff"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(DIFF))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/5"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "Add login", "body": "PR body",
+            "state": "open", "merged": false,
+            "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"}, "changed_files": 1
+        })))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let output = postil()
+        .current_dir(dir.path())
+        .env("CI", "true")
+        .env("GITHUB_ACTIONS", "true")
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .args([
+            "respond",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "5",
+            "--comment",
+            "@postil is this safe?",
+        ])
+        .assert()
+        .success();
+
+    assert!(String::from_utf8_lossy(&output.get_output().stdout).contains("Parameterize it."));
+    let requests = server.received_requests().await.unwrap();
+    assert!(!requests.iter().any(|request| {
+        request.method == wiremock::http::Method::POST
+            && request.url.path() == "/repos/acme/api/issues/5/comments"
+    }));
 }
 
 #[tokio::test]

@@ -2,7 +2,7 @@ use clap::Parser;
 
 #[cfg(feature = "qualification-candidate")]
 use postil_cli::attribution;
-use postil_cli::cli::{Cli, Command, ForgeArg, HookAction};
+use postil_cli::cli::{Cli, Command, ForgeArg, HookAction, publication_enabled};
 use postil_cli::config::{Config, qualification_metadata, starter_config};
 use postil_cli::review::{ForgeKind, ReviewArgs};
 use postil_cli::{doctor, hook, plan, respond, review};
@@ -87,7 +87,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
                 config,
                 model,
                 bounded,
-                no_post: no_post || !publish,
+                no_post: !publication_enabled(publish, no_post)?,
                 defer_gate_check,
             })
             .await
@@ -118,7 +118,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
                 comment,
                 config,
                 model,
-                no_post: no_post || !publish,
+                no_post: !publication_enabled(publish, no_post)?,
             })
             .await
         }
