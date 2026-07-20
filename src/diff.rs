@@ -6,7 +6,7 @@
 //! with its new-file line number.
 
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::RangeInclusive;
@@ -408,6 +408,12 @@ pub struct DiffIndex {
     old_evidence: HashMap<(String, u32), String>,
     content_policy_evidence: HashMap<(String, u32), String>,
     rendered_evidence: HashMap<(String, u32), Vec<String>>,
+    rendered_old_coordinates: HashSet<(String, u32)>,
+    /// Old-to-new paths for files renamed by the reviewed change. Baseline
+    /// findings cite the old head, so reconciliation must follow an unchanged
+    /// evidence line represented in the diff across a rename instead of
+    /// expiring or misplacing it.
+    renamed_paths: HashMap<String, String>,
 }
 
 impl Default for DiffIndex {
@@ -422,6 +428,8 @@ impl Default for DiffIndex {
             old_evidence: HashMap::new(),
             content_policy_evidence: HashMap::new(),
             rendered_evidence: HashMap::new(),
+            rendered_old_coordinates: HashSet::new(),
+            renamed_paths: HashMap::new(),
         }
     }
 }
@@ -430,6 +438,11 @@ impl DiffIndex {
     pub fn build(diff: &Diff) -> Self {
         let mut index = Self::default();
         for file in &diff.files {
+            if !file.deleted && file.old_path != file.path {
+                index
+                    .renamed_paths
+                    .insert(file.old_path.clone(), file.path.clone());
+            }
             if file.binary {
                 continue;
             }
@@ -494,6 +507,9 @@ impl DiffIndex {
         }
         self.new_evidence.extend(next.new_evidence);
         self.old_evidence.extend(next.old_evidence);
+        self.rendered_old_coordinates
+            .extend(next.rendered_old_coordinates);
+        self.renamed_paths.extend(next.renamed_paths);
     }
 
     fn insert_range(&mut self, path: String, range: RangeInclusive<u32>, old: bool) {
@@ -572,6 +588,13 @@ impl DiffIndex {
             let Some(path) = current_path.as_ref() else {
                 continue;
             };
+            if let Some(old) = line.strip_prefix("old ")
+                && let Some(number) = old.split_whitespace().next()
+                && let Ok(number) = number.parse::<u32>()
+            {
+                self.rendered_old_coordinates.insert((path.clone(), number));
+                continue;
+            }
             let Some((number, marked)) = line.trim_start().split_once(' ') else {
                 continue;
             };
@@ -646,11 +669,106 @@ impl DiffIndex {
         })
     }
 
-    pub fn remap_evidence(&self, finding: &crate::envelope::Finding) -> Option<u32> {
-        let evidence = finding.evidence.as_ref()?;
-        self.new_evidence.iter().find_map(|((path, line), actual)| {
-            (path == &finding.path && actual == evidence).then_some(*line)
+    fn nearest_evidence_anchor<'a, I>(
+        finding: &crate::envelope::Finding,
+        candidates: I,
+    ) -> Option<(String, u32)>
+    where
+        I: IntoIterator<Item = (&'a (String, u32), &'a String)>,
+    {
+        let evidence = finding.evidence.as_deref()?;
+        candidates
+            .into_iter()
+            .filter(|((path, _), actual)| path == &finding.path && actual.as_str() == evidence)
+            .map(|((path, line), _)| (path.clone(), *line))
+            .min_by_key(|(path, line)| {
+                (
+                    (path != &finding.path) as u8,
+                    line.abs_diff(finding.line),
+                    *line,
+                )
+            })
+    }
+
+    /// Locate the baseline's exact evidence in the current reviewed head.
+    /// Duplicate text resolves deterministically to the nearest line, and a
+    /// pure rename follows the new path.
+    pub fn remap_current_evidence(
+        &self,
+        finding: &crate::envelope::Finding,
+    ) -> Option<(String, u32)> {
+        let current_path = self
+            .renamed_paths
+            .get(&finding.path)
+            .unwrap_or(&finding.path);
+        let mut candidate = finding.clone();
+        candidate.path.clone_from(current_path);
+        Self::nearest_evidence_anchor(&candidate, self.new_evidence.iter()).or_else(|| {
+            Self::nearest_evidence_anchor(&candidate, self.content_policy_evidence.iter())
         })
+    }
+
+    /// Locate exact baseline evidence that a selected model request actually
+    /// contained. A bounded full review may resolve a reproduced anchor only
+    /// when that anchor was inside its reviewed evidence.
+    pub fn remap_reviewed_evidence(
+        &self,
+        finding: &crate::envelope::Finding,
+    ) -> Option<(String, u32)> {
+        let evidence = finding.evidence.as_deref()?;
+        let current_path = self
+            .renamed_paths
+            .get(&finding.path)
+            .unwrap_or(&finding.path);
+        let mut candidates = self
+            .rendered_evidence
+            .iter()
+            .filter(|((path, _), values)| {
+                path == current_path && values.iter().any(|actual| actual == evidence)
+            })
+            .map(|((path, line), _)| (path.clone(), *line))
+            .collect::<Vec<_>>();
+        if finding.kind == crate::envelope::Kind::ContentPolicy {
+            candidates.extend(
+                self.content_policy_evidence
+                    .iter()
+                    .filter(|((path, _), actual)| path == current_path && *actual == evidence)
+                    .map(|((path, line), _)| (path.clone(), *line)),
+            );
+        }
+        candidates.into_iter().min_by_key(|(path, line)| {
+            (
+                (path != &finding.path) as u8,
+                line.abs_diff(finding.line),
+                *line,
+            )
+        })
+    }
+
+    /// True only when a selected model request contained the baseline's exact
+    /// old coordinate or the corresponding current coordinate. This lets a
+    /// completed bounded review resolve changed evidence it actually saw while
+    /// keeping changed evidence outside the selected requests open.
+    pub fn contains_reviewed_baseline_coordinate(
+        &self,
+        finding: &crate::envelope::Finding,
+    ) -> bool {
+        let current_path = self
+            .renamed_paths
+            .get(&finding.path)
+            .unwrap_or(&finding.path);
+        if self
+            .rendered_old_coordinates
+            .contains(&(finding.path.clone(), finding.line))
+            || self
+                .rendered_old_coordinates
+                .contains(&(current_path.clone(), finding.line))
+        {
+            return true;
+        }
+        self.rendered_evidence
+            .keys()
+            .any(|(path, line)| path == current_path && *line == finding.line)
     }
 
     pub fn contains(&self, path: &str, line: u32) -> bool {
