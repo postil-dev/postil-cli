@@ -404,6 +404,9 @@ async fn run_local(args: &ReviewArgs, cfg: &Config) -> Result<i32> {
     let diff_snapshot = local::acquire(&source).await?;
     let head_sha = local::head_sha().await;
     let baseline = load_baseline(args)?;
+    // This is a fail-closed placeholder, not the completed review's trust.
+    // review_diff replaces it with Failed, Bounded, or Exhaustive after the
+    // selected requests finish; an early model failure deliberately keeps it.
     let scope = if args.since_sha.is_some() {
         filter::ReconcileScope::Incremental {
             trust: filter::ReviewTrust::Failed,
@@ -1336,7 +1339,12 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                     let first = request_index == 0;
                     let (annotated, user, cross_window_synthesis) =
                         review_batch_prompt(&runtime_prompt_context, batch, first);
-                    index.add_rendered_evidence(&annotated);
+                    // Synthesis digests can ground new cross-window findings, but
+                    // they are lossy summaries rather than direct source coverage.
+                    // Only selected source requests may retire baseline evidence.
+                    if !cross_window_synthesis {
+                        index.add_rendered_evidence(&annotated);
+                    }
                     eprintln!(
                         "postil: reviewing {} request {}/{} ({} bytes)",
                         if cross_window_synthesis {

@@ -2441,6 +2441,11 @@ async fn bounded_reviews_resolve_changed_prior_evidence_when_selected() {
             )
             .unwrap();
         }
+        writeln!(
+            diff,
+            "@@ -100 +230 @@\n-const LATE_ORIGINAL_{file}: &str = \"old\";\n+const LATE_UPDATED_{file}: &str = \"new\";"
+        )
+        .unwrap();
     }
     std::fs::write(&diff_path, diff).unwrap();
 
@@ -2481,6 +2486,7 @@ async fn bounded_reviews_resolve_changed_prior_evidence_when_selected() {
     );
     assert_eq!(envelope["resolved"][0]["title"], "prior middle finding");
     assert_eq!(envelope["findings"], json!([]));
+    assert_eq!(envelope["counts"]["error"], 0);
     assert_eq!(envelope["gate"]["failing"], false);
 
     let incremental = postil()
@@ -2502,7 +2508,56 @@ async fn bounded_reviews_resolve_changed_prior_evidence_when_selected() {
         "prior middle finding"
     );
     assert_eq!(incremental_envelope["findings"], json!([]));
+    assert_eq!(incremental_envelope["counts"]["error"], 0);
     assert_eq!(incremental_envelope["gate"]["failing"], false);
+
+    let requests = server.received_requests().await.unwrap();
+    let unselected_file = (0..7)
+        .find(|file| {
+            let marker = format!("LATE_ORIGINAL_{file}");
+            requests.iter().all(|request| {
+                let body = String::from_utf8_lossy(&request.body);
+                !body.contains("Review this selected source batch independently")
+                    || !body.contains(&marker)
+            })
+        })
+        .expect("bounded review leaves at least one source batch unselected");
+    let unselected_baseline = json!({
+        "version": 1, "summary": "", "silent": false,
+        "findings": [{
+            "path": format!("src/churn-{unselected_file}.rs"), "line": 100,
+            "severity": "error", "kind": "risk", "confidence": 0.9,
+            "title": "unselected prior finding", "body": "the cited line must remain current",
+            "evidence": format!("const LATE_ORIGINAL_{unselected_file}: &str = \"old\";")
+        }],
+        "resolved": [], "counts": {"info": 0, "warn": 0, "error": 1, "suppressed": 0},
+        "confidenceBuckets": [0,0,0,0,1],
+        "gate": {"failOn": "error", "failing": true},
+        "modelUsed": "model", "usage": {"promptTokens": 0, "completionTokens": 0},
+        "baseSha": null, "headSha": null, "sinceSha": null
+    });
+    std::fs::write(&baseline_path, unselected_baseline.to_string()).unwrap();
+    let carried = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--bounded", "--diff-file"])
+        .arg(&diff_path)
+        .arg("--baseline")
+        .arg(&baseline_path)
+        .args(["--output", "json"])
+        .assert()
+        .code(1);
+    let carried_envelope: Value = serde_json::from_slice(&carried.get_output().stdout).unwrap();
+    assert_eq!(carried_envelope["resolved"], json!([]));
+    assert_eq!(carried_envelope["counts"]["error"], 1);
+    assert_eq!(carried_envelope["gate"]["failing"], true);
+    assert!(
+        carried_envelope["findings"][0]["body"]
+            .as_str()
+            .unwrap()
+            .starts_with("[carried from previous review]")
+    );
 }
 
 #[tokio::test]
