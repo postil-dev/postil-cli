@@ -41,6 +41,9 @@ import {
 
 const execFile = promisify(execFileCb);
 const ADMISSION_API_BASE = "https://openrouter.ai:443/api/v1";
+const REQUEST_TIMEOUT_ENV = "POSTIL_LLM_REQUEST_TIMEOUT_SECS";
+const TOTAL_TIMEOUT_ENV = "POSTIL_LLM_TOTAL_TIMEOUT_SECS";
+const DEFAULT_CASE_TIMEOUT_MS = 180_000;
 
 /** Default number of cases run concurrently. Live inference is I/O-bound on the
  * provider, so a small pool cuts wall-clock time without overloading the API.
@@ -170,6 +173,7 @@ export interface LiveSummary {
   providerContractEnforced: boolean;
   screeningProfileSha256: string | null;
   upstreamProviderIdentity: string | null;
+  timeoutOverrides: LiveTimeoutOverrides;
   ranAt: string;
   totalCases: number;
   defectCases: number;
@@ -202,6 +206,12 @@ export interface LiveReport {
   results: LiveCaseResult[];
 }
 
+export interface LiveTimeoutOverrides {
+  requestSeconds: string | null;
+  totalSeconds: string | null;
+  caseProcessMilliseconds: number;
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 
@@ -216,6 +226,7 @@ export async function runLive(
         "(it is never logged or printed). Mock mode (bun run bench) needs no key.",
     );
   }
+  const timeoutOverrides = resolveLiveTimeoutOverrides(options.timeoutMs);
   const cases = inputs.map((input) => benchmarkCase.parse(input));
   const provider = liveProvider();
   const screeningProfile = options.screenProfilePath === undefined
@@ -232,6 +243,7 @@ export async function runLive(
 
   const rootDir = options.rootDir ?? resolve(import.meta.dir, "..", ".runs");
   const runRoot = await reserveLiveRunRoot(rootDir, options.runId);
+  await writeLiveRunContract(runRoot, options, timeoutOverrides);
 
   // Bounded worker pool: a small fixed number of workers pull case indices off a
   // shared cursor until the queue drains. Each case writes its result into the
@@ -243,7 +255,13 @@ export async function runLive(
     for (;;) {
       const index = cursor++;
       if (index >= cases.length) return;
-      results[index] = await runLiveCaseWithRetry(cases[index]!, index, runRoot, options);
+      results[index] = await runLiveCaseWithRetry(
+        cases[index]!,
+        index,
+        runRoot,
+        options,
+        timeoutOverrides,
+      );
     }
   };
   await Promise.all(Array.from({ length: concurrency }, () => worker()));
@@ -267,9 +285,77 @@ export async function runLive(
       evaluatorSha256,
       provider,
       screeningProfile,
+      timeoutOverrides,
     ),
     results: ordered,
   };
+}
+
+const CANONICAL_POSITIVE_SECONDS = /^[1-9][0-9]*$/u;
+
+export function resolveLiveTimeoutOverrides(
+  timeoutMs: number | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): LiveTimeoutOverrides {
+  const caseProcessMilliseconds = timeoutMs ?? DEFAULT_CASE_TIMEOUT_MS;
+  if (!Number.isSafeInteger(caseProcessMilliseconds) || caseProcessMilliseconds <= 0) {
+    throw new Error("live benchmark case timeout must be a positive integer number of milliseconds");
+  }
+  const requestSeconds = validateTimeoutOverride(
+    REQUEST_TIMEOUT_ENV,
+    env[REQUEST_TIMEOUT_ENV],
+    caseProcessMilliseconds,
+  );
+  const totalSeconds = validateTimeoutOverride(
+    TOTAL_TIMEOUT_ENV,
+    env[TOTAL_TIMEOUT_ENV],
+    caseProcessMilliseconds,
+  );
+  if (
+    requestSeconds !== null &&
+    totalSeconds !== null &&
+    Number(requestSeconds) > Number(totalSeconds)
+  ) {
+    throw new Error(`${REQUEST_TIMEOUT_ENV} must not exceed ${TOTAL_TIMEOUT_ENV}`);
+  }
+  return Object.freeze({ requestSeconds, totalSeconds, caseProcessMilliseconds });
+}
+
+function validateTimeoutOverride(
+  name: string,
+  raw: string | undefined,
+  caseProcessMilliseconds: number,
+): string | null {
+  if (raw === undefined) return null;
+  if (!CANONICAL_POSITIVE_SECONDS.test(raw)) {
+    throw new Error(`${name} must be a canonical positive integer number of seconds`);
+  }
+  const seconds = Number(raw);
+  if (!Number.isSafeInteger(seconds) || seconds * 1_000 >= caseProcessMilliseconds) {
+    throw new Error(
+      `${name} must expire before the ${caseProcessMilliseconds}ms live benchmark case timeout`,
+    );
+  }
+  return raw;
+}
+
+async function writeLiveRunContract(
+  runRoot: string,
+  options: LiveOptions,
+  timeoutOverrides: LiveTimeoutOverrides,
+): Promise<void> {
+  const contract = {
+    artifactType: "diff-file-live-run",
+    runId: options.runId,
+    model: options.model,
+    scorerModel: options.scorerModel ?? null,
+    reviewMode: options.bounded ? "bounded" : "exhaustive",
+    timeoutOverrides,
+  };
+  await writeFile(join(runRoot, "run.json"), `${JSON.stringify(contract, null, 2)}\n`, {
+    flag: "wx",
+    mode: 0o600,
+  });
 }
 
 async function screeningProfileMetadata(path: string): Promise<{
@@ -324,11 +410,12 @@ async function runLiveCaseWithRetry(
   index: number,
   runRoot: string,
   options: LiveOptions,
+  timeoutOverrides: LiveTimeoutOverrides,
 ): Promise<LiveCaseResult> {
   const maxRetries = options.retries ?? DEFAULT_LIVE_RETRIES;
   let last: LiveCaseResult | undefined;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    last = await runLiveCase(c, index, attempt + 1, runRoot, options);
+    last = await runLiveCase(c, index, attempt + 1, runRoot, options, timeoutOverrides);
     // Scored => a valid envelope was produced; that is a normal result (even if
     // it has findings or false positives), so never retry it.
     if (last.scored) return last;
@@ -432,6 +519,7 @@ async function runLiveCase(
   attempt: number,
   runRoot: string,
   options: LiveOptions,
+  timeoutOverrides: LiveTimeoutOverrides,
 ): Promise<LiveCaseResult> {
   const truth = groundTruthOf(c);
   const base: LiveCaseResult = {
@@ -481,8 +569,9 @@ async function runLiveCase(
           homeDir,
           tmpDir,
           liveProvider(),
+          timeoutOverrides,
         ),
-        timeout: options.timeoutMs ?? 180_000,
+        timeout: timeoutOverrides.caseProcessMilliseconds,
         maxBuffer: 8 * 1024 * 1024,
       },
     );
@@ -637,6 +726,7 @@ function liveEnv(
   homeDir: string,
   tmpDir: string,
   provider: LiveProvider,
+  timeoutOverrides: LiveTimeoutOverrides,
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     PATH: process.env.PATH,
@@ -652,6 +742,12 @@ function liveEnv(
     REVIEW_MODEL: model,
     POSTIL_API_BASE: provider.apiBase,
     POSTIL_API_FORMAT: provider.apiFormat,
+    ...(timeoutOverrides.requestSeconds === null
+      ? {}
+      : { [REQUEST_TIMEOUT_ENV]: timeoutOverrides.requestSeconds }),
+    ...(timeoutOverrides.totalSeconds === null
+      ? {}
+      : { [TOTAL_TIMEOUT_ENV]: timeoutOverrides.totalSeconds }),
     ...(scorerModel === undefined
       ? { POSTIL_DISABLE_SCORER: "1" }
       : { REVIEW_SCORER_MODEL: scorerModel }),
@@ -756,6 +852,7 @@ function summarize(
   evaluatorSha256: string,
   provider: LiveProvider,
   screeningProfile: { sha256: string; upstreamProviderIdentity: string } | null,
+  timeoutOverrides: LiveTimeoutOverrides,
 ): LiveSummary {
   const defects = results.filter((r) => r.type === "defect");
   const cleans = results.filter((r) => r.type === "clean");
@@ -800,6 +897,7 @@ function summarize(
     providerContractEnforced: options.screenProfilePath !== undefined,
     screeningProfileSha256: screeningProfile?.sha256 ?? null,
     upstreamProviderIdentity: screeningProfile?.upstreamProviderIdentity ?? null,
+    timeoutOverrides,
     ranAt: new Date().toISOString(),
     totalCases: results.length,
     defectCases: defects.length,
