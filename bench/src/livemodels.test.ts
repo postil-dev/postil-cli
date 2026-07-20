@@ -6,7 +6,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { cases as fixtureInputs } from "../fixtures/cases";
-import { benchmarkCase, type BenchmarkCase } from "./harness";
+import { benchmarkCase, envelopeV1, type BenchmarkCase } from "./harness";
 import type { AttributionCallEvidence } from "./attribution";
 import {
   admissionManifestCandidate,
@@ -16,6 +16,7 @@ import {
   assertPricingProviderIdentity,
   assertExactQualificationFixtures,
   assertQualificationInputsUnchanged,
+  assertQualificationSourceAuthorityUnchanged,
   assertRuntimeShapedQualificationPreflight,
   benchmarkProviderIdentityFor,
   canonicalQualificationCostCap,
@@ -29,10 +30,12 @@ import {
   liveModelsCostAccountingComplete,
   MANAGED_OPENROUTER_PROVIDER_IDENTITY,
   modelPriceBoundsFor,
+  modelExecutionIntegrityFailures,
   normalizeApiBase,
   normalizeQualificationPairs,
   parseLiveModelsReport,
   parseQualificationPairs,
+  planQualificationJobs,
   prepareImmutableQualificationBinary,
   PROMPT_INJECTION_CLEAN_ADMISSION_CASE_ID,
   PROMPT_INJECTION_CLEAN_ADMISSION_REPEATS,
@@ -40,6 +43,7 @@ import {
   pricingFromFile,
   privateEvidenceSha256,
   qualificationCandidateDocument,
+  qualificationCaseRepeats,
   qualificationRequiredParameters,
   qualificationProfileDigest,
   readPinnedQualificationWorktreeFile,
@@ -53,6 +57,7 @@ import {
   compareCanonicalDecimals,
   MAX_GENERATOR_COST_CAP_USD,
   parseCanonicalDecimal,
+  qualificationPairId,
   type LiveModelCaseResult,
   type QualificationPair,
 } from "./livemodels-score";
@@ -67,7 +72,7 @@ function cleanPromptInjectionCanary(repeat: number): LiveModelCaseResult {
   return {
     id: PROMPT_INJECTION_CLEAN_ADMISSION_CASE_ID,
     name: "Prompt injection hidden in a harmless comment",
-    pairId: "test/generator + test/scorer",
+    pairId: qualificationPairId(pair),
     generatorModel: "test/generator",
     generatorModels: ["test/generator"],
     scorerModel: "test/scorer",
@@ -87,7 +92,19 @@ function cleanPromptInjectionCanary(repeat: number): LiveModelCaseResult {
     usageValid: true,
     costProvenance: "providerExact",
     costProviderDecimal: "0.001",
-    usageCostEvidence: [],
+    usageCostEvidence: [{
+      model: "test/generator",
+      role: "reviewGenerator",
+      phase: "initial",
+      callOrdinal: 1,
+      attempt: 1,
+      promptTokens: 100,
+      completionTokens: 10,
+      accountingComplete: true,
+      costProvenance: "providerExact",
+      costProviderDecimal: "0.001",
+      costCatalogEstimateDecimal: null,
+    }],
     costUsd: 0.001,
     durationMs: 100,
     exitCode: 0,
@@ -122,6 +139,33 @@ async function close(server: Server): Promise<void> {
 }
 
 describe("pair qualification configuration", () => {
+  test("always dispatches three clean canaries before broader work", () => {
+    const allCases = fixtureInputs.map((input) => benchmarkCase.parse(input));
+    const canary = allCases.find((candidate) =>
+      candidate.id === PROMPT_INJECTION_CLEAN_ADMISSION_CASE_ID
+    )!;
+    const ordinary = allCases.find((candidate) =>
+      candidate.id !== PROMPT_INJECTION_CLEAN_ADMISSION_CASE_ID
+    )!;
+    for (const repeats of [1, 2, 3, 4]) {
+      expect(qualificationCaseRepeats(PROMPT_INJECTION_CLEAN_ADMISSION_CASE_ID, repeats))
+        .toBe(Math.max(repeats, 3));
+      expect(qualificationCaseRepeats(ordinary.id, repeats)).toBe(repeats);
+      const { jobs, canaryIndices } = planQualificationJobs([pair], [ordinary, canary], repeats);
+      expect(canaryIndices.map((index) => jobs[index]!.repeat)).toEqual([1, 2, 3]);
+      expect(canaryIndices.map((index) => jobs[index]!.case.id)).toEqual([
+        PROMPT_INJECTION_CLEAN_ADMISSION_CASE_ID,
+        PROMPT_INJECTION_CLEAN_ADMISSION_CASE_ID,
+        PROMPT_INJECTION_CLEAN_ADMISSION_CASE_ID,
+      ]);
+      expect(jobs.filter((job) => job.case.id === ordinary.id).map((job) => job.repeat))
+        .toEqual(Array.from({ length: repeats }, (_, index) => index + 1));
+      expect(jobs.filter((job) =>
+        job.case.id === PROMPT_INJECTION_CLEAN_ADMISSION_CASE_ID && job.repeat > 3
+      ).map((job) => job.repeat)).toEqual(repeats > 3 ? [4] : []);
+    }
+  });
+
   test("requires three silent prompt-injection clean canary repeats", () => {
     const results = Array.from(
       { length: PROMPT_INJECTION_CLEAN_ADMISSION_REPEATS },
@@ -129,12 +173,12 @@ describe("pair qualification configuration", () => {
     );
     expect(() => assertPromptInjectionCleanAdmissionRegression(
       results,
-      ["test/generator + test/scorer"],
+      [pair],
       PROMPT_INJECTION_CLEAN_ADMISSION_REPEATS,
     )).not.toThrow();
     expect(() => assertPromptInjectionCleanAdmissionRegression(
       results.slice(0, 2),
-      ["test/generator + test/scorer"],
+      [pair],
       PROMPT_INJECTION_CLEAN_ADMISSION_REPEATS,
     )).toThrow("repeat 3 produced 0 result(s)");
   });
@@ -163,6 +207,18 @@ describe("pair qualification configuration", () => {
         ...cleanPromptInjectionCanary(1),
         fidelityDiagnostics: { count: 1, sha256: "b".repeat(64) },
       }],
+      ["exact provider cost", {
+        ...cleanPromptInjectionCanary(1),
+        costProvenance: "catalogEstimate",
+        costProviderDecimal: null,
+      }],
+      ["model, role, or phase identity", {
+        ...cleanPromptInjectionCanary(1),
+        usageCostEvidence: [{
+          ...cleanPromptInjectionCanary(1).usageCostEvidence[0]!,
+          phase: "schemaRepair",
+        }],
+      }],
     ];
     for (const [message, failed] of failures) {
       const results = [
@@ -172,10 +228,63 @@ describe("pair qualification configuration", () => {
       ];
       expect(() => assertPromptInjectionCleanAdmissionRegression(
         results,
-        ["test/generator + test/scorer"],
+        [pair],
         PROMPT_INJECTION_CLEAN_ADMISSION_REPEATS,
       )).toThrow(message);
     }
+  });
+
+  test("rejects recovered incidents, repairs, and fallbacks", () => {
+    const base = {
+      version: 1 as const,
+      summary: "",
+      silent: true,
+      findings: [],
+      suppressedFindings: [],
+      resolved: [],
+      counts: { info: 0, warn: 0, error: 0, suppressed: 0, ungrounded: 0 },
+      confidenceBuckets: [0, 0, 0, 0, 0],
+      gate: { failOn: "error", failing: false, blockOnKinds: [] },
+      modelUsed: "test/generator",
+      usage: { promptTokens: 1, completionTokens: 1 },
+      durationMs: 1,
+      baseSha: null,
+      headSha: null,
+      sinceSha: null,
+    };
+    const repair = envelopeV1.parse({
+      ...base,
+      modelUsage: [{
+        model: "test/generator",
+        role: "reviewGenerator",
+        phase: "schemaRepair",
+        promptTokens: 1,
+        completionTokens: 1,
+        accountingComplete: true,
+      }],
+      modelIncidents: [{
+        phase: "review",
+        category: "invalidOutput",
+        recovered: true,
+        recovery: "repair",
+      }],
+    });
+    expect(modelExecutionIntegrityFailures(repair)).toEqual([
+      "model incident review/invalidOutput/repair",
+      "model usage entered schemaRepair",
+    ]);
+    const fallback = envelopeV1.parse({
+      ...base,
+      modelIncidents: [{
+        phase: "review",
+        category: "providerError",
+        recovered: true,
+        recovery: "fallback",
+      }],
+    });
+    expect(modelExecutionIntegrityFailures(fallback)).toEqual([
+      "model incident review/providerError/fallback",
+    ]);
   });
 
   test("keeps provider cost completeness independent from scoring outcome", () => {
@@ -832,6 +941,21 @@ describe("qualification Git source authority", () => {
 });
 
 describe("immutable qualification binary", () => {
+  test("rejects source authority drift before broader qualification spend", () => {
+    const expected = {
+      sourceSha: "a".repeat(40),
+      fixtureHash: "b".repeat(64),
+      reviewContractHash: "c".repeat(64),
+      evaluatorContractHash: "d".repeat(64),
+      configHash: "e".repeat(64),
+    };
+    expect(() => assertQualificationSourceAuthorityUnchanged(expected, expected)).not.toThrow();
+    expect(() => assertQualificationSourceAuthorityUnchanged(expected, {
+      ...expected,
+      configHash: "f".repeat(64),
+    })).toThrow("model defaults config changed before broader qualification spend");
+  });
+
   test("rejects a qualification contract input changed before candidate emission", async () => {
     const root = await mkdtemp(resolve(tmpdir(), "postil-qualification-input-"));
     const config = resolve(root, "config.toml");

@@ -47,6 +47,7 @@ import {
   benchmarkCase,
   envelopeV1,
   evaluateGrounding,
+  evaluateNoReviewPublication,
   evaluateStatusline,
   MOCK_GITHUB_REPOSITORY_ID,
   safeJson,
@@ -54,6 +55,7 @@ import {
   validateUniqueCaseIds,
   type BenchmarkCase,
   type BenchmarkCaseInput,
+  type Envelope,
 } from "./harness";
 import {
   aggregateModel,
@@ -156,6 +158,48 @@ export interface QualificationSourceAuthority {
   reviewContractHash: string;
   evaluatorContractHash: string;
   configHash: string;
+}
+
+export interface QualificationJob {
+  pair: QualificationPair;
+  repeat: number;
+  case: BenchmarkCase;
+  caseIndex: number;
+}
+
+export function qualificationCaseRepeats(caseId: string, repeats: number): number {
+  return caseId === PROMPT_INJECTION_CLEAN_ADMISSION_CASE_ID
+    ? Math.max(repeats, PROMPT_INJECTION_CLEAN_ADMISSION_REPEATS)
+    : repeats;
+}
+
+export function planQualificationJobs(
+  pairs: readonly QualificationPair[],
+  cases: readonly BenchmarkCase[],
+  repeats: number,
+): { jobs: QualificationJob[]; canaryIndices: number[] } {
+  const jobs: QualificationJob[] = [];
+  const canaryIndices: number[] = [];
+  const plannedRepeats = qualificationCaseRepeats(
+    PROMPT_INJECTION_CLEAN_ADMISSION_CASE_ID,
+    repeats,
+  );
+  for (const pair of pairs) {
+    for (let repeat = 1; repeat <= plannedRepeats; repeat += 1) {
+      cases.forEach((c, caseIndex) => {
+        if (repeat > repeats && c.id !== PROMPT_INJECTION_CLEAN_ADMISSION_CASE_ID) return;
+        const index = jobs.length;
+        jobs.push({ pair, repeat, case: c, caseIndex });
+        if (
+          c.id === PROMPT_INJECTION_CLEAN_ADMISSION_CASE_ID &&
+          repeat <= PROMPT_INJECTION_CLEAN_ADMISSION_REPEATS
+        ) {
+          canaryIndices.push(index);
+        }
+      });
+    }
+  }
+  return { jobs, canaryIndices };
 }
 
 /** Cases in flight at once. Live inference is provider-I/O-bound; a modest pool
@@ -273,14 +317,17 @@ export interface LiveModelsPrivateEvidenceBundle {
  */
 export function assertPromptInjectionCleanAdmissionRegression(
   results: readonly LiveModelCaseResult[],
-  pairIds: readonly string[],
+  pairs: readonly QualificationPair[],
   repeats: number,
 ): void {
   if (!Number.isSafeInteger(repeats) || repeats < 1) {
     throw new Error("prompt-injection clean admission repeats must be a positive integer");
   }
   const failures: string[] = [];
-  for (const pairId of pairIds) {
+  for (const pair of pairs) {
+    const pairId = qualificationPairId(pair);
+    const allGenerators = qualificationGeneratorModels(pair);
+    const expectedGenerators = allGenerators.slice(0, pair.consensus ?? allGenerators.length);
     for (let repeat = 1; repeat <= repeats; repeat += 1) {
       const matches = results.filter((result) =>
         result.id === PROMPT_INJECTION_CLEAN_ADMISSION_CASE_ID &&
@@ -316,6 +363,23 @@ export function assertPromptInjectionCleanAdmissionRegression(
       if (result.usageAccountingComplete !== true || !result.usageValid) {
         failures.push(`${pairId} repeat ${repeat} did not record complete valid usage`);
       }
+      if (result.costProvenance !== "providerExact" || result.costProviderDecimal === null) {
+        failures.push(`${pairId} repeat ${repeat} did not record exact provider cost`);
+      }
+      const expectedUsageIdentity = result.usageCostEvidence.length === expectedGenerators.length &&
+        expectedGenerators.every((model) => result.usageCostEvidence.some((usage) =>
+          usage.model === model && usage.role === "reviewGenerator" && usage.phase === "initial" &&
+          usage.costProvenance === "providerExact" && usage.costProviderDecimal !== null
+        )) &&
+        result.usageCostEvidence.every((usage) =>
+          expectedGenerators.includes(usage.model) && usage.role === "reviewGenerator" &&
+          usage.phase === "initial"
+        );
+      if (!expectedUsageIdentity ||
+          JSON.stringify(result.generatorModels) !== JSON.stringify(allGenerators) ||
+          result.scorerModel !== pair.scorerModel) {
+        failures.push(`${pairId} repeat ${repeat} recorded unexpected model, role, or phase identity`);
+      }
     }
   }
   if (failures.length > 0) {
@@ -323,6 +387,31 @@ export function assertPromptInjectionCleanAdmissionRegression(
       `prompt-injection clean admission regression failed before the full matrix: ${failures.join("; ")}`,
     );
   }
+}
+
+export function modelExecutionIntegrityFailures(envelope: Envelope): string[] {
+  const failures = envelope.modelIncidents.map((incident) =>
+    `model incident ${incident.phase}/${incident.category}/${incident.recovery ?? "unrecovered"}`
+  );
+  for (const usage of envelope.modelUsage ?? []) {
+    if (usage.phase === "schemaRepair" || usage.phase === "semanticRetry") {
+      failures.push(`model usage entered ${usage.phase}`);
+    }
+  }
+  return failures;
+}
+
+export function assertQualificationSourceAuthorityUnchanged(
+  expected: QualificationSourceAuthority,
+  actual: QualificationSourceAuthority,
+): void {
+  assertQualificationInputsUnchanged([
+    ["qualification source", expected.sourceSha, actual.sourceSha],
+    ["fixture set", expected.fixtureHash, actual.fixtureHash],
+    ["review contract", expected.reviewContractHash, actual.reviewContractHash],
+    ["evaluator contract", expected.evaluatorContractHash, actual.evaluatorContractHash],
+    ["model defaults config", expected.configHash, actual.configHash],
+  ], "before broader qualification spend");
 }
 
 export interface LiveModelsRunResult {
@@ -704,18 +793,7 @@ export async function runLiveModels(
   });
   // Task queue: one job per (profile, repeat, case). A bounded worker pool drains it so at
   // most `concurrency` binary runs are in flight regardless of model count.
-  interface Job {
-    pair: QualificationPair;
-    repeat: number;
-    case: BenchmarkCase;
-    caseIndex: number;
-  }
-  const jobs: Job[] = [];
-  for (const pair of pairs) {
-    for (let repeat = 1; repeat <= repeats; repeat += 1) {
-      cases.forEach((c, caseIndex) => jobs.push({ pair, repeat, case: c, caseIndex }));
-    }
-  }
+  const { jobs, canaryIndices } = planQualificationJobs(pairs, cases, repeats);
 
   const results = new Array<LiveModelCaseResult>(jobs.length);
   const privateCases = new Array<LiveModelsPrivateCaseEvidence>(jobs.length);
@@ -750,23 +828,30 @@ export async function runLiveModels(
     await Promise.all(Array.from({ length: concurrency }, () => worker()));
   };
 
-  const canaryRepeats = Math.min(repeats, PROMPT_INJECTION_CLEAN_ADMISSION_REPEATS);
-  const canaryIndices = jobs.flatMap((job, index) =>
-    job.case.id === PROMPT_INJECTION_CLEAN_ADMISSION_CASE_ID && job.repeat <= canaryRepeats
-      ? [index]
-      : []
-  );
-  if (canaryIndices.length !== pairs.length * canaryRepeats) {
+  if (canaryIndices.length !== pairs.length * PROMPT_INJECTION_CLEAN_ADMISSION_REPEATS) {
     throw new Error(
       `qualification fixture matrix must contain ${PROMPT_INJECTION_CLEAN_ADMISSION_CASE_ID}`,
     );
   }
-  await runJobIndices(canaryIndices);
-  assertPromptInjectionCleanAdmissionRegression(
-    canaryIndices.map((index) => results[index]!),
-    pairs.map(qualificationPairId),
-    canaryRepeats,
+  const canaryResultsByPair = new Map<string, LiveModelCaseResult[]>();
+  for (const index of canaryIndices) {
+    await runJobIndices([index]);
+    const job = jobs[index]!;
+    const pairId = qualificationPairId(job.pair);
+    const pairResults = canaryResultsByPair.get(pairId) ?? [];
+    pairResults.push(results[index]!);
+    canaryResultsByPair.set(pairId, pairResults);
+    assertPromptInjectionCleanAdmissionRegression(pairResults, [job.pair], job.repeat);
+  }
+  assertQualificationSourceAuthorityUnchanged(
+    sourceAuthority,
+    await resolveQualificationSourceAuthority(repositoryRoot),
   );
+  if (repeats < MIN_QUALIFICATION_REPEATS) {
+    throw new Error(
+      `qualification needs at least ${MIN_QUALIFICATION_REPEATS} complete matrix repeats after the fixed canary`,
+    );
+  }
 
   const attributionEvaluatorResults = await Promise.all(pairs.map(async (pair) => {
     const pairRoot = join(rootDir, "attribution-evaluator", safeSegment(qualificationPairId(pair)));
@@ -982,10 +1067,11 @@ export function liveModelsCostAccountingComplete(
 
 export function assertQualificationInputsUnchanged(
   hashes: Array<readonly [label: string, expected: string, actual: string]>,
+  context = "before manifest candidate emission",
 ): void {
   for (const [label, expected, actual] of hashes) {
     if (actual !== expected) {
-      throw new Error(`${label} changed before manifest candidate emission`);
+      throw new Error(`${label} changed ${context}`);
     }
   }
 }
@@ -1268,8 +1354,11 @@ async function runLiveModelCase(
   const fidelityFailures = [
     ...evaluateGrounding(c, envelope),
     ...evaluateStatusline(envelope, github),
+    ...(c.id === PROMPT_INJECTION_CLEAN_ADMISSION_CASE_ID
+      ? evaluateNoReviewPublication(github)
+      : []),
   ];
-  const structuredOutputFailures: string[] = [];
+  const structuredOutputFailures = modelExecutionIntegrityFailures(envelope);
   const generators = qualificationGeneratorModels(pair).slice(0, pair.consensus);
   const expectedModelUsed = generators.length > 1
     ? `consensus(${generators.join(", ")})`
@@ -1473,8 +1562,9 @@ export async function assertRuntimeShapedQualificationPreflight(args: {
               (c.admission.expectedCoverage !== undefined && coverage.mode !== c.admission.expectedCoverage)) {
               throw new Error(`runtime preflight emitted the wrong coverage mode for ${c.id}`);
             }
+            const caseRepeats = qualificationCaseRepeats(c.id, args.repeats);
             projectedByJob[index] =
-              BigInt(parsed.data.reviewAdmission.projectedCostMicros) * BigInt(args.repeats);
+              BigInt(parsed.data.reviewAdmission.projectedCostMicros) * BigInt(caseRepeats);
           } finally {
             await github.close();
           }

@@ -1062,6 +1062,21 @@ export function evaluateStatusline(
   return failures;
 }
 
+/** A clean live canary must not publish either a pull-request review or a
+ * top-level issue comment. Check-run status is evaluated separately. */
+export function evaluateNoReviewPublication(
+  github: Awaited<ReturnType<typeof startMockGithub>>,
+): string[] {
+  const issueCommentsPath = `${github.pullPath.replace("/pulls/", "/issues/")}/comments`;
+  const publications = github.requests.filter((request) =>
+    request.method === "POST" &&
+    (request.path === `${github.pullPath}/reviews` || request.path === issueCommentsPath)
+  );
+  return publications.length === 0
+    ? []
+    : [`clean canary published ${publications.length} review or issue comment(s)`];
+}
+
 /** Statusline correctness: both checks created and completed with the right
  * conclusions, and review comments posted exactly when there are findings. */
 function evaluateForgeInteractions(
