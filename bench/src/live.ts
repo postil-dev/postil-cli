@@ -565,6 +565,8 @@ export function scorerOperationalFailure(
   if (expectedScorer === undefined) return null;
   const scorerUsage = (env.modelUsage ?? []).filter((event) => event.role === "findingScorer");
   const generatorWasSilent = env.findings.length === 0 && (env.suppressedFindings?.length ?? 0) === 0;
+  // The production scorer receives findings, not the whole review. A silent
+  // generator therefore has no scorer call or scorer identity to attest.
   if (generatorWasSilent && env.scorerModel === undefined && scorerUsage.length === 0) {
     return null;
   }
