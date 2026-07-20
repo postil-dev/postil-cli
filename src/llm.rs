@@ -2390,23 +2390,35 @@ impl LlmClient {
                 )
                 .await;
             match retry {
-                Ok(content) => {
-                    if let Ok(raw) = parse_review(&content) {
+                Ok(content) => match parse_review(&content) {
+                    Ok(raw) => {
                         let mut candidate = into_review(raw, model, retry_usage);
                         candidate.model_usage = call_usage.clone();
                         candidate.model_incidents = review.model_incidents.clone();
                         candidate.usage_accounting_complete = retry_accounting_complete;
-                        if validate(&candidate).is_ok() {
-                            candidate.model_incidents.push(ModelIncident {
-                                phase: ModelIncidentPhase::Review,
-                                category: ModelIncidentCategory::InvalidOutput,
-                                recovered: true,
-                                recovery: Some(ModelIncidentRecovery::Repair),
-                            });
-                            return Ok(candidate);
+                        match validate(&candidate) {
+                            Ok(()) => {
+                                candidate.model_incidents.push(ModelIncident {
+                                    phase: ModelIncidentPhase::Review,
+                                    category: ModelIncidentCategory::InvalidOutput,
+                                    recovered: true,
+                                    recovery: Some(ModelIncidentRecovery::Repair),
+                                });
+                                return Ok(candidate);
+                            }
+                            Err(retry_reason) => eprintln!(
+                                "postil: model {} semantic retry remained unusable: {}",
+                                log_text(model),
+                                log_text(&retry_reason),
+                            ),
                         }
                     }
-                }
+                    Err(parse_error) => eprintln!(
+                        "postil: model {} semantic retry returned invalid JSON: {}",
+                        log_text(model),
+                        log_text(&parse_error),
+                    ),
+                },
                 Err(error) => {
                     let mut error = ModelError::new(
                         error.context("review validation retry failed"),
@@ -4250,7 +4262,7 @@ fn into_review(raw: RawReview, model: &str, usage: Usage) -> ModelReview {
                 Some("contentPolicy") | Some("content_policy") => Kind::ContentPolicy,
                 _ => Kind::Risk,
             };
-            Finding {
+            let mut finding = Finding {
                 path: f.path.trim_start_matches("./").to_string(),
                 line: f.line,
                 end_line: f.end_line.filter(|e| *e >= f.line),
@@ -4266,7 +4278,9 @@ fn into_review(raw: RawReview, model: &str, usage: Usage) -> ModelReview {
                 body: f.body,
                 evidence: f.evidence,
                 id: None,
-            }
+            };
+            crate::envelope::normalize_finding_publication(&mut finding);
+            finding
         })
         .collect();
     ModelReview {
@@ -6046,7 +6060,7 @@ mod tests {
     }
 
     #[test]
-    fn into_review_preserves_finding_prose_for_contract_validation() {
+    fn into_review_normalizes_presentation_markup_before_contract_validation() {
         let raw = RawReview {
             summary: String::new(),
             findings: vec![RawFinding {
@@ -6067,8 +6081,11 @@ mod tests {
 
         let review = into_review(raw, "m", Usage::default());
         let finding = &review.findings[0];
-        assert_eq!(finding.title, "@octocat <img> **unsafe**");
-        assert!(finding.body.contains("@octocat <details>"));
+        assert_eq!(finding.title, "＠octocat &lt;img&gt; unsafe");
+        assert!(finding.body.starts_with("\\# Summary\n"));
+        assert!(finding.body.contains("＠octocat &lt;details&gt;"));
+        assert!(finding.body.contains(r"\![pixel](https://bad.test/x)"));
+        assert!(crate::envelope::validate_finding_publication(finding).is_err());
     }
 
     fn mk(model: &str, path: &str, line: u32, conf: f64) -> ModelReview {

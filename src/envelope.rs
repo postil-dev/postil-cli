@@ -151,18 +151,20 @@ pub fn forge_safe_finding_publication_text(finding: &Finding) -> FindingPublicat
         return finding_publication_text(&finding.title, &finding.body);
     }
 
-    let title = sanitize_publication_title(&finding.title);
-    let title = if title.is_empty() || title.chars().count() > FINDING_PUBLIC_TITLE_MAX_CHARS {
+    let mut normalized = finding.clone();
+    normalize_finding_publication(&mut normalized);
+    if validate_finding_publication(&normalized).is_ok() {
+        return finding_publication_text(&normalized.title, &normalized.body);
+    }
+
+    let title = if normalized.title.is_empty()
+        || normalized.title.chars().count() > FINDING_PUBLIC_TITLE_MAX_CHARS
+    {
         "Review finding".to_string()
     } else {
-        title
+        normalized.title
     };
-    let body = finding
-        .body
-        .lines()
-        .map(sanitize_publication_line)
-        .collect::<Vec<_>>()
-        .join("\n");
+    let body = normalized.body;
     let body_is_publishable = !body.is_empty()
         && body.trim() == body
         && body.chars().count() <= FINDING_PUBLIC_BODY_MAX_CHARS
@@ -177,7 +179,18 @@ pub fn forge_safe_finding_publication_text(finding: &Finding) -> FindingPublicat
         "This carried finding does not satisfy the publication contract. Open Review details for the complete record.".to_string()
     };
 
-    FindingPublicationText { title, body }
+    let publication = FindingPublicationText { title, body };
+    let mut projected = finding.clone();
+    projected.title.clone_from(&publication.title);
+    projected.body.clone_from(&publication.body);
+    if validate_finding_publication(&projected).is_ok() {
+        publication
+    } else {
+        FindingPublicationText {
+            title: "Review finding".to_string(),
+            body: "This carried finding does not satisfy the publication contract. Open Review details for the complete record.".to_string(),
+        }
+    }
 }
 
 pub fn validate_finding_publication(finding: &Finding) -> Result<(), String> {
@@ -225,6 +238,7 @@ pub fn validate_finding_publication(finding: &Finding) -> Result<(), String> {
             || neutralize_unmatched_backticks(line) != line
             || markdown_fence_line(trimmed)
             || markdown_atx_heading(trimmed)
+            || markdown_thematic_break(trimmed)
             || (index > 0 && markdown_setext_delimiter(trimmed))
             || markdown_table_delimiter(trimmed)
         {
@@ -232,6 +246,45 @@ pub fn validate_finding_publication(finding: &Finding) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Normalize presentation-only hazards in fresh model prose before admission.
+///
+/// This projection does not truncate prose or repair semantic requirements
+/// such as sentence completeness and size limits. Those remain validation
+/// errors.
+pub(crate) fn normalize_finding_publication(finding: &mut Finding) {
+    finding.title = sanitize_publication_title(&finding.title);
+    finding.body = finding
+        .body
+        .lines()
+        .enumerate()
+        .map(|(index, line)| normalize_publication_body_line(line, index))
+        .collect::<Vec<_>>()
+        .join("\n");
+}
+
+fn normalize_publication_body_line(value: &str, index: usize) -> String {
+    let line = neutralize_unmatched_backticks(&sanitize_publication_line(value));
+    let trimmed = line.trim();
+    let block_markup = markdown_fence_line(trimmed)
+        || markdown_atx_heading(trimmed)
+        || markdown_thematic_break(trimmed)
+        || (index > 0 && markdown_setext_delimiter(trimmed))
+        || markdown_table_delimiter(trimmed);
+    if !block_markup {
+        return line;
+    }
+
+    let first_content = line
+        .char_indices()
+        .find_map(|(offset, character)| (!character.is_whitespace()).then_some(offset))
+        .unwrap_or(line.len());
+    let mut normalized = String::with_capacity(line.len() + 1);
+    normalized.push_str(&line[..first_content]);
+    normalized.push('\\');
+    normalized.push_str(&line[first_content..]);
+    normalized
 }
 
 fn sanitize_publication_title(value: &str) -> String {
@@ -245,12 +298,29 @@ fn sanitize_publication_title(value: &str) -> String {
             }
         })
         .collect::<String>();
-    let line = sanitize_publication_line(&single_line).replace(['`', '*', '_', '[', ']', '#'], " ");
+    let line = sanitize_publication_line(&single_line).replace(['`', '*', '[', ']', '#'], " ");
+    let characters = line.chars().collect::<Vec<_>>();
+    let line = characters
+        .iter()
+        .enumerate()
+        .map(|(index, character)| {
+            if *character != '_'
+                || (index > 0
+                    && index + 1 < characters.len()
+                    && characters[index - 1].is_alphanumeric()
+                    && characters[index + 1].is_alphanumeric())
+            {
+                *character
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>();
     line.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn sanitize_publication_line(value: &str) -> String {
-    let text = value
+    let text = escape_unsafe_unicode(value)
         .chars()
         .filter(|character| !character.is_control() || *character == '\t')
         .collect::<String>()
@@ -258,6 +328,27 @@ fn sanitize_publication_line(value: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;");
     neutralize_markdown_images(&text)
+}
+
+fn escape_unsafe_unicode(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for character in value.chars() {
+        if matches!(
+            character,
+            '\u{00ad}'
+                | '\u{034f}'
+                | '\u{061c}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{206f}'
+                | '\u{feff}'
+        ) {
+            output.push_str(&format!("[U+{:04X}]", character as u32));
+        } else {
+            output.push(character);
+        }
+    }
+    output
 }
 
 fn neutralize_markdown_images(value: &str) -> String {
@@ -296,6 +387,24 @@ fn markdown_setext_delimiter(value: &str) -> bool {
     value.len() >= 3
         && (value.chars().all(|character| character == '=')
             || value.chars().all(|character| character == '-'))
+}
+
+fn markdown_thematic_break(value: &str) -> bool {
+    for marker in ['-', '*', '_'] {
+        let mut count = 0usize;
+        let valid = value.chars().all(|character| {
+            if character == marker {
+                count += 1;
+                true
+            } else {
+                character == ' ' || character == '\t'
+            }
+        });
+        if valid && count >= 3 {
+            return true;
+        }
+    }
+    false
 }
 
 fn markdown_table_delimiter(value: &str) -> bool {
@@ -1037,6 +1146,69 @@ mod tests {
     }
 
     #[test]
+    fn fresh_finding_normalization_neutralizes_markup_without_truncation() {
+        let mut finding = finding(Severity::Warn, 0.9);
+        finding.title = "Use `POSTIL_PRIVATE_MONITOR_DATABASE_URL` safely".into();
+        finding.body =
+            "# Impact\n@operator must not publish <details> or an unmatched ` marker.".into();
+
+        normalize_finding_publication(&mut finding);
+
+        assert_eq!(
+            finding.title,
+            "Use POSTIL_PRIVATE_MONITOR_DATABASE_URL safely"
+        );
+        assert!(finding.body.starts_with("\\# Impact\n"));
+        assert!(finding.body.contains("＠operator"));
+        assert!(finding.body.contains("&lt;details&gt;"));
+        assert!(finding.body.contains("unmatched \\` marker."));
+        assert_eq!(validate_finding_publication(&finding), Ok(()));
+    }
+
+    #[test]
+    fn fresh_finding_normalization_does_not_hide_semantic_contract_failures() {
+        let mut incomplete = finding(Severity::Warn, 0.9);
+        incomplete.body = "Sentence remains cut off".into();
+        normalize_finding_publication(&mut incomplete);
+        assert_eq!(
+            validate_finding_publication(&incomplete),
+            Err("finding body must end with sentence punctuation".to_string())
+        );
+
+        let mut over_limit = finding(Severity::Warn, 0.9);
+        over_limit.body = format!("{}.", "x".repeat(FINDING_PUBLIC_BODY_MAX_CHARS));
+        let original = over_limit.body.clone();
+        normalize_finding_publication(&mut over_limit);
+        assert_eq!(over_limit.body, original);
+        assert!(validate_finding_publication(&over_limit).is_err());
+    }
+
+    #[test]
+    fn normalization_exposes_directional_and_zero_width_controls() {
+        let mut finding = finding(Severity::Warn, 0.9);
+        finding.title = "Visible\u{202e}title".into();
+        finding.body = "The value contains x\u{200b}y and \u{2066}isolated\u{2069} text.".into();
+
+        normalize_finding_publication(&mut finding);
+
+        assert_eq!(finding.title, "Visible U+202E title");
+        assert!(finding.body.contains("x[U+200B]y"));
+        assert!(finding.body.contains("[U+2066]isolated[U+2069]"));
+        assert_eq!(validate_finding_publication(&finding), Ok(()));
+    }
+
+    #[test]
+    fn normalization_escapes_thematic_breaks_on_every_line() {
+        for separator in ["---", "- - -", "* * *", "_ _ _"] {
+            let mut finding = finding(Severity::Warn, 0.9);
+            finding.body = format!("{separator}\nComplete explanation.");
+            normalize_finding_publication(&mut finding);
+            assert!(finding.body.starts_with('\\'), "{separator:?}");
+            assert_eq!(validate_finding_publication(&finding), Ok(()));
+        }
+    }
+
+    #[test]
     fn over_limit_body_fails_without_word_boundary_truncation() {
         let body = format!("word {}.", "complete ".repeat(150));
         assert!(body.chars().count() > FINDING_PUBLIC_BODY_MAX_CHARS);
@@ -1062,6 +1234,24 @@ mod tests {
         assert!(!publication.body.contains('@'));
         assert!(!publication.body.contains("<details>"));
         assert!(publication.body.ends_with("&lt;/details&gt;."));
+    }
+
+    #[test]
+    fn forge_projection_reuses_complete_normalization_and_revalidates() {
+        let mut legacy = finding(Severity::Warn, 0.9);
+        legacy.title = "Use `SAFE_VALUE`".into();
+        legacy.body = "---\n@operator sees x\u{202e}y and an unmatched ` marker.".into();
+
+        let publication = forge_safe_finding_publication_text(&legacy);
+        legacy.title.clone_from(&publication.title);
+        legacy.body.clone_from(&publication.body);
+
+        assert_eq!(legacy.title, "Use SAFE_VALUE");
+        assert!(legacy.body.starts_with("\\---\n"));
+        assert!(legacy.body.contains("＠operator"));
+        assert!(legacy.body.contains("x[U+202E]y"));
+        assert!(legacy.body.contains("unmatched \\` marker."));
+        assert_eq!(validate_finding_publication(&legacy), Ok(()));
     }
 
     #[test]
