@@ -29,7 +29,9 @@ import {
   liveEnv,
   liveModelsQualificationExitCode,
   liveModelsCostAccountingComplete,
+  managedQualificationUpstreamProvider,
   MANAGED_OPENROUTER_PROVIDER_IDENTITY,
+  MANAGED_QUALIFICATION_UPSTREAM_PROVIDER_IDENTITY,
   modelPriceBoundsFor,
   modelExecutionIntegrityFailures,
   normalizeApiBase,
@@ -164,6 +166,18 @@ async function close(server: Server): Promise<void> {
 }
 
 describe("pair qualification configuration", () => {
+  test("accepts only the source-pinned managed upstream provider", () => {
+    expect(managedQualificationUpstreamProvider()).toBe(
+      MANAGED_QUALIFICATION_UPSTREAM_PROVIDER_IDENTITY,
+    );
+    expect(managedQualificationUpstreamProvider("Fireworks")).toBe("Fireworks");
+    for (const requested of ["", " Fireworks ", "OtherProvider"]) {
+      expect(() => managedQualificationUpstreamProvider(requested)).toThrow(
+        "live qualification requires the source-pinned Fireworks upstream provider",
+      );
+    }
+  });
+
   test("always dispatches three clean canaries before broader work", () => {
     const allCases = fixtureInputs.map((input) => benchmarkCase.parse(input));
     const canary = allCases.find((candidate) =>
@@ -504,12 +518,12 @@ describe("pair qualification configuration", () => {
       intendedManagedPricing,
       apiBase,
       "openai-compatible",
-      "Fireworks",
+      MANAGED_QUALIFICATION_UPSTREAM_PROVIDER_IDENTITY,
     )).toEqual({
       benchmarkProviderIdentity: MANAGED_OPENROUTER_PROVIDER_IDENTITY,
       apiBase,
       apiFormat: "openai-compatible",
-      upstreamProviderIdentity: "Fireworks",
+      upstreamProviderIdentity: MANAGED_QUALIFICATION_UPSTREAM_PROVIDER_IDENTITY,
       generatorChain: ["deepseek/deepseek-v4-flash"],
       consensus: 1,
       scorerChain: ["z-ai/glm-5.2"],
@@ -529,7 +543,7 @@ describe("pair qualification configuration", () => {
     expect(() => assertPricingProviderIdentity(
       intendedManagedPricing,
       [intendedManagedPair.generatorModel, intendedManagedPair.scorerModel],
-      "Fireworks",
+      MANAGED_QUALIFICATION_UPSTREAM_PROVIDER_IDENTITY,
     )).not.toThrow();
     expect(() => assertPricingProviderIdentity(
       intendedManagedPricing,
@@ -723,7 +737,7 @@ describe("pair qualification configuration", () => {
         apiBase: normalizeApiBase("https://openrouter.ai/api/v1"),
         apiFormat: "openai-compatible",
         costCapUsdDecimal: "70",
-        upstreamProvider: "Fireworks",
+        upstreamProvider: MANAGED_QUALIFICATION_UPSTREAM_PROVIDER_IDENTITY,
       });
       expect(projected).toBe("61.457763");
     } finally {
@@ -1369,9 +1383,9 @@ describe("managed admission workflow", () => {
       `^ {6}cost_cap_usd:\\n(?: {8}.*\\n){2} {8}default: "${MAX_GENERATOR_COST_CAP_USD}"$`,
       "mu",
     ));
-    expect(workflow).toContain("upstream_provider:");
-    expect(workflow).toMatch(/upstream_provider:\n(?: {8}.*\n){2} {8}default: "Fireworks"/u);
-    expect(workflow).toContain("POSTIL_BENCH_UPSTREAM_PROVIDER: ${{ inputs.upstream_provider }}");
+    expect(workflow).not.toContain("upstream_provider:");
+    expect(workflow).toContain("POSTIL_BENCH_UPSTREAM_PROVIDER: Fireworks");
+    expect(workflow).not.toContain("inputs.upstream_provider");
     expect(workflow).toContain("OPENROUTER_MANAGEMENT_API_KEY: ${{ secrets.OPENROUTER_MANAGEMENT_API_KEY }}");
     expect(workflow).toContain("OPENROUTER_QUALIFICATION_KEY_SHA256: ${{ secrets.OPENROUTER_QUALIFICATION_KEY_SHA256 }}");
     expect(workflow).toContain("COMPLETION_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}");

@@ -254,6 +254,10 @@ export async function verifyProvisionalRelease(
   if (scorer.fallback.length > 0 && scorer.fallback === scorer.default_model) {
     throw new Error("scorer fallback must differ from scorer.defaultModel");
   }
+  const defaultsSha = createHash("sha256").update(configSource).digest("hex");
+  if (manifest.modelDefaultsSha256 !== defaultsSha) {
+    throw new Error("empty qualification manifest does not match embedded model defaults");
+  }
   if (
     config.default_model !== profile.generatorChain[0] ||
     JSON.stringify(config.cascade) !== JSON.stringify(profile.generatorChain.slice(1)) ||
@@ -265,11 +269,7 @@ export async function verifyProvisionalRelease(
     scorer.fallback !== (profile.scorerChain[1] ?? "") ||
     JSON.stringify(scorer.qualification_candidates) !== JSON.stringify(profile.scorerChain)
   ) {
-    throw new Error("provisional hosted profile does not exactly match embedded model defaults");
-  }
-  const defaultsSha = createHash("sha256").update(configSource).digest("hex");
-  if (manifest.modelDefaultsSha256 !== defaultsSha) {
-    throw new Error("empty qualification manifest does not match embedded model defaults");
+    throw new Error("no provisional hosted profile is active for embedded model defaults");
   }
   return "provisional";
 }

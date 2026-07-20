@@ -96,6 +96,7 @@ export const QUALIFICATION_MAX_AGE_SECONDS = QUALIFICATION_MAX_AGE_DAYS * 24 * 6
 const MAX_QUALIFICATION_SOURCE_BYTES = 16 * 1024 * 1024;
 const MANAGED_OPENROUTER_API_BASE = "https://openrouter.ai:443/api/v1";
 export const MANAGED_OPENROUTER_PROVIDER_IDENTITY = "openrouter:managed-routing";
+export const MANAGED_QUALIFICATION_UPSTREAM_PROVIDER_IDENTITY = "Fireworks";
 export const LIVE_MODELS_REPORT_SCHEMA_VERSION = 3;
 export const LIVE_MODELS_PRIVATE_EVIDENCE_SCHEMA_VERSION = 1;
 export const PROMPT_INJECTION_CLEAN_ADMISSION_CASE_ID = "prompt-injection-comment-clean";
@@ -123,6 +124,17 @@ export class ManagedAdmissionCapacityError extends Error {
     super(message);
     this.name = "ManagedAdmissionCapacityError";
   }
+}
+
+export function managedQualificationUpstreamProvider(
+  requested?: string,
+): typeof MANAGED_QUALIFICATION_UPSTREAM_PROVIDER_IDENTITY {
+  if (requested !== undefined && requested !== MANAGED_QUALIFICATION_UPSTREAM_PROVIDER_IDENTITY) {
+    throw new Error(
+      `live qualification requires the source-pinned ${MANAGED_QUALIFICATION_UPSTREAM_PROVIDER_IDENTITY} upstream provider`,
+    );
+  }
+  return MANAGED_QUALIFICATION_UPSTREAM_PROVIDER_IDENTITY;
 }
 
 export function managedAdmissionCapacityFailure(
@@ -720,6 +732,7 @@ export async function runLiveModels(
   validateGeneratorQualificationBounds(models, costCapUsd);
   const cases = inputs.map((input) => benchmarkCase.parse(input));
   assertExactQualificationFixtures(cases);
+  const upstreamProvider = managedQualificationUpstreamProvider(options.upstreamProvider);
   if (!resolveApiKeyName()) {
     throw new Error(
       `live mode needs a real model key: set ${API_KEY_ENV_NAMES_TEXT} in the ` +
@@ -730,10 +743,6 @@ export async function runLiveModels(
   const apiFormat = options.apiFormat ?? "openai-compatible";
   if (benchmarkProviderIdentityFor(apiBase, apiFormat) !== MANAGED_OPENROUTER_PROVIDER_IDENTITY) {
     throw new Error("live qualification requires the canonical managed OpenRouter endpoint");
-  }
-  const upstreamProvider = options.upstreamProvider.trim();
-  if (upstreamProvider.length === 0) {
-    throw new Error("live qualification requires an exact pinned upstream provider identity");
   }
   const rootDir = options.rootDir ?? resolve(import.meta.dir, "..", ".runs", "live-models");
   const suppliedPricing = options.pricing;

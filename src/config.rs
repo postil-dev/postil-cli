@@ -1482,11 +1482,27 @@ fn provisional_hosted_roster_enabled() -> bool {
     provisional_hosted_roster_allowed(
         std::env::var(PROVISIONAL_HOSTED_ROSTER_ENV).as_deref() == Ok("1"),
         qualification_manifest().profiles.is_empty(),
+        provisional_hosted_profile_matches_model_defaults(),
     )
 }
 
-fn provisional_hosted_roster_allowed(requested: bool, qualification_manifest_empty: bool) -> bool {
-    requested && qualification_manifest_empty
+fn provisional_hosted_roster_allowed(
+    requested: bool,
+    qualification_manifest_empty: bool,
+    provisional_profile_matches_model_defaults: bool,
+) -> bool {
+    requested && qualification_manifest_empty && provisional_profile_matches_model_defaults
+}
+
+fn provisional_hosted_profile_matches_model_defaults() -> bool {
+    let defaults = model_defaults();
+    let profile = provisional_hosted_profile();
+    let (generator_chain, scorer_chain, api_base) = qualification_defaults(defaults);
+    generator_chain == profile.generator_chain
+        && scorer_chain == profile.scorer_chain
+        && defaults.consensus == profile.consensus
+        && defaults.api_format == profile.api_format
+        && api_base == profile.api_base
 }
 
 pub(crate) fn bounded_review_selection_mode() -> bool {
@@ -2995,6 +3011,7 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
             defaults.scorer_qualification_candidates,
             vec!["z-ai/glm-5.2"]
         );
+        assert!(!provisional_hosted_profile_matches_model_defaults());
     }
 
     #[test]
@@ -3054,9 +3071,10 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
 
     #[test]
     fn provisional_hosted_roster_cannot_override_formal_admission() {
-        assert!(provisional_hosted_roster_allowed(true, true));
-        assert!(!provisional_hosted_roster_allowed(true, false));
-        assert!(!provisional_hosted_roster_allowed(false, true));
+        assert!(provisional_hosted_roster_allowed(true, true, true));
+        assert!(!provisional_hosted_roster_allowed(true, true, false));
+        assert!(!provisional_hosted_roster_allowed(true, false, true));
+        assert!(!provisional_hosted_roster_allowed(false, true, true));
     }
 
     #[test]

@@ -44,13 +44,51 @@ async function temporaryDirectory(): Promise<string> {
 }
 
 describe("admission attestation verification", () => {
-  test("verifies the repository provisional hosted release profile", async () => {
+  test("keeps the repository candidate configuration non-provisional", async () => {
     const repositoryRoot = join(import.meta.dir, "..", "..");
-    expect(await verifyProvisionalRelease(
+    await expect(verifyProvisionalRelease(
       join(repositoryRoot, "qualified-models.json"),
       join(repositoryRoot, "config.toml"),
       join(repositoryRoot, "provisional-models.json"),
-    )).toBe("provisional");
+    )).rejects.toThrow("no provisional hosted profile is active for embedded model defaults");
+  });
+
+  test("verifies a provisional release only when its profile matches the embedded defaults", async () => {
+    const repositoryRoot = join(import.meta.dir, "..", "..");
+    const directory = await temporaryDirectory();
+    const manifest = join(directory, "qualified-models.json");
+    const config = join(directory, "config.toml");
+    const profile = join(directory, "provisional-models.json");
+    await writeFile(manifest, await readFile(join(repositoryRoot, "qualified-models.json")));
+    await writeFile(config, await readFile(join(repositoryRoot, "config.toml")));
+    const exact = JSON.parse(
+      await readFile(join(repositoryRoot, "provisional-models.json"), "utf8"),
+    ) as {
+      generatorChain: string[];
+      scorerChain: string[];
+      modelPriceBounds: Array<{
+        model: string;
+        inputMicrosPerMillionTokens: number;
+        outputMicrosPerMillionTokens: number;
+      }>;
+    };
+    exact.generatorChain = ["deepseek/deepseek-v4-flash"];
+    exact.scorerChain = ["z-ai/glm-5.2"];
+    exact.modelPriceBounds = [
+      {
+        model: "deepseek/deepseek-v4-flash",
+        inputMicrosPerMillionTokens: 140_000,
+        outputMicrosPerMillionTokens: 280_000,
+      },
+      {
+        model: "z-ai/glm-5.2",
+        inputMicrosPerMillionTokens: 1_400_000,
+        outputMicrosPerMillionTokens: 4_400_000,
+      },
+    ];
+    await writeFile(profile, JSON.stringify(exact));
+
+    expect(await verifyProvisionalRelease(manifest, config, profile)).toBe("provisional");
   });
 
   test("keeps attestation verification active after a profile is formally admitted", async () => {
@@ -97,7 +135,7 @@ describe("admission attestation verification", () => {
     await writeFile(profile, JSON.stringify(altered));
 
     await expect(verifyProvisionalRelease(manifest, config, profile)).rejects.toThrow(
-      "does not exactly match embedded model defaults",
+      "no provisional hosted profile is active for embedded model defaults",
     );
   });
 

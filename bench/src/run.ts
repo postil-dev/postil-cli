@@ -56,6 +56,7 @@ import {
   formatLiveModelsReport,
   liveModelsQualificationExitCode,
   MANAGED_OPENROUTER_PROVIDER_IDENTITY,
+  managedQualificationUpstreamProvider,
   managedAdmissionCapacityFailure,
   managedAdmissionCapacityFailureCategories,
   parseLiveModelsReport,
@@ -245,10 +246,9 @@ async function main() {
     const repeatsRaw = process.env.POSTIL_BENCH_REPEATS ?? flagValue(args, "--repeats");
     const apiFormat = qualificationApiFormat(process.env.POSTIL_API_FORMAT);
     const pricingFile = process.env.POSTIL_BENCH_PRICING_FILE ?? flagValue(args, "--pricing-file");
-    const upstreamProvider = process.env.POSTIL_BENCH_UPSTREAM_PROVIDER ?? flagValue(args, "--upstream-provider");
-    if (!upstreamProvider?.trim()) {
-      throw new Error("live-models admission needs POSTIL_BENCH_UPSTREAM_PROVIDER or --upstream-provider");
-    }
+    const requestedUpstreamProvider =
+      process.env.POSTIL_BENCH_UPSTREAM_PROVIDER ?? flagValue(args, "--upstream-provider");
+    const upstreamProvider = managedQualificationUpstreamProvider(requestedUpstreamProvider);
     const qualificationSourceSha = await resolveQualificationSourceSha(
       resolve(import.meta.dir, "..", ".."),
     );
