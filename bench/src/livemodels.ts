@@ -2596,7 +2596,7 @@ export async function resolveBinaryQualificationMetadata(binary: string): Promis
   return metadata;
 }
 
-function assertBinaryMatchesQualificationWorktree(args: {
+export function assertBinaryMatchesQualificationWorktree(args: {
   metadata: BinaryQualificationMetadata;
   fixtureHash: string;
   reviewContractHash: string;

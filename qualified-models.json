@@ -4,6 +4,6 @@
   "qualificationIssuedAtUnixSeconds": null,
   "qualificationExpiresAtUnixSeconds": null,
   "qualificationMaxAgeDays": null,
-  "modelDefaultsSha256": "98de5a44a3f45557e746ed36afd5d7aae55942aa4f57d74a77335894fd21e9f3",
+  "modelDefaultsSha256": "1479ff69457cb2d12b2db5225559130f38e2ddc25ccf7dd4ec8f100a45694919",
   "profiles": []
 }

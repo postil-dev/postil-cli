@@ -2986,11 +2986,15 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
     #[test]
     fn hosted_candidate_matches_the_qualification_profile() {
         let defaults = model_defaults();
-        assert_eq!(defaults.default_model, "z-ai/glm-5.2");
+        assert_eq!(defaults.default_model, "deepseek/deepseek-v4-flash");
         assert!(defaults.cascade.is_empty());
-        assert!(defaults.scorer_model.is_empty());
+        assert!(defaults.scorer_enabled);
+        assert_eq!(defaults.scorer_model, "z-ai/glm-5.2");
         assert!(defaults.scorer_fallback.is_empty());
-        assert!(defaults.scorer_qualification_candidates.is_empty());
+        assert_eq!(
+            defaults.scorer_qualification_candidates,
+            vec!["z-ai/glm-5.2"]
+        );
     }
 
     #[test]

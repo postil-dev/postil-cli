@@ -1385,8 +1385,8 @@ fn qualification_candidate_preflights_the_bounded_hosted_path_without_provider_c
     std::fs::write(&diff_path, diff).unwrap();
 
     let metadata = postil_cli::config::qualification_metadata();
-    let generator_chain = vec!["openai/gpt-5-mini".to_string()];
-    let scorer_chain = vec!["openai/gpt-5-mini".to_string()];
+    let generator_chain = metadata.generator_chain.clone();
+    let scorer_chain = metadata.scorer_chain.clone();
     let mut models = generator_chain.clone();
     models.extend(scorer_chain.clone());
     models.sort();
@@ -1452,6 +1452,10 @@ fn qualification_candidate_admits_worst_case_json_escaped_hosted_batches() {
     std::fs::write(&diff_path, diff).unwrap();
 
     let metadata = postil_cli::config::qualification_metadata();
+    let mut models = metadata.generator_chain.clone();
+    models.extend(metadata.scorer_chain.clone());
+    models.sort();
+    models.dedup();
     let profile_path = dir.path().join("candidate.json");
     std::fs::write(
         &profile_path,
@@ -1460,14 +1464,14 @@ fn qualification_candidate_admits_worst_case_json_escaped_hosted_batches() {
             "upstreamProviderIdentity": "test-provider",
             "apiBase": metadata.default_api_base,
             "apiFormat": metadata.default_api_format,
-            "generatorChain": ["openai/gpt-5-mini"],
-            "consensus": 1,
-            "scorerChain": ["openai/gpt-5-mini"],
-            "modelPriceBounds": [{
-                "model": "openai/gpt-5-mini",
+            "generatorChain": metadata.generator_chain,
+            "consensus": metadata.consensus,
+            "scorerChain": metadata.scorer_chain,
+            "modelPriceBounds": models.into_iter().map(|model| json!({
+                "model": model,
                 "inputMicrosPerMillionTokens": 1,
                 "outputMicrosPerMillionTokens": 1
-            }]
+            })).collect::<Vec<_>>()
         }))
         .unwrap(),
     )
@@ -1591,6 +1595,8 @@ fn qualification_candidate_admits_fixture_51_shape_at_fireworks_price_bounds() {
     std::fs::write(&diff_path, diff).unwrap();
 
     let metadata = postil_cli::config::qualification_metadata();
+    assert_eq!(metadata.generator_chain, vec!["deepseek/deepseek-v4-flash"]);
+    assert_eq!(metadata.scorer_chain, vec!["z-ai/glm-5.2"]);
     let profile_path = dir.path().join("candidate.json");
     std::fs::write(
         &profile_path,
@@ -1599,19 +1605,19 @@ fn qualification_candidate_admits_fixture_51_shape_at_fireworks_price_bounds() {
             "upstreamProviderIdentity": "Fireworks",
             "apiBase": metadata.default_api_base,
             "apiFormat": metadata.default_api_format,
-            "generatorChain": ["deepseek/deepseek-v4-pro"],
-            "consensus": 1,
-            "scorerChain": ["z-ai/glm-5.2"],
+            "generatorChain": metadata.generator_chain,
+            "consensus": metadata.consensus,
+            "scorerChain": metadata.scorer_chain,
             "modelPriceBounds": [
                 {
-                    "model": "deepseek/deepseek-v4-pro",
-                    "inputMicrosPerMillionTokens": 1_740_000,
-                    "outputMicrosPerMillionTokens": 3_480_000
+                    "model": "deepseek/deepseek-v4-flash",
+                    "inputMicrosPerMillionTokens": 140_000,
+                    "outputMicrosPerMillionTokens": 280_000
                 },
                 {
                     "model": "z-ai/glm-5.2",
-                    "inputMicrosPerMillionTokens": 2_100_000,
-                    "outputMicrosPerMillionTokens": 6_600_000
+                    "inputMicrosPerMillionTokens": 1_400_000,
+                    "outputMicrosPerMillionTokens": 4_400_000
                 }
             ]
         }))

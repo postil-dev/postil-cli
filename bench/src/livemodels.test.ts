@@ -10,6 +10,7 @@ import { benchmarkCase, envelopeV1, type BenchmarkCase } from "./harness";
 import type { AttributionCallEvidence } from "./attribution";
 import {
   admissionManifestCandidate,
+  assertBinaryMatchesQualificationWorktree,
   assertPromptInjectionCleanAdmissionRegression,
   assertManagedAdmissionCapacityPreflight,
   assertGitTreeSourceAuthority,
@@ -53,6 +54,7 @@ import {
   verifyPrivateEvidenceBundle,
   withImmutableQualificationBinary,
   type LiveModelsReport,
+  type BinaryQualificationMetadata,
 } from "./livemodels";
 import {
   compareCanonicalDecimals,
@@ -64,6 +66,28 @@ import {
 } from "./livemodels-score";
 
 const pair: QualificationPair = { generatorModel: "test/generator", scorerModel: "test/scorer" };
+const intendedManagedPair: QualificationPair = {
+  generatorModel: "deepseek/deepseek-v4-flash",
+  scorerModel: "z-ai/glm-5.2",
+  consensus: 1,
+};
+
+const intendedManagedPricing = new Map([
+  [intendedManagedPair.generatorModel, {
+    providerIdentity: "Fireworks",
+    promptUsdPerToken: 0.00000014,
+    completionUsdPerToken: 0.00000028,
+    inputMicrosPerMillionTokens: 140_000,
+    outputMicrosPerMillionTokens: 280_000,
+  }],
+  [intendedManagedPair.scorerModel, {
+    providerIdentity: "Fireworks",
+    promptUsdPerToken: 0.0000014,
+    completionUsdPerToken: 0.0000044,
+    inputMicrosPerMillionTokens: 1_400_000,
+    outputMicrosPerMillionTokens: 4_400_000,
+  }],
+]);
 
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
@@ -473,6 +497,47 @@ describe("pair qualification configuration", () => {
     ).POSTIL_QUALIFICATION_CANDIDATE_PROFILE).toBe("/tmp/candidate.json");
   });
 
+  test("binds the intended managed candidate to Fireworks and exact price ceilings", () => {
+    const apiBase = normalizeApiBase("https://openrouter.ai/api/v1");
+    expect(qualificationCandidateDocument(
+      intendedManagedPair,
+      intendedManagedPricing,
+      apiBase,
+      "openai-compatible",
+      "Fireworks",
+    )).toEqual({
+      benchmarkProviderIdentity: MANAGED_OPENROUTER_PROVIDER_IDENTITY,
+      apiBase,
+      apiFormat: "openai-compatible",
+      upstreamProviderIdentity: "Fireworks",
+      generatorChain: ["deepseek/deepseek-v4-flash"],
+      consensus: 1,
+      scorerChain: ["z-ai/glm-5.2"],
+      modelPriceBounds: [
+        {
+          model: "deepseek/deepseek-v4-flash",
+          inputMicrosPerMillionTokens: 140_000,
+          outputMicrosPerMillionTokens: 280_000,
+        },
+        {
+          model: "z-ai/glm-5.2",
+          inputMicrosPerMillionTokens: 1_400_000,
+          outputMicrosPerMillionTokens: 4_400_000,
+        },
+      ],
+    });
+    expect(() => assertPricingProviderIdentity(
+      intendedManagedPricing,
+      [intendedManagedPair.generatorModel, intendedManagedPair.scorerModel],
+      "Fireworks",
+    )).not.toThrow();
+    expect(() => assertPricingProviderIdentity(
+      intendedManagedPricing,
+      [intendedManagedPair.generatorModel, intendedManagedPair.scorerModel],
+      "OtherProvider",
+    )).toThrow("not bound to upstream provider OtherProvider");
+  });
+
   test("activates the exact candidate profile for evaluator-bank calls", async () => {
     const root = await mkdtemp(resolve(tmpdir(), "postil-evaluator-profile-"));
     const pricing = new Map([
@@ -633,6 +698,34 @@ describe("pair qualification configuration", () => {
         parseCanonicalDecimal(projected),
         parseCanonicalDecimal("70"),
       )).toBeLessThanOrEqual(0);
+    } finally {
+      if (inheritedModelKey === undefined) delete process.env.MODEL_API_KEY;
+      else process.env.MODEL_API_KEY = inheritedModelKey;
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("projects the intended managed pair without provider access", async () => {
+    const root = await mkdtemp(resolve(tmpdir(), "postil-intended-runtime-preflight-"));
+    const inheritedModelKey = process.env.MODEL_API_KEY;
+    try {
+      process.env.MODEL_API_KEY = "postil-plan-only-fixture";
+      const binary = process.env.POSTIL_BIN === undefined
+        ? resolve(import.meta.dir, "..", "..", "target", "release", "postil")
+        : resolve(process.env.POSTIL_BIN);
+      const projected = await assertRuntimeShapedQualificationPreflight({
+        binary,
+        rootDir: root,
+        cases: fixtureInputs.map((input) => benchmarkCase.parse(input)),
+        pairs: normalizeQualificationPairs([intendedManagedPair]),
+        repeats: 3,
+        pricing: intendedManagedPricing,
+        apiBase: normalizeApiBase("https://openrouter.ai/api/v1"),
+        apiFormat: "openai-compatible",
+        costCapUsdDecimal: "70",
+        upstreamProvider: "Fireworks",
+      });
+      expect(projected).toBe("61.457763");
     } finally {
       if (inheritedModelKey === undefined) delete process.env.MODEL_API_KEY;
       else process.env.MODEL_API_KEY = inheritedModelKey;
@@ -951,6 +1044,53 @@ describe("qualification Git source authority", () => {
 });
 
 describe("immutable qualification binary", () => {
+  test("accepts only the intended embedded generator and scorer identity", async () => {
+    const configHash = createHash("sha256")
+      .update(await readFile(resolve(import.meta.dir, "..", "..", "config.toml")))
+      .digest("hex");
+    const metadata: BinaryQualificationMetadata = {
+      qualificationIssuedAtUnixSeconds: null,
+      qualificationExpiresAtUnixSeconds: null,
+      qualificationMaxAgeDays: null,
+      modelDefaultsSha256: configHash,
+      reviewContractSha256: "b".repeat(64),
+      fixtureSetSha256: "c".repeat(64),
+      evaluatorContractSha256: "d".repeat(64),
+      evaluatorRuntimeIdentity: "bun@1.3.14",
+      defaultApiBase: normalizeApiBase("https://openrouter.ai/api/v1"),
+      defaultApiFormat: "openai-compatible",
+      generatorChain: [intendedManagedPair.generatorModel],
+      consensus: 1,
+      scorerChain: [intendedManagedPair.scorerModel],
+      hostedOperationCostCapMicros: 1_000_000,
+      attributionMaxInputBytes: 4 * 1024,
+      attributionMaxProviderRequestBytes: 5_000,
+      admittedProfile: null,
+    };
+    const authority = {
+      metadata,
+      fixtureHash: metadata.fixtureSetSha256,
+      reviewContractHash: metadata.reviewContractSha256,
+      evaluatorContractHash: metadata.evaluatorContractSha256,
+      evaluatorRuntimeIdentity: metadata.evaluatorRuntimeIdentity,
+      configHash,
+      apiBase: metadata.defaultApiBase,
+      apiFormat: metadata.defaultApiFormat,
+    } as const;
+    expect(() => assertBinaryMatchesQualificationWorktree({
+      ...authority,
+      pairs: normalizeQualificationPairs([intendedManagedPair]),
+    })).not.toThrow();
+    expect(() => assertBinaryMatchesQualificationWorktree({
+      ...authority,
+      pairs: normalizeQualificationPairs([{
+        generatorModel: "z-ai/glm-5.2",
+        scorerModel: "z-ai/glm-5.2",
+        consensus: 1,
+      }]),
+    })).toThrow("qualification pair does not match the supplied binary's embedded default profile");
+  });
+
   test("rejects source authority drift before broader qualification spend", () => {
     const expected = {
       sourceSha: "a".repeat(40),
@@ -1224,11 +1364,13 @@ describe("managed admission workflow", () => {
     expect(workflow).toContain("POSTIL_API_FORMAT: openai-compatible");
     expect(workflow).toContain("POSTIL_BENCH_REPEATS: \"3\"");
     expect(workflow).toContain("POSTIL_BENCH_PAIRS: ${{ inputs.pairs }}");
+    expect(workflow).toMatch(/pairs:\n(?: {8}.*\n){2} {8}default: "deepseek\/deepseek-v4-flash::1::z-ai\/glm-5\.2"/u);
     expect(workflow).toMatch(new RegExp(
       `^ {6}cost_cap_usd:\\n(?: {8}.*\\n){2} {8}default: "${MAX_GENERATOR_COST_CAP_USD}"$`,
       "mu",
     ));
     expect(workflow).toContain("upstream_provider:");
+    expect(workflow).toMatch(/upstream_provider:\n(?: {8}.*\n){2} {8}default: "Fireworks"/u);
     expect(workflow).toContain("POSTIL_BENCH_UPSTREAM_PROVIDER: ${{ inputs.upstream_provider }}");
     expect(workflow).toContain("OPENROUTER_MANAGEMENT_API_KEY: ${{ secrets.OPENROUTER_MANAGEMENT_API_KEY }}");
     expect(workflow).toContain("OPENROUTER_QUALIFICATION_KEY_SHA256: ${{ secrets.OPENROUTER_QUALIFICATION_KEY_SHA256 }}");

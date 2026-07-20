@@ -8,9 +8,11 @@ on:
       pairs:
         description: Exact generators::consensus::scorer+fallback profile
         required: true
+        default: "deepseek/deepseek-v4-flash::1::z-ai/glm-5.2"
       upstream_provider:
         description: Exact ZDR provider identity serving every model in the profile
         required: true
+        default: "Fireworks"
       cost_cap_usd:
         description: Abort when projected qualification spend exceeds this amount
         required: true
