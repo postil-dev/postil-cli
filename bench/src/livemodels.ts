@@ -96,6 +96,8 @@ const MANAGED_OPENROUTER_API_BASE = "https://openrouter.ai:443/api/v1";
 export const MANAGED_OPENROUTER_PROVIDER_IDENTITY = "openrouter:managed-routing";
 export const LIVE_MODELS_REPORT_SCHEMA_VERSION = 3;
 export const LIVE_MODELS_PRIVATE_EVIDENCE_SCHEMA_VERSION = 1;
+export const PROMPT_INJECTION_CLEAN_ADMISSION_CASE_ID = "prompt-injection-comment-clean";
+export const PROMPT_INJECTION_CLEAN_ADMISSION_REPEATS = 3;
 
 export const managedAdmissionCapacityFailureCategories = [
   "account-preflight-credentials",
@@ -261,6 +263,66 @@ export interface LiveModelsPrivateEvidenceBundle {
     evidence: AttributionCallEvidence[];
   }>;
   cases: LiveModelsPrivateCaseEvidence[];
+}
+
+/**
+ * The known prompt-injection clean case is an admission canary. It runs before
+ * the rest of the paid matrix and must be silent after every pipeline stage.
+ * Suppressed findings count as failures because a scorer lowering confidence
+ * does not make a noisy generator suitable for hosted review.
+ */
+export function assertPromptInjectionCleanAdmissionRegression(
+  results: readonly LiveModelCaseResult[],
+  pairIds: readonly string[],
+  repeats: number,
+): void {
+  if (!Number.isSafeInteger(repeats) || repeats < 1) {
+    throw new Error("prompt-injection clean admission repeats must be a positive integer");
+  }
+  const failures: string[] = [];
+  for (const pairId of pairIds) {
+    for (let repeat = 1; repeat <= repeats; repeat += 1) {
+      const matches = results.filter((result) =>
+        result.id === PROMPT_INJECTION_CLEAN_ADMISSION_CASE_ID &&
+        result.pairId === pairId &&
+        result.repeat === repeat
+      );
+      if (matches.length !== 1) {
+        failures.push(`${pairId} repeat ${repeat} produced ${matches.length} result(s)`);
+        continue;
+      }
+      const result = matches[0]!;
+      if (!result.scored) failures.push(`${pairId} repeat ${repeat} produced no scored envelope`);
+      if (result.findingEvidence.length > 0) {
+        const dispositions = [...new Set(result.findingEvidence.map((finding) => finding.disposition))]
+          .sort()
+          .join("+");
+        failures.push(
+          `${pairId} repeat ${repeat} retained ${result.findingEvidence.length} ${dispositions} finding(s)`,
+        );
+      }
+      if (result.gateFailingActual !== false) {
+        failures.push(`${pairId} repeat ${repeat} did not leave the gate passing`);
+      }
+      if (result.exitCode !== 0) {
+        failures.push(`${pairId} repeat ${repeat} exited ${result.exitCode ?? "without a code"}`);
+      }
+      if (result.fidelityDiagnostics.count > 0) {
+        failures.push(`${pairId} repeat ${repeat} failed final publication fidelity`);
+      }
+      if (result.structuredOutputDiagnostics.count > 0) {
+        failures.push(`${pairId} repeat ${repeat} failed generator, repair, or scorer structure`);
+      }
+      if (result.usageAccountingComplete !== true || !result.usageValid) {
+        failures.push(`${pairId} repeat ${repeat} did not record complete valid usage`);
+      }
+    }
+  }
+  if (failures.length > 0) {
+    throw new Error(
+      `prompt-injection clean admission regression failed before the full matrix: ${failures.join("; ")}`,
+    );
+  }
 }
 
 export interface LiveModelsRunResult {
@@ -640,6 +702,72 @@ export async function runLiveModels(
     attributionContractHash: attributionContractSha256(),
     attributionBankHash: attributionBankSha256(),
   });
+  // Task queue: one job per (profile, repeat, case). A bounded worker pool drains it so at
+  // most `concurrency` binary runs are in flight regardless of model count.
+  interface Job {
+    pair: QualificationPair;
+    repeat: number;
+    case: BenchmarkCase;
+    caseIndex: number;
+  }
+  const jobs: Job[] = [];
+  for (const pair of pairs) {
+    for (let repeat = 1; repeat <= repeats; repeat += 1) {
+      cases.forEach((c, caseIndex) => jobs.push({ pair, repeat, case: c, caseIndex }));
+    }
+  }
+
+  const results = new Array<LiveModelCaseResult>(jobs.length);
+  const privateCases = new Array<LiveModelsPrivateCaseEvidence>(jobs.length);
+  const runJobIndices = async (indices: readonly number[]): Promise<void> => {
+    const concurrency = Math.max(
+      1,
+      Math.min(options.concurrency ?? DEFAULT_LIVE_CONCURRENCY, indices.length || 1),
+    );
+    let cursor = 0;
+    const worker = async (): Promise<void> => {
+      for (;;) {
+        const queuedIndex = cursor++;
+        if (queuedIndex >= indices.length) return;
+        const index = indices[queuedIndex]!;
+        const job = jobs[index]!;
+        const completed = await runLiveModelCase(
+          job.case,
+          job.caseIndex,
+          job.pair,
+          job.repeat,
+          pricing,
+          rootDir,
+          { ...options, apiBase, apiFormat },
+          attributionSourceSha256,
+          cliBinaryHash,
+          attributionGovernor,
+        );
+        results[index] = completed.result;
+        privateCases[index] = completed.privateEvidence;
+      }
+    };
+    await Promise.all(Array.from({ length: concurrency }, () => worker()));
+  };
+
+  const canaryRepeats = Math.min(repeats, PROMPT_INJECTION_CLEAN_ADMISSION_REPEATS);
+  const canaryIndices = jobs.flatMap((job, index) =>
+    job.case.id === PROMPT_INJECTION_CLEAN_ADMISSION_CASE_ID && job.repeat <= canaryRepeats
+      ? [index]
+      : []
+  );
+  if (canaryIndices.length !== pairs.length * canaryRepeats) {
+    throw new Error(
+      `qualification fixture matrix must contain ${PROMPT_INJECTION_CLEAN_ADMISSION_CASE_ID}`,
+    );
+  }
+  await runJobIndices(canaryIndices);
+  assertPromptInjectionCleanAdmissionRegression(
+    canaryIndices.map((index) => results[index]!),
+    pairs.map(qualificationPairId),
+    canaryRepeats,
+  );
+
   const attributionEvaluatorResults = await Promise.all(pairs.map(async (pair) => {
     const pairRoot = join(rootDir, "attribution-evaluator", safeSegment(qualificationPairId(pair)));
     const evaluatorEnv = await prepareAttributionEvaluatorEnvironment(
@@ -670,47 +798,8 @@ export async function runLiveModels(
   );
   const attributionEvaluators = attributionEvaluatorResults.map(summarizeAttributionEvaluator);
 
-  // Task queue: one job per (profile, repeat, case). A bounded worker pool drains it so at
-  // most `concurrency` binary runs are in flight regardless of model count.
-  interface Job {
-    pair: QualificationPair;
-    repeat: number;
-    case: BenchmarkCase;
-    caseIndex: number;
-  }
-  const jobs: Job[] = [];
-  for (const pair of pairs) {
-    for (let repeat = 1; repeat <= repeats; repeat += 1) {
-      cases.forEach((c, caseIndex) => jobs.push({ pair, repeat, case: c, caseIndex }));
-    }
-  }
-
-  const results = new Array<LiveModelCaseResult>(jobs.length);
-  const privateCases = new Array<LiveModelsPrivateCaseEvidence>(jobs.length);
-  const concurrency = Math.max(1, Math.min(options.concurrency ?? DEFAULT_LIVE_CONCURRENCY, jobs.length || 1));
-  let cursor = 0;
-  const worker = async (): Promise<void> => {
-    for (;;) {
-      const index = cursor++;
-      if (index >= jobs.length) return;
-      const job = jobs[index]!;
-      const completed = await runLiveModelCase(
-        job.case,
-        job.caseIndex,
-        job.pair,
-        job.repeat,
-        pricing,
-        rootDir,
-        { ...options, apiBase, apiFormat },
-        attributionSourceSha256,
-        cliBinaryHash,
-        attributionGovernor,
-      );
-      results[index] = completed.result;
-      privateCases[index] = completed.privateEvidence;
-    }
-  };
-  await Promise.all(Array.from({ length: concurrency }, () => worker()));
+  const canaryIndexSet = new Set(canaryIndices);
+  await runJobIndices(jobs.flatMap((_job, index) => canaryIndexSet.has(index) ? [] : [index]));
 
   const cliVersion = options.cliVersion ?? (await resolveCliVersion(options.binary));
   const aggregates = pairs.map((pair) =>
