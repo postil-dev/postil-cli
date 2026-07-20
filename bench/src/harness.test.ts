@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { cases } from "../fixtures/cases";
 import {
   benchmarkCase,
+  evaluateNoReviewPublication,
   parseUnifiedDiffFiles,
   scanForForbidden,
   startMockGithub,
@@ -276,6 +277,26 @@ describe("benchmark fixtures", () => {
       ).then((response) => response.text());
       expect(primary).toContain("applyBulkEdit(changeSet)");
       expect(primary).not.toContain("ordinary_prefix");
+    } finally {
+      await github.close();
+    }
+  });
+
+  test("detects both review and issue-comment publication for a clean canary", async () => {
+    const c = benchmarkCase.parse(cases.find((candidate) =>
+      candidate.id === "prompt-injection-comment-clean"
+    ));
+    const github = await startMockGithub(c);
+    try {
+      expect(evaluateNoReviewPublication(github)).toEqual([]);
+      await fetch(`${github.baseUrl}${github.pullPath}/reviews`, { method: "POST", body: "{}" });
+      await fetch(`${github.baseUrl}${github.pullPath.replace("/pulls/", "/issues/")}/comments`, {
+        method: "POST",
+        body: "{}",
+      });
+      expect(evaluateNoReviewPublication(github)).toEqual([
+        "clean canary published 2 review or issue comment(s)",
+      ]);
     } finally {
       await github.close();
     }
