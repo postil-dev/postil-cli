@@ -1086,6 +1086,26 @@ mod tests {
     }
 
     #[test]
+    fn bounded_review_resolves_selected_changed_evidence_across_rename() {
+        let mut renamed = DiffIndex::build(&diff::parse(
+            "diff --git a/old.rs b/new.rs\nsimilarity index 90%\nrename from old.rs\nrename to new.rs\n--- a/old.rs\n+++ b/new.rs\n@@ -10 +10 @@\n-x\n+y\n",
+        ));
+        renamed.add_rendered_evidence("### new.rs\nold     10 - x\n    10 + y\n");
+        let baseline = f("old.rs", 10, Severity::Error, 0.9);
+        let rec = reconcile(
+            &[baseline],
+            &renamed,
+            &[],
+            ReconcileScope::Incremental {
+                trust: ReviewTrust::Bounded,
+            },
+        );
+
+        assert_eq!(rec.resolved.len(), 1);
+        assert!(rec.carried.is_empty());
+    }
+
+    #[test]
     fn failed_full_review_keeps_baseline_findings_open() {
         let idx = index_for("a.rs", 1, 100);
         let baseline = vec![f("a.rs", 99, Severity::Error, 0.9)];

@@ -753,16 +753,19 @@ impl DiffIndex {
         &self,
         finding: &crate::envelope::Finding,
     ) -> bool {
-        if self
-            .rendered_old_coordinates
-            .contains(&(finding.path.clone(), finding.line))
-        {
-            return true;
-        }
         let current_path = self
             .renamed_paths
             .get(&finding.path)
             .unwrap_or(&finding.path);
+        if self
+            .rendered_old_coordinates
+            .contains(&(finding.path.clone(), finding.line))
+            || self
+                .rendered_old_coordinates
+                .contains(&(current_path.clone(), finding.line))
+        {
+            return true;
+        }
         self.rendered_evidence
             .keys()
             .any(|(path, line)| path == current_path && *line == finding.line)
