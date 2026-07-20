@@ -566,6 +566,12 @@ const PROVIDER_RETRY_DELAY_CAP_SECS: u64 = 30;
 /// Unqualified models receive a bounded review budget. A larger bound belongs
 /// in explicit admitted-model metadata after that model proves it needs one.
 pub(crate) const REVIEW_MAX_TOKENS: u32 = 8_000;
+
+pub(crate) struct ReviewPreflightPrompts<'a> {
+    pub first_users: &'a [String],
+    pub later_users: &'a [String],
+    pub output_tokens: &'a [u32],
+}
 pub(crate) const MAX_PROVIDER_ATTEMPTS: usize = 216;
 pub(crate) const MAX_REPORTED_TOKEN_SPEND: usize = 20_000_000;
 const MAX_PROVIDER_INPUT_BYTES: usize = 64 * 1024 * 1024;
@@ -1338,12 +1344,35 @@ impl LlmClient {
         candidate_later_users: &[String],
         planner: Option<(&str, usize)>,
     ) -> Result<ReviewAdmission> {
+        let output_tokens = vec![REVIEW_MAX_TOKENS; candidate_first_users.len()];
+        self.preflight_review_plan_with_output_limits(
+            cfg,
+            batch_count,
+            system,
+            ReviewPreflightPrompts {
+                first_users: candidate_first_users,
+                later_users: candidate_later_users,
+                output_tokens: &output_tokens,
+            },
+            planner,
+        )
+    }
+
+    pub(crate) fn preflight_review_plan_with_output_limits(
+        &self,
+        cfg: &Config,
+        batch_count: usize,
+        system: &str,
+        prompts: ReviewPreflightPrompts<'_>,
+        planner: Option<(&str, usize)>,
+    ) -> Result<ReviewAdmission> {
         let Some(bounds) = &self.hosted_price_bounds else {
             anyhow::bail!("hosted review preflight has no admitted price bounds");
         };
         ensure!(
-            candidate_first_users.len() >= batch_count
-                && candidate_first_users.len() == candidate_later_users.len(),
+            prompts.first_users.len() >= batch_count
+                && prompts.first_users.len() == prompts.later_users.len()
+                && prompts.first_users.len() == prompts.output_tokens.len(),
             "hosted preflight has fewer candidate prompts than selectable batches"
         );
         let review_models = if cfg.consensus > 1 {
@@ -1393,23 +1422,27 @@ impl LlmClient {
             let price = bounds
                 .get(model)
                 .ok_or_else(|| anyhow!("hosted model {model:?} has no admitted price bound"))?;
-            let request_for = |user: &str| -> Result<(usize, usize)> {
+            let request_for = |user: &str, max_tokens: u32| -> Result<(usize, usize)> {
                 self.planned_request_exposure(
                     model,
                     system,
                     user,
-                    REVIEW_MAX_TOKENS,
+                    max_tokens,
                     0.1,
                     LlmPhase::Review,
                 )
             };
-            let first_requests = candidate_first_users
+            let first_requests = prompts
+                .first_users
                 .iter()
-                .map(|user| request_for(user))
+                .zip(prompts.output_tokens)
+                .map(|(user, max_tokens)| request_for(user, *max_tokens))
                 .collect::<Result<Vec<_>>>()?;
-            let later_requests = candidate_later_users
+            let later_requests = prompts
+                .later_users
                 .iter()
-                .map(|user| request_for(user))
+                .zip(prompts.output_tokens)
+                .map(|(user, max_tokens)| request_for(user, *max_tokens))
                 .collect::<Result<Vec<_>>>()?;
             let mut worst_requests = Vec::new();
             let mut worst_bytes = 0usize;
@@ -1692,6 +1725,24 @@ impl LlmClient {
             + Sync
             + 'static,
     {
+        self.review_validated_with_safe_output_limit(cfg, system, user, REVIEW_MAX_TOKENS, validate)
+            .await
+    }
+
+    pub(crate) async fn review_validated_with_safe_output_limit<F>(
+        &self,
+        cfg: &Config,
+        system: &str,
+        user: &str,
+        max_tokens: u32,
+        validate: F,
+    ) -> std::result::Result<ModelReview, ModelError>
+    where
+        F: Fn(&ModelReview) -> std::result::Result<(), ReviewValidationFailure>
+            + Send
+            + Sync
+            + 'static,
+    {
         let validate = Arc::new(validate);
         let chain = cfg.model_chain();
         if cfg.consensus > 1 && chain.len() > 1 {
@@ -1708,7 +1759,13 @@ impl LlmClient {
                         eprintln!("postil: attempting consensus model: {model_log}");
                         let started_at = Instant::now();
                         let result = client
-                            .review_with_model(&task_model, &system, &user, validate.as_ref())
+                            .review_with_model(
+                                &task_model,
+                                &system,
+                                &user,
+                                max_tokens,
+                                validate.as_ref(),
+                            )
                             .await;
                         let elapsed = elapsed_text(started_at.elapsed());
                         match &result {
@@ -1836,7 +1893,7 @@ impl LlmClient {
                 );
                 let started_at = Instant::now();
                 match self
-                    .review_with_model(model, system, user, validate.as_ref())
+                    .review_with_model(model, system, user, max_tokens, validate.as_ref())
                     .await
                 {
                     Ok(mut r) => {
@@ -2219,6 +2276,7 @@ impl LlmClient {
         model: &str,
         system: &str,
         user: &str,
+        max_tokens: u32,
         validate: &(
              dyn Fn(&ModelReview) -> std::result::Result<(), ReviewValidationFailure> + Send + Sync
          ),
@@ -2235,7 +2293,7 @@ impl LlmClient {
                 &mut usage,
                 &mut call_usage,
                 &mut usage_accounting_complete,
-                REVIEW_MAX_TOKENS,
+                max_tokens,
                 LlmPhase::Review,
                 LlmCallPhase::Initial,
             )
@@ -2281,7 +2339,7 @@ impl LlmClient {
                         &mut usage,
                         &mut call_usage,
                         &mut usage_accounting_complete,
-                        REVIEW_MAX_TOKENS,
+                        max_tokens,
                         LlmPhase::Review,
                         LlmCallPhase::SchemaRepair,
                     )
@@ -2361,7 +2419,7 @@ impl LlmClient {
                     &mut retry_usage,
                     &mut call_usage,
                     &mut usage_accounting_complete,
-                    REVIEW_MAX_TOKENS,
+                    max_tokens,
                     LlmPhase::Review,
                     LlmCallPhase::SemanticRetry,
                 )
@@ -2453,7 +2511,7 @@ impl LlmClient {
                     &mut retry_usage,
                     &mut call_usage,
                     &mut retry_accounting_complete,
-                    REVIEW_MAX_TOKENS,
+                    max_tokens,
                     LlmPhase::Review,
                     LlmCallPhase::SemanticRetry,
                 )
@@ -5711,10 +5769,8 @@ mod tests {
         );
         assert_eq!(crate::review::HOSTED_LLM_REVIEW_TIMEOUT_SECS, 420);
         assert_eq!(
-            crate::review::HOSTED_LLM_REVIEW_TIMEOUT_SECS
-                - crate::review::HOSTED_LLM_REQUEST_TIMEOUT_SECS
-                - TIMEOUT_RETRY_CAP_SECS,
-            90
+            crate::review::HOSTED_LLM_REVIEW_TIMEOUT_SECS,
+            crate::review::HOSTED_LLM_REQUEST_TIMEOUT_SECS * 6 + 60
         );
         assert_eq!(
             crate::review::HOSTED_LLM_TOTAL_TIMEOUT_SECS

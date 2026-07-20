@@ -1692,6 +1692,7 @@ mod tests {
             selected_batches: 5,
             total_batches: 19,
             planner_fallback: true,
+            receipt: None,
         });
 
         let rich = check_summary(&env, true, Default::default());
@@ -1873,6 +1874,7 @@ mod tests {
             selected_batches: 5,
             total_batches: 19,
             planner_fallback: false,
+            receipt: None,
         });
         let summary = check_summary(&env, true, Default::default());
         assert!(summary.starts_with("No issues were found in the risk-selected changes reviewed."));

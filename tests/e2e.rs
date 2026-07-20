@@ -1633,20 +1633,27 @@ fn qualification_candidate_admits_fixture_51_shape_at_fireworks_price_bounds() {
         .success();
     let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     assert_eq!(envelope["reviewCoverage"]["mode"], "bounded");
-    assert_eq!(envelope["reviewAdmission"]["providerAttempts"], 7);
-    assert_eq!(envelope["reviewAdmission"]["outputTokens"], 85_184);
+    assert_eq!(envelope["reviewAdmission"]["providerAttempts"], 3);
+    // One direct source request, one semantic synthesis request, and the
+    // maximum scorer response. Review preflight reserves the doubled retry
+    // ceiling used by runtime for each generator request.
+    assert_eq!(
+        envelope["reviewAdmission"]["outputTokens"],
+        12_000 + 4_000 + 3_136
+    );
     assert!(
         envelope["reviewAdmission"]["serializedInputBytes"]
             .as_u64()
             .unwrap()
-            < 699_617
+            < 200_000
     );
     assert!(
         envelope["reviewAdmission"]["projectedCostMicros"]
             .as_u64()
             .unwrap()
-            <= 1_000_000
+            <= 500_000
     );
+    assert_eq!(envelope["reviewCoverage"]["receipt"]["unreviewedHunks"], 0);
 }
 
 #[tokio::test]
@@ -1959,7 +1966,7 @@ async fn generated_named_source_is_not_omitted_from_review() {
 }
 
 #[tokio::test]
-async fn large_source_diff_reviews_every_bounded_batch_and_aggregates_findings() {
+async fn oversized_security_hunk_fails_before_provider_contact() {
     use std::fmt::Write as _;
 
     let server = MockServer::start().await;
@@ -2016,20 +2023,198 @@ async fn large_source_diff_reviews_every_bounded_batch_and_aggregates_findings()
         .arg(&diff)
         .args(["--output", "json"])
         .assert()
-        .success();
+        .code(2);
 
-    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
-    assert_eq!(envelope["findings"][0]["path"], "src/auth.rs");
-    assert_eq!(envelope["findings"][0]["line"], 10_000);
-    let requests = server.received_requests().await.unwrap();
     assert!(
-        requests.len() > 1,
-        "large source changes must use multiple batches"
+        String::from_utf8_lossy(&out.get_output().stderr)
+            .contains("mandatory hunk src/auth.rs:1 cannot fit the 24 batch large-review limit")
     );
+    let requests = server.received_requests().await.unwrap();
+    assert!(requests.is_empty());
+}
+
+#[tokio::test]
+async fn automatic_large_diff_route_is_concurrent_receipted_and_fails_closed_on_unreviewed_hunks() {
+    use std::fmt::Write as _;
+    use std::time::{Duration, Instant};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(200))
+                .set_body_json(llm_content(json!([]))),
+        )
+        .mount(&server)
+        .await;
+
+    let mut source = String::new();
+    for file in 0..30 {
+        let path = if file == 15 {
+            "src/auth/permission.ts".to_string()
+        } else {
+            format!("src/churn/file-{file}.ts")
+        };
+        writeln!(
+            source,
+            "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@"
+        )
+        .unwrap();
+        if file == 15 {
+            writeln!(
+                source,
+                "-if (!actor.can('admin')) throw new Error('Forbidden');"
+            )
+            .unwrap();
+            writeln!(
+                source,
+                "+await privilegedWrite(input); // {}",
+                "x".repeat(45_000)
+            )
+            .unwrap();
+        } else {
+            writeln!(source, "-const value = {file};").unwrap();
+            writeln!(
+                source,
+                "+const value = eval(source_{file}); // {}",
+                "x".repeat(45_000)
+            )
+            .unwrap();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let diff = dir.path().join("automatic-large.diff");
+    std::fs::write(&diff, source).unwrap();
+    let started = Instant::now();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .env("REVIEW_MODEL", "mistralai/mistral-small-3.2-24b-instruct")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .failure();
+    let elapsed = started.elapsed();
+
+    let envelope: Value =
+        serde_json::from_slice(&out.get_output().stdout).unwrap_or_else(|error| {
+            panic!(
+                "large-route command did not emit an envelope: {error}; stderr={}",
+                String::from_utf8_lossy(&out.get_output().stderr)
+            )
+        });
+    let coverage = &envelope["reviewCoverage"];
+    assert_eq!(coverage["mode"], "bounded");
+    assert_eq!(coverage["selectedBatches"], 24);
+    assert!(coverage["totalBatches"].as_u64().unwrap() > 24);
+    assert_eq!(coverage["receipt"]["totalHunks"], 30);
+    assert!(coverage["receipt"]["unreviewedHunks"].as_u64().unwrap() > 0);
+    assert_eq!(
+        coverage["receipt"]["planSha256"].as_str().unwrap().len(),
+        64
+    );
+    assert_eq!(envelope["gate"]["failing"], true);
     assert!(
-        requests
+        envelope["findings"]
+            .as_array()
+            .unwrap()
             .iter()
-            .all(|request| { !String::from_utf8_lossy(&request.body).contains("diff truncated") })
+            .any(|finding| {
+                finding["path"] == ".postil/model-output"
+                    && finding["body"]
+                        .as_str()
+                        .is_some_and(|body| body.contains("normalized hunks unreviewed"))
+            })
+    );
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 24);
+    assert!(requests.iter().any(|request| {
+        let body = String::from_utf8_lossy(&request.body);
+        body.contains("src/auth/permission.ts")
+            && body.contains("actor.can('admin')")
+            && body.contains("privilegedWrite")
+    }));
+    assert!(
+        elapsed < Duration::from_millis(4_500),
+        "24 delayed calls were not executed in four-way bounded waves: {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn semantic_large_diff_coverage_does_not_resolve_baseline_evidence() {
+    use std::fmt::Write as _;
+
+    let server = MockServer::start().await;
+    mock_review(&server, json!([])).await;
+
+    let mut source = String::new();
+    for file in 0..26 {
+        let path = format!("src/churn/file-{file}.ts");
+        writeln!(
+            source,
+            "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@"
+        )
+        .unwrap();
+        writeln!(source, "-const value = {file};").unwrap();
+        writeln!(source, "+const value = {file}; // {}", "x".repeat(45_000)).unwrap();
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let diff = dir.path().join("semantic-baseline.diff");
+    std::fs::write(&diff, source).unwrap();
+    let baseline = json!({
+        "version": 1,
+        "summary": "",
+        "silent": false,
+        "findings": [{
+            "path": "src/churn/file-25.ts",
+            "line": 1,
+            "severity": "error",
+            "kind": "risk",
+            "confidence": 0.9,
+            "title": "Keep the prior finding open",
+            "body": "Semantic coverage cannot resolve exact baseline evidence.",
+            "evidence": "const value = 25;"
+        }],
+        "resolved": [],
+        "counts": {"info": 0, "warn": 0, "error": 1, "suppressed": 0},
+        "confidenceBuckets": [0, 0, 0, 0, 1],
+        "gate": {"failOn": "error", "failing": true},
+        "modelUsed": "model",
+        "usage": {"promptTokens": 0, "completionTokens": 0},
+        "baseSha": null,
+        "headSha": null,
+        "sinceSha": null
+    });
+    let baseline_path = dir.path().join("baseline.json");
+    std::fs::write(&baseline_path, baseline.to_string()).unwrap();
+
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .env("REVIEW_MODEL", "mistralai/mistral-small-3.2-24b-instruct")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--baseline")
+        .arg(&baseline_path)
+        .args(["--output", "json"])
+        .assert()
+        .failure();
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(
+        envelope["findings"][0]["title"],
+        "Keep the prior finding open"
+    );
+    assert_eq!(envelope["resolved"], json!([]));
+    assert_eq!(envelope["reviewCoverage"]["receipt"]["unreviewedHunks"], 0);
+    assert!(
+        envelope["reviewCoverage"]["receipt"]["semanticHunks"]
+            .as_u64()
+            .unwrap()
+            > 0
     );
 }
 
@@ -2284,10 +2469,10 @@ async fn local_bounded_is_explicit_and_default_local_review_remains_exhaustive()
         let path = format!("src/churn-{file}.rs");
         writeln!(
             source,
-            "diff --git a/{path} b/{path}\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,130 @@"
+            "diff --git a/{path} b/{path}\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,70 @@"
         )
         .unwrap();
-        for line in 0..130 {
+        for line in 0..70 {
             writeln!(
                 source,
                 "+const CHURN_{file}_{line}: &str = \"{}\";",
@@ -2430,10 +2615,10 @@ async fn bounded_reviews_resolve_changed_prior_evidence_when_selected() {
         let path = format!("src/churn-{file}.rs");
         writeln!(
             diff,
-            "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1,130 @@\n-const ORIGINAL_{file}: &str = \"old\";\n+const UPDATED_{file}: &str = \"new\";"
+            "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1,70 @@\n-const ORIGINAL_{file}: &str = \"old\";\n+const UPDATED_{file}: &str = \"new\";"
         )
         .unwrap();
-        for line in 1..130 {
+        for line in 1..70 {
             writeln!(
                 diff,
                 "+const ORDINARY_{file}_{line}: &str = \"{}\";",
@@ -2617,10 +2802,10 @@ async fn final_synthesis_detects_cross_batch_validation_sink_relationship() {
         .respond_with(|request: &wiremock::Request| {
             let body = String::from_utf8_lossy(&request.body);
             let findings = if body.contains("validate_pair") && body.contains("dangerous_sink") {
-                let evidence = prompt_evidence(request, "src/sink.rs", 1100, "dangerous_sink");
+                let evidence = prompt_evidence(request, "src/sink.rs", 100, "dangerous_sink");
                 json!([{
                     "path": "src/sink.rs",
-                    "line": 1100,
+                    "line": 100,
                     "severity": "warn",
                     "kind": "risk",
                     "confidence": 0.95,
@@ -2637,10 +2822,10 @@ async fn final_synthesis_detects_cross_batch_validation_sink_relationship() {
         .await;
 
     let mut source = String::from(
-        "diff --git a/src/validate.rs b/src/validate.rs\n--- a/src/validate.rs\n+++ b/src/validate.rs\n@@ -0,0 +1,2201 @@\n",
+        "diff --git a/src/validate.rs b/src/validate.rs\n--- a/src/validate.rs\n+++ b/src/validate.rs\n@@ -0,0 +1,200 @@\n",
     );
-    for line in 1..=2201 {
-        if line == 1100 {
+    for line in 1..=200 {
+        if line == 100 {
             source.push_str("+let validated = validate_pair(left, right);\n");
         } else {
             writeln!(
@@ -2652,10 +2837,10 @@ async fn final_synthesis_detects_cross_batch_validation_sink_relationship() {
         }
     }
     source.push_str(
-        "diff --git a/src/sink.rs b/src/sink.rs\n--- a/src/sink.rs\n+++ b/src/sink.rs\n@@ -0,0 +1,2201 @@\n",
+        "diff --git a/src/sink.rs b/src/sink.rs\n--- a/src/sink.rs\n+++ b/src/sink.rs\n@@ -0,0 +1,200 @@\n",
     );
-    for line in 1..=2201 {
-        if line == 1100 {
+    for line in 1..=200 {
+        if line == 100 {
             source.push_str("+dangerous_sink(original);\n");
         } else {
             writeln!(
@@ -2682,7 +2867,7 @@ async fn final_synthesis_detects_cross_batch_validation_sink_relationship() {
 
     let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     assert_eq!(envelope["findings"][0]["path"], "src/sink.rs");
-    assert_eq!(envelope["findings"][0]["line"], 1100);
+    assert_eq!(envelope["findings"][0]["line"], 100);
     let requests = server.received_requests().await.unwrap();
     assert!(requests.len() >= 3);
     assert!(requests.iter().any(|request| {
@@ -2691,17 +2876,6 @@ async fn final_synthesis_detects_cross_batch_validation_sink_relationship() {
             && body.contains("validate_pair")
             && body.contains("dangerous_sink")
     }));
-    assert!(
-        requests
-            .iter()
-            .filter(|request| {
-                let body = String::from_utf8_lossy(&request.body);
-                body.contains("validate_pair") && body.contains("dangerous_sink")
-            })
-            .all(|request| {
-                String::from_utf8_lossy(&request.body).contains("Cross-window semantic digests")
-            })
-    );
 }
 
 #[cfg(feature = "qualification-candidate")]
@@ -2717,7 +2891,7 @@ async fn bounded_synthesis_repairs_source_exact_evidence_without_relaxing_valida
             calls: correction_calls.clone(),
             prompt_marker: "dangerous_sink(original)",
             path: "src/sink.rs",
-            line: 1100,
+            line: 100,
             evidence: "dangerous_sink(original);",
         })
         .mount(&server)
@@ -2734,17 +2908,17 @@ async fn bounded_synthesis_repairs_source_exact_evidence_without_relaxing_valida
         writeln!(source, "diff --git a/{path_name} b/{path_name}").unwrap();
         writeln!(
             source,
-            "--- /dev/null\n+++ b/{path_name}\n@@ -0,0 +1,2201 @@"
+            "--- /dev/null\n+++ b/{path_name}\n@@ -0,0 +1,200 @@"
         )
         .unwrap();
-        for line in 1..=2201 {
-            if line == 1100 {
+        for line in 1..=200 {
+            if line == 100 {
                 writeln!(source, "+{marker}").unwrap();
             } else {
                 writeln!(
                     source,
                     "+let padding_{line:04} = trusted; // {}",
-                    "x".repeat(1_000)
+                    "x".repeat(100)
                 )
                 .unwrap();
             }
@@ -2790,7 +2964,13 @@ async fn bounded_synthesis_repairs_source_exact_evidence_without_relaxing_valida
     assert!(review_requests.len() >= 2);
     assert!(review_requests.iter().all(|request| {
         let body: Value = request.body_json().unwrap();
-        body["max_tokens"] == 8_000 && body.get("response_format").is_none()
+        let serialized = String::from_utf8_lossy(&request.body);
+        let expected = if serialized.contains("bounded synthesis window") {
+            2_000
+        } else {
+            8_000
+        };
+        body["max_tokens"] == expected && body.get("response_format").is_none()
     }));
 }
 

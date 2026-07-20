@@ -792,6 +792,21 @@ pub struct ReviewCoverage {
     pub total_batches: u32,
     #[serde(default, skip_serializing_if = "is_false")]
     pub planner_fallback: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<ReviewCoverageReceipt>,
+}
+
+/// Compact durable commitment to the deterministic large-review plan. The
+/// hunk-level receipt remains internal and bounded; these counts plus its hash
+/// make the exact plan auditable without inflating every stored envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewCoverageReceipt {
+    pub plan_sha256: String,
+    pub total_hunks: u32,
+    pub direct_hunks: u32,
+    pub semantic_hunks: u32,
+    pub unreviewed_hunks: u32,
 }
 
 impl ReviewCoverage {
@@ -1348,6 +1363,7 @@ mod tests {
             selected_batches: 5,
             total_batches: 17,
             planner_fallback: true,
+            receipt: None,
         });
         let mut with_coverage = serde_json::to_value(&env).unwrap();
         assert_eq!(with_coverage["reviewCoverage"]["mode"], "bounded");

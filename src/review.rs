@@ -4,12 +4,14 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
+use futures::StreamExt;
 
 use crate::config::{Config, GateLevel, OnError};
 use crate::diff;
 use crate::envelope::{
     Envelope, Finding, Gate, Kind, ModelIncident, ModelIncidentCategory, ModelUsage,
-    ReviewAdmission, ReviewCoverage, ReviewCoverageMode, Usage, fail_closed_finding,
+    ReviewAdmission, ReviewCoverage, ReviewCoverageMode, ReviewCoverageReceipt, Usage,
+    fail_closed_finding,
 };
 use crate::filter;
 use crate::forge::{
@@ -33,6 +35,10 @@ pub(crate) const MAX_REVIEW_BATCH_BYTES: usize = crate::llm::MAX_PROVIDER_REQUES
 pub(crate) const MAX_HOSTED_REVIEW_BATCH_BYTES: usize = MAX_REVIEW_BATCH_BYTES;
 pub(crate) const MAX_REVIEW_MANIFEST_BYTES: usize = 24_000;
 pub(crate) const MAX_HOSTED_SELECTED_BATCHES: usize = 5;
+pub(crate) const MAX_LARGE_DIFF_SELECTED_BATCHES: usize = 24;
+pub(crate) const MAX_LARGE_DIFF_CONCURRENCY: usize = 4;
+const LARGE_SOURCE_REVIEW_MAX_TOKENS: u32 = 6_000;
+const SYNTHESIS_REVIEW_MAX_TOKENS: u32 = 2_000;
 pub(crate) const MAX_HOSTED_PLANNER_CANDIDATES: usize = 96;
 pub(crate) const MAX_MODELS_PER_REQUEST: usize = 3;
 pub(crate) const MAX_SCORER_PROMPT_BYTES: usize = 56_000;
@@ -41,10 +47,10 @@ const MAX_STREAMED_SUMMARY_BYTES: usize = 64_000;
 const MAX_REVIEW_VALIDATION_REASON_BYTES: usize = 16_384;
 const HOSTED_WORKER_WATCHDOG_SECS: u64 = 600;
 pub(crate) const HOSTED_LLM_TOTAL_TIMEOUT_SECS: u64 = 540;
-/// Hosted reviews get a 240s primary attempt plus one timeout retry capped at
-/// 90s. The entire review-model phase stops at 420s, leaving 120s of the total
-/// LLM budget for scoring.
-pub(crate) const HOSTED_LLM_REQUEST_TIMEOUT_SECS: u64 = 240;
+/// Large reviews run at most six waves of four 60-second calls. The review
+/// phase keeps a final 60-second reserve for one bounded transient retry; the
+/// remaining 120 seconds of the total LLM budget belongs to scoring.
+pub(crate) const HOSTED_LLM_REQUEST_TIMEOUT_SECS: u64 = 60;
 pub(crate) const HOSTED_LLM_REVIEW_TIMEOUT_SECS: u64 = 420;
 const FORGE_READ_TIMEOUT_SECS: u64 = 60;
 const FORGE_DIFF_MAX_TIMEOUT_SECS: u64 = 300;
@@ -52,6 +58,16 @@ const CHECK_START_TIMEOUT_SECS: u64 = 30;
 const CHECK_COMPLETION_TIMEOUT_SECS: u64 = 30;
 const REVIEW_POST_TIMEOUT_SECS: u64 = 20;
 pub(crate) const SCORER_TIMEOUT_SECS: u64 = 120;
+
+fn review_output_token_limit(synthesis: bool, deterministic_large_review: bool) -> u32 {
+    if synthesis {
+        SYNTHESIS_REVIEW_MAX_TOKENS
+    } else if deterministic_large_review {
+        LARGE_SOURCE_REVIEW_MAX_TOKENS
+    } else {
+        crate::llm::REVIEW_MAX_TOKENS
+    }
+}
 
 fn full_diff_timeout_secs(snapshot: &PrMeta) -> u64 {
     let files = snapshot.changed_files.unwrap_or(480) as u64;
@@ -1132,8 +1148,42 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                 model_used = "none (empty diff)".to_string();
                 review_trust = filter::ReviewTrust::Exhaustive;
             } else {
-                let bounded_candidates = if (args.bounded
-                    || crate::config::bounded_review_selection_mode())
+                let large_diff_receipt = (batches.source_count > MAX_LARGE_DIFF_SELECTED_BATCHES)
+                    .then(|| batches.deterministic_bounded_receipt(MAX_LARGE_DIFF_SELECTED_BATCHES))
+                    .transpose()?;
+                if let Some(receipt) = &large_diff_receipt {
+                    eprintln!(
+                        "postil: deterministic large-review plan={} direct_hunks={} semantic_hunks={} unreviewed_hunks={} selected_batches={}/{} concurrency={} request_timeout={}s review_budget={}s",
+                        receipt.plan_sha256,
+                        receipt.direct_hunks(),
+                        receipt.semantic_hunks(),
+                        receipt.unreviewed_hunks(),
+                        receipt.selected_batch_ids.len(),
+                        batches.count,
+                        MAX_LARGE_DIFF_CONCURRENCY,
+                        HOSTED_LLM_REQUEST_TIMEOUT_SECS,
+                        HOSTED_LLM_REVIEW_TIMEOUT_SECS,
+                    );
+                }
+                let large_receipt_summary = large_diff_receipt
+                    .as_ref()
+                    .map(|receipt| -> Result<ReviewCoverageReceipt> {
+                        Ok(ReviewCoverageReceipt {
+                            plan_sha256: receipt.plan_sha256.clone(),
+                            total_hunks: u32::try_from(receipt.entries.len())
+                                .context("coverage receipt hunk count exceeds envelope range")?,
+                            direct_hunks: u32::try_from(receipt.direct_hunks())
+                                .context("direct hunk count exceeds envelope range")?,
+                            semantic_hunks: u32::try_from(receipt.semantic_hunks())
+                                .context("semantic hunk count exceeds envelope range")?,
+                            unreviewed_hunks: u32::try_from(receipt.unreviewed_hunks())
+                                .context("unreviewed hunk count exceeds envelope range")?,
+                        })
+                    })
+                    .transpose()?;
+                let deterministic_large_review = large_diff_receipt.is_some();
+                let bounded_candidates = if large_diff_receipt.is_none()
+                    && (args.bounded || crate::config::bounded_review_selection_mode())
                     && batches.count > MAX_HOSTED_SELECTED_BATCHES
                 {
                     Some(batches.hosted_candidates(
@@ -1153,20 +1203,27 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                     )?,
                     None => LlmClient::from_env(cfg)?,
                 };
-                let planned_batch_count = bounded_candidates
-                    .as_ref()
-                    .map_or(batches.count, |_| MAX_HOSTED_SELECTED_BATCHES);
+                let planned_batch_count = large_diff_receipt.as_ref().map_or_else(
+                    || {
+                        bounded_candidates
+                            .as_ref()
+                            .map_or(batches.count, |_| MAX_HOSTED_SELECTED_BATCHES)
+                    },
+                    |receipt| receipt.selected_batch_ids.len(),
+                );
                 let preflight_prompt_context = ReviewBatchPromptContext {
                     cfg,
                     repo,
                     meta,
                     incremental,
                     content_policy_active,
-                    bounded_selection: bounded_candidates.is_some(),
+                    bounded_selection: bounded_candidates.is_some() || deterministic_large_review,
                     multiple: planned_batch_count > 1,
                 };
                 if crate::config::hosted_runtime_mode() {
-                    let preflight_ids = if let Some(candidates) = &bounded_candidates {
+                    let preflight_ids = if let Some(receipt) = &large_diff_receipt {
+                        receipt.selected_batch_ids.clone()
+                    } else if let Some(candidates) = &bounded_candidates {
                         candidates
                             .candidate_ids
                             .iter()
@@ -1180,21 +1237,26 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                     let candidate_prompts = preflight_batches
                         .into_iter()
                         .map(|batch| {
-                            let first =
-                                review_batch_prompt(&preflight_prompt_context, batch.clone(), true)
-                                    .1;
-                            let later =
-                                review_batch_prompt(&preflight_prompt_context, batch, false).1;
-                            (first, later)
+                            let (_, first, synthesis) =
+                                review_batch_prompt(&preflight_prompt_context, batch.clone(), true);
+                            let (_, later, _) =
+                                review_batch_prompt(&preflight_prompt_context, batch, false);
+                            let max_tokens =
+                                review_output_token_limit(synthesis, deterministic_large_review);
+                            (first, later, max_tokens)
                         })
                         .collect::<Vec<_>>();
                     let candidate_first_users = candidate_prompts
                         .iter()
-                        .map(|(first, _)| first.clone())
+                        .map(|(first, _, _)| first.clone())
+                        .collect::<Vec<_>>();
+                    let candidate_output_tokens = candidate_prompts
+                        .iter()
+                        .map(|(_, _, max_tokens)| *max_tokens)
                         .collect::<Vec<_>>();
                     let candidate_later_users = candidate_prompts
                         .into_iter()
-                        .map(|(_, later)| later)
+                        .map(|(_, later, _)| later)
                         .collect::<Vec<_>>();
                     let planner = bounded_candidates.as_ref().and_then(|candidates| {
                         let remaining = MAX_HOSTED_SELECTED_BATCHES
@@ -1206,19 +1268,38 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                                 .any(|id| !candidates.mandatory_ids.contains(id)))
                         .then_some((candidates.manifest.as_str(), remaining))
                     });
-                    let admission = client.preflight_review_plan(
-                        cfg,
-                        planned_batch_count,
-                        &system,
-                        &candidate_first_users,
-                        &candidate_later_users,
-                        planner,
-                    )?;
+                    let admission = if candidate_output_tokens
+                        .iter()
+                        .all(|max_tokens| *max_tokens == crate::llm::REVIEW_MAX_TOKENS)
+                    {
+                        client.preflight_review_plan(
+                            cfg,
+                            planned_batch_count,
+                            &system,
+                            &candidate_first_users,
+                            &candidate_later_users,
+                            planner,
+                        )?
+                    } else {
+                        client.preflight_review_plan_with_output_limits(
+                            cfg,
+                            planned_batch_count,
+                            &system,
+                            crate::llm::ReviewPreflightPrompts {
+                                first_users: &candidate_first_users,
+                                later_users: &candidate_later_users,
+                                output_tokens: &candidate_output_tokens,
+                            },
+                            planner,
+                        )?
+                    };
                     review_admission = Some(admission);
                     if crate::config::qualification_plan_only() {
-                        let bounded = bounded_candidates.is_some();
+                        let bounded = bounded_candidates.is_some() || large_diff_receipt.is_some();
                         let source_count = batches.source_count;
-                        let selected_count = if bounded {
+                        let selected_count = if let Some(receipt) = &large_diff_receipt {
+                            batches.selected_source_count(&receipt.selected_batch_ids)
+                        } else if bounded {
                             source_count
                                 .min(MAX_HOSTED_SELECTED_BATCHES.saturating_sub(1))
                                 .min(source_count.saturating_sub(1))
@@ -1243,6 +1324,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                                 total_batches: u32::try_from(source_count)
                                     .context("planned total batch count exceeds envelope range")?,
                                 planner_fallback: false,
+                                receipt: large_receipt_summary.clone(),
                             },
                             review_started.elapsed().as_millis() as u64,
                         ));
@@ -1252,7 +1334,16 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                 let total_source_batches = batches.source_count;
                 let mut selected_source_batches = total_source_batches;
                 let mut planner_fallback = false;
-                if let Some(candidates) = bounded_candidates {
+                if let Some(receipt) = large_diff_receipt {
+                    selected_source_batches =
+                        batches.selected_source_count(&receipt.selected_batch_ids);
+                    let selected = batches.selected_batches(&receipt.selected_batch_ids)?;
+                    anyhow::ensure!(
+                        selected.len() <= MAX_LARGE_DIFF_SELECTED_BATCHES,
+                        "deterministic large-review plan exceeded its request bound"
+                    );
+                    selected_batches = Some(selected.into_iter());
+                } else if let Some(candidates) = bounded_candidates {
                     anyhow::ensure!(
                         candidates.source_batch_count == total_source_batches,
                         "bounded planner source-batch inventory changed during selection"
@@ -1305,6 +1396,9 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                     .as_ref()
                     .map_or(batches.count, |selected| selected.len());
                 let risk_selected_review = selected_batches.is_some();
+                let coverage_incomplete = large_receipt_summary
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.unreviewed_hunks > 0);
                 let runtime_prompt_context = ReviewBatchPromptContext {
                     multiple: total_requests > 1,
                     ..preflight_prompt_context
@@ -1320,6 +1414,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                     total_batches: u32::try_from(total_source_batches)
                         .context("total review batch count exceeds envelope range")?,
                     planner_fallback,
+                    receipt: large_receipt_summary,
                 });
                 let mut raw_findings = Vec::new();
                 let mut summary_parts = Vec::new();
@@ -1327,8 +1422,15 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                 let mut batch_models = Vec::new();
                 let mut batch_failed = false;
                 let mut batch_failure = None;
+                if coverage_incomplete {
+                    batch_failed = true;
+                    batch_failure = Some(fail_closed_finding(
+                        "deterministic large-review coverage left one or more normalized hunks unreviewed",
+                    ));
+                }
                 let mut batch_ungrounded = 0u32;
                 let mut request_index = 0usize;
+                let mut batch_requests = Vec::with_capacity(total_requests);
                 loop {
                     let next = if let Some(selected) = selected_batches.as_mut() {
                         selected.next()
@@ -1346,7 +1448,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                         index.add_rendered_evidence(&annotated);
                     }
                     eprintln!(
-                        "postil: reviewing {} request {}/{} ({} bytes)",
+                        "postil: queued {} request {}/{} ({} bytes)",
                         if cross_window_synthesis {
                             "synthesis"
                         } else {
@@ -1356,19 +1458,78 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                         total_requests,
                         annotated.len()
                     );
-                    let validation_annotated = annotated.clone();
-                    let validation_user = user.clone();
-                    match client
-                        .review_validated_with_safe(cfg, &system, &user, move |review| {
-                            review_batch_validation_reasons(
-                                &review.findings,
-                                &validation_annotated,
-                                first.then_some(validation_user.as_str()),
+                    batch_requests.push((
+                        request_index,
+                        annotated,
+                        user,
+                        cross_window_synthesis,
+                        first,
+                    ));
+                    request_index += 1;
+                }
+                let concurrency = if deterministic_large_review {
+                    MAX_LARGE_DIFF_CONCURRENCY
+                } else {
+                    1
+                };
+                let cfg_owned = cfg.clone();
+                let system_owned = system.clone();
+                let mut outcomes = futures::stream::iter(batch_requests.into_iter().map(
+                    |(index, annotated, user, cross_window_synthesis, first)| {
+                        let client = client.clone();
+                        let cfg = cfg_owned.clone();
+                        let system = system_owned.clone();
+                        async move {
+                            eprintln!(
+                                "postil: reviewing {} request {}/{} ({} bytes)",
+                                if cross_window_synthesis {
+                                    "synthesis"
+                                } else {
+                                    "source"
+                                },
+                                index + 1,
+                                total_requests,
+                                annotated.len()
+                            );
+                            let validation_annotated = annotated.clone();
+                            let validation_user = user.clone();
+                            let max_tokens = review_output_token_limit(
+                                cross_window_synthesis,
+                                deterministic_large_review,
+                            );
+                            let result = client
+                                .review_validated_with_safe_output_limit(
+                                    &cfg,
+                                    &system,
+                                    &user,
+                                    max_tokens,
+                                    move |review| {
+                                        review_batch_validation_reasons(
+                                            &review.findings,
+                                            &validation_annotated,
+                                            first.then_some(validation_user.as_str()),
+                                        )
+                                        .map_or(Ok(()), Err)
+                                    },
+                                )
+                                .await;
+                            (
+                                index,
+                                annotated,
+                                user,
+                                cross_window_synthesis,
+                                first,
+                                result,
                             )
-                            .map_or(Ok(()), Err)
-                        })
-                        .await
-                    {
+                        }
+                    },
+                ))
+                .buffer_unordered(concurrency)
+                .collect::<Vec<_>>()
+                .await;
+                outcomes.sort_by_key(|(index, ..)| *index);
+                for (_index, annotated, user, _cross_window_synthesis, first, result) in outcomes {
+                    match result {
                         Ok(mut model_review) => {
                             add_usage(&mut usage, model_review.usage);
                             model_usage.extend(model_review.model_usage);
@@ -1461,7 +1622,6 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                             batch_failed = true;
                         }
                     }
-                    request_index += 1;
                 }
                 if !batch_models.is_empty() {
                     model_used = batch_models.join(", ");
@@ -2047,6 +2207,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn preflight_and_runtime_share_large_review_output_limits() {
+        assert_eq!(review_output_token_limit(false, true), 6_000);
+        assert_eq!(review_output_token_limit(true, true), 2_000);
+        assert_eq!(
+            review_output_token_limit(false, false),
+            crate::llm::REVIEW_MAX_TOKENS
+        );
+        assert_eq!(review_output_token_limit(true, false), 2_000);
+    }
+
+    #[test]
     fn hosted_scorer_failure_blocks_unscored_output() {
         assert!(scorer_failure_blocks_hosted(true, true));
         assert!(!scorer_failure_blocks_hosted(true, false));
@@ -2141,6 +2312,7 @@ mod tests {
                 selected_batches: 5,
                 total_batches: 9,
                 planner_fallback: false,
+                receipt: None,
             }),
             review_admission: Some(ReviewAdmission {
                 provider_attempts: 12,
@@ -2305,8 +2477,12 @@ mod tests {
     fn default_llm_timeouts_fit_inside_hosted_worker_watchdog() {
         const PROCESS_OVERHEAD_SECS: u64 = 10;
 
-        assert_eq!(HOSTED_LLM_REQUEST_TIMEOUT_SECS, 240);
+        assert_eq!(HOSTED_LLM_REQUEST_TIMEOUT_SECS, 60);
         assert_eq!(HOSTED_LLM_REVIEW_TIMEOUT_SECS, 420);
+        assert_eq!(
+            HOSTED_LLM_REVIEW_TIMEOUT_SECS,
+            HOSTED_LLM_REQUEST_TIMEOUT_SECS * 6 + 60
+        );
         assert_eq!(
             HOSTED_LLM_TOTAL_TIMEOUT_SECS,
             HOSTED_LLM_REVIEW_TIMEOUT_SECS + SCORER_TIMEOUT_SECS

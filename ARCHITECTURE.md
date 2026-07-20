@@ -56,7 +56,15 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
 - `review.rs`: orchestration; enforces acquisition, model-aware context, request,
   provider-attempt, output-token, and worst-case token-exposure budgets before calls;
   one UTF-8 byte counts as one projected token rather than using an optimistic ratio;
-  reviews every evidence batch outside hosted inference. Hosted inference uses a
+  reviews every evidence batch outside hosted inference. A diff that materializes more
+  than 24 source batches enters a deterministic large-review route on every surface,
+  including `--diff-file`: at most 24 requests, at most four concurrent requests, and
+  an exact hunk receipt committed by SHA-256 before provider contact. Security,
+  authorization, configuration, policy, billing, migration, release-control, and
+  executable vendor hunks require direct source evidence. Exact-evidence summaries are
+  limited to supported dependency metadata, provenance-bound generated output, and
+  low-risk non-security churn. Missing or invalid receipt coverage fails closed.
+  Smaller hosted reviews use a
   bounded, schema-validated planner over deterministic candidate digests, always
   including boundary, high-risk, and global-synthesis evidence. A planner outage or
   invalid response retains its complete usage and cost records, then falls back to the
@@ -194,9 +202,12 @@ additions (violations are `kind: contentPolicy`). Content policy is on by defaul
     planner and scorer input, worst-case token exposure, and projected cost across
     cascade or consensus before provider contact.
 12. Every completed review envelope records source-batch coverage when batching runs.
-    Synthesis requests remain outside those counts. Bounded reviews expose selected and
-    total source-batch counts in compact output. Planner
-    fallback remains audit metadata and does not expose provider failure details to a PR.
+    Deterministic large reviews also record a plan hash and direct, semantic, and
+    unreviewed hunk counts. Every normalized hunk has exactly one disposition; evidence
+    identifiers bind the exact hunk digest, and any unreviewed hunk fails the gate.
+    Semantic coverage cannot resolve baseline findings. Bounded reviews expose selected
+    and total source-batch counts in compact output. Planner fallback remains audit
+    metadata and does not expose provider failure details to a PR.
 13. Operational and provider virtual anchors expire after each run. Reviewable
     PR-description and change-metadata anchors carry across unrelated incremental
     reviews, and a same-head rerun with either anchor falls back to a full review.

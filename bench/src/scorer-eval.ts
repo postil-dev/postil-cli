@@ -856,6 +856,13 @@ export function reviewCoverageFailure(
     selectedBatches?: unknown;
     totalBatches?: unknown;
     plannerFallback?: unknown;
+    receipt?: {
+      planSha256?: unknown;
+      totalHunks?: unknown;
+      directHunks?: unknown;
+      semanticHunks?: unknown;
+      unreviewedHunks?: unknown;
+    };
   } | undefined;
   if (coverage?.mode !== expected) {
     return `review coverage mode ${String(coverage?.mode ?? "missing")} does not match ${expected}`;
@@ -879,7 +886,25 @@ export function reviewCoverageFailure(
     if (coverage.plannerFallback !== false) {
       return "bounded review did not complete a non-fallback planner selection";
     }
-    if (plannerUsage !== 1) {
+    if (coverage.receipt !== undefined) {
+      const receipt = coverage.receipt;
+      if (
+        typeof receipt.planSha256 !== "string" ||
+        !/^[0-9a-f]{64}$/u.test(receipt.planSha256) ||
+        typeof receipt.totalHunks !== "number" ||
+        typeof receipt.directHunks !== "number" ||
+        typeof receipt.semanticHunks !== "number" ||
+        typeof receipt.unreviewedHunks !== "number" ||
+        receipt.totalHunks !==
+          receipt.directHunks + receipt.semanticHunks + receipt.unreviewedHunks ||
+        receipt.unreviewedHunks !== 0
+      ) {
+        return "deterministic bounded review receipt is incomplete";
+      }
+      if (plannerUsage !== 0) {
+        return `deterministic bounded review recorded ${plannerUsage} planner usage event(s)`;
+      }
+    } else if (plannerUsage !== 1) {
       return `bounded review recorded ${plannerUsage} planner usage event(s), expected 1`;
     }
   } else if (coverage.selectedBatches !== coverage.totalBatches || plannerUsage !== 0) {

@@ -222,6 +222,7 @@ mod tests {
                 selected_batches,
                 total_batches: 19,
                 planner_fallback,
+                receipt: None,
             });
             let sarif = to_sarif(&env);
             let coverage = &sarif["runs"][0]["properties"]["reviewCoverage"];
