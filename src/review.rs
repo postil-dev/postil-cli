@@ -1737,6 +1737,21 @@ async fn finish<F: Forge>(
             && !duplicate_of_baseline
             && !intentional_no_comment;
         if !should_comment {
+            let mut receipt = forge.plan_review_publication(&envelope, expected_snapshot);
+            if duplicate_of_baseline {
+                for finding in &mut receipt.findings {
+                    if matches!(
+                        finding.initial_outcome,
+                        crate::forge::FindingPublicationOutcome::Inline
+                            | crate::forge::FindingPublicationOutcome::SummaryOnly
+                    ) {
+                        finding.initial_outcome = crate::forge::FindingPublicationOutcome::Carried;
+                        finding.inline_rejected = false;
+                        finding.comment_id = None;
+                    }
+                }
+            }
+            crate::forge::write_review_publication_receipt_from_env(&receipt)?;
             return Ok(if envelope.gate.failing { 1 } else { 0 });
         }
         let freshness = if let Some(started_at) = hosted_budget_started_at {
@@ -1769,22 +1784,26 @@ async fn finish<F: Forge>(
                 return Ok(if envelope.gate.failing { 1 } else { 0 });
             }
         }
-        let summary = forge.review_summary(&envelope);
         let posted = run_with_hosted_budget(
             hosted_budget_started_at,
             REVIEW_POST_TIMEOUT_SECS,
-            forge.post_review(&summary, &envelope.findings, expected_snapshot),
+            forge.post_review(&envelope, expected_snapshot),
             "posting review comment",
         )
         .await;
-        if let Err(e) = posted {
-            if crate::forge::is_repository_identity_failure(&e) {
-                return Err(e);
+        match posted {
+            Ok(receipt) => {
+                crate::forge::write_review_publication_receipt_from_env(&receipt)?;
             }
-            if strict_publication {
-                return Err(e).context("required hosted review publication failed");
+            Err(e) => {
+                if crate::forge::is_repository_identity_failure(&e) {
+                    return Err(e);
+                }
+                if strict_publication {
+                    return Err(e).context("required hosted review publication failed");
+                }
+                eprintln!("postil: could not post review comment ({e:#})");
             }
-            eprintln!("postil: could not post review comment ({e:#})");
         }
     }
     Ok(if envelope.gate.failing { 1 } else { 0 })

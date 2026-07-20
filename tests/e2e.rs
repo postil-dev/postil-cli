@@ -7485,9 +7485,8 @@ async fn github_flow_posts_review_and_completes_both_checks() {
     assert_eq!(body["comments"][0]["line"], 41);
     let summary = body["body"].as_str().unwrap();
     assert!(summary.starts_with(&format!(
-        "{} **1 new finding** · {} **1 blocking finding open**\n",
-        postil_cli::forge::icon_md("warn"),
-        postil_cli::forge::icon_md("error"),
+        "{} **1 inline finding**\n",
+        postil_cli::forge::icon_md("info"),
     )));
     assert!(!summary.contains("Unsanitized input reaches query"));
     assert!(!summary.contains("`src/auth.rs:41`"));
@@ -7717,7 +7716,7 @@ async fn content_policy_pr_body_finding_survives_grounding() {
     );
     let summary = body["body"].as_str().unwrap();
     assert!(summary.contains(&format!(
-        "{} **1 new advisory finding**",
+        "{} **1 finding in summary**",
         postil_cli::forge::icon_md("info")
     )));
     assert!(summary.contains("AI-authorship residue in PR description"));

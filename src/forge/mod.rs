@@ -9,15 +9,18 @@ pub mod github;
 pub mod gitlab;
 
 use anyhow::{Context, Result, ensure};
-use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::path::Path;
 
 use crate::diff::DiffSnapshot;
 use crate::envelope::{Envelope, Finding, Severity, SuppressionReason};
 
 pub const MAX_FORGE_METADATA_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_FORGE_CHANGED_FILES: usize = 20_000;
+pub const PUBLICATION_RECEIPT_PATH_ENV: &str = "POSTIL_PUBLICATION_RECEIPT_PATH";
 
 pub fn checked_metadata_total(current: usize, additional: usize, context: &str) -> Result<usize> {
     let total = current
@@ -385,6 +388,192 @@ pub enum ThreadKind {
     Issue,
 }
 
+/// Versioned result of one review publication attempt. Finding outcomes are
+/// keyed by the envelope's stable finding ID so the hosted service can join
+/// the immutable delivery result to later thread lifecycle observations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewPublicationReceipt {
+    pub version: u8,
+    pub receipt_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_id: Option<String>,
+    pub findings: Vec<FindingPublicationReceipt>,
+}
+
+impl ReviewPublicationReceipt {
+    pub const VERSION: u8 = 1;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FindingPublicationReceipt {
+    pub finding_id: String,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub stable_identity: bool,
+    pub initial_outcome: FindingPublicationOutcome,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub inline_rejected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment_id: Option<String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FindingPublicationOutcome {
+    Inline,
+    SummaryOnly,
+    Carried,
+    Resolved,
+    Suppressed,
+    /// Delivery succeeded, but the forge response could not establish the
+    /// per-finding publication channel.
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReviewPublicationSummary {
+    pub active_inline: usize,
+    pub summary_only: usize,
+    pub rejected_inline: usize,
+    pub carried: usize,
+}
+
+pub fn untracked_review_publication_receipt(
+    forge: &str,
+    envelope: &Envelope,
+    head_sha: &str,
+) -> ReviewPublicationReceipt {
+    let mut findings = Vec::new();
+    for finding in envelope
+        .findings
+        .iter()
+        .chain(envelope.resolved.iter())
+        .chain(
+            envelope
+                .suppressed_findings
+                .iter()
+                .map(|suppressed| &suppressed.finding),
+        )
+    {
+        let (finding_id, stable_identity) = if let Some(id) = finding.id.as_deref() {
+            (id.to_string(), true)
+        } else {
+            let mut digest = Sha256::new();
+            digest.update(finding.path.as_bytes());
+            digest.update(finding.line.to_be_bytes());
+            digest.update(finding.title.as_bytes());
+            let hash = digest.finalize();
+            (
+                format!(
+                    "legacy-v1:{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                    hash[0], hash[1], hash[2], hash[3], hash[4], hash[5]
+                ),
+                false,
+            )
+        };
+        findings.push(FindingPublicationReceipt {
+            finding_id,
+            stable_identity,
+            initial_outcome: FindingPublicationOutcome::Unknown,
+            inline_rejected: false,
+            comment_id: None,
+        });
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"review-receipt-v1\0");
+    digest.update(forge.as_bytes());
+    digest.update(head_sha.as_bytes());
+    for finding in &findings {
+        digest.update(finding.finding_id.as_bytes());
+    }
+    let hash = digest.finalize();
+    ReviewPublicationReceipt {
+        version: ReviewPublicationReceipt::VERSION,
+        receipt_id: format!(
+            "{forge}-review-v1:{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            hash[0], hash[1], hash[2], hash[3], hash[4], hash[5]
+        ),
+        review_id: None,
+        findings,
+    }
+}
+
+pub fn write_review_publication_receipt_from_env(receipt: &ReviewPublicationReceipt) -> Result<()> {
+    let Some(path) = std::env::var_os(PUBLICATION_RECEIPT_PATH_ENV) else {
+        return Ok(());
+    };
+    ensure!(
+        !path.is_empty(),
+        "{PUBLICATION_RECEIPT_PATH_ENV} must not be empty"
+    );
+    write_review_publication_receipt(Path::new(&path), receipt)
+}
+
+fn write_review_publication_receipt(path: &Path, receipt: &ReviewPublicationReceipt) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("publication receipt path must name a file"))?;
+    ensure!(
+        parent.is_dir(),
+        "publication receipt directory does not exist"
+    );
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        ensure!(
+            !metadata.file_type().is_symlink(),
+            "publication receipt path must not be a symlink"
+        );
+    }
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("publication receipt path must name a file"))?;
+    let temporary = parent.join(format!(
+        ".{}.{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&temporary);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| -> Result<()> {
+        let mut file = options
+            .open(&temporary)
+            .context("creating private publication receipt")?;
+        serde_json::to_writer(&mut file, receipt).context("serializing publication receipt")?;
+        file.write_all(b"\n")
+            .context("writing publication receipt")?;
+        file.sync_all().context("syncing publication receipt")?;
+        fs::rename(&temporary, path).context("atomically publishing publication receipt")?;
+        #[cfg(unix)]
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .context("syncing publication receipt directory")?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
 #[allow(async_fn_in_trait)]
 pub trait Forge {
     /// True when the forge renders inline HTML `<img>` in markdown comments
@@ -396,6 +585,13 @@ pub trait Forge {
     /// otherwise forge-neutral envelope metadata.
     fn review_summary(&self, envelope: &Envelope) -> String {
         check_summary(envelope, self.rich_markdown(), SummaryContext::from_env())
+    }
+    fn plan_review_publication(
+        &self,
+        envelope: &Envelope,
+        snapshot: &PrMeta,
+    ) -> ReviewPublicationReceipt {
+        untracked_review_publication_receipt("forge", envelope, &snapshot.head_sha)
     }
     async fn fetch_pr_meta(&self) -> Result<PrMeta>;
     /// Unified diff of the immutable snapshot returned by `fetch_pr_meta`.
@@ -409,10 +605,9 @@ pub trait Forge {
     /// revalidate the snapshot immediately before writing to the forge.
     async fn post_review(
         &self,
-        summary: &str,
-        findings: &[Finding],
+        envelope: &Envelope,
         snapshot: &PrMeta,
-    ) -> Result<()>;
+    ) -> Result<ReviewPublicationReceipt>;
     /// Ensure both check runs exist (in_progress); returns (advisory_id, gate_id).
     async fn start_checks(&self, head_sha: &str) -> Result<(String, String)>;
     /// Complete the advisory check and, when supplied, the gate check only
@@ -623,6 +818,7 @@ pub struct SummaryContext {
     pub details_url: Option<String>,
     pub prevention_hint: bool,
     pub prevention_commands: Vec<String>,
+    pub publication: Option<ReviewPublicationSummary>,
 }
 
 impl SummaryContext {
@@ -631,6 +827,7 @@ impl SummaryContext {
             details_url: valid_details_url(std::env::var("POSTIL_DETAILS_URL").ok()),
             prevention_hint: std::env::var("POSTIL_PREVENTION_HINT").as_deref() == Ok("1"),
             prevention_commands: prevention_commands_from_env(),
+            publication: None,
         }
     }
 }
@@ -705,12 +902,17 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
             .iter()
             .filter(|finding| !is_operational_path(&finding.path))
             .count();
-        let new_visible = envelope
-            .findings
-            .iter()
-            .filter(|finding| !is_operational_path(&finding.path))
-            .filter(|finding| !crate::filter::is_carried(finding))
-            .count();
+        let new_visible = context.publication.map_or_else(
+            || {
+                envelope
+                    .findings
+                    .iter()
+                    .filter(|finding| !is_operational_path(&finding.path))
+                    .filter(|finding| !crate::filter::is_carried(finding))
+                    .count()
+            },
+            |publication| publication.active_inline + publication.summary_only,
+        );
         let open_blocking = envelope
             .findings
             .iter()
@@ -724,7 +926,59 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
                 )
             })
             .count();
-        if has_operational && new_visible > 0 {
+        if context
+            .publication
+            .is_some_and(|publication| publication.rejected_inline > 0)
+        {
+            let rejected = context
+                .publication
+                .expect("publication summary is present")
+                .rejected_inline;
+            s.push_str(&summary_count(
+                rich,
+                "info",
+                rejected,
+                "finding in review details",
+                "findings in review details",
+            ));
+            s.push_str(" · inline placement unavailable");
+            if open_blocking > 0 {
+                s.push_str(" · ");
+                s.push_str(&summary_count(
+                    rich,
+                    "error",
+                    open_blocking,
+                    "blocking finding open",
+                    "blocking findings open",
+                ));
+            }
+            s.push('\n');
+        } else if let Some(publication) = context.publication
+            && (publication.active_inline > 0 || publication.summary_only > 0)
+        {
+            if publication.active_inline > 0 {
+                s.push_str(&summary_count(
+                    rich,
+                    "info",
+                    publication.active_inline,
+                    "inline finding",
+                    "inline findings",
+                ));
+            }
+            if publication.summary_only > 0 {
+                if publication.active_inline > 0 {
+                    s.push_str(" · ");
+                }
+                s.push_str(&summary_count(
+                    rich,
+                    "info",
+                    publication.summary_only,
+                    "finding in summary",
+                    "findings in summary",
+                ));
+            }
+            s.push('\n');
+        } else if has_operational && new_visible > 0 {
             s.push_str(&summary_count(
                 rich,
                 "warn",
@@ -875,20 +1129,16 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
         }
     }
 
-    if context.prevention_hint && !operational && !envelope.silent {
+    let prevention_applies = context
+        .publication
+        .is_none_or(|publication| publication.active_inline > 0);
+    if context.prevention_hint && prevention_applies && !operational && !envelope.silent {
         if rich {
             s.push_str("\n<details><summary>Before the next push</summary>\n\n");
         } else {
             s.push_str("\nBefore the next push:\n");
         }
-        s.push_str("Install committed-change review with `postil hook install`.\n");
-        if !context.prevention_commands.is_empty() {
-            s.push_str("Run the repository's verified checks:\n");
-            for command in &context.prevention_commands {
-                s.push_str(&format!("- `{command}`\n"));
-            }
-        }
-        s.push_str("After staging and before committing, run `postil review --staged`.\n");
+        s.push_str("Run `postil review --staged`, or install it with `postil hook install`.\n");
         if rich {
             s.push_str("\n</details>\n");
         }
@@ -986,6 +1236,37 @@ mod tests {
                 .contains("aggregate limit")
         );
         assert!(checked_metadata_total(usize::MAX, 1, "pages").is_err());
+    }
+
+    #[test]
+    fn publication_receipt_is_atomically_written_as_private_versioned_json() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("publication.json");
+        let receipt = ReviewPublicationReceipt {
+            version: ReviewPublicationReceipt::VERSION,
+            receipt_id: "github-review-v1:test".into(),
+            review_id: Some("77".into()),
+            findings: vec![FindingPublicationReceipt {
+                finding_id: "finding-1".into(),
+                stable_identity: true,
+                initial_outcome: FindingPublicationOutcome::Inline,
+                inline_rejected: false,
+                comment_id: Some("501".into()),
+            }],
+        };
+
+        write_review_publication_receipt(&path, &receipt).unwrap();
+        let stored: ReviewPublicationReceipt =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored, receipt);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 
     #[tokio::test]
@@ -1272,6 +1553,7 @@ mod tests {
                 details_url: Some("https://postil.dev/orgs/acme/runs/run-1".into()),
                 prevention_hint: true,
                 prevention_commands: vec!["cargo test --lib".into()],
+                publication: None,
             },
         );
 
@@ -1291,7 +1573,7 @@ mod tests {
         assert!(!summary.contains("Ignored generated file"));
         assert!(summary.contains("postil review --staged"));
         assert!(summary.contains("postil hook install"));
-        assert!(summary.contains("cargo test --lib"));
+        assert!(!summary.contains("cargo test --lib"));
         assert!(
             summary
                 .contains("<sub>[Review details](https://postil.dev/orgs/acme/runs/run-1)</sub>")
@@ -1450,6 +1732,40 @@ mod tests {
         );
         assert_eq!(parsed, vec!["cargo test --lib", "bun test"]);
         assert!(parse_prevention_commands(&"x".repeat(4_097)).is_empty());
+    }
+
+    #[test]
+    fn prevention_coaching_requires_a_fresh_inline_publication() {
+        let env = envelope_with_findings(vec![finding()]);
+        let summary_only = check_summary(
+            &env,
+            true,
+            SummaryContext {
+                prevention_hint: true,
+                publication: Some(ReviewPublicationSummary {
+                    summary_only: 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        assert!(!summary_only.contains("Before the next push"));
+
+        let inline = check_summary(
+            &env,
+            true,
+            SummaryContext {
+                prevention_hint: true,
+                publication: Some(ReviewPublicationSummary {
+                    active_inline: 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        assert!(inline.contains("Before the next push"));
+        assert!(inline.contains("postil review --staged"));
+        assert!(!inline.contains("cargo test"));
     }
 
     #[test]
