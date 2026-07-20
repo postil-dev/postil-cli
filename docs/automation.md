@@ -34,6 +34,7 @@ The report shows which findings become visible or suppressed and which gate resu
 
 `postil respond` answers a mention on a pull request. GitHub and GitLab also support issue mentions. It does not open pull requests or push commits.
 Posting the reply requires `--publish`; without it, the reply is printed locally.
+CI detection and environment variables do not authorize a forge write.
 
 ```sh
 POSTIL_COMMENT='@postil is this safe?' \

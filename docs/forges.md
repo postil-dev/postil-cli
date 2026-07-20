@@ -3,6 +3,7 @@
 Postil reviews pull requests on GitHub, GitLab, Bitbucket, and Azure DevOps. Each integration accepts a base URL for self-managed installations.
 
 Forge writes require `--publish`. Without it, remote pull requests are fetched and reviewed locally without comments or checks.
+CI detection and environment variables do not enable publication. `POSTIL_PUBLISH` and `POSTIL_NO_POST` are rejected because publication must be explicit in the command.
 
 ## GitHub
 

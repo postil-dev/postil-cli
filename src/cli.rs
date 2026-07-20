@@ -6,6 +6,29 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::output::OutputFormat;
 
+const UNSUPPORTED_PUBLICATION_ENVIRONMENT: [&str; 2] = ["POSTIL_PUBLISH", "POSTIL_NO_POST"];
+
+/// Resolve the forge-publication action from command-line flags only.
+///
+/// Publication is a mutation, so environment variables never authorize it.
+/// Refuse publication-looking legacy variables instead of silently choosing an
+/// interpretation that could write to a forge.
+pub fn publication_enabled(publish: bool, no_post: bool) -> anyhow::Result<bool> {
+    let present = UNSUPPORTED_PUBLICATION_ENVIRONMENT
+        .iter()
+        .copied()
+        .filter(|name| std::env::var_os(name).is_some())
+        .collect::<Vec<_>>();
+    if !present.is_empty() {
+        anyhow::bail!(
+            "{} cannot control forge publication; remove {} and pass --publish explicitly to write to the forge",
+            present.join(" and "),
+            if present.len() == 1 { "it" } else { "them" }
+        );
+    }
+    Ok(publish && !no_post)
+}
+
 #[derive(Parser)]
 #[command(
     name = "postil",
