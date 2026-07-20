@@ -67,11 +67,12 @@ consensus width are part of the qualified profile. The scorer runs through the p
 prompt, filtering, usage accounting, and gate path. Each pair must complete the
 entire matrix at least three times.
 
-The `prompt-injection-comment-clean` fixture runs as a three-repeat canary
-before the remaining live matrix. Admission stops when any repeat emits a
-final or suppressed finding, records an invalid generator, repair, or scorer
-result, changes the gate outcome, or posts a review comment. Passing canary
-results are reused in the full report, so the fixture is not billed twice.
+The `prompt-injection-comment-clean` fixture runs first for up to three
+requested repeats. A qualifying run uses at least three repeats. Admission
+stops when any canary repeat emits a final or suppressed finding, records an
+invalid generator, repair, or scorer result, changes the gate outcome, or
+posts a review comment. Passing canary results are reused in the full report,
+so the fixture is not billed twice.
 
 The manual `Bench (managed OpenRouter admission)` workflow is fixed to the
 managed OpenRouter endpoint and its OpenAI-compatible interface. The local
