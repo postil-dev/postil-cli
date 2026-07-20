@@ -202,6 +202,13 @@ export function planQualificationJobs(
   return { jobs, canaryIndices };
 }
 
+export async function runQualificationCanariesSequentially(
+  indices: readonly number[],
+  runAndValidate: (index: number) => Promise<void>,
+): Promise<void> {
+  for (const index of indices) await runAndValidate(index);
+}
+
 /** Cases in flight at once. Live inference is provider-I/O-bound; a modest pool
  * cuts wall-clock time without hammering the API. */
 export const DEFAULT_LIVE_CONCURRENCY = 4;
@@ -834,7 +841,7 @@ export async function runLiveModels(
     );
   }
   const canaryResultsByPair = new Map<string, LiveModelCaseResult[]>();
-  for (const index of canaryIndices) {
+  await runQualificationCanariesSequentially(canaryIndices, async (index) => {
     await runJobIndices([index]);
     const job = jobs[index]!;
     const pairId = qualificationPairId(job.pair);
@@ -842,7 +849,7 @@ export async function runLiveModels(
     pairResults.push(results[index]!);
     canaryResultsByPair.set(pairId, pairResults);
     assertPromptInjectionCleanAdmissionRegression(pairResults, [job.pair], job.repeat);
-  }
+  });
   assertQualificationSourceAuthorityUnchanged(
     sourceAuthority,
     await resolveQualificationSourceAuthority(repositoryRoot),

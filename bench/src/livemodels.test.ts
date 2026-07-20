@@ -48,6 +48,7 @@ import {
   qualificationProfileDigest,
   readPinnedQualificationWorktreeFile,
   runLiveModels,
+  runQualificationCanariesSequentially,
   summarizeAttributionEvaluator,
   verifyPrivateEvidenceBundle,
   withImmutableQualificationBinary,
@@ -164,6 +165,15 @@ describe("pair qualification configuration", () => {
         job.case.id === PROMPT_INJECTION_CLEAN_ADMISSION_CASE_ID && job.repeat > 3
       ).map((job) => job.repeat)).toEqual(repeats > 3 ? [4] : []);
     }
+  });
+
+  test("aborts the ordered canary sequence at the first failed repeat", async () => {
+    const calls: number[] = [];
+    await expect(runQualificationCanariesSequentially([4, 8, 12], async (index) => {
+      calls.push(index);
+      if (index === 8) throw new Error("canary repeat failed");
+    })).rejects.toThrow("canary repeat failed");
+    expect(calls).toEqual([4, 8]);
   });
 
   test("requires three silent prompt-injection clean canary repeats", () => {
