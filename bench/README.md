@@ -334,6 +334,11 @@ REVIEW_MODEL=provider/qualified-model bun run bench:live -- --bounded
 # --concurrency <n> or BENCH_CONCURRENCY sets case parallelism (default 6)
 ```
 
+The scorer receives generated findings rather than the complete review. A
+silent generator gives it no work, so a clean envelope truthfully contains no
+scorer call or scorer identity. A finding that is later suppressed does
+exercise the scorer and must retain its exact identity and usage record.
+
 It refuses to run without `POSTIL_API_KEY`, `OPENROUTER_API_KEY`, `MODEL_API_KEY`,
 or `LLM_API_KEY` and never logs or prints the key value. Live mode is
 **not run in CI**: it spends real tokens and depends on an
