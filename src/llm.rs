@@ -433,6 +433,33 @@ struct RawReview {
     findings: Vec<RawFinding>,
 }
 
+/// Caller-owned semantic validation keeps the detailed correction prompt
+/// separate from the bounded diagnostic that can reach logs and run reports.
+/// The safe detail must contain categories and counts only, never model prose,
+/// repository paths, line text, or copied evidence.
+#[derive(Debug, Clone)]
+pub(crate) struct ReviewValidationFailure {
+    repair_detail: String,
+    safe_detail: String,
+}
+
+impl ReviewValidationFailure {
+    pub(crate) fn new(repair_detail: String, safe_detail: String) -> Self {
+        Self {
+            repair_detail,
+            safe_detail,
+        }
+    }
+
+    pub(crate) fn repair_detail(&self) -> &str {
+        &self.repair_detail
+    }
+
+    pub(crate) fn safe_detail(&self) -> &str {
+        &self.safe_detail
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawFinding {
@@ -1634,7 +1661,7 @@ impl LlmClient {
     /// Run a review while treating caller-rejected content as invalid model
     /// output. Each model gets one bounded semantic correction before the
     /// configured cascade advances, and every consumed call remains in usage.
-    pub async fn review_validated<F>(
+    pub(crate) async fn review_validated<F>(
         &self,
         cfg: &Config,
         system: &str,
@@ -1642,7 +1669,10 @@ impl LlmClient {
         validate: F,
     ) -> std::result::Result<ModelReview, ModelError>
     where
-        F: Fn(&ModelReview) -> std::result::Result<(), String> + Send + Sync + 'static,
+        F: Fn(&ModelReview) -> std::result::Result<(), ReviewValidationFailure>
+            + Send
+            + Sync
+            + 'static,
     {
         let validate = Arc::new(validate);
         let chain = cfg.model_chain();
@@ -2171,7 +2201,9 @@ impl LlmClient {
         model: &str,
         system: &str,
         user: &str,
-        validate: &(dyn Fn(&ModelReview) -> std::result::Result<(), String> + Send + Sync),
+        validate: &(
+             dyn Fn(&ModelReview) -> std::result::Result<(), ReviewValidationFailure> + Send + Sync
+         ),
     ) -> std::result::Result<ModelReview, ModelError> {
         let mut usage = Usage::default();
         let mut call_usage = Vec::new();
@@ -2205,6 +2237,11 @@ impl LlmClient {
         let raw = match parsed_initial {
             Ok(raw) => raw,
             Err(parse_err) => {
+                eprintln!(
+                    "postil: model {} review JSON validation failed shape={}",
+                    log_text(model),
+                    safe_review_output_shape(&content),
+                );
                 let incident = ModelIncident {
                     phase: ModelIncidentPhase::Review,
                     category: ModelIncidentCategory::InvalidOutput,
@@ -2242,6 +2279,11 @@ impl LlmClient {
                     }
                 };
                 let parsed = parse_review(&repaired).map_err(|error| {
+                    eprintln!(
+                        "postil: model {} review JSON repair remained invalid shape={}",
+                        log_text(model),
+                        safe_review_output_shape(&repaired),
+                    );
                     let mut error = ModelError::new(
                         anyhow!("model output invalid after repair: {error}"),
                         usage,
@@ -2357,10 +2399,18 @@ impl LlmClient {
             }
         }
 
-        if let Err(reason) = validate(&review) {
+        if let Err(validation_failure) = validate(&review) {
+            eprintln!(
+                "postil: model {} output validation failed categories={}",
+                log_text(model),
+                validation_failure.safe_detail(),
+            );
             if correction_used {
                 let mut error = ModelError::new(
-                    anyhow!("model output remained unusable after its correction call"),
+                    anyhow!(
+                        "model output remained unusable after its correction call (validation categories: {})",
+                        validation_failure.safe_detail()
+                    ),
                     review.usage,
                     review.usage_accounting_complete,
                 );
@@ -2373,7 +2423,8 @@ impl LlmClient {
                 log_text(model),
             );
             let previous = truncate_utf8_bytes(&content, 16_384);
-            let retry_user = review_validation_retry_user(user, previous, &reason);
+            let retry_user =
+                review_validation_retry_user(user, previous, validation_failure.repair_detail());
             let mut retry_usage = review.usage;
             let mut retry_accounting_complete = review.usage_accounting_complete;
             let retry = self
@@ -2389,6 +2440,7 @@ impl LlmClient {
                     LlmCallPhase::SemanticRetry,
                 )
                 .await;
+            let mut retry_safe_detail = "invalidJson=1".to_string();
             match retry {
                 Ok(content) => match parse_review(&content) {
                     Ok(raw) => {
@@ -2406,17 +2458,21 @@ impl LlmClient {
                                 });
                                 return Ok(candidate);
                             }
-                            Err(retry_reason) => eprintln!(
-                                "postil: model {} semantic retry remained unusable: {}",
-                                log_text(model),
-                                log_text(&retry_reason),
-                            ),
+                            Err(retry_failure) => {
+                                retry_safe_detail = retry_failure.safe_detail().to_string();
+                                eprintln!(
+                                    "postil: model {} semantic retry remained unusable categories={}",
+                                    log_text(model),
+                                    retry_failure.safe_detail(),
+                                );
+                            }
                         }
                     }
                     Err(parse_error) => eprintln!(
-                        "postil: model {} semantic retry returned invalid JSON: {}",
+                        "postil: model {} semantic retry returned invalid JSON: {} shape={}",
                         log_text(model),
                         log_text(&parse_error),
+                        safe_review_output_shape(&content),
                     ),
                 },
                 Err(error) => {
@@ -2438,7 +2494,9 @@ impl LlmClient {
             }
 
             let mut error = ModelError::new(
-                anyhow!("model output remained unusable after semantic retry"),
+                anyhow!(
+                    "model output remained unusable after semantic retry (validation categories: {retry_safe_detail})"
+                ),
                 retry_usage,
                 retry_accounting_complete,
             );
@@ -4079,6 +4137,60 @@ fn parse_review(content: &str) -> Result<RawReview, String> {
     serde_json::from_str::<RawReview>(json_str).map_err(|e| e.to_string())
 }
 
+fn safe_review_output_shape(content: &str) -> String {
+    fn value_kind(value: Option<&serde_json::Value>) -> &'static str {
+        match value {
+            None => "missing",
+            Some(serde_json::Value::Null) => "null",
+            Some(serde_json::Value::Bool(_)) => "boolean",
+            Some(serde_json::Value::Number(_)) => "number",
+            Some(serde_json::Value::String(_)) => "string",
+            Some(serde_json::Value::Array(_)) => "array",
+            Some(serde_json::Value::Object(_)) => "object",
+        }
+    }
+
+    let Some(json) = extract_json_object(content) else {
+        let status = if content.contains('{') {
+            "incomplete"
+        } else {
+            "missing"
+        };
+        return format!("bytes={} jsonObject={status}", content.len());
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return format!("bytes={} jsonObject=malformed", content.len());
+    };
+    let summary = value_kind(value.get("summary"));
+    let findings = value.get("findings");
+    let finding_count = findings
+        .and_then(serde_json::Value::as_array)
+        .map_or_else(|| "unknown".to_string(), |items| items.len().to_string());
+    let invalid_finding_shapes = findings
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| {
+                    let Some(item) = item.as_object() else {
+                        return true;
+                    };
+                    !matches!(item.get("path"), Some(serde_json::Value::String(_)))
+                        || !matches!(item.get("line"), Some(serde_json::Value::Number(_)))
+                        || !matches!(item.get("severity"), Some(serde_json::Value::String(_)))
+                        || !matches!(item.get("body"), Some(serde_json::Value::String(_)))
+                })
+                .count()
+        })
+        .unwrap_or_default();
+    format!(
+        "bytes={} jsonObject=complete summary={summary} findings={}:{} invalidFindingShapes={invalid_finding_shapes}",
+        content.len(),
+        value_kind(findings),
+        finding_count,
+    )
+}
+
 fn parse_scores(content: &str, expected_len: usize) -> Result<Vec<FindingScore>, String> {
     let json_str = extract_json_array(content).ok_or("no JSON array found")?;
     let raw = serde_json::from_str::<Vec<RawScore>>(json_str).map_err(|e| e.to_string())?;
@@ -5027,16 +5139,40 @@ mod tests {
         .unwrap();
         *client.http.lock().unwrap() = Some(reqwest::Client::new());
 
-        let result = client
+        let error = client
             .review_validated(&config, "system", "user", |review| {
                 review
                     .findings
                     .iter()
                     .try_for_each(crate::envelope::validate_finding_publication)
+                    .map_err(|reason| {
+                        ReviewValidationFailure::new(reason, "publicationContract=1".to_string())
+                    })
             })
-            .await;
-        assert!(result.is_err());
+            .await
+            .unwrap_err();
+        let detail = format!("{error:#}");
+        assert!(detail.contains("validation categories: publicationContract=1"));
+        assert!(!detail.contains("word word"));
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn review_output_shape_reports_structure_without_model_text() {
+        let missing = safe_review_output_shape("model prose without JSON");
+        assert_eq!(missing, "bytes=24 jsonObject=missing");
+
+        let malformed = safe_review_output_shape(r#"prefix {"summary":"private text""#);
+        assert!(malformed.contains("jsonObject=incomplete"));
+        assert!(!malformed.contains("private text"));
+
+        let wrong_shape = safe_review_output_shape(
+            r#"{"summary":false,"findings":[{"path":"private.rs","line":"7","severity":"warn"}]}"#,
+        );
+        assert!(wrong_shape.contains("summary=boolean"));
+        assert!(wrong_shape.contains("findings=array:1"));
+        assert!(wrong_shape.contains("invalidFindingShapes=1"));
+        assert!(!wrong_shape.contains("private.rs"));
     }
 
     #[tokio::test]
