@@ -15,7 +15,7 @@ use crate::filter;
 use crate::forge::{
     CheckState, Forge, PrMeta, azure::Azure, bitbucket::Bitbucket, github::GitHub, gitlab::GitLab,
 };
-use crate::llm::{FindingScore, LlmClient, add_usage};
+use crate::llm::{FindingScore, LlmClient, ReviewValidationFailure, add_usage};
 use crate::local::{self, LocalSource};
 use crate::output::{self, OutputFormat};
 use crate::prompt::{self, PrContext};
@@ -89,16 +89,25 @@ fn conservative_context_tokens(model: &str) -> usize {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReviewBatchValidationReason {
+    category: &'static str,
+    repair_detail: String,
+}
+
 fn review_batch_validation_reason(
     finding: &Finding,
     annotated: &str,
     content_policy_prompt: Option<&str>,
-) -> Option<String> {
+) -> Option<ReviewBatchValidationReason> {
     if let Err(reason) = crate::envelope::validate_finding_publication(finding) {
-        return Some(format!(
-            "finding at {}:{} violates the publication contract: {reason}",
-            finding.path, finding.line
-        ));
+        return Some(ReviewBatchValidationReason {
+            category: "publicationContract",
+            repair_detail: format!(
+                "finding at {}:{} violates the publication contract: {reason}",
+                finding.path, finding.line
+            ),
+        });
     }
 
     if diff::review_batch_contains_exact_evidence(
@@ -127,63 +136,98 @@ fn review_batch_validation_reason(
         });
 
     let Some(evidence_source) = evidence_source else {
-        return Some(format!(
-            "finding at {}:{} does not cite a non-empty new-side line displayed in this review input; retract it or cite a displayed new-side line",
-            finding.path, finding.line
-        ));
+        return Some(ReviewBatchValidationReason {
+            category: "missingEvidenceAnchor",
+            repair_detail: format!(
+                "finding at {}:{} does not cite a non-empty new-side line displayed in this review input; retract it or cite a displayed new-side line",
+                finding.path, finding.line
+            ),
+        });
     };
     let Some(expected) =
         diff::review_batch_expected_evidence(evidence_source, &finding.path, finding.line)
     else {
-        return Some(format!(
-            "finding at {}:{} has multiple displayed new-side evidence strings; copy the exact supporting string or retract it",
-            finding.path, finding.line
-        ));
+        return Some(ReviewBatchValidationReason {
+            category: "ambiguousEvidence",
+            repair_detail: format!(
+                "finding at {}:{} has multiple displayed new-side evidence strings; copy the exact supporting string or retract it",
+                finding.path, finding.line
+            ),
+        });
     };
-    Some(format!(
-        "finding at {}:{} must set `evidence` to the exact JSON string {}",
-        finding.path,
-        finding.line,
-        serde_json::to_string(&expected).expect("evidence string is JSON-serializable")
-    ))
+    Some(ReviewBatchValidationReason {
+        category: "evidenceMismatch",
+        repair_detail: format!(
+            "finding at {}:{} must set `evidence` to the exact JSON string {}",
+            finding.path,
+            finding.line,
+            serde_json::to_string(&expected).expect("evidence string is JSON-serializable")
+        ),
+    })
 }
 
 fn review_batch_validation_reasons(
     findings: &[Finding],
     annotated: &str,
     content_policy_prompt: Option<&str>,
-) -> Option<String> {
+) -> Option<ReviewValidationFailure> {
     let mut reasons = String::new();
-    for reason in findings.iter().filter_map(|finding| {
-        review_batch_validation_reason(
-            finding,
-            annotated,
-            (finding.kind == crate::envelope::Kind::ContentPolicy)
-                .then_some(content_policy_prompt)
-                .flatten(),
-        )
-    }) {
+    let mut category_counts = HashMap::<&'static str, usize>::new();
+    let validation_reasons = findings
+        .iter()
+        .filter_map(|finding| {
+            review_batch_validation_reason(
+                finding,
+                annotated,
+                (finding.kind == crate::envelope::Kind::ContentPolicy)
+                    .then_some(content_policy_prompt)
+                    .flatten(),
+            )
+        })
+        .collect::<Vec<_>>();
+    for reason in &validation_reasons {
+        *category_counts.entry(reason.category).or_default() += 1;
+    }
+    for reason in validation_reasons {
         let separator = if reasons.is_empty() { "" } else { "; " };
         let remaining = MAX_REVIEW_VALIDATION_REASON_BYTES.saturating_sub(reasons.len());
-        if separator.len().saturating_add(reason.len()) <= remaining {
+        if separator.len().saturating_add(reason.repair_detail.len()) <= remaining {
             reasons.push_str(separator);
-            reasons.push_str(&reason);
+            reasons.push_str(&reason.repair_detail);
             continue;
         }
         if remaining > separator.len() {
             reasons.push_str(separator);
             let available = remaining - separator.len();
             let end = reason
+                .repair_detail
                 .char_indices()
                 .map(|(index, _)| index)
                 .take_while(|index| *index <= available)
                 .last()
                 .unwrap_or(0);
-            reasons.push_str(&reason[..end]);
+            reasons.push_str(&reason.repair_detail[..end]);
         }
         break;
     }
-    (!reasons.is_empty()).then_some(reasons)
+    if reasons.is_empty() {
+        return None;
+    }
+    let safe_detail = [
+        "publicationContract",
+        "missingEvidenceAnchor",
+        "ambiguousEvidence",
+        "evidenceMismatch",
+    ]
+    .into_iter()
+    .filter_map(|category| {
+        category_counts
+            .get(category)
+            .map(|count| format!("{category}={count}"))
+    })
+    .collect::<Vec<_>>()
+    .join(",");
+    Some(ReviewValidationFailure::new(reasons, safe_detail))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1295,7 +1339,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                     let validation_annotated = annotated.clone();
                     let validation_user = user.clone();
                     match client
-                        .review_validated(cfg, &system, &user, move |review| {
+                        .review_validated_with_safe(cfg, &system, &user, move |review| {
                             review_batch_validation_reasons(
                                 &review.findings,
                                 &validation_annotated,
@@ -2484,9 +2528,10 @@ mod tests {
 
         let reason = review_batch_validation_reason(&finding, annotated, None).unwrap();
         assert_eq!(
-            reason,
+            reason.repair_detail,
             "finding at src/lib.rs:7 must set `evidence` to the exact JSON string \"  changed();\""
         );
+        assert_eq!(reason.category, "evidenceMismatch");
 
         finding.evidence = Some("  changed();".to_string());
         assert_eq!(
@@ -2502,9 +2547,10 @@ mod tests {
         finding.evidence = Some("changed();".to_string());
 
         assert_eq!(
-            review_batch_validation_reason(&finding, annotated, None).as_deref(),
+            review_batch_validation_reason(&finding, annotated, None)
+                .map(|reason| reason.repair_detail),
             Some(
-                "finding at src/lib.rs:7 violates the publication contract: finding body must end with sentence punctuation"
+                "finding at src/lib.rs:7 violates the publication contract: finding body must end with sentence punctuation".to_string()
             )
         );
     }
@@ -2519,10 +2565,21 @@ mod tests {
 
         let reason = review_batch_validation_reasons(&[first, second], annotated, None).unwrap();
 
-        assert!(reason.contains("src/lib.rs:7"));
-        assert!(reason.contains("exact JSON string \"first();\""));
-        assert!(reason.contains("src/lib.rs:8"));
-        assert!(reason.contains("exact JSON string \"second();\""));
+        assert!(reason.repair_detail().contains("src/lib.rs:7"));
+        assert!(
+            reason
+                .repair_detail()
+                .contains("exact JSON string \"first();\"")
+        );
+        assert!(reason.repair_detail().contains("src/lib.rs:8"));
+        assert!(
+            reason
+                .repair_detail()
+                .contains("exact JSON string \"second();\"")
+        );
+        assert_eq!(reason.safe_detail(), "evidenceMismatch=2");
+        assert!(!reason.safe_detail().contains("src/lib.rs"));
+        assert!(!reason.safe_detail().contains("first();"));
     }
 
     #[test]
@@ -2550,9 +2607,10 @@ mod tests {
         finding.evidence = Some("approximate evidence".to_string());
 
         assert_eq!(
-            review_batch_validation_reason(&finding, annotated, None).as_deref(),
+            review_batch_validation_reason(&finding, annotated, None)
+                .map(|reason| reason.repair_detail),
             Some(
-                "finding at src/lib.rs:7 has multiple displayed new-side evidence strings; copy the exact supporting string or retract it"
+                "finding at src/lib.rs:7 has multiple displayed new-side evidence strings; copy the exact supporting string or retract it".to_string()
             )
         );
     }

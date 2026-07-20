@@ -5534,6 +5534,12 @@ async fn ungrounded_output_fails_closed() {
     assert_eq!(env["modelUsage"][1]["phase"], "semanticRetry");
     assert_eq!(env["modelIncidents"][0]["category"], "invalidOutput");
     assert_eq!(env["modelIncidents"][0]["recovered"], false);
+    let body = env["findings"][0]["body"].as_str().unwrap();
+    assert!(body.contains("validation categories: missingEvidenceAnchor=1"));
+    assert!(!body.contains("src/auth.rs:999"));
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("output validation failed categories=missingEvidenceAnchor=1"));
+    assert!(stderr.contains("semantic retry remained unusable categories=missingEvidenceAnchor=1"));
 }
 
 #[tokio::test]
