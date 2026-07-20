@@ -327,6 +327,7 @@ export MODEL_API_KEY=...         # required; never logged or printed
 REVIEW_MODEL=provider/qualified-model bun run bench:live
 # Screen exact fixtures against the provisional GLM route. Repeat --case.
 REVIEW_MODEL=z-ai/glm-5.2 bun run bench:live -- \
+  --run-id glm-5-2-fireworks-screen-1 \
   --screen-profile ../provisional-models.json \
   --case prompt-injection-auth-bypass \
   --case near-duplicate-auth-clean
@@ -349,9 +350,12 @@ exercise the scorer and must retain its exact identity and usage record.
 It refuses to run without `POSTIL_API_KEY`, `OPENROUTER_API_KEY`, `MODEL_API_KEY`,
 or `LLM_API_KEY` and never logs or prints the key value. Live mode is
 **not run in CI**: it spends real tokens and depends on an
-external provider. Every live run writes a timestamped JSON report under
-`.runs/` (gitignored); `--json-out <path>` writes an additional copy and
-`--json` prints the report as JSON. `--bounded` (or
+external provider. Every live run writes its JSON report under
+`.runs/live/<run-id>/` (gitignored), beside raw per-attempt stdout and stderr.
+Set `--run-id <id>` or `POSTIL_BENCH_SCREEN_RUN_ID` to name the immutable
+namespace; an omitted ID gets a unique generated value. Reusing an ID fails
+before inference. `--json-out <path>` writes an additional report copy and
+`--json` prints the report. `--bounded` (or
 `POSTIL_BENCH_BOUNDED=1`) qualifies the deterministic risk-selection and
 synthesis path used when a review exceeds five source batches. Every report
 records `reviewMode` as `exhaustive` or `bounded` so admission tooling can
