@@ -2390,8 +2390,19 @@ async fn local_bounded_is_explicit_and_default_local_review_remains_exhaustive()
 }
 
 #[tokio::test]
-async fn bounded_reviews_expire_changed_prior_evidence_outside_selected_batches() {
+async fn bounded_reviews_resolve_changed_prior_evidence_when_selected() {
     use std::fmt::Write as _;
+
+    fn batch_id_containing(prompt: &str, needle: &str) -> usize {
+        prompt
+            .split("Batch ")
+            .skip(1)
+            .find_map(|block| {
+                let (id, _) = block.split_once(' ')?;
+                block.contains(needle).then(|| id.parse::<usize>().unwrap())
+            })
+            .expect("planner manifest contains the baseline path")
+    }
 
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -2399,7 +2410,12 @@ async fn bounded_reviews_expire_changed_prior_evidence_outside_selected_batches(
         .respond_with(|request: &wiremock::Request| {
             let body = String::from_utf8_lossy(&request.body);
             if body.contains("select bounded code-review batches") {
-                ResponseTemplate::new(200).set_body_json(llm_text(r#"{"batchIds":[]}"#))
+                let request: Value = serde_json::from_slice(&request.body).unwrap();
+                let prompt = request["messages"][1]["content"].as_str().unwrap();
+                ResponseTemplate::new(200).set_body_json(llm_text(&format!(
+                    r#"{{"batchIds":[{}]}}"#,
+                    batch_id_containing(prompt, "src/churn-3.rs")
+                )))
             } else {
                 ResponseTemplate::new(200).set_body_json(llm_content(json!([])))
             }

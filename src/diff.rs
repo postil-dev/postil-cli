@@ -6,7 +6,7 @@
 //! with its new-file line number.
 
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::RangeInclusive;
@@ -408,6 +408,7 @@ pub struct DiffIndex {
     old_evidence: HashMap<(String, u32), String>,
     content_policy_evidence: HashMap<(String, u32), String>,
     rendered_evidence: HashMap<(String, u32), Vec<String>>,
+    rendered_old_coordinates: HashSet<(String, u32)>,
     /// Old-to-new paths for files renamed by the reviewed change. Baseline
     /// findings cite the old head, so reconciliation must follow an unchanged
     /// evidence line represented in the diff across a rename instead of
@@ -427,6 +428,7 @@ impl Default for DiffIndex {
             old_evidence: HashMap::new(),
             content_policy_evidence: HashMap::new(),
             rendered_evidence: HashMap::new(),
+            rendered_old_coordinates: HashSet::new(),
             renamed_paths: HashMap::new(),
         }
     }
@@ -505,6 +507,8 @@ impl DiffIndex {
         }
         self.new_evidence.extend(next.new_evidence);
         self.old_evidence.extend(next.old_evidence);
+        self.rendered_old_coordinates
+            .extend(next.rendered_old_coordinates);
         self.renamed_paths.extend(next.renamed_paths);
     }
 
@@ -584,6 +588,13 @@ impl DiffIndex {
             let Some(path) = current_path.as_ref() else {
                 continue;
             };
+            if let Some(old) = line.strip_prefix("old ")
+                && let Some(number) = old.split_whitespace().next()
+                && let Ok(number) = number.parse::<u32>()
+            {
+                self.rendered_old_coordinates.insert((path.clone(), number));
+                continue;
+            }
             let Some((number, marked)) = line.trim_start().split_once(' ') else {
                 continue;
             };
@@ -732,6 +743,29 @@ impl DiffIndex {
                 *line,
             )
         })
+    }
+
+    /// True only when a selected model request contained the baseline's exact
+    /// old coordinate or the corresponding current coordinate. This lets a
+    /// completed bounded review resolve changed evidence it actually saw while
+    /// keeping changed evidence outside the selected requests open.
+    pub fn contains_reviewed_baseline_coordinate(
+        &self,
+        finding: &crate::envelope::Finding,
+    ) -> bool {
+        if self
+            .rendered_old_coordinates
+            .contains(&(finding.path.clone(), finding.line))
+        {
+            return true;
+        }
+        let current_path = self
+            .renamed_paths
+            .get(&finding.path)
+            .unwrap_or(&finding.path);
+        self.rendered_evidence
+            .keys()
+            .any(|(path, line)| path == current_path && *line == finding.line)
     }
 
     pub fn contains(&self, path: &str, line: u32) -> bool {

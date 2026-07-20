@@ -347,7 +347,9 @@ pub fn reconcile(
                 carry.end_line = None;
                 push_carried(&mut carried, &mut carried_identities, carry);
             } else if trust == ReviewTrust::Exhaustive
-                || (trust == ReviewTrust::Bounded && f.evidence.is_some())
+                || (trust == ReviewTrust::Bounded
+                    && f.evidence.is_some()
+                    && index.contains_reviewed_baseline_coordinate(f))
             {
                 resolved.push(f.clone());
             } else {
@@ -371,14 +373,18 @@ pub fn reconcile(
                     carry.end_line = None;
                     push_carried(&mut carried, &mut carried_identities, carry);
                 }
-            } else if f.evidence.is_some() && f.path != crate::envelope::CHANGE_METADATA_PATH {
-                // The complete current diff or PR-description evidence no
-                // longer contains the exact citation. The historical finding
-                // cannot remain grounded, even when model coverage was bounded.
+            } else if f.evidence.is_some()
+                && f.path != crate::envelope::CHANGE_METADATA_PATH
+                && index.contains_reviewed_baseline_coordinate(f)
+            {
+                // The selected input covered this coordinate and the complete
+                // current diff no longer contains the exact citation. The
+                // completed model request did not reproduce the issue.
                 resolved.push(f.clone());
             } else {
-                // Historical findings without canonical evidence, and virtual
-                // change metadata outside the selected input, remain open.
+                // Changed evidence outside the selected input, historical
+                // findings without canonical evidence, and virtual change
+                // metadata remain open.
                 push_carried(&mut carried, &mut carried_identities, f.clone());
             }
         } else if touch_addresses(index, f, scope) {
@@ -903,8 +909,21 @@ mod tests {
                 trust: ReviewTrust::Bounded,
             },
         );
-        assert_eq!(bounded.resolved.len(), 1);
-        assert!(bounded.carried.is_empty());
+        assert!(bounded.resolved.is_empty());
+        assert_eq!(bounded.carried.len(), 1);
+
+        let mut selected_change = changed.clone();
+        selected_change.add_rendered_evidence("### a.rs\nold     10 - x\n    10 + y\n");
+        let selected = reconcile(
+            &[f("a.rs", 10, Severity::Error, 0.9)],
+            &selected_change,
+            &[],
+            ReconcileScope::Incremental {
+                trust: ReviewTrust::Bounded,
+            },
+        );
+        assert_eq!(selected.resolved.len(), 1);
+        assert!(selected.carried.is_empty());
     }
 
     #[test]
@@ -945,10 +964,30 @@ mod tests {
     }
 
     #[test]
-    fn bounded_full_review_resolves_removed_baseline_evidence() {
+    fn bounded_full_review_carries_changed_unselected_baseline_evidence() {
         let changed = DiffIndex::build(&diff::parse(
             "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -10 +10 @@\n-x\n+y\n",
         ));
+        let baseline = f("a.rs", 10, Severity::Error, 0.9);
+        let rec = reconcile(
+            &[baseline],
+            &changed,
+            &[],
+            ReconcileScope::Full {
+                trust: ReviewTrust::Bounded,
+            },
+        );
+
+        assert!(rec.resolved.is_empty());
+        assert_eq!(rec.carried.len(), 1);
+    }
+
+    #[test]
+    fn bounded_full_review_resolves_changed_selected_baseline_evidence() {
+        let mut changed = DiffIndex::build(&diff::parse(
+            "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -10 +10 @@\n-x\n+y\n",
+        ));
+        changed.add_rendered_evidence("### a.rs\nold     10 - x\n    10 + y\n");
         let baseline = f("a.rs", 10, Severity::Error, 0.9);
         let rec = reconcile(
             &[baseline],

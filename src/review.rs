@@ -1513,9 +1513,9 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                     } else {
                         // Bounded mode reviews deterministic direct evidence and
                         // lossy synthesis, not every source batch. Reconciliation
-                        // carries exact baseline evidence that remains outside the
-                        // selected input and expires citations absent from the
-                        // complete current diff.
+                        // carries baseline evidence outside the selected input.
+                        // A changed citation expires only when a completed model
+                        // request covered its coordinate and did not reproduce it.
                         review_trust = if batch_failed {
                             filter::ReviewTrust::Failed
                         } else if risk_selected_review {
