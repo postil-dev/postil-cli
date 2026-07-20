@@ -16,7 +16,10 @@ use serde::Deserialize;
 use serde_json::json;
 use std::io::Write;
 
-use super::{CheckState, Forge, PrMeta, ThreadKind, check_summary, check_title};
+use super::{
+    CheckState, Forge, PrMeta, ReviewPublicationReceipt, ThreadKind, check_summary, check_title,
+    untracked_review_publication_receipt,
+};
 use crate::diff::{DiffSnapshot, DiffSpool, WorkspaceBudget};
 use crate::envelope::{Envelope, Finding};
 
@@ -460,17 +463,19 @@ impl Forge for Azure {
 
     async fn post_review(
         &self,
-        summary: &str,
-        findings: &[Finding],
+        envelope: &Envelope,
         snapshot: &PrMeta,
-    ) -> Result<()> {
+    ) -> Result<ReviewPublicationReceipt> {
+        let findings = &envelope.findings;
+        let receipt = untracked_review_publication_receipt("azure", envelope, &snapshot.head_sha);
         if super::only_operational_findings(findings) {
-            return Ok(());
+            return Ok(receipt);
         }
         if !self.snapshot_is_current(snapshot).await? {
             eprintln!("postil: azure review delivery skipped because the pull request changed");
-            return Ok(());
+            return Ok(receipt);
         }
+        let summary = self.review_summary(envelope);
         // One failed comment must not drop the rest: post everything we can,
         // then report the failures together.
         let mut failures: Vec<String> = Vec::new();
@@ -502,7 +507,7 @@ impl Forge for Azure {
             Self::check_ok(resp, "summary post").await?;
         }
         if failures.is_empty() {
-            Ok(())
+            Ok(receipt)
         } else {
             Err(anyhow!(
                 "{} finding comment(s) failed to post: {}",
