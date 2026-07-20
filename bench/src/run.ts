@@ -41,9 +41,11 @@
 //   BENCH_LIVE              set to 1 to select diff-file live mode
 //   BENCH_CONCURRENCY       live-mode case parallelism (else --concurrency, else default)
 //   POSTIL_BENCH_BOUNDED    set to 1 to qualify the bounded large-review path
+//   POSTIL_BENCH_SCREEN_RUN_ID  optional live-screen artifact namespace
 //   --case <fixture-id>     repeatable non-admission fixture selection
 //   --screen-profile <path> exact provider and price contract for selected cases
 //   --scorer-model <id>     optional scorer for non-admission diff-file screening
+//   --run-id <id>           optional live-screen artifact namespace
 
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
@@ -162,7 +164,7 @@ export function validateModeSpecificFlags(
   args: readonly string[],
   mode: "mock" | "live-screen" | "live-admission",
 ): void {
-  for (const flag of ["--case", "--scorer-model", "--screen-profile"]) {
+  for (const flag of ["--case", "--scorer-model", "--screen-profile", "--run-id"]) {
     if (!args.includes(flag)) continue;
     if (mode === "live-admission") {
       throw new Error(`${flag} is a non-admission diff-file screen option and is unavailable in live-models admission mode`);
@@ -170,6 +172,15 @@ export function validateModeSpecificFlags(
     if (mode === "mock") {
       throw new Error(`${flag} is available only with --live diff-file screening`);
     }
+  }
+}
+
+export function validateRunIdentityEnvironment(
+  runId: string | undefined,
+  mode: "mock" | "live-screen" | "live-admission",
+): void {
+  if (runId !== undefined && mode !== "live-screen") {
+    throw new Error("POSTIL_BENCH_SCREEN_RUN_ID is available only with --live diff-file screening");
   }
 }
 
@@ -206,6 +217,11 @@ function liveConcurrency(args: string[]): number {
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_LIVE_CONCURRENCY;
 }
 
+export function generatedLiveScreenRunId(now = new Date(), uuid = randomUUID()): string {
+  const stamp = now.toISOString().replace(/[:.]/gu, "-");
+  return `screen-${stamp}-${uuid}`;
+}
+
 async function main() {
   const args = process.argv.slice(2);
   const json = args.includes("--json");
@@ -219,8 +235,10 @@ async function main() {
   const liveModels =
     process.env.POSTIL_BENCH_MODE === "live" || args.includes("--live-models");
   const live = args.includes("--live") || process.env.BENCH_LIVE === "1";
+  const mode = liveModels ? "live-admission" : live ? "live-screen" : "mock";
   validateScreeningEnvironment(process.env.POSTIL_BENCH_SCREEN_PROFILE);
-  validateModeSpecificFlags(args, liveModels ? "live-admission" : live ? "live-screen" : "mock");
+  validateModeSpecificFlags(args, mode);
+  validateRunIdentityEnvironment(process.env.POSTIL_BENCH_SCREEN_RUN_ID, mode);
 
   await prepareExplicitOutputs(jsonOut, manifestOut, liveModels ? privateEvidenceOut : undefined);
   if (args.includes("--json-out") && jsonOut === undefined) {
@@ -306,6 +324,12 @@ async function main() {
     const bounded =
       args.includes("--bounded") || process.env.POSTIL_BENCH_BOUNDED === "1";
     const selectedCaseIds = repeatedFlagValues(args, "--case");
+    const runIdFlag = flagValue(args, "--run-id");
+    if (args.includes("--run-id") && runIdFlag === undefined) {
+      throw new Error("--run-id requires a value");
+    }
+    const runId = runIdFlag ?? process.env.POSTIL_BENCH_SCREEN_RUN_ID ??
+      generatedLiveScreenRunId();
     validateLiveScreenContract(selectedCaseIds, scorerModel, screenProfilePath);
     const report = await runLive(selectLiveScreeningCases(cases, selectedCaseIds), {
       binary,
@@ -315,8 +339,9 @@ async function main() {
       concurrency,
       bounded,
       selectedCaseIds,
+      runId,
     });
-    await writeReport(jsonOut, JSON.stringify(report, null, 2));
+    await writeReport(jsonOut, JSON.stringify(report, null, 2), runId);
     console.log(json ? JSON.stringify(report, null, 2) : formatLiveReport(report));
     return;
   }
@@ -537,13 +562,11 @@ export async function writePrivateEvidenceBundle(
   verifyPrivateEvidenceBundle(persisted, parseLiveModelsReport(report));
 }
 
-/** Live mode always writes a JSON report under bench/.runs (gitignored), plus
- * the optional explicit --json-out path. */
-async function writeReport(jsonOut: string | undefined, jsonReport: string) {
-  const runsDir = resolve(import.meta.dir, "..", ".runs");
-  await mkdir(runsDir, { recursive: true });
-  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  await writeFile(resolve(runsDir, `live-${stamp}.json`), `${jsonReport}\n`);
+/** Live screening writes the aggregate report beside its raw run artifacts,
+ * plus the optional explicit --json-out copy. */
+async function writeReport(jsonOut: string | undefined, jsonReport: string, runId: string) {
+  const runDir = resolve(import.meta.dir, "..", ".runs", "live", runId);
+  await writeFile(resolve(runDir, "report.json"), `${jsonReport}\n`, { flag: "wx", mode: 0o600 });
   if (jsonOut) {
     await atomicWriteOutput(jsonOut, `${jsonReport}\n`);
   }

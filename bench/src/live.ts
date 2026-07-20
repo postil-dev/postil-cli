@@ -100,6 +100,8 @@ export interface LiveOptions {
   bounded?: boolean;
   /** Exact fixture IDs for a non-admission screening subset. */
   selectedCaseIds?: string[];
+  /** Unique artifact namespace for this screen. */
+  runId: string;
 }
 
 export function liveReviewArguments(diffPath: string, bounded = false): string[] {
@@ -229,6 +231,7 @@ export async function runLive(
   const evaluatorSha256 = await evaluatorSourceSha256();
 
   const rootDir = options.rootDir ?? resolve(import.meta.dir, "..", ".runs");
+  const runRoot = await reserveLiveRunRoot(rootDir, options.runId);
 
   // Bounded worker pool: a small fixed number of workers pull case indices off a
   // shared cursor until the queue drains. Each case writes its result into the
@@ -240,7 +243,7 @@ export async function runLive(
     for (;;) {
       const index = cursor++;
       if (index >= cases.length) return;
-      results[index] = await runLiveCaseWithRetry(cases[index]!, index, rootDir, options);
+      results[index] = await runLiveCaseWithRetry(cases[index]!, index, runRoot, options);
     }
   };
   await Promise.all(Array.from({ length: concurrency }, () => worker()));
@@ -319,13 +322,13 @@ async function evaluatorSourceSha256(): Promise<string> {
 async function runLiveCaseWithRetry(
   c: ReturnType<typeof benchmarkCase.parse>,
   index: number,
-  rootDir: string,
+  runRoot: string,
   options: LiveOptions,
 ): Promise<LiveCaseResult> {
   const maxRetries = options.retries ?? DEFAULT_LIVE_RETRIES;
   let last: LiveCaseResult | undefined;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    last = await runLiveCase(c, index, rootDir, options);
+    last = await runLiveCase(c, index, attempt + 1, runRoot, options);
     // Scored => a valid envelope was produced; that is a normal result (even if
     // it has findings or false positives), so never retry it.
     if (last.scored) return last;
@@ -376,6 +379,34 @@ function isTransientFailure(result: LiveCaseResult): boolean {
   return result.error?.startsWith("no valid v1 envelope") ?? false;
 }
 
+const LIVE_RUN_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/u;
+
+export function validateLiveRunId(runId: string): string {
+  if (!LIVE_RUN_ID_PATTERN.test(runId)) {
+    throw new Error(
+      "live benchmark run identity must be 1 to 96 ASCII letters, digits, dots, underscores, or hyphens, starting with a letter or digit",
+    );
+  }
+  return runId;
+}
+
+async function reserveLiveRunRoot(rootDir: string, runId: string): Promise<string> {
+  const liveRoot = join(rootDir, "live");
+  await mkdir(liveRoot, { recursive: true, mode: 0o700 });
+  const runRoot = join(liveRoot, validateLiveRunId(runId));
+  try {
+    await mkdir(runRoot, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      throw new Error(
+        `live benchmark run identity already exists: ${runId}. Choose another --run-id so retained evidence is not overwritten`,
+      );
+    }
+    throw error;
+  }
+  return runRoot;
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((res) => setTimeout(res, ms));
 }
@@ -398,7 +429,8 @@ async function assertBinary(binary: string): Promise<void> {
 async function runLiveCase(
   c: ReturnType<typeof benchmarkCase.parse>,
   index: number,
-  rootDir: string,
+  attempt: number,
+  runRoot: string,
   options: LiveOptions,
 ): Promise<LiveCaseResult> {
   const truth = groundTruthOf(c);
@@ -424,7 +456,7 @@ async function runLiveCase(
     exitCode: undefined,
   };
 
-  const runDir = join(rootDir, "live", caseRunDirName(index, c.id));
+  const runDir = join(runRoot, caseRunDirName(index, c.id), `attempt-${attempt}`);
   await mkdir(runDir, { recursive: true, mode: 0o700 });
   const homeDir = join(runDir, "home");
   const tmpDir = join(runDir, "tmp");
@@ -469,6 +501,7 @@ async function runLiveCase(
   base.exitCode = exitCode;
   base.stderr = stderr;
   await writeFile(join(runDir, "stdout.json"), stdout, { mode: 0o600 });
+  await writeFile(join(runDir, "stderr.log"), stderr, { mode: 0o600 });
 
   const parsed = envelopeV1.safeParse(safeJson(stdout));
   if (!parsed.success) {

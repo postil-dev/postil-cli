@@ -13,6 +13,7 @@ import {
 import {
   atomicWriteOutput,
   createLiveModelsFailureReport,
+  generatedLiveScreenRunId,
   invalidateExplicitOutputs,
   parseLiveModelsFailureReport,
   prepareExplicitOutputs,
@@ -20,6 +21,7 @@ import {
   validateScreeningEnvironment,
   validateModeSpecificFlags,
   validateLiveScreenContract,
+  validateRunIdentityEnvironment,
   writePrivateEvidenceBundle,
 } from "./run";
 import { AtomicAttributionTransportError } from "./attribution";
@@ -49,8 +51,8 @@ describe("diff-file live screening selection", () => {
       .toThrow("must not repeat");
   });
 
-  test("keeps case and scorer flags outside formal admission", () => {
-    for (const flag of ["--case", "--scorer-model", "--screen-profile"]) {
+  test("keeps screen-only flags outside formal admission", () => {
+    for (const flag of ["--case", "--scorer-model", "--screen-profile", "--run-id"]) {
       expect(() => validateModeSpecificFlags([flag, "value"], "live-admission"))
         .toThrow("non-admission");
       expect(() => validateModeSpecificFlags([flag, "value"], "mock"))
@@ -58,6 +60,17 @@ describe("diff-file live screening selection", () => {
       expect(() => validateModeSpecificFlags([flag, "value"], "live-screen"))
         .not.toThrow();
     }
+  });
+
+  test("generates path-safe unique screen identities and scopes the environment override", () => {
+    expect(generatedLiveScreenRunId(
+      new Date("2026-07-20T12:34:56.789Z"),
+      "12345678-1234-1234-1234-123456789abc",
+    )).toBe("screen-2026-07-20T12-34-56-789Z-12345678-1234-1234-1234-123456789abc");
+    expect(() => validateRunIdentityEnvironment("screen-1", "live-screen")).not.toThrow();
+    expect(() => validateRunIdentityEnvironment("screen-1", "mock")).toThrow("only with --live");
+    expect(() => validateRunIdentityEnvironment("screen-1", "live-admission"))
+      .toThrow("only with --live");
   });
 
   test("rejects inherited internal screening state at the benchmark entry point", () => {

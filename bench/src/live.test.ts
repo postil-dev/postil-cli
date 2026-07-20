@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
+import { cases } from "../fixtures/cases";
 import type { Envelope } from "./harness";
 import {
   boundedCoverageFailure,
@@ -7,8 +11,17 @@ import {
   exactProviderCost,
   liveCostAccountingComplete,
   liveReviewArguments,
+  runLive,
   scorerOperationalFailure,
+  validateLiveRunId,
 } from "./live";
+
+async function onlyCaseAttempt(runRoot: string): Promise<string> {
+  const caseDirectories = (await readdir(runRoot, { withFileTypes: true }))
+    .filter((entry) => entry.isDirectory());
+  expect(caseDirectories).toHaveLength(1);
+  return join(runRoot, caseDirectories[0]!.name, "attempt-1");
+}
 
 describe("live benchmark review mode", () => {
   test("keeps cost completeness independent from review outcome", () => {
@@ -17,6 +30,62 @@ describe("live benchmark review mode", () => {
       { costAccountingComplete: true },
       { costAccountingComplete: false },
     ])).toBe(false);
+  });
+
+  test("retains raw artifacts for sequential screens of the same case", async () => {
+    const root = await mkdtemp(join(tmpdir(), "postil-live-run-isolation-"));
+    const previousKey = process.env.MODEL_API_KEY;
+    process.env.MODEL_API_KEY = "test-key-not-sent-anywhere";
+    try {
+      const input = [cases[0]!];
+
+      await runLive(input, {
+        binary: "/bin/echo",
+        model: "test/first",
+        rootDir: root,
+        runId: "first-screen",
+        concurrency: 1,
+        retries: 0,
+      });
+      await runLive(input, {
+        binary: "/bin/sh",
+        model: "test/second",
+        rootDir: root,
+        runId: "second-screen",
+        concurrency: 1,
+        retries: 0,
+      });
+
+      const firstAttempt = await onlyCaseAttempt(join(root, "live", "first-screen"));
+      const secondAttempt = await onlyCaseAttempt(join(root, "live", "second-screen"));
+      const firstStdout = await readFile(join(firstAttempt, "stdout.json"), "utf8");
+      const secondStderr = await readFile(join(secondAttempt, "stderr.log"), "utf8");
+      expect(firstStdout).toContain("first-screen");
+      expect(await readFile(join(firstAttempt, "stderr.log"), "utf8")).toBe("");
+      expect(await readFile(join(secondAttempt, "stdout.json"), "utf8")).toBe("");
+      expect(secondStderr).toContain("review");
+
+      await expect(runLive(input, {
+        binary: "/bin/sh",
+        model: "test/second",
+        rootDir: root,
+        runId: "first-screen",
+        concurrency: 1,
+        retries: 0,
+      })).rejects.toThrow("run identity already exists");
+      expect(await readFile(join(firstAttempt, "stdout.json"), "utf8")).toBe(firstStdout);
+    } finally {
+      if (previousKey === undefined) delete process.env.MODEL_API_KEY;
+      else process.env.MODEL_API_KEY = previousKey;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("accepts only path-safe live run identities", () => {
+    expect(validateLiveRunId("glm-5.2_fireworks.1")).toBe("glm-5.2_fireworks.1");
+    for (const invalid of ["", ".hidden", "../escape", "has spaces", "a".repeat(97)]) {
+      expect(() => validateLiveRunId(invalid)).toThrow("run identity");
+    }
   });
 
   test("adds bounded selection only when explicitly requested", () => {
