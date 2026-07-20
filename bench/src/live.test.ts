@@ -183,4 +183,30 @@ describe("live benchmark operational envelopes", () => {
         event.role === "findingScorer" ? { ...event, model: "other/scorer" } : event),
     }, "qualified/scorer")).toContain("usage identity mismatch");
   });
+
+  test("accepts a configured scorer that is truthfully skipped for a silent generator", () => {
+    const silent = {
+      ...valid,
+      findings: [],
+      suppressedFindings: [],
+      scorerModel: undefined,
+    } as Envelope;
+
+    expect(scorerOperationalFailure(silent, "qualified/scorer")).toBeNull();
+    expect(scorerOperationalFailure({
+      ...silent,
+      suppressedFindings: [{
+        finding: {
+          path: "src/a.ts",
+          line: 1,
+          severity: "warn" as const,
+          confidence: 0.4,
+          kind: "risk" as const,
+          title: "Candidate",
+          body: "Candidate finding.",
+        },
+        reason: "below threshold",
+      }],
+    }, "qualified/scorer")).toContain("identity missing");
+  });
 });
