@@ -1661,7 +1661,25 @@ impl LlmClient {
     /// Run a review while treating caller-rejected content as invalid model
     /// output. Each model gets one bounded semantic correction before the
     /// configured cascade advances, and every consumed call remains in usage.
-    pub(crate) async fn review_validated<F>(
+    pub async fn review_validated<F>(
+        &self,
+        cfg: &Config,
+        system: &str,
+        user: &str,
+        validate: F,
+    ) -> std::result::Result<ModelReview, ModelError>
+    where
+        F: Fn(&ModelReview) -> std::result::Result<(), String> + Send + Sync + 'static,
+    {
+        self.review_validated_with_safe(cfg, system, user, move |review| {
+            validate(review).map_err(|repair_detail| {
+                ReviewValidationFailure::new(repair_detail, "callerValidation=1".to_string())
+            })
+        })
+        .await
+    }
+
+    pub(crate) async fn review_validated_with_safe<F>(
         &self,
         cfg: &Config,
         system: &str,
@@ -5145,14 +5163,11 @@ mod tests {
                     .findings
                     .iter()
                     .try_for_each(crate::envelope::validate_finding_publication)
-                    .map_err(|reason| {
-                        ReviewValidationFailure::new(reason, "publicationContract=1".to_string())
-                    })
             })
             .await
             .unwrap_err();
         let detail = format!("{error:#}");
-        assert!(detail.contains("validation categories: publicationContract=1"));
+        assert!(detail.contains("validation categories: callerValidation=1"));
         assert!(!detail.contains("word word"));
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }

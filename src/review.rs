@@ -1339,7 +1339,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                     let validation_annotated = annotated.clone();
                     let validation_user = user.clone();
                     match client
-                        .review_validated(cfg, &system, &user, move |review| {
+                        .review_validated_with_safe(cfg, &system, &user, move |review| {
                             review_batch_validation_reasons(
                                 &review.findings,
                                 &validation_annotated,
