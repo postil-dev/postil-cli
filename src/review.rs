@@ -47,10 +47,13 @@ const MAX_STREAMED_SUMMARY_BYTES: usize = 64_000;
 const MAX_REVIEW_VALIDATION_REASON_BYTES: usize = 16_384;
 const HOSTED_WORKER_WATCHDOG_SECS: u64 = 600;
 pub(crate) const HOSTED_LLM_TOTAL_TIMEOUT_SECS: u64 = 540;
+/// Ordinary hosted reviews retain one long primary attempt plus a bounded
+/// timeout retry inside the review phase.
+pub(crate) const HOSTED_LLM_REQUEST_TIMEOUT_SECS: u64 = 240;
 /// Large reviews run at most six waves of four 60-second calls. The review
 /// phase keeps a final 60-second reserve for one bounded transient retry; the
 /// remaining 120 seconds of the total LLM budget belongs to scoring.
-pub(crate) const HOSTED_LLM_REQUEST_TIMEOUT_SECS: u64 = 60;
+pub(crate) const LARGE_DIFF_LLM_REQUEST_TIMEOUT_SECS: u64 = 60;
 pub(crate) const HOSTED_LLM_REVIEW_TIMEOUT_SECS: u64 = 420;
 const FORGE_READ_TIMEOUT_SECS: u64 = 60;
 const FORGE_DIFF_MAX_TIMEOUT_SECS: u64 = 300;
@@ -66,6 +69,14 @@ fn review_output_token_limit(synthesis: bool, deterministic_large_review: bool) 
         LARGE_SOURCE_REVIEW_MAX_TOKENS
     } else {
         crate::llm::REVIEW_MAX_TOKENS
+    }
+}
+
+fn hosted_request_timeout_secs(deterministic_large_review: bool) -> u64 {
+    if deterministic_large_review {
+        LARGE_DIFF_LLM_REQUEST_TIMEOUT_SECS
+    } else {
+        HOSTED_LLM_REQUEST_TIMEOUT_SECS
     }
 }
 
@@ -1161,7 +1172,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                         receipt.selected_batch_ids.len(),
                         batches.count,
                         MAX_LARGE_DIFF_CONCURRENCY,
-                        HOSTED_LLM_REQUEST_TIMEOUT_SECS,
+                        LARGE_DIFF_LLM_REQUEST_TIMEOUT_SECS,
                         HOSTED_LLM_REVIEW_TIMEOUT_SECS,
                     );
                 }
@@ -1197,7 +1208,9 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                     Some(started_at) => LlmClient::from_env_for_remote_review(
                         cfg,
                         started_at,
-                        Duration::from_secs(HOSTED_LLM_REQUEST_TIMEOUT_SECS),
+                        Duration::from_secs(hosted_request_timeout_secs(
+                            deterministic_large_review,
+                        )),
                         Duration::from_secs(HOSTED_LLM_REVIEW_TIMEOUT_SECS),
                         Duration::from_secs(HOSTED_LLM_TOTAL_TIMEOUT_SECS),
                     )?,
@@ -2477,11 +2490,14 @@ mod tests {
     fn default_llm_timeouts_fit_inside_hosted_worker_watchdog() {
         const PROCESS_OVERHEAD_SECS: u64 = 10;
 
-        assert_eq!(HOSTED_LLM_REQUEST_TIMEOUT_SECS, 60);
+        assert_eq!(HOSTED_LLM_REQUEST_TIMEOUT_SECS, 240);
+        assert_eq!(LARGE_DIFF_LLM_REQUEST_TIMEOUT_SECS, 60);
+        assert_eq!(hosted_request_timeout_secs(false), 240);
+        assert_eq!(hosted_request_timeout_secs(true), 60);
         assert_eq!(HOSTED_LLM_REVIEW_TIMEOUT_SECS, 420);
         assert_eq!(
             HOSTED_LLM_REVIEW_TIMEOUT_SECS,
-            HOSTED_LLM_REQUEST_TIMEOUT_SECS * 6 + 60
+            LARGE_DIFF_LLM_REQUEST_TIMEOUT_SECS * 6 + 60
         );
         assert_eq!(
             HOSTED_LLM_TOTAL_TIMEOUT_SECS,

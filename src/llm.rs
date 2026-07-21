@@ -5769,8 +5769,10 @@ mod tests {
         );
         assert_eq!(crate::review::HOSTED_LLM_REVIEW_TIMEOUT_SECS, 420);
         assert_eq!(
-            crate::review::HOSTED_LLM_REVIEW_TIMEOUT_SECS,
-            crate::review::HOSTED_LLM_REQUEST_TIMEOUT_SECS * 6 + 60
+            crate::review::HOSTED_LLM_REVIEW_TIMEOUT_SECS
+                - crate::review::HOSTED_LLM_REQUEST_TIMEOUT_SECS
+                - TIMEOUT_RETRY_CAP_SECS,
+            90
         );
         assert_eq!(
             crate::review::HOSTED_LLM_TOTAL_TIMEOUT_SECS
