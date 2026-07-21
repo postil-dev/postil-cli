@@ -192,6 +192,7 @@ additions (violations are `kind: contentPolicy`). Content policy is on by defaul
 7. Forge summaries do not duplicate inline findings or expose model/provider details.
    GitHub inline counts require observed comment IDs: the create-review body makes no
    inline-delivery claim, then an idempotent summary update adds the reconciled count.
+   Exhausted update retries leave that claim absent without invalidating the receipt.
    Operational-only failures skip the PR review and use generic linked check text.
 8. `humanEscalation` blocks by kind at confidence 0.30 or above. It represents an
    irreducible owner decision, not uncertainty about a concrete defect. Admin overrides

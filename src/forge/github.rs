@@ -138,6 +138,23 @@ impl GitHub {
         Ok(())
     }
 
+    async fn finalize_review_summary_if_possible(
+        &self,
+        envelope: &Envelope,
+        receipt: &ReviewPublicationReceipt,
+        marker: &str,
+    ) {
+        if self
+            .finalize_review_summary(envelope, receipt, marker)
+            .await
+            .is_err()
+        {
+            eprintln!(
+                "postil: github operation=review-summary-update status=incomplete recovery=truthful-initial-summary"
+            );
+        }
+    }
+
     fn check_external_id(&self, name: &str, head_sha: &str) -> String {
         let run_id = self.details_url.as_deref().and_then(|details_url| {
             reqwest::Url::parse(details_url)
@@ -1302,8 +1319,8 @@ impl Forge for GitHub {
                     .materialize_review_receipt(planned_receipt, review)
                     .await?;
                 if has_planned_inline {
-                    self.finalize_review_summary(envelope, &receipt, &marker)
-                        .await?;
+                    self.finalize_review_summary_if_possible(envelope, &receipt, &marker)
+                        .await;
                 }
                 return Ok(receipt);
             }
@@ -1316,8 +1333,8 @@ impl Forge for GitHub {
                 .materialize_review_receipt(planned_receipt, review)
                 .await?;
             if has_planned_inline {
-                self.finalize_review_summary(envelope, &receipt, &marker)
-                    .await?;
+                self.finalize_review_summary_if_possible(envelope, &receipt, &marker)
+                    .await;
             }
             return Ok(receipt);
         }
@@ -2161,6 +2178,61 @@ mod tests {
         assert!(final_summary.contains("1 finding in review details"));
         assert!(final_summary.contains("3 advisory findings"));
         assert!(final_summary.contains("1 resolved finding"));
+    }
+
+    #[tokio::test]
+    async fn github_summary_update_failure_preserves_truthful_review_and_receipt() {
+        let server = MockServer::start().await;
+        mount_current_delivery_snapshot(&server).await;
+        let envelope = delivery_envelope_with_findings(
+            "aaaaaaaaaaaa",
+            "cccccccccccc",
+            vec![publication_finding(
+                "inline-1",
+                "src/lib.rs",
+                "A concrete issue.",
+            )],
+        );
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 79,
+                "commit_id": "aaaaaaaaaaaa",
+                "comments": [{
+                    "id": 502,
+                    "body": format!("finding\n\n{}", super::finding_marker("inline-1"))
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/repos/owner/repo/pulls/1/reviews/79"))
+            .respond_with(ResponseTemplate::new(422))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let receipt = test_github(&server)
+            .post_review(
+                &envelope,
+                &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(receipt.review_id.as_deref(), Some("79"));
+        assert_eq!(receipt.findings[0].comment_id.as_deref(), Some("502"));
+        let requests = server.received_requests().await.unwrap();
+        let initial: serde_json::Value = serde_json::from_slice(
+            &requests
+                .iter()
+                .find(|request| request.method == reqwest::Method::POST)
+                .unwrap()
+                .body,
+        )
+        .unwrap();
+        assert!(!initial["body"].as_str().unwrap().contains("posted inline"));
     }
 
     #[tokio::test]
