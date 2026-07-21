@@ -39,7 +39,11 @@ pub(crate) const MAX_HOSTED_SELECTED_BATCHES: usize = 5;
 pub(crate) const MAX_LARGE_DIFF_SELECTED_BATCHES: usize = 24;
 pub(crate) const MAX_LARGE_DIFF_CONCURRENCY: usize = 4;
 const LARGE_SOURCE_REVIEW_MAX_TOKENS: u32 = 6_000;
-const SYNTHESIS_REVIEW_MAX_TOKENS: u32 = 2_000;
+// Synthesis requests join evidence from several source windows. Reasoning
+// models need room for both analysis and the final structured review. The
+// single exhausted-output retry may expand this to 8,000 tokens, and hosted
+// admission prices that full exposure before any provider request begins.
+const SYNTHESIS_REVIEW_MAX_TOKENS: u32 = 4_000;
 pub(crate) const MAX_HOSTED_PLANNER_CANDIDATES: usize = 96;
 pub(crate) const MAX_MODELS_PER_REQUEST: usize = 3;
 pub(crate) const MAX_SCORER_PROMPT_BYTES: usize = 56_000;
@@ -2265,12 +2269,12 @@ mod tests {
     #[test]
     fn preflight_and_runtime_share_large_review_output_limits() {
         assert_eq!(review_output_token_limit(false, true), 6_000);
-        assert_eq!(review_output_token_limit(true, true), 2_000);
+        assert_eq!(review_output_token_limit(true, true), 4_000);
         assert_eq!(
             review_output_token_limit(false, false),
             crate::llm::REVIEW_MAX_TOKENS
         );
-        assert_eq!(review_output_token_limit(true, false), 2_000);
+        assert_eq!(review_output_token_limit(true, false), 4_000);
     }
 
     #[test]
