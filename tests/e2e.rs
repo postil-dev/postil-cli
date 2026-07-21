@@ -8093,7 +8093,7 @@ async fn github_flow_posts_review_and_completes_both_checks() {
     let update_body: Value = update.body_json().unwrap();
     let summary = update_body["body"].as_str().unwrap();
     assert!(summary.starts_with(&format!(
-        "{} **1 blocking finding**\n",
+        "{} **1 blocking finding open**\n",
         postil_cli::forge::icon_md("error"),
     )));
     assert!(summary.contains("1 finding posted inline"));
@@ -8326,7 +8326,7 @@ async fn content_policy_pr_body_finding_survives_grounding() {
     );
     let summary = body["body"].as_str().unwrap();
     assert!(summary.contains(&format!(
-        "{} **1 advisory finding**",
+        "{} **1 advisory finding open**",
         postil_cli::forge::icon_md("info")
     )));
     assert!(summary.contains("1 finding in review details"));
