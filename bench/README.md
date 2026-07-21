@@ -247,7 +247,11 @@ a 5,000-byte serialized provider request whose size conservatively caps prompt
 tokens, and six possibly billed attempts across the initial request and one
 schema repair.
 The inference key stays in the child environment and is never printed or placed
-on an argument list.
+on an argument list. Every inference request crosses one loopback proxy owned by
+the admission run. The proxy admits at most four request starts per second across
+all child processes and applies a provider `Retry-After` pause to the complete
+bank, capped at 30 seconds. The CLI retains its per-call attempt, deadline, and
+spend limits.
 
 These fixtures are internal evidence, not a competitor comparison. Inference is
 nondeterministic, so one successful matrix is insufficient for admission.

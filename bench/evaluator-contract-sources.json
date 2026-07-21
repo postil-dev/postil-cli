@@ -10,6 +10,7 @@
   "bench/src/harness.ts",
   "bench/src/livemodels-score.ts",
   "bench/src/livemodels.ts",
+  "bench/src/request-window.ts",
   "bench/src/run.ts",
   "bench/src/verify-admission.ts"
 ]

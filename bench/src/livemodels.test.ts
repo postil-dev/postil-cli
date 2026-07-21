@@ -470,7 +470,21 @@ describe("pair qualification configuration", () => {
       apiBase,
       "openai-compatible",
       "/tmp/candidate.json",
-    ).POSTIL_QUALIFICATION_CANDIDATE_PROFILE).toBe("/tmp/candidate.json");
+      "http://127.0.0.1:4321",
+    )).toMatchObject({
+      POSTIL_QUALIFICATION_CANDIDATE_PROFILE: "/tmp/candidate.json",
+      POSTIL_QUALIFICATION_CAPTURE_API_BASE: "http://127.0.0.1:4321",
+    });
+    expect(() => liveEnv(
+      "/tmp/home",
+      "/tmp/tmp",
+      "http://127.0.0.1:1234",
+      pair,
+      apiBase,
+      "openai-compatible",
+      undefined,
+      "http://127.0.0.1:4321",
+    )).toThrow("requires a qualification candidate profile");
   });
 
   test("activates the exact candidate profile for evaluator-bank calls", async () => {
@@ -499,9 +513,11 @@ describe("pair qualification configuration", () => {
         normalizeApiBase("https://openrouter.ai/api/v1"),
         "openai-compatible",
         "PinnedProvider",
+        "http://127.0.0.1:4321",
       );
       const profilePath = env.POSTIL_QUALIFICATION_CANDIDATE_PROFILE;
       expect(profilePath).toBe(resolve(root, "qualification-candidate.json"));
+      expect(env.POSTIL_QUALIFICATION_CAPTURE_API_BASE).toBe("http://127.0.0.1:4321");
       expect(await Bun.file(profilePath!).json()).toMatchObject({
         upstreamProviderIdentity: "PinnedProvider",
         scorerChain: [pair.scorerModel],
