@@ -497,7 +497,9 @@ impl Respond for ReconciledReviewListResponder {
 
 impl Respond for PublishedReviewResponder {
     fn respond(&self, request: &Request) -> ResponseTemplate {
-        let request_body = request.body_json::<Value>().unwrap();
+        let request_body = request
+            .body_json::<Value>()
+            .expect("published review request must be valid JSON");
         let comments = request_body["comments"]
             .as_array()
             .into_iter()

@@ -97,12 +97,14 @@ impl GitHub {
         envelope: &Envelope,
         receipt: &ReviewPublicationReceipt,
     ) -> String {
+        let from_env = SummaryContext::from_env();
         check_summary(
             envelope,
             true,
             SummaryContext {
                 details_url: self.details_url.clone(),
                 prevention_hint: std::env::var("POSTIL_PREVENTION_HINT").as_deref() == Ok("1"),
+                prevention_commands: from_env.prevention_commands,
                 publication: Some(publication_summary(receipt)),
             },
         )
@@ -1474,6 +1476,7 @@ impl Forge for GitHub {
                             SummaryContext {
                                 details_url: self.details_url.clone(),
                                 prevention_hint: false,
+                                prevention_commands: vec![],
                                 publication: None,
                             },
                         )
@@ -1712,13 +1715,13 @@ fn append_marker(body: &str, marker: &str) -> String {
     }
 }
 
-const MAX_REVIEW_BODY_CHARS: usize = 60_000;
+const MAX_REVIEW_BODY_BYTES: usize = 60_000;
 
 fn bounded_review_body(body: &str, marker: &str) -> Result<String> {
     let marked = append_marker(body, marker);
     ensure!(
-        marked.chars().count() <= MAX_REVIEW_BODY_CHARS,
-        "GitHub review summary exceeds the {MAX_REVIEW_BODY_CHARS}-character publication limit"
+        marked.len() <= MAX_REVIEW_BODY_BYTES,
+        "GitHub review summary exceeds the {MAX_REVIEW_BODY_BYTES}-byte publication limit"
     );
     Ok(marked)
 }
@@ -1835,7 +1838,7 @@ mod tests {
             format!("summary\n\n{marker}")
         );
         assert!(
-            super::bounded_review_body(&"x".repeat(super::MAX_REVIEW_BODY_CHARS), marker)
+            super::bounded_review_body(&"x".repeat(super::MAX_REVIEW_BODY_BYTES), marker)
                 .unwrap_err()
                 .to_string()
                 .contains("publication limit")

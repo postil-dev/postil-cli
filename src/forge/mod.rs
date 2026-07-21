@@ -817,6 +817,7 @@ pub fn clean_review_message(envelope: &Envelope) -> String {
 pub struct SummaryContext {
     pub details_url: Option<String>,
     pub prevention_hint: bool,
+    pub prevention_commands: Vec<String>,
     pub publication: Option<ReviewPublicationSummary>,
 }
 
@@ -825,9 +826,37 @@ impl SummaryContext {
         Self {
             details_url: valid_details_url(std::env::var("POSTIL_DETAILS_URL").ok()),
             prevention_hint: std::env::var("POSTIL_PREVENTION_HINT").as_deref() == Ok("1"),
+            prevention_commands: prevention_commands_from_env(),
             publication: None,
         }
     }
+}
+
+fn prevention_commands_from_env() -> Vec<String> {
+    let Ok(raw) = std::env::var("POSTIL_PREVENTION_COMMANDS_JSON") else {
+        return Vec::new();
+    };
+    parse_prevention_commands(&raw)
+}
+
+fn parse_prevention_commands(raw: &str) -> Vec<String> {
+    if raw.len() > 4_096 {
+        return Vec::new();
+    }
+    let Ok(commands) = serde_json::from_str::<Vec<String>>(raw) else {
+        return Vec::new();
+    };
+    commands
+        .into_iter()
+        .take(5)
+        .filter_map(|command| {
+            let command = command.trim();
+            (!command.is_empty()
+                && command.chars().count() <= 200
+                && !command.chars().any(|ch| ch.is_control() || ch == '`'))
+            .then(|| command.to_string())
+        })
+        .collect()
 }
 
 fn summary_count(
@@ -1477,6 +1506,7 @@ mod tests {
             SummaryContext {
                 details_url: Some("https://postil.dev/orgs/acme/runs/run-1".into()),
                 prevention_hint: true,
+                prevention_commands: vec!["cargo test --lib".into()],
                 publication: None,
             },
         );
@@ -1650,6 +1680,15 @@ mod tests {
         assert!(summary.contains("Add the compatibility impact"));
         assert!(!summary.contains("private provider title"));
         assert!(!summary.contains("private provider body"));
+    }
+
+    #[test]
+    fn prevention_commands_remain_bounded_and_markdown_safe() {
+        let parsed = parse_prevention_commands(
+            r#"["cargo test --lib","bun test","bad`command","line\nbreak","","one","two","three","four"]"#,
+        );
+        assert_eq!(parsed, vec!["cargo test --lib", "bun test"]);
+        assert!(parse_prevention_commands(&"x".repeat(4_097)).is_empty());
     }
 
     #[test]
