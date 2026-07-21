@@ -5337,10 +5337,11 @@ async fn advisory_on_error_lets_gate_stand_aside() {
     assert_eq!(patches.len(), 2);
     // The gate stands aside (success) but the outage stays visible: the
     // advisory check goes neutral, never green-on-green.
-    let conclusions: Vec<&str> = patches
+    let mut conclusions: Vec<&str> = patches
         .iter()
         .map(|p| p["conclusion"].as_str().unwrap())
         .collect();
+    conclusions.sort_unstable();
     assert_eq!(conclusions, vec!["neutral", "success"]);
 }
 
