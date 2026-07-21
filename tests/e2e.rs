@@ -8233,7 +8233,7 @@ async fn content_policy_pr_server(llm: Value) -> MockServer {
         .and(path("/repos/acme/api/pulls/7"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "Add login",
-            "body": "This change guarantees permanent retention for every stored review.",
+            "body": "This change updates review retention behavior.",
             "state": "open", "merged": false,
             "head": {"sha": "aaaaaaaaaaaa"}, "base": {"sha": "bbbbbbbbbbbb"}, "changed_files": 1
         })))
@@ -8265,12 +8265,12 @@ async fn content_policy_pr_body_finding_survives_grounding() {
     let cp_finding = json!([{
         "path": ".postil/pr-description", "line": 2, "severity": "warn",
         "kind": "contentPolicy", "confidence": 0.9,
-        "title": "Unsupported retention guarantee in PR description",
-        "body": "The description promises permanent retention without implementation evidence.",
-        "evidence": "This change guarantees permanent retention for every stored review."
+        "title": "Retention scope missing from PR description",
+        "body": "State the supported retention scope in the description.",
+        "evidence": "This change updates review retention behavior."
     }]);
     let server = content_policy_pr_server(llm_with_summary(
-        "PR description makes an unsupported retention guarantee.",
+        "PR description omits the supported retention scope.",
         cp_finding,
     ))
     .await;
@@ -8310,11 +8310,7 @@ async fn content_policy_pr_body_finding_survives_grounding() {
     let user_msg = sent["messages"][1]["content"].as_str().unwrap();
     assert!(user_msg.contains(".postil/pr-description"));
     assert!(user_msg.contains("     1   Add login"));
-    assert!(
-        user_msg.contains(
-            "     2   This change guarantees permanent retention for every stored review."
-        )
-    );
+    assert!(user_msg.contains("     2   This change updates review retention behavior."));
 
     // The reserved-path finding has no real line, so its bounded detail appears
     // in the PR summary instead of an inline comment.
@@ -8334,13 +8330,9 @@ async fn content_policy_pr_body_finding_survives_grounding() {
         postil_cli::forge::icon_md("info")
     )));
     assert!(summary.contains("1 finding in review details"));
-    assert!(summary.contains("Unsupported retention guarantee in PR description"));
+    assert!(summary.contains("Retention scope missing from PR description"));
     assert!(summary.contains("in pull request description"));
-    assert!(
-        summary.contains(
-            "The description promises permanent retention without implementation evidence."
-        )
-    );
+    assert!(summary.contains("State the supported retention scope in the description."));
 }
 
 #[tokio::test]
