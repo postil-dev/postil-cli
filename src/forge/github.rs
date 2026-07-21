@@ -123,7 +123,7 @@ impl GitHub {
             .parse::<u64>()
             .context("GitHub published review returned an invalid review id")?;
         let summary = self.review_summary_for_receipt(envelope, receipt);
-        let body = bounded_review_body(&summary, marker)?;
+        let body = bounded_review_body(&summary, marker, self.details_url.as_deref());
         let response = self
             .send_write_retryable(
                 self.request(
@@ -1299,7 +1299,7 @@ impl Forge for GitHub {
             return Ok(planned_receipt);
         }
         let marker = review_marker(&planned_receipt.receipt_id);
-        let marked_summary = bounded_review_body(&summary, &marker)?;
+        let marked_summary = bounded_review_body(&summary, &marker, self.details_url.as_deref());
         let has_planned_inline = planned_receipt
             .findings
             .iter()
@@ -1355,11 +1355,15 @@ impl Forge for GitHub {
         let summary_only = json!({
             "commit_id": head_sha,
             "event": "COMMENT",
-            "body": bounded_review_body(if fallback_summary.is_empty() {
-                "Postil completed the review, but GitHub could not attach its inline comments."
-            } else {
-                &fallback_summary
-            }, &marker)?,
+            "body": bounded_review_body(
+                if fallback_summary.is_empty() {
+                    "Postil completed the review, but GitHub could not attach its inline comments."
+                } else {
+                    &fallback_summary
+                },
+                &marker,
+                self.details_url.as_deref(),
+            ),
         });
         let fallback = self
             .send_review_reconciled(&summary_only, &marker, head_sha, "summary-only review post")
@@ -1733,14 +1737,24 @@ fn append_marker(body: &str, marker: &str) -> String {
 }
 
 const MAX_REVIEW_BODY_BYTES: usize = 60_000;
+const OVERSIZED_REVIEW_MESSAGE: &str =
+    "Review summary omitted because it exceeds GitHub's size limit.";
 
-fn bounded_review_body(body: &str, marker: &str) -> Result<String> {
+fn bounded_review_body(body: &str, marker: &str, details_url: Option<&str>) -> String {
     let marked = append_marker(body, marker);
-    ensure!(
-        marked.len() <= MAX_REVIEW_BODY_BYTES,
-        "GitHub review summary exceeds the {MAX_REVIEW_BODY_BYTES}-byte publication limit"
-    );
-    Ok(marked)
+    if marked.len() <= MAX_REVIEW_BODY_BYTES {
+        return marked;
+    }
+    if let Some(details_url) = details_url {
+        let linked = append_marker(
+            &format!("{OVERSIZED_REVIEW_MESSAGE}\n\n<sub>[Review details]({details_url})</sub>"),
+            marker,
+        );
+        if linked.len() <= MAX_REVIEW_BODY_BYTES {
+            return linked;
+        }
+    }
+    append_marker(OVERSIZED_REVIEW_MESSAGE, marker)
 }
 
 fn comment_marker(number: u64, body: &str) -> String {
@@ -1851,15 +1865,27 @@ mod tests {
     fn review_summary_body_is_bounded_before_github_publication() {
         let marker = "<!-- postil-review:test -->";
         assert_eq!(
-            super::bounded_review_body("summary", marker).unwrap(),
+            super::bounded_review_body("summary", marker, None),
             format!("summary\n\n{marker}")
         );
-        assert!(
-            super::bounded_review_body(&"x".repeat(super::MAX_REVIEW_BODY_BYTES), marker)
-                .unwrap_err()
-                .to_string()
-                .contains("publication limit")
+        let fallback = super::bounded_review_body(
+            &"x".repeat(super::MAX_REVIEW_BODY_BYTES),
+            marker,
+            Some("https://postil.dev/runs/1"),
         );
+        assert!(fallback.contains(super::OVERSIZED_REVIEW_MESSAGE));
+        assert!(fallback.contains("[Review details](https://postil.dev/runs/1)"));
+        assert!(fallback.ends_with(marker));
+        assert!(fallback.len() <= super::MAX_REVIEW_BODY_BYTES);
+
+        let oversized_url = format!("https://postil.dev/{}", "x".repeat(60_000));
+        let without_link = super::bounded_review_body(
+            &"x".repeat(super::MAX_REVIEW_BODY_BYTES),
+            marker,
+            Some(&oversized_url),
+        );
+        assert!(!without_link.contains("Review details"));
+        assert!(without_link.len() <= super::MAX_REVIEW_BODY_BYTES);
     }
 
     fn delivery_snapshot(head_sha: &str, target_sha: &str, merge_base_sha: &str) -> PrMeta {
@@ -2233,6 +2259,67 @@ mod tests {
         )
         .unwrap();
         assert!(!initial["body"].as_str().unwrap().contains("posted inline"));
+    }
+
+    #[tokio::test]
+    async fn github_oversized_summary_falls_back_without_losing_inline_publication() {
+        let server = MockServer::start().await;
+        mount_current_delivery_snapshot(&server).await;
+        let envelope = delivery_envelope_with_findings(
+            "aaaaaaaaaaaa",
+            "cccccccccccc",
+            vec![publication_finding(
+                "inline-1",
+                "src/lib.rs",
+                "A concrete issue.",
+            )],
+        );
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 80,
+                "commit_id": "aaaaaaaaaaaa",
+                "comments": [{
+                    "id": 503,
+                    "body": format!("finding\n\n{}", super::finding_marker("inline-1"))
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/repos/owner/repo/pulls/1/reviews/80"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut github = test_github(&server);
+        github.details_url = Some(format!("https://postil.dev/{}", "x".repeat(60_000)));
+
+        let receipt = github
+            .post_review(
+                &envelope,
+                &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(receipt.findings[0].comment_id.as_deref(), Some("503"));
+        let requests = server.received_requests().await.unwrap();
+        let initial: serde_json::Value = serde_json::from_slice(
+            &requests
+                .iter()
+                .find(|request| request.method == reqwest::Method::POST)
+                .unwrap()
+                .body,
+        )
+        .unwrap();
+        assert_eq!(initial["comments"].as_array().unwrap().len(), 1);
+        let body = initial["body"].as_str().unwrap();
+        assert!(body.contains(super::OVERSIZED_REVIEW_MESSAGE));
+        assert!(!body.contains("Review details"));
+        assert!(body.contains("<!-- postil-review:v1:"));
+        assert!(body.len() <= super::MAX_REVIEW_BODY_BYTES);
     }
 
     #[tokio::test]
