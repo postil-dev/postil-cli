@@ -939,8 +939,8 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
                 rich,
                 "error",
                 open_blocking,
-                "blocking finding",
-                "blocking findings",
+                "blocking finding open",
+                "blocking findings open",
             ));
         }
         if open_advisory > 0 {
@@ -948,8 +948,8 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
                 rich,
                 "info",
                 open_advisory,
-                "advisory finding",
-                "advisory findings",
+                "advisory finding open",
+                "advisory findings open",
             ));
         }
         if !envelope.resolved.is_empty() {
@@ -1088,9 +1088,9 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
         .is_none_or(|publication| publication.active_inline > 0);
     if context.prevention_hint && prevention_applies && !operational && !envelope.silent {
         if rich {
-            s.push_str("\n<details><summary>Check before the next push</summary>\n\n");
+            s.push_str("\n<details><summary>Before the next push</summary>\n\n");
         } else {
-            s.push_str("\nCheck before the next push:\n");
+            s.push_str("\nBefore the next push:\n");
         }
         s.push_str("Run `postil review --staged`.\n");
         if rich {
@@ -1511,7 +1511,7 @@ mod tests {
             },
         );
 
-        assert!(summary.starts_with(&format!("{} **1 advisory finding**", icon_md("info"))));
+        assert!(summary.starts_with(&format!("{} **1 advisory finding open**", icon_md("info"))));
         assert!(!summary.contains("does not block"));
         assert!(!summary.contains("Unsanitized input reaches query"));
         assert!(!summary.contains("src/auth.rs:41"));
@@ -1541,14 +1541,16 @@ mod tests {
     fn summary_counts_cover_blocking_advisory_resolved_and_suppressed() {
         let blocking = envelope_with_findings(vec![finding()]);
         let blocking_summary = check_summary(&blocking, true, Default::default());
-        assert!(
-            blocking_summary
-                .starts_with(&format!("{} **1 blocking finding**\n", icon_md("error"),))
-        );
+        assert!(blocking_summary.starts_with(&format!(
+            "{} **1 blocking finding open**\n",
+            icon_md("error"),
+        )));
         let blocking_plural = envelope_with_findings(vec![finding(), finding()]);
         assert!(
-            check_summary(&blocking_plural, true, Default::default())
-                .starts_with(&format!("{} **2 blocking findings**\n", icon_md("error"),))
+            check_summary(&blocking_plural, true, Default::default()).starts_with(&format!(
+                "{} **2 blocking findings open**\n",
+                icon_md("error"),
+            ))
         );
 
         let mut advisory_one = finding();
@@ -1558,9 +1560,10 @@ mod tests {
         let mut advisory = envelope_with_findings(vec![advisory_one, advisory_two]);
         advisory.gate.failing = false;
         let advisory_summary = check_summary(&advisory, true, Default::default());
-        assert!(
-            advisory_summary.starts_with(&format!("{} **2 advisory findings**\n", icon_md("info")))
-        );
+        assert!(advisory_summary.starts_with(&format!(
+            "{} **2 advisory findings open**\n",
+            icon_md("info")
+        )));
 
         let mut carried = finding();
         carried.body = format!("{}\n\n{}", crate::filter::CARRIED_MARKER, carried.body);
@@ -1573,7 +1576,7 @@ mod tests {
             Default::default(),
         );
         assert!(carried_summary.starts_with(&format!(
-            "{} **review incomplete** · {} **1 blocking finding**\n",
+            "{} **review incomplete** · {} **1 blocking finding open**\n",
             icon_md("warn"),
             icon_md("error")
         )));
@@ -1706,7 +1709,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(!summary_only.contains("Check before the next push"));
+        assert!(!summary_only.contains("Before the next push"));
 
         let inline = check_summary(
             &env,
@@ -1720,7 +1723,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(inline.contains("Check before the next push"));
+        assert!(inline.contains("Before the next push"));
         assert!(inline.contains("postil review --staged"));
         assert!(!inline.contains("cargo test"));
     }
