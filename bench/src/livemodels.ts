@@ -86,6 +86,7 @@ import {
   type SiteModelAggregate,
   validateGeneratorQualificationBounds,
 } from "./livemodels-score";
+import { withManagedRequestWindowProxy } from "./request-window";
 
 const execFile = promisify(execFileCb);
 
@@ -790,6 +791,7 @@ export async function runLiveModels(
     managementApiKey: process.env.OPENROUTER_MANAGEMENT_API_KEY,
     expectedCompletionKeySha256: process.env.OPENROUTER_QUALIFICATION_KEY_SHA256,
   });
+  return withManagedRequestWindowProxy(apiBase, async (requestProxy) => {
 
   const attributionSourceSha256 = hashSanitizedEvidence({
     qualificationSourceSha,
@@ -827,6 +829,7 @@ export async function runLiveModels(
           attributionSourceSha256,
           cliBinaryHash,
           attributionGovernor,
+          requestProxy.apiBase,
         );
         results[index] = completed.result;
         privateCases[index] = completed.privateEvidence;
@@ -869,6 +872,7 @@ export async function runLiveModels(
       apiBase,
       apiFormat,
       upstreamProvider,
+      requestProxy.apiBase,
     );
     const result = await qualifyAttributionEvaluator({
       binary: options.binary,
@@ -1060,6 +1064,7 @@ export async function runLiveModels(
     parseLiveModelsReport(report);
     verifyPrivateEvidenceBundle(privateEvidence, report);
     return { report, privateEvidence };
+  });
   });
 }
 
@@ -1269,6 +1274,7 @@ async function runLiveModelCase(
   attributionSourceSha256: string,
   cliBinaryHash: string,
   attributionGovernor: AttributionGovernor,
+  qualificationCaptureApiBase: string,
 ): Promise<{ result: LiveModelCaseResult; privateEvidence: LiveModelsPrivateCaseEvidence }> {
   const runDir = join(
     rootDir,
@@ -1314,6 +1320,7 @@ async function runLiveModelCase(
           apiBase,
           apiFormat,
           candidateProfilePath,
+          qualificationCaptureApiBase,
         ),
         timeout: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
         maxBuffer: 8 * 1024 * 1024,
@@ -1417,6 +1424,7 @@ async function runLiveModelCase(
       apiBase,
       apiFormat,
       candidateProfilePath,
+      qualificationCaptureApiBase,
     ),
     sourceSha256: attributionSourceSha256,
     binarySha256: cliBinaryHash,
@@ -1476,6 +1484,7 @@ export async function prepareAttributionEvaluatorEnvironment(
   apiBase: string,
   apiFormat: "openai-compatible" | "anthropic",
   upstreamProvider: string,
+  qualificationCaptureApiBase: string,
 ): Promise<NodeJS.ProcessEnv> {
   const homeDir = join(pairRoot, "home");
   const tmpDir = join(pairRoot, "tmp");
@@ -1495,6 +1504,7 @@ export async function prepareAttributionEvaluatorEnvironment(
     apiBase,
     apiFormat,
     candidateProfilePath,
+    qualificationCaptureApiBase,
   );
 }
 
@@ -1775,6 +1785,7 @@ export function liveEnv(
   apiBase: string,
   apiFormat: "openai-compatible" | "anthropic" = "openai-compatible",
   candidateProfilePath?: string,
+  qualificationCaptureApiBase?: string,
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     PATH: process.env.PATH,
@@ -1803,6 +1814,12 @@ export function liveEnv(
   if (candidateProfilePath !== undefined) {
     env.POSTIL_QUALIFICATION_CANDIDATE_PROFILE = candidateProfilePath;
     env.POSTIL_EXPECTED_GITHUB_REPO_ID = String(MOCK_GITHUB_REPOSITORY_ID);
+  }
+  if (qualificationCaptureApiBase !== undefined) {
+    if (candidateProfilePath === undefined) {
+      throw new Error("managed request-window proxy requires a qualification candidate profile");
+    }
+    env.POSTIL_QUALIFICATION_CAPTURE_API_BASE = qualificationCaptureApiBase;
   }
   const endpointAuth = endpointAuthFromEnvironment(apiFormat);
   if (endpointAuth) {

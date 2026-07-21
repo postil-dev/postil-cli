@@ -139,6 +139,10 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   fixture before inference and records conservative operation exposure in the envelope.
   The completion key must match its pinned fingerprint. Its key limit and the account
   credit authority must each cover the exact projected exposure.
+  One loopback request-window proxy governs generator, scorer, repair, and
+  attribution traffic across every qualification child process. Provider
+  `Retry-After` pauses apply to the complete run within the fixed 30-second cap;
+  per-call attempt, deadline, and spend limits remain authoritative.
   The pinned ZDR provider must advertise every request parameter required by each
   generator and scorer role before its endpoint pricing can enter the exposure plan.
   The qualification metadata exposes the complete admitted profile only when
