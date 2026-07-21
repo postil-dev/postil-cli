@@ -4956,7 +4956,7 @@ async fn scorer_error_fails_open_and_preserves_generator_values() {
 }
 
 #[tokio::test]
-async fn reasoning_only_scorer_response_is_invalid_output_not_a_provider_outage() {
+async fn reasoning_only_scorer_length_response_is_nonterminal_invalid_output() {
     let server = MockServer::start().await;
     mock_review_model(
         &server,
@@ -4997,11 +4997,10 @@ async fn reasoning_only_scorer_response_is_invalid_output_not_a_provider_outage(
 
     let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     assert_eq!(envelope["findings"][0]["path"], "src/auth.rs");
+    let scorer_error = envelope["scorerError"].as_str().unwrap();
     assert!(
-        envelope["scorerError"]
-            .as_str()
-            .unwrap()
-            .contains("no choices/content")
+        scorer_error.contains("model response was nonterminal (length)"),
+        "unexpected scorer error: {scorer_error}"
     );
     assert!(
         envelope["modelIncidents"]
@@ -5012,6 +5011,8 @@ async fn reasoning_only_scorer_response_is_invalid_output_not_a_provider_outage(
                 |incident| incident["phase"] == "scorer" && incident["category"] == "invalidOutput"
             )
     );
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(!stderr.contains("returned empty content"));
     let requests = server.received_requests().await.unwrap();
     let scorer_max_tokens = requests
         .iter()
@@ -5020,7 +5021,7 @@ async fn reasoning_only_scorer_response_is_invalid_output_not_a_provider_outage(
             (body["model"] == "scorer-model").then(|| body["max_tokens"].as_u64().unwrap())
         })
         .collect::<Vec<_>>();
-    assert_eq!(scorer_max_tokens, vec![400, 400]);
+    assert_eq!(scorer_max_tokens, vec![400]);
 }
 
 #[tokio::test]
