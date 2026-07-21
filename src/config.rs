@@ -89,6 +89,10 @@ const EVALUATOR_CONTRACT_SOURCES: &[(&str, &str)] = &[
         "bench/src/livemodels.ts",
         include_str!("../bench/src/livemodels.ts"),
     ),
+    (
+        "bench/src/request-window.ts",
+        include_str!("../bench/src/request-window.ts"),
+    ),
     ("bench/src/run.ts", include_str!("../bench/src/run.ts")),
     (
         "bench/src/verify-admission.ts",
