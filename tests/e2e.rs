@@ -300,6 +300,9 @@ struct ReconciledReviewListResponder {
     published_body: Arc<Mutex<Option<String>>>,
 }
 
+#[derive(Clone)]
+struct PublishedReviewResponder;
+
 struct OutputBudgetResponder;
 
 #[derive(Clone)]
@@ -489,6 +492,29 @@ impl Respond for ReconciledReviewListResponder {
             "body": body,
             "commit_id": "aaaaaaaa"
         }]))
+    }
+}
+
+impl Respond for PublishedReviewResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let request_body = request.body_json::<Value>().unwrap();
+        let comments = request_body["comments"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .map(|(index, comment)| {
+                json!({
+                    "id": 500 + index,
+                    "body": comment["body"],
+                })
+            })
+            .collect::<Vec<_>>();
+        ResponseTemplate::new(200).set_body_json(json!({
+            "id": 77,
+            "commit_id": request_body["commit_id"],
+            "comments": comments,
+        }))
     }
 }
 
@@ -7959,6 +7985,11 @@ async fn github_flow_posts_review_and_completes_both_checks() {
         .await;
     Mock::given(method("POST"))
         .and(path("/repos/acme/api/pulls/7/reviews"))
+        .respond_with(PublishedReviewResponder)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/repos/acme/api/pulls/7/reviews/77"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .mount(&server)
         .await;
@@ -8048,11 +8079,22 @@ async fn github_flow_posts_review_and_completes_both_checks() {
     let body: Value = review.body_json().unwrap();
     assert_eq!(body["comments"][0]["path"], "src/auth.rs");
     assert_eq!(body["comments"][0]["line"], 41);
-    let summary = body["body"].as_str().unwrap();
+    let initial_summary = body["body"].as_str().unwrap();
+    assert!(!initial_summary.contains("posted inline"));
+    let update = reqs
+        .iter()
+        .find(|r| {
+            r.method == wiremock::http::Method::PUT
+                && r.url.path() == "/repos/acme/api/pulls/7/reviews/77"
+        })
+        .expect("review summary updated");
+    let update_body: Value = update.body_json().unwrap();
+    let summary = update_body["body"].as_str().unwrap();
     assert!(summary.starts_with(&format!(
-        "{} **1 inline finding**\n",
-        postil_cli::forge::icon_md("info"),
+        "{} **1 blocking finding**\n",
+        postil_cli::forge::icon_md("error"),
     )));
+    assert!(summary.contains("1 finding posted inline"));
     assert!(!summary.contains("Unsanitized input reaches query"));
     assert!(!summary.contains("`src/auth.rs:41`"));
     assert!(!summary.contains("Review metadata"));
@@ -8281,9 +8323,10 @@ async fn content_policy_pr_body_finding_survives_grounding() {
     );
     let summary = body["body"].as_str().unwrap();
     assert!(summary.contains(&format!(
-        "{} **1 finding in summary**",
+        "{} **1 advisory finding**",
         postil_cli::forge::icon_md("info")
     )));
+    assert!(summary.contains("1 finding in review details"));
     assert!(summary.contains("AI-authorship residue in PR description"));
     assert!(summary.contains("in pull request description"));
     assert!(summary.contains("Rule 3: the description contains model-authorship residue."));

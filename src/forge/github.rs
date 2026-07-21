@@ -97,17 +97,43 @@ impl GitHub {
         envelope: &Envelope,
         receipt: &ReviewPublicationReceipt,
     ) -> String {
-        let from_env = SummaryContext::from_env();
         check_summary(
             envelope,
             true,
             SummaryContext {
                 details_url: self.details_url.clone(),
                 prevention_hint: std::env::var("POSTIL_PREVENTION_HINT").as_deref() == Ok("1"),
-                prevention_commands: from_env.prevention_commands,
                 publication: Some(publication_summary(receipt)),
             },
         )
+    }
+
+    async fn finalize_review_summary(
+        &self,
+        envelope: &Envelope,
+        receipt: &ReviewPublicationReceipt,
+        marker: &str,
+    ) -> Result<()> {
+        let review_id = receipt
+            .review_id
+            .as_deref()
+            .context("GitHub published review omitted its review id")?
+            .parse::<u64>()
+            .context("GitHub published review returned an invalid review id")?;
+        let summary = self.review_summary_for_receipt(envelope, receipt);
+        let body = bounded_review_body(&summary, marker)?;
+        let response = self
+            .send_write_retryable(
+                self.request(
+                    reqwest::Method::PUT,
+                    self.url(&format!("/pulls/{}/reviews/{review_id}", self.pr)),
+                )
+                .json(&json!({ "body": body })),
+                "review summary update",
+            )
+            .await?;
+        Self::check_ok(response, "review summary update").await?;
+        Ok(())
     }
 
     fn check_external_id(&self, name: &str, head_sha: &str) -> String {
@@ -1254,7 +1280,11 @@ impl Forge for GitHub {
             return Ok(planned_receipt);
         }
         let marker = review_marker(&planned_receipt.receipt_id);
-        let marked_summary = append_marker(&summary, &marker);
+        let marked_summary = bounded_review_body(&summary, &marker)?;
+        let has_planned_inline = planned_receipt
+            .findings
+            .iter()
+            .any(|finding| finding.initial_outcome == FindingPublicationOutcome::Inline);
         let body = json!({
             "commit_id": head_sha,
             "event": "COMMENT",
@@ -1266,18 +1296,28 @@ impl Forge for GitHub {
             .await?;
         let resp = match delivery {
             ReviewDelivery::Reconciled(review) => {
-                return self
+                let receipt = self
                     .materialize_review_receipt(planned_receipt, review)
-                    .await;
+                    .await?;
+                if has_planned_inline {
+                    self.finalize_review_summary(envelope, &receipt, &marker)
+                        .await?;
+                }
+                return Ok(receipt);
             }
             ReviewDelivery::Response(response) => response,
         };
         if resp.status().is_success() {
             let review: PublishedReview =
                 super::bounded_response_json(resp, "GitHub published review").await?;
-            return self
+            let receipt = self
                 .materialize_review_receipt(planned_receipt, review)
-                .await;
+                .await?;
+            if has_planned_inline {
+                self.finalize_review_summary(envelope, &receipt, &marker)
+                    .await?;
+            }
+            return Ok(receipt);
         }
         let status = resp.status();
         let request_id = github_request_id(resp.headers()).unwrap_or_else(|| "none".to_string());
@@ -1296,11 +1336,11 @@ impl Forge for GitHub {
         let summary_only = json!({
             "commit_id": head_sha,
             "event": "COMMENT",
-            "body": append_marker(if fallback_summary.is_empty() {
+            "body": bounded_review_body(if fallback_summary.is_empty() {
                 "Postil completed the review, but GitHub could not attach its inline comments."
             } else {
                 &fallback_summary
-            }, &marker),
+            }, &marker)?,
         });
         let fallback = self
             .send_review_reconciled(&summary_only, &marker, head_sha, "summary-only review post")
@@ -1434,7 +1474,6 @@ impl Forge for GitHub {
                             SummaryContext {
                                 details_url: self.details_url.clone(),
                                 prevention_hint: false,
-                                prevention_commands: vec![],
                                 publication: None,
                             },
                         )
@@ -1619,7 +1658,10 @@ fn publication_summary(receipt: &ReviewPublicationReceipt) -> ReviewPublicationS
     let mut summary = ReviewPublicationSummary::default();
     for finding in &receipt.findings {
         match finding.initial_outcome {
-            FindingPublicationOutcome::Inline => summary.active_inline += 1,
+            FindingPublicationOutcome::Inline if finding.comment_id.is_some() => {
+                summary.active_inline += 1;
+            }
+            FindingPublicationOutcome::Inline => {}
             FindingPublicationOutcome::SummaryOnly => summary.summary_only += 1,
             FindingPublicationOutcome::Carried => summary.carried += 1,
             FindingPublicationOutcome::Resolved
@@ -1668,6 +1710,17 @@ fn append_marker(body: &str, marker: &str) -> String {
     } else {
         format!("{body}\n\n{marker}")
     }
+}
+
+const MAX_REVIEW_BODY_CHARS: usize = 60_000;
+
+fn bounded_review_body(body: &str, marker: &str) -> Result<String> {
+    let marked = append_marker(body, marker);
+    ensure!(
+        marked.chars().count() <= MAX_REVIEW_BODY_CHARS,
+        "GitHub review summary exceeds the {MAX_REVIEW_BODY_CHARS}-character publication limit"
+    );
+    Ok(marked)
 }
 
 fn comment_marker(number: u64, body: &str) -> String {
@@ -1772,6 +1825,21 @@ mod tests {
     #[test]
     fn hosted_repository_identity_environment_contract_is_stable() {
         assert_eq!(EXPECTED_REPOSITORY_ID_ENV, "POSTIL_EXPECTED_GITHUB_REPO_ID");
+    }
+
+    #[test]
+    fn review_summary_body_is_bounded_before_github_publication() {
+        let marker = "<!-- postil-review:test -->";
+        assert_eq!(
+            super::bounded_review_body("summary", marker).unwrap(),
+            format!("summary\n\n{marker}")
+        );
+        assert!(
+            super::bounded_review_body(&"x".repeat(super::MAX_REVIEW_BODY_CHARS), marker)
+                .unwrap_err()
+                .to_string()
+                .contains("publication limit")
+        );
     }
 
     fn delivery_snapshot(head_sha: &str, target_sha: &str, merge_base_sha: &str) -> PrMeta {
@@ -2019,6 +2087,12 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
+        Mock::given(method("PUT"))
+            .and(path("/repos/owner/repo/pulls/1/reviews/77"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
 
         let receipt = test_github(&server)
             .post_review(
@@ -2069,10 +2143,21 @@ mod tests {
                 .body,
         )
         .unwrap();
-        let summary = review["body"].as_str().unwrap();
-        assert!(summary.contains("1 inline finding"));
-        assert!(summary.contains("1 finding in summary"));
-        assert!(!summary.contains("3 inline"));
+        let initial_summary = review["body"].as_str().unwrap();
+        assert!(!initial_summary.contains("posted inline"));
+        let update: serde_json::Value = serde_json::from_slice(
+            &requests
+                .iter()
+                .find(|request| request.method == reqwest::Method::PUT)
+                .unwrap()
+                .body,
+        )
+        .unwrap();
+        let final_summary = update["body"].as_str().unwrap();
+        assert!(final_summary.contains("1 finding posted inline"));
+        assert!(final_summary.contains("1 finding in review details"));
+        assert!(final_summary.contains("3 advisory findings"));
+        assert!(final_summary.contains("1 resolved finding"));
     }
 
     #[tokio::test]
@@ -2132,7 +2217,7 @@ mod tests {
         let summary = fallback["body"].as_str().unwrap();
         assert!(summary.contains("1 finding in review details"));
         assert!(summary.contains("inline placement unavailable"));
-        assert!(!summary.contains("Before the next push"));
+        assert!(!summary.contains("Check before the next push"));
     }
 
     #[tokio::test]
@@ -2165,6 +2250,12 @@ mod tests {
                     "commit_id": "aaaaaaaaaaaa"
                 }])),
             )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/repos/owner/repo/pulls/1/reviews/88"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
             .expect(1)
             .mount(&server)
             .await;
@@ -2224,6 +2315,8 @@ mod tests {
             receipt.findings[0].initial_outcome,
             FindingPublicationOutcome::Unknown
         );
+        let summary = test_github(&server).review_summary_for_receipt(&envelope, &receipt);
+        assert!(!summary.contains("posted inline"));
     }
 
     #[tokio::test]
@@ -2850,6 +2943,19 @@ mod tests {
             .await;
         Mock::given(method("POST"))
             .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 99,
+                "comments": []
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1/reviews/99/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/repos/owner/repo/pulls/1/reviews/99"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
             .mount(&server)
             .await;
