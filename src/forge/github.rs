@@ -2379,7 +2379,7 @@ mod tests {
         let summary = fallback["body"].as_str().unwrap();
         assert!(summary.contains("1 finding in review details"));
         assert!(summary.contains("inline placement unavailable"));
-        assert!(!summary.contains("Check before the next push"));
+        assert!(!summary.contains("Before the next push"));
     }
 
     #[tokio::test]
