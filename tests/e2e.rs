@@ -300,6 +300,9 @@ struct ReconciledReviewListResponder {
     published_body: Arc<Mutex<Option<String>>>,
 }
 
+#[derive(Clone)]
+struct PublishedReviewResponder;
+
 struct OutputBudgetResponder;
 
 #[derive(Clone)]
@@ -489,6 +492,31 @@ impl Respond for ReconciledReviewListResponder {
             "body": body,
             "commit_id": "aaaaaaaa"
         }]))
+    }
+}
+
+impl Respond for PublishedReviewResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let request_body = request
+            .body_json::<Value>()
+            .expect("published review request must be valid JSON");
+        let comments = request_body["comments"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .map(|(index, comment)| {
+                json!({
+                    "id": 500 + index,
+                    "body": comment["body"],
+                })
+            })
+            .collect::<Vec<_>>();
+        ResponseTemplate::new(200).set_body_json(json!({
+            "id": 77,
+            "commit_id": request_body["commit_id"],
+            "comments": comments,
+        }))
     }
 }
 
@@ -7996,6 +8024,11 @@ async fn github_flow_posts_review_and_completes_both_checks() {
         .await;
     Mock::given(method("POST"))
         .and(path("/repos/acme/api/pulls/7/reviews"))
+        .respond_with(PublishedReviewResponder)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/repos/acme/api/pulls/7/reviews/77"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .mount(&server)
         .await;
@@ -8085,11 +8118,22 @@ async fn github_flow_posts_review_and_completes_both_checks() {
     let body: Value = review.body_json().unwrap();
     assert_eq!(body["comments"][0]["path"], "src/auth.rs");
     assert_eq!(body["comments"][0]["line"], 41);
-    let summary = body["body"].as_str().unwrap();
+    let initial_summary = body["body"].as_str().unwrap();
+    assert!(!initial_summary.contains("posted inline"));
+    let update = reqs
+        .iter()
+        .find(|r| {
+            r.method == wiremock::http::Method::PUT
+                && r.url.path() == "/repos/acme/api/pulls/7/reviews/77"
+        })
+        .expect("review summary updated");
+    let update_body: Value = update.body_json().unwrap();
+    let summary = update_body["body"].as_str().unwrap();
     assert!(summary.starts_with(&format!(
-        "{} **1 inline finding**\n",
-        postil_cli::forge::icon_md("info"),
+        "{} **1 blocking finding open**\n",
+        postil_cli::forge::icon_md("error"),
     )));
+    assert!(summary.contains("1 finding posted inline"));
     assert!(!summary.contains("Unsanitized input reaches query"));
     assert!(!summary.contains("`src/auth.rs:41`"));
     assert!(!summary.contains("Review metadata"));
@@ -8226,7 +8270,7 @@ async fn content_policy_pr_server(llm: Value) -> MockServer {
         .and(path("/repos/acme/api/pulls/7"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "title": "Add login",
-            "body": "This file is untracked and was written by Claude.",
+            "body": "This change updates review retention behavior.",
             "state": "open", "merged": false,
             "head": {"sha": "aaaaaaaaaaaa"}, "base": {"sha": "bbbbbbbbbbbb"}, "changed_files": 1
         })))
@@ -8256,14 +8300,14 @@ async fn content_policy_pr_body_finding_survives_grounding() {
     // `.postil/pr-description` path instead of being dropped as ungrounded (which
     // would have spuriously fail-closed a run whose only finding was here).
     let cp_finding = json!([{
-        "path": ".postil/pr-description", "line": 1, "severity": "warn",
+        "path": ".postil/pr-description", "line": 2, "severity": "warn",
         "kind": "contentPolicy", "confidence": 0.9,
-        "title": "AI-authorship residue in PR description",
-        "body": "Rule 3: the description contains model-authorship residue.",
-        "evidence": "Add login"
+        "title": "Retention scope missing from PR description",
+        "body": "State the supported retention scope in the description.",
+        "evidence": "This change updates review retention behavior."
     }]);
     let server = content_policy_pr_server(llm_with_summary(
-        "PR description contains model-authorship residue.",
+        "PR description omits the supported retention scope.",
         cp_finding,
     ))
     .await;
@@ -8303,6 +8347,7 @@ async fn content_policy_pr_body_finding_survives_grounding() {
     let user_msg = sent["messages"][1]["content"].as_str().unwrap();
     assert!(user_msg.contains(".postil/pr-description"));
     assert!(user_msg.contains("     1   Add login"));
+    assert!(user_msg.contains("     2   This change updates review retention behavior."));
 
     // The reserved-path finding has no real line, so its bounded detail appears
     // in the PR summary instead of an inline comment.
@@ -8318,12 +8363,13 @@ async fn content_policy_pr_body_finding_survives_grounding() {
     );
     let summary = body["body"].as_str().unwrap();
     assert!(summary.contains(&format!(
-        "{} **1 finding in summary**",
+        "{} **1 advisory finding open**",
         postil_cli::forge::icon_md("info")
     )));
-    assert!(summary.contains("AI-authorship residue in PR description"));
+    assert!(summary.contains("1 finding in review details"));
+    assert!(summary.contains("Retention scope missing from PR description"));
     assert!(summary.contains("in pull request description"));
-    assert!(summary.contains("Rule 3: the description contains model-authorship residue."));
+    assert!(summary.contains("State the supported retention scope in the description."));
 }
 
 #[tokio::test]

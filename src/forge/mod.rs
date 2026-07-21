@@ -894,7 +894,17 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
         }
         s.push('\n');
     } else if envelope.silent {
-        s.push_str(&clean_review_message(envelope));
+        if envelope.resolved.is_empty() {
+            s.push_str(&clean_review_message(envelope));
+        } else {
+            s.push_str(&summary_count(
+                rich,
+                "pass",
+                envelope.resolved.len(),
+                "resolved finding",
+                "resolved findings",
+            ));
+        }
         s.push('\n');
     } else {
         let open_visible = envelope
@@ -902,17 +912,6 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
             .iter()
             .filter(|finding| !is_operational_path(&finding.path))
             .count();
-        let new_visible = context.publication.map_or_else(
-            || {
-                envelope
-                    .findings
-                    .iter()
-                    .filter(|finding| !is_operational_path(&finding.path))
-                    .filter(|finding| !crate::filter::is_carried(finding))
-                    .count()
-            },
-            |publication| publication.active_inline + publication.summary_only,
-        );
         let open_blocking = envelope
             .findings
             .iter()
@@ -926,104 +925,70 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
                 )
             })
             .count();
-        if context
-            .publication
-            .is_some_and(|publication| publication.rejected_inline > 0)
-        {
-            let rejected = context
-                .publication
-                .expect("publication summary is present")
-                .rejected_inline;
-            s.push_str(&summary_count(
-                rich,
-                "info",
-                rejected,
-                "finding in review details",
-                "findings in review details",
-            ));
-            s.push_str(" · inline placement unavailable");
-            if open_blocking > 0 {
-                s.push_str(" · ");
-                s.push_str(&summary_count(
-                    rich,
-                    "error",
-                    open_blocking,
-                    "blocking finding open",
-                    "blocking findings open",
-                ));
-            }
-            s.push('\n');
-        } else if let Some(publication) = context.publication
-            && (publication.active_inline > 0 || publication.summary_only > 0)
-        {
-            if publication.active_inline > 0 {
-                s.push_str(&summary_count(
-                    rich,
-                    "info",
-                    publication.active_inline,
-                    "inline finding",
-                    "inline findings",
-                ));
-            }
-            if publication.summary_only > 0 {
-                if publication.active_inline > 0 {
-                    s.push_str(" · ");
-                }
-                s.push_str(&summary_count(
-                    rich,
-                    "info",
-                    publication.summary_only,
-                    "finding in summary",
-                    "findings in summary",
-                ));
-            }
-            s.push('\n');
-        } else if has_operational && new_visible > 0 {
-            s.push_str(&summary_count(
-                rich,
-                "warn",
-                new_visible,
-                "new finding; review incomplete",
-                "new findings; review incomplete",
-            ));
-            s.push('\n');
-        } else if open_blocking > 0 {
-            if new_visible > 0 {
-                s.push_str(&summary_count(
-                    rich,
-                    "warn",
-                    new_visible,
-                    "new finding",
-                    "new findings",
-                ));
-                s.push_str(" · ");
-            }
-            s.push_str(&summary_count(
+        let open_advisory = open_visible.saturating_sub(open_blocking);
+        let mut counts = Vec::new();
+        if has_operational {
+            counts.push(if rich {
+                format!("{} **review incomplete**", icon_md("warn"))
+            } else {
+                "warn: **review incomplete**".to_string()
+            });
+        }
+        if open_blocking > 0 {
+            counts.push(summary_count(
                 rich,
                 "error",
                 open_blocking,
                 "blocking finding open",
                 "blocking findings open",
             ));
-            s.push('\n');
-        } else if new_visible > 0 {
-            s.push_str(&summary_count(
+        }
+        if open_advisory > 0 {
+            counts.push(summary_count(
                 rich,
                 "info",
-                new_visible,
-                "new advisory finding",
-                "new advisory findings",
-            ));
-            s.push('\n');
-        } else if open_visible > 0 {
-            s.push_str(&summary_count(
-                rich,
-                "info",
-                open_visible,
+                open_advisory,
                 "advisory finding open",
                 "advisory findings open",
             ));
+        }
+        if !envelope.resolved.is_empty() {
+            counts.push(summary_count(
+                rich,
+                "pass",
+                envelope.resolved.len(),
+                "resolved finding",
+                "resolved findings",
+            ));
+        }
+        if !counts.is_empty() {
+            s.push_str(&counts.join(" · "));
             s.push('\n');
+        }
+
+        if let Some(publication) = context.publication {
+            let mut delivery = Vec::new();
+            if publication.active_inline > 0 {
+                delivery.push(format!(
+                    "{} {} posted inline",
+                    publication.active_inline,
+                    plural(publication.active_inline, "finding", "findings"),
+                ));
+            }
+            if publication.summary_only > 0 {
+                delivery.push(format!(
+                    "{} {} in review details",
+                    publication.summary_only,
+                    plural(publication.summary_only, "finding", "findings"),
+                ));
+            }
+            if publication.rejected_inline > 0 {
+                delivery.push("inline placement unavailable".to_string());
+            }
+            if !delivery.is_empty() {
+                s.push_str(&delivery.join(" · "));
+                s.push('\n');
+            }
         }
     }
 
@@ -1070,17 +1035,6 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
             ));
         }
     }
-    if !envelope.resolved.is_empty() {
-        s.push_str(&summary_count(
-            rich,
-            "pass",
-            envelope.resolved.len(),
-            "resolved finding",
-            "resolved findings",
-        ));
-        s.push('\n');
-    }
-
     let eligible: Vec<_> = envelope
         .suppressed_findings
         .iter()
@@ -1138,7 +1092,7 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
         } else {
             s.push_str("\nBefore the next push:\n");
         }
-        s.push_str("Run `postil review --staged`, or install it with `postil hook install`.\n");
+        s.push_str("Run `postil review --staged`.\n");
         if rich {
             s.push_str("\n</details>\n");
         }
@@ -1557,7 +1511,7 @@ mod tests {
             },
         );
 
-        assert!(summary.starts_with(&format!("{} **1 new advisory finding**", icon_md("info"))));
+        assert!(summary.starts_with(&format!("{} **1 advisory finding open**", icon_md("info"))));
         assert!(!summary.contains("does not block"));
         assert!(!summary.contains("Unsanitized input reaches query"));
         assert!(!summary.contains("src/auth.rs:41"));
@@ -1572,8 +1526,7 @@ mod tests {
         assert!(summary.contains("Evidence from the changed branch"));
         assert!(!summary.contains("Ignored generated file"));
         assert!(summary.contains("postil review --staged"));
-        assert!(summary.contains("postil hook install"));
-        assert!(!summary.contains("cargo test --lib"));
+        assert!(!summary.contains("postil hook install"));
         assert!(
             summary
                 .contains("<sub>[Review details](https://postil.dev/orgs/acme/runs/run-1)</sub>")
@@ -1589,15 +1542,13 @@ mod tests {
         let blocking = envelope_with_findings(vec![finding()]);
         let blocking_summary = check_summary(&blocking, true, Default::default());
         assert!(blocking_summary.starts_with(&format!(
-            "{} **1 new finding** · {} **1 blocking finding open**\n",
-            icon_md("warn"),
+            "{} **1 blocking finding open**\n",
             icon_md("error"),
         )));
         let blocking_plural = envelope_with_findings(vec![finding(), finding()]);
         assert!(
             check_summary(&blocking_plural, true, Default::default()).starts_with(&format!(
-                "{} **2 new findings** · {} **2 blocking findings open**\n",
-                icon_md("warn"),
+                "{} **2 blocking findings open**\n",
                 icon_md("error"),
             ))
         );
@@ -1610,7 +1561,7 @@ mod tests {
         advisory.gate.failing = false;
         let advisory_summary = check_summary(&advisory, true, Default::default());
         assert!(advisory_summary.starts_with(&format!(
-            "{} **2 new advisory findings**\n",
+            "{} **2 advisory findings open**\n",
             icon_md("info")
         )));
 
@@ -1625,16 +1576,24 @@ mod tests {
             Default::default(),
         );
         assert!(carried_summary.starts_with(&format!(
-            "{} **1 blocking finding open**\n",
+            "{} **review incomplete** · {} **1 blocking finding open**\n",
+            icon_md("warn"),
             icon_md("error")
         )));
-        assert!(!carried_summary.contains("new finding"));
 
         let mut resolved_singular = envelope_with_findings(vec![finding()]);
         resolved_singular.resolved = vec![finding()];
         assert!(
             check_summary(&resolved_singular, true, Default::default())
                 .contains(&format!("{} **1 resolved finding**\n", icon_md("pass")))
+        );
+
+        let mut resolution_only = envelope_with_findings(vec![]);
+        resolution_only.resolved = vec![finding(), finding()];
+        let resolution_only_summary = check_summary(&resolution_only, true, Default::default());
+        assert_eq!(
+            resolution_only_summary,
+            format!("{} **2 resolved findings**\n", icon_md("pass"))
         );
 
         let mut detail_counts = envelope_with_findings(vec![finding()]);
@@ -1727,7 +1686,7 @@ mod tests {
     }
 
     #[test]
-    fn prevention_commands_are_bounded_and_markdown_safe() {
+    fn prevention_commands_remain_bounded_and_markdown_safe() {
         let parsed = parse_prevention_commands(
             r#"["cargo test --lib","bun test","bad`command","line\nbreak","","one","two","three","four"]"#,
         );
