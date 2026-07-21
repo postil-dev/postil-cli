@@ -4490,13 +4490,20 @@ async fn same_model_generator_and_scorer_emit_separate_balanced_usage_rows() {
 #[tokio::test]
 async fn scorer_confidence_below_minimum_is_suppressed_and_nonblocking() {
     let server = MockServer::start().await;
+    let finding = json!({
+        "path": "src/orders.rs",
+        "line": 21,
+        "severity": "error",
+        "kind": "risk",
+        "confidence": 0.92,
+        "title": "Order update may race without a row lock",
+        "body": "Verify load_order_for_update issues FOR UPDATE before update_order writes the row.",
+        "evidence": "let row = load_order_for_update(id);"
+    });
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .and(body_string_contains("generator-model"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(llm_content(json!([finding_at(41, "error", 0.92)]))),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([finding]))))
         .mount(&server)
         .await;
     Mock::given(method("POST"))
@@ -4514,7 +4521,26 @@ async fn scorer_confidence_below_minimum_is_suppressed_and_nonblocking() {
 
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join(".postil.yaml"), "minConfidence: 0.6\n").unwrap();
-    let diff = write_diff(dir.path());
+    let diff = dir.path().join("change.diff");
+    let diff_text = concat!(
+        "diff --git a/src/orders.rs b/src/orders.rs\n",
+        "--- a/src/orders.rs\n",
+        "+++ b/src/orders.rs\n",
+        "@@ -20,2 +20,3 @@ fn update_order_record() {\n",
+        " context line\n",
+        "+let row = load_order_for_update(id);\n",
+        " update_order(row);\n",
+        "diff --git a/tests/orders.rs b/tests/orders.rs\n",
+        "--- a/tests/orders.rs\n",
+        "+++ b/tests/orders.rs\n",
+        "@@ -60,2 +60,3 @@ fn load_order_locks_the_row() {\n",
+        " let query = load_order_for_update_query(7);\n",
+        "+assert!(query.contains(\"FOR UPDATE\"));\n",
+        " assert!(query.contains(\"WHERE id = $1\"));\n",
+    );
+    let parsed = postil_cli::diff::parse(diff_text);
+    assert!(parsed.complete, "{parsed:#?}\n{diff_text}");
+    std::fs::write(&diff, diff_text).unwrap();
     let out = postil()
         .current_dir(dir.path())
         .env("POSTIL_API_BASE", server.uri())
@@ -4539,9 +4565,20 @@ async fn scorer_confidence_below_minimum_is_suppressed_and_nonblocking() {
     );
     assert_eq!(
         envelope["suppressedFindings"][0]["finding"]["path"],
-        "src/auth.rs"
+        "src/orders.rs"
     );
     assert_eq!(envelope["scorerModel"], "anthropic/claude-haiku-4.5");
+
+    let requests = server.received_requests().await.unwrap();
+    let scorer_request: Value = requests
+        .iter()
+        .map(|request| request.body_json::<Value>().unwrap())
+        .find(|body| body["model"] == "anthropic/claude-haiku-4.5")
+        .unwrap();
+    let scorer_user = scorer_request["messages"][1]["content"].as_str().unwrap();
+    assert!(scorer_user.contains("relatedEvidence"));
+    assert!(scorer_user.contains("### tests/orders.rs"));
+    assert!(scorer_user.contains("FOR UPDATE"));
 }
 
 #[tokio::test]

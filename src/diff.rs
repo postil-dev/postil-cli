@@ -4294,6 +4294,246 @@ pub fn render_review_batch_context(
     (!out.is_empty()).then_some(out)
 }
 
+#[derive(Debug)]
+struct ScorerEvidenceSection {
+    path: String,
+    text: String,
+    order: usize,
+}
+
+#[derive(Debug)]
+struct RelatedScorerEvidenceCandidate {
+    score: usize,
+    order: usize,
+    same_path: bool,
+    test_path: bool,
+    path_related: bool,
+    term_matches: usize,
+    text: String,
+}
+
+fn scorer_evidence_sections(annotated: &str) -> Vec<ScorerEvidenceSection> {
+    let mut sections = Vec::new();
+    let mut current_path = None::<String>;
+    let mut current_text = String::new();
+
+    let flush = |sections: &mut Vec<ScorerEvidenceSection>,
+                 path: &mut Option<String>,
+                 text: &mut String| {
+        if let Some(path) = path.take()
+            && !text.is_empty()
+        {
+            sections.push(ScorerEvidenceSection {
+                path,
+                text: std::mem::take(text),
+                order: sections.len(),
+            });
+        }
+    };
+
+    for rendered in annotated.lines() {
+        if let Some(header) = rendered.strip_prefix("### ") {
+            flush(&mut sections, &mut current_path, &mut current_text);
+            current_path = canonical_prompt_path(prompt_header_path(header))
+                .or_else(|| Some(prompt_header_path(header).to_string()));
+        }
+        if current_path.is_some() {
+            current_text.push_str(rendered);
+            current_text.push('\n');
+        }
+    }
+    flush(&mut sections, &mut current_path, &mut current_text);
+    sections
+}
+
+fn append_complete_lines(output: &mut String, text: &str, max_bytes: usize) {
+    for line in text.split_inclusive('\n') {
+        if output.len().saturating_add(line.len()) > max_bytes {
+            break;
+        }
+        output.push_str(line);
+    }
+}
+
+/// Retain a deterministic, section-balanced subset of one source request for
+/// later scorer fact-checking. Every retained byte comes from the exact review
+/// request, and the caller supplies the per-request bound.
+pub fn bounded_scorer_batch_evidence(annotated: &str, max_bytes: usize) -> String {
+    if max_bytes == 0 {
+        return String::new();
+    }
+    if annotated.len() <= max_bytes {
+        return annotated.to_string();
+    }
+    let sections = scorer_evidence_sections(annotated);
+    if sections.is_empty() {
+        let mut output = String::new();
+        append_complete_lines(&mut output, annotated, max_bytes);
+        return output;
+    }
+
+    let mut output = String::new();
+    for (index, section) in sections.iter().enumerate() {
+        let sections_left = sections.len() - index;
+        let share = max_bytes.saturating_sub(output.len()) / sections_left;
+        if share == 0 {
+            break;
+        }
+        let section_limit = output.len().saturating_add(share).min(max_bytes);
+        append_complete_lines(&mut output, &section.text, section_limit);
+    }
+    output
+}
+
+fn scorer_query_terms(query: &str) -> Vec<String> {
+    const STOP_WORDS: &[&str] = &[
+        "after", "before", "because", "change", "check", "could", "finding", "from", "function",
+        "line", "should", "their", "there", "these", "this", "verify", "with", "would",
+    ];
+    let mut terms = BTreeSet::new();
+
+    let mut in_code = false;
+    let mut code = String::new();
+    for character in query.chars() {
+        if character == '`' {
+            if in_code {
+                let term = code.trim().to_ascii_lowercase();
+                if (4..=96).contains(&term.len()) {
+                    terms.insert(term);
+                }
+                code.clear();
+            }
+            in_code = !in_code;
+        } else if in_code {
+            code.push(character);
+        }
+    }
+
+    let mut token = String::new();
+    for character in query.chars().chain(std::iter::once(' ')) {
+        if character.is_ascii_alphanumeric() || character == '_' || character == '-' {
+            token.push(character.to_ascii_lowercase());
+            continue;
+        }
+        if (4..=96).contains(&token.len()) && !STOP_WORDS.contains(&token.as_str()) {
+            terms.insert(std::mem::take(&mut token));
+        } else {
+            token.clear();
+        }
+    }
+    terms.into_iter().take(32).collect()
+}
+
+fn scorer_path_stem(path: &str) -> Option<String> {
+    let name = path.rsplit('/').next()?;
+    let stem = name.split('.').next()?.to_ascii_lowercase();
+    (stem.len() >= 4).then_some(stem)
+}
+
+/// Select bounded changed-file evidence that can confirm or contradict a
+/// finding outside its cited local window. Selection preserves relevant
+/// same-file, test, and caller evidence instead of letting one large section
+/// consume the whole budget.
+pub fn render_related_scorer_evidence(
+    review_batches: &[String],
+    finding_path: &str,
+    query: &str,
+    max_bytes: usize,
+) -> Option<String> {
+    if max_bytes == 0 {
+        return None;
+    }
+    let terms = scorer_query_terms(query);
+    let finding_stem = scorer_path_stem(finding_path);
+    let mut candidates = Vec::<RelatedScorerEvidenceCandidate>::new();
+    let mut seen = HashSet::new();
+
+    for (batch_index, batch) in review_batches.iter().enumerate() {
+        for section in scorer_evidence_sections(batch) {
+            if !seen.insert(section.text.clone()) {
+                continue;
+            }
+            let lower_text = section.text.to_ascii_lowercase();
+            let lower_path = section.path.to_ascii_lowercase();
+            let same_path = section.path == finding_path;
+            let path_related = finding_stem
+                .as_ref()
+                .is_some_and(|stem| lower_path.contains(stem));
+            let term_matches = terms
+                .iter()
+                .filter(|term| lower_text.contains(term.as_str()))
+                .count();
+            if !same_path && !path_related && term_matches == 0 {
+                continue;
+            }
+            let test_path = lower_path.contains("test") || lower_path.contains("spec");
+            let score = usize::from(same_path) * 10_000
+                + usize::from(path_related) * 1_000
+                + usize::from(test_path && term_matches > 0) * 500
+                + term_matches * 100;
+            let order = batch_index.saturating_mul(1_000_000) + section.order;
+            candidates.push(RelatedScorerEvidenceCandidate {
+                score,
+                order,
+                same_path,
+                test_path,
+                path_related,
+                term_matches,
+                text: section.text,
+            });
+        }
+    }
+
+    candidates.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then(left.order.cmp(&right.order))
+    });
+    let mut selected = Vec::new();
+    let mut select_first = |predicate: &dyn Fn(&RelatedScorerEvidenceCandidate) -> bool| {
+        if let Some((index, _)) = candidates
+            .iter()
+            .enumerate()
+            .find(|(index, candidate)| !selected.contains(index) && predicate(candidate))
+        {
+            selected.push(index);
+        }
+    };
+    select_first(&|candidate| candidate.same_path);
+    select_first(&|candidate| {
+        !candidate.same_path && candidate.test_path && candidate.term_matches > 0
+    });
+    select_first(&|candidate| {
+        !candidate.same_path && !candidate.test_path && candidate.path_related
+    });
+    select_first(&|candidate| !candidate.same_path && candidate.term_matches > 0);
+    for index in 0..candidates.len() {
+        if selected.len() >= 4 {
+            break;
+        }
+        if !selected.contains(&index) {
+            selected.push(index);
+        }
+    }
+
+    let mut output = String::new();
+    for (position, index) in selected.iter().enumerate() {
+        let section = &candidates[*index].text;
+        if !output.is_empty() && output.len().saturating_add(1) <= max_bytes {
+            output.push('\n');
+        }
+        let sections_left = selected.len() - position;
+        let share = max_bytes.saturating_sub(output.len()) / sections_left;
+        if share == 0 {
+            break;
+        }
+        let section_limit = output.len().saturating_add(share).min(max_bytes);
+        append_complete_lines(&mut output, section, section_limit);
+    }
+    (!output.is_empty()).then_some(output)
+}
+
 /// Render the hunk around a cited new-file line for the independent scorer.
 /// The scorer receives only a small local window, not the whole prompt-sized diff.
 pub fn render_hunk_context(diff: &Diff, path: &str, line: u32, radius: u32) -> Option<String> {
@@ -4506,6 +4746,50 @@ Binary files a/img.png and b/img.png differ
         assert!(review_batch_contains_range(&batch, &displayed, 7, 7));
         assert!(review_batch_contains_range(&batch, canonical, 7, 7));
         assert!(render_review_batch_context(&batch, canonical, 7, 1, 4096).is_some());
+    }
+
+    #[test]
+    fn scorer_batch_evidence_balances_changed_file_sections_under_bound() {
+        let batch = (1..=4)
+            .map(|index| {
+                format!(
+                    "### src/file_{index}.rs\n@@ region @@\n{index:>6} + {}\n",
+                    format!("value_{index}();").repeat(80)
+                )
+            })
+            .collect::<String>();
+        let retained = bounded_scorer_batch_evidence(&batch, 800);
+        assert!(retained.len() <= 800);
+        for index in 1..=4 {
+            assert!(
+                retained.contains(&format!("### src/file_{index}.rs")),
+                "section {index} was starved by earlier evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn related_scorer_evidence_finds_same_file_guards_and_matching_tests() {
+        let corpus = vec![
+            "### src/orders.rs\n@@ first @@\n    20 + update_order(row);\n\
+             ### src/orders.rs\n@@ guard @@\n    40 + let row = load_order_for_update(id);\n"
+                .to_string(),
+            "### tests/orders.rs\n@@ regression @@\n    15 + assert!(query.contains(\"FOR UPDATE\"));\n\
+             ### docs/unrelated.md\n@@ prose @@\n     1 + unrelated release note\n"
+                .to_string(),
+        ];
+        let evidence = render_related_scorer_evidence(
+            &corpus,
+            "src/orders.rs",
+            "The update may race. Verify `load_order_for_update` issues `FOR UPDATE`.",
+            1_024,
+        )
+        .unwrap();
+        assert!(evidence.len() <= 1_024);
+        assert!(evidence.contains("load_order_for_update"));
+        assert!(evidence.contains("tests/orders.rs"));
+        assert!(evidence.contains("FOR UPDATE"));
+        assert!(!evidence.contains("unrelated release note"));
     }
 
     #[test]

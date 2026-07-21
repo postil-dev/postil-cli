@@ -47,6 +47,9 @@ const SYNTHESIS_REVIEW_MAX_TOKENS: u32 = 4_000;
 pub(crate) const MAX_HOSTED_PLANNER_CANDIDATES: usize = 96;
 pub(crate) const MAX_MODELS_PER_REQUEST: usize = 3;
 pub(crate) const MAX_SCORER_PROMPT_BYTES: usize = 56_000;
+const MAX_SCORER_EVIDENCE_BYTES: usize = 24_000;
+const MAX_SCORER_EVIDENCE_CORPUS_BYTES: usize = 384 * 1024;
+const MAX_SCORER_BATCH_EVIDENCE_BYTES: usize = 32 * 1024;
 const MAX_STREAMED_CANDIDATE_MULTIPLIER: usize = 8;
 const MAX_STREAMED_SUMMARY_BYTES: usize = 64_000;
 const MAX_REVIEW_VALIDATION_REASON_BYTES: usize = 16_384;
@@ -905,37 +908,59 @@ fn generate_finding_ids(findings: &mut [Finding], head_sha: Option<&str>) {
 }
 
 fn scorer_inputs(
-    parsed: &diff::Diff,
-    review_batches: &[String],
+    finding_batches: &[String],
+    evidence_corpus: &[String],
     findings: &[Finding],
+    total_evidence_budget: usize,
 ) -> Vec<prompt::ScorerPromptFinding> {
+    let per_finding_budget = total_evidence_budget / findings.len().max(1);
+    let local_budget = per_finding_budget.min(8_000) / 3;
+    let related_budget = per_finding_budget.saturating_sub(local_budget);
     findings
         .iter()
         .enumerate()
-        .map(|(index, finding)| prompt::ScorerPromptFinding {
-            index,
-            path: prompt::sanitize_scorer_input(&finding.path),
-            line: finding.line,
-            severity: finding.severity.as_str().to_string(),
-            title: prompt::sanitize_scorer_input(&finding.title),
-            body: prompt::sanitize_scorer_input(&finding.body),
-            diff_hunk: prompt::sanitize_scorer_input(
-                &diff::render_hunk_context(parsed, &finding.path, finding.line, 20)
-                    .or_else(|| {
-                        review_batches.iter().find_map(|batch| {
-                            diff::render_review_batch_context(
-                                batch,
-                                &finding.path,
-                                finding.line,
-                                8,
-                                24_000,
-                            )
-                        })
-                    })
-                    .unwrap_or_else(|| {
-                        "No diff evidence is available for this cited location.".to_string()
-                    }),
-            ),
+        .map(|(index, finding)| {
+            let mut query = format!("{}\n{}\n{}", finding.path, finding.title, finding.body);
+            if let Some(evidence) = finding.evidence.as_deref() {
+                query.push('\n');
+                query.push_str(evidence);
+            }
+            let diff_hunk = finding_batches
+                .iter()
+                .find_map(|batch| {
+                    diff::render_review_batch_context(
+                        batch,
+                        &finding.path,
+                        finding.line,
+                        8,
+                        local_budget,
+                    )
+                })
+                .unwrap_or_else(|| {
+                    "No diff evidence is available for this cited location.".to_string()
+                });
+            let related_evidence = diff::render_related_scorer_evidence(
+                evidence_corpus,
+                &finding.path,
+                &query,
+                related_budget,
+            );
+            prompt::ScorerPromptFinding {
+                index,
+                path: prompt::sanitize_scorer_input(&finding.path),
+                line: finding.line,
+                severity: finding.severity.as_str().to_string(),
+                title: prompt::sanitize_scorer_input(&finding.title),
+                body: prompt::sanitize_scorer_input(&finding.body),
+                cited_evidence: finding
+                    .evidence
+                    .as_deref()
+                    .map(prompt::sanitize_scorer_input),
+                diff_hunk: prompt::sanitize_scorer_input(&diff_hunk),
+                related_evidence: related_evidence
+                    .as_deref()
+                    .map(prompt::sanitize_scorer_input),
+            }
         })
         .collect()
 }
@@ -1479,6 +1504,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                 let mut raw_findings = Vec::new();
                 let mut summary_parts = Vec::new();
                 let mut finding_contexts = Vec::new();
+                let mut scorer_evidence_corpus = Vec::new();
                 let mut batch_models = Vec::new();
                 let mut batch_failed = false;
                 let mut batch_failure = None;
@@ -1532,6 +1558,9 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                 } else {
                     1
                 };
+                let scorer_batch_evidence_budget = (MAX_SCORER_EVIDENCE_CORPUS_BYTES
+                    / total_requests.max(1))
+                .min(MAX_SCORER_BATCH_EVIDENCE_BYTES);
                 let cfg_owned = cfg.clone();
                 let system_owned = system.clone();
                 let mut outcomes = futures::stream::iter(batch_requests.into_iter().map(
@@ -1588,7 +1617,16 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                 .collect::<Vec<_>>()
                 .await;
                 outcomes.sort_by_key(|(index, ..)| *index);
-                for (_index, annotated, user, _cross_window_synthesis, first, result) in outcomes {
+                for (_index, annotated, user, cross_window_synthesis, first, result) in outcomes {
+                    if !cross_window_synthesis {
+                        let bounded = diff::bounded_scorer_batch_evidence(
+                            &annotated,
+                            scorer_batch_evidence_budget,
+                        );
+                        if !bounded.is_empty() {
+                            scorer_evidence_corpus.push(bounded);
+                        }
+                    }
                     match result {
                         Ok(mut model_review) => {
                             add_usage(&mut usage, model_review.usage);
@@ -1754,10 +1792,25 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                         summary = summary_parts.join("\n\n");
                         let mut kept = outcome.kept;
                         if !kept.is_empty() && cfg.scorer_enabled() {
-                            let inputs =
-                                scorer_inputs(&diff::Diff::default(), &finding_contexts, &kept);
                             let scorer_system = prompt::scorer_system_prompt(cfg);
-                            let scorer_user = prompt::scorer_user_prompt(&inputs);
+                            let mut evidence_budget = MAX_SCORER_EVIDENCE_BYTES;
+                            let (inputs, scorer_user) = loop {
+                                let inputs = scorer_inputs(
+                                    &finding_contexts,
+                                    &scorer_evidence_corpus,
+                                    &kept,
+                                    evidence_budget,
+                                );
+                                let scorer_user = prompt::scorer_user_prompt(&inputs);
+                                let prompt_bytes =
+                                    scorer_system.len().saturating_add(scorer_user.len());
+                                if prompt_bytes <= MAX_SCORER_PROMPT_BYTES || evidence_budget == 0 {
+                                    break (inputs, scorer_user);
+                                }
+                                let excess = prompt_bytes.saturating_sub(MAX_SCORER_PROMPT_BYTES);
+                                evidence_budget = evidence_budget
+                                    .saturating_sub(excess.max(evidence_budget / 4).max(1));
+                            };
                             if scorer_system.len().saturating_add(scorer_user.len())
                                 > MAX_SCORER_PROMPT_BYTES
                             {
