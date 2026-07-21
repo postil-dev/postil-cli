@@ -6194,7 +6194,9 @@ mod tests {
             severity: "warn".into(),
             title: "t".into(),
             body: "b".into(),
+            cited_evidence: Some("e".into()),
             diff_hunk: "h".into(),
+            related_evidence: Some("r".into()),
         }]);
         assert!(prompt.contains("\"severity\": \"warn\""));
         assert!(!prompt.contains("\"kind\":"));
