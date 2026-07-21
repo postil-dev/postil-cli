@@ -7,6 +7,7 @@ pub mod cli;
 pub mod config;
 pub mod diff;
 pub mod doctor;
+pub(crate) mod durable_plan;
 pub mod envelope;
 pub mod filter;
 pub mod forge;

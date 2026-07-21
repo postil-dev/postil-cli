@@ -8,6 +8,7 @@ use futures::StreamExt;
 
 use crate::config::{Config, GateLevel, OnError};
 use crate::diff;
+use crate::durable_plan::{DurablePlanRegistrar, DurableReviewPlan};
 use crate::envelope::{
     Envelope, Finding, Gate, Kind, ModelIncident, ModelIncidentCategory, ModelUsage,
     ReviewAdmission, ReviewCoverage, ReviewCoverageMode, ReviewCoverageReceipt, Usage,
@@ -1193,6 +1194,48 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                     })
                     .transpose()?;
                 let deterministic_large_review = large_diff_receipt.is_some();
+                if let Some(registrar) = DurablePlanRegistrar::from_env()? {
+                    let durable_plan = if let Some(receipt) = &large_diff_receipt {
+                        DurableReviewPlan::new(
+                            receipt.plan_sha256.clone(),
+                            u32::try_from(receipt.direct_hunks())
+                                .context("direct hunk count exceeds durable plan range")?,
+                            u32::try_from(receipt.semantic_hunks())
+                                .context("semantic hunk count exceeds durable plan range")?,
+                            u32::try_from(receipt.unreviewed_hunks())
+                                .context("unreviewed hunk count exceeds durable plan range")?,
+                            u32::try_from(receipt.selected_batch_ids.len())
+                                .context("selected batch count exceeds durable plan range")?,
+                            u32::try_from(batches.count)
+                                .context("total batch count exceeds durable plan range")?,
+                            u32::try_from(MAX_LARGE_DIFF_CONCURRENCY)
+                                .context("review concurrency exceeds durable plan range")?,
+                            u32::try_from(LARGE_DIFF_LLM_REQUEST_TIMEOUT_SECS)
+                                .context("request timeout exceeds durable plan range")?,
+                            u32::try_from(HOSTED_LLM_REVIEW_TIMEOUT_SECS)
+                                .context("review budget exceeds durable plan range")?,
+                        )?
+                    } else {
+                        let inventory = batches.durable_request_plan()?;
+                        DurableReviewPlan::new(
+                            inventory.plan_sha256,
+                            u32::try_from(inventory.direct_hunks)
+                                .context("direct hunk count exceeds durable plan range")?,
+                            0,
+                            0,
+                            u32::try_from(inventory.selected_batches)
+                                .context("selected batch count exceeds durable plan range")?,
+                            u32::try_from(inventory.total_batches)
+                                .context("total batch count exceeds durable plan range")?,
+                            1,
+                            u32::try_from(HOSTED_LLM_REQUEST_TIMEOUT_SECS)
+                                .context("request timeout exceeds durable plan range")?,
+                            u32::try_from(HOSTED_LLM_REVIEW_TIMEOUT_SECS)
+                                .context("review budget exceeds durable plan range")?,
+                        )?
+                    };
+                    registrar.register(&durable_plan).await?;
+                }
                 let bounded_candidates = if large_diff_receipt.is_none()
                     && (args.bounded || crate::config::bounded_review_selection_mode())
                     && batches.count > MAX_HOSTED_SELECTED_BATCHES

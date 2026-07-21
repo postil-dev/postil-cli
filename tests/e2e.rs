@@ -719,6 +719,8 @@ fn postil() -> Command {
         .env_remove("POSTIL_API_FORMAT")
         .env_remove("POSTIL_ENDPOINT_AUTH_HEADER")
         .env_remove("POSTIL_ENDPOINT_AUTH_VALUE")
+        .env_remove("POSTIL_LARGE_REVIEW_PLAN_ENDPOINT")
+        .env_remove("POSTIL_LARGE_REVIEW_PLAN_TOKEN")
         .env_remove("POSTIL_ALLOW_PRIVATE_API_BASE")
         .env_remove("POSTIL_DETAILS_URL")
         .env_remove("POSTIL_PREVENTION_HINT")
@@ -1959,6 +1961,137 @@ async fn mock_review(server: &MockServer, findings: Value) {
 }
 
 #[tokio::test]
+async fn ordinary_review_registers_an_authenticated_plan_before_provider_access() {
+    let server = MockServer::start().await;
+    let registration_token = "ordinary-plan-registration-token";
+    Mock::given(method("POST"))
+        .and(path("/durable-plan"))
+        .and(header(
+            "authorization",
+            format!("Bearer {registration_token}"),
+        ))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    mock_review(&server, json!([])).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env(
+            "POSTIL_LARGE_REVIEW_PLAN_ENDPOINT",
+            format!("{}/durable-plan", server.uri()),
+        )
+        .env("POSTIL_LARGE_REVIEW_PLAN_TOKEN", registration_token)
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+    let second = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env(
+            "POSTIL_LARGE_REVIEW_PLAN_ENDPOINT",
+            format!("{}/durable-plan", server.uri()),
+        )
+        .env("POSTIL_LARGE_REVIEW_PLAN_TOKEN", registration_token)
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(requests[0].url.path(), "/durable-plan");
+    assert_eq!(requests[1].url.path(), "/chat/completions");
+    assert_eq!(requests[2].url.path(), "/durable-plan");
+    assert_eq!(requests[3].url.path(), "/chat/completions");
+    let registration: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let repeated_registration: Value = serde_json::from_slice(&requests[2].body).unwrap();
+    assert_eq!(registration, repeated_registration);
+    let mut keys = registration
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "concurrency",
+            "directHunks",
+            "planSha256",
+            "requestTimeoutSeconds",
+            "reviewBudgetSeconds",
+            "selectedBatches",
+            "semanticHunks",
+            "totalBatches",
+            "unreviewedHunks",
+            "version",
+        ]
+    );
+    assert_eq!(registration["version"], 1);
+    assert_eq!(registration["concurrency"], 1);
+    assert_eq!(registration["requestTimeoutSeconds"], 240);
+    assert_eq!(registration["reviewBudgetSeconds"], 420);
+    assert_eq!(
+        registration["selectedBatches"],
+        registration["totalBatches"]
+    );
+    assert_eq!(registration["planSha256"].as_str().unwrap().len(), 64);
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(!stderr.contains(registration_token));
+    assert!(!String::from_utf8_lossy(&second.get_output().stderr).contains(registration_token));
+}
+
+#[tokio::test]
+async fn configured_plan_registration_failure_stops_before_provider_access() {
+    let server = MockServer::start().await;
+    let registration_token = "failed-plan-registration-token";
+    Mock::given(method("POST"))
+        .and(path("/durable-plan"))
+        .and(header(
+            "authorization",
+            format!("Bearer {registration_token}"),
+        ))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    mock_review(&server, json!([])).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env(
+            "POSTIL_LARGE_REVIEW_PLAN_ENDPOINT",
+            format!("{}/durable-plan", server.uri()),
+        )
+        .env("POSTIL_LARGE_REVIEW_PLAN_TOKEN", registration_token)
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .code(2);
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].url.path(), "/durable-plan");
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(stderr.contains("durable review plan registration returned HTTP 500"));
+    assert!(!stderr.contains(registration_token));
+}
+
+#[tokio::test]
 async fn remote_diff_reader_rejects_explicit_truncation_signals() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -2121,6 +2254,16 @@ async fn automatic_large_diff_route_is_concurrent_receipted_and_fails_closed_on_
     use std::time::{Duration, Instant};
 
     let server = MockServer::start().await;
+    let registration_token = "large-plan-registration-token";
+    Mock::given(method("POST"))
+        .and(path("/durable-plan"))
+        .and(header(
+            "authorization",
+            format!("Bearer {registration_token}"),
+        ))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .respond_with(
@@ -2172,6 +2315,11 @@ async fn automatic_large_diff_route_is_concurrent_receipted_and_fails_closed_on_
     let out = postil()
         .current_dir(dir.path())
         .env("POSTIL_API_BASE", server.uri())
+        .env(
+            "POSTIL_LARGE_REVIEW_PLAN_ENDPOINT",
+            format!("{}/durable-plan", server.uri()),
+        )
+        .env("POSTIL_LARGE_REVIEW_PLAN_TOKEN", registration_token)
         .env("POSTIL_DISABLE_SCORER", "1")
         .env("REVIEW_MODEL", "mistralai/mistral-small-3.2-24b-instruct")
         .args(["review", "--diff-file"])
@@ -2212,13 +2360,50 @@ async fn automatic_large_diff_route_is_concurrent_receipted_and_fails_closed_on_
             })
     );
     let requests = server.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 24);
-    assert!(requests.iter().any(|request| {
+    assert_eq!(requests.len(), 25);
+    assert_eq!(requests[0].url.path(), "/durable-plan");
+    let registration: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(registration["version"], 1);
+    assert_eq!(
+        registration["planSha256"],
+        coverage["receipt"]["planSha256"]
+    );
+    assert_eq!(
+        registration["directHunks"],
+        coverage["receipt"]["directHunks"]
+    );
+    assert_eq!(
+        registration["semanticHunks"],
+        coverage["receipt"]["semanticHunks"]
+    );
+    assert_eq!(
+        registration["unreviewedHunks"],
+        coverage["receipt"]["unreviewedHunks"]
+    );
+    assert_eq!(registration["selectedBatches"], 24);
+    assert_eq!(registration["concurrency"], 4);
+    assert_eq!(registration["requestTimeoutSeconds"], 60);
+    assert_eq!(registration["reviewBudgetSeconds"], 420);
+    let provider_requests = requests
+        .iter()
+        .filter(|request| request.url.path() == "/chat/completions")
+        .collect::<Vec<_>>();
+    assert_eq!(provider_requests.len(), 24);
+    assert!(provider_requests.iter().any(|request| {
         let body = String::from_utf8_lossy(&request.body);
         body.contains("src/auth/permission.ts")
             && body.contains("actor.can('admin')")
             && body.contains("privilegedWrite")
     }));
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    let plan_line = stderr
+        .find("postil: deterministic large-review plan=")
+        .expect("deterministic plan line");
+    let first_attempt = stderr
+        .find("postil: llm attempt ")
+        .expect("first provider attempt line");
+    assert!(plan_line < first_attempt);
+    assert!(!stderr.contains(registration_token));
     assert!(
         elapsed < Duration::from_millis(4_500),
         "24 delayed calls were not executed in four-way bounded waves: {elapsed:?}"
