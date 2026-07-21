@@ -297,10 +297,97 @@ impl Write for DiffSpool {
 #[derive(Debug, Default)]
 pub struct ReviewBatchPlan {
     pub batches: Vec<String>,
+    batch_hunks: Vec<BTreeSet<HunkIdentity>>,
     pub synthesis: Option<String>,
     pub incomplete: bool,
     pub projected_input_bytes: usize,
     pub metadata_count: u32,
+}
+
+/// Stable identity for one hunk after forge input has been normalized into a
+/// structurally complete review window. The digest distinguishes split hunks
+/// that retain the same coordinate anchor.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct HunkIdentity {
+    pub path: String,
+    pub old_start: u32,
+    pub old_count: u32,
+    pub new_start: u32,
+    pub new_count: u32,
+    digest: [u8; 32],
+}
+
+impl HunkIdentity {
+    fn new(path: &str, hunk: &Hunk) -> Self {
+        let mut hasher = Sha256::new();
+        for line in &hunk.lines {
+            hasher.update((line.len() as u64).to_le_bytes());
+            hasher.update(line.as_bytes());
+        }
+        Self {
+            path: path.to_string(),
+            old_start: hunk.old_start,
+            old_count: hunk.old_count,
+            new_start: hunk.new_start,
+            new_count: hunk.new_count,
+            digest: hasher.finalize().into(),
+        }
+    }
+
+    fn canonical(&self) -> String {
+        let digest = self
+            .digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        format!(
+            "{}\0{}\0{}\0{}\0{}\0{}",
+            self.path, self.old_start, self.old_count, self.new_start, self.new_count, digest
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HunkDisposition {
+    Direct { batch_ids: Vec<usize> },
+    Semantic { summary_batch_ids: Vec<usize> },
+    Unreviewed { reason: &'static str },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HunkCoverageEntry {
+    pub hunk: HunkIdentity,
+    pub disposition: HunkDisposition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundedCoverageReceipt {
+    pub plan_sha256: String,
+    pub entries: Vec<HunkCoverageEntry>,
+    pub selected_batch_ids: BTreeSet<usize>,
+}
+
+impl BoundedCoverageReceipt {
+    pub fn direct_hunks(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| matches!(entry.disposition, HunkDisposition::Direct { .. }))
+            .count()
+    }
+
+    pub fn unreviewed_hunks(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| matches!(entry.disposition, HunkDisposition::Unreviewed { .. }))
+            .count()
+    }
+
+    pub fn semantic_hunks(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| matches!(entry.disposition, HunkDisposition::Semantic { .. }))
+            .count()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -865,6 +952,17 @@ pub struct ModelBatchSpool {
     pub source_count: usize,
     pub metadata_count: u32,
     synthesis_ids: BTreeSet<usize>,
+    batch_hunks: HashMap<usize, BTreeSet<HunkIdentity>>,
+    all_hunks: BTreeSet<HunkIdentity>,
+    hunk_risk: HashMap<HunkIdentity, HunkRisk>,
+    metadata_batch_ids: BTreeSet<usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HunkRisk {
+    mandatory: bool,
+    semantic_eligible: bool,
+    score: usize,
 }
 
 pub struct HostedBatchCandidates {
@@ -1070,6 +1168,382 @@ impl ModelBatchSpool {
         );
         Ok(selected)
     }
+
+    /// Build the large-diff route without a provider-side planning call. Every
+    /// normalized hunk receives exactly one receipt disposition. Mandatory
+    /// security, control-plane, dependency, and executable-vendor evidence is
+    /// admitted first; remaining capacity is filled by stable risk and path
+    /// order. A mandatory hunk that cannot fit fails before provider contact.
+    pub fn deterministic_bounded_receipt(
+        &mut self,
+        selected_limit: usize,
+    ) -> Result<BoundedCoverageReceipt> {
+        anyhow::ensure!(
+            selected_limit > 0,
+            "bounded review batch limit must be positive"
+        );
+        #[derive(Debug)]
+        struct RankedHunk {
+            hunk: HunkIdentity,
+            direct_batch_ids: BTreeSet<usize>,
+            semantic_batch_ids: BTreeSet<usize>,
+            mandatory: bool,
+            semantic_eligible: bool,
+            score: usize,
+        }
+
+        let mut ranked = self
+            .all_hunks
+            .iter()
+            .cloned()
+            .map(|hunk| {
+                let direct_batch_ids = self
+                    .batch_hunks
+                    .iter()
+                    .filter_map(|(id, hunks)| {
+                        (!self.synthesis_ids.contains(id) && hunks.contains(&hunk)).then_some(*id)
+                    })
+                    .collect::<BTreeSet<_>>();
+                let semantic_batch_ids = self
+                    .batch_hunks
+                    .iter()
+                    .filter_map(|(id, hunks)| {
+                        (self.synthesis_ids.contains(id) && hunks.contains(&hunk)).then_some(*id)
+                    })
+                    .collect::<BTreeSet<_>>();
+                let risk = self.hunk_risk.get(&hunk).copied().unwrap_or(HunkRisk {
+                    mandatory: true,
+                    semantic_eligible: false,
+                    score: usize::MAX,
+                });
+                RankedHunk {
+                    mandatory: risk.mandatory,
+                    semantic_eligible: risk.semantic_eligible,
+                    score: risk.score,
+                    hunk,
+                    direct_batch_ids,
+                    semantic_batch_ids,
+                }
+            })
+            .collect::<Vec<_>>();
+        ranked.sort_by(|left, right| {
+            right
+                .mandatory
+                .cmp(&left.mandatory)
+                .then_with(|| right.score.cmp(&left.score))
+                .then_with(|| left.hunk.path.cmp(&right.hunk.path))
+                .then_with(|| left.hunk.new_start.cmp(&right.hunk.new_start))
+                .then_with(|| left.hunk.old_start.cmp(&right.hunk.old_start))
+                .then_with(|| left.hunk.digest.cmp(&right.hunk.digest))
+        });
+
+        let mut selected = self.metadata_batch_ids.clone();
+        anyhow::ensure!(
+            selected.len() <= selected_limit,
+            "mandatory dependency and artifact evidence needs {} batches, exceeding the {selected_limit} batch large-review limit",
+            selected.len()
+        );
+        for candidate in ranked.iter().filter(|candidate| candidate.mandatory) {
+            anyhow::ensure!(
+                !candidate.direct_batch_ids.is_empty(),
+                "mandatory hunk {}:{} has no materialized source batch",
+                candidate.hunk.path,
+                candidate.hunk.new_start
+            );
+            let additional = candidate.direct_batch_ids.difference(&selected).count();
+            anyhow::ensure!(
+                selected.len().saturating_add(additional) <= selected_limit,
+                "mandatory hunk {}:{} cannot fit the {selected_limit} batch large-review limit",
+                candidate.hunk.path,
+                candidate.hunk.new_start
+            );
+            selected.extend(candidate.direct_batch_ids.iter().copied());
+        }
+        for candidate in ranked.iter().filter(|candidate| !candidate.mandatory) {
+            let direct_additional = candidate.direct_batch_ids.difference(&selected).count();
+            let semantic_id = candidate
+                .semantic_eligible
+                .then(|| {
+                    candidate
+                        .semantic_batch_ids
+                        .iter()
+                        .copied()
+                        .min_by_key(|id| {
+                            (
+                                !selected.contains(id),
+                                std::cmp::Reverse(
+                                    self.batch_hunks.get(id).map_or(0, BTreeSet::len),
+                                ),
+                                *id,
+                            )
+                        })
+                })
+                .flatten();
+            let semantic_additional =
+                semantic_id.map_or(usize::MAX, |id| usize::from(!selected.contains(&id)));
+            let prefer_semantic = semantic_id.is_some_and(|id| {
+                semantic_additional < direct_additional
+                    || (semantic_additional == direct_additional
+                        && self.batch_hunks.get(&id).map_or(0, BTreeSet::len) > 1)
+            });
+            if prefer_semantic
+                && selected.len().saturating_add(semantic_additional) <= selected_limit
+            {
+                selected.insert(semantic_id.expect("preference requires a semantic batch"));
+            } else if direct_additional <= semantic_additional
+                && !candidate.direct_batch_ids.is_empty()
+                && selected.len().saturating_add(direct_additional) <= selected_limit
+            {
+                selected.extend(candidate.direct_batch_ids.iter().copied());
+            } else if let Some(id) = semantic_id
+                && selected.len().saturating_add(semantic_additional) <= selected_limit
+            {
+                selected.insert(id);
+            }
+        }
+
+        let entries = ranked
+            .into_iter()
+            .map(|candidate| {
+                let direct = !candidate.direct_batch_ids.is_empty()
+                    && candidate
+                        .direct_batch_ids
+                        .iter()
+                        .all(|id| selected.contains(id));
+                let semantic_batch_ids = candidate
+                    .semantic_batch_ids
+                    .iter()
+                    .filter(|id| selected.contains(id))
+                    .copied()
+                    .collect::<Vec<_>>();
+                HunkCoverageEntry {
+                    hunk: candidate.hunk,
+                    disposition: if direct {
+                        HunkDisposition::Direct {
+                            batch_ids: candidate.direct_batch_ids.into_iter().collect(),
+                        }
+                    } else if candidate.semantic_eligible && !semantic_batch_ids.is_empty() {
+                        HunkDisposition::Semantic {
+                            summary_batch_ids: semantic_batch_ids,
+                        }
+                    } else {
+                        HunkDisposition::Unreviewed {
+                            reason: "outside deterministic risk capacity",
+                        }
+                    },
+                }
+            })
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            entries.len() == self.all_hunks.len(),
+            "bounded coverage receipt lost a normalized hunk"
+        );
+        anyhow::ensure!(
+            entries.windows(2).all(|pair| pair[0].hunk != pair[1].hunk),
+            "bounded coverage receipt contains a duplicate hunk disposition"
+        );
+
+        let mut hasher = Sha256::new();
+        hasher.update(format!("limit={selected_limit}\n").as_bytes());
+        for id in &selected {
+            hasher.update(format!("batch={id}\n").as_bytes());
+        }
+        for entry in &entries {
+            hasher.update(entry.hunk.canonical().as_bytes());
+            match &entry.disposition {
+                HunkDisposition::Direct { batch_ids } => {
+                    hasher.update(b"\0direct\0");
+                    for id in batch_ids {
+                        hasher.update((*id as u64).to_le_bytes());
+                    }
+                }
+                HunkDisposition::Semantic { summary_batch_ids } => {
+                    hasher.update(b"\0semantic\0");
+                    for id in summary_batch_ids {
+                        hasher.update((*id as u64).to_le_bytes());
+                    }
+                }
+                HunkDisposition::Unreviewed { reason } => {
+                    hasher.update(b"\0unreviewed\0");
+                    hasher.update(reason.as_bytes());
+                }
+            }
+        }
+        let plan_sha256 = hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let receipt = BoundedCoverageReceipt {
+            plan_sha256,
+            entries,
+            selected_batch_ids: selected,
+        };
+        self.validate_coverage_receipt(&receipt)?;
+        Ok(receipt)
+    }
+
+    fn validate_coverage_receipt(&self, receipt: &BoundedCoverageReceipt) -> Result<()> {
+        for entry in &receipt.entries {
+            let risk = self
+                .hunk_risk
+                .get(&entry.hunk)
+                .context("bounded coverage receipt references an unknown normalized hunk")?;
+            let ids = match &entry.disposition {
+                HunkDisposition::Direct { batch_ids } => batch_ids,
+                HunkDisposition::Semantic { summary_batch_ids } => {
+                    anyhow::ensure!(
+                        risk.semantic_eligible && !risk.mandatory,
+                        "semantic coverage is not allowed for this hunk risk class"
+                    );
+                    summary_batch_ids
+                }
+                HunkDisposition::Unreviewed { .. } => continue,
+            };
+            anyhow::ensure!(
+                !ids.is_empty(),
+                "coverage disposition has no evidence batch"
+            );
+            for id in ids {
+                anyhow::ensure!(
+                    receipt.selected_batch_ids.contains(id),
+                    "coverage disposition references an unselected evidence batch"
+                );
+                let expected_synthesis =
+                    matches!(&entry.disposition, HunkDisposition::Semantic { .. });
+                anyhow::ensure!(
+                    self.synthesis_ids.contains(id) == expected_synthesis,
+                    "coverage disposition references the wrong evidence batch kind"
+                );
+                anyhow::ensure!(
+                    self.batch_hunks
+                        .get(id)
+                        .is_some_and(|hunks| hunks.contains(&entry.hunk)),
+                    "coverage evidence batch is not bound to the exact normalized hunk digest"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+fn security_sensitive_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    [
+        "auth",
+        "permission",
+        "access",
+        "security",
+        "secret",
+        "credential",
+        "crypto",
+        "token",
+        "session",
+        "admin",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn control_plane_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    [
+        "config",
+        "policy",
+        "billing",
+        "migration",
+        "release",
+        "deploy",
+        "workflow",
+        ".github/",
+        "dockerfile",
+        "terraform",
+        "kubernetes",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn executable_vendor_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    (lower.contains("vendor/") || lower.contains("vendored/"))
+        && [
+            ".rs", ".go", ".c", ".cc", ".cpp", ".h", ".js", ".ts", ".py", ".sh",
+        ]
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
+}
+
+fn mandatory_large_diff_hunk(path: &str, hunk: &Hunk) -> bool {
+    if security_sensitive_path(path) || control_plane_path(path) || executable_vendor_path(path) {
+        return true;
+    }
+    let removed = hunk
+        .lines
+        .iter()
+        .filter_map(|line| line.strip_prefix('-'))
+        .flat_map(hosted_risk_tokens)
+        .collect::<Vec<_>>();
+    removed.iter().any(|token| {
+        [
+            "authoriz",
+            "permission",
+            "forbidden",
+            "denied",
+            "validate",
+            "guard",
+            "timeout",
+            "encrypt",
+            "signature",
+            "verify",
+        ]
+        .iter()
+        .any(|marker| token.starts_with(marker))
+    })
+}
+
+fn stable_large_diff_risk_score(path: &str, hunk: &Hunk) -> usize {
+    let path_score = if security_sensitive_path(path) {
+        1_000
+    } else if control_plane_path(path) {
+        700
+    } else if executable_vendor_path(path) {
+        600
+    } else if path.contains("test") || path.contains("spec") {
+        100
+    } else if path.ends_with(".md") || path.starts_with("docs/") {
+        25
+    } else {
+        300
+    };
+    let changed = hunk
+        .lines
+        .iter()
+        .filter_map(|line| line.strip_prefix('+').or_else(|| line.strip_prefix('-')))
+        .flat_map(hosted_risk_tokens)
+        .collect::<Vec<_>>();
+    let removed = hunk
+        .lines
+        .iter()
+        .filter_map(|line| line.strip_prefix('-'))
+        .flat_map(hosted_risk_tokens)
+        .collect::<Vec<_>>();
+    path_score
+        + hosted_token_risk_score(&changed)
+        + hosted_token_risk_score(&removed).saturating_mul(2)
+}
+
+fn semantic_large_diff_hunk(path: &str, hunk: &Hunk) -> bool {
+    if mandatory_large_diff_hunk(path, hunk) {
+        return false;
+    }
+    let changed = hunk
+        .lines
+        .iter()
+        .filter_map(|line| line.strip_prefix('+').or_else(|| line.strip_prefix('-')))
+        .flat_map(hosted_risk_tokens)
+        .collect::<Vec<_>>();
+    hosted_token_risk_score(&changed) == 0
 }
 
 fn truncate_owned_utf8(mut value: String, max_bytes: usize) -> String {
@@ -1242,22 +1716,45 @@ pub fn spool_model_batches(
     let mut count = 0usize;
     let mut source_count = 0usize;
     let mut synthesis_ids = BTreeSet::new();
+    let mut batch_hunks = HashMap::new();
+    let mut all_hunks = BTreeSet::new();
+    let mut hunk_risk = HashMap::new();
+    let mut metadata_batch_ids = BTreeSet::new();
     let mut metadata_count = 0u32;
     let synthesis_header = "Cross-window semantic digests:\n";
     let mut cross_window = synthesis_header.to_string();
-    let mut synthesis_chunks = Vec::new();
+    let mut cross_window_hunks = BTreeSet::new();
+    let mut synthesis_chunks = Vec::<(String, BTreeSet<HunkIdentity>)>::new();
     let mut digest_ordinal = 0usize;
     prepared.rewind()?;
     while let Some(window) = prepared.next_window()? {
         let parsed = parse(&window);
         anyhow::ensure!(parsed.complete, "normalized review window is incomplete");
+        for file in &parsed.files {
+            for hunk in &file.hunks {
+                let identity = HunkIdentity::new(&file.path, hunk);
+                hunk_risk.insert(
+                    identity,
+                    HunkRisk {
+                        mandatory: mandatory_large_diff_hunk(&file.path, hunk),
+                        semantic_eligible: semantic_large_diff_hunk(&file.path, hunk),
+                        score: stable_large_diff_risk_score(&file.path, hunk),
+                    },
+                );
+            }
+        }
         let plan = render_review_batches(&parsed, &[], &[], max_batch_bytes, max_manifest_bytes);
         anyhow::ensure!(
             !plan.incomplete,
             "normalized review window could not be rendered"
         );
+        let plan_hunks = plan
+            .batch_hunks
+            .iter()
+            .flat_map(|hunks| hunks.iter().cloned())
+            .collect::<BTreeSet<_>>();
         metadata_count = metadata_count.max(plan.metadata_count);
-        for batch in plan.batches {
+        for (batch, hunks) in plan.batches.into_iter().zip(plan.batch_hunks) {
             let digest = semantic_digest(&batch);
             if !digest.is_empty() {
                 let next_ordinal = digest_ordinal
@@ -1271,12 +1768,16 @@ pub fn spool_model_batches(
                 let entry = format!("{heading}{digest}");
                 if cross_window.len().saturating_add(entry.len()) > max_batch_bytes {
                     if cross_window.len() > synthesis_header.len() {
-                        synthesis_chunks.push(std::mem::take(&mut cross_window));
+                        synthesis_chunks.push((
+                            std::mem::take(&mut cross_window),
+                            std::mem::take(&mut cross_window_hunks),
+                        ));
                     }
                     cross_window.push_str(synthesis_header);
                 }
                 digest_ordinal = next_ordinal;
                 cross_window.push_str(&entry);
+                cross_window_hunks.extend(hunks.iter().cloned());
             }
             write_length_prefixed(
                 &mut file,
@@ -1294,8 +1795,11 @@ pub fn spool_model_batches(
             source_count = source_count
                 .checked_add(1)
                 .context("source model batch count overflowed")?;
+            all_hunks.extend(hunks.iter().cloned());
+            batch_hunks.insert(count, hunks);
         }
         if let Some(synthesis) = plan.synthesis {
+            let synthesis = bind_synthesis_hunks(synthesis, &plan_hunks, max_batch_bytes)?;
             write_length_prefixed(
                 &mut file,
                 &mut lease,
@@ -1310,6 +1814,7 @@ pub fn spool_model_batches(
                 .checked_add(1)
                 .context("model batch count overflowed")?;
             synthesis_ids.insert(count);
+            batch_hunks.insert(count, plan_hunks);
         }
     }
 
@@ -1350,6 +1855,7 @@ pub fn spool_model_batches(
             source_count = source_count
                 .checked_add(1)
                 .context("source model batch count overflowed")?;
+            metadata_batch_ids.insert(count);
         }
         if let Some(synthesis) = plan.synthesis {
             write_length_prefixed(
@@ -1371,7 +1877,7 @@ pub fn spool_model_batches(
         artifact_start = artifact_end;
     }
     if cross_window.len() > synthesis_header.len() && digest_ordinal > 1 {
-        synthesis_chunks.push(cross_window);
+        synthesis_chunks.push((cross_window, cross_window_hunks));
     }
     if digest_ordinal > 1 {
         let mut level = 1usize;
@@ -1379,7 +1885,9 @@ pub fn spool_model_batches(
         while !chunks.is_empty() {
             let chunk_count = chunks.len();
             let mut digests = Vec::with_capacity(chunk_count);
-            for chunk in chunks {
+            let mut covered_hunks = Vec::with_capacity(chunk_count);
+            for (chunk, hunks) in chunks {
+                let chunk = bind_synthesis_hunks(chunk, &hunks, max_batch_bytes)?;
                 write_length_prefixed(
                     &mut file,
                     &mut lease,
@@ -1394,17 +1902,27 @@ pub fn spool_model_batches(
                     .checked_add(1)
                     .context("model batch count overflowed")?;
                 synthesis_ids.insert(count);
+                batch_hunks.insert(count, hunks.clone());
                 digests.push(chunk);
+                covered_hunks.push(hunks);
             }
             if chunk_count == 1 {
                 break;
             }
-            let next = pack_semantic_digests(&digests, level + 1, max_batch_bytes)?;
+            let next_text = pack_semantic_digests(&digests, level + 1, max_batch_bytes)?;
+            let next_hunks = covered_hunks
+                .chunks(2)
+                .map(|pair| {
+                    pair.iter()
+                        .flat_map(|hunks| hunks.iter().cloned())
+                        .collect::<BTreeSet<_>>()
+                })
+                .collect::<Vec<_>>();
             anyhow::ensure!(
-                next.len() < chunk_count,
+                next_text.len() < chunk_count && next_text.len() == next_hunks.len(),
                 "recursive synthesis did not reduce its bounded fan-in"
             );
-            chunks = next;
+            chunks = next_text.into_iter().zip(next_hunks).collect();
             level = level
                 .checked_add(1)
                 .context("recursive synthesis level overflowed")?;
@@ -1434,6 +1952,10 @@ pub fn spool_model_batches(
         source_count,
         metadata_count,
         synthesis_ids,
+        batch_hunks,
+        all_hunks,
+        hunk_risk,
+        metadata_batch_ids,
     })
 }
 
@@ -1482,6 +2004,58 @@ fn pack_semantic_digests(
         chunks.push(chunk);
     }
     Ok(chunks)
+}
+
+fn hunk_set_sha256(hunks: &BTreeSet<HunkIdentity>) -> String {
+    let mut hasher = Sha256::new();
+    for hunk in hunks {
+        let canonical = hunk.canonical();
+        hasher.update((canonical.len() as u64).to_le_bytes());
+        hasher.update(canonical.as_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn bind_synthesis_hunks(
+    synthesis: String,
+    hunks: &BTreeSet<HunkIdentity>,
+    max_batch_bytes: usize,
+) -> Result<String> {
+    anyhow::ensure!(
+        !hunks.is_empty(),
+        "semantic synthesis has no normalized hunk commitment"
+    );
+    let commitment = format!(
+        "Exact normalized hunk-set commitment (SHA-256): {}\n",
+        hunk_set_sha256(hunks)
+    );
+    let receipt_header = synthesis
+        .lines()
+        .next()
+        .filter(|line| {
+            line.starts_with("Cross-window semantic digests")
+                || line.starts_with("Cross-batch semantic digests")
+        })
+        .map_or_else(
+            || "Cross-window semantic digests (receipt-bound):\n".to_string(),
+            |line| format!("{line}\n"),
+        );
+    let evidence_limit = max_batch_bytes
+        .checked_sub(receipt_header.len().saturating_add(commitment.len()))
+        .context("semantic hunk commitment exceeded its batch bound")?;
+    let synthesis = compact_semantic_digest(synthesis, evidence_limit)?;
+    let evidence = synthesis
+        .split_once('\n')
+        .filter(|(line, _)| {
+            line.starts_with("Cross-window semantic digests")
+                || line.starts_with("Cross-batch semantic digests")
+        })
+        .map_or(synthesis.as_str(), |(_, evidence)| evidence);
+    Ok(format!("{receipt_header}{commitment}{evidence}"))
 }
 
 #[derive(Clone, Copy)]
@@ -3008,11 +3582,13 @@ pub fn render_review_batches(
     }
 
     let mut current = String::new();
+    let mut current_hunks = BTreeSet::new();
     for file in &diff.files {
         if file.binary || file.hunks.is_empty() {
             continue;
         }
         for hunk in &file.hunks {
+            let hunk_identity = HunkIdentity::new(&file.path, hunk);
             let Some(units) =
                 render_hunk_units(file, hunk, max_bytes.saturating_sub(manifest.text.len()))
             else {
@@ -3020,7 +3596,15 @@ pub fn render_review_batches(
                 return plan;
             };
             for unit in units {
-                if !append_unit(&mut plan, &mut current, &manifest.text, &unit, max_bytes) {
+                if !append_unit(
+                    &mut plan,
+                    &mut current,
+                    &mut current_hunks,
+                    &manifest.text,
+                    &unit,
+                    &hunk_identity,
+                    max_bytes,
+                ) {
                     plan.incomplete = true;
                     return plan;
                 }
@@ -3029,10 +3613,12 @@ pub fn render_review_batches(
     }
     if !current.is_empty() {
         plan.batches.push(current);
+        plan.batch_hunks.push(current_hunks);
     } else if plan.batches.is_empty()
         && (!diff.files.is_empty() || !lockfiles.is_empty() || !compacted_artifacts.is_empty())
     {
         plan.batches.push(manifest.text.clone());
+        plan.batch_hunks.push(BTreeSet::new());
     }
 
     if plan.batches.len() > 1 {
@@ -3297,8 +3883,10 @@ fn render_line_segments(marker: &str, content: &str, old_line: u32, new_line: u3
 fn append_unit(
     plan: &mut ReviewBatchPlan,
     current: &mut String,
+    current_hunks: &mut BTreeSet<HunkIdentity>,
     manifest: &str,
     unit: &str,
+    hunk: &HunkIdentity,
     max_bytes: usize,
 ) -> bool {
     if manifest.len() + unit.len() > max_bytes {
@@ -3310,10 +3898,12 @@ fn append_unit(
     }
     if current.len() + unit.len() > max_bytes {
         plan.batches.push(std::mem::take(current));
+        plan.batch_hunks.push(std::mem::take(current_hunks));
         current.push_str(manifest);
         current.push('\n');
     }
     current.push_str(unit);
+    current_hunks.insert(hunk.clone());
     true
 }
 
@@ -4519,6 +5109,188 @@ diff --git a/two.rs b/two.rs
                 .iter()
                 .any(|batch| batch.contains("Cross-window semantic digests"))
         );
+    }
+
+    fn deterministic_large_fixture(security_hunks: usize) -> String {
+        use std::fmt::Write as _;
+
+        let mut source = String::new();
+        for file in 0..30 {
+            let security = file < security_hunks;
+            let path = if security {
+                format!("src/auth/permission-{file}.ts")
+            } else if file == 29 {
+                "vendor/runtime/dispatch.ts".to_string()
+            } else {
+                format!("src/churn/file-{file}.ts")
+            };
+            writeln!(
+                source,
+                "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@"
+            )
+            .unwrap();
+            if security {
+                writeln!(
+                    source,
+                    "-if (!actor.can('admin')) throw new Error('Forbidden');"
+                )
+                .unwrap();
+                writeln!(
+                    source,
+                    "+await privilegedWrite(input); // {}",
+                    "x".repeat(10_000)
+                )
+                .unwrap();
+            } else {
+                writeln!(source, "-const value = {file};").unwrap();
+                writeln!(source, "+const value = {file}; // {}", "x".repeat(10_000)).unwrap();
+            }
+        }
+        source
+    }
+
+    fn deterministic_receipt_for(source: &str) -> BoundedCoverageReceipt {
+        let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+        let mut prepared = prepare_review(&snapshot).unwrap();
+        let mut batches = spool_model_batches(&mut prepared, 16_000, 4_096, false).unwrap();
+        assert!(batches.source_count > crate::review::MAX_LARGE_DIFF_SELECTED_BATCHES);
+        batches
+            .deterministic_bounded_receipt(crate::review::MAX_LARGE_DIFF_SELECTED_BATCHES)
+            .unwrap()
+    }
+
+    #[test]
+    fn deterministic_large_receipt_is_stable_and_keeps_security_and_vendor_hunks() {
+        let source = deterministic_large_fixture(1);
+        let first = deterministic_receipt_for(&source);
+        let second = deterministic_receipt_for(&source);
+
+        assert_eq!(first.plan_sha256, second.plan_sha256);
+        assert_eq!(first.entries, second.entries);
+        assert_eq!(first.entries.len(), 30);
+        assert_eq!(first.selected_batch_ids.len(), 3);
+        assert_eq!(first.direct_hunks(), 2);
+        assert_eq!(first.semantic_hunks(), 28);
+        assert_eq!(first.unreviewed_hunks(), 0);
+        for path in ["src/auth/permission-0.ts", "vendor/runtime/dispatch.ts"] {
+            let entry = first
+                .entries
+                .iter()
+                .find(|entry| entry.hunk.path == path)
+                .unwrap();
+            assert!(
+                matches!(entry.disposition, HunkDisposition::Direct { .. }),
+                "mandatory {path} hunk was not reviewed directly"
+            );
+        }
+        let unique = first
+            .entries
+            .iter()
+            .map(|entry| entry.hunk.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(unique.len(), first.entries.len());
+    }
+
+    #[test]
+    fn semantic_receipt_rejects_a_missing_exact_hunk_mapping() {
+        let source = deterministic_large_fixture(1);
+        let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+        let mut prepared = prepare_review(&snapshot).unwrap();
+        let mut batches = spool_model_batches(&mut prepared, 16_000, 4_096, false).unwrap();
+        let receipt = batches
+            .deterministic_bounded_receipt(crate::review::MAX_LARGE_DIFF_SELECTED_BATCHES)
+            .unwrap();
+        let (hunk, summary_id) = receipt
+            .entries
+            .iter()
+            .find_map(|entry| match &entry.disposition {
+                HunkDisposition::Semantic { summary_batch_ids } => {
+                    Some((entry.hunk.clone(), summary_batch_ids[0]))
+                }
+                _ => None,
+            })
+            .unwrap();
+        batches
+            .batch_hunks
+            .get_mut(&summary_id)
+            .unwrap()
+            .remove(&hunk);
+        let error = batches.validate_coverage_receipt(&receipt).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("not bound to the exact normalized hunk digest")
+        );
+    }
+
+    #[test]
+    fn semantic_receipt_prompt_commits_to_its_exact_normalized_hunk_set() {
+        let source = deterministic_large_fixture(1);
+        let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+        let mut prepared = prepare_review(&snapshot).unwrap();
+        let mut batches = spool_model_batches(&mut prepared, 16_000, 4_096, false).unwrap();
+        let receipt = batches
+            .deterministic_bounded_receipt(crate::review::MAX_LARGE_DIFF_SELECTED_BATCHES)
+            .unwrap();
+        let summary_id = receipt
+            .entries
+            .iter()
+            .find_map(|entry| match &entry.disposition {
+                HunkDisposition::Semantic { summary_batch_ids } => Some(summary_batch_ids[0]),
+                _ => None,
+            })
+            .unwrap();
+        let expected = hunk_set_sha256(batches.batch_hunks.get(&summary_id).unwrap());
+        let selected = batches
+            .selected_batches(&BTreeSet::from([summary_id]))
+            .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert!(selected[0].contains(&format!(
+            "Exact normalized hunk-set commitment (SHA-256): {expected}"
+        )));
+    }
+
+    #[test]
+    fn semantic_receipt_rejects_a_tampered_summary_batch_identity() {
+        let source = deterministic_large_fixture(1);
+        let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+        let mut prepared = prepare_review(&snapshot).unwrap();
+        let mut batches = spool_model_batches(&mut prepared, 16_000, 4_096, false).unwrap();
+        let mut receipt = batches
+            .deterministic_bounded_receipt(crate::review::MAX_LARGE_DIFF_SELECTED_BATCHES)
+            .unwrap();
+        let direct_id = receipt
+            .entries
+            .iter()
+            .find_map(|entry| match &entry.disposition {
+                HunkDisposition::Direct { batch_ids } => Some(batch_ids[0]),
+                _ => None,
+            })
+            .unwrap();
+        let semantic = receipt
+            .entries
+            .iter_mut()
+            .find(|entry| matches!(entry.disposition, HunkDisposition::Semantic { .. }))
+            .unwrap();
+        semantic.disposition = HunkDisposition::Semantic {
+            summary_batch_ids: vec![direct_id],
+        };
+        receipt.selected_batch_ids.insert(direct_id);
+        let error = batches.validate_coverage_receipt(&receipt).unwrap_err();
+        assert!(error.to_string().contains("wrong evidence batch kind"));
+    }
+
+    #[test]
+    fn deterministic_large_plan_rejects_an_unselected_security_hunk() {
+        let source = deterministic_large_fixture(25);
+        let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+        let mut prepared = prepare_review(&snapshot).unwrap();
+        let mut batches = spool_model_batches(&mut prepared, 16_000, 4_096, false).unwrap();
+        let error = batches
+            .deterministic_bounded_receipt(crate::review::MAX_LARGE_DIFF_SELECTED_BATCHES)
+            .unwrap_err();
+        assert!(error.to_string().contains("mandatory hunk"));
+        assert!(error.to_string().contains("cannot fit"));
     }
 
     #[test]

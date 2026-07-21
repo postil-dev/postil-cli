@@ -227,6 +227,13 @@ export const envelopeV1 = z.object({
     selectedBatches: z.number().int().nonnegative(),
     totalBatches: z.number().int().nonnegative(),
     plannerFallback: z.boolean().default(false),
+    receipt: z.object({
+      planSha256: z.string().regex(/^[0-9a-f]{64}$/u),
+      totalHunks: z.number().int().nonnegative(),
+      directHunks: z.number().int().nonnegative(),
+      semanticHunks: z.number().int().nonnegative(),
+      unreviewedHunks: z.number().int().nonnegative(),
+    }).optional(),
   }).optional(),
   reviewAdmission: z.object({
     providerAttempts: z.number().int().nonnegative(),
@@ -952,7 +959,19 @@ function evaluateEnvelope(c: BenchmarkCase, env: Envelope, exitCode: number | un
       failures.push("bounded review did not complete a non-fallback planner selection");
     }
     const plannerUsage = env.modelUsage?.filter((usage) => usage.role === "reviewPlanner") ?? [];
-    if (plannerUsage.length !== 1) {
+    const receipt = env.reviewCoverage?.receipt;
+    if (receipt !== undefined) {
+      if (
+        receipt.totalHunks !==
+          receipt.directHunks + receipt.semanticHunks + receipt.unreviewedHunks ||
+        receipt.unreviewedHunks !== 0
+      ) {
+        failures.push("deterministic bounded review receipt is incomplete");
+      }
+      if (plannerUsage.length !== 0) {
+        failures.push(`deterministic bounded review recorded ${plannerUsage.length} planner usage event(s)`);
+      }
+    } else if (plannerUsage.length !== 1) {
       failures.push(`bounded review recorded ${plannerUsage.length} planner usage event(s), expected 1`);
     }
   }

@@ -355,6 +355,7 @@ mod tests {
                 selected_batches: 5,
                 total_batches: 8,
                 planner_fallback: true,
+                receipt: None,
             }),
             review_admission: Some(ReviewAdmission {
                 provider_attempts: 3,
@@ -496,6 +497,7 @@ mod tests {
                 selected_batches: 5,
                 total_batches: 21,
                 planner_fallback: true,
+                receipt: None,
             }),
             review_admission: None,
             usage_accounting_complete: true,
@@ -525,6 +527,7 @@ mod tests {
                 selected_batches: 5,
                 total_batches: 21,
                 planner_fallback: true,
+                receipt: None,
             }),
             "coverage: 5 source batches reviewed directly; 16 not reviewed directly (21 total; planner fallback: yes)\n"
         );
@@ -534,6 +537,7 @@ mod tests {
                 selected_batches: 7,
                 total_batches: 7,
                 planner_fallback: false,
+                receipt: None,
             }),
             "coverage: 7 source batches reviewed directly (exhaustive; planner fallback: no)\n"
         );

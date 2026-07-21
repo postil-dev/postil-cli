@@ -290,12 +290,19 @@ export function scoreLiveCase(args: {
   const coverage = env.reviewCoverage;
   const boundedCoverage = coverage?.mode === "bounded";
   const plannerUsage = modelUsage.filter((entry) => entry.role === "reviewPlanner");
+  const deterministicReceiptValid = coverage?.receipt !== undefined &&
+    coverage.receipt.totalHunks ===
+      coverage.receipt.directHunks +
+        coverage.receipt.semanticHunks +
+        coverage.receipt.unreviewedHunks &&
+    coverage.receipt.unreviewedHunks === 0 && plannerUsage.length === 0;
   const coverageValid = coverage !== undefined &&
     coverage.totalBatches > 0 &&
     coverage.selectedBatches > 0 &&
     coverage.selectedBatches <= coverage.totalBatches &&
     (coverage.mode === "bounded"
-      ? coverage.selectedBatches < coverage.totalBatches && plannerUsage.length > 0
+      ? coverage.selectedBatches < coverage.totalBatches &&
+        (deterministicReceiptValid || (coverage.receipt === undefined && plannerUsage.length > 0))
       : coverage.selectedBatches === coverage.totalBatches && !coverage.plannerFallback && plannerUsage.length === 0) &&
     (c.admission.expectedCoverage === undefined || coverage.mode === c.admission.expectedCoverage);
   const usageValid =

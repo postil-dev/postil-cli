@@ -789,7 +789,20 @@ export function boundedCoverageFailure(
     if (coverage.plannerFallback) {
       return "bounded review used planner fallback";
     }
-    if (plannerUsage !== 1) {
+    if (coverage.receipt !== undefined) {
+      if (plannerUsage !== 0) {
+        return `deterministic bounded review recorded ${plannerUsage} planner usage event(s)`;
+      }
+      if (
+        coverage.receipt.totalHunks !==
+          coverage.receipt.directHunks +
+            coverage.receipt.semanticHunks +
+            coverage.receipt.unreviewedHunks ||
+        coverage.receipt.unreviewedHunks !== 0
+      ) {
+        return "deterministic bounded review receipt is incomplete";
+      }
+    } else if (plannerUsage !== 1) {
       return `bounded review recorded ${plannerUsage} planner usage event(s), expected 1`;
     }
   } else if (coverage.selectedBatches !== coverage.totalBatches || plannerUsage !== 0) {

@@ -59,7 +59,7 @@ function boundedScorerFixture() {
   const ordinaryFile = (ordinal: number) => {
     const path = `src/ordinary/segment-${ordinal}.ts`;
     const lines = Array.from(
-      { length: 2_200 },
+      { length: 200 },
       (_, line) => ordinal === 0 && line === 0
         ? "+export const accessPermissionLabel = 'Account access'; // ordinary display copy"
         : `+export const ordinary_${ordinal}_${line} = ${ordinal + line}; // ordinary source behavior`,
