@@ -63,7 +63,11 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   authorization, configuration, policy, billing, migration, release-control, and
   executable vendor hunks require direct source evidence. Exact-evidence summaries are
   limited to supported dependency metadata, provenance-bound generated output, and
-  low-risk non-security churn. Missing or invalid receipt coverage fails closed.
+  low-risk non-security churn. Missing or invalid receipt coverage fails closed. When
+  `POSTIL_LARGE_REVIEW_PLAN_ENDPOINT` and `POSTIL_LARGE_REVIEW_PLAN_TOKEN` are set, the
+  CLI registers a versioned deterministic request plan with the authenticated loopback
+  endpoint before any provider call. A missing, rejected, or unreachable registration
+  stops the review.
   Smaller hosted reviews use a
   bounded, schema-validated planner over deterministic candidate digests, always
   including boundary, high-risk, and global-synthesis evidence. A planner outage or

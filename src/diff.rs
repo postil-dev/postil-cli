@@ -958,6 +958,14 @@ pub struct ModelBatchSpool {
     metadata_batch_ids: BTreeSet<usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableRequestPlan {
+    pub plan_sha256: String,
+    pub direct_hunks: usize,
+    pub selected_batches: usize,
+    pub total_batches: usize,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct HunkRisk {
     mandatory: bool,
@@ -992,6 +1000,49 @@ fn sanitize_planner_evidence(value: &str) -> String {
 impl ModelBatchSpool {
     pub fn next_batch(&mut self) -> Result<Option<String>> {
         read_length_prefixed(&mut self.file, "model batch")
+    }
+
+    /// Stable identity for the complete provider-request inventory. Reviews
+    /// without a deterministic bounded receipt register this exhaustive plan
+    /// before any planner, review, or scorer request reaches the worker proxy.
+    pub fn durable_request_plan(&mut self) -> Result<DurableRequestPlan> {
+        self.file
+            .seek(SeekFrom::Start(0))
+            .context("rewinding model batches for durable plan registration")?;
+        let plan = (|| -> Result<DurableRequestPlan> {
+            let mut hasher = Sha256::new();
+            hasher.update(b"postil-durable-request-plan-v1\0");
+            let mut batch_id = 0usize;
+            while let Some(batch) = read_length_prefixed(&mut self.file, "durable plan batch")? {
+                batch_id = batch_id
+                    .checked_add(1)
+                    .context("durable plan batch id overflowed")?;
+                hasher.update((batch_id as u64).to_le_bytes());
+                hasher.update((batch.len() as u64).to_le_bytes());
+                hasher.update(batch.as_bytes());
+            }
+            anyhow::ensure!(
+                batch_id == self.count,
+                "durable plan batch inventory changed during registration"
+            );
+            Ok(DurableRequestPlan {
+                plan_sha256: hasher
+                    .finalize()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect(),
+                direct_hunks: self.all_hunks.len(),
+                selected_batches: batch_id,
+                total_batches: batch_id,
+            })
+        })();
+        let rewind = self
+            .file
+            .seek(SeekFrom::Start(0))
+            .context("rewinding model batches after durable plan registration");
+        let plan = plan?;
+        rewind?;
+        Ok(plan)
     }
 
     pub fn hosted_candidates(
@@ -5157,6 +5208,27 @@ diff --git a/two.rs b/two.rs
         batches
             .deterministic_bounded_receipt(crate::review::MAX_LARGE_DIFF_SELECTED_BATCHES)
             .unwrap()
+    }
+
+    fn durable_request_plan_for(source: &str) -> DurableRequestPlan {
+        let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+        let mut prepared = prepare_review(&snapshot).unwrap();
+        let mut batches = spool_model_batches(&mut prepared, 16_000, 4_096, false).unwrap();
+        batches.durable_request_plan().unwrap()
+    }
+
+    #[test]
+    fn ordinary_request_plan_is_stable_and_binds_the_complete_batch_inventory() {
+        let source = deterministic_large_fixture(1);
+        let first = durable_request_plan_for(&source);
+        let second = durable_request_plan_for(&source);
+        let changed =
+            durable_request_plan_for(&source.replace("const value = 1", "const value = 2"));
+
+        assert_eq!(first, second);
+        assert_ne!(first.plan_sha256, changed.plan_sha256);
+        assert_eq!(first.selected_batches, first.total_batches);
+        assert!(first.direct_hunks > 0);
     }
 
     #[test]
