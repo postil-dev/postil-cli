@@ -1723,7 +1723,7 @@ fn qualification_candidate_admits_fixture_51_shape_at_fireworks_price_bounds() {
     // ceiling used by runtime for each generator request.
     assert_eq!(
         envelope["reviewAdmission"]["outputTokens"],
-        12_000 + 4_000 + 3_136
+        12_000 + 8_000 + 3_136
     );
     assert!(
         envelope["reviewAdmission"]["serializedInputBytes"]
@@ -3233,7 +3233,7 @@ async fn bounded_synthesis_repairs_source_exact_evidence_without_relaxing_valida
         let body: Value = request.body_json().unwrap();
         let serialized = String::from_utf8_lossy(&request.body);
         let expected = if serialized.contains("bounded synthesis window") {
-            2_000
+            4_000
         } else {
             8_000
         };
@@ -6563,6 +6563,60 @@ async fn exhausted_reasoning_budget_expands_the_same_model_retry() {
     assert!(stderr.contains("reasoning_tokens=8000"));
 
     let requests = server.received_requests().await.unwrap();
+    let max_tokens = requests
+        .iter()
+        .map(|request| {
+            request.body_json::<Value>().unwrap()["max_tokens"]
+                .as_u64()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(max_tokens, vec![8_000, 16_000]);
+}
+
+#[tokio::test]
+async fn repeated_exhausted_reasoning_budget_does_not_consume_an_empty_retry() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("primary-model"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "finish_reason": "length",
+                "message": {"content": null, "reasoning": "budget exhausted"}
+            }],
+            "usage": {
+                "prompt_tokens": 4_194,
+                "completion_tokens": 8_000,
+                "completion_tokens_details": {"reasoning_tokens": 8_000}
+            }
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "primary-model")
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .code(1);
+
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["findings"][0]["path"], ".postil/model-output");
+    assert_eq!(envelope["modelUsage"].as_array().unwrap().len(), 2);
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(stderr.contains("retrying the complete request with 16000 tokens"));
+    assert!(!stderr.contains("returned empty content"));
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
     let max_tokens = requests
         .iter()
         .map(|request| {

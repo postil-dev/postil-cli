@@ -3244,6 +3244,13 @@ impl LlmClient {
                     .into_iter()
                     .next()
                     .ok_or_else(|| anyhow::Error::new(ModelContentFailure::MissingChoices))?;
+                if let Some(reason) = choice.finish_reason.as_deref()
+                    && reason != "stop"
+                {
+                    return Err(anyhow::Error::new(ModelContentFailure::NonTerminal {
+                        reason: reason.to_string(),
+                    }));
+                }
                 let content = choice
                     .message
                     .content
