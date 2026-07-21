@@ -66,10 +66,10 @@ export class ManagedRequestWindowGovernor {
   }
 
   async observeRetryAfter(value: string | null): Promise<void> {
-    const now = this.#now();
-    const delay = parseRetryAfterMillis(value, now, this.retryAfterCapMs);
-    if (delay === null) return;
     await this.#exclusive(() => {
+      const now = this.#now();
+      const delay = parseRetryAfterMillis(value, now, this.retryAfterCapMs);
+      if (delay === null) return;
       this.#blockedUntil = Math.max(this.#blockedUntil, now + delay);
     });
   }

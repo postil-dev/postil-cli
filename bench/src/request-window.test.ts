@@ -47,6 +47,27 @@ describe("managed request-window governor", () => {
     expect(parseRetryAfterMillis("invalid", now)).toBeNull();
   });
 
+  test("starts a numeric Retry-After window only after entering the governor mutex", async () => {
+    let now = 100;
+    const sleeps: number[] = [];
+    const governor = new ManagedRequestWindowGovernor({
+      maxStarts: 10,
+      windowMs: 1,
+      now: () => now,
+      sleep: async (milliseconds) => {
+        sleeps.push(milliseconds);
+        now += milliseconds;
+      },
+    });
+
+    const observation = governor.observeRetryAfter("1");
+    now = 500;
+    await observation;
+    await governor.acquire();
+
+    expect(sleeps).toEqual([1_000]);
+  });
+
   test("proxies approved requests through one real shared window", async () => {
     const starts: number[] = [];
     const authorizations: Array<string | null> = [];
