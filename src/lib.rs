@@ -17,6 +17,7 @@ pub mod local;
 pub mod output;
 pub mod plan;
 pub mod prompt;
+pub(crate) mod resolve;
 pub mod respond;
 pub mod review;
 pub mod sarif;

@@ -147,6 +147,10 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
                     postil_cli::config::OnClean::Comment => "comment",
                 }
             );
+            println!(
+                "review.uncertaintyResolution: {}",
+                cfg.uncertainty_resolution
+            );
             println!("gate.failOn: {}", cfg.gate_fail_on.as_str());
             println!(
                 "gate.onError: {}",

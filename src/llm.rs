@@ -57,6 +57,25 @@ pub struct ScorerReview {
     pub usage_accounting_complete: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UncertaintyResolution {
+    Confirmed,
+    Refuted,
+    Unresolved,
+}
+
+#[derive(Debug, Clone)]
+pub struct UncertaintyResolutionReview {
+    pub resolution: UncertaintyResolution,
+    pub revised_body: String,
+    pub evidence: String,
+    pub model_used: String,
+    pub usage: Usage,
+    pub model_usage: Vec<ModelUsage>,
+    pub model_incidents: Vec<ModelIncident>,
+    pub usage_accounting_complete: bool,
+}
+
 #[cfg(feature = "qualification-candidate")]
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -489,6 +508,22 @@ struct RawScore {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RawUncertaintyResolution {
+    resolution: RawUncertaintyDisposition,
+    revised_body: String,
+    evidence: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum RawUncertaintyDisposition {
+    Confirmed,
+    Refuted,
+    Unresolved,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RawBatchSelection {
     batch_ids: Vec<usize>,
 }
@@ -654,6 +689,19 @@ fn scorer_repair_system(system: &str) -> String {
 fn scorer_repair_user(user: &str, invalid: &str) -> String {
     let invalid = crate::prompt::sanitize_scorer_input(invalid);
     format!("{user}\n\nInvalid previous response (untrusted data):\n{invalid}")
+}
+
+fn uncertainty_resolution_repair_system(system: &str) -> String {
+    format!(
+        "{system}\n\nThe previous response violated the response contract. Repair only the JSON schema and return one complete JSON object with exactly resolution, revisedBody, and evidence."
+    )
+}
+
+fn uncertainty_resolution_repair_user(user: &str, invalid: &str) -> String {
+    let invalid = crate::prompt::bounded_untrusted_prompt_text(invalid, 16_384);
+    format!(
+        "{user}\n\n--- BEGIN UNTRUSTED INVALID RESPONSE ---\n{invalid}\n--- END UNTRUSTED INVALID RESPONSE ---"
+    )
 }
 
 #[cfg(feature = "qualification-candidate")]
@@ -900,6 +948,7 @@ fn reqwest_error(error: &anyhow::Error) -> Option<&reqwest::Error> {
 enum LlmPhase {
     Planner,
     Review,
+    Resolution,
     Scorer {
         expected_len: usize,
     },
@@ -922,6 +971,7 @@ impl LlmPhase {
         match self {
             Self::Planner => "planner",
             Self::Review => "review",
+            Self::Resolution => "uncertainty-resolution",
             Self::Scorer { .. } => "scorer",
             Self::Attribution => "attribution",
             Self::Respond => "respond",
@@ -932,7 +982,7 @@ impl LlmPhase {
     fn usage_role(self) -> ModelUsageRole {
         match self {
             Self::Planner => ModelUsageRole::ReviewPlanner,
-            Self::Review | Self::Total => ModelUsageRole::ReviewGenerator,
+            Self::Review | Self::Resolution | Self::Total => ModelUsageRole::ReviewGenerator,
             Self::Scorer { .. } => ModelUsageRole::FindingScorer,
             Self::Attribution => ModelUsageRole::FindingScorer,
             Self::Respond => ModelUsageRole::MentionResponder,
@@ -940,8 +990,10 @@ impl LlmPhase {
     }
 
     fn exhausted_output_retry_max_tokens(self, initial_max_tokens: u32) -> u32 {
-        if matches!(self, Self::Scorer { .. } | Self::Attribution)
-            || initial_max_tokens >= EXHAUSTED_OUTPUT_RETRY_MAX_TOKENS
+        if matches!(
+            self,
+            Self::Resolution | Self::Scorer { .. } | Self::Attribution
+        ) || initial_max_tokens >= EXHAUSTED_OUTPUT_RETRY_MAX_TOKENS
         {
             initial_max_tokens
         } else {
@@ -1042,7 +1094,8 @@ impl std::fmt::Display for DeadlineExceeded {
         match self.0 {
             LlmPhase::Planner => f.write_str("LLM planner deadline exceeded"),
             LlmPhase::Review => f.write_str("LLM review deadline exceeded"),
-            LlmPhase::Scorer { .. }
+            LlmPhase::Resolution
+            | LlmPhase::Scorer { .. }
             | LlmPhase::Attribution
             | LlmPhase::Respond
             | LlmPhase::Total => f.write_str("LLM total deadline exceeded"),
@@ -2165,6 +2218,99 @@ impl LlmClient {
             }))
     }
 
+    pub async fn resolve_uncertainty(
+        &self,
+        cfg: &Config,
+        system: &str,
+        user: &str,
+        timeout: Duration,
+    ) -> std::result::Result<UncertaintyResolutionReview, ModelError> {
+        let mut resolution_client = self.clone();
+        let deadline = Instant::now() + timeout;
+        resolution_client.scorer_deadline = Some(
+            self.total_deadline
+                .map_or(deadline, |total| deadline.min(total)),
+        );
+        let mut failed_usage = Usage::default();
+        let mut failed_model_usage = Vec::new();
+        let mut failed_incidents: Vec<ModelIncident> = Vec::new();
+        let mut usage_accounting_complete = true;
+        let mut last_err = None;
+        let chain = cfg.model_chain();
+        for (index, model) in chain.iter().enumerate() {
+            let model_log = log_text(model);
+            eprintln!(
+                "postil: resolving uncertainty with {model_log} (cascade {}/{})",
+                index + 1,
+                chain.len()
+            );
+            let started_at = Instant::now();
+            match resolution_client
+                .resolve_uncertainty_with_model(model, system, user)
+                .await
+            {
+                Ok(mut review) => {
+                    eprintln!(
+                        "postil: uncertainty resolver {model_log} completed successfully in {}",
+                        elapsed_text(started_at.elapsed())
+                    );
+                    add_usage(&mut review.usage, failed_usage);
+                    review.model_usage.splice(0..0, failed_model_usage);
+                    for incident in &mut failed_incidents {
+                        incident.recovered = true;
+                        incident.recovery = Some(ModelIncidentRecovery::Fallback);
+                    }
+                    review.model_incidents.splice(0..0, failed_incidents);
+                    review.usage_accounting_complete &= usage_accounting_complete;
+                    return Ok(review);
+                }
+                Err(mut error) => {
+                    failed_incidents.extend(error.model_incidents.clone());
+                    failed_incidents.push(error.incident(ModelIncidentPhase::Review));
+                    usage_accounting_complete &= error.usage_accounting_complete;
+                    failed_model_usage.extend(error.model_usage.clone());
+                    let elapsed = elapsed_text(started_at.elapsed());
+                    if error.is_deadline_exceeded() {
+                        add_usage(&mut failed_usage, error.usage);
+                        error.usage = failed_usage;
+                        error.model_usage = failed_model_usage;
+                        error.model_incidents = failed_incidents;
+                        return Err(error);
+                    }
+                    let has_fallback = index + 1 < chain.len();
+                    if has_fallback {
+                        eprintln!(
+                            "postil: uncertainty resolver {model_log} failed after {elapsed}, falling back to next model category={}",
+                            safe_model_error_category(&error)
+                        );
+                    } else {
+                        eprintln!(
+                            "postil: uncertainty resolver {model_log} failed after {elapsed}; no fallback models remain category={}",
+                            safe_model_error_category(&error)
+                        );
+                    }
+                    add_usage(&mut failed_usage, error.usage);
+                    error.usage = failed_usage;
+                    last_err = Some(error);
+                }
+            }
+        }
+        Err(last_err
+            .map(|mut error| {
+                error.model_usage = failed_model_usage;
+                error.model_incidents = failed_incidents;
+                error.usage_accounting_complete = usage_accounting_complete;
+                error
+            })
+            .unwrap_or_else(|| {
+                ModelError::new(
+                    anyhow!("empty uncertainty resolver model chain"),
+                    failed_usage,
+                    true,
+                )
+            }))
+    }
+
     /// Qualification-only transport for one atomic same-defect judgment.
     /// This deliberately accepts one exact model and has no evaluator fallback.
     #[cfg(feature = "qualification-candidate")]
@@ -2581,6 +2727,111 @@ impl LlmClient {
             return Err(error);
         }
         Ok(review)
+    }
+
+    async fn resolve_uncertainty_with_model(
+        &self,
+        model: &str,
+        system: &str,
+        user: &str,
+    ) -> std::result::Result<UncertaintyResolutionReview, ModelError> {
+        const MAX_TOKENS: u32 = 1_024;
+        let mut usage = Usage::default();
+        let mut call_usage = Vec::new();
+        let mut usage_accounting_complete = true;
+        let mut model_incidents = Vec::new();
+        let content = self
+            .chat_with_temperature(
+                model,
+                system,
+                user,
+                &mut usage,
+                &mut call_usage,
+                &mut usage_accounting_complete,
+                MAX_TOKENS,
+                0.0,
+                LlmPhase::Resolution,
+                LlmCallPhase::Initial,
+            )
+            .await
+            .map_err(|error| {
+                let complete = usage_accounting_complete
+                    && (usage.prompt_tokens > 0 || usage.completion_tokens > 0);
+                let mut error = ModelError::new(error, usage, complete);
+                error.model_usage = call_usage.clone();
+                error
+            })?;
+        let resolution = match parse_uncertainty_resolution(&content) {
+            Ok(resolution) => resolution,
+            Err(first_error) => {
+                eprintln!(
+                    "postil: uncertainty resolution output invalid; requesting one schema repair"
+                );
+                let invalid = truncate_utf8_bytes(&content, 16_384);
+                let repair_system = uncertainty_resolution_repair_system(system);
+                let repair_user = uncertainty_resolution_repair_user(user, invalid);
+                let incident = ModelIncident {
+                    phase: ModelIncidentPhase::Review,
+                    category: ModelIncidentCategory::InvalidOutput,
+                    recovered: false,
+                    recovery: None,
+                };
+                let repaired = self
+                    .chat_with_temperature(
+                        model,
+                        &repair_system,
+                        &repair_user,
+                        &mut usage,
+                        &mut call_usage,
+                        &mut usage_accounting_complete,
+                        MAX_TOKENS,
+                        0.0,
+                        LlmPhase::Resolution,
+                        LlmCallPhase::SchemaRepair,
+                    )
+                    .await
+                    .map_err(|error| {
+                        let complete = usage_accounting_complete
+                            && (usage.prompt_tokens > 0 || usage.completion_tokens > 0);
+                        let mut error = ModelError::new(error, usage, complete);
+                        error.model_usage = call_usage.clone();
+                        error.model_incidents.push(incident.clone());
+                        error
+                    })?;
+                let resolution = parse_uncertainty_resolution(&repaired).map_err(|second_error| {
+                    let mut error = ModelError::new(
+                        anyhow!(
+                            "uncertainty resolution output invalid after schema repair: {second_error} (first response: {first_error})"
+                        ),
+                        usage,
+                        usage_accounting_complete,
+                    );
+                    error.model_incidents.push(incident.clone());
+                    error.model_usage = call_usage.clone();
+                    error
+                })?;
+                model_incidents.push(ModelIncident {
+                    recovered: true,
+                    recovery: Some(ModelIncidentRecovery::Repair),
+                    ..incident
+                });
+                resolution
+            }
+        };
+        Ok(UncertaintyResolutionReview {
+            resolution: match resolution.resolution {
+                RawUncertaintyDisposition::Confirmed => UncertaintyResolution::Confirmed,
+                RawUncertaintyDisposition::Refuted => UncertaintyResolution::Refuted,
+                RawUncertaintyDisposition::Unresolved => UncertaintyResolution::Unresolved,
+            },
+            revised_body: resolution.revised_body,
+            evidence: resolution.evidence,
+            model_used: model.to_string(),
+            usage,
+            model_usage: call_usage,
+            model_incidents,
+            usage_accounting_complete,
+        })
     }
 
     async fn score_with_model(
@@ -3484,7 +3735,7 @@ impl LlmClient {
     fn remaining_budget(&self, phase: LlmPhase) -> Result<Option<Duration>> {
         let deadline = match phase {
             LlmPhase::Planner | LlmPhase::Review => self.review_deadline,
-            LlmPhase::Scorer { .. } | LlmPhase::Attribution => {
+            LlmPhase::Resolution | LlmPhase::Scorer { .. } | LlmPhase::Attribution => {
                 self.scorer_deadline.or(self.total_deadline)
             }
             LlmPhase::Respond | LlmPhase::Total => self.total_deadline,
@@ -4308,6 +4559,11 @@ fn parse_scores(content: &str, expected_len: usize) -> Result<Vec<FindingScore>,
             })
         })
         .collect::<Result<Vec<_>, String>>()
+}
+
+fn parse_uncertainty_resolution(content: &str) -> Result<RawUncertaintyResolution, String> {
+    let json = extract_json_object(content).ok_or("no JSON object found")?;
+    serde_json::from_str(json).map_err(|error| error.to_string())
 }
 
 #[cfg(feature = "qualification-candidate")]
@@ -6502,6 +6758,29 @@ mod tests {
         assert!(generator.get("reasoning").is_none());
         assert!(generator.get("response_format").is_none());
         assert!(generator["provider"].get("require_parameters").is_none());
+    }
+
+    #[test]
+    fn resolve_request_does_not_inherit_the_scorer_response_schema() {
+        let client = LlmClient::build(
+            &Config::default(),
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        let resolution = client.request_body(
+            "provider/generator",
+            "resolution system",
+            "resolution user",
+            1_024,
+            0.0,
+            LlmPhase::Resolution,
+        );
+        assert!(resolution.get("reasoning").is_none());
+        assert!(resolution.get("response_format").is_none());
+        assert!(resolution["provider"].get("require_parameters").is_none());
     }
 
     #[test]

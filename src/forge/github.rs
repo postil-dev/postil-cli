@@ -766,6 +766,18 @@ impl GitHub {
         Ok((snapshot, byte_count))
     }
 
+    pub(crate) async fn fetch_repository_file_at_revision(
+        &self,
+        revision: &str,
+        path: &str,
+    ) -> Result<String> {
+        let (snapshot, _) = self
+            .source_file(revision, path, WorkspaceBudget::new())
+            .await?;
+        String::from_utf8(snapshot.as_bytes().to_vec())
+            .context("GitHub repository file is not valid UTF-8")
+    }
+
     async fn build_complete_diff(
         &self,
         files: Vec<PullFile>,
@@ -2067,6 +2079,38 @@ mod tests {
             pr: 1,
             expected_repository_id: None,
         }
+    }
+
+    #[tokio::test]
+    async fn fetch_repository_file_at_revision_returns_text_and_rejects_binary() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/contents/config/review.toml"))
+            .and(query_param("ref", "abc123"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("enabled = true\n"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/contents/assets/data.bin"))
+            .and(query_param("ref", "def456"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0xff, 0xfe]))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let github = test_github(&server);
+
+        let text = github
+            .fetch_repository_file_at_revision("abc123", "config/review.toml")
+            .await
+            .unwrap();
+        assert_eq!(text, "enabled = true\n");
+
+        let error = github
+            .fetch_repository_file_at_revision("def456", "assets/data.bin")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not valid UTF-8"));
     }
 
     async fn mount_current_delivery_snapshot(server: &MockServer) {

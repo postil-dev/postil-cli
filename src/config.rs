@@ -924,6 +924,7 @@ pub struct Config {
     pub tone: String,
     pub focus: Vec<String>,
     pub on_clean: OnClean,
+    pub uncertainty_resolution: bool,
     pub gate_fail_on: GateLevel,
     /// Gate behavior on operational error. Default: fail closed.
     pub gate_on_error: OnError,
@@ -968,6 +969,7 @@ impl Default for Config {
             tone: "concise, dry, lightly sardonic, never hostile; no praise or filler".to_string(),
             focus: Vec::new(),
             on_clean: OnClean::Skip,
+            uncertainty_resolution: false,
             gate_fail_on: GateLevel::Severity(Severity::Error),
             gate_on_error: OnError::Block,
             block_on_kinds: vec![Kind::HumanEscalation],
@@ -1015,6 +1017,7 @@ pub struct ReviewerSection {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ReviewSection {
     pub on_clean: Option<OnClean>,
+    pub uncertainty_resolution: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -1158,10 +1161,13 @@ impl Config {
                 self.focus = fo;
             }
         }
-        if let Some(r) = f.review
-            && let Some(oc) = r.on_clean
-        {
-            self.on_clean = oc;
+        if let Some(r) = f.review {
+            if let Some(oc) = r.on_clean {
+                self.on_clean = oc;
+            }
+            if let Some(enabled) = r.uncertainty_resolution {
+                self.uncertainty_resolution = enabled;
+            }
         }
         if let Some(g) = f.gate {
             if let Some(fo) = g.fail_on {
@@ -1282,6 +1288,17 @@ impl Config {
     }
 
     fn apply_env(&mut self) -> Result<()> {
+        if let Ok(value) = std::env::var("POSTIL_UNCERTAINTY_RESOLUTION")
+            && !value.trim().is_empty()
+        {
+            self.uncertainty_resolution = match value.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" => true,
+                "0" | "false" => false,
+                _ => anyhow::bail!(
+                    "POSTIL_UNCERTAINTY_RESOLUTION must be 1, true, 0, or false (got {value:?})"
+                ),
+            };
+        }
         if hosted_mode() {
             if let Some(profile) = admitted_profile_for(model_defaults(), qualification_manifest())
             {
@@ -1898,6 +1915,7 @@ reviewer:
 
 review:
   onClean: skip           # skip = stay silent on clean PRs (default) | comment
+  uncertaintyResolution: false # fetch referenced repository files to resolve uncertainty findings
 
 gate:
   failOn: error           # the postil/gate check fails at/above: info | warn | error | never
@@ -2001,6 +2019,45 @@ style linter.";
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::Mutex;
+
+    struct EnvRestore {
+        name: &'static str,
+        value: Option<std::ffi::OsString>,
+    }
+
+    impl EnvRestore {
+        fn capture(name: &'static str) -> Self {
+            Self {
+                name,
+                value: std::env::var_os(name),
+            }
+        }
+
+        fn set(name: &str, value: &str) {
+            unsafe {
+                std::env::set_var(name, value);
+            }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match &self.value {
+                Some(value) => unsafe {
+                    std::env::set_var(self.name, value);
+                },
+                None => unsafe {
+                    std::env::remove_var(self.name);
+                },
+            }
+        }
+    }
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     fn write(dir: &Path, name: &str, content: &str) {
         let mut f = std::fs::File::create(dir.join(name)).unwrap();
@@ -2241,10 +2298,52 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
         let c = Config::default();
         assert_eq!(c.min_confidence, 0.6);
         assert_eq!(c.on_clean, OnClean::Skip);
+        assert!(!c.uncertainty_resolution);
         assert!(matches!(
             c.gate_fail_on,
             GateLevel::Severity(Severity::Error)
         ));
+    }
+
+    #[test]
+    fn file_enables_uncertainty_resolution() {
+        let file: FileConfig =
+            yaml_serde::from_str("review:\n  uncertaintyResolution: true\n").unwrap();
+        let mut config = Config::default();
+        config.apply_file_inner(file, false, false).unwrap();
+        assert!(config.uncertainty_resolution);
+    }
+
+    #[test]
+    fn uncertainty_resolution_env_accepts_booleans_and_rejects_invalid_values() {
+        const NAME: &str = "POSTIL_UNCERTAINTY_RESOLUTION";
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvRestore::capture(NAME);
+
+        for value in ["1", "true", "TRUE"] {
+            EnvRestore::set(NAME, value);
+            let mut config = Config::default();
+            config.apply_env().unwrap();
+            assert!(config.uncertainty_resolution, "value {value:?}");
+        }
+
+        for value in ["0", "false", "FALSE"] {
+            EnvRestore::set(NAME, value);
+            let mut config = Config {
+                uncertainty_resolution: true,
+                ..Config::default()
+            };
+            config.apply_env().unwrap();
+            assert!(!config.uncertainty_resolution, "value {value:?}");
+        }
+
+        EnvRestore::set(NAME, "sometimes");
+        let error = Config::default().apply_env().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("POSTIL_UNCERTAINTY_RESOLUTION must be 1, true, 0, or false")
+        );
     }
 
     #[test]
