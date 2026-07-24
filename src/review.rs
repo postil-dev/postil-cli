@@ -1912,6 +1912,12 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                         model_usage.extend(resolution.model_usage);
                         model_incidents.extend(resolution.model_incidents);
                         usage_accounting_complete &= resolution.usage_accounting_complete;
+                        let brevity =
+                            crate::brevity::compress_findings(cfg, &client, &mut kept).await;
+                        add_usage(&mut usage, brevity.usage);
+                        model_usage.extend(brevity.model_usage);
+                        model_incidents.extend(brevity.model_incidents);
+                        usage_accounting_complete &= brevity.usage_accounting_complete;
                         findings = kept;
                     }
                 }

@@ -732,6 +732,7 @@ fn postil() -> Command {
         .env_remove("REVIEW_SCORER_MODEL_CASCADE")
         .env_remove("POSTIL_DISABLE_SCORER")
         .env_remove("POSTIL_UNCERTAINTY_RESOLUTION")
+        .env_remove("POSTIL_CONCISE_FINDINGS")
         .env_remove("POSTIL_HOSTED_MODE")
         .env_remove("POSTIL_EXPECTED_GITHUB_REPO_ID")
         .env_remove("POSTIL_QUALIFICATION_CANDIDATE_PROFILE")
@@ -3726,6 +3727,25 @@ async fn mock_uncertainty_resolution(
         .await;
 }
 
+async fn mock_finding_compression(
+    server: &MockServer,
+    model: &str,
+    content: &str,
+    expected_calls: u64,
+) {
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains(format!("\"model\":\"{model}\"")))
+        .and(body_string_contains(
+            "You rewrite one over-long code-review finding body",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_text(content)))
+        .with_priority(1)
+        .expect(expected_calls)
+        .mount(server)
+        .await;
+}
+
 #[test]
 fn hosted_config_ignores_repository_model_provider_and_scorer() {
     let dir = tempfile::tempdir().unwrap();
@@ -4993,6 +5013,19 @@ fn uncertainty_finding(body: &str) -> Value {
     })
 }
 
+fn concise_finding(body: &str) -> Value {
+    json!({
+        "path": "src/auth.rs",
+        "line": 41,
+        "severity": "warn",
+        "kind": "risk",
+        "confidence": 0.9,
+        "title": "Retry bypasses the idempotency guard",
+        "body": body,
+        "evidence": "let token = format!(\"{}\", user_input);"
+    })
+}
+
 fn enable_uncertainty_resolution(directory: &std::path::Path) {
     std::fs::write(
         directory.join(".postil.yaml"),
@@ -5248,6 +5281,162 @@ async fn uncertainty_resolution_explicit_off_makes_no_resolution_call() {
     let envelope: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
     assert_eq!(envelope["findings"][0]["body"], original_body);
     assert_eq!(envelope["counts"]["suppressed"], 0);
+}
+
+#[tokio::test]
+async fn concise_findings_compresses_an_overlong_body_and_preserves_other_fields() {
+    let server = MockServer::start().await;
+    let original_body =
+        "The retry bypasses the idempotency guard and can duplicate the transaction. "
+            .repeat(9)
+            .trim_end()
+            .to_string();
+    let compressed_body = "The retry bypasses the idempotency guard and can duplicate the transaction. Restore the guard before retrying the operation.";
+    let original_finding = concise_finding(&original_body);
+    mock_review_model(
+        &server,
+        "generator-model",
+        json!([original_finding.clone()]),
+    )
+    .await;
+    mock_finding_compression(
+        &server,
+        "generator-model",
+        &json!({"body": compressed_body}).to_string(),
+        1,
+    )
+    .await;
+
+    let directory = tempfile::tempdir().unwrap();
+    let diff = write_diff(directory.path());
+    let output = postil()
+        .current_dir(directory.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "generator-model")
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+
+    let envelope: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    let finding = &envelope["findings"][0];
+    assert_eq!(finding["body"], compressed_body);
+    let mut actual_other_fields = finding.as_object().unwrap().clone();
+    actual_other_fields.remove("body");
+    assert!(actual_other_fields.remove("id").is_some());
+    let mut expected_other_fields = original_finding.as_object().unwrap().clone();
+    expected_other_fields.remove("body");
+    assert_eq!(actual_other_fields, expected_other_fields);
+    assert_eq!(envelope["modelUsage"].as_array().unwrap().len(), 2);
+    assert_model_usage_matches_aggregate(&envelope);
+}
+
+#[tokio::test]
+async fn concise_findings_malformed_response_preserves_the_original_body() {
+    let server = MockServer::start().await;
+    let original_body =
+        "The retry bypasses the idempotency guard and can duplicate the transaction. "
+            .repeat(9)
+            .trim_end()
+            .to_string();
+    mock_review_model(
+        &server,
+        "generator-model",
+        json!([concise_finding(&original_body)]),
+    )
+    .await;
+    mock_finding_compression(&server, "generator-model", "{not valid JSON", 1).await;
+
+    let directory = tempfile::tempdir().unwrap();
+    let diff = write_diff(directory.path());
+    let output = postil()
+        .current_dir(directory.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "generator-model")
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+
+    let envelope: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    assert_eq!(envelope["findings"][0]["body"], original_body);
+    assert_eq!(envelope["modelUsage"].as_array().unwrap().len(), 2);
+    assert_model_usage_matches_aggregate(&envelope);
+}
+
+#[tokio::test]
+async fn concise_findings_explicit_off_makes_no_compression_call() {
+    let server = MockServer::start().await;
+    let original_body =
+        "The retry bypasses the idempotency guard and can duplicate the transaction. "
+            .repeat(9)
+            .trim_end()
+            .to_string();
+    mock_review_model(
+        &server,
+        "generator-model",
+        json!([concise_finding(&original_body)]),
+    )
+    .await;
+    mock_finding_compression(&server, "generator-model", r#"{"body":"unused"}"#, 0).await;
+
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join(".postil.yaml"),
+        "review:\n  conciseFindings: false\n",
+    )
+    .unwrap();
+    let diff = write_diff(directory.path());
+    let output = postil()
+        .current_dir(directory.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "generator-model")
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+
+    let envelope: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    assert_eq!(envelope["findings"][0]["body"], original_body);
+    assert_eq!(envelope["modelUsage"].as_array().unwrap().len(), 1);
+    assert_model_usage_matches_aggregate(&envelope);
+}
+
+#[tokio::test]
+async fn concise_findings_short_body_makes_no_compression_call_by_default() {
+    let server = MockServer::start().await;
+    let original_body = "The retry bypasses the idempotency guard.";
+    mock_review_model(
+        &server,
+        "generator-model",
+        json!([concise_finding(original_body)]),
+    )
+    .await;
+    mock_finding_compression(&server, "generator-model", r#"{"body":"unused"}"#, 0).await;
+
+    let directory = tempfile::tempdir().unwrap();
+    let diff = write_diff(directory.path());
+    let output = postil()
+        .current_dir(directory.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "generator-model")
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+
+    let envelope: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    assert_eq!(envelope["findings"][0]["body"], original_body);
+    assert_eq!(envelope["modelUsage"].as_array().unwrap().len(), 1);
+    assert_model_usage_matches_aggregate(&envelope);
 }
 
 #[tokio::test]

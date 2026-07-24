@@ -76,6 +76,16 @@ pub struct UncertaintyResolutionReview {
     pub usage_accounting_complete: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct FindingCompressionReview {
+    pub body: String,
+    pub model_used: String,
+    pub usage: Usage,
+    pub model_usage: Vec<ModelUsage>,
+    pub model_incidents: Vec<ModelIncident>,
+    pub usage_accounting_complete: bool,
+}
+
 #[cfg(feature = "qualification-candidate")]
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -515,6 +525,12 @@ struct RawUncertaintyResolution {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFindingCompression {
+    body: String,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum RawUncertaintyDisposition {
     Confirmed,
@@ -949,6 +965,7 @@ enum LlmPhase {
     Planner,
     Review,
     Resolution,
+    Brevity,
     Scorer {
         expected_len: usize,
     },
@@ -972,6 +989,7 @@ impl LlmPhase {
             Self::Planner => "planner",
             Self::Review => "review",
             Self::Resolution => "uncertainty-resolution",
+            Self::Brevity => "finding-compression",
             Self::Scorer { .. } => "scorer",
             Self::Attribution => "attribution",
             Self::Respond => "respond",
@@ -982,7 +1000,9 @@ impl LlmPhase {
     fn usage_role(self) -> ModelUsageRole {
         match self {
             Self::Planner => ModelUsageRole::ReviewPlanner,
-            Self::Review | Self::Resolution | Self::Total => ModelUsageRole::ReviewGenerator,
+            Self::Review | Self::Resolution | Self::Brevity | Self::Total => {
+                ModelUsageRole::ReviewGenerator
+            }
             Self::Scorer { .. } => ModelUsageRole::FindingScorer,
             Self::Attribution => ModelUsageRole::FindingScorer,
             Self::Respond => ModelUsageRole::MentionResponder,
@@ -992,7 +1012,7 @@ impl LlmPhase {
     fn exhausted_output_retry_max_tokens(self, initial_max_tokens: u32) -> u32 {
         if matches!(
             self,
-            Self::Resolution | Self::Scorer { .. } | Self::Attribution
+            Self::Resolution | Self::Brevity | Self::Scorer { .. } | Self::Attribution
         ) || initial_max_tokens >= EXHAUSTED_OUTPUT_RETRY_MAX_TOKENS
         {
             initial_max_tokens
@@ -1095,6 +1115,7 @@ impl std::fmt::Display for DeadlineExceeded {
             LlmPhase::Planner => f.write_str("LLM planner deadline exceeded"),
             LlmPhase::Review => f.write_str("LLM review deadline exceeded"),
             LlmPhase::Resolution
+            | LlmPhase::Brevity
             | LlmPhase::Scorer { .. }
             | LlmPhase::Attribution
             | LlmPhase::Respond
@@ -2311,6 +2332,100 @@ impl LlmClient {
             }))
     }
 
+    pub async fn compress_finding(
+        &self,
+        cfg: &Config,
+        system: &str,
+        user: &str,
+        timeout: Duration,
+    ) -> std::result::Result<FindingCompressionReview, ModelError> {
+        let mut compression_client = self.clone();
+        let deadline = Instant::now() + timeout;
+        compression_client.scorer_deadline = Some(
+            self.total_deadline
+                .map_or(deadline, |total| deadline.min(total)),
+        );
+        let mut failed_usage = Usage::default();
+        let mut failed_model_usage = Vec::new();
+        let mut failed_incidents: Vec<ModelIncident> = Vec::new();
+        let mut usage_accounting_complete = true;
+        let mut last_err = None;
+        let chain = cfg.model_chain();
+        for (index, model) in chain.iter().enumerate() {
+            let model_log = log_text(model);
+            eprintln!(
+                "postil: compressing finding with {model_log} (cascade {}/{})",
+                index + 1,
+                chain.len()
+            );
+            let started_at = Instant::now();
+            match compression_client
+                .compress_finding_with_model(model, system, user)
+                .await
+            {
+                Ok(mut review) => {
+                    eprintln!(
+                        "postil: finding compressor {model_log} completed successfully in {}",
+                        elapsed_text(started_at.elapsed())
+                    );
+                    add_usage(&mut review.usage, failed_usage);
+                    review.model_usage.splice(0..0, failed_model_usage);
+                    for incident in &mut failed_incidents {
+                        incident.recovered = true;
+                        incident.recovery = Some(ModelIncidentRecovery::Fallback);
+                    }
+                    review.model_incidents.splice(0..0, failed_incidents);
+                    review.usage_accounting_complete &= usage_accounting_complete;
+                    return Ok(review);
+                }
+                Err(mut error) => {
+                    failed_incidents.extend(error.model_incidents.clone());
+                    failed_incidents.push(error.incident(ModelIncidentPhase::Review));
+                    usage_accounting_complete &= error.usage_accounting_complete;
+                    failed_model_usage.extend(error.model_usage.clone());
+                    let elapsed = elapsed_text(started_at.elapsed());
+                    if error.is_deadline_exceeded() {
+                        add_usage(&mut failed_usage, error.usage);
+                        error.usage = failed_usage;
+                        error.model_usage = failed_model_usage;
+                        error.model_incidents = failed_incidents;
+                        error.usage_accounting_complete = usage_accounting_complete;
+                        return Err(error);
+                    }
+                    let has_fallback = index + 1 < chain.len();
+                    if has_fallback {
+                        eprintln!(
+                            "postil: finding compressor {model_log} failed after {elapsed}, falling back to next model category={}",
+                            safe_model_error_category(&error)
+                        );
+                    } else {
+                        eprintln!(
+                            "postil: finding compressor {model_log} failed after {elapsed}; no fallback models remain category={}",
+                            safe_model_error_category(&error)
+                        );
+                    }
+                    add_usage(&mut failed_usage, error.usage);
+                    error.usage = failed_usage;
+                    last_err = Some(error);
+                }
+            }
+        }
+        Err(last_err
+            .map(|mut error| {
+                error.model_usage = failed_model_usage;
+                error.model_incidents = failed_incidents;
+                error.usage_accounting_complete = usage_accounting_complete;
+                error
+            })
+            .unwrap_or_else(|| {
+                ModelError::new(
+                    anyhow!("empty finding compressor model chain"),
+                    failed_usage,
+                    true,
+                )
+            }))
+    }
+
     /// Qualification-only transport for one atomic same-defect judgment.
     /// This deliberately accepts one exact model and has no evaluator fallback.
     #[cfg(feature = "qualification-candidate")]
@@ -2830,6 +2945,56 @@ impl LlmClient {
             usage,
             model_usage: call_usage,
             model_incidents,
+            usage_accounting_complete,
+        })
+    }
+
+    async fn compress_finding_with_model(
+        &self,
+        model: &str,
+        system: &str,
+        user: &str,
+    ) -> std::result::Result<FindingCompressionReview, ModelError> {
+        const MAX_TOKENS: u32 = 512;
+        let mut usage = Usage::default();
+        let mut call_usage = Vec::new();
+        let mut usage_accounting_complete = true;
+        let content = self
+            .chat_with_temperature(
+                model,
+                system,
+                user,
+                &mut usage,
+                &mut call_usage,
+                &mut usage_accounting_complete,
+                MAX_TOKENS,
+                0.0,
+                LlmPhase::Brevity,
+                LlmCallPhase::Initial,
+            )
+            .await
+            .map_err(|error| {
+                let complete = usage_accounting_complete
+                    && (usage.prompt_tokens > 0 || usage.completion_tokens > 0);
+                let mut error = ModelError::new(error, usage, complete);
+                error.model_usage = call_usage.clone();
+                error
+            })?;
+        let compression = parse_finding_compression(&content).map_err(|error| {
+            let mut model_error = ModelError::new(
+                anyhow!("finding compression output invalid: {error}"),
+                usage,
+                usage_accounting_complete,
+            );
+            model_error.model_usage = call_usage.clone();
+            model_error
+        })?;
+        Ok(FindingCompressionReview {
+            body: compression.body,
+            model_used: model.to_string(),
+            usage,
+            model_usage: call_usage,
+            model_incidents: Vec::new(),
             usage_accounting_complete,
         })
     }
@@ -3735,9 +3900,10 @@ impl LlmClient {
     fn remaining_budget(&self, phase: LlmPhase) -> Result<Option<Duration>> {
         let deadline = match phase {
             LlmPhase::Planner | LlmPhase::Review => self.review_deadline,
-            LlmPhase::Resolution | LlmPhase::Scorer { .. } | LlmPhase::Attribution => {
-                self.scorer_deadline.or(self.total_deadline)
-            }
+            LlmPhase::Resolution
+            | LlmPhase::Brevity
+            | LlmPhase::Scorer { .. }
+            | LlmPhase::Attribution => self.scorer_deadline.or(self.total_deadline),
             LlmPhase::Respond | LlmPhase::Total => self.total_deadline,
         };
         let Some(deadline) = deadline else {
@@ -4566,6 +4732,10 @@ fn parse_uncertainty_resolution(content: &str) -> Result<RawUncertaintyResolutio
     serde_json::from_str(json).map_err(|error| error.to_string())
 }
 
+fn parse_finding_compression(content: &str) -> Result<RawFindingCompression, String> {
+    serde_json::from_str(content.trim()).map_err(|error| error.to_string())
+}
+
 #[cfg(feature = "qualification-candidate")]
 fn parse_atomic_attribution(content: &str) -> Result<RawAtomicAttribution, String> {
     let json = extract_json_object(content).ok_or("no JSON object found")?;
@@ -4819,6 +4989,14 @@ fn consensus_merge(runs: Vec<ModelReview>) -> ModelReview {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn brevity_parser_requires_one_strict_json_object() {
+        assert!(parse_finding_compression(r#"{"body":"short"}"#).is_ok());
+        assert!(parse_finding_compression("prefix\n{\"body\":\"short\"}").is_err());
+        assert!(parse_finding_compression("{\"body\":\"short\"}\nsuffix").is_err());
+        assert!(parse_finding_compression("```json\n{\"body\":\"short\"}\n```").is_err());
+    }
 
     #[test]
     fn validation_retry_includes_the_response_and_failure_to_repair() {
