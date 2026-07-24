@@ -731,6 +731,7 @@ fn postil() -> Command {
         .env_remove("REVIEW_SCORER_MODEL")
         .env_remove("REVIEW_SCORER_MODEL_CASCADE")
         .env_remove("POSTIL_DISABLE_SCORER")
+        .env_remove("POSTIL_UNCERTAINTY_RESOLUTION")
         .env_remove("POSTIL_HOSTED_MODE")
         .env_remove("POSTIL_EXPECTED_GITHUB_REPO_ID")
         .env_remove("POSTIL_QUALIFICATION_CANDIDATE_PROFILE")
@@ -3706,6 +3707,25 @@ async fn mock_scorer_model(server: &MockServer, model: &str, scores: Value) {
         .await;
 }
 
+async fn mock_uncertainty_resolution(
+    server: &MockServer,
+    model: &str,
+    content: &str,
+    expected_calls: u64,
+) {
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains(format!("\"model\":\"{model}\"")))
+        .and(body_string_contains(
+            "You resolve one code-review uncertainty",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_text(content)))
+        .with_priority(1)
+        .expect(expected_calls)
+        .mount(server)
+        .await;
+}
+
 #[test]
 fn hosted_config_ignores_repository_model_provider_and_scorer() {
     let dir = tempfile::tempdir().unwrap();
@@ -4958,6 +4978,229 @@ async fn large_confidence_disagreement_escalates_to_uncertainty_with_default_gat
     assert_eq!(env["findings"][0]["generatorKind"], "risk");
     assert_eq!(env["findings"][0]["scorerKind"], "risk");
     assert_eq!(env["scorerDisagreements"], 1);
+}
+
+fn uncertainty_finding(body: &str) -> Value {
+    json!({
+        "path": "src/auth.rs",
+        "line": 41,
+        "severity": "warn",
+        "kind": "uncertainty",
+        "confidence": 0.9,
+        "title": "Verify the repository-wide caller contract",
+        "body": body,
+        "evidence": "let token = format!(\"{}\", user_input);"
+    })
+}
+
+fn enable_uncertainty_resolution(directory: &std::path::Path) {
+    std::fs::write(
+        directory.join(".postil.yaml"),
+        "review:\n  uncertaintyResolution: true\n",
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn uncertainty_resolution_refuted_with_verbatim_evidence_is_suppressed() {
+    let server = MockServer::start().await;
+    let original_body = "Inspect `src/reference.rs` to determine whether verification is inserted.";
+    mock_review_model(
+        &server,
+        "generator-model",
+        json!([uncertainty_finding(original_body)]),
+    )
+    .await;
+    mock_uncertainty_resolution(
+        &server,
+        "generator-model",
+        &json!({
+            "resolution": "refuted",
+            "revisedBody": "",
+            "evidence": "verification is always inserted"
+        })
+        .to_string(),
+        1,
+    )
+    .await;
+
+    let directory = tempfile::tempdir().unwrap();
+    enable_uncertainty_resolution(directory.path());
+    std::fs::create_dir_all(directory.path().join("src")).unwrap();
+    std::fs::write(
+        directory.path().join("src/reference.rs"),
+        "// verification is always inserted\n",
+    )
+    .unwrap();
+    let diff = write_diff(directory.path());
+    let output = postil()
+        .current_dir(directory.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "generator-model")
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+
+    let envelope: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    assert!(envelope["findings"].as_array().unwrap().is_empty());
+    assert_eq!(envelope["counts"]["suppressed"], 1);
+    assert_eq!(envelope["suppressedFindings"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        envelope["suppressedFindings"][0]["finding"]["body"],
+        original_body
+    );
+    assert_eq!(envelope["suppressedFindings"][0]["reason"], "nonActionable");
+    assert_model_usage_matches_aggregate(&envelope);
+}
+
+#[tokio::test]
+async fn uncertainty_resolution_confirmed_replaces_only_the_body() {
+    let server = MockServer::start().await;
+    let original_body = "Inspect `src/reference.rs` to confirm the summary insertion path.";
+    let revised_body =
+        "`src/reference.rs` omits `service_summary` when scheduling the notification job.";
+    mock_review_model(
+        &server,
+        "generator-model",
+        json!([uncertainty_finding(original_body)]),
+    )
+    .await;
+    mock_uncertainty_resolution(
+        &server,
+        "generator-model",
+        &json!({
+            "resolution": "confirmed",
+            "revisedBody": revised_body,
+            "evidence": "service_summary is omitted"
+        })
+        .to_string(),
+        1,
+    )
+    .await;
+
+    let directory = tempfile::tempdir().unwrap();
+    enable_uncertainty_resolution(directory.path());
+    std::fs::create_dir_all(directory.path().join("src")).unwrap();
+    std::fs::write(
+        directory.path().join("src/reference.rs"),
+        "// service_summary is omitted\n",
+    )
+    .unwrap();
+    let diff = write_diff(directory.path());
+    let output = postil()
+        .current_dir(directory.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "generator-model")
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+
+    let envelope: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    let finding = &envelope["findings"][0];
+    assert_eq!(finding["body"], revised_body);
+    assert_eq!(finding["kind"], "uncertainty");
+    assert_eq!(finding["severity"], "warn");
+    assert_eq!(finding["confidence"], 0.9);
+    assert_eq!(finding["path"], "src/auth.rs");
+    assert_eq!(finding["line"], 41);
+    assert_eq!(envelope["counts"]["suppressed"], 0);
+    assert_eq!(envelope["modelUsage"].as_array().unwrap().len(), 2);
+    assert!(
+        envelope["modelUsage"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["role"] == "reviewGenerator")
+    );
+    assert_model_usage_matches_aggregate(&envelope);
+}
+
+#[tokio::test]
+async fn uncertainty_resolution_malformed_response_preserves_original_finding() {
+    let server = MockServer::start().await;
+    let original_body = "Inspect `src/reference.rs` before merging.";
+    mock_review_model(
+        &server,
+        "generator-model",
+        json!([uncertainty_finding(original_body)]),
+    )
+    .await;
+    mock_uncertainty_resolution(&server, "generator-model", "{not valid JSON", 2).await;
+
+    let directory = tempfile::tempdir().unwrap();
+    enable_uncertainty_resolution(directory.path());
+    std::fs::create_dir_all(directory.path().join("src")).unwrap();
+    std::fs::write(
+        directory.path().join("src/reference.rs"),
+        "repository evidence\n",
+    )
+    .unwrap();
+    let diff = write_diff(directory.path());
+    let output = postil()
+        .current_dir(directory.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "generator-model")
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+
+    let envelope: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    assert_eq!(envelope["findings"][0]["body"], original_body);
+    assert_eq!(envelope["findings"][0]["kind"], "uncertainty");
+    assert_eq!(envelope["counts"]["suppressed"], 0);
+    assert_eq!(envelope["modelUsage"].as_array().unwrap().len(), 3);
+    assert_model_usage_matches_aggregate(&envelope);
+}
+
+#[tokio::test]
+async fn uncertainty_resolution_is_off_by_default_and_makes_no_resolution_call() {
+    let server = MockServer::start().await;
+    let original_body = "Inspect `src/reference.rs` before merging.";
+    mock_review_model(
+        &server,
+        "generator-model",
+        json!([uncertainty_finding(original_body)]),
+    )
+    .await;
+    mock_uncertainty_resolution(
+        &server,
+        "generator-model",
+        r#"{"resolution":"unresolved","revisedBody":"","evidence":""}"#,
+        0,
+    )
+    .await;
+
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(directory.path().join("src")).unwrap();
+    std::fs::write(
+        directory.path().join("src/reference.rs"),
+        "repository evidence\n",
+    )
+    .unwrap();
+    let diff = write_diff(directory.path());
+    let output = postil()
+        .current_dir(directory.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "generator-model")
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+
+    let envelope: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    assert_eq!(envelope["findings"][0]["body"], original_body);
+    assert_eq!(envelope["counts"]["suppressed"], 0);
 }
 
 #[tokio::test]

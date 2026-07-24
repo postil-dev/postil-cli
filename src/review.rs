@@ -1,6 +1,6 @@
 //! Review orchestration: one engine for local, CI, and hosted runs.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
@@ -22,6 +22,7 @@ use crate::llm::{FindingScore, LlmClient, ReviewValidationFailure, add_usage};
 use crate::local::{self, LocalSource};
 use crate::output::{self, OutputFormat};
 use crate::prompt::{self, PrContext};
+use crate::resolve::RepositorySource;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
@@ -318,11 +319,13 @@ struct ReviewInput<'a> {
     scope: filter::ReconcileScope,
     force_model: bool,
     llm_budget_started_at: Option<Instant>,
+    repository_source: RepositorySource<'a>,
 }
 
 struct RemoteReviewInput<'a> {
     meta: &'a PrMeta,
     review_started: Instant,
+    repository_source: RepositorySource<'a>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -388,26 +391,26 @@ pub async fn run(args: ReviewArgs) -> Result<i32> {
     }
 
     match args.forge {
-        ForgeKind::Local => run_local(&args, &cfg).await,
+        ForgeKind::Local => run_local(&args, &cfg, &cwd).await,
         ForgeKind::GitHub => {
             let repo = require_repo(&args)?;
             let forge = GitHub::new(&repo, require_pr(&args)?)?;
-            run_remote(&args, &cfg, &forge, &repo).await
+            run_remote(&args, &cfg, &forge, &repo, RepositorySource::GitHub(&forge)).await
         }
         ForgeKind::GitLab => {
             let repo = require_repo(&args)?;
             let forge = GitLab::new(&repo, require_pr(&args)?)?;
-            run_remote(&args, &cfg, &forge, &repo).await
+            run_remote(&args, &cfg, &forge, &repo, RepositorySource::Unavailable).await
         }
         ForgeKind::Bitbucket => {
             let repo = require_repo(&args)?;
             let forge = Bitbucket::new(&repo, require_pr(&args)?)?;
-            run_remote(&args, &cfg, &forge, &repo).await
+            run_remote(&args, &cfg, &forge, &repo, RepositorySource::Unavailable).await
         }
         ForgeKind::Azure => {
             let repo = require_repo(&args)?;
             let forge = Azure::new(&repo, require_pr(&args)?)?;
-            run_remote(&args, &cfg, &forge, &repo).await
+            run_remote(&args, &cfg, &forge, &repo, RepositorySource::Unavailable).await
         }
     }
 }
@@ -424,7 +427,7 @@ fn require_pr(args: &ReviewArgs) -> Result<u64> {
         .ok_or_else(|| anyhow!("--pr <number> is required for remote review"))
 }
 
-async fn run_local(args: &ReviewArgs, cfg: &Config) -> Result<i32> {
+async fn run_local(args: &ReviewArgs, cfg: &Config, repo_root: &Path) -> Result<i32> {
     let source = if let Some(path) = &args.diff_file {
         LocalSource::DiffFile(path.clone())
     } else if args.staged {
@@ -463,6 +466,7 @@ async fn run_local(args: &ReviewArgs, cfg: &Config) -> Result<i32> {
             scope,
             force_model: false,
             llm_budget_started_at: None,
+            repository_source: RepositorySource::Local(repo_root),
         },
     )
     .await?;
@@ -474,6 +478,7 @@ async fn run_remote<F: Forge>(
     cfg: &Config,
     forge: &F,
     repo: &str,
+    repository_source: RepositorySource<'_>,
 ) -> Result<i32> {
     let review_started = std::time::Instant::now();
     let strict_publication = strict_hosted_github_publication(args);
@@ -537,6 +542,7 @@ async fn run_remote<F: Forge>(
         RemoteReviewInput {
             meta: &meta,
             review_started,
+            repository_source,
         },
     )
     .await;
@@ -752,6 +758,7 @@ async fn remote_review<F: Forge>(
     let RemoteReviewInput {
         meta,
         review_started,
+        repository_source,
     } = input;
     let head_sha = meta.head_sha.as_str();
     let baseline = load_baseline(args)?;
@@ -838,6 +845,7 @@ async fn remote_review<F: Forge>(
             scope,
             force_model,
             llm_budget_started_at: Some(review_started),
+            repository_source,
         },
     )
     .await
@@ -1089,6 +1097,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
         scope,
         force_model,
         llm_budget_started_at,
+        repository_source,
     } = input;
     let review_started = std::time::Instant::now();
     let mut prepared = diff::prepare_review(diff_snapshot)?;
@@ -1887,6 +1896,22 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                                 .into());
                             }
                         }
+                        let resolution = crate::resolve::resolve_uncertainties(
+                            cfg,
+                            &client,
+                            &repository_source,
+                            head_sha.as_deref(),
+                            &finding_contexts,
+                            diff_snapshot.as_str(),
+                            &mut kept,
+                        )
+                        .await;
+                        suppressed += resolution.suppressed_findings.len() as u32;
+                        suppressed_findings.extend(resolution.suppressed_findings);
+                        add_usage(&mut usage, resolution.usage);
+                        model_usage.extend(resolution.model_usage);
+                        model_incidents.extend(resolution.model_incidents);
+                        usage_accounting_complete &= resolution.usage_accounting_complete;
                         findings = kept;
                     }
                 }
