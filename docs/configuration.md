@@ -23,7 +23,7 @@ reviewer:
   focus: [security, concurrency]
 review:
   onClean: skip
-  uncertaintyResolution: false # resolve uncertainty findings from referenced repository files
+  uncertaintyResolution: true # resolve uncertainty findings from referenced repository files
 gate:
   failOn: error               # info, warn, error, or never
   onError: block              # block or advisory for provider outages

@@ -969,7 +969,7 @@ impl Default for Config {
             tone: "concise, dry, lightly sardonic, never hostile; no praise or filler".to_string(),
             focus: Vec::new(),
             on_clean: OnClean::Skip,
-            uncertainty_resolution: false,
+            uncertainty_resolution: true,
             gate_fail_on: GateLevel::Severity(Severity::Error),
             gate_on_error: OnError::Block,
             block_on_kinds: vec![Kind::HumanEscalation],
@@ -1915,7 +1915,9 @@ reviewer:
 
 review:
   onClean: skip           # skip = stay silent on clean PRs (default) | comment
-  uncertaintyResolution: false # fetch referenced repository files to resolve uncertainty findings
+  # Reviews fetch referenced repository files to resolve uncertainty findings
+  # by default. Uncomment this explicit opt-out to disable that pass.
+  # uncertaintyResolution: false
 
 gate:
   failOn: error           # the postil/gate check fails at/above: info | warn | error | never
@@ -2249,7 +2251,7 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
         let c = Config::default();
         assert_eq!(c.min_confidence, 0.6);
         assert_eq!(c.on_clean, OnClean::Skip);
-        assert!(!c.uncertainty_resolution);
+        assert!(c.uncertainty_resolution);
         assert!(matches!(
             c.gate_fail_on,
             GateLevel::Severity(Severity::Error)
