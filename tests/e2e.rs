@@ -5162,7 +5162,49 @@ async fn uncertainty_resolution_malformed_response_preserves_original_finding() 
 }
 
 #[tokio::test]
-async fn uncertainty_resolution_is_off_by_default_and_makes_no_resolution_call() {
+async fn uncertainty_resolution_defaults_on_and_fails_open_when_unresolved() {
+    let server = MockServer::start().await;
+    let original_body = "Inspect `src/reference.rs` before merging.";
+    mock_review_model(
+        &server,
+        "generator-model",
+        json!([uncertainty_finding(original_body)]),
+    )
+    .await;
+    mock_uncertainty_resolution(
+        &server,
+        "generator-model",
+        r#"{"resolution":"unresolved","revisedBody":"","evidence":""}"#,
+        1,
+    )
+    .await;
+
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(directory.path().join("src")).unwrap();
+    std::fs::write(
+        directory.path().join("src/reference.rs"),
+        "repository evidence\n",
+    )
+    .unwrap();
+    let diff = write_diff(directory.path());
+    let output = postil()
+        .current_dir(directory.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "generator-model")
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+
+    let envelope: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    assert_eq!(envelope["findings"][0]["body"], original_body);
+    assert_eq!(envelope["counts"]["suppressed"], 0);
+}
+
+#[tokio::test]
+async fn uncertainty_resolution_explicit_off_makes_no_resolution_call() {
     let server = MockServer::start().await;
     let original_body = "Inspect `src/reference.rs` before merging.";
     mock_review_model(
@@ -5180,6 +5222,11 @@ async fn uncertainty_resolution_is_off_by_default_and_makes_no_resolution_call()
     .await;
 
     let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join(".postil.yaml"),
+        "review:\n  uncertaintyResolution: false\n",
+    )
+    .unwrap();
     std::fs::create_dir_all(directory.path().join("src")).unwrap();
     std::fs::write(
         directory.path().join("src/reference.rs"),
