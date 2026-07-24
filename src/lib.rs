@@ -3,6 +3,7 @@
 pub(crate) mod api_key;
 #[cfg(feature = "qualification-candidate")]
 pub mod attribution;
+pub(crate) mod brevity;
 pub mod cli;
 pub mod config;
 pub mod diff;

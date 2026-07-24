@@ -151,6 +151,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
                 "review.uncertaintyResolution: {}",
                 cfg.uncertainty_resolution
             );
+            println!("review.conciseFindings: {}", cfg.concise_findings);
             println!("gate.failOn: {}", cfg.gate_fail_on.as_str());
             println!(
                 "gate.onError: {}",

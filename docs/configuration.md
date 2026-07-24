@@ -24,6 +24,7 @@ reviewer:
 review:
   onClean: skip
   uncertaintyResolution: true # resolve uncertainty findings from referenced repository files
+  conciseFindings: true       # compress over-long finding bodies before rendering
 gate:
   failOn: error               # info, warn, error, or never
   onError: block              # block or advisory for provider outages
@@ -55,6 +56,7 @@ Place organization-specific merge rules in `.postil/guardrails.md`. Place additi
 | `REVIEW_SCORER_MODEL` | Scorer model override |
 | `REVIEW_SCORER_MODEL_CASCADE` | One scorer fallback model |
 | `POSTIL_UNCERTAINTY_RESOLUTION` | Override uncertainty resolution with `true`/`false` or `1`/`0` |
+| `POSTIL_CONCISE_FINDINGS` | Override concise findings with `true`/`false` or `1`/`0` |
 | `POSTIL_LLM_REQUEST_TIMEOUT_SECS` | Per-attempt model request timeout; defaults to 480 seconds |
 | `POSTIL_LLM_TOTAL_TIMEOUT_SECS` | Optional total local-review model deadline |
 | `POSTIL_DETAILS_URL` | HTTP(S) details link for forge check runs |

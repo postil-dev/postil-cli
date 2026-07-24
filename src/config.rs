@@ -925,6 +925,7 @@ pub struct Config {
     pub focus: Vec<String>,
     pub on_clean: OnClean,
     pub uncertainty_resolution: bool,
+    pub concise_findings: bool,
     pub gate_fail_on: GateLevel,
     /// Gate behavior on operational error. Default: fail closed.
     pub gate_on_error: OnError,
@@ -970,6 +971,7 @@ impl Default for Config {
             focus: Vec::new(),
             on_clean: OnClean::Skip,
             uncertainty_resolution: true,
+            concise_findings: true,
             gate_fail_on: GateLevel::Severity(Severity::Error),
             gate_on_error: OnError::Block,
             block_on_kinds: vec![Kind::HumanEscalation],
@@ -1018,6 +1020,7 @@ pub struct ReviewerSection {
 pub struct ReviewSection {
     pub on_clean: Option<OnClean>,
     pub uncertainty_resolution: Option<bool>,
+    pub concise_findings: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -1168,6 +1171,9 @@ impl Config {
             if let Some(enabled) = r.uncertainty_resolution {
                 self.uncertainty_resolution = enabled;
             }
+            if let Some(enabled) = r.concise_findings {
+                self.concise_findings = enabled;
+            }
         }
         if let Some(g) = f.gate {
             if let Some(fo) = g.fail_on {
@@ -1288,6 +1294,17 @@ impl Config {
     }
 
     fn apply_env(&mut self) -> Result<()> {
+        if let Ok(value) = std::env::var("POSTIL_CONCISE_FINDINGS")
+            && !value.trim().is_empty()
+        {
+            self.concise_findings = match value.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" => true,
+                "0" | "false" => false,
+                _ => anyhow::bail!(
+                    "POSTIL_CONCISE_FINDINGS must be 1, true, 0, or false (got {value:?})"
+                ),
+            };
+        }
         if let Ok(value) = std::env::var("POSTIL_UNCERTAINTY_RESOLUTION")
             && !value.trim().is_empty()
         {
@@ -1918,6 +1935,9 @@ review:
   # Reviews fetch referenced repository files to resolve uncertainty findings
   # by default. Uncomment this explicit opt-out to disable that pass.
   # uncertaintyResolution: false
+  # Over-long kept finding bodies are compressed by default. Uncomment this
+  # explicit opt-out to preserve the original body text.
+  # conciseFindings: false
 
 gate:
   failOn: error           # the postil/gate check fails at/above: info | warn | error | never
@@ -2252,6 +2272,7 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
         assert_eq!(c.min_confidence, 0.6);
         assert_eq!(c.on_clean, OnClean::Skip);
         assert!(c.uncertainty_resolution);
+        assert!(c.concise_findings);
         assert!(matches!(
             c.gate_fail_on,
             GateLevel::Severity(Severity::Error)
@@ -2265,6 +2286,46 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
         let mut config = Config::default();
         config.apply_file_inner(file, false, false).unwrap();
         assert!(config.uncertainty_resolution);
+    }
+
+    #[test]
+    fn file_disables_concise_findings() {
+        let file: FileConfig = yaml_serde::from_str("review:\n  conciseFindings: false\n").unwrap();
+        let mut config = Config::default();
+        config.apply_file_inner(file, false, false).unwrap();
+        assert!(!config.concise_findings);
+    }
+
+    #[test]
+    fn concise_findings_env_accepts_booleans_and_rejects_invalid_values() {
+        const NAME: &str = "POSTIL_CONCISE_FINDINGS";
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvRestore::capture(NAME);
+
+        for value in ["1", "true", "TRUE"] {
+            EnvRestore::set(NAME, value);
+            let mut config = Config::default();
+            config.apply_env().unwrap();
+            assert!(config.concise_findings, "value {value:?}");
+        }
+
+        for value in ["0", "false", "FALSE"] {
+            EnvRestore::set(NAME, value);
+            let mut config = Config {
+                concise_findings: true,
+                ..Config::default()
+            };
+            config.apply_env().unwrap();
+            assert!(!config.concise_findings, "value {value:?}");
+        }
+
+        EnvRestore::set(NAME, "sometimes");
+        let error = Config::default().apply_env().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("POSTIL_CONCISE_FINDINGS must be 1, true, 0, or false")
+        );
     }
 
     #[test]
@@ -2381,6 +2442,7 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
         assert!(c.model.is_empty());
         assert!(c.cascade.is_empty());
         assert!(c.scorer.is_empty());
+        assert!(c.concise_findings);
         assert!(!c.scorer_enabled);
         assert!(c.scorer_chain().is_empty());
         assert!(c.model_chain().is_empty());
