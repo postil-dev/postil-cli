@@ -1946,56 +1946,7 @@ pub fn starter_config() -> &'static str {
 /// identifiers, or structured data. Kept conservative and low-noise on
 /// purpose. This augments, rather than replacing, Postil's core "silence is
 /// the correct output for most diffs" stance.
-pub const BUILTIN_CONTENT_POLICY: &str = "\
-1. Fabricated or contradicted claims (report at error). A changed comment, \
-docstring, or doc line that contradicts the code/config/files in this diff or \
-repo, or that describes a command, flag, path, env var, or behavior that does \
-not exist. A good-faith, plausible description of the system is NOT a \
-violation merely because the diff does not prove it; flag only a claim you \
-can show is false or invented.\n\
-\n\
-2. Self-contradiction the change creates (report at warn). A changed doc or \
-comment asserts something (not tracked, created by hand, does not exist, \
-excluded) that another file changed in this SAME diff plainly refutes (e.g. a \
-comment says a file is untracked while this diff adds and commits it). Both \
-sides of the contradiction must be in this diff; do not infer one from \
-unchanged files.\n\
-\n\
-3. Authoring-process narration and AI-authorship residue (report at warn). \
-Prose that narrates the act of writing the code rather than stating what it \
-does (\"I decided to cache X after trying Y\", \"as discussed\", \"here's what \
-I did\"), or that surfaces the text as assistant/model output (\"as an AI\", \
-\"I cannot help with that\", \"let me know if you need anything else\", \
-\"written by Claude/ChatGPT/Copilot/Gemini\"). A plain mention of an AI/LLM as \
-a product feature or integration (\"this service calls the Gemini API\") is \
-NOT a violation; flag only text that narrates the authoring process or \
-speaks as the model that produced it.\n\
-\n\
-4. Conversation and transcript leakage (report at error). Pasted chat logs, \
-turn markers (\"User:\", \"Assistant:\"), narration of what \"the user\" asked, \
-tool-call/tool-result dumps, or chain-of-thought leaking into committed text.\n\
-\n\
-5. Stale temporal and TODO residue in reference documentation (report at \
-info, and only when it reads as genuinely stale, not a dated changelog entry \
-or explicit roadmap section): \"currently\", \"for now\", \"at the moment\", a \
-dangling TODO/FIXME/XXX with no owner or ticket, \"previously\"/\"used to\"/\"no \
-longer\" phrasing describing an already-completed transition.\n\
-\n\
-6. House writing style (report at info, and only when the SAME pattern \
-appears 3 or more times in one file - a single instance is not worth \
-flagging): em-dashes; flowery/themed language (\"behold\", \"journey\" as \
-metaphor, medieval/fantasy framing); hype filler (\"delve\", \"seamless\", \
-\"robust\" as a buzzword, \"leverage\" as a verb, \"unlock\", \"empower\", \"game-\
-changer\", \"it's not about X, it's about Y\", \"here's the kicker\", \"let's dive \
-in\").\n\
-\n\
-Scope: apply these rules ONLY to human-readable prose - Markdown files, code \
-comments, docstrings, and user-facing or log strings, plus the PR title/\
-description. Do NOT apply them to code logic, identifiers, config keys/\
-values, URLs, or any text that is itself an example of a banned pattern \
-inside documentation ABOUT this policy. When a line is borderline, do not \
-flag it; this augments the core reviewer, it does not turn Postil into a \
-style linter.";
+pub const BUILTIN_CONTENT_POLICY: &str = include_str!("builtin-content-policy.md");
 
 #[cfg(test)]
 mod tests {
