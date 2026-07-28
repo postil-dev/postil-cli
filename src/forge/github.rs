@@ -1455,6 +1455,7 @@ impl Forge for GitHub {
         gate: Option<CheckState>,
         envelope: &Envelope,
         snapshot: &PrMeta,
+        annotate_findings: bool,
     ) -> Result<()> {
         if !self.snapshot_is_current(snapshot).await? {
             return Err(anyhow!(
@@ -1469,29 +1470,39 @@ impl Forge for GitHub {
             CheckState::Failure => "failure",
             CheckState::Neutral => "neutral",
         };
-        let annotations: Vec<_> = envelope
-            .findings
-            .iter()
-            // Synthetic-path findings have no real file line to annotate; they
-            // are already carried in the check-run summary body.
-            .filter(|f| !super::is_synthetic_path(&f.path))
-            .take(50) // GitHub caps annotations per request at 50.
-            .map(|f| {
-                let publication = crate::envelope::forge_safe_finding_publication_text(f);
-                json!({
-                    "path": f.path,
-                    "start_line": f.line,
-                    "end_line": f.end_line.unwrap_or(f.line),
-                    "annotation_level": match f.severity {
-                        Severity::Info => "notice",
-                        Severity::Warn => "warning",
-                        Severity::Error => "failure",
-                    },
-                    "title": publication.title,
-                    "message": publication.body,
+        let annotations: Vec<_> = if annotate_findings {
+            envelope
+                .findings
+                .iter()
+                // Carried findings remain visible on the review that introduced
+                // them. Re-annotating can also target a stale line range.
+                .filter(|f| !filter::is_carried(f))
+                // Synthetic-path findings have no real file line to annotate;
+                // they are already carried in the check-run summary body.
+                .filter(|f| !super::is_synthetic_path(&f.path))
+                .map(|f| {
+                    let publication = crate::envelope::forge_safe_finding_publication_text(f);
+                    json!({
+                        "path": f.path,
+                        "start_line": f.line,
+                        "end_line": f.end_line.unwrap_or(f.line),
+                        "annotation_level": match f.severity {
+                            Severity::Info => "notice",
+                            Severity::Warn => "warning",
+                            Severity::Error => "failure",
+                        },
+                        "title": publication.title,
+                        "message": publication.body,
+                    })
                 })
-            })
-            .collect();
+                .collect()
+        } else {
+            Vec::new()
+        };
+        ensure!(
+            annotations.len() <= 50,
+            "GitHub check annotation count exceeds the 50-annotation request limit"
+        );
         let mut checks = vec![(advisory_id, advisory, "postil/review", true)];
         if let Some(gate) = gate {
             checks.push((gate_id, gate, "postil/gate", false));
@@ -1525,7 +1536,7 @@ impl Forge for GitHub {
                         "title": super::cap_check_title(&title),
                         "summary": super::cap_check_summary(&gate_note),
                     });
-                    if with_annotations && !annotations.is_empty() {
+                    if annotate_findings && with_annotations && !annotations.is_empty() {
                         output["annotations"] = json!(annotations);
                     }
                     let mut body = json!({
@@ -1672,7 +1683,7 @@ fn planned_review_receipt(envelope: &Envelope, head_sha: &str) -> ReviewPublicat
     }));
 
     let mut digest = Sha256::new();
-    digest.update(b"github-review-receipt-v1\0");
+    digest.update(b"github-review-receipt-v2\0");
     digest.update(head_sha.as_bytes());
     for finding in &findings {
         digest.update(finding.finding_id.as_bytes());
@@ -1681,8 +1692,9 @@ fn planned_review_receipt(envelope: &Envelope, head_sha: &str) -> ReviewPublicat
     let hash = digest.finalize();
     ReviewPublicationReceipt {
         version: ReviewPublicationReceipt::VERSION,
+        channel: super::ReviewPublicationChannel::ReviewComments,
         receipt_id: format!(
-            "github-review-v1:{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            "github-review-v2:{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
             hash[0], hash[1], hash[2], hash[3], hash[4], hash[5]
         ),
         review_id: None,
@@ -1698,6 +1710,7 @@ fn publication_summary(receipt: &ReviewPublicationReceipt) -> ReviewPublicationS
                 summary.active_inline += 1;
             }
             FindingPublicationOutcome::Inline => {}
+            FindingPublicationOutcome::CheckAnnotation => summary.summary_only += 1,
             FindingPublicationOutcome::SummaryOnly => summary.summary_only += 1,
             FindingPublicationOutcome::Carried => summary.carried += 1,
             FindingPublicationOutcome::Resolved
@@ -2192,8 +2205,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(receipt.version, 1);
-        assert!(receipt.receipt_id.starts_with("github-review-v1:"));
+        assert_eq!(receipt.version, 2);
+        assert_eq!(
+            receipt.channel,
+            super::super::ReviewPublicationChannel::ReviewComments
+        );
+        assert!(receipt.receipt_id.starts_with("github-review-v2:"));
         assert_eq!(receipt.review_id.as_deref(), Some("77"));
         let outcome = |id: &str| {
             receipt
@@ -2550,6 +2567,7 @@ mod tests {
                 Some(CheckState::Success),
                 &delivery_envelope("aaaaaaaaaaaa", "cccccccccccc"),
                 &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                false,
             )
             .await
             .unwrap_err();
@@ -2584,6 +2602,7 @@ mod tests {
                 Some(CheckState::Success),
                 &envelope,
                 &snapshot,
+                false,
             ),
         )
         .await;
@@ -2956,6 +2975,7 @@ mod tests {
                 Some(CheckState::Success),
                 &delivery_envelope("aaaaaaaaaaaa", "cccccccccccc"),
                 &snapshot,
+                false,
             )
             .await
             .unwrap_err();
@@ -3030,6 +3050,7 @@ mod tests {
                 Some(CheckState::Success),
                 &envelope,
                 &snapshot,
+                false,
             )
             .await
             .unwrap_err();
@@ -3127,7 +3148,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn github_review_and_check_annotations_preserve_valid_model_prose() {
+    async fn github_finding_presentations_are_exclusive_and_preserve_valid_model_prose() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/repos/owner/repo/pulls/1"))
@@ -3165,7 +3186,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
             .mount(&server)
             .await;
-        for id in ["11", "12"] {
+        for id in ["11", "12", "13", "14"] {
             Mock::given(method("PATCH"))
                 .and(path(format!("/repos/owner/repo/check-runs/{id}")))
                 .respond_with(ResponseTemplate::new(200))
@@ -3244,6 +3265,19 @@ mod tests {
                 Some(CheckState::Failure),
                 &envelope,
                 &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                false,
+            )
+            .await
+            .unwrap();
+        github
+            .complete_checks(
+                "13",
+                "14",
+                CheckState::Failure,
+                Some(CheckState::Failure),
+                &envelope,
+                &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                true,
             )
             .await
             .unwrap();
@@ -3260,9 +3294,21 @@ mod tests {
         let inline = review_body["comments"][0]["body"].as_str().unwrap();
         assert!(inline.contains(&finding.body));
 
-        let advisory = requests
+        let review_comment_advisory = requests
             .iter()
             .find(|request| request.url.path().ends_with("/check-runs/11"))
+            .unwrap();
+        let review_comment_check_body: serde_json::Value =
+            serde_json::from_slice(&review_comment_advisory.body).unwrap();
+        assert!(
+            review_comment_check_body["output"]
+                .get("annotations")
+                .is_none()
+        );
+
+        let advisory = requests
+            .iter()
+            .find(|request| request.url.path().ends_with("/check-runs/13"))
             .unwrap();
         let check_body: serde_json::Value = serde_json::from_slice(&advisory.body).unwrap();
         let annotation = &check_body["output"]["annotations"][0];

@@ -14,6 +14,8 @@ postil review --repo owner/repository --pr 123 --publish
 
 `GITHUB_API_URL` selects a GitHub Enterprise Server API. GitHub review delivery needs pull-request and check-run write access.
 
+Findings appear in one batched review by default. Set `review.findingPresentation: checkAnnotations` to publish them only as annotations on `postil/review`. Both modes retain the advisory and gate check summaries and conclusions.
+
 Automated callers can bind a run to an observed pull-request snapshot with `--sha <head>` and `--base-sha <target>`. Before each GitHub write, Postil verifies the head commit, target-branch commit, and merge base from the acquired review snapshot. A changed value suppresses delivery.
 
 ## GitLab

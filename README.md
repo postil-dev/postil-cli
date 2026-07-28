@@ -39,7 +39,7 @@ export GITHUB_TOKEN=...
 postil review --repo owner/repository --pr 123 --publish
 ```
 
-`--publish` is required for any forge write. Without it, the CLI fetches the pull request and reports locally. Published runs create inline findings and separate `postil/review` and `postil/gate` checks. Mark only `postil/gate` as required in branch protection.
+`--publish` is required for any forge write. Without it, the CLI fetches the pull request and reports locally. Published runs create separate `postil/review` and `postil/gate` checks. Findings appear in one batched review by default; GitHub repositories can set `review.findingPresentation: checkAnnotations` to put them on the advisory check instead. Mark only `postil/gate` as required in branch protection.
 
 For GitHub Actions, use [`postil-action`](https://github.com/postil-dev/postil-action). Hosted GitHub reviews are available at [postil.dev/install](https://postil.dev/install).
 

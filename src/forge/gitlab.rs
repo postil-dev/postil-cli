@@ -553,6 +553,7 @@ impl Forge for GitLab {
         gate: Option<CheckState>,
         envelope: &Envelope,
         snapshot: &PrMeta,
+        _annotate_findings: bool,
     ) -> Result<()> {
         let current = self.mr().await?;
         if !mr_matches_snapshot(&current, snapshot) {

@@ -148,6 +148,10 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
                 }
             );
             println!(
+                "review.findingPresentation: {}",
+                cfg.finding_presentation.as_str()
+            );
+            println!(
                 "review.uncertaintyResolution: {}",
                 cfg.uncertainty_resolution
             );

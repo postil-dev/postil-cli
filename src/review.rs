@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use futures::StreamExt;
 
-use crate::config::{Config, GateLevel, OnError};
+use crate::config::{Config, FindingPresentation, GateLevel, OnError};
 use crate::diff;
 use crate::durable_plan::{DurablePlanRegistrar, DurableReviewPlan};
 use crate::envelope::{
@@ -389,6 +389,14 @@ pub async fn run(args: ReviewArgs) -> Result<i32> {
         cfg.gate_fail_on =
             GateLevel::parse(fo).ok_or_else(|| anyhow!("invalid --fail-on {fo:?}"))?;
     }
+    if !args.no_post
+        && cfg.finding_presentation == FindingPresentation::CheckAnnotations
+        && args.forge != ForgeKind::GitHub
+    {
+        return Err(anyhow!(
+            "review.findingPresentation checkAnnotations requires GitHub publication"
+        ));
+    }
 
     match args.forge {
         ForgeKind::Local => run_local(&args, &cfg, &cwd).await,
@@ -527,6 +535,11 @@ async fn run_remote<F: Forge>(
                 if crate::forge::is_repository_identity_failure(&e) {
                     return Err(e).context("creating check runs");
                 }
+                if cfg.finding_presentation == FindingPresentation::CheckAnnotations {
+                    return Err(e).context(
+                        "creating check runs required by review.findingPresentation checkAnnotations",
+                    );
+                }
                 // CI tokens without checks:write still get review + exit code.
                 eprintln!("postil: cannot create check runs ({e:#}); continuing without");
                 None
@@ -563,7 +576,7 @@ async fn run_remote<F: Forge>(
                         || f.path == crate::envelope::PROVIDER_PATH
                 });
                 let advisory_state = if operational {
-                    CheckState::Neutral
+                    CheckState::Failure
                 } else {
                     CheckState::Success
                 };
@@ -575,6 +588,7 @@ async fn run_remote<F: Forge>(
                     (!args.defer_gate_check).then_some(gate_state),
                     &envelope,
                     &meta,
+                    cfg.finding_presentation == FindingPresentation::CheckAnnotations,
                     review_started,
                 )
                 .await
@@ -602,8 +616,8 @@ async fn run_remote<F: Forge>(
             eprintln!("postil: review failed before completion ({e:#})");
             // Fail closed by default: an errored run must never read as a silent
             // pass. `gate.onError: advisory` opts a repo out of blocking on
-            // operational errors (provider outage). The advisory check still
-            // shows the error; only the gate stands aside.
+            // operational errors (provider outage). The review check still
+            // fails truthfully; only the merge gate stands aside.
             //
             // Build the error envelope and route it through the SAME output path
             // (finish) as a successful run: emitting the envelope/SARIF and
@@ -627,10 +641,11 @@ async fn run_remote<F: Forge>(
                     forge,
                     a,
                     g,
-                    CheckState::Neutral,
+                    CheckState::Failure,
                     (!args.defer_gate_check).then_some(gate_state),
                     &envelope,
                     &meta,
+                    cfg.finding_presentation == FindingPresentation::CheckAnnotations,
                     review_started,
                 )
                 .await
@@ -705,13 +720,22 @@ async fn complete_remote_checks<F: Forge>(
     gate: Option<CheckState>,
     envelope: &Envelope,
     snapshot: &PrMeta,
+    annotate_findings: bool,
     review_started: Instant,
 ) -> Result<()> {
     require_current_snapshot(forge, snapshot, review_started, "check completion").await?;
     run_with_hosted_budget(
         Some(review_started),
         CHECK_COMPLETION_TIMEOUT_SECS,
-        forge.complete_checks(advisory_id, gate_id, advisory, gate, envelope, snapshot),
+        forge.complete_checks(
+            advisory_id,
+            gate_id,
+            advisory,
+            gate,
+            envelope,
+            snapshot,
+            annotate_findings,
+        ),
         "completing check runs",
     )
     .await
@@ -1962,7 +1986,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
     // Operational findings (model unreachable/unusable) fail the gate by default
     // and fail closed. `gate.onError: advisory` lets the gate stand aside on a
     // provider outage so a blip does not freeze every merge; the finding still
-    // shows in the output and the advisory check goes neutral. Unusable model
+    // shows in the output and the review check fails. Unusable model
     // output (OPERATIONAL_PATH) never bypasses the gate: a malicious diff can
     // induce it via prompt injection.
     let advisory_on_error = cfg.gate_on_error == OnError::Advisory;
@@ -2102,6 +2126,20 @@ async fn finish<F: Forge>(
     {
         let expected_snapshot =
             expected_snapshot.context("remote publication is missing its immutable PR snapshot")?;
+        if cfg.finding_presentation == FindingPresentation::CheckAnnotations {
+            let mut receipt = forge.plan_review_publication(&envelope, expected_snapshot);
+            receipt.channel = crate::forge::ReviewPublicationChannel::CheckAnnotations;
+            for finding in &mut receipt.findings {
+                if finding.initial_outcome == crate::forge::FindingPublicationOutcome::Inline {
+                    finding.initial_outcome =
+                        crate::forge::FindingPublicationOutcome::CheckAnnotation;
+                    finding.inline_rejected = false;
+                    finding.comment_id = None;
+                }
+            }
+            crate::forge::write_review_publication_receipt_from_env(&receipt)?;
+            return Ok(if envelope.gate.failing { 1 } else { 0 });
+        }
         let duplicate_of_baseline = load_baseline(args)
             .ok()
             .is_some_and(|baseline| visible_finding_sets_equal(&baseline, &envelope.findings));

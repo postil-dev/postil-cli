@@ -581,6 +581,7 @@ impl Forge for Bitbucket {
         gate: Option<CheckState>,
         envelope: &Envelope,
         snapshot: &PrMeta,
+        _annotate_findings: bool,
     ) -> Result<()> {
         if !self.snapshot_is_current(snapshot).await? {
             eprintln!("postil: bitbucket status delivery skipped because the pull request changed");
