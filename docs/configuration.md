@@ -23,6 +23,7 @@ reviewer:
   focus: [security, concurrency]
 review:
   onClean: skip
+  findingPresentation: reviewComments # reviewComments or checkAnnotations (GitHub only)
   uncertaintyResolution: true # resolve uncertainty findings from referenced repository files
   conciseFindings: true       # compress over-long finding bodies before rendering
 gate:

@@ -870,6 +870,26 @@ pub enum OnClean {
     Comment,
 }
 
+/// Where GitHub renders individual findings. Check runs always retain their
+/// status and summary; this setting selects one detailed finding surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FindingPresentation {
+    /// Publish findings as one batched pull-request review with inline comments.
+    ReviewComments,
+    /// Publish findings as annotations on the advisory check run.
+    CheckAnnotations,
+}
+
+impl FindingPresentation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReviewComments => "reviewComments",
+            Self::CheckAnnotations => "checkAnnotations",
+        }
+    }
+}
+
 /// What the gate does when the review cannot complete (model outage, rate-limit
 /// exhaustion). Default is fail closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -878,7 +898,7 @@ pub enum OnError {
     /// Operational error fails the gate. Nothing merges on a broken review.
     Block,
     /// Provider outage passes the gate (advisory only): an outage does not
-    /// freeze every merge in the org; the review check goes neutral. Unusable
+    /// freeze every merge in the org; the review check still fails. Unusable
     /// model output still blocks because that class is attacker-influenceable.
     Advisory,
 }
@@ -924,6 +944,7 @@ pub struct Config {
     pub tone: String,
     pub focus: Vec<String>,
     pub on_clean: OnClean,
+    pub finding_presentation: FindingPresentation,
     pub uncertainty_resolution: bool,
     pub concise_findings: bool,
     pub gate_fail_on: GateLevel,
@@ -970,6 +991,7 @@ impl Default for Config {
             tone: "concise, dry, lightly sardonic, never hostile; no praise or filler".to_string(),
             focus: Vec::new(),
             on_clean: OnClean::Skip,
+            finding_presentation: FindingPresentation::ReviewComments,
             uncertainty_resolution: true,
             concise_findings: true,
             gate_fail_on: GateLevel::Severity(Severity::Error),
@@ -1019,6 +1041,7 @@ pub struct ReviewerSection {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ReviewSection {
     pub on_clean: Option<OnClean>,
+    pub finding_presentation: Option<FindingPresentation>,
     pub uncertainty_resolution: Option<bool>,
     pub concise_findings: Option<bool>,
 }
@@ -1167,6 +1190,9 @@ impl Config {
         if let Some(r) = f.review {
             if let Some(oc) = r.on_clean {
                 self.on_clean = oc;
+            }
+            if let Some(presentation) = r.finding_presentation {
+                self.finding_presentation = presentation;
             }
             if let Some(enabled) = r.uncertainty_resolution {
                 self.uncertainty_resolution = enabled;
@@ -1932,6 +1958,7 @@ reviewer:
 
 review:
   onClean: skip           # skip = stay silent on clean PRs (default) | comment
+  # findingPresentation: reviewComments # reviewComments (default) | checkAnnotations (GitHub only)
   # Reviews fetch referenced repository files to resolve uncertainty findings
   # by default. Uncomment this explicit opt-out to disable that pass.
   # uncertaintyResolution: false
@@ -1945,7 +1972,7 @@ gate:
     - humanEscalation     # genuine owner/product decisions only; concrete bugs remain risk
   # onError: block          # block (default, fail closed) | advisory: gate outcome when
   #                         # the review itself errors (model outage). advisory keeps an
-  #                         # outage from freezing merges; the review check goes neutral, not green.
+  #                         # outage from freezing merges; the review check still fails.
 
 model:
   name: __DEFAULT_MODEL__
@@ -2271,6 +2298,7 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
         let c = Config::default();
         assert_eq!(c.min_confidence, 0.6);
         assert_eq!(c.on_clean, OnClean::Skip);
+        assert_eq!(c.finding_presentation, FindingPresentation::ReviewComments);
         assert!(c.uncertainty_resolution);
         assert!(c.concise_findings);
         assert!(matches!(
@@ -2286,6 +2314,18 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
         let mut config = Config::default();
         config.apply_file_inner(file, false, false).unwrap();
         assert!(config.uncertainty_resolution);
+    }
+
+    #[test]
+    fn file_selects_check_annotation_finding_presentation() {
+        let file: FileConfig =
+            yaml_serde::from_str("review:\n  findingPresentation: checkAnnotations\n").unwrap();
+        let mut config = Config::default();
+        config.apply_file_inner(file, false, false).unwrap();
+        assert_eq!(
+            config.finding_presentation,
+            FindingPresentation::CheckAnnotations
+        );
     }
 
     #[test]

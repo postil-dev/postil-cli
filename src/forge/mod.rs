@@ -377,6 +377,12 @@ pub enum CheckState {
     Neutral,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckRunIds<'a> {
+    pub advisory: &'a str,
+    pub gate: &'a str,
+}
+
 /// What a `respond` thread number points at. GitHub's issues API covers both,
 /// so it ignores this; GitLab/Bitbucket/Azure key issues and PRs on different
 /// endpoints, so they branch on it.
@@ -391,10 +397,18 @@ pub enum ThreadKind {
 /// Versioned result of one review publication attempt. Finding outcomes are
 /// keyed by the envelope's stable finding ID so the hosted service can join
 /// the immutable delivery result to later thread lifecycle observations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ReviewPublicationChannel {
+    ReviewComments,
+    CheckAnnotations,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewPublicationReceipt {
     pub version: u8,
+    pub channel: ReviewPublicationChannel,
     pub receipt_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub review_id: Option<String>,
@@ -402,7 +416,7 @@ pub struct ReviewPublicationReceipt {
 }
 
 impl ReviewPublicationReceipt {
-    pub const VERSION: u8 = 1;
+    pub const VERSION: u8 = 2;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -434,6 +448,7 @@ fn is_true(value: &bool) -> bool {
 #[serde(rename_all = "camelCase")]
 pub enum FindingPublicationOutcome {
     Inline,
+    CheckAnnotation,
     SummaryOnly,
     Carried,
     Resolved,
@@ -493,7 +508,7 @@ pub fn untracked_review_publication_receipt(
         });
     }
     let mut digest = Sha256::new();
-    digest.update(b"review-receipt-v1\0");
+    digest.update(b"review-receipt-v2\0");
     digest.update(forge.as_bytes());
     digest.update(head_sha.as_bytes());
     for finding in &findings {
@@ -502,8 +517,9 @@ pub fn untracked_review_publication_receipt(
     let hash = digest.finalize();
     ReviewPublicationReceipt {
         version: ReviewPublicationReceipt::VERSION,
+        channel: ReviewPublicationChannel::ReviewComments,
         receipt_id: format!(
-            "{forge}-review-v1:{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            "{forge}-review-v2:{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
             hash[0], hash[1], hash[2], hash[3], hash[4], hash[5]
         ),
         review_id: None,
@@ -614,12 +630,12 @@ pub trait Forge {
     /// while the acquired snapshot remains current.
     async fn complete_checks(
         &self,
-        advisory_id: &str,
-        gate_id: &str,
+        check_ids: CheckRunIds<'_>,
         advisory: CheckState,
         gate: Option<CheckState>,
         envelope: &Envelope,
         snapshot: &PrMeta,
+        annotate_findings: bool,
     ) -> Result<()>;
 
     /// Confirm that publication still targets the snapshot that was reviewed.
@@ -1198,7 +1214,8 @@ mod tests {
         let path = directory.path().join("publication.json");
         let receipt = ReviewPublicationReceipt {
             version: ReviewPublicationReceipt::VERSION,
-            receipt_id: "github-review-v1:test".into(),
+            channel: ReviewPublicationChannel::ReviewComments,
+            receipt_id: "github-review-v2:test".into(),
             review_id: Some("77".into()),
             findings: vec![FindingPublicationReceipt {
                 finding_id: "finding-1".into(),

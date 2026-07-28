@@ -6065,14 +6065,14 @@ async fn advisory_on_error_lets_gate_stand_aside() {
         .map(|r| r.body_json().unwrap())
         .collect();
     assert_eq!(patches.len(), 2);
-    // The gate stands aside (success) but the outage stays visible: the
-    // advisory check goes neutral, never green-on-green.
+    // The gate stands aside (success), while the review check fails so the
+    // outage remains visible.
     let mut conclusions: Vec<&str> = patches
         .iter()
         .map(|p| p["conclusion"].as_str().unwrap())
         .collect();
     conclusions.sort_unstable();
-    assert_eq!(conclusions, vec!["neutral", "success"]);
+    assert_eq!(conclusions, vec!["failure", "success"]);
 }
 
 // Shared setup for the pre-review diff-fetch-failure tests: PR meta succeeds,
@@ -6160,7 +6160,7 @@ async fn diff_fetch_failure_advisory_emits_envelope_and_exits_zero() {
     assert_eq!(env["gate"]["failing"], false);
     assert_eq!(env["headSha"], "aaaaaaaaaaaa");
 
-    // The advisory check went neutral, the gate success.
+    // The review check failed, while the gate stood aside with success.
     let reqs = server.received_requests().await.unwrap();
     let conclusions: Vec<String> = reqs
         .iter()
@@ -6172,7 +6172,7 @@ async fn diff_fetch_failure_advisory_emits_envelope_and_exits_zero() {
                 .to_string()
         })
         .collect();
-    assert_eq!(conclusions, vec!["neutral", "success"]);
+    assert_eq!(conclusions, vec!["failure", "success"]);
 }
 
 #[tokio::test]
@@ -8580,6 +8580,11 @@ async fn github_flow_posts_review_and_completes_both_checks() {
         .collect();
     assert!(conclusions.contains(&"success"));
     assert!(conclusions.contains(&"failure"));
+    assert!(
+        patches
+            .iter()
+            .all(|patch| patch["output"].get("annotations").is_none())
+    );
     let gate_patch = patches
         .iter()
         .find(|patch| patch["conclusion"] == "failure")
@@ -8622,6 +8627,74 @@ async fn github_flow_posts_review_and_completes_both_checks() {
         summary.contains("<sub>[Review details](https://postil.dev/orgs/acme/runs/review-7)</sub>")
     );
 
+    std::fs::write(
+        dir.path().join(".postil.yaml"),
+        "review:\n  findingPresentation: checkAnnotations\n",
+    )
+    .unwrap();
+    let annotation_receipt_path = dir.path().join("annotation-receipt.json");
+    let request_count_before_annotations = reqs.len();
+    postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .env("POSTIL_PUBLICATION_RECEIPT_PATH", &annotation_receipt_path)
+        .args([
+            "review",
+            "--publish",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--output-json",
+        ])
+        .assert()
+        .code(1);
+    let annotation_receipt: Value =
+        serde_json::from_slice(&std::fs::read(&annotation_receipt_path).unwrap()).unwrap();
+    assert_eq!(annotation_receipt["version"], 2);
+    assert_eq!(annotation_receipt["channel"], "checkAnnotations");
+    assert!(annotation_receipt.get("reviewId").is_none());
+    assert_eq!(
+        annotation_receipt["findings"][0]["initialOutcome"],
+        "checkAnnotation"
+    );
+    assert!(annotation_receipt["findings"][0].get("commentId").is_none());
+    let annotation_requests = server.received_requests().await.unwrap();
+    let annotation_requests = &annotation_requests[request_count_before_annotations..];
+    assert!(!annotation_requests.iter().any(|request| {
+        request.method == wiremock::http::Method::POST
+            && request.url.path() == "/repos/acme/api/pulls/7/reviews"
+    }));
+    let annotation_patches = annotation_requests
+        .iter()
+        .filter(|request| request.method == wiremock::http::Method::PATCH)
+        .map(|request| request.body_json::<Value>().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(annotation_patches.len(), 2);
+    let advisory_annotation = annotation_patches
+        .iter()
+        .find(|patch| patch["output"].get("annotations").is_some())
+        .expect("advisory check annotation");
+    assert_eq!(
+        advisory_annotation["output"]["annotations"][0]["path"],
+        "src/auth.rs"
+    );
+    assert_eq!(
+        advisory_annotation["output"]["annotations"][0]["start_line"],
+        41
+    );
+    assert_eq!(
+        annotation_patches
+            .iter()
+            .filter(|patch| patch["output"].get("annotations").is_some())
+            .count(),
+        1
+    );
+    std::fs::remove_file(dir.path().join(".postil.yaml")).unwrap();
+    let request_count_before_deferred_gate = server.received_requests().await.unwrap().len();
+
     let out = postil()
         .current_dir(dir.path())
         .env("POSTIL_API_BASE", server.uri())
@@ -8644,10 +8717,9 @@ async fn github_flow_posts_review_and_completes_both_checks() {
     assert_eq!(env["gate"]["failing"], true);
 
     let reqs = server.received_requests().await.unwrap();
-    let conclusions: Vec<String> = reqs
+    let conclusions: Vec<String> = reqs[request_count_before_deferred_gate..]
         .iter()
         .filter(|request| request.method == wiremock::http::Method::PATCH)
-        .skip(2)
         .map(|request| {
             request.body_json::<Value>().unwrap()["conclusion"]
                 .as_str()
