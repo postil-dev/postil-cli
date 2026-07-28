@@ -567,15 +567,14 @@ async fn run_remote<F: Forge>(
                 } else {
                     CheckState::Success
                 };
-                // An operational failure inside the review (provider outage,
-                // unusable output) must stay visible on the advisory check.
-                // green-on-green would make an outage look like a clean pass
-                // when the gate stands aside under `gate.onError: advisory`.
+                // `postil/review` reports whether a review verdict exists. It
+                // fails when inference is operationally incomplete, independent
+                // of whether `postil/gate` is configured to stand aside.
                 let operational = envelope.findings.iter().any(|f| {
                     f.path == crate::envelope::OPERATIONAL_PATH
                         || f.path == crate::envelope::PROVIDER_PATH
                 });
-                let advisory_state = if operational {
+                let review_state = if operational {
                     CheckState::Failure
                 } else {
                     CheckState::Success
@@ -584,7 +583,7 @@ async fn run_remote<F: Forge>(
                     forge,
                     a,
                     g,
-                    advisory_state,
+                    review_state,
                     (!args.defer_gate_check).then_some(gate_state),
                     &envelope,
                     &meta,

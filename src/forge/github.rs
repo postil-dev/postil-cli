@@ -20,6 +20,12 @@ use crate::envelope::{Envelope, Finding, Severity};
 use crate::filter;
 
 pub const EXPECTED_REPOSITORY_ID_ENV: &str = "POSTIL_EXPECTED_GITHUB_REPO_ID";
+const GITHUB_MAX_ANNOTATIONS_PER_REQUEST: usize = 50;
+
+// Filtering caps visible findings before forge publication, so one completed
+// check update always fits GitHub's annotation request limit. Raising the
+// product cap requires implementing multi-request annotation delivery first.
+const _: () = assert!(crate::config::MAX_FINDINGS <= GITHUB_MAX_ANNOTATIONS_PER_REQUEST);
 
 pub struct GitHub {
     http: reqwest::Client,
@@ -1499,10 +1505,7 @@ impl Forge for GitHub {
         } else {
             Vec::new()
         };
-        ensure!(
-            annotations.len() <= 50,
-            "GitHub check annotation count exceeds the 50-annotation request limit"
-        );
+        debug_assert!(annotations.len() <= GITHUB_MAX_ANNOTATIONS_PER_REQUEST);
         let mut checks = vec![(advisory_id, advisory, "postil/review", true)];
         if let Some(gate) = gate {
             checks.push((gate_id, gate, "postil/gate", false));
