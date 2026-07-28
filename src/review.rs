@@ -727,8 +727,10 @@ async fn complete_remote_checks<F: Forge>(
         Some(review_started),
         CHECK_COMPLETION_TIMEOUT_SECS,
         forge.complete_checks(
-            advisory_id,
-            gate_id,
+            crate::forge::CheckRunIds {
+                advisory: advisory_id,
+                gate: gate_id,
+            },
             advisory,
             gate,
             envelope,

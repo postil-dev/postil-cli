@@ -11,7 +11,7 @@ use std::io::Write;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{
-    CheckState, FindingPublicationOutcome, FindingPublicationReceipt, Forge, PrMeta,
+    CheckRunIds, CheckState, FindingPublicationOutcome, FindingPublicationReceipt, Forge, PrMeta,
     ReviewPublicationReceipt, ReviewPublicationSummary, SummaryContext, ThreadKind, check_summary,
     check_title, only_operational_findings, valid_details_url,
 };
@@ -1455,8 +1455,7 @@ impl Forge for GitHub {
 
     async fn complete_checks(
         &self,
-        advisory_id: &str,
-        gate_id: &str,
+        check_ids: CheckRunIds<'_>,
         advisory: CheckState,
         gate: Option<CheckState>,
         envelope: &Envelope,
@@ -1506,9 +1505,9 @@ impl Forge for GitHub {
             Vec::new()
         };
         debug_assert!(annotations.len() <= GITHUB_MAX_ANNOTATIONS_PER_REQUEST);
-        let mut checks = vec![(advisory_id, advisory, "postil/review", true)];
+        let mut checks = vec![(check_ids.advisory, advisory, "postil/review", true)];
         if let Some(gate) = gate {
-            checks.push((gate_id, gate, "postil/gate", false));
+            checks.push((check_ids.gate, gate, "postil/gate", false));
         }
         let mut results = stream::iter(checks.into_iter().enumerate().map(
             |(index, (id, state, name, with_annotations))| {
@@ -1806,7 +1805,7 @@ mod tests {
     use crate::envelope::{
         Envelope, Finding, Gate, Kind, Severity, SuppressedFinding, SuppressionReason, Usage,
     };
-    use crate::forge::{CheckState, FindingPublicationOutcome, Forge, PrMeta};
+    use crate::forge::{CheckRunIds, CheckState, FindingPublicationOutcome, Forge, PrMeta};
     use reqwest::header::{HeaderMap, HeaderValue};
     use std::sync::{
         Arc,
@@ -2564,8 +2563,10 @@ mod tests {
 
         let error = test_github(&server)
             .complete_checks(
-                "11",
-                "12",
+                CheckRunIds {
+                    advisory: "11",
+                    gate: "12",
+                },
                 CheckState::Success,
                 Some(CheckState::Success),
                 &delivery_envelope("aaaaaaaaaaaa", "cccccccccccc"),
@@ -2599,8 +2600,10 @@ mod tests {
         let result = tokio::time::timeout(
             Duration::from_millis(100),
             github.complete_checks(
-                "11",
-                "12",
+                CheckRunIds {
+                    advisory: "11",
+                    gate: "12",
+                },
                 CheckState::Success,
                 Some(CheckState::Success),
                 &envelope,
@@ -2972,8 +2975,10 @@ mod tests {
         assert!(review_error.to_string().contains("PR snapshot changed"));
         let check_error = github
             .complete_checks(
-                "11",
-                "12",
+                CheckRunIds {
+                    advisory: "11",
+                    gate: "12",
+                },
                 CheckState::Success,
                 Some(CheckState::Success),
                 &delivery_envelope("aaaaaaaaaaaa", "cccccccccccc"),
@@ -3047,8 +3052,10 @@ mod tests {
         assert!(review_error.to_string().contains("PR snapshot changed"));
         let check_error = github
             .complete_checks(
-                "11",
-                "12",
+                CheckRunIds {
+                    advisory: "11",
+                    gate: "12",
+                },
                 CheckState::Success,
                 Some(CheckState::Success),
                 &envelope,
@@ -3262,8 +3269,10 @@ mod tests {
             .unwrap();
         github
             .complete_checks(
-                "11",
-                "12",
+                CheckRunIds {
+                    advisory: "11",
+                    gate: "12",
+                },
                 CheckState::Failure,
                 Some(CheckState::Failure),
                 &envelope,
@@ -3274,8 +3283,10 @@ mod tests {
             .unwrap();
         github
             .complete_checks(
-                "13",
-                "14",
+                CheckRunIds {
+                    advisory: "13",
+                    gate: "14",
+                },
                 CheckState::Failure,
                 Some(CheckState::Failure),
                 &envelope,

@@ -377,6 +377,12 @@ pub enum CheckState {
     Neutral,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckRunIds<'a> {
+    pub advisory: &'a str,
+    pub gate: &'a str,
+}
+
 /// What a `respond` thread number points at. GitHub's issues API covers both,
 /// so it ignores this; GitLab/Bitbucket/Azure key issues and PRs on different
 /// endpoints, so they branch on it.
@@ -624,8 +630,7 @@ pub trait Forge {
     /// while the acquired snapshot remains current.
     async fn complete_checks(
         &self,
-        advisory_id: &str,
-        gate_id: &str,
+        check_ids: CheckRunIds<'_>,
         advisory: CheckState,
         gate: Option<CheckState>,
         envelope: &Envelope,

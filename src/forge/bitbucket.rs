@@ -21,8 +21,8 @@ use sha2::Digest;
 use std::io::Write;
 
 use super::{
-    CheckState, Forge, PrMeta, ReviewPublicationReceipt, ThreadKind, check_summary, check_title,
-    untracked_review_publication_receipt,
+    CheckRunIds, CheckState, Forge, PrMeta, ReviewPublicationReceipt, ThreadKind, check_summary,
+    check_title, untracked_review_publication_receipt,
 };
 use crate::diff::{DiffSnapshot, DiffSpool, WorkspaceBudget};
 use crate::envelope::{Envelope, Finding};
@@ -575,8 +575,7 @@ impl Forge for Bitbucket {
 
     async fn complete_checks(
         &self,
-        _advisory_id: &str,
-        _gate_id: &str,
+        _check_ids: CheckRunIds<'_>,
         advisory: CheckState,
         gate: Option<CheckState>,
         envelope: &Envelope,
