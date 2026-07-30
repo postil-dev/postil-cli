@@ -7,6 +7,19 @@
 //! resolved base URL receives the deployment's bearer key. It is ignored by
 //! default and honored only when `POSTIL_ALLOW_CONFIG_API_BASE=1` (single-user
 //! local setups with a trusted repo). `POSTIL_API_BASE` (env) always applies.
+//!
+//! Inference credential: `POSTIL_API_KEY`, `OPENROUTER_API_KEY`,
+//! `MODEL_API_KEY`, and `LLM_API_KEY` (first set wins) all take priority over
+//! a stored `postil login` credential. When none of those four is set and a
+//! valid, unexpired credential exists at
+//! `${XDG_CONFIG_HOME:-~/.config}/postil/credentials.json`, its token becomes
+//! the bearer key (see `api_key::resolve_effective`) and its `apiBase`/
+//! `model` replace the values resolved above -- unless `POSTIL_API_BASE` /
+//! `REVIEW_MODEL` are set, which still win, applied first in this same
+//! function. An expired or unreadable stored credential is left alone here;
+//! `resolve_api_key` reports it as one actionable "run `postil login` again"
+//! error instead of blocking commands, like `postil config`, that never need
+//! a live key.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -15,6 +28,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::api_key;
+use crate::credentials;
 use crate::envelope::{Kind, Severity};
 
 const MODEL_DEFAULTS_TOML: &str = include_str!("../config.toml");
@@ -1438,7 +1453,41 @@ impl Config {
         {
             self.api_format = ApiFormat::parse(&format)?;
         }
+        self.apply_stored_login_credential();
         Ok(())
+    }
+
+    /// A first-time `postil login` user gets working defaults with zero
+    /// `.postil.yaml`: when no explicit key env var is set, a stored
+    /// credential supplies `apiBase` and `model`, unless `POSTIL_API_BASE`/
+    /// `REVIEW_MODEL` (just applied above) already overrode them. The
+    /// cascade is cleared along with `model`, since a leftover BYOK cascade
+    /// names models the hosted gateway does not operate.
+    ///
+    /// This applies even when the credential is expired: routing
+    /// (`apiBase`/`model`) is not a secret, and populating it here is what
+    /// lets `require_model` pass and `postil doctor`'s checks actually run
+    /// instead of failing before they can report the expiry. The live key
+    /// resolution in `resolve_api_key` is the sole place that enforces and
+    /// reports expiry -- it still refuses the token regardless of what
+    /// happens here.
+    fn apply_stored_login_credential(&mut self) {
+        if api_key::resolve_from_process_env().is_some() {
+            return;
+        }
+        let Ok(path) = credentials::default_path() else {
+            return;
+        };
+        let Ok(Some(creds)) = credentials::read(&path) else {
+            return;
+        };
+        if std::env::var("POSTIL_API_BASE").is_err() {
+            self.api_base = creds.api_base;
+        }
+        if std::env::var("REVIEW_MODEL").is_err() {
+            self.model = creds.model;
+            self.cascade.clear();
+        }
     }
 
     /// All models to try, in order, deduplicated.

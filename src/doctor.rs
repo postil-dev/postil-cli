@@ -7,6 +7,7 @@
 
 use crate::api_key;
 use crate::config::Config;
+use crate::credentials;
 use crate::llm::LlmClient;
 use anyhow::Result;
 
@@ -47,15 +48,46 @@ pub async fn run(cfg: &Config) -> Result<Vec<Check>> {
         },
     });
 
-    let key = api_key::resolve_from_process_env();
+    let credentials_path = credentials::default_path();
+    let stored_login = credentials_path
+        .as_ref()
+        .ok()
+        .and_then(|path| credentials::read(path).ok().flatten());
+    checks.push(Check {
+        name: "login",
+        ok: stored_login.as_ref().is_none_or(|c| !c.is_expired()),
+        detail: match &stored_login {
+            None => "not logged in; `postil login` gives zero-config hosted inference".to_string(),
+            Some(c) if c.is_expired() => format!(
+                "credential for org {} expired at {}; run `postil login` again",
+                c.org, c.expires_at
+            ),
+            Some(c) => format!("logged in to org {} (expires {})", c.org, c.expires_at),
+        },
+    });
+
     let key_names = api_key::names_text();
+    let key_lookup = credentials_path
+        .as_ref()
+        .map_err(|e| anyhow::anyhow!("{e:#}"))
+        .and_then(|path| api_key::resolve_effective(path));
+    let (key_ok, key_detail, key) = match key_lookup {
+        Ok(Some(k)) => (
+            true,
+            format!("resolved from {key_names}, or a stored login credential (value not shown)"),
+            Some(k),
+        ),
+        Ok(None) => (
+            false,
+            format!("set {key_names}, or run `postil login`; Postil never proxies inference"),
+            None,
+        ),
+        Err(e) => (false, format!("{e:#}"), None),
+    };
     checks.push(Check {
         name: "api key",
-        ok: key.is_some(),
-        detail: match &key {
-            Some(_) => format!("{key_names} is set (value not shown)"),
-            None => format!("set {key_names}; Postil never proxies inference"),
-        },
+        ok: key_ok,
+        detail: key_detail,
     });
 
     // Live probe: a 1-token response proves base URL + key + model + selected
