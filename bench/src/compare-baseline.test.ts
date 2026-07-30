@@ -113,13 +113,22 @@ describe("extractObservedMetrics", () => {
     expect(metrics.latencyMs.p50).toBe(1000);
   });
 
-  test("throws when every case is unscored", () => {
+  test("names an all-unscored run an operational failure, not a regression", () => {
+    // A release blocked because the model got worse and one blocked because the
+    // run never reached the model need different responses from whoever reads
+    // the log, so the message has to say which happened.
     const report = fakeReport({
       results: [
         { id: "errored-1", type: "defect", scored: false, truthSeverity: "error", durationMs: null, exitCode: undefined },
+        { id: "errored-2", type: "defect", scored: false, truthSeverity: "error", durationMs: null, exitCode: undefined },
       ],
     });
-    expect(() => extractObservedMetrics(report)).toThrow("no scored cases");
+    expect(() => extractObservedMetrics(report)).toThrow(
+      "scored none of its 2 cases",
+    );
+    expect(() => extractObservedMetrics(report)).toThrow(
+      "operational failure rather than a quality regression",
+    );
   });
 });
 

@@ -345,6 +345,19 @@ async function main() {
     });
     await writeReport(jsonOut, JSON.stringify(report, null, 2), runId);
     console.log(json ? JSON.stringify(report, null, 2) : formatLiveReport(report));
+    // A run that scored nothing measured nothing. Exiting 0 here leaves the
+    // release gate to infer an outage from an empty report, which reads as a
+    // tooling problem rather than as "the provider was never reached".
+    if (report.results.length > 0 && !report.results.some((result) => result.scored)) {
+      console.error(
+        `live benchmark produced no scored case out of ${report.results.length}: ` +
+          "every case failed before a valid envelope was produced. This is an " +
+          "operational failure, not a quality measurement. Check the provider " +
+          "credential, the account's remaining credit, and the model's " +
+          "availability before rerunning.",
+      );
+      process.exitCode = 1;
+    }
     return;
   }
 

@@ -47,10 +47,34 @@ jobs:
         with:
           bun-version: 1.3.14
 
-      - name: Require OpenRouter credential
+      # A present-but-rejected key fails all 70 cases about three minutes later
+      # with nothing that names the credential. Probing it costs one request and
+      # turns that into an immediate, accurate failure.
+      - name: Require a working OpenRouter credential
         env:
           COMPLETION_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-        run: test -n "$COMPLETION_API_KEY"
+        run: |
+          set -euo pipefail
+          if [[ -z "${COMPLETION_API_KEY}" ]]; then
+            echo "::error::OPENROUTER_API_KEY is not set."
+            exit 1
+          fi
+          status="$(curl --fail-with-body --silent --show-error \
+            --output /tmp/openrouter-key.json --write-out '%{http_code}' \
+            --connect-timeout 10 --max-time 30 \
+            -H "Authorization: Bearer ${COMPLETION_API_KEY}" \
+            https://openrouter.ai/api/v1/key)" || {
+            echo "::error::OPENROUTER_API_KEY was rejected by OpenRouter (HTTP ${status:-none}). Rotate the repository secret."
+            exit 1
+          }
+          # A key with a spent limit authenticates and then fails every call.
+          remaining="$(jq -r '.data.limit_remaining // "unlimited"' /tmp/openrouter-key.json)"
+          if [[ "${remaining}" != "unlimited" ]] && \
+             awk "BEGIN { exit !(${remaining} < 1) }"; then
+            echo "::error::OPENROUTER_API_KEY has ${remaining} credit remaining, below the cost of one benchmark run."
+            exit 1
+          fi
+          echo "OpenRouter credential accepted (remaining: ${remaining})."
 
       # Plain release profile: the same build the release job ships, so the
       # gate measures the binary users will actually get.

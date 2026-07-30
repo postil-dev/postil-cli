@@ -161,7 +161,16 @@ export function extractObservedMetrics(report: LiveReportForComparison): Observe
   const s = report.summary;
   const scoredResults = report.results.filter((r) => r.scored);
   if (scoredResults.length === 0) {
-    throw new Error("live report has no scored cases; nothing to compare");
+    // Distinguishable on purpose. A release blocked because the model got worse
+    // and a release blocked because the run never reached the model call for
+    // different responses, and the second must not be mistaken for the first.
+    throw new Error(
+      `live report scored none of its ${report.results.length} cases, so no metric ` +
+        "could be computed. This is an operational failure rather than a quality " +
+        "regression: every case failed before producing a valid envelope. Check " +
+        "the provider credential, the account's remaining credit, and the model's " +
+        "availability, then rerun the benchmark.",
+    );
   }
 
   const gateCorrect = scoredResults.filter(
