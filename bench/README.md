@@ -358,9 +358,11 @@ scorer call or scorer identity. A finding that is later suppressed does
 exercise the scorer and must retain its exact identity and usage record.
 
 It refuses to run without `POSTIL_API_KEY`, `OPENROUTER_API_KEY`, `MODEL_API_KEY`,
-or `LLM_API_KEY` and never logs or prints the key value. Live mode is
-**not run in CI**: it spends real tokens and depends on an
-external provider. Every live run writes its JSON report under
+or `LLM_API_KEY` and never logs or prints the key value. Live mode spends real
+tokens and depends on an external provider, so it is **not run on ordinary
+pushes or pull requests**; the release pipeline runs a full-corpus live pass
+against `bench/baseline.json` before every tagged release (see "Release gate"
+below). Every live run writes its JSON report under
 `.runs/live/<run-id>/` (gitignored), beside raw per-attempt stdout and stderr.
 Set `--run-id <id>` or `POSTIL_BENCH_SCREEN_RUN_ID` to name the immutable
 namespace; an omitted ID gets a unique generated value. Reusing an ID fails
@@ -434,3 +436,40 @@ per case, diff-only with no repository context or policy docs. **Neither
 severity metric is a peer-comparison claim**: no competitor has been run on the
 same fixtures. Results vary across runs because model inference is
 nondeterministic. Treat them as internal evidence, not a published benchmark.
+
+## Release gate
+
+The `Release` workflow runs a full-corpus diff-file live pass
+(`REVIEW_MODEL=z-ai/glm-5.2 bun run bench:live`) against the plain release
+binary before it builds any target, then checks the result with
+`bun run bench:compare`. A material regression blocks the release: `build`
+depends on the `bench-live` job.
+
+`compare-baseline.ts` computes five metrics from the live report and compares
+each against the matching model entry in `bench/baseline.json`: authored-target
+detection rate, false/unrelated finding count, gate-verdict correctness (does
+the CLI's exit code agree with the authored must-block/advisory/clean
+classification), mean provider cost per case, and p95 review latency. Each
+metric has its own tolerance (see the exported `*_MAX_*` constants at the top
+of `compare-baseline.ts`), wide enough to absorb ordinary run-to-run inference
+variance but not a real behavioral, cost, or latency regression. The baseline
+also records the fixture-corpus and evaluator-source SHA-256 digests the live
+report already computes; a mismatch fails loudly instead of comparing metrics
+across an unrelated fixture set.
+
+```sh
+# Compare an existing report against the committed baseline.
+bun run bench:compare -- --result <path-to-report.json>
+bun run bench:compare -- --run-id <run-id>   # resolves .runs/live/<run-id>/report.json
+
+# Re-baseline deliberately, after confirming the new numbers are an accepted
+# tradeoff (a model change, a fixture change, an intentional pipeline change):
+REVIEW_MODEL=z-ai/glm-5.2 bun run bench:live -- --json-out live-report.json
+bun run bench:compare -- --result live-report.json --record
+```
+
+`--record` is the only thing that writes `bench/baseline.json`; nothing else
+updates it implicitly. When the gate fails in CI, the printed table shows
+baseline vs. observed vs. verdict for every metric, so the failing metric and
+by how much is visible directly in the job log without downloading the report
+artifact.
