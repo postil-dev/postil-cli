@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "corpus": {
+    "fixtureCorpusSha256": "3c4f952f9411bf2c4e5f0a61b5975e47d203f7681a8235d53d717c743ea9cb54",
+    "evaluatorSha256": "64dd1975bd5743e15b073b8c6dbad91e37cef3388f793073b216d002de80d78a"
+  },
+  "profiles": {
+    "z-ai/glm-5.2": {
+      "populated": true,
+      "generatedAt": "2026-07-30T01:06:07.029Z",
+      "reviewMode": "exhaustive",
+      "sourceRunAt": "2026-07-30T01:05:48.700Z",
+      "totalCases": 70,
+      "scoredCases": 69,
+      "detectionRate": 0.9649122807017544,
+      "falsePositives": 4,
+      "gateVerdictCorrectness": 0.7681159420289855,
+      "meanCostUsdPerCase": 0.004135275999999999,
+      "latencyMs": {
+        "p50": 4528,
+        "p95": 48585
+      }
+    }
+  }
+}

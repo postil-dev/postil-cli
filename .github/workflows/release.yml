@@ -33,8 +33,53 @@ jobs:
             exit 1
           }
 
-  build:
+  bench-live:
     needs: validate-tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Require OpenRouter credential
+        env:
+          COMPLETION_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: test -n "$COMPLETION_API_KEY"
+
+      # Plain release profile: the same build the release job ships, so the
+      # gate measures the binary users will actually get.
+      - run: cargo build --quiet --release
+      - name: Install benchmark dependencies
+        working-directory: bench
+        run: bun install --frozen-lockfile
+
+      - name: Run diff-file live benchmark
+        working-directory: bench
+        env:
+          REVIEW_MODEL: z-ai/glm-5.2
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: bun run bench:live -- --run-id "release-${{ github.ref_name }}" --json-out "${{ runner.temp }}/bench-live-report.json"
+
+      - name: Compare against the recorded baseline
+        id: compare-baseline
+        working-directory: bench
+        run: bun run bench:compare -- --result "${{ runner.temp }}/bench-live-report.json"
+
+      - name: Report benchmark regression
+        if: steps.compare-baseline.outcome == 'failure'
+        run: |
+          echo "::error::Release blocked by a benchmark regression. See the 'Compare against the recorded baseline' step above for the failing metric(s)."
+          echo "## Release blocked" >> "$GITHUB_STEP_SUMMARY"
+          echo "The live benchmark regressed past tolerance against \`bench/baseline.json\`. See the 'Compare against the recorded baseline' step log for the failing metric(s)." >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: [validate-tag, bench-live]
     strategy:
       matrix:
         include:

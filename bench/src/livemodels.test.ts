@@ -1293,8 +1293,13 @@ describe("managed admission workflow", () => {
     const release = await Bun.file(
       resolve(import.meta.dir, "..", "..", ".github", "workflows", "release.yml"),
     ).text();
-    expect(release).toMatch(/validate-tag:\n[\s\S]*?fetch-depth: 0[\s\S]*?bun-version: 1\.3\.14[\s\S]*?bun install --frozen-lockfile[\s\S]*?bun run verify-admission[\s\S]*?\n  build:\n/u);
-    expect(release).toMatch(/build:\n\s+needs: validate-tag/u);
+    expect(release).toMatch(/validate-tag:\n[\s\S]*?fetch-depth: 0[\s\S]*?bun-version: 1\.3\.14[\s\S]*?bun install --frozen-lockfile[\s\S]*?bun run verify-admission[\s\S]*?\n  bench-live:\n/u);
+    expect(release).toMatch(/bench-live:\n\s+needs: validate-tag\n/u);
+    expect(release).toContain("REVIEW_MODEL: z-ai/glm-5.2");
+    expect(release).toContain("OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}");
+    expect(release).toContain("bun run bench:live --");
+    expect(release).toContain("bun run bench:compare --");
+    expect(release).toMatch(/build:\n\s+needs: \[validate-tag, bench-live\]/u);
     let checkedReferences = 0;
     const workflowGlob = new Bun.Glob("*.yml");
     for await (const workflowName of workflowGlob.scan(resolve(import.meta.dir, "..", "..", ".github", "workflows"))) {
