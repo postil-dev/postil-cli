@@ -482,6 +482,18 @@ pub enum SuppressionReason {
     BelowSeverity,
     BelowConfidence,
     MaxFindings,
+    /// The finding's prose names a construct that the diff places elsewhere on
+    /// the same path than the line it cites. A reader cannot verify a claim
+    /// against the wrong code, so the finding is not publishable as written.
+    AnchorMismatch,
+    /// The finding restates a claim that another, retained finding already
+    /// makes about a different location. Only the retained copy is published,
+    /// and it names the other affected locations.
+    DuplicateRootCause,
+    /// A content-policy claim built on top of a finding that was itself
+    /// suppressed as mis-anchored. It inherits the misreading and cannot stand
+    /// on its own.
+    DerivedFromSuppressed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

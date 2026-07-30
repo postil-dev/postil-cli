@@ -632,6 +632,54 @@ impl GitHub {
         ))
     }
 
+    /// Finding markers already carried by inline comments on this pull request.
+    ///
+    /// A finding's id is a hash over the head SHA, kind, path, line, and title,
+    /// so an identical marker is the same finding at the same place on the same
+    /// commit. Two reviews of one head — a push review followed by an `@postil`
+    /// mention, say — legitimately re-detect the same issue, and without this
+    /// the second run posts a second copy of every comment the first already
+    /// left.
+    ///
+    /// Failure here is not a publication failure. A review that cannot read the
+    /// existing comments posts everything it found, which is the behaviour this
+    /// dedup replaces.
+    async fn published_finding_markers(&self) -> std::collections::HashSet<String> {
+        const PAGE_SIZE: usize = 100;
+        const MAX_PAGES: usize = 20;
+        let mut markers = std::collections::HashSet::new();
+        for page in 1..=MAX_PAGES {
+            let request = self.request(
+                reqwest::Method::GET,
+                self.url(&format!(
+                    "/pulls/{}/comments?per_page={PAGE_SIZE}&page={page}",
+                    self.pr
+                )),
+            );
+            let Ok(response) = self.send_retryable(request, "inline comment dedup").await else {
+                return markers;
+            };
+            let Ok(response) = Self::check_ok(response, "inline comment dedup").await else {
+                return markers;
+            };
+            let Ok(comments): Result<Vec<PublishedReviewComment>> =
+                super::bounded_response_json(response, "GitHub inline comment dedup").await
+            else {
+                return markers;
+            };
+            let page_len = comments.len();
+            for comment in comments {
+                if let Some(marker) = finding_marker_in(&comment.body) {
+                    markers.insert(marker);
+                }
+            }
+            if page_len < PAGE_SIZE {
+                break;
+            }
+        }
+        markers
+    }
+
     async fn post_comment_reconciled(&self, number: u64, body: &str, marker: &str) -> Result<()> {
         const RETRIES: u32 = 2;
         for retry in 0..=RETRIES {
@@ -1283,6 +1331,10 @@ impl Forge for GitHub {
                 short_sha(&snapshot.base_sha),
             ));
         }
+        // A re-review of an unchanged head re-detects what the last review
+        // found. Those findings arrive fresh rather than carried, so the carry
+        // filter above cannot see them; their markers already on the PR can.
+        let published = self.published_finding_markers().await;
         let comments: Vec<_> = findings
             .iter()
             // Carried findings already have comments from the previous review.
@@ -1291,6 +1343,10 @@ impl Forge for GitHub {
             // no real file line to anchor an inline comment; they surface only in
             // the summary body.
             .filter(|f| !super::is_synthetic_path(&f.path))
+            .filter(|f| {
+                let (finding_id, _) = finding_receipt_id(f);
+                !published.contains(&finding_marker(&finding_id))
+            })
             .map(|f| {
                 let (finding_id, _) = finding_receipt_id(f);
                 let mut c = json!({
@@ -1755,6 +1811,14 @@ fn review_marker(receipt_id: &str) -> String {
     )
 }
 
+/// The finding marker a published comment body ends with, if any.
+fn finding_marker_in(body: &str) -> Option<String> {
+    const OPEN: &str = "<!-- postil-finding:v1:";
+    let start = body.rfind(OPEN)?;
+    let end = body[start..].find("-->")? + start + "-->".len();
+    Some(body[start..end].to_string())
+}
+
 fn append_marker(body: &str, marker: &str) -> String {
     if body.trim().is_empty() {
         marker.to_string()
@@ -1798,9 +1862,10 @@ fn comment_marker(number: u64, body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        EXPECTED_REPOSITORY_ID_ENV, GitHub, PullFile, gate_summary, github_retry_delay_at,
-        github_retryable_response, github_transport_retry_delay, only_operational_findings,
-        valid_details_url, validate_pull_file,
+        EXPECTED_REPOSITORY_ID_ENV, GitHub, PullFile, finding_marker, finding_marker_in,
+        finding_receipt_id, gate_summary, github_retry_delay_at, github_retryable_response,
+        github_transport_retry_delay, only_operational_findings, valid_details_url,
+        validate_pull_file,
     };
     use crate::envelope::{
         Envelope, Finding, Gate, Kind, Severity, SuppressedFinding, SuppressionReason, Usage,
@@ -3470,5 +3535,222 @@ mod tests {
         assert!(summary.contains("merge check remains blocked"));
         assert!(!summary.contains("provider"));
         assert!(!summary.contains("timeout"));
+    }
+
+    fn dedup_finding() -> Finding {
+        Finding {
+            path: "values.cluster.yaml".into(),
+            line: 675,
+            end_line: None,
+            severity: Severity::Warn,
+            kind: Kind::Uncertainty,
+            confidence: 0.6,
+            generator_confidence: None,
+            scorer_confidence: None,
+            generator_kind: None,
+            scorer_kind: None,
+            scorer_reason: None,
+            title: "rgwConfig may not be a recognized field".into(),
+            body: "The chart may silently ignore this block.".into(),
+            evidence: None,
+            id: None,
+        }
+    }
+
+    fn dedup_github(server: &MockServer) -> GitHub {
+        GitHub {
+            http: reqwest::Client::new(),
+            api_base: server.uri(),
+            details_url: None,
+            token: "test-token".into(),
+            owner: "owner".into(),
+            repo: "repo".into(),
+            pr: 1,
+            expected_repository_id: None,
+        }
+    }
+
+    async fn mount_dedup_snapshot(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "title": "t", "body": "b", "state": "open", "merged": false,
+                "head": {"sha": "aaaaaaaaaaaa"}, "base": {"sha": "bbbbbbbbbbbb"},
+                "changed_files": 1
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/repos/owner/repo/compare/bbbbbbbbbbbb...aaaaaaaaaaaa",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "merge_base_commit": {"sha": "cccccccccccc"}, "files": []
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1/reviews/11/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(server)
+            .await;
+    }
+
+    /// A second review of an unchanged head re-detects what the first found.
+    /// Those findings are fresh, not carried, so only the marker already on the
+    /// pull request can tell the run its comment is a duplicate.
+    #[tokio::test]
+    async fn github_does_not_repost_an_inline_comment_already_on_the_pull_request() {
+        let server = MockServer::start().await;
+        mount_dedup_snapshot(&server).await;
+        let finding = dedup_finding();
+        let envelope =
+            delivery_envelope_with_findings("aaaaaaaaaaaa", "cccccccccccc", vec![finding.clone()]);
+        let github = dedup_github(&server);
+        let (finding_id, _) = finding_receipt_id(
+            envelope
+                .findings
+                .first()
+                .expect("one finding in the envelope"),
+        );
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1/comments"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "id": 7,
+                    "body": format!("**{}**\n\n{}", finding.title, finding_marker(&finding_id)),
+                }])),
+            )
+            .mount(&server)
+            .await;
+        let posted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let captured = posted.clone();
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(move |request: &wiremock::Request| {
+                captured
+                    .lock()
+                    .expect("capture lock")
+                    .push(request.body_json().expect("review body"));
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": 11}))
+            })
+            .mount(&server)
+            .await;
+
+        github
+            .post_review(
+                &envelope,
+                &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+            )
+            .await
+            .expect("the review still posts its summary");
+
+        let bodies = posted.lock().expect("capture lock");
+        let body = bodies.first().expect("one review posted");
+        assert_eq!(
+            body["comments"].as_array().map_or(0, Vec::len),
+            0,
+            "the duplicate inline comment is not reposted"
+        );
+    }
+
+    #[tokio::test]
+    async fn github_posts_an_inline_comment_the_pull_request_does_not_carry() {
+        let server = MockServer::start().await;
+        mount_dedup_snapshot(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1/comments"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "id": 7,
+                    "body": "**Some other finding**\n\n<!-- postil-finding:v1:aabbccddeeff -->",
+                }])),
+            )
+            .mount(&server)
+            .await;
+        let posted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let captured = posted.clone();
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(move |request: &wiremock::Request| {
+                captured
+                    .lock()
+                    .expect("capture lock")
+                    .push(request.body_json().expect("review body"));
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": 11}))
+            })
+            .mount(&server)
+            .await;
+        let envelope =
+            delivery_envelope_with_findings("aaaaaaaaaaaa", "cccccccccccc", vec![dedup_finding()]);
+
+        dedup_github(&server)
+            .post_review(
+                &envelope,
+                &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+            )
+            .await
+            .expect("review posts");
+
+        let bodies = posted.lock().expect("capture lock");
+        let body = bodies.first().expect("one review posted");
+        assert_eq!(
+            body["comments"].as_array().map_or(0, Vec::len),
+            1,
+            "an unrelated marker must not suppress a real finding"
+        );
+    }
+
+    #[tokio::test]
+    async fn github_publishes_normally_when_existing_comments_cannot_be_read() {
+        // Dedup is an improvement on top of publication, never a gate on it.
+        let server = MockServer::start().await;
+        mount_dedup_snapshot(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1/comments"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let posted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let captured = posted.clone();
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(move |request: &wiremock::Request| {
+                captured
+                    .lock()
+                    .expect("capture lock")
+                    .push(request.body_json().expect("review body"));
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": 11}))
+            })
+            .mount(&server)
+            .await;
+        let envelope =
+            delivery_envelope_with_findings("aaaaaaaaaaaa", "cccccccccccc", vec![dedup_finding()]);
+
+        dedup_github(&server)
+            .post_review(
+                &envelope,
+                &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+            )
+            .await
+            .expect("review posts");
+
+        let bodies = posted.lock().expect("capture lock");
+        assert_eq!(
+            bodies.first().expect("one review posted")["comments"]
+                .as_array()
+                .map_or(0, Vec::len),
+            1
+        );
+    }
+
+    #[test]
+    fn finding_marker_is_read_back_from_a_published_comment_body() {
+        let marker = finding_marker("finding-id");
+        assert_eq!(
+            finding_marker_in(&format!("**Title**\n\nBody text.\n\n{marker}")),
+            Some(marker)
+        );
+        assert_eq!(finding_marker_in("no marker here"), None);
     }
 }

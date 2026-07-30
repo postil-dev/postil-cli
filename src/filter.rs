@@ -53,9 +53,39 @@ pub fn apply(cfg: &Config, index: &DiffIndex, mut findings: Vec<Finding>) -> Res
     let ungrounded = (before - findings.len()) as u32;
     let all_ungrounded = had_any && findings.is_empty();
 
+    let mut suppressed_findings = Vec::new();
+
+    // Anchor corroboration. Grounding proves the cited line exists and that the
+    // quoted evidence is its text; it does not prove the finding is ABOUT that
+    // line. A model that reasons correctly about one construct and cites
+    // another produces a claim no reader can check against the code in front of
+    // them, and any later rule that builds on the citation inherits the error.
+    let mismatched: Vec<Finding> = {
+        let mut mismatched = Vec::new();
+        findings.retain(|f| {
+            if anchor_verdict(index, f) == AnchorVerdict::Mismatched {
+                mismatched.push(f.clone());
+                suppressed_findings.push(SuppressedFinding {
+                    finding: f.clone(),
+                    reason: SuppressionReason::AnchorMismatch,
+                });
+                false
+            } else {
+                true
+            }
+        });
+        mismatched
+    };
+
+    // Content-policy claims are second-order: they compare the PR's own prose
+    // against what the diff does. When the "what the diff does" half came from a
+    // finding that misread the diff, the content-policy claim is an accusation
+    // built on that misreading, so it falls with it rather than outliving it at
+    // a higher confidence than the finding it rests on.
+    apply_derived_confidence(&mut findings, &mismatched, &mut suppressed_findings);
+
     // Policy suppression.
     let ignore = build_ignore_set(&cfg.ignore)?;
-    let mut suppressed_findings = Vec::new();
     findings.retain(|f| {
         let reason = if deterministically_non_actionable(f) {
             Some(SuppressionReason::NonActionable)
@@ -78,6 +108,12 @@ pub fn apply(cfg: &Config, index: &DiffIndex, mut findings: Vec<Finding>) -> Res
             true
         }
     });
+
+    // One observation replicated across every file it touches is one finding,
+    // not one per file. Collapsing here rather than at the model boundary keeps
+    // the collapse honest: the retained copy names the other locations, so the
+    // reader still learns the full extent of the issue.
+    collapse_shared_root_cause(&mut findings, &mut suppressed_findings);
 
     // Highest severity first, then confidence; cap to maxFindings.
     findings.sort_by(|a, b| {
@@ -104,6 +140,454 @@ pub fn apply(cfg: &Config, index: &DiffIndex, mut findings: Vec<Finding>) -> Res
         ungrounded,
         all_ungrounded,
     })
+}
+
+/// How far from its cited line a named construct may sit and still corroborate
+/// the anchor. Wide enough to span a function signature, a systemd unit stanza,
+/// or a YAML task block, so a finding that pins the top of a construct and
+/// discusses a key further down still corroborates.
+const ANCHOR_CORROBORATION_WINDOW: u32 = 12;
+
+/// Shortest quoted span treated as a locatable construct. Below this, a token
+/// matches too much of any file to say anything about where a finding belongs.
+const MIN_CONSTRUCT_CHARS: usize = 4;
+
+/// Longest quoted span treated as a locatable construct. A longer quote is
+/// prose being quoted, not an identifier being named.
+const MAX_CONSTRUCT_CHARS: usize = 80;
+
+/// Most words a delimited span may carry and still be a name rather than a
+/// sentence. Long enough for a descriptive task or test name.
+const MAX_CONSTRUCT_WORDS: usize = 6;
+
+/// How much prose a finding must carry before two copies of it can be judged
+/// the same observation. A real finding states a claim in sentences; a pair
+/// that matches on less than this has not earned a collapse.
+const MIN_ROOT_CAUSE_TOKENS: usize = 12;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnchorVerdict {
+    /// A construct the finding names sits at or near the cited line.
+    Corroborated,
+    /// Every construct the finding names sits elsewhere on the same path.
+    Mismatched,
+    /// The finding names nothing the diff can locate, so the anchor can be
+    /// neither confirmed nor contradicted. Grounding already passed; leave it.
+    Unlocatable,
+}
+
+/// Decide whether a finding's own prose corroborates the line it cites.
+///
+/// Two things have to hold for a citation to be checkable. The constructs the
+/// finding names must reach the anchor, and they must sit close enough together
+/// that the relationship the finding asserts between them exists at one place
+/// in the file. A finding fails the first when it simply wrote down the wrong
+/// number. It fails the second when it correctly read several constructs and
+/// then described them as one — the production case, where a password task, its
+/// `no_log`, and an unrelated task's `diff: false` were reported as a single
+/// edit sixteen lines apart.
+///
+/// Neither failure is inferred from silence. A finding that names nothing the
+/// diff can locate is `Unlocatable` and stands on the grounding check alone.
+fn anchor_verdict(index: &DiffIndex, finding: &Finding) -> AnchorVerdict {
+    if crate::envelope::is_reserved_anchor(&finding.path) || !index.has_new_side_text(&finding.path)
+    {
+        return AnchorVerdict::Unlocatable;
+    }
+    let anchor_end = finding.end_line.unwrap_or(finding.line);
+    // Read each construct at the occurrence most favourable to the finding: the
+    // one nearest its anchor. If the claim does not hold together even there, it
+    // does not hold together anywhere.
+    let mut located: Vec<u32> = Vec::new();
+    for construct in named_constructs(finding) {
+        let lines = index.new_side_lines_containing(&finding.path, &construct);
+        if let Some(nearest) = lines
+            .into_iter()
+            .min_by_key(|line| line.abs_diff(finding.line).min(line.abs_diff(anchor_end)))
+        {
+            located.push(nearest);
+        }
+    }
+    if located.is_empty() {
+        return AnchorVerdict::Unlocatable;
+    }
+
+    let low = finding.line.saturating_sub(ANCHOR_CORROBORATION_WINDOW);
+    let high = anchor_end.saturating_add(ANCHOR_CORROBORATION_WINDOW);
+    if !located.iter().any(|line| (low..=high).contains(line)) {
+        return AnchorVerdict::Mismatched;
+    }
+
+    let nearest = *located.iter().min().expect("located is non-empty");
+    let furthest = *located.iter().max().expect("located is non-empty");
+    if furthest - nearest > ANCHOR_CORROBORATION_WINDOW {
+        return AnchorVerdict::Mismatched;
+    }
+    AnchorVerdict::Corroborated
+}
+
+/// Constructs a finding names in its own prose: the spans it puts in backticks
+/// or double quotes that look like code rather than like English.
+fn named_constructs(finding: &Finding) -> Vec<String> {
+    let mut constructs = Vec::new();
+    let own_basename = finding.path.rsplit('/').next().unwrap_or(&finding.path);
+    for text in [finding.title.as_str(), finding.body.as_str()] {
+        // Backticks and quotes are not equivalent. A backticked span is a
+        // literal being named — an identifier, a key, a task title. A
+        // double-quoted span is as often a quoted sentence, so it has to look
+        // like code before it counts.
+        for (delimiter, prose_allowed) in [('`', true), ('"', false)] {
+            let mut parts = text.split(delimiter);
+            // A split on a paired delimiter alternates outside/inside; only the
+            // odd indices are quoted spans, and a trailing unpaired delimiter
+            // leaves a final outside part that is correctly skipped.
+            parts.next();
+            while let Some(span) = parts.next() {
+                if parts.next().is_none() {
+                    break;
+                }
+                let span = span.trim();
+                if !is_locatable_construct(span, prose_allowed) {
+                    continue;
+                }
+                // The finding's own path is metadata about where it points, not
+                // a construct at the line it points to.
+                if span == finding.path || span == own_basename {
+                    continue;
+                }
+                if !constructs.iter().any(|existing| existing == span) {
+                    constructs.push(span.to_string());
+                }
+            }
+        }
+    }
+    constructs
+}
+
+/// Whether a delimited span names something the diff could contain.
+///
+/// `prose_allowed` relaxes the code-shape test for spans the author marked as
+/// literals. A named Ansible task or test case carries no punctuation and no
+/// camel case, and rejecting it loses the one construct that pins where a
+/// finding belongs. The relaxation is safe because an extracted span only ever
+/// matters when the diff actually contains it.
+fn is_locatable_construct(span: &str, prose_allowed: bool) -> bool {
+    let chars = span.chars().count();
+    if !(MIN_CONSTRUCT_CHARS..=MAX_CONSTRUCT_CHARS).contains(&chars) {
+        return false;
+    }
+    let words = span.split_whitespace().count();
+    if span.contains('\n') || words > MAX_CONSTRUCT_WORDS {
+        return false;
+    }
+    if prose_allowed {
+        return true;
+    }
+    let code_punctuation = span
+        .chars()
+        .any(|c| matches!(c, '_' | '.' | ':' | '/' | '-' | '=' | '(' | '[' | '{'));
+    let has_digit = span.chars().any(|c| c.is_ascii_digit());
+    let inner_capital = span
+        .chars()
+        .zip(span.chars().skip(1))
+        .any(|(previous, next)| previous.is_ascii_lowercase() && next.is_ascii_uppercase());
+    code_punctuation || has_digit || inner_capital
+}
+
+/// Cap a content-policy finding's confidence at that of the code finding it
+/// argues from, and drop it outright when every finding it argues from was
+/// suppressed as mis-anchored.
+///
+/// A content-policy finding says "the PR description claims X but the change
+/// does Y". The "does Y" half is only ever as reliable as the reading of the
+/// diff that produced it. Left uncapped, a 0.60-confidence misreading becomes a
+/// 0.95-confidence accusation that the author described their own change
+/// falsely, which is both the most damaging thing this reviewer can say and the
+/// claim it has the least independent basis for.
+fn apply_derived_confidence(
+    findings: &mut Vec<Finding>,
+    mismatched: &[Finding],
+    suppressed_findings: &mut Vec<SuppressedFinding>,
+) {
+    let sources: Vec<(String, f64)> = findings
+        .iter()
+        .filter(|f| f.kind != crate::envelope::Kind::ContentPolicy)
+        .map(|f| (f.path.clone(), f.confidence))
+        .collect();
+    let mismatched_paths: Vec<String> = mismatched
+        .iter()
+        .filter(|f| f.kind != crate::envelope::Kind::ContentPolicy)
+        .map(|f| f.path.clone())
+        .collect();
+
+    let mut derived_only_from_suppressed = Vec::new();
+    for finding in findings.iter_mut() {
+        if finding.kind != crate::envelope::Kind::ContentPolicy {
+            continue;
+        }
+        let ceiling = sources
+            .iter()
+            .filter(|(path, _)| references_path(finding, path))
+            .map(|(_, confidence)| *confidence)
+            .fold(f64::NEG_INFINITY, f64::max);
+        if ceiling.is_finite() {
+            finding.confidence = finding.confidence.min(ceiling);
+            continue;
+        }
+        // No surviving finding backs this claim. If the claim points at a path
+        // whose only finding was suppressed as mis-anchored, it is that
+        // misreading restated as an accusation.
+        if mismatched_paths
+            .iter()
+            .any(|path| references_path(finding, path))
+        {
+            derived_only_from_suppressed.push(finding.clone());
+        }
+    }
+    if derived_only_from_suppressed.is_empty() {
+        return;
+    }
+    findings.retain(|finding| {
+        let dropped = derived_only_from_suppressed
+            .iter()
+            .any(|candidate| finding_identity(candidate) == finding_identity(finding));
+        if dropped {
+            suppressed_findings.push(SuppressedFinding {
+                finding: finding.clone(),
+                reason: SuppressionReason::DerivedFromSuppressed,
+            });
+        }
+        !dropped
+    });
+}
+
+/// Whether a finding's prose points at `path`, by full path or by basename.
+fn references_path(finding: &Finding, path: &str) -> bool {
+    if crate::envelope::is_reserved_anchor(path) {
+        return false;
+    }
+    let basename = path.rsplit('/').next().unwrap_or(path);
+    let haystack = format!("{} {}", finding.title, finding.body).to_ascii_lowercase();
+    haystack.contains(&path.to_ascii_lowercase())
+        || (basename.contains('.') && haystack.contains(&basename.to_ascii_lowercase()))
+}
+
+fn finding_identity(finding: &Finding) -> (String, u32, String, String) {
+    (
+        finding.path.clone(),
+        finding.line,
+        finding.title.clone(),
+        finding.body.clone(),
+    )
+}
+
+/// Collapse findings that make the same claim about different locations into
+/// one finding that names them all.
+///
+/// The retained copy is the most confident, breaking ties toward the earliest
+/// location so the choice is stable across runs.
+fn collapse_shared_root_cause(
+    findings: &mut Vec<Finding>,
+    suppressed_findings: &mut Vec<SuppressedFinding>,
+) {
+    use std::collections::HashMap;
+
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for (position, finding) in findings.iter().enumerate() {
+        if crate::envelope::is_reserved_anchor(&finding.path) || is_carried(finding) {
+            continue;
+        }
+        let Some(key) = root_cause_key(finding) else {
+            continue;
+        };
+        if groups.entry(key.clone()).or_default().is_empty() {
+            order.push(key.clone());
+        }
+        groups
+            .get_mut(&key)
+            .expect("group just inserted")
+            .push(position);
+    }
+
+    let mut drop_positions = std::collections::HashSet::new();
+    for key in &order {
+        let positions = &groups[key];
+        if positions.len() < 2 {
+            continue;
+        }
+        let keep = *positions
+            .iter()
+            .min_by(|left, right| {
+                let a = &findings[**left];
+                let b = &findings[**right];
+                b.confidence
+                    .total_cmp(&a.confidence)
+                    .then_with(|| a.path.cmp(&b.path))
+                    .then_with(|| a.line.cmp(&b.line))
+            })
+            .expect("group is non-empty");
+        let mut others: Vec<String> = positions
+            .iter()
+            .filter(|position| **position != keep)
+            .map(|position| format!("{}:{}", findings[*position].path, findings[*position].line))
+            .collect();
+        others.sort();
+        for position in positions {
+            if *position != keep {
+                drop_positions.insert(*position);
+            }
+        }
+        annotate_shared_locations(&mut findings[keep], &others);
+    }
+    if drop_positions.is_empty() {
+        return;
+    }
+    let mut position = 0;
+    findings.retain(|finding| {
+        let dropped = drop_positions.contains(&position);
+        position += 1;
+        if dropped {
+            suppressed_findings.push(SuppressedFinding {
+                finding: finding.clone(),
+                reason: SuppressionReason::DuplicateRootCause,
+            });
+        }
+        !dropped
+    });
+}
+
+/// The claim a finding makes, with the location it makes it about removed.
+/// Two findings share a root cause when only their locations differ.
+///
+/// Returns `None` for prose too short to identify a claim. Two findings that
+/// agree on a handful of words have not been shown to be the same observation,
+/// and collapsing them would hide a real second defect.
+fn root_cause_key(finding: &Finding) -> Option<String> {
+    let prose = format!("{}\n{}", finding.title, finding.body);
+    let mut normalized = String::with_capacity(prose.len());
+    let mut tokens = 0usize;
+    for token in prose.split_whitespace() {
+        tokens += 1;
+        let trimmed = token.trim_matches(|c: char| !c.is_alphanumeric());
+        let path_like = trimmed.contains('/')
+            || (trimmed.contains('.')
+                && trimmed.rsplit('.').next().is_some_and(|extension| {
+                    !extension.is_empty() && extension.chars().all(|c| c.is_ascii_alphabetic())
+                }));
+        if path_like {
+            normalized.push_str("<path> ");
+        } else if trimmed.chars().any(|c| c.is_ascii_digit()) {
+            normalized.push_str("<n> ");
+        } else {
+            normalized.push_str(&token.to_ascii_lowercase());
+            normalized.push(' ');
+        }
+    }
+    if tokens < MIN_ROOT_CAUSE_TOKENS {
+        return None;
+    }
+    Some(format!(
+        "{}|{}|{}",
+        finding.kind.as_str(),
+        finding.severity.as_str(),
+        normalized.trim()
+    ))
+}
+
+/// Append the other locations sharing this finding's cause, but never at the
+/// cost of the finding's publishability: forge sinks must not repair prose, so
+/// a note that would push the body past the publication limits is dropped
+/// rather than truncated.
+fn annotate_shared_locations(finding: &mut Finding, others: &[String]) {
+    if others.is_empty() {
+        return;
+    }
+    let note = format!(
+        "\n\nThe same issue appears at {}.",
+        others
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let mut annotated = finding.clone();
+    annotated.body = format!("{}{note}", finding.body);
+    if crate::envelope::validate_finding_publication(&annotated).is_ok() {
+        finding.body = annotated.body;
+    }
+}
+
+/// Strip blocking severity from `uncertainty` findings that only ask the author
+/// to check something.
+///
+/// This runs last, after uncertainty resolution has had its chance to turn a
+/// question into an evidenced claim and after policy thresholds have been
+/// applied to the severity the model asked for. The order matters in both
+/// directions: resolving first means a finding that did the work keeps its
+/// severity, and demoting after thresholds means the question stays visible
+/// instead of dropping below a `warn` floor and disappearing.
+pub fn demote_deferred_verification(findings: &mut [Finding]) {
+    for finding in findings {
+        if defers_verification_to_the_author(finding) {
+            finding.severity = crate::envelope::Severity::Info;
+        }
+    }
+}
+
+/// Whether an `uncertainty` finding only asks the author to check something,
+/// without saying what the reviewer itself checked.
+///
+/// "Confirm that X is always created" is a question, not a finding. It costs
+/// the author the verification work the reviewer was supposed to do, and it
+/// does so at a severity that can gate a merge. A finding that reports what it
+/// looked at ("the diff adds no other caller") is doing the work and keeps its
+/// severity.
+fn defers_verification_to_the_author(finding: &Finding) -> bool {
+    if finding.kind != crate::envelope::Kind::Uncertainty
+        || finding.severity == crate::envelope::Severity::Info
+        || crate::envelope::is_reserved_anchor(&finding.path)
+    {
+        return false;
+    }
+    // The ask is read from the body alone. A title is a headline and is
+    // routinely imperative ("Verify the caller contract") even for a finding
+    // whose body then goes and establishes the answer; demoting on the headline
+    // would punish exactly the findings that did the work.
+    let body = finding.body.to_ascii_lowercase();
+    let prose = format!("{} {}", finding.title, finding.body).to_ascii_lowercase();
+    let asks_the_author = [
+        "confirm that",
+        "confirm the",
+        "please confirm",
+        "verify that",
+        "verify the",
+        "please verify",
+        "double-check",
+        "make sure that",
+        "ensure that",
+        "check whether",
+        "check that",
+    ]
+    .iter()
+    .any(|marker| body.contains(marker));
+    if !asks_the_author {
+        return false;
+    }
+    let states_what_it_checked = [
+        "the diff shows",
+        "the diff adds",
+        "the diff does not",
+        "the diff contains no",
+        "no other caller",
+        "no other reference",
+        "searched",
+        "the only caller",
+        "elsewhere in this change",
+    ]
+    .iter()
+    .any(|marker| prose.contains(marker));
+    !states_what_it_checked
 }
 
 fn deterministically_non_actionable(finding: &Finding) -> bool {
@@ -1119,5 +1603,338 @@ mod tests {
         );
         assert!(rec.resolved.is_empty());
         assert_eq!(rec.carried.len(), 1);
+    }
+
+    /// The Ansible playbook from the production misattribution: a
+    /// password-switching task with `no_log: true` sits at 965..972, and an
+    /// unrelated rclone-config task with `diff: false` sits at 979..982.
+    fn playbook_index() -> DiffIndex {
+        let mut text = String::from(
+            "diff --git a/ansible/playbooks/backup.yml b/ansible/playbooks/backup.yml\n\
+             --- a/ansible/playbooks/backup.yml\n\
+             +++ b/ansible/playbooks/backup.yml\n\
+             @@ -960,24 +960,24 @@\n",
+        );
+        for line in 960..=990 {
+            let content = match line {
+                965 => "  - name: Switch RGW admin password".to_string(),
+                972 => "    no_log: true".to_string(),
+                979 => "  - name: Write rclone config".to_string(),
+                981 => "    diff: false".to_string(),
+                other => format!("    key_{other}: value"),
+            };
+            text.push('+');
+            text.push_str(&content);
+            text.push('\n');
+        }
+        DiffIndex::build(&diff::parse(&text))
+    }
+
+    fn playbook_finding(line: u32, title: &str, body: &str) -> Finding {
+        let mut finding = f("ansible/playbooks/backup.yml", line, Severity::Error, 0.6);
+        finding.title = title.into();
+        finding.body = body.into();
+        finding.evidence = Some(match line {
+            981 => "    diff: false".to_string(),
+            other => format!("    key_{other}: value"),
+        });
+        finding
+    }
+
+    #[test]
+    fn a_finding_citing_a_line_its_named_construct_does_not_sit_on_is_suppressed() {
+        // Reproduces the production defect: the model reasoned about the
+        // password task at 965 and cited 981, where an unrelated task lives.
+        // Grounding passes because the evidence really is line 981's text.
+        let idx = playbook_index();
+        let cfg = Config::default();
+        let finding = playbook_finding(
+            981,
+            "Password task drops `no_log: true`",
+            "The `Switch RGW admin password` task replaces `no_log: true` with \
+             `diff: false`, so the new password is written to the job log in \
+             plaintext on every run of this playbook.",
+        );
+
+        let out = apply(&cfg, &idx, vec![finding]).unwrap();
+
+        assert!(
+            out.kept.is_empty(),
+            "a mis-anchored finding is not published"
+        );
+        assert_eq!(
+            out.ungrounded, 0,
+            "it grounded; the anchor is what is wrong"
+        );
+        assert_eq!(out.suppressed_findings.len(), 1);
+        assert_eq!(
+            out.suppressed_findings[0].reason,
+            SuppressionReason::AnchorMismatch
+        );
+    }
+
+    #[test]
+    fn a_finding_citing_the_line_its_named_construct_sits_on_is_kept() {
+        let idx = playbook_index();
+        let cfg = Config::default();
+        let mut finding = playbook_finding(
+            972,
+            "Password task drops `no_log: true`",
+            "The `Switch RGW admin password` task no longer sets `no_log: true`, \
+             so the new password is written to the job log in plaintext.",
+        );
+        finding.evidence = Some("    no_log: true".to_string());
+
+        let out = apply(&cfg, &idx, vec![finding]).unwrap();
+
+        assert_eq!(out.kept.len(), 1);
+        assert!(out.suppressed_findings.is_empty());
+    }
+
+    #[test]
+    fn a_finding_naming_nothing_the_diff_can_locate_keeps_its_anchor() {
+        // Without a locatable construct there is no evidence either way, and
+        // grounding has already done its job. Silence must not become a verdict.
+        let idx = playbook_index();
+        let cfg = Config::default();
+        let finding = playbook_finding(
+            981,
+            "This task is not idempotent",
+            "Re-running the playbook rewrites the file unconditionally, so every \
+             run reports a change even when nothing differs.",
+        );
+
+        let out = apply(&cfg, &idx, vec![finding]).unwrap();
+
+        assert_eq!(out.kept.len(), 1);
+    }
+
+    #[test]
+    fn a_content_policy_claim_built_on_a_mis_anchored_finding_falls_with_it() {
+        // The second production error-severity finding: the PR description was
+        // compared against the misreading and its author accused of describing
+        // the change falsely.
+        let mut idx = playbook_index();
+        idx.add_content_policy_evidence(
+            crate::envelope::PR_DESCRIPTION_PATH,
+            "### .postil/pr-description\n     1   Backup hardening\n     2   Keeps no_log on the password task.\n",
+        );
+        let cfg = Config::default();
+        let mis_anchored = playbook_finding(
+            981,
+            "Password task drops `no_log: true`",
+            "The `Switch RGW admin password` task replaces `no_log: true` with \
+             `diff: false`, exposing the password in the job log.",
+        );
+        let mut derived = f(
+            crate::envelope::PR_DESCRIPTION_PATH,
+            2,
+            Severity::Error,
+            0.95,
+        );
+        derived.kind = Kind::ContentPolicy;
+        derived.title = "PR description contradicts the change".into();
+        derived.body = "The description states no_log is kept, but \
+                        ansible/playbooks/backup.yml removes it."
+            .into();
+        derived.evidence = Some("Keeps no_log on the password task.".into());
+
+        let out = apply(&cfg, &idx, vec![mis_anchored, derived]).unwrap();
+
+        assert!(out.kept.is_empty(), "neither error-severity claim survives");
+        let reasons: Vec<_> = out
+            .suppressed_findings
+            .iter()
+            .map(|entry| entry.reason)
+            .collect();
+        assert!(reasons.contains(&SuppressionReason::AnchorMismatch));
+        assert!(reasons.contains(&SuppressionReason::DerivedFromSuppressed));
+    }
+
+    #[test]
+    fn a_content_policy_claim_cannot_outrank_the_finding_it_argues_from() {
+        let mut idx = playbook_index();
+        idx.add_content_policy_evidence(
+            crate::envelope::PR_DESCRIPTION_PATH,
+            "### .postil/pr-description\n     1   Backup hardening\n     2   Keeps no_log on the password task.\n",
+        );
+        let mut cfg = Config::default();
+        cfg.min_confidence = 0.0;
+        let mut source = playbook_finding(
+            972,
+            "Password task drops `no_log: true`",
+            "The `Switch RGW admin password` task no longer sets `no_log: true`.",
+        );
+        source.evidence = Some("    no_log: true".to_string());
+        source.confidence = 0.55;
+        let mut derived = f(
+            crate::envelope::PR_DESCRIPTION_PATH,
+            2,
+            Severity::Error,
+            0.95,
+        );
+        derived.kind = Kind::ContentPolicy;
+        derived.title = "PR description contradicts the change".into();
+        derived.body = "The description states no_log is kept, but \
+                        ansible/playbooks/backup.yml removes it."
+            .into();
+        derived.evidence = Some("Keeps no_log on the password task.".into());
+
+        let out = apply(&cfg, &idx, vec![source, derived]).unwrap();
+
+        let content_policy = out
+            .kept
+            .iter()
+            .find(|finding| finding.kind == Kind::ContentPolicy)
+            .expect("the claim survives, at its source's confidence");
+        assert!(
+            (content_policy.confidence - 0.55).abs() < f64::EPSILON,
+            "confidence was {}, expected the source's 0.55",
+            content_policy.confidence
+        );
+    }
+
+    #[test]
+    fn one_observation_repeated_across_files_becomes_one_finding() {
+        // Production shape: five systemd unit templates, one claim, bodies
+        // differing only by filename.
+        let units = [
+            "backup-asset.service.j2",
+            "backup-integrity.service.j2",
+            "backup-prune.service.j2",
+            "backup-restore-test.service.j2",
+            "backup-tenant-data-maintenance.service.j2",
+        ];
+        let mut text = String::new();
+        let mut findings = Vec::new();
+        for (position, unit) in units.iter().enumerate() {
+            let path = format!("ansible/roles/backup/templates/{unit}");
+            text.push_str(&format!(
+                "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -10,1 +10,1 @@\n+EnvironmentFile=/etc/backup.env\n",
+            ));
+            let mut finding = f(&path, 10, Severity::Warn, 0.6);
+            finding.kind = Kind::Risk;
+            finding.title = format!("EnvironmentFile in {unit} is not optional");
+            finding.body = format!(
+                "In {unit} the EnvironmentFile directive has no leading dash, so \
+                 systemd refuses to start the unit when the file is absent rather \
+                 than continuing with the environment unset."
+            );
+            finding.evidence = Some("EnvironmentFile=/etc/backup.env".into());
+            finding.confidence = 0.6 + position as f64 * 0.01;
+            findings.push(finding);
+        }
+        let idx = DiffIndex::build(&diff::parse(&text));
+        let cfg = Config::default();
+
+        let out = apply(&cfg, &idx, findings).unwrap();
+
+        assert_eq!(out.kept.len(), 1, "one claim, one finding");
+        assert_eq!(out.suppressed_findings.len(), 4);
+        assert!(
+            out.suppressed_findings
+                .iter()
+                .all(|entry| entry.reason == SuppressionReason::DuplicateRootCause)
+        );
+        let body = &out.kept[0].body;
+        for unit in &units {
+            if !out.kept[0].path.ends_with(unit) {
+                assert!(
+                    body.contains(unit),
+                    "the retained finding names {unit} as also affected"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn findings_with_too_little_prose_to_compare_are_not_collapsed() {
+        let mut text = String::new();
+        let mut findings = Vec::new();
+        for path in ["a.rs", "b.rs"] {
+            text.push_str(&format!(
+                "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1,1 +1,1 @@\n+x\n",
+            ));
+            let mut finding = f(path, 1, Severity::Warn, 0.9);
+            finding.title = "Unchecked index".into();
+            finding.body = "This can panic.".into();
+            findings.push(finding);
+        }
+        let idx = DiffIndex::build(&diff::parse(&text));
+        let cfg = Config::default();
+
+        let out = apply(&cfg, &idx, findings).unwrap();
+
+        assert_eq!(
+            out.kept.len(),
+            2,
+            "two short findings are still two findings"
+        );
+    }
+
+    fn uncertainty(title: &str, body: &str) -> Finding {
+        let mut finding = f("values.cluster.yaml", 675, Severity::Warn, 0.6);
+        finding.kind = Kind::Uncertainty;
+        finding.title = title.into();
+        finding.body = body.into();
+        finding
+    }
+
+    #[test]
+    fn an_uncertainty_finding_that_only_asks_the_author_to_check_stops_blocking() {
+        let mut findings = vec![uncertainty(
+            "rgwConfig may not be a recognized field",
+            "Verify that rgwConfig is a field the chart recognizes; if it is not, \
+             the block is silently ignored.",
+        )];
+
+        demote_deferred_verification(&mut findings);
+
+        assert_eq!(
+            findings[0].severity,
+            Severity::Info,
+            "the question stays visible but cannot carry a blocking severity"
+        );
+    }
+
+    #[test]
+    fn an_uncertainty_finding_that_reports_what_it_checked_keeps_its_severity() {
+        let mut findings = vec![uncertainty(
+            "rgwConfig is not a recognized field",
+            "The diff adds no schema entry for rgwConfig and no other reference to \
+             it, so verify that the chart consumes it.",
+        )];
+
+        demote_deferred_verification(&mut findings);
+
+        assert_eq!(findings[0].severity, Severity::Warn);
+    }
+
+    #[test]
+    fn demotion_leaves_other_kinds_and_reserved_anchors_alone() {
+        let mut risk = uncertainty(
+            "Confirm that the cache is warmed",
+            "Confirm that the cache is warmed before the first request.",
+        );
+        risk.kind = Kind::Risk;
+        let mut operational = uncertainty(
+            "Review incomplete",
+            "Confirm that the full diff was reviewed.",
+        );
+        operational.path = crate::envelope::OPERATIONAL_PATH.into();
+        let mut findings = vec![risk, operational];
+
+        demote_deferred_verification(&mut findings);
+
+        assert_eq!(
+            findings[0].severity,
+            Severity::Warn,
+            "only uncertainty demotes"
+        );
+        assert_eq!(
+            findings[1].severity,
+            Severity::Warn,
+            "an operational anchor states the run's own limits"
+        );
     }
 }

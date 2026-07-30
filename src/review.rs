@@ -1953,6 +1953,11 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
         }
     }
 
+    // A question the reviewer never answered cannot block a merge. This runs
+    // after uncertainty resolution so a finding that went and checked keeps the
+    // severity it earned.
+    crate::filter::demote_deferred_verification(&mut findings);
+
     // Fresh metadata IDs must exist before reconciliation: synthetic line
     // numbers are presentation positions, not issue identity.
     generate_finding_ids(&mut findings, head_sha.as_deref());

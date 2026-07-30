@@ -894,6 +894,39 @@ impl DiffIndex {
             .is_some_and(|rs| rs.iter().any(|r| *r.start() <= end && start <= *r.end()))
     }
 
+    /// New-side lines on `path` whose canonical text contains `needle`, in
+    /// ascending order. This is the same text the model was shown, so a lookup
+    /// answers "where in this file does the construct the finding names
+    /// actually appear" without re-reading the worktree.
+    ///
+    /// The comparison ignores case. Callers use this to decide whether to
+    /// distrust a finding, so a case difference between prose and source must
+    /// count as corroboration rather than as evidence against the anchor.
+    pub fn new_side_lines_containing(&self, path: &str, needle: &str) -> Vec<u32> {
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let needle = needle.to_ascii_lowercase();
+        let mut lines: Vec<u32> = self
+            .new_evidence
+            .iter()
+            .filter(|((candidate, _), text)| {
+                candidate == path && text.to_ascii_lowercase().contains(&needle)
+            })
+            .map(|((_, line), _)| *line)
+            .collect();
+        lines.sort_unstable();
+        lines
+    }
+
+    /// True when the diff carries any new-side text for `path`. A path with no
+    /// new-side coverage cannot corroborate or contradict an anchor.
+    pub fn has_new_side_text(&self, path: &str) -> bool {
+        self.new_evidence
+            .keys()
+            .any(|(candidate, _)| candidate == path)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.ranges.is_empty()
     }
