@@ -34,15 +34,51 @@ import { z } from "zod";
  * before the gate fails. */
 export const DETECTION_RATE_MAX_DROP_PP = 2;
 
-/** The false/unrelated finding count may rise by at most this many findings
- * above baseline before the gate fails. An absolute count, not a rate: the
- * corpus size is fixed, so a rate would just rescale the same tolerance. */
+/** The false/unrelated finding count above baseline that is reported as a
+ * concern. Not blocking: see MEASURED_RUN_TO_RUN_SPREAD. An absolute count,
+ * not a rate, since the corpus size is fixed. */
 export const FALSE_FINDINGS_MAX_INCREASE = 2;
 
 /** Gate-verdict correctness (does the CLI's exit code agree with the
- * authored classification: block must-block, pass everything else) may drop
- * at most this many percentage points below baseline. */
+ * authored classification: block must-block, pass everything else) below
+ * baseline that is reported as a concern. Not blocking: see
+ * MEASURED_RUN_TO_RUN_SPREAD. */
 export const GATE_VERDICT_MAX_DROP_PP = 2;
+
+/**
+ * What one run of this benchmark can and cannot decide.
+ *
+ * Six runs of a single unchanged binary against this corpus, four on
+ * OpenRouter managed routing and two pinned to the qualified upstream
+ * provider, produced:
+ *
+ *   detection rate            96.5% - 100.0%   (3.5pp spread)
+ *   false/unrelated findings  4 - 7
+ *   gate verdict correctness  71.4% - 84.3%    (12.9pp spread)
+ *
+ * Every request is issued at temperature 0, so this is not sampling noise. It
+ * is the provider's own nondeterminism, and pinning the upstream provider did
+ * not remove it: the widest false-finding count came from a pinned run.
+ *
+ * A blocking threshold has to sit outside that spread or it fails releases at
+ * random, and a gate that fails at random gets bypassed, which is worse than
+ * no gate. Detection rate is the one metric whose spread is narrow enough to
+ * gate on from a single run, and it is also the metric that most directly
+ * answers "did the reviewer find the defects". The other two are real signals
+ * and are still reported and worth reading across releases, but a single
+ * sample of either cannot separate a regression from the noise floor, so they
+ * do not block.
+ *
+ * Narrowing them means reducing the noise, not tightening the number:
+ * comparing a median across repeated runs would be the direct fix, at
+ * proportionally more cost and wall-clock per release.
+ */
+export const MEASURED_RUN_TO_RUN_SPREAD = {
+  runs: 6,
+  detectionRatePp: 3.5,
+  falseFindingsCount: 3,
+  gateVerdictPp: 12.9,
+} as const;
 
 /** Mean provider cost per case may rise at most this fraction above baseline
  * before the gate fails. Provider pricing and routing drift more than model
@@ -217,6 +253,8 @@ interface MetricVerdict {
   observed: string;
   verdict: "PASS" | "FAIL";
   detail?: string;
+  /** Reported, but never blocks a release. See MEASURED_RUN_TO_RUN_SPREAD. */
+  informational?: boolean;
 }
 
 export interface ComparisonResult {
@@ -250,7 +288,8 @@ export function compareMetrics(baseline: Extract<BaselineProfile, { populated: t
     baseline: String(baseline.falsePositives),
     observed: String(observed.falsePositives),
     verdict: observed.falsePositives <= falsePositiveCeiling ? "PASS" : "FAIL",
-    detail: `ceiling ${falsePositiveCeiling} (baseline + ${FALSE_FINDINGS_MAX_INCREASE})`,
+    detail: `watch above ${falsePositiveCeiling}; observed spread ${MEASURED_RUN_TO_RUN_SPREAD.falseFindingsCount} unchanged`,
+    informational: true,
   });
 
   const gateFloor = baseline.gateVerdictCorrectness - GATE_VERDICT_MAX_DROP_PP / 100;
@@ -259,7 +298,8 @@ export function compareMetrics(baseline: Extract<BaselineProfile, { populated: t
     baseline: pct(baseline.gateVerdictCorrectness),
     observed: pct(observed.gateVerdictCorrectness),
     verdict: observed.gateVerdictCorrectness >= gateFloor ? "PASS" : "FAIL",
-    detail: `floor ${pct(gateFloor)} (baseline - ${GATE_VERDICT_MAX_DROP_PP}pp)`,
+    detail: `watch below ${pct(gateFloor)}; observed spread ${MEASURED_RUN_TO_RUN_SPREAD.gateVerdictPp}pp unchanged`,
+    informational: true,
   });
 
   const costCeiling = baseline.meanCostUsdPerCase * (1 + MEAN_COST_MAX_INCREASE_RATIO);
@@ -290,7 +330,10 @@ export function compareMetrics(baseline: Extract<BaselineProfile, { populated: t
     verdict: "PASS",
   });
 
-  return { ok: rows.every((r) => r.verdict === "PASS"), rows };
+  return {
+    ok: rows.every((r) => r.informational === true || r.verdict === "PASS"),
+    rows,
+  };
 }
 
 export function formatComparisonTable(rows: readonly MetricVerdict[]): string {
@@ -305,9 +348,22 @@ export function formatComparisonTable(rows: readonly MetricVerdict[]): string {
     [pad("metric", widths.metric), pad("baseline", widths.baseline), pad("observed", widths.observed), pad("verdict", widths.verdict)].join("  "),
   ];
   for (const row of rows) {
+    // An informational row reports a comparison without asserting a verdict on
+    // the release, so it must not render a bare PASS/FAIL that reads like one.
+    const verdict = row.informational === true ? "report" : row.verdict;
     lines.push(
-      [pad(row.metric, widths.metric), pad(row.baseline, widths.baseline), pad(row.observed, widths.observed), pad(row.verdict, widths.verdict)].join("  ") +
+      [pad(row.metric, widths.metric), pad(row.baseline, widths.baseline), pad(row.observed, widths.observed), pad(verdict, widths.verdict)].join("  ") +
         (row.detail ? `  (${row.detail})` : ""),
+    );
+  }
+  const noisy = rows.filter((row) => row.informational === true && row.verdict === "FAIL");
+  if (noisy.length > 0) {
+    lines.push(
+      "",
+      `Outside its usual range, but not blocking: ${noisy.map((row) => row.metric).join(", ")}. ` +
+        `One run cannot separate this from provider nondeterminism (${MEASURED_RUN_TO_RUN_SPREAD.runs} runs ` +
+        `of one unchanged binary spanned ${MEASURED_RUN_TO_RUN_SPREAD.gateVerdictPp}pp of gate verdict ` +
+        `correctness). Worth reading across several releases, not acting on alone.`,
     );
   }
   return lines.join("\n");
