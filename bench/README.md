@@ -451,8 +451,27 @@ detection rate, false/unrelated finding count, gate-verdict correctness (does
 the CLI's exit code agree with the authored must-block/advisory/clean
 classification), mean provider cost per case, and p95 review latency. Each
 metric has its own tolerance (see the exported `*_MAX_*` constants at the top
-of `compare-baseline.ts`), wide enough to absorb ordinary run-to-run inference
-variance but not a real behavioral, cost, or latency regression. The baseline
+of `compare-baseline.ts`).
+
+Three of those metrics block a release: detection rate, mean cost per case, and
+p95 latency. False/unrelated findings and gate-verdict correctness are reported
+but never block, because one run cannot measure them precisely enough to act on.
+Six runs of a single unchanged binary against this corpus, four on managed
+routing and two pinned to the qualified upstream provider, spanned 4 to 7 false
+findings and 12.9 percentage points of gate-verdict correctness, against
+thresholds of 2 findings and 2 points. Every request goes out at temperature 0,
+so this is the provider's own nondeterminism rather than sampling, and pinning
+the provider did not remove it: the widest false-finding count came from a
+pinned run. Detection rate over the same six runs spanned 3.5 points, which
+leaves a threshold that still catches a real regression.
+
+Read the two reported metrics across releases rather than acting on a single
+run. Making them blocking again means reducing the noise rather than tightening
+the number: comparing a median across repeated runs is the direct fix, at
+proportionally more cost and wall-clock per release. A gate that fails at
+random is worse than no gate, because it teaches everyone to bypass it.
+
+The baseline
 also records the fixture-corpus and evaluator-source SHA-256 digests the live
 report already computes; a mismatch fails loudly instead of comparing metrics
 across an unrelated fixture set.

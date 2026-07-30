@@ -7,6 +7,7 @@ import {
   MEAN_COST_MAX_INCREASE_RATIO,
   compareMetrics,
   extractObservedMetrics,
+  formatComparisonTable,
   percentile,
   type BaselineProfile,
   type LiveReportForComparison,
@@ -169,20 +170,49 @@ describe("compareMetrics", () => {
     expect(comparison.rows.find((row) => row.metric === "detection rate")?.verdict).toBe("PASS");
   });
 
-  test("fails when false/unrelated findings rise past the absolute budget", () => {
+  test("reports false/unrelated findings past the budget without blocking", () => {
+    // Six runs of one unchanged binary spanned 4 to 7 false findings against a
+    // budget of baseline + 2, so this threshold marks a run worth reading, not
+    // a release worth stopping.
     const observed = extractObservedMetrics(fakeReport({
       falsePositives: populatedBaseline.falsePositives + FALSE_FINDINGS_MAX_INCREASE + 1,
     }));
     const comparison = compareMetrics(populatedBaseline, observed);
-    expect(comparison.rows.find((row) => row.metric === "false/unrelated findings")?.verdict).toBe("FAIL");
+    const row = comparison.rows.find((r) => r.metric === "false/unrelated findings");
+    expect(row?.verdict).toBe("FAIL");
+    expect(row?.informational).toBe(true);
+    expect(comparison.ok).toBe(true);
+  });
+
+  test("says so in the table when a reported metric leaves its usual range", () => {
+    const observed = extractObservedMetrics(fakeReport({
+      falsePositives: populatedBaseline.falsePositives + FALSE_FINDINGS_MAX_INCREASE + 1,
+    }));
+    const table = formatComparisonTable(compareMetrics(populatedBaseline, observed).rows);
+    expect(table).toContain("Outside its usual range, but not blocking");
+    expect(table).toContain("false/unrelated findings");
+  });
+
+  test("a detection-rate drop still blocks the release", () => {
+    // The one metric whose spread across those runs (3.5pp) stayed inside a
+    // threshold that can still catch a real regression.
+    const observed = {
+      ...extractObservedMetrics(fakeReport()),
+      detectionRate: populatedBaseline.detectionRate - (DETECTION_RATE_MAX_DROP_PP / 100) - 0.01,
+    };
+    const comparison = compareMetrics(populatedBaseline, observed);
+    expect(comparison.rows.find((r) => r.metric === "detection rate")?.verdict).toBe("FAIL");
     expect(comparison.ok).toBe(false);
   });
 
-  test("fails when gate-verdict correctness drops more than the tolerance", () => {
+  test("reports a gate-verdict drop past the tolerance without blocking", () => {
     const baseline = { ...populatedBaseline, gateVerdictCorrectness: 1 };
     const observed = { ...extractObservedMetrics(fakeReport()), gateVerdictCorrectness: 1 - (GATE_VERDICT_MAX_DROP_PP / 100) - 0.01 };
     const comparison = compareMetrics(baseline, observed);
-    expect(comparison.rows.find((row) => row.metric === "gate verdict correctness")?.verdict).toBe("FAIL");
+    const row = comparison.rows.find((r) => r.metric === "gate verdict correctness");
+    expect(row?.verdict).toBe("FAIL");
+    expect(row?.informational).toBe(true);
+    expect(comparison.ok).toBe(true);
   });
 
   test("fails when mean cost rises past the ratio budget", () => {
