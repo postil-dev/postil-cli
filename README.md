@@ -20,9 +20,12 @@ Release binaries cover Linux x86_64 and ARM64 with glibc or musl, plus macOS on 
 
 ## Review before pushing
 
+Authenticate once for hosted inference against your organization's entitlement, or bring your own model key:
+
 ```sh
-export MODEL_API_KEY=...                 # OpenRouter is the default endpoint
-export REVIEW_MODEL=provider/qualified-model
+postil login                             # zero-config: stores a credential for hosted inference
+# or: export MODEL_API_KEY=...           # OpenRouter is the default endpoint
+#     export REVIEW_MODEL=provider/qualified-model
 postil doctor                            # validate the endpoint and repository
 postil review --staged                   # review the staged change
 postil review --base origin/main         # review the branch

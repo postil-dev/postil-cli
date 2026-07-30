@@ -203,6 +203,15 @@ pub enum Command {
         #[command(subcommand)]
         action: HookAction,
     },
+    /// Authenticate against postil.dev for zero-config hosted inference.
+    Login {
+        /// Organization to select during approval. The browser approval page
+        /// is authoritative for membership; this only pre-fills a hint.
+        #[arg(long)]
+        org: Option<String>,
+    },
+    /// Remove the stored login credential and revoke it server-side.
+    Logout,
 }
 
 #[derive(Subcommand)]
@@ -345,5 +354,27 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn login_accepts_an_optional_org_hint() {
+        let parsed = Cli::try_parse_from(["postil", "login"]).unwrap();
+        let Command::Login { org } = parsed.command else {
+            panic!("expected login command");
+        };
+        assert_eq!(org, None);
+
+        let parsed = Cli::try_parse_from(["postil", "login", "--org", "runatlas-is"]).unwrap();
+        let Command::Login { org } = parsed.command else {
+            panic!("expected login command");
+        };
+        assert_eq!(org.as_deref(), Some("runatlas-is"));
+    }
+
+    #[test]
+    fn logout_takes_no_arguments() {
+        let parsed = Cli::try_parse_from(["postil", "logout"]).unwrap();
+        assert!(matches!(parsed.command, Command::Logout));
+        assert!(Cli::try_parse_from(["postil", "logout", "--org", "runatlas-is"]).is_err());
     }
 }

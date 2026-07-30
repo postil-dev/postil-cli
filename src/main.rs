@@ -5,7 +5,7 @@ use postil_cli::attribution;
 use postil_cli::cli::{Cli, Command, ForgeArg, HookAction, publication_enabled};
 use postil_cli::config::{Config, qualification_metadata, starter_config};
 use postil_cli::review::{ForgeKind, ReviewArgs};
-use postil_cli::{doctor, hook, plan, respond, review};
+use postil_cli::{doctor, hook, login, plan, respond, review};
 
 #[tokio::main]
 async fn main() {
@@ -212,5 +212,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
                 Ok(0)
             }
         },
+        Command::Login { org } => login::run_login(org).await,
+        Command::Logout => login::run_logout().await,
     }
 }

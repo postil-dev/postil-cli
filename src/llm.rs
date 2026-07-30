@@ -4400,12 +4400,23 @@ impl LlmTimeouts {
 }
 
 fn resolve_api_key() -> Result<String> {
-    api_key::resolve_from_process_env().ok_or_else(|| {
-        let key_names = api_key::names_text();
-        anyhow!(
-            "no API key: set {key_names}. Postil never proxies your inference; bring your own key."
-        )
-    })
+    // Checked first, and independently of the credentials-path lookup below,
+    // so an explicit key still works in a minimal environment with no HOME
+    // or XDG_CONFIG_HOME -- exactly what worked before login existed.
+    if let Some(key) = api_key::resolve_from_process_env() {
+        return Ok(key);
+    }
+    let credentials_path = crate::credentials::default_path()
+        .context("resolving the postil login credentials path")?;
+    match api_key::resolve_effective(&credentials_path)? {
+        Some(key) => Ok(key),
+        None => {
+            let key_names = api_key::names_text();
+            Err(anyhow!(
+                "no API key: set {key_names}, or run `postil login`. Postil never proxies your inference without one of these."
+            ))
+        }
+    }
 }
 
 fn duration_from_env(name: &str, default_secs: Option<u64>) -> Result<Option<Duration>> {
@@ -4470,7 +4481,7 @@ struct AnthropicUsage {
     output_tokens: Option<u64>,
 }
 
-fn secure_http_client(api_base: &str) -> Result<reqwest::Client> {
+pub(crate) fn secure_http_client(api_base: &str) -> Result<reqwest::Client> {
     let (hostname, addresses) = resolve_api_endpoint(api_base)?;
     reqwest::Client::builder()
         // A system proxy resolves the destination itself and would bypass the
