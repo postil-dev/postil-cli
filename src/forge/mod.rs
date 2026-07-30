@@ -1135,6 +1135,11 @@ fn suppression_reason(reason: SuppressionReason) -> &'static str {
         SuppressionReason::BelowSeverity => "below the configured severity threshold",
         SuppressionReason::BelowConfidence => "below the configured confidence threshold",
         SuppressionReason::MaxFindings => "outside the configured finding cap",
+        SuppressionReason::AnchorMismatch => "cites a line the named construct does not sit on",
+        SuppressionReason::DuplicateRootCause => {
+            "restates a retained finding about another location"
+        }
+        SuppressionReason::DerivedFromSuppressed => "built on a finding suppressed as mis-anchored",
     }
 }
 
