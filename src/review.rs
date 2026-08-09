@@ -1125,7 +1125,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
         repository_source,
     } = input;
     let review_started = std::time::Instant::now();
-    let mut prepared = diff::prepare_review(diff_snapshot)?;
+    let mut prepared = diff::prepare_review_with_ignore(diff_snapshot, &cfg.ignore)?;
     let input_incomplete = prepared.reserved_anchor;
     let mut index = std::mem::take(&mut prepared.index);
     let incremental = matches!(scope, filter::ReconcileScope::Incremental { .. });

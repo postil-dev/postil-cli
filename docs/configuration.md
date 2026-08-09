@@ -40,6 +40,8 @@ model:
 
 Place organization-specific merge rules in `.postil/guardrails.md`. Place additions to the built-in prose policy in `.postil/content-policy.md`. Repository policy extends the built-in content policy unless `contentPolicy.enabled` is false.
 
+Ignored paths are excluded before review planning, so generated artifacts do not consume model context or bounded-review coverage.
+
 ## Environment
 
 | Variable | Purpose |
