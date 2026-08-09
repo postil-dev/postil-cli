@@ -2429,7 +2429,15 @@ fn read_length_prefixed(file: &mut File, context: &str) -> Result<Option<String>
 }
 
 pub fn prepare_review(snapshot: &DiffSnapshot) -> Result<PreparedReview> {
+    prepare_review_with_ignore(snapshot, &[])
+}
+
+pub fn prepare_review_with_ignore(
+    snapshot: &DiffSnapshot,
+    ignore_patterns: &[String],
+) -> Result<PreparedReview> {
     let text = snapshot.as_str();
+    let ignore = crate::filter::build_ignore_set(ignore_patterns)?;
     let mut windows = tempfile::tempfile().context("creating review-window spool")?;
     let mut window_lease = WorkspaceLease::new(snapshot.workspace_budget());
     let mut index = DiffIndex::default();
@@ -2462,6 +2470,10 @@ pub fn prepare_review(snapshot: &DiffSnapshot) -> Result<PreparedReview> {
         let end = next_diff_start(text, cursor + "diff --git ".len()).unwrap_or(text.len());
         let section = &text[cursor..end];
         let path = section_path(section).context("review section has an invalid path header")?;
+        if ignore.is_match(&path) {
+            cursor = end;
+            continue;
+        }
         if is_known_lockfile(&path)
             && let Some(evidence) = lockfile_evidence(&path, section)
         {

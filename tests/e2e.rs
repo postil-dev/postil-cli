@@ -2211,6 +2211,44 @@ async fn generated_named_source_is_not_omitted_from_review() {
 }
 
 #[tokio::test]
+async fn ignored_paths_are_removed_before_review_planning() {
+    let server = MockServer::start().await;
+    mock_review(&server, json!([])).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = dir.path().join("ignored-source.diff");
+    std::fs::write(
+        &diff,
+        "diff --git a/generated/snapshot.json b/generated/snapshot.json\n--- a/generated/snapshot.json\n+++ b/generated/snapshot.json\n@@ -0,0 +1 @@\n+generated_snapshot_payload\ndiff --git a/src/live.rs b/src/live.rs\n--- a/src/live.rs\n+++ b/src/live.rs\n@@ -0,0 +1 @@\n+validate_live_path();\n",
+    )
+    .unwrap();
+    let config = dir.path().join("postil.yml");
+    std::fs::write(&config, "ignore:\n  - \"generated/**\"\n").unwrap();
+
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--config")
+        .arg(&config)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert!(envelope["findings"].as_array().unwrap().is_empty());
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let body = String::from_utf8_lossy(&requests[0].body);
+    assert!(body.contains("src/live.rs"));
+    assert!(body.contains("validate_live_path"));
+    assert!(!body.contains("generated/snapshot.json"));
+    assert!(!body.contains("generated_snapshot_payload"));
+}
+
+#[tokio::test]
 async fn oversized_security_hunk_fails_before_provider_contact() {
     use std::fmt::Write as _;
 
