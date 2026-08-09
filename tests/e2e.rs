@@ -5001,10 +5001,14 @@ async fn large_confidence_disagreement_escalates_to_uncertainty_with_default_gat
 }
 
 fn uncertainty_finding(body: &str) -> Value {
+    uncertainty_finding_with_severity(body, "warn")
+}
+
+fn uncertainty_finding_with_severity(body: &str, severity: &str) -> Value {
     json!({
         "path": "src/auth.rs",
         "line": 41,
-        "severity": "warn",
+        "severity": severity,
         "kind": "uncertainty",
         "confidence": 0.9,
         "title": "Verify the repository-wide caller contract",
@@ -5234,6 +5238,88 @@ async fn uncertainty_resolution_defaults_on_and_fails_open_when_unresolved() {
     let envelope: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
     assert_eq!(envelope["findings"][0]["body"], original_body);
     assert_eq!(envelope["counts"]["suppressed"], 0);
+}
+
+#[tokio::test]
+async fn uncertainty_resolution_uses_diff_when_no_referenced_files_exist() {
+    let server = MockServer::start().await;
+    let original_body = "The added call may pass the wrong value to the query executor.";
+    let revised_body = "The added call passes the request token directly to the query executor.";
+    mock_review_model(
+        &server,
+        "generator-model",
+        json!([uncertainty_finding(original_body)]),
+    )
+    .await;
+    mock_uncertainty_resolution(
+        &server,
+        "generator-model",
+        &json!({
+            "resolution": "confirmed",
+            "revisedBody": revised_body,
+            "evidence": "exec_query(&token);"
+        })
+        .to_string(),
+        1,
+    )
+    .await;
+
+    let directory = tempfile::tempdir().unwrap();
+    enable_uncertainty_resolution(directory.path());
+    let diff = write_diff(directory.path());
+    let output = postil()
+        .current_dir(directory.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "generator-model")
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+
+    let envelope: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    assert_eq!(envelope["findings"][0]["body"], revised_body);
+    assert_eq!(envelope["findings"][0]["severity"], "warn");
+    assert_eq!(envelope["counts"]["suppressed"], 0);
+}
+
+#[tokio::test]
+async fn unresolved_error_uncertainty_is_retained_but_demoted_to_warn() {
+    let server = MockServer::start().await;
+    let original_body = "The added call may pass the wrong value to the query executor.";
+    mock_review_model(
+        &server,
+        "generator-model",
+        json!([uncertainty_finding_with_severity(original_body, "error")]),
+    )
+    .await;
+    mock_uncertainty_resolution(
+        &server,
+        "generator-model",
+        r#"{"resolution":"unresolved","revisedBody":"","evidence":""}"#,
+        1,
+    )
+    .await;
+
+    let directory = tempfile::tempdir().unwrap();
+    enable_uncertainty_resolution(directory.path());
+    let diff = write_diff(directory.path());
+    let output = postil()
+        .current_dir(directory.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_MODEL", "generator-model")
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+
+    let envelope: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    assert_eq!(envelope["findings"][0]["body"], original_body);
+    assert_eq!(envelope["findings"][0]["severity"], "warn");
+    assert_eq!(envelope["gate"]["failing"], false);
 }
 
 #[tokio::test]

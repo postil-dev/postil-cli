@@ -1925,7 +1925,10 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                             cfg,
                             &client,
                             &repository_source,
-                            head_sha.as_deref(),
+                            crate::resolve::ResolutionRevisions {
+                                head: head_sha.as_deref(),
+                                base: meta.map(|metadata| metadata.base_sha.as_str()),
+                            },
                             &finding_contexts,
                             diff_snapshot.as_str(),
                             &mut kept,
