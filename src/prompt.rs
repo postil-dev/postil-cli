@@ -116,9 +116,6 @@ pub fn review_contract(cfg: &Config) -> String {
          humanEscalation = multiple valid product or policy outcomes remain and only an \
          accountable owner can choose among them; guardrail = violates a stated repo rule; \
          uncertainty = you cannot verify something critical from the diff. Never classify \
-         a finding as risk when the supplied diff cannot verify it but repository files or \
-         repository-wide context could; classify that repo-check case as uncertainty so the \
-         uncertainty resolver can inspect the additional evidence. Never classify \
          an ordinary bug as humanEscalation merely because it is uncertain or needs \
          confirmation. Classify the primary merge reason: a concrete code or security \
          defect is risk even when changed prose also contradicts that defect. Use \
@@ -472,14 +469,6 @@ mod tests {
             assert!(prompt.contains("report only a concrete defect"));
             assert!(prompt.contains("never classify it as contentPolicy"));
         }
-    }
-
-    #[test]
-    fn system_prompt_routes_repo_checks_through_uncertainty_resolution() {
-        let prompt = system_prompt(&Config::default());
-        assert!(prompt.contains("repository files or repository-wide context could"));
-        assert!(prompt.contains("classify that repo-check case as uncertainty"));
-        assert!(prompt.contains("uncertainty resolver can inspect the additional evidence"));
     }
 
     #[test]
