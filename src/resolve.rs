@@ -9,7 +9,7 @@ use serde_json::json;
 use crate::config::Config;
 use crate::diff;
 use crate::envelope::{
-    Finding, Kind, ModelIncident, ModelUsage, SuppressedFinding, SuppressionReason, Usage,
+    Finding, Kind, ModelIncident, ModelUsage, Severity, SuppressedFinding, SuppressionReason, Usage,
 };
 use crate::forge::{github::GitHub, valid_repository_path};
 use crate::llm::{LlmClient, UncertaintyResolution, UncertaintyResolutionReview, add_usage};
@@ -27,6 +27,11 @@ pub(crate) enum RepositorySource<'a> {
     Local(&'a Path),
     GitHub(&'a GitHub),
     Unavailable,
+}
+
+pub(crate) struct ResolutionRevisions<'a> {
+    pub(crate) head: Option<&'a str>,
+    pub(crate) base: Option<&'a str>,
 }
 
 #[derive(Default)]
@@ -54,7 +59,7 @@ pub(crate) async fn resolve_uncertainties(
     cfg: &Config,
     client: &LlmClient,
     source: &RepositorySource<'_>,
-    revision: Option<&str>,
+    revisions: ResolutionRevisions<'_>,
     finding_contexts: &[String],
     diff_text: &str,
     findings: &mut Vec<Finding>,
@@ -77,24 +82,31 @@ pub(crate) async fn resolve_uncertainties(
         .filter_map(|(index, finding)| (finding.kind == Kind::Uncertainty).then_some(index))
         .take(MAX_FINDINGS)
         .collect::<Vec<_>>();
+    for (index, finding) in findings.iter_mut().enumerate() {
+        if finding.kind == Kind::Uncertainty && !eligible.contains(&index) {
+            demote_unresolved_uncertainty(finding);
+        }
+    }
     let mut confirmed = 0usize;
     let mut unresolved = uncertainty_count.saturating_sub(MAX_FINDINGS);
     let mut refuted = Vec::new();
 
     for index in eligible {
         let original = findings[index].clone();
-        let files = match fetch_referenced_files(source, revision, &original.body).await {
-            Ok(files) if !files.is_empty() => files,
-            Ok(_) => {
-                unresolved += 1;
-                continue;
-            }
+        let files = match fetch_referenced_files(
+            source,
+            revisions.head,
+            revisions.base,
+            &original.body,
+        )
+        .await
+        {
+            Ok(files) => files,
             Err(error) => {
                 eprintln!(
-                    "postil: uncertainty resolution kept the original finding after repository file acquisition failed: {error:#}"
+                    "postil: uncertainty resolution is continuing with diff evidence after repository file acquisition failed: {error:#}"
                 );
-                unresolved += 1;
-                continue;
+                Vec::new()
             }
         };
         let diff_hunk = finding_contexts
@@ -141,7 +153,10 @@ pub(crate) async fn resolve_uncertainties(
         };
 
         match resolution_disposition(resolution.as_ref(), &files, diff_text) {
-            Disposition::KeepOriginal => unresolved += 1,
+            Disposition::KeepOriginal => {
+                demote_unresolved_uncertainty(&mut findings[index]);
+                unresolved += 1;
+            }
             Disposition::KeepConfirmed(body) => {
                 findings[index].body = body;
                 confirmed += 1;
@@ -191,6 +206,15 @@ fn resolution_disposition(
     }
 }
 
+fn demote_unresolved_uncertainty(finding: &mut Finding) {
+    if finding.kind == Kind::Uncertainty
+        && !crate::envelope::is_reserved_anchor(&finding.path)
+        && finding.severity == Severity::Error
+    {
+        finding.severity = Severity::Warn;
+    }
+}
+
 fn evidence_is_grounded(evidence: &str, files: &[ReferencedFile], diff_text: &str) -> bool {
     if evidence.is_empty() {
         return false;
@@ -211,7 +235,8 @@ fn byte_contains(haystack: &[u8], needle: &[u8]) -> bool {
 
 async fn fetch_referenced_files(
     source: &RepositorySource<'_>,
-    revision: Option<&str>,
+    head_revision: Option<&str>,
+    base_revision: Option<&str>,
     body: &str,
 ) -> Result<Vec<ReferencedFile>> {
     let mut files = Vec::new();
@@ -220,7 +245,7 @@ async fn fetch_referenced_files(
         if files.len() == MAX_FILES_PER_FINDING || total == MAX_TOTAL_FILE_BYTES {
             break;
         }
-        let Some(content) = fetch_file(source, revision, &path).await? else {
+        let Some(content) = fetch_file(source, head_revision, base_revision, &path).await? else {
             continue;
         };
         let limit = MAX_FILE_BYTES.min(MAX_TOTAL_FILE_BYTES - total);
@@ -237,15 +262,17 @@ async fn fetch_referenced_files(
 
 async fn fetch_file(
     source: &RepositorySource<'_>,
-    revision: Option<&str>,
+    head_revision: Option<&str>,
+    base_revision: Option<&str>,
     path: &str,
 ) -> Result<Option<String>> {
     match source {
         RepositorySource::Local(root) => read_local_file(root, path),
         RepositorySource::GitHub(github) => {
-            let revision = revision.context("GitHub uncertainty resolution requires a head SHA")?;
+            let head_revision =
+                head_revision.context("GitHub uncertainty resolution requires a head SHA")?;
             github
-                .fetch_repository_file_at_revision(revision, path)
+                .fetch_repository_file_with_base_fallback(head_revision, base_revision, path)
                 .await
                 .map(Some)
         }
@@ -384,6 +411,7 @@ mod tests {
         }
         let files = fetch_referenced_files(
             &RepositorySource::Local(directory.path()),
+            None,
             None,
             "Inspect `src/a.rs`, `src/missing.rs`, `src/b.rs`, `src/c.rs`, and `src/d.rs`.",
         )

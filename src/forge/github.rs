@@ -832,6 +832,64 @@ impl GitHub {
             .context("GitHub repository file is not valid UTF-8")
     }
 
+    pub(crate) async fn fetch_repository_file_with_base_fallback(
+        &self,
+        head_revision: &str,
+        base_revision: Option<&str>,
+        path: &str,
+    ) -> Result<String> {
+        if let Some(content) = self
+            .fetch_repository_file_if_present(head_revision, path)
+            .await?
+        {
+            return Ok(content);
+        }
+        let base_revision = base_revision.context(format!(
+            "GitHub repository file is absent at head {head_revision} and no base SHA is available"
+        ))?;
+        self.fetch_repository_file_at_revision(base_revision, path)
+            .await
+            .with_context(|| {
+                format!(
+                    "GitHub repository file is absent at head {head_revision} and the base fetch at {base_revision} failed"
+                )
+            })
+    }
+
+    async fn fetch_repository_file_if_present(
+        &self,
+        revision: &str,
+        path: &str,
+    ) -> Result<Option<String>> {
+        ensure!(
+            super::valid_repository_path(path),
+            "GitHub returned an unsafe repository path"
+        );
+        let mut url = reqwest::Url::parse(&self.url(&format!("/contents/{}", encode_path(path))))
+            .context("building GitHub contents URL")?;
+        url.query_pairs_mut().append_pair("ref", revision);
+        let response = self
+            .send_retryable(
+                self.request(reqwest::Method::GET, url.to_string())
+                    .header("Accept", "application/vnd.github.raw+json"),
+                "repository file fetch",
+            )
+            .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let snapshot = super::response_snapshot_in(
+            Self::check_ok(response, "repository file fetch").await?,
+            "GitHub repository file",
+            WorkspaceBudget::new(),
+            None,
+        )
+        .await?;
+        String::from_utf8(snapshot.as_bytes().to_vec())
+            .context("GitHub repository file is not valid UTF-8")
+            .map(Some)
+    }
+
     async fn build_complete_diff(
         &self,
         files: Vec<PullFile>,
@@ -2191,6 +2249,67 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("not valid UTF-8"));
+    }
+
+    #[tokio::test]
+    async fn fetch_repository_file_with_base_fallback_reads_deleted_head_files_from_base() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/contents/config/review.toml"))
+            .and(query_param("ref", "head123"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/contents/config/review.toml"))
+            .and(query_param("ref", "base123"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("enabled = true\n"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let github = test_github(&server);
+        let content = github
+            .fetch_repository_file_with_base_fallback(
+                "head123",
+                Some("base123"),
+                "config/review.toml",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(content, "enabled = true\n");
+    }
+
+    #[tokio::test]
+    async fn fetch_repository_file_with_base_fallback_does_not_mask_head_failures() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/contents/config/review.toml"))
+            .and(query_param("ref", "head123"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(3)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/contents/config/review.toml"))
+            .and(query_param("ref", "base123"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("stale = true\n"))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let error = test_github(&server)
+            .fetch_repository_file_with_base_fallback(
+                "head123",
+                Some("base123"),
+                "config/review.toml",
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("500"));
     }
 
     async fn mount_current_delivery_snapshot(server: &MockServer) {
