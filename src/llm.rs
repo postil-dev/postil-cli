@@ -560,21 +560,29 @@ fn default_confidence() -> f64 {
 #[derive(Clone)]
 pub struct LlmClient {
     http: Arc<Mutex<Option<reqwest::Client>>>,
-    api_base: String,
     request_api_base: String,
     api_key: String,
-    api_format: ApiFormat,
     endpoint_auth: Option<EndpointAuth>,
-    require_openrouter_privacy: bool,
+    request_decorations: RequestDecorations,
     request_timeout: Duration,
     timeout_retry_timeout: Duration,
     review_deadline: Option<Instant>,
     scorer_deadline: Option<Instant>,
     total_deadline: Option<Instant>,
     admission: Arc<Mutex<ProviderAdmission>>,
+    call_ordinal: Arc<AtomicU32>,
+}
+
+/// The complete, credential-free request contract. Batch admission uses this
+/// same builder as provider contact so serialized sizing cannot drift from the
+/// provider, privacy, routing, or pricing fields sent at runtime.
+#[derive(Clone)]
+struct RequestDecorations {
+    api_base: String,
+    api_format: ApiFormat,
+    require_openrouter_privacy: bool,
     hosted_price_bounds: Option<Arc<HashMap<String, ModelPriceBound>>>,
     pinned_upstream_provider: Option<String>,
-    call_ordinal: Arc<AtomicU32>,
 }
 
 #[derive(Debug, Default)]
@@ -622,23 +630,16 @@ const PROVIDER_RETRY_DELAY_CAP_SECS: u64 = 30;
 pub(crate) const REVIEW_MAX_TOKENS: u32 = 8_000;
 
 pub(crate) fn conservative_context_tokens(model: &str) -> usize {
-    let model = model.to_ascii_lowercase();
-    if [
-        "gpt-5",
-        "gemma-3",
-        "glm-5",
-        "qwen3",
-        "deepseek-v4",
-        "mistral-small",
-    ]
-    .iter()
-    .any(|known| model.contains(known))
-    {
-        128_000
-    } else {
+    // Context authority is granted only to exact normalized model IDs.
+    // Prefixes and substrings are configuration data, not an attestation.
+    match model.trim().to_ascii_lowercase().as_str() {
+        "z-ai/glm-5.2"
+        | "moonshotai/kimi-k2.7-code"
+        | "openai/gpt-5-mini"
+        | "mistralai/mistral-small-3.2-24b-instruct" => 128_000,
         // Unknown BYOK endpoints get a conservative floor rather than an
         // optimistic provider-specific assumption.
-        32_000
+        _ => 32_000,
     }
 }
 
@@ -927,18 +928,153 @@ fn base_request_body(
     }
 }
 
-pub(crate) fn serialized_base_review_request_bytes(
-    api_format: ApiFormat,
+impl RequestDecorations {
+    fn from_config(cfg: &Config) -> Result<Self> {
+        let screening_profile = crate::config::benchmark_screening_profile_for_config(cfg)?;
+        let hosted_price_bounds = if crate::config::hosted_runtime_mode() {
+            ensure_hosted_provider_contract(cfg.api_format, &cfg.api_base)?;
+            Some(Arc::new(
+                crate::config::hosted_price_bounds_for_config(cfg)?
+                    .ok_or_else(|| anyhow!("hosted inference has no exact price-bound profile"))?
+                    .into_iter()
+                    .map(|bound| (bound.model.clone(), bound))
+                    .collect(),
+            ))
+        } else if let Some(profile) = screening_profile.as_ref() {
+            ensure_hosted_provider_contract(cfg.api_format, &cfg.api_base)?;
+            Some(Arc::new(
+                profile
+                    .model_price_bounds
+                    .iter()
+                    .cloned()
+                    .map(|bound| (bound.model.clone(), bound))
+                    .collect(),
+            ))
+        } else {
+            None
+        };
+        let pinned_upstream_provider =
+            if let Some(provider) = crate::config::provisional_hosted_provider_for_config(cfg) {
+                Some(provider.to_string())
+            } else if crate::config::qualification_candidate_mode() {
+                Some(
+                    crate::config::qualification_candidate_profile_for_config(cfg)?
+                        .ok_or_else(|| anyhow!("qualification provider profile is unavailable"))?
+                        .upstream_provider_identity,
+                )
+            } else if let Some(profile) = screening_profile {
+                Some(profile.upstream_provider_identity)
+            } else {
+                None
+            };
+        Ok(Self {
+            api_base: cfg.api_base.trim_end_matches('/').to_string(),
+            api_format: cfg.api_format,
+            require_openrouter_privacy: is_canonical_openrouter_base(&cfg.api_base)
+                && (crate::config::hosted_runtime_mode()
+                    || crate::config::benchmark_screening_mode()
+                    || env_flag("POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY")),
+            hosted_price_bounds,
+            pinned_upstream_provider,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn request_body(
+        &self,
+        model: &str,
+        system: &str,
+        user: &str,
+        max_tokens: u32,
+        temperature: f64,
+        phase: LlmPhase,
+        _expected_provider: Option<&str>,
+    ) -> serde_json::Value {
+        match self.api_format {
+            ApiFormat::OpenaiCompatible => {
+                let mut body = base_request_body(
+                    self.api_format,
+                    model,
+                    system,
+                    user,
+                    max_tokens,
+                    temperature,
+                );
+                apply_openrouter_privacy(&mut body, self.require_openrouter_privacy);
+                let canonical_openrouter = is_canonical_openrouter_base(&self.api_base);
+                if let Some(provider) = self.pinned_upstream_provider.as_deref() {
+                    apply_openrouter_provider_pin(&mut body, provider);
+                }
+                if canonical_openrouter && let LlmPhase::Scorer { expected_len } = phase {
+                    apply_openrouter_scorer_contract(&mut body, expected_len);
+                }
+                #[cfg(feature = "qualification-candidate")]
+                if matches!(phase, LlmPhase::Attribution) {
+                    apply_openrouter_atomic_attribution_contract(&mut body, _expected_provider);
+                }
+                if canonical_openrouter
+                    && let Some(bound) = self
+                        .hosted_price_bounds
+                        .as_ref()
+                        .and_then(|bounds| bounds.get(model))
+                {
+                    apply_openrouter_price_ceiling(&mut body, bound);
+                }
+                body
+            }
+            ApiFormat::Anthropic => base_request_body(
+                self.api_format,
+                model,
+                system,
+                user,
+                max_tokens,
+                temperature,
+            ),
+        }
+    }
+}
+
+/// Serialize the largest unavoidable review request shape used for provider
+/// contact without resolving a credential. Correction evidence is truncated
+/// at runtime, but its fixed wrapper must fit alongside the original prompt.
+/// Invalid input can therefore fail closed before key lookup while valid batch
+/// admission includes every decoration and correction path.
+pub(crate) fn serialized_review_request_bytes(
+    cfg: &Config,
     model: &str,
     system: &str,
     user: &str,
     max_tokens: u32,
 ) -> Result<usize> {
-    serde_json::to_vec(&base_request_body(
-        api_format, model, system, user, max_tokens, 0.1,
-    ))
-    .map(|request| request.len())
-    .context("serializing review request for batch admission")
+    let decorations = RequestDecorations::from_config(cfg)?;
+    let semantic_user = review_semantic_retry_user(user, "");
+    let validation_user = review_validation_retry_user(user, "", "");
+    let schema_user = review_schema_repair_user("", "");
+    [
+        (system, user),
+        (system, semantic_user.as_str()),
+        (system, validation_user.as_str()),
+        (REVIEW_SCHEMA_REPAIR_SYSTEM, schema_user.as_str()),
+    ]
+    .into_iter()
+    .map(|(request_system, request_user)| {
+        serialized_provider_request_bytes(
+            &decorations.request_body(
+                model,
+                request_system,
+                request_user,
+                max_tokens,
+                0.1,
+                LlmPhase::Review,
+                None,
+            ),
+            "serializing decorated review request for batch admission",
+        )
+    })
+    .collect::<Result<Vec<_>>>()?
+    .into_iter()
+    .max()
+    .context("review admission has no request shape")
 }
 
 pub(crate) fn scorer_max_tokens(expected_len: usize) -> Option<u32> {
@@ -1507,7 +1643,7 @@ impl LlmClient {
         system: &str,
         user: &str,
     ) -> Result<ReviewAdmission> {
-        let Some(bounds) = &self.hosted_price_bounds else {
+        let Some(bounds) = &self.request_decorations.hosted_price_bounds else {
             return Ok(ReviewAdmission::default());
         };
         let models = cfg.model_chain();
@@ -1727,7 +1863,7 @@ impl LlmClient {
         prompts: ReviewPreflightPrompts<'_>,
         planner: Option<(&str, usize)>,
     ) -> Result<ReviewAdmission> {
-        let Some(bounds) = &self.hosted_price_bounds else {
+        let Some(bounds) = &self.request_decorations.hosted_price_bounds else {
             anyhow::bail!("hosted review preflight has no admitted price bounds");
         };
         ensure!(
@@ -1877,8 +2013,8 @@ impl LlmClient {
         if !response.status.is_success() {
             let summary = safe_response_summary(
                 &response.text,
-                client.api_format,
-                is_canonical_openrouter_base(&client.api_base),
+                client.request_decorations.api_format,
+                is_canonical_openrouter_base(&client.request_decorations.api_base),
             );
             return Err(anyhow!(provider_http_status_detail(
                 response.status,
@@ -1939,66 +2075,23 @@ impl LlmClient {
         total_deadline: Option<Instant>,
     ) -> Result<Self> {
         let endpoint_auth = endpoint_auth_from_env(cfg.api_format)?;
-        let screening_profile = crate::config::benchmark_screening_profile_for_config(cfg)?;
-        let hosted_price_bounds = if crate::config::hosted_runtime_mode() {
-            ensure_hosted_provider_contract(cfg.api_format, &cfg.api_base)?;
-            Some(Arc::new(
-                crate::config::hosted_price_bounds_for_config(cfg)?
-                    .ok_or_else(|| anyhow!("hosted inference has no exact price-bound profile"))?
-                    .into_iter()
-                    .map(|bound| (bound.model.clone(), bound))
-                    .collect(),
-            ))
-        } else if let Some(profile) = screening_profile.as_ref() {
-            ensure_hosted_provider_contract(cfg.api_format, &cfg.api_base)?;
-            Some(Arc::new(
-                profile
-                    .model_price_bounds
-                    .iter()
-                    .cloned()
-                    .map(|bound| (bound.model.clone(), bound))
-                    .collect(),
-            ))
-        } else {
-            None
-        };
-        let pinned_upstream_provider =
-            if let Some(provider) = crate::config::provisional_hosted_provider_for_config(cfg) {
-                Some(provider.to_string())
-            } else if crate::config::qualification_candidate_mode() {
-                Some(
-                    crate::config::qualification_candidate_profile_for_config(cfg)?
-                        .ok_or_else(|| anyhow!("qualification provider profile is unavailable"))?
-                        .upstream_provider_identity,
-                )
-            } else if let Some(profile) = screening_profile {
-                Some(profile.upstream_provider_identity)
-            } else {
-                None
-            };
+        let request_decorations = RequestDecorations::from_config(cfg)?;
         let request_api_base = qualification_request_api_base(&cfg.api_base)?;
         Ok(LlmClient {
             // The attempt timeout wraps both sending the request and consuming
             // the complete response body, so header and body stalls take the
             // same retry path.
             http: Arc::new(Mutex::new(None)),
-            api_base: cfg.api_base.trim_end_matches('/').to_string(),
             request_api_base,
             api_key,
-            api_format: cfg.api_format,
             endpoint_auth,
-            require_openrouter_privacy: is_canonical_openrouter_base(&cfg.api_base)
-                && (crate::config::hosted_runtime_mode()
-                    || crate::config::benchmark_screening_mode()
-                    || env_flag("POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY")),
+            request_decorations,
             request_timeout,
             timeout_retry_timeout: request_timeout.min(Duration::from_secs(TIMEOUT_RETRY_CAP_SECS)),
             review_deadline,
             scorer_deadline: None,
             total_deadline,
             admission: Arc::new(Mutex::new(ProviderAdmission::default())),
-            hosted_price_bounds,
-            pinned_upstream_provider,
             call_ordinal: Arc::new(AtomicU32::new(0)),
         })
     }
@@ -3497,7 +3590,7 @@ impl LlmClient {
         phase: LlmPhase,
         call_phase: LlmCallPhase,
     ) -> Result<ChatSuccess> {
-        if let Some(global) = self.pinned_upstream_provider.as_deref() {
+        if let Some(global) = self.request_decorations.pinned_upstream_provider.as_deref() {
             ensure!(
                 global == expected_provider,
                 "qualification provider identity mismatch"
@@ -3538,7 +3631,8 @@ impl LlmClient {
         phase: LlmPhase,
         call_phase: LlmCallPhase,
     ) -> Result<ChatSuccess> {
-        let route_provider = expected_provider.or(self.pinned_upstream_provider.as_deref());
+        let route_provider =
+            expected_provider.or(self.request_decorations.pinned_upstream_provider.as_deref());
         // This mutable flag is stack-local state held through one exclusively
         // borrowed async call. Request retries run sequentially in this loop,
         // so updating it before continuing or returning needs no atomic type.
@@ -3628,8 +3722,8 @@ impl LlmClient {
                 Ok(response) => {
                     let summary = safe_response_summary(
                         &response.text,
-                        self.api_format,
-                        is_canonical_openrouter_base(&self.api_base)
+                        self.request_decorations.api_format,
+                        is_canonical_openrouter_base(&self.request_decorations.api_base)
                             || matches!(phase, LlmPhase::Attribution),
                     );
                     let elapsed = elapsed_text(attempt_started_at.elapsed());
@@ -3934,53 +4028,21 @@ impl LlmClient {
         max_tokens: u32,
         temperature: f64,
         phase: LlmPhase,
-        _expected_provider: Option<&str>,
+        expected_provider: Option<&str>,
     ) -> serde_json::Value {
-        match self.api_format {
-            ApiFormat::OpenaiCompatible => {
-                let mut body = base_request_body(
-                    self.api_format,
-                    model,
-                    system,
-                    user,
-                    max_tokens,
-                    temperature,
-                );
-                apply_openrouter_privacy(&mut body, self.require_openrouter_privacy);
-                let canonical_openrouter = is_canonical_openrouter_base(&self.api_base);
-                if let Some(expected_provider) = self.pinned_upstream_provider.as_deref() {
-                    apply_openrouter_provider_pin(&mut body, expected_provider);
-                }
-                if canonical_openrouter && let LlmPhase::Scorer { expected_len } = phase {
-                    apply_openrouter_scorer_contract(&mut body, expected_len);
-                }
-                #[cfg(feature = "qualification-candidate")]
-                if matches!(phase, LlmPhase::Attribution) {
-                    apply_openrouter_atomic_attribution_contract(&mut body, _expected_provider);
-                }
-                if canonical_openrouter
-                    && let Some(bound) = self
-                        .hosted_price_bounds
-                        .as_ref()
-                        .and_then(|bounds| bounds.get(model))
-                {
-                    apply_openrouter_price_ceiling(&mut body, bound);
-                }
-                body
-            }
-            ApiFormat::Anthropic => base_request_body(
-                self.api_format,
-                model,
-                system,
-                user,
-                max_tokens,
-                temperature,
-            ),
-        }
+        self.request_decorations.request_body(
+            model,
+            system,
+            user,
+            max_tokens,
+            temperature,
+            phase,
+            expected_provider,
+        )
     }
 
     fn parse_response(&self, text: &str, usage: &mut Usage) -> Result<String> {
-        match self.api_format {
+        match self.request_decorations.api_format {
             ApiFormat::OpenaiCompatible => {
                 let parsed: ChatResponse = serde_json::from_str(text)
                     .context("model endpoint returned non-JSON OpenAI-compatible body")?;
@@ -4053,7 +4115,7 @@ impl LlmClient {
     async fn request_once(&self, body: &serde_json::Value) -> Result<ModelHttpResponse> {
         self.reserve_provider_attempt(body)?;
         let http = self.http_client()?;
-        let mut request = match self.api_format {
+        let mut request = match self.request_decorations.api_format {
             ApiFormat::OpenaiCompatible => {
                 let url = format!("{}/chat/completions", self.request_api_base);
                 http.post(&url)
@@ -4071,7 +4133,7 @@ impl LlmClient {
         if let Some(auth) = &self.endpoint_auth {
             request = request.header(auth.name.clone(), auth.value.clone());
         }
-        let canonical_openrouter = is_canonical_openrouter_base(&self.api_base);
+        let canonical_openrouter = is_canonical_openrouter_base(&self.request_decorations.api_base);
         if canonical_openrouter {
             request = request.header("X-OpenRouter-Experimental-Metadata", "enabled");
         }
@@ -4106,7 +4168,9 @@ impl LlmClient {
             .and_then(serde_json::Value::as_u64)
             .and_then(|value| usize::try_from(value).ok())
             .ok_or_else(|| anyhow!("model request is missing a bounded max_tokens value"))?;
-        let projected_cost_micros = if let Some(bounds) = &self.hosted_price_bounds {
+        let projected_cost_micros = if let Some(bounds) =
+            &self.request_decorations.hosted_price_bounds
+        {
             let model = body
                 .get("model")
                 .and_then(serde_json::Value::as_str)
@@ -4152,7 +4216,7 @@ impl LlmClient {
             .projected_cost_exposure_micros
             .checked_add(projected_cost_micros)
             .ok_or_else(|| anyhow!("model provider projected cost exposure overflowed"))?;
-        if self.hosted_price_bounds.is_some() {
+        if self.request_decorations.hosted_price_bounds.is_some() {
             ensure!(
                 attempts <= MAX_PROVIDER_ATTEMPTS,
                 "model provider attempt hard cap ({MAX_PROVIDER_ATTEMPTS}) exceeded"
@@ -4205,7 +4269,7 @@ impl LlmClient {
                     .unwrap_or(0),
             )
             .ok_or_else(|| anyhow!("model provider reported cost overflowed"))?;
-        if self.hosted_price_bounds.is_some() {
+        if self.request_decorations.hosted_price_bounds.is_some() {
             ensure!(
                 total_tokens <= MAX_REPORTED_TOKEN_SPEND,
                 "model token spend exceeded the {MAX_REPORTED_TOKEN_SPEND} token hard cap"
@@ -5434,8 +5498,20 @@ mod tests {
     }
 
     #[test]
-    fn glm_five_uses_its_conservative_published_context_floor() {
+    fn known_exact_models_use_their_conservative_published_context_floor() {
         assert_eq!(conservative_context_tokens("z-ai/glm-5.2"), 128_000);
+        assert_eq!(
+            conservative_context_tokens("moonshotai/kimi-k2.7-code"),
+            128_000
+        );
+        assert_eq!(conservative_context_tokens("openai/gpt-5-mini"), 128_000);
+        assert_eq!(
+            conservative_context_tokens("mistralai/mistral-small-3.2-24b-instruct"),
+            128_000
+        );
+        assert_eq!(conservative_context_tokens(" Z-AI/GLM-5.2 "), 128_000);
+        assert_eq!(conservative_context_tokens("example/glm-5.2"), 32_000);
+        assert_eq!(conservative_context_tokens("z-ai/glm-5.2-spoof"), 32_000);
         assert_eq!(
             conservative_context_tokens("example/unknown-context"),
             32_000
@@ -5782,6 +5858,108 @@ mod tests {
     }
 
     #[test]
+    fn review_admission_sizes_the_decorated_runtime_request() {
+        let config = Config {
+            model: "example/unknown-context".into(),
+            ..Config::default()
+        };
+        let mut client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        client.request_decorations.require_openrouter_privacy = true;
+        client.request_decorations.pinned_upstream_provider = Some("p".repeat(12_000));
+        client.request_decorations.hosted_price_bounds = Some(Arc::new(HashMap::from([(
+            config.model.clone(),
+            ModelPriceBound {
+                model: config.model.clone(),
+                input_micros_per_million_tokens: 1,
+                output_micros_per_million_tokens: 1,
+            },
+        )])));
+
+        let user = "x".repeat(6_000);
+        let undecorated = base_request_body(
+            config.api_format,
+            &config.model,
+            "system",
+            &user,
+            REVIEW_MAX_OUTPUT_TOKENS,
+            0.1,
+        );
+        let undecorated_required =
+            serde_json::to_vec(&undecorated).unwrap().len() + REVIEW_MAX_OUTPUT_TOKENS as usize;
+        assert!(undecorated_required <= conservative_context_tokens(&config.model));
+
+        let runtime = client.request_body(
+            &config.model,
+            "system",
+            &user,
+            REVIEW_MAX_OUTPUT_TOKENS,
+            0.1,
+            LlmPhase::Review,
+        );
+        let runtime_bytes = serde_json::to_vec(&runtime).unwrap().len();
+        assert!(runtime["provider"]["data_collection"] == "deny");
+        assert!(runtime["provider"]["order"][0].as_str().unwrap().len() == 12_000);
+        assert!(runtime["provider"].get("max_price").is_some());
+        assert!(
+            runtime_bytes + REVIEW_MAX_OUTPUT_TOKENS as usize
+                > conservative_context_tokens(&config.model)
+        );
+
+        let error = client
+            .planned_review_request_exposure(&config.model, "system", &user, REVIEW_MAX_TOKENS)
+            .unwrap_err();
+        assert!(error.downcast_ref::<ReviewContextExceeded>().is_some());
+    }
+
+    #[test]
+    fn review_batch_admission_reserves_the_fixed_correction_wrapper() {
+        let config = Config {
+            model: "example/unknown-context".into(),
+            ..Config::default()
+        };
+        let decorations = RequestDecorations::from_config(&config).unwrap();
+        let user = "x".repeat(6_000);
+        let initial = serialized_provider_request_bytes(
+            &decorations.request_body(
+                &config.model,
+                "system",
+                &user,
+                REVIEW_MAX_OUTPUT_TOKENS,
+                0.1,
+                LlmPhase::Review,
+                None,
+            ),
+            "serializing initial review request",
+        )
+        .unwrap();
+        let admitted = serialized_review_request_bytes(
+            &config,
+            &config.model,
+            "system",
+            &user,
+            REVIEW_MAX_OUTPUT_TOKENS,
+        )
+        .unwrap();
+
+        assert!(admitted > initial);
+        assert!(
+            conservative_context_tokens(&config.model)
+                .saturating_sub(REVIEW_MAX_OUTPUT_TOKENS as usize)
+                .saturating_sub(admitted)
+                < conservative_context_tokens(&config.model)
+                    .saturating_sub(REVIEW_MAX_OUTPUT_TOKENS as usize)
+                    .saturating_sub(initial)
+        );
+    }
+
+    #[test]
     fn planner_selection_is_exact_unique_bounded_and_grounded() {
         let allowed = BTreeSet::from([2usize, 4, 8]);
         assert_eq!(
@@ -5812,7 +5990,7 @@ mod tests {
             None,
         )
         .unwrap();
-        client.hosted_price_bounds = Some(Arc::new(HashMap::from([(
+        client.request_decorations.hosted_price_bounds = Some(Arc::new(HashMap::from([(
             "provider/model".into(),
             ModelPriceBound {
                 model: "provider/model".into(),
@@ -6291,7 +6469,7 @@ mod tests {
             None,
         )
         .unwrap();
-        client.hosted_price_bounds = Some(Arc::new(HashMap::from([
+        client.request_decorations.hosted_price_bounds = Some(Arc::new(HashMap::from([
             (
                 "provider/primary".into(),
                 ModelPriceBound {
@@ -6369,7 +6547,7 @@ mod tests {
             None,
         )
         .unwrap();
-        client.hosted_price_bounds = Some(Arc::new(HashMap::from([
+        client.request_decorations.hosted_price_bounds = Some(Arc::new(HashMap::from([
             (
                 "provider/generator".into(),
                 ModelPriceBound {
@@ -6420,7 +6598,7 @@ mod tests {
             None,
         )
         .unwrap();
-        client.hosted_price_bounds = Some(Arc::new(HashMap::from([(
+        client.request_decorations.hosted_price_bounds = Some(Arc::new(HashMap::from([(
             "provider/model".into(),
             ModelPriceBound {
                 model: "provider/model".into(),
@@ -6486,7 +6664,7 @@ mod tests {
             )
             .unwrap()
         };
-        client.hosted_price_bounds = Some(Arc::new(HashMap::from([(
+        client.request_decorations.hosted_price_bounds = Some(Arc::new(HashMap::from([(
             "provider/model".into(),
             ModelPriceBound {
                 model: "provider/model".into(),
@@ -7618,8 +7796,8 @@ mod tests {
             None,
         )
         .unwrap();
-        client.pinned_upstream_provider = Some("PinnedProvider".into());
-        client.hosted_price_bounds = Some(Arc::new(HashMap::from([(
+        client.request_decorations.pinned_upstream_provider = Some("PinnedProvider".into());
+        client.request_decorations.hosted_price_bounds = Some(Arc::new(HashMap::from([(
             "provider/model".into(),
             ModelPriceBound {
                 model: "provider/model".into(),
@@ -7721,7 +7899,7 @@ mod tests {
             None,
         )
         .unwrap();
-        client.hosted_price_bounds = Some(Arc::new(HashMap::from([(
+        client.request_decorations.hosted_price_bounds = Some(Arc::new(HashMap::from([(
             "provider/model".into(),
             ModelPriceBound {
                 model: "provider/model".into(),

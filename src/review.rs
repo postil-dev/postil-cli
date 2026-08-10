@@ -1172,46 +1172,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
         } else {
             chain.len()
         };
-        let review_output_tokens = crate::llm::REVIEW_MAX_OUTPUT_TOKENS as usize;
-        // Account for the fixed request context in its serialized provider
-        // shape. Remaining UTF-8 batch bytes conservatively upper-bound input
-        // tokens without relying on a provider-specific tokenizer.
-        let admission_context = PrContext {
-            repo,
-            title: meta.map(|value| value.title.as_str()),
-            body: meta.map(|value| value.body.as_str()),
-            incremental,
-            content_policy: content_policy_active,
-        };
-        let mut admission_user = prompt::user_prompt(
-            &admission_context,
-            BOUNDED_SYNTHESIS_BATCH_CONTEXT,
-            cfg.max_findings,
-        );
-        admission_user.push_str(SYNTHESIS_BATCH_CONTEXT);
-        let batch_budget = chain
-            .iter()
-            .take(active_model_count)
-            .map(|model| {
-                crate::llm::serialized_base_review_request_bytes(
-                    cfg.api_format,
-                    model,
-                    &system,
-                    &admission_user,
-                    crate::llm::REVIEW_MAX_OUTPUT_TOKENS,
-                )
-                .map(|input_bytes| {
-                    crate::llm::conservative_context_tokens(model)
-                        .saturating_sub(review_output_tokens)
-                        .saturating_sub(input_bytes)
-                        .min(MAX_REVIEW_BATCH_BYTES)
-                })
-            })
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .min()
-            .unwrap_or(0);
-        let invalid_input = if input_incomplete {
+        let preliminary_invalid_input = if input_incomplete {
             Some((
                 crate::envelope::IncompleteReviewReason::ReservedInput,
                 "review input is incomplete or contains reserved evidence; no provider request was made"
@@ -1224,6 +1185,54 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                     "configured model fan-out is invalid (models {active_model_count}/{MAX_MODELS_PER_REQUEST}); no provider request was made"
                 ),
             ))
+        } else {
+            None
+        };
+        let batch_budget = if preliminary_invalid_input.is_some() {
+            0
+        } else {
+            let review_output_tokens = crate::llm::REVIEW_MAX_OUTPUT_TOKENS as usize;
+            // Admission serializes the complete request builder used for provider
+            // contact. Remaining UTF-8 batch bytes conservatively upper-bound
+            // input tokens without relying on a provider-specific tokenizer.
+            let admission_context = PrContext {
+                repo,
+                title: meta.map(|value| value.title.as_str()),
+                body: meta.map(|value| value.body.as_str()),
+                incremental,
+                content_policy: content_policy_active,
+            };
+            let mut admission_user = prompt::user_prompt(
+                &admission_context,
+                BOUNDED_SYNTHESIS_BATCH_CONTEXT,
+                cfg.max_findings,
+            );
+            admission_user.push_str(SYNTHESIS_BATCH_CONTEXT);
+            chain
+                .iter()
+                .take(active_model_count)
+                .map(|model| {
+                    crate::llm::serialized_review_request_bytes(
+                        cfg,
+                        model,
+                        &system,
+                        &admission_user,
+                        crate::llm::REVIEW_MAX_OUTPUT_TOKENS,
+                    )
+                    .map(|input_bytes| {
+                        crate::llm::conservative_context_tokens(model)
+                            .saturating_sub(review_output_tokens)
+                            .saturating_sub(input_bytes)
+                            .min(MAX_REVIEW_BATCH_BYTES)
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .min()
+                .unwrap_or(0)
+        };
+        let invalid_input = if let Some(invalid_input) = preliminary_invalid_input {
+            Some(invalid_input)
         } else if batch_budget < 4_096 {
             Some((
                 crate::envelope::IncompleteReviewReason::InsufficientContextBudget,

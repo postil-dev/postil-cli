@@ -1001,14 +1001,14 @@ pub fn is_ephemeral_anchor(path: &str) -> bool {
 /// Internal reason a review stopped before it could issue a trustworthy
 /// verdict. Forge adapters expose only generic check text for these findings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IncompleteReviewReason {
+pub(crate) enum IncompleteReviewReason {
     IncompleteInput,
     ReservedInput,
     InsufficientContextBudget,
     InvalidModelFanOut,
 }
 
-pub fn incomplete_review_finding(reason: IncompleteReviewReason) -> Finding {
+pub(crate) fn incomplete_review_finding(reason: IncompleteReviewReason) -> Finding {
     let body = match reason {
         IncompleteReviewReason::IncompleteInput => {
             "Postil could not acquire complete review input, so no clean verdict was issued. Retry after the forge can supply a complete immutable change."

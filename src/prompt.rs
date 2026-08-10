@@ -353,6 +353,21 @@ pub fn respond_system_prompt(cfg: &Config) -> String {
     p
 }
 
+const MAX_PR_BODY_PROMPT_CHARS: usize = 2_000;
+
+fn bounded_pr_body(body: Option<&str>) -> Option<String> {
+    body.map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .chars()
+                .take(MAX_PR_BODY_PROMPT_CHARS)
+                .collect::<String>()
+        })
+        .map(|value| value.trim_end().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 /// Render the PR title and description as a numbered block under the reserved
 /// content-policy path, mirroring the diff's left-margin line numbering so the
 /// model can cite a real, groundable line. Returns the rendered text and the
@@ -364,8 +379,7 @@ pub fn render_pr_description(title: Option<&str>, body: Option<&str>) -> (String
     // Truncation lives here, not in the callers: the grounding range in
     // review.rs and the prompt block in user_prompt must count the same
     // lines, or the index would accept line numbers the model never saw.
-    let body: String = body.unwrap_or("").trim().chars().take(2000).collect();
-    let body = body.trim_end();
+    let body = bounded_pr_body(body).unwrap_or_default();
     if title.is_empty() && body.is_empty() {
         return (String::new(), 0);
     }
@@ -416,10 +430,7 @@ pub(crate) fn pr_context_prompt(ctx: &PrContext<'_>) -> String {
         if let Some(title) = ctx.title {
             p.push_str(&format!("PR title: {title}\n"));
         }
-        let truncated_body: Option<String> = ctx
-            .body
-            .filter(|b| !b.trim().is_empty())
-            .map(|b| b.chars().take(2000).collect());
+        let truncated_body = bounded_pr_body(ctx.body);
         if let Some(body) = &truncated_body {
             p.push_str(&format!("PR description:\n{body}\n"));
         }
@@ -455,6 +466,24 @@ mod tests {
         assert_eq!(focus.len(), MAX_FOCUS_PROMPT_BYTES);
         assert!(focus.ends_with(PROMPT_TRUNCATION_MARKER));
     }
+
+    #[test]
+    fn numbered_and_plain_pr_context_share_the_body_limit() {
+        let body = format!("{}TAIL", "x".repeat(MAX_PR_BODY_PROMPT_CHARS));
+        let numbered = render_pr_description(Some("title"), Some(&body)).0;
+        let plain = pr_context_prompt(&PrContext {
+            repo: None,
+            title: Some("title"),
+            body: Some(&body),
+            incremental: false,
+            content_policy: false,
+        });
+        assert!(numbered.contains(&"x".repeat(MAX_PR_BODY_PROMPT_CHARS)));
+        assert!(plain.contains(&"x".repeat(MAX_PR_BODY_PROMPT_CHARS)));
+        assert!(!numbered.contains("TAIL"));
+        assert!(!plain.contains("TAIL"));
+    }
+
     use crate::config::Config;
 
     #[test]

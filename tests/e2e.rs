@@ -2668,9 +2668,9 @@ async fn irreparable_batch_keeps_later_batches_in_the_strict_failure_envelope() 
         .await;
 
     let mut source = String::from(
-        "diff --git a/src/a-invalid.rs b/src/a-invalid.rs\n--- /dev/null\n+++ b/src/a-invalid.rs\n@@ -0,0 +1,700 @@\n+invalid_batch_marker();\n",
+        "diff --git a/src/a-invalid.rs b/src/a-invalid.rs\n--- /dev/null\n+++ b/src/a-invalid.rs\n@@ -0,0 +1,160 @@\n+invalid_batch_marker();\n",
     );
-    for line in 2..=700 {
+    for line in 2..=160 {
         writeln!(
             source,
             "+let padding_{line:04} = trusted; // {}",
@@ -2689,8 +2689,8 @@ async fn irreparable_batch_keeps_later_batches_in_the_strict_failure_envelope() 
         .current_dir(dir.path())
         .env("POSTIL_API_BASE", server.uri())
         .env("POSTIL_DISABLE_SCORER", "1")
-        .env("REVIEW_MODEL", "gpt-5-primary-model")
-        .env("REVIEW_MODEL_CASCADE", "gpt-5-backup-model")
+        .env("REVIEW_MODEL", "primary-model")
+        .env("REVIEW_MODEL_CASCADE", "backup-model")
         .args(["review", "--diff-file"])
         .arg(&diff)
         .args(["--output", "json"])
@@ -2730,7 +2730,7 @@ async fn irreparable_batch_keeps_later_batches_in_the_strict_failure_envelope() 
             .as_array()
             .unwrap()
             .iter()
-            .any(|usage| usage["model"] == "gpt-5-backup-model")
+            .any(|usage| usage["model"] == "backup-model")
     );
 
     let requests = server.received_requests().await.unwrap();
@@ -6054,7 +6054,7 @@ async fn remote_dependabot_description_uses_bounded_provider_context() {
     let server = MockServer::start().await;
     let body = format!(
         "Bumps example/action from 1 to 2.\n\nRelease notes\n\n{}\nDEPENDABOT_BODY_TAIL",
-        "x".repeat(48_000)
+        "x".repeat(128_000)
     );
     Mock::given(method("GET"))
         .and(path_regex(r"^/repos/acme/api/compare/b+\.\.\.a+$"))
@@ -6139,6 +6139,8 @@ async fn remote_dependabot_description_uses_bounded_provider_context() {
         .collect::<Vec<_>>();
     assert_eq!(model_requests.len(), 1);
     let model_body = String::from_utf8_lossy(&model_requests[0].body);
+    let model_json: Value = serde_json::from_slice(&model_requests[0].body).unwrap();
+    assert_eq!(model_json["model"], "z-ai/glm-5.2");
     assert!(model_body.contains("uses: example/action@v2"));
     assert!(!model_body.contains("DEPENDABOT_BODY_TAIL"));
     assert!(model_body.len() + 16_000 <= 128_000);
@@ -7044,7 +7046,7 @@ async fn all_ungrounded_primary_exhausts_one_retry_then_cascades_before_forge_wr
     mount_github_complete_diff(&server, 7).await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .and(body_string_contains("primary-model"))
+        .and(body_string_contains("openai/gpt-5-mini"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(llm_content(json!([finding_at(999, "error", 0.9)]))),
@@ -7054,7 +7056,7 @@ async fn all_ungrounded_primary_exhausts_one_retry_then_cascades_before_forge_wr
         .await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .and(body_string_contains("backup-model"))
+        .and(body_string_contains("z-ai/glm-5.2"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(llm_content(json!([finding_at(41, "error", 0.9)]))),
@@ -7095,8 +7097,8 @@ async fn all_ungrounded_primary_exhausts_one_retry_then_cascades_before_forge_wr
         .env("POSTIL_API_BASE", server.uri())
         .env("GITHUB_API_URL", server.uri())
         .env("GITHUB_TOKEN", "gh-test-token")
-        .env("REVIEW_MODEL", "primary-model")
-        .env("REVIEW_MODEL_CASCADE", "backup-model")
+        .env("REVIEW_MODEL", "openai/gpt-5-mini")
+        .env("REVIEW_MODEL_CASCADE", "z-ai/glm-5.2")
         .args([
             "review",
             "--publish",
@@ -7111,7 +7113,7 @@ async fn all_ungrounded_primary_exhausts_one_retry_then_cascades_before_forge_wr
     let env: Value =
         serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
     assert_eq!(env["findings"][0]["path"], "src/auth.rs");
-    assert_eq!(env["modelUsed"], "backup-model");
+    assert_eq!(env["modelUsed"], "z-ai/glm-5.2");
     assert_eq!(env["usage"]["promptTokens"], 300);
     assert_eq!(env["usage"]["completionTokens"], 150);
     assert_eq!(env["modelUsage"].as_array().unwrap().len(), 3);
