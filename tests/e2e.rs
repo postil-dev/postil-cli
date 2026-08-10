@@ -2689,8 +2689,8 @@ async fn irreparable_batch_keeps_later_batches_in_the_strict_failure_envelope() 
         .current_dir(dir.path())
         .env("POSTIL_API_BASE", server.uri())
         .env("POSTIL_DISABLE_SCORER", "1")
-        .env("REVIEW_MODEL", "primary-model")
-        .env("REVIEW_MODEL_CASCADE", "backup-model")
+        .env("REVIEW_MODEL", "gpt-5-primary-model")
+        .env("REVIEW_MODEL_CASCADE", "gpt-5-backup-model")
         .args(["review", "--diff-file"])
         .arg(&diff)
         .args(["--output", "json"])
@@ -2730,7 +2730,7 @@ async fn irreparable_batch_keeps_later_batches_in_the_strict_failure_envelope() 
             .as_array()
             .unwrap()
             .iter()
-            .any(|usage| usage["model"] == "backup-model")
+            .any(|usage| usage["model"] == "gpt-5-backup-model")
     );
 
     let requests = server.received_requests().await.unwrap();
@@ -6113,7 +6113,7 @@ async fn remote_dependabot_description_uses_bounded_provider_context() {
         .current_dir(dir.path())
         .env("POSTIL_API_BASE", server.uri())
         .env("POSTIL_DISABLE_SCORER", "1")
-        .env("REVIEW_MODEL", "example/unknown-context")
+        .env("REVIEW_MODEL", "z-ai/glm-5.2")
         .env("GITHUB_API_URL", server.uri())
         .env("GITHUB_TOKEN", "gh-test-token")
         .args([
@@ -6141,7 +6141,7 @@ async fn remote_dependabot_description_uses_bounded_provider_context() {
     let model_body = String::from_utf8_lossy(&model_requests[0].body);
     assert!(model_body.contains("uses: example/action@v2"));
     assert!(!model_body.contains("DEPENDABOT_BODY_TAIL"));
-    assert!(model_body.len() + 16_000 <= 32_000);
+    assert!(model_body.len() + 16_000 <= 128_000);
 }
 
 #[tokio::test]

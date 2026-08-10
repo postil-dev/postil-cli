@@ -623,9 +623,16 @@ pub(crate) const REVIEW_MAX_TOKENS: u32 = 8_000;
 
 pub(crate) fn conservative_context_tokens(model: &str) -> usize {
     let model = model.to_ascii_lowercase();
-    if ["gpt-5", "gemma-3", "qwen3", "deepseek-v4", "mistral-small"]
-        .iter()
-        .any(|known| model.contains(known))
+    if [
+        "gpt-5",
+        "gemma-3",
+        "glm-5",
+        "qwen3",
+        "deepseek-v4",
+        "mistral-small",
+    ]
+    .iter()
+    .any(|known| model.contains(known))
     {
         128_000
     } else {
@@ -5423,6 +5430,15 @@ mod tests {
         );
         assert!(
             schema.matches('\0').count() < MAX_REVIEW_RETRY_PREVIOUS_BYTES + REPAIR_ERROR_MAX_BYTES
+        );
+    }
+
+    #[test]
+    fn glm_five_uses_its_conservative_published_context_floor() {
+        assert_eq!(conservative_context_tokens("z-ai/glm-5.2"), 128_000);
+        assert_eq!(
+            conservative_context_tokens("example/unknown-context"),
+            32_000
         );
     }
 
