@@ -2630,7 +2630,9 @@ async fn irreparable_batch_keeps_later_batches_in_the_strict_failure_envelope() 
         .and(path("/chat/completions"))
         .respond_with(|request: &wiremock::Request| {
             let body = String::from_utf8_lossy(&request.body);
-            if body.contains("bounded synthesis window") {
+            if body.contains("Cross-window semantic digests")
+                || body.contains("Cross-batch semantic digests")
+            {
                 return ResponseTemplate::new(200).set_body_json(llm_content(json!([])));
             }
             if body.contains("invalid_batch_marker") {
@@ -3207,7 +3209,8 @@ async fn final_synthesis_detects_cross_batch_validation_sink_relationship() {
     assert!(requests.len() >= 3);
     assert!(requests.iter().any(|request| {
         let body = String::from_utf8_lossy(&request.body);
-        body.contains("bounded synthesis window")
+        (body.contains("Cross-window semantic digests")
+            || body.contains("Cross-batch semantic digests"))
             && body.contains("validate_pair")
             && body.contains("dangerous_sink")
     }));
@@ -3300,7 +3303,9 @@ async fn bounded_synthesis_repairs_source_exact_evidence_without_relaxing_valida
     assert!(review_requests.iter().all(|request| {
         let body: Value = request.body_json().unwrap();
         let serialized = String::from_utf8_lossy(&request.body);
-        let expected = if serialized.contains("bounded synthesis window") {
+        let expected = if serialized.contains("Cross-window semantic digests")
+            || serialized.contains("Cross-batch semantic digests")
+        {
             4_000
         } else {
             8_000

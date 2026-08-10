@@ -49,6 +49,12 @@ import {
 
 const fixtures = fixtureInputs.map((input) => benchmarkCase.parse(input));
 
+function postilBinaryPath(): string {
+  return resolve(
+    process.env.POSTIL_BIN ?? resolve(import.meta.dir, "..", "..", "target", "release", "postil"),
+  );
+}
+
 function fixture(id: string) {
   const c = fixtures.find((candidate) => candidate.id === id);
   if (!c) throw new Error(`missing fixture ${id}`);
@@ -59,7 +65,7 @@ function boundedScorerFixture() {
   const ordinaryFile = (ordinal: number) => {
     const path = `src/ordinary/segment-${ordinal}.ts`;
     const lines = Array.from(
-      { length: 200 },
+      { length: 100 },
       (_, line) => ordinal === 0 && line === 0
         ? "+export const accessPermissionLabel = 'Account access'; // ordinary display copy"
         : `+export const ordinary_${ordinal}_${line} = ${ordinal + line}; // ordinary source behavior`,
@@ -486,7 +492,7 @@ describe("scorer proxy and isolated runtime", () => {
         "falseFinding",
         "scorer/model",
         1,
-        resolve(import.meta.dir, "..", "..", "target", "release", "postil"),
+        postilBinaryPath(),
         root,
         upstreamBase,
         keyName,
@@ -498,6 +504,30 @@ describe("scorer proxy and isolated runtime", () => {
         },
         SCORER_CASE_EXEC_TIMEOUT_MS,
       );
+      const runArtifacts = join(root, "scorer_model", "repeat-1", calibration.id, "artifacts");
+      const proxyTelemetry = JSON.parse(
+        await readFile(join(runArtifacts, "proxy-telemetry.json"), "utf8"),
+      ) as {
+        plannerRequests: number;
+        generatorRequests: number;
+        generatorRequestKinds: Array<"source" | "synthesis">;
+        plannerSelections: Array<{
+          targetBatchId: number | null;
+          targetWasMandatory: boolean;
+          returnedBatchIds: number[];
+        }>;
+        unexpectedRequests: Array<{ method: string; path: string }>;
+      };
+      const stdout = await readFile(join(runArtifacts, "stdout.json"), "utf8");
+      if (!evaluation.envelopeProduced) {
+        const stderr = await readFile(join(runArtifacts, "stderr.log"), "utf8");
+        throw new Error(`${evaluation.reason}\n${stderr}`);
+      }
+      const envelope = envelopeV1.parse(
+        JSON.parse(stdout),
+      );
+      expect(proxyTelemetry.plannerSelections).toHaveLength(1);
+      expect(proxyTelemetry.plannerSelections[0]?.targetBatchId).toBeGreaterThan(0);
       expect(evaluation).toMatchObject({
         envelopeProduced: true,
         scorerModel: "scorer/model",
@@ -516,8 +546,6 @@ describe("scorer proxy and isolated runtime", () => {
       const scorerPrompt = scorerRequest.messages?.map((message) => message.content ?? "").join("\n") ?? "";
       expect(scorerPrompt).toContain("src/ui/copy.ts");
       expect(scorerPrompt).toContain('"line": 44');
-      const runArtifacts = join(root, "scorer_model", "repeat-1", calibration.id, "artifacts");
-      const envelope = envelopeV1.parse(JSON.parse(await readFile(join(runArtifacts, "stdout.json"), "utf8")));
       expect(envelope.findings).toHaveLength(0);
       expect(envelope.silent).toBe(true);
       expect(envelope.gate.failing).toBe(false);
@@ -532,19 +560,6 @@ describe("scorer proxy and isolated runtime", () => {
         promptTokens: 20,
         completionTokens: 4,
       });
-      const proxyTelemetry = JSON.parse(
-        await readFile(join(runArtifacts, "proxy-telemetry.json"), "utf8"),
-      ) as {
-        plannerRequests: number;
-        generatorRequests: number;
-        generatorRequestKinds: Array<"source" | "synthesis">;
-        plannerSelections: Array<{
-          targetBatchId: number | null;
-          targetWasMandatory: boolean;
-          returnedBatchIds: number[];
-        }>;
-        unexpectedRequests: Array<{ method: string; path: string }>;
-      };
       expect(proxyTelemetry.plannerRequests).toBe(1);
       expect(proxyTelemetry.unexpectedRequests).toEqual([]);
       const sourceRequests = proxyTelemetry.generatorRequestKinds.filter(
@@ -558,7 +573,6 @@ describe("scorer proxy and isolated runtime", () => {
       );
       expect(sourceRequests).toHaveLength(envelope.reviewCoverage!.selectedBatches);
       expect(synthesisRequests).toHaveLength(1);
-      expect(proxyTelemetry.plannerSelections).toHaveLength(1);
       expect(proxyTelemetry.plannerSelections[0]?.targetWasMandatory).toBe(false);
       const targetBatchId = proxyTelemetry.plannerSelections[0]?.targetBatchId;
       expect(targetBatchId).toBeGreaterThan(0);
@@ -630,7 +644,7 @@ describe("scorer proxy and isolated runtime", () => {
         "trueFinding",
         "scorer/model",
         1,
-        resolve(import.meta.dir, "..", "..", "target", "release", "postil"),
+        postilBinaryPath(),
         root,
         upstreamBase,
         keyName,
@@ -648,7 +662,7 @@ describe("scorer proxy and isolated runtime", () => {
         "falseFinding",
         "scorer/model",
         1,
-        resolve(import.meta.dir, "..", "..", "target", "release", "postil"),
+        postilBinaryPath(),
         root,
         upstreamBase,
         keyName,

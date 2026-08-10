@@ -980,9 +980,9 @@ export async function startScorerProxy(
       }
       generatorRequests.push(bodyText);
       const user = body.messages?.find((message) => message.role === "user")?.content ?? "";
-      const isSynthesis = user.includes(
-        "This bounded synthesis window joins semantic evidence",
-      );
+      const isSynthesis =
+        user.includes("Cross-window semantic digests") ||
+        user.includes("Cross-batch semantic digests");
       generatorRequestKinds.push(
         isSynthesis ? "synthesis" : "source",
       );

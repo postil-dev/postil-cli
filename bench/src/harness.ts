@@ -767,7 +767,9 @@ async function startMockModel(c: BenchmarkCase, artifactsDir: string) {
         return;
       }
       const targetPath = c.primaryChange?.path ?? c.modelOutput.findings[0]?.path;
-      const synthesis = user.includes("This bounded synthesis window joins semantic evidence");
+      const synthesis =
+        user.includes("Cross-window semantic digests") ||
+        user.includes("Cross-batch semantic digests");
       const targetBatch = targetPath === undefined || user
         .split("\n")
         .some((line) => line.trim() === `### ${targetPath}`);
