@@ -111,20 +111,6 @@ async fn snapshot_is_current<F: Forge>(
     .await
 }
 
-fn conservative_context_tokens(model: &str) -> usize {
-    let model = model.to_ascii_lowercase();
-    if ["gpt-5", "gemma-3", "qwen3", "deepseek-v4", "mistral-small"]
-        .iter()
-        .any(|known| model.contains(known))
-    {
-        128_000
-    } else {
-        // Unknown BYOK endpoints get a conservative floor rather than an
-        // optimistic provider-specific assumption.
-        32_000
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReviewBatchValidationReason {
     category: &'static str,
@@ -1071,6 +1057,11 @@ struct ReviewBatchPromptContext<'a> {
     multiple: bool,
 }
 
+const BOUNDED_SOURCE_BATCH_CONTEXT: &str = "This source batch was selected from a larger diff. Review only the supplied grounded evidence. Do not claim literal examination of every changed line. Boundary, risk, and synthesis evidence are reviewed as separate requests.\n\n";
+const BOUNDED_SYNTHESIS_BATCH_CONTEXT: &str = "This synthesis batch was selected from a larger diff. Review only the supplied grounded evidence. Do not claim literal examination of every changed line. Boundary, risk, and synthesis evidence are reviewed as separate requests.\n\n";
+const SYNTHESIS_BATCH_CONTEXT: &str = "\n\nThis bounded synthesis window joins semantic evidence from adjacent source windows. Look specifically for merge-relevant relationships such as caller/API, config/consumer, validation/sink, and lifecycle pairs. Cite the exact numbered path and line retained in the digest.";
+const MULTIPLE_BATCH_CONTEXT: &str = "\n\nReview this selected source batch independently. Other selected source batches are reviewed separately.";
+
 fn review_batch_prompt(
     context: &ReviewBatchPromptContext<'_>,
     mut annotated: String,
@@ -1079,10 +1070,11 @@ fn review_batch_prompt(
     let synthesis = annotated.starts_with("Cross-window semantic digests")
         || annotated.starts_with("Cross-batch semantic digests");
     if context.bounded_selection {
-        let kind = if synthesis { "synthesis" } else { "source" };
-        annotated.insert_str(0, &format!(
-            "This {kind} batch was selected from a larger diff. Review only the supplied grounded evidence. Do not claim literal examination of every changed line. Boundary, risk, and synthesis evidence are reviewed as separate requests.\n\n"
-        ));
+        if synthesis {
+            annotated.insert_str(0, BOUNDED_SYNTHESIS_BATCH_CONTEXT);
+        } else {
+            annotated.insert_str(0, BOUNDED_SOURCE_BATCH_CONTEXT);
+        }
     }
     let prompt_context = PrContext {
         repo: context.repo,
@@ -1101,13 +1093,9 @@ fn review_batch_prompt(
     };
     let mut user = prompt::user_prompt(&prompt_context, &annotated, context.cfg.max_findings);
     if synthesis {
-        user.push_str(
-            "\n\nThis bounded synthesis window joins semantic evidence from adjacent source windows. Look specifically for merge-relevant relationships such as caller/API, config/consumer, validation/sink, and lifecycle pairs. Cite the exact numbered path and line retained in the digest.",
-        );
+        user.push_str(SYNTHESIS_BATCH_CONTEXT);
     } else if context.multiple {
-        user.push_str(
-            "\n\nReview this selected source batch independently. Other selected source batches are reviewed separately.",
-        );
+        user.push_str(MULTIPLE_BATCH_CONTEXT);
     }
     (annotated, user, synthesis)
 }
@@ -1184,49 +1172,73 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
         } else {
             chain.len()
         };
-        let context_tokens = chain
-            .iter()
-            .take(active_model_count)
-            .map(|model| conservative_context_tokens(model))
-            .min()
-            .unwrap_or(32_000);
-        let review_output_tokens = crate::llm::REVIEW_MAX_TOKENS as usize;
-        // Serialized UTF-8 bytes conservatively upper-bound the corresponding
-        // input token count. This intentionally under-fills the model context
-        // rather than relying on a provider-specific tokenizer.
-        let pr_context = prompt::pr_context_prompt(&PrContext {
+        let review_output_tokens = crate::llm::REVIEW_MAX_OUTPUT_TOKENS as usize;
+        // Account for the fixed request context in its serialized provider
+        // shape. Remaining UTF-8 batch bytes conservatively upper-bound input
+        // tokens without relying on a provider-specific tokenizer.
+        let admission_context = PrContext {
             repo,
             title: meta.map(|value| value.title.as_str()),
             body: meta.map(|value| value.body.as_str()),
             incremental,
             content_policy: content_policy_active,
-        });
-        let shared_context_token_upper_bound = system.len() + pr_context.len() + 4096;
-        let batch_budget = context_tokens
-            .saturating_sub(review_output_tokens)
-            .saturating_sub(shared_context_token_upper_bound)
-            .min(MAX_REVIEW_BATCH_BYTES);
+        };
+        let mut admission_user = prompt::user_prompt(
+            &admission_context,
+            BOUNDED_SYNTHESIS_BATCH_CONTEXT,
+            cfg.max_findings,
+        );
+        admission_user.push_str(SYNTHESIS_BATCH_CONTEXT);
+        let batch_budget = chain
+            .iter()
+            .take(active_model_count)
+            .map(|model| {
+                crate::llm::serialized_base_review_request_bytes(
+                    cfg.api_format,
+                    model,
+                    &system,
+                    &admission_user,
+                    crate::llm::REVIEW_MAX_OUTPUT_TOKENS,
+                )
+                .map(|input_bytes| {
+                    crate::llm::conservative_context_tokens(model)
+                        .saturating_sub(review_output_tokens)
+                        .saturating_sub(input_bytes)
+                        .min(MAX_REVIEW_BATCH_BYTES)
+                })
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .min()
+            .unwrap_or(0);
         let invalid_input = if input_incomplete {
-            Some(
+            Some((
+                crate::envelope::IncompleteReviewReason::ReservedInput,
                 "review input is incomplete or contains reserved evidence; no provider request was made"
                     .to_string(),
-            )
+            ))
         } else if active_model_count == 0 || active_model_count > MAX_MODELS_PER_REQUEST {
-            Some(format!(
-                "configured model fan-out is invalid (models {active_model_count}/{MAX_MODELS_PER_REQUEST}); no provider request was made"
+            Some((
+                crate::envelope::IncompleteReviewReason::InvalidModelFanOut,
+                format!(
+                    "configured model fan-out is invalid (models {active_model_count}/{MAX_MODELS_PER_REQUEST}); no provider request was made"
+                ),
             ))
         } else if batch_budget < 4_096 {
-            Some(format!(
-                "review context budget is insufficient after serialized shared context (batch budget {batch_budget} bytes; requires at least 4096); no provider request was made"
+            Some((
+                crate::envelope::IncompleteReviewReason::InsufficientContextBudget,
+                format!(
+                    "review context budget is insufficient after serialized shared context (batch budget {batch_budget} bytes; requires at least 4096); no provider request was made"
+                ),
             ))
         } else {
             None
         };
 
-        if let Some(invalid_input) = invalid_input {
-            eprintln!("postil: {invalid_input}");
+        if let Some((reason, diagnostic)) = invalid_input {
+            eprintln!("postil: {diagnostic}");
             model_used = "none (invalid review input)".to_string();
-            findings = vec![crate::envelope::incomplete_review_finding()];
+            findings = vec![crate::envelope::incomplete_review_finding(reason)];
         } else {
             let mut batches = diff::spool_model_batches(
                 &mut prepared,
@@ -2340,7 +2352,9 @@ fn error_envelope(
     let invalid_output =
         review_failure.is_some_and(|failure| failure.kind == ReviewFailureKind::InvalidOutput);
     let findings = vec![if incomplete_input {
-        crate::envelope::incomplete_review_finding()
+        crate::envelope::incomplete_review_finding(
+            crate::envelope::IncompleteReviewReason::IncompleteInput,
+        )
     } else if invalid_output {
         fail_closed_finding(
             review_failure

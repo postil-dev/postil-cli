@@ -611,12 +611,29 @@ const EMPTY_RESPONSE_RETRIES: u32 = 1;
 const EXHAUSTED_OUTPUT_RETRIES: u32 = 1;
 const TIMEOUT_RETRY_CAP_SECS: u64 = 90;
 const EMPTY_RESPONSE_RETRY_TIMEOUT_SECS: u64 = 30;
-const EXHAUSTED_OUTPUT_RETRY_MAX_TOKENS: u32 = 16_000;
+pub(crate) const REVIEW_MAX_OUTPUT_TOKENS: u32 = 16_000;
+const EXHAUSTED_OUTPUT_RETRY_MAX_TOKENS: u32 = REVIEW_MAX_OUTPUT_TOKENS;
+const MAX_REVIEW_RETRY_PREVIOUS_BYTES: usize = 16_384;
+const MAX_REVIEW_RETRY_REASON_BYTES: usize = 16_384;
 const PROVIDER_RETRY_DELAY_CAP_SECS: u64 = 30;
 
 /// Unqualified models receive a bounded review budget. A larger bound belongs
 /// in explicit admitted-model metadata after that model proves it needs one.
 pub(crate) const REVIEW_MAX_TOKENS: u32 = 8_000;
+
+pub(crate) fn conservative_context_tokens(model: &str) -> usize {
+    let model = model.to_ascii_lowercase();
+    if ["gpt-5", "gemma-3", "qwen3", "deepseek-v4", "mistral-small"]
+        .iter()
+        .any(|known| model.contains(known))
+    {
+        128_000
+    } else {
+        // Unknown BYOK endpoints get a conservative floor rather than an
+        // optimistic provider-specific assumption.
+        32_000
+    }
+}
 
 pub(crate) struct ReviewPreflightPrompts<'a> {
     pub first_users: &'a [String],
@@ -642,6 +659,7 @@ const SCORER_MAX_TOKENS_PER_FINDING: u32 = 144;
 const SCORER_REPAIR_BYTES_PER_OUTPUT_TOKEN: usize = 4;
 pub(crate) const SCORER_MAX_FINDINGS: usize = 20;
 const REPAIR_ERROR_MAX_BYTES: usize = 1_024;
+const REVIEW_SCHEMA_REPAIR_SYSTEM: &str = "You repair malformed JSON. Output only valid JSON.";
 // The publication contract targets 1,200 characters and hard-stops at 2,400.
 // Keep generation bounded too, so an invalid model cannot spend an article's
 // worth of output tokens before the validator rejects it.
@@ -874,6 +892,48 @@ fn serialized_provider_request_bytes(body: &serde_json::Value, context: &str) ->
     Ok(bytes.len())
 }
 
+fn base_request_body(
+    api_format: ApiFormat,
+    model: &str,
+    system: &str,
+    user: &str,
+    max_tokens: u32,
+    temperature: f64,
+) -> serde_json::Value {
+    match api_format {
+        ApiFormat::OpenaiCompatible => json!({
+            "model": model,
+            "temperature": temperature,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "max_tokens": max_tokens,
+        }),
+        ApiFormat::Anthropic => json!({
+            "model": model,
+            "system": system,
+            "messages": [{"role": "user", "content": user}],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }),
+    }
+}
+
+pub(crate) fn serialized_base_review_request_bytes(
+    api_format: ApiFormat,
+    model: &str,
+    system: &str,
+    user: &str,
+    max_tokens: u32,
+) -> Result<usize> {
+    serde_json::to_vec(&base_request_body(
+        api_format, model, system, user, max_tokens, 0.1,
+    ))
+    .map(|request| request.len())
+    .context("serializing review request for batch admission")
+}
+
 pub(crate) fn scorer_max_tokens(expected_len: usize) -> Option<u32> {
     (expected_len <= SCORER_MAX_FINDINGS)
         .then(|| SCORER_BASE_MAX_TOKENS + expected_len as u32 * SCORER_MAX_TOKENS_PER_FINDING)
@@ -1099,7 +1159,9 @@ impl std::fmt::Display for ModelContentFailure {
 impl std::error::Error for ModelContentFailure {}
 
 fn classify_chat_error(error: anyhow::Error) -> anyhow::Error {
-    if error.downcast_ref::<ModelContentFailure>().is_some() {
+    if error.downcast_ref::<ModelContentFailure>().is_some()
+        || error.downcast_ref::<ReviewContextExceeded>().is_some()
+    {
         error
     } else {
         error.context(ProviderError)
@@ -1137,7 +1199,55 @@ impl std::fmt::Display for RequestTimedOut {
 
 impl std::error::Error for RequestTimedOut {}
 
+#[derive(Debug, Clone, Copy)]
+struct ReviewContextExceeded {
+    required: usize,
+    limit: usize,
+}
+
+impl std::fmt::Display for ReviewContextExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "review request needs {} conservative context tokens, exceeding the {} token model limit",
+            self.required, self.limit
+        )
+    }
+}
+
+impl std::error::Error for ReviewContextExceeded {}
+
 impl LlmClient {
+    fn review_request_context_usage(
+        &self,
+        model: &str,
+        body: &serde_json::Value,
+        output_tokens: u32,
+    ) -> Result<(usize, usize)> {
+        let input_bytes = serialized_provider_request_bytes(
+            body,
+            "serializing review request for conservative context validation",
+        )?;
+        let required = input_bytes
+            .checked_add(output_tokens as usize)
+            .context("review request context accounting overflowed")?;
+        Ok((required, conservative_context_tokens(model)))
+    }
+
+    fn ensure_review_request_fits_context(
+        &self,
+        model: &str,
+        body: &serde_json::Value,
+        output_tokens: u32,
+    ) -> Result<()> {
+        let (required, limit) = self.review_request_context_usage(model, body, output_tokens)?;
+        if required > limit {
+            return Err(ReviewContextExceeded { required, limit }.into());
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     fn planned_request_bytes(
         &self,
         model: &str,
@@ -1162,10 +1272,180 @@ impl LlmClient {
         temperature: f64,
         phase: LlmPhase,
     ) -> Result<(usize, usize)> {
-        let output_tokens = phase.exhausted_output_retry_max_tokens(initial_max_tokens);
+        let initial_body =
+            self.request_body(model, system, user, initial_max_tokens, temperature, phase);
+        let initial_bytes = serialized_provider_request_bytes(
+            &initial_body,
+            "serializing hosted request for preflight",
+        )?;
+        if matches!(phase, LlmPhase::Review) {
+            self.ensure_review_request_fits_context(model, &initial_body, initial_max_tokens)?;
+        }
+
+        let expanded_tokens = phase.exhausted_output_retry_max_tokens(initial_max_tokens);
+        if expanded_tokens == initial_max_tokens {
+            return Ok((initial_bytes, initial_max_tokens as usize));
+        }
+        let expanded_body =
+            self.request_body(model, system, user, expanded_tokens, temperature, phase);
+        let expanded_bytes = serialized_provider_request_bytes(
+            &expanded_body,
+            "serializing hosted output retry for preflight",
+        )?;
+        if matches!(phase, LlmPhase::Review) {
+            self.ensure_review_request_fits_context(model, &expanded_body, expanded_tokens)?;
+        }
+        Ok((expanded_bytes, expanded_tokens as usize))
+    }
+
+    fn bounded_review_retry_user<F>(
+        &self,
+        model: &str,
+        system: &str,
+        previous: &str,
+        reason: &str,
+        max_tokens: u32,
+        render: F,
+    ) -> Result<String>
+    where
+        F: Fn(&str, &str) -> String,
+    {
+        let previous = truncate_utf8_bytes(previous, MAX_REVIEW_RETRY_PREVIOUS_BYTES);
+        let reason = truncate_utf8_bytes(reason, MAX_REVIEW_RETRY_REASON_BYTES);
+        let mut previous_limit = previous.len();
+        let mut reason_limit = reason.len();
+
+        loop {
+            let bounded_previous = truncate_utf8_bytes(previous, previous_limit);
+            let bounded_reason = truncate_utf8_bytes(reason, reason_limit);
+            let retry_user = render(bounded_previous, bounded_reason);
+            let retry_max_tokens = LlmPhase::Review.exhausted_output_retry_max_tokens(max_tokens);
+            let body = self.request_body(
+                model,
+                system,
+                &retry_user,
+                retry_max_tokens,
+                0.1,
+                LlmPhase::Review,
+            );
+            let (required, limit) =
+                self.review_request_context_usage(model, &body, retry_max_tokens)?;
+            if required <= limit {
+                return Ok(retry_user);
+            }
+
+            let excess = required.saturating_sub(limit).max(1);
+            if previous_limit > 0 {
+                previous_limit = previous_limit.saturating_sub(excess.min(previous_limit));
+            } else if reason_limit > 0 {
+                reason_limit = reason_limit.saturating_sub(excess.min(reason_limit));
+            } else {
+                return Err(ReviewContextExceeded { required, limit }.into());
+            }
+        }
+    }
+
+    fn bounded_semantic_retry_user(
+        &self,
+        model: &str,
+        system: &str,
+        user: &str,
+        previous: &str,
+        max_tokens: u32,
+    ) -> Result<String> {
+        self.bounded_review_retry_user(model, system, previous, "", max_tokens, |previous, _| {
+            review_semantic_retry_user(user, previous)
+        })
+    }
+
+    fn bounded_schema_repair_user(
+        &self,
+        model: &str,
+        invalid: &str,
+        error: &str,
+        max_tokens: u32,
+    ) -> Result<String> {
+        let error = truncate_utf8_bytes(error, REPAIR_ERROR_MAX_BYTES);
+        self.bounded_review_retry_user(
+            model,
+            REVIEW_SCHEMA_REPAIR_SYSTEM,
+            invalid,
+            error,
+            max_tokens,
+            review_schema_repair_user,
+        )
+    }
+
+    fn bounded_validation_retry_user(
+        &self,
+        model: &str,
+        system: &str,
+        user: &str,
+        previous: &str,
+        reason: &str,
+        max_tokens: u32,
+    ) -> Result<String> {
+        self.bounded_review_retry_user(
+            model,
+            system,
+            previous,
+            reason,
+            max_tokens,
+            |previous, reason| review_validation_retry_user(user, previous, reason),
+        )
+    }
+
+    fn planned_review_request_exposure(
+        &self,
+        model: &str,
+        system: &str,
+        user: &str,
+        max_tokens: u32,
+    ) -> Result<(usize, usize)> {
+        let initial =
+            self.planned_request_exposure(model, system, user, max_tokens, 0.1, LlmPhase::Review)?;
+        let hostile_previous = "\0".repeat(MAX_REVIEW_RETRY_PREVIOUS_BYTES);
+        let hostile_reason = "\0".repeat(MAX_REVIEW_RETRY_REASON_BYTES);
+        let schema_error = "\0".repeat(REPAIR_ERROR_MAX_BYTES);
+        let schema_user =
+            self.bounded_schema_repair_user(model, &hostile_previous, &schema_error, max_tokens)?;
+        let semantic_user =
+            self.bounded_semantic_retry_user(model, system, user, &hostile_previous, max_tokens)?;
+        let validation_user = self.bounded_validation_retry_user(
+            model,
+            system,
+            user,
+            &hostile_previous,
+            &hostile_reason,
+            max_tokens,
+        )?;
+        let semantic = self.planned_request_exposure(
+            model,
+            system,
+            &semantic_user,
+            max_tokens,
+            0.1,
+            LlmPhase::Review,
+        )?;
+        let validation = self.planned_request_exposure(
+            model,
+            system,
+            &validation_user,
+            max_tokens,
+            0.1,
+            LlmPhase::Review,
+        )?;
+        let schema = self.planned_request_exposure(
+            model,
+            REVIEW_SCHEMA_REPAIR_SYSTEM,
+            &schema_user,
+            max_tokens,
+            0.1,
+            LlmPhase::Review,
+        )?;
         Ok((
-            self.planned_request_bytes(model, system, user, output_tokens, temperature, phase)?,
-            output_tokens as usize,
+            initial.0.max(semantic.0).max(validation.0).max(schema.0),
+            initial.1.max(semantic.1).max(validation.1).max(schema.1),
         ))
     }
 
@@ -1488,23 +1768,16 @@ impl LlmClient {
             logical_calls <= MAX_HOSTED_PLANNED_CALLS_BY_WATCHDOG,
             "complete hosted review needs {logical_calls} logical model calls, exceeding the {MAX_HOSTED_PLANNED_CALLS_BY_WATCHDOG}-call watchdog plan"
         );
-        // Admission proves that the normal path can finish within the operation
-        // cap. Repairs and transport retries reserve their actual request cost
-        // atomically before each network call and stop at the same hard cap.
+        // Admission includes the largest bounded correction or output retry.
+        // Transport retries reserve their actual request cost atomically before
+        // each network call and stop at the same hard cap.
         let mut exposure = PlannedExposure::default();
         for model in &review_models {
             let price = bounds
                 .get(model)
                 .ok_or_else(|| anyhow!("hosted model {model:?} has no admitted price bound"))?;
             let request_for = |user: &str, max_tokens: u32| -> Result<(usize, usize)> {
-                self.planned_request_exposure(
-                    model,
-                    system,
-                    user,
-                    max_tokens,
-                    0.1,
-                    LlmPhase::Review,
-                )
+                self.planned_review_request_exposure(model, system, user, max_tokens)
             };
             let first_requests = prompts
                 .first_users
@@ -2586,16 +2859,23 @@ impl LlmClient {
                     recovery: None,
                 };
                 // One repair attempt: ask the same model to fix its own JSON.
-                let invalid = truncate_utf8_bytes(&content, 16_384);
                 let parse_error = parse_err;
-                let repair_user = review_schema_repair_user(
-                    invalid,
-                    truncate_utf8_bytes(&parse_error, REPAIR_ERROR_MAX_BYTES),
-                );
+                let repair_user = self
+                    .bounded_schema_repair_user(model, &content, &parse_error, max_tokens)
+                    .map_err(|error| {
+                        let mut error = ModelError::new(
+                            error.context("review schema repair exceeded its context bound"),
+                            usage,
+                            usage_accounting_complete,
+                        );
+                        error.model_usage = call_usage.clone();
+                        error.model_incidents.push(incident.clone());
+                        error
+                    })?;
                 let repaired = match self
                     .chat(
                         model,
-                        "You repair malformed JSON. Output only valid JSON.",
+                        REVIEW_SCHEMA_REPAIR_SYSTEM,
                         &repair_user,
                         &mut usage,
                         &mut call_usage,
@@ -2669,8 +2949,18 @@ impl LlmClient {
                 recovered: false,
                 recovery: None,
             });
-            let previous = truncate_utf8_bytes(&content, 16_384);
-            let retry_user = review_semantic_retry_user(user, previous);
+            let retry_user = self
+                .bounded_semantic_retry_user(model, system, user, &content, max_tokens)
+                .map_err(|error| {
+                    let mut error = ModelError::new(
+                        error.context("review semantic retry exceeded its context bound"),
+                        review.usage,
+                        review.usage_accounting_complete,
+                    );
+                    error.model_usage = review.model_usage.clone();
+                    error.model_incidents = review.model_incidents.clone();
+                    error
+                })?;
             let mut retry_usage = usage;
             match self
                 .chat(
@@ -2759,9 +3049,25 @@ impl LlmClient {
                 "postil: model {} returned unusable review content; requesting one semantic retry",
                 log_text(model),
             );
-            let previous = truncate_utf8_bytes(&content, 16_384);
-            let retry_user =
-                review_validation_retry_user(user, previous, validation_failure.repair_detail());
+            let retry_user = self
+                .bounded_validation_retry_user(
+                    model,
+                    system,
+                    user,
+                    &content,
+                    validation_failure.repair_detail(),
+                    max_tokens,
+                )
+                .map_err(|error| {
+                    let mut error = ModelError::new(
+                        error.context("review validation retry exceeded its context bound"),
+                        review.usage,
+                        review.usage_accounting_complete,
+                    );
+                    error.model_usage = review.model_usage.clone();
+                    error.model_incidents = review.model_incidents.clone();
+                    error
+                })?;
             let mut retry_usage = review.usage;
             let mut retry_accounting_complete = review.usage_accounting_complete;
             let retry = self
@@ -3239,6 +3545,19 @@ impl LlmClient {
             phase,
             expected_provider,
         );
+        if matches!(phase, LlmPhase::Review) {
+            let retry_max_tokens = phase.exhausted_output_retry_max_tokens(max_tokens);
+            let retry_body = self.request_body_with_provider(
+                model,
+                system,
+                user,
+                retry_max_tokens,
+                temperature,
+                phase,
+                expected_provider,
+            );
+            self.ensure_review_request_fits_context(model, &retry_body, retry_max_tokens)?;
+        }
         #[cfg(feature = "qualification-candidate")]
         if matches!(phase, LlmPhase::Attribution) {
             Self::ensure_atomic_attribution_request_size(&body)?;
@@ -3249,6 +3568,9 @@ impl LlmClient {
         let mut exhausted_output_retries = 0u32;
         let mut attempt_timeout = self.request_timeout;
         loop {
+            if matches!(phase, LlmPhase::Review) {
+                self.ensure_review_request_fits_context(model, &body, request_max_tokens)?;
+            }
             let attempt = retries.saturating_add(1);
             let attempt_started_at = Instant::now();
             let remaining = self.remaining_budget(phase)?;
@@ -3400,6 +3722,22 @@ impl LlmClient {
                                     && exhausted_output_retries < EXHAUSTED_OUTPUT_RETRIES
                                     && retries < TRANSIENT_RETRIES
                                 {
+                                    let expanded_body = self.request_body_with_provider(
+                                        model,
+                                        system,
+                                        user,
+                                        expanded_max_tokens,
+                                        temperature,
+                                        phase,
+                                        expected_provider,
+                                    );
+                                    if matches!(phase, LlmPhase::Review) {
+                                        self.ensure_review_request_fits_context(
+                                            model,
+                                            &expanded_body,
+                                            expanded_max_tokens,
+                                        )?;
+                                    }
                                     retries += 1;
                                     exhausted_output_retries += 1;
                                     let wait = provider_retry_delay(retries);
@@ -3409,15 +3747,7 @@ impl LlmClient {
                                         elapsed_text(wait),
                                     );
                                     request_max_tokens = expanded_max_tokens;
-                                    body = self.request_body_with_provider(
-                                        model,
-                                        system,
-                                        user,
-                                        request_max_tokens,
-                                        temperature,
-                                        phase,
-                                        expected_provider,
-                                    );
+                                    body = expanded_body;
                                     self.sleep_with_budget(phase, wait).await?;
                                     attempt_timeout = self
                                         .request_timeout
@@ -3601,15 +3931,14 @@ impl LlmClient {
     ) -> serde_json::Value {
         match self.api_format {
             ApiFormat::OpenaiCompatible => {
-                let mut body = json!({
-                    "model": model,
-                    "temperature": temperature,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
-                });
-                body["max_tokens"] = json!(max_tokens);
+                let mut body = base_request_body(
+                    self.api_format,
+                    model,
+                    system,
+                    user,
+                    max_tokens,
+                    temperature,
+                );
                 apply_openrouter_privacy(&mut body, self.require_openrouter_privacy);
                 let canonical_openrouter = is_canonical_openrouter_base(&self.api_base);
                 if let Some(expected_provider) = self.pinned_upstream_provider.as_deref() {
@@ -3632,13 +3961,14 @@ impl LlmClient {
                 }
                 body
             }
-            ApiFormat::Anthropic => json!({
-                "model": model,
-                "system": system,
-                "messages": [{"role": "user", "content": user}],
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-            }),
+            ApiFormat::Anthropic => base_request_body(
+                self.api_format,
+                model,
+                system,
+                user,
+                max_tokens,
+                temperature,
+            ),
         }
     }
 
@@ -5024,6 +5354,130 @@ mod tests {
     }
 
     #[test]
+    fn bounded_review_corrections_leave_room_for_the_largest_output_retry() {
+        let config = Config {
+            model: "example/unknown-context".into(),
+            ..Config::default()
+        };
+        let client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        let user = "u".repeat(12_000);
+        let previous = "\0".repeat(MAX_REVIEW_RETRY_PREVIOUS_BYTES);
+        let reason = "\0".repeat(MAX_REVIEW_RETRY_REASON_BYTES);
+        let semantic = client
+            .bounded_semantic_retry_user(
+                &config.model,
+                "system",
+                &user,
+                &previous,
+                REVIEW_MAX_TOKENS,
+            )
+            .unwrap();
+        let validation = client
+            .bounded_validation_retry_user(
+                &config.model,
+                "system",
+                &user,
+                &previous,
+                &reason,
+                REVIEW_MAX_TOKENS,
+            )
+            .unwrap();
+        let schema = client
+            .bounded_schema_repair_user(&config.model, &previous, &reason, REVIEW_MAX_TOKENS)
+            .unwrap();
+
+        for (retry_system, retry_user) in [
+            ("system", &semantic),
+            ("system", &validation),
+            (REVIEW_SCHEMA_REPAIR_SYSTEM, &schema),
+        ] {
+            let body = client.request_body(
+                &config.model,
+                retry_system,
+                retry_user,
+                REVIEW_MAX_OUTPUT_TOKENS,
+                0.1,
+                LlmPhase::Review,
+            );
+            let (required, limit) = client
+                .review_request_context_usage(&config.model, &body, REVIEW_MAX_OUTPUT_TOKENS)
+                .unwrap();
+            assert!(required <= limit, "required={required} limit={limit}");
+        }
+        assert!(semantic.contains("[Correction]"));
+        assert!(validation.contains("[Correction]"));
+        assert!(semantic.starts_with(&user));
+        assert!(validation.starts_with(&user));
+        assert!(schema.contains("corrected JSON object"));
+        assert!(semantic.matches('\0').count() < MAX_REVIEW_RETRY_PREVIOUS_BYTES);
+        assert!(
+            validation.matches('\0').count()
+                < MAX_REVIEW_RETRY_PREVIOUS_BYTES + MAX_REVIEW_RETRY_REASON_BYTES
+        );
+        assert!(
+            schema.matches('\0').count() < MAX_REVIEW_RETRY_PREVIOUS_BYTES + REPAIR_ERROR_MAX_BYTES
+        );
+    }
+
+    #[test]
+    fn review_preflight_admits_unknown_model_only_when_the_largest_retry_fits() {
+        let config = Config {
+            model: "example/unknown-context".into(),
+            ..Config::default()
+        };
+        let client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        let fitting_user = "x".repeat(15_000);
+        let (input_bytes, output_tokens) = client
+            .planned_review_request_exposure(
+                &config.model,
+                "system",
+                &fitting_user,
+                REVIEW_MAX_TOKENS,
+            )
+            .unwrap();
+        let required = input_bytes + output_tokens;
+        assert_eq!(output_tokens, REVIEW_MAX_OUTPUT_TOKENS as usize);
+        assert!(required <= conservative_context_tokens(&config.model));
+        assert!(required > 30_000, "required={required}");
+
+        let rejected_user = "x".repeat(16_500);
+        let initial_body = client.request_body(
+            &config.model,
+            "system",
+            &rejected_user,
+            REVIEW_MAX_TOKENS,
+            0.1,
+            LlmPhase::Review,
+        );
+        client
+            .ensure_review_request_fits_context(&config.model, &initial_body, REVIEW_MAX_TOKENS)
+            .unwrap();
+        let error = client
+            .planned_review_request_exposure(
+                &config.model,
+                "system",
+                &rejected_user,
+                REVIEW_MAX_TOKENS,
+            )
+            .unwrap_err();
+        assert!(error.downcast_ref::<ReviewContextExceeded>().is_some());
+    }
+
+    #[test]
     fn provider_retry_delay_uses_bounded_equal_jitter() {
         assert_eq!(
             provider_retry_delay_with_sample(1, 0),
@@ -5584,6 +6038,47 @@ mod tests {
             let body = String::from_utf8_lossy(&request.body);
             body.contains("\"content\":\"user\"") && !body.contains("You repair malformed JSON")
         }));
+    }
+
+    #[tokio::test]
+    async fn review_rejects_before_contact_when_only_the_initial_output_budget_fits() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let config = Config {
+            api_base: server.uri(),
+            api_format: ApiFormat::OpenaiCompatible,
+            model: "example/unknown-context".into(),
+            scorer_enabled: false,
+            ..Config::default()
+        };
+        let client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(2),
+            None,
+            None,
+        )
+        .unwrap();
+        *client.http.lock().unwrap() = Some(reqwest::Client::new());
+
+        let error = client
+            .review(&config, "system", &"x".repeat(16_500))
+            .await
+            .unwrap_err();
+
+        assert!(!error.is_provider());
+        assert!(
+            error
+                .error
+                .chain()
+                .any(|cause| cause.downcast_ref::<ReviewContextExceeded>().is_some())
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]

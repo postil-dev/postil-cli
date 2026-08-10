@@ -1387,6 +1387,29 @@ mod tests {
         assert!(is_incomplete_review_input(&unauthorized));
     }
 
+    #[test]
+    fn forge_summary_keeps_incomplete_review_reasons_generic() {
+        for reason in [
+            crate::envelope::IncompleteReviewReason::IncompleteInput,
+            crate::envelope::IncompleteReviewReason::ReservedInput,
+            crate::envelope::IncompleteReviewReason::InsufficientContextBudget,
+            crate::envelope::IncompleteReviewReason::InvalidModelFanOut,
+        ] {
+            let finding = crate::envelope::incomplete_review_finding(reason);
+            let reason_body = finding.body.clone();
+            let summary = check_summary(
+                &envelope_with_findings(vec![finding]),
+                false,
+                Default::default(),
+            );
+
+            assert!(summary.starts_with(
+                "Postil could not complete this review, so no review verdict exists."
+            ));
+            assert!(!summary.contains(&reason_body));
+        }
+    }
+
     fn finding() -> Finding {
         Finding {
             path: "src/auth.rs".into(),

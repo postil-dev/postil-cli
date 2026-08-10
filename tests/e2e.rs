@@ -3432,8 +3432,47 @@ async fn model_chain_above_hard_cap_fails_before_provider_calls() {
         .code(1);
     let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     assert_eq!(envelope["findings"][0]["title"], "Review incomplete");
+    let body = envelope["findings"][0]["body"].as_str().unwrap();
+    assert!(body.contains("configured model fan-out"));
+    assert!(!body.contains("bounded review budget"));
     let stderr = String::from_utf8_lossy(&out.get_output().stderr);
     assert!(stderr.contains("configured model fan-out is invalid"));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn reserved_review_anchor_reports_its_cause_without_provider_contact() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let diff = dir.path().join("reserved.diff");
+    std::fs::write(
+        &diff,
+        "diff --git a/.postil/model-output b/.postil/model-output\n\
+         new file mode 100644\n\
+         --- /dev/null\n\
+         +++ b/.postil/model-output\n\
+         @@ -0,0 +1 @@\n\
+         +repository content\n",
+    )
+    .unwrap();
+
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .code(1);
+
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let body = envelope["findings"][0]["body"].as_str().unwrap();
+    assert!(body.contains("path reserved"));
+    assert!(body.contains("Rename the conflicting path"));
+    assert!(!body.contains("bounded review budget"));
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(stderr.contains("contains reserved evidence"));
     assert!(server.received_requests().await.unwrap().is_empty());
 }
 
@@ -5948,6 +5987,69 @@ async fn full_remote_review_uses_an_immutable_merge_base_snapshot() {
 }
 
 #[tokio::test]
+async fn insufficient_shared_context_reports_its_cause_without_provider_contact() {
+    let server = MockServer::start().await;
+    mount_github_complete_diff(&server, 7).await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .and(header("Accept", "application/vnd.github.v3.diff"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(DIFF))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "x".repeat(40_000),
+            "body": "",
+            "state": "open", "merged": false,
+            "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"}, "changed_files": 1
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .env("REVIEW_MODEL", "example/unknown-context")
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .args([
+            "review",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--no-post",
+            "--output",
+            "json",
+        ])
+        .assert()
+        .code(1);
+
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let body = envelope["findings"][0]["body"].as_str().unwrap();
+    assert!(body.contains("serialized shared review context"));
+    assert!(body.contains("conservative context limit"));
+    assert!(!body.contains("bounded review budget"));
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(stderr.contains("review context budget is insufficient"));
+    let requests = server.received_requests().await.unwrap();
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.url.path() != "/chat/completions")
+    );
+}
+
+#[tokio::test]
 async fn remote_dependabot_description_uses_bounded_provider_context() {
     let server = MockServer::start().await;
     let body = format!(
@@ -6039,6 +6141,7 @@ async fn remote_dependabot_description_uses_bounded_provider_context() {
     let model_body = String::from_utf8_lossy(&model_requests[0].body);
     assert!(model_body.contains("uses: example/action@v2"));
     assert!(!model_body.contains("DEPENDABOT_BODY_TAIL"));
+    assert!(model_body.len() + 16_000 <= 32_000);
 }
 
 #[tokio::test]

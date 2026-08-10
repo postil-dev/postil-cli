@@ -998,10 +998,31 @@ pub fn is_ephemeral_anchor(path: &str) -> bool {
     matches!(path, OPERATIONAL_PATH | PROVIDER_PATH | DIFF_PATH)
 }
 
-/// A complete, trustworthy review could not fit inside Postil's bounded local
-/// resource and provider-request budget. This is an internal fail-closed state;
-/// forge adapters expose only generic check text for operational findings.
-pub fn incomplete_review_finding() -> Finding {
+/// Internal reason a review stopped before it could issue a trustworthy
+/// verdict. Forge adapters expose only generic check text for these findings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncompleteReviewReason {
+    IncompleteInput,
+    ReservedInput,
+    InsufficientContextBudget,
+    InvalidModelFanOut,
+}
+
+pub fn incomplete_review_finding(reason: IncompleteReviewReason) -> Finding {
+    let body = match reason {
+        IncompleteReviewReason::IncompleteInput => {
+            "Postil could not acquire complete review input, so no clean verdict was issued. Retry after the forge can supply a complete immutable change."
+        }
+        IncompleteReviewReason::ReservedInput => {
+            "The change uses a path reserved for Postil's synthetic review evidence, so repository content cannot be separated safely from operational findings. No clean verdict was issued. Rename the conflicting path before retrying."
+        }
+        IncompleteReviewReason::InsufficientContextBudget => {
+            "The serialized shared review context leaves insufficient room for reviewable change evidence within the configured model's conservative context limit. No clean verdict was issued. Reduce the shared review context or select a model with a larger context before retrying."
+        }
+        IncompleteReviewReason::InvalidModelFanOut => {
+            "The configured model fan-out is empty or exceeds Postil's per-request model limit. No clean verdict was issued. Configure a supported review model fan-out before retrying."
+        }
+    };
     Finding {
         path: OPERATIONAL_PATH.to_string(),
         line: 1,
@@ -1010,7 +1031,7 @@ pub fn incomplete_review_finding() -> Finding {
         kind: Kind::Uncertainty,
         confidence: 1.0,
         title: "Review incomplete".to_string(),
-        body: "The complete change did not fit within Postil's bounded review budget. No clean verdict was issued. Split the change or run focused local reviews before retrying.".to_string(),
+        body: body.to_string(),
         evidence: None,
         id: None,
         generator_confidence: None,
@@ -1106,6 +1127,29 @@ pub fn provider_error_finding(_detail: &str) -> Finding {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incomplete_review_reasons_have_distinct_operational_guidance() {
+        let cases = [
+            (
+                IncompleteReviewReason::IncompleteInput,
+                "complete review input",
+            ),
+            (IncompleteReviewReason::ReservedInput, "path reserved"),
+            (
+                IncompleteReviewReason::InsufficientContextBudget,
+                "serialized shared review context",
+            ),
+            (IncompleteReviewReason::InvalidModelFanOut, "model fan-out"),
+        ];
+
+        for (reason, expected) in cases {
+            let finding = incomplete_review_finding(reason);
+            assert_eq!(finding.title, "Review incomplete");
+            assert!(finding.body.contains(expected), "body: {}", finding.body);
+            assert!(!finding.body.contains("change did not fit"));
+        }
+    }
 
     fn finding(sev: Severity, conf: f64) -> Finding {
         Finding {
