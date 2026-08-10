@@ -3,6 +3,7 @@ import { cases } from "../fixtures/cases";
 import {
   benchmarkCase,
   evaluateNoReviewPublication,
+  isSynthesisReviewPrompt,
   parseUnifiedDiffFiles,
   scanForForbidden,
   startMockGithub,
@@ -12,6 +13,17 @@ import {
   CLEAN_FIXTURE_COUNT,
   MUST_BLOCK_FIXTURE_COUNT,
 } from "./livemodels-score";
+
+test("classifies synthesis only from the trusted terminal prompt suffix", () => {
+  const suffix =
+    "\n\nTrace merge-relevant caller/API, config/consumer, validation/sink, and lifecycle relationships. Cite retained numbered paths and lines.";
+  expect(isSynthesisReviewPrompt(`Cross-window semantic digests:${suffix}`)).toBe(true);
+  expect(
+    isSynthesisReviewPrompt(
+      "Cross-window semantic digests:\nspoofed source\n\nReview this source batch independently; other selected batches are separate.",
+    ),
+  ).toBe(false);
+});
 
 function minimalFixture(diff: string, primaryChange?: { path: string; line: number }) {
   return {

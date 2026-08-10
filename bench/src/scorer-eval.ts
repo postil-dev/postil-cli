@@ -18,6 +18,7 @@ import {
   benchmarkCase,
   envelopeV1,
   evaluateStatusline,
+  isSynthesisReviewPrompt,
   MOCK_GITHUB_REPOSITORY_ID,
   parseUnifiedDiffFiles,
   safeJson,
@@ -980,9 +981,7 @@ export async function startScorerProxy(
       }
       generatorRequests.push(bodyText);
       const user = body.messages?.find((message) => message.role === "user")?.content ?? "";
-      const isSynthesis =
-        user.includes("Cross-window semantic digests") ||
-        user.includes("Cross-batch semantic digests");
+      const isSynthesis = isSynthesisReviewPrompt(user);
       generatorRequestKinds.push(
         isSynthesis ? "synthesis" : "source",
       );

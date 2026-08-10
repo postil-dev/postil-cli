@@ -1122,7 +1122,7 @@ impl ReviewBatchBudgets {
             }
         };
         Self {
-            source: self.source,
+            source: stabilize(self.source),
             synthesis: stabilize(self.synthesis),
         }
     }
@@ -2555,7 +2555,7 @@ mod tests {
         assert_eq!(
             ci_budgets.stabilized_for_rendering(),
             ReviewBatchBudgets {
-                source: ci_budgets.source,
+                source: diff::MIN_REVIEW_BATCH_BYTES,
                 synthesis: diff::MIN_REVIEW_BATCH_BYTES,
             }
         );

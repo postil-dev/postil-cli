@@ -39,6 +39,32 @@ fn llm_content(findings: Value) -> Value {
     })
 }
 
+const SYNTHESIS_REVIEW_PROMPT_SUFFIX: &str = "\n\nTrace merge-relevant caller/API, config/consumer, validation/sink, and lifecycle relationships. Cite retained numbered paths and lines.";
+
+fn request_message_content(request: &Request, role: &str) -> Option<String> {
+    request
+        .body_json::<Value>()
+        .ok()?
+        .get("messages")?
+        .as_array()?
+        .iter()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some(role))?
+        .get("content")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn is_synthesis_review_request(request: &Request) -> bool {
+    request_message_content(request, "user")
+        .is_some_and(|user| user.ends_with(SYNTHESIS_REVIEW_PROMPT_SUFFIX))
+}
+
+fn is_source_review_request(request: &Request) -> bool {
+    request_message_content(request, "system")
+        .is_some_and(|system| !system.contains("select bounded code-review batches"))
+        && !is_synthesis_review_request(request)
+}
+
 fn scorer_content(scores: Value) -> Value {
     scorer_text(&scores.to_string())
 }
@@ -2630,9 +2656,7 @@ async fn irreparable_batch_keeps_later_batches_in_the_strict_failure_envelope() 
         .and(path("/chat/completions"))
         .respond_with(|request: &wiremock::Request| {
             let body = String::from_utf8_lossy(&request.body);
-            if body.contains("Cross-window semantic digests")
-                || body.contains("Cross-batch semantic digests")
-            {
+            if is_synthesis_review_request(request) {
                 return ResponseTemplate::new(200).set_body_json(llm_content(json!([])));
             }
             if body.contains("invalid_batch_marker") {
@@ -3034,14 +3058,22 @@ async fn bounded_reviews_resolve_changed_prior_evidence_when_selected() {
     assert_eq!(incremental_envelope["gate"]["failing"], false);
 
     let requests = server.received_requests().await.unwrap();
+    let source_requests = requests
+        .iter()
+        .filter(|request| is_source_review_request(request))
+        .collect::<Vec<_>>();
+    assert!(!source_requests.is_empty());
+    assert!(
+        source_requests
+            .iter()
+            .any(|request| { String::from_utf8_lossy(&request.body).contains("LATE_ORIGINAL_") })
+    );
     let unselected_file = (0..7)
         .find(|file| {
             let marker = format!("LATE_ORIGINAL_{file}");
-            requests.iter().all(|request| {
-                let body = String::from_utf8_lossy(&request.body);
-                !body.contains("Review this selected source batch independently")
-                    || !body.contains(&marker)
-            })
+            source_requests
+                .iter()
+                .all(|request| !String::from_utf8_lossy(&request.body).contains(&marker))
         })
         .expect("bounded review leaves at least one source batch unselected");
     let unselected_baseline = json!({
@@ -3209,8 +3241,7 @@ async fn final_synthesis_detects_cross_batch_validation_sink_relationship() {
     assert!(requests.len() >= 3);
     assert!(requests.iter().any(|request| {
         let body = String::from_utf8_lossy(&request.body);
-        (body.contains("Cross-window semantic digests")
-            || body.contains("Cross-batch semantic digests"))
+        is_synthesis_review_request(request)
             && body.contains("validate_pair")
             && body.contains("dangerous_sink")
     }));
@@ -3302,10 +3333,7 @@ async fn bounded_synthesis_repairs_source_exact_evidence_without_relaxing_valida
     assert!(review_requests.len() >= 2);
     assert!(review_requests.iter().all(|request| {
         let body: Value = request.body_json().unwrap();
-        let serialized = String::from_utf8_lossy(&request.body);
-        let expected = if serialized.contains("Cross-window semantic digests")
-            || serialized.contains("Cross-batch semantic digests")
-        {
+        let expected = if is_synthesis_review_request(request) {
             4_000
         } else {
             8_000

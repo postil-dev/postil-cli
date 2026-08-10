@@ -20,6 +20,13 @@ import { z } from "zod";
 
 const execFile = promisify(execFileCb);
 
+const SYNTHESIS_REVIEW_PROMPT_SUFFIX =
+  "\n\nTrace merge-relevant caller/API, config/consumer, validation/sink, and lifecycle relationships. Cite retained numbered paths and lines.";
+
+export function isSynthesisReviewPrompt(user: string): boolean {
+  return user.endsWith(SYNTHESIS_REVIEW_PROMPT_SUFFIX);
+}
+
 // ---------------------------------------------------------------------------
 // Case schema
 
@@ -767,9 +774,7 @@ async function startMockModel(c: BenchmarkCase, artifactsDir: string) {
         return;
       }
       const targetPath = c.primaryChange?.path ?? c.modelOutput.findings[0]?.path;
-      const synthesis =
-        user.includes("Cross-window semantic digests") ||
-        user.includes("Cross-batch semantic digests");
+      const synthesis = isSynthesisReviewPrompt(user);
       const targetBatch = targetPath === undefined || user
         .split("\n")
         .some((line) => line.trim() === `### ${targetPath}`);

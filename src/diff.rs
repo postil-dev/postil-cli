@@ -1803,6 +1803,10 @@ pub(crate) fn spool_model_batches_with_synthesis_budget(
     force_empty: bool,
 ) -> Result<ModelBatchSpool> {
     anyhow::ensure!(
+        max_source_batch_bytes >= MIN_REVIEW_BATCH_BYTES,
+        "source batch limit must leave room for context"
+    );
+    anyhow::ensure!(
         max_synthesis_batch_bytes >= MIN_REVIEW_BATCH_BYTES,
         "synthesis batch limit must leave room for context"
     );
@@ -5628,6 +5632,25 @@ diff --git a/two.rs b/two.rs
             target_in_source,
             "interior path missing from source candidate evidence"
         );
+    }
+
+    #[test]
+    fn separate_batch_budgets_reject_a_source_limit_below_the_semantic_floor() {
+        let snapshot = DiffSnapshot::from_bytes(
+            b"diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n",
+        )
+        .unwrap();
+        let mut prepared = prepare_review(&snapshot).unwrap();
+        let error = spool_model_batches_with_synthesis_budget(
+            &mut prepared,
+            MIN_REVIEW_BATCH_BYTES - 1,
+            MIN_REVIEW_BATCH_BYTES,
+            MIN_REVIEW_BATCH_BYTES / 3,
+            false,
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("source batch limit"));
     }
 
     fn deterministic_large_fixture(security_hunks: usize) -> String {
