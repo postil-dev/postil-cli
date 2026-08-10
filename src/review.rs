@@ -1194,21 +1194,37 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
         // Serialized UTF-8 bytes conservatively upper-bound the corresponding
         // input token count. This intentionally under-fills the model context
         // rather than relying on a provider-specific tokenizer.
-        let shared_context_token_upper_bound =
-            system.len() + meta.map_or(0, |value| value.title.len() + value.body.len()) + 4096;
+        let pr_context = prompt::pr_context_prompt(&PrContext {
+            repo,
+            title: meta.map(|value| value.title.as_str()),
+            body: meta.map(|value| value.body.as_str()),
+            incremental,
+            content_policy: content_policy_active,
+        });
+        let shared_context_token_upper_bound = system.len() + pr_context.len() + 4096;
         let batch_budget = context_tokens
             .saturating_sub(review_output_tokens)
             .saturating_sub(shared_context_token_upper_bound)
             .min(MAX_REVIEW_BATCH_BYTES);
-        let invalid_input = input_incomplete
-            || batch_budget < 4_096
-            || active_model_count == 0
-            || active_model_count > MAX_MODELS_PER_REQUEST;
+        let invalid_input = if input_incomplete {
+            Some(
+                "review input is incomplete or contains reserved evidence; no provider request was made"
+                    .to_string(),
+            )
+        } else if active_model_count == 0 || active_model_count > MAX_MODELS_PER_REQUEST {
+            Some(format!(
+                "configured model fan-out is invalid (models {active_model_count}/{MAX_MODELS_PER_REQUEST}); no provider request was made"
+            ))
+        } else if batch_budget < 4_096 {
+            Some(format!(
+                "review context budget is insufficient after serialized shared context (batch budget {batch_budget} bytes; requires at least 4096); no provider request was made"
+            ))
+        } else {
+            None
+        };
 
-        if invalid_input {
-            eprintln!(
-                "postil: review input is malformed or the configured model fan-out is invalid (models {active_model_count}/{MAX_MODELS_PER_REQUEST})",
-            );
+        if let Some(invalid_input) = invalid_input {
+            eprintln!("postil: {invalid_input}");
             model_used = "none (invalid review input)".to_string();
             findings = vec![crate::envelope::incomplete_review_finding()];
         } else {

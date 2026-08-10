@@ -3432,6 +3432,8 @@ async fn model_chain_above_hard_cap_fails_before_provider_calls() {
         .code(1);
     let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     assert_eq!(envelope["findings"][0]["title"], "Review incomplete");
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(stderr.contains("configured model fan-out is invalid"));
     assert!(server.received_requests().await.unwrap().is_empty());
 }
 
@@ -5943,6 +5945,100 @@ async fn full_remote_review_uses_an_immutable_merge_base_snapshot() {
     assert!(requests.iter().any(|request| {
         request.url.path() == "/repos/acme/api/compare/bbbbbbbbbbbb...aaaaaaaaaaaa"
     }));
+}
+
+#[tokio::test]
+async fn remote_dependabot_description_uses_bounded_provider_context() {
+    let server = MockServer::start().await;
+    let body = format!(
+        "Bumps example/action from 1 to 2.\n\nRelease notes\n\n{}\nDEPENDABOT_BODY_TAIL",
+        "x".repeat(48_000)
+    );
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/repos/acme/api/compare/b+\.\.\.a+$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "merge_base_commit": {"sha": "bbbbbbbb"},
+            "files": []
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7/files"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "filename": ".github/workflows/dependabot.yml",
+            "status": "modified",
+            "changes": 1
+        }])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/repos/acme/api/contents/.github/workflows/dependabot.yml",
+        ))
+        .respond_with(|request: &Request| {
+            let base = request
+                .url
+                .query_pairs()
+                .any(|(name, value)| name == "ref" && value.starts_with('b'));
+            let source = if base {
+                "uses: example/action@v1\n"
+            } else {
+                "uses: example/action@v2\n"
+            };
+            ResponseTemplate::new(200).set_body_string(source)
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "Bump example/action from 1 to 2",
+            "body": body,
+            "state": "open", "merged": false,
+            "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"}, "changed_files": 1
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .env("REVIEW_MODEL", "example/unknown-context")
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .args([
+            "review",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--no-post",
+            "--output",
+            "json",
+        ])
+        .assert()
+        .success();
+
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert!(envelope["findings"].as_array().unwrap().is_empty());
+    assert_eq!(envelope["gate"]["failing"], false);
+    let requests = server.received_requests().await.unwrap();
+    let model_requests = requests
+        .iter()
+        .filter(|request| request.url.path() == "/chat/completions")
+        .collect::<Vec<_>>();
+    assert_eq!(model_requests.len(), 1);
+    let model_body = String::from_utf8_lossy(&model_requests[0].body);
+    assert!(model_body.contains("uses: example/action@v2"));
+    assert!(!model_body.contains("DEPENDABOT_BODY_TAIL"));
 }
 
 #[tokio::test]

@@ -382,7 +382,10 @@ pub fn render_pr_description(title: Option<&str>, body: Option<&str>) -> (String
     (out, line_no)
 }
 
-pub fn user_prompt(ctx: &PrContext, annotated_diff: &str, max_findings: usize) -> String {
+/// Render the PR metadata prefix exactly as it appears in a review prompt.
+/// Keeping this separate lets review admission account for the bounded text
+/// that can actually reach a provider.
+pub(crate) fn pr_context_prompt(ctx: &PrContext<'_>) -> String {
     let mut p = String::new();
     if let Some(repo) = ctx.repo {
         p.push_str(&format!("Repository: {repo}\n"));
@@ -421,6 +424,11 @@ pub fn user_prompt(ctx: &PrContext, annotated_diff: &str, max_findings: usize) -
             p.push_str(&format!("PR description:\n{body}\n"));
         }
     }
+    p
+}
+
+pub fn user_prompt(ctx: &PrContext, annotated_diff: &str, max_findings: usize) -> String {
+    let mut p = pr_context_prompt(ctx);
     if ctx.incremental {
         p.push_str(
             "\nThis is an INCREMENTAL review: the diff below covers only commits pushed \
@@ -610,6 +618,27 @@ mod tests {
         let p = user_prompt(&ctx, "DIFF", 5);
         assert!(!p.contains(".postil/pr-description"));
         assert!(p.contains("PR title: Add feature"));
+    }
+
+    #[test]
+    fn pr_context_prompt_uses_the_bounded_body_that_reaches_the_provider() {
+        let body = format!("{} tail marker", "x".repeat(2_000));
+        let ctx = PrContext {
+            repo: None,
+            title: Some("Bump example/action from 1 to 2"),
+            body: Some(&body),
+            incremental: false,
+            content_policy: false,
+        };
+
+        let prompt = pr_context_prompt(&ctx);
+        assert_eq!(
+            prompt,
+            format!(
+                "PR title: Bump example/action from 1 to 2\nPR description:\n{}\n",
+                "x".repeat(2_000)
+            )
+        );
     }
 
     #[test]
