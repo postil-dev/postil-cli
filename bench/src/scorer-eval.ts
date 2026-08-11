@@ -16,13 +16,18 @@ import { cases as fixtureInputs } from "../fixtures/cases";
 import { API_KEY_ENV_NAMES_TEXT, resolveApiKeyName } from "./api-key";
 import {
   benchmarkCase,
+  decodeDisplayedPath,
   envelopeV1,
   evaluateStatusline,
-  isSynthesisReviewPrompt,
+  isReviewSystemRequest,
   MOCK_GITHUB_REPOSITORY_ID,
   parseUnifiedDiffFiles,
+  plannerManifestPath,
+  reviewEvidenceFromPrompt,
   safeJson,
+  SourceReviewTargetClassifier,
   startMockGithub,
+  SynthesisReviewRequestClassifier,
   type BenchmarkCase,
 } from "./harness";
 import {
@@ -927,6 +932,8 @@ export async function startScorerProxy(
   const plannerRequests: string[] = [];
   const generatorRequests: string[] = [];
   const generatorRequestKinds: Array<"source" | "synthesis"> = [];
+  const targetClassifier = new SourceReviewTargetClassifier();
+  const synthesisClassifier = new SynthesisReviewRequestClassifier();
   const unexpectedRequests: Array<{ method: string; path: string }> = [];
   let falseFindingOutputSent = false;
   let plannedTargetAvailable = false;
@@ -953,6 +960,7 @@ export async function startScorerProxy(
     const bodyText = await readRequestBody(req);
     const body = safeJson(bodyText) as {
       model?: string;
+      max_tokens?: unknown;
       messages?: Array<{ role?: string; content?: string }>;
     } | undefined;
     if (body?.model === GENERATOR_MODEL) {
@@ -979,9 +987,20 @@ export async function startScorerProxy(
         }));
         return;
       }
+      if (!isReviewSystemRequest(system)) {
+        unexpectedRequests.push({ method: req.method ?? "unknown", path: "generator-call-phase" });
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "unsupported non-terminal scorer benchmark call" }));
+        return;
+      }
       generatorRequests.push(bodyText);
       const user = body.messages?.find((message) => message.role === "user")?.content ?? "";
-      const isSynthesis = isSynthesisReviewPrompt(user);
+      const isSynthesis = synthesisClassifier.includes(
+        system,
+        user,
+        body.max_tokens,
+        body.messages,
+      );
       generatorRequestKinds.push(
         isSynthesis ? "synthesis" : "source",
       );
@@ -989,7 +1008,9 @@ export async function startScorerProxy(
       const containsTarget =
         user.length === 0 ||
         targetPath === undefined ||
-        (!isSynthesis && user.includes(`### ${targetPath}\n`));
+        (!isSynthesis && isReviewSystemRequest(system) && (c.primaryChange === undefined
+          ? user.includes(`### ${targetPath}\n`)
+          : targetClassifier.includes(system, user, c.primaryChange)));
       let output = { summary: "", findings: [] as ReturnType<typeof falseFinding>[] };
       if (scenario === "trueFinding" && containsTarget) {
         output = generatorOutput(c, scenario);
@@ -1133,7 +1154,7 @@ export function plannerBatchIdForPath(prompt: string, path: string | undefined):
       sourceBatchId = null;
       continue;
     }
-    if (sourceBatchId !== null && line === `### ${path}`) {
+    if (sourceBatchId !== null && line === `### ${plannerManifestPath(path)}`) {
       matches.add(sourceBatchId);
     }
   }
@@ -1141,7 +1162,11 @@ export function plannerBatchIdForPath(prompt: string, path: string | undefined):
   if (matches.size > 1) {
     throw new Error(`planner manifest contains duplicate source batches for ${path}`);
   }
-  if (prompt.includes(`### ${path}\n`) || prompt.endsWith(`### ${path}`)) {
+  if (
+    prompt.split("\n").some((line) =>
+      line === `### ${plannerManifestPath(path)}`
+    )
+  ) {
     throw new Error(`planner manifest contains the expected path ${path} outside a source batch`);
   }
   return null;
@@ -1409,11 +1434,13 @@ export function falseFinding(c: BenchmarkCase) {
 }
 
 export function falseFindingFromSourceRequest(request: string) {
+  const evidencePrompt = reviewEvidenceFromPrompt(request);
+  if (evidencePrompt === undefined) return null;
   let path: string | null = null;
-  for (const line of request.split("\n")) {
+  for (const line of evidencePrompt.split("\n")) {
     const header = /^### (\S.*)$/u.exec(line);
     if (header) {
-      path = header[1]!;
+      path = decodeDisplayedPath(header[1]!) ?? null;
       continue;
     }
     const added = /^\s*(\d+) \+ (.+)$/u.exec(line);

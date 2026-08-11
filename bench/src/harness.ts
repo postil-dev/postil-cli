@@ -20,11 +20,192 @@ import { z } from "zod";
 
 const execFile = promisify(execFileCb);
 
-const SYNTHESIS_REVIEW_PROMPT_SUFFIX =
-  "\n\nTrace merge-relevant caller/API, config/consumer, validation/sink, and lifecycle relationships. Cite retained numbered paths and lines.";
+const SYNTHESIS_REVIEW_MAX_TOKENS = 4_000;
+const REVIEW_EVIDENCE_FRAMING =
+  /\nReport at most \d+ findings; if more exist, keep the most severe\.\n\nReview evidence \(cite exactly the numbered new-file or change-metadata lines\):\n\n/gu;
+const REVIEW_RETRY_BOUNDARY = "\n\n[Your previous response]\n";
+const REVIEW_SYSTEM_PREFIX = "You are Postil, a merge-gate code reviewer.";
 
-export function isSynthesisReviewPrompt(user: string): boolean {
-  return user.endsWith(SYNTHESIS_REVIEW_PROMPT_SUFFIX);
+// Initial synthesis uses the fixed 4,000-token budget. An 8,000-token request
+// is synthesis only when it repeats the exact messages from a recognized
+// 4,000-token synthesis call, leaving ordinary 8,000-token source requests unambiguous.
+export function isReviewSystemRequest(system: string): boolean {
+  return system.startsWith(REVIEW_SYSTEM_PREFIX);
+}
+
+export class SynthesisReviewRequestClassifier {
+  readonly #initialPrompts = new Set<string>();
+  readonly #synthesisMessages = new Set<string>();
+
+  includes(
+    system: string,
+    user: string,
+    maxTokens: unknown,
+    messages: Array<{ role?: string; content?: string }> | undefined,
+  ): boolean {
+    if (!isReviewSystemRequest(system)) return false;
+    const messageSignature = JSON.stringify(messages ?? []);
+    if (maxTokens === SYNTHESIS_REVIEW_MAX_TOKENS * 2) {
+      return this.#synthesisMessages.has(messageSignature);
+    }
+    if (maxTokens !== SYNTHESIS_REVIEW_MAX_TOKENS) return false;
+    for (const initial of this.#initialPrompts) {
+      if (user.startsWith(`${initial}${REVIEW_RETRY_BOUNDARY}`)) {
+        this.#synthesisMessages.add(messageSignature);
+        return true;
+      }
+    }
+    this.#initialPrompts.add(user);
+    this.#synthesisMessages.add(messageSignature);
+    return true;
+  }
+}
+
+function parseGitPathToken(input: string): { value: string; rest: string } | undefined {
+  if (!input.startsWith('"')) {
+    const end = input.search(/\s/u);
+    const tokenEnd = end < 0 ? input.length : end;
+    return { value: input.slice(0, tokenEnd), rest: input.slice(tokenEnd) };
+  }
+  const bytes: number[] = [];
+  let index = 1;
+  while (index < input.length) {
+    const char = input[index]!;
+    if (char === '"') {
+      try {
+        return {
+          value: new TextDecoder("utf-8", { fatal: true }).decode(Uint8Array.from(bytes)),
+          rest: input.slice(index + 1),
+        };
+      } catch {
+        return undefined;
+      }
+    }
+    if (char !== "\\") {
+      const codePoint = input.codePointAt(index);
+      if (codePoint === undefined) return undefined;
+      const unescaped = String.fromCodePoint(codePoint);
+      bytes.push(...new TextEncoder().encode(unescaped));
+      index += unescaped.length;
+      continue;
+    }
+    index += 1;
+    const escaped = input[index];
+    if (escaped === undefined) return undefined;
+    if (escaped === '"' || escaped === "\\") bytes.push(escaped.charCodeAt(0));
+    else if (escaped === "t") bytes.push(0x09);
+    else if (escaped === "n") bytes.push(0x0a);
+    else if (escaped === "r") bytes.push(0x0d);
+    else if (/^[0-7]$/u.test(escaped)) {
+      let octal = escaped;
+      while (octal.length < 3 && /^[0-7]$/u.test(input[index + 1] ?? "")) {
+        index += 1;
+        octal += input[index];
+      }
+      const value = Number.parseInt(octal, 8);
+      if (value > 0xff) return undefined;
+      bytes.push(value);
+    } else return undefined;
+    index += 1;
+  }
+  return undefined;
+}
+
+export function decodeDisplayedPath(displayed: string): string | undefined {
+  if (!displayed.startsWith('"')) return displayed;
+  const parsed = parseGitPathToken(displayed);
+  return parsed !== undefined && parsed.rest.trim().length === 0 ? parsed.value : undefined;
+}
+
+function displayPath(path: string): string {
+  const bytes = Buffer.from(path, "utf8");
+  const asciiWhitespace = (byte: number | undefined) =>
+    byte !== undefined && (byte === 0x20 || (byte >= 0x09 && byte <= 0x0d));
+  const quoted = asciiWhitespace(bytes[0]) || asciiWhitespace(bytes[bytes.length - 1]) ||
+    bytes.some((byte) => byte < 0x20 || byte > 0x7e || byte === 0x22 || byte === 0x5c);
+  if (!quoted) return path;
+  let rendered = '"';
+  for (const byte of bytes) {
+    if (byte === 0x22) rendered += '\\"';
+    else if (byte === 0x5c) rendered += "\\\\";
+    else if (byte === 0x09) rendered += "\\t";
+    else if (byte === 0x0a) rendered += "\\n";
+    else if (byte === 0x0d) rendered += "\\r";
+    else if (byte >= 0x20 && byte <= 0x7e) rendered += String.fromCharCode(byte);
+    else rendered += `\\${byte.toString(8).padStart(3, "0")}`;
+  }
+  return `${rendered}"`;
+}
+
+export function plannerManifestPath(path: string): string {
+  return displayPath(path)
+    .replaceAll("\t", " ")
+    .replaceAll("\r", " ")
+    .replaceAll('"', "'")
+    .replaceAll("\\", "/")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu, " ");
+}
+
+function parseGitMarkerPath(value: string): string | undefined {
+  if (value === "/dev/null") return value;
+  const parsed = value.startsWith('"')
+    ? parseGitPathToken(value)
+    : { value: value.split("\t", 1)[0] ?? "", rest: "" };
+  if (parsed === undefined || parsed.rest.trim().length > 0) return undefined;
+  return parsed.value.startsWith("a/") || parsed.value.startsWith("b/")
+    ? parsed.value.slice(2)
+    : parsed.value;
+}
+
+function parseGitRenamePath(value: string): string | undefined {
+  const parsed = value.startsWith('"')
+    ? parseGitPathToken(value)
+    : { value: value.split("\t", 1)[0] ?? "", rest: "" };
+  return parsed !== undefined && parsed.rest.trim().length === 0 ? parsed.value : undefined;
+}
+
+export function reviewPromptContainsAddedCoordinate(
+  user: string,
+  change: { path: string; line: number },
+): boolean {
+  const evidence = reviewEvidenceFromPrompt(user);
+  if (evidence === undefined) return false;
+  const addedLine = new RegExp(`^\\s*${change.line}\\s+\\+`, "u");
+  let inTargetSection = false;
+  for (const line of evidence.split("\n")) {
+    if (line.startsWith("### ")) {
+      inTargetSection = decodeDisplayedPath(line.slice(4)) === change.path;
+    } else if (inTargetSection && addedLine.test(line)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function reviewEvidenceFromPrompt(user: string): string | undefined {
+  let evidenceStart = -1;
+  for (const match of user.matchAll(REVIEW_EVIDENCE_FRAMING)) {
+    evidenceStart = (match.index ?? -1) + match[0].length;
+  }
+  return evidenceStart < 0 ? undefined : user.slice(evidenceStart);
+}
+
+export class SourceReviewTargetClassifier {
+  readonly #sourcePrompts = new Map<string, boolean>();
+
+  includes(
+    system: string,
+    user: string,
+    change: { path: string; line: number },
+  ): boolean {
+    if (!isReviewSystemRequest(system)) return false;
+    for (const [source, includesTarget] of this.#sourcePrompts) {
+      if (user.startsWith(`${source}${REVIEW_RETRY_BOUNDARY}`)) return includesTarget;
+    }
+    const includesTarget = reviewPromptContainsAddedCoordinate(user, change);
+    this.#sourcePrompts.set(user, includesTarget);
+    return includesTarget;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -669,8 +850,14 @@ export function parseUnifiedDiffFiles(diff: string): ParsedUnifiedDiffFile[] {
     const newHeader = section.find((line) => line.startsWith("+++ "));
     const renameFrom = section.find((line) => line.startsWith("rename from "))?.slice(12);
     const renameTo = section.find((line) => line.startsWith("rename to "))?.slice(10);
-    const oldPath = oldHeader?.startsWith("--- a/") ? oldHeader.slice(6) : renameFrom;
-    const newPath = newHeader?.startsWith("+++ b/") ? newHeader.slice(6) : renameTo;
+    const oldMarker = oldHeader === undefined ? undefined : parseGitMarkerPath(oldHeader.slice(4));
+    const newMarker = newHeader === undefined ? undefined : parseGitMarkerPath(newHeader.slice(4));
+    const oldPath = oldMarker === "/dev/null"
+      ? undefined
+      : oldMarker ?? (renameFrom === undefined ? undefined : parseGitRenamePath(renameFrom));
+    const newPath = newMarker === "/dev/null"
+      ? undefined
+      : newMarker ?? (renameTo === undefined ? undefined : parseGitRenamePath(renameTo));
     const path = newPath ?? oldPath;
     if (path === undefined || path.length === 0) {
       throw new Error("benchmark diff section has no canonical file path");
@@ -680,7 +867,7 @@ export function parseUnifiedDiffFiles(diff: string): ParsedUnifiedDiffFile[] {
     const versions = sourceVersionsFromSection(section);
     return {
       path,
-      status: oldHeader === "--- /dev/null" ? "added" : newHeader === "+++ /dev/null" ? "removed" : "modified",
+      status: oldMarker === "/dev/null" ? "added" : newMarker === "/dev/null" ? "removed" : "modified",
       patch,
       ...versions,
     };
@@ -745,6 +932,8 @@ function boundedErrorMessage(error: unknown): string {
 
 async function startMockModel(c: BenchmarkCase, artifactsDir: string) {
   const requestBodies: string[] = [];
+  const targetClassifier = new SourceReviewTargetClassifier();
+  const synthesisClassifier = new SynthesisReviewRequestClassifier();
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     if (req.method === "POST" && req.url === "/chat/completions") {
       const body = await readRequestBody(req);
@@ -753,6 +942,7 @@ async function startMockModel(c: BenchmarkCase, artifactsDir: string) {
         mode: 0o600,
       });
       const request = safeJson(body) as {
+        max_tokens?: unknown;
         messages?: Array<{ role?: string; content?: string }>;
       } | undefined;
       const system = request?.messages?.find((message) => message.role === "system")?.content ?? "";
@@ -773,12 +963,25 @@ async function startMockModel(c: BenchmarkCase, artifactsDir: string) {
         );
         return;
       }
+      if (!isReviewSystemRequest(system)) {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "unsupported non-terminal benchmark model call" }));
+        return;
+      }
       const targetPath = c.primaryChange?.path ?? c.modelOutput.findings[0]?.path;
-      const synthesis = isSynthesisReviewPrompt(user);
-      const targetBatch = targetPath === undefined || user
-        .split("\n")
-        .some((line) => line.trim() === `### ${targetPath}`);
-      const output = !synthesis && targetBatch
+      const synthesis = synthesisClassifier.includes(
+        system,
+        user,
+        request?.max_tokens,
+        request?.messages,
+      );
+      const targetBatch = !synthesis && isReviewSystemRequest(system) &&
+        (c.primaryChange === undefined
+          ? targetPath === undefined || user
+            .split("\n")
+            .some((line) => line.trim() === `### ${targetPath}`)
+          : targetClassifier.includes(system, user, c.primaryChange));
+      const output = targetBatch
         ? c.modelOutput
         : { summary: "", findings: [] };
       res.writeHead(200, { "content-type": "application/json" });
@@ -818,11 +1021,27 @@ function plannerMandatoryIds(prompt: string): Set<number> {
 
 function plannerBatchIdForPath(prompt: string, path: string | undefined): number | null {
   if (path === undefined) return null;
-  for (const block of prompt.split("\nBatch ").slice(1)) {
-    if (!block.includes(path)) continue;
-    const id = Number.parseInt(block, 10);
-    if (Number.isSafeInteger(id) && id > 0) return id;
+  const matches = new Set<number>();
+  let sourceBatchId: number | null = null;
+  for (const line of prompt.split("\n")) {
+    const header = /^Batch (\d+) risk=\d+ kind=(source|synthesis)$/u.exec(line);
+    if (header) {
+      const id = Number.parseInt(header[1]!, 10);
+      sourceBatchId = header[2] === "source" && Number.isSafeInteger(id) && id > 0
+        ? id
+        : null;
+      continue;
+    }
+    if (/^\S+ \d+ risk=/u.test(line)) {
+      sourceBatchId = null;
+      continue;
+    }
+    if (sourceBatchId !== null && line === `### ${plannerManifestPath(path)}`) {
+      matches.add(sourceBatchId);
+    }
   }
+  if (matches.size === 1) return matches.values().next().value!;
+  if (matches.size > 1) throw new Error(`planner manifest contains duplicate source batches`);
   return null;
 }
 

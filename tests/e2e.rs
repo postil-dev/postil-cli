@@ -39,8 +39,6 @@ fn llm_content(findings: Value) -> Value {
     })
 }
 
-const SYNTHESIS_REVIEW_PROMPT_SUFFIX: &str = "\n\nTrace merge-relevant caller/API, config/consumer, validation/sink, and lifecycle relationships. Cite retained numbered paths and lines.";
-
 fn request_message_content(request: &Request, role: &str) -> Option<String> {
     request
         .body_json::<Value>()
@@ -54,9 +52,34 @@ fn request_message_content(request: &Request, role: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn review_evidence_from_prompt(prompt: &str) -> Option<&str> {
+    const PREFIX: &str = "\nReport at most ";
+    const SUFFIX: &str = " findings; if more exist, keep the most severe.\n\nReview evidence (cite exactly the numbered new-file or change-metadata lines):\n\n";
+    let mut evidence = None;
+    for (start, _) in prompt.match_indices(PREFIX) {
+        let tail = &prompt[start + PREFIX.len()..];
+        let digits = tail.bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0 && tail[digits..].starts_with(SUFFIX) {
+            evidence = Some(&tail[digits + SUFFIX.len()..]);
+        }
+    }
+    evidence
+}
+
 fn is_synthesis_review_request(request: &Request) -> bool {
-    request_message_content(request, "user")
-        .is_some_and(|user| user.ends_with(SYNTHESIS_REVIEW_PROMPT_SUFFIX))
+    let max_tokens = request
+        .body_json::<Value>()
+        .ok()
+        .and_then(|body| body.get("max_tokens").and_then(Value::as_u64));
+    max_tokens == Some(4_000)
+        || (max_tokens == Some(8_000)
+            && request_message_content(request, "user")
+                .and_then(|user| review_evidence_from_prompt(&user).map(str::to_owned))
+                .is_some_and(|evidence| {
+                    evidence.starts_with("This is bounded synthesis from a larger diff.")
+                        || evidence.starts_with("Cross-window semantic digests")
+                        || evidence.starts_with("Cross-batch semantic digests")
+                }))
 }
 
 fn is_source_review_request(request: &Request) -> bool {
@@ -252,13 +275,14 @@ fn prompt_evidence(request: &Request, path: &str, line: u32, needle: &str) -> St
         .and_then(|messages| messages.last())
         .and_then(|message| message["content"].as_str())
         .expect("review request contains a user prompt");
+    let displayed_path = postil_cli::diff::display_path(path);
     let mut current_path = None;
     for rendered in prompt.lines() {
         if let Some(header) = rendered.strip_prefix("### ") {
             current_path = Some(header.trim());
             continue;
         }
-        if current_path != Some(path) || !rendered.contains(needle) {
+        if current_path != Some(displayed_path.as_str()) || !rendered.contains(needle) {
             continue;
         }
         let Some((number, marked)) = rendered.trim_start().split_once(' ') else {
@@ -275,6 +299,42 @@ fn prompt_evidence(request: &Request, path: &str, line: u32, needle: &str) -> St
         }
     }
     panic!("prompt did not contain exact evidence for {path}:{line}");
+}
+
+fn prompt_added_evidence_at(request: &Request, path: &str, line: u32) -> String {
+    const EVIDENCE_BOUNDARY: &str =
+        "Review evidence (cite exactly the numbered new-file or change-metadata lines):\n\n";
+    let payload: Value = serde_json::from_slice(&request.body).unwrap();
+    let prompt = payload["messages"]
+        .as_array()
+        .and_then(|messages| messages.last())
+        .and_then(|message| message["content"].as_str())
+        .expect("review request contains a user prompt");
+    let evidence_prompt = prompt
+        .rsplit_once(EVIDENCE_BOUNDARY)
+        .map(|(_, evidence)| evidence)
+        .expect("review request contains the trusted evidence boundary");
+    let displayed_path = postil_cli::diff::display_path(path);
+    let mut current_path = None;
+    for rendered in evidence_prompt.lines() {
+        if let Some(header) = rendered.strip_prefix("### ") {
+            current_path = Some(header.trim());
+            continue;
+        }
+        if current_path != Some(displayed_path.as_str()) {
+            continue;
+        }
+        let Some((number, marked)) = rendered.trim_start().split_once(' ') else {
+            continue;
+        };
+        if number.parse::<u32>().ok() != Some(line) {
+            continue;
+        }
+        if let Some(evidence) = marked.strip_prefix("+ ") {
+            return evidence.to_string();
+        }
+    }
+    panic!("prompt did not contain exact added evidence for {path}:{line}");
 }
 
 fn fixture_credential(label: &str) -> String {
@@ -3165,13 +3225,104 @@ async fn deletion_only_auth_change_is_reviewed_through_numbered_metadata() {
 async fn final_synthesis_detects_cross_batch_validation_sink_relationship() {
     use std::fmt::Write as _;
 
+    enum SynthesisRetryState {
+        AwaitingCorrection(Value),
+        AwaitingExpanded { initial: Value, correction: Value },
+    }
+
     let server = MockServer::start().await;
+    let retry_states = Arc::new(Mutex::new(
+        BTreeMap::<String, Vec<SynthesisRetryState>>::new(),
+    ));
+    let completed_lineages = Arc::new(Mutex::new(Vec::<[Value; 3]>::new()));
+    let responder_states = retry_states.clone();
+    let responder_lineages = completed_lineages.clone();
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(|request: &wiremock::Request| {
-            let body = String::from_utf8_lossy(&request.body);
-            let findings = if body.contains("validate_pair") && body.contains("dangerous_sink") {
-                let evidence = prompt_evidence(request, "src/sink.rs", 100, "dangerous_sink");
+        .respond_with(move |request: &wiremock::Request| {
+            let body: Value = request.body_json().unwrap();
+            let model = body["model"].as_str().unwrap_or_default().to_owned();
+            let user = body["messages"][1]["content"].as_str().unwrap_or_default();
+            let max_tokens = body["max_tokens"].as_u64();
+            if max_tokens == Some(4_000) {
+                let mut states = responder_states.lock().unwrap();
+                let model_states = states.entry(model.clone()).or_default();
+                let correction = model_states.iter().position(|state| {
+                    let SynthesisRetryState::AwaitingCorrection(initial) = state else {
+                        return false;
+                    };
+                    let initial_user = initial["messages"][1]["content"]
+                        .as_str()
+                        .unwrap_or_default();
+                    user.starts_with(&format!("{initial_user}\n\n[Your previous response]\n"))
+                });
+                if let Some(index) = correction {
+                    let SynthesisRetryState::AwaitingCorrection(initial) =
+                        model_states.remove(index)
+                    else {
+                        unreachable!()
+                    };
+                    model_states.push(SynthesisRetryState::AwaitingExpanded {
+                        initial,
+                        correction: body.clone(),
+                    });
+                    drop(states);
+                    return ResponseTemplate::new(200).set_body_json(json!({
+                        "choices": [{
+                            "finish_reason": "length",
+                            "message": {"content": null, "reasoning": "budget exhausted"}
+                        }],
+                        "usage": {
+                            "prompt_tokens": 100,
+                            "completion_tokens": 4_000,
+                            "completion_tokens_details": {"reasoning_tokens": 4_000},
+                            "cost": 0.000123
+                        }
+                    }));
+                }
+                model_states.push(SynthesisRetryState::AwaitingCorrection(body.clone()));
+                drop(states);
+                return ResponseTemplate::new(200).set_body_json(json!({
+                    "choices": [{"finish_reason": "stop", "message": {"content": json!({
+                        "summary": "The synthesized relationship is risky.",
+                        "findings": []
+                    }).to_string()}}],
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 50, "cost": 0.000123}
+                }));
+            }
+            let expanded_synthesis = if max_tokens == Some(8_000) {
+                let mut states = responder_states.lock().unwrap();
+                let model_states = states.entry(model).or_default();
+                let expanded = model_states.iter().position(|state| {
+                    matches!(
+                        state,
+                        SynthesisRetryState::AwaitingExpanded { correction, .. }
+                            if correction["messages"] == body["messages"]
+                    )
+                });
+                if let Some(index) = expanded {
+                    let SynthesisRetryState::AwaitingExpanded {
+                        initial,
+                        correction,
+                    } = model_states.remove(index)
+                    else {
+                        unreachable!()
+                    };
+                    drop(states);
+                    responder_lineages
+                        .lock()
+                        .unwrap()
+                        .push([initial, correction, body.clone()]);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            let findings = if expanded_synthesis {
+                let _validated = prompt_added_evidence_at(request, "src/validate.rs", 100);
+                let evidence = prompt_added_evidence_at(request, "src/sink.rs", 100);
                 json!([{
                     "path": "src/sink.rs",
                     "line": 100,
@@ -3237,14 +3388,20 @@ async fn final_synthesis_detects_cross_batch_validation_sink_relationship() {
     let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     assert_eq!(envelope["findings"][0]["path"], "src/sink.rs");
     assert_eq!(envelope["findings"][0]["line"], 100);
-    let requests = server.received_requests().await.unwrap();
-    assert!(requests.len() >= 3);
-    assert!(requests.iter().any(|request| {
-        let body = String::from_utf8_lossy(&request.body);
-        is_synthesis_review_request(request)
-            && body.contains("validate_pair")
-            && body.contains("dangerous_sink")
-    }));
+    let lineages = completed_lineages.lock().unwrap();
+    assert!(!lineages.is_empty());
+    for calls in lineages.iter() {
+        assert_eq!(calls[0]["max_tokens"], 4_000);
+        assert_eq!(calls[1]["max_tokens"], 4_000);
+        assert_eq!(calls[2]["max_tokens"], 8_000);
+        let initial_user = calls[0]["messages"][1]["content"].as_str().unwrap();
+        let correction_user = calls[1]["messages"][1]["content"].as_str().unwrap();
+        assert!(
+            correction_user.starts_with(&format!("{initial_user}\n\n[Your previous response]\n"))
+        );
+        assert_eq!(calls[1]["messages"], calls[2]["messages"]);
+    }
+    assert!(retry_states.lock().unwrap().values().all(Vec::is_empty));
 }
 
 #[cfg(feature = "qualification-candidate")]
