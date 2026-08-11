@@ -1742,6 +1742,11 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                                     &system,
                                     &user,
                                     max_tokens,
+                                    if cross_window_synthesis {
+                                        crate::llm::ReviewRequestRoute::Synthesis
+                                    } else {
+                                        crate::llm::ReviewRequestRoute::Source
+                                    },
                                     move |review| {
                                         review_batch_validation_reasons(
                                             &review.findings,

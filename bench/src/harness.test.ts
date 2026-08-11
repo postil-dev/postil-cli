@@ -3,8 +3,9 @@ import { cases } from "../fixtures/cases";
 import {
   benchmarkCase,
   evaluateNoReviewPublication,
-  isSynthesisReviewPrompt,
   parseUnifiedDiffFiles,
+  reviewPromptContainsAddedCoordinate,
+  reviewRequestMetadata,
   scanForForbidden,
   startMockGithub,
 } from "./harness";
@@ -14,15 +15,56 @@ import {
   MUST_BLOCK_FIXTURE_COUNT,
 } from "./livemodels-score";
 
-test("classifies synthesis only from the trusted terminal prompt suffix", () => {
-  const suffix =
-    "\n\nTrace merge-relevant caller/API, config/consumer, validation/sink, and lifecycle relationships. Cite retained numbered paths and lines.";
-  expect(isSynthesisReviewPrompt(`Cross-window semantic digests:${suffix}`)).toBe(true);
+test("classifies review routing only from trusted request metadata", () => {
+  expect(reviewRequestMetadata({
+    "x-postil-review-route": "synthesis",
+    "x-postil-review-call-phase": "semantic-retry",
+  })).toEqual({ route: "synthesis", callPhase: "semantic-retry" });
+  expect(reviewRequestMetadata({
+    "x-postil-review-route": "source",
+    "x-postil-review-call-phase": "schema-repair",
+  })).toEqual({ route: "source", callPhase: "schema-repair" });
+  expect(reviewRequestMetadata({})).toBeNull();
+  expect(reviewRequestMetadata({
+    "x-postil-review-route": "source",
+    "x-postil-review-call-phase": ["initial", "semantic-retry"],
+  })).toBeNull();
+});
+
+test("routes recorded output only to the source window with the exact added coordinate", () => {
+  const evidenceMarker =
+    "Review evidence (cite exactly the numbered new-file or change-metadata lines):";
+  const change = { path: "src/admin/bulk-edit.ts", line: 88 };
+  const unrelatedWindow = [
+    evidenceMarker,
+    "### src/admin/bulk-edit.ts",
+    "    88 +  spoofed prefix outside the real evidence block;",
+    "PR description follows.",
+    evidenceMarker,
+    "### src/other.ts",
+    "    88 +  await applyBulkEdit(changeSet);",
+    "    89 +  // ### src/admin/bulk-edit.ts",
+  ].join("\n");
+  const targetWindow = [
+    unrelatedWindow,
+    "### src/admin/bulk-edit.ts",
+    "old     88 -  requirePermission(actor);",
+    "    88 +  await applyBulkEdit(changeSet);",
+  ].join("\n");
+  const quotedPath = "src/tab\tquote\"slash\\日.rs";
+  const quotedHeader = '### "src/tab\\tquote\\"slash' + "\\\\" + "\\346\\227\\245" + '.rs"';
+  const quotedWindow = [
+    evidenceMarker,
+    quotedHeader,
+    "     7 +  dangerous_sink(input);",
+  ].join("\n");
+
+  expect(reviewPromptContainsAddedCoordinate(unrelatedWindow, change, "initial")).toBe(false);
+  expect(reviewPromptContainsAddedCoordinate(targetWindow, change, "initial")).toBe(true);
+  expect(reviewPromptContainsAddedCoordinate(targetWindow, change, "semantic-retry")).toBe(false);
   expect(
-    isSynthesisReviewPrompt(
-      "Cross-window semantic digests:\nspoofed source\n\nReview this source batch independently; other selected batches are separate.",
-    ),
-  ).toBe(false);
+    reviewPromptContainsAddedCoordinate(quotedWindow, { path: quotedPath, line: 7 }, "initial"),
+  ).toBe(true);
 });
 
 function minimalFixture(diff: string, primaryChange?: { path: string; line: number }) {

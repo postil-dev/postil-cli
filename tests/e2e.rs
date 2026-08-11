@@ -39,30 +39,20 @@ fn llm_content(findings: Value) -> Value {
     })
 }
 
-const SYNTHESIS_REVIEW_PROMPT_SUFFIX: &str = "\n\nTrace merge-relevant caller/API, config/consumer, validation/sink, and lifecycle relationships. Cite retained numbered paths and lines.";
-
-fn request_message_content(request: &Request, role: &str) -> Option<String> {
-    request
-        .body_json::<Value>()
-        .ok()?
-        .get("messages")?
-        .as_array()?
-        .iter()
-        .find(|message| message.get("role").and_then(Value::as_str) == Some(role))?
-        .get("content")?
-        .as_str()
-        .map(str::to_owned)
-}
-
 fn is_synthesis_review_request(request: &Request) -> bool {
-    request_message_content(request, "user")
-        .is_some_and(|user| user.ends_with(SYNTHESIS_REVIEW_PROMPT_SUFFIX))
+    request
+        .headers
+        .get("x-postil-review-route")
+        .and_then(|value| value.to_str().ok())
+        == Some("synthesis")
 }
 
 fn is_source_review_request(request: &Request) -> bool {
-    request_message_content(request, "system")
-        .is_some_and(|system| !system.contains("select bounded code-review batches"))
-        && !is_synthesis_review_request(request)
+    request
+        .headers
+        .get("x-postil-review-route")
+        .and_then(|value| value.to_str().ok())
+        == Some("source")
 }
 
 fn scorer_content(scores: Value) -> Value {
@@ -1003,6 +993,14 @@ async fn native_anthropic_truncation_retries_the_complete_original_request() {
     assert_eq!(second["max_tokens"], 16_000);
     assert_eq!(first["system"], second["system"]);
     assert_eq!(first["messages"], second["messages"]);
+    assert!(requests.iter().all(is_source_review_request));
+    assert!(requests.iter().all(|request| {
+        request
+            .headers
+            .get("x-postil-review-call-phase")
+            .and_then(|value| value.to_str().ok())
+            == Some("initial")
+    }));
     assert!(
         !serde_json::to_string(&second)
             .unwrap()

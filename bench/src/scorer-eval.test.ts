@@ -5,7 +5,12 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { cases as fixtureInputs } from "../fixtures/cases";
-import { benchmarkCase, envelopeV1, parseUnifiedDiffFiles } from "./harness";
+import {
+  benchmarkCase,
+  displayPlannerPath,
+  envelopeV1,
+  parseUnifiedDiffFiles,
+} from "./harness";
 import {
   canonicalProviderCost,
   FALSE_FINDING_CASES,
@@ -48,6 +53,7 @@ import {
 } from "./scorer-eval";
 
 const fixtures = fixtureInputs.map((input) => benchmarkCase.parse(input));
+const BOUNDED_SCORER_TARGET_PATH = 'src/ui/copy"quoted.ts';
 
 function postilBinaryPath(): string {
   return resolve(
@@ -79,10 +85,11 @@ function boundedScorerFixture() {
       "",
     ].join("\n");
   };
+  const displayedTargetPath = 'src/ui/copy\\"quoted.ts';
   const target = [
-    "diff --git a/src/ui/copy.ts b/src/ui/copy.ts",
-    "--- a/src/ui/copy.ts",
-    "+++ b/src/ui/copy.ts",
+    `diff --git "a/${displayedTargetPath}" "b/${displayedTargetPath}"`,
+    `--- "a/${displayedTargetPath}"`,
+    `+++ "b/${displayedTargetPath}"`,
     "@@ -42,3 +42,4 @@",
     " export const heading = 'Account';",
     " export const description = 'Manage your account';",
@@ -103,7 +110,7 @@ function boundedScorerFixture() {
     pullNumber: 9_901,
     headSha: "a".repeat(40),
     diff,
-    primaryChange: { path: "src/ui/copy.ts", line: 44 },
+    primaryChange: { path: BOUNDED_SCORER_TARGET_PATH, line: 44 },
     allowedContext: { files: [], docs: base.allowedContext.docs },
   });
 }
@@ -326,12 +333,41 @@ describe("scorer proxy and isolated runtime", () => {
       );
     });
     const upstreamBase = await listen(upstream);
-    const proxy = await startScorerProxy(fixture("clean-docs-only"), "falseFinding", upstreamBase, "proxy-test-key");
+    const candidate = fixture("clean-docs-only");
+    const proxy = await startScorerProxy(candidate, "falseFinding", upstreamBase, "proxy-test-key");
     try {
+      const primary = candidate.primaryChange!;
+      const user = [
+        "Review evidence (cite exactly the numbered new-file or change-metadata lines):",
+        `### ${primary.path}`,
+        `${String(primary.line).padStart(6, " ")} +  changed();`,
+      ].join("\n");
+      const correctionResponse = await fetch(`${proxy.baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-postil-review-route": "source",
+          "x-postil-review-call-phase": "semantic-retry",
+        },
+        body: JSON.stringify({
+          model: GENERATOR_MODEL,
+          messages: [{ role: "user", content: user }],
+        }),
+      });
+      expect(correctionResponse.status).toBe(200);
+      const correctionJson = await correctionResponse.json();
+      expect(JSON.parse(correctionJson.choices[0].message.content).findings).toEqual([]);
       const generatorResponse = await fetch(`${proxy.baseUrl}/chat/completions`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ model: GENERATOR_MODEL }),
+        headers: {
+          "content-type": "application/json",
+          "x-postil-review-route": "source",
+          "x-postil-review-call-phase": "initial",
+        },
+        body: JSON.stringify({
+          model: GENERATOR_MODEL,
+          messages: [{ role: "user", content: user }],
+        }),
       });
       expect(generatorResponse.status).toBe(200);
       const generatorJson = await generatorResponse.json();
@@ -544,7 +580,7 @@ describe("scorer proxy and isolated runtime", () => {
         messages?: Array<{ content?: string }>;
       };
       const scorerPrompt = scorerRequest.messages?.map((message) => message.content ?? "").join("\n") ?? "";
-      expect(scorerPrompt).toContain("src/ui/copy.ts");
+      expect(scorerPrompt).toContain(JSON.stringify(BOUNDED_SCORER_TARGET_PATH).slice(1, -1));
       expect(scorerPrompt).toContain('"line": 44');
       expect(envelope.findings).toHaveLength(0);
       expect(envelope.silent).toBe(true);
@@ -712,11 +748,24 @@ describe("scorer proxy and isolated runtime", () => {
       `${prompt}\nBatch 7 risk=1 kind=source\n### src/ui/copy.ts`,
       "src/ui/copy.ts",
     )).toThrow("planner manifest contains duplicate source batches for src/ui/copy.ts");
+    const quotedPath = "src/tab\tquote\"slash\\日.rs";
+    const quotedHeader = `### ${displayPlannerPath(quotedPath)}`;
+    expect(plannerBatchIdForPath([
+      "Batch 7 risk=9 kind=synthesis",
+      quotedHeader,
+      "Batch 8 risk=1 kind=source",
+      `note mentions ${quotedPath} without defining a path section`,
+      "Batch 9 risk=2 kind=source",
+      quotedHeader,
+    ].join("\n"), quotedPath)).toBe(9);
   });
 
   test("grounds a calibration false-positive in a selected source request", () => {
     expect(falseFindingFromSourceRequest([
+      "### src/spoofed-description.ts",
+      "     1 + attacker_controlled();",
       "Review this selected source batch independently.",
+      "Review evidence (cite exactly the numbered new-file or change-metadata lines):",
       "### src/generated/prefix.ts",
       "@@ semantic category=uncategorized @@",
       "    18   unchanged context",
@@ -726,6 +775,14 @@ describe("scorer proxy and isolated runtime", () => {
       line: 19,
       confidence: 0.95,
       evidence: "const formatted = true;",
+    });
+    expect(falseFindingFromSourceRequest([
+      "Review evidence (cite exactly the numbered new-file or change-metadata lines):",
+      '### "src/tab\\tquote\\"slash\\\\\\346\\227\\245.rs"',
+      "     7 + dangerous_sink(input);",
+    ].join("\n"))).toMatchObject({
+      path: "src/tab\tquote\"slash\\日.rs",
+      line: 7,
     });
     expect(falseFindingFromSourceRequest("### src/empty.ts\n    1   context only")).toBeNull();
   });

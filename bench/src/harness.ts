@@ -12,7 +12,12 @@
 import { execFile as execFileCb } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import {
+  createServer,
+  type IncomingHttpHeaders,
+  type IncomingMessage,
+  type ServerResponse,
+} from "node:http";
 import type { AddressInfo } from "node:net";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -20,11 +25,169 @@ import { z } from "zod";
 
 const execFile = promisify(execFileCb);
 
-const SYNTHESIS_REVIEW_PROMPT_SUFFIX =
-  "\n\nTrace merge-relevant caller/API, config/consumer, validation/sink, and lifecycle relationships. Cite retained numbered paths and lines.";
+const REVIEW_EVIDENCE_MARKER =
+  "Review evidence (cite exactly the numbered new-file or change-metadata lines):";
 
-export function isSynthesisReviewPrompt(user: string): boolean {
-  return user.endsWith(SYNTHESIS_REVIEW_PROMPT_SUFFIX);
+export type ReviewRequestMetadata = {
+  route: "source" | "synthesis";
+  callPhase: "initial" | "schema-repair" | "semantic-retry";
+};
+
+export function reviewRequestMetadata(
+  headers: IncomingHttpHeaders,
+): ReviewRequestMetadata | null {
+  const route = headers["x-postil-review-route"];
+  const callPhase = headers["x-postil-review-call-phase"];
+  if (
+    typeof route !== "string" ||
+    !["source", "synthesis"].includes(route) ||
+    typeof callPhase !== "string" ||
+    !["initial", "schema-repair", "semantic-retry"].includes(callPhase)
+  ) {
+    return null;
+  }
+  return {
+    route: route as ReviewRequestMetadata["route"],
+    callPhase: callPhase as ReviewRequestMetadata["callPhase"],
+  };
+}
+
+export function displayPromptPath(path: string): string {
+  const bytes = Buffer.from(path, "utf8");
+  const asciiWhitespace = (byte: number) => byte === 0x20 || (byte >= 0x09 && byte <= 0x0d);
+  const boundaryWhitespace =
+    (bytes.length > 0 && asciiWhitespace(bytes[0]!)) ||
+    (bytes.length > 0 && asciiWhitespace(bytes[bytes.length - 1]!));
+  const safe = !boundaryWhitespace && bytes.every(
+    (byte) => byte >= 0x20 && byte <= 0x7e && byte !== 0x22 && byte !== 0x5c,
+  );
+  if (safe) return path;
+
+  let displayed = '"';
+  for (const byte of bytes) {
+    if (byte === 0x22) displayed += '\\"';
+    else if (byte === 0x5c) displayed += "\\\\";
+    else if (byte === 0x09) displayed += "\\t";
+    else if (byte === 0x0a) displayed += "\\n";
+    else if (byte === 0x0d) displayed += "\\r";
+    else if (byte >= 0x20 && byte <= 0x7e) displayed += String.fromCharCode(byte);
+    else displayed += `\\${byte.toString(8).padStart(3, "0")}`;
+  }
+  return `${displayed}"`;
+}
+
+export function displayPlannerPath(path: string): string {
+  return Array.from(displayPromptPath(path), (character) => {
+    if (character === "\t" || character === "\r" || character === '"') return character === '"' ? "'" : " ";
+    if (character === "\\") return "/";
+    if (/\p{Cc}/u.test(character)) return " ";
+    return character;
+  }).join("");
+}
+
+function parseDisplayedPromptPath(displayed: string): string | null {
+  if (!displayed.startsWith('"')) return displayed;
+  if (!displayed.endsWith('"') || displayed.length < 2) return null;
+  const bytes: number[] = [];
+  for (let index = 1; index < displayed.length - 1; index += 1) {
+    const character = displayed[index]!;
+    if (character !== "\\") {
+      const encoded = Buffer.from(character, "utf8");
+      bytes.push(...encoded);
+      continue;
+    }
+    index += 1;
+    if (index >= displayed.length - 1) return null;
+    const escaped = displayed[index]!;
+    if (escaped === '"' || escaped === "\\") bytes.push(escaped.charCodeAt(0));
+    else if (escaped === "t") bytes.push(0x09);
+    else if (escaped === "n") bytes.push(0x0a);
+    else if (escaped === "r") bytes.push(0x0d);
+    else if (/^[0-7]$/u.test(escaped)) {
+      const octal = displayed.slice(index, index + 3);
+      if (!/^[0-7]{3}$/u.test(octal)) return null;
+      bytes.push(Number.parseInt(octal, 8));
+      index += 2;
+    } else return null;
+  }
+  const path = Buffer.from(bytes).toString("utf8");
+  return displayPromptPath(path) === displayed ? path : null;
+}
+
+export function reviewPromptFirstAddedCoordinate(
+  user: string,
+): { path: string; line: number; evidence: string } | null {
+  const lines = user.split("\n");
+  const evidenceStart = lines.lastIndexOf(REVIEW_EVIDENCE_MARKER);
+  if (evidenceStart < 0) return null;
+  let path: string | null = null;
+  for (const line of lines.slice(evidenceStart + 1)) {
+    if (line.startsWith("### ")) {
+      path = parseDisplayedPromptPath(line.slice(4));
+      continue;
+    }
+    const added = /^\s*(\d+) \+ (.+)$/u.exec(line);
+    if (path !== null && added) {
+      const lineNumber = Number.parseInt(added[1]!, 10);
+      const evidence = added[2]!;
+      if (Number.isSafeInteger(lineNumber) && lineNumber > 0 && evidence.trim().length > 0) {
+        return { path, line: lineNumber, evidence };
+      }
+    }
+  }
+  return null;
+}
+
+export function plannerBatchIdForPath(prompt: string, path: string | undefined): number | null {
+  if (path === undefined) return null;
+  const targetHeader = `### ${displayPlannerPath(path)}`;
+  const matches = new Set<number>();
+  let sourceBatchId: number | null = null;
+  for (const line of prompt.split("\n")) {
+    const header = /^Batch (\d+) risk=\d+ kind=(source|synthesis)$/u.exec(line);
+    if (header) {
+      const id = Number.parseInt(header[1]!, 10);
+      sourceBatchId = header[2] === "source" && Number.isSafeInteger(id) && id > 0
+        ? id
+        : null;
+      continue;
+    }
+    if (/^\S+ \d+ risk=/u.test(line)) {
+      sourceBatchId = null;
+      continue;
+    }
+    if (sourceBatchId !== null && line === targetHeader) matches.add(sourceBatchId);
+  }
+  if (matches.size === 1) return matches.values().next().value!;
+  if (matches.size > 1) {
+    throw new Error(`planner manifest contains duplicate source batches for ${path}`);
+  }
+  if (prompt.split("\n").includes(targetHeader)) {
+    throw new Error(`planner manifest contains the expected path ${path} outside a source batch`);
+  }
+  return null;
+}
+
+export function reviewPromptContainsAddedCoordinate(
+  user: string,
+  change: { path: string; line: number },
+  callPhase: ReviewRequestMetadata["callPhase"],
+): boolean {
+  if (callPhase !== "initial") return false;
+  const lines = user.split("\n");
+  const evidenceStart = lines.lastIndexOf(REVIEW_EVIDENCE_MARKER);
+  if (evidenceStart < 0) return false;
+  const targetHeader = `### ${displayPromptPath(change.path)}`;
+  const addedLine = new RegExp(`^\\s*${change.line}\\s+\\+`, "u");
+  let inTargetSection = false;
+  for (const line of lines.slice(evidenceStart + 1)) {
+    if (line.startsWith("### ")) {
+      inTargetSection = line === targetHeader;
+    } else if (inTargetSection && addedLine.test(line)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -658,6 +821,15 @@ export interface ParsedUnifiedDiffFile {
   after: string;
 }
 
+function unifiedDiffHeaderPath(header: string | undefined, marker: "--- " | "+++ "): string | undefined {
+  if (header === undefined) return undefined;
+  const displayed = header.slice(marker.length);
+  if (displayed === "/dev/null") return undefined;
+  const path = parseDisplayedPromptPath(displayed);
+  const prefix = marker === "--- " ? "a/" : "b/";
+  return path?.startsWith(prefix) ? path.slice(prefix.length) : undefined;
+}
+
 export function parseUnifiedDiffFiles(diff: string): ParsedUnifiedDiffFile[] {
   const lines = diff.split("\n");
   const starts = lines
@@ -669,8 +841,8 @@ export function parseUnifiedDiffFiles(diff: string): ParsedUnifiedDiffFile[] {
     const newHeader = section.find((line) => line.startsWith("+++ "));
     const renameFrom = section.find((line) => line.startsWith("rename from "))?.slice(12);
     const renameTo = section.find((line) => line.startsWith("rename to "))?.slice(10);
-    const oldPath = oldHeader?.startsWith("--- a/") ? oldHeader.slice(6) : renameFrom;
-    const newPath = newHeader?.startsWith("+++ b/") ? newHeader.slice(6) : renameTo;
+    const oldPath = unifiedDiffHeaderPath(oldHeader, "--- ") ?? renameFrom;
+    const newPath = unifiedDiffHeaderPath(newHeader, "+++ ") ?? renameTo;
     const path = newPath ?? oldPath;
     if (path === undefined || path.length === 0) {
       throw new Error("benchmark diff section has no canonical file path");
@@ -773,12 +945,17 @@ async function startMockModel(c: BenchmarkCase, artifactsDir: string) {
         );
         return;
       }
-      const targetPath = c.primaryChange?.path ?? c.modelOutput.findings[0]?.path;
-      const synthesis = isSynthesisReviewPrompt(user);
-      const targetBatch = targetPath === undefined || user
-        .split("\n")
-        .some((line) => line.trim() === `### ${targetPath}`);
-      const output = !synthesis && targetBatch
+      const metadata = reviewRequestMetadata(req.headers);
+      if (metadata === null) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "review request metadata is missing or invalid" }));
+        return;
+      }
+      const targetBatch = c.primaryChange !== undefined &&
+        reviewPromptContainsAddedCoordinate(user, c.primaryChange, metadata.callPhase);
+      const output = metadata.route === "source" &&
+          metadata.callPhase === "initial" &&
+          targetBatch
         ? c.modelOutput
         : { summary: "", findings: [] };
       res.writeHead(200, { "content-type": "application/json" });
@@ -814,16 +991,6 @@ function plannerMandatoryIds(prompt: string): Set<number> {
       .map((value) => Number.parseInt(value.trim(), 10))
       .filter(Number.isSafeInteger),
   );
-}
-
-function plannerBatchIdForPath(prompt: string, path: string | undefined): number | null {
-  if (path === undefined) return null;
-  for (const block of prompt.split("\nBatch ").slice(1)) {
-    if (!block.includes(path)) continue;
-    const id = Number.parseInt(block, 10);
-    if (Number.isSafeInteger(id) && id > 0) return id;
-  }
-  return null;
 }
 
 function listen(server: ReturnType<typeof createServer>): Promise<void> {
