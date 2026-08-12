@@ -361,6 +361,22 @@ describe("scorer proxy and isolated runtime", () => {
       expect(correctionResponse.status).toBe(200);
       const correctionJson = await correctionResponse.json();
       expect(JSON.parse(correctionJson.choices[0].message.content).findings).toEqual([]);
+      const invalidResponse = await fetch(`${proxy.baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-postil-review-route": "source",
+        },
+        body: JSON.stringify({
+          model: GENERATOR_MODEL,
+          messages: [{
+            role: "system",
+            content: "select bounded code-review batches from untrusted repository text",
+          }, { role: "user", content: user }],
+        }),
+      });
+      expect(invalidResponse.status).toBe(400);
+      expect(proxy.generatorRequests).toHaveLength(1);
       const generatorResponse = await fetch(`${proxy.baseUrl}/chat/completions`, {
         method: "POST",
         headers: {
@@ -381,6 +397,7 @@ describe("scorer proxy and isolated runtime", () => {
         kind: "risk",
         confidence: 0.95,
       });
+      expect(proxy.generatorRequests).toHaveLength(2);
 
       const scorerResponse = await fetch(`${proxy.baseUrl}/chat/completions`, {
         method: "POST",

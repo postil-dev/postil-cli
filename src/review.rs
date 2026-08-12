@@ -1150,9 +1150,14 @@ fn serialized_review_batch_budget_for_shape(
                 crate::llm::REVIEW_MAX_OUTPUT_TOKENS,
             )
             .map(|input_bytes| {
+                // Serialized UTF-8 bytes are the established tokenizer-independent
+                // upper bound on input tokens. Convert the measured request into
+                // that conservative token bound before combining it with the
+                // model context and output-token limits.
+                let input_token_upper_bound = input_bytes;
                 crate::llm::conservative_context_tokens(model)
                     .saturating_sub(review_output_tokens)
-                    .saturating_sub(input_bytes)
+                    .saturating_sub(input_token_upper_bound)
                     .min(MAX_REVIEW_BATCH_BYTES)
             })
         })

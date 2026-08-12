@@ -985,13 +985,13 @@ export async function startScorerProxy(
         }));
         return;
       }
-      generatorRequests.push(bodyText);
       const user = body.messages?.find((message) => message.role === "user")?.content ?? "";
       if (requestKind?.kind !== "review") {
         res.writeHead(400, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: "review request metadata is missing or invalid" }));
         return;
       }
+      generatorRequests.push(bodyText);
       const metadata = requestKind;
       const isSynthesis = metadata.route === "synthesis";
       generatorRequestKinds.push(
