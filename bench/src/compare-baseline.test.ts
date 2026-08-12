@@ -1,4 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
+import { cases } from "../fixtures/cases";
 import {
   DETECTION_RATE_MAX_DROP_PP,
   FALSE_FINDINGS_MAX_INCREASE,
@@ -12,6 +16,22 @@ import {
   type BaselineProfile,
   type LiveReportForComparison,
 } from "./compare-baseline";
+import { benchmarkCase } from "./harness";
+import { evaluatorSourceSha256 } from "./live";
+
+test("committed baseline authority matches the current benchmark sources", async () => {
+  const baseline = JSON.parse(
+    await readFile(resolve(import.meta.dir, "..", "baseline.json"), "utf8"),
+  ) as {
+    corpus: { fixtureCorpusSha256: string; evaluatorSha256: string };
+  };
+  const fixtureCorpusSha256 = createHash("sha256")
+    .update(JSON.stringify(cases.map((input) => benchmarkCase.parse(input))))
+    .digest("hex");
+
+  expect(baseline.corpus.fixtureCorpusSha256).toBe(fixtureCorpusSha256);
+  expect(baseline.corpus.evaluatorSha256).toBe(await evaluatorSourceSha256());
+});
 
 function fakeReport(overrides: {
   falsePositives?: number;
