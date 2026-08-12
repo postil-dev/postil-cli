@@ -380,7 +380,7 @@ async function screeningProfileMetadata(path: string): Promise<{
   };
 }
 
-async function evaluatorSourceSha256(): Promise<string> {
+export async function evaluatorSourceSha256(): Promise<string> {
   const benchRoot = resolve(fileURLToPath(import.meta.url), "..", "..");
   const sources = [
     "fixtures/cases.ts",
