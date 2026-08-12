@@ -8024,23 +8024,32 @@ mod tests {
 
     #[test]
     fn benchmark_screening_enforces_the_exact_provisional_provider_contract() {
-        let _lock = env_lock().lock().unwrap();
-        let _env = EnvRestore::capture(&[
-            "POSTIL_HOSTED_MODE",
-            "POSTIL_QUALIFICATION_CANDIDATE_PROFILE",
-            "POSTIL_BENCH_SCREEN_PROFILE",
-            "POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY",
-        ]);
-        EnvRestore::remove("POSTIL_HOSTED_MODE");
-        EnvRestore::remove("POSTIL_QUALIFICATION_CANDIDATE_PROFILE");
-        let directory = tempfile::tempdir().unwrap();
-        let profile_path = directory.path().join("screen-profile.json");
-        std::fs::write(&profile_path, include_str!("../provisional-models.json")).unwrap();
-        EnvRestore::set(
-            "POSTIL_BENCH_SCREEN_PROFILE",
-            profile_path.to_str().unwrap(),
-        );
-        EnvRestore::set("POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY", "1");
+        const CHILD_ENV: &str = "POSTIL_TEST_BENCHMARK_SCREENING_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            let profile_path = directory.path().join("screen-profile.json");
+            std::fs::write(&profile_path, include_str!("../provisional-models.json")).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "llm::tests::benchmark_screening_enforces_the_exact_provisional_provider_contract",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .env("POSTIL_BENCH_SCREEN_PROFILE", &profile_path)
+                .env("POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY", "1")
+                .env_remove("POSTIL_HOSTED_MODE")
+                .env_remove("POSTIL_QUALIFICATION_CANDIDATE_PROFILE")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated screening test failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
 
         let config = Config {
             model: "z-ai/glm-5.2".into(),
