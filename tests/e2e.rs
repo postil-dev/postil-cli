@@ -8237,6 +8237,28 @@ async fn exhausted_timeout_retry_falls_back_to_next_model() {
     let envelope: Value =
         serde_json::from_slice(&out.get_output().stdout).expect("review output should be JSON");
     assert_eq!(envelope["modelUsed"], "backup-model");
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("model primary-model hit a request timeout after"));
+    assert!(stderr.contains("timeout retry 1/1"));
+    let attempts = envelope["modelUsage"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["model"].as_str().unwrap(),
+                entry["attempt"].as_u64().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        attempts,
+        vec![
+            ("primary-model", 1),
+            ("primary-model", 2),
+            ("backup-model", 1)
+        ]
+    );
 
     let requests = server.received_requests().await.unwrap();
     let models = requests
@@ -8248,9 +8270,19 @@ async fn exhausted_timeout_retry_falls_back_to_next_model() {
                 .to_string()
         })
         .collect::<Vec<_>>();
+    assert_eq!(models.last().map(String::as_str), Some("backup-model"));
+    assert!(models.len() <= 3);
     assert_eq!(
-        models,
-        vec!["primary-model", "primary-model", "backup-model"]
+        models
+            .iter()
+            .filter(|model| model.as_str() == "backup-model")
+            .count(),
+        1
+    );
+    assert!(
+        models[..models.len() - 1]
+            .iter()
+            .all(|model| model == "primary-model")
     );
 }
 
