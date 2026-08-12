@@ -28,6 +28,10 @@ pub const MAX_REVIEW_SPOOL_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_DIFF_INDEX_PATHS: usize = 100_000;
 const MAX_DIFF_INDEX_RANGES: usize = 250_000;
 const NORMALIZED_MANIFEST_RESERVE_BYTES: usize = 16 * 1024;
+/// Smallest batch that preserves source framing, planner evidence, and
+/// recursive semantic synthesis. Provider admission applies separate exact
+/// serialized-request and model-context bounds before rendering.
+pub(crate) const MIN_REVIEW_BATCH_BYTES: usize = 4 * 1024;
 
 #[derive(Clone)]
 pub struct WorkspaceBudget {
@@ -1120,7 +1124,7 @@ impl ModelBatchSpool {
             if digest.is_empty() {
                 digest = batch.chars().take(800).collect();
             } else {
-                digest = truncate_owned_utf8(digest, 1_200);
+                digest = compact_planner_digest(digest, 1_200)?;
             }
             digest = sanitize_planner_evidence(&digest);
             let candidate = Candidate {
@@ -1630,18 +1634,6 @@ fn semantic_large_diff_hunk(path: &str, hunk: &Hunk) -> bool {
     hosted_token_risk_score(&changed) == 0
 }
 
-fn truncate_owned_utf8(mut value: String, max_bytes: usize) -> String {
-    if value.len() <= max_bytes {
-        return value;
-    }
-    let mut end = max_bytes;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    value.truncate(end);
-    value
-}
-
 const HOSTED_RISK_MARKERS: [(&str, usize); 19] = [
     ("unsafe", 12),
     ("eval", 12),
@@ -1794,6 +1786,30 @@ pub fn spool_model_batches(
     max_manifest_bytes: usize,
     force_empty: bool,
 ) -> Result<ModelBatchSpool> {
+    spool_model_batches_with_synthesis_budget(
+        prepared,
+        max_batch_bytes,
+        max_batch_bytes,
+        max_manifest_bytes,
+        force_empty,
+    )
+}
+
+pub(crate) fn spool_model_batches_with_synthesis_budget(
+    prepared: &mut PreparedReview,
+    max_source_batch_bytes: usize,
+    max_synthesis_batch_bytes: usize,
+    max_manifest_bytes: usize,
+    force_empty: bool,
+) -> Result<ModelBatchSpool> {
+    anyhow::ensure!(
+        max_source_batch_bytes >= MIN_REVIEW_BATCH_BYTES,
+        "source batch limit must leave room for context"
+    );
+    anyhow::ensure!(
+        max_synthesis_batch_bytes >= MIN_REVIEW_BATCH_BYTES,
+        "synthesis batch limit must leave room for context"
+    );
     let mut file = tempfile::tempfile().context("creating model-batch spool")?;
     let mut lease = WorkspaceLease::new(prepared._window_lease.budget.clone());
     let mut spool_bytes = 0u64;
@@ -1827,7 +1843,13 @@ pub fn spool_model_batches(
                 );
             }
         }
-        let plan = render_review_batches(&parsed, &[], &[], max_batch_bytes, max_manifest_bytes);
+        let plan = render_review_batches(
+            &parsed,
+            &[],
+            &[],
+            max_source_batch_bytes,
+            max_manifest_bytes,
+        );
         anyhow::ensure!(
             !plan.incomplete,
             "normalized review window could not be rendered"
@@ -1845,12 +1867,12 @@ pub fn spool_model_batches(
                     .checked_add(1)
                     .context("semantic digest ordinal overflowed")?;
                 let heading = format!("\nSource window {next_ordinal}:\n");
-                let digest_bound = max_batch_bytes
+                let digest_bound = max_synthesis_batch_bytes
                     .checked_sub(synthesis_header.len().saturating_add(heading.len()))
                     .context("semantic synthesis header exceeded its bound")?;
                 let digest = compact_semantic_digest(digest, digest_bound)?;
                 let entry = format!("{heading}{digest}");
-                if cross_window.len().saturating_add(entry.len()) > max_batch_bytes {
+                if cross_window.len().saturating_add(entry.len()) > max_synthesis_batch_bytes {
                     if cross_window.len() > synthesis_header.len() {
                         synthesis_chunks.push((
                             std::mem::take(&mut cross_window),
@@ -1867,7 +1889,7 @@ pub fn spool_model_batches(
                 &mut file,
                 &mut lease,
                 &batch,
-                max_batch_bytes,
+                max_source_batch_bytes,
                 "model batch",
             )?;
             spool_bytes = spool_bytes
@@ -1883,12 +1905,13 @@ pub fn spool_model_batches(
             batch_hunks.insert(count, hunks);
         }
         if let Some(synthesis) = plan.synthesis {
-            let synthesis = bind_synthesis_hunks(synthesis, &plan_hunks, max_batch_bytes)?;
+            let synthesis =
+                bind_synthesis_hunks(synthesis, &plan_hunks, max_synthesis_batch_bytes)?;
             write_length_prefixed(
                 &mut file,
                 &mut lease,
                 &synthesis,
-                max_batch_bytes,
+                max_synthesis_batch_bytes,
                 "model batch",
             )?;
             spool_bytes = spool_bytes
@@ -1915,7 +1938,7 @@ pub fn spool_model_batches(
             &Diff::default(),
             &prepared.lockfiles[lock_start..lock_end],
             &prepared.compacted_artifacts[artifact_start..artifact_end],
-            max_batch_bytes,
+            max_source_batch_bytes,
             max_manifest_bytes,
         );
         if plan.incomplete {
@@ -1927,7 +1950,7 @@ pub fn spool_model_batches(
                 &mut file,
                 &mut lease,
                 &batch,
-                max_batch_bytes,
+                max_source_batch_bytes,
                 "artifact model batch",
             )?;
             spool_bytes = spool_bytes
@@ -1942,11 +1965,12 @@ pub fn spool_model_batches(
             metadata_batch_ids.insert(count);
         }
         if let Some(synthesis) = plan.synthesis {
+            let synthesis = compact_semantic_digest(synthesis, max_synthesis_batch_bytes)?;
             write_length_prefixed(
                 &mut file,
                 &mut lease,
                 &synthesis,
-                max_batch_bytes,
+                max_synthesis_batch_bytes,
                 "artifact synthesis batch",
             )?;
             spool_bytes = spool_bytes
@@ -1971,12 +1995,12 @@ pub fn spool_model_batches(
             let mut digests = Vec::with_capacity(chunk_count);
             let mut covered_hunks = Vec::with_capacity(chunk_count);
             for (chunk, hunks) in chunks {
-                let chunk = bind_synthesis_hunks(chunk, &hunks, max_batch_bytes)?;
+                let chunk = bind_synthesis_hunks(chunk, &hunks, max_synthesis_batch_bytes)?;
                 write_length_prefixed(
                     &mut file,
                     &mut lease,
                     &chunk,
-                    max_batch_bytes,
+                    max_synthesis_batch_bytes,
                     "cross-window synthesis batch",
                 )?;
                 spool_bytes = spool_bytes
@@ -1993,7 +2017,7 @@ pub fn spool_model_batches(
             if chunk_count == 1 {
                 break;
             }
-            let next_text = pack_semantic_digests(&digests, level + 1, max_batch_bytes)?;
+            let next_text = pack_semantic_digests(&digests, level + 1, max_synthesis_batch_bytes)?;
             let next_hunks = covered_hunks
                 .chunks(2)
                 .map(|pair| {
@@ -2013,7 +2037,13 @@ pub fn spool_model_batches(
         }
     }
     if count == 0 && force_empty {
-        write_length_prefixed(&mut file, &mut lease, "", max_batch_bytes, "model batch")?;
+        write_length_prefixed(
+            &mut file,
+            &mut lease,
+            "",
+            max_source_batch_bytes,
+            "model batch",
+        )?;
         spool_bytes = spool_bytes.saturating_add(8);
         count = 1;
         source_count = 1;
@@ -2216,6 +2246,57 @@ fn compact_semantic_digest(digest: String, max_bytes: usize) -> Result<String> {
             .position(|record| record.category == category)
         {
             selected.insert(index);
+        }
+    }
+    let selected = selected
+        .into_iter()
+        .map(|index| records[index])
+        .collect::<Vec<_>>();
+    render_semantic_evidence(&selected, max_bytes)
+}
+
+fn compact_planner_digest(digest: String, max_bytes: usize) -> Result<String> {
+    if digest.len() <= max_bytes {
+        return Ok(digest);
+    }
+    let records = parse_semantic_evidence(&digest);
+    anyhow::ensure!(
+        !records.is_empty(),
+        "planner digest contained no bounded evidence records"
+    );
+
+    let mut selected = BTreeSet::from([0, records.len() - 1]);
+    let fits = |indexes: &BTreeSet<usize>| {
+        let selected = indexes
+            .iter()
+            .map(|index| records[*index])
+            .collect::<Vec<_>>();
+        render_semantic_evidence(&selected, max_bytes).is_ok()
+    };
+
+    // Planner evidence retains one identity per interior path while capacity
+    // allows, even when another file owns the first high-signal token.
+    let mut represented_paths = BTreeSet::new();
+    for (index, record) in records.iter().enumerate() {
+        if !represented_paths.insert(record.path) || selected.contains(&index) {
+            continue;
+        }
+        let mut candidate = selected.clone();
+        candidate.insert(index);
+        if fits(&candidate) {
+            selected = candidate;
+        }
+    }
+    for (category, _) in SEMANTIC_CATEGORIES {
+        if let Some(index) = records
+            .iter()
+            .position(|record| record.category == category)
+        {
+            let mut candidate = selected.clone();
+            candidate.insert(index);
+            if fits(&candidate) {
+                selected = candidate;
+            }
         }
     }
     let selected = selected
@@ -2920,8 +3001,12 @@ fn parse_git_path_token(input: &str) -> Option<(String, &str)> {
                 let escaped = *bytes.get(index)?;
                 match escaped {
                     b'"' | b'\\' => decoded.push(escaped),
+                    b'a' => decoded.push(0x07),
+                    b'b' => decoded.push(0x08),
                     b't' => decoded.push(b'\t'),
                     b'n' => decoded.push(b'\n'),
+                    b'v' => decoded.push(0x0b),
+                    b'f' => decoded.push(0x0c),
                     b'r' => decoded.push(b'\r'),
                     b'0'..=b'7' => {
                         let mut value = (escaped - b'0') as u16;
@@ -3664,7 +3749,7 @@ pub fn render_review_batches(
     max_manifest_bytes: usize,
 ) -> ReviewBatchPlan {
     assert!(
-        max_bytes >= 4096,
+        max_bytes >= MIN_REVIEW_BATCH_BYTES,
         "review batch limit must leave room for context"
     );
     let manifest = build_manifest(diff, lockfiles, compacted_artifacts, max_manifest_bytes);
@@ -4776,6 +4861,18 @@ Binary files a/img.png and b/img.png differ
     }
 
     #[test]
+    fn git_named_control_escapes_decode_without_losing_identity() {
+        let source = "diff --git \"a/src/alarm\\aback\\bvertical\\vform\\f.rs\" \"b/src/alarm\\aback\\bvertical\\vform\\f.rs\"\n--- \"a/src/alarm\\aback\\bvertical\\vform\\f.rs\"\n+++ \"b/src/alarm\\aback\\bvertical\\vform\\f.rs\"\n@@ -0,0 +1 @@\n+safe();\n";
+        let parsed = parse(source);
+        assert_eq!(parsed.files.len(), 1);
+        assert_eq!(
+            parsed.files[0].path,
+            "src/alarm\u{7}back\u{8}vertical\u{b}form\u{c}.rs"
+        );
+        assert!(!prepare_diff(source).incomplete);
+    }
+
+    #[test]
     fn prompt_path_spelling_is_reversible_and_groundable() {
         let canonical = " src/odd (name)\ttab\rbreak\nquote\"slash\\日.rs ";
         let displayed = display_path(canonical);
@@ -5042,9 +5139,9 @@ Binary files a/img.png and b/img.png differ
                 )
             })
             .to_vec();
-        let packed = pack_semantic_digests(&digests, 1, 4_096).unwrap();
+        let packed = pack_semantic_digests(&digests, 1, MIN_REVIEW_BATCH_BYTES).unwrap();
         assert_eq!(packed.len(), 1);
-        assert!(packed[0].len() <= 4_096);
+        assert!(packed[0].len() <= MIN_REVIEW_BATCH_BYTES);
         assert!(packed[0].contains("src/first.rs"));
         assert!(packed[0].contains("src/second.rs"));
     }
@@ -5467,7 +5564,13 @@ diff --git a/two.rs b/two.rs
         }
         let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
         let mut prepared = prepare_review(&snapshot).unwrap();
-        let mut batches = spool_model_batches(&mut prepared, 4_096, 1_024, false).unwrap();
+        let mut batches = spool_model_batches(
+            &mut prepared,
+            MIN_REVIEW_BATCH_BYTES,
+            MIN_REVIEW_BATCH_BYTES / 3,
+            false,
+        )
+        .unwrap();
         assert!(batches.count > 22);
         assert!(batches.source_count < batches.count);
         let candidates = batches.hosted_candidates(5, 32).unwrap();
@@ -5489,6 +5592,81 @@ diff --git a/two.rs b/two.rs
                 .iter()
                 .any(|batch| batch.contains("Cross-window semantic digests"))
         );
+    }
+
+    #[test]
+    fn hosted_planner_retains_an_interior_file_path_in_compacted_evidence() {
+        use std::fmt::Write as _;
+
+        let mut source = String::new();
+        for file in 0..8 {
+            if file == 4 {
+                source.push_str(
+                    "diff --git a/src/ui/copy.ts b/src/ui/copy.ts\n--- a/src/ui/copy.ts\n+++ b/src/ui/copy.ts\n@@ -42,3 +42,4 @@\n export const heading = 'Account';\n export const description = 'Manage your account';\n+export const validatedHint = 'Changes save automatically';\n export const action = 'Save';\n",
+                );
+            }
+            let path = format!("src/ordinary/segment-{file}.ts");
+            writeln!(
+                source,
+                "diff --git a/{path} b/{path}\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,200 @@"
+            )
+            .unwrap();
+            for line in 0..200 {
+                if file == 0 && line == 0 {
+                    source.push_str(
+                        "+export const accessPermissionLabel = 'Account access'; // ordinary display copy\n",
+                    );
+                } else {
+                    writeln!(
+                        source,
+                        "+export const ordinary_{file}_{line} = {}; // ordinary source behavior",
+                        file + line
+                    )
+                    .unwrap();
+                }
+            }
+        }
+
+        let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+        let mut prepared = prepare_review(&snapshot).unwrap();
+        let mut batches = spool_model_batches(
+            &mut prepared,
+            MIN_REVIEW_BATCH_BYTES,
+            MIN_REVIEW_BATCH_BYTES / 3,
+            false,
+        )
+        .unwrap();
+        let candidates = batches.hosted_candidates(5, 96).unwrap();
+        let target_in_source = candidates.manifest.split("\nBatch ").skip(1).any(|entry| {
+            entry
+                .lines()
+                .next()
+                .is_some_and(|header| header.ends_with("kind=source"))
+                && entry.contains("### src/ui/copy.ts\n")
+        });
+        assert!(
+            target_in_source,
+            "interior path missing from source candidate evidence"
+        );
+    }
+
+    #[test]
+    fn separate_batch_budgets_reject_a_source_limit_below_the_semantic_floor() {
+        let snapshot = DiffSnapshot::from_bytes(
+            b"diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n",
+        )
+        .unwrap();
+        let mut prepared = prepare_review(&snapshot).unwrap();
+        let error = spool_model_batches_with_synthesis_budget(
+            &mut prepared,
+            MIN_REVIEW_BATCH_BYTES - 1,
+            MIN_REVIEW_BATCH_BYTES,
+            MIN_REVIEW_BATCH_BYTES / 3,
+            false,
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("source batch limit"));
     }
 
     fn deterministic_large_fixture(security_hunks: usize) -> String {
@@ -5969,10 +6147,16 @@ diff --git a/two.rs b/two.rs
         }
         let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
         let mut prepared = prepare_review(&snapshot).unwrap();
-        let mut batches = spool_model_batches(&mut prepared, 4_096, 1_024, false).unwrap();
+        let mut batches = spool_model_batches(
+            &mut prepared,
+            MIN_REVIEW_BATCH_BYTES,
+            MIN_REVIEW_BATCH_BYTES / 3,
+            false,
+        )
+        .unwrap();
         let mut saw_synthesis = false;
         while let Some(batch) = batches.next_batch().unwrap() {
-            assert!(batch.len() <= 4_096);
+            assert!(batch.len() <= MIN_REVIEW_BATCH_BYTES);
             saw_synthesis |= batch.contains("Cross-window semantic digests");
         }
         assert!(saw_synthesis);
@@ -5997,14 +6181,20 @@ diff --git a/two.rs b/two.rs
         }
         let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
         let mut prepared = prepare_review(&snapshot).unwrap();
-        let mut batches = spool_model_batches(&mut prepared, 4_096, 1_024, false).unwrap();
+        let mut batches = spool_model_batches(
+            &mut prepared,
+            MIN_REVIEW_BATCH_BYTES,
+            MIN_REVIEW_BATCH_BYTES / 3,
+            false,
+        )
+        .unwrap();
         let source_count = batches.source_count;
         let total_count = batches.count;
         let mut recursive_levels = BTreeSet::new();
         let mut final_level = 0usize;
         let mut final_synthesis = String::new();
         while let Some(batch) = batches.next_batch().unwrap() {
-            assert!(batch.len() <= 4_096);
+            assert!(batch.len() <= MIN_REVIEW_BATCH_BYTES);
             if let Some(level) = batch
                 .lines()
                 .next()

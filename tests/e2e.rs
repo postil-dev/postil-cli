@@ -39,6 +39,22 @@ fn llm_content(findings: Value) -> Value {
     })
 }
 
+fn is_synthesis_review_request(request: &Request) -> bool {
+    request
+        .headers
+        .get("x-postil-review-route")
+        .and_then(|value| value.to_str().ok())
+        == Some("synthesis")
+}
+
+fn is_source_review_request(request: &Request) -> bool {
+    request
+        .headers
+        .get("x-postil-review-route")
+        .and_then(|value| value.to_str().ok())
+        == Some("source")
+}
+
 fn scorer_content(scores: Value) -> Value {
     scorer_text(&scores.to_string())
 }
@@ -226,13 +242,14 @@ fn prompt_evidence(request: &Request, path: &str, line: u32, needle: &str) -> St
         .and_then(|messages| messages.last())
         .and_then(|message| message["content"].as_str())
         .expect("review request contains a user prompt");
+    let displayed_path = postil_cli::diff::display_path(path);
     let mut current_path = None;
     for rendered in prompt.lines() {
         if let Some(header) = rendered.strip_prefix("### ") {
             current_path = Some(header.trim());
             continue;
         }
-        if current_path != Some(path) || !rendered.contains(needle) {
+        if current_path != Some(displayed_path.as_str()) || !rendered.contains(needle) {
             continue;
         }
         let Some((number, marked)) = rendered.trim_start().split_once(' ') else {
@@ -249,6 +266,42 @@ fn prompt_evidence(request: &Request, path: &str, line: u32, needle: &str) -> St
         }
     }
     panic!("prompt did not contain exact evidence for {path}:{line}");
+}
+
+fn prompt_added_evidence_at(request: &Request, path: &str, line: u32) -> String {
+    const EVIDENCE_BOUNDARY: &str =
+        "Review evidence (cite exactly the numbered new-file or change-metadata lines):\n\n";
+    let payload: Value = serde_json::from_slice(&request.body).unwrap();
+    let prompt = payload["messages"]
+        .as_array()
+        .and_then(|messages| messages.last())
+        .and_then(|message| message["content"].as_str())
+        .expect("review request contains a user prompt");
+    let evidence_prompt = prompt
+        .rsplit_once(EVIDENCE_BOUNDARY)
+        .map(|(_, evidence)| evidence)
+        .expect("review request contains the trusted evidence boundary");
+    let displayed_path = postil_cli::diff::display_path(path);
+    let mut current_path = None;
+    for rendered in evidence_prompt.lines() {
+        if let Some(header) = rendered.strip_prefix("### ") {
+            current_path = Some(header.trim());
+            continue;
+        }
+        if current_path != Some(displayed_path.as_str()) {
+            continue;
+        }
+        let Some((number, marked)) = rendered.trim_start().split_once(' ') else {
+            continue;
+        };
+        if number.parse::<u32>().ok() != Some(line) {
+            continue;
+        }
+        if let Some(evidence) = marked.strip_prefix("+ ") {
+            return evidence.to_string();
+        }
+    }
+    panic!("prompt did not contain exact added evidence for {path}:{line}");
 }
 
 fn fixture_credential(label: &str) -> String {
@@ -977,6 +1030,14 @@ async fn native_anthropic_truncation_retries_the_complete_original_request() {
     assert_eq!(second["max_tokens"], 16_000);
     assert_eq!(first["system"], second["system"]);
     assert_eq!(first["messages"], second["messages"]);
+    assert!(requests.iter().all(is_source_review_request));
+    assert!(requests.iter().all(|request| {
+        request
+            .headers
+            .get("x-postil-review-call-phase")
+            .and_then(|value| value.to_str().ok())
+            == Some("initial")
+    }));
     assert!(
         !serde_json::to_string(&second)
             .unwrap()
@@ -2630,7 +2691,7 @@ async fn irreparable_batch_keeps_later_batches_in_the_strict_failure_envelope() 
         .and(path("/chat/completions"))
         .respond_with(|request: &wiremock::Request| {
             let body = String::from_utf8_lossy(&request.body);
-            if body.contains("bounded synthesis window") {
+            if is_synthesis_review_request(request) {
                 return ResponseTemplate::new(200).set_body_json(llm_content(json!([])));
             }
             if body.contains("invalid_batch_marker") {
@@ -2668,9 +2729,9 @@ async fn irreparable_batch_keeps_later_batches_in_the_strict_failure_envelope() 
         .await;
 
     let mut source = String::from(
-        "diff --git a/src/a-invalid.rs b/src/a-invalid.rs\n--- /dev/null\n+++ b/src/a-invalid.rs\n@@ -0,0 +1,700 @@\n+invalid_batch_marker();\n",
+        "diff --git a/src/a-invalid.rs b/src/a-invalid.rs\n--- /dev/null\n+++ b/src/a-invalid.rs\n@@ -0,0 +1,160 @@\n+invalid_batch_marker();\n",
     );
-    for line in 2..=700 {
+    for line in 2..=160 {
         writeln!(
             source,
             "+let padding_{line:04} = trusted; // {}",
@@ -3032,14 +3093,22 @@ async fn bounded_reviews_resolve_changed_prior_evidence_when_selected() {
     assert_eq!(incremental_envelope["gate"]["failing"], false);
 
     let requests = server.received_requests().await.unwrap();
+    let source_requests = requests
+        .iter()
+        .filter(|request| is_source_review_request(request))
+        .collect::<Vec<_>>();
+    assert!(!source_requests.is_empty());
+    assert!(
+        source_requests
+            .iter()
+            .any(|request| { String::from_utf8_lossy(&request.body).contains("LATE_ORIGINAL_") })
+    );
     let unselected_file = (0..7)
         .find(|file| {
             let marker = format!("LATE_ORIGINAL_{file}");
-            requests.iter().all(|request| {
-                let body = String::from_utf8_lossy(&request.body);
-                !body.contains("Review this selected source batch independently")
-                    || !body.contains(&marker)
-            })
+            source_requests
+                .iter()
+                .all(|request| !String::from_utf8_lossy(&request.body).contains(&marker))
         })
         .expect("bounded review leaves at least one source batch unselected");
     let unselected_baseline = json!({
@@ -3131,13 +3200,131 @@ async fn deletion_only_auth_change_is_reviewed_through_numbered_metadata() {
 async fn final_synthesis_detects_cross_batch_validation_sink_relationship() {
     use std::fmt::Write as _;
 
+    #[derive(Clone)]
+    struct RecordedReviewRequest {
+        body: Value,
+        route: String,
+        call_phase: String,
+    }
+
+    fn recorded_review_request(request: &Request) -> RecordedReviewRequest {
+        let header = |name: &str| {
+            request
+                .headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned()
+        };
+        RecordedReviewRequest {
+            body: request.body_json().unwrap(),
+            route: header("x-postil-review-route"),
+            call_phase: header("x-postil-review-call-phase"),
+        }
+    }
+
+    enum SynthesisRetryState {
+        AwaitingCorrection(RecordedReviewRequest),
+        AwaitingExpanded {
+            initial: RecordedReviewRequest,
+            correction: RecordedReviewRequest,
+        },
+    }
+
     let server = MockServer::start().await;
+    let retry_states = Arc::new(Mutex::new(
+        BTreeMap::<String, Vec<SynthesisRetryState>>::new(),
+    ));
+    let completed_lineages = Arc::new(Mutex::new(Vec::<[RecordedReviewRequest; 3]>::new()));
+    let responder_states = retry_states.clone();
+    let responder_lineages = completed_lineages.clone();
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(|request: &wiremock::Request| {
-            let body = String::from_utf8_lossy(&request.body);
-            let findings = if body.contains("validate_pair") && body.contains("dangerous_sink") {
-                let evidence = prompt_evidence(request, "src/sink.rs", 100, "dangerous_sink");
+        .respond_with(move |request: &wiremock::Request| {
+            let recorded = recorded_review_request(request);
+            let body = &recorded.body;
+            let model = body["model"].as_str().unwrap_or_default().to_owned();
+            let user = body["messages"][1]["content"].as_str().unwrap_or_default();
+            let max_tokens = body["max_tokens"].as_u64();
+            if max_tokens == Some(4_000) {
+                let mut states = responder_states.lock().unwrap();
+                let model_states = states.entry(model.clone()).or_default();
+                let correction = model_states.iter().position(|state| {
+                    let SynthesisRetryState::AwaitingCorrection(initial) = state else {
+                        return false;
+                    };
+                    let initial_user = initial.body["messages"][1]["content"]
+                        .as_str()
+                        .unwrap_or_default();
+                    user.starts_with(&format!("{initial_user}\n\n[Your previous response]\n"))
+                });
+                if let Some(index) = correction {
+                    let SynthesisRetryState::AwaitingCorrection(initial) =
+                        model_states.remove(index)
+                    else {
+                        unreachable!()
+                    };
+                    model_states.push(SynthesisRetryState::AwaitingExpanded {
+                        initial,
+                        correction: recorded.clone(),
+                    });
+                    drop(states);
+                    return ResponseTemplate::new(200).set_body_json(json!({
+                        "choices": [{
+                            "finish_reason": "length",
+                            "message": {"content": null, "reasoning": "budget exhausted"}
+                        }],
+                        "usage": {
+                            "prompt_tokens": 100,
+                            "completion_tokens": 4_000,
+                            "completion_tokens_details": {"reasoning_tokens": 4_000},
+                            "cost": 0.000123
+                        }
+                    }));
+                }
+                model_states.push(SynthesisRetryState::AwaitingCorrection(recorded));
+                drop(states);
+                return ResponseTemplate::new(200).set_body_json(json!({
+                    "choices": [{"finish_reason": "stop", "message": {"content": json!({
+                        "summary": "The synthesized relationship is risky.",
+                        "findings": []
+                    }).to_string()}}],
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 50, "cost": 0.000123}
+                }));
+            }
+            let expanded_synthesis = if max_tokens == Some(8_000) {
+                let mut states = responder_states.lock().unwrap();
+                let model_states = states.entry(model).or_default();
+                let expanded = model_states.iter().position(|state| {
+                    matches!(
+                        state,
+                        SynthesisRetryState::AwaitingExpanded { correction, .. }
+                            if correction.body["messages"] == body["messages"]
+                    )
+                });
+                if let Some(index) = expanded {
+                    let SynthesisRetryState::AwaitingExpanded {
+                        initial,
+                        correction,
+                    } = model_states.remove(index)
+                    else {
+                        unreachable!()
+                    };
+                    drop(states);
+                    responder_lineages
+                        .lock()
+                        .unwrap()
+                        .push([initial, correction, recorded]);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            let findings = if expanded_synthesis {
+                let _validated = prompt_added_evidence_at(request, "src/validate.rs", 100);
+                let evidence = prompt_added_evidence_at(request, "src/sink.rs", 100);
                 json!([{
                     "path": "src/sink.rs",
                     "line": 100,
@@ -3203,14 +3390,24 @@ async fn final_synthesis_detects_cross_batch_validation_sink_relationship() {
     let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     assert_eq!(envelope["findings"][0]["path"], "src/sink.rs");
     assert_eq!(envelope["findings"][0]["line"], 100);
-    let requests = server.received_requests().await.unwrap();
-    assert!(requests.len() >= 3);
-    assert!(requests.iter().any(|request| {
-        let body = String::from_utf8_lossy(&request.body);
-        body.contains("bounded synthesis window")
-            && body.contains("validate_pair")
-            && body.contains("dangerous_sink")
-    }));
+    let lineages = completed_lineages.lock().unwrap();
+    assert!(!lineages.is_empty());
+    for calls in lineages.iter() {
+        assert!(calls.iter().all(|call| call.route == "synthesis"));
+        assert_eq!(calls[0].call_phase, "initial");
+        assert_eq!(calls[1].call_phase, "semantic-retry");
+        assert_eq!(calls[2].call_phase, "semantic-retry");
+        assert_eq!(calls[0].body["max_tokens"], 4_000);
+        assert_eq!(calls[1].body["max_tokens"], 4_000);
+        assert_eq!(calls[2].body["max_tokens"], 8_000);
+        let initial_user = calls[0].body["messages"][1]["content"].as_str().unwrap();
+        let correction_user = calls[1].body["messages"][1]["content"].as_str().unwrap();
+        assert!(
+            correction_user.starts_with(&format!("{initial_user}\n\n[Your previous response]\n"))
+        );
+        assert_eq!(calls[1].body["messages"], calls[2].body["messages"]);
+    }
+    assert!(retry_states.lock().unwrap().values().all(Vec::is_empty));
 }
 
 #[cfg(feature = "qualification-candidate")]
@@ -3299,8 +3496,7 @@ async fn bounded_synthesis_repairs_source_exact_evidence_without_relaxing_valida
     assert!(review_requests.len() >= 2);
     assert!(review_requests.iter().all(|request| {
         let body: Value = request.body_json().unwrap();
-        let serialized = String::from_utf8_lossy(&request.body);
-        let expected = if serialized.contains("bounded synthesis window") {
+        let expected = if is_synthesis_review_request(request) {
             4_000
         } else {
             8_000
@@ -3432,6 +3628,47 @@ async fn model_chain_above_hard_cap_fails_before_provider_calls() {
         .code(1);
     let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     assert_eq!(envelope["findings"][0]["title"], "Review incomplete");
+    let body = envelope["findings"][0]["body"].as_str().unwrap();
+    assert!(body.contains("configured model fan-out"));
+    assert!(!body.contains("bounded review budget"));
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(stderr.contains("configured model fan-out is invalid"));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn reserved_review_anchor_reports_its_cause_without_provider_contact() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let diff = dir.path().join("reserved.diff");
+    std::fs::write(
+        &diff,
+        "diff --git a/.postil/model-output b/.postil/model-output\n\
+         new file mode 100644\n\
+         --- /dev/null\n\
+         +++ b/.postil/model-output\n\
+         @@ -0,0 +1 @@\n\
+         +repository content\n",
+    )
+    .unwrap();
+
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .code(1);
+
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let body = envelope["findings"][0]["body"].as_str().unwrap();
+    assert!(body.contains("path reserved"));
+    assert!(body.contains("Rename the conflicting path"));
+    assert!(!body.contains("bounded review budget"));
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(stderr.contains("contains reserved evidence"));
     assert!(server.received_requests().await.unwrap().is_empty());
 }
 
@@ -5946,6 +6183,166 @@ async fn full_remote_review_uses_an_immutable_merge_base_snapshot() {
 }
 
 #[tokio::test]
+async fn insufficient_shared_context_reports_its_cause_without_provider_contact() {
+    let server = MockServer::start().await;
+    mount_github_complete_diff(&server, 7).await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .and(header("Accept", "application/vnd.github.v3.diff"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(DIFF))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "x".repeat(40_000),
+            "body": "",
+            "state": "open", "merged": false,
+            "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"}, "changed_files": 1
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .env("REVIEW_MODEL", "example/unknown-context")
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .args([
+            "review",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--no-post",
+            "--output",
+            "json",
+        ])
+        .assert()
+        .code(1);
+
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let body = envelope["findings"][0]["body"].as_str().unwrap();
+    assert!(body.contains("serialized shared review context"));
+    assert!(body.contains("conservative context limit"));
+    assert!(!body.contains("bounded review budget"));
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(stderr.contains("review context budget is insufficient"));
+    let requests = server.received_requests().await.unwrap();
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.url.path() != "/chat/completions")
+    );
+}
+
+#[tokio::test]
+async fn remote_dependabot_description_uses_bounded_provider_context() {
+    let server = MockServer::start().await;
+    let body = format!(
+        "Bumps example/action from 1 to 2.\n\nRelease notes\n\n{}\nDEPENDABOT_BODY_TAIL",
+        "x".repeat(128_000)
+    );
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/repos/acme/api/compare/b+\.\.\.a+$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "merge_base_commit": {"sha": "bbbbbbbb"},
+            "files": []
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7/files"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "filename": ".github/workflows/dependabot.yml",
+            "status": "modified",
+            "changes": 1
+        }])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/repos/acme/api/contents/.github/workflows/dependabot.yml",
+        ))
+        .respond_with(|request: &Request| {
+            let base = request
+                .url
+                .query_pairs()
+                .any(|(name, value)| name == "ref" && value.starts_with('b'));
+            let source = if base {
+                "uses: example/action@v1\n"
+            } else {
+                "uses: example/action@v2\n"
+            };
+            ResponseTemplate::new(200).set_body_string(source)
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "Bump example/action from 1 to 2",
+            "body": body,
+            "state": "open", "merged": false,
+            "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"}, "changed_files": 1
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .env("REVIEW_MODEL", "z-ai/glm-5.2")
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .args([
+            "review",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--no-post",
+            "--output",
+            "json",
+        ])
+        .assert()
+        .success();
+
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert!(envelope["findings"].as_array().unwrap().is_empty());
+    assert_eq!(envelope["gate"]["failing"], false);
+    let requests = server.received_requests().await.unwrap();
+    let model_requests = requests
+        .iter()
+        .filter(|request| request.url.path() == "/chat/completions")
+        .collect::<Vec<_>>();
+    assert_eq!(model_requests.len(), 1);
+    let model_body = String::from_utf8_lossy(&model_requests[0].body);
+    let model_json: Value = serde_json::from_slice(&model_requests[0].body).unwrap();
+    assert_eq!(model_json["model"], "z-ai/glm-5.2");
+    assert!(model_body.contains("uses: example/action@v2"));
+    assert!(!model_body.contains("DEPENDABOT_BODY_TAIL"));
+    assert!(model_body.len() + 16_000 <= 128_000);
+}
+
+#[tokio::test]
 async fn github_large_lockfile_streams_past_legacy_response_limit_and_compacts() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -6845,7 +7242,7 @@ async fn all_ungrounded_primary_exhausts_one_retry_then_cascades_before_forge_wr
     mount_github_complete_diff(&server, 7).await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .and(body_string_contains("primary-model"))
+        .and(body_string_contains("openai/gpt-5-mini"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(llm_content(json!([finding_at(999, "error", 0.9)]))),
@@ -6855,7 +7252,7 @@ async fn all_ungrounded_primary_exhausts_one_retry_then_cascades_before_forge_wr
         .await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .and(body_string_contains("backup-model"))
+        .and(body_string_contains("z-ai/glm-5.2"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(llm_content(json!([finding_at(41, "error", 0.9)]))),
@@ -6896,8 +7293,8 @@ async fn all_ungrounded_primary_exhausts_one_retry_then_cascades_before_forge_wr
         .env("POSTIL_API_BASE", server.uri())
         .env("GITHUB_API_URL", server.uri())
         .env("GITHUB_TOKEN", "gh-test-token")
-        .env("REVIEW_MODEL", "primary-model")
-        .env("REVIEW_MODEL_CASCADE", "backup-model")
+        .env("REVIEW_MODEL", "openai/gpt-5-mini")
+        .env("REVIEW_MODEL_CASCADE", "z-ai/glm-5.2")
         .args([
             "review",
             "--publish",
@@ -6912,7 +7309,7 @@ async fn all_ungrounded_primary_exhausts_one_retry_then_cascades_before_forge_wr
     let env: Value =
         serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
     assert_eq!(env["findings"][0]["path"], "src/auth.rs");
-    assert_eq!(env["modelUsed"], "backup-model");
+    assert_eq!(env["modelUsed"], "z-ai/glm-5.2");
     assert_eq!(env["usage"]["promptTokens"], 300);
     assert_eq!(env["usage"]["completionTokens"], 150);
     assert_eq!(env["modelUsage"].as_array().unwrap().len(), 3);

@@ -353,6 +353,21 @@ pub fn respond_system_prompt(cfg: &Config) -> String {
     p
 }
 
+const MAX_PR_BODY_PROMPT_CHARS: usize = 2_000;
+
+fn bounded_pr_body(body: Option<&str>) -> Option<String> {
+    body.map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .chars()
+                .take(MAX_PR_BODY_PROMPT_CHARS)
+                .collect::<String>()
+        })
+        .map(|value| value.trim_end().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 /// Render the PR title and description as a numbered block under the reserved
 /// content-policy path, mirroring the diff's left-margin line numbering so the
 /// model can cite a real, groundable line. Returns the rendered text and the
@@ -364,8 +379,7 @@ pub fn render_pr_description(title: Option<&str>, body: Option<&str>) -> (String
     // Truncation lives here, not in the callers: the grounding range in
     // review.rs and the prompt block in user_prompt must count the same
     // lines, or the index would accept line numbers the model never saw.
-    let body: String = body.unwrap_or("").trim().chars().take(2000).collect();
-    let body = body.trim_end();
+    let body = bounded_pr_body(body).unwrap_or_default();
     if title.is_empty() && body.is_empty() {
         return (String::new(), 0);
     }
@@ -382,7 +396,10 @@ pub fn render_pr_description(title: Option<&str>, body: Option<&str>) -> (String
     (out, line_no)
 }
 
-pub fn user_prompt(ctx: &PrContext, annotated_diff: &str, max_findings: usize) -> String {
+/// Render the PR metadata prefix exactly as it appears in a review prompt.
+/// Keeping this separate lets review admission account for the bounded text
+/// that can actually reach a provider.
+pub(crate) fn pr_context_prompt(ctx: &PrContext<'_>) -> String {
     let mut p = String::new();
     if let Some(repo) = ctx.repo {
         p.push_str(&format!("Repository: {repo}\n"));
@@ -413,14 +430,16 @@ pub fn user_prompt(ctx: &PrContext, annotated_diff: &str, max_findings: usize) -
         if let Some(title) = ctx.title {
             p.push_str(&format!("PR title: {title}\n"));
         }
-        let truncated_body: Option<String> = ctx
-            .body
-            .filter(|b| !b.trim().is_empty())
-            .map(|b| b.chars().take(2000).collect());
+        let truncated_body = bounded_pr_body(ctx.body);
         if let Some(body) = &truncated_body {
             p.push_str(&format!("PR description:\n{body}\n"));
         }
     }
+    p
+}
+
+pub fn user_prompt(ctx: &PrContext, annotated_diff: &str, max_findings: usize) -> String {
+    let mut p = pr_context_prompt(ctx);
     if ctx.incremental {
         p.push_str(
             "\nThis is an INCREMENTAL review: the diff below covers only commits pushed \
@@ -447,6 +466,24 @@ mod tests {
         assert_eq!(focus.len(), MAX_FOCUS_PROMPT_BYTES);
         assert!(focus.ends_with(PROMPT_TRUNCATION_MARKER));
     }
+
+    #[test]
+    fn numbered_and_plain_pr_context_share_the_body_limit() {
+        let body = format!("{}TAIL", "x".repeat(MAX_PR_BODY_PROMPT_CHARS));
+        let numbered = render_pr_description(Some("title"), Some(&body)).0;
+        let plain = pr_context_prompt(&PrContext {
+            repo: None,
+            title: Some("title"),
+            body: Some(&body),
+            incremental: false,
+            content_policy: false,
+        });
+        assert!(numbered.contains(&"x".repeat(MAX_PR_BODY_PROMPT_CHARS)));
+        assert!(plain.contains(&"x".repeat(MAX_PR_BODY_PROMPT_CHARS)));
+        assert!(!numbered.contains("TAIL"));
+        assert!(!plain.contains("TAIL"));
+    }
+
     use crate::config::Config;
 
     #[test]
@@ -610,6 +647,27 @@ mod tests {
         let p = user_prompt(&ctx, "DIFF", 5);
         assert!(!p.contains(".postil/pr-description"));
         assert!(p.contains("PR title: Add feature"));
+    }
+
+    #[test]
+    fn pr_context_prompt_uses_the_bounded_body_that_reaches_the_provider() {
+        let body = format!("{} tail marker", "x".repeat(2_000));
+        let ctx = PrContext {
+            repo: None,
+            title: Some("Bump example/action from 1 to 2"),
+            body: Some(&body),
+            incremental: false,
+            content_policy: false,
+        };
+
+        let prompt = pr_context_prompt(&ctx);
+        assert_eq!(
+            prompt,
+            format!(
+                "PR title: Bump example/action from 1 to 2\nPR description:\n{}\n",
+                "x".repeat(2_000)
+            )
+        );
     }
 
     #[test]

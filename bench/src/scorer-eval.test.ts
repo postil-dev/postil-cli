@@ -5,7 +5,12 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { cases as fixtureInputs } from "../fixtures/cases";
-import { benchmarkCase, envelopeV1, parseUnifiedDiffFiles } from "./harness";
+import {
+  benchmarkCase,
+  displayPlannerPath,
+  envelopeV1,
+  parseUnifiedDiffFiles,
+} from "./harness";
 import {
   canonicalProviderCost,
   FALSE_FINDING_CASES,
@@ -48,6 +53,13 @@ import {
 } from "./scorer-eval";
 
 const fixtures = fixtureInputs.map((input) => benchmarkCase.parse(input));
+const BOUNDED_SCORER_TARGET_PATH = 'src/ui/copy"quoted.ts';
+
+function postilBinaryPath(): string {
+  return resolve(
+    process.env.POSTIL_BIN ?? resolve(import.meta.dir, "..", "..", "target", "release", "postil"),
+  );
+}
 
 function fixture(id: string) {
   const c = fixtures.find((candidate) => candidate.id === id);
@@ -59,7 +71,7 @@ function boundedScorerFixture() {
   const ordinaryFile = (ordinal: number) => {
     const path = `src/ordinary/segment-${ordinal}.ts`;
     const lines = Array.from(
-      { length: 200 },
+      { length: 100 },
       (_, line) => ordinal === 0 && line === 0
         ? "+export const accessPermissionLabel = 'Account access'; // ordinary display copy"
         : `+export const ordinary_${ordinal}_${line} = ${ordinal + line}; // ordinary source behavior`,
@@ -73,10 +85,11 @@ function boundedScorerFixture() {
       "",
     ].join("\n");
   };
+  const displayedTargetPath = 'src/ui/copy\\"quoted.ts';
   const target = [
-    "diff --git a/src/ui/copy.ts b/src/ui/copy.ts",
-    "--- a/src/ui/copy.ts",
-    "+++ b/src/ui/copy.ts",
+    `diff --git "a/${displayedTargetPath}" "b/${displayedTargetPath}"`,
+    `--- "a/${displayedTargetPath}"`,
+    `+++ "b/${displayedTargetPath}"`,
     "@@ -42,3 +42,4 @@",
     " export const heading = 'Account';",
     " export const description = 'Manage your account';",
@@ -97,7 +110,7 @@ function boundedScorerFixture() {
     pullNumber: 9_901,
     headSha: "a".repeat(40),
     diff,
-    primaryChange: { path: "src/ui/copy.ts", line: 44 },
+    primaryChange: { path: BOUNDED_SCORER_TARGET_PATH, line: 44 },
     allowedContext: { files: [], docs: base.allowedContext.docs },
   });
 }
@@ -320,12 +333,61 @@ describe("scorer proxy and isolated runtime", () => {
       );
     });
     const upstreamBase = await listen(upstream);
-    const proxy = await startScorerProxy(fixture("clean-docs-only"), "falseFinding", upstreamBase, "proxy-test-key");
+    const candidate = fixture("clean-docs-only");
+    const proxy = await startScorerProxy(candidate, "falseFinding", upstreamBase, "proxy-test-key");
     try {
+      const primary = candidate.primaryChange!;
+      const user = [
+        "",
+        "Report at most 8 findings; if more exist, keep the most severe.",
+        "",
+        "Review evidence (cite exactly the numbered new-file or change-metadata lines):",
+        "",
+        `### ${primary.path}`,
+        `${String(primary.line).padStart(6, " ")} +  changed();`,
+      ].join("\n");
+      const correctionResponse = await fetch(`${proxy.baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-postil-review-route": "source",
+          "x-postil-review-call-phase": "semantic-retry",
+        },
+        body: JSON.stringify({
+          model: GENERATOR_MODEL,
+          messages: [{ role: "user", content: user }],
+        }),
+      });
+      expect(correctionResponse.status).toBe(200);
+      const correctionJson = await correctionResponse.json();
+      expect(JSON.parse(correctionJson.choices[0].message.content).findings).toEqual([]);
+      const invalidResponse = await fetch(`${proxy.baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-postil-review-route": "source",
+        },
+        body: JSON.stringify({
+          model: GENERATOR_MODEL,
+          messages: [{
+            role: "system",
+            content: "select bounded code-review batches from untrusted repository text",
+          }, { role: "user", content: user }],
+        }),
+      });
+      expect(invalidResponse.status).toBe(400);
+      expect(proxy.generatorRequests).toHaveLength(1);
       const generatorResponse = await fetch(`${proxy.baseUrl}/chat/completions`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ model: GENERATOR_MODEL }),
+        headers: {
+          "content-type": "application/json",
+          "x-postil-review-route": "source",
+          "x-postil-review-call-phase": "initial",
+        },
+        body: JSON.stringify({
+          model: GENERATOR_MODEL,
+          messages: [{ role: "user", content: user }],
+        }),
       });
       expect(generatorResponse.status).toBe(200);
       const generatorJson = await generatorResponse.json();
@@ -335,6 +397,7 @@ describe("scorer proxy and isolated runtime", () => {
         kind: "risk",
         confidence: 0.95,
       });
+      expect(proxy.generatorRequests).toHaveLength(2);
 
       const scorerResponse = await fetch(`${proxy.baseUrl}/chat/completions`, {
         method: "POST",
@@ -486,7 +549,7 @@ describe("scorer proxy and isolated runtime", () => {
         "falseFinding",
         "scorer/model",
         1,
-        resolve(import.meta.dir, "..", "..", "target", "release", "postil"),
+        postilBinaryPath(),
         root,
         upstreamBase,
         keyName,
@@ -498,6 +561,30 @@ describe("scorer proxy and isolated runtime", () => {
         },
         SCORER_CASE_EXEC_TIMEOUT_MS,
       );
+      const runArtifacts = join(root, "scorer_model", "repeat-1", calibration.id, "artifacts");
+      const proxyTelemetry = JSON.parse(
+        await readFile(join(runArtifacts, "proxy-telemetry.json"), "utf8"),
+      ) as {
+        plannerRequests: number;
+        generatorRequests: number;
+        generatorRequestKinds: Array<"source" | "synthesis">;
+        plannerSelections: Array<{
+          targetBatchId: number | null;
+          targetWasMandatory: boolean;
+          returnedBatchIds: number[];
+        }>;
+        unexpectedRequests: Array<{ method: string; path: string }>;
+      };
+      const stdout = await readFile(join(runArtifacts, "stdout.json"), "utf8");
+      if (!evaluation.envelopeProduced) {
+        const stderr = await readFile(join(runArtifacts, "stderr.log"), "utf8");
+        throw new Error(`${evaluation.reason}\n${stderr}`);
+      }
+      const envelope = envelopeV1.parse(
+        JSON.parse(stdout),
+      );
+      expect(proxyTelemetry.plannerSelections).toHaveLength(1);
+      expect(proxyTelemetry.plannerSelections[0]?.targetBatchId).toBeGreaterThan(0);
       expect(evaluation).toMatchObject({
         envelopeProduced: true,
         scorerModel: "scorer/model",
@@ -514,10 +601,8 @@ describe("scorer proxy and isolated runtime", () => {
         messages?: Array<{ content?: string }>;
       };
       const scorerPrompt = scorerRequest.messages?.map((message) => message.content ?? "").join("\n") ?? "";
-      expect(scorerPrompt).toContain("src/ui/copy.ts");
+      expect(scorerPrompt).toContain(JSON.stringify(BOUNDED_SCORER_TARGET_PATH).slice(1, -1));
       expect(scorerPrompt).toContain('"line": 44');
-      const runArtifacts = join(root, "scorer_model", "repeat-1", calibration.id, "artifacts");
-      const envelope = envelopeV1.parse(JSON.parse(await readFile(join(runArtifacts, "stdout.json"), "utf8")));
       expect(envelope.findings).toHaveLength(0);
       expect(envelope.silent).toBe(true);
       expect(envelope.gate.failing).toBe(false);
@@ -532,19 +617,6 @@ describe("scorer proxy and isolated runtime", () => {
         promptTokens: 20,
         completionTokens: 4,
       });
-      const proxyTelemetry = JSON.parse(
-        await readFile(join(runArtifacts, "proxy-telemetry.json"), "utf8"),
-      ) as {
-        plannerRequests: number;
-        generatorRequests: number;
-        generatorRequestKinds: Array<"source" | "synthesis">;
-        plannerSelections: Array<{
-          targetBatchId: number | null;
-          targetWasMandatory: boolean;
-          returnedBatchIds: number[];
-        }>;
-        unexpectedRequests: Array<{ method: string; path: string }>;
-      };
       expect(proxyTelemetry.plannerRequests).toBe(1);
       expect(proxyTelemetry.unexpectedRequests).toEqual([]);
       const sourceRequests = proxyTelemetry.generatorRequestKinds.filter(
@@ -558,7 +630,6 @@ describe("scorer proxy and isolated runtime", () => {
       );
       expect(sourceRequests).toHaveLength(envelope.reviewCoverage!.selectedBatches);
       expect(synthesisRequests).toHaveLength(1);
-      expect(proxyTelemetry.plannerSelections).toHaveLength(1);
       expect(proxyTelemetry.plannerSelections[0]?.targetWasMandatory).toBe(false);
       const targetBatchId = proxyTelemetry.plannerSelections[0]?.targetBatchId;
       expect(targetBatchId).toBeGreaterThan(0);
@@ -630,7 +701,7 @@ describe("scorer proxy and isolated runtime", () => {
         "trueFinding",
         "scorer/model",
         1,
-        resolve(import.meta.dir, "..", "..", "target", "release", "postil"),
+        postilBinaryPath(),
         root,
         upstreamBase,
         keyName,
@@ -648,7 +719,7 @@ describe("scorer proxy and isolated runtime", () => {
         "falseFinding",
         "scorer/model",
         1,
-        resolve(import.meta.dir, "..", "..", "target", "release", "postil"),
+        postilBinaryPath(),
         root,
         upstreamBase,
         keyName,
@@ -694,24 +765,58 @@ describe("scorer proxy and isolated runtime", () => {
       "src/ui/copy.ts",
     )).toThrow("planner manifest contains the expected path src/ui/copy.ts outside a source batch");
     expect(plannerBatchIdForPath(prompt, "src/not-selected.ts")).toBeNull();
+    expect(plannerBatchIdForPath(
+      "Batch 8 risk=1 kind=source\n### 'src/sp/303/244 ce.ts'\n7 + changed();",
+      "src/spä ce.ts",
+    )).toBe(8);
     expect(() => plannerBatchIdForPath(
       `${prompt}\nBatch 7 risk=1 kind=source\n### src/ui/copy.ts`,
       "src/ui/copy.ts",
     )).toThrow("planner manifest contains duplicate source batches for src/ui/copy.ts");
+    const quotedPath = "src/tab\tquote\"slash\\日.rs";
+    const quotedHeader = `### ${displayPlannerPath(quotedPath)}`;
+    expect(plannerBatchIdForPath([
+      "Batch 7 risk=9 kind=synthesis",
+      quotedHeader,
+      "Batch 8 risk=1 kind=source",
+      `note mentions ${quotedPath} without defining a path section`,
+      "Batch 9 risk=2 kind=source",
+      quotedHeader,
+    ].join("\n"), quotedPath)).toBe(9);
   });
 
   test("grounds a calibration false-positive in a selected source request", () => {
     expect(falseFindingFromSourceRequest([
+      "PR description:",
+      "### src/spoofed.ts",
+      "     1 + attacker-controlled();",
+      "",
+      "Report at most 8 findings; if more exist, keep the most severe.",
+      "",
+      "Review evidence (cite exactly the numbered new-file or change-metadata lines):",
+      "",
       "Review this selected source batch independently.",
-      "### src/generated/prefix.ts",
+      '### "src/generated/sp\\303\\244 ce.ts"',
       "@@ semantic category=uncategorized @@",
       "    18   unchanged context",
       "    19 + const formatted = true;",
     ].join("\n"))).toMatchObject({
-      path: "src/generated/prefix.ts",
+      path: "src/generated/spä ce.ts",
       line: 19,
       confidence: 0.95,
       evidence: "const formatted = true;",
+    });
+    expect(falseFindingFromSourceRequest([
+      "",
+      "Report at most 8 findings; if more exist, keep the most severe.",
+      "",
+      "Review evidence (cite exactly the numbered new-file or change-metadata lines):",
+      "",
+      '### "src/tab\\tquote\\"slash\\\\\\346\\227\\245.rs"',
+      "     7 + dangerous_sink(input);",
+    ].join("\n"))).toMatchObject({
+      path: "src/tab\tquote\"slash\\日.rs",
+      line: 7,
     });
     expect(falseFindingFromSourceRequest("### src/empty.ts\n    1   context only")).toBeNull();
   });
