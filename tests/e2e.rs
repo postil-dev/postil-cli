@@ -39,53 +39,20 @@ fn llm_content(findings: Value) -> Value {
     })
 }
 
-fn request_message_content(request: &Request, role: &str) -> Option<String> {
-    request
-        .body_json::<Value>()
-        .ok()?
-        .get("messages")?
-        .as_array()?
-        .iter()
-        .find(|message| message.get("role").and_then(Value::as_str) == Some(role))?
-        .get("content")?
-        .as_str()
-        .map(str::to_owned)
-}
-
-fn review_evidence_from_prompt(prompt: &str) -> Option<&str> {
-    const PREFIX: &str = "\nReport at most ";
-    const SUFFIX: &str = " findings; if more exist, keep the most severe.\n\nReview evidence (cite exactly the numbered new-file or change-metadata lines):\n\n";
-    let mut evidence = None;
-    for (start, _) in prompt.match_indices(PREFIX) {
-        let tail = &prompt[start + PREFIX.len()..];
-        let digits = tail.bytes().take_while(u8::is_ascii_digit).count();
-        if digits > 0 && tail[digits..].starts_with(SUFFIX) {
-            evidence = Some(&tail[digits + SUFFIX.len()..]);
-        }
-    }
-    evidence
-}
-
 fn is_synthesis_review_request(request: &Request) -> bool {
-    let max_tokens = request
-        .body_json::<Value>()
-        .ok()
-        .and_then(|body| body.get("max_tokens").and_then(Value::as_u64));
-    max_tokens == Some(4_000)
-        || (max_tokens == Some(8_000)
-            && request_message_content(request, "user")
-                .and_then(|user| review_evidence_from_prompt(&user).map(str::to_owned))
-                .is_some_and(|evidence| {
-                    evidence.starts_with("This is bounded synthesis from a larger diff.")
-                        || evidence.starts_with("Cross-window semantic digests")
-                        || evidence.starts_with("Cross-batch semantic digests")
-                }))
+    request
+        .headers
+        .get("x-postil-review-route")
+        .and_then(|value| value.to_str().ok())
+        == Some("synthesis")
 }
 
 fn is_source_review_request(request: &Request) -> bool {
-    request_message_content(request, "system")
-        .is_some_and(|system| !system.contains("select bounded code-review batches"))
-        && !is_synthesis_review_request(request)
+    request
+        .headers
+        .get("x-postil-review-route")
+        .and_then(|value| value.to_str().ok())
+        == Some("source")
 }
 
 fn scorer_content(scores: Value) -> Value {
@@ -1063,6 +1030,14 @@ async fn native_anthropic_truncation_retries_the_complete_original_request() {
     assert_eq!(second["max_tokens"], 16_000);
     assert_eq!(first["system"], second["system"]);
     assert_eq!(first["messages"], second["messages"]);
+    assert!(requests.iter().all(is_source_review_request));
+    assert!(requests.iter().all(|request| {
+        request
+            .headers
+            .get("x-postil-review-call-phase")
+            .and_then(|value| value.to_str().ok())
+            == Some("initial")
+    }));
     assert!(
         !serde_json::to_string(&second)
             .unwrap()
@@ -3225,22 +3200,49 @@ async fn deletion_only_auth_change_is_reviewed_through_numbered_metadata() {
 async fn final_synthesis_detects_cross_batch_validation_sink_relationship() {
     use std::fmt::Write as _;
 
+    #[derive(Clone)]
+    struct RecordedReviewRequest {
+        body: Value,
+        route: String,
+        call_phase: String,
+    }
+
+    fn recorded_review_request(request: &Request) -> RecordedReviewRequest {
+        let header = |name: &str| {
+            request
+                .headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned()
+        };
+        RecordedReviewRequest {
+            body: request.body_json().unwrap(),
+            route: header("x-postil-review-route"),
+            call_phase: header("x-postil-review-call-phase"),
+        }
+    }
+
     enum SynthesisRetryState {
-        AwaitingCorrection(Value),
-        AwaitingExpanded { initial: Value, correction: Value },
+        AwaitingCorrection(RecordedReviewRequest),
+        AwaitingExpanded {
+            initial: RecordedReviewRequest,
+            correction: RecordedReviewRequest,
+        },
     }
 
     let server = MockServer::start().await;
     let retry_states = Arc::new(Mutex::new(
         BTreeMap::<String, Vec<SynthesisRetryState>>::new(),
     ));
-    let completed_lineages = Arc::new(Mutex::new(Vec::<[Value; 3]>::new()));
+    let completed_lineages = Arc::new(Mutex::new(Vec::<[RecordedReviewRequest; 3]>::new()));
     let responder_states = retry_states.clone();
     let responder_lineages = completed_lineages.clone();
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .respond_with(move |request: &wiremock::Request| {
-            let body: Value = request.body_json().unwrap();
+            let recorded = recorded_review_request(request);
+            let body = &recorded.body;
             let model = body["model"].as_str().unwrap_or_default().to_owned();
             let user = body["messages"][1]["content"].as_str().unwrap_or_default();
             let max_tokens = body["max_tokens"].as_u64();
@@ -3251,7 +3253,7 @@ async fn final_synthesis_detects_cross_batch_validation_sink_relationship() {
                     let SynthesisRetryState::AwaitingCorrection(initial) = state else {
                         return false;
                     };
-                    let initial_user = initial["messages"][1]["content"]
+                    let initial_user = initial.body["messages"][1]["content"]
                         .as_str()
                         .unwrap_or_default();
                     user.starts_with(&format!("{initial_user}\n\n[Your previous response]\n"))
@@ -3264,7 +3266,7 @@ async fn final_synthesis_detects_cross_batch_validation_sink_relationship() {
                     };
                     model_states.push(SynthesisRetryState::AwaitingExpanded {
                         initial,
-                        correction: body.clone(),
+                        correction: recorded.clone(),
                     });
                     drop(states);
                     return ResponseTemplate::new(200).set_body_json(json!({
@@ -3280,7 +3282,7 @@ async fn final_synthesis_detects_cross_batch_validation_sink_relationship() {
                         }
                     }));
                 }
-                model_states.push(SynthesisRetryState::AwaitingCorrection(body.clone()));
+                model_states.push(SynthesisRetryState::AwaitingCorrection(recorded));
                 drop(states);
                 return ResponseTemplate::new(200).set_body_json(json!({
                     "choices": [{"finish_reason": "stop", "message": {"content": json!({
@@ -3297,7 +3299,7 @@ async fn final_synthesis_detects_cross_batch_validation_sink_relationship() {
                     matches!(
                         state,
                         SynthesisRetryState::AwaitingExpanded { correction, .. }
-                            if correction["messages"] == body["messages"]
+                            if correction.body["messages"] == body["messages"]
                     )
                 });
                 if let Some(index) = expanded {
@@ -3312,7 +3314,7 @@ async fn final_synthesis_detects_cross_batch_validation_sink_relationship() {
                     responder_lineages
                         .lock()
                         .unwrap()
-                        .push([initial, correction, body.clone()]);
+                        .push([initial, correction, recorded]);
                     true
                 } else {
                     false
@@ -3391,15 +3393,19 @@ async fn final_synthesis_detects_cross_batch_validation_sink_relationship() {
     let lineages = completed_lineages.lock().unwrap();
     assert!(!lineages.is_empty());
     for calls in lineages.iter() {
-        assert_eq!(calls[0]["max_tokens"], 4_000);
-        assert_eq!(calls[1]["max_tokens"], 4_000);
-        assert_eq!(calls[2]["max_tokens"], 8_000);
-        let initial_user = calls[0]["messages"][1]["content"].as_str().unwrap();
-        let correction_user = calls[1]["messages"][1]["content"].as_str().unwrap();
+        assert!(calls.iter().all(|call| call.route == "synthesis"));
+        assert_eq!(calls[0].call_phase, "initial");
+        assert_eq!(calls[1].call_phase, "semantic-retry");
+        assert_eq!(calls[2].call_phase, "semantic-retry");
+        assert_eq!(calls[0].body["max_tokens"], 4_000);
+        assert_eq!(calls[1].body["max_tokens"], 4_000);
+        assert_eq!(calls[2].body["max_tokens"], 8_000);
+        let initial_user = calls[0].body["messages"][1]["content"].as_str().unwrap();
+        let correction_user = calls[1].body["messages"][1]["content"].as_str().unwrap();
         assert!(
             correction_user.starts_with(&format!("{initial_user}\n\n[Your previous response]\n"))
         );
-        assert_eq!(calls[1]["messages"], calls[2]["messages"]);
+        assert_eq!(calls[1].body["messages"], calls[2].body["messages"]);
     }
     assert!(retry_states.lock().unwrap().values().all(Vec::is_empty));
 }

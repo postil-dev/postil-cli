@@ -3001,8 +3001,12 @@ fn parse_git_path_token(input: &str) -> Option<(String, &str)> {
                 let escaped = *bytes.get(index)?;
                 match escaped {
                     b'"' | b'\\' => decoded.push(escaped),
+                    b'a' => decoded.push(0x07),
+                    b'b' => decoded.push(0x08),
                     b't' => decoded.push(b'\t'),
                     b'n' => decoded.push(b'\n'),
+                    b'v' => decoded.push(0x0b),
+                    b'f' => decoded.push(0x0c),
                     b'r' => decoded.push(b'\r'),
                     b'0'..=b'7' => {
                         let mut value = (escaped - b'0') as u16;
@@ -4854,6 +4858,18 @@ Binary files a/img.png and b/img.png differ
         assert_eq!(parsed.files[0].old_path, "src/tab\tquote\"slash\\日.rs");
         let prepared = prepare_diff(source);
         assert!(!prepared.incomplete);
+    }
+
+    #[test]
+    fn git_named_control_escapes_decode_without_losing_identity() {
+        let source = "diff --git \"a/src/alarm\\aback\\bvertical\\vform\\f.rs\" \"b/src/alarm\\aback\\bvertical\\vform\\f.rs\"\n--- \"a/src/alarm\\aback\\bvertical\\vform\\f.rs\"\n+++ \"b/src/alarm\\aback\\bvertical\\vform\\f.rs\"\n@@ -0,0 +1 @@\n+safe();\n";
+        let parsed = parse(source);
+        assert_eq!(parsed.files.len(), 1);
+        assert_eq!(
+            parsed.files[0].path,
+            "src/alarm\u{7}back\u{8}vertical\u{b}form\u{c}.rs"
+        );
+        assert!(!prepare_diff(source).incomplete);
     }
 
     #[test]

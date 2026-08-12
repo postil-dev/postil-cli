@@ -12,7 +12,12 @@
 import { execFile as execFileCb } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import {
+  createServer,
+  type IncomingHttpHeaders,
+  type IncomingMessage,
+  type ServerResponse,
+} from "node:http";
 import type { AddressInfo } from "node:net";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -20,46 +25,84 @@ import { z } from "zod";
 
 const execFile = promisify(execFileCb);
 
-const SYNTHESIS_REVIEW_MAX_TOKENS = 4_000;
 const REVIEW_EVIDENCE_FRAMING =
   /\nReport at most \d+ findings; if more exist, keep the most severe\.\n\nReview evidence \(cite exactly the numbered new-file or change-metadata lines\):\n\n/gu;
-const REVIEW_RETRY_BOUNDARY = "\n\n[Your previous response]\n";
-const REVIEW_SYSTEM_PREFIX = "You are Postil, a merge-gate code reviewer.";
 
-// Initial synthesis uses the fixed 4,000-token budget. An 8,000-token request
-// is synthesis only when it repeats the exact messages from a recognized
-// 4,000-token synthesis call, leaving ordinary 8,000-token source requests unambiguous.
-export function isReviewSystemRequest(system: string): boolean {
-  return system.startsWith(REVIEW_SYSTEM_PREFIX);
-}
+export type ReviewRequestMetadata = {
+  route: "source" | "synthesis";
+  callPhase: "initial" | "schema-repair" | "semantic-retry";
+};
 
-export class SynthesisReviewRequestClassifier {
-  readonly #initialPrompts = new Set<string>();
-  readonly #synthesisMessages = new Set<string>();
+export type ModelRequestKind =
+  | ({ kind: "review" } & ReviewRequestMetadata)
+  | { kind: "planner" };
 
-  includes(
-    system: string,
-    user: string,
-    maxTokens: unknown,
-    messages: Array<{ role?: string; content?: string }> | undefined,
-  ): boolean {
-    if (!isReviewSystemRequest(system)) return false;
-    const messageSignature = JSON.stringify(messages ?? []);
-    if (maxTokens === SYNTHESIS_REVIEW_MAX_TOKENS * 2) {
-      return this.#synthesisMessages.has(messageSignature);
-    }
-    if (maxTokens !== SYNTHESIS_REVIEW_MAX_TOKENS) return false;
-    for (const initial of this.#initialPrompts) {
-      if (user.startsWith(`${initial}${REVIEW_RETRY_BOUNDARY}`)) {
-        this.#synthesisMessages.add(messageSignature);
-        return true;
-      }
-    }
-    this.#initialPrompts.add(user);
-    this.#synthesisMessages.add(messageSignature);
-    return true;
+export function reviewRequestMetadata(
+  headers: IncomingHttpHeaders,
+): ReviewRequestMetadata | null {
+  const route = headers["x-postil-review-route"];
+  const callPhase = headers["x-postil-review-call-phase"];
+  if (
+    typeof route !== "string" ||
+    !["source", "synthesis"].includes(route) ||
+    typeof callPhase !== "string" ||
+    !["initial", "schema-repair", "semantic-retry"].includes(callPhase)
+  ) {
+    return null;
   }
+  return {
+    route: route as ReviewRequestMetadata["route"],
+    callPhase: callPhase as ReviewRequestMetadata["callPhase"],
+  };
 }
+
+export function modelRequestKind(
+  headers: IncomingHttpHeaders,
+  system: string,
+): ModelRequestKind | null {
+  const metadata = reviewRequestMetadata(headers);
+  if (metadata !== null) return { kind: "review", ...metadata };
+  if (
+    headers["x-postil-review-route"] !== undefined ||
+    headers["x-postil-review-call-phase"] !== undefined
+  ) return null;
+  return system.includes("select bounded code-review batches") ? { kind: "planner" } : null;
+}
+
+export function displayPromptPath(path: string): string {
+  const bytes = Buffer.from(path, "utf8");
+  const asciiWhitespace = (byte: number) => byte === 0x20 || (byte >= 0x09 && byte <= 0x0d);
+  const boundaryWhitespace =
+    (bytes.length > 0 && asciiWhitespace(bytes[0]!)) ||
+    (bytes.length > 0 && asciiWhitespace(bytes[bytes.length - 1]!));
+  const safe = !boundaryWhitespace && bytes.every(
+    (byte) => byte >= 0x20 && byte <= 0x7e && byte !== 0x22 && byte !== 0x5c,
+  );
+  if (safe) return path;
+
+  let displayed = '"';
+  for (const byte of bytes) {
+    if (byte === 0x22) displayed += '\\"';
+    else if (byte === 0x5c) displayed += "\\\\";
+    else if (byte === 0x09) displayed += "\\t";
+    else if (byte === 0x0a) displayed += "\\n";
+    else if (byte === 0x0d) displayed += "\\r";
+    else if (byte >= 0x20 && byte <= 0x7e) displayed += String.fromCharCode(byte);
+    else displayed += `\\${byte.toString(8).padStart(3, "0")}`;
+  }
+  return `${displayed}"`;
+}
+
+export function plannerManifestPath(path: string): string {
+  return displayPromptPath(path)
+    .replaceAll("\t", " ")
+    .replaceAll("\r", " ")
+    .replaceAll('"', "'")
+    .replaceAll("\\", "/")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu, " ");
+}
+
+export const displayPlannerPath = plannerManifestPath;
 
 function parseGitPathToken(input: string): { value: string; rest: string } | undefined {
   if (!input.startsWith('"')) {
@@ -70,8 +113,8 @@ function parseGitPathToken(input: string): { value: string; rest: string } | und
   const bytes: number[] = [];
   let index = 1;
   while (index < input.length) {
-    const char = input[index]!;
-    if (char === '"') {
+    const character = input[index]!;
+    if (character === '"') {
       try {
         return {
           value: new TextDecoder("utf-8", { fatal: true }).decode(Uint8Array.from(bytes)),
@@ -81,7 +124,7 @@ function parseGitPathToken(input: string): { value: string; rest: string } | und
         return undefined;
       }
     }
-    if (char !== "\\") {
+    if (character !== "\\") {
       const codePoint = input.codePointAt(index);
       if (codePoint === undefined) return undefined;
       const unescaped = String.fromCodePoint(codePoint);
@@ -93,8 +136,12 @@ function parseGitPathToken(input: string): { value: string; rest: string } | und
     const escaped = input[index];
     if (escaped === undefined) return undefined;
     if (escaped === '"' || escaped === "\\") bytes.push(escaped.charCodeAt(0));
+    else if (escaped === "a") bytes.push(0x07);
+    else if (escaped === "b") bytes.push(0x08);
     else if (escaped === "t") bytes.push(0x09);
     else if (escaped === "n") bytes.push(0x0a);
+    else if (escaped === "v") bytes.push(0x0b);
+    else if (escaped === "f") bytes.push(0x0c);
     else if (escaped === "r") bytes.push(0x0d);
     else if (/^[0-7]$/u.test(escaped)) {
       let octal = escaped;
@@ -114,36 +161,8 @@ function parseGitPathToken(input: string): { value: string; rest: string } | und
 export function decodeDisplayedPath(displayed: string): string | undefined {
   if (!displayed.startsWith('"')) return displayed;
   const parsed = parseGitPathToken(displayed);
-  return parsed !== undefined && parsed.rest.trim().length === 0 ? parsed.value : undefined;
-}
-
-function displayPath(path: string): string {
-  const bytes = Buffer.from(path, "utf8");
-  const asciiWhitespace = (byte: number | undefined) =>
-    byte !== undefined && (byte === 0x20 || (byte >= 0x09 && byte <= 0x0d));
-  const quoted = asciiWhitespace(bytes[0]) || asciiWhitespace(bytes[bytes.length - 1]) ||
-    bytes.some((byte) => byte < 0x20 || byte > 0x7e || byte === 0x22 || byte === 0x5c);
-  if (!quoted) return path;
-  let rendered = '"';
-  for (const byte of bytes) {
-    if (byte === 0x22) rendered += '\\"';
-    else if (byte === 0x5c) rendered += "\\\\";
-    else if (byte === 0x09) rendered += "\\t";
-    else if (byte === 0x0a) rendered += "\\n";
-    else if (byte === 0x0d) rendered += "\\r";
-    else if (byte >= 0x20 && byte <= 0x7e) rendered += String.fromCharCode(byte);
-    else rendered += `\\${byte.toString(8).padStart(3, "0")}`;
-  }
-  return `${rendered}"`;
-}
-
-export function plannerManifestPath(path: string): string {
-  return displayPath(path)
-    .replaceAll("\t", " ")
-    .replaceAll("\r", " ")
-    .replaceAll('"', "'")
-    .replaceAll("\\", "/")
-    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu, " ");
+  if (parsed === undefined || parsed.rest.trim().length > 0) return undefined;
+  return displayPromptPath(parsed.value) === displayed ? parsed.value : undefined;
 }
 
 function parseGitMarkerPath(value: string): string | undefined {
@@ -164,10 +183,73 @@ function parseGitRenamePath(value: string): string | undefined {
   return parsed !== undefined && parsed.rest.trim().length === 0 ? parsed.value : undefined;
 }
 
+export function reviewEvidenceFromPrompt(user: string): string | undefined {
+  let evidenceStart = -1;
+  for (const match of user.matchAll(REVIEW_EVIDENCE_FRAMING)) {
+    evidenceStart = (match.index ?? -1) + match[0].length;
+  }
+  return evidenceStart < 0 ? undefined : user.slice(evidenceStart);
+}
+
+export function reviewPromptFirstAddedCoordinate(
+  user: string,
+): { path: string; line: number; evidence: string } | null {
+  const evidence = reviewEvidenceFromPrompt(user);
+  if (evidence === undefined) return null;
+  let path: string | null = null;
+  for (const line of evidence.split("\n")) {
+    if (line.startsWith("### ")) {
+      path = decodeDisplayedPath(line.slice(4)) ?? null;
+      continue;
+    }
+    const added = /^\s*(\d+) \+ (.+)$/u.exec(line);
+    if (path !== null && added) {
+      const lineNumber = Number.parseInt(added[1]!, 10);
+      const evidence = added[2]!;
+      if (Number.isSafeInteger(lineNumber) && lineNumber > 0 && evidence.trim().length > 0) {
+        return { path, line: lineNumber, evidence };
+      }
+    }
+  }
+  return null;
+}
+
+export function plannerBatchIdForPath(prompt: string, path: string | undefined): number | null {
+  if (path === undefined) return null;
+  const targetHeader = `### ${plannerManifestPath(path)}`;
+  const matches = new Set<number>();
+  let sourceBatchId: number | null = null;
+  for (const line of prompt.split("\n")) {
+    const header = /^Batch (\d+) risk=\d+ kind=(source|synthesis)$/u.exec(line);
+    if (header) {
+      const id = Number.parseInt(header[1]!, 10);
+      sourceBatchId = header[2] === "source" && Number.isSafeInteger(id) && id > 0
+        ? id
+        : null;
+      continue;
+    }
+    if (/^\S+ \d+ risk=/u.test(line)) {
+      sourceBatchId = null;
+      continue;
+    }
+    if (sourceBatchId !== null && line === targetHeader) matches.add(sourceBatchId);
+  }
+  if (matches.size === 1) return matches.values().next().value!;
+  if (matches.size > 1) {
+    throw new Error(`planner manifest contains duplicate source batches for ${path}`);
+  }
+  if (prompt.split("\n").includes(targetHeader)) {
+    throw new Error(`planner manifest contains the expected path ${path} outside a source batch`);
+  }
+  return null;
+}
+
 export function reviewPromptContainsAddedCoordinate(
   user: string,
   change: { path: string; line: number },
+  callPhase: ReviewRequestMetadata["callPhase"],
 ): boolean {
+  if (callPhase !== "initial") return false;
   const evidence = reviewEvidenceFromPrompt(user);
   if (evidence === undefined) return false;
   const addedLine = new RegExp(`^\\s*${change.line}\\s+\\+`, "u");
@@ -180,32 +262,6 @@ export function reviewPromptContainsAddedCoordinate(
     }
   }
   return false;
-}
-
-export function reviewEvidenceFromPrompt(user: string): string | undefined {
-  let evidenceStart = -1;
-  for (const match of user.matchAll(REVIEW_EVIDENCE_FRAMING)) {
-    evidenceStart = (match.index ?? -1) + match[0].length;
-  }
-  return evidenceStart < 0 ? undefined : user.slice(evidenceStart);
-}
-
-export class SourceReviewTargetClassifier {
-  readonly #sourcePrompts = new Map<string, boolean>();
-
-  includes(
-    system: string,
-    user: string,
-    change: { path: string; line: number },
-  ): boolean {
-    if (!isReviewSystemRequest(system)) return false;
-    for (const [source, includesTarget] of this.#sourcePrompts) {
-      if (user.startsWith(`${source}${REVIEW_RETRY_BOUNDARY}`)) return includesTarget;
-    }
-    const includesTarget = reviewPromptContainsAddedCoordinate(user, change);
-    this.#sourcePrompts.set(user, includesTarget);
-    return includesTarget;
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -932,8 +988,6 @@ function boundedErrorMessage(error: unknown): string {
 
 async function startMockModel(c: BenchmarkCase, artifactsDir: string) {
   const requestBodies: string[] = [];
-  const targetClassifier = new SourceReviewTargetClassifier();
-  const synthesisClassifier = new SynthesisReviewRequestClassifier();
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     if (req.method === "POST" && req.url === "/chat/completions") {
       const body = await readRequestBody(req);
@@ -947,7 +1001,8 @@ async function startMockModel(c: BenchmarkCase, artifactsDir: string) {
       } | undefined;
       const system = request?.messages?.find((message) => message.role === "system")?.content ?? "";
       const user = request?.messages?.find((message) => message.role === "user")?.content ?? "";
-      if (system.includes("select bounded code-review batches")) {
+      const requestKind = modelRequestKind(req.headers, system);
+      if (requestKind?.kind === "planner") {
         const targetId = plannerBatchIdForPath(user, c.primaryChange?.path);
         const mandatoryIds = plannerMandatoryIds(user);
         const batchIds = targetId !== null && !mandatoryIds.has(targetId) ? [targetId] : [];
@@ -963,25 +1018,17 @@ async function startMockModel(c: BenchmarkCase, artifactsDir: string) {
         );
         return;
       }
-      if (!isReviewSystemRequest(system)) {
-        res.writeHead(500, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: "unsupported non-terminal benchmark model call" }));
+      if (requestKind?.kind !== "review") {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "review request metadata is missing or invalid" }));
         return;
       }
-      const targetPath = c.primaryChange?.path ?? c.modelOutput.findings[0]?.path;
-      const synthesis = synthesisClassifier.includes(
-        system,
-        user,
-        request?.max_tokens,
-        request?.messages,
-      );
-      const targetBatch = !synthesis && isReviewSystemRequest(system) &&
-        (c.primaryChange === undefined
-          ? targetPath === undefined || user
-            .split("\n")
-            .some((line) => line.trim() === `### ${targetPath}`)
-          : targetClassifier.includes(system, user, c.primaryChange));
-      const output = targetBatch
+      const metadata = requestKind;
+      const targetBatch = c.primaryChange !== undefined &&
+        reviewPromptContainsAddedCoordinate(user, c.primaryChange, metadata.callPhase);
+      const output = metadata.route === "source" &&
+          metadata.callPhase === "initial" &&
+          targetBatch
         ? c.modelOutput
         : { summary: "", findings: [] };
       res.writeHead(200, { "content-type": "application/json" });
@@ -1017,32 +1064,6 @@ function plannerMandatoryIds(prompt: string): Set<number> {
       .map((value) => Number.parseInt(value.trim(), 10))
       .filter(Number.isSafeInteger),
   );
-}
-
-function plannerBatchIdForPath(prompt: string, path: string | undefined): number | null {
-  if (path === undefined) return null;
-  const matches = new Set<number>();
-  let sourceBatchId: number | null = null;
-  for (const line of prompt.split("\n")) {
-    const header = /^Batch (\d+) risk=\d+ kind=(source|synthesis)$/u.exec(line);
-    if (header) {
-      const id = Number.parseInt(header[1]!, 10);
-      sourceBatchId = header[2] === "source" && Number.isSafeInteger(id) && id > 0
-        ? id
-        : null;
-      continue;
-    }
-    if (/^\S+ \d+ risk=/u.test(line)) {
-      sourceBatchId = null;
-      continue;
-    }
-    if (sourceBatchId !== null && line === `### ${plannerManifestPath(path)}`) {
-      matches.add(sourceBatchId);
-    }
-  }
-  if (matches.size === 1) return matches.values().next().value!;
-  if (matches.size > 1) throw new Error(`planner manifest contains duplicate source batches`);
-  return null;
 }
 
 function listen(server: ReturnType<typeof createServer>): Promise<void> {

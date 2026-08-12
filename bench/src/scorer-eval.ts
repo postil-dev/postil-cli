@@ -16,20 +16,19 @@ import { cases as fixtureInputs } from "../fixtures/cases";
 import { API_KEY_ENV_NAMES_TEXT, resolveApiKeyName } from "./api-key";
 import {
   benchmarkCase,
-  decodeDisplayedPath,
   envelopeV1,
   evaluateStatusline,
-  isReviewSystemRequest,
   MOCK_GITHUB_REPOSITORY_ID,
+  modelRequestKind,
   parseUnifiedDiffFiles,
-  plannerManifestPath,
-  reviewEvidenceFromPrompt,
+  plannerBatchIdForPath,
+  reviewPromptFirstAddedCoordinate,
+  reviewPromptContainsAddedCoordinate,
   safeJson,
-  SourceReviewTargetClassifier,
   startMockGithub,
-  SynthesisReviewRequestClassifier,
   type BenchmarkCase,
 } from "./harness";
+export { plannerBatchIdForPath } from "./harness";
 import {
   formatCanonicalDecimal,
   parseCanonicalDecimal,
@@ -932,8 +931,6 @@ export async function startScorerProxy(
   const plannerRequests: string[] = [];
   const generatorRequests: string[] = [];
   const generatorRequestKinds: Array<"source" | "synthesis"> = [];
-  const targetClassifier = new SourceReviewTargetClassifier();
-  const synthesisClassifier = new SynthesisReviewRequestClassifier();
   const unexpectedRequests: Array<{ method: string; path: string }> = [];
   let falseFindingOutputSent = false;
   let plannedTargetAvailable = false;
@@ -965,7 +962,8 @@ export async function startScorerProxy(
     } | undefined;
     if (body?.model === GENERATOR_MODEL) {
       const system = body.messages?.find((message) => message.role === "system")?.content ?? "";
-      if (system.includes("select bounded code-review batches")) {
+      const requestKind = modelRequestKind(req.headers, system);
+      if (requestKind?.kind === "planner") {
         plannerRequests.push(bodyText);
         const user = body.messages?.find((message) => message.role === "user")?.content ?? "";
         const targetId = plannerBatchIdForPath(user, c.primaryChange?.path);
@@ -987,35 +985,28 @@ export async function startScorerProxy(
         }));
         return;
       }
-      if (!isReviewSystemRequest(system)) {
-        unexpectedRequests.push({ method: req.method ?? "unknown", path: "generator-call-phase" });
-        res.writeHead(500, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: "unsupported non-terminal scorer benchmark call" }));
-        return;
-      }
       generatorRequests.push(bodyText);
       const user = body.messages?.find((message) => message.role === "user")?.content ?? "";
-      const isSynthesis = synthesisClassifier.includes(
-        system,
-        user,
-        body.max_tokens,
-        body.messages,
-      );
+      if (requestKind?.kind !== "review") {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "review request metadata is missing or invalid" }));
+        return;
+      }
+      const metadata = requestKind;
+      const isSynthesis = metadata.route === "synthesis";
       generatorRequestKinds.push(
         isSynthesis ? "synthesis" : "source",
       );
-      const targetPath = c.primaryChange?.path;
-      const containsTarget =
-        user.length === 0 ||
-        targetPath === undefined ||
-        (!isSynthesis && isReviewSystemRequest(system) && (c.primaryChange === undefined
-          ? user.includes(`### ${targetPath}\n`)
-          : targetClassifier.includes(system, user, c.primaryChange)));
+      const containsTarget = metadata.callPhase === "initial" &&
+        !isSynthesis &&
+        c.primaryChange !== undefined &&
+        reviewPromptContainsAddedCoordinate(user, c.primaryChange, metadata.callPhase);
       let output = { summary: "", findings: [] as ReturnType<typeof falseFinding>[] };
       if (scenario === "trueFinding" && containsTarget) {
         output = generatorOutput(c, scenario);
       } else if (
         scenario === "falseFinding" &&
+        metadata.callPhase === "initial" &&
         !isSynthesis &&
         !falseFindingOutputSent &&
         (containsTarget || !plannedTargetAvailable)
@@ -1135,41 +1126,6 @@ function plannerMandatoryIds(prompt: string): Set<number> {
       .map((value) => Number.parseInt(value.trim(), 10))
       .filter(Number.isSafeInteger),
   );
-}
-
-export function plannerBatchIdForPath(prompt: string, path: string | undefined): number | null {
-  if (path === undefined) return null;
-  const matches = new Set<number>();
-  let sourceBatchId: number | null = null;
-  for (const line of prompt.split("\n")) {
-    const header = /^Batch (\d+) risk=\d+ kind=(source|synthesis)$/u.exec(line);
-    if (header) {
-      const id = Number.parseInt(header[1]!, 10);
-      sourceBatchId = header[2] === "source" && Number.isSafeInteger(id) && id > 0
-        ? id
-        : null;
-      continue;
-    }
-    if (/^\S+ \d+ risk=/u.test(line)) {
-      sourceBatchId = null;
-      continue;
-    }
-    if (sourceBatchId !== null && line === `### ${plannerManifestPath(path)}`) {
-      matches.add(sourceBatchId);
-    }
-  }
-  if (matches.size === 1) return matches.values().next().value!;
-  if (matches.size > 1) {
-    throw new Error(`planner manifest contains duplicate source batches for ${path}`);
-  }
-  if (
-    prompt.split("\n").some((line) =>
-      line === `### ${plannerManifestPath(path)}`
-    )
-  ) {
-    throw new Error(`planner manifest contains the expected path ${path} outside a source batch`);
-  }
-  return null;
 }
 
 function scoredFinding(envelope: Record<string, any>): Record<string, any> | undefined {
@@ -1434,25 +1390,10 @@ export function falseFinding(c: BenchmarkCase) {
 }
 
 export function falseFindingFromSourceRequest(request: string) {
-  const evidencePrompt = reviewEvidenceFromPrompt(request);
-  if (evidencePrompt === undefined) return null;
-  let path: string | null = null;
-  for (const line of evidencePrompt.split("\n")) {
-    const header = /^### (\S.*)$/u.exec(line);
-    if (header) {
-      path = decodeDisplayedPath(header[1]!) ?? null;
-      continue;
-    }
-    const added = /^\s*(\d+) \+ (.+)$/u.exec(line);
-    if (path !== null && added) {
-      const lineNumber = Number.parseInt(added[1]!, 10);
-      const evidence = added[2]!;
-      if (Number.isSafeInteger(lineNumber) && lineNumber > 0 && evidence.trim().length > 0) {
-        return falseFindingAt(path, lineNumber, evidence);
-      }
-    }
-  }
-  return null;
+  const coordinate = reviewPromptFirstAddedCoordinate(request);
+  return coordinate === null
+    ? null
+    : falseFindingAt(coordinate.path, coordinate.line, coordinate.evidence);
 }
 
 function falseFindingAt(path: string, line: number, evidence: string) {

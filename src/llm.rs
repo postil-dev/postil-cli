@@ -683,7 +683,13 @@ const ALLOW_PRIVATE_API_BASE_ENV: &str = "POSTIL_ALLOW_PRIVATE_API_BASE";
 static PROVIDER_RETRY_JITTER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "qualification-candidate")]
 const QUALIFICATION_CAPTURE_API_BASE_ENV: &str = "POSTIL_QUALIFICATION_CAPTURE_API_BASE";
-const ALWAYS_MANAGED_HEADERS: &[&str] = &["x-api-key", "anthropic-version", "content-type"];
+const ALWAYS_MANAGED_HEADERS: &[&str] = &[
+    "x-api-key",
+    "anthropic-version",
+    "content-type",
+    "x-postil-review-route",
+    "x-postil-review-call-phase",
+];
 
 #[cfg(test)]
 fn hostile_json_text(bytes: usize) -> String {
@@ -1186,6 +1192,12 @@ enum LlmCallPhase {
     SemanticRetry,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ReviewRequestRoute {
+    Source,
+    Synthesis,
+}
+
 impl LlmPhase {
     fn as_str(self) -> &'static str {
         match self {
@@ -1228,11 +1240,28 @@ impl LlmPhase {
 }
 
 impl LlmCallPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Initial => "initial",
+            Self::SchemaRepair => "schema-repair",
+            Self::SemanticRetry => "semantic-retry",
+        }
+    }
+
     fn usage_phase(self) -> ModelUsagePhase {
         match self {
             Self::Initial => ModelUsagePhase::Initial,
             Self::SchemaRepair => ModelUsagePhase::SchemaRepair,
             Self::SemanticRetry => ModelUsagePhase::SemanticRetry,
+        }
+    }
+}
+
+impl ReviewRequestRoute {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Synthesis => "synthesis",
         }
     }
 }
@@ -2172,8 +2201,15 @@ impl LlmClient {
             + Sync
             + 'static,
     {
-        self.review_validated_with_safe_output_limit(cfg, system, user, REVIEW_MAX_TOKENS, validate)
-            .await
+        self.review_validated_with_safe_output_limit(
+            cfg,
+            system,
+            user,
+            REVIEW_MAX_TOKENS,
+            ReviewRequestRoute::Source,
+            validate,
+        )
+        .await
     }
 
     pub(crate) async fn review_validated_with_safe_output_limit<F>(
@@ -2182,6 +2218,7 @@ impl LlmClient {
         system: &str,
         user: &str,
         max_tokens: u32,
+        route: ReviewRequestRoute,
         validate: F,
     ) -> std::result::Result<ModelReview, ModelError>
     where
@@ -2211,6 +2248,7 @@ impl LlmClient {
                                 &system,
                                 &user,
                                 max_tokens,
+                                route,
                                 validate.as_ref(),
                             )
                             .await;
@@ -2340,7 +2378,7 @@ impl LlmClient {
                 );
                 let started_at = Instant::now();
                 match self
-                    .review_with_model(model, system, user, max_tokens, validate.as_ref())
+                    .review_with_model(model, system, user, max_tokens, route, validate.as_ref())
                     .await
                 {
                     Ok(mut r) => {
@@ -2911,6 +2949,7 @@ impl LlmClient {
         system: &str,
         user: &str,
         max_tokens: u32,
+        route: ReviewRequestRoute,
         validate: &(
              dyn Fn(&ModelReview) -> std::result::Result<(), ReviewValidationFailure> + Send + Sync
          ),
@@ -2920,7 +2959,7 @@ impl LlmClient {
         let mut usage_accounting_complete = true;
         let mut model_incidents = Vec::new();
         let initial = self
-            .chat(
+            .review_chat(
                 model,
                 system,
                 user,
@@ -2928,7 +2967,7 @@ impl LlmClient {
                 &mut call_usage,
                 &mut usage_accounting_complete,
                 max_tokens,
-                LlmPhase::Review,
+                route,
                 LlmCallPhase::Initial,
             )
             .await;
@@ -2973,7 +3012,7 @@ impl LlmClient {
                         error
                     })?;
                 let repaired = match self
-                    .chat(
+                    .review_chat(
                         model,
                         REVIEW_SCHEMA_REPAIR_SYSTEM,
                         &repair_user,
@@ -2981,7 +3020,7 @@ impl LlmClient {
                         &mut call_usage,
                         &mut usage_accounting_complete,
                         max_tokens,
-                        LlmPhase::Review,
+                        route,
                         LlmCallPhase::SchemaRepair,
                     )
                     .await
@@ -3063,7 +3102,7 @@ impl LlmClient {
                 })?;
             let mut retry_usage = usage;
             match self
-                .chat(
+                .review_chat(
                     model,
                     system,
                     &retry_user,
@@ -3071,7 +3110,7 @@ impl LlmClient {
                     &mut call_usage,
                     &mut usage_accounting_complete,
                     max_tokens,
-                    LlmPhase::Review,
+                    route,
                     LlmCallPhase::SemanticRetry,
                 )
                 .await
@@ -3171,7 +3210,7 @@ impl LlmClient {
             let mut retry_usage = review.usage;
             let mut retry_accounting_complete = review.usage_accounting_complete;
             let retry = self
-                .chat(
+                .review_chat(
                     model,
                     system,
                     &retry_user,
@@ -3179,7 +3218,7 @@ impl LlmClient {
                     &mut call_usage,
                     &mut retry_accounting_complete,
                     max_tokens,
-                    LlmPhase::Review,
+                    route,
                     LlmCallPhase::SemanticRetry,
                 )
                 .await;
@@ -3543,6 +3582,38 @@ impl LlmClient {
     }
 
     #[allow(clippy::too_many_arguments)]
+    async fn review_chat(
+        &self,
+        model: &str,
+        system: &str,
+        user: &str,
+        usage: &mut Usage,
+        call_usage: &mut Vec<ModelUsage>,
+        usage_accounting_complete: &mut bool,
+        max_tokens: u32,
+        route: ReviewRequestRoute,
+        call_phase: LlmCallPhase,
+    ) -> Result<String> {
+        self.chat_inner(
+            model,
+            None,
+            system,
+            user,
+            usage,
+            call_usage,
+            usage_accounting_complete,
+            max_tokens,
+            0.1,
+            LlmPhase::Review,
+            call_phase,
+            Some(route),
+        )
+        .await
+        .map(|success| success.content)
+        .map_err(classify_chat_error)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn chat_with_temperature(
         &self,
         model: &str,
@@ -3568,6 +3639,7 @@ impl LlmClient {
             temperature,
             phase,
             call_phase,
+            None,
         )
         .await
         .map(|success| success.content)
@@ -3608,6 +3680,7 @@ impl LlmClient {
             temperature,
             phase,
             call_phase,
+            None,
         )
         .await
         .map_err(classify_chat_error)
@@ -3630,6 +3703,7 @@ impl LlmClient {
         temperature: f64,
         phase: LlmPhase,
         call_phase: LlmCallPhase,
+        review_route: Option<ReviewRequestRoute>,
     ) -> Result<ChatSuccess> {
         let route_provider =
             expected_provider.or(self.request_decorations.pinned_upstream_provider.as_deref());
@@ -3688,7 +3762,12 @@ impl LlmClient {
                     .map(elapsed_text)
                     .unwrap_or_else(|| "unbounded".to_string()),
             );
-            let response = match tokio::time::timeout(timeout, self.request_once(&body)).await {
+            let response = match tokio::time::timeout(
+                timeout,
+                self.request_once_with_review_metadata(&body, review_route, call_phase),
+            )
+            .await
+            {
                 Ok(result) => result,
                 Err(_) if deadline_limited => {
                     *usage_accounting_complete = false;
@@ -4113,6 +4192,16 @@ impl LlmClient {
     }
 
     async fn request_once(&self, body: &serde_json::Value) -> Result<ModelHttpResponse> {
+        self.request_once_with_review_metadata(body, None, LlmCallPhase::Initial)
+            .await
+    }
+
+    async fn request_once_with_review_metadata(
+        &self,
+        body: &serde_json::Value,
+        review_route: Option<ReviewRequestRoute>,
+        call_phase: LlmCallPhase,
+    ) -> Result<ModelHttpResponse> {
         self.reserve_provider_attempt(body)?;
         let http = self.http_client()?;
         let mut request = match self.request_decorations.api_format {
@@ -4136,6 +4225,11 @@ impl LlmClient {
         let canonical_openrouter = is_canonical_openrouter_base(&self.request_decorations.api_base);
         if canonical_openrouter {
             request = request.header("X-OpenRouter-Experimental-Metadata", "enabled");
+        }
+        if let Some(route) = review_route {
+            request = request
+                .header("X-Postil-Review-Route", route.as_str())
+                .header("X-Postil-Review-Call-Phase", call_phase.as_str());
         }
         let mut response = request.json(body).send().await?;
         let status = response.status();
@@ -5662,7 +5756,13 @@ mod tests {
         let _lock = env_lock().lock().unwrap();
         let _env = EnvRestore::capture(&[ENDPOINT_AUTH_HEADER_ENV, ENDPOINT_AUTH_VALUE_ENV]);
         EnvRestore::set(ENDPOINT_AUTH_VALUE_ENV, "secret-value");
-        for name in ["X-API-Key", "Anthropic-Version", "Content-Type"] {
+        for name in [
+            "X-API-Key",
+            "Anthropic-Version",
+            "Content-Type",
+            "X-Postil-Review-Route",
+            "X-Postil-Review-Call-Phase",
+        ] {
             EnvRestore::set(ENDPOINT_AUTH_HEADER_ENV, name);
             for format in [ApiFormat::OpenaiCompatible, ApiFormat::Anthropic] {
                 let error = endpoint_auth_from_env(format)
@@ -6230,8 +6330,190 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert!(requests.iter().all(|request| {
             let body = String::from_utf8_lossy(&request.body);
-            body.contains("\"content\":\"user\"") && !body.contains("You repair malformed JSON")
+            body.contains("\"content\":\"user\"")
+                && !body.contains("You repair malformed JSON")
+                && request
+                    .headers
+                    .get("x-postil-review-route")
+                    .and_then(|value| value.to_str().ok())
+                    == Some("source")
+                && request
+                    .headers
+                    .get("x-postil-review-call-phase")
+                    .and_then(|value| value.to_str().ok())
+                    == Some("initial")
         }));
+    }
+
+    #[tokio::test]
+    async fn review_route_metadata_survives_each_expanded_output_budget() {
+        for (route, route_name, initial_tokens, expanded_tokens) in [
+            (
+                ReviewRequestRoute::Synthesis,
+                "synthesis",
+                4_000_u32,
+                8_000_u32,
+            ),
+            (ReviewRequestRoute::Source, "source", 6_000_u32, 12_000_u32),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .and(body_string_contains(format!(
+                    "\"max_tokens\":{expanded_tokens}"
+                )))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"finish_reason": "stop", "message": {"content": "{\"summary\":\"\",\"findings\":[]}"}}],
+                    "usage": {"prompt_tokens": 20, "completion_tokens": 3}
+                })))
+                .with_priority(1)
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .and(body_string_contains(format!("\"max_tokens\":{initial_tokens}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"finish_reason": "length", "message": {"content": "{\"summary\":\"partial"}}],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": initial_tokens}
+                })))
+                .with_priority(2)
+                .expect(1)
+                .mount(&server)
+                .await;
+            let config = Config {
+                api_base: server.uri(),
+                api_format: ApiFormat::OpenaiCompatible,
+                model: "provider/model".into(),
+                scorer_enabled: false,
+                ..Config::default()
+            };
+            let client = LlmClient::build(
+                &config,
+                "test-key".into(),
+                Duration::from_secs(2),
+                None,
+                None,
+            )
+            .unwrap();
+            *client.http.lock().unwrap() = Some(reqwest::Client::new());
+
+            let result = client
+                .review_validated_with_safe_output_limit(
+                    &config,
+                    "system",
+                    "user",
+                    initial_tokens,
+                    route,
+                    |_| Ok(()),
+                )
+                .await
+                .unwrap();
+            assert!(result.findings.is_empty());
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(
+                requests
+                    .iter()
+                    .map(
+                        |request| request.body_json::<serde_json::Value>().unwrap()["max_tokens"]
+                            .as_u64()
+                            .unwrap()
+                    )
+                    .collect::<Vec<_>>(),
+                vec![u64::from(initial_tokens), u64::from(expanded_tokens)]
+            );
+            assert!(requests.iter().all(|request| {
+                request
+                    .headers
+                    .get("x-postil-review-route")
+                    .and_then(|value| value.to_str().ok())
+                    == Some(route_name)
+                    && request
+                        .headers
+                        .get("x-postil-review-call-phase")
+                        .and_then(|value| value.to_str().ok())
+                        == Some("initial")
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn synthesis_schema_repair_keeps_explicit_route_metadata() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("You repair malformed JSON"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"finish_reason": "stop", "message": {"content": "{\"summary\":\"\",\"findings\":[]}"}}],
+                "usage": {"prompt_tokens": 20, "completion_tokens": 3}
+            })))
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"finish_reason": "stop", "message": {"content": "malformed"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+            })))
+            .with_priority(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let config = Config {
+            api_base: server.uri(),
+            api_format: ApiFormat::OpenaiCompatible,
+            model: "provider/model".into(),
+            scorer_enabled: false,
+            ..Config::default()
+        };
+        let client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(2),
+            None,
+            None,
+        )
+        .unwrap();
+        *client.http.lock().unwrap() = Some(reqwest::Client::new());
+
+        let result = client
+            .review_validated_with_safe_output_limit(
+                &config,
+                "system",
+                "user",
+                4_000,
+                ReviewRequestRoute::Synthesis,
+                |_| Ok(()),
+            )
+            .await
+            .unwrap();
+        assert!(result.findings.is_empty());
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| {
+                    (
+                        request
+                            .headers
+                            .get("x-postil-review-route")
+                            .and_then(|value| value.to_str().ok()),
+                        request
+                            .headers
+                            .get("x-postil-review-call-phase")
+                            .and_then(|value| value.to_str().ok()),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                (Some("synthesis"), Some("initial")),
+                (Some("synthesis"), Some("schema-repair")),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -6368,7 +6650,29 @@ mod tests {
         let detail = format!("{error:#}");
         assert!(detail.contains("validation categories: callerValidation=1"));
         assert!(!detail.contains("word word"));
-        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| {
+                    (
+                        request
+                            .headers
+                            .get("x-postil-review-route")
+                            .and_then(|value| value.to_str().ok()),
+                        request
+                            .headers
+                            .get("x-postil-review-call-phase")
+                            .and_then(|value| value.to_str().ok()),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                (Some("source"), Some("initial")),
+                (Some("source"), Some("semantic-retry")),
+            ]
+        );
     }
 
     #[test]
