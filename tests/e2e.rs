@@ -2471,7 +2471,7 @@ async fn mock_review(server: &MockServer, findings: Value) {
 }
 
 #[tokio::test]
-async fn query_truncated_adjudication_suppresses_the_candidate() {
+async fn query_truncated_adjudication_preserves_the_grounded_candidate() {
     let server = MockServer::start().await;
     let terms = (0..128)
         .map(|index| format!("q{index:03}"))
@@ -2498,11 +2498,13 @@ async fn query_truncated_adjudication_suppresses_the_candidate() {
         .arg(&diff)
         .args(["--output", "json"])
         .assert()
-        .success();
+        .code(1);
     let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
-    assert_eq!(envelope["findings"], json!([]));
-    assert_eq!(envelope["counts"]["suppressed"], 1);
-    assert_eq!(envelope["gate"]["failing"], false);
+    assert_eq!(envelope["findings"].as_array().unwrap().len(), 1);
+    assert_eq!(envelope["findings"][0]["path"], "src/auth.rs");
+    assert_eq!(envelope["counts"]["error"], 1);
+    assert_eq!(envelope["counts"]["suppressed"], 0);
+    assert_eq!(envelope["gate"]["failing"], true);
 
     let requests = server.received_requests().await.unwrap();
     let adjudication: Value = requests

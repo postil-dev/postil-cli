@@ -105,7 +105,6 @@ pub(crate) struct AdjudicationApplication {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeterministicDemotionReason {
     RepositoryReceipt,
-    DirectReceipt,
     CitationFragment,
 }
 
@@ -1036,8 +1035,8 @@ fn applied_adjudication_results(
     findings: &[Finding],
     candidate_ids: &[String],
     results: Vec<AdjudicationResult>,
-    corpus: &str,
-    receipt: &DiffCorpusReceipt,
+    _corpus: &str,
+    _receipt: &DiffCorpusReceipt,
     repository_receipt: &RepositorySearchReceipt,
 ) -> Vec<AppliedAdjudicationResult> {
     let finding_by_id = candidate_ids
@@ -1051,14 +1050,9 @@ fn applied_adjudication_results(
             let Some(finding) = finding_by_id.get(result.candidate_id.as_str()).copied() else {
                 return model_applied_result(result);
             };
-            let Some(reason) = deterministic_demotion_reason(
-                snapshot_id,
-                finding,
-                &result,
-                corpus,
-                receipt,
-                repository_receipt,
-            ) else {
+            let Some(reason) =
+                deterministic_demotion_reason(snapshot_id, finding, &result, repository_receipt)
+            else {
                 return model_applied_result(result);
             };
             AppliedAdjudicationResult {
@@ -1104,8 +1098,6 @@ fn deterministic_demotion_reason(
     snapshot_id: &str,
     finding: &Finding,
     result: &AdjudicationResult,
-    _corpus: &str,
-    receipt: &DiffCorpusReceipt,
     repository_receipt: &RepositorySearchReceipt,
 ) -> Option<DeterministicDemotionReason> {
     let claim_unresolved = !matches!(result.status, AdjudicationStatus::Refuted)
@@ -1118,43 +1110,11 @@ fn deterministic_demotion_reason(
         matches!(result.status, AdjudicationStatus::Confirmed) && bounded_citation;
     if claim_unresolved {
         Some(DeterministicDemotionReason::RepositoryReceipt)
-    } else if !matches!(result.status, AdjudicationStatus::Refuted)
-        && !candidate_direct_search_is_complete(finding, &result.candidate_id, receipt)
-    {
-        Some(DeterministicDemotionReason::DirectReceipt)
     } else if incomplete_citation {
         Some(DeterministicDemotionReason::CitationFragment)
     } else {
         None
     }
-}
-
-fn candidate_direct_search_is_complete(
-    finding: &Finding,
-    candidate_id: &str,
-    receipt: &DiffCorpusReceipt,
-) -> bool {
-    let selected_terms = receipt
-        .queries
-        .iter()
-        .map(|query| query.term.as_str())
-        .collect::<HashSet<_>>();
-    let queries_complete = [
-        Some(finding.path.as_str()),
-        Some(finding.title.as_str()),
-        Some(finding.body.as_str()),
-        finding.evidence.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .flat_map(semantic_terms)
-    .all(|term| selected_terms.contains(term.as_str()));
-    let matching_windows_complete = receipt
-        .candidate_citations
-        .iter()
-        .find(|citation| citation.candidate_id == candidate_id)
-        .is_some_and(|citation| citation.matching_windows_complete);
-    receipt.scan_complete && queries_complete && matching_windows_complete
 }
 
 fn result_is_bounded_citation_fragment(result: &AdjudicationResult, finding: &Finding) -> bool {
@@ -2172,7 +2132,7 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_candidate_query_or_window_receipts_suppress_confirmations() {
+    fn incomplete_query_or_window_receipts_do_not_override_grounded_confirmation() {
         let snapshot = "a".repeat(40);
         let mut query_finding = finding(
             Kind::Risk,
@@ -2248,8 +2208,8 @@ mod tests {
                 );
                 if confirmed {
                     let applied = applied.unwrap();
-                    assert!(applied.kept.is_empty());
-                    assert_eq!(applied.suppressed.len(), 1);
+                    assert_eq!(applied.kept.len(), 1);
+                    assert!(applied.suppressed.is_empty());
                 } else {
                     assert!(applied.is_err());
                 }
@@ -2258,7 +2218,7 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_candidate_queries_do_not_suppress_a_complete_peer() {
+    fn incomplete_candidate_queries_do_not_suppress_grounded_findings() {
         let snapshot = "a".repeat(40);
         let mut incomplete = finding(
             Kind::Risk,
@@ -2272,6 +2232,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(" "),
         );
+        incomplete.body.push('.');
         let mut complete = finding(
             Kind::Risk,
             "Validate the dangerous sink",
@@ -2284,16 +2245,6 @@ mod tests {
         let corpus = "+ uses: action@old\n+ dangerous_sink(input);\n";
         let receipt = direct_receipt(&snapshot, corpus, &findings, &ids);
         assert!(!receipt.queries_complete);
-        assert!(!candidate_direct_search_is_complete(
-            &findings[0],
-            &ids[0],
-            &receipt
-        ));
-        assert!(candidate_direct_search_is_complete(
-            &findings[1],
-            &ids[1],
-            &receipt
-        ));
         let results = findings
             .iter()
             .zip(&ids)
@@ -2317,9 +2268,8 @@ mod tests {
             &unavailable_receipt(),
         )
         .unwrap();
-        assert_eq!(applied.kept.len(), 1);
-        assert_eq!(applied.kept[0].path, "src/sink.rs");
-        assert_eq!(applied.suppressed.len(), 1);
+        assert_eq!(applied.kept.len(), 2);
+        assert!(applied.suppressed.is_empty());
     }
 
     #[test]
