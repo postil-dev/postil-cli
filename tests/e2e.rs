@@ -2480,7 +2480,7 @@ async fn query_truncated_adjudication_preserves_the_grounded_candidate() {
     mock_review(
         &server,
         json!([{
-            "path": "src/auth.rs", "line": 42, "severity": "error", "kind": "risk",
+            "path": "src/auth.rs", "line": 42, "severity": "warn", "kind": "risk",
             "confidence": 0.99, "title": "Restore the authorization guard",
             "body": format!("The authorization guard is unsafe. {terms}."),
             "evidence": "exec_query(&token);"
@@ -2542,6 +2542,18 @@ async fn adjudication_provider_failure_preserves_generated_blockers_under_adviso
         }]),
     )
     .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("provider/scorer"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(scorer_content(json!([{
+                "confidence": 0.01,
+                "kind": "risk",
+                "reason": "A scorer must not run after incomplete adjudication."
+            }]))),
+        )
+        .mount(&server)
+        .await;
 
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -2553,7 +2565,7 @@ async fn adjudication_provider_failure_preserves_generated_blockers_under_adviso
     let out = postil()
         .current_dir(dir.path())
         .env("POSTIL_API_BASE", server.uri())
-        .env("POSTIL_DISABLE_SCORER", "1")
+        .env("REVIEW_SCORER_MODEL", "provider/scorer")
         .args(["review", "--diff-file"])
         .arg(&diff)
         .args(["--output", "json"])
@@ -2574,6 +2586,10 @@ async fn adjudication_provider_failure_preserves_generated_blockers_under_adviso
                 incident["category"] == "providerError" && incident["recovered"] == false
             })
     );
+    let requests = server.received_requests().await.unwrap();
+    assert!(requests.iter().all(|request| {
+        !String::from_utf8_lossy(&request.body).contains("Postil's independent second-model scorer")
+    }));
 }
 
 #[tokio::test]
@@ -2643,7 +2659,7 @@ async fn prompt_injection_all_refuted_adjudication_cannot_clean_the_gate() {
     mock_review(
         &server,
         json!([{
-            "path": "src/auth.rs", "line": 42, "severity": "error", "kind": "risk",
+            "path": "src/auth.rs", "line": 42, "severity": "warn", "kind": "risk",
             "confidence": 0.99, "title": "Validate query input",
             "body": "The query executes attacker-controlled input without validation.",
             "evidence": "exec_query(&token);"
@@ -2670,8 +2686,23 @@ async fn prompt_injection_all_refuted_adjudication_cannot_clean_the_gate() {
     assert_eq!(envelope["version"], 1);
     assert_eq!(envelope["silent"], false);
     assert_eq!(envelope["gate"]["failing"], true);
-    assert_eq!(envelope["findings"][0]["path"], "src/auth.rs");
-    assert_eq!(envelope["findings"][0]["title"], "Validate query input");
+    assert!(
+        envelope["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| {
+                finding["path"] == "src/auth.rs" && finding["title"] == "Validate query input"
+            })
+    );
+    assert!(
+        envelope["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| { finding["path"] == ".postil/model-output" })
+    );
+    assert_eq!(envelope["counts"]["warn"], 1);
     assert_eq!(envelope["counts"]["error"], 1);
     assert!(
         envelope["modelIncidents"]

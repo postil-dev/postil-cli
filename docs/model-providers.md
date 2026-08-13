@@ -22,7 +22,7 @@ Hosted reviews preflight generator, scorer, repair, fallback, consensus, bounded
 
 ## OpenAI-compatible
 
-OpenRouter is the default endpoint. Hosted OpenRouter requests deny data-collecting routes and require ZDR-capable routes through [OpenRouter's per-request provider controls](https://openrouter.ai/docs/guides/routing/provider-selection). OpenRouter can select upstream providers dynamically, so an endpoint identity does not claim a pinned upstream route. Ollama, vLLM, SGLang, LiteLLM, and private gateways can use the same contract. BYOK operators control their provider routing and retention settings.
+OpenRouter is the default endpoint. Hosted OpenRouter requests deny data-collecting routes, require ZDR-capable routes, and pin the admitted upstream provider through [OpenRouter's per-request provider controls](https://openrouter.ai/docs/guides/routing/provider-selection). Postil validates the returned model and provider identity before accepting output. Unmanaged OpenRouter use can select upstream providers dynamically. Ollama, vLLM, SGLang, LiteLLM, and private gateways can use the same contract. BYOK operators control their provider routing and retention settings.
 
 ```sh
 export MODEL_API_KEY=...

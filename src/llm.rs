@@ -1310,15 +1310,6 @@ impl RequestDecorations {
         let pinned_upstream_provider =
             if let Some(provider) = crate::config::provisional_hosted_provider_for_config(cfg) {
                 Some(provider.to_string())
-            } else if crate::config::hosted_runtime_mode() {
-                Some(
-                    crate::config::admitted_profile_for_config(cfg)
-                        .ok_or_else(|| {
-                            anyhow!("hosted inference has no exact admitted provider profile")
-                        })?
-                        .upstream_provider_identity
-                        .clone(),
-                )
             } else if crate::config::qualification_candidate_mode() {
                 Some(
                     crate::config::qualification_candidate_profile_for_config(cfg)?
@@ -1327,6 +1318,15 @@ impl RequestDecorations {
                 )
             } else if let Some(profile) = screening_profile {
                 Some(profile.upstream_provider_identity)
+            } else if crate::config::hosted_mode() {
+                Some(
+                    crate::config::admitted_profile_for_config(cfg)
+                        .ok_or_else(|| {
+                            anyhow!("hosted inference has no exact admitted provider profile")
+                        })?
+                        .upstream_provider_identity
+                        .clone(),
+                )
             } else {
                 None
             };

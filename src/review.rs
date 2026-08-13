@@ -1407,6 +1407,8 @@ async fn review_diff_at(
     let mut repository_search = None;
     let mut adjudication_resolved = Vec::new();
     let mut adjudication_preserved_baseline = Vec::new();
+    let mut adjudication_failure = None;
+    let mut adjudication_incomplete = false;
 
     // Run the model when there is a diff to review, or when content policy is
     // active and there is a PR title/description to review (an empty diff should
@@ -2267,6 +2269,7 @@ async fn review_diff_at(
                                     ) {
                                         Ok(application) => application,
                                         Err(error) => {
+                                            adjudication_incomplete = true;
                                             eprintln!(
                                                 "postil: finding adjudication validation failed; preserving all generated findings: {error:#}"
                                             );
@@ -2276,6 +2279,9 @@ async fn review_diff_at(
                                                 recovered: false,
                                                 recovery: None,
                                             });
+                                            adjudication_failure = Some(fail_closed_finding(
+                                                "finding adjudication output did not satisfy its admitted contract",
+                                            ));
                                             preserve_unadjudicated_findings(
                                                 all_adjudication_candidates,
                                             )
@@ -2283,6 +2289,7 @@ async fn review_diff_at(
                                     }
                                 }
                                 Err(error) => {
+                                    adjudication_incomplete = true;
                                     eprintln!(
                                         "postil: finding adjudication unavailable; preserving all generated findings"
                                     );
@@ -2290,6 +2297,11 @@ async fn review_diff_at(
                                     model_usage.extend_from_slice(error.model_usage());
                                     model_incidents.extend_from_slice(error.model_incidents());
                                     usage_accounting_complete &= error.usage_accounting_complete();
+                                    if !error.is_provider() {
+                                        adjudication_failure = Some(fail_closed_finding(
+                                            "finding adjudication output did not satisfy its admitted contract",
+                                        ));
+                                    }
                                     preserve_unadjudicated_findings(all_adjudication_candidates)
                                 }
                             };
@@ -2353,7 +2365,7 @@ async fn review_diff_at(
                                     .collect();
                             }
                         }
-                        if !kept.is_empty() && cfg.scorer_enabled() {
+                        if !kept.is_empty() && cfg.scorer_enabled() && !adjudication_incomplete {
                             let scorer_system = prompt::scorer_system_prompt(cfg, current_utc_date);
                             let mut evidence_budget = MAX_SCORER_EVIDENCE_BYTES;
                             let (inputs, scorer_user) = loop {
@@ -2546,6 +2558,9 @@ async fn review_diff_at(
     // keep them open without revalidating them as fresh model output. Fresh
     // findings are validated before they can reach reconciliation.
     findings.extend(rec.carried);
+    if let Some(failure) = adjudication_failure {
+        findings.push(failure);
+    }
 
     // Operational findings (model unreachable/unusable) fail the gate by default
     // and fail closed. `gate.onError: advisory` lets the gate stand aside on a
