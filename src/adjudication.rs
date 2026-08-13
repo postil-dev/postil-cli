@@ -49,6 +49,8 @@ pub(crate) struct CandidateCitationReceipt {
     pub context_occurrences: u64,
     pub queries_complete: bool,
     pub matching_windows_complete: bool,
+    #[serde(skip)]
+    candidate_line_sha256: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -316,6 +318,7 @@ pub(crate) fn build_diff_corpus_receipt(
                 context_occurrences: 0,
                 queries_complete,
                 matching_windows_complete: false,
+                candidate_line_sha256: BTreeSet::new(),
             }
         })
         .collect::<Vec<_>>();
@@ -371,6 +374,7 @@ pub(crate) fn build_diff_corpus_receipt(
                 &mut global_window,
                 &mut rendered,
                 &mut candidate_windows,
+                &mut candidate_citations,
             );
             while buffered.front().is_some_and(|line| line.index + 1 < center) {
                 buffered.pop_front();
@@ -384,6 +388,7 @@ pub(crate) fn build_diff_corpus_receipt(
             &mut global_window,
             &mut rendered,
             &mut candidate_windows,
+            &mut candidate_citations,
         );
     }
     for ((finding, receipt), window) in findings
@@ -488,6 +493,7 @@ fn finalize_streamed_center(
     global_window: &mut WindowBudget,
     rendered: &mut String,
     candidate_windows: &mut [WindowBudget],
+    candidate_citations: &mut [CandidateCitationReceipt],
 ) {
     let Some(center_line) = buffered.iter().find(|line| line.index == center) else {
         return;
@@ -526,8 +532,16 @@ fn finalize_streamed_center(
                     .copied()
                     .unwrap_or(false)
             })
+            && window.add(center, row_bytes)
+            && let Some(receipt) = candidate_citations.get_mut(candidate_index)
         {
-            window.add(center, row_bytes);
+            let source = center_line
+                .raw
+                .trim_end_matches(['\r', '\n'])
+                .strip_prefix(['+', '-', ' '])
+                .unwrap_or(center_line.raw.trim_end_matches(['\r', '\n']))
+                .trim_start();
+            receipt.candidate_line_sha256.insert(sha256(source));
         }
     }
 }
@@ -671,8 +685,13 @@ pub(crate) fn validate_results(
             );
         }
         let finding = finding_by_id[&result.candidate_id];
-        let direct_grounded =
-            evidence_is_directly_grounded(&result.evidence, finding, corpus, diff_receipt);
+        let direct_grounded = evidence_is_directly_grounded(
+            &result.evidence,
+            finding,
+            &result.candidate_id,
+            corpus,
+            diff_receipt,
+        );
         let citation_deleted_only = citation_is_deleted_only(
             &result.evidence,
             finding,
@@ -1073,26 +1092,18 @@ fn candidate_repository_evidence_is_complete(
 fn evidence_is_directly_grounded(
     evidence: &str,
     finding: &Finding,
+    candidate_id: &str,
     corpus: &str,
     receipt: &DiffCorpusReceipt,
 ) -> bool {
     if evidence.trim().is_empty() {
         return false;
     }
-    let normalized_evidence = evidence.to_ascii_lowercase();
-    let candidate_term_matches = [finding.path.as_str(), &finding.title, &finding.body]
-        .into_iter()
-        .flat_map(semantic_terms)
-        .any(|term| normalized_evidence.contains(&term));
-    let rendered_line = receipt.rendered_evidence.lines().any(|row| {
-        row.split_once(':').map(|(_, source)| {
-            source
-                .strip_prefix(['+', '-', ' '])
-                .unwrap_or(source)
-                .trim_start()
-        }) == Some(evidence)
-    });
-    let corpus_window = corpus.contains(evidence) && rendered_line && candidate_term_matches;
+    let corpus_window = corpus.contains(evidence)
+        && receipt.candidate_citations.iter().any(|citation| {
+            citation.candidate_id == candidate_id
+                && citation.candidate_line_sha256.contains(&sha256(evidence))
+        });
     let cited_window = finding.evidence.as_deref().is_some_and(|cited| {
         let (bounded, _) = bounded_cited_evidence(cited, &finding.title, &finding.body);
         bounded == evidence
