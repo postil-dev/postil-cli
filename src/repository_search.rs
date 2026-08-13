@@ -150,7 +150,11 @@ pub(crate) fn search_terms<'a>(
     let mut total = 0usize;
     for (kind, value) in claims.flat_map(RepositoryClaim::typed_values) {
         let value = value.trim();
-        if value.len() < 2 || value.len() > MAX_TERM_BYTES || value.contains('\0') {
+        if value.len() < 2
+            || value.len() > MAX_TERM_BYTES
+            || value.contains('\0')
+            || (kind == RepositorySearchQueryKind::Identifier && !valid_identifier(value))
+        {
             return Err(());
         }
         if values.insert((kind, value.to_string())) {
@@ -593,8 +597,6 @@ struct StreamMatcher {
     counts: Vec<u64>,
     tail: Vec<u8>,
     overlap: usize,
-    identifier_token: Vec<u8>,
-    identifier_overflowed: bool,
 }
 
 impl StreamMatcher {
@@ -605,11 +607,11 @@ impl StreamMatcher {
             tail: Vec::new(),
             overlap: terms
                 .iter()
-                .map(|term| term.normalized.len().saturating_sub(1))
+                // Retain one byte before the longest term so an identifier
+                // match that reaches the next chunk can validate its left boundary.
+                .map(|term| term.normalized.len().saturating_add(1))
                 .max()
                 .unwrap_or(0),
-            identifier_token: Vec::new(),
-            identifier_overflowed: false,
         }
     }
 
@@ -620,27 +622,19 @@ impl StreamMatcher {
         combined.extend_from_slice(chunk);
         let combined = ascii_lower(&combined);
         for (index, term) in self.terms.iter().enumerate() {
-            if term.kind == RepositorySearchQueryKind::Identifier {
-                continue;
-            }
             for position in occurrence_positions(&combined, term.normalized()) {
-                if position.saturating_add(term.normalized().len()) > tail_len {
+                let end = position.saturating_add(term.normalized().len());
+                let newly_observable = end > tail_len
+                    || (term.kind == RepositorySearchQueryKind::Identifier
+                        && end == tail_len
+                        && combined.get(end).is_some());
+                if newly_observable
+                    && (term.kind != RepositorySearchQueryKind::Identifier
+                        || (end < combined.len()
+                            && identifier_has_boundaries(&combined, position, term.normalized())))
+                {
                     self.counts[index] = self.counts[index].saturating_add(1);
                 }
-            }
-        }
-        for byte in ascii_lower(chunk) {
-            if is_identifier_byte(byte) {
-                if !self.identifier_overflowed {
-                    if self.identifier_token.len() < MAX_TERM_BYTES {
-                        self.identifier_token.push(byte);
-                    } else {
-                        self.identifier_token.clear();
-                        self.identifier_overflowed = true;
-                    }
-                }
-            } else {
-                self.finish_identifier_token();
             }
         }
         let keep = self.overlap.min(combined.len());
@@ -650,24 +644,16 @@ impl StreamMatcher {
     }
 
     fn finish(&mut self) {
-        self.finish_identifier_token();
-    }
-
-    fn finish_identifier_token(&mut self) {
-        if self.identifier_token.is_empty() || self.identifier_overflowed {
-            self.identifier_token.clear();
-            self.identifier_overflowed = false;
-            return;
-        }
         for (index, term) in self.terms.iter().enumerate() {
             if term.kind == RepositorySearchQueryKind::Identifier
-                && term.normalized() == self.identifier_token
+                && occurrence_positions(&self.tail, term.normalized()).any(|position| {
+                    position.saturating_add(term.normalized().len()) == self.tail.len()
+                        && identifier_has_boundaries(&self.tail, position, term.normalized())
+                })
             {
                 self.counts[index] = self.counts[index].saturating_add(1);
             }
         }
-        self.identifier_token.clear();
-        self.identifier_overflowed = false;
     }
 }
 
@@ -955,19 +941,38 @@ fn count_occurrences(haystack: &[u8], term: &SearchTerm) -> u64 {
 
 fn identifier_occurrences(haystack: &[u8], needle: &[u8]) -> u64 {
     occurrence_positions(haystack, needle)
-        .filter(|position| {
-            let before = position
-                .checked_sub(1)
-                .and_then(|index| haystack.get(index));
-            let after = haystack.get(position.saturating_add(needle.len()));
-            !before.is_some_and(|byte| is_identifier_byte(*byte))
-                && !after.is_some_and(|byte| is_identifier_byte(*byte))
-        })
+        .filter(|position| identifier_has_boundaries(haystack, *position, needle))
         .count() as u64
 }
 
+fn identifier_has_boundaries(haystack: &[u8], position: usize, needle: &[u8]) -> bool {
+    let before = position
+        .checked_sub(1)
+        .and_then(|index| haystack.get(index));
+    let after = haystack.get(position.saturating_add(needle.len()));
+    !before.is_some_and(|byte| is_identifier_byte(*byte))
+        && !after.is_some_and(|byte| is_identifier_byte(*byte))
+}
+
 fn is_identifier_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
+    byte.is_ascii_alphanumeric() || byte == b'_' || !byte.is_ascii()
+}
+
+fn valid_identifier(value: &str) -> bool {
+    value
+        .split('.')
+        .flat_map(|part| part.split("::"))
+        .all(valid_identifier_segment)
+}
+
+fn valid_identifier_segment(segment: &str) -> bool {
+    let mut characters = segment.chars();
+    characters
+        .next()
+        .is_some_and(|character| character == '_' || character.is_alphabetic())
+        && characters.all(|character| {
+            character == '_' || character.is_alphabetic() || character.is_numeric()
+        })
 }
 
 fn occurrence_positions<'a>(
@@ -985,6 +990,29 @@ fn occurrence_positions<'a>(
 mod tests {
     use super::*;
     use crate::envelope::{Kind, RepositoryClaimKind, Severity};
+
+    struct ChunkedReader<'a> {
+        bytes: &'a [u8],
+        chunks: &'a [usize],
+        chunk_index: usize,
+        position: usize,
+    }
+
+    impl Read for ChunkedReader<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.position == self.bytes.len() {
+                return Ok(0);
+            }
+            let chunk = self.chunks[self.chunk_index.min(self.chunks.len() - 1)];
+            self.chunk_index = self.chunk_index.saturating_add(1);
+            let count = chunk
+                .min(buffer.len())
+                .min(self.bytes.len().saturating_sub(self.position));
+            buffer[..count].copy_from_slice(&self.bytes[self.position..self.position + count]);
+            self.position += count;
+            Ok(count)
+        }
+    }
 
     fn run_git(root: &Path, args: &[&str]) -> String {
         let output = std::process::Command::new("git")
@@ -1102,6 +1130,77 @@ mod tests {
         let receipt = search.complete("head", sha256_hex(b"tree"));
         assert_eq!(receipt.match_count, 1);
         assert_eq!(receipt.matches[0].occurrences, 1);
+    }
+
+    #[test]
+    fn identifier_queries_support_qualified_and_unicode_terms_in_paths_and_streams() {
+        let claim = RepositoryClaim {
+            kind: RepositoryClaimKind::Absence,
+            resources: vec![],
+            values: vec![],
+            versions: vec![],
+            paths: vec![],
+            identifiers: vec!["Client::send".into(), "Δοκιμή::send".into()],
+        };
+        let terms = search_terms(std::iter::once(&claim)).unwrap();
+        let qualified = terms
+            .iter()
+            .find(|term| term.normalized() == b"client::send")
+            .unwrap()
+            .query_sha256
+            .clone();
+        let unicode = terms
+            .iter()
+            .find(|term| term.normalized() == "Δοκιμή::send".as_bytes())
+            .unwrap()
+            .query_sha256
+            .clone();
+        let mut search = SearchAccumulator::new(terms);
+
+        search.scan_path("src/Client::send.rs");
+        let bytes = "NotClient::send Client::sender Client::send\nΔοκιμή::send\n".as_bytes();
+        let mut reader = ChunkedReader {
+            bytes,
+            chunks: &[9, 4, 7, 3, 5, 2, 11],
+            chunk_index: 0,
+            position: 0,
+        };
+        search
+            .scan_reader("src/client.rs", &mut reader, bytes.len() as u64)
+            .unwrap();
+        let receipt = search.complete("head", sha256_hex(b"tree"));
+
+        assert_eq!(receipt.match_count, 3);
+        assert_eq!(
+            receipt
+                .matches
+                .iter()
+                .find(|matched| matched.query_sha256 == qualified)
+                .map(|matched| matched.occurrences),
+            Some(2)
+        );
+        assert_eq!(
+            receipt
+                .matches
+                .iter()
+                .find(|matched| matched.query_sha256 == unicode)
+                .map(|matched| matched.occurrences),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn malformed_identifier_queries_fail_closed() {
+        let claim = RepositoryClaim {
+            kind: RepositoryClaimKind::Absence,
+            resources: vec![],
+            values: vec![],
+            versions: vec![],
+            paths: vec![],
+            identifiers: vec!["Client::".into()],
+        };
+
+        assert!(search_terms(std::iter::once(&claim)).is_err());
     }
 
     #[test]
