@@ -120,7 +120,6 @@ enum AdjudicationDisposition {
     SuppressRefuted,
     SuppressDuplicate,
     PreserveUnresolved,
-    SuppressUnsupported,
 }
 
 #[derive(Debug, Clone)]
@@ -988,9 +987,7 @@ pub(crate) fn apply_results(
                 kept.push(finding);
             }
             (
-                AdjudicationProvenance::DeterministicEvidenceReceipt(
-                    DeterministicDemotionReason::RepositoryReceipt,
-                ),
+                AdjudicationProvenance::DeterministicEvidenceReceipt(_),
                 AdjudicationDisposition::PreserveUnresolved,
             ) => {
                 kept_indices.push(index);
@@ -1008,15 +1005,6 @@ pub(crate) fn apply_results(
                 suppressed.push(SuppressedFinding {
                     finding,
                     reason: SuppressionReason::DuplicateRootCause,
-                });
-            }
-            (
-                AdjudicationProvenance::DeterministicEvidenceReceipt(_),
-                AdjudicationDisposition::SuppressUnsupported,
-            ) => {
-                suppressed.push(SuppressedFinding {
-                    finding,
-                    reason: SuppressionReason::NonActionable,
                 });
             }
             _ => return Err(anyhow!("invalid adjudication disposition provenance")),
@@ -1057,11 +1045,7 @@ fn applied_adjudication_results(
             };
             AppliedAdjudicationResult {
                 effective_result: unresolved_result(result),
-                disposition: if reason == DeterministicDemotionReason::RepositoryReceipt {
-                    AdjudicationDisposition::PreserveUnresolved
-                } else {
-                    AdjudicationDisposition::SuppressUnsupported
-                },
+                disposition: AdjudicationDisposition::PreserveUnresolved,
                 provenance: AdjudicationProvenance::DeterministicEvidenceReceipt(reason),
             }
         })
@@ -2281,6 +2265,7 @@ mod tests {
             "Restore the authorization guard",
             "The changed authorization guard is unsafe.",
         );
+        truncated.severity = Severity::Error;
         truncated.evidence = Some(long_citation.clone());
         let findings = vec![truncated];
         let ids = stable_candidate_ids(&snapshot, &findings);
@@ -2310,7 +2295,7 @@ mod tests {
         );
         assert_eq!(
             outcomes[0].disposition,
-            AdjudicationDisposition::SuppressUnsupported
+            AdjudicationDisposition::PreserveUnresolved
         );
         assert_eq!(
             outcomes[0].provenance,
@@ -2328,8 +2313,18 @@ mod tests {
             &unavailable_receipt(),
         )
         .unwrap();
-        assert!(applied.kept.is_empty());
-        assert_eq!(applied.suppressed.len(), 1);
+        assert_eq!(applied.kept.len(), 1);
+        assert!(crate::envelope::finding_blocks_gate(
+            &applied.kept[0],
+            "error",
+            &[],
+            false,
+        ));
+        assert_eq!(
+            applied.kept[0].evidence.as_deref(),
+            Some(long_citation.as_str())
+        );
+        assert!(applied.suppressed.is_empty());
     }
 
     #[test]
