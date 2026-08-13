@@ -25,6 +25,7 @@ use crate::prompt::{self, PrContext};
 use crate::resolve::RepositorySource;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use time::{Date, OffsetDateTime};
 
 /// Each model request stays bounded. Large reviews continue through sequential
 /// source windows; actual provider-attempt, deadline, and spend guards remain
@@ -1198,6 +1199,15 @@ fn review_batch_budgets_are_usable(batch_budgets: ReviewBatchBudgets) -> bool {
 }
 
 async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) -> Result<Envelope> {
+    review_diff_at(cfg, args, input, OffsetDateTime::now_utc().date()).await
+}
+
+async fn review_diff_at(
+    cfg: &Config,
+    args: &ReviewArgs,
+    input: ReviewInput<'_>,
+    current_utc_date: Date,
+) -> Result<Envelope> {
     let ReviewInput {
         diff_snapshot,
         meta,
@@ -1262,7 +1272,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
         || !prepared.compacted_artifacts.is_empty()
         || pr_desc_lines > 0
     {
-        let system = prompt::system_prompt(cfg);
+        let system = prompt::system_prompt(cfg, current_utc_date);
         let chain = cfg.model_chain();
         let active_model_count = if cfg.consensus > 1 {
             cfg.consensus.min(chain.len())
@@ -1513,31 +1523,18 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                                 .any(|id| !candidates.mandatory_ids.contains(id)))
                         .then_some((candidates.manifest.as_str(), remaining))
                     });
-                    let admission = if candidate_output_tokens
-                        .iter()
-                        .all(|max_tokens| *max_tokens == crate::llm::REVIEW_MAX_TOKENS)
-                    {
-                        client.preflight_review_plan(
-                            cfg,
-                            planned_batch_count,
-                            &system,
-                            &candidate_first_users,
-                            &candidate_later_users,
-                            planner,
-                        )?
-                    } else {
-                        client.preflight_review_plan_with_output_limits(
-                            cfg,
-                            planned_batch_count,
-                            &system,
-                            crate::llm::ReviewPreflightPrompts {
-                                first_users: &candidate_first_users,
-                                later_users: &candidate_later_users,
-                                output_tokens: &candidate_output_tokens,
-                            },
-                            planner,
-                        )?
-                    };
+                    let admission = client.preflight_review_plan_with_output_limits(
+                        cfg,
+                        planned_batch_count,
+                        &system,
+                        crate::llm::ReviewPreflightPrompts {
+                            first_users: &candidate_first_users,
+                            later_users: &candidate_later_users,
+                            output_tokens: &candidate_output_tokens,
+                            current_utc_date,
+                        },
+                        planner,
+                    )?;
                     review_admission = Some(admission);
                     if crate::config::qualification_plan_only() {
                         let bounded = bounded_candidates.is_some() || large_diff_receipt.is_some();
@@ -1607,6 +1604,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                         let plan = client
                             .plan_review_batches(
                                 cfg,
+                                current_utc_date,
                                 &candidates.manifest,
                                 &additional_candidates,
                                 remaining,
@@ -1957,7 +1955,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                         summary = summary_parts.join("\n\n");
                         let mut kept = outcome.kept;
                         if !kept.is_empty() && cfg.scorer_enabled() {
-                            let scorer_system = prompt::scorer_system_prompt(cfg);
+                            let scorer_system = prompt::scorer_system_prompt(cfg, current_utc_date);
                             let mut evidence_budget = MAX_SCORER_EVIDENCE_BYTES;
                             let (inputs, scorer_user) = loop {
                                 let inputs = scorer_inputs(
@@ -2059,6 +2057,7 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                             crate::resolve::ResolutionRevisions {
                                 head: head_sha.as_deref(),
                                 base: meta.map(|metadata| metadata.base_sha.as_str()),
+                                current_utc_date,
                             },
                             &finding_contexts,
                             diff_snapshot.as_str(),
@@ -2071,8 +2070,13 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                         model_usage.extend(resolution.model_usage);
                         model_incidents.extend(resolution.model_incidents);
                         usage_accounting_complete &= resolution.usage_accounting_complete;
-                        let brevity =
-                            crate::brevity::compress_findings(cfg, &client, &mut kept).await;
+                        let brevity = crate::brevity::compress_findings(
+                            cfg,
+                            &client,
+                            current_utc_date,
+                            &mut kept,
+                        )
+                        .await;
                         add_usage(&mut usage, brevity.usage);
                         model_usage.extend(brevity.model_usage);
                         model_incidents.extend(brevity.model_incidents);
@@ -2538,7 +2542,10 @@ mod tests {
             ..Config::default()
         };
         let models = vec![cfg.model.clone()];
-        let system = prompt::system_prompt(&cfg);
+        let system = prompt::system_prompt(
+            &cfg,
+            Date::from_calendar_date(2026, time::Month::August, 10).unwrap(),
+        );
         let batch_budgets_for_title = |title: &str| {
             serialized_review_batch_budgets(
                 &cfg,
@@ -2555,13 +2562,13 @@ mod tests {
             .unwrap()
         };
 
-        let local_edge = format!("Benchmark pull request{}", "x".repeat(42));
-        let ci_edge = format!("Benchmark pull request{}", "x".repeat(143));
-        let below_floor = format!("Benchmark pull request{}", "x".repeat(182));
+        let local_edge = format!("Benchmark pull request{}", "x".repeat(0));
+        let ci_edge = format!("Benchmark pull request{}", "x".repeat(21));
+        let below_floor = format!("Benchmark pull request{}", "x".repeat(60));
 
         let local_budgets = batch_budgets_for_title(&local_edge);
-        assert_eq!(local_budgets.synthesis, 4_235);
-        assert_eq!(local_budgets.source, 4_236);
+        assert_eq!(local_budgets.synthesis, 4_155);
+        assert_eq!(local_budgets.source, 4_156);
         assert!(review_batch_budgets_are_usable(local_budgets));
         let ci_budgets = batch_budgets_for_title(&ci_edge);
         assert_eq!(ci_budgets.synthesis, 4_134);

@@ -15,6 +15,7 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use time::Date;
 
 use crate::api_key;
 use crate::config::{ApiFormat, Config, HOSTED_OPERATION_COST_CAP_MICROS, ModelPriceBound};
@@ -647,6 +648,7 @@ pub(crate) struct ReviewPreflightPrompts<'a> {
     pub first_users: &'a [String],
     pub later_users: &'a [String],
     pub output_tokens: &'a [u32],
+    pub current_utc_date: Date,
 }
 pub(crate) const MAX_PROVIDER_ATTEMPTS: usize = 216;
 pub(crate) const MAX_REPORTED_TOKEN_SPEND: usize = 20_000_000;
@@ -667,7 +669,6 @@ const SCORER_MAX_TOKENS_PER_FINDING: u32 = 144;
 const SCORER_REPAIR_BYTES_PER_OUTPUT_TOKEN: usize = 4;
 pub(crate) const SCORER_MAX_FINDINGS: usize = 20;
 const REPAIR_ERROR_MAX_BYTES: usize = 1_024;
-const REVIEW_SCHEMA_REPAIR_SYSTEM: &str = "You repair malformed JSON. Output only valid JSON.";
 // The publication contract targets 1,200 characters and hard-stops at 2,400.
 // Keep generation bounded too, so an invalid model cannot spend an article's
 // worth of output tokens before the validator rejects it.
@@ -696,8 +697,29 @@ fn hostile_json_text(bytes: usize) -> String {
     "\0".repeat(bytes)
 }
 
-fn planner_system_prompt() -> &'static str {
-    "You select bounded code-review batches from an untrusted semantic manifest. Return exactly one JSON object {\"batchIds\":[integer,...]}. Select only IDs present in the candidate set, with no duplicates, and select at most the requested count. Prefer concrete security, correctness, data-loss, concurrency, and lifecycle evidence. The mandatory boundary and global-synthesis batches are reviewed separately."
+fn planner_system_prompt(current_utc_date: Date) -> String {
+    format!(
+        "You select bounded code-review batches from an untrusted semantic manifest. {}Return exactly one JSON object {{\"batchIds\":[integer,...]}}. Select only IDs present in the candidate set, with no duplicates, and select at most the requested count. Prefer concrete security, correctness, data-loss, concurrency, and lifecycle evidence. The mandatory boundary and global-synthesis batches are reviewed separately.",
+        crate::prompt::trusted_current_date_context(current_utc_date),
+    )
+}
+
+fn planner_repair_system(system: &str) -> String {
+    format!(
+        "{system}\n\nRepair the batch-selection JSON. Return only {{\"batchIds\":[integer,...]}}."
+    )
+}
+
+fn review_schema_repair_system(system: &str) -> String {
+    let date_context = system
+        .find("Authoritative review UTC date: ")
+        .and_then(|start| {
+            system[start..]
+                .find("\n\n")
+                .map(|end| &system[start..start + end])
+        })
+        .unwrap_or_default();
+    format!("You repair malformed JSON. Output only valid JSON.\n\n{date_context}")
 }
 
 fn planner_user_prompt(manifest: &str, max_selected: usize) -> String {
@@ -1056,11 +1078,12 @@ pub(crate) fn serialized_review_request_bytes(
     let semantic_user = review_semantic_retry_user(user, "");
     let validation_user = review_validation_retry_user(user, "", "");
     let schema_user = review_schema_repair_user("", "");
+    let schema_system = review_schema_repair_system(system);
     [
         (system, user),
         (system, semantic_user.as_str()),
         (system, validation_user.as_str()),
-        (REVIEW_SCHEMA_REPAIR_SYSTEM, schema_user.as_str()),
+        (schema_system.as_str(), schema_user.as_str()),
     ]
     .into_iter()
     .map(|(request_system, request_user)| {
@@ -1533,14 +1556,16 @@ impl LlmClient {
     fn bounded_schema_repair_user(
         &self,
         model: &str,
+        system: &str,
         invalid: &str,
         error: &str,
         max_tokens: u32,
     ) -> Result<String> {
         let error = truncate_utf8_bytes(error, REPAIR_ERROR_MAX_BYTES);
+        let repair_system = review_schema_repair_system(system);
         self.bounded_review_retry_user(
             model,
-            REVIEW_SCHEMA_REPAIR_SYSTEM,
+            &repair_system,
             invalid,
             error,
             max_tokens,
@@ -1579,8 +1604,14 @@ impl LlmClient {
         let hostile_previous = "\0".repeat(MAX_REVIEW_RETRY_PREVIOUS_BYTES);
         let hostile_reason = "\0".repeat(MAX_REVIEW_RETRY_REASON_BYTES);
         let schema_error = "\0".repeat(REPAIR_ERROR_MAX_BYTES);
-        let schema_user =
-            self.bounded_schema_repair_user(model, &hostile_previous, &schema_error, max_tokens)?;
+        let schema_user = self.bounded_schema_repair_user(
+            model,
+            system,
+            &hostile_previous,
+            &schema_error,
+            max_tokens,
+        )?;
+        let schema_system = review_schema_repair_system(system);
         let semantic_user =
             self.bounded_semantic_retry_user(model, system, user, &hostile_previous, max_tokens)?;
         let validation_user = self.bounded_validation_retry_user(
@@ -1609,7 +1640,7 @@ impl LlmClient {
         )?;
         let schema = self.planned_request_exposure(
             model,
-            REVIEW_SCHEMA_REPAIR_SYSTEM,
+            &schema_system,
             &schema_user,
             max_tokens,
             0.1,
@@ -1698,6 +1729,7 @@ impl LlmClient {
     pub async fn plan_review_batches(
         &self,
         cfg: &Config,
+        current_utc_date: Date,
         manifest: &str,
         allowed_ids: &BTreeSet<usize>,
         max_selected: usize,
@@ -1712,7 +1744,7 @@ impl LlmClient {
                 fallback_used: false,
             });
         }
-        let system = planner_system_prompt();
+        let system = planner_system_prompt(current_utc_date);
         let user = planner_user_prompt(manifest, max_selected);
         let mut aggregate_usage = Usage::default();
         let mut aggregate_model_usage = Vec::new();
@@ -1728,7 +1760,7 @@ impl LlmClient {
         };
         for model in planner_models {
             match self
-                .plan_with_model(&model, system, &user, allowed_ids, max_selected)
+                .plan_with_model(&model, &system, &user, allowed_ids, max_selected)
                 .await
             {
                 Ok(mut result) => {
@@ -1813,10 +1845,11 @@ impl LlmClient {
                     invalid,
                     truncate_utf8_bytes(&first_error, REPAIR_ERROR_MAX_BYTES),
                 );
+                let repair_system = planner_repair_system(system);
                 let repaired = self
                     .chat(
                         model,
-                        "Repair the batch-selection JSON. Return only {\"batchIds\":[integer,...]}.",
+                        &repair_system,
                         &repair_user,
                         &mut usage,
                         &mut model_usage,
@@ -1859,29 +1892,6 @@ impl LlmClient {
             usage_accounting_complete: accounting_complete,
             fallback_used: false,
         })
-    }
-
-    pub(crate) fn preflight_review_plan(
-        &self,
-        cfg: &Config,
-        batch_count: usize,
-        system: &str,
-        candidate_first_users: &[String],
-        candidate_later_users: &[String],
-        planner: Option<(&str, usize)>,
-    ) -> Result<ReviewAdmission> {
-        let output_tokens = vec![REVIEW_MAX_TOKENS; candidate_first_users.len()];
-        self.preflight_review_plan_with_output_limits(
-            cfg,
-            batch_count,
-            system,
-            ReviewPreflightPrompts {
-                first_users: candidate_first_users,
-                later_users: candidate_later_users,
-                output_tokens: &output_tokens,
-            },
-            planner,
-        )
     }
 
     pub(crate) fn preflight_review_plan_with_output_limits(
@@ -1994,7 +2004,7 @@ impl LlmClient {
             let price = bounds
                 .get(model)
                 .ok_or_else(|| anyhow!("hosted scorer {model:?} has no admitted price bound"))?;
-            let scorer_system = crate::prompt::scorer_system_prompt(cfg);
+            let scorer_system = crate::prompt::scorer_system_prompt(cfg, prompts.current_utc_date);
             let scorer_user_bytes =
                 crate::review::MAX_SCORER_PROMPT_BYTES.saturating_sub(scorer_system.len());
             let scorer_user = "\"".repeat(scorer_user_bytes);
@@ -2021,7 +2031,7 @@ impl LlmClient {
                 })?;
                 let (initial, output_tokens) = self.planned_request_exposure(
                     model,
-                    planner_system_prompt(),
+                    &planner_system_prompt(prompts.current_utc_date),
                     &user,
                     PLANNER_MAX_TOKENS,
                     0.1,
@@ -3000,7 +3010,7 @@ impl LlmClient {
                 // One repair attempt: ask the same model to fix its own JSON.
                 let parse_error = parse_err;
                 let repair_user = self
-                    .bounded_schema_repair_user(model, &content, &parse_error, max_tokens)
+                    .bounded_schema_repair_user(model, system, &content, &parse_error, max_tokens)
                     .map_err(|error| {
                         let mut error = ModelError::new(
                             error.context("review schema repair exceeded its context bound"),
@@ -3011,10 +3021,11 @@ impl LlmClient {
                         error.model_incidents.push(incident.clone());
                         error
                     })?;
+                let repair_system = review_schema_repair_system(system);
                 let repaired = match self
                     .review_chat(
                         model,
-                        REVIEW_SCHEMA_REPAIR_SYSTEM,
+                        &repair_system,
                         &repair_user,
                         &mut usage,
                         &mut call_usage,
@@ -5496,6 +5507,10 @@ fn consensus_merge(runs: Vec<ModelReview>) -> ModelReview {
 mod tests {
     use super::*;
 
+    fn trusted_date() -> Date {
+        Date::from_calendar_date(2026, time::Month::August, 10).unwrap()
+    }
+
     #[test]
     fn brevity_parser_requires_one_strict_json_object() {
         assert!(parse_finding_compression(r#"{"body":"short"}"#).is_ok());
@@ -5516,6 +5531,29 @@ mod tests {
         assert!(prompt.contains(r#"{"summary":"","findings":[{"path":"wrong.rs"}]}"#));
         assert!(prompt.contains("finding at wrong.rs:7 is not grounded"));
         assert!(prompt.contains("Correct every listed contract failure"));
+    }
+
+    #[test]
+    fn fixed_review_date_survives_generator_scorer_and_repair_prompts() {
+        let date = trusted_date();
+        let expected = "Authoritative review UTC date: 2026-08-10.";
+        let generator = crate::prompt::system_prompt(&Config::default(), date);
+        let scorer = crate::prompt::scorer_system_prompt(&Config::default(), date);
+        let generator_schema_repair = review_schema_repair_system(&generator);
+        let scorer_schema_repair = scorer_repair_system(&scorer);
+        let planner = planner_system_prompt(date);
+        let planner_schema_repair = planner_repair_system(&planner);
+
+        for system in [
+            generator.as_str(),
+            scorer.as_str(),
+            generator_schema_repair.as_str(),
+            scorer_schema_repair.as_str(),
+            planner.as_str(),
+            planner_schema_repair.as_str(),
+        ] {
+            assert_eq!(system.matches(expected).count(), 1);
+        }
     }
 
     #[test]
@@ -5555,13 +5593,20 @@ mod tests {
             )
             .unwrap();
         let schema = client
-            .bounded_schema_repair_user(&config.model, &previous, &reason, REVIEW_MAX_TOKENS)
+            .bounded_schema_repair_user(
+                &config.model,
+                "system",
+                &previous,
+                &reason,
+                REVIEW_MAX_TOKENS,
+            )
             .unwrap();
+        let schema_system = review_schema_repair_system("system");
 
         for (retry_system, retry_user) in [
             ("system", &semantic),
             ("system", &validation),
-            (REVIEW_SCHEMA_REPAIR_SYSTEM, &schema),
+            (schema_system.as_str(), &schema),
         ] {
             let body = client.request_body(
                 &config.model,
@@ -6073,6 +6118,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn planner_initial_and_schema_repair_share_the_injected_review_date() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("Repair the batch-selection JSON"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"finish_reason": "stop", "message": {"content": "{\"batchIds\":[2]}"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+            })))
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"finish_reason": "stop", "message": {"content": "invalid"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+            })))
+            .with_priority(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let config = Config {
+            api_base: server.uri(),
+            api_format: ApiFormat::OpenaiCompatible,
+            model: "provider/model".into(),
+            scorer_enabled: false,
+            ..Config::default()
+        };
+        let client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(2),
+            None,
+            None,
+        )
+        .unwrap();
+        *client.http.lock().unwrap() = Some(reqwest::Client::new());
+
+        client
+            .plan_review_batches(
+                &config,
+                trusted_date(),
+                "Batch 2 risk=1 kind=source\nchange",
+                &BTreeSet::from([2usize]),
+                1,
+            )
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            let body = String::from_utf8_lossy(&request.body);
+            assert_eq!(
+                body.matches("Authoritative review UTC date: 2026-08-10.")
+                    .count(),
+                1
+            );
+            assert!(!body.contains("Authoritative review UTC date: 2026-08-11."));
+        }
+    }
+
+    #[tokio::test]
     async fn zero_capacity_planner_has_no_preflight_exposure_or_provider_call() {
         let server = MockServer::start().await;
         let config = Config {
@@ -6100,12 +6210,16 @@ mod tests {
         )])));
 
         let admission = client
-            .preflight_review_plan(
+            .preflight_review_plan_with_output_limits(
                 &config,
                 1,
                 "system",
-                &["candidate".to_string()],
-                &["candidate".to_string()],
+                ReviewPreflightPrompts {
+                    first_users: &["candidate".to_string()],
+                    later_users: &["candidate".to_string()],
+                    output_tokens: &[REVIEW_MAX_TOKENS],
+                    current_utc_date: trusted_date(),
+                },
                 Some(("hostile planner manifest", 0)),
             )
             .unwrap();
@@ -6116,6 +6230,7 @@ mod tests {
         let plan = client
             .plan_review_batches(
                 &config,
+                trusted_date(),
                 "hostile planner manifest",
                 &BTreeSet::from([2usize]),
                 0,
@@ -6174,6 +6289,7 @@ mod tests {
         let result = client
             .plan_review_batches(
                 &config,
+                trusted_date(),
                 "Batch 2 risk=1 kind=source\nchange",
                 &BTreeSet::from([2usize]),
                 1,
@@ -6255,6 +6371,7 @@ mod tests {
         let result = client
             .plan_review_batches(
                 &config,
+                trusted_date(),
                 "Batch 2 risk=1 kind=source\nchange",
                 &BTreeSet::from([2usize]),
                 1,
@@ -6737,6 +6854,7 @@ mod tests {
         let result = client
             .plan_review_batches(
                 &config,
+                trusted_date(),
                 "Batch 2 risk=1 kind=source\nchange",
                 &BTreeSet::from([2usize]),
                 1,
@@ -6871,12 +6989,16 @@ mod tests {
         ])));
 
         let admission = client
-            .preflight_review_plan(
+            .preflight_review_plan_with_output_limits(
                 &config,
                 1,
                 "system",
-                &["candidate".to_string()],
-                &["candidate".to_string()],
+                ReviewPreflightPrompts {
+                    first_users: &["candidate".to_string()],
+                    later_users: &["candidate".to_string()],
+                    output_tokens: &[REVIEW_MAX_TOKENS],
+                    current_utc_date: trusted_date(),
+                },
                 None,
             )
             .unwrap();
@@ -6911,12 +7033,22 @@ mod tests {
             },
         )])));
         let admission = client
-            .preflight_review_plan(
+            .preflight_review_plan_with_output_limits(
                 &config,
                 crate::review::MAX_HOSTED_SELECTED_BATCHES,
                 "system",
-                &vec!["bounded candidate".to_string(); crate::review::MAX_HOSTED_SELECTED_BATCHES],
-                &vec!["bounded candidate".to_string(); crate::review::MAX_HOSTED_SELECTED_BATCHES],
+                ReviewPreflightPrompts {
+                    first_users: &vec![
+                        "bounded candidate".to_string();
+                        crate::review::MAX_HOSTED_SELECTED_BATCHES
+                    ],
+                    later_users: &vec![
+                        "bounded candidate".to_string();
+                        crate::review::MAX_HOSTED_SELECTED_BATCHES
+                    ],
+                    output_tokens: &[REVIEW_MAX_TOKENS; crate::review::MAX_HOSTED_SELECTED_BATCHES],
+                    current_utc_date: trusted_date(),
+                },
                 Some((&"m".repeat(96_000), 1)),
             )
             .unwrap();
@@ -6978,12 +7110,22 @@ mod tests {
         )])));
 
         let error = client
-            .preflight_review_plan(
+            .preflight_review_plan_with_output_limits(
                 &config,
                 crate::review::MAX_HOSTED_SELECTED_BATCHES,
                 "system",
-                &vec![hostile_json_text(400_000); crate::review::MAX_HOSTED_SELECTED_BATCHES],
-                &vec![hostile_json_text(400_000); crate::review::MAX_HOSTED_SELECTED_BATCHES],
+                ReviewPreflightPrompts {
+                    first_users: &vec![
+                        hostile_json_text(400_000);
+                        crate::review::MAX_HOSTED_SELECTED_BATCHES
+                    ],
+                    later_users: &vec![
+                        hostile_json_text(400_000);
+                        crate::review::MAX_HOSTED_SELECTED_BATCHES
+                    ],
+                    output_tokens: &[REVIEW_MAX_TOKENS; crate::review::MAX_HOSTED_SELECTED_BATCHES],
+                    current_utc_date: trusted_date(),
+                },
                 Some(("manifest", 1)),
             )
             .unwrap_err();
