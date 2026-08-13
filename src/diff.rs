@@ -6471,11 +6471,11 @@ Binary files a/img.png and b/img.png differ
     #[test]
     fn partial_lockfile_records_and_unrepresented_security_fields_stay_raw() {
         for source in [
-            "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1,4 +1,4 @@\n name = \"package-one\"\n-version = \"1.0.0\"\n+version = \"2.0.0\"\n-source = \"registry+https://trusted.example/index\"\n+source = \"registry+https://attacker.example/index\"\n",
-            "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1,4 +1,4 @@\n name = \"package-one\"\n version = \"1.0.0\"\n-checksum = \"trusted\"\n+checksum = \"attacker\"\n",
-            "diff --git a/package-lock.json b/package-lock.json\n--- a/package-lock.json\n+++ b/package-lock.json\n@@ -1,4 +1,4 @@\n \"left-pad\": {\n \"version\": \"1.0.0\",\n-\"resolved\": \"https://trusted.example/pkg.tgz\"\n+\"resolved\": \"https://attacker.example/pkg.tgz\"\n",
-            "diff --git a/package-lock.json b/package-lock.json\n--- a/package-lock.json\n+++ b/package-lock.json\n@@ -1,4 +1,4 @@\n \"left-pad\": {\n \"version\": \"1.0.0\",\n-\"integrity\": \"sha512-trusted\"\n+\"integrity\": \"sha512-attacker\"\n",
-            "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1,4 +1,4 @@\n name = \"package-one\"\n version = \"1.0.0\"\n-custom = \"trusted\"\n+custom = \"attacker\"\n",
+            "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1,3 +1,3 @@\n name = \"package-one\"\n-version = \"1.0.0\"\n+version = \"2.0.0\"\n-source = \"registry+https://trusted.example/index\"\n+source = \"registry+https://attacker.example/index\"\n",
+            "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1,3 +1,3 @@\n name = \"package-one\"\n version = \"1.0.0\"\n-checksum = \"trusted\"\n+checksum = \"attacker\"\n",
+            "diff --git a/package-lock.json b/package-lock.json\n--- a/package-lock.json\n+++ b/package-lock.json\n@@ -1,3 +1,3 @@\n \"left-pad\": {\n \"version\": \"1.0.0\",\n-\"resolved\": \"https://trusted.example/pkg.tgz\"\n+\"resolved\": \"https://attacker.example/pkg.tgz\"\n",
+            "diff --git a/package-lock.json b/package-lock.json\n--- a/package-lock.json\n+++ b/package-lock.json\n@@ -1,3 +1,3 @@\n \"left-pad\": {\n \"version\": \"1.0.0\",\n-\"integrity\": \"sha512-trusted\"\n+\"integrity\": \"sha512-attacker\"\n",
+            "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1,3 +1,3 @@\n name = \"package-one\"\n version = \"1.0.0\"\n-custom = \"trusted\"\n+custom = \"attacker\"\n",
         ] {
             let prepared = prepare_diff(source);
             assert!(prepared.lockfiles.is_empty());
@@ -6533,7 +6533,7 @@ Binary files a/img.png and b/img.png differ
             ["removed @scope/pkg@1.0.0", "added @scope/pkg@1.1.0"]
         );
 
-        let npm = "diff --git a/package-lock.json b/package-lock.json\n--- a/package-lock.json\n+++ b/package-lock.json\n@@ -1,3 +1,3 @@\n \"left-pad\": {\n-  \"version\": \"1.0.0\"\n+  \"version\": \"1.1.0\"\n";
+        let npm = "diff --git a/package-lock.json b/package-lock.json\n--- a/package-lock.json\n+++ b/package-lock.json\n@@ -1,2 +1,2 @@\n \"left-pad\": {\n-  \"version\": \"1.0.0\"\n+  \"version\": \"1.1.0\"\n";
         let npm = prepare_diff(npm);
         assert_eq!(
             npm.lockfiles[0].changes,

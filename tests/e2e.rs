@@ -2334,7 +2334,9 @@ async fn inconsistent_ignored_header_paths_fail_before_provider_contact() {
         .current_dir(dir.path())
         .env("POSTIL_API_BASE", server.uri())
         .env("POSTIL_DISABLE_SCORER", "1")
-        .args(["review", "--diff", diff.to_str().unwrap(), "--config"])
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--config")
         .arg(&config)
         .args(["--output", "json"])
         .assert()
@@ -7197,6 +7199,71 @@ async fn low_confidence_only_finding_with_risk_summary_fails_closed() {
             .as_str()
             .unwrap()
             .contains("SQL injection risk in auth path.")
+    );
+}
+
+#[tokio::test]
+async fn misanchored_finding_does_not_turn_its_stale_summary_into_an_operational_error() {
+    let server = MockServer::start().await;
+    let finding = json!({
+        "path": "ansible/playbooks/cloudstack-tenant-roles.yml",
+        "line": 92,
+        "severity": "warn",
+        "kind": "uncertainty",
+        "confidence": 0.72,
+        "title": "Terminal `deny *` is ensured to exist but not verified as last rule",
+        "body": "Each role must end in `deny *`, but this task only sets `state: present`; a later rule could still follow it.",
+        "evidence": "    state: present"
+    });
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([finding]))))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = dir.path().join("cloudstack-tenant-roles.diff");
+    std::fs::write(
+        &diff,
+        concat!(
+            "diff --git a/ansible/playbooks/cloudstack-tenant-roles.yml b/ansible/playbooks/cloudstack-tenant-roles.yml\n",
+            "--- a/ansible/playbooks/cloudstack-tenant-roles.yml\n",
+            "+++ b/ansible/playbooks/cloudstack-tenant-roles.yml\n",
+            "@@ -8,3 +8,3 @@ permissions:\n",
+            "     - name: terminal rule\n",
+            "-      permission: allow *\n",
+            "+      permission: deny *\n",
+            "       description: reject every unlisted API\n",
+            "@@ -91,2 +91,2 @@\n",
+            "   ansible.builtin.cloudstack_role_permission:\n",
+            "-    state: absent\n",
+            "+    state: present\n",
+        ),
+    )
+    .unwrap();
+
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .success();
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+
+    assert!(envelope["findings"].as_array().unwrap().is_empty());
+    assert_eq!(envelope["gate"]["failing"], false);
+    assert_eq!(envelope["counts"]["suppressed"], 1);
+    assert_eq!(
+        envelope["suppressedFindings"][0]["reason"],
+        "anchorMismatch"
+    );
+    assert_ne!(
+        envelope["suppressedFindings"][0]["finding"]["path"],
+        ".postil/model-output"
     );
 }
 

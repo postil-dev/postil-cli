@@ -1912,6 +1912,14 @@ async fn review_diff_at(
                     let raw_findings = deduplicated;
                     let grounded_candidate_count = raw_findings.len();
                     let outcome = filter::apply(cfg, &index, raw_findings)?;
+                    let all_suppressed_as_misanchored = !outcome.suppressed_findings.is_empty()
+                        && outcome.suppressed_findings.iter().all(|entry| {
+                            matches!(
+                                entry.reason,
+                                crate::envelope::SuppressionReason::AnchorMismatch
+                                    | crate::envelope::SuppressionReason::DerivedFromSuppressed
+                            )
+                        });
                     suppressed = outcome.suppressed;
                     suppressed_findings = outcome.suppressed_findings;
                     ungrounded = outcome.ungrounded + batch_ungrounded;
@@ -1922,7 +1930,10 @@ async fn review_diff_at(
                             "model reported {} finding(s), none grounded in the diff",
                             ungrounded
                         ))];
-                    } else if outcome.kept.is_empty() && !summary_parts.is_empty() {
+                    } else if outcome.kept.is_empty()
+                        && !summary_parts.is_empty()
+                        && !all_suppressed_as_misanchored
+                    {
                         // Risk narrated in prose while NO finding survives to the
                         // gate. Passing this as clean is the predecessor product's
                         // worst failure mode; fail closed instead and carry the
@@ -1934,8 +1945,10 @@ async fn review_diff_at(
                         // (so raw_findings != 0) while the summary still narrates
                         // risk. That previously slipped through silently. The
                         // all_ungrounded case is handled above, so this branch only
-                        // fires for the genuinely-empty-after-policy case and does
-                        // not double-fire.
+                        // fires for the genuinely-empty-after-policy case. A claim
+                        // rejected because its own named constructs contradict its
+                        // anchor cannot be restored as an operational error through
+                        // the prose summary that accompanied the same claim.
                         findings = vec![crate::envelope::narrated_risk_finding(
                             &summary_parts.join("\n\n"),
                         )];
