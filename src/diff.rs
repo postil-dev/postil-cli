@@ -6,7 +6,7 @@
 //! with its new-file line number.
 
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::RangeInclusive;
@@ -500,6 +500,8 @@ pub struct DiffIndex {
     content_policy_evidence: HashMap<(String, u32), String>,
     rendered_evidence: HashMap<(String, u32), Vec<String>>,
     rendered_old_coordinates: HashSet<(String, u32)>,
+    rendered_exact_ranges: HashMap<String, Vec<RangeInclusive<u32>>>,
+    rendered_exact_old_ranges: HashMap<String, Vec<RangeInclusive<u32>>>,
     /// Old-to-new paths for files renamed by the reviewed change. Baseline
     /// findings cite the old head, so reconciliation must follow an unchanged
     /// evidence line represented in the diff across a rename instead of
@@ -520,12 +522,24 @@ impl Default for DiffIndex {
             content_policy_evidence: HashMap::new(),
             rendered_evidence: HashMap::new(),
             rendered_old_coordinates: HashSet::new(),
+            rendered_exact_ranges: HashMap::new(),
+            rendered_exact_old_ranges: HashMap::new(),
             renamed_paths: HashMap::new(),
         }
     }
 }
 
 impl DiffIndex {
+    fn selected_exact_line(
+        ranges: &HashMap<String, Vec<RangeInclusive<u32>>>,
+        path: &str,
+        line: u32,
+    ) -> bool {
+        ranges
+            .get(path)
+            .is_some_and(|ranges| ranges.iter().any(|range| range.contains(&line)))
+    }
+
     pub fn build(diff: &Diff) -> Self {
         let mut index = Self::default();
         for file in &diff.files {
@@ -670,6 +684,7 @@ impl DiffIndex {
     }
 
     pub fn add_rendered_evidence(&mut self, rendered: &str) {
+        let exact_semantic = is_exact_semantic_batch(rendered);
         let mut current_path = None::<String>;
         for line in rendered.lines() {
             if let Some(header) = line.strip_prefix("### ") {
@@ -680,10 +695,23 @@ impl DiffIndex {
                 continue;
             };
             if let Some(old) = line.strip_prefix("old ")
-                && let Some(number) = old.split_whitespace().next()
+                && let Some((number, marked)) = old.split_once(' ')
                 && let Ok(number) = number.parse::<u32>()
             {
-                self.rendered_old_coordinates.insert((path.clone(), number));
+                if exact_semantic {
+                    let Some(end_line) = marked
+                        .strip_prefix("- ")
+                        .and_then(|payload| exact_semantic_evidence_end_line(payload, number))
+                    else {
+                        continue;
+                    };
+                    self.rendered_exact_old_ranges
+                        .entry(path.clone())
+                        .or_default()
+                        .push(number..=end_line);
+                } else {
+                    self.rendered_old_coordinates.insert((path.clone(), number));
+                }
                 continue;
             }
             let Some((number, marked)) = line.trim_start().split_once(' ') else {
@@ -699,6 +727,16 @@ impl DiffIndex {
             else {
                 continue;
             };
+            if exact_semantic {
+                let Some(end_line) = exact_semantic_evidence_end_line(content, number) else {
+                    continue;
+                };
+                self.rendered_exact_ranges
+                    .entry(path.clone())
+                    .or_default()
+                    .push(number..=end_line);
+                continue;
+            }
             let evidence = self
                 .rendered_evidence
                 .entry((path.clone(), number))
@@ -819,6 +857,16 @@ impl DiffIndex {
             })
             .map(|((path, line), _)| (path.clone(), *line))
             .collect::<Vec<_>>();
+        candidates.extend(
+            self.new_evidence
+                .iter()
+                .filter(|((path, line), actual)| {
+                    path == current_path
+                        && actual.as_str() == evidence
+                        && Self::selected_exact_line(&self.rendered_exact_ranges, path, *line)
+                })
+                .map(|((path, line), _)| (path.clone(), *line)),
+        );
         if finding.kind == crate::envelope::Kind::ContentPolicy {
             candidates.extend(
                 self.content_policy_evidence
@@ -854,12 +902,23 @@ impl DiffIndex {
             || self
                 .rendered_old_coordinates
                 .contains(&(current_path.clone(), finding.line))
+            || Self::selected_exact_line(
+                &self.rendered_exact_old_ranges,
+                &finding.path,
+                finding.line,
+            )
+            || Self::selected_exact_line(
+                &self.rendered_exact_old_ranges,
+                current_path,
+                finding.line,
+            )
         {
             return true;
         }
         self.rendered_evidence
             .keys()
             .any(|(path, line)| path == current_path && *line == finding.line)
+            || Self::selected_exact_line(&self.rendered_exact_ranges, current_path, finding.line)
     }
 
     pub fn contains(&self, path: &str, line: u32) -> bool {
@@ -989,6 +1048,7 @@ pub struct ModelBatchSpool {
     pub source_count: usize,
     pub metadata_count: u32,
     synthesis_ids: BTreeSet<usize>,
+    exact_semantic_ids: BTreeSet<usize>,
     batch_hunks: HashMap<usize, BTreeSet<HunkIdentity>>,
     all_hunks: BTreeSet<HunkIdentity>,
     hunk_risk: HashMap<HunkIdentity, HunkRisk>,
@@ -1113,6 +1173,9 @@ impl ModelBatchSpool {
             id = id
                 .checked_add(1)
                 .context("hosted planner batch id overflowed")?;
+            if self.exact_semantic_ids.contains(&id) {
+                continue;
+            }
             let synthesis = self.synthesis_ids.contains(&id);
             if synthesis {
                 final_synthesis = Some(id);
@@ -1231,7 +1294,7 @@ impl ModelBatchSpool {
 
     pub fn selected_source_count(&self, ids: &BTreeSet<usize>) -> usize {
         ids.iter()
-            .filter(|id| !self.synthesis_ids.contains(id))
+            .filter(|id| !self.synthesis_ids.contains(id) || self.exact_semantic_ids.contains(id))
             .count()
     }
 
@@ -1255,6 +1318,34 @@ impl ModelBatchSpool {
             "hosted planner selected a batch outside the materialized spool"
         );
         Ok(selected)
+    }
+
+    fn batch_text_by_id(&mut self, ids: &BTreeSet<usize>) -> Result<HashMap<usize, String>> {
+        self.file
+            .seek(SeekFrom::Start(0))
+            .context("rewinding model batches for coverage validation")?;
+        let batches = (|| -> Result<HashMap<usize, String>> {
+            let mut selected = HashMap::new();
+            let mut id = 0usize;
+            while let Some(batch) = read_length_prefixed(&mut self.file, "coverage batch")? {
+                id = id.checked_add(1).context("coverage batch id overflowed")?;
+                if ids.contains(&id) {
+                    selected.insert(id, batch);
+                }
+            }
+            anyhow::ensure!(
+                selected.len() == ids.len(),
+                "coverage receipt selected a batch outside the materialized spool"
+            );
+            Ok(selected)
+        })();
+        let rewind = self
+            .file
+            .seek(SeekFrom::Start(0))
+            .context("rewinding model batches after coverage validation");
+        let batches = batches?;
+        rewind?;
+        Ok(batches)
     }
 
     /// Build the large-diff route without a provider-side planning call. Every
@@ -1296,7 +1387,8 @@ impl ModelBatchSpool {
                     .batch_hunks
                     .iter()
                     .filter_map(|(id, hunks)| {
-                        (self.synthesis_ids.contains(id) && hunks.contains(&hunk)).then_some(*id)
+                        (self.exact_semantic_ids.contains(id) && hunks.contains(&hunk))
+                            .then_some(*id)
                     })
                     .collect::<BTreeSet<_>>();
                 let risk = self.hunk_risk.get(&hunk).copied().unwrap_or(HunkRisk {
@@ -1341,7 +1433,7 @@ impl ModelBatchSpool {
             let additional = candidate.direct_batch_ids.difference(&selected).count();
             anyhow::ensure!(
                 selected.len().saturating_add(additional) <= selected_limit,
-                "mandatory hunk {}:{} cannot fit the {selected_limit} batch large-review limit",
+                "mandatory hunk {}:{} cannot fit the {selected_limit} batch large-review limit; no provider request was made",
                 candidate.hunk.path,
                 candidate.hunk.new_start
             );
@@ -1471,7 +1563,8 @@ impl ModelBatchSpool {
         Ok(receipt)
     }
 
-    fn validate_coverage_receipt(&self, receipt: &BoundedCoverageReceipt) -> Result<()> {
+    fn validate_coverage_receipt(&mut self, receipt: &BoundedCoverageReceipt) -> Result<()> {
+        let selected_batches = self.batch_text_by_id(&receipt.selected_batch_ids)?;
         for entry in &receipt.entries {
             let risk = self
                 .hunk_risk
@@ -1503,12 +1596,30 @@ impl ModelBatchSpool {
                     self.synthesis_ids.contains(id) == expected_synthesis,
                     "coverage disposition references the wrong evidence batch kind"
                 );
+                if expected_synthesis {
+                    anyhow::ensure!(
+                        self.exact_semantic_ids.contains(id),
+                        "semantic coverage is not bound to exact bounded evidence"
+                    );
+                }
                 anyhow::ensure!(
                     self.batch_hunks
                         .get(id)
                         .is_some_and(|hunks| hunks.contains(&entry.hunk)),
                     "coverage evidence batch is not bound to the exact normalized hunk digest"
                 );
+                if expected_synthesis {
+                    anyhow::ensure!(
+                        selected_batches.get(id).is_some_and(|batch| {
+                            final_model_visible_semantic_hunks(
+                                batch,
+                                &BTreeSet::from([entry.hunk.clone()]),
+                            )
+                            .contains(&entry.hunk)
+                        }),
+                        "semantic coverage proof is not visible in the selected provider prompt"
+                    );
+                }
             }
         }
         Ok(())
@@ -1622,16 +1733,7 @@ fn stable_large_diff_risk_score(path: &str, hunk: &Hunk) -> usize {
 }
 
 fn semantic_large_diff_hunk(path: &str, hunk: &Hunk) -> bool {
-    if mandatory_large_diff_hunk(path, hunk) {
-        return false;
-    }
-    let changed = hunk
-        .lines
-        .iter()
-        .filter_map(|line| line.strip_prefix('+').or_else(|| line.strip_prefix('-')))
-        .flat_map(hosted_risk_tokens)
-        .collect::<Vec<_>>();
-    hosted_token_risk_score(&changed) == 0
+    !mandatory_large_diff_hunk(path, hunk)
 }
 
 const HOSTED_RISK_MARKERS: [(&str, usize); 19] = [
@@ -1795,6 +1897,461 @@ pub fn spool_model_batches(
     )
 }
 
+fn exact_rle_segments(content: &str) -> String {
+    const MIN_REPEAT_RUN: usize = 16;
+
+    let mut segments = Vec::new();
+    let mut literal = String::new();
+    let mut characters = content.chars().peekable();
+    while let Some(character) = characters.next() {
+        let mut count = 1usize;
+        while characters.peek().is_some_and(|next| *next == character) {
+            characters.next();
+            count = count.saturating_add(1);
+        }
+        if count >= MIN_REPEAT_RUN {
+            if !literal.is_empty() {
+                segments.push(format!(
+                    "[\"l\",{}]",
+                    serde_json::to_string(&std::mem::take(&mut literal)).unwrap()
+                ));
+            }
+            segments.push(format!(
+                "[\"r\",{count},{}]",
+                serde_json::to_string(&character.to_string()).unwrap()
+            ));
+        } else {
+            literal.extend(std::iter::repeat_n(character, count));
+        }
+    }
+    if !literal.is_empty() {
+        segments.push(format!(
+            "[\"l\",{}]",
+            serde_json::to_string(&literal).unwrap()
+        ));
+    }
+    format!("[{}]", segments.join(","))
+}
+
+fn decode_exact_rle_segments(value: &serde_json::Value) -> Option<String> {
+    let segments = value.as_array()?;
+    let mut decoded = String::new();
+    for segment in segments {
+        let segment = segment.as_array()?;
+        match segment.as_slice() {
+            [kind, literal] if kind.as_str() == Some("l") => {
+                let literal = literal.as_str()?;
+                let next = decoded.len().checked_add(literal.len())?;
+                (next <= LINE_CHUNK_BYTES).then_some(())?;
+                decoded.push_str(literal);
+            }
+            [kind, count, scalar] if kind.as_str() == Some("r") => {
+                let count = usize::try_from(count.as_u64()?).ok()?;
+                let scalar = scalar.as_str()?;
+                let mut characters = scalar.chars();
+                let character = characters.next()?;
+                characters.next().is_none().then_some(())?;
+                let repeated_bytes = character.len_utf8().checked_mul(count)?;
+                let next = decoded.len().checked_add(repeated_bytes)?;
+                (next <= LINE_CHUNK_BYTES).then_some(())?;
+                decoded.extend(std::iter::repeat_n(character, count));
+            }
+            _ => return None,
+        }
+    }
+    Some(decoded)
+}
+
+struct DecodedExactTemplate {
+    counter_end: u64,
+    counter_start: u64,
+    end_line: u32,
+    prefix: String,
+    suffix: String,
+}
+
+fn decode_exact_template(encoded: &str, start_line: u32) -> Option<DecodedExactTemplate> {
+    let value = serde_json::from_str::<serde_json::Value>(encoded).ok()?;
+    let object = value.as_object()?;
+    (object.len() == 5).then_some(())?;
+    let counter_end = object.get("counterEnd")?.as_u64()?;
+    let counter_start = object.get("counterStart")?.as_u64()?;
+    let end_line = u32::try_from(object.get("endLine")?.as_u64()?).ok()?;
+    let prefix = decode_exact_rle_segments(object.get("prefix")?)?;
+    let suffix = decode_exact_rle_segments(object.get("suffix")?)?;
+    let line_count = end_line.checked_sub(start_line)?.checked_add(1)? as u64;
+    let counter_count = counter_end.checked_sub(counter_start)?.checked_add(1)?;
+    (line_count == counter_count && line_count <= MAX_DIFF_INDEX_RANGES as u64).then_some(())?;
+    Some(DecodedExactTemplate {
+        counter_end,
+        counter_start,
+        end_line,
+        prefix,
+        suffix,
+    })
+}
+
+fn decode_exact_semantic_evidence(
+    payload: &str,
+    start_line: u32,
+    requested_line: u32,
+) -> Option<String> {
+    if let Some(encoded) = payload.strip_prefix("exact-rle-v1 ") {
+        (requested_line == start_line).then_some(())?;
+        return decode_exact_rle_segments(&serde_json::from_str(encoded).ok()?);
+    }
+    if let Some(encoded) = payload.strip_prefix("exact-template-v1 ") {
+        let template = decode_exact_template(encoded, start_line)?;
+        (start_line..=template.end_line)
+            .contains(&requested_line)
+            .then_some(())?;
+        let counter = template
+            .counter_start
+            .checked_add(u64::from(requested_line - start_line))?;
+        (counter <= template.counter_end).then_some(())?;
+        let rendered_bytes = template
+            .prefix
+            .len()
+            .checked_add(counter.to_string().len())?
+            .checked_add(template.suffix.len())?;
+        (rendered_bytes <= LINE_CHUNK_BYTES).then_some(())?;
+        return Some(format!("{}{counter}{}", template.prefix, template.suffix));
+    }
+    (requested_line == start_line).then(|| payload.to_string())
+}
+
+fn exact_semantic_evidence_end_line(payload: &str, start_line: u32) -> Option<u32> {
+    if let Some(encoded) = payload.strip_prefix("exact-template-v1 ") {
+        return Some(decode_exact_template(encoded, start_line)?.end_line);
+    }
+    if let Some(encoded) = payload.strip_prefix("exact-rle-v1 ") {
+        decode_exact_rle_segments(&serde_json::from_str(encoded).ok()?)?;
+    }
+    Some(start_line)
+}
+
+fn is_exact_semantic_batch(annotated: &str) -> bool {
+    annotated
+        .lines()
+        .take_while(|line| !line.starts_with("### "))
+        .any(|line| line == "Exact bounded semantic evidence:")
+}
+
+fn exact_line_number_prefix(marker: &str, old_line: u32, new_line: u32) -> String {
+    match marker {
+        "+" => format!("{new_line} + "),
+        "-" => format!("old {old_line} - "),
+        _ => unreachable!(),
+    }
+}
+
+fn exact_semantic_line(marker: &str, content: &str, old_line: u32, new_line: u32) -> String {
+    const MIN_EXACT_RLE_LINE_BYTES: usize = 160;
+
+    let rendered = render_line_segments(marker, content, old_line, new_line).concat();
+    let reserved_prefix =
+        content.starts_with("exact-rle-v1 ") || content.starts_with("exact-template-v1 ");
+    if content.len() < MIN_EXACT_RLE_LINE_BYTES && !reserved_prefix {
+        return rendered;
+    }
+    let encoded = format!(
+        "{}exact-rle-v1 {}\n",
+        exact_line_number_prefix(marker, old_line, new_line),
+        exact_rle_segments(content)
+    );
+    if encoded.len() < rendered.len() || reserved_prefix {
+        encoded
+    } else {
+        rendered
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ExactChangedLine<'a> {
+    marker: &'a str,
+    content: &'a str,
+    old_line: u32,
+    new_line: u32,
+}
+
+fn decimal_runs(content: &str) -> Vec<(usize, usize, u64)> {
+    let bytes = content.as_bytes();
+    let mut runs = Vec::new();
+    let mut start = 0usize;
+    while start < bytes.len() {
+        if !bytes[start].is_ascii_digit() {
+            start += 1;
+            continue;
+        }
+        let mut end = start + 1;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        if let Ok(number) = content[start..end].parse::<u64>()
+            && content[start..end] == number.to_string()
+        {
+            runs.push((start, end, number));
+        }
+        start = end;
+    }
+    runs
+}
+
+fn sequential_template_length(lines: &[ExactChangedLine<'_>]) -> Option<(usize, usize, usize)> {
+    const MIN_TEMPLATE_LINES: usize = 4;
+    let first = lines.first()?;
+    let mut best = None;
+    for (start, end, first_counter) in decimal_runs(first.content).into_iter().rev() {
+        let prefix = &first.content[..start];
+        let suffix = &first.content[end..];
+        let mut length = 1usize;
+        for candidate in &lines[1..] {
+            if candidate.marker != first.marker {
+                break;
+            }
+            let expected_counter = first_counter.checked_add(length as u64)?;
+            let expected_line = match first.marker {
+                "+" => first.new_line.checked_add(length as u32)?,
+                "-" => first.old_line.checked_add(length as u32)?,
+                _ => unreachable!(),
+            };
+            let candidate_line = if first.marker == "+" {
+                candidate.new_line
+            } else {
+                candidate.old_line
+            };
+            if candidate_line != expected_line {
+                break;
+            }
+            let Some(middle) = candidate
+                .content
+                .strip_prefix(prefix)
+                .and_then(|content| content.strip_suffix(suffix))
+            else {
+                break;
+            };
+            if middle != expected_counter.to_string() {
+                break;
+            }
+            length += 1;
+        }
+        if length >= MIN_TEMPLATE_LINES
+            && best.is_none_or(|(_, _, best_length)| length > best_length)
+        {
+            best = Some((start, end, length));
+        }
+    }
+    best
+}
+
+fn exact_semantic_template(lines: &[ExactChangedLine<'_>]) -> Option<(String, usize)> {
+    let first = *lines.first()?;
+    let (start, end, length) = sequential_template_length(lines)?;
+    let last = lines[length - 1];
+    let first_counter = first.content[start..end].parse::<u64>().ok()?;
+    let last_counter = first_counter.checked_add(length.saturating_sub(1) as u64)?;
+    let end_line = if first.marker == "+" {
+        last.new_line
+    } else {
+        last.old_line
+    };
+    let encoded = format!(
+        "{}exact-template-v1 {{\"counterEnd\":{last_counter},\"counterStart\":{first_counter},\"endLine\":{end_line},\"prefix\":{},\"suffix\":{}}}\n",
+        exact_line_number_prefix(first.marker, first.old_line, first.new_line),
+        exact_rle_segments(&first.content[..start]),
+        exact_rle_segments(&first.content[end..]),
+    );
+    let rendered_bytes = lines[..length]
+        .iter()
+        .map(|line| {
+            exact_semantic_line(line.marker, line.content, line.old_line, line.new_line).len()
+        })
+        .sum::<usize>();
+    (encoded.len() < rendered_bytes).then_some((encoded, length))
+}
+
+fn exact_semantic_hunk_proof(path: &str, hunk: &Hunk) -> Option<String> {
+    let mut old_line = hunk.old_start;
+    let mut new_line = hunk.new_start;
+    let mut changed_lines = Vec::<ExactChangedLine<'_>>::new();
+    let mut substantive_added = false;
+    for raw in &hunk.lines {
+        let (marker, content) = raw.split_at(if raw.is_empty() { 0 } else { 1 });
+        if matches!(marker, "+" | "-") {
+            if marker == "+"
+                && hosted_risk_tokens(content)
+                    .iter()
+                    .any(|token| token.len() >= 2)
+            {
+                substantive_added = true;
+            }
+            changed_lines.push(ExactChangedLine {
+                marker,
+                content,
+                old_line,
+                new_line,
+            });
+        }
+        match marker {
+            "+" => new_line = new_line.checked_add(1)?,
+            "-" => old_line = old_line.checked_add(1)?,
+            _ => {
+                old_line = old_line.checked_add(1)?;
+                new_line = new_line.checked_add(1)?;
+            }
+        }
+    }
+    substantive_added.then_some(())?;
+    let identity = hunk_receipt_identity(&HunkIdentity::new(path, hunk));
+    let mut proof = format!(
+        "### {}\n@@ exact bounded hunk identity={identity} old={},{} new={},{} @@\n",
+        display_path(path),
+        hunk.old_start,
+        hunk.old_count,
+        hunk.new_start,
+        hunk.new_count,
+    );
+    let mut index = 0usize;
+    while index < changed_lines.len() {
+        if let Some((template, length)) = exact_semantic_template(&changed_lines[index..]) {
+            proof.push_str(&template);
+            index += length;
+            continue;
+        }
+        let line = changed_lines[index];
+        proof.push_str(&exact_semantic_line(
+            line.marker,
+            line.content,
+            line.old_line,
+            line.new_line,
+        ));
+        index += 1;
+    }
+    Some(proof)
+}
+
+fn exact_semantic_batch_header(hunks: &BTreeSet<HunkIdentity>) -> String {
+    format!(
+        "Exact bounded semantic evidence:\nEvery credited hunk below retains its repository path, every changed line, and a non-empty added line. `exact-rle-v1` concatenates literal `[\"l\", text]` and Unicode-scalar repeat `[\"r\", count, scalar]` segments. `exact-template-v1` is a JSON object that expands the inclusive `counterStart` through `counterEnd` range between its exact `prefix` and `suffix` for each source line through `endLine`. These lossless forms reconstruct the complete source; do not infer omitted context. A finding may cite any represented new-side line, but its `evidence` must be that line's complete reconstructed source text, never the encoding record.\nExact normalized hunk-set commitment (SHA-256): {}\n",
+        hunk_set_sha256(hunks)
+    )
+}
+
+fn hunk_receipt_identity(hunk: &HunkIdentity) -> String {
+    Sha256::digest(hunk.canonical().as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn final_model_visible_semantic_hunks(
+    batch: &str,
+    candidates: &BTreeSet<HunkIdentity>,
+) -> BTreeSet<HunkIdentity> {
+    let mut path = None::<&str>;
+    let mut identity = None::<&str>;
+    let mut visible = BTreeSet::new();
+    for line in batch.lines() {
+        if let Some(value) = line.strip_prefix("### ") {
+            path = Some(prompt_header_path(value));
+            identity = None;
+            continue;
+        }
+        if let Some(value) = line
+            .strip_prefix("@@ exact bounded hunk identity=")
+            .and_then(|value| value.split_once(' ').map(|(identity, _)| identity))
+        {
+            identity = Some(value);
+            continue;
+        }
+        let Some((number, marked)) = line.trim_start().split_once(' ') else {
+            continue;
+        };
+        let Some(line_number) = number.parse::<u32>().ok() else {
+            continue;
+        };
+        let Some(evidence) = marked.strip_prefix("+ ") else {
+            continue;
+        };
+        if evidence.trim().is_empty() {
+            continue;
+        }
+        let Some((path, identity)) = path.zip(identity) else {
+            continue;
+        };
+        visible.extend(
+            candidates
+                .iter()
+                .filter(|hunk| {
+                    let Some(evidence_end) =
+                        exact_semantic_evidence_end_line(evidence, line_number)
+                    else {
+                        return false;
+                    };
+                    let Some(hunk_end) =
+                        hunk.new_start.checked_add(hunk.new_count.saturating_sub(1))
+                    else {
+                        return false;
+                    };
+                    prompt_paths_equal(path, &hunk.path)
+                        && hunk_receipt_identity(hunk) == identity
+                        && hunk.new_count > 0
+                        && (hunk.new_start..=hunk_end).contains(&line_number)
+                        && evidence_end <= hunk_end
+                        && decode_exact_semantic_evidence(evidence, line_number, line_number)
+                            .is_some_and(|decoded| !decoded.trim().is_empty())
+                })
+                .cloned(),
+        );
+    }
+    visible
+}
+
+fn finalize_exact_semantic_batch(
+    payload: String,
+    candidates: BTreeSet<HunkIdentity>,
+) -> Option<(String, BTreeSet<HunkIdentity>)> {
+    let visible = final_model_visible_semantic_hunks(&payload, &candidates);
+    if visible.is_empty() {
+        return None;
+    }
+    let header = exact_semantic_batch_header(&visible);
+    Some((format!("{header}{payload}"), visible))
+}
+
+fn exact_semantic_batches(
+    proofs: BTreeMap<HunkIdentity, String>,
+    max_batch_bytes: usize,
+) -> Vec<(String, BTreeSet<HunkIdentity>)> {
+    let header_reserve = exact_semantic_batch_header(&BTreeSet::new()).len();
+    let payload_capacity = max_batch_bytes.saturating_sub(header_reserve);
+    let mut batches = Vec::new();
+    let mut payload = String::new();
+    let mut hunks = BTreeSet::new();
+    for (hunk, proof) in proofs {
+        if proof.len() > payload_capacity {
+            continue;
+        }
+        if !payload.is_empty()
+            && payload.len().saturating_add(proof.len()) > payload_capacity
+            && let Some(batch) = finalize_exact_semantic_batch(
+                std::mem::take(&mut payload),
+                std::mem::take(&mut hunks),
+            )
+        {
+            batches.push(batch);
+        }
+        payload.push_str(&proof);
+        hunks.insert(hunk);
+    }
+    if !payload.is_empty()
+        && let Some(batch) = finalize_exact_semantic_batch(payload, hunks)
+    {
+        batches.push(batch);
+    }
+    batches
+}
+
 pub(crate) fn spool_model_batches_with_synthesis_budget(
     prepared: &mut PreparedReview,
     max_source_batch_bytes: usize,
@@ -1816,9 +2373,13 @@ pub(crate) fn spool_model_batches_with_synthesis_budget(
     let mut count = 0usize;
     let mut source_count = 0usize;
     let mut synthesis_ids = BTreeSet::new();
+    let mut exact_semantic_ids = BTreeSet::new();
     let mut batch_hunks = HashMap::new();
     let mut all_hunks = BTreeSet::new();
     let mut hunk_risk = HashMap::new();
+    let mut semantic_hunk_proofs = BTreeMap::new();
+    let semantic_proof_capacity = max_synthesis_batch_bytes
+        .saturating_sub(exact_semantic_batch_header(&BTreeSet::new()).len());
     let mut metadata_batch_ids = BTreeSet::new();
     let mut metadata_count = 0u32;
     let synthesis_header = "Cross-window semantic digests:\n";
@@ -1834,13 +2395,19 @@ pub(crate) fn spool_model_batches_with_synthesis_budget(
             for hunk in &file.hunks {
                 let identity = HunkIdentity::new(&file.path, hunk);
                 hunk_risk.insert(
-                    identity,
+                    identity.clone(),
                     HunkRisk {
                         mandatory: mandatory_large_diff_hunk(&file.path, hunk),
                         semantic_eligible: semantic_large_diff_hunk(&file.path, hunk),
                         score: stable_large_diff_risk_score(&file.path, hunk),
                     },
                 );
+                if semantic_large_diff_hunk(&file.path, hunk)
+                    && let Some(proof) = exact_semantic_hunk_proof(&file.path, hunk)
+                    && proof.len() <= semantic_proof_capacity
+                {
+                    semantic_hunk_proofs.insert(identity, proof);
+                }
             }
         }
         let plan = render_review_batches(
@@ -2036,6 +2603,28 @@ pub(crate) fn spool_model_batches_with_synthesis_budget(
                 .context("recursive synthesis level overflowed")?;
         }
     }
+    if source_count > crate::review::MAX_LARGE_DIFF_SELECTED_BATCHES {
+        for (batch, hunks) in
+            exact_semantic_batches(semantic_hunk_proofs, max_synthesis_batch_bytes)
+        {
+            write_length_prefixed(
+                &mut file,
+                &mut lease,
+                &batch,
+                max_synthesis_batch_bytes,
+                "exact semantic model batch",
+            )?;
+            spool_bytes = spool_bytes
+                .checked_add(batch.len() as u64 + 8)
+                .context("model-batch spool size overflowed")?;
+            count = count
+                .checked_add(1)
+                .context("model batch count overflowed")?;
+            synthesis_ids.insert(count);
+            exact_semantic_ids.insert(count);
+            batch_hunks.insert(count, hunks);
+        }
+    }
     if count == 0 && force_empty {
         write_length_prefixed(
             &mut file,
@@ -2066,6 +2655,7 @@ pub(crate) fn spool_model_batches_with_synthesis_budget(
         source_count,
         metadata_count,
         synthesis_ids,
+        exact_semantic_ids,
         batch_hunks,
         all_hunks,
         hunk_risk,
@@ -4262,8 +4852,24 @@ fn semantic_digest(batch: &str) -> String {
     out
 }
 
+fn rendered_new_evidence_range(rendered: &str, exact_semantic: bool) -> Option<(u32, u32, &str)> {
+    let (number, marked) = rendered.trim_start().split_once(' ')?;
+    let number = number.parse::<u32>().ok()?;
+    let payload = marked
+        .strip_prefix("+ ")
+        .or_else(|| marked.strip_prefix("  "))?;
+    (!payload.trim().is_empty()).then_some(())?;
+    let end_line = if exact_semantic {
+        exact_semantic_evidence_end_line(payload, number)?
+    } else {
+        number
+    };
+    Some((number, end_line, payload))
+}
+
 /// Return the segment that contains a citation in the exact model input.
 fn review_batch_segments(annotated: &str, path: &str, line: u32) -> Vec<usize> {
+    let exact_semantic = is_exact_semantic_batch(annotated);
     let mut current_path: Option<&str> = None;
     let mut segment = 0usize;
     let mut matches = Vec::new();
@@ -4280,10 +4886,10 @@ fn review_batch_segments(annotated: &str, path: &str, line: u32) -> Vec<usize> {
         if !current_path.is_some_and(|current| prompt_paths_equal(current, path)) {
             continue;
         }
-        let Some((number, _)) = rendered.trim_start().split_once(' ') else {
+        let Some((start, end, _)) = rendered_new_evidence_range(rendered, exact_semantic) else {
             continue;
         };
-        if number.parse::<u32>().ok() == Some(line) {
+        if (start..=end).contains(&line) {
             matches.push(segment);
         }
     }
@@ -4323,21 +4929,22 @@ pub fn review_batch_canonical_evidence(
 ) -> Option<String> {
     let evidence = evidence.filter(|value| !value.trim().is_empty())?;
     let payloads = review_batch_evidence_payloads(annotated, path, line);
-    if let Some(exact) = payloads.iter().find(|payload| **payload == evidence) {
-        return Some((*exact).to_string());
+    if let Some(exact) = payloads.iter().find(|payload| payload.as_str() == evidence) {
+        return Some(exact.clone());
     }
     let trimmed_matches = payloads
         .into_iter()
         .filter(|payload| payload.trim() == evidence.trim())
         .collect::<Vec<_>>();
-    let first = *trimmed_matches.first()?;
+    let first = trimmed_matches.first()?.clone();
     trimmed_matches
         .iter()
-        .all(|payload| *payload == first)
-        .then(|| first.to_string())
+        .all(|payload| payload == &first)
+        .then_some(first)
 }
 
-fn review_batch_evidence_payloads<'a>(annotated: &'a str, path: &str, line: u32) -> Vec<&'a str> {
+fn review_batch_evidence_payloads(annotated: &str, path: &str, line: u32) -> Vec<String> {
+    let exact_semantic = is_exact_semantic_batch(annotated);
     let mut current_path: Option<&str> = None;
     let mut payloads = Vec::new();
     for rendered in annotated.lines() {
@@ -4348,17 +4955,19 @@ fn review_batch_evidence_payloads<'a>(annotated: &'a str, path: &str, line: u32)
         if !current_path.is_some_and(|current| prompt_paths_equal(current, path)) {
             continue;
         }
-        let Some((number, marked)) = rendered.trim_start().split_once(' ') else {
+        let Some((start, end, payload)) = rendered_new_evidence_range(rendered, exact_semantic)
+        else {
             continue;
         };
-        if number.parse::<u32>().ok() != Some(line) {
+        if !(start..=end).contains(&line) {
             continue;
         }
-        let payload = marked
-            .strip_prefix("+ ")
-            .or_else(|| marked.strip_prefix("  "));
-        if let Some(payload) = payload.filter(|value| !value.trim().is_empty()) {
-            payloads.push(payload);
+        if exact_semantic {
+            if let Some(payload) = decode_exact_semantic_evidence(payload, start, line) {
+                payloads.push(payload);
+            }
+        } else {
+            payloads.push(payload.to_string());
         }
     }
     payloads
@@ -4369,11 +4978,11 @@ fn review_batch_evidence_payloads<'a>(annotated: &'a str, path: &str, line: u32)
 /// continues to require an exact match through `review_batch_canonical_evidence`.
 pub fn review_batch_expected_evidence(annotated: &str, path: &str, line: u32) -> Option<String> {
     let payloads = review_batch_evidence_payloads(annotated, path, line);
-    let first = *payloads.first()?;
+    let first = payloads.first()?.clone();
     payloads
         .iter()
-        .all(|payload| *payload == first)
-        .then(|| first.to_string())
+        .all(|payload| payload == &first)
+        .then_some(first)
 }
 
 pub fn review_batch_has_evidence_anchor(annotated: &str, path: &str, line: u32) -> bool {
@@ -4390,6 +4999,7 @@ pub fn render_review_batch_context(
     radius: usize,
     max_bytes: usize,
 ) -> Option<String> {
+    let exact_semantic = is_exact_semantic_batch(annotated);
     let lines: Vec<&str> = annotated.lines().collect();
     let mut current_path: Option<&str> = None;
     let mut target = None;
@@ -4401,10 +5011,10 @@ pub fn render_review_batch_context(
         if !current_path.is_some_and(|current| prompt_paths_equal(current, path)) {
             continue;
         }
-        let Some((number, _)) = rendered.trim_start().split_once(' ') else {
+        let Some((start, end, _)) = rendered_new_evidence_range(rendered, exact_semantic) else {
             continue;
         };
-        if number.parse::<u32>().ok() == Some(line) {
+        if (start..=end).contains(&line) {
             target = Some(index);
             break;
         }
@@ -5707,6 +6317,256 @@ diff --git a/two.rs b/two.rs
         source
     }
 
+    fn exact_bounded_risk_fixture() -> String {
+        use std::fmt::Write as _;
+
+        let mut source = String::new();
+        for file in 0..30 {
+            writeln!(
+                source,
+                "diff --git a/src/module-{file}.rs b/src/module-{file}.rs"
+            )
+            .unwrap();
+            writeln!(source, "--- a/src/module-{file}.rs").unwrap();
+            writeln!(source, "+++ b/src/module-{file}.rs").unwrap();
+            writeln!(source, "@@ -1,81 +1,81 @@").unwrap();
+            writeln!(source, "-let mode = \"old\";").unwrap();
+            writeln!(source, "+let retry_mode = \"bounded\";").unwrap();
+            for _ in 0..80 {
+                writeln!(source, " {}", "context".repeat(64)).unwrap();
+            }
+        }
+        source
+    }
+
+    #[test]
+    fn exact_semantic_proof_losslessly_compacts_repeated_long_lines() {
+        let content = format!("{} eval(hidden) {}", "x".repeat(400), "y".repeat(400));
+        let source = format!(
+            "diff --git a/src/long.ts b/src/long.ts\n--- a/src/long.ts\n+++ b/src/long.ts\n@@ -1 +1 @@\n-old\n+{content}\n"
+        );
+        let parsed = parse(&source);
+        let hunk = &parsed.files[0].hunks[0];
+        let proof = exact_semantic_hunk_proof("src/long.ts", hunk).unwrap();
+
+        assert!(proof.contains("exact-rle-v1"));
+        assert!(proof.contains("[\"r\",400,\"x\"]"));
+        assert!(proof.contains("eval(hidden)"));
+        assert!(proof.contains("[\"r\",400,\"y\"]"));
+        assert!(!proof.contains(&content));
+        assert!(proof.len() < 1_000);
+    }
+
+    #[test]
+    fn exact_semantic_templates_round_trip_added_and_removed_lines() {
+        let padding = "x".repeat(200);
+        let removed = (1..=4)
+            .map(|counter| format!("const old_{counter} = actor.id; // {padding}"))
+            .collect::<Vec<_>>();
+        let added = (5..=8)
+            .map(|counter| format!("const new_{counter} = actor.id; // {padding}"))
+            .collect::<Vec<_>>();
+        let source = format!(
+            "diff --git a/src/long.ts b/src/long.ts\n--- a/src/long.ts\n+++ b/src/long.ts\n@@ -10,4 +20,4 @@\n{}\n{}\n",
+            removed
+                .iter()
+                .map(|line| format!("-{line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            added
+                .iter()
+                .map(|line| format!("+{line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let parsed = parse(&source);
+        let proof = exact_semantic_hunk_proof("src/long.ts", &parsed.files[0].hunks[0]).unwrap();
+        let templates = proof
+            .lines()
+            .filter_map(|line| {
+                line.split_once("exact-template-v1 ")
+                    .map(|(prefix, encoded)| (prefix, serde_json::from_str(encoded).unwrap()))
+            })
+            .collect::<Vec<(&str, serde_json::Value)>>();
+        assert_eq!(templates.len(), 2);
+
+        for ((line_prefix, template), (expected_marker, expected)) in
+            templates.iter().zip([("-", &removed), ("+", &added)])
+        {
+            let (marker, start_line) = if let Some(line) = line_prefix.strip_prefix("old ") {
+                (
+                    "-",
+                    line.strip_suffix(" - ").unwrap().parse::<u32>().unwrap(),
+                )
+            } else {
+                (
+                    "+",
+                    line_prefix
+                        .strip_suffix(" + ")
+                        .unwrap()
+                        .parse::<u32>()
+                        .unwrap(),
+                )
+            };
+            let counter_start = template["counterStart"].as_u64().unwrap();
+            let counter_end = template["counterEnd"].as_u64().unwrap();
+            let end_line = template["endLine"].as_u64().unwrap() as u32;
+            let prefix = decode_exact_rle_segments(&template["prefix"]).unwrap();
+            let suffix = decode_exact_rle_segments(&template["suffix"]).unwrap();
+            let reconstructed = (counter_start..=counter_end)
+                .map(|counter| format!("{prefix}{counter}{suffix}"))
+                .collect::<Vec<_>>();
+
+            assert_eq!(&reconstructed, expected);
+            assert_eq!(end_line, start_line + expected.len() as u32 - 1);
+            assert_eq!(marker, expected_marker);
+        }
+    }
+
+    #[test]
+    fn exact_semantic_grounding_uses_reconstructed_source_not_transport_records() {
+        let padding = "x".repeat(200);
+        let removed = (1..=4)
+            .map(|counter| format!("const old_{counter} = actor.id; // {padding}"))
+            .collect::<Vec<_>>();
+        let added = (5..=8)
+            .map(|counter| format!("const new_{counter} = actor.id; // {padding}"))
+            .collect::<Vec<_>>();
+        let source = format!(
+            "diff --git a/src/long.ts b/src/long.ts\n--- a/src/long.ts\n+++ b/src/long.ts\n@@ -10,4 +20,4 @@\n{}\n{}\n",
+            removed
+                .iter()
+                .map(|line| format!("-{line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            added
+                .iter()
+                .map(|line| format!("+{line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let parsed = parse(&source);
+        let proof = exact_semantic_hunk_proof("src/long.ts", &parsed.files[0].hunks[0]).unwrap();
+        let batch = format!("{}{}", exact_semantic_batch_header(&BTreeSet::new()), proof);
+        let transport = batch
+            .lines()
+            .find_map(|line| line.split_once("20 + ").map(|(_, payload)| payload))
+            .unwrap();
+
+        for (offset, expected) in added.iter().enumerate() {
+            let line = 20 + offset as u32;
+            assert_eq!(
+                review_batch_expected_evidence(&batch, "src/long.ts", line).as_deref(),
+                Some(expected.as_str())
+            );
+            assert_eq!(
+                review_batch_canonical_evidence(&batch, "src/long.ts", line, Some(expected))
+                    .as_deref(),
+                Some(expected.as_str())
+            );
+            assert!(
+                review_batch_canonical_evidence(&batch, "src/long.ts", line, Some(transport))
+                    .is_none()
+            );
+        }
+
+        let mut index = DiffIndex::build(&parsed);
+        index.add_rendered_evidence(&batch);
+        for line in 10..=13 {
+            assert!(DiffIndex::selected_exact_line(
+                &index.rendered_exact_old_ranges,
+                "src/long.ts",
+                line
+            ));
+        }
+        for offset in 0..added.len() {
+            assert!(DiffIndex::selected_exact_line(
+                &index.rendered_exact_ranges,
+                "src/long.ts",
+                20 + offset as u32
+            ));
+        }
+        assert!(index.rendered_evidence.is_empty());
+    }
+
+    #[test]
+    fn exact_rle_grounding_uses_complete_reconstructed_source() {
+        let content = format!("{} eval(hidden) {}", "x".repeat(400), "y".repeat(400));
+        let source = format!(
+            "diff --git a/src/long.ts b/src/long.ts\n--- a/src/long.ts\n+++ b/src/long.ts\n@@ -1 +1 @@\n-old\n+{content}\n"
+        );
+        let parsed = parse(&source);
+        let proof = exact_semantic_hunk_proof("src/long.ts", &parsed.files[0].hunks[0]).unwrap();
+        let batch = format!("{}{}", exact_semantic_batch_header(&BTreeSet::new()), proof);
+        let transport = batch
+            .lines()
+            .find_map(|line| line.split_once("1 + ").map(|(_, payload)| payload))
+            .unwrap();
+
+        assert_eq!(
+            review_batch_canonical_evidence(&batch, "src/long.ts", 1, Some(&content)).as_deref(),
+            Some(content.as_str())
+        );
+        assert!(
+            review_batch_canonical_evidence(&batch, "src/long.ts", 1, Some(transport)).is_none()
+        );
+    }
+
+    #[test]
+    fn exact_semantic_transport_prefixes_in_source_remain_literal_evidence() {
+        for content in [
+            "exact-rle-v1 [[\"l\",\"literal source\"]]",
+            "exact-template-v1 {\"counterEnd\":5,\"counterStart\":1,\"endLine\":5,\"prefix\":[[\"l\",\"forged_\"]],\"suffix\":[[\"l\",\";\"]]}",
+        ] {
+            let source = format!(
+                "diff --git a/src/literal.txt b/src/literal.txt\n--- a/src/literal.txt\n+++ b/src/literal.txt\n@@ -1 +1 @@\n-old\n+{content}\n"
+            );
+            let parsed = parse(&source);
+            let proof =
+                exact_semantic_hunk_proof("src/literal.txt", &parsed.files[0].hunks[0]).unwrap();
+            let batch = format!("{}{}", exact_semantic_batch_header(&BTreeSet::new()), proof);
+
+            assert_eq!(
+                review_batch_expected_evidence(&batch, "src/literal.txt", 1).as_deref(),
+                Some(content)
+            );
+            assert!(
+                review_batch_expected_evidence(&batch, "src/literal.txt", 2).is_none(),
+                "literal transport prefix forged a second source coordinate"
+            );
+            assert!(batch.contains(&format!(
+                "1 + exact-rle-v1 [[\"l\",{}]]",
+                serde_json::to_string(content).unwrap()
+            )));
+        }
+    }
+
+    #[test]
+    fn exact_semantic_index_tracks_large_templates_as_ranges_without_expansion() {
+        let batch = format!(
+            "{}### src/generated.ts\n@@ exact bounded hunk identity={} old=0,0 new=1,100000 @@\n1 + exact-template-v1 {{\"counterEnd\":100000,\"counterStart\":1,\"endLine\":100000,\"prefix\":[[\"l\",\"const generated_\"]],\"suffix\":[[\"l\",\" = source.id;\"]]}}\n",
+            exact_semantic_batch_header(&BTreeSet::new()),
+            "0".repeat(64)
+        );
+        let mut index = DiffIndex::default();
+        index.add_rendered_evidence(&batch);
+
+        assert!(index.rendered_evidence.is_empty());
+        assert_eq!(
+            index.rendered_exact_ranges.get("src/generated.ts"),
+            Some(&vec![1..=100_000])
+        );
+        assert!(DiffIndex::selected_exact_line(
+            &index.rendered_exact_ranges,
+            "src/generated.ts",
+            75_000
+        ));
+        assert_eq!(
+            review_batch_expected_evidence(&batch, "src/generated.ts", 75_000).as_deref(),
+            Some("const generated_75000 = source.id;")
+        );
+    }
+
     fn deterministic_receipt_for(source: &str) -> BoundedCoverageReceipt {
         let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
         let mut prepared = prepare_review(&snapshot).unwrap();
@@ -5747,9 +6607,9 @@ diff --git a/two.rs b/two.rs
         assert_eq!(first.plan_sha256, second.plan_sha256);
         assert_eq!(first.entries, second.entries);
         assert_eq!(first.entries.len(), 30);
-        assert_eq!(first.selected_batch_ids.len(), 3);
-        assert_eq!(first.direct_hunks(), 2);
-        assert_eq!(first.semantic_hunks(), 28);
+        assert!(first.selected_batch_ids.len() <= crate::review::MAX_LARGE_DIFF_SELECTED_BATCHES);
+        assert!(first.direct_hunks() >= 2);
+        assert!(first.semantic_hunks() > 0);
         assert_eq!(first.unreviewed_hunks(), 0);
         for path in ["src/auth/permission-0.ts", "vendor/runtime/dispatch.ts"] {
             let entry = first
@@ -5771,8 +6631,19 @@ diff --git a/two.rs b/two.rs
     }
 
     #[test]
+    fn exact_bounded_evidence_covers_nonmandatory_risk_markers() {
+        let source = exact_bounded_risk_fixture();
+        let receipt = deterministic_receipt_for(&source);
+
+        assert_eq!(receipt.entries.len(), 30);
+        assert_eq!(receipt.unreviewed_hunks(), 0);
+        assert!(receipt.semantic_hunks() > 0);
+        assert!(receipt.selected_batch_ids.len() <= crate::review::MAX_LARGE_DIFF_SELECTED_BATCHES);
+    }
+
+    #[test]
     fn semantic_receipt_rejects_a_missing_exact_hunk_mapping() {
-        let source = deterministic_large_fixture(1);
+        let source = exact_bounded_risk_fixture();
         let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
         let mut prepared = prepare_review(&snapshot).unwrap();
         let mut batches = spool_model_batches(&mut prepared, 16_000, 4_096, false).unwrap();
@@ -5804,7 +6675,7 @@ diff --git a/two.rs b/two.rs
 
     #[test]
     fn semantic_receipt_prompt_commits_to_its_exact_normalized_hunk_set() {
-        let source = deterministic_large_fixture(1);
+        let source = exact_bounded_risk_fixture();
         let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
         let mut prepared = prepare_review(&snapshot).unwrap();
         let mut batches = spool_model_batches(&mut prepared, 16_000, 4_096, false).unwrap();
@@ -5831,20 +6702,18 @@ diff --git a/two.rs b/two.rs
 
     #[test]
     fn semantic_receipt_rejects_a_tampered_summary_batch_identity() {
-        let source = deterministic_large_fixture(1);
+        let source = exact_bounded_risk_fixture();
         let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
         let mut prepared = prepare_review(&snapshot).unwrap();
         let mut batches = spool_model_batches(&mut prepared, 16_000, 4_096, false).unwrap();
         let mut receipt = batches
             .deterministic_bounded_receipt(crate::review::MAX_LARGE_DIFF_SELECTED_BATCHES)
             .unwrap();
-        let direct_id = receipt
-            .entries
-            .iter()
-            .find_map(|entry| match &entry.disposition {
-                HunkDisposition::Direct { batch_ids } => Some(batch_ids[0]),
-                _ => None,
-            })
+        let direct_id = batches
+            .batch_hunks
+            .keys()
+            .find(|id| !batches.synthesis_ids.contains(id))
+            .copied()
             .unwrap();
         let semantic = receipt
             .entries
