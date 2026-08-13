@@ -266,10 +266,15 @@ pub(crate) fn publication_exposes_evidence_boundary(finding: &Finding) -> bool {
     let prose = format!("{} {}", finding.title, finding.body).to_ascii_lowercase();
     [
         "in the diff",
+        "in this diff",
         "the diff shows",
+        "this diff shows",
         "the diff adds",
+        "this diff adds",
         "the diff does not",
+        "this diff does not",
         "the diff contains",
+        "this diff contains",
         "supplied diff",
         "provided diff",
         "available context",
@@ -1389,7 +1394,8 @@ mod tests {
         universal.body = "No other caller handles this value; add a compatible caller.".into();
         let mut boundary = finding(claim("unused"));
         boundary.repository_claim = None;
-        boundary.body = "In the diff this is the only value; verify that consumers agree.".into();
+        boundary.body =
+            "No CephCluster image change appears in this diff; update it to v19.2.5.".into();
         let mut findings = vec![universal, boundary];
 
         assert_eq!(enforce_receipt(&mut findings, &receipt).len(), 2);
