@@ -328,7 +328,7 @@ pub(crate) fn sanitize_scorer_input(value: &str) -> String {
 /// System prompt for the interactive bot answering a maintainer's mention.
 /// The small JSON envelope keeps generated prose behind a deterministic
 /// publication check before it can reach a forge.
-pub fn respond_system_prompt(cfg: &Config) -> String {
+pub fn respond_system_prompt(cfg: &Config, current_utc_date: Date) -> String {
     let mut p = String::from(
         "You are Postil, replying to a maintainer who mentioned you on a pull request or \
          issue. Answer the actual question directly. Ground every claim in the diff or thread \
@@ -354,6 +354,7 @@ pub fn respond_system_prompt(cfg: &Config) -> String {
          or 24 nonblank lines, extra fields, Markdown headings, more than three list items, and \
          unsafe Markdown.",
     );
+    p.push_str(&trusted_current_date_context(current_utc_date));
     if let Some(rules) = &cfg.guardrails {
         p.push_str("\n\nRepository guardrails you may reference:\n");
         let rules = bounded_untrusted_prompt_text(rules, MAX_GUARDRAIL_PROMPT_BYTES / 2);
@@ -587,7 +588,13 @@ mod tests {
 
     #[test]
     fn respond_prompt_requires_a_compact_structured_reply() {
-        let p = respond_system_prompt(&Config::default());
+        let p = respond_system_prompt(&Config::default(), trusted_date());
+        assert_eq!(
+            p.matches("Authoritative review UTC date: 2026-08-10.")
+                .count(),
+            1
+        );
+        assert!(!p.contains("Authoritative review UTC date: 2026-08-11."));
         assert!(p.contains("at or below 1,200 characters"));
         assert!(p.contains("not an article"));
         assert!(p.contains("{\"answer\":\"concise GitHub-flavored Markdown\",\"diagram\":null}"));
