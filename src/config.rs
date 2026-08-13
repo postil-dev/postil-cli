@@ -2904,8 +2904,8 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
     }
 
     #[test]
-    fn review_contract_manifest_covers_every_rust_source_and_required_manifest() {
-        fn collect_rust_sources(root: &Path, directory: &Path, paths: &mut Vec<String>) {
+    fn review_contract_manifest_covers_every_source_file_and_required_manifest() {
+        fn collect_review_sources(root: &Path, directory: &Path, paths: &mut Vec<String>) {
             let mut entries = std::fs::read_dir(directory)
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
@@ -2914,8 +2914,8 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
             for entry in entries {
                 let path = entry.path();
                 if path.is_dir() {
-                    collect_rust_sources(root, &path, paths);
-                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    collect_review_sources(root, &path, paths);
+                } else if path.is_file() {
                     paths.push(
                         path.strip_prefix(root)
                             .unwrap()
@@ -2933,7 +2933,7 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
             "Cargo.toml".to_string(),
             "build.rs".to_string(),
         ];
-        collect_rust_sources(root, &root.join("src"), &mut expected);
+        collect_review_sources(root, &root.join("src"), &mut expected);
         expected.sort_unstable();
 
         let declared: Vec<String> =

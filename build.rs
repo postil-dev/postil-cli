@@ -20,7 +20,7 @@ fn main() {
         .iter()
         .map(ToString::to_string)
         .collect::<Vec<_>>();
-    collect_rust_sources(
+    collect_review_sources(
         &repository_root,
         &repository_root.join("src"),
         &mut expected,
@@ -29,7 +29,7 @@ fn main() {
 
     assert_eq!(
         declared, expected,
-        "review contract manifest must exactly cover required manifests and every src/**/*.rs file"
+        "review contract manifest must exactly cover required manifests and every regular file under src"
     );
 
     for path in &expected {
@@ -48,7 +48,7 @@ fn main() {
     fs::write(output_path, generated).expect("generated review contract sources must be writable");
 }
 
-fn collect_rust_sources(repository_root: &Path, directory: &Path, paths: &mut Vec<String>) {
+fn collect_review_sources(repository_root: &Path, directory: &Path, paths: &mut Vec<String>) {
     let mut entries = fs::read_dir(directory)
         .expect("source directory must be readable")
         .collect::<Result<Vec<_>, _>>()
@@ -64,9 +64,8 @@ fn collect_rust_sources(repository_root: &Path, directory: &Path, paths: &mut Ve
             path.display()
         );
         if metadata.is_dir() {
-            collect_rust_sources(repository_root, &path, paths);
-        } else if metadata.is_file() && path.extension().is_some_and(|extension| extension == "rs")
-        {
+            collect_review_sources(repository_root, &path, paths);
+        } else if metadata.is_file() {
             let relative = path
                 .strip_prefix(repository_root)
                 .expect("source path must be inside the repository root")

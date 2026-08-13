@@ -6,6 +6,7 @@
   "src/api_key.rs",
   "src/attribution.rs",
   "src/brevity.rs",
+  "src/builtin-content-policy.md",
   "src/cli.rs",
   "src/config.rs",
   "src/credentials.rs",
