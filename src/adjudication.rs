@@ -47,6 +47,8 @@ pub(crate) struct CandidateCitationReceipt {
     pub added_occurrences: u64,
     pub removed_occurrences: u64,
     pub context_occurrences: u64,
+    pub queries_complete: bool,
+    pub matching_windows_complete: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,8 +100,9 @@ pub(crate) struct AdjudicationApplication {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeterministicDemotionReason {
-    RepositoryReceiptIncomplete,
-    CitationFragmentIncomplete,
+    RepositoryReceipt,
+    DirectReceipt,
+    CitationFragment,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,9 +259,9 @@ pub(crate) fn build_diff_corpus_receipt(
     let mut digest = Sha256::new();
     digest.update(diff.as_bytes());
     let corpus_sha256 = hex_digest(digest.finalize().as_slice());
-    let all_terms = findings
+    let candidate_terms = findings
         .iter()
-        .flat_map(|finding| {
+        .map(|finding| {
             [
                 Some(finding.path.as_str()),
                 Some(finding.title.as_str()),
@@ -268,22 +271,16 @@ pub(crate) fn build_diff_corpus_receipt(
             .into_iter()
             .flatten()
             .flat_map(semantic_terms)
+            .collect::<BTreeSet<_>>()
         })
+        .collect::<Vec<_>>();
+    let all_terms = candidate_terms
+        .iter()
+        .flatten()
+        .cloned()
         .collect::<BTreeSet<_>>();
-    let mut selected_terms = Vec::new();
-    let mut query_bytes = 0usize;
-    let mut queries_complete = true;
-    for term in all_terms {
-        let next_bytes = query_bytes.saturating_add(term.len());
-        if selected_terms.len() == MAX_DIRECT_EVIDENCE_QUERIES
-            || next_bytes > MAX_DIRECT_EVIDENCE_QUERY_BYTES
-        {
-            queries_complete = false;
-            break;
-        }
-        query_bytes = next_bytes;
-        selected_terms.push(term);
-    }
+    let (selected_terms, queries_complete) = bounded_query_terms(&all_terms);
+    let selected_term_set = selected_terms.iter().cloned().collect::<BTreeSet<_>>();
     let lines = if diff.is_empty() {
         Vec::new()
     } else {
@@ -306,14 +303,21 @@ pub(crate) fn build_diff_corpus_receipt(
     let candidate_citations = findings
         .iter()
         .zip(candidate_ids)
-        .map(|(finding, candidate_id)| {
+        .zip(&candidate_terms)
+        .map(|((finding, candidate_id), terms)| {
+            let queries_complete = terms.iter().all(|term| selected_term_set.contains(term));
+            let candidate_selected_terms = terms.iter().cloned().collect::<Vec<_>>();
             let Some(citation) = finding.evidence.as_deref() else {
+                let matching_windows_complete = queries_complete
+                    && matching_windows_fit(&lines, &normalized_lines, &candidate_selected_terms);
                 return CandidateCitationReceipt {
                     candidate_id: candidate_id.clone(),
                     citation_sha256: None,
                     added_occurrences: 0,
                     removed_occurrences: 0,
                     context_occurrences: 0,
+                    queries_complete,
+                    matching_windows_complete,
                 };
             };
             let mut citation_digest = Sha256::new();
@@ -324,6 +328,8 @@ pub(crate) fn build_diff_corpus_receipt(
                 added_occurrences: 0,
                 removed_occurrences: 0,
                 context_occurrences: 0,
+                queries_complete,
+                matching_windows_complete: false,
             };
             for line in &lines {
                 let line = line.trim_end_matches(['\r', '\n']);
@@ -341,40 +347,21 @@ pub(crate) fn build_diff_corpus_receipt(
                     _ => {}
                 }
             }
+            let citation_occurrences = receipt
+                .added_occurrences
+                .saturating_add(receipt.removed_occurrences)
+                .saturating_add(receipt.context_occurrences);
+            let exact_unique_citation =
+                citation.len() <= MAX_CITED_EVIDENCE_BYTES && citation_occurrences == 1;
+            receipt.matching_windows_complete = receipt.queries_complete
+                && (exact_unique_citation
+                    || matching_windows_fit(&lines, &normalized_lines, &candidate_selected_terms));
             receipt
         })
         .collect();
-    let mut selected = BTreeSet::new();
-    for (index, line) in lines.iter().enumerate() {
-        let normalized = line.to_ascii_lowercase();
-        if selected_terms.iter().any(|term| normalized.contains(term)) {
-            for nearby in index.saturating_sub(2)..=(index + 2).min(lines.len().saturating_sub(1)) {
-                selected.insert(nearby);
-            }
-        }
-    }
-    let mut rendered = String::new();
-    let mut matching_windows_complete = true;
-    let mut previous = None;
-    for index in selected {
-        if previous.is_some_and(|value: usize| index > value + 1) {
-            if rendered.len().saturating_add(22) > MAX_ADJUDICATION_CORPUS_BYTES {
-                matching_windows_complete = false;
-                break;
-            }
-            rendered.push_str("[matching window gap]\n");
-        }
-        let mut row = format!("{}:{}", index + 1, lines[index]);
-        if !row.ends_with('\n') {
-            row.push('\n');
-        }
-        if rendered.len().saturating_add(row.len()) > MAX_ADJUDICATION_CORPUS_BYTES {
-            matching_windows_complete = false;
-            break;
-        }
-        rendered.push_str(&row);
-        previous = Some(index);
-    }
+    let selected = matching_line_indices(&normalized_lines, &selected_terms);
+    let (rendered, matching_windows_complete) =
+        render_matching_windows(&lines, selected, MAX_ADJUDICATION_CORPUS_BYTES);
     debug_assert_eq!(findings.len(), candidate_ids.len());
     DiffCorpusReceipt {
         snapshot_id: snapshot_id.to_string(),
@@ -388,6 +375,72 @@ pub(crate) fn build_diff_corpus_receipt(
         candidate_citations,
         rendered_evidence: rendered,
     }
+}
+
+fn bounded_query_terms(terms: &BTreeSet<String>) -> (Vec<String>, bool) {
+    let mut selected = Vec::new();
+    let mut bytes = 0usize;
+    for term in terms {
+        let next_bytes = bytes.saturating_add(term.len());
+        if selected.len() == MAX_DIRECT_EVIDENCE_QUERIES
+            || next_bytes > MAX_DIRECT_EVIDENCE_QUERY_BYTES
+        {
+            return (selected, false);
+        }
+        bytes = next_bytes;
+        selected.push(term.clone());
+    }
+    (selected, true)
+}
+
+fn matching_line_indices(normalized_lines: &[String], terms: &[String]) -> BTreeSet<usize> {
+    let mut selected = BTreeSet::new();
+    for (index, line) in normalized_lines.iter().enumerate() {
+        if terms.iter().any(|term| line.contains(term)) {
+            for nearby in
+                index.saturating_sub(2)..=(index + 2).min(normalized_lines.len().saturating_sub(1))
+            {
+                selected.insert(nearby);
+            }
+        }
+    }
+    selected
+}
+
+fn render_matching_windows(
+    lines: &[&str],
+    selected: BTreeSet<usize>,
+    max_bytes: usize,
+) -> (String, bool) {
+    let mut rendered = String::new();
+    let mut previous = None;
+    for index in selected {
+        if previous.is_some_and(|value: usize| index > value + 1) {
+            if rendered.len().saturating_add(22) > max_bytes {
+                return (rendered, false);
+            }
+            rendered.push_str("[matching window gap]\n");
+        }
+        let mut row = format!("{}:{}", index + 1, lines[index]);
+        if !row.ends_with('\n') {
+            row.push('\n');
+        }
+        if rendered.len().saturating_add(row.len()) > max_bytes {
+            return (rendered, false);
+        }
+        rendered.push_str(&row);
+        previous = Some(index);
+    }
+    (rendered, true)
+}
+
+fn matching_windows_fit(lines: &[&str], normalized_lines: &[String], terms: &[String]) -> bool {
+    render_matching_windows(
+        lines,
+        matching_line_indices(normalized_lines, terms),
+        MAX_ADJUDICATION_CORPUS_BYTES,
+    )
+    .1
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
@@ -800,7 +853,7 @@ fn deterministic_demotion_reason(
     finding: &Finding,
     result: &AdjudicationResult,
     _corpus: &str,
-    _receipt: &DiffCorpusReceipt,
+    receipt: &DiffCorpusReceipt,
     repository_receipt: &RepositorySearchReceipt,
 ) -> Option<DeterministicDemotionReason> {
     let repository_grounded =
@@ -814,12 +867,45 @@ fn deterministic_demotion_reason(
         && bounded_citation
         && !repository_grounded;
     if claim_unresolved {
-        Some(DeterministicDemotionReason::RepositoryReceiptIncomplete)
+        Some(DeterministicDemotionReason::RepositoryReceipt)
+    } else if !matches!(result.status, AdjudicationStatus::Refuted)
+        && !candidate_direct_search_is_complete(finding, &result.candidate_id, receipt)
+        && !repository_grounded
+    {
+        Some(DeterministicDemotionReason::DirectReceipt)
     } else if incomplete_citation {
-        Some(DeterministicDemotionReason::CitationFragmentIncomplete)
+        Some(DeterministicDemotionReason::CitationFragment)
     } else {
         None
     }
+}
+
+fn candidate_direct_search_is_complete(
+    finding: &Finding,
+    candidate_id: &str,
+    receipt: &DiffCorpusReceipt,
+) -> bool {
+    let selected_terms = receipt
+        .queries
+        .iter()
+        .map(|query| query.term.as_str())
+        .collect::<HashSet<_>>();
+    let queries_complete = [
+        Some(finding.path.as_str()),
+        Some(finding.title.as_str()),
+        Some(finding.body.as_str()),
+        finding.evidence.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .flat_map(semantic_terms)
+    .all(|term| selected_terms.contains(term.as_str()));
+    let matching_windows_complete = receipt
+        .candidate_citations
+        .iter()
+        .find(|citation| citation.candidate_id == candidate_id)
+        .is_some_and(|citation| citation.matching_windows_complete);
+    receipt.scan_complete && queries_complete && matching_windows_complete
 }
 
 fn result_is_bounded_citation_fragment(result: &AdjudicationResult, finding: &Finding) -> bool {
@@ -1471,7 +1557,7 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_query_or_window_receipts_demote_corpus_wide_outcomes() {
+    fn incomplete_candidate_query_or_window_receipts_suppress_confirmations() {
         let snapshot = "a".repeat(40);
         let mut query_finding = finding(
             Kind::Risk,
@@ -1547,13 +1633,78 @@ mod tests {
                 );
                 if confirmed {
                     let applied = applied.unwrap();
-                    assert_eq!(applied.kept.len(), 1);
-                    assert!(applied.suppressed.is_empty());
+                    assert!(applied.kept.is_empty());
+                    assert_eq!(applied.suppressed.len(), 1);
                 } else {
                     assert!(applied.is_err());
                 }
             }
         }
+    }
+
+    #[test]
+    fn incomplete_candidate_queries_do_not_suppress_a_complete_peer() {
+        let snapshot = "a".repeat(40);
+        let mut incomplete = finding(
+            Kind::Risk,
+            "Restore the required action",
+            "The changed action omits the required call.",
+        );
+        incomplete.body.push(' ');
+        incomplete.body.push_str(
+            &(0..MAX_DIRECT_EVIDENCE_QUERIES)
+                .map(|index| format!("zterm{index:03}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+        let mut complete = finding(
+            Kind::Risk,
+            "Validate the dangerous sink",
+            "The dangerous sink receives unchecked input.",
+        );
+        complete.path = "src/sink.rs".into();
+        complete.evidence = Some("dangerous_sink(input);".into());
+        let findings = vec![incomplete, complete];
+        let ids = stable_candidate_ids(&snapshot, &findings);
+        let corpus = "+ uses: action@old\n+ dangerous_sink(input);\n";
+        let receipt = direct_receipt(&snapshot, corpus, &findings, &ids);
+        assert!(!receipt.queries_complete);
+        assert!(!candidate_direct_search_is_complete(
+            &findings[0],
+            &ids[0],
+            &receipt
+        ));
+        assert!(candidate_direct_search_is_complete(
+            &findings[1],
+            &ids[1],
+            &receipt
+        ));
+        let results = findings
+            .iter()
+            .zip(&ids)
+            .map(|(finding, candidate_id)| AdjudicationResult {
+                candidate_id: candidate_id.clone(),
+                status: AdjudicationStatus::Confirmed,
+                revised_title: finding.title.clone(),
+                revised_body: finding.body.clone(),
+                evidence: finding.evidence.clone().unwrap(),
+                duplicate_of: None,
+            })
+            .collect();
+
+        let applied = apply_results(
+            &snapshot,
+            findings,
+            ids,
+            results,
+            corpus,
+            &receipt,
+            &unavailable_receipt(),
+        )
+        .unwrap();
+        assert_eq!(applied.kept.len(), 1);
+        assert_eq!(applied.kept[0].path, "src/sink.rs");
+        assert_eq!(applied.suppressed.len(), 1);
     }
 
     #[test]
@@ -1599,7 +1750,7 @@ mod tests {
         assert_eq!(
             outcomes[0].provenance,
             AdjudicationProvenance::DeterministicEvidenceReceipt(
-                DeterministicDemotionReason::CitationFragmentIncomplete
+                DeterministicDemotionReason::CitationFragment
             )
         );
         let applied = apply_results(
