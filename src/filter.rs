@@ -748,13 +748,13 @@ fn defect_identity(finding: &Finding) -> (String, crate::envelope::Kind, String,
 /// edit landed elsewhere in the span.
 ///
 /// Incremental baselines cite the OLD head, so their anchors must be checked
-/// against old-side hunk coordinates. A trustworthy full review is
-/// authoritative over the complete PR and resolves any baseline issue the
-/// fresh model run did not reproduce.
+/// against old-side hunk coordinates. Full-review resolution is handled by the
+/// explicit adjudication ledger before reconciliation; model silence alone is
+/// never proof that an open finding is resolved.
 fn touch_addresses(index: &DiffIndex, f: &Finding, scope: ReconcileScope) -> bool {
     match scope {
         ReconcileScope::Incremental { .. } => index.contains_old(&f.path, f.line),
-        ReconcileScope::Full { trust } => trust == ReviewTrust::Exhaustive,
+        ReconcileScope::Full { .. } => false,
     }
 }
 
@@ -820,43 +820,19 @@ pub fn reconcile(
             } else {
                 push_carried(&mut carried, &mut carried_identities, f.clone());
             }
-        } else if let ReconcileScope::Full {
-            trust: ReviewTrust::Bounded,
-        } = scope
-        {
+        } else if matches!(scope, ReconcileScope::Full { .. }) {
             if let Some((path, line)) = index.remap_current_evidence(f) {
-                if index.remap_reviewed_evidence(f).as_ref() == Some(&(path.clone(), line)) {
-                    // The selected model input contained this exact current
-                    // anchor and the model did not reproduce it.
-                    resolved.push(f.clone());
-                } else {
-                    // The issue's evidence remains in an unselected part of
-                    // the full diff. Keep it open at its current coordinate.
-                    let mut carry = f.clone();
-                    carry.path = path;
-                    carry.line = line;
-                    carry.end_line = None;
-                    push_carried(&mut carried, &mut carried_identities, carry);
-                }
-            } else if f.evidence.is_some()
-                && f.path != crate::envelope::CHANGE_METADATA_PATH
-                && index.contains_reviewed_baseline_coordinate(f)
-            {
-                // The selected input covered this coordinate and the complete
-                // current diff no longer contains the exact citation. The
-                // completed model request did not reproduce the issue.
-                resolved.push(f.clone());
+                let mut carry = f.clone();
+                carry.path = path;
+                carry.line = line;
+                carry.end_line = None;
+                push_carried(&mut carried, &mut carried_identities, carry);
             } else {
-                // Changed evidence outside the selected input, historical
-                // findings without canonical evidence, and virtual change
-                // metadata remain open.
                 push_carried(&mut carried, &mut carried_identities, f.clone());
             }
         } else if touch_addresses(index, f, scope) {
-            // An incremental edit touched the old-head anchor, or a trustworthy
-            // full review did not reproduce the issue: treat it as resolved.
-            // Incremental touch is imperfect because a non-fixing edit can also
-            // resolve it, but a full re-review re-detects a still-broken issue.
+            // An incremental edit touched the old-head anchor. Incremental
+            // touch is imperfect because a non-fixing edit can also resolve it.
             resolved.push(f.clone());
         } else {
             // Not superseded and the anchor line was not touched: the issue
@@ -1414,7 +1390,7 @@ mod tests {
     }
 
     #[test]
-    fn trustworthy_full_review_resolves_findings_it_does_not_reproduce() {
+    fn full_review_carries_findings_outside_explicit_adjudication() {
         let idx = index_for("other.rs", 1, 1);
         let baseline = vec![f("a.rs", 99, Severity::Error, 0.9)];
         let rec = reconcile(
@@ -1425,8 +1401,8 @@ mod tests {
                 trust: ReviewTrust::Exhaustive,
             },
         );
-        assert_eq!(rec.resolved.len(), 1);
-        assert!(rec.carried.is_empty());
+        assert!(rec.resolved.is_empty());
+        assert_eq!(rec.carried.len(), 1);
     }
 
     #[test]
@@ -1449,7 +1425,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_full_review_resolves_changed_selected_baseline_evidence() {
+    fn bounded_full_review_carries_changed_selected_baseline_until_adjudication() {
         let mut changed = DiffIndex::build(&diff::parse(
             "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -10 +10 @@\n-x\n+y\n",
         ));
@@ -1464,8 +1440,8 @@ mod tests {
             },
         );
 
-        assert_eq!(rec.resolved.len(), 1);
-        assert!(rec.carried.is_empty());
+        assert!(rec.resolved.is_empty());
+        assert_eq!(rec.carried.len(), 1);
     }
 
     #[test]
@@ -1490,7 +1466,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_full_review_resolves_selected_evidence_not_reproduced() {
+    fn bounded_full_review_carries_selected_evidence_until_adjudication() {
         let mut unchanged = DiffIndex::build(&diff::parse(
             "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -10 +10 @@\n x\n",
         ));
@@ -1505,8 +1481,8 @@ mod tests {
             },
         );
 
-        assert_eq!(rec.resolved.len(), 1);
-        assert!(rec.carried.is_empty());
+        assert!(rec.resolved.is_empty());
+        assert_eq!(rec.carried.len(), 1);
     }
 
     #[test]

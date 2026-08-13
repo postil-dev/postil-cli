@@ -581,8 +581,13 @@ pub(crate) fn validate_results(
             &result.candidate_id,
             diff_receipt,
         );
-        let repository_grounded =
-            repository_evidence_is_complete(&result.evidence, repository_receipt, snapshot_id);
+        let repository_grounded = candidate_repository_evidence_is_complete(
+            finding,
+            &result.candidate_id,
+            &result.evidence,
+            repository_receipt,
+            snapshot_id,
+        );
         let claim_verdict = finding.repository_claim.as_ref().map(|claim| {
             crate::repository_search::claim_verdict(claim, repository_receipt, snapshot_id)
         });
@@ -749,6 +754,15 @@ pub(crate) fn apply_results(
                 kept_indices.push(index);
                 kept.push(finding);
             }
+            (
+                AdjudicationProvenance::DeterministicEvidenceReceipt(
+                    DeterministicDemotionReason::RepositoryReceipt,
+                ),
+                AdjudicationDisposition::PreserveUnresolved,
+            ) => {
+                kept_indices.push(index);
+                kept.push(finding);
+            }
             (AdjudicationProvenance::Model, AdjudicationDisposition::SuppressRefuted) => {
                 resolved_indices.push(index);
                 suppressed.push(SuppressedFinding {
@@ -815,7 +829,11 @@ fn applied_adjudication_results(
             };
             AppliedAdjudicationResult {
                 effective_result: unresolved_result(result),
-                disposition: AdjudicationDisposition::SuppressUnsupported,
+                disposition: if reason == DeterministicDemotionReason::RepositoryReceipt {
+                    AdjudicationDisposition::PreserveUnresolved
+                } else {
+                    AdjudicationDisposition::SuppressUnsupported
+                },
                 provenance: AdjudicationProvenance::DeterministicEvidenceReceipt(reason),
             }
         })
@@ -856,8 +874,13 @@ fn deterministic_demotion_reason(
     receipt: &DiffCorpusReceipt,
     repository_receipt: &RepositorySearchReceipt,
 ) -> Option<DeterministicDemotionReason> {
-    let repository_grounded =
-        repository_evidence_is_complete(&result.evidence, repository_receipt, snapshot_id);
+    let repository_grounded = candidate_repository_evidence_is_complete(
+        finding,
+        &result.candidate_id,
+        &result.evidence,
+        repository_receipt,
+        snapshot_id,
+    );
     let claim_unresolved = finding.repository_claim.as_ref().is_some_and(|claim| {
         crate::repository_search::claim_verdict(claim, repository_receipt, snapshot_id)
             == RepositoryClaimVerdict::Unresolved
@@ -921,16 +944,30 @@ fn direct_search_is_complete(receipt: &DiffCorpusReceipt) -> bool {
     receipt.scan_complete && receipt.queries_complete && receipt.matching_windows_complete
 }
 
-fn repository_evidence_is_complete(
+fn candidate_repository_evidence_is_complete(
+    finding: &Finding,
+    candidate_id: &str,
     evidence: &str,
     receipt: &RepositorySearchReceipt,
     snapshot_id: &str,
 ) -> bool {
-    receipt.state == crate::envelope::RepositorySearchState::Complete
+    let Some(claim) = finding.repository_claim.as_ref() else {
+        return false;
+    };
+    let Ok(candidate_terms) = crate::repository_search::search_terms(std::iter::once(claim)) else {
+        return false;
+    };
+    let candidate_queries = candidate_terms
+        .iter()
+        .map(|term| term.query_sha256.as_str())
+        .collect::<HashSet<_>>();
+    !candidate_queries.is_empty()
+        && !candidate_id.is_empty()
+        && receipt.state == crate::envelope::RepositorySearchState::Complete
         && receipt.head_sha.as_deref() == Some(snapshot_id)
         && receipt.tree_sha256.is_some()
         && !receipt.matches_truncated
-        && repository_evidence_is_grounded(evidence, receipt)
+        && candidate_repository_evidence_is_grounded(evidence, receipt, &candidate_queries)
 }
 
 fn evidence_is_directly_grounded(
@@ -976,18 +1013,19 @@ fn sha256(value: &str) -> String {
     hex_digest(digest.finalize().as_slice())
 }
 
-fn repository_evidence_is_grounded(evidence: &str, receipt: &RepositorySearchReceipt) -> bool {
+fn candidate_repository_evidence_is_grounded(
+    evidence: &str,
+    receipt: &RepositorySearchReceipt,
+    candidate_queries: &HashSet<&str>,
+) -> bool {
     !evidence.trim().is_empty()
-        && (receipt.head_sha.as_deref() == Some(evidence)
-            || receipt.tree_sha256.as_deref() == Some(evidence)
-            || receipt
-                .queries
-                .iter()
-                .any(|query| query.query_sha256 == evidence)
-            || receipt
-                .matches
-                .iter()
-                .any(|matched| matched.path == evidence || matched.query_sha256 == evidence))
+        && (receipt.queries.iter().any(|query| {
+            candidate_queries.contains(query.query_sha256.as_str())
+                && query.query_sha256 == evidence
+        }) || receipt.matches.iter().any(|matched| {
+            candidate_queries.contains(matched.query_sha256.as_str())
+                && (matched.path == evidence || matched.query_sha256 == evidence)
+        }))
 }
 
 pub(crate) fn primary_kind_rank(kind: Kind) -> u8 {
@@ -1343,8 +1381,8 @@ mod tests {
             &mismatched,
         )
         .unwrap();
-        assert!(mismatched_application.kept.is_empty());
-        assert_eq!(mismatched_application.suppressed.len(), 1);
+        assert_eq!(mismatched_application.kept.len(), 1);
+        assert!(mismatched_application.suppressed.is_empty());
         let refuted = RepositorySearchReceipt {
             matched_query_sha256: vec![queries[0].query_sha256.clone()],
             matches: vec![RepositorySearchMatch {
@@ -1470,6 +1508,74 @@ mod tests {
             error
                 .to_string()
                 .contains("candidate-specific contradictory evidence")
+        );
+    }
+
+    #[test]
+    fn repository_evidence_cannot_cross_candidate_boundaries() {
+        let snapshot = "a".repeat(40);
+        let mut repository_candidate = finding(
+            Kind::Risk,
+            "Add the required image",
+            "The repository omits the required image.",
+        );
+        repository_candidate.repository_claim = Some(RepositoryClaim {
+            kind: RepositoryClaimKind::Absence,
+            resources: vec![],
+            values: vec!["required-image".into()],
+            versions: vec![],
+            paths: vec![],
+            identifiers: vec![],
+        });
+        let diff_local_candidate = finding(
+            Kind::Risk,
+            "Validate the query input",
+            "The changed query executes untrusted input without validation.",
+        );
+        let findings = vec![repository_candidate, diff_local_candidate];
+        let ids = stable_candidate_ids(&snapshot, &findings);
+        let required_query = crate::repository_search::search_terms(std::iter::once(
+            findings[0].repository_claim.as_ref().unwrap(),
+        ))
+        .unwrap()[0]
+            .query_sha256
+            .clone();
+        let receipt = RepositorySearchReceipt {
+            head_sha: Some(snapshot.clone()),
+            state: RepositorySearchState::Complete,
+            tree_sha256: Some("b".repeat(64)),
+            queries: vec![RepositorySearchQuery {
+                kind: RepositorySearchQueryKind::Value,
+                query_sha256: required_query.clone(),
+            }],
+            ..RepositorySearchReceipt::default()
+        };
+        let corpus = "+ uses: action@old\n";
+        let direct = direct_receipt(&snapshot, corpus, &findings, &ids);
+        let results = vec![
+            AdjudicationResult {
+                candidate_id: ids[0].clone(),
+                status: AdjudicationStatus::Confirmed,
+                revised_title: findings[0].title.clone(),
+                revised_body: findings[0].body.clone(),
+                evidence: required_query,
+                duplicate_of: None,
+            },
+            AdjudicationResult {
+                candidate_id: ids[1].clone(),
+                status: AdjudicationStatus::Confirmed,
+                revised_title: findings[1].title.clone(),
+                revised_body: findings[1].body.clone(),
+                evidence: receipt.queries[0].query_sha256.clone(),
+                duplicate_of: None,
+            },
+        ];
+        let error = apply_results(&snapshot, findings, ids, results, corpus, &direct, &receipt)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("supplied evidence window or structured receipt")
         );
     }
 

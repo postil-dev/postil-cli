@@ -126,22 +126,18 @@ pub(crate) fn enforce_receipt(
     let mut kept = Vec::with_capacity(findings.len());
     let mut suppressed = Vec::new();
     for finding in findings.drain(..) {
-        let repository_dependent =
-            finding.repository_claim.is_some() || prose_requires_repository_search(&finding);
-        let supported = !publication_exposes_evidence_boundary(&finding)
-            && match finding.repository_claim.as_ref() {
-                Some(claim) => matches!(
-                    claim_verdict(claim, receipt, snapshot_id),
-                    RepositoryClaimVerdict::Supported
-                ),
-                None => !prose_requires_repository_search(&finding),
-            };
-        if supported {
+        let exposes_boundary = publication_exposes_evidence_boundary(&finding);
+        let unstructured_repository_claim =
+            finding.repository_claim.is_none() && prose_requires_repository_search(&finding);
+        let refuted = finding.repository_claim.as_ref().is_some_and(|claim| {
+            claim_verdict(claim, receipt, snapshot_id) == RepositoryClaimVerdict::Refuted
+        });
+        if !exposes_boundary && !unstructured_repository_claim && !refuted {
             kept.push(finding);
         } else {
             suppressed.push(SuppressedFinding {
                 finding,
-                reason: if repository_dependent {
+                reason: if unstructured_repository_claim || refuted {
                     SuppressionReason::RepositoryClaimUnsupported
                 } else {
                     SuppressionReason::NonActionable
@@ -1681,7 +1677,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_receipt_without_the_claim_query_never_supports_it() {
+    fn complete_receipt_without_the_claim_query_leaves_it_unresolved() {
         let mut findings = vec![finding(claim("missing"))];
         let receipt = RepositorySearchReceipt {
             head_sha: Some("a".repeat(40)),
@@ -1690,12 +1686,12 @@ mod tests {
             ..RepositorySearchReceipt::default()
         };
 
-        assert_eq!(enforce_receipt(&mut findings, &receipt).len(), 1);
-        assert!(findings.is_empty());
+        assert!(enforce_receipt(&mut findings, &receipt).is_empty());
+        assert_eq!(findings.len(), 1);
     }
 
     #[test]
-    fn unavailable_and_exhausted_search_never_support_a_claim() {
+    fn unavailable_and_exhausted_search_leave_a_claim_unresolved() {
         for state in [
             RepositorySearchState::Unavailable,
             RepositorySearchState::Exhausted,
@@ -1706,8 +1702,8 @@ mod tests {
                 state,
                 ..RepositorySearchReceipt::default()
             };
-            assert_eq!(enforce_receipt(&mut findings, &receipt).len(), 1);
-            assert!(findings.is_empty());
+            assert!(enforce_receipt(&mut findings, &receipt).is_empty());
+            assert_eq!(findings.len(), 1);
         }
     }
 
