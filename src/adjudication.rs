@@ -747,14 +747,10 @@ pub(crate) fn user_prompt(
     Ok(prompt)
 }
 
-pub(crate) fn validate_results(
-    snapshot_id: &str,
+fn validate_result_structure(
     findings: &[Finding],
     candidate_ids: &[String],
     results: &[AdjudicationResult],
-    corpus: &str,
-    diff_receipt: &DiffCorpusReceipt,
-    repository_receipt: &RepositorySearchReceipt,
 ) -> Result<()> {
     ensure!(
         findings.len() <= MAX_ADJUDICATION_CANDIDATES,
@@ -767,10 +763,6 @@ pub(crate) fn validate_results(
     ensure!(
         candidate_ids.len() == findings.len(),
         "adjudication candidate identity count mismatch"
-    );
-    ensure!(
-        diff_receipt.snapshot_id == snapshot_id,
-        "adjudication direct-source receipt snapshot mismatch"
     );
     let expected = candidate_ids.iter().cloned().collect::<HashSet<_>>();
     ensure!(
@@ -806,6 +798,62 @@ pub(crate) fn validate_results(
                 "only a confirmed candidate can be collapsed as a duplicate"
             );
         }
+    }
+    ensure!(
+        seen == expected,
+        "adjudication omitted a candidate identity"
+    );
+    let result_by_id = results
+        .iter()
+        .map(|result| (result.candidate_id.as_str(), result))
+        .collect::<HashMap<_, _>>();
+    for result in results {
+        let Some(primary_id) = result.duplicate_of.as_deref() else {
+            continue;
+        };
+        let primary = result_by_id
+            .get(primary_id)
+            .ok_or_else(|| anyhow!("duplicate primary disappeared"))?;
+        ensure!(
+            matches!(primary.status, AdjudicationStatus::Confirmed)
+                && primary.duplicate_of.is_none(),
+            "duplicate primary must be a retained confirmed candidate"
+        );
+        ensure!(
+            result.revised_title == primary.revised_title
+                && result.revised_body == primary.revised_body,
+            "semantic duplicates must establish one identical canonical defect"
+        );
+        let duplicate_kind = finding_by_id[&result.candidate_id].kind;
+        let primary_kind = finding_by_id[primary_id].kind;
+        ensure!(
+            primary_kind_rank(primary_kind) <= primary_kind_rank(duplicate_kind),
+            "semantic duplicate must retain the more concrete primary kind"
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_results(
+    snapshot_id: &str,
+    findings: &[Finding],
+    candidate_ids: &[String],
+    results: &[AdjudicationResult],
+    corpus: &str,
+    diff_receipt: &DiffCorpusReceipt,
+    repository_receipt: &RepositorySearchReceipt,
+) -> Result<()> {
+    validate_result_structure(findings, candidate_ids, results)?;
+    ensure!(
+        diff_receipt.snapshot_id == snapshot_id,
+        "adjudication direct-source receipt snapshot mismatch"
+    );
+    let finding_by_id = candidate_ids
+        .iter()
+        .cloned()
+        .zip(findings)
+        .collect::<HashMap<_, _>>();
+    for result in results {
         let finding = finding_by_id[&result.candidate_id];
         let direct_grounded = evidence_is_directly_grounded(
             &result.evidence,
@@ -893,38 +941,6 @@ pub(crate) fn validate_results(
             ),
         }
     }
-    ensure!(
-        seen == expected,
-        "adjudication omitted a candidate identity"
-    );
-    let result_by_id = results
-        .iter()
-        .map(|result| (result.candidate_id.as_str(), result))
-        .collect::<HashMap<_, _>>();
-    for result in results {
-        let Some(primary_id) = result.duplicate_of.as_deref() else {
-            continue;
-        };
-        let primary = result_by_id
-            .get(primary_id)
-            .ok_or_else(|| anyhow!("duplicate primary disappeared"))?;
-        ensure!(
-            matches!(primary.status, AdjudicationStatus::Confirmed)
-                && primary.duplicate_of.is_none(),
-            "duplicate primary must be a retained confirmed candidate"
-        );
-        ensure!(
-            result.revised_title == primary.revised_title
-                && result.revised_body == primary.revised_body,
-            "semantic duplicates must establish one identical canonical defect"
-        );
-        let duplicate_kind = finding_by_id[&result.candidate_id].kind;
-        let primary_kind = finding_by_id[primary_id].kind;
-        ensure!(
-            primary_kind_rank(primary_kind) <= primary_kind_rank(duplicate_kind),
-            "semantic duplicate must retain the more concrete primary kind"
-        );
-    }
     Ok(())
 }
 
@@ -937,6 +953,7 @@ pub(crate) fn apply_results(
     diff_receipt: &DiffCorpusReceipt,
     repository_receipt: &RepositorySearchReceipt,
 ) -> Result<AdjudicationApplication> {
+    validate_result_structure(&findings, &candidate_ids, &results)?;
     normalize_confirmed_publication(&findings, &candidate_ids, &mut results);
     let outcomes = applied_adjudication_results(
         snapshot_id,
@@ -1589,6 +1606,95 @@ mod tests {
         }
         assert!(applied.resolved_indices.is_empty());
         assert!(applied.suppressed.is_empty());
+    }
+
+    #[test]
+    fn invalid_confirmation_cannot_hide_a_malformed_duplicate_identity() {
+        let snapshot = "a".repeat(40);
+        let findings = vec![finding(
+            Kind::Risk,
+            "Restore the transaction guard",
+            "The transaction guard is bypassed before the debit.",
+        )];
+        let ids = stable_candidate_ids(&snapshot, &findings);
+        let corpus = "+transaction guard\n";
+        let receipt = direct_receipt(&snapshot, corpus, &findings, &ids);
+        for duplicate_of in [ids[0].clone(), "unknown-candidate".into()] {
+            let result = AdjudicationResult {
+                candidate_id: ids[0].clone(),
+                status: AdjudicationStatus::Confirmed,
+                revised_title: "Restore the transaction guard".into(),
+                revised_body: "The transaction guard is bypassed before the debit.".into(),
+                evidence: "evidence the receipt did not review".into(),
+                duplicate_of: Some(duplicate_of),
+            };
+            assert!(
+                apply_results(
+                    &snapshot,
+                    findings.clone(),
+                    ids.clone(),
+                    vec![result],
+                    corpus,
+                    &receipt,
+                    &unavailable_receipt(),
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_confirmation_cannot_hide_a_duplicate_chain() {
+        let snapshot = "a".repeat(40);
+        let findings = vec![
+            finding(
+                Kind::Risk,
+                "Canonical defect",
+                "The canonical defect remains.",
+            ),
+            finding(
+                Kind::Uncertainty,
+                "Canonical defect",
+                "The canonical defect remains.",
+            ),
+            finding(
+                Kind::Uncertainty,
+                "Canonical defect",
+                "The canonical defect remains.",
+            ),
+        ];
+        let ids = stable_candidate_ids(&snapshot, &findings);
+        let corpus = "+canonical defect\n";
+        let receipt = direct_receipt(&snapshot, corpus, &findings, &ids);
+        let results = ids
+            .iter()
+            .enumerate()
+            .map(|(index, candidate_id)| AdjudicationResult {
+                candidate_id: candidate_id.clone(),
+                status: AdjudicationStatus::Confirmed,
+                revised_title: "Canonical defect".into(),
+                revised_body: "The canonical defect remains.".into(),
+                evidence: if index == 0 {
+                    "evidence the receipt did not review".into()
+                } else {
+                    "canonical defect".into()
+                },
+                duplicate_of: (index > 0).then(|| ids[index - 1].clone()),
+            })
+            .collect();
+
+        assert!(
+            apply_results(
+                &snapshot,
+                findings,
+                ids,
+                results,
+                corpus,
+                &receipt,
+                &unavailable_receipt(),
+            )
+            .is_err()
+        );
     }
 
     #[test]
