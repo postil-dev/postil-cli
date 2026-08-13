@@ -2299,10 +2299,15 @@ async fn review_diff_at(
                                     model_usage.extend_from_slice(error.model_usage());
                                     model_incidents.extend_from_slice(error.model_incidents());
                                     usage_accounting_complete &= error.usage_accounting_complete();
-                                    adjudication_failure =
-                                        Some(crate::envelope::provider_error_finding(
+                                    adjudication_failure = Some(if error.is_provider() {
+                                        crate::envelope::provider_error_finding(
                                             "finding adjudication did not complete",
-                                        ));
+                                        )
+                                    } else {
+                                        fail_closed_finding(
+                                            "finding adjudication output did not satisfy its admitted contract",
+                                        )
+                                    });
                                     preserve_unadjudicated_findings(all_adjudication_candidates)
                                 }
                             };
