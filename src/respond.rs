@@ -805,9 +805,7 @@ mod tests {
             time::Date::from_calendar_date(2026, time::Month::August, 10).unwrap(),
         );
         assert_eq!(
-            system
-                .matches("Authoritative review UTC date: 2026-08-10.")
-                .count(),
+            system.matches("UTC date 2026-08-10; later=future.").count(),
             1
         );
         for body in [

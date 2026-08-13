@@ -712,7 +712,7 @@ fn planner_repair_system(system: &str) -> String {
 
 fn review_schema_repair_system(system: &str) -> String {
     let date_context = system
-        .find("Authoritative review UTC date: ")
+        .find("UTC date ")
         .and_then(|start| {
             system[start..]
                 .find("\n\n")
@@ -5548,7 +5548,7 @@ mod tests {
     #[test]
     fn fixed_review_date_survives_generator_scorer_and_repair_prompts() {
         let date = trusted_date();
-        let expected = "Authoritative review UTC date: 2026-08-10.";
+        let expected = "UTC date 2026-08-10; later=future.";
         let generator = crate::prompt::system_prompt(&Config::default(), date);
         let scorer = crate::prompt::scorer_system_prompt(&Config::default(), date);
         let generator_schema_repair = review_schema_repair_system(&generator);
@@ -6237,11 +6237,10 @@ mod tests {
         for request in requests {
             let body = String::from_utf8_lossy(&request.body);
             assert_eq!(
-                body.matches("Authoritative review UTC date: 2026-08-10.")
-                    .count(),
+                body.matches("UTC date 2026-08-10; later=future.").count(),
                 1
             );
-            assert!(!body.contains("Authoritative review UTC date: 2026-08-11."));
+            assert!(!body.contains("UTC date 2026-08-11; later=future."));
         }
     }
 

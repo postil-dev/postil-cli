@@ -485,6 +485,6 @@ mod tests {
     fn resolver_prompt_uses_the_trusted_review_date() {
         let date = Date::from_calendar_date(2026, time::Month::August, 10).unwrap();
         let (system, _) = resolution_prompt(date, &finding("check this"), "", &[]);
-        assert_eq!(system.matches("Authoritative review UTC date").count(), 1);
+        assert_eq!(system.matches("UTC date").count(), 1);
     }
 }

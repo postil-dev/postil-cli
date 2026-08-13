@@ -2566,15 +2566,15 @@ mod tests {
 
         let local_edge = format!("Benchmark pull request{}", "x".repeat(0));
         let ci_edge = format!("Benchmark pull request{}", "x".repeat(21));
-        let below_floor = format!("Benchmark pull request{}", "x".repeat(60));
+        let below_floor = format!("Benchmark pull request{}", "x".repeat(144));
 
         let local_budgets = batch_budgets_for_title(&local_edge);
-        assert_eq!(local_budgets.synthesis, 4_155);
-        assert_eq!(local_budgets.source, 4_156);
+        assert_eq!(local_budgets.synthesis, 4_239);
+        assert_eq!(local_budgets.source, 4_240);
         assert!(review_batch_budgets_are_usable(local_budgets));
         let ci_budgets = batch_budgets_for_title(&ci_edge);
-        assert_eq!(ci_budgets.synthesis, 4_134);
-        assert_eq!(ci_budgets.source, 4_135);
+        assert_eq!(ci_budgets.synthesis, 4_218);
+        assert_eq!(ci_budgets.source, 4_219);
         assert!(review_batch_budgets_are_usable(ci_budgets));
         assert_eq!(
             ci_budgets.stabilized_for_rendering(),

@@ -18,9 +18,7 @@ const MAX_GUARDRAIL_PROMPT_BYTES: usize = 4 * 1024;
 const MAX_CONTENT_POLICY_PROMPT_BYTES: usize = 6 * 1024;
 
 pub(crate) fn trusted_current_date_context(current_utc_date: Date) -> String {
-    format!(
-        "Authoritative review UTC date: {current_utc_date}. {current_utc_date} is not future; later merge-relevant content may be future-dated.\n\n"
-    )
+    format!("UTC date {current_utc_date}; later=future.\n\n")
 }
 
 pub(crate) fn bounded_untrusted_prompt_text(value: &str, max_bytes: usize) -> String {
@@ -515,7 +513,7 @@ mod tests {
         let date = trusted_date();
         let same_day = Date::from_calendar_date(2026, time::Month::August, 10).unwrap();
         let genuinely_future = Date::from_calendar_date(2026, time::Month::August, 11).unwrap();
-        let expected = "Authoritative review UTC date: 2026-08-10.";
+        let expected = "UTC date 2026-08-10; later=future.";
 
         assert!(same_day <= date, "same-day dates must remain clean");
         assert!(
@@ -527,8 +525,7 @@ mod tests {
             scorer_system_prompt(&Config::default(), date),
         ] {
             assert_eq!(prompt.matches(expected).count(), 1);
-            assert!(prompt.contains("2026-08-10 is not future"));
-            assert!(prompt.contains("later merge-relevant content may be future-dated"));
+            assert!(!prompt.contains("UTC date 2026-08-11; later=future."));
         }
     }
 
@@ -589,12 +586,8 @@ mod tests {
     #[test]
     fn respond_prompt_requires_a_compact_structured_reply() {
         let p = respond_system_prompt(&Config::default(), trusted_date());
-        assert_eq!(
-            p.matches("Authoritative review UTC date: 2026-08-10.")
-                .count(),
-            1
-        );
-        assert!(!p.contains("Authoritative review UTC date: 2026-08-11."));
+        assert_eq!(p.matches("UTC date 2026-08-10; later=future.").count(), 1);
+        assert!(!p.contains("UTC date 2026-08-11; later=future."));
         assert!(p.contains("at or below 1,200 characters"));
         assert!(p.contains("not an article"));
         assert!(p.contains("{\"answer\":\"concise GitHub-flavored Markdown\",\"diagram\":null}"));
