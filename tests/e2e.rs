@@ -2523,6 +2523,60 @@ async fn query_truncated_adjudication_preserves_the_grounded_candidate() {
 }
 
 #[tokio::test]
+async fn adjudication_provider_failure_preserves_generated_blockers_under_advisory_policy() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("single finding adjudicator"))
+        .respond_with(ResponseTemplate::new(503))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    mock_review(
+        &server,
+        json!([{
+            "path": "src/auth.rs", "line": 42, "severity": "error", "kind": "risk",
+            "confidence": 0.99, "title": "Validate query input",
+            "body": "The query executes attacker-controlled input without validation.",
+            "evidence": "exec_query(&token);"
+        }]),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".postil.yaml"),
+        "gate:\n  onError: advisory\n",
+    )
+    .unwrap();
+    let diff = write_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .code(1);
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+
+    assert_eq!(envelope["findings"].as_array().unwrap().len(), 1);
+    assert_eq!(envelope["findings"][0]["title"], "Validate query input");
+    assert_eq!(envelope["counts"]["error"], 1);
+    assert_eq!(envelope["gate"]["failing"], true);
+    assert!(
+        envelope["modelIncidents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|incident| {
+                incident["category"] == "providerError" && incident["recovered"] == false
+            })
+    );
+}
+
+#[tokio::test]
 async fn prompt_injection_unresolved_adjudication_cannot_clean_the_gate() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

@@ -2249,76 +2249,48 @@ async fn review_diff_at(
                                     Duration::from_secs(FINDING_ADJUDICATION_TIMEOUT_SECS),
                                 )
                                 .await;
-                            let adjudicated = match adjudicated {
-                                Ok(adjudicated) => adjudicated,
+                            let mut application = match adjudicated {
+                                Ok(adjudicated) => {
+                                    add_usage(&mut usage, adjudicated.usage);
+                                    model_usage.extend(adjudicated.model_usage);
+                                    model_incidents.extend(adjudicated.model_incidents);
+                                    usage_accounting_complete &=
+                                        adjudicated.usage_accounting_complete;
+                                    match crate::adjudication::apply_results(
+                                        &snapshot_id,
+                                        all_adjudication_candidates.clone(),
+                                        candidate_ids.clone(),
+                                        adjudicated.results,
+                                        diff_snapshot.as_str(),
+                                        &diff_receipt,
+                                        receipt,
+                                    ) {
+                                        Ok(application) => application,
+                                        Err(error) => {
+                                            eprintln!(
+                                                "postil: finding adjudication validation failed; preserving all generated findings: {error:#}"
+                                            );
+                                            model_incidents.push(ModelIncident {
+                                                phase: ModelIncidentPhase::Scorer,
+                                                category: ModelIncidentCategory::InvalidOutput,
+                                                recovered: false,
+                                                recovery: None,
+                                            });
+                                            preserve_unadjudicated_findings(
+                                                all_adjudication_candidates,
+                                            )
+                                        }
+                                    }
+                                }
                                 Err(error) => {
+                                    eprintln!(
+                                        "postil: finding adjudication unavailable; preserving all generated findings"
+                                    );
                                     add_usage(&mut usage, error.usage());
                                     model_usage.extend_from_slice(error.model_usage());
                                     model_incidents.extend_from_slice(error.model_incidents());
                                     usage_accounting_complete &= error.usage_accounting_complete();
-                                    return Err(ReviewFailure {
-                                        kind: if error.is_provider() {
-                                            ReviewFailureKind::Provider
-                                        } else {
-                                            ReviewFailureKind::InvalidOutput
-                                        },
-                                        detail: "complete finding adjudication did not complete"
-                                            .to_string(),
-                                        model_used: model_used.clone(),
-                                        scorer_model: Some(adjudication_model.clone()),
-                                        scorer_error: Some(
-                                            "finding adjudication output did not satisfy its admitted contract"
-                                                .to_string(),
-                                        ),
-                                        usage,
-                                        model_usage,
-                                        model_incidents,
-                                        review_coverage,
-                                        review_admission,
-                                        usage_accounting_complete,
-                                    }
-                                    .into());
-                                }
-                            };
-                            add_usage(&mut usage, adjudicated.usage);
-                            model_usage.extend(adjudicated.model_usage);
-                            model_incidents.extend(adjudicated.model_incidents);
-                            usage_accounting_complete &= adjudicated.usage_accounting_complete;
-                            let application = crate::adjudication::apply_results(
-                                &snapshot_id,
-                                all_adjudication_candidates,
-                                candidate_ids,
-                                adjudicated.results,
-                                diff_snapshot.as_str(),
-                                &diff_receipt,
-                                receipt,
-                            );
-                            let mut application = match application {
-                                Ok(application) => application,
-                                Err(error) => {
-                                    model_incidents.push(ModelIncident {
-                                        phase: ModelIncidentPhase::Scorer,
-                                        category: ModelIncidentCategory::InvalidOutput,
-                                        recovered: false,
-                                        recovery: None,
-                                    });
-                                    return Err(ReviewFailure {
-                                        kind: ReviewFailureKind::InvalidOutput,
-                                        detail: "complete finding adjudication returned an invalid result set"
-                                            .to_string(),
-                                        model_used: model_used.clone(),
-                                        scorer_model: Some(adjudication_model.clone()),
-                                        scorer_error: Some(format!(
-                                            "finding adjudication result validation failed: {error:#}"
-                                        )),
-                                        usage,
-                                        model_usage,
-                                        model_incidents,
-                                        review_coverage,
-                                        review_admission,
-                                        usage_accounting_complete,
-                                    }
-                                    .into());
+                                    preserve_unadjudicated_findings(all_adjudication_candidates)
                                 }
                             };
                             debug_assert!(application.kept_indices.iter().all(|index| *index
@@ -2955,6 +2927,17 @@ fn visible_body(body: &str) -> &str {
     body.strip_prefix(filter::CARRIED_MARKER)
         .map(str::trim_start)
         .unwrap_or(body)
+}
+
+fn preserve_unadjudicated_findings(
+    findings: Vec<Finding>,
+) -> crate::adjudication::AdjudicationApplication {
+    crate::adjudication::AdjudicationApplication {
+        kept_indices: (0..findings.len()).collect(),
+        kept: findings,
+        resolved_indices: Vec::new(),
+        suppressed: Vec::new(),
+    }
 }
 
 fn error_envelope(

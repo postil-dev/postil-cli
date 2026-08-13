@@ -1310,6 +1310,15 @@ impl RequestDecorations {
         let pinned_upstream_provider =
             if let Some(provider) = crate::config::provisional_hosted_provider_for_config(cfg) {
                 Some(provider.to_string())
+            } else if crate::config::hosted_runtime_mode() {
+                Some(
+                    crate::config::admitted_profile_for_config(cfg)
+                        .ok_or_else(|| {
+                            anyhow!("hosted inference has no exact admitted provider profile")
+                        })?
+                        .upstream_provider_identity
+                        .clone(),
+                )
             } else if crate::config::qualification_candidate_mode() {
                 Some(
                     crate::config::qualification_candidate_profile_for_config(cfg)?
@@ -1691,6 +1700,9 @@ impl std::error::Error for ModelContentFailure {}
 fn classify_chat_error(error: anyhow::Error) -> anyhow::Error {
     if error.downcast_ref::<ModelContentFailure>().is_some()
         || error.downcast_ref::<ReviewContextExceeded>().is_some()
+        || error
+            .downcast_ref::<AtomicAttributionIdentityFailure>()
+            .is_some()
     {
         error
     } else {
@@ -9258,6 +9270,13 @@ mod tests {
                 .is_some_and(|failure| {
                     matches!(failure, AtomicAttributionIdentityFailure::Mismatch)
                 })
+        );
+        let classified = classify_chat_error(mismatch);
+        assert!(classified.downcast_ref::<ProviderError>().is_none());
+        assert!(
+            classified
+                .downcast_ref::<AtomicAttributionIdentityFailure>()
+                .is_some()
         );
     }
 
