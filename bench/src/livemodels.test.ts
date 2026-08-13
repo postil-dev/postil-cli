@@ -603,24 +603,28 @@ describe("pair qualification configuration", () => {
 
   });
 
-  test("keeps runtime-shaped exact pair exposure inside the hard cap", async () => {
+  test("rejects runtime-shaped exact pair exposure above the hard cap", async () => {
     const root = await mkdtemp(resolve(tmpdir(), "postil-runtime-preflight-"));
     const cases = fixtureInputs.map((input) => benchmarkCase.parse(input));
     const inheritedModelKey = process.env.MODEL_API_KEY;
+    const runtimePair: QualificationPair = {
+      generatorModel: "z-ai/glm-5.2",
+      scorerModel: "openai/gpt-5-mini",
+    };
     const pricing = new Map([
-      [pair.generatorModel, {
+      [runtimePair.generatorModel, {
         providerIdentity: "PinnedProvider",
-        promptUsdPerToken: 0.0009478,
-        completionUsdPerToken: 0.0029788,
-        inputMicrosPerMillionTokens: 947_800,
-        outputMicrosPerMillionTokens: 2_978_800,
+        promptUsdPerToken: 0.00028434,
+        completionUsdPerToken: 0.00089364,
+        inputMicrosPerMillionTokens: 284_340,
+        outputMicrosPerMillionTokens: 893_640,
       }],
-      [pair.scorerModel, {
+      [runtimePair.scorerModel, {
         providerIdentity: "PinnedProvider",
-        promptUsdPerToken: 0.0009478,
-        completionUsdPerToken: 0.0029788,
-        inputMicrosPerMillionTokens: 947_800,
-        outputMicrosPerMillionTokens: 2_978_800,
+        promptUsdPerToken: 0.00028434,
+        completionUsdPerToken: 0.00089364,
+        inputMicrosPerMillionTokens: 284_340,
+        outputMicrosPerMillionTokens: 893_640,
       }],
     ]);
     try {
@@ -628,27 +632,19 @@ describe("pair qualification configuration", () => {
       const binary = process.env.POSTIL_BIN === undefined
         ? resolve(import.meta.dir, "..", "..", "target", "release", "postil")
         : resolve(process.env.POSTIL_BIN);
-      const normalizedPair = normalizeQualificationPairs([pair])[0]!;
-      const projected = await assertRuntimeShapedQualificationPreflight({
+      const normalizedPair = normalizeQualificationPairs([runtimePair])[0]!;
+      await expect(assertRuntimeShapedQualificationPreflight({
         binary,
         rootDir: root,
         cases,
         pairs: [normalizedPair],
-        repeats: 3,
+        repeats: 9,
         pricing,
         apiBase: normalizeApiBase("https://openrouter.ai/api/v1"),
         apiFormat: "openai-compatible",
         costCapUsdDecimal: "70",
         upstreamProvider: "PinnedProvider",
-      });
-      expect(compareCanonicalDecimals(
-        parseCanonicalDecimal(projected),
-        parseCanonicalDecimal("35"),
-      )).toBeGreaterThan(0);
-      expect(compareCanonicalDecimals(
-        parseCanonicalDecimal(projected),
-        parseCanonicalDecimal("70"),
-      )).toBeLessThanOrEqual(0);
+      })).rejects.toThrow("exceeding the 1000000 micro-dollar operation cap");
     } finally {
       if (inheritedModelKey === undefined) delete process.env.MODEL_API_KEY;
       else process.env.MODEL_API_KEY = inheritedModelKey;

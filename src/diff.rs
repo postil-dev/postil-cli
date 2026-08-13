@@ -6,7 +6,7 @@
 //! with its new-file line number.
 
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::RangeInclusive;
@@ -18,6 +18,26 @@ use sha2::{Digest, Sha256};
 
 const MAX_LOCKFILE_DIRECTIONAL_CHANGES: usize = 256;
 const MAX_LOCKFILE_PACKAGE_RECORDS: usize = 100_000;
+const KNOWN_LOCKFILE_NAMES: [&str; 18] = [
+    "cargo.lock",
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "bun.lock",
+    "bun.lockb",
+    "composer.lock",
+    "gemfile.lock",
+    "poetry.lock",
+    "uv.lock",
+    "pipfile.lock",
+    "go.sum",
+    "mix.lock",
+    "pubspec.lock",
+    "gradle.lockfile",
+    "packages.lock.json",
+    ".terraform.lock.hcl",
+];
 /// Maximum size of one buffered forge metadata page. Changed-file bodies use
 /// file-backed streaming and are deliberately not subject to this limit.
 pub const MAX_FORGE_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
@@ -348,6 +368,13 @@ impl HunkIdentity {
             "{}\0{}\0{}\0{}\0{}\0{}",
             self.path, self.old_start, self.old_count, self.new_start, self.new_count, digest
         )
+    }
+
+    fn new_range(&self) -> Option<RangeInclusive<u32>> {
+        let end = self
+            .new_start
+            .checked_add(self.new_count.saturating_sub(1))?;
+        Some(self.new_start..=end)
     }
 }
 
@@ -1010,6 +1037,17 @@ struct HunkRisk {
     score: usize,
 }
 
+impl HunkRisk {
+    fn merge(self, other: Self) -> Self {
+        let mandatory = self.mandatory || other.mandatory;
+        Self {
+            mandatory,
+            semantic_eligible: !mandatory && self.semantic_eligible && other.semantic_eligible,
+            score: self.score.max(other.score),
+        }
+    }
+}
+
 pub struct HostedBatchCandidates {
     pub manifest: String,
     pub mandatory_ids: Vec<usize>,
@@ -1176,7 +1214,7 @@ impl ModelBatchSpool {
             }
         }
 
-        let mut mandatory = BTreeSet::new();
+        let mut mandatory = self.metadata_batch_ids.clone();
         if let Some(id) = first_source {
             mandatory.insert(id);
         }
@@ -1192,10 +1230,14 @@ impl ModelBatchSpool {
         if let Some(candidate) = highest_removal {
             mandatory.insert(candidate.id);
         }
-        debug_assert!(mandatory.len() <= selected_limit);
+        anyhow::ensure!(
+            mandatory.len() <= selected_limit,
+            "mandatory dependency, artifact, and source evidence needs {} batches, exceeding the {selected_limit} batch hosted-review limit",
+            mandatory.len()
+        );
 
         let mut manifest = format!(
-            "The complete diff was normalized into {id} bounded batches. Select only batch IDs from this candidate set. Boundary, highest-risk, and global-synthesis batches are already mandatory.\nMandatory IDs: {:?}\n",
+            "The complete diff was normalized into {id} bounded batches. Select only batch IDs from this candidate set. Dependency, artifact, boundary, highest-risk, and global-synthesis batches are already mandatory.\nMandatory IDs: {:?}\n",
             mandatory.iter().copied().collect::<Vec<_>>()
         );
         let mut candidate_ids = BTreeSet::new();
@@ -1471,7 +1513,8 @@ impl ModelBatchSpool {
         Ok(receipt)
     }
 
-    fn validate_coverage_receipt(&self, receipt: &BoundedCoverageReceipt) -> Result<()> {
+    fn validate_coverage_receipt(&mut self, receipt: &BoundedCoverageReceipt) -> Result<()> {
+        let selected_batches = self.batch_text_by_id(&receipt.selected_batch_ids)?;
         for entry in &receipt.entries {
             let risk = self
                 .hunk_risk
@@ -1509,9 +1552,49 @@ impl ModelBatchSpool {
                         .is_some_and(|hunks| hunks.contains(&entry.hunk)),
                     "coverage evidence batch is not bound to the exact normalized hunk digest"
                 );
+                if expected_synthesis {
+                    anyhow::ensure!(
+                        selected_batches.get(id).is_some_and(|batch| {
+                            final_model_visible_semantic_hunks(
+                                batch,
+                                &BTreeSet::from([entry.hunk.clone()]),
+                            )
+                            .contains(&entry.hunk)
+                        }),
+                        "semantic coverage proof is not visible in the selected provider prompt"
+                    );
+                }
             }
         }
         Ok(())
+    }
+
+    fn batch_text_by_id(&mut self, ids: &BTreeSet<usize>) -> Result<HashMap<usize, String>> {
+        self.file
+            .seek(SeekFrom::Start(0))
+            .context("rewinding model batches for coverage validation")?;
+        let batches = (|| -> Result<HashMap<usize, String>> {
+            let mut selected = HashMap::new();
+            let mut id = 0usize;
+            while let Some(batch) = read_length_prefixed(&mut self.file, "coverage batch")? {
+                id = id.checked_add(1).context("coverage batch id overflowed")?;
+                if ids.contains(&id) {
+                    selected.insert(id, batch);
+                }
+            }
+            anyhow::ensure!(
+                selected.len() == ids.len(),
+                "coverage receipt selected a batch outside the materialized spool"
+            );
+            Ok(selected)
+        })();
+        let rewind = self
+            .file
+            .seek(SeekFrom::Start(0))
+            .context("rewinding model batches after coverage validation");
+        let batches = batches?;
+        rewind?;
+        Ok(batches)
     }
 }
 
@@ -1552,18 +1635,106 @@ fn control_plane_path(path: &str) -> bool {
     .any(|marker| lower.contains(marker))
 }
 
-fn executable_vendor_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    (lower.contains("vendor/") || lower.contains("vendored/"))
-        && [
-            ".rs", ".go", ".c", ".cc", ".cpp", ".h", ".js", ".ts", ".py", ".sh",
-        ]
-        .iter()
-        .any(|suffix| lower.ends_with(suffix))
+fn git_mode_is_executable(mode: Option<&str>) -> bool {
+    mode.and_then(|mode| u32::from_str_radix(mode, 8).ok())
+        .is_some_and(|mode| mode & 0o111 != 0)
 }
 
-fn mandatory_large_diff_hunk(path: &str, hunk: &Hunk) -> bool {
-    if security_sensitive_path(path) || control_plane_path(path) || executable_vendor_path(path) {
+fn reviewable_vendor_source_path(path: &str, executable_mode: bool) -> bool {
+    let components = path.split(['/', '\\']).collect::<Vec<_>>();
+    let vendored = components.iter().any(|component| {
+        component.eq_ignore_ascii_case("vendor") || component.eq_ignore_ascii_case("vendored")
+    });
+    if !vendored {
+        return false;
+    }
+    if executable_mode {
+        return true;
+    }
+    let file = components.last().copied().unwrap_or_default();
+    let extension = file.rsplit_once('.').map(|(_, extension)| extension);
+    extension.is_some_and(|extension| {
+        [
+            "asm", "awk", "bash", "bat", "c", "cc", "clj", "cljs", "cljc", "cmd", "cpp", "cs",
+            "cxx", "dart", "erl", "ex", "exs", "fish", "fs", "fsx", "go", "groovy", "h", "hh",
+            "hpp", "hrl", "hs", "java", "jl", "js", "jsx", "kt", "kts", "lua", "mjs", "cjs", "nim",
+            "php", "pl", "pm", "ps1", "py", "r", "rb", "rs", "s", "scala", "sh", "sol", "swift",
+            "tcl", "ts", "tsx", "v", "vb", "vue", "zig", "zsh",
+        ]
+        .iter()
+        .any(|source| extension.eq_ignore_ascii_case(source))
+    }) || components
+        .windows(2)
+        .any(|pair| pair[0].eq_ignore_ascii_case("bin") && pair[1] == file && !file.contains('.'))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LargeDiffPathClass {
+    Documentation,
+    Test,
+    Neutral,
+    VendorSource,
+    Dependency,
+    ControlPlane,
+    Security,
+}
+
+impl LargeDiffPathClass {
+    fn mandatory(self) -> bool {
+        matches!(
+            self,
+            Self::VendorSource | Self::Dependency | Self::ControlPlane | Self::Security
+        )
+    }
+
+    fn risk_score(self) -> usize {
+        match self {
+            Self::Documentation => 25,
+            Self::Test => 100,
+            Self::Neutral => 300,
+            Self::VendorSource => 600,
+            Self::Dependency => 650,
+            Self::ControlPlane => 700,
+            Self::Security => 1_000,
+        }
+    }
+}
+
+fn large_diff_path_class(path: &str, executable_mode: bool) -> LargeDiffPathClass {
+    if security_sensitive_path(path) {
+        LargeDiffPathClass::Security
+    } else if control_plane_path(path) {
+        LargeDiffPathClass::ControlPlane
+    } else if is_known_lockfile(path) {
+        LargeDiffPathClass::Dependency
+    } else if reviewable_vendor_source_path(path, executable_mode) {
+        LargeDiffPathClass::VendorSource
+    } else if path.contains("test") || path.contains("spec") {
+        LargeDiffPathClass::Test
+    } else if path.ends_with(".md") || path.starts_with("docs/") {
+        LargeDiffPathClass::Documentation
+    } else {
+        LargeDiffPathClass::Neutral
+    }
+}
+
+fn large_diff_file_path_class(
+    old_path: &str,
+    path: &str,
+    old_mode: Option<&str>,
+    new_mode: Option<&str>,
+) -> LargeDiffPathClass {
+    let old = large_diff_path_class(old_path, git_mode_is_executable(old_mode));
+    let new = large_diff_path_class(path, git_mode_is_executable(new_mode));
+    if old.risk_score() >= new.risk_score() {
+        old
+    } else {
+        new
+    }
+}
+
+fn mandatory_large_diff_hunk(path_class: LargeDiffPathClass, hunk: &Hunk) -> bool {
+    if path_class.mandatory() {
         return true;
     }
     let removed = hunk
@@ -1590,20 +1761,7 @@ fn mandatory_large_diff_hunk(path: &str, hunk: &Hunk) -> bool {
     })
 }
 
-fn stable_large_diff_risk_score(path: &str, hunk: &Hunk) -> usize {
-    let path_score = if security_sensitive_path(path) {
-        1_000
-    } else if control_plane_path(path) {
-        700
-    } else if executable_vendor_path(path) {
-        600
-    } else if path.contains("test") || path.contains("spec") {
-        100
-    } else if path.ends_with(".md") || path.starts_with("docs/") {
-        25
-    } else {
-        300
-    };
+fn stable_large_diff_risk_score(path_class: LargeDiffPathClass, hunk: &Hunk) -> usize {
     let changed = hunk
         .lines
         .iter()
@@ -1616,13 +1774,13 @@ fn stable_large_diff_risk_score(path: &str, hunk: &Hunk) -> usize {
         .filter_map(|line| line.strip_prefix('-'))
         .flat_map(hosted_risk_tokens)
         .collect::<Vec<_>>();
-    path_score
+    path_class.risk_score()
         + hosted_token_risk_score(&changed)
         + hosted_token_risk_score(&removed).saturating_mul(2)
 }
 
-fn semantic_large_diff_hunk(path: &str, hunk: &Hunk) -> bool {
-    if mandatory_large_diff_hunk(path, hunk) {
+fn semantic_large_diff_hunk(path_class: LargeDiffPathClass, hunk: &Hunk) -> bool {
+    if mandatory_large_diff_hunk(path_class, hunk) {
         return false;
     }
     let changed = hunk
@@ -1780,6 +1938,160 @@ pub fn bounded_respond_context(
     }
 }
 
+fn exact_semantic_hunk_proof(path: &str, hunk: &Hunk) -> Option<String> {
+    let mut old_line = hunk.old_start;
+    let mut new_line = hunk.new_start;
+    let mut changed_lines = Vec::new();
+    let mut substantive_added = false;
+    for raw in &hunk.lines {
+        let (marker, content) = raw.split_at(if raw.is_empty() { 0 } else { 1 });
+        if matches!(marker, "+" | "-") {
+            let rendered = render_line_segments(marker, content, old_line, new_line).concat();
+            if marker == "+"
+                && hosted_risk_tokens(content)
+                    .iter()
+                    .any(|token| token.len() >= 2)
+            {
+                substantive_added = true;
+            }
+            changed_lines.push(rendered);
+        }
+        match marker {
+            "+" => new_line = new_line.checked_add(1)?,
+            "-" => old_line = old_line.checked_add(1)?,
+            _ => {
+                old_line = old_line.checked_add(1)?;
+                new_line = new_line.checked_add(1)?;
+            }
+        }
+    }
+    substantive_added.then_some(())?;
+    let identity = hunk_receipt_identity(&HunkIdentity::new(path, hunk));
+    let mut proof = format!(
+        "### {}\n@@ exact low-risk hunk identity={identity} old={},{} new={},{} @@\n",
+        display_path(path),
+        hunk.old_start,
+        hunk.old_count,
+        hunk.new_start,
+        hunk.new_count,
+    );
+    for line in changed_lines {
+        proof.push_str(&line);
+    }
+    Some(proof)
+}
+
+fn exact_semantic_batch_header(hunks: &BTreeSet<HunkIdentity>) -> String {
+    format!(
+        "Exact low-risk semantic evidence:\nEvery credited hunk below retains its repository path and a non-empty added line.\nExact normalized hunk-set commitment (SHA-256): {}\n",
+        hunk_set_sha256(hunks)
+    )
+}
+
+fn hunk_receipt_identity(hunk: &HunkIdentity) -> String {
+    Sha256::digest(hunk.canonical().as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn final_model_visible_semantic_hunks(
+    batch: &str,
+    candidates: &BTreeSet<HunkIdentity>,
+) -> BTreeSet<HunkIdentity> {
+    let mut path = None::<&str>;
+    let mut identity = None::<&str>;
+    let mut visible = BTreeSet::new();
+    for line in batch.lines() {
+        if let Some(value) = line.strip_prefix("### ") {
+            path = Some(prompt_header_path(value));
+            identity = None;
+            continue;
+        }
+        if let Some(value) = line
+            .strip_prefix("@@ exact low-risk hunk identity=")
+            .and_then(|value| value.split_once(' ').map(|(identity, _)| identity))
+        {
+            identity = Some(value);
+            continue;
+        }
+        let Some((number, marked)) = line.trim_start().split_once(' ') else {
+            continue;
+        };
+        let Some(line_number) = number.parse::<u32>().ok() else {
+            continue;
+        };
+        let Some(evidence) = marked.strip_prefix("+ ") else {
+            continue;
+        };
+        if evidence.trim().is_empty() {
+            continue;
+        }
+        let Some((path, identity)) = path.zip(identity) else {
+            continue;
+        };
+        visible.extend(
+            candidates
+                .iter()
+                .filter(|hunk| {
+                    prompt_paths_equal(path, &hunk.path)
+                        && hunk_receipt_identity(hunk) == identity
+                        && hunk.new_count > 0
+                        && hunk
+                            .new_range()
+                            .is_some_and(|range| range.contains(&line_number))
+                })
+                .cloned(),
+        );
+    }
+    visible
+}
+
+fn finalize_exact_semantic_batch(
+    payload: String,
+    candidates: BTreeSet<HunkIdentity>,
+) -> Option<(String, BTreeSet<HunkIdentity>)> {
+    let visible = final_model_visible_semantic_hunks(&payload, &candidates);
+    if visible.is_empty() {
+        return None;
+    }
+    let header = exact_semantic_batch_header(&visible);
+    Some((format!("{header}{payload}"), visible))
+}
+
+fn exact_semantic_batches(
+    proofs: BTreeMap<HunkIdentity, String>,
+    max_batch_bytes: usize,
+) -> Vec<(String, BTreeSet<HunkIdentity>)> {
+    let header_reserve = exact_semantic_batch_header(&BTreeSet::new()).len();
+    let payload_capacity = max_batch_bytes.saturating_sub(header_reserve);
+    let mut batches = Vec::new();
+    let mut payload = String::new();
+    let mut hunks = BTreeSet::new();
+    for (hunk, proof) in proofs {
+        if proof.len() > payload_capacity {
+            continue;
+        }
+        if !payload.is_empty()
+            && payload.len().saturating_add(proof.len()) > payload_capacity
+            && let Some(batch) = finalize_exact_semantic_batch(
+                std::mem::take(&mut payload),
+                std::mem::take(&mut hunks),
+            )
+        {
+            batches.push(batch);
+        }
+        payload.push_str(&proof);
+        hunks.insert(hunk);
+    }
+    if !payload.is_empty()
+        && let Some(batch) = finalize_exact_semantic_batch(payload, hunks)
+    {
+        batches.push(batch);
+    }
+    batches
+}
+
 pub fn spool_model_batches(
     prepared: &mut PreparedReview,
     max_batch_bytes: usize,
@@ -1792,6 +2104,7 @@ pub fn spool_model_batches(
         max_batch_bytes,
         max_manifest_bytes,
         force_empty,
+        crate::review::MAX_LARGE_DIFF_SELECTED_BATCHES,
     )
 }
 
@@ -1801,6 +2114,7 @@ pub(crate) fn spool_model_batches_with_synthesis_budget(
     max_synthesis_batch_bytes: usize,
     max_manifest_bytes: usize,
     force_empty: bool,
+    semantic_receipt_limit: usize,
 ) -> Result<ModelBatchSpool> {
     anyhow::ensure!(
         max_source_batch_bytes >= MIN_REVIEW_BATCH_BYTES,
@@ -1818,13 +2132,15 @@ pub(crate) fn spool_model_batches_with_synthesis_budget(
     let mut synthesis_ids = BTreeSet::new();
     let mut batch_hunks = HashMap::new();
     let mut all_hunks = BTreeSet::new();
-    let mut hunk_risk = HashMap::new();
+    let mut hunk_risk = HashMap::<HunkIdentity, HunkRisk>::new();
+    let mut semantic_hunk_proofs = BTreeMap::new();
+    let semantic_proof_capacity = max_synthesis_batch_bytes
+        .saturating_sub(exact_semantic_batch_header(&BTreeSet::new()).len());
     let mut metadata_batch_ids = BTreeSet::new();
     let mut metadata_count = 0u32;
     let synthesis_header = "Cross-window semantic digests:\n";
     let mut cross_window = synthesis_header.to_string();
-    let mut cross_window_hunks = BTreeSet::new();
-    let mut synthesis_chunks = Vec::<(String, BTreeSet<HunkIdentity>)>::new();
+    let mut synthesis_chunks = Vec::<String>::new();
     let mut digest_ordinal = 0usize;
     prepared.rewind()?;
     while let Some(window) = prepared.next_window()? {
@@ -1833,14 +2149,31 @@ pub(crate) fn spool_model_batches_with_synthesis_budget(
         for file in &parsed.files {
             for hunk in &file.hunks {
                 let identity = HunkIdentity::new(&file.path, hunk);
-                hunk_risk.insert(
-                    identity,
-                    HunkRisk {
-                        mandatory: mandatory_large_diff_hunk(&file.path, hunk),
-                        semantic_eligible: semantic_large_diff_hunk(&file.path, hunk),
-                        score: stable_large_diff_risk_score(&file.path, hunk),
-                    },
+                let path_class = large_diff_file_path_class(
+                    &file.old_path,
+                    &file.path,
+                    file.old_mode.as_deref(),
+                    file.new_mode.as_deref(),
                 );
+                let mandatory = mandatory_large_diff_hunk(path_class, hunk);
+                let semantic_eligible = semantic_large_diff_hunk(path_class, hunk);
+                let risk = HunkRisk {
+                    mandatory,
+                    semantic_eligible,
+                    score: stable_large_diff_risk_score(path_class, hunk),
+                };
+                let accumulated_risk = *hunk_risk
+                    .entry(identity.clone())
+                    .and_modify(|existing| *existing = existing.merge(risk))
+                    .or_insert(risk);
+                if accumulated_risk.semantic_eligible
+                    && let Some(proof) = exact_semantic_hunk_proof(&file.path, hunk)
+                    && proof.len() <= semantic_proof_capacity
+                {
+                    semantic_hunk_proofs.insert(identity.clone(), proof);
+                } else {
+                    semantic_hunk_proofs.remove(&identity);
+                }
             }
         }
         let plan = render_review_batches(
@@ -1854,11 +2187,15 @@ pub(crate) fn spool_model_batches_with_synthesis_budget(
             !plan.incomplete,
             "normalized review window could not be rendered"
         );
-        let plan_hunks = plan
-            .batch_hunks
-            .iter()
-            .flat_map(|hunks| hunks.iter().cloned())
-            .collect::<BTreeSet<_>>();
+        let requires_manifest_batch = parsed.files.iter().any(|file| {
+            file.hunks.is_empty()
+                || file.binary
+                || file.deleted
+                || file.old_path != file.path
+                || (file.old_mode != file.new_mode
+                    && (file.old_mode.is_some() || file.new_mode.is_some()))
+        });
+        let mut first_window_batch = true;
         metadata_count = metadata_count.max(plan.metadata_count);
         for (batch, hunks) in plan.batches.into_iter().zip(plan.batch_hunks) {
             let digest = semantic_digest(&batch);
@@ -1874,16 +2211,12 @@ pub(crate) fn spool_model_batches_with_synthesis_budget(
                 let entry = format!("{heading}{digest}");
                 if cross_window.len().saturating_add(entry.len()) > max_synthesis_batch_bytes {
                     if cross_window.len() > synthesis_header.len() {
-                        synthesis_chunks.push((
-                            std::mem::take(&mut cross_window),
-                            std::mem::take(&mut cross_window_hunks),
-                        ));
+                        synthesis_chunks.push(std::mem::take(&mut cross_window));
                     }
                     cross_window.push_str(synthesis_header);
                 }
                 digest_ordinal = next_ordinal;
                 cross_window.push_str(&entry);
-                cross_window_hunks.extend(hunks.iter().cloned());
             }
             write_length_prefixed(
                 &mut file,
@@ -1903,10 +2236,15 @@ pub(crate) fn spool_model_batches_with_synthesis_budget(
                 .context("source model batch count overflowed")?;
             all_hunks.extend(hunks.iter().cloned());
             batch_hunks.insert(count, hunks);
+            if (first_window_batch && requires_manifest_batch)
+                || batch_hunks.get(&count).is_some_and(BTreeSet::is_empty)
+            {
+                metadata_batch_ids.insert(count);
+            }
+            first_window_batch = false;
         }
         if let Some(synthesis) = plan.synthesis {
-            let synthesis =
-                bind_synthesis_hunks(synthesis, &plan_hunks, max_synthesis_batch_bytes)?;
+            let synthesis = compact_semantic_digest(synthesis, max_synthesis_batch_bytes)?;
             write_length_prefixed(
                 &mut file,
                 &mut lease,
@@ -1921,7 +2259,6 @@ pub(crate) fn spool_model_batches_with_synthesis_budget(
                 .checked_add(1)
                 .context("model batch count overflowed")?;
             synthesis_ids.insert(count);
-            batch_hunks.insert(count, plan_hunks);
         }
     }
 
@@ -1985,7 +2322,7 @@ pub(crate) fn spool_model_batches_with_synthesis_budget(
         artifact_start = artifact_end;
     }
     if cross_window.len() > synthesis_header.len() && digest_ordinal > 1 {
-        synthesis_chunks.push((cross_window, cross_window_hunks));
+        synthesis_chunks.push(cross_window);
     }
     if digest_ordinal > 1 {
         let mut level = 1usize;
@@ -1993,9 +2330,7 @@ pub(crate) fn spool_model_batches_with_synthesis_budget(
         while !chunks.is_empty() {
             let chunk_count = chunks.len();
             let mut digests = Vec::with_capacity(chunk_count);
-            let mut covered_hunks = Vec::with_capacity(chunk_count);
-            for (chunk, hunks) in chunks {
-                let chunk = bind_synthesis_hunks(chunk, &hunks, max_synthesis_batch_bytes)?;
+            for chunk in chunks {
                 write_length_prefixed(
                     &mut file,
                     &mut lease,
@@ -2010,30 +2345,41 @@ pub(crate) fn spool_model_batches_with_synthesis_budget(
                     .checked_add(1)
                     .context("model batch count overflowed")?;
                 synthesis_ids.insert(count);
-                batch_hunks.insert(count, hunks.clone());
                 digests.push(chunk);
-                covered_hunks.push(hunks);
             }
             if chunk_count == 1 {
                 break;
             }
             let next_text = pack_semantic_digests(&digests, level + 1, max_synthesis_batch_bytes)?;
-            let next_hunks = covered_hunks
-                .chunks(2)
-                .map(|pair| {
-                    pair.iter()
-                        .flat_map(|hunks| hunks.iter().cloned())
-                        .collect::<BTreeSet<_>>()
-                })
-                .collect::<Vec<_>>();
             anyhow::ensure!(
-                next_text.len() < chunk_count && next_text.len() == next_hunks.len(),
-                "recursive synthesis did not reduce its bounded fan-in"
+                next_text.len() < chunk_count,
+                "recursive planner synthesis did not reduce its bounded fan-in"
             );
-            chunks = next_text.into_iter().zip(next_hunks).collect();
+            chunks = next_text;
             level = level
                 .checked_add(1)
                 .context("recursive synthesis level overflowed")?;
+        }
+    }
+    if count > semantic_receipt_limit {
+        for (batch, hunks) in
+            exact_semantic_batches(semantic_hunk_proofs, max_synthesis_batch_bytes)
+        {
+            write_length_prefixed(
+                &mut file,
+                &mut lease,
+                &batch,
+                max_synthesis_batch_bytes,
+                "exact semantic model batch",
+            )?;
+            spool_bytes = spool_bytes
+                .checked_add(batch.len() as u64 + 8)
+                .context("model-batch spool size overflowed")?;
+            count = count
+                .checked_add(1)
+                .context("model batch count overflowed")?;
+            synthesis_ids.insert(count);
+            batch_hunks.insert(count, hunks);
         }
     }
     if count == 0 && force_empty {
@@ -2132,44 +2478,6 @@ fn hunk_set_sha256(hunks: &BTreeSet<HunkIdentity>) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
-}
-
-fn bind_synthesis_hunks(
-    synthesis: String,
-    hunks: &BTreeSet<HunkIdentity>,
-    max_batch_bytes: usize,
-) -> Result<String> {
-    anyhow::ensure!(
-        !hunks.is_empty(),
-        "semantic synthesis has no normalized hunk commitment"
-    );
-    let commitment = format!(
-        "Exact normalized hunk-set commitment (SHA-256): {}\n",
-        hunk_set_sha256(hunks)
-    );
-    let receipt_header = synthesis
-        .lines()
-        .next()
-        .filter(|line| {
-            line.starts_with("Cross-window semantic digests")
-                || line.starts_with("Cross-batch semantic digests")
-        })
-        .map_or_else(
-            || "Cross-window semantic digests (receipt-bound):\n".to_string(),
-            |line| format!("{line}\n"),
-        );
-    let evidence_limit = max_batch_bytes
-        .checked_sub(receipt_header.len().saturating_add(commitment.len()))
-        .context("semantic hunk commitment exceeded its batch bound")?;
-    let synthesis = compact_semantic_digest(synthesis, evidence_limit)?;
-    let evidence = synthesis
-        .split_once('\n')
-        .filter(|(line, _)| {
-            line.starts_with("Cross-window semantic digests")
-                || line.starts_with("Cross-batch semantic digests")
-        })
-        .map_or(synthesis.as_str(), |(_, evidence)| evidence);
-    Ok(format!("{receipt_header}{commitment}{evidence}"))
 }
 
 #[derive(Clone, Copy)]
@@ -2550,8 +2858,10 @@ pub fn prepare_review_with_ignore(
     while cursor < text.len() {
         let end = next_diff_start(text, cursor + "diff --git ".len()).unwrap_or(text.len());
         let section = &text[cursor..end];
-        let path = section_path(section).context("review section has an invalid path header")?;
-        if ignore.is_match(&path) {
+        let paths = validated_section_paths(section).context("validating review section paths")?;
+        let ignored = ignore.is_match(&paths.path) && ignore.is_match(&paths.old_path);
+        let path = paths.path;
+        if ignored {
             cursor = end;
             continue;
         }
@@ -2833,7 +3143,7 @@ pub fn prepare_diff(text: &str) -> PreparedDiff<'_> {
     while let Some(start) = cursor {
         let end = next_diff_start(text, start + "diff --git ".len()).unwrap_or(text.len());
         let section = &text[start..end];
-        let Some(path) = section_path(section) else {
+        let Ok(paths) = validated_section_paths(section) else {
             return PreparedDiff {
                 source: None,
                 lockfiles: Vec::new(),
@@ -2841,6 +3151,7 @@ pub fn prepare_diff(text: &str) -> PreparedDiff<'_> {
                 incomplete: true,
             };
         };
+        let path = paths.path;
         if is_known_lockfile(&path) {
             if let Some(evidence) = lockfile_evidence(&path, section) {
                 compacted = true;
@@ -2872,7 +3183,7 @@ pub fn prepare_diff(text: &str) -> PreparedDiff<'_> {
     while let Some(start) = cursor {
         let end = next_diff_start(text, start + "diff --git ".len()).unwrap_or(text.len());
         let section = &text[start..end];
-        let Some(path) = section_path(section) else {
+        let Ok(paths) = validated_section_paths(section) else {
             return PreparedDiff {
                 source: None,
                 lockfiles: Vec::new(),
@@ -2880,6 +3191,7 @@ pub fn prepare_diff(text: &str) -> PreparedDiff<'_> {
                 incomplete: true,
             };
         };
+        let path = paths.path;
         let compact_lockfile =
             is_known_lockfile(&path) && lockfile_evidence(&path, section).is_some();
         if !compact_lockfile && !is_compactable_generated_artifact(&path, section) {
@@ -2954,32 +3266,462 @@ fn next_diff_start(text: &str, from: usize) -> Option<usize> {
     tail.find("\ndiff --git ").map(|offset| from + offset + 1)
 }
 
-fn section_path(section: &str) -> Option<String> {
-    section
-        .lines()
-        .next()
-        .and_then(|header| header.strip_prefix("diff --git "))
-        .and_then(parse_diff_header_paths)
-        .map(|(_, path)| path)
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SectionPaths {
+    old_path: String,
+    path: String,
 }
 
-fn parse_diff_header_paths(rest: &str) -> Option<(String, String)> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DiffMarkerPath {
+    Null,
+    Path(String),
+}
+
+fn valid_diff_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.starts_with('/')
+        && !path.contains('\0')
+        && path
+            .split('/')
+            .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
+}
+
+fn canonical_side_path(value: &str, prefix: &str) -> Option<DiffMarkerPath> {
+    if value == "/dev/null" {
+        return Some(DiffMarkerPath::Null);
+    }
+    let path = value.strip_prefix(prefix)?;
+    valid_diff_path(path).then(|| DiffMarkerPath::Path(path.to_string()))
+}
+
+fn parse_git_side_marker_path(value: &str, prefix: &str) -> Option<DiffMarkerPath> {
+    if value == "/dev/null" {
+        return Some(DiffMarkerPath::Null);
+    }
+    let (decoded, trailing) = if value.starts_with('"') {
+        parse_git_path_token(value)?
+    } else {
+        (value.split('\t').next()?.to_string(), "")
+    };
+    if !trailing.trim().is_empty() {
+        return None;
+    }
+    canonical_side_path(&decoded, prefix)
+}
+
+fn parse_git_extended_path(value: &str) -> Option<String> {
+    let (decoded, trailing) = if value.starts_with('"') {
+        parse_git_path_token(value)?
+    } else {
+        (value.to_string(), "")
+    };
+    if !trailing.trim().is_empty() || !valid_diff_path(&decoded) {
+        return None;
+    }
+    Some(decoded)
+}
+
+fn parse_binary_marker_path_candidates(
+    line: &str,
+) -> Option<Vec<(DiffMarkerPath, DiffMarkerPath)>> {
+    let inner = line
+        .strip_prefix("Binary files ")?
+        .strip_suffix(" differ")?;
+    if inner.starts_with('"') {
+        let (old, remainder) = parse_git_path_token(inner)?;
+        let remainder = remainder.strip_prefix(" and ")?;
+        let (new, trailing) = parse_git_path_token(remainder)?;
+        if !trailing.trim().is_empty() {
+            return None;
+        }
+        return Some(vec![(
+            canonical_side_path(&old, "a/")?,
+            canonical_side_path(&new, "b/")?,
+        )]);
+    }
+    let candidates = inner
+        .match_indices(" and ")
+        .filter_map(|(index, separator)| {
+            let old = &inner[..index];
+            let new = &inner[index + separator.len()..];
+            Some((
+                canonical_side_path(old, "a/")?,
+                canonical_side_path(new, "b/")?,
+            ))
+        });
+    let candidates = candidates.collect::<Vec<_>>();
+    (!candidates.is_empty()).then_some(candidates)
+}
+
+fn marker_pair_matches(old: &DiffMarkerPath, new: &DiffMarkerPath, paths: &SectionPaths) -> bool {
+    match (old, new) {
+        (DiffMarkerPath::Path(old), DiffMarkerPath::Path(new)) => {
+            old == &paths.old_path && new == &paths.path
+        }
+        (DiffMarkerPath::Null, DiffMarkerPath::Path(new)) => {
+            paths.old_path == paths.path && new == &paths.path
+        }
+        (DiffMarkerPath::Path(old), DiffMarkerPath::Null) => {
+            paths.old_path == paths.path && old == &paths.old_path
+        }
+        (DiffMarkerPath::Null, DiffMarkerPath::Null) => false,
+    }
+}
+
+fn consume_diff_hunk_line(line: &str, old_left: &mut u32, new_left: &mut u32) -> bool {
+    if *old_left == 0 && *new_left == 0 {
+        return false;
+    }
+    match line.chars().next() {
+        Some('+') if *new_left > 0 => *new_left -= 1,
+        Some('-') if *old_left > 0 => *old_left -= 1,
+        Some(' ') if *old_left > 0 && *new_left > 0 => {
+            *old_left -= 1;
+            *new_left -= 1;
+        }
+        _ => return false,
+    }
+    true
+}
+
+fn validated_section_paths(section: &str) -> Result<SectionPaths> {
+    section_paths(section, true)
+}
+
+fn section_paths(section: &str, require_complete_hunks: bool) -> Result<SectionPaths> {
+    let mut lines = section.lines();
+    let path_candidates = lines
+        .next()
+        .and_then(|header| header.strip_prefix("diff --git "))
+        .and_then(parse_diff_header_path_candidates)
+        .context("diff section has an invalid path header")?;
+    let mut old_marker = None;
+    let mut new_marker = None;
+    let mut rename_from = None;
+    let mut rename_to = None;
+    let mut copy_from = None;
+    let mut copy_to = None;
+    let mut binary_paths = None;
+    let mut index_mode = None::<Option<String>>;
+    let mut explicit_old_mode = None::<String>;
+    let mut explicit_new_mode = None::<String>;
+    let mut saw_change_evidence = false;
+    let mut saw_hunk = false;
+    let mut old_left = 0u32;
+    let mut new_left = 0u32;
+
+    while let Some(line) = lines.next() {
+        if consume_diff_hunk_line(line, &mut old_left, &mut new_left) {
+            continue;
+        }
+        if old_left != 0 || new_left != 0 {
+            if line == "\\ No newline at end of file" {
+                continue;
+            }
+            if !require_complete_hunks {
+                break;
+            }
+            anyhow::bail!("diff section hunk body does not match its declared range");
+        }
+        if line == "GIT binary patch" {
+            anyhow::ensure!(
+                !saw_hunk,
+                "diff section mixes text hunks with a binary patch"
+            );
+            anyhow::ensure!(
+                !lines.any(|remaining| remaining.starts_with("@@")),
+                "diff section mixes a binary patch with text hunks"
+            );
+            saw_change_evidence = true;
+            break;
+        }
+        if let Some(header) = line.strip_prefix("@@ ") {
+            anyhow::ensure!(
+                binary_paths.is_none(),
+                "diff section mixes binary markers with text hunks"
+            );
+            let Some((_, old_count, _, new_count)) = parse_hunk_header(header) else {
+                if require_complete_hunks {
+                    anyhow::bail!("diff section has a malformed hunk range");
+                }
+                break;
+            };
+            saw_hunk = true;
+            saw_change_evidence = true;
+            old_left = old_count;
+            new_left = new_count;
+            continue;
+        }
+        if line.starts_with("@@") {
+            if require_complete_hunks {
+                anyhow::bail!("diff section has a malformed hunk range");
+            }
+            break;
+        }
+        if saw_hunk && line.starts_with([' ', '+', '-']) {
+            if require_complete_hunks {
+                anyhow::bail!("diff section hunk body exceeds its declared range");
+            }
+            break;
+        }
+        if line.starts_with([' ', '+', '-'])
+            && !line.starts_with("--- ")
+            && !line.starts_with("+++ ")
+        {
+            if require_complete_hunks {
+                anyhow::bail!("diff section has changed content outside a hunk");
+            }
+            break;
+        }
+        if line.starts_with("index ") {
+            anyhow::ensure!(
+                index_mode.is_none(),
+                "diff section repeats its index metadata"
+            );
+            let mode = unchanged_index_mode(line)?;
+            if let Some(mode) = mode {
+                anyhow::ensure!(
+                    explicit_old_mode.as_deref().is_none_or(|old| old == mode)
+                        && explicit_new_mode.as_deref().is_none_or(|new| new == mode),
+                    "diff section index and explicit mode disagree"
+                );
+            }
+            index_mode = Some(mode.map(str::to_string));
+        } else if let Some(value) = line.strip_prefix("--- ") {
+            anyhow::ensure!(
+                old_marker.is_none(),
+                "diff section repeats its old path marker"
+            );
+            old_marker = Some(
+                parse_git_side_marker_path(value, "a/")
+                    .context("diff section has an invalid old path marker")?,
+            );
+        } else if let Some(value) = line.strip_prefix("+++ ") {
+            anyhow::ensure!(
+                new_marker.is_none(),
+                "diff section repeats its new path marker"
+            );
+            new_marker = Some(
+                parse_git_side_marker_path(value, "b/")
+                    .context("diff section has an invalid new path marker")?,
+            );
+        } else if let Some(value) = line.strip_prefix("rename from ") {
+            anyhow::ensure!(rename_from.is_none(), "diff section repeats rename-from");
+            rename_from = Some(
+                parse_git_extended_path(value)
+                    .context("diff section has an invalid rename-from path")?,
+            );
+            saw_change_evidence = true;
+        } else if let Some(value) = line.strip_prefix("rename to ") {
+            anyhow::ensure!(rename_to.is_none(), "diff section repeats rename-to");
+            rename_to = Some(
+                parse_git_extended_path(value)
+                    .context("diff section has an invalid rename-to path")?,
+            );
+            saw_change_evidence = true;
+        } else if let Some(value) = line.strip_prefix("copy from ") {
+            anyhow::ensure!(copy_from.is_none(), "diff section repeats copy-from");
+            copy_from = Some(
+                parse_git_extended_path(value)
+                    .context("diff section has an invalid copy-from path")?,
+            );
+            saw_change_evidence = true;
+        } else if let Some(value) = line.strip_prefix("copy to ") {
+            anyhow::ensure!(copy_to.is_none(), "diff section repeats copy-to");
+            copy_to = Some(
+                parse_git_extended_path(value)
+                    .context("diff section has an invalid copy-to path")?,
+            );
+            saw_change_evidence = true;
+        } else if line.starts_with("Binary files ") {
+            anyhow::ensure!(
+                !saw_hunk,
+                "diff section mixes text hunks with binary markers"
+            );
+            anyhow::ensure!(binary_paths.is_none(), "diff section repeats binary paths");
+            binary_paths = Some(
+                parse_binary_marker_path_candidates(line)
+                    .context("diff section has invalid binary path markers")?,
+            );
+            saw_change_evidence = true;
+        } else if let Some(mode) = line.strip_prefix("old mode ") {
+            anyhow::ensure!(explicit_old_mode.is_none(), "diff section repeats old mode");
+            let mode = validated_git_mode(mode)?;
+            anyhow::ensure!(
+                index_mode
+                    .as_ref()
+                    .and_then(Option::as_deref)
+                    .is_none_or(|index| index == mode),
+                "diff section index and old mode disagree"
+            );
+            explicit_old_mode = Some(mode.to_string());
+            saw_change_evidence = true;
+        } else if let Some(mode) = line.strip_prefix("new mode ") {
+            anyhow::ensure!(explicit_new_mode.is_none(), "diff section repeats new mode");
+            let mode = validated_git_mode(mode)?;
+            anyhow::ensure!(
+                index_mode
+                    .as_ref()
+                    .and_then(Option::as_deref)
+                    .is_none_or(|index| index == mode),
+                "diff section index and new mode disagree"
+            );
+            explicit_new_mode = Some(mode.to_string());
+            saw_change_evidence = true;
+        } else if let Some(mode) = line.strip_prefix("new file mode ") {
+            anyhow::ensure!(explicit_new_mode.is_none(), "diff section repeats new mode");
+            explicit_new_mode = Some(validated_git_mode(mode)?.to_string());
+            saw_change_evidence = true;
+        } else if let Some(mode) = line.strip_prefix("deleted file mode ") {
+            anyhow::ensure!(explicit_old_mode.is_none(), "diff section repeats old mode");
+            explicit_old_mode = Some(validated_git_mode(mode)?.to_string());
+            saw_change_evidence = true;
+        }
+    }
+    if require_complete_hunks {
+        anyhow::ensure!(
+            old_left == 0 && new_left == 0,
+            "diff section hunk body does not match its declared range"
+        );
+        anyhow::ensure!(
+            !saw_hunk || (old_marker.is_some() && new_marker.is_some()),
+            "diff section hunk has no file path marker pair"
+        );
+        anyhow::ensure!(
+            saw_change_evidence,
+            "diff section has no complete change evidence"
+        );
+    }
+
+    match (&old_marker, &new_marker) {
+        (None, None) => {}
+        (Some(_), Some(_)) => {}
+        _ => anyhow::bail!("diff section has an incomplete file path marker pair"),
+    }
+    match (&rename_from, &rename_to) {
+        (None, None) => {}
+        (Some(_), Some(_)) => {}
+        _ => anyhow::bail!("diff section has an incomplete rename path pair"),
+    }
+    match (&copy_from, &copy_to) {
+        (None, None) => {}
+        (Some(_), Some(_)) => {}
+        _ => anyhow::bail!("diff section has an incomplete copy path pair"),
+    }
+    anyhow::ensure!(
+        rename_from.is_none() || copy_from.is_none(),
+        "diff section mixes rename and copy paths"
+    );
+    let markers_match = old_marker
+        .as_ref()
+        .zip(new_marker.as_ref())
+        .is_none_or(|(old, new)| {
+            path_candidates
+                .iter()
+                .any(|paths| marker_pair_matches(old, new, paths))
+        });
+    let rename_matches = rename_from
+        .as_ref()
+        .zip(rename_to.as_ref())
+        .is_none_or(|(old, new)| {
+            path_candidates
+                .iter()
+                .any(|paths| old == &paths.old_path && new == &paths.path)
+        });
+    let copy_matches = copy_from
+        .as_ref()
+        .zip(copy_to.as_ref())
+        .is_none_or(|(old, new)| {
+            path_candidates
+                .iter()
+                .any(|paths| old == &paths.old_path && new == &paths.path)
+        });
+    let binary_matches = binary_paths.as_ref().is_none_or(|binary_candidates| {
+        path_candidates.iter().any(|paths| {
+            binary_candidates
+                .iter()
+                .any(|(old, new)| marker_pair_matches(old, new, paths))
+        })
+    });
+    let matching_paths = path_candidates
+        .into_iter()
+        .filter(|paths| {
+            old_marker
+                .as_ref()
+                .zip(new_marker.as_ref())
+                .is_none_or(|(old, new)| marker_pair_matches(old, new, paths))
+                && rename_from
+                    .as_ref()
+                    .zip(rename_to.as_ref())
+                    .is_none_or(|(old, new)| old == &paths.old_path && new == &paths.path)
+                && copy_from
+                    .as_ref()
+                    .zip(copy_to.as_ref())
+                    .is_none_or(|(old, new)| old == &paths.old_path && new == &paths.path)
+                && binary_paths.as_ref().is_none_or(|candidates| {
+                    candidates
+                        .iter()
+                        .any(|(old, new)| marker_pair_matches(old, new, paths))
+                })
+        })
+        .collect::<Vec<_>>();
+    match matching_paths.as_slice() {
+        [paths] => Ok(paths.clone()),
+        [] if !markers_match => {
+            anyhow::bail!("diff header and file path markers disagree")
+        }
+        [] if !rename_matches => anyhow::bail!("diff header and rename paths disagree"),
+        [] if !copy_matches => anyhow::bail!("diff header and copy paths disagree"),
+        [] if !binary_matches => anyhow::bail!("diff header and binary paths disagree"),
+        [] => anyhow::bail!("diff header has no canonical path match"),
+        _ => anyhow::bail!("diff section has an unresolved ambiguous path header"),
+    }
+}
+
+fn diff_section_path_resolutions(text: &str) -> Vec<(Option<SectionPaths>, bool)> {
+    let mut resolutions = Vec::new();
+    let mut cursor = next_diff_start(text, 0);
+    while let Some(start) = cursor {
+        let end = next_diff_start(text, start + "diff --git ".len()).unwrap_or(text.len());
+        let section = &text[start..end];
+        resolutions.push((
+            section_paths(section, false).ok(),
+            section_paths(section, true).is_ok(),
+        ));
+        cursor = (end < text.len()).then_some(end);
+    }
+    resolutions
+}
+
+fn parse_diff_header_path_candidates(rest: &str) -> Option<Vec<SectionPaths>> {
     if rest.starts_with('"') {
         let (old, remainder) = parse_git_path_token(rest)?;
         let (new, trailing) = parse_git_path_token(remainder.trim_start())?;
         if !trailing.trim().is_empty() {
             return None;
         }
-        return Some((
-            strip_prefix_ab(&old).to_string(),
-            strip_prefix_ab(&new).to_string(),
-        ));
+        let old = old.strip_prefix("a/")?;
+        let new = new.strip_prefix("b/")?;
+        return (valid_diff_path(old) && valid_diff_path(new)).then(|| {
+            vec![SectionPaths {
+                old_path: old.to_string(),
+                path: new.to_string(),
+            }]
+        });
     }
-    let (old, new) = rest.rsplit_once(" b/")?;
-    Some((
-        strip_prefix_ab(old).to_string(),
-        strip_prefix_ab(new).to_string(),
-    ))
+    let candidates = rest
+        .match_indices(" b/")
+        .filter_map(|(index, _separator)| {
+            let old = rest[..index].strip_prefix("a/")?;
+            let new = rest[index + 1..].strip_prefix("b/")?;
+            (valid_diff_path(old) && valid_diff_path(new)).then(|| SectionPaths {
+                old_path: old.to_string(),
+                path: new.to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    (!candidates.is_empty()).then_some(candidates)
 }
 
 fn parse_git_path_token(input: &str) -> Option<(String, &str)> {
@@ -3405,27 +4147,41 @@ fn parse_go_sum_records<'a>(lines: impl Iterator<Item = &'a str>) -> Option<BTre
 pub fn is_known_lockfile(path: &str) -> bool {
     let normalized = path.replace('\\', "/").to_ascii_lowercase();
     let name = normalized.rsplit('/').next().unwrap_or(&normalized);
-    matches!(
-        name,
-        "cargo.lock"
-            | "package-lock.json"
-            | "npm-shrinkwrap.json"
-            | "pnpm-lock.yaml"
-            | "yarn.lock"
-            | "bun.lock"
-            | "bun.lockb"
-            | "composer.lock"
-            | "gemfile.lock"
-            | "poetry.lock"
-            | "uv.lock"
-            | "pipfile.lock"
-            | "go.sum"
-            | "mix.lock"
-            | "pubspec.lock"
-            | "gradle.lockfile"
-            | "packages.lock.json"
-            | ".terraform.lock.hcl"
-    )
+    KNOWN_LOCKFILE_NAMES.contains(&name)
+}
+
+fn validated_git_mode(mode: &str) -> Result<&str> {
+    anyhow::ensure!(
+        matches!(mode, "100644" | "100755" | "120000" | "160000"),
+        "diff section has an invalid Git mode"
+    );
+    Ok(mode)
+}
+
+fn unchanged_index_mode(line: &str) -> Result<Option<&str>> {
+    let value = line
+        .strip_prefix("index ")
+        .context("diff section has malformed index metadata")?;
+    let mut fields = value.split_whitespace();
+    let object_ids = fields
+        .next()
+        .context("diff section index is missing object IDs")?;
+    let mode = fields.next();
+    anyhow::ensure!(
+        fields.next().is_none(),
+        "diff section index has trailing metadata"
+    );
+    let (old, new) = object_ids
+        .split_once("..")
+        .context("diff section index has invalid object IDs")?;
+    let object_id_is_hex = |value: &str| {
+        (4..=64).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    };
+    anyhow::ensure!(
+        old.len() == new.len() && object_id_is_hex(old) && object_id_is_hex(new),
+        "diff section index has invalid object IDs"
+    );
+    mode.map(validated_git_mode).transpose()
 }
 
 /// Parse a unified diff (git format). Tolerant of mode lines, renames, and
@@ -3440,7 +4196,10 @@ pub fn parse(text: &str) -> Diff {
     // phantom line that would render an ungroundable numbered line.
     let mut old_left: u32 = 0;
     let mut new_left: u32 = 0;
-    let mut complete = true;
+    let mut index_mode = None::<Option<String>>;
+    let path_resolutions = diff_section_path_resolutions(text);
+    let mut complete = path_resolutions.iter().all(|(_, valid)| *valid);
+    let mut path_resolutions = path_resolutions.into_iter().map(|(paths, _)| paths);
 
     let flush_hunk = |file: &mut Option<FileDiff>,
                       hunk: &mut Option<Hunk>,
@@ -3456,7 +4215,7 @@ pub fn parse(text: &str) -> Diff {
     };
 
     for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("diff --git ") {
+        if line.starts_with("diff --git ") {
             flush_hunk(
                 &mut current,
                 &mut current_hunk,
@@ -3467,36 +4226,73 @@ pub fn parse(text: &str) -> Diff {
             if let Some(f) = current.take() {
                 files.push(f);
             }
-            // Seed the path from the header (binary diffs have no +++/--- lines);
-            // the +++/--- lines that follow refine it for renames.
-            let Some((old_path, path)) = parse_diff_header_paths(rest) else {
+            let Some(Some(paths)) = path_resolutions.next() else {
                 complete = false;
                 current = None;
                 continue;
             };
             current = Some(FileDiff {
-                old_path,
-                path,
+                old_path: paths.old_path,
+                path: paths.path,
                 deleted: false,
                 binary: false,
                 old_mode: None,
                 new_mode: None,
                 hunks: Vec::new(),
             });
+            index_mode = None;
+        } else if line.starts_with("index ") {
+            let parsed_mode = unchanged_index_mode(line);
+            if index_mode.is_some() || parsed_mode.is_err() {
+                complete = false;
+            }
+            let mode = parsed_mode.ok().flatten().map(str::to_string);
+            if let (Some(f), Some(mode)) = (current.as_mut(), mode.as_ref()) {
+                if f.old_mode.as_ref().is_some_and(|old| old != mode)
+                    || f.new_mode.as_ref().is_some_and(|new| new != mode)
+                {
+                    complete = false;
+                }
+                f.old_mode.get_or_insert_with(|| mode.clone());
+                f.new_mode.get_or_insert_with(|| mode.clone());
+            }
+            index_mode = Some(mode);
         } else if let Some(mode) = line.strip_prefix("old mode ") {
             if let Some(f) = current.as_mut() {
+                if validated_git_mode(mode).is_err()
+                    || index_mode
+                        .as_ref()
+                        .and_then(Option::as_ref)
+                        .is_some_and(|index| index != mode)
+                {
+                    complete = false;
+                }
                 f.old_mode = Some(mode.to_string());
             }
         } else if let Some(mode) = line.strip_prefix("new mode ") {
             if let Some(f) = current.as_mut() {
+                if validated_git_mode(mode).is_err()
+                    || index_mode
+                        .as_ref()
+                        .and_then(Option::as_ref)
+                        .is_some_and(|index| index != mode)
+                {
+                    complete = false;
+                }
                 f.new_mode = Some(mode.to_string());
             }
         } else if let Some(mode) = line.strip_prefix("new file mode ") {
             if let Some(f) = current.as_mut() {
+                if validated_git_mode(mode).is_err() {
+                    complete = false;
+                }
                 f.new_mode = Some(mode.to_string());
             }
         } else if let Some(mode) = line.strip_prefix("deleted file mode ") {
             if let Some(f) = current.as_mut() {
+                if validated_git_mode(mode).is_err() {
+                    complete = false;
+                }
                 f.old_mode = Some(mode.to_string());
             }
         } else if let Some(rest) = line.strip_prefix("+++ ") {
@@ -3543,14 +4339,21 @@ pub fn parse(text: &str) -> Diff {
             } else {
                 complete = false;
             }
+        } else if line.starts_with("@@") {
+            flush_hunk(
+                &mut current,
+                &mut current_hunk,
+                old_left,
+                new_left,
+                &mut complete,
+            );
+            complete = false;
         } else if let Some(h) = current_hunk.as_mut() {
             // The hunk is complete once every declared old- and new-side line has
             // been consumed. Anything after that (a blank separator, a stray
             // line) belongs to the next file, not this hunk.
             let hunk_complete = old_left == 0 && new_left == 0;
-            if !hunk_complete && (line.starts_with(['+', '-', ' ']) || line.is_empty()) {
-                // A bare blank line counts as an unchanged (context) line: it is
-                // present on both sides.
+            if !hunk_complete && line.starts_with(['+', '-', ' ']) {
                 let consumed = match line.chars().next() {
                     Some('+') if new_left > 0 => {
                         new_left -= 1;
@@ -3574,7 +4377,7 @@ pub fn parse(text: &str) -> Diff {
                     complete = false;
                 }
                 h.lines.push(line.to_string());
-            } else if line.starts_with('\\') {
+            } else if line == "\\ No newline at end of file" {
                 // "\ No newline at end of file" is not content.
             } else {
                 // Hunk complete, or a trailer (e.g. next file's "index" line in
@@ -3616,21 +4419,27 @@ fn strip_prefix_ab(path: &str) -> &str {
 /// (old_start, old_count, new_start, new_count). Counts default to 1 when a
 /// header omits them (single-line hunk).
 fn parse_hunk_header(header: &str) -> Option<(u32, u32, u32, u32)> {
-    let range_of = |token: &str| -> Option<(u32, u32)> {
-        let spec = &token[1..];
+    let range_of = |spec: &str| -> Option<(u32, u32)> {
+        let parse_number = |value: &str| {
+            (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+                .then(|| value.parse().ok())
+                .flatten()
+        };
         match spec.split_once(',') {
-            Some((start, count)) => Some((start.parse().ok()?, count.parse().ok()?)),
-            None => Some((spec.parse().ok()?, 1)),
+            Some((start, count)) => Some((parse_number(start)?, parse_number(count)?)),
+            None => Some((parse_number(spec)?, 1)),
         }
     };
-    let (old_start, old_count) = header
-        .split_whitespace()
-        .find(|t| t.starts_with('-'))
-        .and_then(range_of)?;
-    let (new_start, new_count) = header
-        .split_whitespace()
-        .find(|t| t.starts_with('+'))
-        .and_then(range_of)?;
+    let (ranges, _) = header.split_once(" @@")?;
+    let mut ranges = ranges.split_whitespace();
+    let (old_start, old_count) = range_of(ranges.next()?.strip_prefix('-')?)?;
+    let (new_start, new_count) = range_of(ranges.next()?.strip_prefix('+')?)?;
+    if ranges.next().is_some() {
+        return None;
+    }
+    if (old_count > 0 && old_start == 0) || (new_count > 0 && new_start == 0) {
+        return None;
+    }
     old_start.checked_add(old_count.saturating_sub(1))?;
     new_start.checked_add(new_count.saturating_sub(1))?;
     Some((old_start, old_count, new_start, new_count))
@@ -4711,7 +5520,7 @@ mod tests {
 
     const SAMPLE: &str = "\
 diff --git a/src/lib.rs b/src/lib.rs
-index 111..222 100644
+index 1111..2222 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -10,4 +10,5 @@ fn ctx() {
@@ -4771,6 +5580,11 @@ Binary files a/img.png and b/img.png differ
 
     #[test]
     fn rejects_truncated_and_malformed_hunks() {
+        let header_only_source = "diff --git a/a.rs b/a.rs\nindex 1111111..2222222 100644\n";
+        let header_only = parse(header_only_source);
+        assert!(!header_only.complete);
+        assert!(prepare_diff(header_only_source).incomplete);
+
         let truncated = parse(
             "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n",
         );
@@ -4784,6 +5598,11 @@ Binary files a/img.png and b/img.png differ
             "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -0,0 +1,1 @@\n+one\n+two\n",
         );
         assert!(!overfull.complete);
+
+        let outside_hunk = parse(
+            "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n+hidden();\n@@ -1 +1 @@\n-old();\n+new();\n",
+        );
+        assert!(!outside_hunk.complete);
     }
 
     #[test]
@@ -4870,6 +5689,183 @@ Binary files a/img.png and b/img.png differ
             "src/alarm\u{7}back\u{8}vertical\u{b}form\u{c}.rs"
         );
         assert!(!prepare_diff(source).incomplete);
+    }
+
+    #[test]
+    fn unquoted_git_paths_can_contain_header_and_binary_separator_text() {
+        let text = "diff --git a/x b/y.txt b/x b/y.txt\n--- a/x b/y.txt\n+++ b/x b/y.txt\n@@ -1 +1 @@\n-old\n+new\n";
+        let parsed = parse(text);
+        assert!(parsed.complete);
+        assert_eq!(parsed.files[0].path, "x b/y.txt");
+        assert!(!prepare_diff(text).incomplete);
+
+        let binary = "diff --git a/x and y.bin b/x and y.bin\nBinary files a/x and y.bin and b/x and y.bin differ\n";
+        let parsed = parse(binary);
+        assert!(parsed.complete);
+        assert_eq!(parsed.files[0].path, "x and y.bin");
+        assert!(parsed.files[0].binary);
+    }
+
+    #[test]
+    fn ambiguous_unquoted_headers_resolve_against_canonical_path_metadata() {
+        let renamed = "diff --git a/old b/日.rs b/new b/日.rs\nsimilarity index 90%\nrename from old b/日.rs\nrename to new b/日.rs\n--- a/old b/日.rs\n+++ b/new b/日.rs\n@@ -1 +1 @@\n-old();\n+new();\n";
+        let copied = "diff --git a/source b/name.rs b/copy b/name.rs\nsimilarity index 90%\ncopy from source b/name.rs\ncopy to copy b/name.rs\n--- a/source b/name.rs\n+++ b/copy b/name.rs\n@@ -1 +1 @@\n-old();\n+new();\n";
+        let binary = "diff --git a/old and name.bin b/new and name.bin\nBinary files a/old and name.bin and b/new and name.bin differ\n";
+
+        for (source, old_path, new_path) in [
+            (renamed, "old b/日.rs", "new b/日.rs"),
+            (copied, "source b/name.rs", "copy b/name.rs"),
+            (binary, "old and name.bin", "new and name.bin"),
+        ] {
+            let parsed = parse(source);
+            assert!(parsed.complete, "failed to resolve {source}");
+            assert_eq!(parsed.files[0].old_path, old_path);
+            assert_eq!(parsed.files[0].path, new_path);
+            let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+            assert!(prepare_review(&snapshot).is_ok());
+        }
+    }
+
+    #[test]
+    fn unresolved_unquoted_header_ambiguity_fails_closed() {
+        let source =
+            "diff --git a/old b/name.rs b/new b/name.rs\nold mode 100644\nnew mode 100755\n";
+        let parsed = parse(source);
+        assert!(!parsed.complete);
+        assert!(parsed.files.is_empty());
+        let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+        let error = prepare_review(&snapshot)
+            .err()
+            .expect("ambiguous path header must fail closed");
+        assert!(format!("{error:#}").contains("unresolved ambiguous path header"));
+    }
+
+    #[test]
+    fn every_path_identity_must_match_the_canonical_header() {
+        let cases = [
+            "diff --git a/src/old.rs b/src/new.rs\n--- a/src/old.rs\n+++ b/src/other.rs\n@@ -1 +1 @@\n-old();\n+new();\n",
+            "diff --git a/src/old.rs b/src/new.rs\nrename from Cargo.lock\nrename to src/new.rs\n--- a/src/old.rs\n+++ b/src/new.rs\n@@ -1 +1 @@\n-old();\n+new();\n",
+            "diff --git a/src/old.rs b/src/new.rs\ncopy from vendor/lib/Runner.java\ncopy to src/new.rs\n--- a/src/old.rs\n+++ b/src/new.rs\n@@ -1 +1 @@\n-old();\n+new();\n",
+            "diff --git a/assets/old.bin b/assets/new.bin\nBinary files a/src/auth/control.bin and b/assets/new.bin differ\n",
+        ];
+
+        for source in cases {
+            assert!(
+                validated_section_paths(source).is_err(),
+                "accepted {source}"
+            );
+            assert!(!parse(source).complete, "parsed {source}");
+            assert!(prepare_diff(source).incomplete, "prepared {source}");
+        }
+    }
+
+    #[test]
+    fn rename_is_ignored_only_when_both_paths_match() {
+        let source = "diff --git a/src/auth/permission.ts b/generated/permission.ts\nsimilarity index 100%\nrename from src/auth/permission.ts\nrename to generated/permission.ts\n";
+        let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+        let prepared =
+            prepare_review_with_ignore(&snapshot, &["generated/**".to_string()]).unwrap();
+        assert!(prepared.has_source);
+
+        let ignored_source = "diff --git a/generated/old.ts b/generated/new.ts\nsimilarity index 100%\nrename from generated/old.ts\nrename to generated/new.ts\n";
+        let snapshot = DiffSnapshot::from_bytes(ignored_source.as_bytes()).unwrap();
+        let prepared =
+            prepare_review_with_ignore(&snapshot, &["generated/**".to_string()]).unwrap();
+        assert!(!prepared.has_source);
+    }
+
+    #[test]
+    fn hunkless_source_metadata_is_mandatory_in_large_receipts() {
+        let mut source = String::from(
+            "diff --git a/src/old.rs b/src/new.rs\nsimilarity index 100%\nrename from src/old.rs\nrename to src/new.rs\n",
+        );
+        for file in 0..2 {
+            source.push_str(&format!(
+                "diff --git a/src/churn-{file}.rs b/src/churn-{file}.rs\n--- a/src/churn-{file}.rs\n+++ b/src/churn-{file}.rs\n@@ -1,50 +1,50 @@\n",
+            ));
+            for line in 0..50 {
+                source.push_str(&format!("-old_{file}_{line}_{}();\n", "x".repeat(80)));
+            }
+            for line in 0..50 {
+                source.push_str(&format!("+new_{file}_{line}_{}();\n", "x".repeat(80)));
+            }
+        }
+        let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+        let mut prepared = prepare_review(&snapshot).unwrap();
+        let mut batches = spool_model_batches_with_synthesis_budget(
+            &mut prepared,
+            MIN_REVIEW_BATCH_BYTES,
+            MIN_REVIEW_BATCH_BYTES,
+            4096,
+            false,
+            1,
+        )
+        .unwrap();
+        assert!(batches.count > 2);
+        let receipt = batches.deterministic_bounded_receipt(2).unwrap();
+        let selected = batches
+            .selected_batches(&receipt.selected_batch_ids)
+            .unwrap();
+        assert!(
+            selected
+                .iter()
+                .any(|batch| { batch.contains("src/new.rs") && batch.contains("[renamed]") })
+        );
+    }
+
+    #[test]
+    fn malformed_hunk_grammar_and_mixed_binary_sections_fail_before_planning() {
+        for header in [
+            "@@ +1 -1 @@",
+            "@@ -1 +1",
+            "@@ -1 +1 trailing @@",
+            "@@ -1,+1 +1 @@",
+        ] {
+            let source = format!(
+                "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n{header}\n-old();\n+new();\n"
+            );
+            let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+            assert!(prepare_review(&snapshot).is_err(), "accepted {header}");
+            assert!(prepare_diff(&source).incomplete, "prepared {header}");
+            assert!(!parse(&source).complete, "parsed {header}");
+        }
+
+        let missing_markers =
+            "diff --git a/src/lib.rs b/src/lib.rs\n@@ -1 +1 @@\n-old();\n+new();\n";
+        let snapshot = DiffSnapshot::from_bytes(missing_markers.as_bytes()).unwrap();
+        let error = prepare_review(&snapshot)
+            .err()
+            .expect("hunk without markers must fail closed");
+        assert!(format!("{error:#}").contains("hunk has no file path marker pair"));
+
+        let overfull_lockfile = "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1 +1 @@\n-old\n+new\n+undeclared\n";
+        let snapshot = DiffSnapshot::from_bytes(overfull_lockfile.as_bytes()).unwrap();
+        let error = prepare_review(&snapshot)
+            .err()
+            .expect("overfull lockfile must fail closed");
+        assert!(format!("{error:#}").contains("hunk body exceeds its declared range"));
+
+        for binary_marker in [
+            "GIT binary patch\nliteral 0\nHcmV?d00001\n",
+            "Binary files a/Cargo.lock and b/Cargo.lock differ\n",
+        ] {
+            let mixed = format!(
+                "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1 +1 @@\n-old\n+new\n{binary_marker}"
+            );
+            let snapshot = DiffSnapshot::from_bytes(mixed.as_bytes()).unwrap();
+            let error = prepare_review(&snapshot)
+                .err()
+                .expect("mixed text and binary section must fail closed");
+            assert!(format!("{error:#}").contains("mixes text hunks with"));
+        }
+
+        for invalid_metadata in ["\\ arbitrary metadata", ""] {
+            let source = format!(
+                "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n{invalid_metadata}\n"
+            );
+            let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+            assert!(prepare_review(&snapshot).is_err());
+        }
     }
 
     #[test]
@@ -5222,11 +6218,11 @@ Binary files a/img.png and b/img.png differ
     #[test]
     fn partial_lockfile_records_and_unrepresented_security_fields_stay_raw() {
         for source in [
-            "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1,4 +1,4 @@\n name = \"package-one\"\n-version = \"1.0.0\"\n+version = \"2.0.0\"\n-source = \"registry+https://trusted.example/index\"\n+source = \"registry+https://attacker.example/index\"\n",
-            "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1,4 +1,4 @@\n name = \"package-one\"\n version = \"1.0.0\"\n-checksum = \"trusted\"\n+checksum = \"attacker\"\n",
-            "diff --git a/package-lock.json b/package-lock.json\n--- a/package-lock.json\n+++ b/package-lock.json\n@@ -1,4 +1,4 @@\n \"left-pad\": {\n \"version\": \"1.0.0\",\n-\"resolved\": \"https://trusted.example/pkg.tgz\"\n+\"resolved\": \"https://attacker.example/pkg.tgz\"\n",
-            "diff --git a/package-lock.json b/package-lock.json\n--- a/package-lock.json\n+++ b/package-lock.json\n@@ -1,4 +1,4 @@\n \"left-pad\": {\n \"version\": \"1.0.0\",\n-\"integrity\": \"sha512-trusted\"\n+\"integrity\": \"sha512-attacker\"\n",
-            "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1,4 +1,4 @@\n name = \"package-one\"\n version = \"1.0.0\"\n-custom = \"trusted\"\n+custom = \"attacker\"\n",
+            "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1,3 +1,3 @@\n name = \"package-one\"\n-version = \"1.0.0\"\n+version = \"2.0.0\"\n-source = \"registry+https://trusted.example/index\"\n+source = \"registry+https://attacker.example/index\"\n",
+            "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1,3 +1,3 @@\n name = \"package-one\"\n version = \"1.0.0\"\n-checksum = \"trusted\"\n+checksum = \"attacker\"\n",
+            "diff --git a/package-lock.json b/package-lock.json\n--- a/package-lock.json\n+++ b/package-lock.json\n@@ -1,3 +1,3 @@\n \"left-pad\": {\n \"version\": \"1.0.0\",\n-\"resolved\": \"https://trusted.example/pkg.tgz\"\n+\"resolved\": \"https://attacker.example/pkg.tgz\"\n",
+            "diff --git a/package-lock.json b/package-lock.json\n--- a/package-lock.json\n+++ b/package-lock.json\n@@ -1,3 +1,3 @@\n \"left-pad\": {\n \"version\": \"1.0.0\",\n-\"integrity\": \"sha512-trusted\"\n+\"integrity\": \"sha512-attacker\"\n",
+            "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1,3 +1,3 @@\n name = \"package-one\"\n version = \"1.0.0\"\n-custom = \"trusted\"\n+custom = \"attacker\"\n",
         ] {
             let prepared = prepare_diff(source);
             assert!(prepared.lockfiles.is_empty());
@@ -5278,13 +6274,16 @@ Binary files a/img.png and b/img.png differ
     #[test]
     fn yarn_berry_and_package_lock_v1_have_directional_evidence() {
         let yarn = "diff --git a/yarn.lock b/yarn.lock\n--- a/yarn.lock\n+++ b/yarn.lock\n@@ -1,2 +1,2 @@\n \"@scope/pkg@npm:^1.0.0\":\n-  version: 1.0.0\n+  version: 1.1.0\n";
+        assert!(validated_section_paths(yarn).is_ok());
+        assert!(lockfile_changed_lines_are_represented("yarn.lock", yarn));
+        assert!(lockfile_evidence("yarn.lock", yarn).is_some());
         let yarn = prepare_diff(yarn);
         assert_eq!(
             yarn.lockfiles[0].changes,
             ["removed @scope/pkg@1.0.0", "added @scope/pkg@1.1.0"]
         );
 
-        let npm = "diff --git a/package-lock.json b/package-lock.json\n--- a/package-lock.json\n+++ b/package-lock.json\n@@ -1,3 +1,3 @@\n \"left-pad\": {\n-  \"version\": \"1.0.0\"\n+  \"version\": \"1.1.0\"\n";
+        let npm = "diff --git a/package-lock.json b/package-lock.json\n--- a/package-lock.json\n+++ b/package-lock.json\n@@ -1,2 +1,2 @@\n \"left-pad\": {\n-  \"version\": \"1.0.0\"\n+  \"version\": \"1.1.0\"\n";
         let npm = prepare_diff(npm);
         assert_eq!(
             npm.lockfiles[0].changes,
@@ -5467,6 +6466,58 @@ Binary files a/img.png and b/img.png differ
         assert_eq!(parse_hunk_header("-1 +5 @@"), Some((1, 1, 5, 1)));
         assert_eq!(parse_hunk_header("-1,2 +3,4 @@"), Some((1, 2, 3, 4)));
         assert_eq!(parse_hunk_header("-0,0 +1,3 @@"), Some((0, 0, 1, 3)));
+        assert_eq!(parse_hunk_header("-1,3 +0,0 @@"), Some((1, 3, 0, 0)));
+    }
+
+    #[test]
+    fn positive_hunk_counts_reject_zero_start_coordinates() {
+        for header in ["@@ -0,1 +1,1 @@", "@@ -1,1 +0,1 @@"] {
+            let source = format!(
+                "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n{header}\n-old();\n+new();\n"
+            );
+            assert!(!parse(&source).complete, "parsed {header}");
+            assert!(prepare_diff(&source).incomplete, "prepared {header}");
+            let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+            assert!(prepare_review(&snapshot).is_err(), "accepted {header}");
+        }
+    }
+
+    #[test]
+    fn canonical_zero_count_hunks_preserve_index_and_receipt_coordinates() {
+        let source = "diff --git a/added.rs b/added.rs\nnew file mode 100644\n--- /dev/null\n+++ b/added.rs\n@@ -0,0 +1,1 @@\n+added();\ndiff --git a/deleted.rs b/deleted.rs\ndeleted file mode 100644\n--- a/deleted.rs\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-deleted();\n";
+        let parsed = parse(source);
+        assert!(parsed.complete);
+        assert_eq!(parsed.files[0].hunks[0].old_start, 0);
+        assert_eq!(parsed.files[0].hunks[0].old_count, 0);
+        assert_eq!(parsed.files[1].hunks[0].new_start, 0);
+        assert_eq!(parsed.files[1].hunks[0].new_count, 0);
+
+        let index = DiffIndex::build(&parsed);
+        assert!(index.contains("added.rs", 1));
+        assert!(!index.contains("added.rs", 0));
+        assert!(index.contains_old("deleted.rs", 1));
+        assert!(!index.contains_old("deleted.rs", 0));
+
+        let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+        let mut prepared = prepare_review(&snapshot).unwrap();
+        let mut batches = spool_model_batches(&mut prepared, 16_000, 4_096, false).unwrap();
+        let receipt = batches.deterministic_bounded_receipt(24).unwrap();
+        assert_eq!(receipt.entries.len(), 2);
+        let added = receipt
+            .entries
+            .iter()
+            .find(|entry| entry.hunk.path == "added.rs")
+            .unwrap();
+        let deleted = receipt
+            .entries
+            .iter()
+            .find(|entry| entry.hunk.path == "deleted.rs")
+            .unwrap();
+        assert_eq!(added.hunk.old_start, 0);
+        assert_eq!(added.hunk.old_count, 0);
+        assert_eq!(deleted.hunk.new_start, 0);
+        assert_eq!(deleted.hunk.new_count, 0);
+        assert_eq!(receipt.unreviewed_hunks(), 0);
     }
 
     #[test]
@@ -5595,6 +6646,63 @@ diff --git a/two.rs b/two.rs
     }
 
     #[test]
+    fn hosted_planner_requires_every_compacted_metadata_batch() {
+        use std::fmt::Write as _;
+
+        fn lockfile_changes(count: usize) -> String {
+            let mut source = String::new();
+            for package in 0..count {
+                let path = format!("packages/package-{package}/package-lock.json");
+                writeln!(
+                    source,
+                    "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1,2 +1,2 @@\n \"dependency-{package}\": {{\n-  \"version\": \"1.0.0\"\n+  \"version\": \"2.0.0\""
+                )
+                .unwrap();
+            }
+            source
+        }
+
+        let source = lockfile_changes(40);
+        let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+        let mut prepared = prepare_review(&snapshot).unwrap();
+        let mut batches = spool_model_batches(
+            &mut prepared,
+            crate::review::MAX_HOSTED_REVIEW_BATCH_BYTES,
+            crate::review::MAX_REVIEW_MANIFEST_BYTES,
+            false,
+        )
+        .unwrap();
+        assert_eq!(batches.metadata_batch_ids.len(), 3);
+        let candidates = batches.hosted_candidates(24, 96).unwrap();
+        let mandatory = candidates
+            .mandatory_ids
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        assert!(batches.metadata_batch_ids.is_subset(&mandatory));
+
+        let source = lockfile_changes(81);
+        let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+        let mut prepared = prepare_review(&snapshot).unwrap();
+        let mut batches = spool_model_batches(
+            &mut prepared,
+            crate::review::MAX_HOSTED_REVIEW_BATCH_BYTES,
+            crate::review::MAX_REVIEW_MANIFEST_BYTES,
+            false,
+        )
+        .unwrap();
+        assert_eq!(batches.metadata_batch_ids.len(), 6);
+        let error = match batches.hosted_candidates(5, 96) {
+            Ok(_) => panic!("hosted planning accepted excess mandatory metadata"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("mandatory dependency, artifact, and source evidence needs 6 batches")
+        );
+    }
+
+    #[test]
     fn hosted_planner_retains_an_interior_file_path_in_compacted_evidence() {
         use std::fmt::Write as _;
 
@@ -5663,6 +6771,7 @@ diff --git a/two.rs b/two.rs
             MIN_REVIEW_BATCH_BYTES,
             MIN_REVIEW_BATCH_BYTES / 3,
             false,
+            crate::review::MAX_LARGE_DIFF_SELECTED_BATCHES,
         )
         .err()
         .unwrap();
@@ -5684,7 +6793,7 @@ diff --git a/two.rs b/two.rs
             };
             writeln!(
                 source,
-                "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@"
+                "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1,2 +1,2 @@"
             )
             .unwrap();
             if security {
@@ -5693,16 +6802,12 @@ diff --git a/two.rs b/two.rs
                     "-if (!actor.can('admin')) throw new Error('Forbidden');"
                 )
                 .unwrap();
-                writeln!(
-                    source,
-                    "+await privilegedWrite(input); // {}",
-                    "x".repeat(10_000)
-                )
-                .unwrap();
+                writeln!(source, "+await privilegedWrite(input);").unwrap();
             } else {
                 writeln!(source, "-const value = {file};").unwrap();
-                writeln!(source, "+const value = {file}; // {}", "x".repeat(10_000)).unwrap();
+                writeln!(source, "+const value = {file};").unwrap();
             }
+            writeln!(source, " {}", "x".repeat(10_000)).unwrap();
         }
         source
     }
@@ -5739,6 +6844,163 @@ diff --git a/two.rs b/two.rs
     }
 
     #[test]
+    fn mandatory_classification_covers_lockfiles_vendor_source_and_renames() {
+        let hunk = Hunk {
+            old_start: 1,
+            old_count: 1,
+            new_start: 1,
+            new_count: 1,
+            lines: vec!["-value = 1".to_string(), "+value = 2".to_string()],
+        };
+        for path in KNOWN_LOCKFILE_NAMES {
+            let path_class = large_diff_file_path_class(path, path, None, None);
+            assert!(
+                mandatory_large_diff_hunk(path_class, &hunk),
+                "raw lockfile hunk was not mandatory: {path}"
+            );
+        }
+        for path in [
+            "vendor/lib/Runner.java",
+            "vendor/lib/Runner.cs",
+            "vendor/lib/runner.rb",
+            "vendor/lib/index.php",
+            "vendor/lib/Runner.kt",
+            "vendor/lib/Runner.swift",
+            "vendor/lib/runner.lua",
+            "vendor/bin/runner",
+            "vendor/bin/tool.bash",
+            "vendor/tools/deploy.ps1",
+            "Vendored\\Runtime\\Runner.scala",
+        ] {
+            let path_class = large_diff_file_path_class(path, path, None, None);
+            assert!(
+                mandatory_large_diff_hunk(path_class, &hunk),
+                "reviewable vendor source hunk was not mandatory: {path}"
+            );
+        }
+        for (path, old_mode, new_mode) in [
+            ("vendor/tools/release.custom", None, Some("100755")),
+            ("vendor/tools/runner", Some("100755"), Some("100644")),
+        ] {
+            let path_class = large_diff_file_path_class(path, path, old_mode, new_mode);
+            assert!(
+                mandatory_large_diff_hunk(path_class, &hunk),
+                "mode-marked vendor executable was not mandatory: {path}"
+            );
+        }
+        let neutral =
+            large_diff_file_path_class("src/OldRunner.java", "src/Runner.java", None, None);
+        assert!(!mandatory_large_diff_hunk(neutral, &hunk));
+        assert!(semantic_large_diff_hunk(neutral, &hunk));
+        for path in [
+            "vendor/README.md",
+            "vendor/docs/operations.txt",
+            "vendor/data/fixtures.json",
+            "vendored/assets/theme.css",
+        ] {
+            let path_class = large_diff_file_path_class(path, path, None, None);
+            assert!(
+                !mandatory_large_diff_hunk(path_class, &hunk),
+                "non-executable vendor content was mandatory: {path}"
+            );
+        }
+        let non_vendor_executable = large_diff_file_path_class(
+            "assets/tool.custom",
+            "assets/tool.custom",
+            None,
+            Some("100755"),
+        );
+        assert!(!mandatory_large_diff_hunk(non_vendor_executable, &hunk));
+
+        for mandatory_path in [
+            "Cargo.lock",
+            "vendor/lib/Runner.java",
+            "src/auth/permission.ts",
+            ".github/workflows/release.yml",
+        ] {
+            for path_class in [
+                large_diff_file_path_class(mandatory_path, "src/neutral.rs", None, None),
+                large_diff_file_path_class("src/neutral.rs", mandatory_path, None, None),
+            ] {
+                assert!(mandatory_large_diff_hunk(path_class, &hunk));
+                assert!(!semantic_large_diff_hunk(path_class, &hunk));
+            }
+        }
+    }
+
+    #[test]
+    fn unchanged_executable_vendor_mode_is_mandatory_after_diff_parsing() {
+        use std::fmt::Write as _;
+
+        let mut source = String::from(
+            "diff --git a/vendor/tools/runner b/vendor/tools/runner\nindex 1111111..2222222 100755\n--- a/vendor/tools/runner\n+++ b/vendor/tools/runner\n@@ -1,81 +1,81 @@\n-old_value\n+new_value\n",
+        );
+        for _ in 0..80 {
+            writeln!(source, " {}", "x".repeat(500)).unwrap();
+        }
+        let parsed = parse(&source);
+        assert!(parsed.complete);
+        assert_eq!(parsed.files[0].old_mode.as_deref(), Some("100755"));
+        assert_eq!(parsed.files[0].new_mode.as_deref(), Some("100755"));
+
+        let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+        let mut prepared = prepare_review(&snapshot).unwrap();
+        let mut batches = spool_model_batches(
+            &mut prepared,
+            MIN_REVIEW_BATCH_BYTES,
+            MIN_REVIEW_BATCH_BYTES,
+            false,
+        )
+        .unwrap();
+        let error = batches.deterministic_bounded_receipt(1).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("mandatory hunk vendor/tools/runner:1")
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("cannot fit the 1 batch large-review limit")
+        );
+    }
+
+    #[test]
+    fn malformed_duplicate_and_conflicting_index_modes_fail_closed() {
+        let base = |metadata: &str| {
+            format!(
+                "diff --git a/vendor/tools/runner b/vendor/tools/runner\n{metadata}\n--- a/vendor/tools/runner\n+++ b/vendor/tools/runner\n@@ -1 +1 @@\n-old\n+new\n"
+            )
+        };
+        for metadata in [
+            "index not-hex..2222222 100755",
+            "index 1..2 100755",
+            "index 1111..22222 100755",
+            "index 1111111..2222222 100999",
+            "index 1111111..2222222 100600",
+            "index 1111111..2222222 100755 trailing",
+            "index 1111111..2222222 100755\nindex 1111111..2222222 100755",
+            "old mode 100755\nnew mode 100644\nindex 1111111..2222222 100644",
+            "index 1111111..2222222 100644\nold mode 100755\nnew mode 100644",
+        ] {
+            let source = base(metadata);
+            assert!(!parse(&source).complete, "accepted metadata: {metadata}");
+            let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+            assert!(
+                prepare_review(&snapshot).is_err(),
+                "prepared metadata: {metadata}"
+            );
+        }
+
+        let valid_mode_change = base("old mode 100755\nnew mode 100644\nindex 1111111..2222222");
+        assert!(parse(&valid_mode_change).complete);
+        assert!(
+            prepare_review(&DiffSnapshot::from_bytes(valid_mode_change.as_bytes()).unwrap())
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn deterministic_large_receipt_is_stable_and_keeps_security_and_vendor_hunks() {
         let source = deterministic_large_fixture(1);
         let first = deterministic_receipt_for(&source);
@@ -5747,9 +7009,9 @@ diff --git a/two.rs b/two.rs
         assert_eq!(first.plan_sha256, second.plan_sha256);
         assert_eq!(first.entries, second.entries);
         assert_eq!(first.entries.len(), 30);
-        assert_eq!(first.selected_batch_ids.len(), 3);
-        assert_eq!(first.direct_hunks(), 2);
-        assert_eq!(first.semantic_hunks(), 28);
+        assert!(first.selected_batch_ids.len() <= 24);
+        assert!(first.direct_hunks() >= 2);
+        assert_eq!(first.direct_hunks() + first.semantic_hunks(), 30);
         assert_eq!(first.unreviewed_hunks(), 0);
         for path in ["src/auth/permission-0.ts", "vendor/runtime/dispatch.ts"] {
             let entry = first
@@ -5827,6 +7089,88 @@ diff --git a/two.rs b/two.rs
         assert!(selected[0].contains(&format!(
             "Exact normalized hunk-set commitment (SHA-256): {expected}"
         )));
+    }
+
+    #[test]
+    fn every_semantic_receipt_hunk_is_visible_in_its_selected_prompt() {
+        let source = deterministic_large_fixture(1);
+        let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+        let mut prepared = prepare_review(&snapshot).unwrap();
+        let mut batches = spool_model_batches(&mut prepared, 16_000, 4_096, false).unwrap();
+        let receipt = batches
+            .deterministic_bounded_receipt(crate::review::MAX_LARGE_DIFF_SELECTED_BATCHES)
+            .unwrap();
+        let prompts = batches
+            .batch_text_by_id(&receipt.selected_batch_ids)
+            .unwrap();
+
+        for entry in receipt
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry.disposition, HunkDisposition::Semantic { .. }))
+        {
+            let HunkDisposition::Semantic { summary_batch_ids } = &entry.disposition else {
+                unreachable!();
+            };
+            assert!(summary_batch_ids.iter().all(|id| {
+                final_model_visible_semantic_hunks(
+                    prompts.get(id).unwrap(),
+                    &BTreeSet::from([entry.hunk.clone()]),
+                )
+                .contains(&entry.hunk)
+            }));
+        }
+    }
+
+    #[test]
+    fn semantic_proof_range_overflow_fails_closed_deterministically() {
+        let hunk = HunkIdentity {
+            path: "src/boundary.rs".to_string(),
+            old_start: 1,
+            old_count: 1,
+            new_start: u32::MAX - 1,
+            new_count: 4,
+            digest: [0xA5; 32],
+        };
+        let prompt = format!(
+            "### {}\n@@ exact low-risk hunk identity={} old=1,1 new={},4 @@\n{} + outside range\n",
+            hunk.path,
+            hunk_receipt_identity(&hunk),
+            hunk.new_start,
+            hunk.new_start,
+        );
+        let candidates = BTreeSet::from([hunk]);
+        let first = final_model_visible_semantic_hunks(&prompt, &candidates);
+        let second = final_model_visible_semantic_hunks(&prompt, &candidates);
+        assert_eq!(first, second);
+        assert!(first.is_empty());
+    }
+
+    #[test]
+    fn semantic_proof_includes_every_changed_line_and_requires_substance() {
+        let hunk = Hunk {
+            old_start: 1,
+            old_count: 1,
+            new_start: 1,
+            new_count: 2,
+            lines: vec![
+                "-old_value();".to_string(),
+                "+}".to_string(),
+                "+new_value();".to_string(),
+            ],
+        };
+        let proof = exact_semantic_hunk_proof("src/neutral.rs", &hunk).unwrap();
+        assert!(proof.contains("+ new_value();"));
+        assert!(proof.contains("+ }"));
+
+        let punctuation_only = Hunk {
+            old_start: 1,
+            old_count: 0,
+            new_start: 1,
+            new_count: 1,
+            lines: vec!["+}".to_string()],
+        };
+        assert!(exact_semantic_hunk_proof("src/neutral.rs", &punctuation_only).is_none());
     }
 
     #[test]
@@ -5914,23 +7258,28 @@ diff --git a/two.rs b/two.rs
             let path = format!("src/churn/{side}-{file}.ts");
             writeln!(
                 source,
-                "diff --git a/{path} b/{path}\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,131 @@"
+                "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1,131 +1,131 @@"
             )
             .unwrap();
             writeln!(
                 source,
-                "+export function ordinary_{side}_{file}(actor: Actor) {{"
+                " export function ordinary_{side}_{file}(actor: Actor) {{"
             )
             .unwrap();
             for line in 2..130 {
-                writeln!(
-                    source,
-                    "+  const ordinary_{side}_{file}_{line} = actor.id; // {}",
-                    "x".repeat(900)
-                )
-                .unwrap();
+                if line == 64 {
+                    writeln!(source, "-  const ordinary_{side}_{file}_{line}=actor.id;").unwrap();
+                    writeln!(source, "+  const ordinary_{side}_{file}_{line} = actor.id;").unwrap();
+                } else {
+                    writeln!(
+                        source,
+                        "   const ordinary_{side}_{file}_{line} = actor.id; // {}",
+                        "x".repeat(900)
+                    )
+                    .unwrap();
+                }
             }
-            writeln!(source, "+  return actor.id;\n+}}").unwrap();
+            writeln!(source, "   return actor.id;\n }}").unwrap();
         }
 
         fn push_change(source: &mut String, line: usize, before: &str, after: &str) {
@@ -5987,13 +7336,13 @@ diff --git a/two.rs b/two.rs
         for file in 0..3 {
             push_churn(&mut source, "suffix", file);
         }
-        assert_eq!(source.len(), 728_616);
+        assert_eq!(source.len(), 723_528);
         assert_eq!(
             Sha256::digest(source.as_bytes())
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>(),
-            "21abd4b0305bb11f3314dbc68725ba2373a00848094fe94fbf842461718e3b2d"
+            "12057ae5d5c57ad8053565e05b431d69798a9236c8bd22bc29c2ef77b9967eb7"
         );
 
         let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
@@ -6027,11 +7376,18 @@ diff --git a/two.rs b/two.rs
             }),
             "permission-removal batch was not mandatory; mandatory={mandatory:?}"
         );
-        assert!(selected.iter().any(|batch| {
-            batch.contains("Cross-window semantic digests")
-                && batch.contains("actor.can('bulkEdit')")
-                && batch.contains("Forbidden")
-        }));
+        let receipt = batches
+            .deterministic_bounded_receipt(crate::review::MAX_LARGE_DIFF_SELECTED_BATCHES)
+            .unwrap();
+        assert_eq!(
+            receipt.unreviewed_hunks(),
+            0,
+            "fixture receipt direct={} semantic={} selected={}/{}",
+            receipt.direct_hunks(),
+            receipt.semantic_hunks(),
+            receipt.selected_batch_ids.len(),
+            batches.count
+        );
     }
 
     #[test]

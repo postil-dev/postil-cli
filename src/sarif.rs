@@ -43,7 +43,7 @@ fn rule_descriptions() -> Vec<Value> {
         ),
         (
             Kind::Uncertainty,
-            "Something critical could not be verified from the diff.",
+            "Something critical could not be verified from repository evidence.",
         ),
         (
             Kind::ContentPolicy,
@@ -102,6 +102,8 @@ pub fn to_sarif(envelope: &Envelope) -> Value {
             "plannerFallback": coverage.planner_fallback,
         });
     }
+    properties["repositorySearch"] =
+        serde_json::to_value(&envelope.repository_search).expect("receipt is JSON-serializable");
 
     json!({
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
@@ -150,6 +152,7 @@ mod tests {
             model_incidents: vec![],
             review_coverage: None,
             review_admission: None,
+            repository_search: Default::default(),
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
@@ -172,6 +175,7 @@ mod tests {
             generator_kind: None,
             scorer_kind: None,
             scorer_reason: None,
+            repository_claim: None,
             title: "Bug".into(),
             body: "details".into(),
             evidence: None,
@@ -199,6 +203,10 @@ mod tests {
         let s = to_sarif(&env_with(vec![]));
         assert_eq!(s["runs"][0]["results"].as_array().unwrap().len(), 0);
         assert_eq!(s["runs"][0]["properties"]["silent"], true);
+        assert_eq!(
+            s["runs"][0]["properties"]["repositorySearch"]["state"],
+            "unavailable"
+        );
     }
 
     #[test]

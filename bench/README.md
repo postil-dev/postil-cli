@@ -237,7 +237,8 @@ and existing file identity, including symlinked parents and hardlinks.
 The managed preflight runs the CLI's exact normalized and compacted request
 plan for every fixture before inference. It includes bounded planner, selected
 source and synthesis requests, scoring, consensus, fallback, repair, and
-transport retries. It rejects missing prices, more than six models, a review
+bounded post-processing requests. Transport retries reserve exact exposure at
+runtime under the same hard limits. Preflight rejects missing prices, more than six models, a review
 above the $1 hosted operation cap, a total above the configured qualification
 cap, or a cap outside `(0, $70]`. A single model used for more than one role is
 priced for each planned invocation.

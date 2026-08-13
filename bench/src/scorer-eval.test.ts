@@ -39,6 +39,7 @@ import {
   runScorerEvalCase,
   runScorerEvalMatrix,
   reviewCoverageFailure,
+  safeSegment,
   scorerCasePasses,
   scorerCostProviderDecimal,
   providerCostDecimalFromResponse,
@@ -54,6 +55,7 @@ import {
 
 const fixtures = fixtureInputs.map((input) => benchmarkCase.parse(input));
 const BOUNDED_SCORER_TARGET_PATH = 'src/ui/copy"quoted.ts';
+const TEST_SCORER_MODEL = "z-ai/glm-5.2";
 
 function postilBinaryPath(): string {
   return resolve(
@@ -73,7 +75,7 @@ function boundedScorerFixture() {
     const lines = Array.from(
       { length: 100 },
       (_, line) => ordinal === 0 && line === 0
-        ? "+export const accessPermissionLabel = 'Account access'; // ordinary display copy"
+        ? "+export const displayHeadingLabel = 'Account overview'; // ordinary display copy"
         : `+export const ordinary_${ordinal}_${line} = ${ordinal + line}; // ordinary source behavior`,
     );
     return [
@@ -93,14 +95,14 @@ function boundedScorerFixture() {
     "@@ -42,3 +42,4 @@",
     " export const heading = 'Account';",
     " export const description = 'Manage your account';",
-    "+export const validatedHint = 'Changes save automatically';",
+    "+export const saveHint = 'Changes save automatically';",
     " export const action = 'Save';",
     "",
   ].join("\n");
   const diff = [
-    ...Array.from({ length: 4 }, (_, index) => ordinaryFile(index)),
+    ...Array.from({ length: 3 }, (_, index) => ordinaryFile(index)),
     target,
-    ...Array.from({ length: 4 }, (_, index) => ordinaryFile(index + 4)),
+    ...Array.from({ length: 2 }, (_, index) => ordinaryFile(index + 3)),
   ].join("");
   const base = fixture("huge-low-signal-clean");
   return benchmarkCase.parse({
@@ -140,7 +142,7 @@ function result(overrides: Partial<ScorerEvalCase>): ScorerEvalCase {
     routingValid: true,
     coverageValid: true,
     publicationValid: true,
-    upstreamRequests: 1,
+    upstreamRequests: 2,
     durationMs: 1000,
     promptTokens: 10,
     completionTokens: 5,
@@ -199,6 +201,41 @@ function requestBody(req: IncomingMessage): Promise<string> {
     req.on("end", () => resolvePromise(Buffer.concat(chunks).toString("utf8")));
     req.on("error", reject);
   });
+}
+
+function adjudicationResponse(body: string): string | null {
+  let request: {
+    messages?: Array<{ role?: string; content?: string }>;
+  };
+  try {
+    request = JSON.parse(body) as typeof request;
+  } catch {
+    return null;
+  }
+  const isAdjudication = request.messages?.some((message) =>
+    message.content?.includes("Postil's single finding adjudicator")
+  ) ?? false;
+  if (!isAdjudication) return null;
+  const user = request.messages?.findLast((message) => message.role === "user")?.content ?? "{}";
+  const payload = JSON.parse(user) as {
+    candidates?: Array<{
+      candidateId?: string;
+      title?: string;
+      body?: string;
+      citedEvidence?: string | null;
+    }>;
+  };
+  return JSON.stringify((payload.candidates ?? []).map((candidate) => {
+    const body = candidate.body ?? "";
+    return {
+      candidateId: candidate.candidateId ?? "",
+      status: "confirmed",
+      revisedTitle: candidate.title ?? "",
+      revisedBody: /[.!?。！？]$/u.test(body) ? body : `${body}.`,
+      evidence: candidate.citedEvidence ?? "",
+      duplicateOf: null,
+    };
+  }));
 }
 
 describe("parseModels", () => {
@@ -275,7 +312,7 @@ describe("scorer calibration findings", () => {
 
   test("anchors a large clean fixture to its declared interior change rather than prefix noise", () => {
     const clean = fixture("huge-low-signal-clean");
-    expect(firstAddedLineForPath(clean.diff, "src/churn/prefix-0.ts")).toBe(1);
+    expect(firstAddedLineForPath(clean.diff, "src/churn/prefix-0.ts")).toBe(64);
     expect(falseFinding(clean)).toMatchObject({
       path: "src/ui/copy.ts",
       line: 44,
@@ -523,16 +560,18 @@ describe("scorer proxy and isolated runtime", () => {
   test("selects an interior clean change through bounded planning and scores it exactly once", async () => {
     const scorerRequests: string[] = [];
     const upstream = createServer(async (req: IncomingMessage, res: ServerResponse) => {
-      scorerRequests.push(await requestBody(req));
+      const body = await requestBody(req);
+      const adjudication = adjudicationResponse(body);
+      if (adjudication === null) scorerRequests.push(body);
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({
         choices: [{
           finish_reason: "stop",
-          message: { content: JSON.stringify([{
-            confidence: 0.2,
-            kind: "uncertainty",
-            reason: "The claimed runtime break is unsupported by the change.",
-          }]) },
+          message: { content: adjudication ?? JSON.stringify([{
+              confidence: 0.2,
+              kind: "uncertainty",
+              reason: "The claimed runtime break is unsupported by the change.",
+            }]) },
         }],
         usage: { prompt_tokens: 30, completion_tokens: 10, cost: 0.000045 },
       }));
@@ -547,7 +586,7 @@ describe("scorer proxy and isolated runtime", () => {
       const evaluation = await runScorerEvalCase(
         calibration,
         "falseFinding",
-        "scorer/model",
+        TEST_SCORER_MODEL,
         1,
         postilBinaryPath(),
         root,
@@ -561,7 +600,7 @@ describe("scorer proxy and isolated runtime", () => {
         },
         SCORER_CASE_EXEC_TIMEOUT_MS,
       );
-      const runArtifacts = join(root, "scorer_model", "repeat-1", calibration.id, "artifacts");
+      const runArtifacts = join(root, safeSegment(TEST_SCORER_MODEL), "repeat-1", calibration.id, "artifacts");
       const proxyTelemetry = JSON.parse(
         await readFile(join(runArtifacts, "proxy-telemetry.json"), "utf8"),
       ) as {
@@ -576,7 +615,7 @@ describe("scorer proxy and isolated runtime", () => {
         unexpectedRequests: Array<{ method: string; path: string }>;
       };
       const stdout = await readFile(join(runArtifacts, "stdout.json"), "utf8");
-      if (!evaluation.envelopeProduced) {
+      if (!evaluation.envelopeProduced || evaluation.scorerError !== null) {
         const stderr = await readFile(join(runArtifacts, "stderr.log"), "utf8");
         throw new Error(`${evaluation.reason}\n${stderr}`);
       }
@@ -587,9 +626,9 @@ describe("scorer proxy and isolated runtime", () => {
       expect(proxyTelemetry.plannerSelections[0]?.targetBatchId).toBeGreaterThan(0);
       expect(evaluation).toMatchObject({
         envelopeProduced: true,
-        scorerModel: "scorer/model",
+        scorerModel: TEST_SCORER_MODEL,
         scorerError: null,
-        upstreamRequests: 1,
+        upstreamRequests: 2,
         usageValid: true,
         publicationValid: true,
         passed: true,
@@ -668,14 +707,15 @@ describe("scorer proxy and isolated runtime", () => {
   test("keeps scorer quality misses separate from publication transport validity", async () => {
     const confidences = [0.2, 0.9];
     const upstream = createServer(async (req: IncomingMessage, res: ServerResponse) => {
-      await requestBody(req);
-      const confidence = confidences.shift();
-      if (confidence === undefined) throw new Error("unexpected scorer request");
+      const body = await requestBody(req);
+      const adjudication = adjudicationResponse(body);
+      const confidence = adjudication === null ? confidences.shift() : undefined;
+      if (adjudication === null && confidence === undefined) throw new Error("unexpected scorer request");
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({
         choices: [{
           finish_reason: "stop",
-          message: { content: JSON.stringify([{
+          message: { content: adjudication ?? JSON.stringify([{
             confidence,
             kind: "risk",
             reason: "The finding receives the deliberately wrong calibration verdict.",
@@ -699,7 +739,7 @@ describe("scorer proxy and isolated runtime", () => {
       const trueMiss = await runScorerEvalCase(
         fixture(TRUE_FINDING_CASES[0]!),
         "trueFinding",
-        "scorer/model",
+        TEST_SCORER_MODEL,
         1,
         postilBinaryPath(),
         root,
@@ -712,12 +752,12 @@ describe("scorer proxy and isolated runtime", () => {
         passed: false,
         publicationValid: true,
       });
-      expect(isAdmissionFatalStructuralResult(trueMiss, "scorer/model")).toBe(false);
+      expect(isAdmissionFatalStructuralResult(trueMiss, TEST_SCORER_MODEL)).toBe(false);
 
       const falseMiss = await runScorerEvalCase(
         fixture(FALSE_FINDING_CASES[0]!),
         "falseFinding",
-        "scorer/model",
+        TEST_SCORER_MODEL,
         1,
         postilBinaryPath(),
         root,
@@ -730,7 +770,7 @@ describe("scorer proxy and isolated runtime", () => {
         passed: false,
         publicationValid: true,
       });
-      expect(isAdmissionFatalStructuralResult(falseMiss, "scorer/model")).toBe(false);
+      expect(isAdmissionFatalStructuralResult(falseMiss, TEST_SCORER_MODEL)).toBe(false);
       expect(confidences).toHaveLength(0);
     } finally {
       if (previousKey === undefined) delete process.env[keyName];
@@ -947,7 +987,7 @@ describe("candidate matrix execution", () => {
       result({ coverageValid: false }),
       result({ publicationValid: false }),
       result({ gateFailing: null }),
-      result({ upstreamRequests: 2 }),
+      result({ upstreamRequests: 1 }),
     ];
     expect(fatalCases.every((item) => isAdmissionFatalStructuralResult(item, "scorer/model"))).toBe(true);
     expect(isAdmissionFatalStructuralResult(result({
@@ -1182,8 +1222,8 @@ describe("qualification utilities", () => {
         inputMicrosPerMillionTokens: 100_000, outputMicrosPerMillionTokens: 200_000,
       }],
     ]);
-    expect(projectedQualificationSpendUsd(["a/model"], 5, cheap)).toBeCloseTo(0.705312, 6);
-    expect(assertQualificationPreflight(["a/model"], 5, cheap)).toBeCloseTo(0.705312, 6);
+    expect(projectedQualificationSpendUsd(["a/model"], 5, cheap)).toBeCloseTo(1.878048, 6);
+    expect(assertQualificationPreflight(["a/model"], 5, cheap)).toBeCloseTo(1.878048, 6);
     expect(() => assertQualificationPreflight(["missing/model"], 5, cheap)).toThrow("pricing missing");
     expect(() =>
       assertQualificationPreflight(
@@ -1268,33 +1308,60 @@ describe("formatReport", () => {
     expect(output).toContain("yes");
   });
 
-  test("accepts one complete canonical scorer cost event", () => {
+  test("sums two complete canonical scorer cost events", () => {
     expect(scorerCostProviderDecimal({
-      modelUsage: [{
-        model: "scorer/model",
-        role: "findingScorer",
-        accountingComplete: true,
-        costSource: "providerReported",
-        costProviderDecimal: "0.00012",
-      }],
-    }, "scorer/model")).toBe("0.00012");
+      modelUsage: [
+        {
+          model: "scorer/model",
+          role: "findingScorer",
+          accountingComplete: true,
+          costSource: "providerReported",
+          costProviderDecimal: "0.00012",
+        },
+        {
+          model: "scorer/model",
+          role: "findingScorer",
+          accountingComplete: true,
+          costSource: "providerReported",
+          costProviderDecimal: "0.00003",
+        },
+      ],
+    }, "scorer/model")).toBe("0.00015");
     expect(scorerCostProviderDecimal({
-      modelUsage: [{
-        model: "scorer/model",
-        role: "findingScorer",
-        accountingComplete: false,
-        costSource: "providerReported",
-        costProviderDecimal: "0.00012",
-      }],
+      modelUsage: [
+        {
+          model: "scorer/model",
+          role: "findingScorer",
+          accountingComplete: false,
+          costSource: "providerReported",
+          costProviderDecimal: "0.00012",
+        },
+        {
+          model: "scorer/model",
+          role: "findingScorer",
+          accountingComplete: true,
+          costSource: "providerReported",
+          costProviderDecimal: "0.00003",
+        },
+      ],
     }, "scorer/model")).toBeNull();
     expect(scorerCostProviderDecimal({
-      modelUsage: [{
-        model: "scorer/model",
-        role: "findingScorer",
-        accountingComplete: true,
-        costSource: "providerReported",
-        costProviderDecimal: "0.0001200",
-      }],
+      modelUsage: [
+        {
+          model: "scorer/model",
+          role: "findingScorer",
+          accountingComplete: true,
+          costSource: "providerReported",
+          costProviderDecimal: "0.0001200",
+        },
+        {
+          model: "scorer/model",
+          role: "findingScorer",
+          accountingComplete: true,
+          costSource: "providerReported",
+          costProviderDecimal: "0.00003",
+        },
+      ],
     }, "scorer/model")).toBeNull();
   });
 

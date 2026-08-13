@@ -1140,6 +1140,7 @@ fn suppression_reason(reason: SuppressionReason) -> &'static str {
             "restates a retained finding about another location"
         }
         SuppressionReason::DerivedFromSuppressed => "built on a finding suppressed as mis-anchored",
+        SuppressionReason::RepositoryClaimUnsupported => "repository-wide claim is not publishable",
     }
 }
 
@@ -1423,6 +1424,7 @@ mod tests {
             generator_kind: None,
             scorer_kind: None,
             scorer_reason: None,
+            repository_claim: None,
             title: "Unsanitized input reaches query".into(),
             body: "user_input flows into exec_query.".into(),
             evidence: None,
@@ -1454,6 +1456,7 @@ mod tests {
             model_incidents: vec![],
             review_coverage: None,
             review_admission: None,
+            repository_search: Default::default(),
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
@@ -1538,6 +1541,7 @@ mod tests {
             model_incidents: vec![],
             review_coverage: None,
             review_admission: None,
+            repository_search: Default::default(),
             usage_accounting_complete: true,
             duration_ms: 1_250,
             base_sha: None,
@@ -1798,6 +1802,7 @@ mod tests {
             model_incidents: vec![],
             review_coverage: None,
             review_admission: None,
+            repository_search: Default::default(),
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
@@ -1864,6 +1869,7 @@ mod tests {
             model_incidents: vec![],
             review_coverage: None,
             review_admission: None,
+            repository_search: Default::default(),
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
@@ -1912,6 +1918,7 @@ mod tests {
             model_incidents: vec![],
             review_coverage: None,
             review_admission: None,
+            repository_search: Default::default(),
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,

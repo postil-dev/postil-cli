@@ -55,7 +55,9 @@ fn render_csv(envelope: &Envelope) -> String {
     let mut out = String::from(
         "version,silent,summary,path,line,endLine,severity,kind,confidence,title,body,\
          gateFailOn,gateFailing,modelUsed,promptTokens,completionTokens,durationMs,baseSha,\
-         headSha,sinceSha,coverageMode,selectedBatches,totalBatches,plannerFallback\n",
+         headSha,sinceSha,coverageMode,selectedBatches,totalBatches,plannerFallback,\
+         repositorySearchState,repositorySearchHeadSha,repositorySearchTreeSha256,\
+         repositorySearchQueries\n",
     );
     if envelope.findings.is_empty() {
         push_csv_row(&mut out, envelope, None);
@@ -118,6 +120,18 @@ fn push_csv_row(out: &mut String, envelope: &Envelope, finding: Option<&crate::e
             .as_ref()
             .map(|coverage| coverage.planner_fallback.to_string())
             .unwrap_or_default(),
+        envelope.repository_search.state.as_str().to_string(),
+        envelope
+            .repository_search
+            .head_sha
+            .clone()
+            .unwrap_or_default(),
+        envelope
+            .repository_search
+            .tree_sha256
+            .clone()
+            .unwrap_or_default(),
+        envelope.repository_search.queries.len().to_string(),
     ]);
     out.push_str(
         &fields
@@ -199,6 +213,7 @@ pub fn print_pretty(envelope: &Envelope) {
     if let Some(coverage) = &envelope.review_coverage {
         out.push_str(&render_review_coverage(coverage));
     }
+    out.push_str(&render_repository_search(&envelope.repository_search));
     let gate = if envelope.gate.failing {
         paint(color, "gate: failing", Paint::Red)
     } else {
@@ -229,6 +244,17 @@ fn render_review_coverage(coverage: &ReviewCoverage) -> String {
             coverage.total_batches,
         ),
     }
+}
+
+fn render_repository_search(receipt: &crate::envelope::RepositorySearchReceipt) -> String {
+    let head = receipt.head_sha.as_deref().unwrap_or("unbound");
+    format!(
+        "repository search: {} (head: {head}; {} queries; {} blobs; {} bytes)\n",
+        receipt.state.as_str(),
+        receipt.queries.len(),
+        receipt.searched_blobs,
+        receipt.searched_bytes,
+    )
 }
 
 /// Neutralize control characters in model-authored text before it reaches the
@@ -288,6 +314,7 @@ mod tests {
             generator_kind: Some(Kind::Risk),
             scorer_kind: Some(Kind::HumanEscalation),
             scorer_reason: Some("The changed branch can skip authorization.".into()),
+            repository_claim: None,
             title: "Authorization branch can be skipped".into(),
             body: "The fallback path returns before the policy check.".into(),
             evidence: Some("return Ok(response);".into()),
@@ -363,6 +390,7 @@ mod tests {
                 output_tokens: 2048,
                 projected_cost_micros: 900,
             }),
+            repository_search: Default::default(),
             usage_accounting_complete: true,
             duration_ms: 4567,
             base_sha: Some("base".into()),
@@ -408,6 +436,7 @@ mod tests {
             generator_kind: None,
             scorer_kind: None,
             scorer_reason: None,
+            repository_claim: None,
             title: "\x1b[2Jhijacked title".into(),
             body: "line one\n\x1b[31mFAKE ALL CLEAR\x1b[0m\nline three".into(),
             evidence: None,
@@ -436,6 +465,7 @@ mod tests {
             model_incidents: vec![],
             review_coverage: None,
             review_admission: None,
+            repository_search: Default::default(),
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
@@ -500,6 +530,7 @@ mod tests {
                 receipt: None,
             }),
             review_admission: None,
+            repository_search: Default::default(),
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
@@ -512,9 +543,14 @@ mod tests {
             csv.lines()
                 .next()
                 .unwrap()
-                .ends_with("coverageMode,selectedBatches,totalBatches,plannerFallback")
+                .ends_with("repositorySearchState,repositorySearchHeadSha,repositorySearchTreeSha256,repositorySearchQueries")
         );
-        assert!(csv.lines().nth(1).unwrap().ends_with("bounded,5,21,true"));
+        assert!(
+            csv.lines()
+                .nth(1)
+                .unwrap()
+                .ends_with("bounded,5,21,true,unavailable,,,0")
+        );
     }
 
     #[test]
@@ -540,6 +576,25 @@ mod tests {
                 receipt: None,
             }),
             "coverage: 7 source batches reviewed directly (exhaustive; planner fallback: no)\n"
+        );
+    }
+
+    #[test]
+    fn text_records_the_explicit_repository_search_state() {
+        use crate::envelope::{RepositorySearchReceipt, RepositorySearchState};
+
+        assert_eq!(
+            render_repository_search(&RepositorySearchReceipt {
+                head_sha: Some("a".repeat(40)),
+                state: RepositorySearchState::Exhausted,
+                searched_blobs: 7,
+                searched_bytes: 99,
+                ..RepositorySearchReceipt::default()
+            }),
+            format!(
+                "repository search: exhausted (head: {}; 0 queries; 7 blobs; 99 bytes)\n",
+                "a".repeat(40)
+            )
         );
     }
 }

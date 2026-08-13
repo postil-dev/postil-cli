@@ -535,14 +535,13 @@ pub fn demote_deferred_verification(findings: &mut [Finding]) {
     }
 }
 
-/// Whether an `uncertainty` finding only asks the author to check something,
-/// without saying what the reviewer itself checked.
+/// Whether an `uncertainty` finding only asks the author to check something.
 ///
 /// "Confirm that X is always created" is a question, not a finding. It costs
 /// the author the verification work the reviewer was supposed to do, and it
-/// does so at a severity that can gate a merge. A finding that reports what it
-/// looked at ("the diff adds no other caller") is doing the work and keeps its
-/// severity.
+/// does so at a severity that can gate a merge. Repository-wide support is
+/// represented by a structured receipt, so prose about search work is not
+/// treated as proof.
 fn defers_verification_to_the_author(finding: &Finding) -> bool {
     if finding.kind != crate::envelope::Kind::Uncertainty
         || finding.severity == crate::envelope::Severity::Info
@@ -555,8 +554,7 @@ fn defers_verification_to_the_author(finding: &Finding) -> bool {
     // whose body then goes and establishes the answer; demoting on the headline
     // would punish exactly the findings that did the work.
     let body = finding.body.to_ascii_lowercase();
-    let prose = format!("{} {}", finding.title, finding.body).to_ascii_lowercase();
-    let asks_the_author = [
+    [
         "confirm that",
         "confirm the",
         "please confirm",
@@ -570,24 +568,7 @@ fn defers_verification_to_the_author(finding: &Finding) -> bool {
         "check that",
     ]
     .iter()
-    .any(|marker| body.contains(marker));
-    if !asks_the_author {
-        return false;
-    }
-    let states_what_it_checked = [
-        "the diff shows",
-        "the diff adds",
-        "the diff does not",
-        "the diff contains no",
-        "no other caller",
-        "no other reference",
-        "searched",
-        "the only caller",
-        "elsewhere in this change",
-    ]
-    .iter()
-    .any(|marker| prose.contains(marker));
-    !states_what_it_checked
+    .any(|marker| body.contains(marker))
 }
 
 fn deterministically_non_actionable(finding: &Finding) -> bool {
@@ -907,6 +888,7 @@ mod tests {
             generator_kind: None,
             scorer_kind: None,
             scorer_reason: None,
+            repository_claim: None,
             title: "t".into(),
             body: "b".into(),
             evidence: Some("x".into()),
@@ -1898,7 +1880,7 @@ mod tests {
     }
 
     #[test]
-    fn an_uncertainty_finding_that_reports_what_it_checked_keeps_its_severity() {
+    fn prose_about_search_work_does_not_substitute_for_a_repository_receipt() {
         let mut findings = vec![uncertainty(
             "rgwConfig is not a recognized field",
             "The diff adds no schema entry for rgwConfig and no other reference to \
@@ -1907,7 +1889,7 @@ mod tests {
 
         demote_deferred_verification(&mut findings);
 
-        assert_eq!(findings[0].severity, Severity::Warn);
+        assert_eq!(findings[0].severity, Severity::Info);
     }
 
     #[test]

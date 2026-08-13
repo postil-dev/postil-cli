@@ -1001,6 +1001,56 @@ async function startMockModel(c: BenchmarkCase, artifactsDir: string) {
       } | undefined;
       const system = request?.messages?.find((message) => message.role === "system")?.content ?? "";
       const user = request?.messages?.find((message) => message.role === "user")?.content ?? "";
+      if (system.includes("Postil's single finding adjudicator")) {
+        const payload = safeJson(user) as {
+          candidates?: Array<{
+            candidateId?: unknown;
+            title?: unknown;
+            body?: unknown;
+            citedEvidence?: unknown;
+            repositoryContext?: unknown;
+          }>;
+        } | undefined;
+        const results = payload?.candidates?.map((candidate) => {
+          const candidateId = typeof candidate.candidateId === "string" ? candidate.candidateId : "";
+          const title = typeof candidate.title === "string" ? candidate.title : "";
+          const body = typeof candidate.body === "string" ? candidate.body : "";
+          const evidence = typeof candidate.citedEvidence === "string"
+            ? candidate.citedEvidence
+            : "";
+          const repositoryDependent = candidate.repositoryContext !== undefined &&
+            candidate.repositoryContext !== null;
+          if (!candidateId || !title || !body || !evidence || repositoryDependent) {
+            return {
+              candidateId,
+              status: "unresolved",
+              revisedTitle: "",
+              revisedBody: "",
+              evidence: "",
+              duplicateOf: null,
+            };
+          }
+          return {
+            candidateId,
+            status: "confirmed",
+            revisedTitle: title,
+            revisedBody: /[.!?。！？]$/u.test(body) ? body : `${body}.`,
+            evidence,
+            duplicateOf: null,
+          };
+        }) ?? [];
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            choices: [{
+              finish_reason: "stop",
+              message: { content: JSON.stringify(results) },
+            }],
+            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+          }),
+        );
+        return;
+      }
       const requestKind = modelRequestKind(req.headers, system);
       if (requestKind?.kind === "planner") {
         const targetId = plannerBatchIdForPath(user, c.primaryChange?.path);
@@ -1029,7 +1079,13 @@ async function startMockModel(c: BenchmarkCase, artifactsDir: string) {
       const output = metadata.route === "source" &&
           metadata.callPhase === "initial" &&
           targetBatch
-        ? c.modelOutput
+        ? {
+            ...c.modelOutput,
+            findings: c.modelOutput.findings.map((finding) => ({
+              ...finding,
+              repositoryContext: { claim: "none" },
+            })),
+          }
         : { summary: "", findings: [] };
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
