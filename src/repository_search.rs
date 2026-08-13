@@ -210,6 +210,38 @@ fn claim_is_refuted(claim: &RepositoryClaim, receipt: &RepositorySearchReceipt) 
     })
 }
 
+pub(crate) fn refutation_evidence_is_grounded(
+    claim: &RepositoryClaim,
+    receipt: &RepositorySearchReceipt,
+    snapshot_id: &str,
+    evidence: &str,
+) -> bool {
+    if evidence.trim().is_empty()
+        || claim_verdict(claim, receipt, snapshot_id) != RepositoryClaimVerdict::Refuted
+    {
+        return false;
+    }
+    let categories = claim_category_hashes(claim);
+    let mut units = BTreeMap::<&str, BTreeSet<&str>>::new();
+    for matched in &receipt.matches {
+        units
+            .entry(matched.path.as_str())
+            .or_default()
+            .insert(matched.query_sha256.as_str());
+    }
+    units.iter().any(|(path, matched)| {
+        let refutes = categories.iter().all(|category| {
+            category.is_empty() || category.iter().any(|hash| matched.contains(hash.as_str()))
+        });
+        refutes
+            && (*path == evidence
+                || categories
+                    .iter()
+                    .flatten()
+                    .any(|hash| hash == evidence && matched.contains(hash.as_str())))
+    })
+}
+
 fn claim_category_hashes(claim: &RepositoryClaim) -> Vec<Vec<String>> {
     let hashes = |kind, values: &[String]| {
         values

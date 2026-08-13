@@ -533,6 +533,15 @@ pub(crate) fn validate_results(
         let claim_verdict = finding.repository_claim.as_ref().map(|claim| {
             crate::repository_search::claim_verdict(claim, repository_receipt, snapshot_id)
         });
+        let repository_refutation_grounded =
+            finding.repository_claim.as_ref().is_some_and(|claim| {
+                crate::repository_search::refutation_evidence_is_grounded(
+                    claim,
+                    repository_receipt,
+                    snapshot_id,
+                    &result.evidence,
+                )
+            });
         match result.status {
             AdjudicationStatus::Confirmed => {
                 ensure!(
@@ -575,9 +584,7 @@ pub(crate) fn validate_results(
                     "refuted adjudication cannot publish revised finding text"
                 );
                 ensure!(
-                    citation_deleted_only
-                        || (claim_verdict == Some(RepositoryClaimVerdict::Refuted)
-                            && repository_grounded),
+                    citation_deleted_only || repository_refutation_grounded,
                     "refuted adjudication must cite candidate-specific contradictory evidence"
                 );
                 if claim_verdict.is_some() {
@@ -1283,6 +1290,100 @@ mod tests {
             .suppressed
             .len(),
             1
+        );
+    }
+
+    #[test]
+    fn repository_refutation_rejects_an_unrelated_receipt_match() {
+        let snapshot = "a".repeat(40);
+        let mut candidate = finding(
+            Kind::Risk,
+            "Add the required cluster image",
+            "The cluster manifest omits the required release image.",
+        );
+        candidate.repository_claim = Some(RepositoryClaim {
+            kind: RepositoryClaimKind::Absence,
+            resources: vec![],
+            values: vec!["required-image".into()],
+            versions: vec![],
+            paths: vec![],
+            identifiers: vec![],
+        });
+        let findings = vec![candidate];
+        let ids = stable_candidate_ids(&snapshot, &findings);
+        let required = crate::repository_search::search_terms(std::iter::once(
+            findings[0].repository_claim.as_ref().unwrap(),
+        ))
+        .unwrap()[0]
+            .query_sha256
+            .clone();
+        let unrelated_claim = RepositoryClaim {
+            kind: RepositoryClaimKind::Absence,
+            resources: vec![],
+            values: vec!["unrelated-image".into()],
+            versions: vec![],
+            paths: vec![],
+            identifiers: vec![],
+        };
+        let unrelated = crate::repository_search::search_terms(std::iter::once(&unrelated_claim))
+            .unwrap()[0]
+            .query_sha256
+            .clone();
+        let receipt = RepositorySearchReceipt {
+            head_sha: Some(snapshot.clone()),
+            state: RepositorySearchState::Complete,
+            tree_sha256: Some("b".repeat(64)),
+            queries: vec![
+                RepositorySearchQuery {
+                    kind: RepositorySearchQueryKind::Value,
+                    query_sha256: required.clone(),
+                },
+                RepositorySearchQuery {
+                    kind: RepositorySearchQueryKind::Value,
+                    query_sha256: unrelated.clone(),
+                },
+            ],
+            matched_query_sha256: vec![required.clone(), unrelated.clone()],
+            matches: vec![
+                RepositorySearchMatch {
+                    query_sha256: required,
+                    path: "generated/required.yaml".into(),
+                    occurrences: 1,
+                },
+                RepositorySearchMatch {
+                    query_sha256: unrelated,
+                    path: "generated/unrelated.yaml".into(),
+                    occurrences: 1,
+                },
+            ],
+            match_count: 2,
+            ..RepositorySearchReceipt::default()
+        };
+        let result = AdjudicationResult {
+            candidate_id: ids[0].clone(),
+            status: AdjudicationStatus::Refuted,
+            revised_title: String::new(),
+            revised_body: String::new(),
+            evidence: "generated/unrelated.yaml".into(),
+            duplicate_of: None,
+        };
+        let corpus = "+ image: old-image\n";
+        let direct = direct_receipt(&snapshot, corpus, &findings, &ids);
+
+        let error = apply_results(
+            &snapshot,
+            findings,
+            ids,
+            vec![result],
+            corpus,
+            &direct,
+            &receipt,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("candidate-specific contradictory evidence")
         );
     }
 
