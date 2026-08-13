@@ -845,12 +845,8 @@ pub fn reconcile(
         {
             if let Some((path, line)) = index.remap_current_evidence(f) {
                 if index.remap_reviewed_evidence(f).as_ref() == Some(&(path.clone(), line)) {
-                    // The selected model input contained this exact current
-                    // anchor and the model did not reproduce it.
                     resolved.push(f.clone());
                 } else {
-                    // The issue's evidence remains in an unselected part of
-                    // the full diff. Keep it open at its current coordinate.
                     let mut carry = f.clone();
                     carry.path = path;
                     carry.line = line;
@@ -861,21 +857,13 @@ pub fn reconcile(
                 && f.path != crate::envelope::CHANGE_METADATA_PATH
                 && index.contains_reviewed_baseline_coordinate(f)
             {
-                // The selected input covered this coordinate and the complete
-                // current diff no longer contains the exact citation. The
-                // completed model request did not reproduce the issue.
                 resolved.push(f.clone());
             } else {
-                // Changed evidence outside the selected input, historical
-                // findings without canonical evidence, and virtual change
-                // metadata remain open.
                 push_carried(&mut carried, &mut carried_identities, f.clone());
             }
         } else if touch_addresses(index, f, scope) {
             // An incremental edit touched the old-head anchor, or a trustworthy
             // full review did not reproduce the issue: treat it as resolved.
-            // Incremental touch is imperfect because a non-fixing edit can also
-            // resolve it, but a full re-review re-detects a still-broken issue.
             resolved.push(f.clone());
         } else {
             // Not superseded and the anchor line was not touched: the issue

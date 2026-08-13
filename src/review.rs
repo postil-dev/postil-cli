@@ -1348,6 +1348,11 @@ async fn review_diff(cfg: &Config, args: &ReviewArgs, input: ReviewInput<'_>) ->
                     .then(|| batches.deterministic_bounded_receipt(MAX_LARGE_DIFF_SELECTED_BATCHES))
                     .transpose()?;
                 if let Some(receipt) = &large_diff_receipt {
+                    anyhow::ensure!(
+                        receipt.unreviewed_hunks() == 0,
+                        "deterministic large-review plan leaves {} normalized hunks unreviewed within its {MAX_LARGE_DIFF_SELECTED_BATCHES}-request limit; no provider request was made",
+                        receipt.unreviewed_hunks()
+                    );
                     eprintln!(
                         "postil: deterministic large-review plan={} direct_hunks={} semantic_hunks={} unreviewed_hunks={} selected_batches={}/{} concurrency={} request_timeout={}s review_budget={}s",
                         receipt.plan_sha256,

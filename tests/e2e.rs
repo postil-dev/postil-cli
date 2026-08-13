@@ -1829,6 +1829,12 @@ fn qualification_candidate_admits_fixture_51_shape_at_fireworks_price_bounds() {
             <= 500_000
     );
     assert_eq!(envelope["reviewCoverage"]["receipt"]["unreviewedHunks"], 0);
+    assert!(
+        envelope["reviewCoverage"]["selectedBatches"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
 }
 
 #[tokio::test]
@@ -2378,9 +2384,9 @@ async fn oversized_security_hunk_fails_before_provider_contact() {
 }
 
 #[tokio::test]
-async fn automatic_large_diff_route_is_concurrent_receipted_and_fails_closed_on_unreviewed_hunks() {
+async fn automatic_large_diff_route_fails_closed_before_provider_on_unreviewed_hunks() {
     use std::fmt::Write as _;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     let server = MockServer::start().await;
     let registration_token = "large-plan-registration-token";
@@ -2440,7 +2446,6 @@ async fn automatic_large_diff_route_is_concurrent_receipted_and_fails_closed_on_
     let dir = tempfile::tempdir().unwrap();
     let diff = dir.path().join("automatic-large.diff");
     std::fs::write(&diff, source).unwrap();
-    let started = Instant::now();
     let out = postil()
         .current_dir(dir.path())
         .env("POSTIL_API_BASE", server.uri())
@@ -2456,91 +2461,17 @@ async fn automatic_large_diff_route_is_concurrent_receipted_and_fails_closed_on_
         .args(["--output", "json"])
         .assert()
         .failure();
-    let elapsed = started.elapsed();
-
-    let envelope: Value =
-        serde_json::from_slice(&out.get_output().stdout).unwrap_or_else(|error| {
-            panic!(
-                "large-route command did not emit an envelope: {error}; stderr={}",
-                String::from_utf8_lossy(&out.get_output().stderr)
-            )
-        });
-    let coverage = &envelope["reviewCoverage"];
-    assert_eq!(coverage["mode"], "bounded");
-    assert_eq!(coverage["selectedBatches"], 24);
-    assert!(coverage["totalBatches"].as_u64().unwrap() > 24);
-    assert_eq!(coverage["receipt"]["totalHunks"], 30);
-    assert!(coverage["receipt"]["unreviewedHunks"].as_u64().unwrap() > 0);
-    assert_eq!(
-        coverage["receipt"]["planSha256"].as_str().unwrap().len(),
-        64
-    );
-    assert_eq!(envelope["gate"]["failing"], true);
-    assert!(
-        envelope["findings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|finding| {
-                finding["path"] == ".postil/model-output"
-                    && finding["body"]
-                        .as_str()
-                        .is_some_and(|body| body.contains("normalized hunks unreviewed"))
-            })
-    );
+    assert!(out.get_output().stdout.is_empty());
     let requests = server.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 25);
-    assert_eq!(requests[0].url.path(), "/durable-plan");
-    let registration: Value = serde_json::from_slice(&requests[0].body).unwrap();
-    assert_eq!(registration["version"], 1);
-    assert_eq!(
-        registration["planSha256"],
-        coverage["receipt"]["planSha256"]
-    );
-    assert_eq!(
-        registration["directHunks"],
-        coverage["receipt"]["directHunks"]
-    );
-    assert_eq!(
-        registration["semanticHunks"],
-        coverage["receipt"]["semanticHunks"]
-    );
-    assert_eq!(
-        registration["unreviewedHunks"],
-        coverage["receipt"]["unreviewedHunks"]
-    );
-    assert_eq!(registration["selectedBatches"], 24);
-    assert_eq!(registration["concurrency"], 4);
-    assert_eq!(registration["requestTimeoutSeconds"], 60);
-    assert_eq!(registration["reviewBudgetSeconds"], 420);
-    let provider_requests = requests
-        .iter()
-        .filter(|request| request.url.path() == "/chat/completions")
-        .collect::<Vec<_>>();
-    assert_eq!(provider_requests.len(), 24);
-    assert!(provider_requests.iter().any(|request| {
-        let body = String::from_utf8_lossy(&request.body);
-        body.contains("src/auth/permission.ts")
-            && body.contains("actor.can('admin')")
-            && body.contains("privilegedWrite")
-    }));
+    assert!(requests.is_empty());
     let stderr = String::from_utf8_lossy(&out.get_output().stderr);
-    let plan_line = stderr
-        .find("postil: deterministic large-review plan=")
-        .expect("deterministic plan line");
-    let first_attempt = stderr
-        .find("postil: llm attempt ")
-        .expect("first provider attempt line");
-    assert!(plan_line < first_attempt);
+    assert!(stderr.contains("normalized hunks unreviewed"));
+    assert!(stderr.contains("no provider request was made"));
     assert!(!stderr.contains(registration_token));
-    assert!(
-        elapsed < Duration::from_millis(4_500),
-        "24 delayed calls were not executed in four-way bounded waves: {elapsed:?}"
-    );
 }
 
 #[tokio::test]
-async fn semantic_large_diff_coverage_does_not_resolve_baseline_evidence() {
+async fn exact_semantic_large_diff_coverage_resolves_selected_baseline_evidence() {
     use std::fmt::Write as _;
 
     let server = MockServer::start().await;
@@ -2551,11 +2482,12 @@ async fn semantic_large_diff_coverage_does_not_resolve_baseline_evidence() {
         let path = format!("src/churn/file-{file}.ts");
         writeln!(
             source,
-            "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@"
+            "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1,2 +1,2 @@"
         )
         .unwrap();
         writeln!(source, "-const value = {file};").unwrap();
-        writeln!(source, "+const value = {file}; // {}", "x".repeat(45_000)).unwrap();
+        writeln!(source, "+const value = {file};").unwrap();
+        writeln!(source, " {}", "x".repeat(45_000)).unwrap();
     }
     let dir = tempfile::tempdir().unwrap();
     let diff = dir.path().join("semantic-baseline.diff");
@@ -2570,8 +2502,8 @@ async fn semantic_large_diff_coverage_does_not_resolve_baseline_evidence() {
             "severity": "error",
             "kind": "risk",
             "confidence": 0.9,
-            "title": "Keep the prior finding open",
-            "body": "Semantic coverage cannot resolve exact baseline evidence.",
+            "title": "Re-evaluate the prior finding",
+            "body": "Exact semantic coverage includes this evidence.",
             "evidence": "const value = 25;"
         }],
         "resolved": [],
@@ -2598,13 +2530,13 @@ async fn semantic_large_diff_coverage_does_not_resolve_baseline_evidence() {
         .arg(&baseline_path)
         .args(["--output", "json"])
         .assert()
-        .failure();
+        .success();
     let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["findings"], json!([]));
     assert_eq!(
-        envelope["findings"][0]["title"],
-        "Keep the prior finding open"
+        envelope["resolved"][0]["title"],
+        "Re-evaluate the prior finding"
     );
-    assert_eq!(envelope["resolved"], json!([]));
     assert_eq!(envelope["reviewCoverage"]["receipt"]["unreviewedHunks"], 0);
     assert!(
         envelope["reviewCoverage"]["receipt"]["semanticHunks"]

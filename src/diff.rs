@@ -6,7 +6,7 @@
 //! with its new-file line number.
 
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::RangeInclusive;
@@ -989,6 +989,7 @@ pub struct ModelBatchSpool {
     pub source_count: usize,
     pub metadata_count: u32,
     synthesis_ids: BTreeSet<usize>,
+    exact_semantic_ids: BTreeSet<usize>,
     batch_hunks: HashMap<usize, BTreeSet<HunkIdentity>>,
     all_hunks: BTreeSet<HunkIdentity>,
     hunk_risk: HashMap<HunkIdentity, HunkRisk>,
@@ -1113,6 +1114,9 @@ impl ModelBatchSpool {
             id = id
                 .checked_add(1)
                 .context("hosted planner batch id overflowed")?;
+            if self.exact_semantic_ids.contains(&id) {
+                continue;
+            }
             let synthesis = self.synthesis_ids.contains(&id);
             if synthesis {
                 final_synthesis = Some(id);
@@ -1231,7 +1235,7 @@ impl ModelBatchSpool {
 
     pub fn selected_source_count(&self, ids: &BTreeSet<usize>) -> usize {
         ids.iter()
-            .filter(|id| !self.synthesis_ids.contains(id))
+            .filter(|id| !self.synthesis_ids.contains(id) || self.exact_semantic_ids.contains(id))
             .count()
     }
 
@@ -1255,6 +1259,34 @@ impl ModelBatchSpool {
             "hosted planner selected a batch outside the materialized spool"
         );
         Ok(selected)
+    }
+
+    fn batch_text_by_id(&mut self, ids: &BTreeSet<usize>) -> Result<HashMap<usize, String>> {
+        self.file
+            .seek(SeekFrom::Start(0))
+            .context("rewinding model batches for coverage validation")?;
+        let batches = (|| -> Result<HashMap<usize, String>> {
+            let mut selected = HashMap::new();
+            let mut id = 0usize;
+            while let Some(batch) = read_length_prefixed(&mut self.file, "coverage batch")? {
+                id = id.checked_add(1).context("coverage batch id overflowed")?;
+                if ids.contains(&id) {
+                    selected.insert(id, batch);
+                }
+            }
+            anyhow::ensure!(
+                selected.len() == ids.len(),
+                "coverage receipt selected a batch outside the materialized spool"
+            );
+            Ok(selected)
+        })();
+        let rewind = self
+            .file
+            .seek(SeekFrom::Start(0))
+            .context("rewinding model batches after coverage validation");
+        let batches = batches?;
+        rewind?;
+        Ok(batches)
     }
 
     /// Build the large-diff route without a provider-side planning call. Every
@@ -1296,7 +1328,8 @@ impl ModelBatchSpool {
                     .batch_hunks
                     .iter()
                     .filter_map(|(id, hunks)| {
-                        (self.synthesis_ids.contains(id) && hunks.contains(&hunk)).then_some(*id)
+                        (self.exact_semantic_ids.contains(id) && hunks.contains(&hunk))
+                            .then_some(*id)
                     })
                     .collect::<BTreeSet<_>>();
                 let risk = self.hunk_risk.get(&hunk).copied().unwrap_or(HunkRisk {
@@ -1471,7 +1504,8 @@ impl ModelBatchSpool {
         Ok(receipt)
     }
 
-    fn validate_coverage_receipt(&self, receipt: &BoundedCoverageReceipt) -> Result<()> {
+    fn validate_coverage_receipt(&mut self, receipt: &BoundedCoverageReceipt) -> Result<()> {
+        let selected_batches = self.batch_text_by_id(&receipt.selected_batch_ids)?;
         for entry in &receipt.entries {
             let risk = self
                 .hunk_risk
@@ -1503,12 +1537,30 @@ impl ModelBatchSpool {
                     self.synthesis_ids.contains(id) == expected_synthesis,
                     "coverage disposition references the wrong evidence batch kind"
                 );
+                if expected_synthesis {
+                    anyhow::ensure!(
+                        self.exact_semantic_ids.contains(id),
+                        "semantic coverage is not bound to exact bounded evidence"
+                    );
+                }
                 anyhow::ensure!(
                     self.batch_hunks
                         .get(id)
                         .is_some_and(|hunks| hunks.contains(&entry.hunk)),
                     "coverage evidence batch is not bound to the exact normalized hunk digest"
                 );
+                if expected_synthesis {
+                    anyhow::ensure!(
+                        selected_batches.get(id).is_some_and(|batch| {
+                            final_model_visible_semantic_hunks(
+                                batch,
+                                &BTreeSet::from([entry.hunk.clone()]),
+                            )
+                            .contains(&entry.hunk)
+                        }),
+                        "semantic coverage proof is not visible in the selected provider prompt"
+                    );
+                }
             }
         }
         Ok(())
@@ -1622,16 +1674,7 @@ fn stable_large_diff_risk_score(path: &str, hunk: &Hunk) -> usize {
 }
 
 fn semantic_large_diff_hunk(path: &str, hunk: &Hunk) -> bool {
-    if mandatory_large_diff_hunk(path, hunk) {
-        return false;
-    }
-    let changed = hunk
-        .lines
-        .iter()
-        .filter_map(|line| line.strip_prefix('+').or_else(|| line.strip_prefix('-')))
-        .flat_map(hosted_risk_tokens)
-        .collect::<Vec<_>>();
-    hosted_token_risk_score(&changed) == 0
+    !mandatory_large_diff_hunk(path, hunk)
 }
 
 const HOSTED_RISK_MARKERS: [(&str, usize); 19] = [
@@ -1795,6 +1838,161 @@ pub fn spool_model_batches(
     )
 }
 
+fn exact_semantic_hunk_proof(path: &str, hunk: &Hunk) -> Option<String> {
+    let mut old_line = hunk.old_start;
+    let mut new_line = hunk.new_start;
+    let mut changed_lines = Vec::new();
+    let mut substantive_added = false;
+    for raw in &hunk.lines {
+        let (marker, content) = raw.split_at(if raw.is_empty() { 0 } else { 1 });
+        if matches!(marker, "+" | "-") {
+            let rendered = render_line_segments(marker, content, old_line, new_line).concat();
+            if marker == "+"
+                && hosted_risk_tokens(content)
+                    .iter()
+                    .any(|token| token.len() >= 2)
+            {
+                substantive_added = true;
+            }
+            changed_lines.push(rendered);
+        }
+        match marker {
+            "+" => new_line = new_line.checked_add(1)?,
+            "-" => old_line = old_line.checked_add(1)?,
+            _ => {
+                old_line = old_line.checked_add(1)?;
+                new_line = new_line.checked_add(1)?;
+            }
+        }
+    }
+    substantive_added.then_some(())?;
+    let identity = hunk_receipt_identity(&HunkIdentity::new(path, hunk));
+    let mut proof = format!(
+        "### {}\n@@ exact bounded hunk identity={identity} old={},{} new={},{} @@\n",
+        display_path(path),
+        hunk.old_start,
+        hunk.old_count,
+        hunk.new_start,
+        hunk.new_count,
+    );
+    for line in changed_lines {
+        proof.push_str(&line);
+    }
+    Some(proof)
+}
+
+fn exact_semantic_batch_header(hunks: &BTreeSet<HunkIdentity>) -> String {
+    format!(
+        "Exact bounded semantic evidence:\nEvery credited hunk below retains its repository path, every changed line, and a non-empty added line. Treat only the displayed lines as evidence and do not infer omitted context.\nExact normalized hunk-set commitment (SHA-256): {}\n",
+        hunk_set_sha256(hunks)
+    )
+}
+
+fn hunk_receipt_identity(hunk: &HunkIdentity) -> String {
+    Sha256::digest(hunk.canonical().as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn final_model_visible_semantic_hunks(
+    batch: &str,
+    candidates: &BTreeSet<HunkIdentity>,
+) -> BTreeSet<HunkIdentity> {
+    let mut path = None::<&str>;
+    let mut identity = None::<&str>;
+    let mut visible = BTreeSet::new();
+    for line in batch.lines() {
+        if let Some(value) = line.strip_prefix("### ") {
+            path = Some(prompt_header_path(value));
+            identity = None;
+            continue;
+        }
+        if let Some(value) = line
+            .strip_prefix("@@ exact bounded hunk identity=")
+            .and_then(|value| value.split_once(' ').map(|(identity, _)| identity))
+        {
+            identity = Some(value);
+            continue;
+        }
+        let Some((number, marked)) = line.trim_start().split_once(' ') else {
+            continue;
+        };
+        let Some(line_number) = number.parse::<u32>().ok() else {
+            continue;
+        };
+        let Some(evidence) = marked.strip_prefix("+ ") else {
+            continue;
+        };
+        if evidence.trim().is_empty() {
+            continue;
+        }
+        let Some((path, identity)) = path.zip(identity) else {
+            continue;
+        };
+        visible.extend(
+            candidates
+                .iter()
+                .filter(|hunk| {
+                    prompt_paths_equal(path, &hunk.path)
+                        && hunk_receipt_identity(hunk) == identity
+                        && hunk.new_count > 0
+                        && hunk
+                            .new_start
+                            .checked_add(hunk.new_count.saturating_sub(1))
+                            .is_some_and(|end| (hunk.new_start..=end).contains(&line_number))
+                })
+                .cloned(),
+        );
+    }
+    visible
+}
+
+fn finalize_exact_semantic_batch(
+    payload: String,
+    candidates: BTreeSet<HunkIdentity>,
+) -> Option<(String, BTreeSet<HunkIdentity>)> {
+    let visible = final_model_visible_semantic_hunks(&payload, &candidates);
+    if visible.is_empty() {
+        return None;
+    }
+    let header = exact_semantic_batch_header(&visible);
+    Some((format!("{header}{payload}"), visible))
+}
+
+fn exact_semantic_batches(
+    proofs: BTreeMap<HunkIdentity, String>,
+    max_batch_bytes: usize,
+) -> Vec<(String, BTreeSet<HunkIdentity>)> {
+    let header_reserve = exact_semantic_batch_header(&BTreeSet::new()).len();
+    let payload_capacity = max_batch_bytes.saturating_sub(header_reserve);
+    let mut batches = Vec::new();
+    let mut payload = String::new();
+    let mut hunks = BTreeSet::new();
+    for (hunk, proof) in proofs {
+        if proof.len() > payload_capacity {
+            continue;
+        }
+        if !payload.is_empty()
+            && payload.len().saturating_add(proof.len()) > payload_capacity
+            && let Some(batch) = finalize_exact_semantic_batch(
+                std::mem::take(&mut payload),
+                std::mem::take(&mut hunks),
+            )
+        {
+            batches.push(batch);
+        }
+        payload.push_str(&proof);
+        hunks.insert(hunk);
+    }
+    if !payload.is_empty()
+        && let Some(batch) = finalize_exact_semantic_batch(payload, hunks)
+    {
+        batches.push(batch);
+    }
+    batches
+}
+
 pub(crate) fn spool_model_batches_with_synthesis_budget(
     prepared: &mut PreparedReview,
     max_source_batch_bytes: usize,
@@ -1816,9 +2014,13 @@ pub(crate) fn spool_model_batches_with_synthesis_budget(
     let mut count = 0usize;
     let mut source_count = 0usize;
     let mut synthesis_ids = BTreeSet::new();
+    let mut exact_semantic_ids = BTreeSet::new();
     let mut batch_hunks = HashMap::new();
     let mut all_hunks = BTreeSet::new();
     let mut hunk_risk = HashMap::new();
+    let mut semantic_hunk_proofs = BTreeMap::new();
+    let semantic_proof_capacity = max_synthesis_batch_bytes
+        .saturating_sub(exact_semantic_batch_header(&BTreeSet::new()).len());
     let mut metadata_batch_ids = BTreeSet::new();
     let mut metadata_count = 0u32;
     let synthesis_header = "Cross-window semantic digests:\n";
@@ -1834,13 +2036,19 @@ pub(crate) fn spool_model_batches_with_synthesis_budget(
             for hunk in &file.hunks {
                 let identity = HunkIdentity::new(&file.path, hunk);
                 hunk_risk.insert(
-                    identity,
+                    identity.clone(),
                     HunkRisk {
                         mandatory: mandatory_large_diff_hunk(&file.path, hunk),
                         semantic_eligible: semantic_large_diff_hunk(&file.path, hunk),
                         score: stable_large_diff_risk_score(&file.path, hunk),
                     },
                 );
+                if semantic_large_diff_hunk(&file.path, hunk)
+                    && let Some(proof) = exact_semantic_hunk_proof(&file.path, hunk)
+                    && proof.len() <= semantic_proof_capacity
+                {
+                    semantic_hunk_proofs.insert(identity, proof);
+                }
             }
         }
         let plan = render_review_batches(
@@ -2036,6 +2244,28 @@ pub(crate) fn spool_model_batches_with_synthesis_budget(
                 .context("recursive synthesis level overflowed")?;
         }
     }
+    if source_count > crate::review::MAX_LARGE_DIFF_SELECTED_BATCHES {
+        for (batch, hunks) in
+            exact_semantic_batches(semantic_hunk_proofs, max_synthesis_batch_bytes)
+        {
+            write_length_prefixed(
+                &mut file,
+                &mut lease,
+                &batch,
+                max_synthesis_batch_bytes,
+                "exact semantic model batch",
+            )?;
+            spool_bytes = spool_bytes
+                .checked_add(batch.len() as u64 + 8)
+                .context("model-batch spool size overflowed")?;
+            count = count
+                .checked_add(1)
+                .context("model batch count overflowed")?;
+            synthesis_ids.insert(count);
+            exact_semantic_ids.insert(count);
+            batch_hunks.insert(count, hunks);
+        }
+    }
     if count == 0 && force_empty {
         write_length_prefixed(
             &mut file,
@@ -2066,6 +2296,7 @@ pub(crate) fn spool_model_batches_with_synthesis_budget(
         source_count,
         metadata_count,
         synthesis_ids,
+        exact_semantic_ids,
         batch_hunks,
         all_hunks,
         hunk_risk,
@@ -5707,6 +5938,28 @@ diff --git a/two.rs b/two.rs
         source
     }
 
+    fn exact_bounded_risk_fixture() -> String {
+        use std::fmt::Write as _;
+
+        let mut source = String::new();
+        for file in 0..30 {
+            writeln!(
+                source,
+                "diff --git a/src/module-{file}.rs b/src/module-{file}.rs"
+            )
+            .unwrap();
+            writeln!(source, "--- a/src/module-{file}.rs").unwrap();
+            writeln!(source, "+++ b/src/module-{file}.rs").unwrap();
+            writeln!(source, "@@ -1,81 +1,81 @@").unwrap();
+            writeln!(source, "-let mode = \"old\";").unwrap();
+            writeln!(source, "+let retry_mode = \"bounded\";").unwrap();
+            for _ in 0..80 {
+                writeln!(source, " {}", "context".repeat(64)).unwrap();
+            }
+        }
+        source
+    }
+
     fn deterministic_receipt_for(source: &str) -> BoundedCoverageReceipt {
         let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
         let mut prepared = prepare_review(&snapshot).unwrap();
@@ -5747,10 +6000,10 @@ diff --git a/two.rs b/two.rs
         assert_eq!(first.plan_sha256, second.plan_sha256);
         assert_eq!(first.entries, second.entries);
         assert_eq!(first.entries.len(), 30);
-        assert_eq!(first.selected_batch_ids.len(), 3);
-        assert_eq!(first.direct_hunks(), 2);
-        assert_eq!(first.semantic_hunks(), 28);
-        assert_eq!(first.unreviewed_hunks(), 0);
+        assert!(first.selected_batch_ids.len() <= crate::review::MAX_LARGE_DIFF_SELECTED_BATCHES);
+        assert!(first.direct_hunks() >= 2);
+        assert_eq!(first.semantic_hunks() + first.unreviewed_hunks(), 6);
+        assert!(first.unreviewed_hunks() > 0);
         for path in ["src/auth/permission-0.ts", "vendor/runtime/dispatch.ts"] {
             let entry = first
                 .entries
@@ -5771,8 +6024,19 @@ diff --git a/two.rs b/two.rs
     }
 
     #[test]
+    fn exact_bounded_evidence_covers_nonmandatory_risk_markers() {
+        let source = exact_bounded_risk_fixture();
+        let receipt = deterministic_receipt_for(&source);
+
+        assert_eq!(receipt.entries.len(), 30);
+        assert_eq!(receipt.unreviewed_hunks(), 0);
+        assert!(receipt.semantic_hunks() > 0);
+        assert!(receipt.selected_batch_ids.len() <= crate::review::MAX_LARGE_DIFF_SELECTED_BATCHES);
+    }
+
+    #[test]
     fn semantic_receipt_rejects_a_missing_exact_hunk_mapping() {
-        let source = deterministic_large_fixture(1);
+        let source = exact_bounded_risk_fixture();
         let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
         let mut prepared = prepare_review(&snapshot).unwrap();
         let mut batches = spool_model_batches(&mut prepared, 16_000, 4_096, false).unwrap();
@@ -5804,7 +6068,7 @@ diff --git a/two.rs b/two.rs
 
     #[test]
     fn semantic_receipt_prompt_commits_to_its_exact_normalized_hunk_set() {
-        let source = deterministic_large_fixture(1);
+        let source = exact_bounded_risk_fixture();
         let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
         let mut prepared = prepare_review(&snapshot).unwrap();
         let mut batches = spool_model_batches(&mut prepared, 16_000, 4_096, false).unwrap();
@@ -5831,20 +6095,18 @@ diff --git a/two.rs b/two.rs
 
     #[test]
     fn semantic_receipt_rejects_a_tampered_summary_batch_identity() {
-        let source = deterministic_large_fixture(1);
+        let source = exact_bounded_risk_fixture();
         let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
         let mut prepared = prepare_review(&snapshot).unwrap();
         let mut batches = spool_model_batches(&mut prepared, 16_000, 4_096, false).unwrap();
         let mut receipt = batches
             .deterministic_bounded_receipt(crate::review::MAX_LARGE_DIFF_SELECTED_BATCHES)
             .unwrap();
-        let direct_id = receipt
-            .entries
-            .iter()
-            .find_map(|entry| match &entry.disposition {
-                HunkDisposition::Direct { batch_ids } => Some(batch_ids[0]),
-                _ => None,
-            })
+        let direct_id = batches
+            .batch_hunks
+            .keys()
+            .find(|id| !batches.synthesis_ids.contains(id))
+            .copied()
             .unwrap();
         let semantic = receipt
             .entries
