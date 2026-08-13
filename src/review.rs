@@ -2115,8 +2115,15 @@ async fn review_diff_at(
                         let mut baseline_candidate_indices = Vec::new();
                         if full_rereview {
                             for (baseline_index, previous) in baseline.iter().enumerate() {
-                                let applicable = index
+                                // The complete direct diff may prove an exact citation was
+                                // deleted even when bounded source selection omitted its batch.
+                                // A removal followed by the same addition remains current and
+                                // must not be retired from semantic coverage alone.
+                                let exact_citation_deleted = index.old_evidence_matches(previous)
+                                    && index.remap_current_evidence(previous).is_none();
+                                let applicable = (index
                                     .contains_reviewed_baseline_coordinate(previous)
+                                    || exact_citation_deleted)
                                     && !crate::envelope::is_reserved_anchor(&previous.path)
                                     && !kept
                                         .iter()
