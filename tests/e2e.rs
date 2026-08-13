@@ -2670,12 +2670,17 @@ async fn prompt_injection_all_refuted_adjudication_cannot_clean_the_gate() {
     assert_eq!(envelope["version"], 1);
     assert_eq!(envelope["silent"], false);
     assert_eq!(envelope["gate"]["failing"], true);
-    assert_eq!(envelope["findings"][0]["path"], ".postil/model-output");
+    assert_eq!(envelope["findings"][0]["path"], "src/auth.rs");
+    assert_eq!(envelope["findings"][0]["title"], "Validate query input");
+    assert_eq!(envelope["counts"]["error"], 1);
     assert!(
-        envelope["summary"]
-            .as_str()
+        envelope["modelIncidents"]
+            .as_array()
             .unwrap()
-            .contains("failing closed")
+            .iter()
+            .any(|incident| {
+                incident["category"] == "invalidOutput" && incident["recovered"] == false
+            })
     );
 }
 
