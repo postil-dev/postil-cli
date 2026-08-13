@@ -3339,6 +3339,20 @@ fn parse_git_side_marker_path(value: &str, prefix: &str) -> Option<DiffMarkerPat
     canonical_side_path(&decoded, prefix)
 }
 
+pub(crate) fn parse_old_file_marker(line: &str) -> Option<String> {
+    match parse_git_side_marker_path(line.strip_prefix("--- ")?, "a/")? {
+        DiffMarkerPath::Path(path) => Some(path),
+        DiffMarkerPath::Null => None,
+    }
+}
+
+pub(crate) fn parse_new_file_marker(line: &str) -> Option<String> {
+    match parse_git_side_marker_path(line.strip_prefix("+++ ")?, "b/")? {
+        DiffMarkerPath::Path(path) => Some(path),
+        DiffMarkerPath::Null => None,
+    }
+}
+
 fn parse_git_extended_path(value: &str) -> Option<String> {
     let (decoded, trailing) = if value.starts_with('"') {
         parse_git_path_token(value)?
@@ -4447,7 +4461,7 @@ fn strip_prefix_ab(path: &str) -> &str {
 /// "@@ -l,c +l,c @@ ctx" minus the leading "@@ ". Returns
 /// (old_start, old_count, new_start, new_count). Counts default to 1 when a
 /// header omits them (single-line hunk).
-fn parse_hunk_header(header: &str) -> Option<(u32, u32, u32, u32)> {
+pub(crate) fn parse_hunk_header(header: &str) -> Option<(u32, u32, u32, u32)> {
     let range_of = |spec: &str| -> Option<(u32, u32)> {
         let parse_number = |value: &str| {
             (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))

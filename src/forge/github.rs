@@ -938,7 +938,7 @@ impl GitHub {
             tree_count = tree_count
                 .checked_add(1)
                 .context("repository tree object count overflowed")?;
-            if tree_count > crate::repository_search::tree_object_cap() {
+            if tree_count > crate::repository_search::github_tree_object_cap() {
                 return Ok(crate::repository_search::exhausted_with_terms(
                     head_sha, &terms,
                 ));

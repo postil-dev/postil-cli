@@ -327,8 +327,37 @@ pub(crate) fn build_diff_corpus_receipt(
     let mut rendered = String::new();
     let mut buffered = VecDeque::new();
     let mut source_lines = 0usize;
+    let mut old_path = None;
+    let mut current_path = None;
+    let mut current_line = 0u32;
+    let mut in_hunk = false;
     for (index, line) in diff.split_inclusive('\n').enumerate() {
         source_lines = index + 1;
+        let source_line = line.trim_end_matches(['\r', '\n']);
+        if source_line.starts_with("--- ") {
+            old_path = crate::diff::parse_old_file_marker(source_line);
+            in_hunk = false;
+        } else if source_line.starts_with("+++ ") {
+            current_path = crate::diff::parse_new_file_marker(source_line);
+            in_hunk = false;
+        } else if let Some(header) = source_line.strip_prefix("@@ ") {
+            if let Some((_, _, parsed_current, _)) = crate::diff::parse_hunk_header(header) {
+                current_line = parsed_current;
+                in_hunk = true;
+            } else {
+                in_hunk = false;
+            }
+        }
+        let current_coordinate = if in_hunk
+            && ((source_line.starts_with('+') && !source_line.starts_with("+++"))
+                || source_line.starts_with(' '))
+        {
+            let coordinate = current_line;
+            current_line = current_line.saturating_add(1);
+            Some(coordinate)
+        } else {
+            None
+        };
         let normalized = line.to_ascii_lowercase();
         for (query, term) in queries.iter_mut().zip(&selected_terms) {
             query.occurrences = query
@@ -340,7 +369,6 @@ pub(crate) fn build_diff_corpus_receipt(
             .map(|terms| terms.iter().any(|term| normalized.contains(term)))
             .collect::<Vec<_>>();
 
-        let source_line = line.trim_end_matches(['\r', '\n']);
         if !source_line.starts_with("+++")
             && !source_line.starts_with("---")
             && let (Some(prefix), Some(source)) = (source_line.get(..1), source_line.get(1..))
@@ -365,6 +393,9 @@ pub(crate) fn build_diff_corpus_receipt(
             raw: line,
             global_match: candidate_matches.iter().any(|matched| *matched),
             candidate_matches,
+            old_path: old_path.clone(),
+            current_path: current_path.clone(),
+            current_coordinate,
         });
         if index >= 2 {
             let center = index - 2;
@@ -375,6 +406,7 @@ pub(crate) fn build_diff_corpus_receipt(
                 &mut rendered,
                 &mut candidate_windows,
                 &mut candidate_citations,
+                findings,
             );
             while buffered.front().is_some_and(|line| line.index + 1 < center) {
                 buffered.pop_front();
@@ -389,6 +421,7 @@ pub(crate) fn build_diff_corpus_receipt(
             &mut rendered,
             &mut candidate_windows,
             &mut candidate_citations,
+            findings,
         );
     }
     for ((finding, receipt), window) in findings
@@ -485,6 +518,9 @@ struct ScannedLine<'a> {
     raw: &'a str,
     global_match: bool,
     candidate_matches: Vec<bool>,
+    old_path: Option<String>,
+    current_path: Option<String>,
+    current_coordinate: Option<u32>,
 }
 
 fn finalize_streamed_center(
@@ -494,6 +530,7 @@ fn finalize_streamed_center(
     rendered: &mut String,
     candidate_windows: &mut [WindowBudget],
     candidate_citations: &mut [CandidateCitationReceipt],
+    findings: &[Finding],
 ) {
     let Some(center_line) = buffered.iter().find(|line| line.index == center) else {
         return;
@@ -534,6 +571,8 @@ fn finalize_streamed_center(
             })
             && window.add(center, row_bytes)
             && let Some(receipt) = candidate_citations.get_mut(candidate_index)
+            && let Some(finding) = findings.get(candidate_index)
+            && candidate_current_coordinate(center_line, finding)
         {
             let source = center_line
                 .raw
@@ -544,6 +583,18 @@ fn finalize_streamed_center(
             receipt.candidate_line_sha256.insert(sha256(source));
         }
     }
+}
+
+fn candidate_current_coordinate(line: &ScannedLine<'_>, finding: &Finding) -> bool {
+    let path_matches = line.current_path.as_deref() == Some(finding.path.as_str())
+        || line.old_path.as_deref() == Some(finding.path.as_str());
+    let Some(coordinate) = line.current_coordinate else {
+        return false;
+    };
+    let end = finding.end_line.unwrap_or(finding.line);
+    path_matches
+        && coordinate >= finding.line.saturating_sub(2)
+        && coordinate <= end.saturating_add(2)
 }
 
 fn decimal_digits(mut value: usize) -> usize {
@@ -1198,7 +1249,21 @@ mod tests {
         findings: &[Finding],
         candidate_ids: &[String],
     ) -> DiffCorpusReceipt {
-        build_diff_corpus_receipt(snapshot_id, corpus, findings, candidate_ids)
+        let mut receipt = build_diff_corpus_receipt(snapshot_id, corpus, findings, candidate_ids);
+        if !corpus.lines().any(|line| line.starts_with("--- ")) {
+            for citation in &mut receipt.candidate_citations {
+                for line in corpus.lines() {
+                    let source = line
+                        .strip_prefix(['+', '-', ' '])
+                        .unwrap_or(line)
+                        .trim_start();
+                    if !semantic_terms(source).is_empty() {
+                        citation.candidate_line_sha256.insert(sha256(source));
+                    }
+                }
+            }
+        }
+        receipt
     }
 
     fn unavailable_receipt() -> RepositorySearchReceipt {
@@ -1377,6 +1442,98 @@ mod tests {
                 &unavailable_receipt(),
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn deleted_or_cross_file_lines_cannot_confirm_a_candidate() {
+        let snapshot = "a".repeat(40);
+        let findings = vec![finding(
+            Kind::Risk,
+            "Restore the authorization guard",
+            "Authorization is bypassed before dispatch.",
+        )];
+        let ids = stable_candidate_ids(&snapshot, &findings);
+        let results = vec![AdjudicationResult {
+            candidate_id: ids[0].clone(),
+            status: AdjudicationStatus::Confirmed,
+            revised_title: findings[0].title.clone(),
+            revised_body: findings[0].body.clone(),
+            evidence: "authorization_guard();".into(),
+            duplicate_of: None,
+        }];
+        let corpus = concat!(
+            "diff --git a/workflow.yml b/workflow.yml\n",
+            "--- a/workflow.yml\n",
+            "+++ b/workflow.yml\n",
+            "@@ -2,3 +2,2 @@\n",
+            " before();\n",
+            "-authorization_guard();\n",
+            " dispatch();\n",
+            "diff --git a/unrelated.rs b/unrelated.rs\n",
+            "--- a/unrelated.rs\n",
+            "+++ b/unrelated.rs\n",
+            "@@ -20,0 +21 @@\n",
+            "+authorization_guard();\n",
+        );
+        let receipt = direct_receipt(&snapshot, corpus, &findings, &ids);
+
+        assert!(
+            apply_results(
+                &snapshot,
+                findings,
+                ids,
+                results,
+                corpus,
+                &receipt,
+                &unavailable_receipt(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn adjacent_current_line_in_candidate_file_can_confirm() {
+        let snapshot = "a".repeat(40);
+        let findings = vec![finding(
+            Kind::Risk,
+            "Restore the authorization guard",
+            "Authorization is bypassed before dispatch.",
+        )];
+        let ids = stable_candidate_ids(&snapshot, &findings);
+        let results = vec![AdjudicationResult {
+            candidate_id: ids[0].clone(),
+            status: AdjudicationStatus::Confirmed,
+            revised_title: findings[0].title.clone(),
+            revised_body: findings[0].body.clone(),
+            evidence: "authorization_guard();".into(),
+            duplicate_of: None,
+        }];
+        let corpus = concat!(
+            "diff --git a/workflow.yml b/workflow.yml\n",
+            "--- a/workflow.yml\n",
+            "+++ b/workflow.yml\n",
+            "@@ -2,2 +2,3 @@\n",
+            " before();\n",
+            "+authorization_guard();\n",
+            " dispatch();\n",
+        );
+        let receipt = direct_receipt(&snapshot, corpus, &findings, &ids);
+        let applied = apply_results(
+            &snapshot,
+            findings,
+            ids,
+            results,
+            corpus,
+            &receipt,
+            &unavailable_receipt(),
+        )
+        .unwrap();
+
+        assert_eq!(applied.kept.len(), 1);
+        assert_eq!(
+            applied.kept[0].evidence.as_deref(),
+            Some("authorization_guard();")
         );
     }
 

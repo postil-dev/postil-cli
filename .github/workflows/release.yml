@@ -75,12 +75,19 @@ jobs:
             exit 1
           }
           # A key with a spent limit authenticates and then fails every call.
-          remaining="$(jq -r '.data.limit_remaining // "unlimited"' /tmp/openrouter-key.json)"
-          if [[ "${remaining}" != "unlimited" ]] && \
-             awk "BEGIN { exit !(${remaining} < 1) }"; then
+          if ! jq -e \
+            '.data.limit_remaining == null or (.data.limit_remaining | type == "number")' \
+            /tmp/openrouter-key.json >/dev/null; then
+            echo "::error::OpenRouter returned an invalid credit limit." >&2
+            exit 1
+          fi
+          if jq -e '.data.limit_remaining != null and .data.limit_remaining < 1' \
+            /tmp/openrouter-key.json >/dev/null; then
+            remaining="$(jq -r '.data.limit_remaining' /tmp/openrouter-key.json)"
             echo "::error::OPENROUTER_API_KEY has ${remaining} credit remaining, below the cost of one benchmark run."
             exit 1
           fi
+          remaining="$(jq -r '.data.limit_remaining // "unlimited"' /tmp/openrouter-key.json)"
           echo "OpenRouter credential accepted (remaining: ${remaining})."
 
       # Plain release profile: the same build the release job ships, so the

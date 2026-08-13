@@ -23,7 +23,7 @@ const MAX_TERM_TOTAL_BYTES: usize = 8 * 1024;
 const MAX_TREE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TREE_ENTRIES: usize = 100_000;
 const MAX_TREE_DEPTH: usize = 256;
-const MAX_TREE_OBJECTS: usize = 256;
+const MAX_GITHUB_TREE_OBJECTS: usize = 256;
 const MAX_SEARCH_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_RECORDED_MATCHES: usize = 128;
 const GITHUB_REQUEST_CAP: usize = 256;
@@ -1039,8 +1039,8 @@ pub(crate) fn tree_depth_cap() -> usize {
     MAX_TREE_DEPTH
 }
 
-pub(crate) fn tree_object_cap() -> usize {
-    MAX_TREE_OBJECTS
+pub(crate) fn github_tree_object_cap() -> usize {
+    MAX_GITHUB_TREE_OBJECTS
 }
 
 pub(crate) fn github_request_cap() -> usize {
