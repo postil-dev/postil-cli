@@ -38,7 +38,7 @@ jobs:
       POSTIL_API_FORMAT: openai-compatible
       POSTIL_QUALIFICATION_SOURCE_SHA: ${{ github.sha }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -186,7 +186,7 @@ jobs:
 
       - name: Upload admission report
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bench-live-report
           path: ${{ env.POSTIL_REPORT_OUT }}
@@ -194,7 +194,7 @@ jobs:
 
       - name: Upload admitted candidate
         if: success()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: qualified-models-candidate
           path: |
@@ -204,7 +204,7 @@ jobs:
 
       - name: Upload encrypted private replay evidence
         if: always() && steps.encrypt-private-evidence.outcome == 'success'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bench-live-private-evidence
           path: ${{ env.POSTIL_PRIVATE_EVIDENCE_ENCRYPTED_OUT }}
