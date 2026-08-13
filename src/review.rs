@@ -543,7 +543,11 @@ async fn run_local(args: &ReviewArgs, cfg: &Config, repo_root: &Path) -> Result<
     .await;
     let envelope = match result {
         Ok(envelope) => envelope,
-        Err(error) => {
+        // Only a completed review that failed operationally has enough
+        // review state to produce a truthful error envelope. Input,
+        // planning, registration, and client-construction failures occur
+        // before provider access and retain the CLI error contract (exit 2).
+        Err(error) if error.downcast_ref::<ReviewFailure>().is_some() => {
             eprintln!("postil: review failed before completion ({error:#})");
             error_envelope(
                 cfg,
@@ -553,6 +557,7 @@ async fn run_local(args: &ReviewArgs, cfg: &Config, repo_root: &Path) -> Result<
                 review_started.elapsed().as_millis() as u64,
             )
         }
+        Err(error) => return Err(error),
     };
     finish(args, cfg, envelope, None::<&GitHub>, None, None, false).await
 }
