@@ -1099,7 +1099,8 @@ fn evidence_is_directly_grounded(
     if evidence.trim().is_empty() {
         return false;
     }
-    let corpus_window = corpus.contains(evidence)
+    let corpus_window = !semantic_terms(evidence).is_empty()
+        && corpus.contains(evidence)
         && receipt.candidate_citations.iter().any(|citation| {
             citation.candidate_id == candidate_id
                 && citation.candidate_line_sha256.contains(&sha256(evidence))
@@ -1342,6 +1343,40 @@ mod tests {
         assert_eq!(
             applied.kept[0].evidence.as_deref(),
             Some("transaction guard")
+        );
+    }
+
+    #[test]
+    fn punctuation_only_adjacent_lines_cannot_confirm_a_candidate() {
+        let snapshot = "a".repeat(40);
+        let findings = vec![finding(
+            Kind::Risk,
+            "Restore the authorization guard",
+            "Authorization is bypassed before dispatch.",
+        )];
+        let ids = stable_candidate_ids(&snapshot, &findings);
+        let results = vec![AdjudicationResult {
+            candidate_id: ids[0].clone(),
+            status: AdjudicationStatus::Confirmed,
+            revised_title: findings[0].title.clone(),
+            revised_body: findings[0].body.clone(),
+            evidence: "}".into(),
+            duplicate_of: None,
+        }];
+        let corpus = "+authorization guard\n+}\n";
+        let receipt = direct_receipt(&snapshot, corpus, &findings, &ids);
+
+        assert!(
+            apply_results(
+                &snapshot,
+                findings,
+                ids,
+                results,
+                corpus,
+                &receipt,
+                &unavailable_receipt(),
+            )
+            .is_err()
         );
     }
 
