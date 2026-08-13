@@ -2480,7 +2480,7 @@ async fn query_truncated_adjudication_preserves_the_grounded_candidate() {
     mock_review(
         &server,
         json!([{
-            "path": "src/auth.rs", "line": 42, "severity": "warn", "kind": "risk",
+            "path": "src/auth.rs", "line": 42, "severity": "error", "kind": "risk",
             "confidence": 0.99, "title": "Restore the authorization guard",
             "body": format!("The authorization guard is unsafe. {terms}."),
             "evidence": "exec_query(&token);"
