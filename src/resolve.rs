@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use serde_json::json;
 use time::Date;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 use crate::config::Config;
 use crate::diff;
@@ -312,34 +312,102 @@ async fn read_local_file_with_command(
     let mut child = tokio::process::Command::new(git)
         .arg("-C")
         .arg(root)
-        .args(["cat-file", "blob", &object])
+        .args(["cat-file", "--batch"])
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("reading repository path {path} at reviewed head"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("git blob reader did not provide standard input")?;
+    stdin
+        .write_all(format!("{object}\n").as_bytes())
+        .await
+        .with_context(|| format!("requesting repository path {path} at reviewed head"))?;
+    drop(stdin);
     let stdout = child
         .stdout
         .take()
         .context("git blob reader did not provide standard output")?;
-    let mut bytes = Vec::with_capacity(MAX_FILE_BYTES + 1);
-    let mut limited = stdout.take((MAX_FILE_BYTES + 1) as u64);
-    limited
-        .read_to_end(&mut bytes)
+    let mut stdout = BufReader::new(stdout);
+    let mut header = Vec::with_capacity(256);
+    let mut limited_header = (&mut stdout).take(257);
+    limited_header
+        .read_until(b'\n', &mut header)
         .await
-        .with_context(|| format!("reading repository path {path} at reviewed head"))?;
-    let truncated = bytes.len() > MAX_FILE_BYTES;
-    drop(limited);
-    if truncated {
-        let _ = child.kill().await;
+        .with_context(|| format!("reading repository path {path} object header"))?;
+    drop(limited_header);
+    if header.ends_with(b" missing\n") {
+        let status = child
+            .wait()
+            .await
+            .with_context(|| format!("waiting for repository path {path} at reviewed head"))?;
+        anyhow::ensure!(status.success(), "git blob reader failed for {path}");
+        return Ok(None);
     }
+    anyhow::ensure!(
+        header.len() <= 256 && header.ends_with(b"\n"),
+        "git blob reader returned an invalid object header for {path}"
+    );
+    let header = std::str::from_utf8(&header[..header.len() - 1])
+        .with_context(|| format!("git blob reader returned a non-UTF-8 header for {path}"))?;
+    let fields = header.split_ascii_whitespace().collect::<Vec<_>>();
+    anyhow::ensure!(
+        fields.len() == 3
+            && crate::repository_search::valid_full_object_id(fields[0])
+            && fields[1] == "blob",
+        "git blob reader returned an invalid object header for {path}"
+    );
+    let size = fields[2]
+        .parse::<u64>()
+        .with_context(|| format!("git blob reader returned an invalid size for {path}"))?;
+    anyhow::ensure!(
+        size <= crate::repository_search::search_byte_cap(),
+        "repository path {path} exceeds the evidence byte limit"
+    );
+    let mut object_hash = crate::repository_search::GitObjectHash::new("blob", size);
+    let mut bytes = Vec::with_capacity(MAX_FILE_BYTES.min(size as usize));
+    let mut remaining = size;
+    let mut chunk = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let available = usize::try_from(remaining.min(chunk.len() as u64))
+            .context("repository blob size overflowed")?;
+        let count = stdout
+            .read(&mut chunk[..available])
+            .await
+            .with_context(|| format!("reading repository path {path} at reviewed head"))?;
+        anyhow::ensure!(
+            count > 0,
+            "git blob reader truncated repository path {path}"
+        );
+        object_hash.update(&chunk[..count]);
+        let retained = MAX_FILE_BYTES.saturating_sub(bytes.len()).min(count);
+        bytes.extend_from_slice(&chunk[..retained]);
+        remaining -= count as u64;
+    }
+    let mut delimiter = [0u8; 1];
+    stdout
+        .read_exact(&mut delimiter)
+        .await
+        .with_context(|| format!("reading repository path {path} delimiter"))?;
+    anyhow::ensure!(
+        delimiter == *b"\n",
+        "git blob reader omitted its delimiter for {path}"
+    );
+    drop(stdout);
     let status = child
         .wait()
         .await
         .with_context(|| format!("waiting for repository path {path} at reviewed head"))?;
-    if !truncated && !status.success() {
-        return Ok(None);
-    }
+    anyhow::ensure!(status.success(), "git blob reader failed for {path}");
+    anyhow::ensure!(
+        object_hash.matches(fields[0]),
+        "repository path {path} did not match its Git object id"
+    );
+    let truncated = size > MAX_FILE_BYTES as u64;
     if truncated {
         let mut end = MAX_FILE_BYTES.saturating_sub(TRUNCATION_MARKER.len());
         while end > 0 && std::str::from_utf8(&bytes[..end]).is_err() {
@@ -599,6 +667,39 @@ mod tests {
         .await;
 
         assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_blob_reader_rejects_body_substitution() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("substituting-git");
+        let expected = crate::repository_search::git_blob_sha1(b"wanted");
+        std::fs::write(
+            &executable,
+            format!("#!/bin/sh\nread request\nprintf '{expected} blob 6\\nforged\\n'\n"),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+
+        let error = read_local_file_with_command(
+            executable.as_os_str(),
+            directory.path(),
+            &"a".repeat(40),
+            "src/substituted.rs",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("did not match its Git object id")
+        );
     }
 
     #[test]

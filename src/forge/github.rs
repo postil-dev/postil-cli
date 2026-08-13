@@ -966,6 +966,17 @@ impl GitHub {
             );
             ensure!(!tree.truncated, "GitHub repository tree was incomplete");
             let mut entries = tree.tree;
+            ensure!(
+                crate::repository_search::git_tree_matches(
+                    &tree_sha,
+                    entries.iter().map(|entry| (
+                        entry.path.as_str(),
+                        entry.mode.as_str(),
+                        entry.sha.as_str(),
+                    )),
+                ),
+                "GitHub repository tree entries did not match the requested object"
+            );
             entries.sort_by(|left, right| left.path.cmp(&right.path));
             budget.charge_objects(entries.len())?;
             let mut names = HashSet::with_capacity(entries.len());
@@ -2648,8 +2659,6 @@ mod tests {
 
         let server = MockServer::start().await;
         let head = "a".repeat(40);
-        let root_tree = "b".repeat(40);
-        let manifest_tree = "c".repeat(40);
         let readme = b"CephCluster supports stable releases.\n";
         let generated = b"clusterVersion: 19.2.5\nimage: ceph:19.2.5\n";
         let symlink = b"../outside";
@@ -2657,6 +2666,17 @@ mod tests {
         let generated_blob = crate::repository_search::git_blob_sha1(generated);
         let symlink_blob = crate::repository_search::git_blob_sha1(symlink);
         let submodule = "1".repeat(40);
+        let manifest_tree = crate::repository_search::git_tree_sha1([(
+            "generated.yaml",
+            "100644",
+            generated_blob.as_str(),
+        )]);
+        let root_tree = crate::repository_search::git_tree_sha1([
+            ("README.md", "100644", readme_blob.as_str()),
+            ("manifests", "040000", manifest_tree.as_str()),
+            ("outside-link", "120000", symlink_blob.as_str()),
+            ("vendor", "160000", submodule.as_str()),
+        ]);
 
         Mock::given(method("GET"))
             .and(path(format!("/repos/owner/repo/git/commits/{head}")))
@@ -2751,11 +2771,12 @@ mod tests {
 
         let server = MockServer::start().await;
         let head = "a".repeat(40);
-        let tree = "b".repeat(40);
         let expected = b"required-construct=true\n";
         let substituted = b"required-construct=fals\n";
         assert_eq!(expected.len(), substituted.len());
         let blob = crate::repository_search::git_blob_sha1(expected);
+        let tree =
+            crate::repository_search::git_tree_sha1([("config.txt", "100644", blob.as_str())]);
 
         Mock::given(method("GET"))
             .and(path(format!("/repos/owner/repo/git/commits/{head}")))
@@ -2780,6 +2801,49 @@ mod tests {
         Mock::given(method("GET"))
             .and(path(format!("/repos/owner/repo/git/blobs/{blob}")))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(substituted))
+            .mount(&server)
+            .await;
+
+        let receipt = test_github(&server)
+            .search_repository_at_head(&head, repository_search_terms())
+            .await;
+
+        assert_eq!(receipt.state, RepositorySearchState::Unavailable);
+        assert_eq!(receipt.searched_blobs, 0);
+    }
+
+    #[tokio::test]
+    async fn repository_search_rejects_tree_entry_substitution() {
+        use crate::envelope::RepositorySearchState;
+
+        let server = MockServer::start().await;
+        let head = "a".repeat(40);
+        let expected_blob = crate::repository_search::git_blob_sha1(b"expected\n");
+        let substituted_blob = crate::repository_search::git_blob_sha1(b"attacker\n");
+        let tree = crate::repository_search::git_tree_sha1([(
+            "config.txt",
+            "100644",
+            expected_blob.as_str(),
+        )]);
+
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/owner/repo/git/commits/{head}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sha": head,
+                "tree": {"sha": tree}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/owner/repo/git/trees/{tree}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sha": tree,
+                "truncated": false,
+                "tree": [{
+                    "path": "config.txt", "mode": "100644", "type": "blob",
+                    "sha": substituted_blob, "size": 9
+                }]
+            })))
             .mount(&server)
             .await;
 
@@ -2837,8 +2901,8 @@ mod tests {
 
         let server = MockServer::start().await;
         let head = "a".repeat(40);
-        let tree = "b".repeat(40);
         let blob = "c".repeat(40);
+        let tree = crate::repository_search::git_tree_sha1([("huge.bin", "100644", blob.as_str())]);
         Mock::given(method("GET"))
             .and(path(format!("/repos/owner/repo/git/commits/{head}")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({

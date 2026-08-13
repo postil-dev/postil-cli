@@ -505,6 +505,7 @@ impl SearchAccumulator {
         }
 
         let mut scanner = StreamMatcher::new(&self.terms);
+        let mut object_hash = GitObjectHash::new("blob", expected_size);
         let mut read = 0u64;
         let mut remaining = expected_size;
         let mut chunk = [0u8; 64 * 1024];
@@ -522,6 +523,7 @@ impl SearchAccumulator {
                 .checked_add(count as u64)
                 .ok_or_else(|| std::io::Error::other("repository search byte count overflowed"))?;
             remaining = remaining.saturating_sub(count as u64);
+            object_hash.update(&chunk[..count]);
             scanner.push(&chunk[..count]);
         }
         let mut terminator = [0u8; 1];
@@ -532,6 +534,11 @@ impl SearchAccumulator {
             ));
         }
         scanner.finish();
+        if !object_hash.matches(object_id) {
+            return Err(std::io::Error::other(
+                "git batch blob did not match its object id",
+            ));
+        }
         self.finish_blob(path, read, scanner.counts);
         Ok(())
     }
@@ -551,7 +558,7 @@ impl SearchAccumulator {
             anyhow::ensure!(size == expected_size, "repository blob size changed");
         }
         let mut scanner = StreamMatcher::new(&self.terms);
-        let mut object_hash = GitBlobHash::new(expected_size);
+        let mut object_hash = GitObjectHash::new("blob", expected_size);
         let mut read = 0u64;
         while let Some(chunk) = response.chunk().await? {
             read = read
@@ -638,14 +645,14 @@ impl SearchAccumulator {
     }
 }
 
-struct GitBlobHash {
+pub(crate) struct GitObjectHash {
     sha1: Sha1,
     sha256: Sha256,
 }
 
-impl GitBlobHash {
-    fn new(size: u64) -> Self {
-        let header = format!("blob {size}\0");
+impl GitObjectHash {
+    pub(crate) fn new(kind: &str, size: u64) -> Self {
+        let header = format!("{kind} {size}\0");
         let mut sha1 = Sha1::new();
         sha1.update(header.as_bytes());
         let mut sha256 = Sha256::new();
@@ -653,12 +660,12 @@ impl GitBlobHash {
         Self { sha1, sha256 }
     }
 
-    fn update(&mut self, bytes: &[u8]) {
+    pub(crate) fn update(&mut self, bytes: &[u8]) {
         self.sha1.update(bytes);
         self.sha256.update(bytes);
     }
 
-    fn matches(self, expected: &str) -> bool {
+    pub(crate) fn matches(self, expected: &str) -> bool {
         let actual = match expected.len() {
             40 => hex_digest(self.sha1.finalize()),
             64 => hex_digest(self.sha256.finalize()),
@@ -670,9 +677,195 @@ impl GitBlobHash {
 
 #[cfg(test)]
 pub(crate) fn git_blob_sha1(bytes: &[u8]) -> String {
-    let mut hash = GitBlobHash::new(bytes.len() as u64);
+    let mut hash = GitObjectHash::new("blob", bytes.len() as u64);
     hash.update(bytes);
     hex_digest(hash.sha1.finalize())
+}
+
+pub(crate) fn git_tree_matches<'a>(
+    expected: &str,
+    entries: impl IntoIterator<Item = (&'a str, &'a str, &'a str)>,
+) -> bool {
+    git_tree_object_id(expected.len(), entries)
+        .is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
+}
+
+fn git_tree_object_id<'a>(
+    object_id_hex_len: usize,
+    entries: impl IntoIterator<Item = (&'a str, &'a str, &'a str)>,
+) -> Option<String> {
+    if !matches!(object_id_hex_len, 40 | 64) {
+        return None;
+    }
+    let mut entries = entries.into_iter().collect::<Vec<_>>();
+    entries.sort_by(|left, right| git_tree_name_cmp(left.0, left.1, right.0, right.1));
+    if entries
+        .windows(2)
+        .any(|pair| pair[0].0.as_bytes() == pair[1].0.as_bytes())
+    {
+        return None;
+    }
+    let object_id_bytes = object_id_hex_len / 2;
+    let mut payload_size = 0u64;
+    for (path, mode, object_id) in &entries {
+        let mode = canonical_tree_mode(mode)?;
+        if path.is_empty()
+            || path.contains('/')
+            || path.contains('\0')
+            || object_id.len() != object_id_hex_len
+            || !object_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        payload_size = payload_size
+            .checked_add(mode.len() as u64)?
+            .checked_add(1)?
+            .checked_add(path.len() as u64)?
+            .checked_add(1)?
+            .checked_add(object_id_bytes as u64)?;
+    }
+    let mut hash = GitObjectHash::new("tree", payload_size);
+    let mut decoded = [0u8; 32];
+    for (path, mode, object_id) in entries {
+        let mode = canonical_tree_mode(mode)?;
+        hash.update(mode.as_bytes());
+        hash.update(b" ");
+        hash.update(path.as_bytes());
+        hash.update(b"\0");
+        decode_hex_into(object_id, &mut decoded[..object_id_bytes])?;
+        hash.update(&decoded[..object_id_bytes]);
+    }
+    Some(match object_id_hex_len {
+        40 => hex_digest(hash.sha1.finalize()),
+        64 => hex_digest(hash.sha256.finalize()),
+        _ => unreachable!(),
+    })
+}
+
+fn canonical_tree_mode(mode: &str) -> Option<&str> {
+    match mode {
+        "040000" | "40000" => Some("40000"),
+        "100644" | "100755" | "120000" | "160000" => Some(mode),
+        _ => None,
+    }
+}
+
+fn git_tree_name_cmp(
+    left_path: &str,
+    left_mode: &str,
+    right_path: &str,
+    right_mode: &str,
+) -> std::cmp::Ordering {
+    let left = left_path.as_bytes();
+    let right = right_path.as_bytes();
+    let shared = left.len().min(right.len());
+    let prefix = left[..shared].cmp(&right[..shared]);
+    if prefix != std::cmp::Ordering::Equal {
+        return prefix;
+    }
+    let left_suffix = left.get(shared).copied().unwrap_or({
+        if matches!(left_mode, "040000" | "40000") {
+            b'/'
+        } else {
+            0
+        }
+    });
+    let right_suffix = right.get(shared).copied().unwrap_or({
+        if matches!(right_mode, "040000" | "40000") {
+            b'/'
+        } else {
+            0
+        }
+    });
+    left_suffix.cmp(&right_suffix)
+}
+
+fn decode_hex_into(value: &str, output: &mut [u8]) -> Option<()> {
+    if value.len() != output.len().checked_mul(2)? {
+        return None;
+    }
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        output[index] = hex_nibble(pair[0])?.checked_mul(16)? + hex_nibble(pair[1])?;
+    }
+    Some(())
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn git_tree_sha1<'a>(
+    entries: impl IntoIterator<Item = (&'a str, &'a str, &'a str)>,
+) -> String {
+    git_tree_object_id(40, entries).expect("valid fixture tree")
+}
+
+pub(crate) fn reconstructed_root_tree_matches(
+    entries: &[RepositorySnapshotEntry],
+    expected: &str,
+) -> bool {
+    if !valid_full_object_id(expected) {
+        return false;
+    }
+    let mut directories = BTreeMap::<String, Vec<(String, String, String)>>::new();
+    directories.entry(String::new()).or_default();
+    for entry in entries {
+        let components = entry.path.split('/').collect::<Vec<_>>();
+        if components.is_empty() || components.iter().any(|component| component.is_empty()) {
+            return false;
+        }
+        let name = components.last().expect("non-empty components").to_string();
+        let parent = components[..components.len() - 1].join("/");
+        for depth in 0..components.len() {
+            directories
+                .entry(components[..depth].join("/"))
+                .or_default();
+        }
+        directories.entry(parent).or_default().push((
+            name,
+            entry.mode.clone(),
+            entry.object_id.clone(),
+        ));
+    }
+    let mut paths = directories.keys().cloned().collect::<Vec<_>>();
+    paths.sort_by(|left, right| {
+        right
+            .bytes()
+            .filter(|byte| *byte == b'/')
+            .count()
+            .cmp(&left.bytes().filter(|byte| *byte == b'/').count())
+            .then_with(|| right.len().cmp(&left.len()))
+    });
+    let mut root = None;
+    for path in paths {
+        let children = directories.remove(&path).unwrap_or_default();
+        let Some(object_id) = git_tree_object_id(
+            expected.len(),
+            children
+                .iter()
+                .map(|(name, mode, object_id)| (name.as_str(), mode.as_str(), object_id.as_str())),
+        ) else {
+            return false;
+        };
+        if path.is_empty() {
+            root = Some(object_id);
+            continue;
+        }
+        let (parent, name) = path
+            .rsplit_once('/')
+            .map_or(("", path.as_str()), |(parent, name)| (parent, name));
+        let Some(siblings) = directories.get_mut(parent) else {
+            return false;
+        };
+        siblings.push((name.to_string(), "040000".to_string(), object_id));
+    }
+    root.is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -790,18 +983,7 @@ async fn search_local_inner(
     if !valid_full_object_id(head_sha) {
         return Err(LocalSearchFailure::Unavailable);
     }
-    let object_type = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["cat-file", "-t", head_sha])
-        .kill_on_drop(true)
-        .output()
-        .await;
-    if !object_type.is_ok_and(|output| {
-        output.status.success() && matches!(output.stdout.as_slice(), b"commit\n" | b"tree\n")
-    }) {
-        return Err(LocalSearchFailure::Unavailable);
-    }
+    let root_tree_id = local_root_tree_id(root, head_sha).await?;
     let output = local_tree_bytes(root, head_sha).await?;
     let mut entries = Vec::new();
     let mut total_bytes = 0u64;
@@ -862,6 +1044,9 @@ async fn search_local_inner(
         return Err(LocalSearchFailure::Exhausted);
     }
     entries.sort_by(|left, right| left.path.cmp(&right.path));
+    if !reconstructed_root_tree_matches(&entries, &root_tree_id) {
+        return Err(LocalSearchFailure::Unavailable);
+    }
     let tree_sha256 = tree_sha256(&entries);
     let mut search = SearchAccumulator::new(terms);
     let mut has_gitlinks = false;
@@ -907,6 +1092,88 @@ async fn search_local_inner(
     } else {
         Ok(search.complete(head_sha, tree_sha256))
     }
+}
+
+async fn local_root_tree_id(root: &Path, head_sha: &str) -> Result<String, LocalSearchFailure> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["cat-file", "--batch"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|_| LocalSearchFailure::Unavailable)?;
+    let mut input = child.stdin.take().ok_or(LocalSearchFailure::Unavailable)?;
+    input
+        .write_all(format!("{head_sha}\n").as_bytes())
+        .await
+        .map_err(|_| LocalSearchFailure::Unavailable)?;
+    drop(input);
+    let output = child.stdout.take().ok_or(LocalSearchFailure::Unavailable)?;
+    let mut output = BufReader::new(output);
+    let mut header = Vec::with_capacity(MAX_BATCH_HEADER_BYTES);
+    let mut limited_header = (&mut output).take((MAX_BATCH_HEADER_BYTES + 1) as u64);
+    limited_header
+        .read_until(b'\n', &mut header)
+        .await
+        .map_err(|_| LocalSearchFailure::Unavailable)?;
+    drop(limited_header);
+    if header.len() > MAX_BATCH_HEADER_BYTES || !header.ends_with(b"\n") {
+        return Err(LocalSearchFailure::Unavailable);
+    }
+    let header = std::str::from_utf8(&header[..header.len() - 1])
+        .map_err(|_| LocalSearchFailure::Unavailable)?;
+    let fields = header.split_ascii_whitespace().collect::<Vec<_>>();
+    if fields.len() != 3
+        || !fields[0].eq_ignore_ascii_case(head_sha)
+        || !matches!(fields[1], "commit" | "tree")
+    {
+        return Err(LocalSearchFailure::Unavailable);
+    }
+    let size = fields[2]
+        .parse::<usize>()
+        .map_err(|_| LocalSearchFailure::Unavailable)?;
+    if size > MAX_TREE_BYTES {
+        return Err(LocalSearchFailure::Exhausted);
+    }
+    let mut bytes = vec![0u8; size];
+    output
+        .read_exact(&mut bytes)
+        .await
+        .map_err(|_| LocalSearchFailure::Unavailable)?;
+    let mut delimiter = [0u8; 1];
+    output
+        .read_exact(&mut delimiter)
+        .await
+        .map_err(|_| LocalSearchFailure::Unavailable)?;
+    if delimiter != *b"\n" {
+        return Err(LocalSearchFailure::Unavailable);
+    }
+    drop(output);
+    if !child.wait().await.is_ok_and(|status| status.success()) {
+        return Err(LocalSearchFailure::Unavailable);
+    }
+    let mut object_hash = GitObjectHash::new(fields[1], size as u64);
+    object_hash.update(&bytes);
+    if !object_hash.matches(head_sha) {
+        return Err(LocalSearchFailure::Unavailable);
+    }
+    if fields[1] == "tree" {
+        return Ok(head_sha.to_ascii_lowercase());
+    }
+    let Some(line_end) = bytes.iter().position(|byte| *byte == b'\n') else {
+        return Err(LocalSearchFailure::Unavailable);
+    };
+    let Some(raw_tree) = bytes[..line_end].strip_prefix(b"tree ") else {
+        return Err(LocalSearchFailure::Unavailable);
+    };
+    let tree = std::str::from_utf8(raw_tree).map_err(|_| LocalSearchFailure::Unavailable)?;
+    if tree.len() != head_sha.len() || !valid_full_object_id(tree) {
+        return Err(LocalSearchFailure::Unavailable);
+    }
+    Ok(tree.to_ascii_lowercase())
 }
 
 async fn local_tree_bytes(root: &Path, head_sha: &str) -> Result<Vec<u8>, LocalSearchFailure> {
@@ -1271,20 +1538,39 @@ mod tests {
         assert_eq!(receipt.matches[0].occurrences, 2);
     }
 
+    #[test]
+    fn canonical_tree_hash_matches_git_for_nested_prefix_names() {
+        let directory = tempfile::tempdir().unwrap();
+        run_git(directory.path(), &["init", "--quiet"]);
+        std::fs::create_dir(directory.path().join("foo")).unwrap();
+        std::fs::write(directory.path().join("foo/nested"), "nested\n").unwrap();
+        std::fs::write(directory.path().join("foo.bar"), "root\n").unwrap();
+        run_git(directory.path(), &["add", "foo/nested", "foo.bar"]);
+        let expected = run_git(directory.path(), &["write-tree"]);
+        let nested_blob = git_blob_sha1(b"nested\n");
+        let root_blob = git_blob_sha1(b"root\n");
+        let nested_tree = git_tree_sha1([("nested", "100644", nested_blob.as_str())]);
+        let actual = git_tree_sha1([
+            ("foo", "040000", nested_tree.as_str()),
+            ("foo.bar", "100644", root_blob.as_str()),
+        ]);
+
+        assert_eq!(actual, expected);
+    }
+
     #[tokio::test]
     async fn batch_reader_uses_one_protocol_for_multiple_blobs() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, duplex};
 
         let claim = claim("needle");
         let mut search = SearchAccumulator::new(search_terms(std::iter::once(&claim)).unwrap());
-        let first = "a".repeat(40);
-        let second = "b".repeat(40);
+        let first_body = b"first needle\n".to_vec();
+        let second_body = b"second needle\n".to_vec();
+        let first = git_blob_sha1(&first_body);
+        let second = git_blob_sha1(&second_body);
         let (mut input, requests) = duplex(1024);
         let (mut responses, output) = duplex(1024);
-        let expected = vec![
-            (first.clone(), b"first needle\n".to_vec()),
-            (second.clone(), b"second needle\n".to_vec()),
-        ];
+        let expected = vec![(first.clone(), first_body), (second.clone(), second_body)];
         let server = tokio::spawn(async move {
             let mut requests = BufReader::new(requests);
             let mut seen = Vec::new();
@@ -1360,6 +1646,36 @@ mod tests {
             assert_eq!(search.searched_blobs, 0);
             assert_eq!(search.searched_bytes, 0);
         }
+    }
+
+    #[tokio::test]
+    async fn batch_reader_rejects_blob_bytes_that_do_not_match_the_object_id() {
+        use tokio::io::{AsyncWriteExt, duplex};
+
+        let expected = git_blob_sha1(b"wanted");
+        let response = format!("{expected} blob 6\nforged\n");
+        let claim = claim("forged");
+        let mut search = SearchAccumulator::new(search_terms(std::iter::once(&claim)).unwrap());
+        let (mut input, _requests) = duplex(1024);
+        let (mut writer, output) = duplex(1024);
+        writer.write_all(response.as_bytes()).await.unwrap();
+        drop(writer);
+        let mut output = BufReader::new(output);
+
+        assert!(
+            scan_batch_object(
+                &mut search,
+                "config.yaml",
+                &expected,
+                &mut input,
+                &mut output,
+                6,
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(search.searched_blobs, 0);
+        assert_eq!(search.searched_bytes, 0);
     }
 
     #[test]
