@@ -1067,40 +1067,6 @@ pub fn fail_closed_finding(detail: &str) -> Finding {
     }
 }
 
-/// The synthetic finding emitted when the model narrated merge-relevant risk
-/// in its summary while reporting zero structured findings. The contradiction
-/// means the output cannot be trusted as a pass; the narration is preserved so
-/// the concern is not silently dropped. Uses OPERATIONAL_PATH: a malicious
-/// diff can induce this shape via prompt injection, so it never bypasses the
-/// gate.
-pub fn narrated_risk_finding(summary: &str) -> Finding {
-    let quoted: String = summary.lines().map(|l| format!("> {l}\n")).collect();
-    Finding {
-        path: OPERATIONAL_PATH.to_string(),
-        line: 1,
-        end_line: None,
-        severity: Severity::Error,
-        kind: Kind::Uncertainty,
-        confidence: 1.0,
-        title: "Model narrated risk without structured findings".to_string(),
-        body: format!(
-            "The model's summary describes merge-relevant risk but it reported no \
-             structured findings, so the review cannot be trusted as a pass. Postil is \
-             failing closed instead of posting a clean status above contradictory prose.\n\n\
-             Narrated summary:\n\n{quoted}\n\
-             Re-run the review; if the contradiction persists, inspect the areas the \
-             summary names and address them or record findings manually."
-        ),
-        evidence: None,
-        id: None,
-        generator_confidence: None,
-        scorer_confidence: None,
-        generator_kind: None,
-        scorer_kind: None,
-        scorer_reason: None,
-    }
-}
-
 /// The synthetic finding emitted when the provider could not be reached at all.
 pub fn provider_error_finding(_detail: &str) -> Finding {
     Finding {

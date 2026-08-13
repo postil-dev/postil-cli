@@ -53,7 +53,6 @@ const MAX_SCORER_EVIDENCE_BYTES: usize = 24_000;
 const MAX_SCORER_EVIDENCE_CORPUS_BYTES: usize = 384 * 1024;
 const MAX_SCORER_BATCH_EVIDENCE_BYTES: usize = 32 * 1024;
 const MAX_STREAMED_CANDIDATE_MULTIPLIER: usize = 8;
-const MAX_STREAMED_SUMMARY_BYTES: usize = 64_000;
 const MAX_REVIEW_VALIDATION_REASON_BYTES: usize = 16_384;
 const HOSTED_WORKER_WATCHDOG_SECS: u64 = 600;
 pub(crate) const HOSTED_LLM_TOTAL_TIMEOUT_SECS: u64 = 540;
@@ -1048,6 +1047,30 @@ fn sort_findings_for_display(findings: &mut [Finding]) {
     });
 }
 
+fn summary_from_findings(findings: &[Finding]) -> String {
+    const DISPLAYED_TITLES: usize = 3;
+
+    let mut sentences = findings
+        .iter()
+        .take(DISPLAYED_TITLES)
+        .map(|finding| {
+            let mut title = crate::envelope::forge_safe_finding_publication_text(finding)
+                .title
+                .trim()
+                .to_string();
+            if !title.ends_with(['.', '!', '?', '\u{3002}', '\u{ff01}', '\u{ff1f}']) {
+                title.push('.');
+            }
+            title
+        })
+        .collect::<Vec<_>>();
+    let remaining = findings.len().saturating_sub(sentences.len());
+    if remaining > 0 {
+        sentences.push(format!("{remaining} more."));
+    }
+    sentences.join(" ")
+}
+
 struct ReviewBatchPromptContext<'a> {
     cfg: &'a Config,
     repo: Option<&'a str>,
@@ -1242,7 +1265,6 @@ async fn review_diff_at(
         index.add_content_policy_evidence(crate::envelope::PR_DESCRIPTION_PATH, &pr_description);
     }
 
-    let mut summary = String::new();
     let mut model_used = "none (empty diff)".to_string();
     let mut usage = Usage::default();
     let mut model_usage: Vec<ModelUsage> = Vec::new();
@@ -1660,7 +1682,6 @@ async fn review_diff_at(
                     receipt: large_receipt_summary,
                 });
                 let mut raw_findings = Vec::new();
-                let mut summary_parts = Vec::new();
                 let mut finding_contexts = Vec::new();
                 let mut scorer_evidence_corpus = Vec::new();
                 let mut batch_models = Vec::new();
@@ -1799,12 +1820,6 @@ async fn review_diff_at(
                             if !batch_models.contains(&model_review.model_used) {
                                 batch_models.push(model_review.model_used);
                             }
-                            if !model_review.summary.trim().is_empty()
-                                && summary_parts.iter().map(String::len).sum::<usize>()
-                                    < MAX_STREAMED_SUMMARY_BYTES
-                            {
-                                summary_parts.push(model_review.summary);
-                            }
                             for finding in &mut model_review.findings {
                                 if finding.end_line.is_some_and(|end| {
                                     !diff::review_batch_contains_range(
@@ -1912,14 +1927,6 @@ async fn review_diff_at(
                     let raw_findings = deduplicated;
                     let grounded_candidate_count = raw_findings.len();
                     let outcome = filter::apply(cfg, &index, raw_findings)?;
-                    let all_suppressed_as_misanchored = !outcome.suppressed_findings.is_empty()
-                        && outcome.suppressed_findings.iter().all(|entry| {
-                            matches!(
-                                entry.reason,
-                                crate::envelope::SuppressionReason::AnchorMismatch
-                                    | crate::envelope::SuppressionReason::DerivedFromSuppressed
-                            )
-                        });
                     suppressed = outcome.suppressed;
                     suppressed_findings = outcome.suppressed_findings;
                     ungrounded = outcome.ungrounded + batch_ungrounded;
@@ -1930,28 +1937,6 @@ async fn review_diff_at(
                             "model reported {} finding(s), none grounded in the diff",
                             ungrounded
                         ))];
-                    } else if outcome.kept.is_empty()
-                        && !summary_parts.is_empty()
-                        && !all_suppressed_as_misanchored
-                    {
-                        // Risk narrated in prose while NO finding survives to the
-                        // gate. Passing this as clean is the predecessor product's
-                        // worst failure mode; fail closed instead and carry the
-                        // narration into the finding so it is not lost.
-                        //
-                        // Keyed on the POST-FILTER kept set, not raw_findings: the
-                        // hole this closes is a model that returns findings which are
-                        // all removed by min_confidence/severity/ignore suppression
-                        // (so raw_findings != 0) while the summary still narrates
-                        // risk. That previously slipped through silently. The
-                        // all_ungrounded case is handled above, so this branch only
-                        // fires for the genuinely-empty-after-policy case. A claim
-                        // rejected because its own named constructs contradict its
-                        // anchor cannot be restored as an operational error through
-                        // the prose summary that accompanied the same claim.
-                        findings = vec![crate::envelope::narrated_risk_finding(
-                            &summary_parts.join("\n\n"),
-                        )];
                     } else {
                         // Bounded mode reviews deterministic direct evidence and
                         // lossy synthesis, not every source batch. Reconciliation
@@ -1965,7 +1950,6 @@ async fn review_diff_at(
                         } else {
                             filter::ReviewTrust::Exhaustive
                         };
-                        summary = summary_parts.join("\n\n");
                         let mut kept = outcome.kept;
                         if !kept.is_empty() && cfg.scorer_enabled() {
                             let scorer_system = prompt::scorer_system_prompt(cfg, current_utc_date);
@@ -2166,6 +2150,11 @@ async fn review_diff_at(
         }
     });
     let silent = findings.is_empty();
+    // Raw summaries are validated for agreement with raw structured output,
+    // then discarded. Presentation is derived from the final reconciled set so
+    // suppressed, deduplicated, truncated, or resolved findings cannot leave
+    // stale risk prose behind.
+    let summary = summary_from_findings(&findings);
     let mut counts = Envelope::counts_of(&findings, suppressed);
     counts.ungrounded = ungrounded;
     let buckets = Envelope::buckets_of(&findings);
@@ -2176,7 +2165,7 @@ async fn review_diff_at(
 
     Ok(Envelope {
         version: 1,
-        summary: if silent { String::new() } else { summary },
+        summary,
         silent,
         findings,
         suppressed_findings,
@@ -2841,6 +2830,67 @@ mod tests {
             evidence: None,
             id: None,
         }
+    }
+
+    #[test]
+    fn summaries_neutralize_malformed_historical_titles() {
+        let malformed = finding_with_title(
+            "src/lib.rs",
+            1,
+            "Unsafe title\n# forged heading",
+            "Complete historical finding body.",
+        );
+
+        let summary = summary_from_findings(&[malformed]);
+
+        assert!(!summary.contains('\n'));
+        assert!(!summary.contains('#'));
+        assert_eq!(summary, "Unsafe title forged heading.");
+    }
+
+    #[test]
+    fn summaries_preserve_terminal_title_punctuation() {
+        for (title, expected) in [
+            (
+                "Could this bypass authentication?",
+                "Could this bypass authentication?",
+            ),
+            ("Stop unsafe publication!", "Stop unsafe publication!"),
+            ("認証を確認する？", "認証を確認する？"),
+        ] {
+            let finding =
+                finding_with_title("src/lib.rs", 1, title, "Complete historical finding body.");
+            assert_eq!(summary_from_findings(&[finding]), expected);
+        }
+    }
+
+    #[test]
+    fn summaries_compose_multiple_titles_as_sentences() {
+        let findings = vec![
+            finding_with_title(
+                "src/first.rs",
+                1,
+                "Could this bypass authentication?",
+                "Complete first finding body.",
+            ),
+            finding_with_title(
+                "src/second.rs",
+                2,
+                "Stop unsafe publication!",
+                "Complete second finding body.",
+            ),
+            finding_with_title(
+                "src/third.rs",
+                3,
+                "Plain title",
+                "Complete third finding body.",
+            ),
+        ];
+
+        assert_eq!(
+            summary_from_findings(&findings),
+            "Could this bypass authentication? Stop unsafe publication! Plain title."
+        );
     }
 
     fn expected_finding_id(finding: &Finding, head_sha: &str, _duplicate_index: usize) -> String {

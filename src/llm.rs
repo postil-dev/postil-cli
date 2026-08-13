@@ -1523,19 +1523,31 @@ impl LlmClient {
                 0.1,
                 LlmPhase::Review,
             );
-            let (required, limit) =
-                self.review_request_context_usage(model, &body, retry_max_tokens)?;
-            if required <= limit {
+            let input_bytes = serde_json::to_vec(&body)
+                .context("serializing bounded review correction")?
+                .len();
+            let required = input_bytes
+                .checked_add(retry_max_tokens as usize)
+                .context("bounded review correction context accounting overflowed")?;
+            let context_limit = conservative_context_tokens(model);
+            let request_excess = input_bytes.saturating_sub(MAX_PROVIDER_REQUEST_BYTES);
+            let context_excess = required.saturating_sub(context_limit);
+            if request_excess == 0 && context_excess == 0 {
                 return Ok(retry_user);
             }
 
-            let excess = required.saturating_sub(limit).max(1);
+            let excess = request_excess.max(context_excess).max(1);
             if previous_limit > 0 {
                 previous_limit = previous_limit.saturating_sub(excess.min(previous_limit));
             } else if reason_limit > 0 {
                 reason_limit = reason_limit.saturating_sub(excess.min(reason_limit));
             } else {
-                return Err(ReviewContextExceeded { required, limit }.into());
+                return Err(ReviewContextExceeded {
+                    required,
+                    limit: context_limit
+                        .min(MAX_PROVIDER_REQUEST_BYTES.saturating_add(retry_max_tokens as usize)),
+                }
+                .into());
             }
         }
     }
@@ -5633,6 +5645,57 @@ mod tests {
         );
         assert!(
             schema.matches('\0').count() < MAX_REVIEW_RETRY_PREVIOUS_BYTES + REPAIR_ERROR_MAX_BYTES
+        );
+    }
+
+    #[test]
+    fn bounded_review_corrections_honor_the_serialized_request_cap() {
+        let config = Config {
+            model: "openai/gpt-5-mini".into(),
+            ..Config::default()
+        };
+        let client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        let user = "\0".repeat(crate::review::MAX_REVIEW_BATCH_BYTES / 6);
+        let previous = "\0".repeat(MAX_REVIEW_RETRY_PREVIOUS_BYTES);
+        let reason = "\0".repeat(MAX_REVIEW_RETRY_REASON_BYTES);
+        let validation = client
+            .bounded_validation_retry_user(
+                &config.model,
+                "system",
+                &user,
+                &previous,
+                &reason,
+                REVIEW_MAX_TOKENS,
+            )
+            .unwrap();
+        let body = client.request_body(
+            &config.model,
+            "system",
+            &validation,
+            REVIEW_MAX_OUTPUT_TOKENS,
+            0.1,
+            LlmPhase::Review,
+        );
+        let input_bytes = serde_json::to_vec(&body).unwrap().len();
+        let (required, context_limit) = client
+            .review_request_context_usage(&config.model, &body, REVIEW_MAX_OUTPUT_TOKENS)
+            .unwrap();
+
+        assert!(input_bytes <= MAX_PROVIDER_REQUEST_BYTES);
+        assert!(required <= context_limit);
+        assert!(validation.starts_with(&user));
+        assert!(
+            validation.matches('\0').count()
+                < user.matches('\0').count()
+                    + MAX_REVIEW_RETRY_PREVIOUS_BYTES
+                    + MAX_REVIEW_RETRY_REASON_BYTES
         );
     }
 

@@ -30,6 +30,10 @@ fn llm_content(findings: Value) -> Value {
     } else {
         "SQL injection risk in auth path."
     };
+    llm_content_with_summary(summary, findings)
+}
+
+fn llm_content_with_summary(summary: &str, findings: Value) -> Value {
     json!({
         "choices": [{"finish_reason": "stop", "message": {"content": json!({
             "summary": summary,
@@ -37,6 +41,42 @@ fn llm_content(findings: Value) -> Value {
         }).to_string()}}],
         "usage": {"prompt_tokens": 100, "completion_tokens": 50, "cost": 0.000123}
     })
+}
+
+fn terminal_deny_finding() -> Value {
+    json!({
+        "path": "ansible/playbooks/cloudstack-tenant-roles.yml",
+        "line": 92,
+        "severity": "warn",
+        "kind": "uncertainty",
+        "confidence": 0.72,
+        "title": "Terminal `deny *` is ensured to exist but not verified as last rule",
+        "body": "Each role must end in `deny *`, but this task only sets `state: present`; a later rule could still follow it.",
+        "evidence": "    state: present"
+    })
+}
+
+fn write_terminal_deny_diff(directory: &std::path::Path) -> std::path::PathBuf {
+    let diff = directory.join("cloudstack-tenant-roles.diff");
+    std::fs::write(
+        &diff,
+        concat!(
+            "diff --git a/ansible/playbooks/cloudstack-tenant-roles.yml b/ansible/playbooks/cloudstack-tenant-roles.yml\n",
+            "--- a/ansible/playbooks/cloudstack-tenant-roles.yml\n",
+            "+++ b/ansible/playbooks/cloudstack-tenant-roles.yml\n",
+            "@@ -8,3 +8,3 @@ permissions:\n",
+            "     - name: terminal rule\n",
+            "-      permission: allow *\n",
+            "+      permission: deny *\n",
+            "       description: reject every unlisted API\n",
+            "@@ -91,2 +91,2 @@\n",
+            "   ansible.builtin.cloudstack_role_permission:\n",
+            "-    state: absent\n",
+            "+    state: present\n",
+        ),
+    )
+    .unwrap();
+    diff
 }
 
 fn is_synthesis_review_request(request: &Request) -> bool {
@@ -1808,13 +1848,12 @@ fn qualification_candidate_admits_fixture_51_shape_at_fireworks_price_bounds() {
         .success();
     let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     assert_eq!(envelope["reviewCoverage"]["mode"], "bounded");
-    assert_eq!(envelope["reviewAdmission"]["providerAttempts"], 3);
-    // One direct source request, one semantic synthesis request, and the
-    // maximum scorer response. Review preflight reserves the doubled retry
-    // ceiling used by runtime for each generator request.
+    assert_eq!(envelope["reviewAdmission"]["providerAttempts"], 4);
+    // Three generator requests use their phase-specific output ceilings, and
+    // the scorer reserves its maximum response.
     assert_eq!(
         envelope["reviewAdmission"]["outputTokens"],
-        12_000 + 8_000 + 3_136
+        16_000 + 16_000 + 4_000 + 3_136
     );
     assert!(
         envelope["reviewAdmission"]["serializedInputBytes"]
@@ -2344,6 +2383,34 @@ async fn inconsistent_ignored_header_paths_fail_before_provider_contact() {
 
     let stderr = String::from_utf8_lossy(&out.get_output().stderr);
     assert!(stderr.contains("diff header and file path markers disagree"));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn unverifiable_git_binary_patch_fails_before_provider_contact() {
+    let server = MockServer::start().await;
+    mock_review(&server, json!([])).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = dir.path().join("binary.diff");
+    std::fs::write(
+        &diff,
+        "diff --git a/image.bin b/image.bin\nGIT binary patch\nliteral 0\nHcmV?d00001\n\n",
+    )
+    .unwrap();
+
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .code(2);
+
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(stderr.contains("unverifiable binary patch body"));
     assert!(server.received_requests().await.unwrap().is_empty());
 }
 
@@ -4526,24 +4593,19 @@ async fn hidden_atomic_attribution_never_expands_an_empty_length_retry() {
         .and(body_string_contains("provider/scorer"))
         .respond_with(SequentialReviewResponder {
             calls: calls.clone(),
-            responses: Arc::new(vec![
-                json!({
-                    "model": "provider/scorer",
-                    "provider": "test-provider",
-                    "choices": [{
-                        "finish_reason": "length",
-                        "message": {"content": null, "reasoning": "budget exhausted"}
-                    }],
-                    "usage": {
-                        "prompt_tokens": 30,
-                        "completion_tokens": 180,
-                        "cost": 0.000045
-                    }
-                }),
-                attribution_text(
-                    "{\"sameDefect\":true,\"reason\":\"Both describe a retry that bypasses idempotency.\"}",
-                ),
-            ]),
+            responses: Arc::new(vec![json!({
+                "model": "provider/scorer",
+                "provider": "test-provider",
+                "choices": [{
+                    "finish_reason": "length",
+                    "message": {"content": null, "reasoning": "budget exhausted"}
+                }],
+                "usage": {
+                    "prompt_tokens": 30,
+                    "completion_tokens": 180,
+                    "cost": 0.000045
+                }
+            })]),
         })
         .mount(&server)
         .await;
@@ -4567,15 +4629,17 @@ async fn hidden_atomic_attribution_never_expands_an_empty_length_retry() {
         .assert()
         .failure()
         .stderr(
-            predicates::str::contains("atomic attribution usage accounting is incomplete").and(
-                predicates::str::contains(
-                    "postil:atomic-attribution-terminal:v1:{\"category\":\"usage-accounting-incomplete\"",
-                ),
-            ),
+            predicates::str::contains(
+                "postil:atomic-attribution-terminal:v1:{\"category\":\"output-nonterminal-length\"",
+            )
+            .and(predicates::str::contains("\"providerAttemptCount\":1"))
+            .and(predicates::str::contains(
+                "\"usageAccountingComplete\":true",
+            )),
         );
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
     let requests = server.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 1);
     for request in requests {
         let body: Value = serde_json::from_slice(&request.body).unwrap();
         assert_eq!(body["max_tokens"], 180);
@@ -6164,7 +6228,10 @@ async fn local_review_writes_csv_output_file_with_multiple_escaped_findings() {
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0]["version"], "1");
     assert_eq!(rows[0]["silent"], "false");
-    assert_eq!(rows[0]["summary"], "SQL injection risk in auth path.");
+    assert_eq!(
+        rows[0]["summary"],
+        "Comma, quote \"and\" newline in title. Second finding."
+    );
     assert_eq!(rows[0]["path"], "src/auth.rs");
     assert_eq!(rows[0]["line"], "41");
     assert_eq!(rows[0]["endLine"], "");
@@ -7152,13 +7219,7 @@ async fn narrated_risk_retry_recovers_structured_finding() {
 }
 
 #[tokio::test]
-async fn low_confidence_only_finding_with_risk_summary_fails_closed() {
-    // M1 regression: the model returns one grounded finding below minConfidence
-    // (suppressed) WHILE its summary narrates risk. Policy emptying the kept set
-    // must not let a risk-narrating run pass silently. The narrated-risk guard
-    // keys on the post-filter kept set, so this fails closed with the narration
-    // preserved (the same hole, reached through the suppression door instead of
-    // the empty-findings door).
+async fn low_confidence_only_finding_and_its_summary_are_suppressed_together() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
@@ -7181,67 +7242,33 @@ async fn low_confidence_only_finding_with_risk_summary_fails_closed() {
         .arg(&diff)
         .arg("--output-json")
         .assert()
-        .code(1); // fails closed, not a silent pass
+        .success();
     let env: Value =
         serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
-    assert_eq!(env["silent"], false);
-    assert_eq!(env["gate"]["failing"], true);
-    assert_eq!(env["findings"][0]["path"], ".postil/model-output");
-    assert_eq!(
-        env["findings"][0]["title"],
-        "Model narrated risk without structured findings"
-    );
-    // The suppressed finding still counts as suppressed, and the narrated
-    // concern is preserved rather than blanked.
+    assert_eq!(env["silent"], true);
+    assert_eq!(env["summary"], "");
+    assert_eq!(env["gate"]["failing"], false);
+    assert!(env["findings"].as_array().unwrap().is_empty());
     assert_eq!(env["counts"]["suppressed"], 1);
-    assert!(
-        env["findings"][0]["body"]
-            .as_str()
-            .unwrap()
-            .contains("SQL injection risk in auth path.")
-    );
 }
 
 #[tokio::test]
 async fn misanchored_finding_does_not_turn_its_stale_summary_into_an_operational_error() {
     let server = MockServer::start().await;
-    let finding = json!({
-        "path": "ansible/playbooks/cloudstack-tenant-roles.yml",
-        "line": 92,
-        "severity": "warn",
-        "kind": "uncertainty",
-        "confidence": 0.72,
-        "title": "Terminal `deny *` is ensured to exist but not verified as last rule",
-        "body": "Each role must end in `deny *`, but this task only sets `state: present`; a later rule could still follow it.",
-        "evidence": "    state: present"
-    });
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([finding]))))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(llm_content_with_summary(
+                "The terminal deny rule may not remain last.",
+                json!([terminal_deny_finding()]),
+            )),
+        )
         .expect(1)
         .mount(&server)
         .await;
 
     let dir = tempfile::tempdir().unwrap();
-    let diff = dir.path().join("cloudstack-tenant-roles.diff");
-    std::fs::write(
-        &diff,
-        concat!(
-            "diff --git a/ansible/playbooks/cloudstack-tenant-roles.yml b/ansible/playbooks/cloudstack-tenant-roles.yml\n",
-            "--- a/ansible/playbooks/cloudstack-tenant-roles.yml\n",
-            "+++ b/ansible/playbooks/cloudstack-tenant-roles.yml\n",
-            "@@ -8,3 +8,3 @@ permissions:\n",
-            "     - name: terminal rule\n",
-            "-      permission: allow *\n",
-            "+      permission: deny *\n",
-            "       description: reject every unlisted API\n",
-            "@@ -91,2 +91,2 @@\n",
-            "   ansible.builtin.cloudstack_role_permission:\n",
-            "-    state: absent\n",
-            "+    state: present\n",
-        ),
-    )
-    .unwrap();
+    let diff = write_terminal_deny_diff(dir.path());
 
     let out = postil()
         .current_dir(dir.path())
@@ -7265,6 +7292,89 @@ async fn misanchored_finding_does_not_turn_its_stale_summary_into_an_operational
         envelope["suppressedFindings"][0]["finding"]["path"],
         ".postil/model-output"
     );
+}
+
+#[tokio::test]
+async fn unstructured_summary_does_not_resurrect_a_rejected_finding() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(llm_content_with_summary(
+                "SQL injection risk in an authentication query.",
+                json!([terminal_deny_finding()]),
+            )),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_terminal_deny_diff(dir.path());
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .success();
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+
+    assert!(envelope["findings"].as_array().unwrap().is_empty());
+    assert_eq!(envelope["summary"], "");
+    assert_eq!(envelope["gate"]["failing"], false);
+    assert_eq!(envelope["counts"]["suppressed"], 1);
+    assert_eq!(
+        envelope["suppressedFindings"][0]["reason"],
+        "anchorMismatch"
+    );
+}
+
+#[tokio::test]
+async fn mixed_kept_and_rejected_findings_derive_summary_from_the_kept_set() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(llm_content_with_summary(
+                "The terminal deny rule may not remain last.",
+                json!([finding_at(41, "warn", 0.9), terminal_deny_finding()]),
+            )),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let terminal_diff = std::fs::read_to_string(write_terminal_deny_diff(dir.path())).unwrap();
+    let diff = dir.path().join("mixed.diff");
+    std::fs::write(&diff, format!("{DIFF}{terminal_diff}")).unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--output-json")
+        .assert()
+        .success();
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+
+    assert_eq!(envelope["findings"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        envelope["findings"][0]["title"],
+        "Unsanitized input reaches query"
+    );
+    assert_eq!(envelope["summary"], "Unsanitized input reaches query.");
+    assert!(
+        !envelope["summary"]
+            .as_str()
+            .unwrap()
+            .contains("terminal deny")
+    );
+    assert_eq!(envelope["counts"]["suppressed"], 1);
 }
 
 #[tokio::test]

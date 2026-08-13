@@ -3602,24 +3602,32 @@ fn parse_git_extended_path(value: &str) -> Option<String> {
 fn parse_binary_marker_path_candidates(
     line: &str,
 ) -> Option<Vec<(DiffMarkerPath, DiffMarkerPath)>> {
+    fn parse_side(value: &str, prefix: &str) -> Option<DiffMarkerPath> {
+        if value.starts_with('"') {
+            let (decoded, trailing) = parse_git_path_token(value)?;
+            trailing.trim().is_empty().then_some(())?;
+            canonical_side_path(&decoded, prefix)
+        } else {
+            canonical_side_path(value, prefix)
+        }
+    }
+
     let inner = line
         .strip_prefix("Binary files ")?
         .strip_suffix(" differ")?;
     if inner.starts_with('"') {
         let (old, remainder) = parse_git_path_token(inner)?;
-        let (new, trailing) = parse_git_path_token(remainder.strip_prefix(" and ")?)?;
-        trailing.trim().is_empty().then_some(())?;
         return Some(vec![(
             canonical_side_path(&old, "a/")?,
-            canonical_side_path(&new, "b/")?,
+            parse_side(remainder.strip_prefix(" and ")?, "b/")?,
         )]);
     }
     let candidates = inner
         .match_indices(" and ")
         .filter_map(|(index, separator)| {
             Some((
-                canonical_side_path(&inner[..index], "a/")?,
-                canonical_side_path(&inner[index + separator.len()..], "b/")?,
+                parse_side(&inner[..index], "a/")?,
+                parse_side(&inner[index + separator.len()..], "b/")?,
             ))
         })
         .collect::<Vec<_>>();
@@ -3657,6 +3665,15 @@ fn consume_diff_hunk_line(line: &str, old_left: &mut u32, new_left: &mut u32) ->
     true
 }
 
+fn valid_similarity_percentage(value: &str) -> bool {
+    let Some(number) = value.strip_suffix('%') else {
+        return false;
+    };
+    number
+        .parse::<u8>()
+        .is_ok_and(|parsed| parsed <= 100 && parsed.to_string() == number)
+}
+
 fn validated_section_paths(section: &str) -> Result<SectionPaths> {
     section_paths(section, true)
 }
@@ -3682,15 +3699,20 @@ fn section_paths(section: &str, require_complete_hunks: bool) -> Result<SectionP
     let mut saw_hunk = false;
     let mut old_left = 0;
     let mut new_left = 0;
+    let mut no_newline_marker_allowed = false;
+    let mut similarity_metadata_seen = false;
 
-    while let Some(line) = lines.next() {
+    for line in lines {
         if consume_diff_hunk_line(line, &mut old_left, &mut new_left) {
+            no_newline_marker_allowed = true;
             continue;
         }
+        if line == "\\ No newline at end of file" && no_newline_marker_allowed {
+            no_newline_marker_allowed = false;
+            continue;
+        }
+        no_newline_marker_allowed = false;
         if old_left != 0 || new_left != 0 {
-            if line == "\\ No newline at end of file" {
-                continue;
-            }
             if !require_complete_hunks {
                 break;
             }
@@ -3701,11 +3723,11 @@ fn section_paths(section: &str, require_complete_hunks: bool) -> Result<SectionP
                 !saw_hunk,
                 "diff section mixes text hunks with a binary patch"
             );
-            anyhow::ensure!(
-                !lines.any(|remaining| remaining.starts_with("@@")),
-                "diff section mixes a binary patch with text hunks"
-            );
-            saw_change = true;
+            if require_complete_hunks {
+                anyhow::bail!(
+                    "diff section contains an unverifiable binary patch body; use binary path markers"
+                );
+            }
             break;
         }
         if let Some(header) = line.strip_prefix("@@ ") {
@@ -3847,6 +3869,19 @@ fn section_paths(section: &str, require_complete_hunks: bool) -> Result<SectionP
             anyhow::ensure!(explicit_old_mode.is_none(), "diff section repeats old mode");
             explicit_old_mode = Some(validated_git_mode(mode)?.to_string());
             saw_change = true;
+        } else if let Some(value) = line
+            .strip_prefix("similarity index ")
+            .or_else(|| line.strip_prefix("dissimilarity index "))
+        {
+            anyhow::ensure!(
+                !similarity_metadata_seen && valid_similarity_percentage(value),
+                "diff section has invalid similarity metadata"
+            );
+            similarity_metadata_seen = true;
+        } else if require_complete_hunks {
+            anyhow::bail!("diff section has unrecognized content outside a hunk");
+        } else {
+            break;
         }
     }
 
@@ -3933,6 +3968,19 @@ fn section_paths(section: &str, require_complete_hunks: bool) -> Result<SectionP
         .filter(|paths| matches_metadata(paths))
         .cloned()
         .collect::<Vec<_>>();
+    if old_marker.is_none()
+        && rename_from.is_none()
+        && copy_from.is_none()
+        && binary_paths.is_none()
+    {
+        let same_path = matching
+            .iter()
+            .filter(|paths| paths.old_path == paths.path)
+            .collect::<Vec<_>>();
+        if let [paths] = same_path.as_slice() {
+            return Ok((*paths).clone());
+        }
+    }
     match matching.as_slice() {
         [paths] => Ok(paths.clone()),
         [] if !markers_match => {
@@ -3964,7 +4012,17 @@ fn diff_section_path_resolutions(text: &str) -> Vec<(Option<SectionPaths>, bool)
 fn parse_diff_header_path_candidates(rest: &str) -> Option<Vec<SectionPaths>> {
     if rest.starts_with('"') {
         let (old, remainder) = parse_git_path_token(rest)?;
-        let (new, trailing) = parse_git_path_token(remainder.trim_start())?;
+        remainder
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace)
+            .then_some(())?;
+        let remainder = remainder.trim_start();
+        let (new, trailing) = if remainder.starts_with('"') {
+            parse_git_path_token(remainder)?
+        } else {
+            (remainder.to_string(), "")
+        };
         trailing.trim().is_empty().then_some(())?;
         let old = old.strip_prefix("a/")?;
         let new = new.strip_prefix("b/")?;
@@ -3975,7 +4033,7 @@ fn parse_diff_header_path_candidates(rest: &str) -> Option<Vec<SectionPaths>> {
             }]
         });
     }
-    let candidates = rest
+    let mut candidates = rest
         .match_indices(" b/")
         .filter_map(|(index, _)| {
             let old = rest[..index].strip_prefix("a/")?;
@@ -3986,6 +4044,17 @@ fn parse_diff_header_path_candidates(rest: &str) -> Option<Vec<SectionPaths>> {
             })
         })
         .collect::<Vec<_>>();
+    candidates.extend(rest.match_indices(" \"b/").filter_map(|(index, _)| {
+        let old = rest[..index].strip_prefix("a/")?;
+        let (new, trailing) = parse_git_path_token(&rest[index + 1..])?;
+        let new = new.strip_prefix("b/")?;
+        (trailing.trim().is_empty() && valid_diff_path(old) && valid_diff_path(new)).then(|| {
+            SectionPaths {
+                old_path: old.to_string(),
+                path: new.to_string(),
+            }
+        })
+    }));
     (!candidates.is_empty()).then_some(candidates)
 }
 
@@ -4832,6 +4901,18 @@ const HUNK_OVERLAP_LINES: usize = 6;
 const LINE_CHUNK_BYTES: usize = 16_000;
 const LINE_CHUNK_OVERLAP: usize = 256;
 
+fn json_string_content_bytes(value: &str) -> usize {
+    value.chars().map(json_string_character_bytes).sum()
+}
+
+fn json_string_character_bytes(character: char) -> usize {
+    match character {
+        '"' | '\\' | '\u{0008}' | '\u{000c}' | '\n' | '\r' | '\t' => 2,
+        '\u{0000}'..='\u{001f}' => 6,
+        _ => character.len_utf8(),
+    }
+}
+
 struct ChangeManifest {
     text: String,
     metadata_count: u32,
@@ -4854,8 +4935,9 @@ pub fn render_review_batches(
         "review batch limit must leave room for context"
     );
     let manifest = build_manifest(diff, lockfiles, compacted_artifacts, max_manifest_bytes);
+    let manifest_bytes = json_string_content_bytes(&manifest.text);
     let mut plan = ReviewBatchPlan {
-        incomplete: manifest.incomplete || manifest.text.len() >= max_bytes,
+        incomplete: manifest.incomplete || manifest_bytes >= max_bytes,
         metadata_count: manifest.metadata_count,
         ..Default::default()
     };
@@ -4871,9 +4953,11 @@ pub fn render_review_batches(
         }
         for hunk in &file.hunks {
             let hunk_identity = HunkIdentity::new(&file.path, hunk);
-            let Some(units) =
-                render_hunk_units(file, hunk, max_bytes.saturating_sub(manifest.text.len()))
-            else {
+            let Some(units) = render_hunk_units(
+                file,
+                hunk,
+                max_bytes.saturating_sub(manifest_bytes).saturating_sub(2),
+            ) else {
                 plan.incomplete = true;
                 return plan;
             };
@@ -4906,8 +4990,15 @@ pub fn render_review_batches(
     if plan.batches.len() > 1 {
         plan.synthesis = build_synthesis(&manifest.text, &plan.batches, max_bytes);
     }
-    plan.projected_input_bytes = plan.batches.iter().map(String::len).sum::<usize>()
-        + plan.synthesis.as_ref().map_or(0, String::len);
+    plan.projected_input_bytes = plan
+        .batches
+        .iter()
+        .map(|batch| json_string_content_bytes(batch))
+        .sum::<usize>()
+        + plan
+            .synthesis
+            .as_ref()
+            .map_or(0, |value| json_string_content_bytes(value));
     plan
 }
 
@@ -4936,9 +5027,8 @@ fn build_manifest(
             "source"
         };
         let entry = format!("- {} [{status}]\n", manifest_path(&file.path));
-        if text
-            .len()
-            .saturating_add(entry.len())
+        if json_string_content_bytes(&text)
+            .saturating_add(json_string_content_bytes(&entry))
             .saturating_add(metadata_bytes)
             > max_bytes
         {
@@ -4968,8 +5058,9 @@ fn build_manifest(
         }
         if !changes.is_empty() {
             let entry = format!("{}: {}", manifest_path(&file.path), changes.join(", "));
-            metadata_bytes = metadata_bytes.saturating_add(entry.len() + 16);
-            if text.len().saturating_add(metadata_bytes) > max_bytes {
+            metadata_bytes =
+                metadata_bytes.saturating_add(json_string_content_bytes(&entry).saturating_add(16));
+            if json_string_content_bytes(&text).saturating_add(metadata_bytes) > max_bytes {
                 return ChangeManifest {
                     text,
                     metadata_count: 0,
@@ -4981,9 +5072,8 @@ fn build_manifest(
     }
     for lockfile in lockfiles {
         let manifest_entry = format!("- {} [lockfile summary]\n", manifest_path(&lockfile.path));
-        if text
-            .len()
-            .saturating_add(manifest_entry.len())
+        if json_string_content_bytes(&text)
+            .saturating_add(json_string_content_bytes(&manifest_entry))
             .saturating_add(metadata_bytes)
             > max_bytes
         {
@@ -5001,8 +5091,9 @@ fn build_manifest(
             lockfile.removed,
             lockfile.changes.join("; ")
         );
-        metadata_bytes = metadata_bytes.saturating_add(entry.len() + 16);
-        if text.len().saturating_add(metadata_bytes) > max_bytes {
+        metadata_bytes =
+            metadata_bytes.saturating_add(json_string_content_bytes(&entry).saturating_add(16));
+        if json_string_content_bytes(&text).saturating_add(metadata_bytes) > max_bytes {
             return ChangeManifest {
                 text,
                 metadata_count: 0,
@@ -5017,9 +5108,8 @@ fn build_manifest(
             manifest_path(&artifact.path),
             artifact.kind,
         );
-        if text
-            .len()
-            .saturating_add(manifest_entry.len())
+        if json_string_content_bytes(&text)
+            .saturating_add(json_string_content_bytes(&manifest_entry))
             .saturating_add(metadata_bytes)
             > max_bytes
         {
@@ -5038,8 +5128,9 @@ fn build_manifest(
             artifact.removed,
             artifact.bytes,
         );
-        metadata_bytes = metadata_bytes.saturating_add(entry.len() + 16);
-        if text.len().saturating_add(metadata_bytes) > max_bytes {
+        metadata_bytes =
+            metadata_bytes.saturating_add(json_string_content_bytes(&entry).saturating_add(16));
+        if json_string_content_bytes(&text).saturating_add(metadata_bytes) > max_bytes {
             return ChangeManifest {
                 text,
                 metadata_count: 0,
@@ -5059,7 +5150,7 @@ fn build_manifest(
         }
     }
     ChangeManifest {
-        incomplete: text.len() > max_bytes,
+        incomplete: json_string_content_bytes(&text) > max_bytes,
         text,
         metadata_count,
     }
@@ -5079,10 +5170,11 @@ fn render_hunk_units(file: &FileDiff, hunk: &Hunk, budget: usize) -> Option<Vec<
     } else {
         format!("### {}\n", display_path(&file.path))
     };
-    let header_reserve = file_header.len() + 80;
+    let header_reserve = json_string_content_bytes(&file_header) + 80;
     let segment_budget = budget.saturating_sub(header_reserve).max(1024);
     let mut units = Vec::new();
     let mut segment = String::new();
+    let mut segment_bytes = 0usize;
     let mut overlap: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     let mut old_line = hunk.old_start;
     let mut new_line = hunk.new_start;
@@ -5090,22 +5182,30 @@ fn render_hunk_units(file: &FileDiff, hunk: &Hunk, budget: usize) -> Option<Vec<
 
     for raw in &hunk.lines {
         let (marker, content) = raw.split_at(if raw.is_empty() { 0 } else { 1 });
-        let rendered = render_line_segments(marker, content, old_line, new_line);
+        let rendered =
+            render_line_segments_with_budget(marker, content, old_line, new_line, segment_budget);
         for rendered_line in rendered {
-            if !segment.is_empty() && segment.len() + rendered_line.len() > segment_budget {
+            let rendered_bytes = json_string_content_bytes(&rendered_line);
+            if rendered_bytes > segment_budget {
+                return None;
+            }
+            if !segment.is_empty() && segment_bytes + rendered_bytes > segment_budget {
                 units.push(format!(
                     "{file_header}@@ segment starting near new line {segment_start} @@\n{segment}"
                 ));
                 segment = overlap.iter().cloned().collect();
-                while segment.len() + rendered_line.len() > segment_budget {
+                segment_bytes = json_string_content_bytes(&segment);
+                while segment_bytes + rendered_bytes > segment_budget {
                     if overlap.pop_front().is_none() {
                         break;
                     }
                     segment = overlap.iter().cloned().collect();
+                    segment_bytes = json_string_content_bytes(&segment);
                 }
                 segment_start = new_line;
             }
             segment.push_str(&rendered_line);
+            segment_bytes = segment_bytes.saturating_add(rendered_bytes);
             overlap.push_back(rendered_line);
             while overlap.len() > HUNK_OVERLAP_LINES {
                 overlap.pop_front();
@@ -5129,22 +5229,45 @@ fn render_hunk_units(file: &FileDiff, hunk: &Hunk, budget: usize) -> Option<Vec<
 }
 
 fn render_line_segments(marker: &str, content: &str, old_line: u32, new_line: u32) -> Vec<String> {
+    render_line_segments_with_budget(marker, content, old_line, new_line, LINE_CHUNK_BYTES + 80)
+}
+
+fn render_line_segments_with_budget(
+    marker: &str,
+    content: &str,
+    old_line: u32,
+    new_line: u32,
+    max_rendered_bytes: usize,
+) -> Vec<String> {
     let prefix = match marker {
         "+" => format!("{new_line:>6} + "),
         "-" => format!("old {old_line:>6} - "),
         _ => format!("{new_line:>6}   "),
     };
-    if content.len() <= LINE_CHUNK_BYTES {
-        return vec![format!("{prefix}{content}\n")];
+    let whole = format!("{prefix}{content}\n");
+    if json_string_content_bytes(content) <= LINE_CHUNK_BYTES
+        && json_string_content_bytes(&whole) <= max_rendered_bytes
+    {
+        return vec![whole];
     }
-    let step = LINE_CHUNK_BYTES.saturating_sub(LINE_CHUNK_OVERLAP).max(1);
-    let projected_chunks = content.len().saturating_sub(1) / step + 1;
-    let mut rendered = Vec::with_capacity(projected_chunks);
+    let wrapper_bytes = json_string_content_bytes(&format!(
+        "{prefix}[columns {}..{}] \n",
+        usize::MAX,
+        usize::MAX
+    ));
+    let content_budget = LINE_CHUNK_BYTES.min(max_rendered_bytes.saturating_sub(wrapper_bytes));
+    let mut rendered = Vec::new();
     let mut start = 0;
     while start < content.len() {
-        let mut end = (start + LINE_CHUNK_BYTES).min(content.len());
-        while end > start && !content.is_char_boundary(end) {
-            end -= 1;
+        let mut end = start;
+        let mut escaped_bytes = 0usize;
+        for (offset, character) in content[start..].char_indices() {
+            let character_bytes = json_string_character_bytes(character);
+            if escaped_bytes > 0 && escaped_bytes + character_bytes > content_budget {
+                break;
+            }
+            escaped_bytes += character_bytes;
+            end = start + offset + character.len_utf8();
         }
         rendered.push(format!(
             "{prefix}[columns {start}..{end}] {}\n",
@@ -5153,7 +5276,11 @@ fn render_line_segments(marker: &str, content: &str, old_line: u32, new_line: u3
         if end == content.len() {
             break;
         }
-        let mut next = end.saturating_sub(LINE_CHUNK_OVERLAP);
+        let mut next = if end.saturating_sub(start) > LINE_CHUNK_OVERLAP {
+            end - LINE_CHUNK_OVERLAP
+        } else {
+            end
+        };
         while next < end && !content.is_char_boundary(next) {
             next += 1;
         }
@@ -5171,18 +5298,17 @@ fn append_unit(
     hunk: &HunkIdentity,
     max_bytes: usize,
 ) -> bool {
-    if manifest.len() + unit.len() > max_bytes {
+    let initial = format!("{manifest}\n");
+    if json_string_content_bytes(&initial) + json_string_content_bytes(unit) > max_bytes {
         return false;
     }
     if current.is_empty() {
-        current.push_str(manifest);
-        current.push('\n');
+        current.push_str(&initial);
     }
-    if current.len() + unit.len() > max_bytes {
+    if json_string_content_bytes(current) + json_string_content_bytes(unit) > max_bytes {
         plan.batches.push(std::mem::take(current));
         plan.batch_hunks.push(std::mem::take(current_hunks));
-        current.push_str(manifest);
-        current.push('\n');
+        current.push_str(&initial);
     }
     current.push_str(unit);
     current_hunks.insert(hunk.clone());
@@ -5197,10 +5323,9 @@ fn build_synthesis(manifest: &str, batches: &[String], max_bytes: usize) -> Opti
             return None;
         }
         let heading = format!("\nBatch {} semantic digest:\n", index + 1);
-        if synthesis
-            .len()
-            .saturating_add(heading.len())
-            .saturating_add(digest.len())
+        if json_string_content_bytes(&synthesis)
+            .saturating_add(json_string_content_bytes(&heading))
+            .saturating_add(json_string_content_bytes(&digest))
             > max_bytes
         {
             return None;
@@ -5960,10 +6085,66 @@ Binary files a/img.png and b/img.png differ
     }
 
     #[test]
+    fn strict_raw_headers_resolve_an_unquoted_old_path_and_quoted_new_path() {
+        let source = concat!(
+            "diff --git a/plain.rs \"b/tab\\tname.rs\"\n",
+            "similarity index 100%\n",
+            "rename from plain.rs\n",
+            "rename to \"tab\\tname.rs\"\n",
+        );
+
+        let paths = validated_section_paths(source).unwrap();
+        assert_eq!(paths.old_path, "plain.rs");
+        assert_eq!(paths.path, "tab\tname.rs");
+        assert!(parse(source).complete);
+    }
+
+    #[test]
+    fn strict_raw_headers_resolve_a_quoted_old_path_and_unquoted_new_path() {
+        let source = concat!(
+            "diff --git \"a/tab\\told.rs\" b/new name.rs\n",
+            "similarity index 100%\n",
+            "rename from \"tab\\told.rs\"\n",
+            "rename to new name.rs\n",
+        );
+
+        let paths = validated_section_paths(source).unwrap();
+        assert_eq!(paths.old_path, "tab\told.rs");
+        assert_eq!(paths.path, "new name.rs");
+        assert!(parse(source).complete);
+    }
+
+    #[test]
+    fn strict_raw_headers_reject_missing_path_separators() {
+        let source = concat!(
+            "diff --git \"a/tab\\told.rs\"b/new name.rs\n",
+            "similarity index 100%\n",
+            "rename from \"tab\\told.rs\"\n",
+            "rename to new name.rs\n",
+        );
+
+        assert!(validated_section_paths(source).is_err());
+        assert!(!parse(source).complete);
+    }
+
+    #[test]
+    fn mode_only_change_resolves_an_unquoted_same_path_containing_b_slash() {
+        let source =
+            "diff --git a/dir b/file.rs b/dir b/file.rs\nold mode 100644\nnew mode 100755\n";
+
+        let paths = validated_section_paths(source).unwrap();
+        assert_eq!(paths.old_path, "dir b/file.rs");
+        assert_eq!(paths.path, "dir b/file.rs");
+        assert!(parse(source).complete);
+        assert!(!prepare_diff(source).incomplete);
+    }
+
+    #[test]
     fn additions_and_deletions_match_their_canonical_header_identity() {
         for source in [
             "diff --git a/new.rs b/new.rs\nnew file mode 100644\n--- /dev/null\n+++ b/new.rs\n@@ -0,0 +1 @@\n+added();\n",
             "diff --git a/old.rs b/old.rs\ndeleted file mode 100644\n--- a/old.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-removed();\n",
+            "diff --git \"a/tab\\timage.bin\" \"b/tab\\timage.bin\"\nnew file mode 100644\nBinary files /dev/null and \"b/tab\\timage.bin\" differ\n",
         ] {
             let paths = validated_section_paths(source).unwrap();
             assert_eq!(paths.old_path, paths.path);
@@ -6014,6 +6195,24 @@ Binary files a/img.png and b/img.png differ
             "diff --git a/src/lib.rs b/src/lib.rs\n@@ -1 +1 @@\n-old();\n+new();\n";
         let snapshot = DiffSnapshot::from_bytes(missing_markers.as_bytes()).unwrap();
         assert!(prepare_review(&snapshot).is_err());
+
+        let unknown_trailer = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old();\n+new();\nUNRECOGNIZED TRAILER\n";
+        assert!(validated_section_paths(unknown_trailer).is_err());
+        assert!(!parse(unknown_trailer).complete);
+
+        let malformed_binary = "diff --git a/image.bin b/image.bin\nGIT binary patch\nliteral 0\nHcmV?d00001\nUNRECOGNIZED TRAILER\n";
+        assert!(validated_section_paths(malformed_binary).is_err());
+        assert!(!parse(malformed_binary).complete);
+
+        let truncated_binary =
+            "diff --git a/image.bin b/image.bin\nGIT binary patch\nliteral 0\nHcmV?d00001\n";
+        assert!(validated_section_paths(truncated_binary).is_err());
+        assert!(!parse(truncated_binary).complete);
+
+        let well_formed_but_unverified_binary =
+            "diff --git a/image.bin b/image.bin\nGIT binary patch\nliteral 0\nHcmV?d00001\n\n";
+        assert!(validated_section_paths(well_formed_but_unverified_binary).is_err());
+        assert!(!parse(well_formed_but_unverified_binary).complete);
     }
 
     #[test]
@@ -6553,6 +6752,55 @@ Binary files a/img.png and b/img.png differ
         assert!(!plan.incomplete);
         assert!(plan.batches.iter().any(|batch| batch.contains(tail)));
         assert!(plan.batches.iter().all(|batch| batch.len() <= 24_000));
+    }
+
+    #[test]
+    fn json_escape_expansion_stays_within_the_hosted_batch_budget() {
+        let source = format!(
+            "diff --git a/src/payload.rs b/src/payload.rs\n--- /dev/null\n+++ b/src/payload.rs\n@@ -0,0 +1 @@\n+const PAYLOAD: &str = \"{}\";\n",
+            "\0".repeat(31 * 1024)
+        );
+        let parsed = parse(&source);
+        let max_bytes = crate::review::MAX_HOSTED_REVIEW_BATCH_BYTES;
+        let plan = render_review_batches(&parsed, &[], &[], max_bytes, 4096);
+
+        assert!(!plan.incomplete);
+        assert!(plan.batches.len() > 1);
+        assert!(
+            plan.batches
+                .iter()
+                .all(|batch| json_string_content_bytes(batch) <= max_bytes)
+        );
+    }
+
+    #[test]
+    fn minimum_budget_escaped_line_chunks_always_advance() {
+        let path = format!(
+            "{}payload.rs",
+            (0..130)
+                .map(|index| format!("part{index:04}/"))
+                .collect::<String>()
+        );
+        let source = format!(
+            "diff --git a/{path} b/{path}\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1 @@\n+{}\n",
+            "\0".repeat(5_000)
+        );
+        let parsed = parse(&source);
+        let plan = render_review_batches(
+            &parsed,
+            &[],
+            &[],
+            MIN_REVIEW_BATCH_BYTES,
+            MIN_REVIEW_BATCH_BYTES / 3,
+        );
+
+        assert!(!plan.incomplete);
+        assert!(plan.batches.len() > 1);
+        assert!(
+            plan.batches
+                .iter()
+                .all(|batch| json_string_content_bytes(batch) <= MIN_REVIEW_BATCH_BYTES)
+        );
     }
 
     #[test]
