@@ -2703,7 +2703,7 @@ async fn ordinary_review_registers_an_authenticated_plan_before_provider_access(
     assert_eq!(registration["version"], 1);
     assert_eq!(registration["concurrency"], 1);
     assert_eq!(registration["requestTimeoutSeconds"], 240);
-    assert_eq!(registration["reviewBudgetSeconds"], 420);
+    assert_eq!(registration["reviewBudgetSeconds"], 360);
     assert_eq!(
         registration["selectedBatches"],
         registration["totalBatches"]
