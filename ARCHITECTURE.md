@@ -9,8 +9,9 @@ behavior; `src/envelope.rs` is the envelope contract shared with the hosted work
 ```
 acquire diff --> parse supported lockfiles --> parse + index --> bounded evidence batches
                                                                     |
-   envelope <-- gate <-- reconcile <-- filter + aggregate <-- model + final synthesis
-                                                               (cascade/consensus)
+   envelope <-- gate <-- reconcile <-- score <-- adjudicate <-- filter + aggregate <-- model
+                                                    |                         (cascade/consensus)
+                                             repository search
       │                  (baseline)   (ground, policy)
       ├─ stdout JSON (--output-json)
       ├─ terminal (stderr)
@@ -22,9 +23,10 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   the model is allowed to cite. Cargo, npm package-lock/shrinkwrap, Yarn v1/Berry,
   pnpm, and Go checksum lockfiles become bounded,
   format-specific added-package-version and removed-package-version metadata;
-  malformed, unsupported, or over-budget lockfile sections fail closed. Every other
-  path remains untrusted reviewable source, including generated,
-  distribution, vendor, snapshot, and dependency-directory names. Source evidence
+  malformed, unsupported, or over-budget lockfile sections fail closed. Ignore patterns
+  remove matching paths before grounding or review planning. Every other path remains
+  untrusted reviewable source, including generated, distribution, vendor, snapshot, and
+  dependency-directory names. Source evidence
   splits at file and hunk boundaries with overlap, repeats a bounded changed-file
   manifest, segments oversized lines without hiding the tail, and records deletion,
   binary, rename, mode, and dependency evidence under `.postil/change-metadata`.
@@ -42,12 +44,13 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   secret-redaction semantics remain shared. Optional private-endpoint authentication is
   a separate header whose name cannot collide with provider-managed headers. A shared
   admission ledger reserves each HTTP attempt, exact serialized JSON request bytes,
-  maximum output,
-  and worst-case token spend before sending any initial, retry, repair, planner,
-  scorer, or mention-response call. Hosted preflight covers every active cascade or
-  consensus model, schema and semantic repair, transport retry, output bound, and
-  admitted-model price bound before the first provider request. Exact serialization
-  includes JSON expansion for quotes, backslashes, and control characters.
+  maximum output, and worst-case token spend before sending it. Hosted preflight
+  covers every active cascade or consensus model, the largest initial or correction
+  request shape, the logical-call ceiling, output bounds, and admitted-model prices
+  before the first provider request. Preflight reserves maximum bounded uncertainty
+  resolution and finding-compression request shapes. Transport retries reserve their
+  exact exposure atomically at runtime. Exact
+  serialization includes JSON expansion for quotes, backslashes, and control characters.
   Every provider HTTP call has a model-usage record with a product role, logical phase,
   operation-wide call ordinal, phase-local attempt, token counts, and exact-cost source.
   OpenRouter's response `usage.cost` is preserved as canonical decimal dollars without
@@ -55,15 +58,22 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   Endpoints that omit cost retain token-only accounting with unavailable provenance.
 - `review.rs`: orchestration; enforces acquisition, model-aware context, request,
   provider-attempt, output-token, and worst-case token-exposure budgets before calls;
-  one UTF-8 byte counts as one projected token rather than using an optimistic ratio;
-  reviews every evidence batch outside hosted inference. A diff that materializes more
-  than 24 source batches enters a deterministic large-review route on every surface,
-  including `--diff-file`: at most 24 requests, at most four concurrent requests, and
-  an exact hunk receipt committed by SHA-256 before provider contact. Security,
+  one UTF-8 byte counts as one projected token rather than using an optimistic ratio.
+  A diff that exceeds its selected-request capacity enters a deterministic large-review
+  route on every surface, including `--diff-file`. Non-hosted execution selects at most
+  24 requests. Hosted execution lowers that ceiling when the configured generator,
+  consensus, scorer, uncertainty-resolution, and finding-compression fan-out needs
+  fewer requests to stay inside the 64-call watchdog plan. The route uses at most four
+  concurrent provider calls; consensus reduces batch concurrency so combined model
+  fan-out stays within that limit. It commits an exact hunk receipt by SHA-256 before provider
+  contact. Security,
   authorization, configuration, policy, billing, migration, release-control, and
-  executable vendor hunks require direct source evidence. Exact-evidence summaries are
-  limited to supported dependency metadata, provenance-bound generated output, and
-  low-risk non-security churn. Missing or invalid receipt coverage fails closed. When
+  executable vendor hunks require direct source evidence. Low-risk hunks receive
+  semantic credit only from selected proof batches that retain the exact repository
+  path, hunk identity, every changed line, and a substantive added line in the final
+  model request. Missing
+  direct capacity, proof evidence, or complete receipt coverage fails before plan
+  registration or provider contact. When
   `POSTIL_LARGE_REVIEW_PLAN_ENDPOINT` and `POSTIL_LARGE_REVIEW_PLAN_TOKEN` are set, the
   CLI registers a versioned deterministic request plan with the authenticated loopback
   endpoint before any provider call. A missing, rejected, or unreachable registration
@@ -82,6 +92,20 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   the envelope; and owns check-run lifecycle ordering (checks are created before the model
   runs so a crash can still be reported against them). It persists safe structured model
   incidents for monitoring without raw provider or model text.
+  Repository-wide absence and mismatch claims declare bounded typed queries for named
+  resources, values, versions, paths, and identifiers. One receipt binds those queries to
+  the immutable reviewed head and reports `complete`, `unavailable`, or `exhausted`.
+  Only a complete receipt with no positive counterexample supports a universal claim.
+  Incomplete repository evidence cannot confirm it, so the original finding remains open.
+  Every surviving generated candidate, plus applicable baseline candidates during a full
+  rereview, enters one bounded adjudication operation before scoring and publication. The
+  operation admits the complete candidate set or fails closed before provider contact. Its
+  direct-source receipt hashes and scans the complete diff, records deterministic citation
+  occurrence counts, and carries only bounded evidence windows to the model. Adjudication
+  validates exact candidate identities, result completeness, evidence, publication text,
+  and duplicate primaries. Later and cross-file evidence can refute stale claims, while
+  unresolved claims remain open. Semantic duplicates collapse across files and kinds
+  only when one established defect remains; distinct defects sharing a line remain separate.
 - `forge/`: trait + GitHub, GitLab, Bitbucket Cloud, and Azure DevOps implementations,
   with self-managed base URLs where the same API contract applies. Paginated forge
   metadata has aggregate byte and changed-file bounds. Source responses stream to
@@ -100,6 +124,14 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   GitLab full reviews require a collected diff version whose `real_size` matches the
   exhausted paginated file count, then reconstruct source from base/head content;
   incremental compares reject `compare_timeout`.
+  GitHub repository evidence resolves the reviewed commit to its exact tree and streams blobs
+  within one aggregate budget for requests, objects, bytes, and elapsed time. Local base reviews read tree and blob
+  objects from the exact committed head. Staged reviews bind the diff and repository search to
+  one immutable index tree created by `git write-tree`; arbitrary diff files have no proven
+  repository snapshot and cannot support repository-dependent findings. Snapshot digests include
+  object mode, path, blob object ID, and gitlink path and object ID. Symlink blobs are searched as
+  link text and are never followed. A snapshot containing a gitlink remains incomplete because
+  content inside the referenced repository is outside the snapshot.
 - `respond.rs`: interactive bot (`postil respond`): answers an @postil mention on a PR
   or issue, grounded in the diff/issue, and posts one reply. Review-and-answer only; it
   never opens PRs or pushes commits.
@@ -199,10 +231,11 @@ additions (violations are `kind: contentPolicy`). Content policy is on by defaul
 8. `humanEscalation` blocks by kind at confidence 0.30 or above. It represents an
    irreducible owner decision, not uncertainty about a concrete defect. Admin overrides
    apply to that kind-only decision rather than ordinary risk findings.
-9. Review resource or request-budget exhaustion cannot produce a clean verdict. It
-   emits the generic internal `Review incomplete` operational finding before any model
-   call, preserves the hosted global deadline, and keeps full-review reconciliation
-   untrustworthy.
+9. Review resource or request-budget exhaustion cannot produce a clean verdict. An
+   incomplete deterministic receipt fails before durable plan registration or model
+   contact. Other preflight exhaustion emits the generic internal `Review incomplete`
+   operational finding without model contact. Both preserve the hosted global deadline
+   and keep full-review reconciliation untrustworthy.
 10. Bounded JSON metadata pages use a 32 MiB per-page cap and a 64 MiB aggregate
     metadata cap. Source files and reconstructed diffs stream beyond that page limit
     into one 512 MiB operation workspace shared by acquired source snapshots,
@@ -211,21 +244,35 @@ additions (violations are `kind: contentPolicy`). Content policy is on by defaul
     Supported lockfile sections compact independently and have a 16 MiB per-section cap.
 11. Every configured chain is planned against the smallest conservative model context.
     A review admits at most three models per logical request and hard-caps logical
-    requests, HTTP attempts including repair/retry paths, per-response output tokens,
-    planner and scorer input, worst-case token exposure, and projected cost across
-    cascade or consensus before provider contact.
+    requests including repair and bounded post-processing paths, per-response output
+    tokens, planner and scorer input, worst-case token exposure, and projected cost
+    across cascade or consensus before provider contact. Each transport retry reserves
+    its exact attempt, input, output, and cost exposure against the same hard limits.
 12. Every completed review envelope records source-batch coverage when batching runs.
     Deterministic large reviews also record a plan hash and direct, semantic, and
     unreviewed hunk counts. Every normalized hunk has exactly one disposition; evidence
-    identifiers bind the exact hunk digest, and any unreviewed hunk fails the gate.
-    Semantic coverage cannot resolve baseline findings. Bounded reviews expose selected
-    and total source-batch counts in compact output. Planner fallback remains audit
-    metadata and does not expose provider failure details to a PR.
+    identifiers bind the exact hunk digest, and any unreviewed hunk rejects the plan
+    before registration or provider contact. Semantic coverage cannot resolve baseline
+    findings. Bounded reviews expose selected and total source-batch counts in compact
+    output. Planner fallback remains audit metadata and does not expose provider failure
+    details to a PR.
 13. Operational and provider virtual anchors expire after each run. Reviewable
     PR-description and change-metadata anchors carry across unrelated incremental
     reviews, and a same-head rerun with either anchor falls back to a full review.
     Change-metadata supersession requires an exact stable semantic ID; synthetic line
     reuse alone cannot clear a baseline finding.
+14. Repository-dependent findings never derive universal absence or mismatch from incomplete
+    context. Every model finding explicitly declares its repository context. Mismatch refutation
+    requires the named target and compared value in one searched evidence unit. Query, request,
+    object, tree-depth, byte, deadline, and detailed-match bounds are explicit in the receipt
+    outcome. Public findings state the repository construct and correction without describing
+    evidence retrieval boundaries or delegating evidence collection to the author.
+15. Finding adjudication performs exactly one logical provider operation over every admitted
+    candidate. Candidate identities bind the exact snapshot and semantic finding fields.
+    Adjudication input, output, attempts, deadline, and projected cost are bounded, and results
+    cannot expand or enter schema repair. Confirmation and refutation require exact supplied
+    evidence; repository-wide conclusions additionally require a complete receipt for the exact
+    snapshot. Public rewrites describe only the defect, impact, and correction.
 
 ## Residual prompt-injection surface
 

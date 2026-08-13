@@ -1,24 +1,24 @@
 {
   "schemaVersion": 1,
   "corpus": {
-    "fixtureCorpusSha256": "3c4f952f9411bf2c4e5f0a61b5975e47d203f7681a8235d53d717c743ea9cb54",
-    "evaluatorSha256": "b0d452b0c2f8d419ef6f4780791cde8cd760d318a82b439aa5746a226305e125"
+    "fixtureCorpusSha256": "8e4c2cb9ad5a7efdfe6a875566d20133e905155b6f693a873595adf6c069e065",
+    "evaluatorSha256": "e1c5b005a5e516b79866b4c6e98df54e806d424b923b8c9797e3930ff3026874"
   },
   "profiles": {
     "z-ai/glm-5.2": {
       "populated": true,
-      "generatedAt": "2026-07-30T01:06:07.029Z",
+      "generatedAt": "2026-08-13T10:05:48.461Z",
       "reviewMode": "exhaustive",
-      "sourceRunAt": "2026-07-30T01:05:48.700Z",
+      "sourceRunAt": "2026-08-13T10:04:27.827Z",
       "totalCases": 70,
-      "scoredCases": 69,
-      "detectionRate": 0.9649122807017544,
-      "falsePositives": 4,
-      "gateVerdictCorrectness": 0.7681159420289855,
-      "meanCostUsdPerCase": 0.004135275999999999,
+      "scoredCases": 68,
+      "detectionRate": 0.9473684210526315,
+      "falsePositives": 3,
+      "gateVerdictCorrectness": 0.7794117647058824,
+      "meanCostUsdPerCase": 0.0073227050000000005,
       "latencyMs": {
-        "p50": 4528,
-        "p95": 48585
+        "p50": 9311,
+        "p95": 31563
       }
     }
   }

@@ -20,6 +20,8 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --quiet --all-targets -- -D warnings
       - run: cargo test --quiet
+      - run: cargo build --quiet --features qualification-candidate
+      - run: cargo test --quiet --features qualification-candidate
       - run: cargo build --quiet --release
 
   musl:

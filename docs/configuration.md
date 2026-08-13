@@ -40,7 +40,7 @@ model:
 
 Place organization-specific merge rules in `.postil/guardrails.md`. Place additions to the built-in prose policy in `.postil/content-policy.md`. Repository policy extends the built-in content policy unless `contentPolicy.enabled` is false.
 
-Ignored paths are excluded before review planning, so generated artifacts do not consume model context or bounded-review coverage.
+Ignore patterns remove matching paths before grounding, batching, and large-review coverage planning. A rename is removed only when both its old and new paths match. Generated-looking source remains reviewable unless an ignore pattern matches it.
 
 ## Environment
 

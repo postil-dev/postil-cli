@@ -6,7 +6,7 @@
 
 use serde_json::{Value, json};
 
-use crate::envelope::{Envelope, Kind, Severity};
+use crate::envelope::{Envelope, Kind, Severity, forge_safe_finding_publication_text};
 
 fn level(sev: Severity) -> &'static str {
     match sev {
@@ -43,7 +43,7 @@ fn rule_descriptions() -> Vec<Value> {
         ),
         (
             Kind::Uncertainty,
-            "Something critical could not be verified from the diff.",
+            "Something critical could not be verified from repository evidence.",
         ),
         (
             Kind::ContentPolicy,
@@ -67,10 +67,11 @@ pub fn to_sarif(envelope: &Envelope) -> Value {
         .findings
         .iter()
         .map(|f| {
+            let publication = forge_safe_finding_publication_text(f);
             json!({
                 "ruleId": rule_id(f.kind),
                 "level": level(f.severity),
-                "message": { "text": format!("{}\n\n{}", f.title, f.body) },
+                "message": { "text": format!("{}\n\n{}", publication.title, publication.body) },
                 "locations": [{
                     "physicalLocation": {
                         "artifactLocation": { "uri": f.path },
@@ -102,6 +103,8 @@ pub fn to_sarif(envelope: &Envelope) -> Value {
             "plannerFallback": coverage.planner_fallback,
         });
     }
+    properties["repositorySearch"] =
+        serde_json::to_value(&envelope.repository_search).expect("receipt is JSON-serializable");
 
     json!({
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
@@ -150,6 +153,7 @@ mod tests {
             model_incidents: vec![],
             review_coverage: None,
             review_admission: None,
+            repository_search: Default::default(),
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
@@ -172,6 +176,7 @@ mod tests {
             generator_kind: None,
             scorer_kind: None,
             scorer_reason: None,
+            repository_claim: None,
             title: "Bug".into(),
             body: "details".into(),
             evidence: None,
@@ -199,6 +204,43 @@ mod tests {
         let s = to_sarif(&env_with(vec![]));
         assert_eq!(s["runs"][0]["results"].as_array().unwrap().len(), 0);
         assert_eq!(s["runs"][0]["properties"]["silent"], true);
+        assert_eq!(
+            s["runs"][0]["properties"]["repositorySearch"]["state"],
+            "unavailable"
+        );
+    }
+
+    #[test]
+    fn carried_finding_is_projected_before_sarif_publication() {
+        let finding = Finding {
+            path: "src/a.rs".into(),
+            line: 12,
+            end_line: None,
+            severity: Severity::Warn,
+            kind: Kind::Uncertainty,
+            confidence: 0.8,
+            generator_confidence: None,
+            scorer_confidence: None,
+            generator_kind: None,
+            scorer_kind: None,
+            scorer_reason: None,
+            repository_claim: None,
+            title: "Check the sibling update".into(),
+            body: "No sibling update appears in this diff; inspect the deployment manifest.".into(),
+            evidence: None,
+            id: None,
+        };
+        let sarif = to_sarif(&env_with(vec![finding.clone()]));
+        let message = sarif["runs"][0]["results"][0]["message"]["text"]
+            .as_str()
+            .unwrap();
+
+        assert!(!message.to_ascii_lowercase().contains("in this diff"));
+        assert!(!message.to_ascii_lowercase().contains("inspect the"));
+        assert_eq!(
+            message,
+            "Review finding\n\nThis carried finding does not satisfy the publication contract. Open Review details for the complete record."
+        );
     }
 
     #[test]

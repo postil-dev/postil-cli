@@ -1054,7 +1054,12 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
     let eligible: Vec<_> = envelope
         .suppressed_findings
         .iter()
-        .filter(|suppressed| suppressed.reason != SuppressionReason::Ignored)
+        .filter(|suppressed| {
+            !matches!(
+                suppressed.reason,
+                SuppressionReason::Ignored | SuppressionReason::RepositoryClaimUnsupported
+            ) && !crate::envelope::is_ephemeral_anchor(&suppressed.finding.path)
+        })
         .collect();
     let disclosed: Vec<_> = eligible.iter().take(5).copied().collect();
     if !disclosed.is_empty() {
@@ -1140,6 +1145,7 @@ fn suppression_reason(reason: SuppressionReason) -> &'static str {
             "restates a retained finding about another location"
         }
         SuppressionReason::DerivedFromSuppressed => "built on a finding suppressed as mis-anchored",
+        SuppressionReason::RepositoryClaimUnsupported => "repository-wide claim is not publishable",
     }
 }
 
@@ -1423,6 +1429,7 @@ mod tests {
             generator_kind: None,
             scorer_kind: None,
             scorer_reason: None,
+            repository_claim: None,
             title: "Unsanitized input reaches query".into(),
             body: "user_input flows into exec_query.".into(),
             evidence: None,
@@ -1454,6 +1461,7 @@ mod tests {
             model_incidents: vec![],
             review_coverage: None,
             review_admission: None,
+            repository_search: Default::default(),
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
@@ -1476,6 +1484,42 @@ mod tests {
         unsafe_finding.body = "**@octocat <img> [`code`]**\n\nKeep `useful()` formatting.".into();
 
         assert!(crate::envelope::validate_finding_publication(&unsafe_finding).is_err());
+    }
+
+    #[test]
+    fn public_summary_omits_unsupported_repository_claims() {
+        let mut env = envelope_with_findings(vec![]);
+        let mut unsupported = finding();
+        unsupported.title = "Private repository claim".into();
+        unsupported.body = "Repository-only detail that must remain diagnostic.".into();
+        env.suppressed_findings
+            .push(crate::envelope::SuppressedFinding {
+                finding: unsupported,
+                reason: SuppressionReason::RepositoryClaimUnsupported,
+            });
+        let summary = check_summary(&env, true, Default::default());
+        assert!(!summary.contains("Private repository claim"));
+        assert!(!summary.contains("Repository-only detail"));
+        assert_eq!(env.suppressed_findings.len(), 1);
+    }
+
+    #[test]
+    fn public_summary_omits_suppressed_ephemeral_findings() {
+        let mut env = envelope_with_findings(vec![]);
+        let mut operational = crate::envelope::fail_closed_finding("private model detail");
+        operational.title = "Private operational title".into();
+        operational.body = "Private operational detail that must remain diagnostic.".into();
+        env.suppressed_findings
+            .push(crate::envelope::SuppressedFinding {
+                finding: operational,
+                reason: SuppressionReason::NonActionable,
+            });
+
+        let summary = check_summary(&env, true, Default::default());
+
+        assert!(!summary.contains("Private operational title"));
+        assert!(!summary.contains("Private operational detail"));
+        assert_eq!(env.suppressed_findings.len(), 1);
     }
 
     #[test]
@@ -1538,6 +1582,7 @@ mod tests {
             model_incidents: vec![],
             review_coverage: None,
             review_admission: None,
+            repository_search: Default::default(),
             usage_accounting_complete: true,
             duration_ms: 1_250,
             base_sha: None,
@@ -1798,6 +1843,7 @@ mod tests {
             model_incidents: vec![],
             review_coverage: None,
             review_admission: None,
+            repository_search: Default::default(),
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
@@ -1864,6 +1910,7 @@ mod tests {
             model_incidents: vec![],
             review_coverage: None,
             review_admission: None,
+            repository_search: Default::default(),
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
@@ -1912,6 +1959,7 @@ mod tests {
             model_incidents: vec![],
             review_coverage: None,
             review_admission: None,
+            repository_search: Default::default(),
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,

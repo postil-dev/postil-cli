@@ -535,14 +535,13 @@ pub fn demote_deferred_verification(findings: &mut [Finding]) {
     }
 }
 
-/// Whether an `uncertainty` finding only asks the author to check something,
-/// without saying what the reviewer itself checked.
+/// Whether an `uncertainty` finding only asks the author to check something.
 ///
 /// "Confirm that X is always created" is a question, not a finding. It costs
 /// the author the verification work the reviewer was supposed to do, and it
-/// does so at a severity that can gate a merge. A finding that reports what it
-/// looked at ("the diff adds no other caller") is doing the work and keeps its
-/// severity.
+/// does so at a severity that can gate a merge. Repository-wide support is
+/// represented by a structured receipt, so prose about search work is not
+/// treated as proof.
 fn defers_verification_to_the_author(finding: &Finding) -> bool {
     if finding.kind != crate::envelope::Kind::Uncertainty
         || finding.severity == crate::envelope::Severity::Info
@@ -555,8 +554,7 @@ fn defers_verification_to_the_author(finding: &Finding) -> bool {
     // whose body then goes and establishes the answer; demoting on the headline
     // would punish exactly the findings that did the work.
     let body = finding.body.to_ascii_lowercase();
-    let prose = format!("{} {}", finding.title, finding.body).to_ascii_lowercase();
-    let asks_the_author = [
+    [
         "confirm that",
         "confirm the",
         "please confirm",
@@ -570,24 +568,7 @@ fn defers_verification_to_the_author(finding: &Finding) -> bool {
         "check that",
     ]
     .iter()
-    .any(|marker| body.contains(marker));
-    if !asks_the_author {
-        return false;
-    }
-    let states_what_it_checked = [
-        "the diff shows",
-        "the diff adds",
-        "the diff does not",
-        "the diff contains no",
-        "no other caller",
-        "no other reference",
-        "searched",
-        "the only caller",
-        "elsewhere in this change",
-    ]
-    .iter()
-    .any(|marker| prose.contains(marker));
-    !states_what_it_checked
+    .any(|marker| body.contains(marker))
 }
 
 fn deterministically_non_actionable(finding: &Finding) -> bool {
@@ -767,13 +748,13 @@ fn defect_identity(finding: &Finding) -> (String, crate::envelope::Kind, String,
 /// edit landed elsewhere in the span.
 ///
 /// Incremental baselines cite the OLD head, so their anchors must be checked
-/// against old-side hunk coordinates. A trustworthy full review is
-/// authoritative over the complete PR and resolves any baseline issue the
-/// fresh model run did not reproduce.
+/// against old-side hunk coordinates. Full-review resolution is handled by the
+/// explicit adjudication ledger before reconciliation; model silence alone is
+/// never proof that an open finding is resolved.
 fn touch_addresses(index: &DiffIndex, f: &Finding, scope: ReconcileScope) -> bool {
     match scope {
         ReconcileScope::Incremental { .. } => index.contains_old(&f.path, f.line),
-        ReconcileScope::Full { trust } => trust == ReviewTrust::Exhaustive,
+        ReconcileScope::Full { .. } => false,
     }
 }
 
@@ -839,31 +820,19 @@ pub fn reconcile(
             } else {
                 push_carried(&mut carried, &mut carried_identities, f.clone());
             }
-        } else if let ReconcileScope::Full {
-            trust: ReviewTrust::Bounded,
-        } = scope
-        {
+        } else if matches!(scope, ReconcileScope::Full { .. }) {
             if let Some((path, line)) = index.remap_current_evidence(f) {
-                if index.remap_reviewed_evidence(f).as_ref() == Some(&(path.clone(), line)) {
-                    resolved.push(f.clone());
-                } else {
-                    let mut carry = f.clone();
-                    carry.path = path;
-                    carry.line = line;
-                    carry.end_line = None;
-                    push_carried(&mut carried, &mut carried_identities, carry);
-                }
-            } else if f.evidence.is_some()
-                && f.path != crate::envelope::CHANGE_METADATA_PATH
-                && index.contains_reviewed_baseline_coordinate(f)
-            {
-                resolved.push(f.clone());
+                let mut carry = f.clone();
+                carry.path = path;
+                carry.line = line;
+                carry.end_line = None;
+                push_carried(&mut carried, &mut carried_identities, carry);
             } else {
                 push_carried(&mut carried, &mut carried_identities, f.clone());
             }
         } else if touch_addresses(index, f, scope) {
-            // An incremental edit touched the old-head anchor, or a trustworthy
-            // full review did not reproduce the issue: treat it as resolved.
+            // An incremental edit touched the old-head anchor. Incremental
+            // touch is imperfect because a non-fixing edit can also resolve it.
             resolved.push(f.clone());
         } else {
             // Not superseded and the anchor line was not touched: the issue
@@ -895,6 +864,7 @@ mod tests {
             generator_kind: None,
             scorer_kind: None,
             scorer_reason: None,
+            repository_claim: None,
             title: "t".into(),
             body: "b".into(),
             evidence: Some("x".into()),
@@ -1420,7 +1390,7 @@ mod tests {
     }
 
     #[test]
-    fn trustworthy_full_review_resolves_findings_it_does_not_reproduce() {
+    fn full_review_carries_findings_outside_explicit_adjudication() {
         let idx = index_for("other.rs", 1, 1);
         let baseline = vec![f("a.rs", 99, Severity::Error, 0.9)];
         let rec = reconcile(
@@ -1431,8 +1401,8 @@ mod tests {
                 trust: ReviewTrust::Exhaustive,
             },
         );
-        assert_eq!(rec.resolved.len(), 1);
-        assert!(rec.carried.is_empty());
+        assert!(rec.resolved.is_empty());
+        assert_eq!(rec.carried.len(), 1);
     }
 
     #[test]
@@ -1455,7 +1425,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_full_review_resolves_changed_selected_baseline_evidence() {
+    fn bounded_full_review_carries_changed_selected_baseline_until_adjudication() {
         let mut changed = DiffIndex::build(&diff::parse(
             "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -10 +10 @@\n-x\n+y\n",
         ));
@@ -1470,8 +1440,8 @@ mod tests {
             },
         );
 
-        assert_eq!(rec.resolved.len(), 1);
-        assert!(rec.carried.is_empty());
+        assert!(rec.resolved.is_empty());
+        assert_eq!(rec.carried.len(), 1);
     }
 
     #[test]
@@ -1496,7 +1466,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_full_review_resolves_selected_evidence_not_reproduced() {
+    fn bounded_full_review_carries_selected_evidence_until_adjudication() {
         let mut unchanged = DiffIndex::build(&diff::parse(
             "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -10 +10 @@\n x\n",
         ));
@@ -1511,8 +1481,8 @@ mod tests {
             },
         );
 
-        assert_eq!(rec.resolved.len(), 1);
-        assert!(rec.carried.is_empty());
+        assert!(rec.resolved.is_empty());
+        assert_eq!(rec.carried.len(), 1);
     }
 
     #[test]
@@ -1886,7 +1856,7 @@ mod tests {
     }
 
     #[test]
-    fn an_uncertainty_finding_that_reports_what_it_checked_keeps_its_severity() {
+    fn prose_about_search_work_does_not_substitute_for_a_repository_receipt() {
         let mut findings = vec![uncertainty(
             "rgwConfig is not a recognized field",
             "The diff adds no schema entry for rgwConfig and no other reference to \
@@ -1895,7 +1865,7 @@ mod tests {
 
         demote_deferred_verification(&mut findings);
 
-        assert_eq!(findings[0].severity, Severity::Warn);
+        assert_eq!(findings[0].severity, Severity::Info);
     }
 
     #[test]

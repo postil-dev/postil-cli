@@ -94,17 +94,24 @@ export function makeDiff(path: string, hunks: FixtureHunk[]): string {
 
 function makeDistantStreamingChurn(side: "prefix" | "suffix"): string {
   return Array.from({ length: 3 }, (_, fileIndex) => {
-    const lines = [`+export function ordinary_${side}_${fileIndex}(actor: Actor) {`];
+    const lines = [` export function ordinary_${side}_${fileIndex}(actor: Actor) {`];
     for (let line = 2; line < 130; line += 1) {
-      lines.push(`+  const ordinary_${side}_${fileIndex}_${line} = actor.id; // ${"x".repeat(900)}`);
+      if (line === 64) {
+        lines.push(
+          `-  const ordinary_${side}_${fileIndex}_${line}=actor.id;`,
+          `+  const ordinary_${side}_${fileIndex}_${line} = actor.id;`,
+        );
+      } else {
+        lines.push(`   const ordinary_${side}_${fileIndex}_${line} = actor.id; // ${"x".repeat(900)}`);
+      }
     }
-    lines.push("+  return actor.id;", "+}");
+    lines.push("   return actor.id;", " }");
     const path = `src/churn/${side}-${fileIndex}.ts`;
     return [
       `diff --git a/${path} b/${path}`,
-      "--- /dev/null",
+      `--- a/${path}`,
       `+++ b/${path}`,
-      `@@ -0,0 +1,${lines.length} @@`,
+      "@@ -1,131 +1,131 @@",
       ...lines,
       "",
     ].join("\n");

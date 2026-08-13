@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { chmod, link, lstat, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
@@ -49,6 +49,8 @@ import {
   readPinnedQualificationWorktreeFile,
   runLiveModels,
   runQualificationCanariesSequentially,
+  BINARY_SOURCE_PATHS,
+  REVIEW_CONTRACT_SOURCE_PATHS,
   summarizeAttributionEvaluator,
   verifyPrivateEvidenceBundle,
   withImmutableQualificationBinary,
@@ -603,52 +605,51 @@ describe("pair qualification configuration", () => {
 
   });
 
-  test("keeps runtime-shaped exact pair exposure inside the hard cap", async () => {
+  test("rejects runtime-shaped exact pair exposure above the hard cap", async () => {
     const root = await mkdtemp(resolve(tmpdir(), "postil-runtime-preflight-"));
     const cases = fixtureInputs.map((input) => benchmarkCase.parse(input));
     const inheritedModelKey = process.env.MODEL_API_KEY;
+    const runtimePair: QualificationPair = {
+      generatorModel: "z-ai/glm-5.2",
+      scorerModel: "openai/gpt-5-mini",
+    };
     const pricing = new Map([
-      [pair.generatorModel, {
+      [runtimePair.generatorModel, {
         providerIdentity: "PinnedProvider",
-        promptUsdPerToken: 0.0009478,
-        completionUsdPerToken: 0.0029788,
-        inputMicrosPerMillionTokens: 947_800,
-        outputMicrosPerMillionTokens: 2_978_800,
+        promptUsdPerToken: 0.00028434,
+        completionUsdPerToken: 0.00089364,
+        inputMicrosPerMillionTokens: 284_340,
+        outputMicrosPerMillionTokens: 893_640,
       }],
-      [pair.scorerModel, {
+      [runtimePair.scorerModel, {
         providerIdentity: "PinnedProvider",
-        promptUsdPerToken: 0.0009478,
-        completionUsdPerToken: 0.0029788,
-        inputMicrosPerMillionTokens: 947_800,
-        outputMicrosPerMillionTokens: 2_978_800,
+        promptUsdPerToken: 0.00028434,
+        completionUsdPerToken: 0.00089364,
+        inputMicrosPerMillionTokens: 284_340,
+        outputMicrosPerMillionTokens: 893_640,
       }],
     ]);
     try {
       process.env.MODEL_API_KEY = "postil-plan-only-fixture";
+      const cargoTarget = process.env.CARGO_TARGET_DIR;
       const binary = process.env.POSTIL_BIN === undefined
-        ? resolve(import.meta.dir, "..", "..", "target", "release", "postil")
+        ? cargoTarget === undefined
+          ? resolve(import.meta.dir, "..", "..", "target", "release", "postil")
+          : resolve(cargoTarget, "release", "postil")
         : resolve(process.env.POSTIL_BIN);
-      const normalizedPair = normalizeQualificationPairs([pair])[0]!;
-      const projected = await assertRuntimeShapedQualificationPreflight({
+      const normalizedPair = normalizeQualificationPairs([runtimePair])[0]!;
+      await expect(assertRuntimeShapedQualificationPreflight({
         binary,
         rootDir: root,
         cases,
         pairs: [normalizedPair],
-        repeats: 3,
+        repeats: 9,
         pricing,
         apiBase: normalizeApiBase("https://openrouter.ai/api/v1"),
         apiFormat: "openai-compatible",
         costCapUsdDecimal: "70",
         upstreamProvider: "PinnedProvider",
-      });
-      expect(compareCanonicalDecimals(
-        parseCanonicalDecimal(projected),
-        parseCanonicalDecimal("35"),
-      )).toBeGreaterThan(0);
-      expect(compareCanonicalDecimals(
-        parseCanonicalDecimal(projected),
-        parseCanonicalDecimal("70"),
-      )).toBeLessThanOrEqual(0);
+      })).rejects.toThrow("exceeding the 1000000 micro-dollar operation cap");
     } finally {
       if (inheritedModelKey === undefined) delete process.env.MODEL_API_KEY;
       else process.env.MODEL_API_KEY = inheritedModelKey;
@@ -967,6 +968,30 @@ describe("qualification Git source authority", () => {
 });
 
 describe("immutable qualification binary", () => {
+  test("review contract hashes every regular source file with the required manifests", async () => {
+    const repositoryRoot = resolve(import.meta.dir, "../..");
+    async function collectReviewSources(directory: string): Promise<string[]> {
+      const entries = await readdir(directory, { withFileTypes: true });
+      const paths = await Promise.all(entries.sort((left, right) =>
+        left.name < right.name ? -1 : left.name > right.name ? 1 : 0)
+        .map(async (entry) => entry.isDirectory()
+          ? collectReviewSources(resolve(directory, entry.name))
+          : entry.isFile()
+          ? [resolve(directory, entry.name).slice(repositoryRoot.length + 1).replaceAll("\\", "/")]
+          : []));
+      return paths.flat();
+    }
+
+    const expected = ["Cargo.lock", "Cargo.toml", "build.rs", ...await collectReviewSources(resolve(repositoryRoot, "src"))]
+      .sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
+    expect(REVIEW_CONTRACT_SOURCE_PATHS).toEqual(expected);
+    expect(BINARY_SOURCE_PATHS).toEqual(expected);
+
+    const sources = await Promise.all(REVIEW_CONTRACT_SOURCE_PATHS.map(async (path) =>
+      [path, await readFile(resolve(repositoryRoot, path))] as const));
+    expect(hashNamedSources(sources)).toMatch(/^[0-9a-f]{64}$/);
+  });
+
   test("rejects source authority drift before broader qualification spend", () => {
     const expected = {
       sourceSha: "a".repeat(40),
