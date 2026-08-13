@@ -1,5 +1,7 @@
 use std::collections::HashSet;
+use std::io::Read;
 use std::path::Path;
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
@@ -293,22 +295,46 @@ async fn fetch_file(
 
 fn read_local_file(root: &Path, head_revision: &str, path: &str) -> Result<Option<String>> {
     let object = format!("{head_revision}:{path}");
-    let output = std::process::Command::new("git")
+    let mut child = std::process::Command::new("git")
         .arg("-C")
         .arg(root)
         .args(["cat-file", "blob", &object])
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .with_context(|| format!("reading repository path {path} at reviewed head"))?;
-    if !output.status.success() {
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("git blob reader did not provide standard output")?;
+    let mut bytes = Vec::with_capacity(MAX_FILE_BYTES + 1);
+    stdout
+        .by_ref()
+        .take((MAX_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading repository path {path} at reviewed head"))?;
+    let truncated = bytes.len() > MAX_FILE_BYTES;
+    drop(stdout);
+    if truncated {
+        let _ = child.kill();
+    }
+    let status = child
+        .wait()
+        .with_context(|| format!("waiting for repository path {path} at reviewed head"))?;
+    if !truncated && !status.success() {
         return Ok(None);
     }
-    let bytes = if output.stdout.len() > MAX_FILE_BYTES {
-        &output.stdout[..MAX_FILE_BYTES]
-    } else {
-        &output.stdout
-    };
-    String::from_utf8(bytes.to_vec())
-        .map(|content| Some(truncate_with_marker(&content, MAX_FILE_BYTES).0))
+    if truncated {
+        let mut end = MAX_FILE_BYTES.saturating_sub(TRUNCATION_MARKER.len());
+        while end > 0 && std::str::from_utf8(&bytes[..end]).is_err() {
+            end -= 1;
+        }
+        let content = std::str::from_utf8(&bytes[..end])
+            .map_err(|_| anyhow!("repository path {path} is not UTF-8 text"))?;
+        return Ok(Some(format!("{content}{TRUNCATION_MARKER}")));
+    }
+    String::from_utf8(bytes)
+        .map(Some)
         .map_err(|_| anyhow!("repository path {path} is not UTF-8 text"))
 }
 
@@ -487,6 +513,35 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["src/a.rs", "src/b.rs", "src/c.rs"]
         );
+    }
+
+    #[test]
+    fn local_blob_reads_stop_after_the_truncation_sentinel() {
+        let directory = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(directory.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "--quiet"]);
+        std::fs::create_dir_all(directory.path().join("src")).unwrap();
+        std::fs::write(
+            directory.path().join("src/large.rs"),
+            "x".repeat(MAX_FILE_BYTES + 128),
+        )
+        .unwrap();
+        git(&["add", "src/large.rs"]);
+        let tree = git(&["write-tree"]);
+        let content = read_local_file(directory.path(), &tree, "src/large.rs")
+            .unwrap()
+            .unwrap();
+        assert_eq!(content.len(), MAX_FILE_BYTES);
+        assert!(content.ends_with(TRUNCATION_MARKER));
     }
 
     #[test]

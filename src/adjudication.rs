@@ -99,8 +99,6 @@ pub(crate) struct AdjudicationApplication {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeterministicDemotionReason {
     RepositoryReceiptIncomplete,
-    DirectReceiptIncompleteForConfirmation,
-    DirectReceiptIncompleteForRefutation,
     CitationFragmentIncomplete,
 }
 
@@ -577,8 +575,10 @@ pub(crate) fn validate_results(
                     "refuted adjudication cannot publish revised finding text"
                 );
                 ensure!(
-                    !result.evidence.trim().is_empty() && (direct_grounded || repository_grounded),
-                    "refuted adjudication must cite exact supplied evidence"
+                    citation_deleted_only
+                        || (claim_verdict == Some(RepositoryClaimVerdict::Refuted)
+                            && repository_grounded),
+                    "refuted adjudication must cite candidate-specific contradictory evidence"
                 );
                 if claim_verdict.is_some() {
                     ensure!(
@@ -792,11 +792,10 @@ fn deterministic_demotion_reason(
     snapshot_id: &str,
     finding: &Finding,
     result: &AdjudicationResult,
-    corpus: &str,
-    receipt: &DiffCorpusReceipt,
+    _corpus: &str,
+    _receipt: &DiffCorpusReceipt,
     repository_receipt: &RepositorySearchReceipt,
 ) -> Option<DeterministicDemotionReason> {
-    let direct_grounded = evidence_is_directly_grounded(&result.evidence, finding, corpus, receipt);
     let repository_grounded =
         repository_evidence_is_complete(&result.evidence, repository_receipt, snapshot_id);
     let claim_unresolved = finding.repository_claim.as_ref().is_some_and(|claim| {
@@ -804,32 +803,16 @@ fn deterministic_demotion_reason(
             == RepositoryClaimVerdict::Unresolved
     });
     let bounded_citation = result_is_bounded_citation_fragment(result, finding);
-    let incomplete_direct_confirmation = matches!(result.status, AdjudicationStatus::Confirmed)
-        && direct_grounded
-        && !direct_search_is_complete(receipt)
-        && !repository_grounded;
-    let incomplete_direct_refutation = matches!(result.status, AdjudicationStatus::Refuted)
-        && direct_grounded
-        && !direct_search_is_complete(receipt)
-        && crate::repository_search::prose_requires_repository_search(finding);
     let incomplete_citation = matches!(result.status, AdjudicationStatus::Confirmed)
         && bounded_citation
         && !repository_grounded;
     if claim_unresolved {
         Some(DeterministicDemotionReason::RepositoryReceiptIncomplete)
-    } else if incomplete_direct_confirmation {
-        Some(DeterministicDemotionReason::DirectReceiptIncompleteForConfirmation)
-    } else if incomplete_direct_refutation {
-        Some(DeterministicDemotionReason::DirectReceiptIncompleteForRefutation)
     } else if incomplete_citation {
         Some(DeterministicDemotionReason::CitationFragmentIncomplete)
     } else {
         None
     }
-}
-
-fn direct_search_is_complete(receipt: &DiffCorpusReceipt) -> bool {
-    receipt.scan_complete && receipt.queries_complete && receipt.matching_windows_complete
 }
 
 fn result_is_bounded_citation_fragment(result: &AdjudicationResult, finding: &Finding) -> bool {
@@ -838,6 +821,11 @@ fn result_is_bounded_citation_fragment(result: &AdjudicationResult, finding: &Fi
     };
     let (bounded, complete) = bounded_cited_evidence(citation, &finding.title, &finding.body);
     !complete && result.evidence == bounded
+}
+
+#[cfg(test)]
+fn direct_search_is_complete(receipt: &DiffCorpusReceipt) -> bool {
+    receipt.scan_complete && receipt.queries_complete && receipt.matching_windows_complete
 }
 
 fn repository_evidence_is_complete(
@@ -962,7 +950,7 @@ mod tests {
     }
 
     #[test]
-    fn later_diff_lines_can_refute_cross_kind_absence_claims() {
+    fn unrelated_direct_evidence_cannot_refute_candidates() {
         let snapshot = "a".repeat(40);
         let findings = vec![
             finding(
@@ -992,7 +980,7 @@ mod tests {
         let corpus = "@@ -3 +3 @@\n- uses: action@old\n@@ -69 +74 @@\n+ uses: action@new\n";
         let direct = direct_receipt(&snapshot, corpus, &findings, &ids);
         assert!(direct.rendered_evidence.contains("uses: action@new"));
-        let applied = apply_results(
+        let error = apply_results(
             &snapshot,
             findings,
             ids,
@@ -1001,9 +989,12 @@ mod tests {
             &direct,
             &unavailable_receipt(),
         )
-        .unwrap();
-        assert!(applied.kept.is_empty());
-        assert_eq!(applied.suppressed.len(), 2);
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("candidate-specific contradictory evidence")
+        );
     }
 
     #[test]
@@ -1383,8 +1374,8 @@ mod tests {
         let snapshot = "a".repeat(40);
         let mut query_finding = finding(
             Kind::Risk,
-            "Action remains absent",
-            "The required action is absent from the repository.",
+            "Restore the required action",
+            "The changed action omits the required call.",
         );
         query_finding.body.push(' ');
         query_finding.body.push_str(
@@ -1401,8 +1392,8 @@ mod tests {
 
         let mut window_finding = finding(
             Kind::Risk,
-            "Action remains absent",
-            "The required action is absent from the repository.",
+            "Restore the required action",
+            "The changed action omits the required call.",
         );
         window_finding.evidence = Some("uses: action@new".into());
         let window_findings = vec![window_finding];
@@ -1430,7 +1421,7 @@ mod tests {
                 candidate_id: ids[0].clone(),
                 status: AdjudicationStatus::Confirmed,
                 revised_title: "Restore the required action".into(),
-                revised_body: "The required action is absent from the repository.".into(),
+                revised_body: "The changed action omits the required call.".into(),
                 evidence: findings[0].evidence.clone().unwrap(),
                 duplicate_of: None,
             };
@@ -1443,6 +1434,7 @@ mod tests {
                 duplicate_of: None,
             };
             for result in [confirmed, refuted] {
+                let confirmed = result.status == AdjudicationStatus::Confirmed;
                 let applied = apply_results(
                     &snapshot,
                     findings.clone(),
@@ -1451,11 +1443,14 @@ mod tests {
                     &corpus,
                     &receipt,
                     &unavailable_receipt(),
-                )
-                .unwrap();
-                assert!(applied.kept.is_empty());
-                assert!(applied.resolved_indices.is_empty());
-                assert_eq!(applied.suppressed.len(), 1);
+                );
+                if confirmed {
+                    let applied = applied.unwrap();
+                    assert_eq!(applied.kept.len(), 1);
+                    assert!(applied.suppressed.is_empty());
+                } else {
+                    assert!(applied.is_err());
+                }
             }
         }
     }

@@ -1054,7 +1054,12 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
     let eligible: Vec<_> = envelope
         .suppressed_findings
         .iter()
-        .filter(|suppressed| suppressed.reason != SuppressionReason::Ignored)
+        .filter(|suppressed| {
+            !matches!(
+                suppressed.reason,
+                SuppressionReason::Ignored | SuppressionReason::RepositoryClaimUnsupported
+            )
+        })
         .collect();
     let disclosed: Vec<_> = eligible.iter().take(5).copied().collect();
     if !disclosed.is_empty() {
@@ -1479,6 +1484,23 @@ mod tests {
         unsafe_finding.body = "**@octocat <img> [`code`]**\n\nKeep `useful()` formatting.".into();
 
         assert!(crate::envelope::validate_finding_publication(&unsafe_finding).is_err());
+    }
+
+    #[test]
+    fn public_summary_omits_unsupported_repository_claims() {
+        let mut env = envelope_with_findings(vec![]);
+        let mut unsupported = finding();
+        unsupported.title = "Private repository claim".into();
+        unsupported.body = "Repository-only detail that must remain diagnostic.".into();
+        env.suppressed_findings
+            .push(crate::envelope::SuppressedFinding {
+                finding: unsupported,
+                reason: SuppressionReason::RepositoryClaimUnsupported,
+            });
+        let summary = check_summary(&env, true, Default::default());
+        assert!(!summary.contains("Private repository claim"));
+        assert!(!summary.contains("Repository-only detail"));
+        assert_eq!(env.suppressed_findings.len(), 1);
     }
 
     #[test]

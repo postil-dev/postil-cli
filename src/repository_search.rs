@@ -400,7 +400,7 @@ impl SearchAccumulator {
     pub(crate) fn scan_path(&mut self, path: &str) {
         let normalized = ascii_lower(path.as_bytes());
         for index in 0..self.terms.len() {
-            let occurrences = count_occurrences(&normalized, self.terms[index].normalized());
+            let occurrences = count_occurrences(&normalized, &self.terms[index]);
             self.record(index, path, occurrences);
         }
     }
@@ -412,7 +412,7 @@ impl SearchAccumulator {
         metadata.extend_from_slice(object_id.as_bytes());
         let normalized = ascii_lower(&metadata);
         for index in 0..self.terms.len() {
-            let occurrences = count_occurrences(&normalized, self.terms[index].normalized());
+            let occurrences = count_occurrences(&normalized, &self.terms[index]);
             self.record(index, path, occurrences);
         }
     }
@@ -436,6 +436,7 @@ impl SearchAccumulator {
                 .ok_or_else(|| std::io::Error::other("repository search byte count overflowed"))?;
             scanner.push(&chunk[..count]);
         }
+        scanner.finish();
         if read != expected_size {
             return Err(std::io::Error::other(
                 "repository blob size did not match tree metadata",
@@ -466,6 +467,7 @@ impl SearchAccumulator {
                 .ok_or_else(|| anyhow::anyhow!("repository search byte count overflowed"))?;
             scanner.push(&chunk);
         }
+        scanner.finish();
         anyhow::ensure!(read == expected_size, "repository blob size changed");
         self.finish_blob(path, read, scanner.counts);
         Ok(())
@@ -555,16 +557,18 @@ pub(crate) struct RepositorySnapshotEntry {
 }
 
 struct StreamMatcher {
-    terms: Vec<Vec<u8>>,
+    terms: Vec<SearchTerm>,
     counts: Vec<u64>,
     tail: Vec<u8>,
     overlap: usize,
+    identifier_token: Vec<u8>,
+    identifier_overflowed: bool,
 }
 
 impl StreamMatcher {
     fn new(terms: &[SearchTerm]) -> Self {
         Self {
-            terms: terms.iter().map(|term| term.normalized.clone()).collect(),
+            terms: terms.to_vec(),
             counts: vec![0; terms.len()],
             tail: Vec::new(),
             overlap: terms
@@ -572,6 +576,8 @@ impl StreamMatcher {
                 .map(|term| term.normalized.len().saturating_sub(1))
                 .max()
                 .unwrap_or(0),
+            identifier_token: Vec::new(),
+            identifier_overflowed: false,
         }
     }
 
@@ -582,16 +588,54 @@ impl StreamMatcher {
         combined.extend_from_slice(chunk);
         let combined = ascii_lower(&combined);
         for (index, term) in self.terms.iter().enumerate() {
-            for position in occurrence_positions(&combined, term) {
-                if position.saturating_add(term.len()) > tail_len {
+            if term.kind == RepositorySearchQueryKind::Identifier {
+                continue;
+            }
+            for position in occurrence_positions(&combined, term.normalized()) {
+                if position.saturating_add(term.normalized().len()) > tail_len {
                     self.counts[index] = self.counts[index].saturating_add(1);
                 }
+            }
+        }
+        for byte in ascii_lower(chunk) {
+            if is_identifier_byte(byte) {
+                if !self.identifier_overflowed {
+                    if self.identifier_token.len() < MAX_TERM_BYTES {
+                        self.identifier_token.push(byte);
+                    } else {
+                        self.identifier_token.clear();
+                        self.identifier_overflowed = true;
+                    }
+                }
+            } else {
+                self.finish_identifier_token();
             }
         }
         let keep = self.overlap.min(combined.len());
         self.tail.clear();
         self.tail
             .extend_from_slice(&combined[combined.len() - keep..]);
+    }
+
+    fn finish(&mut self) {
+        self.finish_identifier_token();
+    }
+
+    fn finish_identifier_token(&mut self) {
+        if self.identifier_token.is_empty() || self.identifier_overflowed {
+            self.identifier_token.clear();
+            self.identifier_overflowed = false;
+            return;
+        }
+        for (index, term) in self.terms.iter().enumerate() {
+            if term.kind == RepositorySearchQueryKind::Identifier
+                && term.normalized() == self.identifier_token
+            {
+                self.counts[index] = self.counts[index].saturating_add(1);
+            }
+        }
+        self.identifier_token.clear();
+        self.identifier_overflowed = false;
     }
 }
 
@@ -870,8 +914,28 @@ fn ascii_lower(value: &[u8]) -> Vec<u8> {
     value.iter().map(u8::to_ascii_lowercase).collect()
 }
 
-fn count_occurrences(haystack: &[u8], needle: &[u8]) -> u64 {
-    occurrence_positions(haystack, needle).count() as u64
+fn count_occurrences(haystack: &[u8], term: &SearchTerm) -> u64 {
+    if term.kind == RepositorySearchQueryKind::Identifier {
+        return identifier_occurrences(haystack, term.normalized());
+    }
+    occurrence_positions(haystack, term.normalized()).count() as u64
+}
+
+fn identifier_occurrences(haystack: &[u8], needle: &[u8]) -> u64 {
+    occurrence_positions(haystack, needle)
+        .filter(|position| {
+            let before = position
+                .checked_sub(1)
+                .and_then(|index| haystack.get(index));
+            let after = haystack.get(position.saturating_add(needle.len()));
+            !before.is_some_and(|byte| is_identifier_byte(*byte))
+                && !after.is_some_and(|byte| is_identifier_byte(*byte))
+        })
+        .count() as u64
+}
+
+fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 fn occurrence_positions<'a>(
@@ -986,6 +1050,26 @@ mod tests {
         let receipt = search.complete("head", sha256_hex(b"tree"));
         assert_eq!(receipt.match_count, 2);
         assert_eq!(receipt.matches[0].occurrences, 2);
+    }
+
+    #[test]
+    fn identifier_queries_require_token_boundaries() {
+        let claim = RepositoryClaim {
+            kind: RepositoryClaimKind::Absence,
+            resources: vec![],
+            values: vec![],
+            versions: vec![],
+            paths: vec![],
+            identifiers: vec!["allow".into()],
+        };
+        let mut search = SearchAccumulator::new(search_terms(std::iter::once(&claim)).unwrap());
+        let bytes = b"disallow allowance allow\n";
+        search
+            .scan_reader("src/policy.rs", &mut &bytes[..], bytes.len() as u64)
+            .unwrap();
+        let receipt = search.complete("head", sha256_hex(b"tree"));
+        assert_eq!(receipt.match_count, 1);
+        assert_eq!(receipt.matches[0].occurrences, 1);
     }
 
     #[test]

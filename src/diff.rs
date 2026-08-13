@@ -1946,7 +1946,14 @@ fn exact_semantic_hunk_proof(path: &str, hunk: &Hunk) -> Option<String> {
     for raw in &hunk.lines {
         let (marker, content) = raw.split_at(if raw.is_empty() { 0 } else { 1 });
         if matches!(marker, "+" | "-") {
-            let rendered = render_line_segments(marker, content, old_line, new_line).concat();
+            let rendered = render_line_segments(
+                marker,
+                content,
+                old_line,
+                new_line,
+                LINE_CHUNK_BYTES.saturating_add(128),
+            )
+            .concat();
             if marker == "+"
                 && hosted_risk_tokens(content)
                     .iter()
@@ -4798,7 +4805,7 @@ fn render_hunk_units(file: &FileDiff, hunk: &Hunk, budget: usize) -> Option<Vec<
 
     for raw in &hunk.lines {
         let (marker, content) = raw.split_at(if raw.is_empty() { 0 } else { 1 });
-        let rendered = render_line_segments(marker, content, old_line, new_line);
+        let rendered = render_line_segments(marker, content, old_line, new_line, segment_budget);
         for rendered_line in rendered {
             if !segment.is_empty() && segment.len() + rendered_line.len() > segment_budget {
                 units.push(format!(
@@ -4836,24 +4843,55 @@ fn render_hunk_units(file: &FileDiff, hunk: &Hunk, budget: usize) -> Option<Vec<
     Some(units)
 }
 
-fn render_line_segments(marker: &str, content: &str, old_line: u32, new_line: u32) -> Vec<String> {
+fn render_line_segments(
+    marker: &str,
+    content: &str,
+    old_line: u32,
+    new_line: u32,
+    max_rendered_bytes: usize,
+) -> Vec<String> {
     let prefix = match marker {
         "+" => format!("{new_line:>6} + "),
         "-" => format!("old {old_line:>6} - "),
         _ => format!("{new_line:>6}   "),
     };
-    if content.len() <= LINE_CHUNK_BYTES {
+    if prefix.len().saturating_add(content.len()).saturating_add(1) <= max_rendered_bytes {
         return vec![format!("{prefix}{content}\n")];
     }
-    let step = LINE_CHUNK_BYTES.saturating_sub(LINE_CHUNK_OVERLAP).max(1);
-    let projected_chunks = content.len().saturating_sub(1) / step + 1;
+    let content_budget = max_rendered_bytes
+        .saturating_sub(prefix.len())
+        .saturating_sub(48)
+        .max(1);
+    let projected_chunks = content.len().saturating_sub(1) / content_budget + 1;
     let mut rendered = Vec::with_capacity(projected_chunks);
     let mut start = 0;
     while start < content.len() {
-        let mut end = (start + LINE_CHUNK_BYTES).min(content.len());
+        let mut end = start.saturating_add(content_budget).min(content.len());
         while end > start && !content.is_char_boundary(end) {
             end -= 1;
         }
+        loop {
+            let rendered_bytes = prefix
+                .len()
+                .saturating_add("[columns ".len())
+                .saturating_add(start.to_string().len())
+                .saturating_add("..".len())
+                .saturating_add(end.to_string().len())
+                .saturating_add("] ".len())
+                .saturating_add(end.saturating_sub(start))
+                .saturating_add(1);
+            if rendered_bytes <= max_rendered_bytes || end == start {
+                break;
+            }
+            end = end.saturating_sub(rendered_bytes - max_rendered_bytes);
+            while end > start && !content.is_char_boundary(end) {
+                end -= 1;
+            }
+        }
+        debug_assert!(
+            end > start,
+            "review batch budget must fit one UTF-8 character"
+        );
         rendered.push(format!(
             "{prefix}[columns {start}..{end}] {}\n",
             &content[start..end]
@@ -4861,7 +4899,8 @@ fn render_line_segments(marker: &str, content: &str, old_line: u32, new_line: u3
         if end == content.len() {
             break;
         }
-        let mut next = end.saturating_sub(LINE_CHUNK_OVERLAP);
+        let overlap = LINE_CHUNK_OVERLAP.min(end.saturating_sub(start + 1));
+        let mut next = end.saturating_sub(overlap);
         while next < end && !content.is_char_boundary(next) {
             next += 1;
         }

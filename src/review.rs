@@ -11,8 +11,8 @@ use crate::diff;
 use crate::durable_plan::{DurablePlanRegistrar, DurableReviewPlan};
 use crate::envelope::{
     Envelope, Finding, Gate, Kind, ModelIncident, ModelIncidentCategory, ModelIncidentPhase,
-    ModelUsage, ReviewAdmission, ReviewCoverage, ReviewCoverageMode, ReviewCoverageReceipt, Usage,
-    fail_closed_finding,
+    ModelUsage, ReviewAdmission, ReviewCoverage, ReviewCoverageMode, ReviewCoverageReceipt,
+    SuppressedFinding, SuppressionReason, Usage, fail_closed_finding,
 };
 use crate::filter;
 use crate::forge::{
@@ -2373,6 +2373,28 @@ async fn review_diff_at(
         }
     }
 
+    // A complete full review makes ephemeral anchors from a prior envelope
+    // obsolete. They are presentation metadata rather than durable defects,
+    // so record the retirement as non-actionable instead of carrying an
+    // anchor that no longer exists in the reviewed input.
+    if review_trust == filter::ReviewTrust::Exhaustive
+        && matches!(scope, filter::ReconcileScope::Full { .. })
+    {
+        let mut durable_baseline = Vec::with_capacity(baseline.len());
+        for finding in baseline {
+            if crate::envelope::is_ephemeral_anchor(&finding.path) {
+                suppressed = suppressed.saturating_add(1);
+                suppressed_findings.push(SuppressedFinding {
+                    finding,
+                    reason: SuppressionReason::NonActionable,
+                });
+            } else {
+                durable_baseline.push(finding);
+            }
+        }
+        baseline = durable_baseline;
+    }
+
     let repository_search = match repository_search {
         Some(receipt) => receipt,
         None => {
@@ -2386,13 +2408,8 @@ async fn review_diff_at(
     };
     let repository_suppressed =
         crate::repository_search::enforce_receipt(&mut findings, &repository_search);
-    let baseline_repository_suppressed =
-        crate::repository_search::enforce_receipt(&mut baseline, &repository_search);
-    suppressed = suppressed
-        .saturating_add(repository_suppressed.len() as u32)
-        .saturating_add(baseline_repository_suppressed.len() as u32);
+    suppressed = suppressed.saturating_add(repository_suppressed.len() as u32);
     suppressed_findings.extend(repository_suppressed);
-    suppressed_findings.extend(baseline_repository_suppressed);
 
     // A question the reviewer never answered cannot block a merge. This runs
     // after uncertainty resolution so a finding that went and checked keeps the
