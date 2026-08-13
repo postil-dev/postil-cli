@@ -1,9 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
 use std::io::Read;
 use std::path::Path;
 use std::process::Stdio;
 
 use sha2::{Digest, Sha256};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
+use tokio::process::Command;
 
 use crate::envelope::{
     Finding, RepositoryClaim, RepositorySearchMatch, RepositorySearchQuery,
@@ -24,6 +29,8 @@ const MAX_RECORDED_MATCHES: usize = 128;
 const GITHUB_REQUEST_CAP: usize = 256;
 const GITHUB_OBJECT_CAP: usize = 512;
 const GITHUB_AGGREGATE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+const LOCAL_AGGREGATE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+const MAX_BATCH_HEADER_BYTES: usize = 256;
 
 #[derive(Clone, Copy)]
 pub(crate) enum RepositorySource<'a> {
@@ -101,8 +108,11 @@ pub(crate) fn claim_verdict(
             .is_some_and(|hashes| hashes.iter().all(|hash| searched.contains(hash.as_str())));
     if !complete_claim {
         RepositoryClaimVerdict::Unresolved
-    } else if claim_is_refuted(claim, receipt) {
-        RepositoryClaimVerdict::Refuted
+    } else if claim_has_refutation_candidate(claim, receipt) {
+        // A search match is lexical evidence only. It can identify the exact
+        // snapshot path and query hashes for an adjudicator, but cannot prove
+        // that a construct exists rather than being mentioned in prose.
+        RepositoryClaimVerdict::Unresolved
     } else {
         RepositoryClaimVerdict::Supported
     }
@@ -195,23 +205,17 @@ pub(crate) fn claim_is_valid(claim: &RepositoryClaim) -> bool {
     }
 }
 
-fn claim_is_refuted(claim: &RepositoryClaim, receipt: &RepositorySearchReceipt) -> bool {
+fn claim_has_refutation_candidate(
+    claim: &RepositoryClaim,
+    receipt: &RepositorySearchReceipt,
+) -> bool {
     if receipt.matches_truncated || !claim_is_valid(claim) {
         return false;
     }
-    let mut units = BTreeMap::<&str, BTreeSet<&str>>::new();
-    for matched in &receipt.matches {
-        units
-            .entry(matched.path.as_str())
-            .or_default()
-            .insert(matched.query_sha256.as_str());
-    }
     let categories = claim_category_hashes(claim);
-    units.values().any(|matched| {
-        categories.iter().all(|category| {
-            category.is_empty() || category.iter().any(|hash| matched.contains(hash.as_str()))
-        })
-    })
+    receipt_match_units(receipt)
+        .values()
+        .any(|matched| category_hashes_match(&categories, matched))
 }
 
 pub(crate) fn refutation_evidence_is_grounded(
@@ -220,12 +224,39 @@ pub(crate) fn refutation_evidence_is_grounded(
     snapshot_id: &str,
     evidence: &str,
 ) -> bool {
-    if evidence.trim().is_empty()
-        || claim_verdict(claim, receipt, snapshot_id) != RepositoryClaimVerdict::Refuted
-    {
+    if evidence.trim().is_empty() || !complete_claim_receipt(claim, receipt, snapshot_id) {
         return false;
     }
     let categories = claim_category_hashes(claim);
+    receipt_match_units(receipt).iter().any(|(path, matched)| {
+        category_hashes_match(&categories, matched)
+            && (*path == evidence
+                || categories
+                    .iter()
+                    .flatten()
+                    .any(|hash| hash == evidence && matched.contains(hash.as_str())))
+    })
+}
+
+fn complete_claim_receipt(
+    claim: &RepositoryClaim,
+    receipt: &RepositorySearchReceipt,
+    snapshot_id: &str,
+) -> bool {
+    let searched = receipt
+        .queries
+        .iter()
+        .map(|query| query.query_sha256.as_str())
+        .collect::<BTreeSet<_>>();
+    receipt.state == RepositorySearchState::Complete
+        && receipt.head_sha.as_deref() == Some(snapshot_id)
+        && receipt.tree_sha256.as_deref().is_some_and(valid_sha256)
+        && !receipt.matches_truncated
+        && claim_query_hashes(claim)
+            .is_some_and(|hashes| hashes.iter().all(|hash| searched.contains(hash.as_str())))
+}
+
+fn receipt_match_units(receipt: &RepositorySearchReceipt) -> BTreeMap<&str, BTreeSet<&str>> {
     let mut units = BTreeMap::<&str, BTreeSet<&str>>::new();
     for matched in &receipt.matches {
         units
@@ -233,16 +264,12 @@ pub(crate) fn refutation_evidence_is_grounded(
             .or_default()
             .insert(matched.query_sha256.as_str());
     }
-    units.iter().any(|(path, matched)| {
-        let refutes = categories.iter().all(|category| {
-            category.is_empty() || category.iter().any(|hash| matched.contains(hash.as_str()))
-        });
-        refutes
-            && (*path == evidence
-                || categories
-                    .iter()
-                    .flatten()
-                    .any(|hash| hash == evidence && matched.contains(hash.as_str())))
+    units
+}
+
+fn category_hashes_match(categories: &[Vec<String>], matched: &BTreeSet<&str>) -> bool {
+    categories.iter().all(|category| {
+        category.is_empty() || category.iter().all(|hash| matched.contains(hash.as_str()))
     })
 }
 
@@ -458,6 +485,7 @@ impl SearchAccumulator {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn scan_reader(
         &mut self,
         path: &str,
@@ -483,6 +511,56 @@ impl SearchAccumulator {
                 "repository blob size did not match tree metadata",
             ));
         }
+        self.finish_blob(path, read, scanner.counts);
+        Ok(())
+    }
+
+    async fn scan_batch_reader(
+        &mut self,
+        path: &str,
+        object_id: &str,
+        reader: &mut (impl AsyncBufRead + Unpin),
+        expected_size: u64,
+    ) -> std::io::Result<()> {
+        let mut header = Vec::with_capacity(MAX_BATCH_HEADER_BYTES);
+        reader
+            .take((MAX_BATCH_HEADER_BYTES + 1) as u64)
+            .read_until(b'\n', &mut header)
+            .await?;
+        if !valid_batch_header(&header, object_id, expected_size) {
+            return Err(std::io::Error::other(
+                "git batch output did not match the tree entry",
+            ));
+        }
+
+        let mut scanner = StreamMatcher::new(&self.terms);
+        let mut read = 0u64;
+        let mut remaining = expected_size;
+        let mut chunk = [0u8; 64 * 1024];
+        while remaining > 0 {
+            let available = usize::try_from(remaining.min(chunk.len() as u64))
+                .map_err(|_| std::io::Error::other("repository blob size overflowed"))?;
+            let count = reader.read(&mut chunk[..available]).await?;
+            if count == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "git batch output truncated a repository blob",
+                ));
+            }
+            read = read
+                .checked_add(count as u64)
+                .ok_or_else(|| std::io::Error::other("repository search byte count overflowed"))?;
+            remaining = remaining.saturating_sub(count as u64);
+            scanner.push(&chunk[..count]);
+        }
+        let mut terminator = [0u8; 1];
+        reader.read_exact(&mut terminator).await?;
+        if terminator != *b"\n" {
+            return Err(std::io::Error::other(
+                "git batch output omitted its blob delimiter",
+            ));
+        }
+        scanner.finish();
         self.finish_blob(path, read, scanner.counts);
         Ok(())
     }
@@ -667,58 +745,49 @@ async fn search_local(
     head_sha: &str,
     terms: Vec<SearchTerm>,
 ) -> RepositorySearchReceipt {
-    let root = root.to_path_buf();
-    let head_sha = head_sha.to_string();
-    let fallback_head = head_sha.clone();
     let fallback_terms = terms.clone();
-    tokio::task::spawn_blocking(move || search_local_blocking(&root, &head_sha, terms))
-        .await
-        .unwrap_or_else(|_| unavailable_with_terms(Some(&fallback_head), &fallback_terms))
+    match tokio::time::timeout(
+        LOCAL_AGGREGATE_DEADLINE,
+        search_local_inner(root, head_sha, terms),
+    )
+    .await
+    {
+        Err(_) => exhausted_with_terms(head_sha, &fallback_terms),
+        Ok(Ok(receipt)) => receipt,
+        Ok(Err(LocalSearchFailure::Exhausted)) => exhausted_with_terms(head_sha, &fallback_terms),
+        Ok(Err(LocalSearchFailure::Unavailable)) => {
+            unavailable_with_terms(Some(head_sha), &fallback_terms)
+        }
+    }
 }
 
-fn search_local_blocking(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalSearchFailure {
+    Unavailable,
+    Exhausted,
+}
+
+async fn search_local_inner(
     root: &Path,
     head_sha: &str,
     terms: Vec<SearchTerm>,
-) -> RepositorySearchReceipt {
+) -> Result<RepositorySearchReceipt, LocalSearchFailure> {
     if !valid_full_object_id(head_sha) {
-        return unavailable_with_terms(Some(head_sha), &terms);
+        return Err(LocalSearchFailure::Unavailable);
     }
-    let object_type = std::process::Command::new("git")
+    let object_type = Command::new("git")
         .arg("-C")
         .arg(root)
         .args(["cat-file", "-t", head_sha])
-        .output();
+        .kill_on_drop(true)
+        .output()
+        .await;
     if !object_type.is_ok_and(|output| {
         output.status.success() && matches!(output.stdout.as_slice(), b"commit\n" | b"tree\n")
     }) {
-        return unavailable_with_terms(Some(head_sha), &terms);
+        return Err(LocalSearchFailure::Unavailable);
     }
-    let output = match std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["ls-tree", "-rlz", "--full-tree", head_sha, "--"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .and_then(|mut child| {
-            let mut bytes = Vec::new();
-            child
-                .stdout
-                .take()
-                .expect("piped git tree output")
-                .take((MAX_TREE_BYTES + 1) as u64)
-                .read_to_end(&mut bytes)?;
-            let status = child.wait()?;
-            if !status.success() {
-                return Err(std::io::Error::other("git tree enumeration failed"));
-            }
-            Ok(bytes)
-        }) {
-        Ok(output) if output.len() <= MAX_TREE_BYTES => output,
-        Ok(_) => return exhausted_with_terms(head_sha, &terms),
-        Err(_) => return unavailable_with_terms(Some(head_sha), &terms),
-    };
+    let output = local_tree_bytes(root, head_sha).await?;
     let mut entries = Vec::new();
     let mut total_bytes = 0u64;
     let mut entry_count = 0usize;
@@ -728,43 +797,43 @@ fn search_local_blocking(
     {
         entry_count = match entry_count.checked_add(1) {
             Some(count) => count,
-            None => return exhausted_with_terms(head_sha, &terms),
+            None => return Err(LocalSearchFailure::Exhausted),
         };
         if entry_count > MAX_TREE_ENTRIES {
-            return exhausted_with_terms(head_sha, &terms);
+            return Err(LocalSearchFailure::Exhausted);
         }
         let Some(tab) = record.iter().position(|byte| *byte == b'\t') else {
-            return unavailable_with_terms(Some(head_sha), &terms);
+            return Err(LocalSearchFailure::Unavailable);
         };
         let metadata = match std::str::from_utf8(&record[..tab]) {
             Ok(value) => value,
-            Err(_) => return unavailable_with_terms(Some(head_sha), &terms),
+            Err(_) => return Err(LocalSearchFailure::Unavailable),
         };
         let path = match std::str::from_utf8(&record[tab + 1..]) {
             Ok(value) if crate::forge::valid_repository_path(value) => value.to_string(),
-            _ => return unavailable_with_terms(Some(head_sha), &terms),
+            _ => return Err(LocalSearchFailure::Unavailable),
         };
         if path.bytes().filter(|byte| *byte == b'/').count() > MAX_TREE_DEPTH {
-            return exhausted_with_terms(head_sha, &terms);
+            return Err(LocalSearchFailure::Exhausted);
         }
         let fields = metadata.split_ascii_whitespace().collect::<Vec<_>>();
         if fields.len() != 4 || !valid_full_object_id(fields[2]) {
-            return unavailable_with_terms(Some(head_sha), &terms);
+            return Err(LocalSearchFailure::Unavailable);
         }
         let (kind, size) = match (fields[0], fields[1], fields[3]) {
             ("100644" | "100755" | "120000", "blob", raw_size) => {
                 let size = match raw_size.parse::<u64>() {
                     Ok(size) => size,
-                    Err(_) => return unavailable_with_terms(Some(head_sha), &terms),
+                    Err(_) => return Err(LocalSearchFailure::Unavailable),
                 };
                 total_bytes = match total_bytes.checked_add(size) {
                     Some(total) => total,
-                    None => return exhausted_with_terms(head_sha, &terms),
+                    None => return Err(LocalSearchFailure::Exhausted),
                 };
                 (RepositorySnapshotEntryKind::Blob, Some(size))
             }
             ("160000", "commit", "-") => (RepositorySnapshotEntryKind::Gitlink, None),
-            _ => return unavailable_with_terms(Some(head_sha), &terms),
+            _ => return Err(LocalSearchFailure::Unavailable),
         };
         entries.push(RepositorySnapshotEntry {
             path,
@@ -775,12 +844,25 @@ fn search_local_blocking(
         });
     }
     if total_bytes > MAX_SEARCH_BYTES {
-        return exhausted_with_terms(head_sha, &terms);
+        return Err(LocalSearchFailure::Exhausted);
     }
     entries.sort_by(|left, right| left.path.cmp(&right.path));
     let tree_sha256 = tree_sha256(&entries);
     let mut search = SearchAccumulator::new(terms);
     let mut has_gitlinks = false;
+    let mut batch = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["cat-file", "--batch"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|_| LocalSearchFailure::Unavailable)?;
+    let mut input = batch.stdin.take().ok_or(LocalSearchFailure::Unavailable)?;
+    let output = batch.stdout.take().ok_or(LocalSearchFailure::Unavailable)?;
+    let mut output = BufReader::new(output);
     for entry in entries {
         if entry.kind == RepositorySnapshotEntryKind::Gitlink {
             has_gitlinks = true;
@@ -789,34 +871,91 @@ fn search_local_blocking(
         }
         search.scan_path(&entry.path);
         let size = entry.size.expect("blob snapshot entry has a size");
-        let mut child = match std::process::Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(["cat-file", "blob", &entry.object_id])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(_) => return unavailable_with_terms(Some(head_sha), &search.terms),
-        };
-        let searched = search
-            .scan_reader(
-                &entry.path,
-                child.stdout.as_mut().expect("piped git blob output"),
-                size,
-            )
-            .is_ok();
-        let completed = child.wait().is_ok_and(|status| status.success());
-        if !searched || !completed {
-            return unavailable_with_terms(Some(head_sha), &search.terms);
-        }
+        scan_batch_object(
+            &mut search,
+            &entry.path,
+            &entry.object_id,
+            &mut input,
+            &mut output,
+            size,
+        )
+        .await
+        .map_err(|_| LocalSearchFailure::Unavailable)?;
+    }
+    drop(input);
+    drop(output);
+    if !batch.wait().await.is_ok_and(|status| status.success()) {
+        return Err(LocalSearchFailure::Unavailable);
     }
     if has_gitlinks {
-        search.incomplete(head_sha, tree_sha256)
+        Ok(search.incomplete(head_sha, tree_sha256))
     } else {
-        search.complete(head_sha, tree_sha256)
+        Ok(search.complete(head_sha, tree_sha256))
     }
+}
+
+async fn local_tree_bytes(root: &Path, head_sha: &str) -> Result<Vec<u8>, LocalSearchFailure> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-tree", "-rlz", "--full-tree", head_sha, "--"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|_| LocalSearchFailure::Unavailable)?;
+    let mut stdout = child.stdout.take().ok_or(LocalSearchFailure::Unavailable)?;
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let count = stdout
+            .read(&mut chunk)
+            .await
+            .map_err(|_| LocalSearchFailure::Unavailable)?;
+        if count == 0 {
+            break;
+        }
+        if bytes.len().saturating_add(count) > MAX_TREE_BYTES {
+            return Err(LocalSearchFailure::Exhausted);
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+    drop(stdout);
+    if !child.wait().await.is_ok_and(|status| status.success()) {
+        return Err(LocalSearchFailure::Unavailable);
+    }
+    Ok(bytes)
+}
+
+fn valid_batch_header(header: &[u8], object_id: &str, expected_size: u64) -> bool {
+    if header.len() > MAX_BATCH_HEADER_BYTES || !header.ends_with(b"\n") {
+        return false;
+    }
+    let Ok(header) = std::str::from_utf8(&header[..header.len().saturating_sub(1)]) else {
+        return false;
+    };
+    let mut fields = header.split_ascii_whitespace();
+    fields.next().is_some_and(|value| value == object_id)
+        && fields.next() == Some("blob")
+        && fields
+            .next()
+            .is_some_and(|value| value.parse::<u64>().ok() == Some(expected_size))
+        && fields.next().is_none()
+}
+
+async fn scan_batch_object(
+    search: &mut SearchAccumulator,
+    path: &str,
+    object_id: &str,
+    input: &mut (impl AsyncWrite + Unpin),
+    output: &mut (impl AsyncBufRead + Unpin),
+    expected_size: u64,
+) -> std::io::Result<()> {
+    input.write_all(format!("{object_id}\n").as_bytes()).await?;
+    input.flush().await?;
+    search
+        .scan_batch_reader(path, object_id, output, expected_size)
+        .await
 }
 
 pub(crate) fn unavailable(head_sha: Option<&str>) -> RepositorySearchReceipt {
@@ -1117,6 +1256,97 @@ mod tests {
         assert_eq!(receipt.matches[0].occurrences, 2);
     }
 
+    #[tokio::test]
+    async fn batch_reader_uses_one_protocol_for_multiple_blobs() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, duplex};
+
+        let claim = claim("needle");
+        let mut search = SearchAccumulator::new(search_terms(std::iter::once(&claim)).unwrap());
+        let first = "a".repeat(40);
+        let second = "b".repeat(40);
+        let (mut input, requests) = duplex(1024);
+        let (mut responses, output) = duplex(1024);
+        let expected = vec![
+            (first.clone(), b"first needle\n".to_vec()),
+            (second.clone(), b"second needle\n".to_vec()),
+        ];
+        let server = tokio::spawn(async move {
+            let mut requests = BufReader::new(requests);
+            let mut seen = Vec::new();
+            for (object_id, body) in expected {
+                let mut request = String::new();
+                requests.read_line(&mut request).await.unwrap();
+                seen.push(request.trim().to_string());
+                responses
+                    .write_all(format!("{object_id} blob {}\n", body.len()).as_bytes())
+                    .await
+                    .unwrap();
+                responses.write_all(&body).await.unwrap();
+                responses.write_all(b"\n").await.unwrap();
+            }
+            seen
+        });
+        let mut output = BufReader::new(output);
+
+        scan_batch_object(
+            &mut search,
+            "first.yaml",
+            &first,
+            &mut input,
+            &mut output,
+            13,
+        )
+        .await
+        .unwrap();
+        scan_batch_object(
+            &mut search,
+            "second.yaml",
+            &second,
+            &mut input,
+            &mut output,
+            14,
+        )
+        .await
+        .unwrap();
+        drop(input);
+
+        assert_eq!(server.await.unwrap(), vec![first, second]);
+        assert_eq!(search.searched_blobs, 2);
+        assert_eq!(search.searched_bytes, 27);
+    }
+
+    #[tokio::test]
+    async fn batch_reader_fails_closed_on_malformed_or_truncated_output() {
+        use tokio::io::{AsyncWriteExt, duplex};
+
+        let object_id = "a".repeat(40);
+        let truncated = format!("{object_id} blob 6\nshort");
+        for response in [b"not-a-git-batch-header\n".as_slice(), truncated.as_bytes()] {
+            let claim = claim("needle");
+            let mut search = SearchAccumulator::new(search_terms(std::iter::once(&claim)).unwrap());
+            let (mut input, _requests) = duplex(1024);
+            let (mut writer, output) = duplex(1024);
+            writer.write_all(response).await.unwrap();
+            drop(writer);
+            let mut output = BufReader::new(output);
+
+            assert!(
+                scan_batch_object(
+                    &mut search,
+                    "config.yaml",
+                    &object_id,
+                    &mut input,
+                    &mut output,
+                    6,
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(search.searched_blobs, 0);
+            assert_eq!(search.searched_bytes, 0);
+        }
+    }
+
     #[test]
     fn identifier_queries_require_token_boundaries() {
         let claim = RepositoryClaim {
@@ -1210,11 +1440,11 @@ mod tests {
     }
 
     #[test]
-    fn positive_match_refutes_a_repository_claim() {
+    fn lexical_match_is_an_unresolved_repository_candidate() {
         let claim = claim("CephCluster");
         let queries = receipt_queries(&search_terms(std::iter::once(&claim)).unwrap());
         let digest = queries[0].query_sha256.clone();
-        let mut findings = vec![finding(claim)];
+        let mut findings = vec![finding(claim.clone())];
         let receipt = RepositorySearchReceipt {
             head_sha: Some("a".repeat(40)),
             state: RepositorySearchState::Complete,
@@ -1231,6 +1461,14 @@ mod tests {
         let suppressed = enforce_receipt(&mut findings, &receipt);
         assert!(findings.is_empty());
         assert_eq!(suppressed.len(), 1);
+        assert_eq!(
+            claim_verdict(
+                suppressed[0].finding.repository_claim.as_ref().unwrap(),
+                &receipt,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ),
+            RepositoryClaimVerdict::Unresolved
+        );
     }
 
     #[test]
@@ -1308,7 +1546,7 @@ mod tests {
     }
 
     #[test]
-    fn mismatch_is_refuted_by_a_matching_target_scoped_value() {
+    fn matching_target_scoped_value_is_candidate_scoped_refutation_evidence() {
         let claim = RepositoryClaim {
             kind: RepositoryClaimKind::Mismatch,
             resources: vec!["CephCluster".into()],
@@ -1328,10 +1566,102 @@ mod tests {
             )
             .unwrap();
         let receipt = search.complete(&"a".repeat(40), "b".repeat(64));
-        let mut findings = vec![finding(claim)];
+        let mut findings = vec![finding(claim.clone())];
 
         assert_eq!(enforce_receipt(&mut findings, &receipt).len(), 1);
         assert!(findings.is_empty());
+        assert_eq!(
+            claim_verdict(&claim, &receipt, &"a".repeat(40)),
+            RepositoryClaimVerdict::Unresolved
+        );
+        assert!(refutation_evidence_is_grounded(
+            &claim,
+            &receipt,
+            &"a".repeat(40),
+            "k8s/ceph/cluster.yaml",
+        ));
+    }
+
+    #[test]
+    fn every_declared_hash_must_match_one_evidence_unit() {
+        let claim = RepositoryClaim {
+            kind: RepositoryClaimKind::Absence,
+            resources: vec![],
+            values: vec![
+                "first-required-value".into(),
+                "second-required-value".into(),
+            ],
+            versions: vec![],
+            paths: vec![],
+            identifiers: vec![],
+        };
+        let mut one = SearchAccumulator::new(search_terms(std::iter::once(&claim)).unwrap());
+        let first = b"first-required-value\n";
+        one.scan_reader("config.yaml", &mut &first[..], first.len() as u64)
+            .unwrap();
+        let one = one.complete(&"a".repeat(40), "b".repeat(64));
+        assert_eq!(
+            claim_verdict(&claim, &one, &"a".repeat(40)),
+            RepositoryClaimVerdict::Supported
+        );
+        assert!(!refutation_evidence_is_grounded(
+            &claim,
+            &one,
+            &"a".repeat(40),
+            "config.yaml",
+        ));
+
+        let mut both = SearchAccumulator::new(search_terms(std::iter::once(&claim)).unwrap());
+        let values = b"first-required-value second-required-value\n";
+        both.scan_reader("config.yaml", &mut &values[..], values.len() as u64)
+            .unwrap();
+        let both = both.complete(&"a".repeat(40), "b".repeat(64));
+        assert_eq!(
+            claim_verdict(&claim, &both, &"a".repeat(40)),
+            RepositoryClaimVerdict::Unresolved
+        );
+        assert!(refutation_evidence_is_grounded(
+            &claim,
+            &both,
+            &"a".repeat(40),
+            "config.yaml",
+        ));
+    }
+
+    #[test]
+    fn filename_and_comment_hits_remain_unresolved_candidates() {
+        let claim = claim("required-construct");
+        let terms = search_terms(std::iter::once(&claim)).unwrap();
+        let mut filename = SearchAccumulator::new(terms.clone());
+        filename.scan_path("docs/required-construct.md");
+        let filename = filename.complete(&"a".repeat(40), "b".repeat(64));
+        assert_eq!(
+            claim_verdict(&claim, &filename, &"a".repeat(40)),
+            RepositoryClaimVerdict::Unresolved
+        );
+        assert!(refutation_evidence_is_grounded(
+            &claim,
+            &filename,
+            &"a".repeat(40),
+            "docs/required-construct.md",
+        ));
+
+        let mut comment = SearchAccumulator::new(terms);
+        let content = b"# required-construct is documented here\n";
+        comment
+            .scan_reader("src/config.rs", &mut &content[..], content.len() as u64)
+            .unwrap();
+        let comment = comment.complete(&"a".repeat(40), "b".repeat(64));
+        assert_eq!(
+            claim_verdict(&claim, &comment, &"a".repeat(40)),
+            RepositoryClaimVerdict::Unresolved
+        );
+        assert!(refutation_evidence_is_grounded(
+            &claim,
+            &comment,
+            &"a".repeat(40),
+            "src/config.rs",
+        ));
     }
 
     #[test]
@@ -1485,8 +1815,8 @@ mod tests {
         assert!(receipt.queries.is_empty());
     }
 
-    #[test]
-    fn gitlink_metadata_is_hashed_and_never_yields_a_complete_receipt() {
+    #[tokio::test]
+    async fn gitlink_metadata_is_hashed_and_never_yields_a_complete_receipt() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         run_git(root, &["init", "--quiet"]);
@@ -1509,11 +1839,12 @@ mod tests {
             paths: vec!["vendor/ceph".into()],
             identifiers: vec![],
         };
-        let first_receipt = search_local_blocking(
+        let first_receipt = search_local(
             root,
             &first_tree,
             search_terms(std::iter::once(&claim)).unwrap(),
-        );
+        )
+        .await;
 
         assert_eq!(first_receipt.state, RepositorySearchState::Unavailable);
         assert!(first_receipt.tree_sha256.is_some());
@@ -1530,17 +1861,18 @@ mod tests {
             ],
         );
         let second_tree = run_git(root, &["write-tree"]);
-        let second_receipt = search_local_blocking(
+        let second_receipt = search_local(
             root,
             &second_tree,
             search_terms(std::iter::once(&claim)).unwrap(),
-        );
+        )
+        .await;
         assert_ne!(first_receipt.tree_sha256, second_receipt.tree_sha256);
     }
 
     #[cfg(unix)]
-    #[test]
-    fn local_search_uses_the_exact_commit_after_head_and_worktree_mutate() {
+    #[tokio::test]
+    async fn local_search_uses_the_exact_commit_after_head_and_worktree_mutate() {
         use std::os::unix::fs::symlink;
 
         let directory = tempfile::tempdir().unwrap();
@@ -1589,7 +1921,7 @@ mod tests {
             .iter()
             .map(|term| (term.kind, term.query_sha256.clone()))
             .collect::<BTreeMap<_, _>>();
-        let receipt = search_local_blocking(root, &reviewed_head, terms);
+        let receipt = search_local(root, &reviewed_head, terms).await;
 
         assert_eq!(receipt.head_sha.as_deref(), Some(reviewed_head.as_str()));
         assert_eq!(receipt.state, RepositorySearchState::Complete);
