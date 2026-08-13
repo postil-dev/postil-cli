@@ -965,21 +965,21 @@ describe("qualification Git source authority", () => {
 });
 
 describe("immutable qualification binary", () => {
-  test("review contract hashes every Rust source with the required manifests", async () => {
+  test("review contract hashes every regular source file with the required manifests", async () => {
     const repositoryRoot = resolve(import.meta.dir, "../..");
-    async function collectRustSources(directory: string): Promise<string[]> {
+    async function collectReviewSources(directory: string): Promise<string[]> {
       const entries = await readdir(directory, { withFileTypes: true });
       const paths = await Promise.all(entries.sort((left, right) =>
         left.name < right.name ? -1 : left.name > right.name ? 1 : 0)
         .map(async (entry) => entry.isDirectory()
-          ? collectRustSources(resolve(directory, entry.name))
-          : entry.isFile() && entry.name.endsWith(".rs")
+          ? collectReviewSources(resolve(directory, entry.name))
+          : entry.isFile()
           ? [resolve(directory, entry.name).slice(repositoryRoot.length + 1).replaceAll("\\", "/")]
           : []));
       return paths.flat();
     }
 
-    const expected = ["Cargo.lock", "Cargo.toml", "build.rs", ...await collectRustSources(resolve(repositoryRoot, "src"))]
+    const expected = ["Cargo.lock", "Cargo.toml", "build.rs", ...await collectReviewSources(resolve(repositoryRoot, "src"))]
       .sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
     expect(REVIEW_CONTRACT_SOURCE_PATHS).toEqual(expected);
     expect(BINARY_SOURCE_PATHS).toEqual(expected);
