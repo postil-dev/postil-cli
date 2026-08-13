@@ -4546,6 +4546,9 @@ pub fn render_annotated(diff: &Diff, max_bytes: usize) -> (String, bool) {
 const HUNK_OVERLAP_LINES: usize = 6;
 const LINE_CHUNK_BYTES: usize = 16_000;
 const LINE_CHUNK_OVERLAP: usize = 256;
+// A numbered evidence payload must remain whole when finding adjudication
+// corroborates it against the original diff.
+const MAX_RENDERED_EVIDENCE_BYTES: usize = 1_024;
 
 struct ChangeManifest {
     text: String,
@@ -4855,13 +4858,15 @@ fn render_line_segments(
         "-" => format!("old {old_line:>6} - "),
         _ => format!("{new_line:>6}   "),
     };
-    if prefix.len().saturating_add(content.len()).saturating_add(1) <= max_rendered_bytes {
+    if content.len() <= MAX_RENDERED_EVIDENCE_BYTES
+        && prefix.len().saturating_add(content.len()).saturating_add(1) <= max_rendered_bytes
+    {
         return vec![format!("{prefix}{content}\n")];
     }
     let content_budget = max_rendered_bytes
         .saturating_sub(prefix.len())
         .saturating_sub(48)
-        .max(1);
+        .clamp(1, MAX_RENDERED_EVIDENCE_BYTES);
     let projected_chunks = content.len().saturating_sub(1) / content_budget + 1;
     let mut rendered = Vec::with_capacity(projected_chunks);
     let mut start = 0;
@@ -4892,10 +4897,7 @@ fn render_line_segments(
             end > start,
             "review batch budget must fit one UTF-8 character"
         );
-        rendered.push(format!(
-            "{prefix}[columns {start}..{end}] {}\n",
-            &content[start..end]
-        ));
+        rendered.push(format!("{prefix}{}\n", &content[start..end]));
         if end == content.len() {
             break;
         }
@@ -6335,13 +6337,21 @@ Binary files a/img.png and b/img.png differ
         let tail = "TAIL_DEFECT_eval(user_input)";
         let source = format!(
             "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -0,0 +1 @@\n+{}{tail}\n",
-            "x".repeat(40_000)
+            "界".repeat(15_000)
         );
         let parsed = parse(&source);
         let plan = render_review_batches(&parsed, &[], &[], 24_000, 4096);
         assert!(!plan.incomplete);
         assert!(plan.batches.iter().any(|batch| batch.contains(tail)));
         assert!(plan.batches.iter().all(|batch| batch.len() <= 24_000));
+        for rendered in plan.batches.iter().flat_map(|batch| batch.lines()) {
+            let Some((_, marked)) = rendered.trim_start().split_once(' ') else {
+                continue;
+            };
+            if let Some(evidence) = marked.strip_prefix("+ ") {
+                assert!(evidence.len() <= MAX_RENDERED_EVIDENCE_BYTES);
+            }
+        }
     }
 
     #[test]
