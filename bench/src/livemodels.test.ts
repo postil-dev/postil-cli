@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { chmod, link, lstat, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
@@ -49,6 +49,8 @@ import {
   readPinnedQualificationWorktreeFile,
   runLiveModels,
   runQualificationCanariesSequentially,
+  BINARY_SOURCE_PATHS,
+  REVIEW_CONTRACT_SOURCE_PATHS,
   summarizeAttributionEvaluator,
   verifyPrivateEvidenceBundle,
   withImmutableQualificationBinary,
@@ -963,6 +965,30 @@ describe("qualification Git source authority", () => {
 });
 
 describe("immutable qualification binary", () => {
+  test("review contract hashes every Rust source with the required manifests", async () => {
+    const repositoryRoot = resolve(import.meta.dir, "../..");
+    async function collectRustSources(directory: string): Promise<string[]> {
+      const entries = await readdir(directory, { withFileTypes: true });
+      const paths = await Promise.all(entries.sort((left, right) =>
+        left.name < right.name ? -1 : left.name > right.name ? 1 : 0)
+        .map(async (entry) => entry.isDirectory()
+          ? collectRustSources(resolve(directory, entry.name))
+          : entry.isFile() && entry.name.endsWith(".rs")
+          ? [resolve(directory, entry.name).slice(repositoryRoot.length + 1).replaceAll("\\", "/")]
+          : []));
+      return paths.flat();
+    }
+
+    const expected = ["Cargo.lock", "Cargo.toml", "build.rs", ...await collectRustSources(resolve(repositoryRoot, "src"))]
+      .sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
+    expect(REVIEW_CONTRACT_SOURCE_PATHS).toEqual(expected);
+    expect(BINARY_SOURCE_PATHS).toEqual(expected);
+
+    const sources = await Promise.all(REVIEW_CONTRACT_SOURCE_PATHS.map(async (path) =>
+      [path, await readFile(resolve(repositoryRoot, path))] as const));
+    expect(hashNamedSources(sources)).toMatch(/^[0-9a-f]{64}$/);
+  });
+
   test("rejects source authority drift before broader qualification spend", () => {
     const expected = {
       sourceSha: "a".repeat(40),

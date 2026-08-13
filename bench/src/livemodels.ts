@@ -25,6 +25,7 @@ import type { FileHandle } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import evaluatorContractSourcePaths from "../evaluator-contract-sources.json";
+import reviewContractSourcePaths from "../review-contract-sources.json";
 import { ATTRIBUTION_BANK } from "../fixtures/attribution-bank";
 import { API_KEY_ENV_NAMES_TEXT, forwardApiKey, resolveApiKeyName } from "./api-key";
 import {
@@ -135,20 +136,7 @@ export function managedAdmissionCapacityFailure(
     : null;
 }
 
-export const REVIEW_CONTRACT_SOURCE_PATHS = [
-  "Cargo.toml", "Cargo.lock",
-  "src/api_key.rs", "src/cli.rs", "src/config.rs", "src/doctor.rs",
-  "src/forge/azure.rs", "src/forge/bitbucket.rs", "src/forge/github.rs",
-  "src/forge/gitlab.rs", "src/forge/mod.rs", "src/hook.rs", "src/lib.rs", "src/local.rs", "src/main.rs",
-  "src/output.rs", "src/plan.rs",
-  "src/prompt.rs",
-  "src/attribution.rs",
-  "src/llm.rs",
-  "src/envelope.rs",
-  "src/respond.rs", "src/review.rs", "src/sarif.rs",
-  "src/diff.rs",
-  "src/filter.rs",
-] as const;
+export const REVIEW_CONTRACT_SOURCE_PATHS = reviewContractSourcePaths as readonly string[];
 export const FIXTURE_SET_SOURCE_PATHS = ["bench/fixtures/cases.ts"] as const;
 export const EVALUATOR_CONTRACT_SOURCE_PATHS = evaluatorContractSourcePaths as readonly string[];
 export const BINARY_SOURCE_PATHS = REVIEW_CONTRACT_SOURCE_PATHS;
