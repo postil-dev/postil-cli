@@ -3140,8 +3140,10 @@ pub fn prepare_review_with_ignore(
     while cursor < text.len() {
         let end = next_diff_start(text, cursor + "diff --git ".len()).unwrap_or(text.len());
         let section = &text[cursor..end];
-        let path = section_path(section).context("review section has an invalid path header")?;
-        if ignore.is_match(&path) {
+        let paths = validated_section_paths(section).context("validating review section paths")?;
+        let ignored = ignore.is_match(&paths.path) && ignore.is_match(&paths.old_path);
+        let path = paths.path;
+        if ignored {
             cursor = end;
             continue;
         }
@@ -3423,7 +3425,7 @@ pub fn prepare_diff(text: &str) -> PreparedDiff<'_> {
     while let Some(start) = cursor {
         let end = next_diff_start(text, start + "diff --git ".len()).unwrap_or(text.len());
         let section = &text[start..end];
-        let Some(path) = section_path(section) else {
+        let Ok(paths) = validated_section_paths(section) else {
             return PreparedDiff {
                 source: None,
                 lockfiles: Vec::new(),
@@ -3431,6 +3433,7 @@ pub fn prepare_diff(text: &str) -> PreparedDiff<'_> {
                 incomplete: true,
             };
         };
+        let path = paths.path;
         if is_known_lockfile(&path) {
             if let Some(evidence) = lockfile_evidence(&path, section) {
                 compacted = true;
@@ -3462,7 +3465,7 @@ pub fn prepare_diff(text: &str) -> PreparedDiff<'_> {
     while let Some(start) = cursor {
         let end = next_diff_start(text, start + "diff --git ".len()).unwrap_or(text.len());
         let section = &text[start..end];
-        let Some(path) = section_path(section) else {
+        let Ok(paths) = validated_section_paths(section) else {
             return PreparedDiff {
                 source: None,
                 lockfiles: Vec::new(),
@@ -3470,6 +3473,7 @@ pub fn prepare_diff(text: &str) -> PreparedDiff<'_> {
                 incomplete: true,
             };
         };
+        let path = paths.path;
         let compact_lockfile =
             is_known_lockfile(&path) && lockfile_evidence(&path, section).is_some();
         if !compact_lockfile && !is_compactable_generated_artifact(&path, section) {
@@ -3544,32 +3548,445 @@ fn next_diff_start(text: &str, from: usize) -> Option<usize> {
     tail.find("\ndiff --git ").map(|offset| from + offset + 1)
 }
 
-fn section_path(section: &str) -> Option<String> {
-    section
-        .lines()
-        .next()
-        .and_then(|header| header.strip_prefix("diff --git "))
-        .and_then(parse_diff_header_paths)
-        .map(|(_, path)| path)
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SectionPaths {
+    old_path: String,
+    path: String,
 }
 
-fn parse_diff_header_paths(rest: &str) -> Option<(String, String)> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DiffMarkerPath {
+    Null,
+    Path(String),
+}
+
+fn valid_diff_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.starts_with('/')
+        && !path.contains('\0')
+        && path
+            .split('/')
+            .all(|segment| !segment.is_empty() && segment != "." && segment != "..")
+}
+
+fn canonical_side_path(value: &str, prefix: &str) -> Option<DiffMarkerPath> {
+    if value == "/dev/null" {
+        return Some(DiffMarkerPath::Null);
+    }
+    let path = value.strip_prefix(prefix)?;
+    valid_diff_path(path).then(|| DiffMarkerPath::Path(path.to_string()))
+}
+
+fn parse_git_side_marker_path(value: &str, prefix: &str) -> Option<DiffMarkerPath> {
+    if value == "/dev/null" {
+        return Some(DiffMarkerPath::Null);
+    }
+    let (decoded, trailing) = if value.starts_with('"') {
+        parse_git_path_token(value)?
+    } else {
+        (value.split('\t').next()?.to_string(), "")
+    };
+    trailing.trim().is_empty().then_some(())?;
+    canonical_side_path(&decoded, prefix)
+}
+
+fn parse_git_extended_path(value: &str) -> Option<String> {
+    let (decoded, trailing) = if value.starts_with('"') {
+        parse_git_path_token(value)?
+    } else {
+        (value.to_string(), "")
+    };
+    (trailing.trim().is_empty() && valid_diff_path(&decoded)).then_some(decoded)
+}
+
+fn parse_binary_marker_path_candidates(
+    line: &str,
+) -> Option<Vec<(DiffMarkerPath, DiffMarkerPath)>> {
+    let inner = line
+        .strip_prefix("Binary files ")?
+        .strip_suffix(" differ")?;
+    if inner.starts_with('"') {
+        let (old, remainder) = parse_git_path_token(inner)?;
+        let (new, trailing) = parse_git_path_token(remainder.strip_prefix(" and ")?)?;
+        trailing.trim().is_empty().then_some(())?;
+        return Some(vec![(
+            canonical_side_path(&old, "a/")?,
+            canonical_side_path(&new, "b/")?,
+        )]);
+    }
+    let candidates = inner
+        .match_indices(" and ")
+        .filter_map(|(index, separator)| {
+            Some((
+                canonical_side_path(&inner[..index], "a/")?,
+                canonical_side_path(&inner[index + separator.len()..], "b/")?,
+            ))
+        })
+        .collect::<Vec<_>>();
+    (!candidates.is_empty()).then_some(candidates)
+}
+
+fn marker_pair_matches(old: &DiffMarkerPath, new: &DiffMarkerPath, paths: &SectionPaths) -> bool {
+    match (old, new) {
+        (DiffMarkerPath::Path(old), DiffMarkerPath::Path(new)) => {
+            old == &paths.old_path && new == &paths.path
+        }
+        (DiffMarkerPath::Null, DiffMarkerPath::Path(new)) => {
+            paths.old_path == paths.path && new == &paths.path
+        }
+        (DiffMarkerPath::Path(old), DiffMarkerPath::Null) => {
+            paths.old_path == paths.path && old == &paths.old_path
+        }
+        (DiffMarkerPath::Null, DiffMarkerPath::Null) => false,
+    }
+}
+
+fn consume_diff_hunk_line(line: &str, old_left: &mut u32, new_left: &mut u32) -> bool {
+    if *old_left == 0 && *new_left == 0 {
+        return false;
+    }
+    match line.chars().next() {
+        Some('+') if *new_left > 0 => *new_left -= 1,
+        Some('-') if *old_left > 0 => *old_left -= 1,
+        Some(' ') if *old_left > 0 && *new_left > 0 => {
+            *old_left -= 1;
+            *new_left -= 1;
+        }
+        _ => return false,
+    }
+    true
+}
+
+fn validated_section_paths(section: &str) -> Result<SectionPaths> {
+    section_paths(section, true)
+}
+
+fn section_paths(section: &str, require_complete_hunks: bool) -> Result<SectionPaths> {
+    let mut lines = section.lines();
+    let candidates = lines
+        .next()
+        .and_then(|header| header.strip_prefix("diff --git "))
+        .and_then(parse_diff_header_path_candidates)
+        .context("diff section has an invalid path header")?;
+    let mut old_marker = None;
+    let mut new_marker = None;
+    let mut rename_from = None;
+    let mut rename_to = None;
+    let mut copy_from = None;
+    let mut copy_to = None;
+    let mut binary_paths = None;
+    let mut index_mode = None::<Option<String>>;
+    let mut explicit_old_mode = None::<String>;
+    let mut explicit_new_mode = None::<String>;
+    let mut saw_change = false;
+    let mut saw_hunk = false;
+    let mut old_left = 0;
+    let mut new_left = 0;
+
+    while let Some(line) = lines.next() {
+        if consume_diff_hunk_line(line, &mut old_left, &mut new_left) {
+            continue;
+        }
+        if old_left != 0 || new_left != 0 {
+            if line == "\\ No newline at end of file" {
+                continue;
+            }
+            if !require_complete_hunks {
+                break;
+            }
+            anyhow::bail!("diff section hunk body does not match its declared range");
+        }
+        if line == "GIT binary patch" {
+            anyhow::ensure!(
+                !saw_hunk,
+                "diff section mixes text hunks with a binary patch"
+            );
+            anyhow::ensure!(
+                !lines.any(|remaining| remaining.starts_with("@@")),
+                "diff section mixes a binary patch with text hunks"
+            );
+            saw_change = true;
+            break;
+        }
+        if let Some(header) = line.strip_prefix("@@ ") {
+            anyhow::ensure!(
+                binary_paths.is_none(),
+                "diff section mixes binary markers with text hunks"
+            );
+            let Some((_, old_count, _, new_count)) = parse_hunk_header(header) else {
+                if require_complete_hunks {
+                    anyhow::bail!("diff section has a malformed hunk range");
+                }
+                break;
+            };
+            saw_hunk = true;
+            saw_change = true;
+            old_left = old_count;
+            new_left = new_count;
+            continue;
+        }
+        if line.starts_with("@@") {
+            if require_complete_hunks {
+                anyhow::bail!("diff section has a malformed hunk range");
+            }
+            break;
+        }
+        if line.starts_with([' ', '+', '-'])
+            && !line.starts_with("--- ")
+            && !line.starts_with("+++ ")
+        {
+            if require_complete_hunks {
+                anyhow::bail!(if saw_hunk {
+                    "diff section hunk body exceeds its declared range"
+                } else {
+                    "diff section has changed content outside a hunk"
+                });
+            }
+            break;
+        }
+        if line.starts_with("index ") {
+            anyhow::ensure!(
+                index_mode.is_none(),
+                "diff section repeats its index metadata"
+            );
+            let mode = unchanged_index_mode(line)?;
+            if let Some(mode) = mode {
+                anyhow::ensure!(
+                    explicit_old_mode.as_deref().is_none_or(|old| old == mode)
+                        && explicit_new_mode.as_deref().is_none_or(|new| new == mode),
+                    "diff section index and explicit mode disagree"
+                );
+            }
+            index_mode = Some(mode.map(str::to_string));
+        } else if let Some(value) = line.strip_prefix("--- ") {
+            anyhow::ensure!(
+                old_marker.is_none(),
+                "diff section repeats its old path marker"
+            );
+            old_marker = Some(
+                parse_git_side_marker_path(value, "a/")
+                    .context("diff section has an invalid old path marker")?,
+            );
+        } else if let Some(value) = line.strip_prefix("+++ ") {
+            anyhow::ensure!(
+                new_marker.is_none(),
+                "diff section repeats its new path marker"
+            );
+            new_marker = Some(
+                parse_git_side_marker_path(value, "b/")
+                    .context("diff section has an invalid new path marker")?,
+            );
+        } else if let Some(value) = line.strip_prefix("rename from ") {
+            anyhow::ensure!(rename_from.is_none(), "diff section repeats rename-from");
+            rename_from = Some(
+                parse_git_extended_path(value)
+                    .context("diff section has an invalid rename-from path")?,
+            );
+            saw_change = true;
+        } else if let Some(value) = line.strip_prefix("rename to ") {
+            anyhow::ensure!(rename_to.is_none(), "diff section repeats rename-to");
+            rename_to = Some(
+                parse_git_extended_path(value)
+                    .context("diff section has an invalid rename-to path")?,
+            );
+            saw_change = true;
+        } else if let Some(value) = line.strip_prefix("copy from ") {
+            anyhow::ensure!(copy_from.is_none(), "diff section repeats copy-from");
+            copy_from = Some(
+                parse_git_extended_path(value)
+                    .context("diff section has an invalid copy-from path")?,
+            );
+            saw_change = true;
+        } else if let Some(value) = line.strip_prefix("copy to ") {
+            anyhow::ensure!(copy_to.is_none(), "diff section repeats copy-to");
+            copy_to = Some(
+                parse_git_extended_path(value)
+                    .context("diff section has an invalid copy-to path")?,
+            );
+            saw_change = true;
+        } else if line.starts_with("Binary files ") {
+            anyhow::ensure!(
+                !saw_hunk,
+                "diff section mixes text hunks with binary markers"
+            );
+            anyhow::ensure!(binary_paths.is_none(), "diff section repeats binary paths");
+            binary_paths = Some(
+                parse_binary_marker_path_candidates(line)
+                    .context("diff section has invalid binary path markers")?,
+            );
+            saw_change = true;
+        } else if let Some(mode) = line.strip_prefix("old mode ") {
+            anyhow::ensure!(explicit_old_mode.is_none(), "diff section repeats old mode");
+            let mode = validated_git_mode(mode)?;
+            anyhow::ensure!(
+                index_mode
+                    .as_ref()
+                    .and_then(Option::as_deref)
+                    .is_none_or(|index| index == mode),
+                "diff section index and old mode disagree"
+            );
+            explicit_old_mode = Some(mode.to_string());
+            saw_change = true;
+        } else if let Some(mode) = line.strip_prefix("new mode ") {
+            anyhow::ensure!(explicit_new_mode.is_none(), "diff section repeats new mode");
+            let mode = validated_git_mode(mode)?;
+            anyhow::ensure!(
+                index_mode
+                    .as_ref()
+                    .and_then(Option::as_deref)
+                    .is_none_or(|index| index == mode),
+                "diff section index and new mode disagree"
+            );
+            explicit_new_mode = Some(mode.to_string());
+            saw_change = true;
+        } else if let Some(mode) = line.strip_prefix("new file mode ") {
+            anyhow::ensure!(explicit_new_mode.is_none(), "diff section repeats new mode");
+            explicit_new_mode = Some(validated_git_mode(mode)?.to_string());
+            saw_change = true;
+        } else if let Some(mode) = line.strip_prefix("deleted file mode ") {
+            anyhow::ensure!(explicit_old_mode.is_none(), "diff section repeats old mode");
+            explicit_old_mode = Some(validated_git_mode(mode)?.to_string());
+            saw_change = true;
+        }
+    }
+
+    if require_complete_hunks {
+        anyhow::ensure!(
+            old_left == 0 && new_left == 0,
+            "diff section hunk body does not match its declared range"
+        );
+        anyhow::ensure!(
+            !saw_hunk || (old_marker.is_some() && new_marker.is_some()),
+            "diff section hunk has no file path marker pair"
+        );
+        anyhow::ensure!(saw_change, "diff section has no complete change evidence");
+    }
+    match (&old_marker, &new_marker) {
+        (None, None) | (Some(_), Some(_)) => {}
+        _ => anyhow::bail!("diff section has an incomplete file path marker pair"),
+    }
+    match (&rename_from, &rename_to) {
+        (None, None) | (Some(_), Some(_)) => {}
+        _ => anyhow::bail!("diff section has an incomplete rename path pair"),
+    }
+    match (&copy_from, &copy_to) {
+        (None, None) | (Some(_), Some(_)) => {}
+        _ => anyhow::bail!("diff section has an incomplete copy path pair"),
+    }
+    anyhow::ensure!(
+        rename_from.is_none() || copy_from.is_none(),
+        "diff section mixes rename and copy paths"
+    );
+
+    let markers_match = old_marker
+        .as_ref()
+        .zip(new_marker.as_ref())
+        .is_none_or(|(old, new)| {
+            candidates
+                .iter()
+                .any(|paths| marker_pair_matches(old, new, paths))
+        });
+    let rename_matches = rename_from
+        .as_ref()
+        .zip(rename_to.as_ref())
+        .is_none_or(|(old, new)| {
+            candidates
+                .iter()
+                .any(|paths| old == &paths.old_path && new == &paths.path)
+        });
+    let copy_matches = copy_from
+        .as_ref()
+        .zip(copy_to.as_ref())
+        .is_none_or(|(old, new)| {
+            candidates
+                .iter()
+                .any(|paths| old == &paths.old_path && new == &paths.path)
+        });
+    let binary_matches = binary_paths.as_ref().is_none_or(|markers| {
+        candidates.iter().any(|paths| {
+            markers
+                .iter()
+                .any(|(old, new)| marker_pair_matches(old, new, paths))
+        })
+    });
+    let matches_metadata = |paths: &SectionPaths| {
+        old_marker
+            .as_ref()
+            .zip(new_marker.as_ref())
+            .is_none_or(|(old, new)| marker_pair_matches(old, new, paths))
+            && rename_from
+                .as_ref()
+                .zip(rename_to.as_ref())
+                .is_none_or(|(old, new)| old == &paths.old_path && new == &paths.path)
+            && copy_from
+                .as_ref()
+                .zip(copy_to.as_ref())
+                .is_none_or(|(old, new)| old == &paths.old_path && new == &paths.path)
+            && binary_paths.as_ref().is_none_or(|markers| {
+                markers
+                    .iter()
+                    .any(|(old, new)| marker_pair_matches(old, new, paths))
+            })
+    };
+    let matching = candidates
+        .iter()
+        .filter(|paths| matches_metadata(paths))
+        .cloned()
+        .collect::<Vec<_>>();
+    match matching.as_slice() {
+        [paths] => Ok(paths.clone()),
+        [] if !markers_match => {
+            anyhow::bail!("diff header and file path markers disagree")
+        }
+        [] if !rename_matches => anyhow::bail!("diff header and rename paths disagree"),
+        [] if !copy_matches => anyhow::bail!("diff header and copy paths disagree"),
+        [] if !binary_matches => anyhow::bail!("diff header and binary paths disagree"),
+        [] => anyhow::bail!("diff header has no canonical path match"),
+        _ => anyhow::bail!("diff section has an unresolved ambiguous path header"),
+    }
+}
+
+fn diff_section_path_resolutions(text: &str) -> Vec<(Option<SectionPaths>, bool)> {
+    let mut resolutions = Vec::new();
+    let mut cursor = next_diff_start(text, 0);
+    while let Some(start) = cursor {
+        let end = next_diff_start(text, start + "diff --git ".len()).unwrap_or(text.len());
+        let section = &text[start..end];
+        resolutions.push((
+            section_paths(section, false).ok(),
+            section_paths(section, true).is_ok(),
+        ));
+        cursor = (end < text.len()).then_some(end);
+    }
+    resolutions
+}
+
+fn parse_diff_header_path_candidates(rest: &str) -> Option<Vec<SectionPaths>> {
     if rest.starts_with('"') {
         let (old, remainder) = parse_git_path_token(rest)?;
         let (new, trailing) = parse_git_path_token(remainder.trim_start())?;
-        if !trailing.trim().is_empty() {
-            return None;
-        }
-        return Some((
-            strip_prefix_ab(&old).to_string(),
-            strip_prefix_ab(&new).to_string(),
-        ));
+        trailing.trim().is_empty().then_some(())?;
+        let old = old.strip_prefix("a/")?;
+        let new = new.strip_prefix("b/")?;
+        return (valid_diff_path(old) && valid_diff_path(new)).then(|| {
+            vec![SectionPaths {
+                old_path: old.to_string(),
+                path: new.to_string(),
+            }]
+        });
     }
-    let (old, new) = rest.rsplit_once(" b/")?;
-    Some((
-        strip_prefix_ab(old).to_string(),
-        strip_prefix_ab(new).to_string(),
-    ))
+    let candidates = rest
+        .match_indices(" b/")
+        .filter_map(|(index, _)| {
+            let old = rest[..index].strip_prefix("a/")?;
+            let new = rest[index + 1..].strip_prefix("b/")?;
+            (valid_diff_path(old) && valid_diff_path(new)).then(|| SectionPaths {
+                old_path: old.to_string(),
+                path: new.to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    (!candidates.is_empty()).then_some(candidates)
 }
 
 fn parse_git_path_token(input: &str) -> Option<(String, &str)> {
@@ -4018,6 +4435,40 @@ pub fn is_known_lockfile(path: &str) -> bool {
     )
 }
 
+fn validated_git_mode(mode: &str) -> Result<&str> {
+    anyhow::ensure!(
+        matches!(mode, "100644" | "100755" | "120000" | "160000"),
+        "diff section has an invalid Git mode"
+    );
+    Ok(mode)
+}
+
+fn unchanged_index_mode(line: &str) -> Result<Option<&str>> {
+    let value = line
+        .strip_prefix("index ")
+        .context("diff section has malformed index metadata")?;
+    let mut fields = value.split_whitespace();
+    let object_ids = fields
+        .next()
+        .context("diff section index is missing object IDs")?;
+    let mode = fields.next();
+    anyhow::ensure!(
+        fields.next().is_none(),
+        "diff section index has trailing metadata"
+    );
+    let (old, new) = object_ids
+        .split_once("..")
+        .context("diff section index has invalid object IDs")?;
+    let valid_object_id = |value: &str| {
+        (3..=64).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    };
+    anyhow::ensure!(
+        old.len() == new.len() && valid_object_id(old) && valid_object_id(new),
+        "diff section index has invalid object IDs"
+    );
+    mode.map(validated_git_mode).transpose()
+}
+
 /// Parse a unified diff (git format). Tolerant of mode lines, renames, and
 /// "\ No newline at end of file" markers.
 pub fn parse(text: &str) -> Diff {
@@ -4030,7 +4481,10 @@ pub fn parse(text: &str) -> Diff {
     // phantom line that would render an ungroundable numbered line.
     let mut old_left: u32 = 0;
     let mut new_left: u32 = 0;
-    let mut complete = true;
+    let mut index_mode = None::<Option<String>>;
+    let path_resolutions = diff_section_path_resolutions(text);
+    let mut complete = path_resolutions.iter().all(|(_, valid)| *valid);
+    let mut path_resolutions = path_resolutions.into_iter().map(|(paths, _)| paths);
 
     let flush_hunk = |file: &mut Option<FileDiff>,
                       hunk: &mut Option<Hunk>,
@@ -4046,7 +4500,14 @@ pub fn parse(text: &str) -> Diff {
     };
 
     for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("diff --git ") {
+        if (old_left > 0 || new_left > 0)
+            && consume_diff_hunk_line(line, &mut old_left, &mut new_left)
+            && let Some(hunk) = current_hunk.as_mut()
+        {
+            hunk.lines.push(line.to_string());
+            continue;
+        }
+        if line.starts_with("diff --git ") {
             flush_hunk(
                 &mut current,
                 &mut current_hunk,
@@ -4057,36 +4518,73 @@ pub fn parse(text: &str) -> Diff {
             if let Some(f) = current.take() {
                 files.push(f);
             }
-            // Seed the path from the header (binary diffs have no +++/--- lines);
-            // the +++/--- lines that follow refine it for renames.
-            let Some((old_path, path)) = parse_diff_header_paths(rest) else {
+            let Some(Some(paths)) = path_resolutions.next() else {
                 complete = false;
                 current = None;
                 continue;
             };
             current = Some(FileDiff {
-                old_path,
-                path,
+                old_path: paths.old_path,
+                path: paths.path,
                 deleted: false,
                 binary: false,
                 old_mode: None,
                 new_mode: None,
                 hunks: Vec::new(),
             });
+            index_mode = None;
+        } else if line.starts_with("index ") {
+            let parsed_mode = unchanged_index_mode(line);
+            if index_mode.is_some() || parsed_mode.is_err() {
+                complete = false;
+            }
+            let mode = parsed_mode.ok().flatten().map(str::to_string);
+            if let (Some(f), Some(mode)) = (current.as_mut(), mode.as_ref()) {
+                if f.old_mode.as_ref().is_some_and(|old| old != mode)
+                    || f.new_mode.as_ref().is_some_and(|new| new != mode)
+                {
+                    complete = false;
+                }
+                f.old_mode.get_or_insert_with(|| mode.clone());
+                f.new_mode.get_or_insert_with(|| mode.clone());
+            }
+            index_mode = Some(mode);
         } else if let Some(mode) = line.strip_prefix("old mode ") {
             if let Some(f) = current.as_mut() {
+                if validated_git_mode(mode).is_err()
+                    || index_mode
+                        .as_ref()
+                        .and_then(Option::as_ref)
+                        .is_some_and(|index| index != mode)
+                {
+                    complete = false;
+                }
                 f.old_mode = Some(mode.to_string());
             }
         } else if let Some(mode) = line.strip_prefix("new mode ") {
             if let Some(f) = current.as_mut() {
+                if validated_git_mode(mode).is_err()
+                    || index_mode
+                        .as_ref()
+                        .and_then(Option::as_ref)
+                        .is_some_and(|index| index != mode)
+                {
+                    complete = false;
+                }
                 f.new_mode = Some(mode.to_string());
             }
         } else if let Some(mode) = line.strip_prefix("new file mode ") {
             if let Some(f) = current.as_mut() {
+                if validated_git_mode(mode).is_err() {
+                    complete = false;
+                }
                 f.new_mode = Some(mode.to_string());
             }
         } else if let Some(mode) = line.strip_prefix("deleted file mode ") {
             if let Some(f) = current.as_mut() {
+                if validated_git_mode(mode).is_err() {
+                    complete = false;
+                }
                 f.old_mode = Some(mode.to_string());
             }
         } else if let Some(rest) = line.strip_prefix("+++ ") {
@@ -4133,14 +4631,21 @@ pub fn parse(text: &str) -> Diff {
             } else {
                 complete = false;
             }
+        } else if line.starts_with("@@") {
+            flush_hunk(
+                &mut current,
+                &mut current_hunk,
+                old_left,
+                new_left,
+                &mut complete,
+            );
+            complete = false;
         } else if let Some(h) = current_hunk.as_mut() {
             // The hunk is complete once every declared old- and new-side line has
             // been consumed. Anything after that (a blank separator, a stray
             // line) belongs to the next file, not this hunk.
             let hunk_complete = old_left == 0 && new_left == 0;
-            if !hunk_complete && (line.starts_with(['+', '-', ' ']) || line.is_empty()) {
-                // A bare blank line counts as an unchanged (context) line: it is
-                // present on both sides.
+            if !hunk_complete && line.starts_with(['+', '-', ' ']) {
                 let consumed = match line.chars().next() {
                     Some('+') if new_left > 0 => {
                         new_left -= 1;
@@ -4164,7 +4669,7 @@ pub fn parse(text: &str) -> Diff {
                     complete = false;
                 }
                 h.lines.push(line.to_string());
-            } else if line.starts_with('\\') {
+            } else if line == "\\ No newline at end of file" {
                 // "\ No newline at end of file" is not content.
             } else {
                 // Hunk complete, or a trailer (e.g. next file's "index" line in
@@ -4205,22 +4710,28 @@ fn strip_prefix_ab(path: &str) -> &str {
 /// "@@ -l,c +l,c @@ ctx" minus the leading "@@ ". Returns
 /// (old_start, old_count, new_start, new_count). Counts default to 1 when a
 /// header omits them (single-line hunk).
-fn parse_hunk_header(header: &str) -> Option<(u32, u32, u32, u32)> {
-    let range_of = |token: &str| -> Option<(u32, u32)> {
-        let spec = &token[1..];
+pub(crate) fn parse_hunk_header(header: &str) -> Option<(u32, u32, u32, u32)> {
+    let range_of = |spec: &str| -> Option<(u32, u32)> {
+        let parse_number = |value: &str| {
+            (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+                .then(|| value.parse().ok())
+                .flatten()
+        };
         match spec.split_once(',') {
-            Some((start, count)) => Some((start.parse().ok()?, count.parse().ok()?)),
-            None => Some((spec.parse().ok()?, 1)),
+            Some((start, count)) => Some((parse_number(start)?, parse_number(count)?)),
+            None => Some((parse_number(spec)?, 1)),
         }
     };
-    let (old_start, old_count) = header
-        .split_whitespace()
-        .find(|t| t.starts_with('-'))
-        .and_then(range_of)?;
-    let (new_start, new_count) = header
-        .split_whitespace()
-        .find(|t| t.starts_with('+'))
-        .and_then(range_of)?;
+    let (ranges, _) = header.split_once(" @@")?;
+    let mut ranges = ranges.split_whitespace();
+    let (old_start, old_count) = range_of(ranges.next()?.strip_prefix('-')?)?;
+    let (new_start, new_count) = range_of(ranges.next()?.strip_prefix('+')?)?;
+    if ranges.next().is_some() {
+        return None;
+    }
+    if (old_count > 0 && old_start == 0) || (new_count > 0 && new_start == 0) {
+        return None;
+    }
     old_start.checked_add(old_count.saturating_sub(1))?;
     new_start.checked_add(new_count.saturating_sub(1))?;
     Some((old_start, old_count, new_start, new_count))
@@ -5381,6 +5892,9 @@ Binary files a/img.png and b/img.png differ
 
     #[test]
     fn rejects_truncated_and_malformed_hunks() {
+        let header_only = parse("diff --git a/a.rs b/a.rs\nindex 1111111..2222222 100644\n");
+        assert!(!header_only.complete);
+
         let truncated = parse(
             "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n",
         );
@@ -5394,6 +5908,131 @@ Binary files a/img.png and b/img.png differ
             "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -0,0 +1,1 @@\n+one\n+two\n",
         );
         assert!(!overfull.complete);
+
+        let outside_hunk = parse(
+            "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n+hidden();\n@@ -1 +1 @@\n-old();\n+new();\n",
+        );
+        assert!(!outside_hunk.complete);
+    }
+
+    #[test]
+    fn hunk_content_that_resembles_file_markers_remains_source() {
+        let source = concat!(
+            "diff --git a/config.rs b/config.rs\n",
+            "--- a/config.rs\n",
+            "+++ b/config.rs\n",
+            "@@ -1 +1 @@\n",
+            "-- disabled;\n",
+            "+++ enabled;\n",
+        );
+        validated_section_paths(source).unwrap();
+        let parsed = parse(source);
+        assert!(parsed.complete);
+        assert_eq!(parsed.files[0].path, "config.rs");
+        assert_eq!(
+            parsed.files[0].hunks[0].lines,
+            vec!["-- disabled;", "+++ enabled;"]
+        );
+        assert!(prepare_review(&DiffSnapshot::from_bytes(source.as_bytes()).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn strict_raw_headers_resolve_ambiguous_and_quoted_paths() {
+        let renamed = "diff --git a/old b/日.rs b/new b/日.rs\nsimilarity index 90%\nrename from old b/日.rs\nrename to new b/日.rs\n--- a/old b/日.rs\n+++ b/new b/日.rs\n@@ -1 +1 @@\n-old();\n+new();\n";
+        let copied = "diff --git a/source b/name.rs b/copy b/name.rs\nsimilarity index 90%\ncopy from source b/name.rs\ncopy to copy b/name.rs\n--- a/source b/name.rs\n+++ b/copy b/name.rs\n@@ -1 +1 @@\n-old();\n+new();\n";
+        let binary = "diff --git a/old and name.bin b/new and name.bin\nBinary files a/old and name.bin and b/new and name.bin differ\n";
+        let quoted = "diff --git \"a/src/tab\\tname.rs\" \"b/src/tab\\tname.rs\"\n--- \"a/src/tab\\tname.rs\"\n+++ \"b/src/tab\\tname.rs\"\n@@ -0,0 +1 @@\n+safe();\n";
+
+        for (source, old_path, path) in [
+            (renamed, "old b/日.rs", "new b/日.rs"),
+            (copied, "source b/name.rs", "copy b/name.rs"),
+            (binary, "old and name.bin", "new and name.bin"),
+            (quoted, "src/tab\tname.rs", "src/tab\tname.rs"),
+        ] {
+            let paths = validated_section_paths(source).unwrap();
+            assert_eq!(paths.old_path, old_path, "{source}");
+            assert_eq!(paths.path, path, "{source}");
+            let parsed = parse(source);
+            assert!(parsed.complete, "{source}");
+            assert_eq!(parsed.files[0].old_path, old_path, "{source}");
+            assert_eq!(parsed.files[0].path, path, "{source}");
+        }
+    }
+
+    #[test]
+    fn additions_and_deletions_match_their_canonical_header_identity() {
+        for source in [
+            "diff --git a/new.rs b/new.rs\nnew file mode 100644\n--- /dev/null\n+++ b/new.rs\n@@ -0,0 +1 @@\n+added();\n",
+            "diff --git a/old.rs b/old.rs\ndeleted file mode 100644\n--- a/old.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-removed();\n",
+        ] {
+            let paths = validated_section_paths(source).unwrap();
+            assert_eq!(paths.old_path, paths.path);
+            assert!(parse(source).complete);
+            assert!(!prepare_diff(source).incomplete);
+        }
+    }
+
+    #[test]
+    fn every_raw_path_identity_must_match_the_canonical_header() {
+        let invalid = [
+            "diff --git a/src/old.rs b/src/new.rs\n--- a/src/old.rs\n+++ b/src/other.rs\n@@ -1 +1 @@\n-old();\n+new();\n",
+            "diff --git a/src/old.rs b/src/new.rs\nrename from Cargo.lock\nrename to src/new.rs\n--- a/src/old.rs\n+++ b/src/new.rs\n@@ -1 +1 @@\n-old();\n+new();\n",
+            "diff --git a/src/old.rs b/src/new.rs\ncopy from vendor/lib/Runner.java\ncopy to src/new.rs\n--- a/src/old.rs\n+++ b/src/new.rs\n@@ -1 +1 @@\n-old();\n+new();\n",
+            "diff --git a/assets/old.bin b/assets/new.bin\nBinary files a/src/auth/control.bin and b/assets/new.bin differ\n",
+            "diff --git a/old b/name.rs b/new b/name.rs\nold mode 100644\nnew mode 100755\n",
+        ];
+        for source in invalid {
+            assert!(
+                validated_section_paths(source).is_err(),
+                "accepted {source}"
+            );
+            assert!(!parse(source).complete, "parsed {source}");
+            assert!(prepare_diff(source).incomplete, "prepared {source}");
+        }
+    }
+
+    #[test]
+    fn malformed_hunk_grammar_and_mixed_binary_sections_fail_before_planning() {
+        for header in [
+            "@@ +1 -1 @@",
+            "@@ -1 +1",
+            "@@ -1 +1 trailing @@",
+            "@@ -1,+1 +1 @@",
+        ] {
+            let source = format!(
+                "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n{header}\n-old();\n+new();\n"
+            );
+            assert!(
+                validated_section_paths(&source).is_err(),
+                "accepted {header}"
+            );
+            assert!(!parse(&source).complete, "parsed {header}");
+        }
+        let mixed = "diff --git a/src/lib.rs b/src/lib.rs\nBinary files a/src/lib.rs and b/src/lib.rs differ\n@@ -1 +1 @@\n-old();\n+new();\n";
+        assert!(validated_section_paths(mixed).is_err());
+        let missing_markers =
+            "diff --git a/src/lib.rs b/src/lib.rs\n@@ -1 +1 @@\n-old();\n+new();\n";
+        let snapshot = DiffSnapshot::from_bytes(missing_markers.as_bytes()).unwrap();
+        assert!(prepare_review(&snapshot).is_err());
+    }
+
+    #[test]
+    fn rename_ignore_requires_both_canonical_paths_to_match() {
+        let source = "diff --git a/src/auth/permission.ts b/generated/permission.ts\nsimilarity index 100%\nrename from src/auth/permission.ts\nrename to generated/permission.ts\n";
+        let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+        assert!(
+            prepare_review_with_ignore(&snapshot, &["generated/**".to_string()])
+                .unwrap()
+                .has_source
+        );
+
+        let ignored = "diff --git a/generated/old.ts b/generated/new.ts\nsimilarity index 100%\nrename from generated/old.ts\nrename to generated/new.ts\n";
+        let snapshot = DiffSnapshot::from_bytes(ignored.as_bytes()).unwrap();
+        assert!(
+            !prepare_review_with_ignore(&snapshot, &["generated/**".to_string()])
+                .unwrap()
+                .has_source
+        );
     }
 
     #[test]

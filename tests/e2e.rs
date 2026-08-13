@@ -2316,6 +2316,36 @@ async fn ignored_paths_are_removed_before_review_planning() {
 }
 
 #[tokio::test]
+async fn inconsistent_ignored_header_paths_fail_before_provider_contact() {
+    let server = MockServer::start().await;
+    mock_review(&server, json!([])).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = dir.path().join("inconsistent-ignored-path.diff");
+    std::fs::write(
+        &diff,
+        "diff --git a/ignored/generated.rs b/ignored/generated.rs\n--- a/src/auth/permission.rs\n+++ b/src/auth/permission.rs\n@@ -1 +1 @@\n-allow();\n+deny();\n",
+    )
+    .unwrap();
+    let config = dir.path().join("postil.yml");
+    std::fs::write(&config, "ignore:\n  - \"ignored/**\"\n").unwrap();
+
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff", diff.to_str().unwrap(), "--config"])
+        .arg(&config)
+        .args(["--output", "json"])
+        .assert()
+        .code(2);
+
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(stderr.contains("diff header and file path markers disagree"));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn oversized_security_hunk_fails_before_provider_contact() {
     use std::fmt::Write as _;
 
