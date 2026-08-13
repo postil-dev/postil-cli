@@ -4258,6 +4258,13 @@ pub fn parse(text: &str) -> Diff {
     };
 
     for line in text.lines() {
+        if (old_left > 0 || new_left > 0)
+            && consume_diff_hunk_line(line, &mut old_left, &mut new_left)
+            && let Some(hunk) = current_hunk.as_mut()
+        {
+            hunk.lines.push(line.to_string());
+            continue;
+        }
         if line.starts_with("diff --git ") {
             flush_hunk(
                 &mut current,
@@ -5680,6 +5687,28 @@ Binary files a/img.png and b/img.png differ
             "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n+hidden();\n@@ -1 +1 @@\n-old();\n+new();\n",
         );
         assert!(!outside_hunk.complete);
+    }
+
+    #[test]
+    fn hunk_content_that_resembles_file_markers_remains_source() {
+        let source = concat!(
+            "diff --git a/config.rs b/config.rs\n",
+            "--- a/config.rs\n",
+            "+++ b/config.rs\n",
+            "@@ -1 +1 @@\n",
+            "-- disabled;\n",
+            "+++ enabled;\n",
+        );
+        validated_section_paths(source).unwrap();
+        let parsed = parse(source);
+
+        assert!(parsed.complete);
+        assert_eq!(parsed.files[0].path, "config.rs");
+        assert_eq!(
+            parsed.files[0].hunks[0].lines,
+            vec!["-- disabled;", "+++ enabled;"]
+        );
+        assert!(prepare_review(&DiffSnapshot::from_bytes(source.as_bytes()).unwrap()).is_ok());
     }
 
     #[test]

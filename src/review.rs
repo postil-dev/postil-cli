@@ -2219,6 +2219,7 @@ async fn review_diff_at(
                                 diff_snapshot.as_str(),
                                 &all_adjudication_candidates,
                                 &candidate_ids,
+                                fresh_candidate_count,
                             );
                             let receipt = crate::repository_search::search(
                                 &repository_source,
