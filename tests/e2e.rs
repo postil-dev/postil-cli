@@ -2523,7 +2523,7 @@ async fn query_truncated_adjudication_preserves_the_grounded_candidate() {
 }
 
 #[tokio::test]
-async fn adjudication_provider_failure_preserves_findings_and_blocks_under_advisory_policy() {
+async fn adjudication_provider_failure_preserves_findings_and_baseline_blocker() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
@@ -2568,7 +2568,7 @@ async fn adjudication_provider_failure_preserves_findings_and_blocks_under_advis
         json!({
             "version": 1, "summary": "", "silent": false,
             "findings": [{
-                "path": "src/auth.rs", "line": 42, "severity": "error", "kind": "risk",
+                "path": "src/auth.rs", "line": 41, "severity": "error", "kind": "risk",
                 "confidence": 0.98, "title": "Keep the prior authorization blocker",
                 "body": "The prior authorization defect remains open.",
                 "evidence": "exec_query(&token);"
@@ -2615,7 +2615,7 @@ async fn adjudication_provider_failure_preserves_findings_and_blocks_under_advis
             .as_array()
             .unwrap()
             .iter()
-            .any(|finding| { finding["path"] == ".postil/model-output" })
+            .any(|finding| { finding["path"] == ".postil/provider" })
     );
     assert_eq!(envelope["counts"]["warn"], 1);
     assert_eq!(envelope["counts"]["error"], 2);
