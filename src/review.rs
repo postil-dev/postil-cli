@@ -2226,7 +2226,7 @@ async fn review_diff_at(
                                 &diff_receipt,
                                 receipt,
                             );
-                            let mut application = match application {
+                            let application = match application {
                                 Ok(application) => application,
                                 Err(error) => {
                                     model_incidents.push(ModelIncident {
@@ -2254,24 +2254,6 @@ async fn review_diff_at(
                                     .into());
                                 }
                             };
-                            // A truncated direct-evidence query set cannot support a
-                            // publication-ready adjudication. Keep the private
-                            // suppression record, but do not let a candidate survive
-                            // merely because the model confirmed it from a partial
-                            // corpus.
-                            if !diff_receipt.queries_complete
-                                || !diff_receipt.matching_windows_complete
-                            {
-                                application.suppressed.extend(
-                                    std::mem::take(&mut application.kept).into_iter().map(
-                                        |finding| SuppressedFinding {
-                                            finding,
-                                            reason: SuppressionReason::NonActionable,
-                                        },
-                                    ),
-                                );
-                                application.kept_indices.clear();
-                            }
                             debug_assert!(application.kept_indices.iter().all(|index| *index
                                 < fresh_candidate_count + baseline_candidate_indices.len()));
                             for candidate_index in &application.resolved_indices {
