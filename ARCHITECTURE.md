@@ -95,8 +95,8 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   Repository-wide absence and mismatch claims declare bounded typed queries for named
   resources, values, versions, paths, and identifiers. One receipt binds those queries to
   the immutable reviewed head and reports `complete`, `unavailable`, or `exhausted`.
-  Only a complete receipt with no positive counterexample supports a universal claim;
-  unsupported claims remain structured suppressed findings rather than public findings.
+  Only a complete receipt with no positive counterexample supports a universal claim.
+  Incomplete repository evidence cannot confirm it, so the original finding remains open.
   Every surviving generated candidate, plus applicable baseline candidates during a full
   rereview, enters one bounded adjudication operation before scoring and publication. The
   operation admits the complete candidate set or fails closed before provider contact. Its
@@ -104,7 +104,7 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   occurrence counts, and carries only bounded evidence windows to the model. Adjudication
   validates exact candidate identities, result completeness, evidence, publication text,
   and duplicate primaries. Later and cross-file evidence can refute stale claims, while
-  unresolved claims remain suppressed. Semantic duplicates collapse across files and kinds
+  unresolved claims remain open. Semantic duplicates collapse across files and kinds
   only when one established defect remains; distinct defects sharing a line remain separate.
 - `forge/`: trait + GitHub, GitLab, Bitbucket Cloud, and Azure DevOps implementations,
   with self-managed base URLs where the same API contract applies. Paginated forge
