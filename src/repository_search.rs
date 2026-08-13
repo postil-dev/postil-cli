@@ -1175,9 +1175,10 @@ mod tests {
             receipt
                 .matches
                 .iter()
-                .find(|matched| matched.query_sha256 == qualified)
-                .map(|matched| matched.occurrences),
-            Some(2)
+                .filter(|matched| matched.query_sha256 == qualified)
+                .map(|matched| matched.occurrences)
+                .sum::<u64>(),
+            2
         );
         assert_eq!(
             receipt
