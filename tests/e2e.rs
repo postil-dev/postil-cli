@@ -3839,10 +3839,12 @@ async fn deletion_only_auth_change_is_reviewed_through_numbered_metadata() {
                 let user = request_body["messages"][1]["content"]
                     .as_str()
                     .unwrap_or_default();
-                let candidate_id = user
-                    .split_once("\"candidateId\":\"")
-                    .and_then(|(_, rest)| rest.split_once('\"'))
-                    .map(|(id, _)| id)
+                let adjudication: Value = serde_json::from_str(user).unwrap();
+                let candidate_id = adjudication["candidates"][0]["candidateId"]
+                    .as_str()
+                    .unwrap();
+                let cited_evidence = adjudication["candidates"][0]["citedEvidence"]
+                    .as_str()
                     .unwrap();
                 return ResponseTemplate::new(200).set_body_json(scorer_text(
                     &json!([{
@@ -3850,7 +3852,7 @@ async fn deletion_only_auth_change_is_reviewed_through_numbered_metadata() {
                         "status": "confirmed",
                         "revisedTitle": "Restore the authorization check",
                         "revisedBody": "The deletion removes the administrator authorization check without a replacement.",
-                        "evidence": "deleted file mode 100644",
+                        "evidence": cited_evidence,
                         "duplicateOf": null
                     }])
                     .to_string(),
@@ -3890,7 +3892,10 @@ async fn deletion_only_auth_change_is_reviewed_through_numbered_metadata() {
         .failure();
 
     let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
-    assert_eq!(envelope["findings"][0]["path"], ".postil/change-metadata");
+    assert_eq!(
+        envelope["findings"][0]["path"], ".postil/change-metadata",
+        "{envelope:#}"
+    );
     let requests = server.received_requests().await.unwrap();
     assert_eq!(requests.len(), 2);
     let body = String::from_utf8_lossy(&requests[0].body);

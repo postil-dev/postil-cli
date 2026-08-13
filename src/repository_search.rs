@@ -215,41 +215,15 @@ fn claim_has_refutation_candidate(
 }
 
 pub(crate) fn refutation_evidence_is_grounded(
-    claim: &RepositoryClaim,
-    receipt: &RepositorySearchReceipt,
-    snapshot_id: &str,
-    evidence: &str,
+    _claim: &RepositoryClaim,
+    _receipt: &RepositorySearchReceipt,
+    _snapshot_id: &str,
+    _evidence: &str,
 ) -> bool {
-    if evidence.trim().is_empty() || !complete_claim_receipt(claim, receipt, snapshot_id) {
-        return false;
-    }
-    let categories = claim_category_hashes(claim);
-    receipt_match_units(receipt).iter().any(|(path, matched)| {
-        category_hashes_match(&categories, matched)
-            && (*path == evidence
-                || categories
-                    .iter()
-                    .flatten()
-                    .any(|hash| hash == evidence && matched.contains(hash.as_str())))
-    })
-}
-
-fn complete_claim_receipt(
-    claim: &RepositoryClaim,
-    receipt: &RepositorySearchReceipt,
-    snapshot_id: &str,
-) -> bool {
-    let searched = receipt
-        .queries
-        .iter()
-        .map(|query| query.query_sha256.as_str())
-        .collect::<BTreeSet<_>>();
-    receipt.state == RepositorySearchState::Complete
-        && receipt.head_sha.as_deref() == Some(snapshot_id)
-        && receipt.tree_sha256.as_deref().is_some_and(valid_sha256)
-        && !receipt.matches_truncated
-        && claim_query_hashes(claim)
-            .is_some_and(|hashes| hashes.iter().all(|hash| searched.contains(hash.as_str())))
+    // Repository matches are lexical routing evidence. The receipt does not
+    // retain source snippets or syntax roles, so a filename, comment, or
+    // unrelated declaration cannot safely refute a finding.
+    false
 }
 
 fn receipt_match_units(receipt: &RepositorySearchReceipt) -> BTreeMap<&str, BTreeSet<&str>> {
@@ -1542,7 +1516,7 @@ mod tests {
     }
 
     #[test]
-    fn matching_target_scoped_value_is_candidate_scoped_refutation_evidence() {
+    fn matching_target_scoped_value_remains_lexical_only() {
         let claim = RepositoryClaim {
             kind: RepositoryClaimKind::Mismatch,
             resources: vec!["CephCluster".into()],
@@ -1570,7 +1544,7 @@ mod tests {
             claim_verdict(&claim, &receipt, &"a".repeat(40)),
             RepositoryClaimVerdict::Unresolved
         );
-        assert!(refutation_evidence_is_grounded(
+        assert!(!refutation_evidence_is_grounded(
             &claim,
             &receipt,
             &"a".repeat(40),
@@ -1616,7 +1590,7 @@ mod tests {
             claim_verdict(&claim, &both, &"a".repeat(40)),
             RepositoryClaimVerdict::Unresolved
         );
-        assert!(refutation_evidence_is_grounded(
+        assert!(!refutation_evidence_is_grounded(
             &claim,
             &both,
             &"a".repeat(40),
@@ -1635,7 +1609,7 @@ mod tests {
             claim_verdict(&claim, &filename, &"a".repeat(40)),
             RepositoryClaimVerdict::Unresolved
         );
-        assert!(refutation_evidence_is_grounded(
+        assert!(!refutation_evidence_is_grounded(
             &claim,
             &filename,
             &"a".repeat(40),
@@ -1652,7 +1626,7 @@ mod tests {
             claim_verdict(&claim, &comment, &"a".repeat(40)),
             RepositoryClaimVerdict::Unresolved
         );
-        assert!(refutation_evidence_is_grounded(
+        assert!(!refutation_evidence_is_grounded(
             &claim,
             &comment,
             &"a".repeat(40),

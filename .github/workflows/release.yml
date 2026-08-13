@@ -93,6 +93,13 @@ jobs:
       # Plain release profile: the same build the release job ships, so the
       # gate measures the binary users will actually get.
       - run: cargo build --quiet --release
+      - name: Preserve benchmarked Linux binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: benchmarked-x86_64-unknown-linux-gnu
+          path: target/release/postil
+          if-no-files-found: error
+          retention-days: 1
       - name: Install benchmark dependencies
         working-directory: bench
         run: bun install --frozen-lockfile
@@ -157,7 +164,18 @@ jobs:
       - run: cargo test --quiet
       # SHA-pinned: this action handles the OIDC token.
       - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
-      - run: cargo build --quiet --release --target ${{ matrix.target }}
+      - name: Download benchmarked Linux binary
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: benchmarked-x86_64-unknown-linux-gnu
+          path: target/${{ matrix.target }}/release
+      - name: Restore benchmarked binary mode
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: chmod 0755 target/${{ matrix.target }}/release/postil
+      - name: Build release binary
+        if: matrix.target != 'x86_64-unknown-linux-gnu'
+        run: cargo build --quiet --release --target ${{ matrix.target }}
       - name: Package, checksum, and sign
         env:
           COSIGN_YES: "true"
