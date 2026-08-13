@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::io::Read;
+use std::ffi::OsStr;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use serde_json::json;
 use time::Date;
+use tokio::io::AsyncReadExt;
 
 use crate::config::Config;
 use crate::diff;
@@ -284,7 +285,7 @@ async fn fetch_file(
         RepositorySource::Local(root) => {
             let head_revision =
                 head_revision.context("local uncertainty resolution requires a head SHA")?;
-            read_local_file(root, head_revision, path)
+            read_local_file(root, head_revision, path).await
         }
         RepositorySource::GitHub(github) => {
             let head_revision =
@@ -297,33 +298,44 @@ async fn fetch_file(
     }
 }
 
-fn read_local_file(root: &Path, head_revision: &str, path: &str) -> Result<Option<String>> {
+async fn read_local_file(root: &Path, head_revision: &str, path: &str) -> Result<Option<String>> {
+    read_local_file_with_command(OsStr::new("git"), root, head_revision, path).await
+}
+
+async fn read_local_file_with_command(
+    git: &OsStr,
+    root: &Path,
+    head_revision: &str,
+    path: &str,
+) -> Result<Option<String>> {
     let object = format!("{head_revision}:{path}");
-    let mut child = std::process::Command::new("git")
+    let mut child = tokio::process::Command::new(git)
         .arg("-C")
         .arg(root)
         .args(["cat-file", "blob", &object])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("reading repository path {path} at reviewed head"))?;
-    let mut stdout = child
+    let stdout = child
         .stdout
         .take()
         .context("git blob reader did not provide standard output")?;
     let mut bytes = Vec::with_capacity(MAX_FILE_BYTES + 1);
-    stdout
-        .by_ref()
-        .take((MAX_FILE_BYTES + 1) as u64)
+    let mut limited = stdout.take((MAX_FILE_BYTES + 1) as u64);
+    limited
         .read_to_end(&mut bytes)
+        .await
         .with_context(|| format!("reading repository path {path} at reviewed head"))?;
     let truncated = bytes.len() > MAX_FILE_BYTES;
-    drop(stdout);
+    drop(limited);
     if truncated {
-        let _ = child.kill();
+        let _ = child.kill().await;
     }
     let status = child
         .wait()
+        .await
         .with_context(|| format!("waiting for repository path {path} at reviewed head"))?;
     if !truncated && !status.success() {
         return Ok(None);
@@ -533,8 +545,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn local_blob_reads_stop_after_the_truncation_sentinel() {
+    #[tokio::test]
+    async fn local_blob_reads_stop_after_the_truncation_sentinel() {
         let directory = tempfile::tempdir().unwrap();
         let git = |args: &[&str]| {
             let output = std::process::Command::new("git")
@@ -556,10 +568,37 @@ mod tests {
         git(&["add", "src/large.rs"]);
         let tree = git(&["write-tree"]);
         let content = read_local_file(directory.path(), &tree, "src/large.rs")
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(content.len(), MAX_FILE_BYTES);
         assert!(content.ends_with(TRUNCATION_MARKER));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_blob_reader_is_preemptible_by_its_async_deadline() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("stalled-git");
+        std::fs::write(&executable, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            read_local_file_with_command(
+                executable.as_os_str(),
+                directory.path(),
+                &"a".repeat(40),
+                "src/stalled.rs",
+            ),
+        )
+        .await;
+
+        assert!(result.is_err());
     }
 
     #[test]

@@ -4,6 +4,7 @@ use std::io::Read;
 use std::path::Path;
 use std::process::Stdio;
 
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
@@ -538,6 +539,7 @@ impl SearchAccumulator {
     pub(crate) async fn scan_response(
         &mut self,
         path: &str,
+        expected_object_id: &str,
         mut response: reqwest::Response,
         expected_size: u64,
     ) -> anyhow::Result<()> {
@@ -549,15 +551,21 @@ impl SearchAccumulator {
             anyhow::ensure!(size == expected_size, "repository blob size changed");
         }
         let mut scanner = StreamMatcher::new(&self.terms);
+        let mut object_hash = GitBlobHash::new(expected_size);
         let mut read = 0u64;
         while let Some(chunk) = response.chunk().await? {
             read = read
                 .checked_add(chunk.len() as u64)
                 .ok_or_else(|| anyhow::anyhow!("repository search byte count overflowed"))?;
+            object_hash.update(&chunk);
             scanner.push(&chunk);
         }
         scanner.finish();
         anyhow::ensure!(read == expected_size, "repository blob size changed");
+        anyhow::ensure!(
+            object_hash.matches(expected_object_id),
+            "repository blob did not match its tree object id"
+        );
         self.finish_blob(path, read, scanner.counts);
         Ok(())
     }
@@ -628,6 +636,43 @@ impl SearchAccumulator {
             matches_truncated,
         }
     }
+}
+
+struct GitBlobHash {
+    sha1: Sha1,
+    sha256: Sha256,
+}
+
+impl GitBlobHash {
+    fn new(size: u64) -> Self {
+        let header = format!("blob {size}\0");
+        let mut sha1 = Sha1::new();
+        sha1.update(header.as_bytes());
+        let mut sha256 = Sha256::new();
+        sha256.update(header.as_bytes());
+        Self { sha1, sha256 }
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        self.sha1.update(bytes);
+        self.sha256.update(bytes);
+    }
+
+    fn matches(self, expected: &str) -> bool {
+        let actual = match expected.len() {
+            40 => hex_digest(self.sha1.finalize()),
+            64 => hex_digest(self.sha256.finalize()),
+            _ => return false,
+        };
+        actual.eq_ignore_ascii_case(expected)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn git_blob_sha1(bytes: &[u8]) -> String {
+    let mut hash = GitBlobHash::new(bytes.len() as u64);
+    hash.update(bytes);
+    hex_digest(hash.sha1.finalize())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

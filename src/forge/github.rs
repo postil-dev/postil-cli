@@ -1079,9 +1079,12 @@ impl GitHub {
                 )
                 .await?;
             let remaining = budget.remaining()?;
-            tokio::time::timeout(remaining, search.scan_response(&path, response, size))
-                .await
-                .map_err(|_| anyhow::Error::new(RepositorySearchExhausted))??;
+            tokio::time::timeout(
+                remaining,
+                search.scan_response(&path, &blob_sha, response, size),
+            )
+            .await
+            .map_err(|_| anyhow::Error::new(RepositorySearchExhausted))??;
         }
         if gitlinks.is_empty() {
             Ok(search.complete(head_sha, tree_sha256))
@@ -2647,13 +2650,13 @@ mod tests {
         let head = "a".repeat(40);
         let root_tree = "b".repeat(40);
         let manifest_tree = "c".repeat(40);
-        let readme_blob = "d".repeat(40);
-        let generated_blob = "e".repeat(40);
-        let symlink_blob = "f".repeat(40);
-        let submodule = "1".repeat(40);
         let readme = b"CephCluster supports stable releases.\n";
         let generated = b"clusterVersion: 19.2.5\nimage: ceph:19.2.5\n";
         let symlink = b"../outside";
+        let readme_blob = crate::repository_search::git_blob_sha1(readme);
+        let generated_blob = crate::repository_search::git_blob_sha1(generated);
+        let symlink_blob = crate::repository_search::git_blob_sha1(symlink);
+        let submodule = "1".repeat(40);
 
         Mock::given(method("GET"))
             .and(path(format!("/repos/owner/repo/git/commits/{head}")))
@@ -2740,6 +2743,52 @@ mod tests {
             .find(|query| query.kind == RepositorySearchQueryKind::Value)
             .unwrap();
         assert!(!receipt.matched_query_sha256.contains(&outside.query_sha256));
+    }
+
+    #[tokio::test]
+    async fn repository_search_rejects_same_size_blob_substitution() {
+        use crate::envelope::RepositorySearchState;
+
+        let server = MockServer::start().await;
+        let head = "a".repeat(40);
+        let tree = "b".repeat(40);
+        let expected = b"required-construct=true\n";
+        let substituted = b"required-construct=fals\n";
+        assert_eq!(expected.len(), substituted.len());
+        let blob = crate::repository_search::git_blob_sha1(expected);
+
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/owner/repo/git/commits/{head}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sha": head,
+                "tree": {"sha": tree}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/owner/repo/git/trees/{tree}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sha": tree,
+                "truncated": false,
+                "tree": [{
+                    "path": "config.txt", "mode": "100644", "type": "blob",
+                    "sha": blob, "size": expected.len()
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/owner/repo/git/blobs/{blob}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(substituted))
+            .mount(&server)
+            .await;
+
+        let receipt = test_github(&server)
+            .search_repository_at_head(&head, repository_search_terms())
+            .await;
+
+        assert_eq!(receipt.state, RepositorySearchState::Unavailable);
+        assert_eq!(receipt.searched_blobs, 0);
     }
 
     #[tokio::test]
