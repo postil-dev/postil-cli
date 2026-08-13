@@ -2384,7 +2384,179 @@ async fn oversized_security_hunk_fails_before_provider_contact() {
 }
 
 #[tokio::test]
-async fn automatic_large_diff_route_fails_closed_before_provider_on_unreviewed_hunks() {
+async fn automatic_large_diff_route_reviews_losslessly_compacted_low_signal_hunks() {
+    use std::fmt::Write as _;
+
+    let server = MockServer::start().await;
+    let registration_token = "large-plan-registration-token";
+    Mock::given(method("POST"))
+        .and(path("/durable-plan"))
+        .and(header(
+            "authorization",
+            format!("Bearer {registration_token}"),
+        ))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let rle_evidence = format!("const value = source_0; // {}", "x".repeat(200));
+    let template_evidence = format!("const ordinary_1_1 = source.id; // {}", "x".repeat(900));
+    let responder_rle_evidence = rle_evidence.clone();
+    let responder_template_evidence = template_evidence.clone();
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(move |request: &Request| {
+            let body: Value = request.body_json().unwrap();
+            let user = body["messages"][1]["content"].as_str().unwrap_or_default();
+            if user.contains("[Correction]") {
+                for expected in [&responder_rle_evidence, &responder_template_evidence] {
+                    let correction = format!(
+                        "must set `evidence` to the exact JSON string {}",
+                        serde_json::to_string(expected).unwrap()
+                    );
+                    assert!(
+                        user.contains(&correction),
+                        "correction did not require reconstructed evidence: {user}"
+                    );
+                }
+            }
+            let mut findings = Vec::new();
+            if user.contains("Exact bounded semantic evidence:")
+                && user.contains("exact-rle-v1")
+                && user.contains("src/churn/file-0.ts")
+            {
+                findings.push(json!({
+                    "path": "src/churn/file-0.ts",
+                    "line": 1,
+                    "severity": "warn",
+                    "kind": "risk",
+                    "confidence": 0.99,
+                    "title": "Preserve the source assignment",
+                    "body": "The assignment uses the wrong source value. Restore the expected value before merging.",
+                    "evidence": responder_rle_evidence.clone()
+                }));
+            }
+            if user.contains("Exact bounded semantic evidence:")
+                && user.contains("exact-template-v1")
+                && user.contains("src/churn/file-1.ts")
+            {
+                findings.push(json!({
+                    "path": "src/churn/file-1.ts",
+                    "line": 1,
+                    "severity": "warn",
+                    "kind": "risk",
+                    "confidence": 0.99,
+                    "title": "Preserve the ordinary source assignment",
+                    "body": "The assignment uses the wrong source value. Restore the expected value before merging.",
+                    "evidence": responder_template_evidence.clone()
+                }));
+            }
+            ResponseTemplate::new(200).set_body_json(llm_content(Value::Array(findings)))
+        })
+        .mount(&server)
+        .await;
+
+    let mut source = String::new();
+    for file in 0..30 {
+        let path = format!("src/churn/file-{file}.ts");
+        if file == 0 {
+            writeln!(
+                source,
+                "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@"
+            )
+            .unwrap();
+            writeln!(source, "-const value = 0;").unwrap();
+            writeln!(source, "+{rle_evidence}").unwrap();
+        } else {
+            writeln!(
+                source,
+                "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1,130 @@"
+            )
+            .unwrap();
+            writeln!(source, "-const value = {file};").unwrap();
+            for line in 1..=130 {
+                writeln!(
+                    source,
+                    "+const ordinary_{file}_{line} = source.id; // {}",
+                    "x".repeat(900)
+                )
+                .unwrap();
+            }
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let diff = dir.path().join("automatic-large-compacted.diff");
+    std::fs::write(&diff, source).unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env(
+            "POSTIL_LARGE_REVIEW_PLAN_ENDPOINT",
+            format!("{}/durable-plan", server.uri()),
+        )
+        .env("POSTIL_LARGE_REVIEW_PLAN_TOKEN", registration_token)
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .env("REVIEW_MODEL", "mistralai/mistral-small-3.2-24b-instruct")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let receipt = &envelope["reviewCoverage"]["receipt"];
+    assert_eq!(envelope["reviewCoverage"]["mode"], "bounded");
+    assert_eq!(receipt["totalHunks"], 30);
+    assert_eq!(receipt["unreviewedHunks"], 0);
+    assert!(receipt["semanticHunks"].as_u64().unwrap() > 0);
+    let findings = envelope["findings"].as_array().unwrap();
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding["evidence"] == rle_evidence)
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding["evidence"] == template_evidence)
+    );
+    assert!(findings.iter().all(|finding| {
+        finding["evidence"]
+            .as_str()
+            .is_none_or(|evidence| !evidence.contains("exact-"))
+    }));
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests[0].url.path(), "/durable-plan");
+    assert!(
+        requests
+            .iter()
+            .skip(1)
+            .any(|request| request.url.path() == "/chat/completions")
+    );
+    let review_users = requests
+        .iter()
+        .skip(1)
+        .filter(|request| request.url.path() == "/chat/completions")
+        .map(|request| {
+            request.body_json::<Value>().unwrap()["messages"][1]["content"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        review_users
+            .iter()
+            .any(|user| user.contains("exact-rle-v1"))
+    );
+    assert!(
+        review_users
+            .iter()
+            .any(|user| user.contains("exact-template-v1"))
+    );
+}
+
+#[tokio::test]
+async fn automatic_large_diff_route_fails_before_provider_when_mandatory_hunks_exceed_capacity() {
     use std::fmt::Write as _;
     use std::time::Duration;
 
@@ -2411,11 +2583,7 @@ async fn automatic_large_diff_route_fails_closed_before_provider_on_unreviewed_h
 
     let mut source = String::new();
     for file in 0..30 {
-        let path = if file == 15 {
-            "src/auth/permission.ts".to_string()
-        } else {
-            format!("src/churn/file-{file}.ts")
-        };
+        let path = format!("src/auth/permission-{file}.ts");
         writeln!(
             source,
             "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@"
@@ -2465,8 +2633,8 @@ async fn automatic_large_diff_route_fails_closed_before_provider_on_unreviewed_h
     let requests = server.received_requests().await.unwrap();
     assert!(requests.is_empty());
     let stderr = String::from_utf8_lossy(&out.get_output().stderr);
-    assert!(stderr.contains("normalized hunks unreviewed"));
-    assert!(stderr.contains("no provider request was made"));
+    assert!(stderr.contains("mandatory hunk"), "{stderr}");
+    assert!(stderr.contains("no provider request was made"), "{stderr}");
     assert!(!stderr.contains(registration_token));
 }
 
