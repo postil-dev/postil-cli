@@ -106,6 +106,7 @@ pub(crate) struct AdjudicationApplication {
 enum DeterministicDemotionReason {
     RepositoryReceipt,
     CitationFragment,
+    InvalidConfirmation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -931,11 +932,12 @@ pub(crate) fn apply_results(
     snapshot_id: &str,
     findings: Vec<Finding>,
     candidate_ids: Vec<String>,
-    results: Vec<AdjudicationResult>,
+    mut results: Vec<AdjudicationResult>,
     corpus: &str,
     diff_receipt: &DiffCorpusReceipt,
     repository_receipt: &RepositorySearchReceipt,
 ) -> Result<AdjudicationApplication> {
+    normalize_confirmed_publication(&findings, &candidate_ids, &mut results);
     let outcomes = applied_adjudication_results(
         snapshot_id,
         &findings,
@@ -1018,13 +1020,39 @@ pub(crate) fn apply_results(
     })
 }
 
+fn normalize_confirmed_publication(
+    findings: &[Finding],
+    candidate_ids: &[String],
+    results: &mut [AdjudicationResult],
+) {
+    let finding_by_id = candidate_ids
+        .iter()
+        .map(String::as_str)
+        .zip(findings)
+        .collect::<HashMap<_, _>>();
+    for result in results {
+        if result.status != AdjudicationStatus::Confirmed {
+            continue;
+        }
+        let Some(finding) = finding_by_id.get(result.candidate_id.as_str()) else {
+            continue;
+        };
+        let mut publication = (*finding).clone();
+        publication.title.clone_from(&result.revised_title);
+        publication.body.clone_from(&result.revised_body);
+        crate::envelope::normalize_finding_publication(&mut publication);
+        result.revised_title = publication.title;
+        result.revised_body = publication.body;
+    }
+}
+
 fn applied_adjudication_results(
     snapshot_id: &str,
     findings: &[Finding],
     candidate_ids: &[String],
     results: Vec<AdjudicationResult>,
-    _corpus: &str,
-    _receipt: &DiffCorpusReceipt,
+    corpus: &str,
+    receipt: &DiffCorpusReceipt,
     repository_receipt: &RepositorySearchReceipt,
 ) -> Vec<AppliedAdjudicationResult> {
     let finding_by_id = candidate_ids
@@ -1032,15 +1060,20 @@ fn applied_adjudication_results(
         .map(String::as_str)
         .zip(findings)
         .collect::<HashMap<_, _>>();
-    results
+    let mut outcomes = results
         .into_iter()
         .map(|result| {
             let Some(finding) = finding_by_id.get(result.candidate_id.as_str()).copied() else {
                 return model_applied_result(result);
             };
-            let Some(reason) =
-                deterministic_demotion_reason(snapshot_id, finding, &result, repository_receipt)
-            else {
+            let Some(reason) = deterministic_demotion_reason(
+                snapshot_id,
+                finding,
+                &result,
+                corpus,
+                receipt,
+                repository_receipt,
+            ) else {
                 return model_applied_result(result);
             };
             AppliedAdjudicationResult {
@@ -1049,7 +1082,35 @@ fn applied_adjudication_results(
                 provenance: AdjudicationProvenance::DeterministicEvidenceReceipt(reason),
             }
         })
-        .collect()
+        .collect::<Vec<_>>();
+    loop {
+        let preserved = outcomes
+            .iter()
+            .filter(|outcome| outcome.disposition == AdjudicationDisposition::PreserveUnresolved)
+            .map(|outcome| outcome.effective_result.candidate_id.clone())
+            .collect::<HashSet<_>>();
+        let mut changed = false;
+        for outcome in &mut outcomes {
+            if outcome.disposition == AdjudicationDisposition::SuppressDuplicate
+                && outcome
+                    .effective_result
+                    .duplicate_of
+                    .as_deref()
+                    .is_some_and(|primary| preserved.contains(primary))
+            {
+                outcome.effective_result = unresolved_result(outcome.effective_result.clone());
+                outcome.disposition = AdjudicationDisposition::PreserveUnresolved;
+                outcome.provenance = AdjudicationProvenance::DeterministicEvidenceReceipt(
+                    DeterministicDemotionReason::InvalidConfirmation,
+                );
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    outcomes
 }
 
 fn model_applied_result(result: AdjudicationResult) -> AppliedAdjudicationResult {
@@ -1082,6 +1143,8 @@ fn deterministic_demotion_reason(
     snapshot_id: &str,
     finding: &Finding,
     result: &AdjudicationResult,
+    corpus: &str,
+    receipt: &DiffCorpusReceipt,
     repository_receipt: &RepositorySearchReceipt,
 ) -> Option<DeterministicDemotionReason> {
     let claim_unresolved = !matches!(result.status, AdjudicationStatus::Refuted)
@@ -1096,6 +1159,29 @@ fn deterministic_demotion_reason(
         Some(DeterministicDemotionReason::RepositoryReceipt)
     } else if incomplete_citation {
         Some(DeterministicDemotionReason::CitationFragment)
+    } else if matches!(result.status, AdjudicationStatus::Confirmed)
+        && (!evidence_is_directly_grounded(
+            &result.evidence,
+            finding,
+            &result.candidate_id,
+            corpus,
+            receipt,
+        ) || citation_is_deleted_only(&result.evidence, finding, &result.candidate_id, receipt)
+            || finding.repository_claim.as_ref().is_some_and(|claim| {
+                crate::repository_search::claim_verdict(claim, repository_receipt, snapshot_id)
+                    != RepositoryClaimVerdict::Supported
+            })
+            || {
+                let mut publication = finding.clone();
+                publication.title.clone_from(&result.revised_title);
+                publication.body.clone_from(&result.revised_body);
+                crate::envelope::validate_finding_publication(&publication).is_err()
+                    || crate::repository_search::publication_exposes_evidence_boundary(&publication)
+                    || (publication.repository_claim.is_none()
+                        && crate::repository_search::prose_requires_repository_search(&publication))
+            })
+    {
+        Some(DeterministicDemotionReason::InvalidConfirmation)
     } else {
         None
     }
@@ -1373,6 +1459,136 @@ mod tests {
             applied.kept[0].evidence.as_deref(),
             Some("transaction guard")
         );
+    }
+
+    #[test]
+    fn confirmed_rewrite_normalizes_publication_markup() {
+        let snapshot = "a".repeat(40);
+        let findings = vec![finding(
+            Kind::Risk,
+            "Restore the transaction guard",
+            "The transaction guard is bypassed before the debit.",
+        )];
+        let ids = stable_candidate_ids(&snapshot, &findings);
+        let corpus = "+transaction guard\n";
+        let receipt = direct_receipt(&snapshot, corpus, &findings, &ids);
+        let applied = apply_results(
+            &snapshot,
+            findings,
+            ids.clone(),
+            vec![AdjudicationResult {
+                candidate_id: ids[0].clone(),
+                status: AdjudicationStatus::Confirmed,
+                revised_title: "**Restore** the transaction guard".into(),
+                revised_body: "# The transaction guard is bypassed before the debit.".into(),
+                evidence: "transaction guard".into(),
+                duplicate_of: None,
+            }],
+            corpus,
+            &receipt,
+            &unavailable_receipt(),
+        )
+        .unwrap();
+
+        assert_eq!(applied.kept[0].title, "Restore the transaction guard");
+        assert_eq!(
+            applied.kept[0].body,
+            "\\# The transaction guard is bypassed before the debit."
+        );
+        assert!(crate::envelope::validate_finding_publication(&applied.kept[0]).is_ok());
+    }
+
+    #[test]
+    fn invalid_confirmation_evidence_preserves_the_original_finding() {
+        let snapshot = "a".repeat(40);
+        let findings = vec![finding(
+            Kind::Risk,
+            "Restore the transaction guard",
+            "The transaction guard is bypassed before the debit.",
+        )];
+        let ids = stable_candidate_ids(&snapshot, &findings);
+        let corpus = "+transaction guard\n";
+        let receipt = direct_receipt(&snapshot, corpus, &findings, &ids);
+        let applied = apply_results(
+            &snapshot,
+            findings.clone(),
+            ids.clone(),
+            vec![AdjudicationResult {
+                candidate_id: ids[0].clone(),
+                status: AdjudicationStatus::Confirmed,
+                revised_title: "Restore the transaction guard".into(),
+                revised_body: "The transaction guard is bypassed before the debit.".into(),
+                evidence: "evidence the receipt did not review".into(),
+                duplicate_of: None,
+            }],
+            corpus,
+            &receipt,
+            &unavailable_receipt(),
+        )
+        .unwrap();
+
+        assert_eq!(applied.kept.len(), 1);
+        assert_eq!(applied.kept[0].title, findings[0].title);
+        assert_eq!(applied.kept[0].body, findings[0].body);
+        assert_eq!(applied.kept[0].evidence, findings[0].evidence);
+        assert!(applied.resolved_indices.is_empty());
+        assert!(applied.suppressed.is_empty());
+    }
+
+    #[test]
+    fn duplicate_of_an_invalid_confirmation_preserves_the_group() {
+        let snapshot = "a".repeat(40);
+        let findings = vec![
+            finding(
+                Kind::Risk,
+                "Restore the transaction guard",
+                "The transaction guard is bypassed before the debit.",
+            ),
+            finding(
+                Kind::Uncertainty,
+                "Verify the transaction guard",
+                "The transaction guard may be bypassed before the debit.",
+            ),
+        ];
+        let ids = stable_candidate_ids(&snapshot, &findings);
+        let corpus = "+transaction guard\n";
+        let receipt = direct_receipt(&snapshot, corpus, &findings, &ids);
+        let applied = apply_results(
+            &snapshot,
+            findings.clone(),
+            ids.clone(),
+            vec![
+                AdjudicationResult {
+                    candidate_id: ids[0].clone(),
+                    status: AdjudicationStatus::Confirmed,
+                    revised_title: "Restore the transaction guard".into(),
+                    revised_body: "The transaction guard is bypassed before the debit.".into(),
+                    evidence: "evidence the receipt did not review".into(),
+                    duplicate_of: None,
+                },
+                AdjudicationResult {
+                    candidate_id: ids[1].clone(),
+                    status: AdjudicationStatus::Confirmed,
+                    revised_title: "Restore the transaction guard".into(),
+                    revised_body: "The transaction guard is bypassed before the debit.".into(),
+                    evidence: "transaction guard".into(),
+                    duplicate_of: Some(ids[0].clone()),
+                },
+            ],
+            corpus,
+            &receipt,
+            &unavailable_receipt(),
+        )
+        .unwrap();
+
+        assert_eq!(applied.kept.len(), 2);
+        for (kept, original) in applied.kept.iter().zip(&findings) {
+            assert_eq!(kept.title, original.title);
+            assert_eq!(kept.body, original.body);
+            assert_eq!(kept.evidence, original.evidence);
+        }
+        assert!(applied.resolved_indices.is_empty());
+        assert!(applied.suppressed.is_empty());
     }
 
     #[test]
