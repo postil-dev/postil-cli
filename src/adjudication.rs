@@ -1085,9 +1085,12 @@ fn evidence_is_directly_grounded(
         .flat_map(semantic_terms)
         .any(|term| normalized_evidence.contains(&term));
     let rendered_line = receipt.rendered_evidence.lines().any(|row| {
-        row.split_once(':')
-            .map(|(_, source)| source.strip_prefix(['+', '-', ' ']).unwrap_or(source))
-            == Some(evidence)
+        row.split_once(':').map(|(_, source)| {
+            source
+                .strip_prefix(['+', '-', ' '])
+                .unwrap_or(source)
+                .trim_start()
+        }) == Some(evidence)
     });
     let corpus_window = corpus.contains(evidence) && rendered_line && candidate_term_matches;
     let cited_window = finding.evidence.as_deref().is_some_and(|cited| {
