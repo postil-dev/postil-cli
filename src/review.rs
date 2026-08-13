@@ -2270,6 +2270,7 @@ async fn review_diff_at(
                                         Ok(application) => application,
                                         Err(error) => {
                                             adjudication_incomplete = true;
+                                            review_trust = filter::ReviewTrust::Failed;
                                             eprintln!(
                                                 "postil: finding adjudication validation failed; preserving all generated findings: {error:#}"
                                             );
@@ -2290,6 +2291,7 @@ async fn review_diff_at(
                                 }
                                 Err(error) => {
                                     adjudication_incomplete = true;
+                                    review_trust = filter::ReviewTrust::Failed;
                                     eprintln!(
                                         "postil: finding adjudication unavailable; preserving all generated findings"
                                     );
@@ -2297,11 +2299,9 @@ async fn review_diff_at(
                                     model_usage.extend_from_slice(error.model_usage());
                                     model_incidents.extend_from_slice(error.model_incidents());
                                     usage_accounting_complete &= error.usage_accounting_complete();
-                                    if !error.is_provider() {
-                                        adjudication_failure = Some(fail_closed_finding(
-                                            "finding adjudication output did not satisfy its admitted contract",
-                                        ));
-                                    }
+                                    adjudication_failure = Some(fail_closed_finding(
+                                        "finding adjudication did not complete its admitted contract",
+                                    ));
                                     preserve_unadjudicated_findings(all_adjudication_candidates)
                                 }
                             };

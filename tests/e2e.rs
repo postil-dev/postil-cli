@@ -2523,7 +2523,7 @@ async fn query_truncated_adjudication_preserves_the_grounded_candidate() {
 }
 
 #[tokio::test]
-async fn adjudication_provider_failure_preserves_generated_blockers_under_advisory_policy() {
+async fn adjudication_provider_failure_preserves_findings_and_blocks_under_advisory_policy() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
@@ -2535,7 +2535,7 @@ async fn adjudication_provider_failure_preserves_generated_blockers_under_adviso
     mock_review(
         &server,
         json!([{
-            "path": "src/auth.rs", "line": 42, "severity": "error", "kind": "risk",
+            "path": "src/auth.rs", "line": 42, "severity": "warn", "kind": "risk",
             "confidence": 0.99, "title": "Validate query input",
             "body": "The query executes attacker-controlled input without validation.",
             "evidence": "exec_query(&token);"
@@ -2562,20 +2562,64 @@ async fn adjudication_provider_failure_preserves_generated_blockers_under_adviso
     )
     .unwrap();
     let diff = write_diff(dir.path());
+    let baseline = dir.path().join("baseline.json");
+    std::fs::write(
+        &baseline,
+        json!({
+            "version": 1, "summary": "", "silent": false,
+            "findings": [{
+                "path": "src/auth.rs", "line": 42, "severity": "error", "kind": "risk",
+                "confidence": 0.98, "title": "Keep the prior authorization blocker",
+                "body": "The prior authorization defect remains open.",
+                "evidence": "exec_query(&token);"
+            }],
+            "resolved": [],
+            "counts": {"info": 0, "warn": 0, "error": 1, "suppressed": 0},
+            "confidenceBuckets": [0, 0, 0, 0, 1],
+            "gate": {"failOn": "error", "failing": true},
+            "modelUsed": "fixture/model", "usage": {"promptTokens": 0, "completionTokens": 0},
+            "baseSha": null, "headSha": "prior", "sinceSha": null
+        })
+        .to_string(),
+    )
+    .unwrap();
     let out = postil()
         .current_dir(dir.path())
         .env("POSTIL_API_BASE", server.uri())
         .env("REVIEW_SCORER_MODEL", "provider/scorer")
         .args(["review", "--diff-file"])
         .arg(&diff)
+        .args(["--since-sha", "abc123", "--baseline"])
+        .arg(&baseline)
         .args(["--output", "json"])
         .assert()
         .code(1);
     let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
 
-    assert_eq!(envelope["findings"].as_array().unwrap().len(), 1);
-    assert_eq!(envelope["findings"][0]["title"], "Validate query input");
-    assert_eq!(envelope["counts"]["error"], 1);
+    assert!(
+        envelope["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| { finding["title"] == "Validate query input" })
+    );
+    assert!(
+        envelope["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| { finding["title"] == "Keep the prior authorization blocker" })
+    );
+    assert!(
+        envelope["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| { finding["path"] == ".postil/model-output" })
+    );
+    assert_eq!(envelope["counts"]["warn"], 1);
+    assert_eq!(envelope["counts"]["error"], 2);
+    assert_eq!(envelope["resolved"], json!([]));
     assert_eq!(envelope["gate"]["failing"], true);
     assert!(
         envelope["modelIncidents"]
