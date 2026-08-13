@@ -2109,14 +2109,15 @@ async fn review_diff_at(
                         let fresh_candidate_count = all_adjudication_candidates.len();
                         let mut baseline_candidate_indices = Vec::new();
                         if full_rereview {
-                            for (index, previous) in baseline.iter().enumerate() {
-                                let applicable =
-                                    !crate::envelope::is_reserved_anchor(&previous.path)
-                                        && !kept
-                                            .iter()
-                                            .any(|fresh| same_visible_finding(fresh, previous));
+                            for (baseline_index, previous) in baseline.iter().enumerate() {
+                                let applicable = index
+                                    .contains_reviewed_baseline_coordinate(previous)
+                                    && !crate::envelope::is_reserved_anchor(&previous.path)
+                                    && !kept
+                                        .iter()
+                                        .any(|fresh| same_visible_finding(fresh, previous));
                                 if applicable {
-                                    baseline_candidate_indices.push(index);
+                                    baseline_candidate_indices.push(baseline_index);
                                     all_adjudication_candidates.push(previous.clone());
                                 }
                             }
