@@ -5902,8 +5902,9 @@ fn parse_adjudication_results(
     content: &str,
     expected_len: usize,
 ) -> Result<Vec<AdjudicationResult>, String> {
-    let results = serde_json::from_str::<Vec<AdjudicationResult>>(content.trim())
-        .map_err(|error| error.to_string())?;
+    let json = extract_json_array(content).ok_or("no JSON array found")?;
+    let results =
+        serde_json::from_str::<Vec<AdjudicationResult>>(json).map_err(|error| error.to_string())?;
     if results.len() != expected_len {
         return Err(format!(
             "expected {expected_len} adjudication result(s), got {}",
@@ -8451,6 +8452,22 @@ mod tests {
         let text = "Here you go:\n```json\n{\"summary\": \"s\", \"findings\": []}\n```";
         let raw = parse_review(text).unwrap();
         assert_eq!(raw.summary, "s");
+    }
+
+    #[test]
+    fn extracts_adjudication_array_from_fenced_output() {
+        let text = "Here you go:\n```json\n[{\"candidateId\":\"candidate\",\"status\":\"unresolved\"}]\n```";
+        let results = parse_adjudication_results(text, 1).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].candidate_id, "candidate");
+    }
+
+    #[test]
+    fn rejects_adjudication_output_without_a_json_array() {
+        assert_eq!(
+            parse_adjudication_results("I could not adjudicate this finding.", 1).unwrap_err(),
+            "no JSON array found"
+        );
     }
 
     #[test]
