@@ -1,10 +1,10 @@
 #!/usr/bin/env bun
 // Live evaluator for the independent scorer role.
 //
-// The primary generator is mocked with fixed findings, while scorer requests
-// are proxied to the real OpenRouter endpoint. This exercises the actual
-// Postil scorer prompt and review path without depending on nondeterministic
-// primary-model output.
+// The primary generator is mocked with fixed findings, while adjudication and
+// scorer requests are proxied to the real OpenRouter endpoint. This exercises
+// the actual Postil adjudication, scorer, and review paths without depending on
+// nondeterministic primary-model output.
 
 import { execFile as execFileCb } from "node:child_process";
 import { mkdir, rename, rm, writeFile } from "node:fs/promises";
@@ -62,6 +62,8 @@ export const SCORER_PREFLIGHT_PROMPT_BYTES_PER_CASE = 17_000;
 export const SCORER_PREFLIGHT_COMPLETION_TOKENS_PER_ATTEMPT = 400;
 export const SCORER_PREFLIGHT_REPAIR_INPUT_BYTES_PER_ATTEMPT = 3_584;
 export const SCORER_PREFLIGHT_TRANSPORT_ATTEMPTS_PER_PHASE = 3;
+export const ADJUDICATION_PREFLIGHT_PROMPT_BYTES_PER_CASE = 48 * 1024;
+export const ADJUDICATION_PREFLIGHT_COMPLETION_TOKENS_PER_ATTEMPT = 8_000;
 
 export const TRUE_FINDING_CASES = [
   "billing-double-charge",
@@ -338,9 +340,11 @@ async function main() {
     throw new Error(`scorer eval needs a real model key: set ${API_KEY_ENV_NAMES_TEXT}`);
   }
 
-  const binary =
-    process.env.POSTIL_BIN ??
-    resolve(import.meta.dir, "..", "..", "target", "release", "postil");
+  const cargoTarget = process.env.CARGO_TARGET_DIR;
+  const binary = process.env.POSTIL_BIN ??
+    (cargoTarget === undefined
+      ? resolve(import.meta.dir, "..", "..", "target", "release", "postil")
+      : resolve(cargoTarget, "release", "postil"));
   const embedded = await loadEmbeddedScorerDefaults();
   const models = parseModels(
     process.env.POSTIL_SCORER_EVAL_MODELS ?? flagValue(args, "--models"),
@@ -449,7 +453,7 @@ export function isAdmissionFatalStructuralResult(
     !result.coverageValid ||
     !result.publicationValid ||
     result.gateFailing === null ||
-    result.upstreamRequests !== 1
+    result.upstreamRequests !== 2
   );
 }
 
@@ -705,7 +709,7 @@ export async function runScorerEvalCase(
   const usageValid = sourceExactUsageValid(
     envelope,
     scorerModel,
-    proxy.attempts[0],
+    proxy.attempts,
     proxy.generatorRequests.length + proxy.plannerRequests.length,
   );
   const costProviderDecimal = scorerCostProviderDecimal(envelope, scorerModel);
@@ -724,7 +728,7 @@ export async function runScorerEvalCase(
     routingValid &&
     coverageValid &&
     publicationValid &&
-    proxy.attempts.length === 1;
+    proxy.attempts.length === 2;
   let passed = false;
   let reason = "";
   if (caseTimedOut) {
@@ -960,8 +964,11 @@ export async function startScorerProxy(
       max_tokens?: unknown;
       messages?: Array<{ role?: string; content?: string }>;
     } | undefined;
-    if (body?.model === GENERATOR_MODEL) {
-      const system = body.messages?.find((message) => message.role === "system")?.content ?? "";
+    const system = body?.messages?.find((message) => message.role === "system")?.content ?? "";
+    const isAdjudication = body?.messages?.some((message) =>
+      message.content?.includes("Postil's single finding adjudicator")
+    ) ?? false;
+    if (body?.model === GENERATOR_MODEL && !isAdjudication) {
       const requestKind = modelRequestKind(req.headers, system);
       if (requestKind?.kind === "planner") {
         plannerRequests.push(bodyText);
@@ -1155,10 +1162,13 @@ function isValidUsage(usage: { prompt_tokens?: number; completion_tokens?: numbe
 function sourceExactUsageValid(
   envelope: Record<string, any>,
   scorerModel: string,
-  attempt: ScorerAttempt | undefined,
+  attempts: ScorerAttempt[],
   expectedMockCalls: number,
 ): boolean {
-  if (attempt === undefined || !attempt.usageValid || attempt.costProviderDecimal === null) return false;
+  if (
+    attempts.length !== 2 ||
+    attempts.some((attempt) => !attempt.usageValid || attempt.costProviderDecimal === null)
+  ) return false;
   const events = Array.isArray(envelope.modelUsage) ? envelope.modelUsage : [];
   const scorerEvents = events.filter((event: Record<string, any>) =>
     event.model === scorerModel && event.role === "findingScorer"
@@ -1168,20 +1178,21 @@ function sourceExactUsageValid(
     (event.role === "reviewGenerator" || event.role === "reviewPlanner")
   );
   if (
-    scorerEvents.length !== 1 ||
+    scorerEvents.length !== attempts.length ||
     mockEvents.length !== expectedMockCalls ||
     scorerEvents.length + mockEvents.length !== events.length
   ) return false;
 
-  const scorer = scorerEvents[0] as Record<string, any>;
-  const scorerValid =
-    scorer.accountingComplete === true &&
-    scorer.costSource === "providerReported" &&
-    scorer.promptTokens === attempt.promptTokens &&
-    scorer.completionTokens === attempt.completionTokens &&
-    typeof scorer.costProviderDecimal === "string" &&
-    canonicalDecimalEqual(scorer.costProviderDecimal, attempt.costProviderDecimal) &&
-    scorer.costMicros === providerCostMicros(attempt.costProviderDecimal);
+  const scorerValid = scorerEvents.every((event: Record<string, any>, index: number) => {
+    const attempt = attempts[index]!;
+    return event.accountingComplete === true &&
+      event.costSource === "providerReported" &&
+      event.promptTokens === attempt.promptTokens &&
+      event.completionTokens === attempt.completionTokens &&
+      typeof event.costProviderDecimal === "string" &&
+      canonicalDecimalEqual(event.costProviderDecimal, attempt.costProviderDecimal!) &&
+      event.costMicros === providerCostMicros(attempt.costProviderDecimal!);
+  });
   const mocksValid = mockEvents.every((event: Record<string, any>) =>
     event.accountingComplete === true &&
     event.costSource === "unavailable" &&
@@ -1276,18 +1287,21 @@ export function scorerCostProviderDecimal(
   const scorerEvents = events.filter((event: Record<string, any>) =>
     event.model === scorerModel && event.role === "findingScorer"
   );
-  if (scorerEvents.length !== 1) return null;
-  const event = scorerEvents[0] as Record<string, any>;
-  if (
-    event.accountingComplete !== true ||
-    event.costSource !== "providerReported" ||
-    typeof event.costProviderDecimal !== "string"
-  ) return null;
+  if (scorerEvents.length !== 2) return null;
   try {
-    const parsed = parseCanonicalDecimal(event.costProviderDecimal);
-    return formatCanonicalDecimal(parsed) === event.costProviderDecimal
-      ? event.costProviderDecimal
-      : null;
+    const costs = scorerEvents.map((event: Record<string, any>) => {
+      if (
+        event.accountingComplete !== true ||
+        event.costSource !== "providerReported" ||
+        typeof event.costProviderDecimal !== "string"
+      ) throw new Error("incomplete provider cost");
+      const parsed = parseCanonicalDecimal(event.costProviderDecimal);
+      if (formatCanonicalDecimal(parsed) !== event.costProviderDecimal) {
+        throw new Error("non-canonical provider cost");
+      }
+      return parsed;
+    });
+    return formatCanonicalDecimal(sumCanonicalDecimals(costs));
   } catch {
     return null;
   }
@@ -1320,8 +1334,11 @@ export function projectedQualificationSpendUsd(
       (SCORER_PREFLIGHT_PROMPT_BYTES_PER_CASE + SCORER_PREFLIGHT_REPAIR_INPUT_BYTES_PER_ATTEMPT) *
         price.promptUsdPerToken +
       SCORER_PREFLIGHT_COMPLETION_TOKENS_PER_ATTEMPT * price.completionUsdPerToken;
+    const adjudicationAttempt =
+      ADJUDICATION_PREFLIGHT_PROMPT_BYTES_PER_CASE * price.promptUsdPerToken +
+      ADJUDICATION_PREFLIGHT_COMPLETION_TOKENS_PER_ATTEMPT * price.completionUsdPerToken;
     return total + callsPerModel * SCORER_PREFLIGHT_TRANSPORT_ATTEMPTS_PER_PHASE *
-      (initialAttempt + repairAttempt);
+      (adjudicationAttempt + initialAttempt + repairAttempt);
   }, 0);
 }
 
@@ -1370,6 +1387,7 @@ export function trueFinding(c: BenchmarkCase) {
     kind: "risk",
     confidence: 0.95,
     evidence,
+    repositoryContext: { claim: "none" },
   };
 }
 
@@ -1409,6 +1427,7 @@ function falseFindingAt(path: string, line: number, evidence: string) {
     body:
       "This change removes required runtime behavior and will break callers after merge.",
     evidence,
+    repositoryContext: { claim: "none" },
   };
 }
 

@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 use time::Date;
@@ -8,9 +8,8 @@ use crate::envelope::{Finding, ModelIncident, ModelUsage, Usage};
 use crate::llm::{FindingCompressionReview, LlmClient, add_usage};
 
 const BODY_LENGTH_THRESHOLD: usize = 600;
-const MAX_COMPRESSIONS: usize = 5;
+pub(crate) const MAX_COMPRESSIONS: usize = 5;
 const MAX_REWRITE_BYTES: usize = 700;
-const COMPRESSION_TIMEOUT_SECS: u64 = 60;
 
 #[derive(Default)]
 pub(crate) struct BrevityPass {
@@ -25,6 +24,7 @@ pub(crate) async fn compress_findings(
     client: &LlmClient,
     current_utc_date: Date,
     findings: &mut [Finding],
+    timeout: Duration,
 ) -> BrevityPass {
     let mut pass = BrevityPass {
         usage_accounting_complete: true,
@@ -34,17 +34,16 @@ pub(crate) async fn compress_findings(
         return pass;
     }
 
+    let deadline = Instant::now() + timeout;
     for index in eligible_finding_indices(findings) {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
         let original_body = findings[index].body.clone();
         let max_body_bytes = rewrite_byte_ceiling(original_body.len());
         let (system, user) = compression_prompt(current_utc_date, &original_body, max_body_bytes);
         let result = client
-            .compress_finding(
-                cfg,
-                &system,
-                &user,
-                Duration::from_secs(COMPRESSION_TIMEOUT_SECS),
-            )
+            .compress_finding(cfg, &system, &user, remaining)
             .await;
         let compression = match result {
             Ok(compression) => {
@@ -100,6 +99,16 @@ fn validated_rewrite<'a>(
     .then_some(body)
 }
 
+pub(crate) fn maximum_compression_prompt(current_utc_date: Date) -> (String, String) {
+    use crate::envelope::FINDING_PUBLIC_BODY_MAX_CHARS;
+
+    compression_prompt(
+        current_utc_date,
+        &"\\".repeat(FINDING_PUBLIC_BODY_MAX_CHARS * 4),
+        MAX_REWRITE_BYTES,
+    )
+}
+
 fn compression_prompt(
     current_utc_date: Date,
     original_body: &str,
@@ -136,6 +145,7 @@ mod tests {
             generator_kind: None,
             scorer_kind: None,
             scorer_reason: None,
+            repository_claim: None,
             title: "Keep the stable finding metadata".to_string(),
             body,
             evidence: Some("changed_call();".to_string()),
@@ -191,7 +201,6 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(eligible_finding_indices(&findings), vec![0, 1, 2, 3, 4]);
     }
-
     #[test]
     fn compression_prompt_uses_the_trusted_review_date() {
         let date = Date::from_calendar_date(2026, time::Month::August, 10).unwrap();

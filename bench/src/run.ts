@@ -231,9 +231,11 @@ async function main() {
   const manifestOut = flagValue(args, "--manifest-out");
   const privateEvidenceOut = process.env.POSTIL_BENCH_PRIVATE_EVIDENCE_OUT ??
     flagValue(args, "--private-evidence-out") ?? defaultPrivateEvidencePath();
-  const binary =
-    process.env.POSTIL_BIN ??
-    resolve(import.meta.dir, "..", "..", "target", "release", "postil");
+  const cargoTarget = process.env.CARGO_TARGET_DIR;
+  const binary = process.env.POSTIL_BIN ??
+    (cargoTarget === undefined
+      ? resolve(import.meta.dir, "..", "..", "target", "release", "postil")
+      : resolve(cargoTarget, "release", "postil"));
   const liveModels =
     process.env.POSTIL_BENCH_MODE === "live" || args.includes("--live-models");
   const live = args.includes("--live") || process.env.BENCH_LIVE === "1";

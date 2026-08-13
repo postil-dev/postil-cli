@@ -10,9 +10,9 @@ use crate::config::{Config, FindingPresentation, GateLevel, OnError};
 use crate::diff;
 use crate::durable_plan::{DurablePlanRegistrar, DurableReviewPlan};
 use crate::envelope::{
-    Envelope, Finding, Gate, Kind, ModelIncident, ModelIncidentCategory, ModelUsage,
-    ReviewAdmission, ReviewCoverage, ReviewCoverageMode, ReviewCoverageReceipt, Usage,
-    fail_closed_finding,
+    Envelope, Finding, Gate, Kind, ModelIncident, ModelIncidentCategory, ModelIncidentPhase,
+    ModelUsage, ReviewAdmission, ReviewCoverage, ReviewCoverageMode, ReviewCoverageReceipt,
+    SuppressedFinding, SuppressionReason, Usage, fail_closed_finding,
 };
 use crate::filter;
 use crate::forge::{
@@ -22,7 +22,7 @@ use crate::llm::{FindingScore, LlmClient, ReviewValidationFailure, add_usage};
 use crate::local::{self, LocalSource};
 use crate::output::{self, OutputFormat};
 use crate::prompt::{self, PrContext};
-use crate::resolve::RepositorySource;
+use crate::repository_search::RepositorySource;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use time::{Date, OffsetDateTime};
@@ -56,20 +56,85 @@ const MAX_STREAMED_CANDIDATE_MULTIPLIER: usize = 8;
 const MAX_REVIEW_VALIDATION_REASON_BYTES: usize = 16_384;
 const HOSTED_WORKER_WATCHDOG_SECS: u64 = 600;
 pub(crate) const HOSTED_LLM_TOTAL_TIMEOUT_SECS: u64 = 540;
-/// Ordinary hosted reviews retain one long primary attempt plus a bounded
-/// timeout retry inside the review phase.
+/// A provider attempt may use this timeout outside the bounded review-model
+/// operation. Hosted review generation applies the shorter operation slot
+/// below across the primary attempt, retries, and correction call together.
 pub(crate) const HOSTED_LLM_REQUEST_TIMEOUT_SECS: u64 = 240;
-/// Large reviews run at most six waves of four 60-second calls. The review
-/// phase keeps a final 60-second reserve for one bounded transient retry; the
-/// remaining 120 seconds of the total LLM budget belongs to scoring.
+/// Every hosted review-model operation, including retries and correction, is
+/// bounded by this slot. Admission prices complete batch waves and sequential
+/// cascades against the review-phase deadline.
 pub(crate) const LARGE_DIFF_LLM_REQUEST_TIMEOUT_SECS: u64 = 60;
 pub(crate) const HOSTED_LLM_REVIEW_TIMEOUT_SECS: u64 = 420;
+pub(crate) const HOSTED_REVIEW_SCHEDULING_RESERVE_SECS: u64 = 30;
 const FORGE_READ_TIMEOUT_SECS: u64 = 60;
 const FORGE_DIFF_MAX_TIMEOUT_SECS: u64 = 300;
 const CHECK_START_TIMEOUT_SECS: u64 = 30;
 const CHECK_COMPLETION_TIMEOUT_SECS: u64 = 30;
 const REVIEW_POST_TIMEOUT_SECS: u64 = 20;
 pub(crate) const SCORER_TIMEOUT_SECS: u64 = 120;
+pub(crate) const POSTPROCESSING_PHASE_TIMEOUT_SECS: u64 = 60;
+pub(crate) const FINDING_ADJUDICATION_TIMEOUT_SECS: u64 = 60;
+
+/// The hosted LLM deadline is shared by generation and every mandatory
+/// post-generation phase. Keep this ledger as the single source for both the
+/// generator deadline and deterministic large-review admission capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HostedReviewPhaseBudgets {
+    generator: u64,
+    scorer: u64,
+    resolution: u64,
+    brevity: u64,
+    adjudication: u64,
+}
+
+impl HostedReviewPhaseBudgets {
+    #[cfg(test)]
+    fn total(self) -> u64 {
+        self.generator
+            .saturating_add(self.scorer)
+            .saturating_add(self.resolution)
+            .saturating_add(self.brevity)
+            .saturating_add(self.adjudication)
+    }
+}
+
+fn hosted_review_phase_budgets(cfg: &Config) -> HostedReviewPhaseBudgets {
+    let scorer = if cfg.scorer_enabled() {
+        SCORER_TIMEOUT_SECS
+    } else {
+        0
+    };
+    let resolution = if cfg.uncertainty_resolution {
+        POSTPROCESSING_PHASE_TIMEOUT_SECS
+    } else {
+        0
+    };
+    let brevity = if cfg.concise_findings {
+        POSTPROCESSING_PHASE_TIMEOUT_SECS
+    } else {
+        0
+    };
+    let adjudication = FINDING_ADJUDICATION_TIMEOUT_SECS;
+    let generator = HOSTED_LLM_REVIEW_TIMEOUT_SECS.min(
+        HOSTED_LLM_TOTAL_TIMEOUT_SECS
+            .saturating_sub(scorer)
+            .saturating_sub(resolution)
+            .saturating_sub(brevity)
+            .saturating_sub(adjudication),
+    );
+
+    HostedReviewPhaseBudgets {
+        generator,
+        scorer,
+        resolution,
+        brevity,
+        adjudication,
+    }
+}
+
+pub(crate) fn hosted_review_timeout_secs(cfg: &Config) -> u64 {
+    hosted_review_phase_budgets(cfg).generator
+}
 
 fn review_output_token_limit(synthesis: bool, deterministic_large_review: bool) -> u32 {
     if synthesis {
@@ -79,6 +144,17 @@ fn review_output_token_limit(synthesis: bool, deterministic_large_review: bool) 
     } else {
         crate::llm::REVIEW_MAX_TOKENS
     }
+}
+
+pub(crate) fn large_diff_batch_concurrency(cfg: &Config) -> usize {
+    let consensus_width = if cfg.consensus > 1 {
+        cfg.consensus
+            .min(cfg.model_chain().len())
+            .min(MAX_MODELS_PER_REQUEST)
+    } else {
+        1
+    };
+    (MAX_LARGE_DIFF_CONCURRENCY / consensus_width).max(1)
 }
 
 fn hosted_request_timeout_secs(deterministic_large_review: bool) -> u64 {
@@ -122,11 +198,42 @@ fn review_batch_validation_reason(
     annotated: &str,
     content_policy_prompt: Option<&str>,
 ) -> Option<ReviewBatchValidationReason> {
+    if crate::repository_search::publication_exposes_evidence_boundary(finding) {
+        return Some(ReviewBatchValidationReason {
+            category: "repositoryClaimPublication",
+            repair_detail: format!(
+                "finding at {}:{} delegates evidence collection or describes review-input boundaries; cite the concrete repository construct and state an actionable fix",
+                finding.path, finding.line
+            ),
+        });
+    }
     if let Err(reason) = crate::envelope::validate_finding_publication(finding) {
         return Some(ReviewBatchValidationReason {
             category: "publicationContract",
             repair_detail: format!(
                 "finding at {}:{} violates the publication contract: {reason}",
+                finding.path, finding.line
+            ),
+        });
+    }
+    if crate::repository_search::prose_requires_repository_search(finding)
+        && finding.repository_claim.is_none()
+    {
+        return Some(ReviewBatchValidationReason {
+            category: "repositoryClaim",
+            repair_detail: format!(
+                "finding at {}:{} makes a repository-wide absence or mismatch claim without a bounded repositoryContext declaration",
+                finding.path, finding.line
+            ),
+        });
+    }
+    if let Some(claim) = finding.repository_claim.as_ref()
+        && !crate::repository_search::claim_is_valid(claim)
+    {
+        return Some(ReviewBatchValidationReason {
+            category: "repositoryClaim",
+            repair_detail: format!(
+                "finding at {}:{} has an invalid or empty repositoryContext search declaration",
                 finding.path, finding.line
             ),
         });
@@ -300,6 +407,7 @@ struct ReviewInput<'a> {
     diff_snapshot: &'a diff::DiffSnapshot,
     meta: Option<&'a PrMeta>,
     head_sha: Option<String>,
+    repository_revision: Option<String>,
     repo: Option<&'a str>,
     baseline: Vec<Finding>,
     scope: filter::ReconcileScope,
@@ -433,8 +541,8 @@ async fn run_local(args: &ReviewArgs, cfg: &Config, repo_root: &Path) -> Result<
             "local review needs one of --staged, --base <ref>, or --diff-file <path>"
         ));
     };
-    let diff_snapshot = local::acquire(&source).await?;
     let head_sha = local::head_sha().await;
+    let local_snapshot = local::acquire(&source, head_sha.as_deref(), repo_root).await?;
     let baseline = load_baseline(args)?;
     // This is a fail-closed placeholder, not the completed review's trust.
     // review_diff replaces it with Failed, Bounded, or Exhaustive after the
@@ -448,22 +556,46 @@ async fn run_local(args: &ReviewArgs, cfg: &Config, repo_root: &Path) -> Result<
             trust: filter::ReviewTrust::Failed,
         }
     };
-    let envelope = review_diff(
+    let review_started = std::time::Instant::now();
+    let result = review_diff(
         cfg,
         args,
         ReviewInput {
-            diff_snapshot: &diff_snapshot,
+            diff_snapshot: &local_snapshot.diff,
             meta: None,
-            head_sha,
+            head_sha: head_sha.clone(),
+            repository_revision: local_snapshot.repository_revision.clone(),
             repo: None,
             baseline,
             scope,
             force_model: false,
             llm_budget_started_at: None,
-            repository_source: RepositorySource::Local(repo_root),
+            repository_source: if local_snapshot.repository_revision.is_some() {
+                RepositorySource::Local(repo_root)
+            } else {
+                RepositorySource::Unavailable
+            },
         },
     )
-    .await?;
+    .await;
+    let envelope = match result {
+        Ok(envelope) => envelope,
+        // Only a completed review that failed operationally has enough
+        // review state to produce a truthful error envelope. Input,
+        // planning, registration, and client-construction failures occur
+        // before provider access and retain the CLI error contract (exit 2).
+        Err(error) if error.downcast_ref::<ReviewFailure>().is_some() => {
+            eprintln!("postil: review failed before completion ({error:#})");
+            error_envelope(
+                cfg,
+                &error,
+                head_sha.as_deref().unwrap_or("local-review"),
+                None,
+                review_started.elapsed().as_millis() as u64,
+            )
+        }
+        Err(error) => return Err(error),
+    };
     finish(args, cfg, envelope, None::<&GitHub>, None, None, false).await
 }
 
@@ -613,7 +745,7 @@ async fn run_remote<F: Forge>(
                 cfg,
                 &e,
                 &head_sha,
-                &meta,
+                Some(&meta),
                 review_started.elapsed().as_millis() as u64,
             );
             let check_completion = if let Some((a, g)) = &checks {
@@ -851,6 +983,7 @@ async fn remote_review<F: Forge>(
             diff_snapshot: &diff_snapshot,
             meta: Some(meta),
             head_sha: Some(head_sha.to_string()),
+            repository_revision: Some(head_sha.to_string()),
             repo: Some(repo),
             baseline,
             scope,
@@ -1072,7 +1205,7 @@ fn summary_from_findings(findings: &[Finding]) -> String {
 }
 
 struct ReviewBatchPromptContext<'a> {
-    cfg: &'a Config,
+    max_findings: usize,
     repo: Option<&'a str>,
     meta: Option<&'a PrMeta>,
     incremental: bool,
@@ -1092,7 +1225,9 @@ fn review_batch_prompt(
     mut annotated: String,
     first: bool,
 ) -> (String, String, bool) {
-    let synthesis = annotated.starts_with("Cross-window semantic digests")
+    let exact_semantic = annotated.starts_with("Exact low-risk semantic evidence:");
+    let synthesis = exact_semantic
+        || annotated.starts_with("Cross-window semantic digests")
         || annotated.starts_with("Cross-batch semantic digests");
     if context.bounded_selection {
         if synthesis {
@@ -1116,8 +1251,12 @@ fn review_batch_prompt(
         incremental: context.incremental,
         content_policy: first && context.content_policy_active,
     };
-    let mut user = prompt::user_prompt(&prompt_context, &annotated, context.cfg.max_findings);
-    if synthesis {
+    let mut user = prompt::user_prompt(&prompt_context, &annotated, context.max_findings);
+    if exact_semantic {
+        user.push_str(
+            "\n\nThis bounded semantic proof batch contains exact low-risk hunk evidence. Each credited hunk retains its repository path, stable identity, and a non-empty added line. Cite only the exact numbered path and line displayed in this request.",
+        );
+    } else if synthesis {
         user.push_str(SYNTHESIS_BATCH_CONTEXT);
     } else if context.multiple {
         user.push_str(MULTIPLE_BATCH_CONTEXT);
@@ -1154,6 +1293,7 @@ impl ReviewBatchBudgets {
 
 fn serialized_review_batch_budget_for_shape(
     cfg: &Config,
+    max_findings: usize,
     models: &[String],
     system: &str,
     context: &PrContext<'_>,
@@ -1161,7 +1301,7 @@ fn serialized_review_batch_budget_for_shape(
     suffix: &str,
 ) -> Result<usize> {
     let review_output_tokens = crate::llm::REVIEW_MAX_OUTPUT_TOKENS as usize;
-    let mut admission_user = prompt::user_prompt(context, batch_context, cfg.max_findings);
+    let mut admission_user = prompt::user_prompt(context, batch_context, max_findings);
     admission_user.push_str(suffix);
     models
         .iter()
@@ -1193,6 +1333,7 @@ fn serialized_review_batch_budget_for_shape(
 
 fn serialized_review_batch_budgets(
     cfg: &Config,
+    max_findings: usize,
     models: &[String],
     system: &str,
     context: &PrContext<'_>,
@@ -1200,6 +1341,7 @@ fn serialized_review_batch_budgets(
     Ok(ReviewBatchBudgets {
         source: serialized_review_batch_budget_for_shape(
             cfg,
+            max_findings,
             models,
             system,
             context,
@@ -1208,6 +1350,7 @@ fn serialized_review_batch_budgets(
         )?,
         synthesis: serialized_review_batch_budget_for_shape(
             cfg,
+            max_findings,
             models,
             system,
             context,
@@ -1235,8 +1378,9 @@ async fn review_diff_at(
         diff_snapshot,
         meta,
         head_sha,
+        repository_revision,
         repo,
-        baseline,
+        mut baseline,
         scope,
         force_model,
         llm_budget_started_at,
@@ -1247,6 +1391,7 @@ async fn review_diff_at(
     let input_incomplete = prepared.reserved_anchor;
     let mut index = std::mem::take(&mut prepared.index);
     let incremental = matches!(scope, filter::ReconcileScope::Incremental { .. });
+    let baseline_adjudication_reserve = baseline_adjudication_reserve(&baseline, &index, scope);
 
     // When content policy is active, render the PR title/description as a
     // numbered, groundable block and register its line range so a title/body
@@ -1281,6 +1426,11 @@ async fn review_diff_at(
     let mut scorer_error: Option<String> = None;
     let mut scorer_disagreements: Option<u32> = None;
     let mut scorer_failure_kind: Option<ReviewFailureKind> = None;
+    let mut repository_search = None;
+    let mut adjudication_resolved = Vec::new();
+    let mut adjudication_preserved_baseline = Vec::new();
+    let mut adjudication_failure = None;
+    let mut adjudication_incomplete = false;
 
     // Run the model when there is a diff to review, or when content policy is
     // active and there is a PR title/description to review (an empty diff should
@@ -1294,6 +1444,16 @@ async fn review_diff_at(
         || !prepared.compacted_artifacts.is_empty()
         || pr_desc_lines > 0
     {
+        anyhow::ensure!(
+            baseline_adjudication_reserve < crate::adjudication::MAX_ADJUDICATION_CANDIDATES,
+            "complete finding adjudication reserves {} baseline candidates, exhausting its {}-candidate bound; no provider request was made",
+            baseline_adjudication_reserve,
+            crate::adjudication::MAX_ADJUDICATION_CANDIDATES,
+        );
+        let generator_max_findings = cfg.max_findings.min(
+            crate::adjudication::MAX_ADJUDICATION_CANDIDATES
+                .saturating_sub(baseline_adjudication_reserve),
+        );
         let system = prompt::system_prompt(cfg, current_utc_date);
         let chain = cfg.model_chain();
         let active_model_count = if cfg.consensus > 1 {
@@ -1335,6 +1495,7 @@ async fn review_diff_at(
             };
             serialized_review_batch_budgets(
                 cfg,
+                generator_max_findings,
                 &chain[..active_model_count],
                 &system,
                 &admission_context,
@@ -1364,25 +1525,32 @@ async fn review_diff_at(
             // near-floor batch boundaries and therefore planner candidates.
             // Admission still uses each exact raw serialized-request budget.
             let batch_budgets = batch_budgets.stabilized_for_rendering();
+            let large_diff_selected_limit = if crate::config::hosted_runtime_mode() {
+                MAX_LARGE_DIFF_SELECTED_BATCHES
+                    .min(crate::llm::max_hosted_review_batches(cfg, false)?)
+            } else {
+                MAX_LARGE_DIFF_SELECTED_BATCHES
+            };
             let mut batches = diff::spool_model_batches_with_synthesis_budget(
                 &mut prepared,
                 batch_budgets.source,
                 batch_budgets.synthesis,
                 MAX_REVIEW_MANIFEST_BYTES.min(batch_budgets.source / 3),
                 force_model || pr_desc_lines > 0,
+                large_diff_selected_limit,
             )?;
             index.add_change_metadata(batches.metadata_count);
             if batches.count == 0 {
                 model_used = "none (empty diff)".to_string();
                 review_trust = filter::ReviewTrust::Exhaustive;
             } else {
-                let large_diff_receipt = (batches.source_count > MAX_LARGE_DIFF_SELECTED_BATCHES)
-                    .then(|| batches.deterministic_bounded_receipt(MAX_LARGE_DIFF_SELECTED_BATCHES))
+                let large_diff_receipt = (batches.count > large_diff_selected_limit)
+                    .then(|| batches.deterministic_bounded_receipt(large_diff_selected_limit))
                     .transpose()?;
                 if let Some(receipt) = &large_diff_receipt {
                     anyhow::ensure!(
                         receipt.unreviewed_hunks() == 0,
-                        "deterministic large-review plan leaves {} normalized hunks unreviewed within its {MAX_LARGE_DIFF_SELECTED_BATCHES}-request limit; no provider request was made",
+                        "deterministic large-review plan leaves {} normalized hunks unreviewed within its {large_diff_selected_limit}-request limit; no provider request was made",
                         receipt.unreviewed_hunks()
                     );
                     eprintln!(
@@ -1393,9 +1561,9 @@ async fn review_diff_at(
                         receipt.unreviewed_hunks(),
                         receipt.selected_batch_ids.len(),
                         batches.count,
-                        MAX_LARGE_DIFF_CONCURRENCY,
+                        large_diff_batch_concurrency(cfg),
                         LARGE_DIFF_LLM_REQUEST_TIMEOUT_SECS,
-                        HOSTED_LLM_REVIEW_TIMEOUT_SECS,
+                        hosted_review_timeout_secs(cfg),
                     );
                 }
                 let large_receipt_summary = large_diff_receipt
@@ -1415,48 +1583,51 @@ async fn review_diff_at(
                     })
                     .transpose()?;
                 let deterministic_large_review = large_diff_receipt.is_some();
-                if let Some(registrar) = DurablePlanRegistrar::from_env()? {
-                    let durable_plan = if let Some(receipt) = &large_diff_receipt {
-                        DurableReviewPlan::new(
-                            receipt.plan_sha256.clone(),
-                            u32::try_from(receipt.direct_hunks())
-                                .context("direct hunk count exceeds durable plan range")?,
-                            u32::try_from(receipt.semantic_hunks())
-                                .context("semantic hunk count exceeds durable plan range")?,
-                            u32::try_from(receipt.unreviewed_hunks())
-                                .context("unreviewed hunk count exceeds durable plan range")?,
-                            u32::try_from(receipt.selected_batch_ids.len())
-                                .context("selected batch count exceeds durable plan range")?,
-                            u32::try_from(batches.count)
-                                .context("total batch count exceeds durable plan range")?,
-                            u32::try_from(MAX_LARGE_DIFF_CONCURRENCY)
-                                .context("review concurrency exceeds durable plan range")?,
-                            u32::try_from(LARGE_DIFF_LLM_REQUEST_TIMEOUT_SECS)
-                                .context("request timeout exceeds durable plan range")?,
-                            u32::try_from(HOSTED_LLM_REVIEW_TIMEOUT_SECS)
-                                .context("review budget exceeds durable plan range")?,
-                        )?
+                let mut durable_plan_registration =
+                    if let Some(registrar) = DurablePlanRegistrar::from_env()? {
+                        let durable_plan = if let Some(receipt) = &large_diff_receipt {
+                            DurableReviewPlan::new(
+                                receipt.plan_sha256.clone(),
+                                u32::try_from(receipt.direct_hunks())
+                                    .context("direct hunk count exceeds durable plan range")?,
+                                u32::try_from(receipt.semantic_hunks())
+                                    .context("semantic hunk count exceeds durable plan range")?,
+                                u32::try_from(receipt.unreviewed_hunks())
+                                    .context("unreviewed hunk count exceeds durable plan range")?,
+                                u32::try_from(receipt.selected_batch_ids.len())
+                                    .context("selected batch count exceeds durable plan range")?,
+                                u32::try_from(batches.count)
+                                    .context("total batch count exceeds durable plan range")?,
+                                u32::try_from(large_diff_batch_concurrency(cfg))
+                                    .context("review concurrency exceeds durable plan range")?,
+                                u32::try_from(LARGE_DIFF_LLM_REQUEST_TIMEOUT_SECS)
+                                    .context("request timeout exceeds durable plan range")?,
+                                u32::try_from(hosted_review_timeout_secs(cfg))
+                                    .context("review budget exceeds durable plan range")?,
+                            )?
+                        } else {
+                            let inventory = batches.durable_request_plan()?;
+                            DurableReviewPlan::new(
+                                inventory.plan_sha256,
+                                u32::try_from(inventory.direct_hunks)
+                                    .context("direct hunk count exceeds durable plan range")?,
+                                0,
+                                0,
+                                u32::try_from(inventory.selected_batches)
+                                    .context("selected batch count exceeds durable plan range")?,
+                                u32::try_from(inventory.total_batches)
+                                    .context("total batch count exceeds durable plan range")?,
+                                1,
+                                u32::try_from(HOSTED_LLM_REQUEST_TIMEOUT_SECS)
+                                    .context("request timeout exceeds durable plan range")?,
+                                u32::try_from(hosted_review_timeout_secs(cfg))
+                                    .context("review budget exceeds durable plan range")?,
+                            )?
+                        };
+                        Some((registrar, durable_plan))
                     } else {
-                        let inventory = batches.durable_request_plan()?;
-                        DurableReviewPlan::new(
-                            inventory.plan_sha256,
-                            u32::try_from(inventory.direct_hunks)
-                                .context("direct hunk count exceeds durable plan range")?,
-                            0,
-                            0,
-                            u32::try_from(inventory.selected_batches)
-                                .context("selected batch count exceeds durable plan range")?,
-                            u32::try_from(inventory.total_batches)
-                                .context("total batch count exceeds durable plan range")?,
-                            1,
-                            u32::try_from(HOSTED_LLM_REQUEST_TIMEOUT_SECS)
-                                .context("request timeout exceeds durable plan range")?,
-                            u32::try_from(HOSTED_LLM_REVIEW_TIMEOUT_SECS)
-                                .context("review budget exceeds durable plan range")?,
-                        )?
+                        None
                     };
-                    registrar.register(&durable_plan).await?;
-                }
                 let bounded_candidates = if large_diff_receipt.is_none()
                     && (args.bounded || crate::config::bounded_review_selection_mode())
                     && batches.count > MAX_HOSTED_SELECTED_BATCHES
@@ -1475,7 +1646,7 @@ async fn review_diff_at(
                         Duration::from_secs(hosted_request_timeout_secs(
                             deterministic_large_review,
                         )),
-                        Duration::from_secs(HOSTED_LLM_REVIEW_TIMEOUT_SECS),
+                        Duration::from_secs(hosted_review_timeout_secs(cfg)),
                         Duration::from_secs(HOSTED_LLM_TOTAL_TIMEOUT_SECS),
                     )?,
                     None => LlmClient::from_env(cfg)?,
@@ -1489,7 +1660,7 @@ async fn review_diff_at(
                     |receipt| receipt.selected_batch_ids.len(),
                 );
                 let preflight_prompt_context = ReviewBatchPromptContext {
-                    cfg,
+                    max_findings: generator_max_findings,
                     repo,
                     meta,
                     incremental,
@@ -1545,6 +1716,12 @@ async fn review_diff_at(
                                 .any(|id| !candidates.mandatory_ids.contains(id)))
                         .then_some((candidates.manifest.as_str(), remaining))
                     });
+                    let admitted_concurrency = if deterministic_large_review {
+                        large_diff_batch_concurrency(cfg)
+                    } else {
+                        1
+                    };
+                    let scorer_system = prompt::scorer_system_prompt(cfg, current_utc_date);
                     let admission = client.preflight_review_plan_with_output_limits(
                         cfg,
                         planned_batch_count,
@@ -1553,11 +1730,18 @@ async fn review_diff_at(
                             first_users: &candidate_first_users,
                             later_users: &candidate_later_users,
                             output_tokens: &candidate_output_tokens,
+                            scorer_system: &scorer_system,
                             current_utc_date,
                         },
-                        planner,
+                        crate::llm::ReviewPlanSchedule {
+                            planner,
+                            batch_concurrency: admitted_concurrency,
+                        },
                     )?;
                     review_admission = Some(admission);
+                    if let Some((registrar, durable_plan)) = durable_plan_registration.take() {
+                        registrar.register(&durable_plan).await?;
+                    }
                     if crate::config::qualification_plan_only() {
                         let bounded = bounded_candidates.is_some() || large_diff_receipt.is_some();
                         let source_count = batches.source_count;
@@ -1594,6 +1778,9 @@ async fn review_diff_at(
                         ));
                     }
                 }
+                if let Some((registrar, durable_plan)) = durable_plan_registration.take() {
+                    registrar.register(&durable_plan).await?;
+                }
                 let mut selected_batches = None;
                 let total_source_batches = batches.source_count;
                 let mut selected_source_batches = total_source_batches;
@@ -1603,7 +1790,7 @@ async fn review_diff_at(
                         batches.selected_source_count(&receipt.selected_batch_ids);
                     let selected = batches.selected_batches(&receipt.selected_batch_ids)?;
                     anyhow::ensure!(
-                        selected.len() <= MAX_LARGE_DIFF_SELECTED_BATCHES,
+                        selected.len() <= large_diff_selected_limit,
                         "deterministic large-review plan exceeded its request bound"
                     );
                     selected_batches = Some(selected.into_iter());
@@ -1661,9 +1848,6 @@ async fn review_diff_at(
                     .as_ref()
                     .map_or(batches.count, |selected| selected.len());
                 let risk_selected_review = selected_batches.is_some();
-                let coverage_incomplete = large_receipt_summary
-                    .as_ref()
-                    .is_some_and(|receipt| receipt.unreviewed_hunks > 0);
                 let runtime_prompt_context = ReviewBatchPromptContext {
                     multiple: total_requests > 1,
                     ..preflight_prompt_context
@@ -1687,12 +1871,6 @@ async fn review_diff_at(
                 let mut batch_models = Vec::new();
                 let mut batch_failed = false;
                 let mut batch_failure = None;
-                if coverage_incomplete {
-                    batch_failed = true;
-                    batch_failure = Some(fail_closed_finding(
-                        "deterministic large-review coverage left one or more normalized hunks unreviewed",
-                    ));
-                }
                 let mut batch_ungrounded = 0u32;
                 let mut request_index = 0usize;
                 let mut batch_requests = Vec::with_capacity(total_requests);
@@ -1733,7 +1911,7 @@ async fn review_diff_at(
                     request_index += 1;
                 }
                 let concurrency = if deterministic_large_review {
-                    MAX_LARGE_DIFF_CONCURRENCY
+                    large_diff_batch_concurrency(cfg)
                 } else {
                     1
                 };
@@ -1926,17 +2104,16 @@ async fn review_diff_at(
                     }
                     let raw_findings = deduplicated;
                     let grounded_candidate_count = raw_findings.len();
-                    let outcome = filter::apply(cfg, &index, raw_findings)?;
+                    let mut generator_filter_cfg = cfg.clone();
+                    generator_filter_cfg.max_findings = generator_max_findings;
+                    let outcome = filter::apply(&generator_filter_cfg, &index, raw_findings)?;
                     suppressed = outcome.suppressed;
                     suppressed_findings = outcome.suppressed_findings;
                     ungrounded = outcome.ungrounded + batch_ungrounded;
                     if outcome.all_ungrounded
                         || (grounded_candidate_count == 0 && batch_ungrounded > 0)
                     {
-                        findings = vec![fail_closed_finding(&format!(
-                            "model reported {} finding(s), none grounded in the diff",
-                            ungrounded
-                        ))];
+                        findings = vec![ungrounded_findings_failure(ungrounded)];
                     } else {
                         // Bounded mode reviews deterministic direct evidence and
                         // lossy synthesis, not every source batch. Reconciliation
@@ -1951,7 +2128,280 @@ async fn review_diff_at(
                             filter::ReviewTrust::Exhaustive
                         };
                         let mut kept = outcome.kept;
-                        if !kept.is_empty() && cfg.scorer_enabled() {
+                        let mut preserved_baseline_publications = Vec::new();
+
+                        let resolution = crate::resolve::resolve_uncertainties(
+                            cfg,
+                            &client,
+                            &repository_source,
+                            crate::resolve::ResolutionRevisions {
+                                head: repository_revision.as_deref(),
+                                timeout: Duration::from_secs(POSTPROCESSING_PHASE_TIMEOUT_SECS),
+                                current_utc_date,
+                            },
+                            &finding_contexts,
+                            diff_snapshot.as_str(),
+                            &mut kept,
+                        )
+                        .await;
+                        suppressed += resolution.suppressed_findings.len() as u32;
+                        suppressed_findings.extend(resolution.suppressed_findings);
+                        add_usage(&mut usage, resolution.usage);
+                        model_usage.extend(resolution.model_usage);
+                        model_incidents.extend(resolution.model_incidents);
+                        usage_accounting_complete &= resolution.usage_accounting_complete;
+                        let brevity = crate::brevity::compress_findings(
+                            cfg,
+                            &client,
+                            current_utc_date,
+                            &mut kept,
+                            Duration::from_secs(POSTPROCESSING_PHASE_TIMEOUT_SECS),
+                        )
+                        .await;
+                        add_usage(&mut usage, brevity.usage);
+                        model_usage.extend(brevity.model_usage);
+                        model_incidents.extend(brevity.model_incidents);
+                        usage_accounting_complete &= brevity.usage_accounting_complete;
+
+                        let full_rereview = matches!(scope, filter::ReconcileScope::Full { .. });
+                        let mut all_adjudication_candidates = kept.clone();
+                        let fresh_candidate_count = all_adjudication_candidates.len();
+                        let mut baseline_candidate_indices = Vec::new();
+                        if full_rereview {
+                            for (baseline_index, previous) in baseline.iter().enumerate() {
+                                // The complete direct diff may prove an exact citation was
+                                // deleted even when bounded source selection omitted its batch.
+                                // A removal followed by the same addition remains current and
+                                // must not be retired from semantic coverage alone.
+                                let applicable = baseline_may_enter_adjudication(previous, &index)
+                                    && !kept
+                                        .iter()
+                                        .any(|fresh| same_visible_finding(fresh, previous));
+                                if applicable {
+                                    baseline_candidate_indices.push(baseline_index);
+                                    all_adjudication_candidates.push(previous.clone());
+                                }
+                            }
+                        }
+
+                        if !all_adjudication_candidates.is_empty() {
+                            anyhow::ensure!(
+                                all_adjudication_candidates.len()
+                                    <= crate::adjudication::MAX_ADJUDICATION_CANDIDATES,
+                                "complete finding adjudication needs {} candidates, exceeding its {}-candidate bound; no adjudication request was made",
+                                all_adjudication_candidates.len(),
+                                crate::adjudication::MAX_ADJUDICATION_CANDIDATES,
+                            );
+                            let snapshot_id = crate::adjudication::reviewed_snapshot_identity(
+                                repository_revision.as_deref(),
+                                diff_snapshot.as_str(),
+                            );
+                            let adjudication_model = cfg
+                                .scorer_chain()
+                                .into_iter()
+                                .next()
+                                .or_else(|| cfg.model_chain().into_iter().next())
+                                .ok_or_else(|| {
+                                    anyhow!(
+                                        "complete finding adjudication requires one provider identity"
+                                    )
+                                })?;
+                            let candidate_ids = crate::adjudication::stable_candidate_ids(
+                                &snapshot_id,
+                                &all_adjudication_candidates,
+                            );
+                            let mut diff_receipt = crate::adjudication::build_diff_corpus_receipt(
+                                &snapshot_id,
+                                diff_snapshot.as_str(),
+                                &all_adjudication_candidates,
+                                &candidate_ids,
+                                fresh_candidate_count,
+                            );
+                            let receipt = crate::repository_search::search(
+                                &repository_source,
+                                repository_revision.as_deref(),
+                                all_adjudication_candidates.iter(),
+                            )
+                            .await;
+                            repository_search = Some(receipt);
+                            let receipt = repository_search
+                                .as_ref()
+                                .expect("repository search receipt was just assigned");
+                            let adjudication_system =
+                                crate::adjudication::system_prompt(current_utc_date);
+                            let adjudication_user = crate::adjudication::user_prompt(
+                                &snapshot_id,
+                                &all_adjudication_candidates,
+                                &candidate_ids,
+                                &mut diff_receipt,
+                                receipt,
+                            );
+                            let adjudicated = match adjudication_user {
+                                Ok(adjudication_user) => Some(
+                                    client
+                                        .adjudicate_findings(
+                                            &adjudication_model,
+                                            &adjudication_system,
+                                            &adjudication_user,
+                                            all_adjudication_candidates.len(),
+                                            Duration::from_secs(FINDING_ADJUDICATION_TIMEOUT_SECS),
+                                        )
+                                        .await,
+                                ),
+                                Err(error) => {
+                                    adjudication_incomplete = true;
+                                    review_trust = filter::ReviewTrust::Failed;
+                                    adjudication_failure = Some(fail_closed_finding(
+                                        "finding adjudication input exceeded its admitted bound",
+                                    ));
+                                    eprintln!(
+                                        "postil: finding adjudication input exceeded its admitted bound; preserving all generated findings: {error:#}"
+                                    );
+                                    None
+                                }
+                            };
+                            let mut application = match adjudicated {
+                                Some(Ok(adjudicated)) => {
+                                    add_usage(&mut usage, adjudicated.usage);
+                                    model_usage.extend(adjudicated.model_usage);
+                                    model_incidents.extend(adjudicated.model_incidents);
+                                    usage_accounting_complete &=
+                                        adjudicated.usage_accounting_complete;
+                                    match crate::adjudication::apply_results(
+                                        &snapshot_id,
+                                        all_adjudication_candidates.clone(),
+                                        candidate_ids.clone(),
+                                        adjudicated.results,
+                                        diff_snapshot.as_str(),
+                                        &diff_receipt,
+                                        receipt,
+                                    ) {
+                                        Ok(application) => application,
+                                        Err(error) => {
+                                            adjudication_incomplete = true;
+                                            review_trust = filter::ReviewTrust::Failed;
+                                            eprintln!(
+                                                "postil: finding adjudication validation failed; preserving all generated findings: {error:#}"
+                                            );
+                                            model_incidents.push(ModelIncident {
+                                                phase: ModelIncidentPhase::Scorer,
+                                                category: ModelIncidentCategory::InvalidOutput,
+                                                recovered: false,
+                                                recovery: None,
+                                            });
+                                            adjudication_failure = Some(fail_closed_finding(
+                                                "finding adjudication output did not satisfy its admitted contract",
+                                            ));
+                                            preserve_unadjudicated_findings(
+                                                all_adjudication_candidates,
+                                            )
+                                        }
+                                    }
+                                }
+                                Some(Err(error)) => {
+                                    adjudication_incomplete = true;
+                                    review_trust = filter::ReviewTrust::Failed;
+                                    eprintln!(
+                                        "postil: finding adjudication unavailable; preserving all generated findings"
+                                    );
+                                    add_usage(&mut usage, error.usage());
+                                    model_usage.extend_from_slice(error.model_usage());
+                                    model_incidents.extend_from_slice(error.model_incidents());
+                                    usage_accounting_complete &= error.usage_accounting_complete();
+                                    adjudication_failure = Some(if error.is_provider() {
+                                        crate::envelope::provider_error_finding(
+                                            "finding adjudication did not complete",
+                                        )
+                                    } else {
+                                        fail_closed_finding(
+                                            "finding adjudication output did not satisfy its admitted contract",
+                                        )
+                                    });
+                                    preserve_unadjudicated_findings(all_adjudication_candidates)
+                                }
+                                None => {
+                                    preserve_unadjudicated_findings(all_adjudication_candidates)
+                                }
+                            };
+                            for (candidate_index, finding) in application
+                                .kept_indices
+                                .iter()
+                                .copied()
+                                .zip(&mut application.kept)
+                            {
+                                let Some(candidate_id) = candidate_ids.get(candidate_index) else {
+                                    continue;
+                                };
+                                let receipt_incomplete = diff_receipt
+                                    .candidate_citations
+                                    .iter()
+                                    .find(|receipt| &receipt.candidate_id == candidate_id)
+                                    .is_none_or(|receipt| !receipt.queries_complete);
+                                if receipt_incomplete {
+                                    finding.severity = crate::envelope::Severity::Error;
+                                }
+                            }
+                            debug_assert!(application.kept_indices.iter().all(|index| *index
+                                < fresh_candidate_count + baseline_candidate_indices.len()));
+                            for candidate_index in &application.resolved_indices {
+                                let Some(baseline_offset) =
+                                    candidate_index.checked_sub(fresh_candidate_count)
+                                else {
+                                    continue;
+                                };
+                                let baseline_index = baseline_candidate_indices[baseline_offset];
+                                adjudication_resolved.push(baseline[baseline_index].clone());
+                            }
+                            // A baseline finding leaves the ledger only through
+                            // an adjudicator's explicit refutation or duplicate
+                            // disposition. Deterministic evidence checks can
+                            // demote a fresh candidate, but they leave a
+                            // full-rereview baseline open for later review.
+                            for (baseline_offset, baseline_index) in
+                                baseline_candidate_indices.iter().copied().enumerate()
+                            {
+                                let candidate_index = fresh_candidate_count + baseline_offset;
+                                if application.resolved_indices.contains(&candidate_index)
+                                    || application.kept_indices.contains(&candidate_index)
+                                {
+                                    continue;
+                                }
+                                application.kept_indices.push(candidate_index);
+                                application.kept.push(baseline[baseline_index].clone());
+                                application.suppressed.retain(|suppressed| {
+                                    !same_visible_finding(
+                                        &suppressed.finding,
+                                        &baseline[baseline_index],
+                                    )
+                                });
+                            }
+                            suppressed += application.suppressed.len() as u32;
+                            suppressed_findings.extend(application.suppressed);
+                            kept.clear();
+                            for (candidate_index, finding) in
+                                application.kept_indices.into_iter().zip(application.kept)
+                            {
+                                if candidate_index >= fresh_candidate_count {
+                                    adjudication_preserved_baseline.push(finding.clone());
+                                    preserved_baseline_publications.push(finding);
+                                } else {
+                                    kept.push(finding);
+                                }
+                            }
+                            if !baseline_candidate_indices.is_empty() {
+                                let removed = baseline_candidate_indices
+                                    .into_iter()
+                                    .collect::<std::collections::BTreeSet<_>>();
+                                baseline = baseline
+                                    .into_iter()
+                                    .enumerate()
+                                    .filter_map(|(index, finding)| {
+                                        (!removed.contains(&index)).then_some(finding)
+                                    })
+                                    .collect();
+                            }
+                        }
+                        if !kept.is_empty() && cfg.scorer_enabled() && !adjudication_incomplete {
                             let scorer_system = prompt::scorer_system_prompt(cfg, current_utc_date);
                             let mut evidence_budget = MAX_SCORER_EVIDENCE_BYTES;
                             let (inputs, scorer_user) = loop {
@@ -2047,37 +2497,8 @@ async fn review_diff_at(
                                 .into());
                             }
                         }
-                        let resolution = crate::resolve::resolve_uncertainties(
-                            cfg,
-                            &client,
-                            &repository_source,
-                            crate::resolve::ResolutionRevisions {
-                                head: head_sha.as_deref(),
-                                base: meta.map(|metadata| metadata.base_sha.as_str()),
-                                current_utc_date,
-                            },
-                            &finding_contexts,
-                            diff_snapshot.as_str(),
-                            &mut kept,
-                        )
-                        .await;
-                        suppressed += resolution.suppressed_findings.len() as u32;
-                        suppressed_findings.extend(resolution.suppressed_findings);
-                        add_usage(&mut usage, resolution.usage);
-                        model_usage.extend(resolution.model_usage);
-                        model_incidents.extend(resolution.model_incidents);
-                        usage_accounting_complete &= resolution.usage_accounting_complete;
-                        let brevity = crate::brevity::compress_findings(
-                            cfg,
-                            &client,
-                            current_utc_date,
-                            &mut kept,
-                        )
-                        .await;
-                        add_usage(&mut usage, brevity.usage);
-                        model_usage.extend(brevity.model_usage);
-                        model_incidents.extend(brevity.model_incidents);
-                        usage_accounting_complete &= brevity.usage_accounting_complete;
+                        kept.extend(preserved_baseline_publications);
+                        sort_findings_for_display(&mut kept);
                         findings = kept;
                     }
                 }
@@ -2088,6 +2509,47 @@ async fn review_diff_at(
         }
     }
 
+    // A complete full review makes ephemeral anchors from a prior envelope
+    // obsolete. They are presentation metadata rather than durable defects,
+    // so record the retirement as non-actionable instead of carrying an
+    // anchor that no longer exists in the reviewed input.
+    if review_trust == filter::ReviewTrust::Exhaustive
+        && matches!(scope, filter::ReconcileScope::Full { .. })
+    {
+        let mut durable_baseline = Vec::with_capacity(baseline.len());
+        for finding in baseline {
+            if crate::envelope::is_reserved_anchor(&finding.path) {
+                suppressed = suppressed.saturating_add(1);
+                suppressed_findings.push(SuppressedFinding {
+                    finding,
+                    reason: SuppressionReason::NonActionable,
+                });
+            } else {
+                durable_baseline.push(finding);
+            }
+        }
+        baseline = durable_baseline;
+    }
+
+    let repository_search = match repository_search {
+        Some(receipt) => receipt,
+        None => {
+            crate::repository_search::search(
+                &repository_source,
+                repository_revision.as_deref(),
+                findings.iter().chain(baseline.iter()),
+            )
+            .await
+        }
+    };
+    let repository_suppressed = suppress_refuted_repository_claims(
+        &mut findings,
+        &repository_search,
+        &adjudication_preserved_baseline,
+    );
+    suppressed = suppressed.saturating_add(repository_suppressed.len() as u32);
+    suppressed_findings.extend(repository_suppressed);
+
     // A question the reviewer never answered cannot block a merge. This runs
     // after uncertainty resolution so a finding that went and checked keeps the
     // severity it earned.
@@ -2096,6 +2558,15 @@ async fn review_diff_at(
     // Fresh metadata IDs must exist before reconciliation: synthetic line
     // numbers are presentation positions, not issue identity.
     generate_finding_ids(&mut findings, head_sha.as_deref());
+
+    // Explicitly adjudicated baseline resolutions are authoritative. Remove
+    // them before fail-closed reconciliation so they cannot be carried back
+    // into the open ledger alongside their resolution record.
+    baseline.retain(|finding| {
+        !adjudication_resolved
+            .iter()
+            .any(|resolved| same_visible_finding(finding, resolved))
+    });
 
     // Reconcile against the previous review (incremental or full re-review).
     // Skip entirely when review is disabled: a repo that set `enabled: false`
@@ -2123,6 +2594,16 @@ async fn review_diff_at(
     // keep them open without revalidating them as fresh model output. Fresh
     // findings are validated before they can reach reconciliation.
     findings.extend(rec.carried);
+    if let Some(failure) = adjudication_failure {
+        findings.push(failure);
+    }
+
+    for finding in findings
+        .iter()
+        .filter(|finding| crate::envelope::is_ephemeral_anchor(&finding.path))
+    {
+        crate::envelope::validate_finding_public_language(finding).map_err(anyhow::Error::msg)?;
+    }
 
     // Operational findings (model unreachable/unusable) fail the gate by default
     // and fail closed. `gate.onError: advisory` lets the gate stand aside on a
@@ -2163,13 +2644,16 @@ async fn review_diff_at(
     generate_finding_ids(&mut findings, head_sha.as_deref());
     model_usage.sort_by_key(|entry| entry.call_ordinal.unwrap_or(u32::MAX));
 
+    let mut resolved = rec.resolved;
+    resolved.extend(adjudication_resolved);
+
     Ok(Envelope {
         version: 1,
         summary,
         silent,
         findings,
         suppressed_findings,
-        resolved: rec.resolved,
+        resolved,
         counts,
         confidence_buckets: buckets,
         gate: Gate {
@@ -2186,6 +2670,7 @@ async fn review_diff_at(
         model_incidents,
         review_coverage,
         review_admission,
+        repository_search,
         usage_accounting_complete,
         duration_ms: review_started.elapsed().as_millis() as u64,
         base_sha: meta.map(|m| m.base_sha.clone()),
@@ -2231,6 +2716,7 @@ fn qualification_plan_envelope(
         model_incidents: vec![],
         review_coverage: Some(review_coverage),
         review_admission: Some(review_admission),
+        repository_search: crate::repository_search::unavailable(head_sha.as_deref()),
         usage_accounting_complete: true,
         duration_ms,
         base_sha: meta.map(|value| value.base_sha.clone()),
@@ -2432,6 +2918,63 @@ fn baseline_has_carryable_findings(findings: &[Finding]) -> bool {
         .any(|finding| !crate::envelope::is_ephemeral_anchor(&finding.path))
 }
 
+/// Reserve every baseline finding that could enter full re-review adjudication
+/// before generating fresh findings. The later candidate set can be smaller
+/// when a fresh finding supersedes a baseline entry, but it must never be
+/// larger than this conservative admission reservation.
+fn baseline_adjudication_reserve(
+    baseline: &[Finding],
+    index: &diff::DiffIndex,
+    scope: filter::ReconcileScope,
+) -> usize {
+    if !matches!(scope, filter::ReconcileScope::Full { .. }) {
+        return 0;
+    }
+    baseline
+        .iter()
+        .filter(|finding| {
+            let exact_citation_deleted = index.old_evidence_matches(finding)
+                && index.remap_current_evidence(finding).is_none();
+            (index.may_render_baseline_coordinate(finding) || exact_citation_deleted)
+                && !crate::envelope::is_reserved_anchor(&finding.path)
+        })
+        .count()
+}
+
+fn baseline_may_enter_adjudication(finding: &Finding, index: &diff::DiffIndex) -> bool {
+    let exact_citation_deleted =
+        index.old_evidence_matches(finding) && index.remap_current_evidence(finding).is_none();
+    (index.contains_reviewed_baseline_coordinate(finding) || exact_citation_deleted)
+        && !crate::envelope::is_reserved_anchor(&finding.path)
+}
+
+/// A complete receipt can refute a fresh repository claim. Baseline candidates
+/// preserved by adjudication remain open until that adjudication explicitly
+/// resolves them. Any unavailable, exhausted, incomplete, or unrelated receipt
+/// leaves a finding open rather than converting uncertainty into a clean review.
+fn suppress_refuted_repository_claims(
+    findings: &mut Vec<Finding>,
+    receipt: &crate::envelope::RepositorySearchReceipt,
+    adjudication_preserved_baseline: &[Finding],
+) -> Vec<SuppressedFinding> {
+    let mut preserved = Vec::new();
+    let mut candidates = Vec::with_capacity(findings.len());
+    for finding in findings.drain(..) {
+        if adjudication_preserved_baseline
+            .iter()
+            .any(|baseline| same_visible_finding(baseline, &finding))
+        {
+            preserved.push(finding);
+        } else {
+            candidates.push(finding);
+        }
+    }
+    let suppressed = crate::repository_search::enforce_receipt(&mut candidates, receipt);
+    preserved.append(&mut candidates);
+    *findings = preserved;
+    suppressed
+}
+
 fn same_visible_finding(a: &Finding, b: &Finding) -> bool {
     a.path == b.path
         && a.line == b.line
@@ -2449,22 +2992,52 @@ fn visible_body(body: &str) -> &str {
         .unwrap_or(body)
 }
 
+fn ungrounded_findings_failure(count: u32) -> Finding {
+    fail_closed_finding(&format!(
+        "model reported {count} finding(s) without a valid code-evidence citation."
+    ))
+}
+
+fn preserve_unadjudicated_findings(
+    findings: Vec<Finding>,
+) -> crate::adjudication::AdjudicationApplication {
+    crate::adjudication::AdjudicationApplication {
+        kept_indices: (0..findings.len()).collect(),
+        kept: findings,
+        resolved_indices: Vec::new(),
+        suppressed: Vec::new(),
+    }
+}
+
 fn error_envelope(
     cfg: &Config,
     err: &anyhow::Error,
     head_sha: &str,
-    meta: &PrMeta,
+    meta: Option<&PrMeta>,
     duration_ms: u64,
 ) -> Envelope {
     let incomplete_input = crate::forge::is_incomplete_review_input(err);
     let review_failure = err.downcast_ref::<ReviewFailure>();
     let invalid_output =
         review_failure.is_some_and(|failure| failure.kind == ReviewFailureKind::InvalidOutput);
+    let advisory_operational_error = review_failure
+        .is_some_and(|failure| failure.kind == ReviewFailureKind::Provider)
+        || err.downcast_ref::<crate::llm::ProviderError>().is_some()
+        || err.chain().any(|cause| {
+            cause
+                .downcast_ref::<crate::forge::ForgeServiceFailure>()
+                .is_some()
+        })
+        || err.chain().any(|cause| {
+            cause
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(|error| error.is_connect() || error.is_timeout())
+        });
     let findings = vec![if incomplete_input {
         crate::envelope::incomplete_review_finding(
             crate::envelope::IncompleteReviewReason::IncompleteInput,
         )
-    } else if invalid_output {
+    } else if invalid_output || !advisory_operational_error {
         fail_closed_finding(
             review_failure
                 .and_then(|failure| failure.scorer_error.as_deref())
@@ -2476,8 +3049,8 @@ fn error_envelope(
     let counts = Envelope::counts_of(&findings, 0);
     let buckets = Envelope::buckets_of(&findings);
     let gate_disabled = cfg.gate_fail_on.as_str().eq_ignore_ascii_case("never");
-    let blocking = !gate_disabled
-        && (incomplete_input || invalid_output || cfg.gate_on_error == OnError::Block);
+    let blocking =
+        !gate_disabled && (!advisory_operational_error || cfg.gate_on_error == OnError::Block);
     let mut model_usage = review_failure
         .map(|failure| failure.model_usage.clone())
         .unwrap_or_default();
@@ -2523,10 +3096,11 @@ fn error_envelope(
             .unwrap_or_default(),
         review_coverage: review_failure.and_then(|failure| failure.review_coverage.clone()),
         review_admission: review_failure.and_then(|failure| failure.review_admission),
+        repository_search: crate::repository_search::unavailable(Some(head_sha)),
         usage_accounting_complete: review_failure
             .is_none_or(|failure| failure.usage_accounting_complete),
         duration_ms,
-        base_sha: Some(meta.base_sha.clone()),
+        base_sha: meta.map(|value| value.base_sha.clone()),
         head_sha: Some(head_sha.to_string()),
         since_sha: None,
     }
@@ -2551,6 +3125,7 @@ mod tests {
         let batch_budgets_for_title = |title: &str| {
             serialized_review_batch_budgets(
                 &cfg,
+                cfg.max_findings,
                 &models,
                 &system,
                 &PrContext {
@@ -2564,17 +3139,17 @@ mod tests {
             .unwrap()
         };
 
-        let local_edge = format!("Benchmark pull request{}", "x".repeat(0));
-        let ci_edge = format!("Benchmark pull request{}", "x".repeat(21));
-        let below_floor = format!("Benchmark pull request{}", "x".repeat(144));
+        let local_edge = format!("Benchmark pull request{}", "x".repeat(42));
+        let ci_edge = format!("Benchmark pull request{}", "x".repeat(58));
+        let below_floor = format!("Benchmark pull request{}", "x".repeat(442));
 
         let local_budgets = batch_budgets_for_title(&local_edge);
-        assert_eq!(local_budgets.synthesis, 4_239);
-        assert_eq!(local_budgets.source, 4_240);
+        assert_eq!(local_budgets.synthesis, 4_495);
+        assert_eq!(local_budgets.source, 4_496);
         assert!(review_batch_budgets_are_usable(local_budgets));
         let ci_budgets = batch_budgets_for_title(&ci_edge);
-        assert_eq!(ci_budgets.synthesis, 4_218);
-        assert_eq!(ci_budgets.source, 4_219);
+        assert_eq!(ci_budgets.synthesis, 4_479);
+        assert_eq!(ci_budgets.source, 4_480);
         assert!(review_batch_budgets_are_usable(ci_budgets));
         assert_eq!(
             ci_budgets.stabilized_for_rendering(),
@@ -2603,12 +3178,34 @@ mod tests {
     }
 
     #[test]
+    fn large_review_batch_concurrency_caps_consensus_provider_fanout() {
+        let config = |consensus, cascade: Vec<&str>| Config {
+            model: "provider/primary".to_string(),
+            consensus,
+            cascade: cascade.into_iter().map(str::to_string).collect(),
+            ..Config::default()
+        };
+        assert_eq!(large_diff_batch_concurrency(&config(1, vec![])), 4);
+        assert_eq!(
+            large_diff_batch_concurrency(&config(2, vec!["provider/second"])),
+            2
+        );
+        assert_eq!(
+            large_diff_batch_concurrency(&config(3, vec!["provider/second", "provider/third"])),
+            1
+        );
+    }
+
+    #[test]
     fn hosted_scorer_failure_blocks_unscored_output() {
         assert!(scorer_failure_blocks_hosted(true, true));
         assert!(!scorer_failure_blocks_hosted(true, false));
         assert!(!scorer_failure_blocks_hosted(false, true));
     }
-    use crate::envelope::{Kind, Severity};
+    use crate::envelope::{
+        Kind, RepositoryClaim, RepositoryClaimKind, RepositorySearchMatch, RepositorySearchQuery,
+        RepositorySearchReceipt, RepositorySearchState, Severity,
+    };
 
     fn pr_meta() -> PrMeta {
         PrMeta {
@@ -2632,7 +3229,7 @@ mod tests {
             &cfg,
             &anyhow::anyhow!("provider unavailable"),
             "head",
-            &pr_meta(),
+            Some(&pr_meta()),
             1,
         );
         assert!(!envelope.gate.failing);
@@ -2717,7 +3314,7 @@ mod tests {
             ..Config::default()
         };
         let error = rich_scorer_failure(ReviewFailureKind::InvalidOutput);
-        let envelope = error_envelope(&cfg, &error, "head", &pr_meta(), 99);
+        let envelope = error_envelope(&cfg, &error, "head", Some(&pr_meta()), 99);
         assert_eq!(envelope.findings[0].path, crate::envelope::OPERATIONAL_PATH);
         assert!(envelope.gate.failing);
         assert_eq!(envelope.model_used, "generator-model");
@@ -2749,11 +3346,24 @@ mod tests {
             ..Config::default()
         };
         let error = rich_scorer_failure(ReviewFailureKind::Provider);
-        let envelope = error_envelope(&cfg, &error, "head", &pr_meta(), 99);
+        let envelope = error_envelope(&cfg, &error, "head", Some(&pr_meta()), 99);
         assert_eq!(envelope.findings[0].path, crate::envelope::PROVIDER_PATH);
         assert!(!envelope.gate.failing);
         assert_eq!(envelope.model_usage.len(), 2);
         assert_eq!(envelope.review_admission.unwrap().provider_attempts, 12);
+    }
+
+    #[test]
+    fn planning_failure_remains_blocking_under_advisory_provider_policy() {
+        let cfg = Config {
+            gate_on_error: OnError::Advisory,
+            ..Config::default()
+        };
+        let error = anyhow::anyhow!("complete hosted review exceeds its watchdog plan");
+        let envelope = error_envelope(&cfg, &error, "head", Some(&pr_meta()), 1);
+        assert_eq!(envelope.findings[0].path, crate::envelope::OPERATIONAL_PATH);
+        assert!(envelope.gate.failing);
+        assert!(envelope.summary.contains("failing closed"));
     }
 
     #[test]
@@ -2778,7 +3388,13 @@ mod tests {
             gate_on_error: OnError::Advisory,
             ..Config::default()
         };
-        let envelope = error_envelope(&cfg, &rich_scorer_failure(kind), "head", &pr_meta(), 99);
+        let envelope = error_envelope(
+            &cfg,
+            &rich_scorer_failure(kind),
+            "head",
+            Some(&pr_meta()),
+            99,
+        );
         assert_eq!(envelope.findings[0].path, crate::envelope::OPERATIONAL_PATH);
         assert!(envelope.gate.failing);
 
@@ -2803,7 +3419,7 @@ mod tests {
             ..Config::default()
         };
         let error = crate::forge::classify_review_input_error(anyhow::anyhow!("invalid diff"));
-        let envelope = error_envelope(&cfg, &error, "head", &pr_meta(), 1);
+        let envelope = error_envelope(&cfg, &error, "head", Some(&pr_meta()), 1);
         assert!(!envelope.gate.failing);
         assert!(envelope.summary.contains("merge gate is disabled"));
     }
@@ -2825,6 +3441,7 @@ mod tests {
             generator_kind: None,
             scorer_kind: None,
             scorer_reason: None,
+            repository_claim: None,
             title: title.to_string(),
             body: body.to_string(),
             evidence: None,
@@ -2929,8 +3546,9 @@ mod tests {
         assert_eq!(hosted_request_timeout_secs(true), 60);
         assert_eq!(HOSTED_LLM_REVIEW_TIMEOUT_SECS, 420);
         assert_eq!(
-            HOSTED_LLM_REVIEW_TIMEOUT_SECS,
-            LARGE_DIFF_LLM_REQUEST_TIMEOUT_SECS * 6 + 60
+            (HOSTED_LLM_REVIEW_TIMEOUT_SECS - HOSTED_REVIEW_SCHEDULING_RESERVE_SECS)
+                / LARGE_DIFF_LLM_REQUEST_TIMEOUT_SECS,
+            6
         );
         assert_eq!(
             HOSTED_LLM_TOTAL_TIMEOUT_SECS,
@@ -2939,6 +3557,61 @@ mod tests {
         assert_eq!(
             HOSTED_WORKER_WATCHDOG_SECS - HOSTED_LLM_TOTAL_TIMEOUT_SECS,
             CHECK_COMPLETION_TIMEOUT_SECS + REVIEW_POST_TIMEOUT_SECS + PROCESS_OVERHEAD_SECS
+        );
+
+        let scorer_disabled = Config {
+            scorer_enabled: false,
+            uncertainty_resolution: true,
+            concise_findings: true,
+            model: "provider/generator".into(),
+            ..Config::default()
+        };
+        let scorer_enabled = Config {
+            scorer: "provider/scorer".into(),
+            scorer_enabled: true,
+            ..scorer_disabled.clone()
+        };
+
+        let scorer_disabled_budgets = hosted_review_phase_budgets(&scorer_disabled);
+        assert_eq!(
+            scorer_disabled_budgets,
+            HostedReviewPhaseBudgets {
+                generator: 360,
+                scorer: 0,
+                resolution: POSTPROCESSING_PHASE_TIMEOUT_SECS,
+                brevity: POSTPROCESSING_PHASE_TIMEOUT_SECS,
+                adjudication: FINDING_ADJUDICATION_TIMEOUT_SECS,
+            }
+        );
+        assert_eq!(
+            scorer_disabled_budgets.total(),
+            HOSTED_LLM_TOTAL_TIMEOUT_SECS
+        );
+        assert_eq!(hosted_review_timeout_secs(&scorer_disabled), 360);
+        assert_eq!(
+            crate::llm::max_hosted_review_batches(&scorer_disabled, false).unwrap(),
+            20
+        );
+
+        let scorer_enabled_budgets = hosted_review_phase_budgets(&scorer_enabled);
+        assert_eq!(
+            scorer_enabled_budgets,
+            HostedReviewPhaseBudgets {
+                generator: 240,
+                scorer: SCORER_TIMEOUT_SECS,
+                resolution: POSTPROCESSING_PHASE_TIMEOUT_SECS,
+                brevity: POSTPROCESSING_PHASE_TIMEOUT_SECS,
+                adjudication: FINDING_ADJUDICATION_TIMEOUT_SECS,
+            }
+        );
+        assert_eq!(
+            scorer_enabled_budgets.total(),
+            HOSTED_LLM_TOTAL_TIMEOUT_SECS
+        );
+        assert_eq!(hosted_review_timeout_secs(&scorer_enabled), 240);
+        assert_eq!(
+            crate::llm::max_hosted_review_batches(&scorer_enabled, false).unwrap(),
+            12
         );
     }
 
@@ -3074,6 +3747,52 @@ mod tests {
         ]));
     }
 
+    #[test]
+    fn adjudication_preserved_baseline_survives_a_deterministic_refutation_receipt() {
+        let snapshot_id = "a".repeat(40);
+        let claim = RepositoryClaim {
+            kind: RepositoryClaimKind::Absence,
+            resources: vec!["widget".into()],
+            values: vec![],
+            versions: vec![],
+            paths: vec![],
+            identifiers: vec![],
+        };
+        let terms = crate::repository_search::search_terms(std::iter::once(&claim)).unwrap();
+        let query = terms[0].query_sha256.clone();
+        let receipt = RepositorySearchReceipt {
+            head_sha: Some(snapshot_id.clone()),
+            state: RepositorySearchState::Complete,
+            tree_sha256: Some("b".repeat(64)),
+            queries: vec![RepositorySearchQuery {
+                kind: terms[0].kind,
+                query_sha256: query.clone(),
+            }],
+            matched_query_sha256: vec![query.clone()],
+            matches: vec![RepositorySearchMatch {
+                query_sha256: query,
+                path: "src/dependencies.txt".into(),
+                occurrences: 1,
+            }],
+            match_count: 1,
+            ..RepositorySearchReceipt::default()
+        };
+        let mut baseline = finding("src/db.rs", 10, "missing widget");
+        baseline.repository_claim = Some(claim);
+
+        let mut preserved = vec![baseline.clone()];
+        assert!(
+            suppress_refuted_repository_claims(&mut preserved, &receipt, &[baseline.clone()],)
+                .is_empty()
+        );
+        assert_eq!(preserved.len(), 1);
+        assert!(same_visible_finding(&preserved[0], &baseline));
+
+        let mut fresh = vec![baseline];
+        assert!(suppress_refuted_repository_claims(&mut fresh, &receipt, &[]).is_empty());
+        assert_eq!(fresh.len(), 1);
+    }
+
     fn score(index: usize, confidence: f64, kind: Kind) -> FindingScore {
         FindingScore {
             index,
@@ -3204,6 +3923,60 @@ mod tests {
             Some(
                 "finding at src/lib.rs:7 violates the publication contract: finding body must end with sentence punctuation".to_string()
             )
+        );
+    }
+
+    #[test]
+    fn batch_validation_requires_typed_queries_for_universal_repository_claims() {
+        let annotated = "### src/lib.rs\n@@ fixture @@\n    7 + changed();\n";
+        let mut finding = finding(
+            "src/lib.rs",
+            7,
+            "No other caller accepts this identifier; add a compatible caller.",
+        );
+        finding.evidence = Some("changed();".to_string());
+
+        let reason = review_batch_validation_reason(&finding, annotated, None).unwrap();
+        assert_eq!(reason.category, "repositoryClaim");
+
+        finding.repository_claim = Some(crate::envelope::RepositoryClaim {
+            kind: crate::envelope::RepositoryClaimKind::Absence,
+            resources: vec![],
+            values: vec![],
+            versions: vec![],
+            paths: vec![],
+            identifiers: vec!["identifier".into()],
+        });
+        assert_eq!(
+            review_batch_validation_reason(&finding, annotated, None),
+            None
+        );
+    }
+
+    #[test]
+    fn batch_validation_rejects_public_evidence_boundary_language() {
+        let annotated = "### src/lib.rs\n@@ fixture @@\n    7 + changed();\n";
+        let mut finding = finding(
+            "src/lib.rs",
+            7,
+            "In the diff this is unsafe; verify that the unchanged callers agree.",
+        );
+        finding.evidence = Some("changed();".to_string());
+
+        let reason = review_batch_validation_reason(&finding, annotated, None).unwrap();
+        assert_eq!(reason.category, "repositoryClaimPublication");
+    }
+
+    #[test]
+    fn all_ungrounded_failure_uses_public_evidence_validation_language() {
+        let finding = ungrounded_findings_failure(3);
+        assert_eq!(
+            finding.body,
+            "Postil could not validate the configured model response against cited code evidence. No clean verdict was issued.\n\nDetail: model reported 3 finding(s) without a valid code-evidence citation."
+        );
+        assert_eq!(
+            crate::envelope::validate_finding_public_language(&finding),
+            Ok(())
         );
     }
 

@@ -6,9 +6,9 @@ use reqwest::header::HeaderMap;
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::io::Write;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::{
     CheckRunIds, CheckState, FindingPublicationOutcome, FindingPublicationReceipt, Forge, PrMeta,
@@ -820,7 +820,8 @@ impl GitHub {
         Ok((snapshot, byte_count))
     }
 
-    pub(crate) async fn fetch_repository_file_at_revision(
+    #[cfg(test)]
+    async fn fetch_repository_file_at_revision(
         &self,
         revision: &str,
         path: &str,
@@ -832,31 +833,7 @@ impl GitHub {
             .context("GitHub repository file is not valid UTF-8")
     }
 
-    pub(crate) async fn fetch_repository_file_with_base_fallback(
-        &self,
-        head_revision: &str,
-        base_revision: Option<&str>,
-        path: &str,
-    ) -> Result<String> {
-        if let Some(content) = self
-            .fetch_repository_file_if_present(head_revision, path)
-            .await?
-        {
-            return Ok(content);
-        }
-        let base_revision = base_revision.context(format!(
-            "GitHub repository file is absent at head {head_revision} and no base SHA is available"
-        ))?;
-        self.fetch_repository_file_at_revision(base_revision, path)
-            .await
-            .with_context(|| {
-                format!(
-                    "GitHub repository file is absent at head {head_revision} and the base fetch at {base_revision} failed"
-                )
-            })
-    }
-
-    async fn fetch_repository_file_if_present(
+    pub(crate) async fn fetch_repository_file_if_present(
         &self,
         revision: &str,
         path: &str,
@@ -888,6 +865,268 @@ impl GitHub {
         String::from_utf8(snapshot.as_bytes().to_vec())
             .context("GitHub repository file is not valid UTF-8")
             .map(Some)
+    }
+
+    pub(crate) async fn search_repository_at_head(
+        &self,
+        head_sha: &str,
+        terms: Vec<crate::repository_search::SearchTerm>,
+    ) -> crate::envelope::RepositorySearchReceipt {
+        if terms.is_empty() {
+            return crate::repository_search::unavailable(Some(head_sha));
+        }
+        let fallback_terms = terms.clone();
+        let deadline = crate::repository_search::github_aggregate_deadline();
+        match tokio::time::timeout(
+            deadline,
+            self.search_repository_at_head_inner(head_sha, terms),
+        )
+        .await
+        {
+            Err(_) => crate::repository_search::exhausted_with_terms(head_sha, &fallback_terms),
+            Ok(Ok(receipt)) => receipt,
+            Ok(Err(error))
+                if error
+                    .chain()
+                    .any(|cause| cause.downcast_ref::<RepositorySearchExhausted>().is_some()) =>
+            {
+                crate::repository_search::exhausted_with_terms(head_sha, &fallback_terms)
+            }
+            Ok(Err(_)) => {
+                crate::repository_search::unavailable_with_terms(Some(head_sha), &fallback_terms)
+            }
+        }
+    }
+
+    async fn search_repository_at_head_inner(
+        &self,
+        head_sha: &str,
+        terms: Vec<crate::repository_search::SearchTerm>,
+    ) -> Result<crate::envelope::RepositorySearchReceipt> {
+        ensure!(
+            crate::repository_search::valid_full_object_id(head_sha),
+            "GitHub repository search requires a full commit SHA"
+        );
+        let mut budget = RepositorySearchBudget::new();
+        let response = self
+            .send_repository_search_request(
+                self.request(
+                    reqwest::Method::GET,
+                    self.url(&format!("/git/commits/{head_sha}")),
+                ),
+                &mut budget,
+            )
+            .await?;
+        let commit: GitCommitResponse =
+            super::bounded_response_json(response, "GitHub repository commit").await?;
+        ensure!(
+            commit.sha.eq_ignore_ascii_case(head_sha),
+            "GitHub repository commit did not match the reviewed head"
+        );
+        ensure!(
+            crate::repository_search::valid_full_object_id(&commit.tree.sha),
+            "GitHub repository commit returned an invalid tree id"
+        );
+
+        let mut queue = VecDeque::from([(String::new(), commit.tree.sha, 0usize)]);
+        let mut blobs = Vec::new();
+        let mut entry_count = 0usize;
+        let mut tree_count = 0usize;
+        let mut total_bytes = 0u64;
+        let mut gitlinks = Vec::new();
+        while let Some((prefix, tree_sha, depth)) = queue.pop_front() {
+            tree_count = tree_count
+                .checked_add(1)
+                .context("repository tree object count overflowed")?;
+            if tree_count > crate::repository_search::github_tree_object_cap() {
+                return Ok(crate::repository_search::exhausted_with_terms(
+                    head_sha, &terms,
+                ));
+            }
+            budget.charge_objects(1)?;
+            if depth > crate::repository_search::tree_depth_cap() {
+                return Ok(crate::repository_search::exhausted_with_terms(
+                    head_sha, &terms,
+                ));
+            }
+            let response = self
+                .send_repository_search_request(
+                    self.request(
+                        reqwest::Method::GET,
+                        self.url(&format!("/git/trees/{tree_sha}")),
+                    ),
+                    &mut budget,
+                )
+                .await?;
+            let tree: GitTreeResponse =
+                super::bounded_response_json(response, "GitHub repository tree").await?;
+            ensure!(
+                tree.sha.eq_ignore_ascii_case(&tree_sha),
+                "GitHub repository tree did not match the requested object"
+            );
+            ensure!(!tree.truncated, "GitHub repository tree was incomplete");
+            let mut entries = tree.tree;
+            ensure!(
+                crate::repository_search::git_tree_matches(
+                    &tree_sha,
+                    entries.iter().map(|entry| (
+                        entry.path.as_str(),
+                        entry.mode.as_str(),
+                        entry.sha.as_str(),
+                    )),
+                ),
+                "GitHub repository tree entries did not match the requested object"
+            );
+            entries.sort_by(|left, right| left.path.cmp(&right.path));
+            budget.charge_objects(entries.len())?;
+            let mut names = HashSet::with_capacity(entries.len());
+            for entry in entries {
+                entry_count = entry_count
+                    .checked_add(1)
+                    .context("repository tree entry count overflowed")?;
+                if entry_count > crate::repository_search::tree_entry_cap() {
+                    return Ok(crate::repository_search::exhausted_with_terms(
+                        head_sha, &terms,
+                    ));
+                }
+                ensure!(
+                    !entry.path.is_empty()
+                        && !entry.path.contains('/')
+                        && entry.path != "."
+                        && entry.path != ".."
+                        && !entry.path.contains('\0')
+                        && names.insert(entry.path.clone()),
+                    "GitHub repository tree returned an unsafe path"
+                );
+                ensure!(
+                    crate::repository_search::valid_full_object_id(&entry.sha),
+                    "GitHub repository tree returned an invalid object id"
+                );
+                let path = if prefix.is_empty() {
+                    entry.path
+                } else {
+                    format!("{prefix}/{}", entry.path)
+                };
+                ensure!(
+                    super::valid_repository_path(&path),
+                    "GitHub repository tree returned an unsafe path"
+                );
+                match (entry.kind.as_str(), entry.mode.as_str()) {
+                    ("tree", "040000") => {
+                        ensure!(entry.size.is_none(), "GitHub repository tree had a size");
+                        queue.push_back((path, entry.sha, depth.saturating_add(1)));
+                    }
+                    ("blob", "100644" | "100755" | "120000") => {
+                        let size = entry
+                            .size
+                            .context("GitHub repository blob omitted its size")?;
+                        let Some(next_total) = total_bytes.checked_add(size) else {
+                            return Ok(crate::repository_search::exhausted_with_terms(
+                                head_sha, &terms,
+                            ));
+                        };
+                        total_bytes = next_total;
+                        if total_bytes > crate::repository_search::search_byte_cap() {
+                            return Ok(crate::repository_search::exhausted_with_terms(
+                                head_sha, &terms,
+                            ));
+                        }
+                        blobs.push((path, entry.sha, entry.mode, size));
+                    }
+                    ("commit", "160000") => {
+                        ensure!(entry.size.is_none(), "GitHub submodule entry had a size");
+                        gitlinks.push((path, entry.sha));
+                    }
+                    _ => {
+                        return Err(anyhow!(
+                            "GitHub repository tree returned an unsupported object type or mode"
+                        ));
+                    }
+                }
+            }
+        }
+        blobs.sort_by(|left, right| left.0.cmp(&right.0));
+        ensure!(
+            blobs.windows(2).all(|pair| pair[0].0 != pair[1].0),
+            "GitHub repository tree returned a duplicate path"
+        );
+        let mut snapshot_entries = blobs
+            .iter()
+            .map(|(path, object_id, mode, size)| {
+                crate::repository_search::RepositorySnapshotEntry {
+                    path: path.clone(),
+                    object_id: object_id.clone(),
+                    mode: mode.clone(),
+                    kind: crate::repository_search::RepositorySnapshotEntryKind::Blob,
+                    size: Some(*size),
+                }
+            })
+            .chain(gitlinks.iter().map(|(path, object_id)| {
+                crate::repository_search::RepositorySnapshotEntry {
+                    path: path.clone(),
+                    object_id: object_id.clone(),
+                    mode: "160000".to_string(),
+                    kind: crate::repository_search::RepositorySnapshotEntryKind::Gitlink,
+                    size: None,
+                }
+            }))
+            .collect::<Vec<_>>();
+        snapshot_entries.sort_by(|left, right| left.path.cmp(&right.path));
+        let tree_sha256 = crate::repository_search::tree_sha256(&snapshot_entries);
+        let mut search = crate::repository_search::SearchAccumulator::new(terms);
+        for (path, object_id) in &gitlinks {
+            search.scan_gitlink(path, object_id);
+        }
+        for (path, blob_sha, _mode, size) in blobs {
+            search.scan_path(&path);
+            let response = self
+                .send_repository_search_request(
+                    self.request(
+                        reqwest::Method::GET,
+                        self.url(&format!("/git/blobs/{blob_sha}")),
+                    )
+                    .header("Accept", "application/vnd.github.raw+json"),
+                    &mut budget,
+                )
+                .await?;
+            let remaining = budget.remaining()?;
+            tokio::time::timeout(
+                remaining,
+                search.scan_response(&path, &blob_sha, response, size),
+            )
+            .await
+            .map_err(|_| anyhow::Error::new(RepositorySearchExhausted))??;
+        }
+        if gitlinks.is_empty() {
+            Ok(search.complete(head_sha, tree_sha256))
+        } else {
+            Ok(search.incomplete(head_sha, tree_sha256))
+        }
+    }
+
+    async fn send_repository_search_request(
+        &self,
+        request: reqwest::RequestBuilder,
+        budget: &mut RepositorySearchBudget,
+    ) -> Result<reqwest::Response> {
+        let remaining = budget.charge_request()?;
+        let response = request.timeout(remaining).send().await.map_err(|error| {
+            if error.is_timeout() {
+                anyhow::Error::new(RepositorySearchExhausted)
+            } else {
+                anyhow!(error).context("GitHub repository object request failed")
+            }
+        })?;
+        if github_repository_rate_limit_risk(response.status(), response.headers()) {
+            return Err(anyhow::Error::new(RepositorySearchExhausted));
+        }
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "GitHub repository object request failed: {}",
+                response.status()
+            ));
+        }
+        Ok(response)
     }
 
     async fn build_complete_diff(
@@ -1019,6 +1258,15 @@ fn github_retryable_response(status: reqwest::StatusCode, headers: &HeaderMap) -
         || (status == reqwest::StatusCode::FORBIDDEN
             && (headers.contains_key("retry-after")
                 || safe_numeric_header(headers, "x-ratelimit-remaining").as_deref() == Some("0")))
+}
+
+fn github_repository_rate_limit_risk(status: reqwest::StatusCode, headers: &HeaderMap) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || (status == reqwest::StatusCode::FORBIDDEN
+            && (headers.contains_key("retry-after")
+                || headers.contains_key("x-ratelimit-reset")
+                || safe_numeric_header(headers, "x-ratelimit-remaining").as_deref() == Some("0")))
+        || safe_numeric_header(headers, "x-ratelimit-remaining").as_deref() == Some("0")
 }
 
 fn github_retry_delay(status: reqwest::StatusCode, headers: &HeaderMap, retry: u32) -> Duration {
@@ -1177,6 +1425,90 @@ struct CompareResponse {
     merge_base_commit: RefObj,
     #[serde(default)]
     files: Vec<PullFile>,
+}
+
+#[derive(Deserialize)]
+struct GitTreeResponse {
+    sha: String,
+    #[serde(default)]
+    truncated: bool,
+    tree: Vec<GitTreeEntry>,
+}
+
+#[derive(Deserialize)]
+struct GitTreeEntry {
+    path: String,
+    mode: String,
+    #[serde(rename = "type")]
+    kind: String,
+    sha: String,
+    #[serde(default)]
+    size: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct GitCommitResponse {
+    sha: String,
+    tree: RefObj,
+}
+
+#[derive(Debug)]
+struct RepositorySearchExhausted;
+
+impl std::fmt::Display for RepositorySearchExhausted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("repository search budget exhausted")
+    }
+}
+
+impl std::error::Error for RepositorySearchExhausted {}
+
+struct RepositorySearchBudget {
+    started_at: Instant,
+    requests: usize,
+    objects: usize,
+}
+
+impl RepositorySearchBudget {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            requests: 0,
+            objects: 0,
+        }
+    }
+
+    fn remaining(&self) -> Result<Duration> {
+        let remaining = crate::repository_search::github_aggregate_deadline()
+            .saturating_sub(self.started_at.elapsed());
+        if remaining.is_zero() {
+            Err(anyhow::Error::new(RepositorySearchExhausted))
+        } else {
+            Ok(remaining)
+        }
+    }
+
+    fn charge_request(&mut self) -> Result<Duration> {
+        self.requests = self
+            .requests
+            .checked_add(1)
+            .ok_or_else(|| anyhow::Error::new(RepositorySearchExhausted))?;
+        if self.requests > crate::repository_search::github_request_cap() {
+            return Err(anyhow::Error::new(RepositorySearchExhausted));
+        }
+        self.remaining()
+    }
+
+    fn charge_objects(&mut self, count: usize) -> Result<()> {
+        self.objects = self
+            .objects
+            .checked_add(count)
+            .ok_or_else(|| anyhow::Error::new(RepositorySearchExhausted))?;
+        if self.objects > crate::repository_search::github_object_cap() {
+            return Err(anyhow::Error::new(RepositorySearchExhausted));
+        }
+        self.remaining().map(|_| ())
+    }
 }
 
 #[derive(Deserialize)]
@@ -1920,10 +2252,10 @@ fn comment_marker(number: u64, body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        EXPECTED_REPOSITORY_ID_ENV, GitHub, PullFile, finding_marker, finding_marker_in,
-        finding_receipt_id, gate_summary, github_retry_delay_at, github_retryable_response,
-        github_transport_retry_delay, only_operational_findings, valid_details_url,
-        validate_pull_file,
+        EXPECTED_REPOSITORY_ID_ENV, GitHub, PullFile, RepositorySearchBudget, finding_marker,
+        finding_marker_in, finding_receipt_id, gate_summary, github_repository_rate_limit_risk,
+        github_retry_delay_at, github_retryable_response, github_transport_retry_delay,
+        only_operational_findings, valid_details_url, validate_pull_file,
     };
     use crate::envelope::{
         Envelope, Finding, Gate, Kind, Severity, SuppressedFinding, SuppressionReason, Usage,
@@ -1934,7 +2266,7 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use wiremock::matchers::{method, path, path_regex, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1962,6 +2294,7 @@ mod tests {
             model_incidents: vec![],
             review_coverage: None,
             review_admission: None,
+            repository_search: Default::default(),
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: Some(base_sha.into()),
@@ -1999,11 +2332,25 @@ mod tests {
             generator_kind: None,
             scorer_kind: None,
             scorer_reason: None,
+            repository_claim: None,
             title: format!("Finding {id}"),
             body: body.into(),
             evidence: Some("let value = risky();".into()),
             id: Some(id.into()),
         }
+    }
+
+    fn repository_search_terms() -> Vec<crate::repository_search::SearchTerm> {
+        use crate::envelope::{RepositoryClaim, RepositoryClaimKind};
+        crate::repository_search::search_terms(std::iter::once(&RepositoryClaim {
+            kind: RepositoryClaimKind::Absence,
+            resources: vec![],
+            values: vec![],
+            versions: vec![],
+            paths: vec![],
+            identifiers: vec!["clusterVersion".into()],
+        }))
+        .unwrap()
     }
 
     #[test]
@@ -2252,7 +2599,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_repository_file_with_base_fallback_reads_deleted_head_files_from_base() {
+    async fn fetch_repository_file_if_present_never_reads_a_base_revision() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/repos/owner/repo/contents/config/review.toml"))
@@ -2265,25 +2612,21 @@ mod tests {
             .and(path("/repos/owner/repo/contents/config/review.toml"))
             .and(query_param("ref", "base123"))
             .respond_with(ResponseTemplate::new(200).set_body_string("enabled = true\n"))
-            .expect(1)
+            .expect(0)
             .mount(&server)
             .await;
 
         let github = test_github(&server);
         let content = github
-            .fetch_repository_file_with_base_fallback(
-                "head123",
-                Some("base123"),
-                "config/review.toml",
-            )
+            .fetch_repository_file_if_present("head123", "config/review.toml")
             .await
             .unwrap();
 
-        assert_eq!(content, "enabled = true\n");
+        assert_eq!(content, None);
     }
 
     #[tokio::test]
-    async fn fetch_repository_file_with_base_fallback_does_not_mask_head_failures() {
+    async fn fetch_repository_file_if_present_does_not_mask_head_failures() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/repos/owner/repo/contents/config/review.toml"))
@@ -2301,15 +2644,398 @@ mod tests {
             .await;
 
         let error = test_github(&server)
-            .fetch_repository_file_with_base_fallback(
-                "head123",
-                Some("base123"),
-                "config/review.toml",
-            )
+            .fetch_repository_file_if_present("head123", "config/review.toml")
             .await
             .unwrap_err();
 
         assert!(error.to_string().contains("500"));
+    }
+
+    #[tokio::test]
+    async fn repository_search_walks_nested_trees_and_every_blob_at_the_pinned_head() {
+        use crate::envelope::{
+            RepositoryClaim, RepositoryClaimKind, RepositorySearchQueryKind, RepositorySearchState,
+        };
+
+        let server = MockServer::start().await;
+        let head = "a".repeat(40);
+        let readme = b"CephCluster supports stable releases.\n";
+        let generated = b"clusterVersion: 19.2.5\nimage: ceph:19.2.5\n";
+        let symlink = b"../outside";
+        let readme_blob = crate::repository_search::git_blob_sha1(readme);
+        let generated_blob = crate::repository_search::git_blob_sha1(generated);
+        let symlink_blob = crate::repository_search::git_blob_sha1(symlink);
+        let submodule = "1".repeat(40);
+        let manifest_tree = crate::repository_search::git_tree_sha1([(
+            "generated.yaml",
+            "100644",
+            generated_blob.as_str(),
+        )]);
+        let root_tree = crate::repository_search::git_tree_sha1([
+            ("README.md", "100644", readme_blob.as_str()),
+            ("manifests", "040000", manifest_tree.as_str()),
+            ("outside-link", "120000", symlink_blob.as_str()),
+            ("vendor", "160000", submodule.as_str()),
+        ]);
+
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/owner/repo/git/commits/{head}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sha": head,
+                "tree": {"sha": root_tree}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/owner/repo/git/trees/{root_tree}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sha": root_tree,
+                "truncated": false,
+                "tree": [
+                    {"path": "README.md", "mode": "100644", "type": "blob", "sha": readme_blob, "size": readme.len()},
+                    {"path": "manifests", "mode": "040000", "type": "tree", "sha": manifest_tree},
+                    {"path": "outside-link", "mode": "120000", "type": "blob", "sha": symlink_blob, "size": symlink.len()},
+                    {"path": "vendor", "mode": "160000", "type": "commit", "sha": submodule}
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/repos/owner/repo/git/trees/{manifest_tree}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sha": manifest_tree,
+                "truncated": false,
+                "tree": [
+                    {"path": "generated.yaml", "mode": "100644", "type": "blob", "sha": generated_blob, "size": generated.len()}
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        for (blob, body) in [
+            (readme_blob.as_str(), readme.as_slice()),
+            (generated_blob.as_str(), generated.as_slice()),
+            (symlink_blob.as_str(), symlink.as_slice()),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/repos/owner/repo/git/blobs/{blob}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+
+        let claim = RepositoryClaim {
+            kind: RepositoryClaimKind::Mismatch,
+            resources: vec!["CephCluster".into()],
+            values: vec!["outside-secret-term".into()],
+            versions: vec!["19.2.5".into()],
+            paths: vec!["manifests/generated.yaml".into()],
+            identifiers: vec!["clusterVersion".into()],
+        };
+        let terms = crate::repository_search::search_terms(std::iter::once(&claim)).unwrap();
+        let receipt = test_github(&server)
+            .search_repository_at_head(&head, terms)
+            .await;
+
+        assert_eq!(receipt.head_sha.as_deref(), Some(head.as_str()));
+        assert_eq!(receipt.state, RepositorySearchState::Unavailable);
+        assert!(receipt.tree_sha256.is_some());
+        assert_eq!(receipt.searched_blobs, 3);
+        assert_eq!(
+            receipt.searched_bytes,
+            (readme.len() + generated.len() + symlink.len()) as u64
+        );
+        assert!(receipt.queries.iter().any(|query| {
+            query.kind == RepositorySearchQueryKind::Path
+                && receipt.matched_query_sha256.contains(&query.query_sha256)
+        }));
+        assert!(receipt.matches.iter().any(|matched| {
+            matched.path == "manifests/generated.yaml" && matched.occurrences == 2
+        }));
+        let outside = receipt
+            .queries
+            .iter()
+            .find(|query| query.kind == RepositorySearchQueryKind::Value)
+            .unwrap();
+        assert!(!receipt.matched_query_sha256.contains(&outside.query_sha256));
+    }
+
+    #[tokio::test]
+    async fn repository_search_rejects_same_size_blob_substitution() {
+        use crate::envelope::RepositorySearchState;
+
+        let server = MockServer::start().await;
+        let head = "a".repeat(40);
+        let expected = b"required-construct=true\n";
+        let substituted = b"required-construct=fals\n";
+        assert_eq!(expected.len(), substituted.len());
+        let blob = crate::repository_search::git_blob_sha1(expected);
+        let tree =
+            crate::repository_search::git_tree_sha1([("config.txt", "100644", blob.as_str())]);
+
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/owner/repo/git/commits/{head}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sha": head,
+                "tree": {"sha": tree}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/owner/repo/git/trees/{tree}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sha": tree,
+                "truncated": false,
+                "tree": [{
+                    "path": "config.txt", "mode": "100644", "type": "blob",
+                    "sha": blob, "size": expected.len()
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/owner/repo/git/blobs/{blob}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(substituted))
+            .mount(&server)
+            .await;
+
+        let receipt = test_github(&server)
+            .search_repository_at_head(&head, repository_search_terms())
+            .await;
+
+        assert_eq!(receipt.state, RepositorySearchState::Unavailable);
+        assert_eq!(receipt.searched_blobs, 0);
+    }
+
+    #[tokio::test]
+    async fn repository_search_rejects_tree_entry_substitution() {
+        use crate::envelope::RepositorySearchState;
+
+        let server = MockServer::start().await;
+        let head = "a".repeat(40);
+        let expected_blob = crate::repository_search::git_blob_sha1(b"expected\n");
+        let substituted_blob = crate::repository_search::git_blob_sha1(b"attacker\n");
+        let tree = crate::repository_search::git_tree_sha1([(
+            "config.txt",
+            "100644",
+            expected_blob.as_str(),
+        )]);
+
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/owner/repo/git/commits/{head}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sha": head,
+                "tree": {"sha": tree}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/owner/repo/git/trees/{tree}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sha": tree,
+                "truncated": false,
+                "tree": [{
+                    "path": "config.txt", "mode": "100644", "type": "blob",
+                    "sha": substituted_blob, "size": 9
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let receipt = test_github(&server)
+            .search_repository_at_head(&head, repository_search_terms())
+            .await;
+
+        assert_eq!(receipt.state, RepositorySearchState::Unavailable);
+        assert_eq!(receipt.searched_blobs, 0);
+    }
+
+    #[tokio::test]
+    async fn repository_search_rejects_head_mutation_before_reading_a_tree() {
+        use crate::envelope::{RepositoryClaim, RepositoryClaimKind, RepositorySearchState};
+
+        let server = MockServer::start().await;
+        let head = "a".repeat(40);
+        let changed_head = "b".repeat(40);
+        let tree = "c".repeat(40);
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/owner/repo/git/commits/{head}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sha": changed_head,
+                "tree": {"sha": tree}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/owner/repo/git/trees/{tree}")))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let claim = RepositoryClaim {
+            kind: RepositoryClaimKind::Absence,
+            resources: vec![],
+            values: vec![],
+            versions: vec![],
+            paths: vec![],
+            identifiers: vec!["identifier".into()],
+        };
+        let terms = crate::repository_search::search_terms(std::iter::once(&claim)).unwrap();
+
+        let receipt = test_github(&server)
+            .search_repository_at_head(&head, terms)
+            .await;
+        assert_eq!(receipt.state, RepositorySearchState::Unavailable);
+        assert_eq!(receipt.queries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn repository_search_reports_exhaustion_before_fetching_oversized_blobs() {
+        use crate::envelope::RepositorySearchState;
+
+        let server = MockServer::start().await;
+        let head = "a".repeat(40);
+        let blob = "c".repeat(40);
+        let tree = crate::repository_search::git_tree_sha1([("huge.bin", "100644", blob.as_str())]);
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/owner/repo/git/commits/{head}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sha": head,
+                "tree": {"sha": tree}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/owner/repo/git/trees/{tree}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sha": tree,
+                "truncated": false,
+                "tree": [{
+                    "path": "huge.bin", "mode": "100644", "type": "blob", "sha": blob,
+                    "size": crate::repository_search::search_byte_cap() + 1
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/owner/repo/git/blobs/{blob}")))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let receipt = test_github(&server)
+            .search_repository_at_head(&head, repository_search_terms())
+            .await;
+        assert_eq!(receipt.state, RepositorySearchState::Exhausted);
+    }
+
+    #[tokio::test]
+    async fn repository_search_rejects_hostile_tree_paths_and_truncated_trees() {
+        use crate::envelope::RepositorySearchState;
+
+        for (entry_path, truncated) in [("../escape", false), ("safe", true)] {
+            let server = MockServer::start().await;
+            let head = "a".repeat(40);
+            let tree = "b".repeat(40);
+            let blob = "c".repeat(40);
+            Mock::given(method("GET"))
+                .and(path(format!("/repos/owner/repo/git/commits/{head}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "sha": head,
+                    "tree": {"sha": tree}
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/repos/owner/repo/git/trees/{tree}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "sha": tree,
+                    "truncated": truncated,
+                    "tree": [{
+                        "path": entry_path, "mode": "100644", "type": "blob", "sha": blob,
+                        "size": 1
+                    }]
+                })))
+                .mount(&server)
+                .await;
+
+            let receipt = test_github(&server)
+                .search_repository_at_head(&head, repository_search_terms())
+                .await;
+            assert_eq!(receipt.state, RepositorySearchState::Unavailable);
+        }
+    }
+
+    #[tokio::test]
+    async fn repository_search_with_zero_terms_makes_no_github_requests() {
+        use crate::envelope::RepositorySearchState;
+
+        let server = MockServer::start().await;
+        let receipt = test_github(&server)
+            .search_repository_at_head(&"a".repeat(40), vec![])
+            .await;
+
+        assert_eq!(receipt.state, RepositorySearchState::Unavailable);
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn repository_search_budget_enforces_request_object_and_deadline_caps() {
+        let mut requests = RepositorySearchBudget::new();
+        for _ in 0..crate::repository_search::github_request_cap() {
+            requests.charge_request().unwrap();
+        }
+        assert!(requests.charge_request().is_err());
+
+        let mut objects = RepositorySearchBudget::new();
+        objects
+            .charge_objects(crate::repository_search::github_object_cap())
+            .unwrap();
+        assert!(objects.charge_objects(1).is_err());
+
+        let mut expired = RepositorySearchBudget::new();
+        expired.started_at = Instant::now() - crate::repository_search::github_aggregate_deadline();
+        assert!(expired.remaining().is_err());
+    }
+
+    #[tokio::test]
+    async fn repository_search_reports_rate_limit_risk_as_exhausted() {
+        use crate::envelope::RepositorySearchState;
+
+        let server = MockServer::start().await;
+        let head = "a".repeat(40);
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/owner/repo/git/commits/{head}")))
+            .respond_with(ResponseTemplate::new(403).insert_header("x-ratelimit-remaining", "0"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let receipt = test_github(&server)
+            .search_repository_at_head(&head, repository_search_terms())
+            .await;
+        assert_eq!(receipt.state, RepositorySearchState::Exhausted);
+    }
+
+    #[test]
+    fn repository_rate_limit_risk_distinguishes_permission_failures() {
+        assert!(!github_repository_rate_limit_risk(
+            reqwest::StatusCode::FORBIDDEN,
+            &HeaderMap::new(),
+        ));
+        let mut limited = HeaderMap::new();
+        limited.insert("x-ratelimit-remaining", HeaderValue::from_static("0"));
+        assert!(github_repository_rate_limit_risk(
+            reqwest::StatusCode::OK,
+            &limited,
+        ));
     }
 
     async fn mount_current_delivery_snapshot(server: &MockServer) {
@@ -3082,6 +3808,7 @@ mod tests {
             generator_kind: None,
             scorer_kind: None,
             scorer_reason: None,
+            repository_claim: None,
             title: "Finding".into(),
             body: "A concrete issue.".into(),
             evidence: None,
@@ -3145,6 +3872,7 @@ mod tests {
             generator_kind: None,
             scorer_kind: None,
             scorer_reason: None,
+            repository_claim: None,
             title: "Finding".into(),
             body: "A concrete issue.".into(),
             evidence: None,
@@ -3223,6 +3951,7 @@ mod tests {
             generator_kind: None,
             scorer_kind: None,
             scorer_reason: None,
+            repository_claim: None,
             title: "Finding".into(),
             body: "A concrete issue.".into(),
             evidence: None,
@@ -3323,6 +4052,7 @@ mod tests {
             generator_kind: None,
             scorer_kind: None,
             scorer_reason: None,
+            repository_claim: None,
             title: "Finding".into(),
             body: "A concrete issue.".into(),
             evidence: None,
@@ -3409,6 +4139,7 @@ mod tests {
             generator_kind: None,
             scorer_kind: None,
             scorer_reason: None,
+            repository_claim: None,
             title: "Preserve the complete finding".into(),
             body: format!("{}.", "a".repeat(226)),
             evidence: Some("let vulnerable = true;".into()),
@@ -3437,6 +4168,7 @@ mod tests {
             model_incidents: vec![],
             review_coverage: None,
             review_admission: None,
+            repository_search: Default::default(),
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: Some("cccccccccccc".into()),
@@ -3575,6 +4307,7 @@ mod tests {
             generator_kind: None,
             scorer_kind: None,
             scorer_reason: None,
+            repository_claim: None,
             title: "Human judgment required".into(),
             body: "Concrete compatibility concern.".into(),
             evidence: None,
@@ -3603,6 +4336,7 @@ mod tests {
             model_incidents: vec![],
             review_coverage: None,
             review_admission: None,
+            repository_search: Default::default(),
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
@@ -3640,6 +4374,7 @@ mod tests {
             model_incidents: vec![],
             review_coverage: None,
             review_admission: None,
+            repository_search: Default::default(),
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
@@ -3669,6 +4404,7 @@ mod tests {
             generator_kind: None,
             scorer_kind: None,
             scorer_reason: None,
+            repository_claim: None,
             title: "rgwConfig may not be a recognized field".into(),
             body: "The chart may silently ignore this block.".into(),
             evidence: None,

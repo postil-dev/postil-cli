@@ -35,34 +35,7 @@ use crate::envelope::{Kind, Severity};
 const MODEL_DEFAULTS_TOML: &str = include_str!("../config.toml");
 const QUALIFIED_MODELS_JSON: &str = include_str!("../qualified-models.json");
 const PROVISIONAL_MODELS_JSON: &str = include_str!("../provisional-models.json");
-const REVIEW_CONTRACT_SOURCES: &[(&str, &str)] = &[
-    ("Cargo.toml", include_str!("../Cargo.toml")),
-    ("Cargo.lock", include_str!("../Cargo.lock")),
-    ("src/api_key.rs", include_str!("api_key.rs")),
-    ("src/cli.rs", include_str!("cli.rs")),
-    ("src/config.rs", include_str!("config.rs")),
-    ("src/doctor.rs", include_str!("doctor.rs")),
-    ("src/forge/azure.rs", include_str!("forge/azure.rs")),
-    ("src/forge/bitbucket.rs", include_str!("forge/bitbucket.rs")),
-    ("src/forge/github.rs", include_str!("forge/github.rs")),
-    ("src/forge/gitlab.rs", include_str!("forge/gitlab.rs")),
-    ("src/forge/mod.rs", include_str!("forge/mod.rs")),
-    ("src/hook.rs", include_str!("hook.rs")),
-    ("src/lib.rs", include_str!("lib.rs")),
-    ("src/local.rs", include_str!("local.rs")),
-    ("src/main.rs", include_str!("main.rs")),
-    ("src/output.rs", include_str!("output.rs")),
-    ("src/plan.rs", include_str!("plan.rs")),
-    ("src/prompt.rs", include_str!("prompt.rs")),
-    ("src/attribution.rs", include_str!("attribution.rs")),
-    ("src/llm.rs", include_str!("llm.rs")),
-    ("src/envelope.rs", include_str!("envelope.rs")),
-    ("src/respond.rs", include_str!("respond.rs")),
-    ("src/review.rs", include_str!("review.rs")),
-    ("src/sarif.rs", include_str!("sarif.rs")),
-    ("src/diff.rs", include_str!("diff.rs")),
-    ("src/filter.rs", include_str!("filter.rs")),
-];
+include!(concat!(env!("OUT_DIR"), "/review_contract_sources.rs"));
 const BENCH_FIXTURES_SOURCE: &str = include_str!("../bench/fixtures/cases.ts");
 const BENCH_PACKAGE_JSON: &str = include_str!("../bench/package.json");
 const BENCH_BUN_LOCK: &str = include_str!("../bench/bun.lock");
@@ -1096,6 +1069,8 @@ pub struct ContentPolicySection {
 impl Config {
     /// Resolve config for a repo root. `explicit` (from --config) bypasses discovery.
     pub fn load(root: &Path, explicit: Option<&Path>) -> Result<Config> {
+        #[cfg(test)]
+        let _environment_guard = tests::env_lock().lock().unwrap();
         let mut cfg = if let Some(path) = explicit {
             let mut c = Self::from_postil_file(path)
                 .with_context(|| format!("reading config {}", path.display()))?;
@@ -2103,7 +2078,7 @@ mod tests {
         }
     }
 
-    fn env_lock() -> &'static Mutex<()> {
+    pub(super) fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
     }
@@ -2928,6 +2903,53 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
             .collect::<Vec<_>>();
         assert_eq!(declared, embedded);
         assert!(declared.contains(&"bench/src/verify-admission.ts".to_string()));
+    }
+
+    #[test]
+    fn review_contract_manifest_covers_every_source_file_and_required_manifest() {
+        fn collect_review_sources(root: &Path, directory: &Path, paths: &mut Vec<String>) {
+            let mut entries = std::fs::read_dir(directory)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                let path = entry.path();
+                if path.is_dir() {
+                    collect_review_sources(root, &path, paths);
+                } else if path.is_file() {
+                    paths.push(
+                        path.strip_prefix(root)
+                            .unwrap()
+                            .to_str()
+                            .unwrap()
+                            .replace('\\', "/"),
+                    );
+                }
+            }
+        }
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut expected = vec![
+            "Cargo.lock".to_string(),
+            "Cargo.toml".to_string(),
+            "build.rs".to_string(),
+        ];
+        collect_review_sources(root, &root.join("src"), &mut expected);
+        expected.sort_unstable();
+
+        let declared: Vec<String> =
+            serde_json::from_str(include_str!("../bench/review-contract-sources.json")).unwrap();
+        let embedded = REVIEW_CONTRACT_PATHS
+            .iter()
+            .map(|path| (*path).to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(declared, expected);
+        assert_eq!(embedded, expected);
+        assert_eq!(
+            review_contract_sha256(),
+            sha256_named_sources(REVIEW_CONTRACT_SOURCES)
+        );
     }
 
     #[test]

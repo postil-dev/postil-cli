@@ -105,6 +105,15 @@ pub struct Finding {
     /// Short scorer rationale for confidence/kind calibration.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub scorer_reason: Option<String>,
+    /// Structured declaration for a finding whose conclusion depends on the
+    /// complete repository at the reviewed head. Fresh model output must
+    /// explicitly distinguish these claims from diff-local findings.
+    #[serde(
+        rename = "repositoryContext",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub repository_claim: Option<RepositoryClaim>,
     pub title: String,
     pub body: String,
     /// Exact new-side text canonicalized from the cited prompt line. This is
@@ -116,6 +125,154 @@ pub struct Finding {
     /// Hash of (head_sha, kind, normalized_path, normalized_line, normalized_title, duplicate_index).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RepositoryClaimKind {
+    Absence,
+    Mismatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositoryClaim {
+    #[serde(rename = "claim")]
+    pub kind: RepositoryClaimKind,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub versions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub identifiers: Vec<String>,
+}
+
+impl RepositoryClaim {
+    pub fn typed_values(&self) -> impl Iterator<Item = (RepositorySearchQueryKind, &str)> {
+        self.resources
+            .iter()
+            .map(|value| (RepositorySearchQueryKind::Resource, value.as_str()))
+            .chain(
+                self.values
+                    .iter()
+                    .map(|value| (RepositorySearchQueryKind::Value, value.as_str())),
+            )
+            .chain(
+                self.versions
+                    .iter()
+                    .map(|value| (RepositorySearchQueryKind::Version, value.as_str())),
+            )
+            .chain(
+                self.paths
+                    .iter()
+                    .map(|value| (RepositorySearchQueryKind::Path, value.as_str())),
+            )
+            .chain(
+                self.identifiers
+                    .iter()
+                    .map(|value| (RepositorySearchQueryKind::Identifier, value.as_str())),
+            )
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RepositorySearchState {
+    Complete,
+    #[default]
+    Unavailable,
+    Exhausted,
+}
+
+impl RepositorySearchState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Unavailable => "unavailable",
+            Self::Exhausted => "exhausted",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RepositorySearchQueryKind {
+    Resource,
+    Value,
+    Version,
+    Path,
+    Identifier,
+}
+
+impl RepositorySearchQueryKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Resource => "resource",
+            Self::Value => "value",
+            Self::Version => "version",
+            Self::Path => "path",
+            Self::Identifier => "identifier",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositorySearchQuery {
+    pub kind: RepositorySearchQueryKind,
+    pub query_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositorySearchMatch {
+    pub query_sha256: String,
+    pub path: String,
+    pub occurrences: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RepositorySearchEvidence {
+    pub path: String,
+    pub line: u32,
+    pub source: String,
+    pub query_sha256: Vec<String>,
+}
+
+/// Review-wide proof that repository-dependent claims were checked against one
+/// immutable head snapshot. The receipt records outcomes, never operational
+/// limit values or provider diagnostics that could leak into public output.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepositorySearchReceipt {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub head_sha: Option<String>,
+    pub state: RepositorySearchState,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tree_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queries: Vec<RepositorySearchQuery>,
+    #[serde(default)]
+    pub searched_blobs: u64,
+    #[serde(default)]
+    pub searched_bytes: u64,
+    #[serde(default)]
+    pub match_count: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matched_query_sha256: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub matches: Vec<RepositorySearchMatch>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub matches_truncated: bool,
+    #[serde(skip)]
+    pub(crate) evidence: Vec<RepositorySearchEvidence>,
+    #[serde(skip)]
+    pub(crate) evidence_truncated: bool,
 }
 
 pub const FINDING_PUBLIC_TITLE_MAX_CHARS: usize = 160;
@@ -194,6 +351,7 @@ pub fn forge_safe_finding_publication_text(finding: &Finding) -> FindingPublicat
 }
 
 pub fn validate_finding_publication(finding: &Finding) -> Result<(), String> {
+    validate_finding_public_language(finding)?;
     let title = &finding.title;
     if title.is_empty() || title.trim() != title {
         return Err("finding title must be non-empty without surrounding whitespace".to_string());
@@ -246,6 +404,284 @@ pub fn validate_finding_publication(finding: &Finding) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+pub(crate) fn validate_finding_public_language(finding: &Finding) -> Result<(), String> {
+    if publication_exposes_evidence_boundary(finding) {
+        return Err(
+            "finding text must state the concrete defect and correction without describing evidence-collection boundaries"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn publication_exposes_evidence_boundary(finding: &Finding) -> bool {
+    let prose = format!("{}. {}", finding.title, finding.body).to_ascii_lowercase();
+    prose_exposes_evidence_boundary(&prose)
+}
+
+fn prose_exposes_evidence_boundary(prose: &str) -> bool {
+    let prose = prose.to_ascii_lowercase();
+    [
+        "diff-grounded",
+        "grounded in the diff",
+        "in the diff",
+        "in this diff",
+        "the diff shows",
+        "this diff shows",
+        "the diff adds",
+        "this diff adds",
+        "the diff does not",
+        "this diff does not",
+        "the diff contains",
+        "this diff contains",
+        "supplied diff",
+        "provided diff",
+        "provided changes",
+        "supplied changes",
+        "available context",
+        "supplied context",
+    ]
+    .iter()
+    .any(|phrase| prose.contains(phrase))
+        || prose_delegates_evidence_collection(&prose)
+        || prose_exposes_review_artifact_boundary(&prose)
+}
+
+fn prose_delegates_evidence_collection(prose: &str) -> bool {
+    prose
+        .split(['.', '!', '?', ';', ':', '\n'])
+        .map(|clause| {
+            clause.trim_start_matches(|character: char| {
+                character.is_whitespace()
+                    || matches!(character, '-' | '*' | '+' | ')' | ']' | '`')
+                    || character.is_ascii_digit()
+            })
+        })
+        .filter(|clause| !clause.is_empty())
+        .any(|clause| {
+            let direct_search = clause.split(',').any(|segment| {
+                let segment = segment.trim_start();
+                [
+                    "search the repository",
+                    "search the codebase",
+                    "grep for ",
+                    "run rg ",
+                    "run `rg` ",
+                    "inspect the repository",
+                    "inspect the codebase",
+                ]
+                .iter()
+                .any(|phrase| segment.starts_with(phrase))
+            });
+            if direct_search {
+                return true;
+            }
+
+            let delegated = [
+                "please check",
+                "please confirm",
+                "please inspect",
+                "please search",
+                "please verify",
+                "you should check",
+                "you should confirm",
+                "you should inspect",
+                "you should search",
+                "you should verify",
+                "the author should check",
+                "the author should confirm",
+                "the author should inspect",
+                "the author should search",
+                "the author should verify",
+                "reviewers should check",
+                "reviewers should confirm",
+                "reviewers should inspect",
+                "reviewers should search",
+                "reviewers should verify",
+            ]
+            .iter()
+            .any(|phrase| clause.contains(phrase));
+            if delegated {
+                return true;
+            }
+
+            let investigative_scope = [
+                " caller",
+                " callers",
+                " consumer",
+                " consumers",
+                " counterpart",
+                " counterparts",
+                " repository",
+                " codebase",
+                " unchanged",
+                " other file",
+                " other manifest",
+                " whether",
+            ]
+            .iter()
+            .any(|marker| clause.contains(marker));
+            let imperative_investigation = clause.split(',').any(|segment| {
+                let segment = segment.trim_start();
+                [
+                    "check ",
+                    "confirm ",
+                    "inspect ",
+                    "verify ",
+                    "search for ",
+                    "look for ",
+                ]
+                .iter()
+                .any(|phrase| segment.starts_with(phrase))
+            });
+            investigative_scope && imperative_investigation
+        })
+}
+
+fn prose_exposes_review_artifact_boundary(prose: &str) -> bool {
+    let normalized = prose
+        .replace(['’', '‘'], "'")
+        .replace("doesn't", "does not")
+        .replace("didn't", "did not")
+        .replace("hasn't", "has not")
+        .replace("haven't", "have not")
+        .replace("isn't", "is not")
+        .replace("can't", "cannot")
+        .replace("couldn't", "could not")
+        .replace("shouldn't", "should not")
+        .replace("won't", "will not")
+        .replace("wouldn't", "would not");
+    normalized
+        .split(['.', '!', '?', ';', ':', '\n'])
+        .any(|clause| {
+            let words = clause
+                .split(|character: char| !character.is_ascii_alphanumeric())
+                .filter(|word| !word.is_empty())
+                .collect::<Vec<_>>();
+            if words.contains(&"changeset")
+                || words.windows(2).any(|pair| {
+                    pair == ["change", "set"]
+                        || pair == ["review", "input"]
+                        || pair == ["review", "material"]
+                })
+            {
+                return true;
+            }
+            let is_product_field = |word: Option<&str>| {
+                word.is_some_and(|word| {
+                    matches!(
+                        word,
+                        "api"
+                            | "body"
+                            | "description"
+                            | "document"
+                            | "endpoint"
+                            | "event"
+                            | "events"
+                            | "handler"
+                            | "metadata"
+                            | "media"
+                            | "method"
+                            | "number"
+                            | "operation"
+                            | "parser"
+                            | "request"
+                            | "response"
+                            | "representation"
+                            | "route"
+                            | "title"
+                            | "type"
+                            | "validation"
+                            | "webhook"
+                    )
+                })
+            };
+            let is_http_patch_field = |word: Option<&str>| {
+                word.is_some_and(|word| {
+                    matches!(
+                        word,
+                        "api"
+                            | "body"
+                            | "document"
+                            | "endpoint"
+                            | "handler"
+                            | "media"
+                            | "method"
+                            | "operation"
+                            | "request"
+                            | "response"
+                            | "representation"
+                            | "route"
+                            | "type"
+                            | "webhook"
+                    )
+                })
+            };
+            let artifact_suffix = |index: usize| {
+                let index = if words.get(index) == Some(&"s") {
+                    index + 1
+                } else {
+                    index
+                };
+                words.get(index).copied()
+            };
+            words.iter().enumerate().any(|(index, word)| {
+                let patch_product_context = *word == "patch"
+                    && (is_http_patch_field(artifact_suffix(index + 1))
+                        || words.get(index + 1).is_some_and(|next| {
+                            matches!(
+                                *next,
+                                "decoder"
+                                    | "encoder"
+                                    | "format"
+                                    | "level"
+                                    | "parser"
+                                    | "release"
+                                    | "series"
+                                    | "version"
+                            )
+                        })
+                        || words.get(index.wrapping_sub(1)).is_some_and(|previous| {
+                            matches!(
+                                *previous,
+                                "dependency"
+                                    | "http"
+                                    | "json"
+                                    | "kernel"
+                                    | "merge"
+                                    | "release"
+                                    | "security"
+                            )
+                        }));
+                let patch_artifact_context = *word == "patch"
+                    && !patch_product_context
+                    && (words.get(index + 1) == Some(&"s")
+                        || words.get(index.wrapping_sub(1)).is_some_and(|previous| {
+                            matches!(*previous, "a" | "current" | "the" | "this")
+                        })
+                        || words.get(index + 1).is_some_and(|next| {
+                            matches!(
+                                *next,
+                                "adds"
+                                    | "changes"
+                                    | "contains"
+                                    | "does"
+                                    | "includes"
+                                    | "omits"
+                                    | "shows"
+                                    | "updates"
+                            )
+                        }));
+                patch_artifact_context
+                    || (matches!(*word, "mr" | "pr")
+                        && !is_product_field(artifact_suffix(index + 1)))
+                    || (matches!(*word, "pull" | "merge")
+                        && words.get(index + 1) == Some(&"request")
+                        && !is_product_field(artifact_suffix(index + 2)))
+            })
+        })
 }
 
 /// Normalize presentation-only hazards in fresh model prose before admission.
@@ -494,6 +930,9 @@ pub enum SuppressionReason {
     /// suppressed as mis-anchored. It inherits the misreading and cannot stand
     /// on its own.
     DerivedFromSuppressed,
+    /// A repository-wide absence or mismatch claim was not supported by one
+    /// complete immutable-head receipt, or a positive counterexample refuted it.
+    RepositoryClaimUnsupported,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -831,7 +1270,7 @@ impl ReviewCoverage {
     }
 }
 
-/// Conservative hosted-provider exposure reserved before the first model call.
+/// Conservative logical hosted-provider exposure reserved before the first model call.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewAdmission {
@@ -888,6 +1327,10 @@ pub struct Envelope {
     /// plan. It is absent for BYOK and historical envelopes.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub review_admission: Option<ReviewAdmission>,
+    /// Complete-head repository search performed for structured absence and
+    /// mismatch claims. Historical v1 envelopes deserialize as unavailable.
+    #[serde(default)]
+    pub repository_search: RepositorySearchReceipt,
     /// False when any sent provider request can have unknown billed usage,
     /// including timeouts and ambiguous transport failures.
     #[serde(default)]
@@ -1011,7 +1454,7 @@ pub(crate) enum IncompleteReviewReason {
 pub(crate) fn incomplete_review_finding(reason: IncompleteReviewReason) -> Finding {
     let body = match reason {
         IncompleteReviewReason::IncompleteInput => {
-            "Postil could not acquire complete review input, so no clean verdict was issued. Retry after the forge can supply a complete immutable change."
+            "Postil could not acquire the complete immutable change from the forge, so no clean verdict was issued. Retry after the forge can supply it."
         }
         IncompleteReviewReason::ReservedInput => {
             "The change uses a path reserved for Postil's synthetic review evidence, so repository content cannot be separated safely from operational findings. No clean verdict was issued. Rename the conflicting path before retrying."
@@ -1039,12 +1482,18 @@ pub(crate) fn incomplete_review_finding(reason: IncompleteReviewReason) -> Findi
         generator_kind: None,
         scorer_kind: None,
         scorer_reason: None,
+        repository_claim: None,
     }
 }
 
 /// The synthetic finding emitted when the model produced unusable output.
 /// Postil fails closed: a review that could not be trusted is an error, not a pass.
 pub fn fail_closed_finding(detail: &str) -> Finding {
+    let detail = if prose_exposes_evidence_boundary(detail) {
+        "The model response did not satisfy the evidence-validation contract."
+    } else {
+        detail
+    };
     Finding {
         path: OPERATIONAL_PATH.to_string(),
         line: 1,
@@ -1054,8 +1503,8 @@ pub fn fail_closed_finding(detail: &str) -> Finding {
         confidence: 1.0,
         title: "Model output could not be validated".to_string(),
         body: format!(
-            "Postil could not obtain a valid, diff-grounded review from the configured \
-             model(s) and is failing closed rather than passing unreviewed code.\n\nDetail: {detail}"
+            "Postil could not validate the configured model response against cited code \
+             evidence. No clean verdict was issued.\n\nDetail: {detail}"
         ),
         evidence: None,
         id: None,
@@ -1064,6 +1513,42 @@ pub fn fail_closed_finding(detail: &str) -> Finding {
         generator_kind: None,
         scorer_kind: None,
         scorer_reason: None,
+        repository_claim: None,
+    }
+}
+
+/// The synthetic finding emitted when the model narrated merge-relevant risk
+/// in its summary while reporting zero structured findings. The contradiction
+/// means the output cannot be trusted as a pass; the narration is preserved so
+/// the concern is not silently dropped. Uses OPERATIONAL_PATH: a malicious
+/// diff can induce this shape via prompt injection, so it never bypasses the
+/// gate.
+pub fn narrated_risk_finding(summary: &str) -> Finding {
+    let quoted: String = summary.lines().map(|l| format!("> {l}\n")).collect();
+    Finding {
+        path: OPERATIONAL_PATH.to_string(),
+        line: 1,
+        end_line: None,
+        severity: Severity::Error,
+        kind: Kind::Uncertainty,
+        confidence: 1.0,
+        title: "Model narrated risk without structured findings".to_string(),
+        body: format!(
+            "The model's summary describes merge-relevant risk but it reported no \
+             structured findings, so the review cannot be trusted as a pass. Postil is \
+             failing closed instead of posting a clean status above contradictory prose.\n\n\
+             Narrated summary:\n\n{quoted}\n\
+             Re-run the review. If the contradiction persists, keep the gate failed and \
+             obtain an independent review before merging."
+        ),
+        evidence: None,
+        id: None,
+        generator_confidence: None,
+        scorer_confidence: None,
+        generator_kind: None,
+        scorer_kind: None,
+        scorer_reason: None,
+        repository_claim: None,
     }
 }
 
@@ -1087,6 +1572,7 @@ pub fn provider_error_finding(_detail: &str) -> Finding {
         generator_kind: None,
         scorer_kind: None,
         scorer_reason: None,
+        repository_claim: None,
     }
 }
 
@@ -1099,7 +1585,7 @@ mod tests {
         let cases = [
             (
                 IncompleteReviewReason::IncompleteInput,
-                "complete review input",
+                "complete immutable change",
             ),
             (IncompleteReviewReason::ReservedInput, "path reserved"),
             (
@@ -1117,6 +1603,134 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fail_closed_finding_uses_concrete_evidence_validation_language() {
+        let finding = fail_closed_finding(
+            "model reported 2 finding(s) without a valid code-evidence citation.",
+        );
+        assert_eq!(
+            finding.body,
+            "Postil could not validate the configured model response against cited code evidence. No clean verdict was issued.\n\nDetail: model reported 2 finding(s) without a valid code-evidence citation."
+        );
+        assert_eq!(validate_finding_public_language(&finding), Ok(()));
+        assert_eq!(validate_finding_publication(&finding), Ok(()));
+    }
+
+    #[test]
+    fn fail_closed_finding_neutralizes_evidence_boundary_details() {
+        let finding = fail_closed_finding("none grounded in the diff");
+        assert_eq!(
+            finding.body,
+            "Postil could not validate the configured model response against cited code evidence. No clean verdict was issued.\n\nDetail: The model response did not satisfy the evidence-validation contract."
+        );
+        assert_eq!(validate_finding_public_language(&finding), Ok(()));
+        assert_eq!(validate_finding_publication(&finding), Ok(()));
+    }
+
+    #[test]
+    fn publication_rejects_review_material_synonyms() {
+        let bodies = [
+            "The patch does not demonstrate that the guard runs before execution; move it above `exec()`.",
+            "This changeset shows only the call; restore the authorization guard.",
+            "The pull request does not contain the required deny rule; add it last.",
+            "The merge request does not contain the required deny rule; add it last.",
+            "The MR does not contain the required deny rule; add it last.",
+            "The PR does not show the matching deployment update; align the versions.",
+            "The PR includes only the call; restore the authorization guard.",
+            "The PR omits unchanged callers; preserve their contract.",
+            "The pull-request doesn't show callers; preserve their contract.",
+            "The change-set doesn't contain the required guard.",
+            "The review-material can't establish ordering.",
+            "A current patch doesn't show the deployment update.",
+            "The patch's description omits rollback steps; add them.",
+            "The patch’s description omits rollback steps; add them.",
+            "The PR updates only the backup image while CephCluster remains on v19.2.3.",
+        ];
+
+        for body in bodies {
+            let mut finding = finding(Severity::Warn, 0.9);
+            finding.body = body.into();
+            assert!(
+                publication_exposes_evidence_boundary(&finding),
+                "body: {body}"
+            );
+            assert!(
+                validate_finding_publication(&finding).is_err(),
+                "body: {body}"
+            );
+            let safe = forge_safe_finding_publication_text(&finding);
+            assert!(!safe.body.to_ascii_lowercase().contains("patch"));
+            let mut projected = finding.clone();
+            projected.title = safe.title;
+            projected.body = safe.body;
+            assert_eq!(validate_finding_publication(&projected), Ok(()));
+        }
+    }
+
+    #[test]
+    fn publication_allows_pull_request_product_fields() {
+        let bodies = [
+            "The PR description does not mention rollback steps; add them.",
+            "The PR's description does not mention rollback steps; add them.",
+            "The PR’s description does not mention rollback steps; add them.",
+            "Add the compatibility impact to the pull request description.",
+            "The pull request webhook accepts an unsigned payload; verify its signature first.",
+            "The pull request's webhook accepts an unsigned payload; verify its signature first.",
+            "The HTTP PATCH handler accepts an unsigned payload; verify its signature first.",
+            "The HTTP PATCH request accepts an unsigned payload; verify its signature first.",
+            "The JSON Patch encoder drops null values; preserve explicit removals.",
+            "The patch release changes persisted state without migrating it; add the migration.",
+            "The security patch omits the certificate check; restore it.",
+            "The patch parser drops null values; preserve explicit removals.",
+        ];
+
+        for body in bodies {
+            let mut finding = finding(Severity::Warn, 0.9);
+            finding.body = body.into();
+            assert!(
+                !publication_exposes_evidence_boundary(&finding),
+                "body: {body}"
+            );
+            assert_eq!(
+                validate_finding_publication(&finding),
+                Ok(()),
+                "body: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn publication_distinguishes_product_verification_from_delegated_search_work() {
+        let allowed = [
+            "The TLS path does not verify that the certificate matches the host; compare the SAN before accepting it.",
+            "The database search for active users omits the tenant predicate; bind `tenant_id` in the query.",
+            "The handler should confirm that the signature covers the raw body before parsing it.",
+            "The caller does not verify the response signature; validate it before use.",
+            "The handler cannot search the repository after pagination; preserve the index cursor.",
+            "The search limit is applied before tenant filtering; apply the tenant predicate first.",
+            "Search for active users crosses tenant boundaries because the query omits `tenant_id`.",
+        ];
+        for body in allowed {
+            let mut finding = finding(Severity::Warn, 0.9);
+            finding.body = body.into();
+            assert_eq!(validate_finding_publication(&finding), Ok(()), "{body}");
+        }
+
+        let rejected = [
+            "Search the repository for other callers before changing this API.",
+            "Please verify that the unchanged consumer accepts this value.",
+            "Check whether another manifest still uses version 19.2.3.",
+            "Before merging, search the codebase for other callers.",
+            "Inspect other callers before merging.",
+            "Reviewers should verify the unchanged consumer.",
+        ];
+        for body in rejected {
+            let mut finding = finding(Severity::Warn, 0.9);
+            finding.body = body.into();
+            assert!(validate_finding_publication(&finding).is_err(), "{body}");
+        }
+    }
+
     fn finding(sev: Severity, conf: f64) -> Finding {
         Finding {
             path: "a.rs".into(),
@@ -1130,6 +1744,7 @@ mod tests {
             generator_kind: None,
             scorer_kind: None,
             scorer_reason: None,
+            repository_claim: None,
             title: "t".into(),
             body: "b".into(),
             evidence: None,
@@ -1336,6 +1951,19 @@ mod tests {
 
     #[test]
     fn envelope_serializes_camel_case() {
+        let mut contextual_finding = finding(Severity::Warn, 0.8);
+        contextual_finding.repository_claim = Some(RepositoryClaim {
+            kind: RepositoryClaimKind::Absence,
+            resources: vec![],
+            values: vec![],
+            versions: vec!["19.2.5".into()],
+            paths: vec![],
+            identifiers: vec![],
+        });
+        let contextual_value = serde_json::to_value(&contextual_finding).unwrap();
+        assert_eq!(contextual_value["repositoryContext"]["claim"], "absence");
+        assert!(contextual_value.get("repositoryClaim").is_none());
+
         let mut env = Envelope {
             version: 1,
             summary: String::new(),
@@ -1359,6 +1987,7 @@ mod tests {
             model_incidents: vec![],
             review_coverage: None,
             review_admission: None,
+            repository_search: RepositorySearchReceipt::default(),
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
@@ -1379,6 +2008,7 @@ mod tests {
         assert_eq!(v["modelIncidents"][0]["phase"], "scorer");
         assert_eq!(v["modelIncidents"][0]["category"], "invalidOutput");
         assert_eq!(v["modelIncidents"][0]["recovery"], "repair");
+        assert_eq!(v["repositorySearch"]["state"], "unavailable");
 
         env.review_coverage = Some(ReviewCoverage {
             mode: ReviewCoverageMode::Bounded,
@@ -1397,8 +2027,16 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("reviewCoverage");
+        with_coverage
+            .as_object_mut()
+            .unwrap()
+            .remove("repositorySearch");
         let historical: Envelope = serde_json::from_value(with_coverage).unwrap();
         assert!(historical.review_coverage.is_none());
+        assert_eq!(
+            historical.repository_search.state,
+            RepositorySearchState::Unavailable
+        );
 
         v.as_object_mut().unwrap().remove("modelIncidents");
         let decoded: Envelope = serde_json::from_value(v).unwrap();
