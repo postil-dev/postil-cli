@@ -519,7 +519,8 @@ async fn run_local(args: &ReviewArgs, cfg: &Config, repo_root: &Path) -> Result<
             trust: filter::ReviewTrust::Failed,
         }
     };
-    let envelope = review_diff(
+    let review_started = std::time::Instant::now();
+    let result = review_diff(
         cfg,
         args,
         ReviewInput {
@@ -539,7 +540,20 @@ async fn run_local(args: &ReviewArgs, cfg: &Config, repo_root: &Path) -> Result<
             },
         },
     )
-    .await?;
+    .await;
+    let envelope = match result {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            eprintln!("postil: review failed before completion ({error:#})");
+            error_envelope(
+                cfg,
+                &error,
+                head_sha.as_deref().unwrap_or("local-review"),
+                None,
+                review_started.elapsed().as_millis() as u64,
+            )
+        }
+    };
     finish(args, cfg, envelope, None::<&GitHub>, None, None, false).await
 }
 
@@ -689,7 +703,7 @@ async fn run_remote<F: Forge>(
                 cfg,
                 &e,
                 &head_sha,
-                &meta,
+                Some(&meta),
                 review_started.elapsed().as_millis() as u64,
             );
             let check_completion = if let Some((a, g)) = &checks {
@@ -2097,7 +2111,7 @@ async fn review_diff_at(
                         if full_rereview {
                             for (index, previous) in baseline.iter().enumerate() {
                                 let applicable =
-                                    !crate::envelope::is_ephemeral_anchor(&previous.path)
+                                    !crate::envelope::is_reserved_anchor(&previous.path)
                                         && !kept
                                             .iter()
                                             .any(|fresh| same_visible_finding(fresh, previous));
@@ -2212,7 +2226,7 @@ async fn review_diff_at(
                                 &diff_receipt,
                                 receipt,
                             );
-                            let application = match application {
+                            let mut application = match application {
                                 Ok(application) => application,
                                 Err(error) => {
                                     model_incidents.push(ModelIncident {
@@ -2240,6 +2254,24 @@ async fn review_diff_at(
                                     .into());
                                 }
                             };
+                            // A truncated direct-evidence query set cannot support a
+                            // publication-ready adjudication. Keep the private
+                            // suppression record, but do not let a candidate survive
+                            // merely because the model confirmed it from a partial
+                            // corpus.
+                            if !diff_receipt.queries_complete
+                                || !diff_receipt.matching_windows_complete
+                            {
+                                application.suppressed.extend(
+                                    std::mem::take(&mut application.kept).into_iter().map(
+                                        |finding| SuppressedFinding {
+                                            finding,
+                                            reason: SuppressionReason::NonActionable,
+                                        },
+                                    ),
+                                );
+                                application.kept_indices.clear();
+                            }
                             debug_assert!(application.kept_indices.iter().all(|index| *index
                                 < fresh_candidate_count + baseline_candidate_indices.len()));
                             for candidate_index in &application.resolved_indices {
@@ -2382,7 +2414,7 @@ async fn review_diff_at(
     {
         let mut durable_baseline = Vec::with_capacity(baseline.len());
         for finding in baseline {
-            if crate::envelope::is_ephemeral_anchor(&finding.path) {
+            if crate::envelope::is_reserved_anchor(&finding.path) {
                 suppressed = suppressed.saturating_add(1);
                 suppressed_findings.push(SuppressedFinding {
                     finding,
@@ -2406,6 +2438,20 @@ async fn review_diff_at(
             .await
         }
     };
+    // An incremental review cannot prove a baseline claim resolved from an
+    // omitted diff alone. A complete, head-pinned repository receipt that
+    // refutes the claim is authoritative, however. Retire only that exact
+    // case; unavailable or incomplete receipts leave the baseline for normal
+    // carry-forward reconciliation.
+    if matches!(scope, filter::ReconcileScope::Incremental { .. }) {
+        let (retained, retired) = retire_incrementally_refuted_baseline(
+            baseline,
+            &repository_search,
+            repository_revision.as_deref().unwrap_or_default(),
+        );
+        baseline = retained;
+        adjudication_resolved.extend(retired);
+    }
     let repository_suppressed =
         crate::repository_search::enforce_receipt(&mut findings, &repository_search);
     suppressed = suppressed.saturating_add(repository_suppressed.len() as u32);
@@ -2755,6 +2801,27 @@ fn baseline_has_carryable_findings(findings: &[Finding]) -> bool {
         .any(|finding| !crate::envelope::is_ephemeral_anchor(&finding.path))
 }
 
+fn retire_incrementally_refuted_baseline(
+    baseline: Vec<Finding>,
+    receipt: &crate::envelope::RepositorySearchReceipt,
+    snapshot_id: &str,
+) -> (Vec<Finding>, Vec<Finding>) {
+    let mut retained = Vec::with_capacity(baseline.len());
+    let mut retired = Vec::new();
+    for finding in baseline {
+        let refuted = finding.repository_claim.as_ref().is_some_and(|claim| {
+            crate::repository_search::claim_verdict(claim, receipt, snapshot_id)
+                == crate::repository_search::RepositoryClaimVerdict::Refuted
+        });
+        if refuted {
+            retired.push(finding);
+        } else {
+            retained.push(finding);
+        }
+    }
+    (retained, retired)
+}
+
 fn same_visible_finding(a: &Finding, b: &Finding) -> bool {
     a.path == b.path
         && a.line == b.line
@@ -2776,7 +2843,7 @@ fn error_envelope(
     cfg: &Config,
     err: &anyhow::Error,
     head_sha: &str,
-    meta: &PrMeta,
+    meta: Option<&PrMeta>,
     duration_ms: u64,
 ) -> Envelope {
     let incomplete_input = crate::forge::is_incomplete_review_input(err);
@@ -2863,7 +2930,7 @@ fn error_envelope(
         usage_accounting_complete: review_failure
             .is_none_or(|failure| failure.usage_accounting_complete),
         duration_ms,
-        base_sha: Some(meta.base_sha.clone()),
+        base_sha: meta.map(|value| value.base_sha.clone()),
         head_sha: Some(head_sha.to_string()),
         since_sha: None,
     }
@@ -2964,7 +3031,10 @@ mod tests {
         assert!(!scorer_failure_blocks_hosted(true, false));
         assert!(!scorer_failure_blocks_hosted(false, true));
     }
-    use crate::envelope::{Kind, Severity};
+    use crate::envelope::{
+        Kind, RepositoryClaim, RepositoryClaimKind, RepositorySearchMatch, RepositorySearchQuery,
+        RepositorySearchReceipt, RepositorySearchState, Severity,
+    };
 
     fn pr_meta() -> PrMeta {
         PrMeta {
@@ -2988,7 +3058,7 @@ mod tests {
             &cfg,
             &anyhow::anyhow!("provider unavailable"),
             "head",
-            &pr_meta(),
+            Some(&pr_meta()),
             1,
         );
         assert!(!envelope.gate.failing);
@@ -3073,7 +3143,7 @@ mod tests {
             ..Config::default()
         };
         let error = rich_scorer_failure(ReviewFailureKind::InvalidOutput);
-        let envelope = error_envelope(&cfg, &error, "head", &pr_meta(), 99);
+        let envelope = error_envelope(&cfg, &error, "head", Some(&pr_meta()), 99);
         assert_eq!(envelope.findings[0].path, crate::envelope::OPERATIONAL_PATH);
         assert!(envelope.gate.failing);
         assert_eq!(envelope.model_used, "generator-model");
@@ -3105,7 +3175,7 @@ mod tests {
             ..Config::default()
         };
         let error = rich_scorer_failure(ReviewFailureKind::Provider);
-        let envelope = error_envelope(&cfg, &error, "head", &pr_meta(), 99);
+        let envelope = error_envelope(&cfg, &error, "head", Some(&pr_meta()), 99);
         assert_eq!(envelope.findings[0].path, crate::envelope::PROVIDER_PATH);
         assert!(!envelope.gate.failing);
         assert_eq!(envelope.model_usage.len(), 2);
@@ -3119,7 +3189,7 @@ mod tests {
             ..Config::default()
         };
         let error = anyhow::anyhow!("complete hosted review exceeds its watchdog plan");
-        let envelope = error_envelope(&cfg, &error, "head", &pr_meta(), 1);
+        let envelope = error_envelope(&cfg, &error, "head", Some(&pr_meta()), 1);
         assert_eq!(envelope.findings[0].path, crate::envelope::OPERATIONAL_PATH);
         assert!(envelope.gate.failing);
         assert!(envelope.summary.contains("failing closed"));
@@ -3147,7 +3217,13 @@ mod tests {
             gate_on_error: OnError::Advisory,
             ..Config::default()
         };
-        let envelope = error_envelope(&cfg, &rich_scorer_failure(kind), "head", &pr_meta(), 99);
+        let envelope = error_envelope(
+            &cfg,
+            &rich_scorer_failure(kind),
+            "head",
+            Some(&pr_meta()),
+            99,
+        );
         assert_eq!(envelope.findings[0].path, crate::envelope::OPERATIONAL_PATH);
         assert!(envelope.gate.failing);
 
@@ -3172,7 +3248,7 @@ mod tests {
             ..Config::default()
         };
         let error = crate::forge::classify_review_input_error(anyhow::anyhow!("invalid diff"));
-        let envelope = error_envelope(&cfg, &error, "head", &pr_meta(), 1);
+        let envelope = error_envelope(&cfg, &error, "head", Some(&pr_meta()), 1);
         assert!(!envelope.gate.failing);
         assert!(envelope.summary.contains("merge gate is disabled"));
     }
@@ -3402,6 +3478,66 @@ mod tests {
         assert!(!baseline_has_carryable_findings(&[
             crate::envelope::provider_error_finding("fixture provider failure"),
         ]));
+    }
+
+    #[test]
+    fn incremental_repository_refutation_retires_only_complete_baseline_claims() {
+        let snapshot_id = "a".repeat(40);
+        let claim = RepositoryClaim {
+            kind: RepositoryClaimKind::Absence,
+            resources: vec!["widget".into()],
+            values: vec![],
+            versions: vec!["2.0".into()],
+            paths: vec![],
+            identifiers: vec![],
+        };
+        let terms = crate::repository_search::search_terms(std::iter::once(&claim)).unwrap();
+        let query_hashes = terms
+            .iter()
+            .map(|term| term.query_sha256.clone())
+            .collect::<Vec<_>>();
+        let receipt = RepositorySearchReceipt {
+            head_sha: Some(snapshot_id.clone()),
+            state: RepositorySearchState::Complete,
+            tree_sha256: Some("b".repeat(64)),
+            queries: terms
+                .iter()
+                .map(|term| RepositorySearchQuery {
+                    kind: term.kind,
+                    query_sha256: term.query_sha256.clone(),
+                })
+                .collect(),
+            searched_blobs: 1,
+            searched_bytes: 16,
+            match_count: query_hashes.len() as u64,
+            matched_query_sha256: query_hashes.clone(),
+            matches: query_hashes
+                .iter()
+                .map(|query_sha256| RepositorySearchMatch {
+                    query_sha256: query_sha256.clone(),
+                    path: "src/dependencies.txt".into(),
+                    occurrences: 1,
+                })
+                .collect(),
+            matches_truncated: false,
+        };
+        let mut finding = finding("src/db.rs", 10, "missing widget");
+        finding.repository_claim = Some(claim);
+
+        let (retained, retired) =
+            retire_incrementally_refuted_baseline(vec![finding.clone()], &receipt, &snapshot_id);
+        assert!(retained.is_empty());
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].title, finding.title);
+
+        let (retained, retired) = retire_incrementally_refuted_baseline(
+            vec![finding.clone()],
+            &RepositorySearchReceipt::default(),
+            &snapshot_id,
+        );
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].title, finding.title);
+        assert!(retired.is_empty());
     }
 
     fn score(index: usize, confidence: f64, kind: Kind) -> FindingScore {

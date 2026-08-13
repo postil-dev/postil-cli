@@ -1058,7 +1058,7 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
             !matches!(
                 suppressed.reason,
                 SuppressionReason::Ignored | SuppressionReason::RepositoryClaimUnsupported
-            )
+            ) && !crate::envelope::is_ephemeral_anchor(&suppressed.finding.path)
         })
         .collect();
     let disclosed: Vec<_> = eligible.iter().take(5).copied().collect();
@@ -1500,6 +1500,25 @@ mod tests {
         let summary = check_summary(&env, true, Default::default());
         assert!(!summary.contains("Private repository claim"));
         assert!(!summary.contains("Repository-only detail"));
+        assert_eq!(env.suppressed_findings.len(), 1);
+    }
+
+    #[test]
+    fn public_summary_omits_suppressed_ephemeral_findings() {
+        let mut env = envelope_with_findings(vec![]);
+        let mut operational = crate::envelope::fail_closed_finding("private model detail");
+        operational.title = "Private operational title".into();
+        operational.body = "Private operational detail that must remain diagnostic.".into();
+        env.suppressed_findings
+            .push(crate::envelope::SuppressedFinding {
+                finding: operational,
+                reason: SuppressionReason::NonActionable,
+            });
+
+        let summary = check_summary(&env, true, Default::default());
+
+        assert!(!summary.contains("Private operational title"));
+        assert!(!summary.contains("Private operational detail"));
         assert_eq!(env.suppressed_findings.len(), 1);
     }
 

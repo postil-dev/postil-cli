@@ -2545,8 +2545,16 @@ async fn prompt_injection_all_refuted_adjudication_cannot_clean_the_gate() {
         .assert()
         .code(1);
     let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["version"], 1);
+    assert_eq!(envelope["silent"], false);
     assert_eq!(envelope["gate"]["failing"], true);
-    assert_eq!(envelope["findings"][0]["path"], ".postil/operational");
+    assert_eq!(envelope["findings"][0]["path"], ".postil/model-output");
+    assert!(
+        envelope["summary"]
+            .as_str()
+            .unwrap()
+            .contains("failing closed")
+    );
 }
 
 #[tokio::test]
@@ -10393,6 +10401,51 @@ async fn incremental_review_resolves_and_carries_baseline_findings() {
     );
     assert_eq!(env["gate"]["failing"], true);
     assert_eq!(env["sinceSha"], "abc123");
+}
+
+#[tokio::test]
+async fn incremental_unavailable_repository_receipt_carries_baseline_claim() {
+    let server = MockServer::start().await;
+    mock_review(&server, json!([])).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let baseline = json!({
+        "version": 1, "summary": "", "silent": false,
+        "findings": [{
+            "path": "src/db.rs", "line": 10, "severity": "error", "kind": "risk",
+            "confidence": 0.9, "title": "Widget dependency is absent",
+            "body": "The repository does not contain widget version 2.0.",
+            "repositoryContext": {"claim": "absence", "resources": ["widget"], "versions": ["2.0"]}
+        }],
+        "resolved": [], "counts": {"info": 0, "warn": 0, "error": 1, "suppressed": 0},
+        "confidenceBuckets": [0,0,0,0,1],
+        "gate": {"failOn": "error", "failing": true},
+        "modelUsed": "m", "usage": {"promptTokens": 0, "completionTokens": 0},
+        "baseSha": null, "headSha": null, "sinceSha": null
+    });
+    let baseline_path = dir.path().join("baseline.json");
+    std::fs::write(&baseline_path, baseline.to_string()).unwrap();
+
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--since-sha", "previous", "--baseline"])
+        .arg(&baseline_path)
+        .args(["--output", "json"])
+        .assert()
+        .code(1);
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["resolved"], json!([]));
+    assert!(
+        envelope["findings"][0]["body"]
+            .as_str()
+            .unwrap()
+            .starts_with("[carried from previous review]")
+    );
+    assert_eq!(envelope["repositorySearch"]["state"], "unavailable");
 }
 
 #[tokio::test]
