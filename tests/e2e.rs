@@ -2381,6 +2381,72 @@ fn write_diff(dir: &std::path::Path) -> std::path::PathBuf {
     p
 }
 
+fn initialize_staged_repository(dir: &std::path::Path) {
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(dir)
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    let base = (1..=40)
+        .map(|line| format!("let context_{line} = ();\n"))
+        .collect::<String>();
+    std::fs::write(dir.join("src/auth.rs"), &base).unwrap();
+    let deep_path = (0..=256).fold(dir.to_path_buf(), |path, _| path.join("d"));
+    std::fs::create_dir_all(&deep_path).unwrap();
+    std::fs::write(deep_path.join("limit.txt"), "repository traversal limit\n").unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(dir)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let tree = std::process::Command::new("git")
+        .args(["write-tree"])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(tree.status.success());
+    let tree_id = String::from_utf8(tree.stdout).unwrap();
+    let commit = std::process::Command::new("git")
+        .args(["commit-tree", tree_id.trim(), "-m", "fixture"])
+        .env("GIT_AUTHOR_NAME", "Fixture")
+        .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Fixture")
+        .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(commit.status.success());
+    let commit_id = String::from_utf8(commit.stdout).unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["update-ref", "HEAD", commit_id.trim()])
+            .current_dir(dir)
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::write(
+        dir.join("src/auth.rs"),
+        format!("{base}let token = format!(\"{{}}\", user_input);\nexec_query(&token);\n"),
+    )
+    .unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["add", "src/auth.rs"])
+            .current_dir(dir)
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
 fn parse_csv_rows(csv: &str) -> Vec<BTreeMap<String, String>> {
     let mut reader = csv::Reader::from_reader(csv.as_bytes());
     let headers = reader.headers().unwrap().clone();
@@ -10446,6 +10512,192 @@ async fn incremental_unavailable_repository_receipt_carries_baseline_claim() {
             .starts_with("[carried from previous review]")
     );
     assert_eq!(envelope["repositorySearch"]["state"], "unavailable");
+}
+
+#[tokio::test]
+async fn full_rereview_preserves_unresolved_baseline_for_unavailable_and_exhausted_receipts() {
+    for (name, repository, resources, state) in [
+        (
+            "unavailable",
+            false,
+            vec!["widget".to_string()],
+            "unavailable",
+        ),
+        ("exhausted", true, vec!["widget".to_string()], "exhausted"),
+    ] {
+        let server = MockServer::start().await;
+        mock_review(&server, json!([])).await;
+        let dir = tempfile::tempdir().unwrap();
+        if repository {
+            initialize_staged_repository(dir.path());
+        }
+        let diff = write_diff(dir.path());
+        let baseline = json!({
+            "version": 1, "summary": "", "silent": false,
+            "findings": [
+                {
+                    "path": "src/auth.rs", "line": 42, "severity": "error", "kind": "risk",
+                    "confidence": 0.9, "title": "Widget dependency is absent",
+                    "body": "The repository does not contain the required widget dependency.",
+                    "evidence": "exec_query(&token);",
+                    "repositoryContext": {"claim": "absence", "resources": resources}
+                },
+                {
+                    "path": "src/other.rs", "line": 10, "severity": "error", "kind": "risk",
+                    "confidence": 0.9, "title": "Unchanged widget dependency is absent",
+                    "body": "The unchanged component requires the missing widget dependency.",
+                    "evidence": "use widget::Client;",
+                    "repositoryContext": {"claim": "absence", "resources": ["widget"]}
+                }
+            ],
+            "resolved": [], "counts": {"info": 0, "warn": 0, "error": 2, "suppressed": 0},
+            "confidenceBuckets": [0,0,0,0,2],
+            "gate": {"failOn": "error", "failing": true},
+            "modelUsed": "m", "usage": {"promptTokens": 0, "completionTokens": 0},
+            "baseSha": null, "headSha": null, "sinceSha": null
+        });
+        let baseline_path = dir.path().join(format!("{name}-baseline.json"));
+        std::fs::write(&baseline_path, baseline.to_string()).unwrap();
+
+        let mut command = postil();
+        command
+            .current_dir(dir.path())
+            .env("POSTIL_API_BASE", server.uri())
+            .env("POSTIL_DISABLE_SCORER", "1")
+            .arg("review");
+        if repository {
+            command.arg("--staged");
+        } else {
+            command.arg("--diff-file").arg(&diff);
+        }
+        command
+            .arg("--baseline")
+            .arg(&baseline_path)
+            .args(["--output", "json"]);
+        let out = command.assert().code(1);
+        let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+        assert_eq!(envelope["repositorySearch"]["state"], state, "{name}");
+        assert_eq!(envelope["resolved"], json!([]), "{name}");
+        assert_eq!(envelope["counts"]["suppressed"], 0, "{name}");
+        let titles = envelope["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|finding| finding["title"].as_str().unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            titles,
+            std::collections::BTreeSet::from([
+                "Unchanged widget dependency is absent",
+                "Widget dependency is absent",
+            ]),
+            "{name}"
+        );
+        assert_eq!(envelope["gate"]["failing"], true, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn fresh_repository_claims_remain_open_for_unavailable_and_exhausted_receipts() {
+    for (name, repository, resources, state) in [
+        (
+            "unavailable",
+            false,
+            vec!["widget".to_string()],
+            "unavailable",
+        ),
+        ("exhausted", true, vec!["widget".to_string()], "exhausted"),
+    ] {
+        let server = MockServer::start().await;
+        mock_review(
+            &server,
+            json!([{
+                "path": "src/auth.rs", "line": 42, "severity": "error", "kind": "risk",
+                "confidence": 0.99, "title": "Widget dependency is absent",
+                "body": "The repository does not contain the required widget dependency.",
+                "evidence": "exec_query(&token);",
+                "repositoryContext": {"claim": "absence", "resources": resources}
+            }]),
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        if repository {
+            initialize_staged_repository(dir.path());
+        }
+        let diff = write_diff(dir.path());
+        let mut command = postil();
+        command
+            .current_dir(dir.path())
+            .env("POSTIL_API_BASE", server.uri())
+            .env("POSTIL_DISABLE_SCORER", "1")
+            .arg("review");
+        if repository {
+            command.arg("--staged");
+        } else {
+            command.arg("--diff-file").arg(&diff);
+        }
+        command.args(["--output", "json"]);
+        let out = command.assert().code(1);
+        let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+        assert_eq!(envelope["repositorySearch"]["state"], state, "{name}");
+        assert_eq!(envelope["counts"]["suppressed"], 0, "{name}");
+        assert_eq!(
+            envelope["findings"][0]["title"], "Widget dependency is absent",
+            "{name}"
+        );
+        assert_eq!(envelope["gate"]["failing"], true, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn full_rereview_rejects_exhausted_baseline_adjudication_capacity_before_provider_contact() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let findings = (0..20)
+        .map(|index| {
+            json!({
+                "path": "src/auth.rs", "line": 42, "severity": "error", "kind": "risk",
+                "confidence": 0.9, "title": format!("Open baseline finding {index}"),
+                "body": "The authorization query remains unsafe.",
+                "evidence": "exec_query(&token);"
+            })
+        })
+        .collect::<Vec<_>>();
+    let baseline = json!({
+        "version": 1, "summary": "", "silent": false, "findings": findings,
+        "resolved": [], "counts": {"info": 0, "warn": 0, "error": 20, "suppressed": 0},
+        "confidenceBuckets": [0,0,0,0,20],
+        "gate": {"failOn": "error", "failing": true},
+        "modelUsed": "m", "usage": {"promptTokens": 0, "completionTokens": 0},
+        "baseSha": null, "headSha": null, "sinceSha": null
+    });
+    let baseline_path = dir.path().join("capacity-baseline.json");
+    std::fs::write(&baseline_path, baseline.to_string()).unwrap();
+
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--baseline")
+        .arg(&baseline_path)
+        .args(["--output", "json"])
+        .assert()
+        .code(2);
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(
+        stderr.contains("exhausting its 20-candidate bound"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("no provider request was made"), "{stderr}");
+    assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]

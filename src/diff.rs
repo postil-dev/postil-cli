@@ -889,6 +889,28 @@ impl DiffIndex {
             .any(|(path, line)| path == current_path && *line == finding.line)
     }
 
+    /// True when the complete diff can place a baseline coordinate into a
+    /// model request. This is a conservative preflight predicate over all
+    /// parsed evidence, before selected batches populate rendered coverage.
+    pub fn may_render_baseline_coordinate(&self, finding: &crate::envelope::Finding) -> bool {
+        let current_path = self
+            .renamed_paths
+            .get(&finding.path)
+            .unwrap_or(&finding.path);
+        self.contains_old(&finding.path, finding.line)
+            || self.contains(current_path, finding.line)
+            || self
+                .old_evidence
+                .contains_key(&(finding.path.clone(), finding.line))
+            || self
+                .new_evidence
+                .contains_key(&(current_path.clone(), finding.line))
+            || (finding.kind == crate::envelope::Kind::ContentPolicy
+                && self
+                    .content_policy_evidence
+                    .contains_key(&(current_path.clone(), finding.line)))
+    }
+
     pub fn contains(&self, path: &str, line: u32) -> bool {
         self.ranges
             .get(path)

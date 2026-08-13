@@ -1144,7 +1144,7 @@ fn sort_findings_for_display(findings: &mut [Finding]) {
 }
 
 struct ReviewBatchPromptContext<'a> {
-    cfg: &'a Config,
+    max_findings: usize,
     repo: Option<&'a str>,
     meta: Option<&'a PrMeta>,
     incremental: bool,
@@ -1190,7 +1190,7 @@ fn review_batch_prompt(
         incremental: context.incremental,
         content_policy: first && context.content_policy_active,
     };
-    let mut user = prompt::user_prompt(&prompt_context, &annotated, context.cfg.max_findings);
+    let mut user = prompt::user_prompt(&prompt_context, &annotated, context.max_findings);
     if exact_semantic {
         user.push_str(
             "\n\nThis bounded semantic proof batch contains exact low-risk hunk evidence. Each credited hunk retains its repository path, stable identity, and a non-empty added line. Cite only the exact numbered path and line displayed in this request.",
@@ -1232,6 +1232,7 @@ impl ReviewBatchBudgets {
 
 fn serialized_review_batch_budget_for_shape(
     cfg: &Config,
+    max_findings: usize,
     models: &[String],
     system: &str,
     context: &PrContext<'_>,
@@ -1239,7 +1240,7 @@ fn serialized_review_batch_budget_for_shape(
     suffix: &str,
 ) -> Result<usize> {
     let review_output_tokens = crate::llm::REVIEW_MAX_OUTPUT_TOKENS as usize;
-    let mut admission_user = prompt::user_prompt(context, batch_context, cfg.max_findings);
+    let mut admission_user = prompt::user_prompt(context, batch_context, max_findings);
     admission_user.push_str(suffix);
     models
         .iter()
@@ -1271,6 +1272,7 @@ fn serialized_review_batch_budget_for_shape(
 
 fn serialized_review_batch_budgets(
     cfg: &Config,
+    max_findings: usize,
     models: &[String],
     system: &str,
     context: &PrContext<'_>,
@@ -1278,6 +1280,7 @@ fn serialized_review_batch_budgets(
     Ok(ReviewBatchBudgets {
         source: serialized_review_batch_budget_for_shape(
             cfg,
+            max_findings,
             models,
             system,
             context,
@@ -1286,6 +1289,7 @@ fn serialized_review_batch_budgets(
         )?,
         synthesis: serialized_review_batch_budget_for_shape(
             cfg,
+            max_findings,
             models,
             system,
             context,
@@ -1326,6 +1330,7 @@ async fn review_diff_at(
     let input_incomplete = prepared.reserved_anchor;
     let mut index = std::mem::take(&mut prepared.index);
     let incremental = matches!(scope, filter::ReconcileScope::Incremental { .. });
+    let baseline_adjudication_reserve = baseline_adjudication_reserve(&baseline, &index, scope);
 
     // When content policy is active, render the PR title/description as a
     // numbered, groundable block and register its line range so a title/body
@@ -1363,6 +1368,7 @@ async fn review_diff_at(
     let mut scorer_failure_kind: Option<ReviewFailureKind> = None;
     let mut repository_search = None;
     let mut adjudication_resolved = Vec::new();
+    let mut adjudication_preserved_baseline = Vec::new();
 
     // Run the model when there is a diff to review, or when content policy is
     // active and there is a PR title/description to review (an empty diff should
@@ -1376,6 +1382,16 @@ async fn review_diff_at(
         || !prepared.compacted_artifacts.is_empty()
         || pr_desc_lines > 0
     {
+        anyhow::ensure!(
+            baseline_adjudication_reserve < crate::adjudication::MAX_ADJUDICATION_CANDIDATES,
+            "complete finding adjudication reserves {} baseline candidates, exhausting its {}-candidate bound; no provider request was made",
+            baseline_adjudication_reserve,
+            crate::adjudication::MAX_ADJUDICATION_CANDIDATES,
+        );
+        let generator_max_findings = cfg.max_findings.min(
+            crate::adjudication::MAX_ADJUDICATION_CANDIDATES
+                .saturating_sub(baseline_adjudication_reserve),
+        );
         let system = prompt::system_prompt(cfg, current_utc_date);
         let chain = cfg.model_chain();
         let active_model_count = if cfg.consensus > 1 {
@@ -1417,6 +1433,7 @@ async fn review_diff_at(
             };
             serialized_review_batch_budgets(
                 cfg,
+                generator_max_findings,
                 &chain[..active_model_count],
                 &system,
                 &admission_context,
@@ -1581,7 +1598,7 @@ async fn review_diff_at(
                     |receipt| receipt.selected_batch_ids.len(),
                 );
                 let preflight_prompt_context = ReviewBatchPromptContext {
-                    cfg,
+                    max_findings: generator_max_findings,
                     repo,
                     meta,
                     incremental,
@@ -2032,7 +2049,9 @@ async fn review_diff_at(
                     }
                     let raw_findings = deduplicated;
                     let grounded_candidate_count = raw_findings.len();
-                    let outcome = filter::apply(cfg, &index, raw_findings)?;
+                    let mut generator_filter_cfg = cfg.clone();
+                    generator_filter_cfg.max_findings = generator_max_findings;
+                    let outcome = filter::apply(&generator_filter_cfg, &index, raw_findings)?;
                     suppressed = outcome.suppressed;
                     suppressed_findings = outcome.suppressed_findings;
                     ungrounded = outcome.ungrounded + batch_ungrounded;
@@ -2119,12 +2138,7 @@ async fn review_diff_at(
                                 // deleted even when bounded source selection omitted its batch.
                                 // A removal followed by the same addition remains current and
                                 // must not be retired from semantic coverage alone.
-                                let exact_citation_deleted = index.old_evidence_matches(previous)
-                                    && index.remap_current_evidence(previous).is_none();
-                                let applicable = (index
-                                    .contains_reviewed_baseline_coordinate(previous)
-                                    || exact_citation_deleted)
-                                    && !crate::envelope::is_reserved_anchor(&previous.path)
+                                let applicable = baseline_may_enter_adjudication(previous, &index)
                                     && !kept
                                         .iter()
                                         .any(|fresh| same_visible_finding(fresh, previous));
@@ -2239,7 +2253,7 @@ async fn review_diff_at(
                                 &diff_receipt,
                                 receipt,
                             );
-                            let application = match application {
+                            let mut application = match application {
                                 Ok(application) => application,
                                 Err(error) => {
                                     model_incidents.push(ModelIncident {
@@ -2277,6 +2291,39 @@ async fn review_diff_at(
                                 };
                                 let baseline_index = baseline_candidate_indices[baseline_offset];
                                 adjudication_resolved.push(baseline[baseline_index].clone());
+                            }
+                            // A baseline finding leaves the ledger only through
+                            // an adjudicator's explicit refutation or duplicate
+                            // disposition. Deterministic evidence checks can
+                            // demote a fresh candidate, but they leave a
+                            // full-rereview baseline open for later review.
+                            for (baseline_offset, baseline_index) in
+                                baseline_candidate_indices.iter().copied().enumerate()
+                            {
+                                let candidate_index = fresh_candidate_count + baseline_offset;
+                                if application.resolved_indices.contains(&candidate_index)
+                                    || application.kept_indices.contains(&candidate_index)
+                                {
+                                    continue;
+                                }
+                                application.kept_indices.push(candidate_index);
+                                application.kept.push(baseline[baseline_index].clone());
+                                application.suppressed.retain(|suppressed| {
+                                    !same_visible_finding(
+                                        &suppressed.finding,
+                                        &baseline[baseline_index],
+                                    )
+                                });
+                            }
+                            for candidate_index in &application.kept_indices {
+                                let Some(baseline_offset) =
+                                    candidate_index.checked_sub(fresh_candidate_count)
+                                else {
+                                    continue;
+                                };
+                                let baseline_index = baseline_candidate_indices[baseline_offset];
+                                adjudication_preserved_baseline
+                                    .push(baseline[baseline_index].clone());
                             }
                             suppressed += application.suppressed.len() as u32;
                             suppressed_findings.extend(application.suppressed);
@@ -2447,8 +2494,11 @@ async fn review_diff_at(
         baseline = retained;
         adjudication_resolved.extend(retired);
     }
-    let repository_suppressed =
-        crate::repository_search::enforce_receipt(&mut findings, &repository_search);
+    let repository_suppressed = suppress_refuted_repository_claims(
+        &mut findings,
+        &repository_search,
+        &adjudication_preserved_baseline,
+    );
     suppressed = suppressed.saturating_add(repository_suppressed.len() as u32);
     suppressed_findings.extend(repository_suppressed);
 
@@ -2460,6 +2510,15 @@ async fn review_diff_at(
     // Fresh metadata IDs must exist before reconciliation: synthetic line
     // numbers are presentation positions, not issue identity.
     generate_finding_ids(&mut findings, head_sha.as_deref());
+
+    // Explicitly adjudicated baseline resolutions are authoritative. Remove
+    // them before fail-closed reconciliation so they cannot be carried back
+    // into the open ledger alongside their resolution record.
+    baseline.retain(|finding| {
+        !adjudication_resolved
+            .iter()
+            .any(|resolved| same_visible_finding(finding, resolved))
+    });
 
     // Reconcile against the previous review (incremental or full re-review).
     // Skip entirely when review is disabled: a repo that set `enabled: false`
@@ -2796,6 +2855,63 @@ fn baseline_has_carryable_findings(findings: &[Finding]) -> bool {
         .any(|finding| !crate::envelope::is_ephemeral_anchor(&finding.path))
 }
 
+/// Reserve every baseline finding that could enter full re-review adjudication
+/// before generating fresh findings. The later candidate set can be smaller
+/// when a fresh finding supersedes a baseline entry, but it must never be
+/// larger than this conservative admission reservation.
+fn baseline_adjudication_reserve(
+    baseline: &[Finding],
+    index: &diff::DiffIndex,
+    scope: filter::ReconcileScope,
+) -> usize {
+    if !matches!(scope, filter::ReconcileScope::Full { .. }) {
+        return 0;
+    }
+    baseline
+        .iter()
+        .filter(|finding| {
+            let exact_citation_deleted = index.old_evidence_matches(finding)
+                && index.remap_current_evidence(finding).is_none();
+            (index.may_render_baseline_coordinate(finding) || exact_citation_deleted)
+                && !crate::envelope::is_reserved_anchor(&finding.path)
+        })
+        .count()
+}
+
+fn baseline_may_enter_adjudication(finding: &Finding, index: &diff::DiffIndex) -> bool {
+    let exact_citation_deleted =
+        index.old_evidence_matches(finding) && index.remap_current_evidence(finding).is_none();
+    (index.contains_reviewed_baseline_coordinate(finding) || exact_citation_deleted)
+        && !crate::envelope::is_reserved_anchor(&finding.path)
+}
+
+/// A complete receipt can refute a fresh repository claim. Baseline candidates
+/// preserved by adjudication remain open until that adjudication explicitly
+/// resolves them. Any unavailable, exhausted, incomplete, or unrelated receipt
+/// leaves a finding open rather than converting uncertainty into a clean review.
+fn suppress_refuted_repository_claims(
+    findings: &mut Vec<Finding>,
+    receipt: &crate::envelope::RepositorySearchReceipt,
+    adjudication_preserved_baseline: &[Finding],
+) -> Vec<SuppressedFinding> {
+    let mut preserved = Vec::new();
+    let mut candidates = Vec::with_capacity(findings.len());
+    for finding in findings.drain(..) {
+        if adjudication_preserved_baseline
+            .iter()
+            .any(|baseline| same_visible_finding(baseline, &finding))
+        {
+            preserved.push(finding);
+        } else {
+            candidates.push(finding);
+        }
+    }
+    let suppressed = crate::repository_search::enforce_receipt(&mut candidates, receipt);
+    preserved.append(&mut candidates);
+    *findings = preserved;
+    suppressed
+}
+
 fn retire_incrementally_refuted_baseline(
     baseline: Vec<Finding>,
     receipt: &crate::envelope::RepositorySearchReceipt,
@@ -2950,6 +3066,7 @@ mod tests {
         let batch_budgets_for_title = |title: &str| {
             serialized_review_batch_budgets(
                 &cfg,
+                cfg.max_findings,
                 &models,
                 &system,
                 &PrContext {
@@ -3533,6 +3650,55 @@ mod tests {
         assert_eq!(retained.len(), 1);
         assert_eq!(retained[0].title, finding.title);
         assert!(retired.is_empty());
+    }
+
+    #[test]
+    fn adjudication_preserved_baseline_survives_a_deterministic_refutation_receipt() {
+        let snapshot_id = "a".repeat(40);
+        let claim = RepositoryClaim {
+            kind: RepositoryClaimKind::Absence,
+            resources: vec!["widget".into()],
+            values: vec![],
+            versions: vec![],
+            paths: vec![],
+            identifiers: vec![],
+        };
+        let terms = crate::repository_search::search_terms(std::iter::once(&claim)).unwrap();
+        let query = terms[0].query_sha256.clone();
+        let receipt = RepositorySearchReceipt {
+            head_sha: Some(snapshot_id.clone()),
+            state: RepositorySearchState::Complete,
+            tree_sha256: Some("b".repeat(64)),
+            queries: vec![RepositorySearchQuery {
+                kind: terms[0].kind,
+                query_sha256: query.clone(),
+            }],
+            matched_query_sha256: vec![query.clone()],
+            matches: vec![RepositorySearchMatch {
+                query_sha256: query,
+                path: "src/dependencies.txt".into(),
+                occurrences: 1,
+            }],
+            match_count: 1,
+            ..RepositorySearchReceipt::default()
+        };
+        let mut baseline = finding("src/db.rs", 10, "missing widget");
+        baseline.repository_claim = Some(claim);
+
+        let mut preserved = vec![baseline.clone()];
+        assert!(
+            suppress_refuted_repository_claims(&mut preserved, &receipt, &[baseline.clone()],)
+                .is_empty()
+        );
+        assert_eq!(preserved.len(), 1);
+        assert!(same_visible_finding(&preserved[0], &baseline));
+
+        let mut fresh = vec![baseline];
+        assert_eq!(
+            suppress_refuted_repository_claims(&mut fresh, &receipt, &[]).len(),
+            1
+        );
+        assert!(fresh.is_empty());
     }
 
     fn score(index: usize, confidence: f64, kind: Kind) -> FindingScore {
