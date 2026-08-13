@@ -1654,6 +1654,7 @@ struct ChatSuccess {
 // treats every other unmarked chat error as a provider failure.
 enum ModelContentFailure {
     Empty,
+    Malformed,
     MissingChoices,
     NonTerminal { reason: String },
 }
@@ -1663,7 +1664,7 @@ impl ModelContentFailure {
     fn nonterminal_reason(&self) -> Option<&str> {
         match self {
             Self::NonTerminal { reason } => Some(reason),
-            Self::Empty | Self::MissingChoices => None,
+            Self::Empty | Self::Malformed | Self::MissingChoices => None,
         }
     }
 
@@ -1676,6 +1677,7 @@ impl std::fmt::Display for ModelContentFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Empty => formatter.write_str("model response had no choices/content"),
+            Self::Malformed => formatter.write_str("model response was not valid endpoint JSON"),
             Self::MissingChoices => formatter.write_str("model response had no choices"),
             Self::NonTerminal { reason } => {
                 write!(formatter, "model response was nonterminal ({reason})")
@@ -4701,7 +4703,7 @@ impl LlmClient {
         match self.request_decorations.api_format {
             ApiFormat::OpenaiCompatible => {
                 let parsed: ChatResponse = serde_json::from_str(text)
-                    .context("model endpoint returned non-JSON OpenAI-compatible body")?;
+                    .map_err(|_| anyhow::Error::new(ModelContentFailure::Malformed))?;
                 if let Some(u) = parsed.usage {
                     add_response_usage(
                         usage,
@@ -4739,7 +4741,7 @@ impl LlmClient {
             }
             ApiFormat::Anthropic => {
                 let parsed: AnthropicResponse = serde_json::from_str(text)
-                    .context("model endpoint returned non-JSON Anthropic body")?;
+                    .map_err(|_| anyhow::Error::new(ModelContentFailure::Malformed))?;
                 if let Some(u) = parsed.usage {
                     usage.prompt_tokens += u.input_tokens.unwrap_or(0);
                     usage.completion_tokens += u.output_tokens.unwrap_or(0);
@@ -6446,6 +6448,7 @@ mod tests {
     fn every_model_content_failure_is_operational_and_never_advisory_bypassable() {
         let failures = [
             ModelContentFailure::Empty,
+            ModelContentFailure::Malformed,
             ModelContentFailure::MissingChoices,
             ModelContentFailure::NonTerminal {
                 reason: "length".to_string(),

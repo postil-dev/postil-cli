@@ -2132,6 +2132,7 @@ async fn review_diff_at(
                         };
                         summary = summary_parts.join("\n\n");
                         let mut kept = outcome.kept;
+                        let mut preserved_baseline_publications = Vec::new();
 
                         let resolution = crate::resolve::resolve_uncertainties(
                             cfg,
@@ -2353,19 +2354,19 @@ async fn review_diff_at(
                                     )
                                 });
                             }
-                            for candidate_index in &application.kept_indices {
-                                let Some(baseline_offset) =
-                                    candidate_index.checked_sub(fresh_candidate_count)
-                                else {
-                                    continue;
-                                };
-                                let baseline_index = baseline_candidate_indices[baseline_offset];
-                                adjudication_preserved_baseline
-                                    .push(baseline[baseline_index].clone());
-                            }
                             suppressed += application.suppressed.len() as u32;
                             suppressed_findings.extend(application.suppressed);
-                            kept = application.kept;
+                            kept.clear();
+                            for (candidate_index, finding) in
+                                application.kept_indices.into_iter().zip(application.kept)
+                            {
+                                if candidate_index >= fresh_candidate_count {
+                                    adjudication_preserved_baseline.push(finding.clone());
+                                    preserved_baseline_publications.push(finding);
+                                } else {
+                                    kept.push(finding);
+                                }
+                            }
                             if !baseline_candidate_indices.is_empty() {
                                 let removed = baseline_candidate_indices
                                     .into_iter()
@@ -2475,6 +2476,8 @@ async fn review_diff_at(
                                 .into());
                             }
                         }
+                        kept.extend(preserved_baseline_publications);
+                        sort_findings_for_display(&mut kept);
                         findings = kept;
                     }
                 }

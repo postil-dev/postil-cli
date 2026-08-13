@@ -845,6 +845,7 @@ pub(crate) fn apply_results(
                 finding
                     .body
                     .clone_from(&outcome.effective_result.revised_body);
+                finding.evidence = Some(outcome.effective_result.evidence.clone());
                 kept_indices.push(index);
                 kept.push(finding);
             }
@@ -1078,7 +1079,17 @@ fn evidence_is_directly_grounded(
     if evidence.trim().is_empty() {
         return false;
     }
-    let corpus_window = corpus.contains(evidence) && receipt.rendered_evidence.contains(evidence);
+    let normalized_evidence = evidence.to_ascii_lowercase();
+    let candidate_term_matches = [finding.path.as_str(), &finding.title, &finding.body]
+        .into_iter()
+        .flat_map(semantic_terms)
+        .any(|term| normalized_evidence.contains(&term));
+    let rendered_line = receipt.rendered_evidence.lines().any(|row| {
+        row.split_once(':')
+            .map(|(_, source)| source.strip_prefix(['+', '-', ' ']).unwrap_or(source))
+            == Some(evidence)
+    });
+    let corpus_window = corpus.contains(evidence) && rendered_line && candidate_term_matches;
     let cited_window = finding.evidence.as_deref().is_some_and(|cited| {
         let (bounded, _) = bounded_cited_evidence(cited, &finding.title, &finding.body);
         bounded == evidence
@@ -1279,6 +1290,44 @@ mod tests {
         assert_eq!(
             applied.suppressed[0].reason,
             SuppressionReason::DuplicateRootCause
+        );
+    }
+
+    #[test]
+    fn confirmed_rewrite_replaces_the_publication_evidence() {
+        let snapshot = "a".repeat(40);
+        let mut candidate = finding(
+            Kind::Risk,
+            "Restore the transaction guard",
+            "The transaction guard is bypassed before the debit.",
+        );
+        candidate.evidence = Some("old guard marker".into());
+        let findings = vec![candidate];
+        let ids = stable_candidate_ids(&snapshot, &findings);
+        let results = vec![AdjudicationResult {
+            candidate_id: ids[0].clone(),
+            status: AdjudicationStatus::Confirmed,
+            revised_title: "Restore the transaction guard".into(),
+            revised_body: "The transaction guard is bypassed before the debit.".into(),
+            evidence: "transaction guard".into(),
+            duplicate_of: None,
+        }];
+        let corpus = "+transaction guard\n+old guard marker\n";
+        let receipt = direct_receipt(&snapshot, corpus, &findings, &ids);
+        let applied = apply_results(
+            &snapshot,
+            findings,
+            ids,
+            results,
+            corpus,
+            &receipt,
+            &unavailable_receipt(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            applied.kept[0].evidence.as_deref(),
+            Some("transaction guard")
         );
     }
 

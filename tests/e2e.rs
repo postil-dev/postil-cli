@@ -2703,7 +2703,7 @@ async fn ordinary_review_registers_an_authenticated_plan_before_provider_access(
     assert_eq!(registration["version"], 1);
     assert_eq!(registration["concurrency"], 1);
     assert_eq!(registration["requestTimeoutSeconds"], 240);
-    assert_eq!(registration["reviewBudgetSeconds"], 360);
+    assert_eq!(registration["reviewBudgetSeconds"], 420);
     assert_eq!(
         registration["selectedBatches"],
         registration["totalBatches"]
@@ -10698,6 +10698,54 @@ async fn full_rereview_rejects_exhausted_baseline_adjudication_capacity_before_p
     );
     assert!(stderr.contains("no provider request was made"), "{stderr}");
     assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn scorer_cannot_suppress_an_unresolved_full_rereview_baseline() {
+    let server = MockServer::start().await;
+    mock_review(&server, json!([])).await;
+    let directory = tempfile::tempdir().unwrap();
+    let diff = write_diff(directory.path());
+    let baseline = json!({
+        "version": 1, "summary": "", "silent": false,
+        "findings": [{
+            "path": "src/auth.rs", "line": 42, "severity": "error", "kind": "risk",
+            "confidence": 0.9, "title": "Authorization guard remains bypassed",
+            "body": "The authorization guard remains bypassed before query execution.",
+            "evidence": "exec_query(&token);"
+        }],
+        "resolved": [], "counts": {"info": 0, "warn": 0, "error": 1, "suppressed": 0},
+        "confidenceBuckets": [0,0,0,0,1],
+        "gate": {"failOn": "error", "failing": true},
+        "modelUsed": "model", "usage": {"promptTokens": 0, "completionTokens": 0},
+        "baseSha": null, "headSha": null, "sinceSha": null
+    });
+    let baseline_path = directory.path().join("scorer-baseline.json");
+    std::fs::write(&baseline_path, baseline.to_string()).unwrap();
+
+    let output = postil()
+        .current_dir(directory.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_SCORER_MODEL", "scorer-model")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .arg("--baseline")
+        .arg(&baseline_path)
+        .args(["--output", "json"])
+        .assert()
+        .code(1);
+    let envelope: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    assert_eq!(
+        envelope["findings"][0]["title"],
+        "Authorization guard remains bypassed"
+    );
+    assert_eq!(envelope["findings"][0]["confidence"], 0.9);
+    assert_eq!(envelope["resolved"], json!([]));
+    assert_eq!(envelope["gate"]["failing"], true);
+    let requests = server.received_requests().await.unwrap();
+    assert!(requests.iter().all(|request| {
+        !String::from_utf8_lossy(&request.body).contains("independent second-model scorer")
+    }));
 }
 
 #[tokio::test]
