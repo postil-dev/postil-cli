@@ -1611,18 +1611,21 @@ mod tests {
         let corpus = "+authorization guard\n+}\n";
         let receipt = direct_receipt(&snapshot, corpus, &findings, &ids);
 
-        assert!(
-            apply_results(
-                &snapshot,
-                findings,
-                ids,
-                results,
-                corpus,
-                &receipt,
-                &unavailable_receipt(),
-            )
-            .is_err()
-        );
+        let original = findings[0].clone();
+        let applied = apply_results(
+            &snapshot,
+            findings,
+            ids,
+            results,
+            corpus,
+            &receipt,
+            &unavailable_receipt(),
+        )
+        .unwrap();
+        assert_eq!(applied.kept[0].title, original.title);
+        assert_eq!(applied.kept[0].body, original.body);
+        assert!(applied.resolved_indices.is_empty());
+        assert!(applied.suppressed.is_empty());
     }
 
     #[test]
@@ -1658,18 +1661,21 @@ mod tests {
         );
         let receipt = direct_receipt(&snapshot, corpus, &findings, &ids);
 
-        assert!(
-            apply_results(
-                &snapshot,
-                findings,
-                ids,
-                results,
-                corpus,
-                &receipt,
-                &unavailable_receipt(),
-            )
-            .is_err()
-        );
+        let original = findings[0].clone();
+        let applied = apply_results(
+            &snapshot,
+            findings,
+            ids,
+            results,
+            corpus,
+            &receipt,
+            &unavailable_receipt(),
+        )
+        .unwrap();
+        assert_eq!(applied.kept[0].title, original.title);
+        assert_eq!(applied.kept[0].body, original.body);
+        assert!(applied.resolved_indices.is_empty());
+        assert!(applied.suppressed.is_empty());
     }
 
     #[test]
@@ -1707,18 +1713,21 @@ mod tests {
         );
         let receipt = build_diff_corpus_receipt(&snapshot, corpus, &findings, &ids, 0);
 
-        assert!(
-            apply_results(
-                &snapshot,
-                findings,
-                ids,
-                results,
-                corpus,
-                &receipt,
-                &unavailable_receipt(),
-            )
-            .is_err()
-        );
+        let original = findings[0].clone();
+        let applied = apply_results(
+            &snapshot,
+            findings,
+            ids,
+            results,
+            corpus,
+            &receipt,
+            &unavailable_receipt(),
+        )
+        .unwrap();
+        assert_eq!(applied.kept[0].title, original.title);
+        assert_eq!(applied.kept[0].body, original.body);
+        assert!(applied.resolved_indices.is_empty());
+        assert!(applied.suppressed.is_empty());
     }
 
     #[test]
@@ -2194,13 +2203,22 @@ mod tests {
                 duplicate_of: None,
             },
         ];
-        let error = apply_results(&snapshot, findings, ids, results, corpus, &direct, &receipt)
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("supplied evidence window or structured receipt")
+        let original_titles = findings
+            .iter()
+            .map(|finding| finding.title.clone())
+            .collect::<Vec<_>>();
+        let applied =
+            apply_results(&snapshot, findings, ids, results, corpus, &direct, &receipt).unwrap();
+        assert_eq!(
+            applied
+                .kept
+                .iter()
+                .map(|finding| finding.title.clone())
+                .collect::<Vec<_>>(),
+            original_titles
         );
+        assert!(applied.resolved_indices.is_empty());
+        assert!(applied.suppressed.is_empty());
     }
 
     #[test]
