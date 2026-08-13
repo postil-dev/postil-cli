@@ -75,7 +75,7 @@ pub(crate) async fn resolve_uncertainties(
     let eligible = findings
         .iter()
         .enumerate()
-        .filter_map(|(index, finding)| (finding.kind == Kind::Uncertainty).then_some(index))
+        .filter_map(|(index, finding)| resolver_eligible(finding).then_some(index))
         .take(MAX_FINDINGS)
         .collect::<Vec<_>>();
     for (index, finding) in findings.iter_mut().enumerate() {
@@ -194,6 +194,10 @@ pub(crate) async fn resolve_uncertainties(
         );
     }
     pass
+}
+
+fn resolver_eligible(finding: &Finding) -> bool {
+    finding.kind == Kind::Uncertainty && finding.repository_claim.is_none()
 }
 
 fn resolution_disposition(
@@ -477,6 +481,20 @@ mod tests {
         let date = Date::from_calendar_date(2026, time::Month::August, 10).unwrap();
         let (system, _) = resolution_prompt(date, &finding("check this"), "", &[]);
         assert_eq!(system.matches("Authoritative review UTC date").count(), 1);
+    }
+
+    #[test]
+    fn repository_claims_require_complete_adjudication_instead_of_file_resolution() {
+        let mut candidate = finding("The repository does not contain the required widget.");
+        candidate.repository_claim = Some(crate::envelope::RepositoryClaim {
+            kind: crate::envelope::RepositoryClaimKind::Absence,
+            resources: vec!["widget".into()],
+            values: vec![],
+            versions: vec![],
+            paths: vec![],
+            identifiers: vec![],
+        });
+        assert!(!resolver_eligible(&candidate));
     }
     #[tokio::test]
     async fn resolve_path_extraction_skips_missing_files_and_caps_at_three() {

@@ -7941,7 +7941,7 @@ mod tests {
     fn maximum_hosted_plan_matches_watchdog_and_transport_arithmetic() {
         let config = Config {
             model: "provider/primary".into(),
-            cascade: vec!["provider/secondary".into(), "provider/tertiary".into()],
+            cascade: vec!["provider/secondary".into()],
             scorer: "provider/scorer".into(),
             scorer_fallback: "provider/scorer-fallback".into(),
             scorer_enabled: true,
@@ -7951,10 +7951,9 @@ mod tests {
         };
         let capacity = max_hosted_review_batches(&config, true).unwrap();
         assert_eq!(capacity, 4);
-        let review_calls =
-            capacity * crate::review::MAX_MODELS_PER_REQUEST * MAX_LOGICAL_CALLS_PER_REVIEW_MODEL;
-        let planner_calls =
-            crate::review::MAX_MODELS_PER_REQUEST * MAX_LOGICAL_CALLS_PER_REVIEW_MODEL;
+        let review_model_count = planned_review_models(&config).len();
+        let review_calls = capacity * review_model_count * MAX_LOGICAL_CALLS_PER_REVIEW_MODEL;
+        let planner_calls = review_model_count * MAX_LOGICAL_CALLS_PER_REVIEW_MODEL;
         let scorer_calls = 2 * MAX_LOGICAL_CALLS_PER_SCORER_MODEL;
         let logical_calls = review_calls + planner_calls + scorer_calls;
 
@@ -7988,15 +7987,15 @@ mod tests {
             ..Config::default()
         };
         for (generator_count, scorer_count, without_planner, with_planner) in [
-            (1, 0, Some(24), Some(20)),
-            (1, 1, Some(16), Some(12)),
-            (1, 2, Some(16), Some(12)),
-            (2, 0, Some(8), Some(7)),
-            (2, 1, Some(7), Some(4)),
-            (2, 2, Some(7), Some(4)),
+            (1, 0, Some(20), Some(16)),
+            (1, 1, Some(12), Some(8)),
+            (1, 2, Some(12), Some(8)),
+            (2, 0, Some(8), Some(6)),
+            (2, 1, Some(6), Some(2)),
+            (2, 2, Some(6), Some(2)),
             (3, 0, Some(3), Some(2)),
-            (3, 1, Some(2), Some(1)),
-            (3, 2, Some(2), Some(1)),
+            (3, 1, Some(2), None),
+            (3, 2, Some(2), None),
         ] {
             let config = config(generator_count, scorer_count);
             assert_eq!(

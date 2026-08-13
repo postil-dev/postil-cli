@@ -1455,11 +1455,11 @@ mod tests {
             ..RepositorySearchReceipt::default()
         };
         let suppressed = enforce_receipt(&mut findings, &receipt);
-        assert!(findings.is_empty());
-        assert_eq!(suppressed.len(), 1);
+        assert_eq!(findings.len(), 1);
+        assert!(suppressed.is_empty());
         assert_eq!(
             claim_verdict(
-                suppressed[0].finding.repository_claim.as_ref().unwrap(),
+                findings[0].repository_claim.as_ref().unwrap(),
                 &receipt,
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             ),
@@ -1564,8 +1564,8 @@ mod tests {
         let receipt = search.complete(&"a".repeat(40), "b".repeat(64));
         let mut findings = vec![finding(claim.clone())];
 
-        assert_eq!(enforce_receipt(&mut findings, &receipt).len(), 1);
-        assert!(findings.is_empty());
+        assert!(enforce_receipt(&mut findings, &receipt).is_empty());
+        assert_eq!(findings.len(), 1);
         assert_eq!(
             claim_verdict(&claim, &receipt, &"a".repeat(40)),
             RepositoryClaimVerdict::Unresolved

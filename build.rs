@@ -57,9 +57,16 @@ fn collect_rust_sources(repository_root: &Path, directory: &Path, paths: &mut Ve
 
     for entry in entries {
         let path = entry.path();
-        if path.is_dir() {
+        let metadata = fs::symlink_metadata(&path).expect("source entry metadata must be readable");
+        assert!(
+            !metadata.file_type().is_symlink(),
+            "review contract source tree cannot contain symlinks: {}",
+            path.display()
+        );
+        if metadata.is_dir() {
             collect_rust_sources(repository_root, &path, paths);
-        } else if path.extension().is_some_and(|extension| extension == "rs") {
+        } else if metadata.is_file() && path.extension().is_some_and(|extension| extension == "rs")
+        {
             let relative = path
                 .strip_prefix(repository_root)
                 .expect("source path must be inside the repository root")

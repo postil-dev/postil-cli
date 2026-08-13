@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use anyhow::{Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
@@ -281,96 +281,137 @@ pub(crate) fn build_diff_corpus_receipt(
         .collect::<BTreeSet<_>>();
     let (selected_terms, queries_complete) = bounded_query_terms(&all_terms);
     let selected_term_set = selected_terms.iter().cloned().collect::<BTreeSet<_>>();
-    let lines = if diff.is_empty() {
-        Vec::new()
-    } else {
-        diff.split_inclusive('\n').collect::<Vec<_>>()
-    };
-    let normalized_lines = lines
-        .iter()
-        .map(|line| line.to_ascii_lowercase())
-        .collect::<Vec<_>>();
-    let queries = selected_terms
+    let mut queries = selected_terms
         .iter()
         .map(|term| DirectEvidenceQuery {
             term: term.clone(),
-            occurrences: normalized_lines
-                .iter()
-                .map(|line| line.match_indices(term).count() as u64)
-                .sum(),
+            occurrences: 0,
         })
         .collect::<Vec<_>>();
-    let candidate_citations = findings
+    let candidate_selected_terms = candidate_terms
+        .iter()
+        .map(|terms| {
+            terms
+                .iter()
+                .filter(|term| selected_term_set.contains(*term))
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut candidate_citations = findings
         .iter()
         .zip(candidate_ids)
         .zip(&candidate_terms)
         .map(|((finding, candidate_id), terms)| {
             let queries_complete = terms.iter().all(|term| selected_term_set.contains(term));
-            let candidate_selected_terms = terms.iter().cloned().collect::<Vec<_>>();
-            let Some(citation) = finding.evidence.as_deref() else {
-                let matching_windows_complete = queries_complete
-                    && matching_windows_fit(&lines, &normalized_lines, &candidate_selected_terms);
-                return CandidateCitationReceipt {
-                    candidate_id: candidate_id.clone(),
-                    citation_sha256: None,
-                    added_occurrences: 0,
-                    removed_occurrences: 0,
-                    context_occurrences: 0,
-                    queries_complete,
-                    matching_windows_complete,
-                };
-            };
-            let mut citation_digest = Sha256::new();
-            citation_digest.update(citation.as_bytes());
-            let mut receipt = CandidateCitationReceipt {
+            CandidateCitationReceipt {
                 candidate_id: candidate_id.clone(),
-                citation_sha256: Some(hex_digest(citation_digest.finalize().as_slice())),
+                citation_sha256: finding.evidence.as_deref().map(|citation| {
+                    let mut citation_digest = Sha256::new();
+                    citation_digest.update(citation.as_bytes());
+                    hex_digest(citation_digest.finalize().as_slice())
+                }),
                 added_occurrences: 0,
                 removed_occurrences: 0,
                 context_occurrences: 0,
                 queries_complete,
                 matching_windows_complete: false,
-            };
-            for line in &lines {
-                let line = line.trim_end_matches(['\r', '\n']);
-                if line.starts_with("+++") || line.starts_with("---") {
-                    continue;
-                }
-                let (Some(prefix), Some(source)) = (line.get(..1), line.get(1..)) else {
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut global_window = WindowBudget::default();
+    let mut candidate_windows = vec![WindowBudget::default(); findings.len()];
+    let mut rendered = String::new();
+    let mut buffered = VecDeque::new();
+    let mut source_lines = 0usize;
+    for (index, line) in diff.split_inclusive('\n').enumerate() {
+        source_lines = index + 1;
+        let normalized = line.to_ascii_lowercase();
+        for (query, term) in queries.iter_mut().zip(&selected_terms) {
+            query.occurrences = query
+                .occurrences
+                .saturating_add(normalized.match_indices(term).count() as u64);
+        }
+        let candidate_matches = candidate_selected_terms
+            .iter()
+            .map(|terms| terms.iter().any(|term| normalized.contains(term)))
+            .collect::<Vec<_>>();
+
+        let source_line = line.trim_end_matches(['\r', '\n']);
+        if !source_line.starts_with("+++")
+            && !source_line.starts_with("---")
+            && let (Some(prefix), Some(source)) = (source_line.get(..1), source_line.get(1..))
+        {
+            for (finding, receipt) in findings.iter().zip(&mut candidate_citations) {
+                let Some(citation) = finding.evidence.as_deref() else {
                     continue;
                 };
                 let occurrences = source.match_indices(citation).count() as u64;
-                match prefix {
-                    "+" => receipt.added_occurrences += occurrences,
-                    "-" => receipt.removed_occurrences += occurrences,
-                    " " => receipt.context_occurrences += occurrences,
-                    _ => {}
-                }
+                let count = match prefix {
+                    "+" => &mut receipt.added_occurrences,
+                    "-" => &mut receipt.removed_occurrences,
+                    " " => &mut receipt.context_occurrences,
+                    _ => continue,
+                };
+                *count = count.saturating_add(occurrences);
             }
-            let citation_occurrences = receipt
-                .added_occurrences
-                .saturating_add(receipt.removed_occurrences)
-                .saturating_add(receipt.context_occurrences);
-            let exact_unique_citation =
-                citation.len() <= MAX_CITED_EVIDENCE_BYTES && citation_occurrences == 1;
-            receipt.matching_windows_complete = receipt.queries_complete
-                && (exact_unique_citation
-                    || matching_windows_fit(&lines, &normalized_lines, &candidate_selected_terms));
-            receipt
-        })
-        .collect();
-    let selected = matching_line_indices(&normalized_lines, &selected_terms);
-    let (rendered, matching_windows_complete) =
-        render_matching_windows(&lines, selected, MAX_ADJUDICATION_CORPUS_BYTES);
+        }
+
+        buffered.push_back(ScannedLine {
+            index,
+            raw: line,
+            global_match: candidate_matches.iter().any(|matched| *matched),
+            candidate_matches,
+        });
+        if index >= 2 {
+            let center = index - 2;
+            finalize_streamed_center(
+                &buffered,
+                center,
+                &mut global_window,
+                &mut rendered,
+                &mut candidate_windows,
+            );
+            while buffered.front().is_some_and(|line| line.index + 1 < center) {
+                buffered.pop_front();
+            }
+        }
+    }
+    for center in source_lines.saturating_sub(2)..source_lines {
+        finalize_streamed_center(
+            &buffered,
+            center,
+            &mut global_window,
+            &mut rendered,
+            &mut candidate_windows,
+        );
+    }
+    for ((finding, receipt), window) in findings
+        .iter()
+        .zip(&mut candidate_citations)
+        .zip(candidate_windows)
+    {
+        let citation_occurrences = receipt
+            .added_occurrences
+            .saturating_add(receipt.removed_occurrences)
+            .saturating_add(receipt.context_occurrences);
+        let exact_unique_citation = finding
+            .evidence
+            .as_deref()
+            .is_some_and(|citation| citation.len() <= MAX_CITED_EVIDENCE_BYTES)
+            && citation_occurrences == 1;
+        receipt.matching_windows_complete =
+            receipt.queries_complete && (exact_unique_citation || window.complete);
+    }
     debug_assert_eq!(findings.len(), candidate_ids.len());
     DiffCorpusReceipt {
         snapshot_id: snapshot_id.to_string(),
         corpus_sha256,
         source_bytes: diff.len(),
-        source_lines: lines.len(),
+        source_lines,
         scan_complete: true,
         queries_complete,
-        matching_windows_complete,
+        matching_windows_complete: global_window.complete,
         queries,
         candidate_citations,
         rendered_evidence: rendered,
@@ -393,54 +434,111 @@ fn bounded_query_terms(terms: &BTreeSet<String>) -> (Vec<String>, bool) {
     (selected, true)
 }
 
-fn matching_line_indices(normalized_lines: &[String], terms: &[String]) -> BTreeSet<usize> {
-    let mut selected = BTreeSet::new();
-    for (index, line) in normalized_lines.iter().enumerate() {
-        if terms.iter().any(|term| line.contains(term)) {
-            for nearby in
-                index.saturating_sub(2)..=(index + 2).min(normalized_lines.len().saturating_sub(1))
-            {
-                selected.insert(nearby);
+#[derive(Clone)]
+struct WindowBudget {
+    bytes: usize,
+    previous: Option<usize>,
+    complete: bool,
+}
+
+impl Default for WindowBudget {
+    fn default() -> Self {
+        Self {
+            bytes: 0,
+            previous: None,
+            complete: true,
+        }
+    }
+}
+
+impl WindowBudget {
+    fn add(&mut self, index: usize, row_bytes: usize) -> bool {
+        if !self.complete {
+            return false;
+        }
+        let gap_bytes = if self.previous.is_some_and(|previous| index > previous + 1) {
+            22
+        } else {
+            0
+        };
+        let next = self
+            .bytes
+            .saturating_add(gap_bytes)
+            .saturating_add(row_bytes);
+        if next > MAX_ADJUDICATION_CORPUS_BYTES {
+            self.complete = false;
+            return false;
+        }
+        self.bytes = next;
+        self.previous = Some(index);
+        true
+    }
+}
+
+struct ScannedLine<'a> {
+    index: usize,
+    raw: &'a str,
+    global_match: bool,
+    candidate_matches: Vec<bool>,
+}
+
+fn finalize_streamed_center(
+    buffered: &VecDeque<ScannedLine<'_>>,
+    center: usize,
+    global_window: &mut WindowBudget,
+    rendered: &mut String,
+    candidate_windows: &mut [WindowBudget],
+) {
+    let Some(center_line) = buffered.iter().find(|line| line.index == center) else {
+        return;
+    };
+    let row_bytes = decimal_digits(center + 1)
+        .saturating_add(1)
+        .saturating_add(center_line.raw.len())
+        .saturating_add(usize::from(!center_line.raw.ends_with('\n')));
+    if buffered
+        .iter()
+        .filter(|line| line.index.abs_diff(center) <= 2)
+        .any(|line| line.global_match)
+    {
+        let gap = global_window
+            .previous
+            .is_some_and(|previous| center > previous + 1);
+        if global_window.add(center, row_bytes) {
+            if gap {
+                rendered.push_str("[matching window gap]\n");
+            }
+            rendered.push_str(&(center + 1).to_string());
+            rendered.push(':');
+            rendered.push_str(center_line.raw);
+            if !center_line.raw.ends_with('\n') {
+                rendered.push('\n');
             }
         }
     }
-    selected
-}
-
-fn render_matching_windows(
-    lines: &[&str],
-    selected: BTreeSet<usize>,
-    max_bytes: usize,
-) -> (String, bool) {
-    let mut rendered = String::new();
-    let mut previous = None;
-    for index in selected {
-        if previous.is_some_and(|value: usize| index > value + 1) {
-            if rendered.len().saturating_add(22) > max_bytes {
-                return (rendered, false);
-            }
-            rendered.push_str("[matching window gap]\n");
+    for (candidate_index, window) in candidate_windows.iter_mut().enumerate() {
+        if buffered
+            .iter()
+            .filter(|line| line.index.abs_diff(center) <= 2)
+            .any(|line| {
+                line.candidate_matches
+                    .get(candidate_index)
+                    .copied()
+                    .unwrap_or(false)
+            })
+        {
+            window.add(center, row_bytes);
         }
-        let mut row = format!("{}:{}", index + 1, lines[index]);
-        if !row.ends_with('\n') {
-            row.push('\n');
-        }
-        if rendered.len().saturating_add(row.len()) > max_bytes {
-            return (rendered, false);
-        }
-        rendered.push_str(&row);
-        previous = Some(index);
     }
-    (rendered, true)
 }
 
-fn matching_windows_fit(lines: &[&str], normalized_lines: &[String], terms: &[String]) -> bool {
-    render_matching_windows(
-        lines,
-        matching_line_indices(normalized_lines, terms),
-        MAX_ADJUDICATION_CORPUS_BYTES,
-    )
-    .1
+fn decimal_digits(mut value: usize) -> usize {
+    let mut digits = 1;
+    while value >= 10 {
+        value /= 10;
+        digits += 1;
+    }
+    digits
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
@@ -647,8 +745,8 @@ pub(crate) fn validate_results(
                 );
                 if claim_verdict.is_some() {
                     ensure!(
-                        claim_verdict == Some(RepositoryClaimVerdict::Refuted),
-                        "repository-dependent finding is not refuted by an exact complete receipt"
+                        repository_refutation_grounded,
+                        "repository-dependent finding lacks exact candidate-specific refutation evidence"
                     );
                 }
             }
@@ -881,10 +979,11 @@ fn deterministic_demotion_reason(
         repository_receipt,
         snapshot_id,
     );
-    let claim_unresolved = finding.repository_claim.as_ref().is_some_and(|claim| {
-        crate::repository_search::claim_verdict(claim, repository_receipt, snapshot_id)
-            == RepositoryClaimVerdict::Unresolved
-    });
+    let claim_unresolved = !matches!(result.status, AdjudicationStatus::Refuted)
+        && finding.repository_claim.as_ref().is_some_and(|claim| {
+            crate::repository_search::claim_verdict(claim, repository_receipt, snapshot_id)
+                == RepositoryClaimVerdict::Unresolved
+        });
     let bounded_citation = result_is_bounded_citation_fragment(result, finding);
     let incomplete_citation = matches!(result.status, AdjudicationStatus::Confirmed)
         && bounded_citation
@@ -1659,6 +1758,25 @@ mod tests {
         assert!(receipt.scan_complete);
         assert!(!receipt.matching_windows_complete);
         assert_eq!(receipt.source_lines, 4_001);
+        assert!(receipt.rendered_evidence.len() <= MAX_ADJUDICATION_CORPUS_BYTES);
+    }
+
+    #[test]
+    fn direct_receipt_streams_many_short_lines_into_bounded_metadata() {
+        let snapshot = "a".repeat(40);
+        let findings = vec![finding(
+            Kind::Risk,
+            "Repeated vulnerable action",
+            "The workflow repeatedly invokes the vulnerable action.",
+        )];
+        let ids = stable_candidate_ids(&snapshot, &findings);
+        let corpus = "+ vulnerable action\n".repeat(250_000);
+        let receipt = direct_receipt(&snapshot, &corpus, &findings, &ids);
+
+        assert_eq!(receipt.source_lines, 250_000);
+        assert_eq!(receipt.source_bytes, corpus.len());
+        assert!(receipt.scan_complete);
+        assert!(!receipt.matching_windows_complete);
         assert!(receipt.rendered_evidence.len() <= MAX_ADJUDICATION_CORPUS_BYTES);
     }
 

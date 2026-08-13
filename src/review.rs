@@ -89,6 +89,7 @@ struct HostedReviewPhaseBudgets {
 }
 
 impl HostedReviewPhaseBudgets {
+    #[cfg(test)]
     fn total(self) -> u64 {
         self.generator
             .saturating_add(self.scorer)
@@ -2221,7 +2222,7 @@ async fn review_diff_at(
                             let receipt = crate::repository_search::search(
                                 &repository_source,
                                 repository_revision.as_deref(),
-                                all_adjudication_candidates.iter().chain(baseline.iter()),
+                                all_adjudication_candidates.iter(),
                             )
                             .await;
                             repository_search = Some(receipt);
@@ -2517,20 +2518,6 @@ async fn review_diff_at(
             .await
         }
     };
-    // An incremental review cannot prove a baseline claim resolved from an
-    // omitted diff alone. A complete, head-pinned repository receipt that
-    // refutes the claim is authoritative, however. Retire only that exact
-    // case; unavailable or incomplete receipts leave the baseline for normal
-    // carry-forward reconciliation.
-    if matches!(scope, filter::ReconcileScope::Incremental { .. }) {
-        let (retained, retired) = retire_incrementally_refuted_baseline(
-            baseline,
-            &repository_search,
-            repository_revision.as_deref().unwrap_or_default(),
-        );
-        baseline = retained;
-        adjudication_resolved.extend(retired);
-    }
     let repository_suppressed = suppress_refuted_repository_claims(
         &mut findings,
         &repository_search,
@@ -2947,27 +2934,6 @@ fn suppress_refuted_repository_claims(
     preserved.append(&mut candidates);
     *findings = preserved;
     suppressed
-}
-
-fn retire_incrementally_refuted_baseline(
-    baseline: Vec<Finding>,
-    receipt: &crate::envelope::RepositorySearchReceipt,
-    snapshot_id: &str,
-) -> (Vec<Finding>, Vec<Finding>) {
-    let mut retained = Vec::with_capacity(baseline.len());
-    let mut retired = Vec::new();
-    for finding in baseline {
-        let refuted = finding.repository_claim.as_ref().is_some_and(|claim| {
-            crate::repository_search::claim_verdict(claim, receipt, snapshot_id)
-                == crate::repository_search::RepositoryClaimVerdict::Refuted
-        });
-        if refuted {
-            retired.push(finding);
-        } else {
-            retained.push(finding);
-        }
-    }
-    (retained, retired)
 }
 
 fn same_visible_finding(a: &Finding, b: &Finding) -> bool {
@@ -3665,66 +3631,6 @@ mod tests {
     }
 
     #[test]
-    fn incremental_repository_refutation_retires_only_complete_baseline_claims() {
-        let snapshot_id = "a".repeat(40);
-        let claim = RepositoryClaim {
-            kind: RepositoryClaimKind::Absence,
-            resources: vec!["widget".into()],
-            values: vec![],
-            versions: vec!["2.0".into()],
-            paths: vec![],
-            identifiers: vec![],
-        };
-        let terms = crate::repository_search::search_terms(std::iter::once(&claim)).unwrap();
-        let query_hashes = terms
-            .iter()
-            .map(|term| term.query_sha256.clone())
-            .collect::<Vec<_>>();
-        let receipt = RepositorySearchReceipt {
-            head_sha: Some(snapshot_id.clone()),
-            state: RepositorySearchState::Complete,
-            tree_sha256: Some("b".repeat(64)),
-            queries: terms
-                .iter()
-                .map(|term| RepositorySearchQuery {
-                    kind: term.kind,
-                    query_sha256: term.query_sha256.clone(),
-                })
-                .collect(),
-            searched_blobs: 1,
-            searched_bytes: 16,
-            match_count: query_hashes.len() as u64,
-            matched_query_sha256: query_hashes.clone(),
-            matches: query_hashes
-                .iter()
-                .map(|query_sha256| RepositorySearchMatch {
-                    query_sha256: query_sha256.clone(),
-                    path: "src/dependencies.txt".into(),
-                    occurrences: 1,
-                })
-                .collect(),
-            matches_truncated: false,
-        };
-        let mut finding = finding("src/db.rs", 10, "missing widget");
-        finding.repository_claim = Some(claim);
-
-        let (retained, retired) =
-            retire_incrementally_refuted_baseline(vec![finding.clone()], &receipt, &snapshot_id);
-        assert!(retained.is_empty());
-        assert_eq!(retired.len(), 1);
-        assert_eq!(retired[0].title, finding.title);
-
-        let (retained, retired) = retire_incrementally_refuted_baseline(
-            vec![finding.clone()],
-            &RepositorySearchReceipt::default(),
-            &snapshot_id,
-        );
-        assert_eq!(retained.len(), 1);
-        assert_eq!(retained[0].title, finding.title);
-        assert!(retired.is_empty());
-    }
-
-    #[test]
     fn adjudication_preserved_baseline_survives_a_deterministic_refutation_receipt() {
         let snapshot_id = "a".repeat(40);
         let claim = RepositoryClaim {
@@ -3766,11 +3672,8 @@ mod tests {
         assert!(same_visible_finding(&preserved[0], &baseline));
 
         let mut fresh = vec![baseline];
-        assert_eq!(
-            suppress_refuted_repository_claims(&mut fresh, &receipt, &[]).len(),
-            1
-        );
-        assert!(fresh.is_empty());
+        assert!(suppress_refuted_repository_claims(&mut fresh, &receipt, &[]).is_empty());
+        assert_eq!(fresh.len(), 1);
     }
 
     fn score(index: usize, confidence: f64, kind: Kind) -> FindingScore {
