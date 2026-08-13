@@ -74,29 +74,66 @@ const CHECK_COMPLETION_TIMEOUT_SECS: u64 = 30;
 const REVIEW_POST_TIMEOUT_SECS: u64 = 20;
 pub(crate) const SCORER_TIMEOUT_SECS: u64 = 120;
 pub(crate) const POSTPROCESSING_PHASE_TIMEOUT_SECS: u64 = 60;
+pub(crate) const FINDING_ADJUDICATION_TIMEOUT_SECS: u64 = 60;
 
-pub(crate) fn hosted_review_timeout_secs(cfg: &Config) -> u64 {
-    let scorer_reserve = if cfg.scorer_enabled() {
+/// The hosted LLM deadline is shared by generation and every mandatory
+/// post-generation phase. Keep this ledger as the single source for both the
+/// generator deadline and deterministic large-review admission capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HostedReviewPhaseBudgets {
+    generator: u64,
+    scorer: u64,
+    resolution: u64,
+    brevity: u64,
+    adjudication: u64,
+}
+
+impl HostedReviewPhaseBudgets {
+    fn total(self) -> u64 {
+        self.generator
+            .saturating_add(self.scorer)
+            .saturating_add(self.resolution)
+            .saturating_add(self.brevity)
+            .saturating_add(self.adjudication)
+    }
+}
+
+fn hosted_review_phase_budgets(cfg: &Config) -> HostedReviewPhaseBudgets {
+    let scorer = if cfg.scorer_enabled() {
         SCORER_TIMEOUT_SECS
     } else {
         0
     };
-    let resolution_reserve = if cfg.uncertainty_resolution {
+    let resolution = if cfg.uncertainty_resolution {
         POSTPROCESSING_PHASE_TIMEOUT_SECS
     } else {
         0
     };
-    let brevity_reserve = if cfg.concise_findings {
+    let brevity = if cfg.concise_findings {
         POSTPROCESSING_PHASE_TIMEOUT_SECS
     } else {
         0
     };
-    HOSTED_LLM_REVIEW_TIMEOUT_SECS.min(
+    let adjudication = FINDING_ADJUDICATION_TIMEOUT_SECS;
+    let generator = HOSTED_LLM_REVIEW_TIMEOUT_SECS.min(
         HOSTED_LLM_TOTAL_TIMEOUT_SECS
-            .saturating_sub(scorer_reserve)
-            .saturating_sub(resolution_reserve)
-            .saturating_sub(brevity_reserve),
-    )
+            .saturating_sub(scorer)
+            .saturating_sub(resolution)
+            .saturating_sub(brevity)
+            .saturating_sub(adjudication),
+    );
+
+    HostedReviewPhaseBudgets {
+        generator,
+        scorer,
+        resolution,
+        brevity,
+        adjudication,
+    }
+}
+
+pub(crate) fn hosted_review_timeout_secs(cfg: &Config) -> u64 {
+    hosted_review_phase_budgets(cfg).generator
 }
 
 fn review_output_token_limit(synthesis: bool, deterministic_large_review: bool) -> u32 {
@@ -2192,7 +2229,7 @@ async fn review_diff_at(
                                     &adjudication_system,
                                     &adjudication_user,
                                     all_adjudication_candidates.len(),
-                                    Duration::from_secs(POSTPROCESSING_PHASE_TIMEOUT_SECS),
+                                    Duration::from_secs(FINDING_ADJUDICATION_TIMEOUT_SECS),
                                 )
                                 .await;
                             let adjudicated = match adjudicated {
@@ -3322,24 +3359,59 @@ mod tests {
             CHECK_COMPLETION_TIMEOUT_SECS + REVIEW_POST_TIMEOUT_SECS + PROCESS_OVERHEAD_SECS
         );
 
-        let postprocessing = Config {
+        let scorer_disabled = Config {
             scorer_enabled: false,
             uncertainty_resolution: true,
             concise_findings: true,
+            model: "provider/generator".into(),
             ..Config::default()
         };
-        assert_eq!(hosted_review_timeout_secs(&postprocessing), 420);
-        let complete_pipeline = Config {
+        let scorer_enabled = Config {
             scorer: "provider/scorer".into(),
             scorer_enabled: true,
-            ..postprocessing
+            ..scorer_disabled.clone()
         };
-        assert_eq!(hosted_review_timeout_secs(&complete_pipeline), 300);
+
+        let scorer_disabled_budgets = hosted_review_phase_budgets(&scorer_disabled);
         assert_eq!(
-            hosted_review_timeout_secs(&complete_pipeline)
-                + SCORER_TIMEOUT_SECS
-                + POSTPROCESSING_PHASE_TIMEOUT_SECS * 2,
+            scorer_disabled_budgets,
+            HostedReviewPhaseBudgets {
+                generator: 360,
+                scorer: 0,
+                resolution: POSTPROCESSING_PHASE_TIMEOUT_SECS,
+                brevity: POSTPROCESSING_PHASE_TIMEOUT_SECS,
+                adjudication: FINDING_ADJUDICATION_TIMEOUT_SECS,
+            }
+        );
+        assert_eq!(
+            scorer_disabled_budgets.total(),
             HOSTED_LLM_TOTAL_TIMEOUT_SECS
+        );
+        assert_eq!(hosted_review_timeout_secs(&scorer_disabled), 360);
+        assert_eq!(
+            crate::llm::max_hosted_review_batches(&scorer_disabled, false).unwrap(),
+            20
+        );
+
+        let scorer_enabled_budgets = hosted_review_phase_budgets(&scorer_enabled);
+        assert_eq!(
+            scorer_enabled_budgets,
+            HostedReviewPhaseBudgets {
+                generator: 240,
+                scorer: SCORER_TIMEOUT_SECS,
+                resolution: POSTPROCESSING_PHASE_TIMEOUT_SECS,
+                brevity: POSTPROCESSING_PHASE_TIMEOUT_SECS,
+                adjudication: FINDING_ADJUDICATION_TIMEOUT_SECS,
+            }
+        );
+        assert_eq!(
+            scorer_enabled_budgets.total(),
+            HOSTED_LLM_TOTAL_TIMEOUT_SECS
+        );
+        assert_eq!(hosted_review_timeout_secs(&scorer_enabled), 240);
+        assert_eq!(
+            crate::llm::max_hosted_review_batches(&scorer_enabled, false).unwrap(),
+            12
         );
     }
 
