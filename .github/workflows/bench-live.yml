@@ -186,7 +186,7 @@ jobs:
 
       - name: Upload admission report
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bench-live-report
           path: ${{ env.POSTIL_REPORT_OUT }}
@@ -194,7 +194,7 @@ jobs:
 
       - name: Upload admitted candidate
         if: success()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: qualified-models-candidate
           path: |
@@ -204,7 +204,7 @@ jobs:
 
       - name: Upload encrypted private replay evidence
         if: always() && steps.encrypt-private-evidence.outcome == 'success'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bench-live-private-evidence
           path: ${{ env.POSTIL_PRIVATE_EVIDENCE_ENCRYPTED_OUT }}
