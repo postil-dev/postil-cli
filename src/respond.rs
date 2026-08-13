@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 
 use crate::config::Config;
 use crate::diff;
@@ -291,9 +292,10 @@ async fn respond_with<F: Forge>(
     no_post: bool,
     usage_receipt: Option<UsageReceiptWriter>,
 ) -> Result<i32> {
+    let current_utc_date = OffsetDateTime::now_utc().date();
     let context = build_context(&forge, repo, number, kind).await?;
 
-    let system = prompt::respond_system_prompt(cfg);
+    let system = prompt::respond_system_prompt(cfg, current_utc_date);
     let user = respond_user_prompt(&context, comment);
     let client = LlmClient::from_env(cfg)?;
     client.preflight_respond_plan(cfg, &system, &user)?;
@@ -798,7 +800,14 @@ mod tests {
         );
         let user = respond_user_prompt(&context, &hostile);
         assert!(!user.contains('\0'));
-        let system = prompt::respond_system_prompt(&Config::default());
+        let system = prompt::respond_system_prompt(
+            &Config::default(),
+            time::Date::from_calendar_date(2026, time::Month::August, 10).unwrap(),
+        );
+        assert_eq!(
+            system.matches("UTC date 2026-08-10; later=future.").count(),
+            1
+        );
         for body in [
             serde_json::json!({
                 "model": "provider/model",
