@@ -122,6 +122,43 @@ impl Respond for DefaultAdjudicator {
 }
 
 #[derive(Clone, Copy)]
+struct RefuteFromReceiptAdjudicator;
+
+impl Respond for RefuteFromReceiptAdjudicator {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let request_body: Value = request.body_json().unwrap();
+        let payload: Value = serde_json::from_str(
+            request_body["messages"]
+                .as_array()
+                .and_then(|messages| messages.last())
+                .and_then(|message| message["content"].as_str())
+                .unwrap(),
+        )
+        .unwrap();
+        let candidate = payload["candidates"].as_array().unwrap().first().unwrap();
+        let candidate_id = candidate["candidateId"].as_str().unwrap();
+        let evidence = payload["diffCorpusReceipt"]["candidateCitations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|receipt| receipt["candidateId"] == candidate_id)
+            .and_then(|receipt| receipt["refutationEvidence"]["source"].as_str())
+            .expect("repository claim fixture must expose exact replacement evidence");
+        ResponseTemplate::new(200).set_body_json(scorer_text(
+            &json!([{
+                "candidateId": candidate_id,
+                "status": "refuted",
+                "revisedTitle": "",
+                "revisedBody": "",
+                "evidence": evidence,
+                "duplicateOf": null
+            }])
+            .to_string(),
+        ))
+    }
+}
+
+#[derive(Clone, Copy)]
 struct AllUnresolvedAdjudicator;
 
 impl Respond for AllUnresolvedAdjudicator {
@@ -11416,6 +11453,197 @@ async fn full_rereview_resolves_false_absence_from_unchanged_repository_source()
     assert_eq!(envelope["gate"]["failing"], false);
     assert!(envelope["repositorySearch"].get("evidence").is_none());
     assert!(envelope.get("repositoryEvidence").is_none());
+}
+
+#[tokio::test]
+async fn same_hunk_groups_replacement_refutes_false_deletion_claim() {
+    const PATH: &str = "ansible/group_vars/atlas.yml";
+    const OLD_LINE: &str = "groups: [atlas_packages_base]";
+    const REPLACEMENT: &str = "groups: [atlas_packages_base, atlas_packages_test]";
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("single finding adjudicator"))
+        .respond_with(RefuteFromReceiptAdjudicator)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    mock_review(
+        &server,
+        json!([{
+            "path": PATH,
+            "line": 120,
+            "severity": "warn",
+            "kind": "uncertainty",
+            "confidence": 0.91,
+            "title": "The groups entry was deleted",
+            "body": "The `groups` entry was deleted without its replacement `atlas_packages_test`.",
+            "evidence": "policy: atlas",
+            "repositoryContext": {
+                "claim": "mismatch",
+                "resources": ["groups"],
+                "values": ["atlas_packages_test"],
+                "versions": [],
+                "paths": [],
+                "identifiers": []
+            }
+        }]),
+    )
+    .await;
+
+    let directory = tempfile::tempdir().unwrap();
+    let diff = directory.path().join("groups-replacement.diff");
+    std::fs::write(
+        &diff,
+        format!(
+            "diff --git a/{PATH} b/{PATH}\n--- a/{PATH}\n+++ b/{PATH}\n@@ -120,4 +120,4 @@\n-policy: legacy\n+policy: atlas\n stable: true\n owner: atlas\n-{OLD_LINE}\n+{REPLACEMENT}\n"
+        ),
+    )
+    .unwrap();
+
+    let output = postil()
+        .current_dir(directory.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+    let envelope: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+
+    assert_eq!(envelope["findings"], json!([]));
+    assert_eq!(envelope["suppressedFindings"][0]["finding"]["path"], PATH);
+    assert_eq!(
+        envelope["suppressedFindings"][0]["finding"]["title"],
+        "The groups entry was deleted"
+    );
+    assert_eq!(envelope["suppressedFindings"][0]["reason"], "nonActionable");
+    assert_eq!(envelope["counts"]["warn"], 0);
+    assert_eq!(envelope["counts"]["suppressed"], 1);
+    assert_eq!(envelope["gate"]["failing"], false);
+
+    let requests = server.received_requests().await.unwrap();
+    let adjudication: Value = requests
+        .iter()
+        .find(|request| request_system_contains(request, "single finding adjudicator"))
+        .unwrap()
+        .body_json()
+        .unwrap();
+    let payload: Value = serde_json::from_str(
+        adjudication["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        payload["diffCorpusReceipt"]["candidateCitations"][0]["refutationEvidenceComplete"],
+        true
+    );
+    assert_eq!(
+        payload["diffCorpusReceipt"]["candidateCitations"][0]["refutationEvidence"]["source"],
+        REPLACEMENT
+    );
+}
+
+#[tokio::test]
+async fn cross_file_package_existence_refutes_false_absence_claim() {
+    const CLAIM_PATH: &str = "ci/package-policy.yml";
+    const PACKAGE_PATH: &str = "packages/atlas/manifest.yml";
+    const REPLACEMENT: &str = "name: atlas_packages_base";
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("single finding adjudicator"))
+        .respond_with(RefuteFromReceiptAdjudicator)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    mock_review(
+        &server,
+        json!([{
+            "path": CLAIM_PATH,
+            "line": 24,
+            "severity": "warn",
+            "kind": "uncertainty",
+            "confidence": 0.88,
+            "title": "The atlas package is absent",
+            "body": "The repository does not contain `atlas_packages_base`.",
+            "evidence": "package: atlas_packages_candidate",
+            "repositoryContext": {
+                "claim": "absence",
+                "resources": ["atlas package"],
+                "values": ["atlas_packages_base"],
+                "versions": [],
+                "paths": [],
+                "identifiers": []
+            }
+        }]),
+    )
+    .await;
+
+    let directory = tempfile::tempdir().unwrap();
+    let diff = directory.path().join("package-existence.diff");
+    std::fs::write(
+        &diff,
+        format!(
+            "diff --git a/{CLAIM_PATH} b/{CLAIM_PATH}\n--- a/{CLAIM_PATH}\n+++ b/{CLAIM_PATH}\n@@ -24,1 +24,1 @@\n-package: atlas_packages_legacy\n+package: atlas_packages_candidate\ndiff --git a/{PACKAGE_PATH} b/{PACKAGE_PATH}\n--- a/{PACKAGE_PATH}\n+++ b/{PACKAGE_PATH}\n@@ -1,2 +1,2 @@\n-type: legacy package\n-name: atlas_packages_legacy\n+type: atlas package\n+{REPLACEMENT}\n"
+        ),
+    )
+    .unwrap();
+
+    let output = postil()
+        .current_dir(directory.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+    let envelope: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+
+    assert_eq!(envelope["findings"], json!([]));
+    assert_eq!(
+        envelope["suppressedFindings"][0]["finding"]["path"],
+        CLAIM_PATH
+    );
+    assert_eq!(
+        envelope["suppressedFindings"][0]["finding"]["title"],
+        "The atlas package is absent"
+    );
+    assert_eq!(envelope["suppressedFindings"][0]["reason"], "nonActionable");
+    assert_eq!(envelope["counts"]["warn"], 0);
+    assert_eq!(envelope["counts"]["suppressed"], 1);
+    assert_eq!(envelope["gate"]["failing"], false);
+
+    let requests = server.received_requests().await.unwrap();
+    let adjudication: Value = requests
+        .iter()
+        .find(|request| request_system_contains(request, "single finding adjudicator"))
+        .unwrap()
+        .body_json()
+        .unwrap();
+    let payload: Value = serde_json::from_str(
+        adjudication["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        payload["diffCorpusReceipt"]["candidateCitations"][0]["refutationEvidenceComplete"],
+        true
+    );
+    assert_eq!(
+        payload["diffCorpusReceipt"]["candidateCitations"][0]["refutationEvidence"]["path"],
+        PACKAGE_PATH
+    );
+    assert_eq!(
+        payload["diffCorpusReceipt"]["candidateCitations"][0]["refutationEvidence"]["source"],
+        REPLACEMENT
+    );
 }
 
 #[tokio::test]
