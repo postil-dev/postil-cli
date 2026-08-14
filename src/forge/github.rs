@@ -3334,7 +3334,9 @@ mod tests {
             )],
         );
 
-        let receipt = test_github(&server)
+        let mut github = test_github(&server);
+        github.details_url = Some("https://postil.dev/orgs/acme/runs/run-1".into());
+        let receipt = github
             .post_review(
                 &envelope,
                 &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
@@ -3357,8 +3359,11 @@ mod tests {
         let fallback: serde_json::Value = serde_json::from_slice(&posts[1].body).unwrap();
         assert!(fallback.get("comments").is_none());
         let summary = fallback["body"].as_str().unwrap();
-        assert!(summary.contains("1 finding in review details"));
-        assert!(summary.contains("inline placement unavailable"));
+        assert!(
+            summary
+                .contains("1 finding could not be placed on the changed lines; see review details")
+        );
+        assert!(!summary.contains("inline placement unavailable"));
         assert!(!summary.contains("Before the next push"));
     }
 

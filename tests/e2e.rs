@@ -10329,6 +10329,10 @@ async fn github_unresolved_inline_line_falls_back_once_to_summary_only() {
         .env("POSTIL_API_BASE", server.uri())
         .env("GITHUB_API_URL", server.uri())
         .env("GITHUB_TOKEN", "gh-test-token")
+        .env(
+            "POSTIL_DETAILS_URL",
+            "https://postil.dev/orgs/acme/runs/run-1",
+        )
         .args([
             "review",
             "--publish",
@@ -10356,6 +10360,12 @@ async fn github_unresolved_inline_line_falls_back_once_to_summary_only() {
     assert_eq!(review_bodies.len(), 2);
     assert!(review_bodies[0].get("comments").is_some());
     assert!(review_bodies[1].get("comments").is_none());
+    let fallback_summary = review_bodies[1]["body"].as_str().unwrap();
+    assert!(
+        fallback_summary
+            .contains("1 finding could not be placed on the changed lines; see review details")
+    );
+    assert!(!fallback_summary.contains("inline placement unavailable"));
 }
 
 #[tokio::test]

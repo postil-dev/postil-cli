@@ -991,15 +991,42 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
                     plural(publication.active_inline, "finding", "findings"),
                 ));
             }
-            if publication.summary_only > 0 {
+            if publication.rejected_inline > 0 {
+                if publication.summary_only > publication.rejected_inline {
+                    if context.details_url.is_some() {
+                        delivery.push(format!(
+                            "{} {} in review details, including {} that could not be placed on the changed lines",
+                            publication.summary_only,
+                            plural(publication.summary_only, "finding", "findings"),
+                            publication.rejected_inline,
+                        ));
+                    } else {
+                        delivery.push(format!(
+                            "{} {} were not posted inline, including {} that could not be placed on the changed lines",
+                            publication.summary_only,
+                            plural(publication.summary_only, "finding", "findings"),
+                            publication.rejected_inline,
+                        ));
+                    }
+                } else {
+                    let details_direction = if context.details_url.is_some() {
+                        "; see review details"
+                    } else {
+                        ""
+                    };
+                    delivery.push(format!(
+                        "{} {} could not be placed on the changed lines{}",
+                        publication.rejected_inline,
+                        plural(publication.rejected_inline, "finding", "findings"),
+                        details_direction,
+                    ));
+                }
+            } else if publication.summary_only > 0 {
                 delivery.push(format!(
                     "{} {} in review details",
                     publication.summary_only,
                     plural(publication.summary_only, "finding", "findings"),
                 ));
-            }
-            if publication.rejected_inline > 0 {
-                delivery.push("inline placement unavailable".to_string());
             }
             if !delivery.is_empty() {
                 s.push_str(&delivery.join(" · "));
@@ -1731,6 +1758,86 @@ mod tests {
         let without_details = check_summary(&env, true, Default::default());
         assert!(!without_details.contains("Review details"));
         assert!(!without_details.contains("<sub>"));
+    }
+
+    #[test]
+    fn publication_summary_explains_unplaced_findings_without_duplicate_counts() {
+        let env = envelope_with_findings(vec![finding(), finding()]);
+        let unplaced_only = check_summary(
+            &env,
+            true,
+            SummaryContext {
+                details_url: Some("https://postil.dev/orgs/acme/runs/run-1".into()),
+                publication: Some(ReviewPublicationSummary {
+                    summary_only: 2,
+                    rejected_inline: 2,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        assert!(
+            unplaced_only.contains(
+                "2 findings could not be placed on the changed lines; see review details"
+            )
+        );
+        assert!(!unplaced_only.contains("inline placement unavailable"));
+        assert!(!unplaced_only.contains("2 findings in review details"));
+
+        let unplaced_without_details_link = check_summary(
+            &env,
+            true,
+            SummaryContext {
+                publication: Some(ReviewPublicationSummary {
+                    summary_only: 2,
+                    rejected_inline: 2,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        assert!(
+            unplaced_without_details_link
+                .contains("2 findings could not be placed on the changed lines")
+        );
+        assert!(!unplaced_without_details_link.contains("see review details"));
+
+        let mixed = check_summary(
+            &env,
+            true,
+            SummaryContext {
+                details_url: Some("https://postil.dev/orgs/acme/runs/run-1".into()),
+                publication: Some(ReviewPublicationSummary {
+                    active_inline: 1,
+                    summary_only: 2,
+                    rejected_inline: 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        assert!(mixed.contains(
+            "2 findings in review details, including 1 that could not be placed on the changed lines"
+        ));
+        assert!(mixed.contains("1 finding posted inline"));
+        assert!(!mixed.contains("inline placement unavailable"));
+
+        let mixed_without_details_link = check_summary(
+            &env,
+            true,
+            SummaryContext {
+                publication: Some(ReviewPublicationSummary {
+                    summary_only: 2,
+                    rejected_inline: 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        assert!(mixed_without_details_link.contains(
+            "2 findings were not posted inline, including 1 that could not be placed on the changed lines"
+        ));
+        assert!(!mixed_without_details_link.contains("review details"));
     }
 
     #[test]
