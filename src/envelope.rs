@@ -720,7 +720,7 @@ fn normalize_publication_body_line(value: &str, index: usize) -> String {
     normalized.push_str(&line[..first_content]);
     normalized.push('\\');
     normalized.push_str(&line[first_content..]);
-    normalized
+    neutralize_unmatched_backticks(&sanitize_publication_line(&normalized))
 }
 
 fn sanitize_publication_title(value: &str) -> String {
@@ -734,7 +734,8 @@ fn sanitize_publication_title(value: &str) -> String {
             }
         })
         .collect::<String>();
-    let line = sanitize_publication_line(&single_line).replace(['`', '*', '[', ']', '#'], " ");
+    let line =
+        sanitize_publication_plain_line(&single_line).replace(['`', '*', '[', ']', '#'], " ");
     let characters = line.chars().collect::<Vec<_>>();
     let line = characters
         .iter()
@@ -760,10 +761,78 @@ fn sanitize_publication_line(value: &str) -> String {
         .chars()
         .filter(|character| !character.is_control() || *character == '\t')
         .collect::<String>()
+        .replace('@', "＠");
+    let text = escape_html_outside_inline_code(&text);
+    neutralize_markdown_images(&text)
+}
+
+fn sanitize_publication_plain_line(value: &str) -> String {
+    let text = escape_unsafe_unicode(value)
+        .chars()
+        .filter(|character| !character.is_control() || *character == '\t')
+        .collect::<String>()
         .replace('@', "＠")
         .replace('<', "&lt;")
         .replace('>', "&gt;");
     neutralize_markdown_images(&text)
+}
+
+fn escape_html_outside_inline_code(value: &str) -> String {
+    let characters = value.chars().collect::<Vec<_>>();
+    let mut output = String::with_capacity(value.len());
+    let mut cursor = 0;
+    while cursor < characters.len() {
+        if characters[cursor] != '`' {
+            match characters[cursor] {
+                '<' => output.push_str("&lt;"),
+                '>' => output.push_str("&gt;"),
+                character => output.push(character),
+            }
+            cursor += 1;
+            continue;
+        }
+
+        let preceding_backslashes = characters[..cursor]
+            .iter()
+            .rev()
+            .take_while(|character| **character == '\\')
+            .count();
+        let width = characters[cursor..]
+            .iter()
+            .take_while(|character| **character == '`')
+            .count();
+        if preceding_backslashes % 2 == 1 {
+            output.extend(characters[cursor..cursor + width].iter());
+            cursor += width;
+            continue;
+        }
+
+        let mut candidate = cursor + width;
+        let mut closing = None;
+        while candidate < characters.len() {
+            if characters[candidate] != '`' {
+                candidate += 1;
+                continue;
+            }
+            let candidate_width = characters[candidate..]
+                .iter()
+                .take_while(|character| **character == '`')
+                .count();
+            if candidate_width == width {
+                closing = Some(candidate + width);
+                break;
+            }
+            candidate += candidate_width;
+        }
+        if let Some(end) = closing {
+            output.extend(characters[cursor..end].iter());
+            cursor = end;
+        } else {
+            output.extend(characters[cursor..cursor + width].iter());
+            cursor += width;
+        }
+    }
+    output
 }
 
 fn escape_unsafe_unicode(value: &str) -> String {
@@ -1815,6 +1884,37 @@ mod tests {
         assert!(finding.body.contains("&lt;details&gt;"));
         assert!(finding.body.contains("unmatched \\` marker."));
         assert_eq!(validate_finding_publication(&finding), Ok(()));
+    }
+
+    #[test]
+    fn fresh_finding_normalization_preserves_operators_in_inline_code() {
+        let mut finding = finding(Severity::Warn, 0.9);
+        finding.body = "The expression `time() - kube_pod_start_time > 60d` measures pod age, while <details> remains markup.".into();
+
+        normalize_finding_publication(&mut finding);
+
+        assert!(
+            finding
+                .body
+                .contains("`time() - kube_pod_start_time > 60d`")
+        );
+        assert!(!finding.body.contains("&gt; 60d`"));
+        assert!(finding.body.contains("&lt;details&gt;"));
+        assert_eq!(validate_finding_publication(&finding), Ok(()));
+    }
+
+    #[test]
+    fn fresh_finding_normalization_is_idempotent_for_fence_shaped_code() {
+        let mut finding = finding(Severity::Warn, 0.9);
+        finding.body = "``` <details> ```.".into();
+
+        normalize_finding_publication(&mut finding);
+        let normalized = finding.body.clone();
+
+        assert_eq!(normalized, "\\``` &lt;details&gt; ```.");
+        assert_eq!(validate_finding_publication(&finding), Ok(()));
+        normalize_finding_publication(&mut finding);
+        assert_eq!(finding.body, normalized);
     }
 
     #[test]
