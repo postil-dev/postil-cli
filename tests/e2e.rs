@@ -2713,9 +2713,10 @@ async fn adjudication_provider_failure_preserves_findings_and_baseline_blocker()
         &server,
         json!([{
             "path": "src/auth.rs", "line": 42, "severity": "warn", "kind": "risk",
-            "confidence": 0.99, "title": "Validate query input",
-            "body": "The query executes attacker-controlled input without validation.",
-            "evidence": "exec_query(&token);"
+            "confidence": 0.99, "title": "Authorization validator is absent",
+            "body": "The repository does not contain `validate_query_input`.",
+            "evidence": "exec_query(&token);",
+            "repositoryContext": {"claim": "absence", "identifiers": ["validate_query_input"]}
         }]),
     )
     .await;
@@ -2778,7 +2779,7 @@ async fn adjudication_provider_failure_preserves_findings_and_baseline_blocker()
             .as_array()
             .unwrap()
             .iter()
-            .any(|finding| { finding["title"] == "Validate query input" })
+            .any(|finding| { finding["title"] == "Authorization validator is absent" })
     );
     assert!(
         envelope["findings"]
@@ -2827,9 +2828,10 @@ async fn malformed_adjudication_output_blocks_under_advisory_provider_policy() {
         &server,
         json!([{
             "path": "src/auth.rs", "line": 42, "severity": "warn", "kind": "risk",
-            "confidence": 0.99, "title": "Validate query input",
-            "body": "The query executes attacker-controlled input without validation.",
-            "evidence": "exec_query(&token);"
+            "confidence": 0.99, "title": "Authorization validator is absent",
+            "body": "The repository does not contain `validate_query_input`.",
+            "evidence": "exec_query(&token);",
+            "repositoryContext": {"claim": "absence", "identifiers": ["validate_query_input"]}
         }]),
     )
     .await;
@@ -2858,7 +2860,8 @@ async fn malformed_adjudication_output_blocks_under_advisory_provider_policy() {
             .unwrap()
             .iter()
             .any(|finding| {
-                finding["path"] == "src/auth.rs" && finding["title"] == "Validate query input"
+                finding["path"] == "src/auth.rs"
+                    && finding["title"] == "Authorization validator is absent"
             })
     );
     assert!(
@@ -11416,7 +11419,7 @@ async fn full_rereview_resolves_false_absence_from_unchanged_repository_source()
 }
 
 #[tokio::test]
-async fn fresh_repository_claims_remain_open_for_unavailable_and_exhausted_receipts() {
+async fn fresh_unresolved_repository_claims_are_suppressed() {
     for (name, repository, resources, state) in [
         (
             "unavailable",
@@ -11455,15 +11458,12 @@ async fn fresh_repository_claims_remain_open_for_unavailable_and_exhausted_recei
             command.arg("--diff-file").arg(&diff);
         }
         command.args(["--output", "json"]);
-        let out = command.assert().code(1);
+        let out = command.assert().code(0);
         let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
         assert_eq!(envelope["repositorySearch"]["state"], state, "{name}");
-        assert_eq!(envelope["counts"]["suppressed"], 0, "{name}");
-        assert_eq!(
-            envelope["findings"][0]["title"], "Widget dependency is absent",
-            "{name}"
-        );
-        assert_eq!(envelope["gate"]["failing"], true, "{name}");
+        assert_eq!(envelope["counts"]["suppressed"], 1, "{name}");
+        assert_eq!(envelope["findings"], json!([]), "{name}");
+        assert_eq!(envelope["gate"]["failing"], false, "{name}");
     }
 }
 

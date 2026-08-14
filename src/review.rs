@@ -2352,6 +2352,10 @@ async fn review_diff_at(
                                     preserve_unadjudicated_findings(all_adjudication_candidates)
                                 }
                             };
+                            suppress_fresh_unresolved_repository_claims(
+                                &mut application,
+                                fresh_candidate_count,
+                            );
                             for (candidate_index, finding) in application
                                 .kept_indices
                                 .iter()
@@ -3036,9 +3040,41 @@ fn preserve_unadjudicated_findings(
     crate::adjudication::AdjudicationApplication {
         kept_indices: (0..findings.len()).collect(),
         kept: findings,
+        unresolved_indices: Vec::new(),
         resolved_indices: Vec::new(),
         suppressed: Vec::new(),
     }
+}
+
+fn suppress_fresh_unresolved_repository_claims(
+    application: &mut crate::adjudication::AdjudicationApplication,
+    fresh_candidate_count: usize,
+) {
+    let mut kept = Vec::with_capacity(application.kept.len());
+    let mut kept_indices = Vec::with_capacity(application.kept_indices.len());
+    for (candidate_index, finding) in application
+        .kept_indices
+        .drain(..)
+        .zip(application.kept.drain(..))
+    {
+        let unsupported = candidate_index < fresh_candidate_count
+            && application.unresolved_indices.contains(&candidate_index)
+            && finding.repository_claim.is_some();
+        if unsupported {
+            application.suppressed.push(SuppressedFinding {
+                finding,
+                reason: SuppressionReason::RepositoryClaimUnsupported,
+            });
+        } else {
+            kept_indices.push(candidate_index);
+            kept.push(finding);
+        }
+    }
+    application.kept = kept;
+    application.kept_indices = kept_indices;
+    application
+        .unresolved_indices
+        .retain(|index| application.kept_indices.contains(index));
 }
 
 fn error_envelope(
@@ -3777,6 +3813,57 @@ mod tests {
         assert!(!baseline_has_carryable_findings(&[
             crate::envelope::provider_error_finding("fixture provider failure"),
         ]));
+    }
+
+    #[test]
+    fn only_fresh_unresolved_repository_claims_are_suppressed() {
+        let claim = RepositoryClaim {
+            kind: RepositoryClaimKind::Absence,
+            resources: vec!["widget".into()],
+            values: vec![],
+            versions: vec![],
+            paths: vec![],
+            identifiers: vec![],
+        };
+        let mut fresh_repository_claim = finding("src/fresh.rs", 1, "widget is absent");
+        fresh_repository_claim.repository_claim = Some(claim.clone());
+        let fresh_local_finding = finding("src/local.rs", 2, "authorization is bypassed");
+        let mut baseline_repository_claim = finding("src/baseline.rs", 3, "widget is absent");
+        baseline_repository_claim.repository_claim = Some(claim);
+        let mut application = crate::adjudication::AdjudicationApplication {
+            kept: vec![
+                fresh_repository_claim.clone(),
+                fresh_local_finding.clone(),
+                baseline_repository_claim.clone(),
+            ],
+            kept_indices: vec![0, 1, 2],
+            unresolved_indices: vec![0, 1, 2],
+            resolved_indices: vec![],
+            suppressed: vec![],
+        };
+
+        suppress_fresh_unresolved_repository_claims(&mut application, 2);
+
+        assert_eq!(application.kept_indices, vec![1, 2]);
+        assert_eq!(application.unresolved_indices, vec![1, 2]);
+        assert_eq!(application.kept.len(), 2);
+        assert!(same_visible_finding(
+            &application.kept[0],
+            &fresh_local_finding
+        ));
+        assert!(same_visible_finding(
+            &application.kept[1],
+            &baseline_repository_claim
+        ));
+        assert_eq!(application.suppressed.len(), 1);
+        assert!(same_visible_finding(
+            &application.suppressed[0].finding,
+            &fresh_repository_claim
+        ));
+        assert_eq!(
+            application.suppressed[0].reason,
+            SuppressionReason::RepositoryClaimUnsupported
+        );
     }
 
     #[test]
