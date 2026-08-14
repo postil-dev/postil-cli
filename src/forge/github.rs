@@ -11,9 +11,14 @@ use std::io::Write;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::{
-    CheckRunIds, CheckState, FindingPublicationOutcome, FindingPublicationReceipt, Forge, PrMeta,
-    ReviewPublicationReceipt, ReviewPublicationSummary, SummaryContext, ThreadKind, check_summary,
-    check_title, only_operational_findings, valid_details_url,
+    CheckRunIds, CheckState, FindingPublicationOutcome, FindingPublicationReceipt, Forge,
+    GitHubPublicationPlan, GitHubPublicationPlanRequest, PrMeta, PublicationPlanCheckAnnotation,
+    PublicationPlanFallbackActivation, PublicationPlanFileComment, PublicationPlanFinding,
+    PublicationPlanFindingFallback, PublicationPlanOperation, PublicationPlanOperationKind,
+    PublicationPlanRepository, PublicationPlanReviewAction, PublicationPlanReviewAttempt,
+    PublicationPlanReviewComment, PublicationPlanSnapshot, ReviewPublicationReceipt,
+    ReviewPublicationSummary, SummaryContext, ThreadKind, check_summary, check_title,
+    only_operational_findings, valid_details_url,
 };
 use crate::diff::{Diff, DiffIndex, DiffSnapshot, DiffSpool, WorkspaceBudget};
 use crate::envelope::{Envelope, Finding, Severity};
@@ -248,6 +253,50 @@ impl GitHub {
             ));
         }
         Ok(())
+    }
+
+    async fn publication_plan_repository_identity(&self) -> Result<RepositoryIdentity> {
+        let response = self
+            .send_retryable(
+                self.request(reqwest::Method::GET, self.url("")),
+                "publication-plan repository identity",
+            )
+            .await?;
+        let identity: RepositoryIdentity = super::bounded_response_json(
+            Self::check_ok(response, "publication-plan repository identity").await?,
+            "GitHub publication-plan repository identity",
+        )
+        .await?;
+        let expected_name = format!("{}/{}", self.owner, self.repo);
+        ensure!(
+            identity.id > 0 && identity.full_name.eq_ignore_ascii_case(&expected_name),
+            "GitHub repository identity changed; refusing publication planning"
+        );
+        if let Some(expected_id) = self.expected_repository_id {
+            ensure!(
+                identity.id == expected_id,
+                "GitHub repository identity changed; refusing publication planning"
+            );
+        }
+        Ok(identity)
+    }
+
+    async fn reconcile_published_finding_markers(
+        &self,
+        receipt: &mut ReviewPublicationReceipt,
+        head_sha: &str,
+    ) -> std::collections::HashMap<String, PublishedReviewComment> {
+        let published = self.published_finding_comments(head_sha).await;
+        for publication in &mut receipt.findings {
+            let marker = finding_marker(&publication.finding_id);
+            let Some(comment) = published.get(&marker) else {
+                continue;
+            };
+            publication.initial_outcome = FindingPublicationOutcome::Carried;
+            publication.inline_rejected = false;
+            publication.comment_id = Some(comment.id.to_string());
+        }
+        published
     }
 
     async fn fetch_pr_state(&self) -> Result<PrResponse> {
@@ -1718,10 +1767,83 @@ enum ReviewDelivery {
     Reconciled(PublishedReview),
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct RepositoryIdentity {
     id: u64,
     full_name: String,
+}
+
+#[derive(Clone)]
+struct PlannedCheckOutput {
+    name: &'static str,
+    state: CheckState,
+    title: String,
+    summary: String,
+    annotations: Vec<PublicationPlanCheckAnnotation>,
+}
+
+fn planned_check_outputs(
+    envelope: &Envelope,
+    advisory: CheckState,
+    gate: Option<CheckState>,
+    annotate_findings: bool,
+    details_url: Option<String>,
+) -> Vec<PlannedCheckOutput> {
+    let annotations = if annotate_findings {
+        envelope
+            .findings
+            .iter()
+            .filter(|finding| !filter::is_carried(finding))
+            .filter(|finding| !super::is_synthetic_path(&finding.path))
+            .map(|finding| {
+                let publication = crate::envelope::forge_safe_finding_publication_text(finding);
+                PublicationPlanCheckAnnotation {
+                    path: finding.path.clone(),
+                    start_line: finding.line,
+                    end_line: finding.end_line.unwrap_or(finding.line),
+                    annotation_level: match finding.severity {
+                        Severity::Info => "notice",
+                        Severity::Warn => "warning",
+                        Severity::Error => "failure",
+                    }
+                    .to_string(),
+                    title: publication.title,
+                    message: publication.body,
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    debug_assert!(annotations.len() <= GITHUB_MAX_ANNOTATIONS_PER_REQUEST);
+
+    let advisory_summary = check_summary(
+        envelope,
+        true,
+        SummaryContext {
+            details_url,
+            prevention_hint: false,
+            prevention_commands: vec![],
+            publication: None,
+        },
+    );
+    let mut checks = vec![PlannedCheckOutput {
+        name: "postil/review",
+        state: advisory,
+        title: super::cap_check_title(&check_title(envelope)),
+        summary: super::cap_check_summary(&advisory_summary),
+        annotations,
+    }];
+    if let Some(gate) = gate {
+        checks.push(PlannedCheckOutput {
+            name: "postil/gate",
+            state: gate,
+            title: super::cap_check_title(gate_title(envelope)),
+            summary: super::cap_check_summary(&gate_summary(envelope)),
+            annotations: vec![],
+        });
+    }
+    checks
 }
 
 impl Forge for GitHub {
@@ -1741,6 +1863,329 @@ impl Forge for GitHub {
         snapshot: &PrMeta,
     ) -> ReviewPublicationReceipt {
         planned_review_receipt(envelope, &snapshot.head_sha)
+    }
+
+    async fn build_publication_plan(
+        &self,
+        request: GitHubPublicationPlanRequest<'_>,
+    ) -> Result<GitHubPublicationPlan> {
+        let GitHubPublicationPlanRequest {
+            envelope,
+            snapshot,
+            publication_diff,
+            should_comment,
+            duplicate_of_baseline,
+            annotate_findings,
+            advisory,
+            gate,
+        } = request;
+        ensure!(
+            self.snapshot_is_current(snapshot).await?,
+            "GitHub publication planning skipped because the pull request snapshot changed"
+        );
+        let repository = self.publication_plan_repository_identity().await?;
+        let target_sha = snapshot
+            .target_sha
+            .as_deref()
+            .context("GitHub publication planning requires a target snapshot")?;
+        let mut receipt = self.plan_review_publication(envelope, snapshot);
+        if annotate_findings {
+            receipt.channel = super::ReviewPublicationChannel::CheckAnnotations;
+            for finding in &mut receipt.findings {
+                if finding.initial_outcome == FindingPublicationOutcome::Inline {
+                    finding.initial_outcome = FindingPublicationOutcome::CheckAnnotation;
+                }
+            }
+        } else if duplicate_of_baseline {
+            for finding in &mut receipt.findings {
+                if matches!(
+                    finding.initial_outcome,
+                    FindingPublicationOutcome::Inline
+                        | FindingPublicationOutcome::FileComment
+                        | FindingPublicationOutcome::SummaryOnly
+                ) {
+                    finding.initial_outcome = FindingPublicationOutcome::Carried;
+                }
+            }
+        }
+
+        let mut action = PublicationPlanReviewAction::Omit;
+        let mut initial_attempt = None;
+        let mut placement_fallback_attempt = None;
+        let mut summary_fallback_attempt = None;
+        let mut fallback_intent =
+            std::collections::HashMap::<String, Vec<PublicationPlanFindingFallback>>::new();
+        let mut file_comment_operations = Vec::new();
+
+        if should_comment && !annotate_findings {
+            let published = self
+                .reconcile_published_finding_markers(&mut receipt, &snapshot.head_sha)
+                .await;
+            let publishable_findings = publication_plan_publishable_findings(envelope, &published);
+            let summary = self.review_summary_for_receipt(envelope, &receipt);
+            let marker = review_marker(&receipt.receipt_id);
+            let comments = publishable_findings
+                .iter()
+                .map(|finding| publication_plan_review_comment(&initial_review_comment(finding)))
+                .collect::<Result<Vec<_>>>()?;
+            if !comments.is_empty() || !summary.is_empty() {
+                action = PublicationPlanReviewAction::Publish;
+                initial_attempt = Some(PublicationPlanReviewAttempt {
+                    body: bounded_review_body(&summary, &marker, self.details_url.as_deref()),
+                    comments,
+                });
+            }
+
+            if !publishable_findings.is_empty() {
+                let owned_publication_diff = if publication_diff.is_none() {
+                    Some(
+                        self.fetch_diff(snapshot)
+                            .await
+                            .context("fetching complete diff for GitHub publication planning")?,
+                    )
+                } else {
+                    None
+                };
+                let parsed_publication_diff = owned_publication_diff
+                    .as_ref()
+                    .map(|diff| crate::diff::parse(diff.as_str()));
+                let publication_diff = publication_diff
+                    .or(parsed_publication_diff.as_ref())
+                    .context(
+                        "GitHub publication planning is missing the complete pull-request diff",
+                    )?;
+                let placement_index = DiffIndex::build(publication_diff);
+                let mut line_findings = Vec::new();
+                let mut file_findings = Vec::new();
+                let mut summary_findings = Vec::new();
+                for finding in &publishable_findings {
+                    let (finding_id, _) = finding_receipt_id(finding);
+                    let Some(path) = publication_file_path(publication_diff, &finding.path) else {
+                        fallback_intent.insert(
+                            finding_id,
+                            vec![PublicationPlanFindingFallback::SummaryOnly],
+                        );
+                        summary_findings.push(*finding);
+                        continue;
+                    };
+                    if let Some(line) = placement_index.nearest_new_side_line(path, finding.line) {
+                        fallback_intent.insert(
+                            finding_id,
+                            vec![
+                                PublicationPlanFindingFallback::RelocatedInline,
+                                PublicationPlanFindingFallback::FileComment,
+                            ],
+                        );
+                        line_findings.push((*finding, path, line));
+                    } else {
+                        fallback_intent.insert(
+                            finding_id,
+                            vec![PublicationPlanFindingFallback::FileComment],
+                        );
+                        file_findings.push((*finding, path));
+                    }
+                }
+
+                let mut fallback_receipt = receipt.clone();
+                for (finding, _) in &file_findings {
+                    set_publication_outcome(
+                        &mut fallback_receipt,
+                        finding,
+                        FindingPublicationOutcome::FileComment,
+                        false,
+                    )?;
+                }
+                for finding in &summary_findings {
+                    set_publication_outcome(
+                        &mut fallback_receipt,
+                        finding,
+                        FindingPublicationOutcome::SummaryOnly,
+                        true,
+                    )?;
+                }
+                let fallback_summary = self.review_summary_with_unplaced_findings(
+                    envelope,
+                    &fallback_receipt,
+                    &summary_findings,
+                );
+                let fallback_summary = if summary_findings.is_empty() {
+                    bounded_review_body(
+                        if fallback_summary.is_empty() {
+                            "Postil completed the review."
+                        } else {
+                            &fallback_summary
+                        },
+                        &marker,
+                        self.details_url.as_deref(),
+                    )
+                } else {
+                    required_review_body(&fallback_summary, &marker)?
+                };
+                placement_fallback_attempt = Some(PublicationPlanReviewAttempt {
+                    body: fallback_summary,
+                    comments: line_findings
+                        .iter()
+                        .map(|(finding, path, line)| {
+                            publication_plan_review_comment(&fallback_line_comment(
+                                finding, path, *line,
+                            ))
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                });
+
+                let mut summary_receipt = fallback_receipt;
+                for (finding, _, _) in &line_findings {
+                    set_publication_outcome(
+                        &mut summary_receipt,
+                        finding,
+                        FindingPublicationOutcome::FileComment,
+                        false,
+                    )?;
+                }
+                if !line_findings.is_empty() {
+                    let summary = self.review_summary_with_unplaced_findings(
+                        envelope,
+                        &summary_receipt,
+                        &summary_findings,
+                    );
+                    summary_fallback_attempt = Some(PublicationPlanReviewAttempt {
+                        body: if summary_findings.is_empty() {
+                            bounded_review_body(&summary, &marker, self.details_url.as_deref())
+                        } else {
+                            required_review_body(&summary, &marker)?
+                        },
+                        comments: vec![],
+                    });
+                }
+
+                for (finding, path) in file_findings.into_iter().chain(
+                    line_findings
+                        .into_iter()
+                        .map(|(finding, path, _)| (finding, path)),
+                ) {
+                    let (finding_id, _) = finding_receipt_id(finding);
+                    let payload = publication_plan_file_comment(&file_level_comment(
+                        finding,
+                        path,
+                        &snapshot.head_sha,
+                    ))?;
+                    file_comment_operations.push(PublicationPlanOperation {
+                        operation_key: publication_plan_operation_key(
+                            repository.id,
+                            self.pr,
+                            &snapshot.head_sha,
+                            "file-comment-fallback",
+                            Some(&finding_id),
+                        ),
+                        desired: PublicationPlanOperationKind::FileCommentFallback {
+                            finding_id,
+                            activation:
+                                PublicationPlanFallbackActivation::CompositeReviewPlacementFailed,
+                            payload,
+                        },
+                    });
+                }
+            }
+        }
+
+        let findings = receipt
+            .findings
+            .iter()
+            .map(|publication| {
+                let finding = publication_plan_finding(envelope, &publication.finding_id)?;
+                Ok(PublicationPlanFinding {
+                    finding_id: publication.finding_id.clone(),
+                    stable_identity: publication.stable_identity,
+                    path: finding.path.clone(),
+                    line: finding.line,
+                    end_line: finding.end_line,
+                    initial_outcome: publication.initial_outcome,
+                    fallback_intent: fallback_intent
+                        .remove(&publication.finding_id)
+                        .unwrap_or_default(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut operations = vec![PublicationPlanOperation {
+            operation_key: publication_plan_operation_key(
+                repository.id,
+                self.pr,
+                &snapshot.head_sha,
+                "composite-review",
+                None,
+            ),
+            desired: PublicationPlanOperationKind::CompositeReview {
+                action,
+                receipt_id: receipt.receipt_id.clone(),
+                initial_attempt,
+                placement_fallback_attempt,
+                summary_fallback_attempt,
+                findings,
+            },
+        }];
+        operations.append(&mut file_comment_operations);
+        let conclusion = |state: CheckState| match state {
+            CheckState::Success => "success",
+            CheckState::Failure => "failure",
+            CheckState::Neutral => "neutral",
+        };
+        for check in planned_check_outputs(
+            envelope,
+            advisory,
+            Some(gate),
+            annotate_findings,
+            self.details_url.clone(),
+        ) {
+            let operation_key = publication_plan_operation_key(
+                repository.id,
+                self.pr,
+                &snapshot.head_sha,
+                check.name,
+                None,
+            );
+            let desired = if check.name == "postil/review" {
+                PublicationPlanOperationKind::AdvisoryCheck {
+                    name: check.name.to_string(),
+                    head_sha: snapshot.head_sha.clone(),
+                    conclusion: conclusion(check.state).to_string(),
+                    title: check.title,
+                    summary: check.summary,
+                    annotations: check.annotations,
+                    details_url: self.details_url.clone(),
+                }
+            } else {
+                PublicationPlanOperationKind::GateCheck {
+                    name: check.name.to_string(),
+                    head_sha: snapshot.head_sha.clone(),
+                    conclusion: conclusion(check.state).to_string(),
+                    title: check.title,
+                    summary: check.summary,
+                    details_url: self.details_url.clone(),
+                }
+            };
+            operations.push(PublicationPlanOperation {
+                operation_key,
+                desired,
+            });
+        }
+
+        GitHubPublicationPlan::new(
+            PublicationPlanRepository {
+                id: repository.id,
+                full_name: repository.full_name,
+            },
+            self.pr,
+            PublicationPlanSnapshot {
+                head_sha: snapshot.head_sha.clone(),
+                merge_base_sha: snapshot.base_sha.clone(),
+                target_sha: target_sha.to_string(),
+                pull_request_title_sha256: publication_plan_text_digest(&snapshot.title),
+                pull_request_body_sha256: publication_plan_text_digest(&snapshot.body),
+            },
+            receipt.receipt_id,
+            operations,
+        )
     }
 
     async fn fetch_pr_meta(&self) -> Result<PrMeta> {
@@ -1886,31 +2331,18 @@ impl Forge for GitHub {
         // A re-review of an unchanged head re-detects what the last review
         // found. Those findings arrive fresh rather than carried, so the carry
         // filter above cannot see them; their markers already on the PR can.
-        let published = self.published_finding_comments(head_sha).await;
-        let mut observed_comment_count = 0usize;
-        for publication in &mut planned_receipt.findings {
-            let marker = finding_marker(&publication.finding_id);
-            let Some(comment) = published.get(&marker) else {
-                continue;
-            };
-            publication.initial_outcome = FindingPublicationOutcome::Carried;
-            publication.inline_rejected = false;
-            publication.comment_id = Some(comment.id.to_string());
-            observed_comment_count += 1;
-        }
-        let publishable_findings: Vec<_> = findings
+        let published = self
+            .reconcile_published_finding_markers(&mut planned_receipt, head_sha)
+            .await;
+        let observed_comment_count = planned_receipt
+            .findings
             .iter()
-            // Carried findings already have comments from the previous review.
-            .filter(|f| !filter::is_carried(f))
-            // Synthetic-path findings (PR description, fail-closed markers) have
-            // no real file line to anchor an inline comment; they surface only in
-            // the summary body.
-            .filter(|f| !super::is_synthetic_path(&f.path))
-            .filter(|f| {
-                let (finding_id, _) = finding_receipt_id(f);
-                !published.contains_key(&finding_marker(&finding_id))
+            .filter(|publication| {
+                publication.initial_outcome == FindingPublicationOutcome::Carried
+                    && publication.comment_id.is_some()
             })
-            .collect();
+            .count();
+        let publishable_findings = publication_plan_publishable_findings(envelope, &published);
         let comments: Vec<_> = publishable_findings
             .iter()
             .map(|finding| initial_review_comment(finding))
@@ -2311,96 +2743,63 @@ impl Forge for GitHub {
             CheckState::Failure => "failure",
             CheckState::Neutral => "neutral",
         };
-        let annotations: Vec<_> = if annotate_findings {
-            envelope
-                .findings
-                .iter()
-                // Carried findings remain visible on the review that introduced
-                // them. Re-annotating can also target a stale line range.
-                .filter(|f| !filter::is_carried(f))
-                // Synthetic-path findings have no real file line to annotate;
-                // they are already carried in the check-run summary body.
-                .filter(|f| !super::is_synthetic_path(&f.path))
-                .map(|f| {
-                    let publication = crate::envelope::forge_safe_finding_publication_text(f);
-                    json!({
-                        "path": f.path,
-                        "start_line": f.line,
-                        "end_line": f.end_line.unwrap_or(f.line),
-                        "annotation_level": match f.severity {
-                            Severity::Info => "notice",
-                            Severity::Warn => "warning",
-                            Severity::Error => "failure",
-                        },
-                        "title": publication.title,
-                        "message": publication.body,
-                    })
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        debug_assert!(annotations.len() <= GITHUB_MAX_ANNOTATIONS_PER_REQUEST);
-        let mut checks = vec![(check_ids.advisory, advisory, "postil/review", true)];
-        if let Some(gate) = gate {
-            checks.push((check_ids.gate, gate, "postil/gate", false));
-        }
+        let checks = planned_check_outputs(
+            envelope,
+            advisory,
+            gate,
+            annotate_findings,
+            self.details_url.clone(),
+        );
         let mut results = stream::iter(checks.into_iter().enumerate().map(
-            |(index, (id, state, name, with_annotations))| {
-                let annotations = &annotations;
-                async move {
-                    let gate_note = if name == "postil/gate" {
-                        gate_summary(envelope)
-                    } else {
-                        check_summary(
-                            envelope,
-                            true,
-                            SummaryContext {
-                                details_url: self.details_url.clone(),
-                                prevention_hint: false,
-                                prevention_commands: vec![],
-                                publication: None,
-                            },
-                        )
-                    };
-                    let title = if name == "postil/gate" {
-                        gate_title(envelope).to_string()
-                    } else {
-                        check_title(envelope)
-                    };
-                    let mut output = json!({
-                        // GitHub rejects title >255 and summary >65535 with HTTP 422,
-                        // which would abort posting both checks. Cap both defensively.
-                        "title": super::cap_check_title(&title),
-                        "summary": super::cap_check_summary(&gate_note),
-                    });
-                    if annotate_findings && with_annotations && !annotations.is_empty() {
-                        output["annotations"] = json!(annotations);
-                    }
-                    let mut body = json!({
-                        "status": "completed",
-                        "conclusion": conclusion(state),
-                        "output": output,
-                    });
-                    self.add_details_url(&mut body);
-                    let result = match self
-                        .send_write_retryable(
-                            self.request(
-                                reqwest::Method::PATCH,
-                                self.url(&format!("/check-runs/{id}")),
-                            )
-                            .json(&body),
-                            &format!("complete {name}"),
-                        )
-                        .await
-                    {
-                        Ok(response) => Self::check_ok(response, "check-run complete")
-                            .await
-                            .map(|_| ()),
-                        Err(error) => Err(error),
-                    };
-                    (index, name, result)
+            |(index, planned)| async move {
+                let id = if planned.name == "postil/review" {
+                    check_ids.advisory
+                } else {
+                    check_ids.gate
+                };
+                let mut output = json!({
+                    "title": planned.title,
+                    "summary": planned.summary,
+                });
+                if !planned.annotations.is_empty() {
+                    output["annotations"] = json!(
+                        planned
+                            .annotations
+                            .iter()
+                            .map(|annotation| json!({
+                                "path": annotation.path,
+                                "start_line": annotation.start_line,
+                                "end_line": annotation.end_line,
+                                "annotation_level": annotation.annotation_level,
+                                "title": annotation.title,
+                                "message": annotation.message,
+                            }))
+                            .collect::<Vec<_>>()
+                    );
                 }
+                let mut body = json!({
+                    "status": "completed",
+                    "conclusion": conclusion(planned.state),
+                    "output": output,
+                });
+                self.add_details_url(&mut body);
+                let result = match self
+                    .send_write_retryable(
+                        self.request(
+                            reqwest::Method::PATCH,
+                            self.url(&format!("/check-runs/{id}")),
+                        )
+                        .json(&body),
+                        &format!("complete {}", planned.name),
+                    )
+                    .await
+                {
+                    Ok(response) => Self::check_ok(response, "check-run complete")
+                        .await
+                        .map(|_| ()),
+                    Err(error) => Err(error),
+                };
+                (index, planned.name, result)
             },
         ))
         .buffer_unordered(2)
@@ -2538,6 +2937,115 @@ fn planned_review_receipt(envelope: &Envelope, head_sha: &str) -> ReviewPublicat
         review_id: None,
         findings,
     }
+}
+
+fn publication_plan_text_digest(value: &str) -> String {
+    format!(
+        "sha256:{}",
+        crate::repository_search::hex_digest(Sha256::digest(value.as_bytes()))
+    )
+}
+
+fn publication_plan_operation_key(
+    repository_id: u64,
+    pull_request_number: u64,
+    head_sha: &str,
+    kind: &str,
+    finding_id: Option<&str>,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"github-publication-operation-v1\0");
+    digest.update(repository_id.to_be_bytes());
+    digest.update(pull_request_number.to_be_bytes());
+    digest.update(head_sha.as_bytes());
+    digest.update(kind.as_bytes());
+    if let Some(finding_id) = finding_id {
+        digest.update([0]);
+        digest.update(finding_id.as_bytes());
+    }
+    format!(
+        "github-publication-v1:{kind}:sha256:{}",
+        crate::repository_search::hex_digest(digest.finalize())
+    )
+}
+
+fn publication_plan_publishable_findings<'a>(
+    envelope: &'a Envelope,
+    published: &std::collections::HashMap<String, PublishedReviewComment>,
+) -> Vec<&'a Finding> {
+    envelope
+        .findings
+        .iter()
+        .filter(|finding| !filter::is_carried(finding))
+        .filter(|finding| !super::is_synthetic_path(&finding.path))
+        .filter(|finding| {
+            let (finding_id, _) = finding_receipt_id(finding);
+            !published.contains_key(&finding_marker(&finding_id))
+        })
+        .collect()
+}
+
+fn publication_plan_finding<'a>(envelope: &'a Envelope, finding_id: &str) -> Result<&'a Finding> {
+    envelope
+        .findings
+        .iter()
+        .chain(envelope.resolved.iter())
+        .chain(
+            envelope
+                .suppressed_findings
+                .iter()
+                .map(|suppressed| &suppressed.finding),
+        )
+        .find(|finding| finding_receipt_id(finding).0 == finding_id)
+        .with_context(|| format!("GitHub publication plan omitted finding identity {finding_id}"))
+}
+
+fn publication_plan_review_comment(
+    value: &serde_json::Value,
+) -> Result<PublicationPlanReviewComment> {
+    Ok(PublicationPlanReviewComment {
+        path: value["path"]
+            .as_str()
+            .context("GitHub review comment plan omitted its path")?
+            .to_string(),
+        line: value["line"]
+            .as_u64()
+            .and_then(|line| u32::try_from(line).ok())
+            .context("GitHub review comment plan omitted its line")?,
+        side: value["side"]
+            .as_str()
+            .context("GitHub review comment plan omitted its side")?
+            .to_string(),
+        start_line: value["start_line"]
+            .as_u64()
+            .and_then(|line| u32::try_from(line).ok()),
+        start_side: value["start_side"].as_str().map(str::to_string),
+        body: value["body"]
+            .as_str()
+            .context("GitHub review comment plan omitted its body")?
+            .to_string(),
+    })
+}
+
+fn publication_plan_file_comment(value: &serde_json::Value) -> Result<PublicationPlanFileComment> {
+    Ok(PublicationPlanFileComment {
+        body: value["body"]
+            .as_str()
+            .context("GitHub file-comment plan omitted its body")?
+            .to_string(),
+        commit_id: value["commit_id"]
+            .as_str()
+            .context("GitHub file-comment plan omitted its commit id")?
+            .to_string(),
+        path: value["path"]
+            .as_str()
+            .context("GitHub file-comment plan omitted its path")?
+            .to_string(),
+        subject_type: value["subject_type"]
+            .as_str()
+            .context("GitHub file-comment plan omitted its subject type")?
+            .to_string(),
+    })
 }
 
 fn initial_review_comment(finding: &Finding) -> serde_json::Value {
@@ -3647,6 +4155,187 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
             .mount(server)
             .await;
+    }
+
+    #[tokio::test]
+    async fn publication_plan_reuses_review_checks_markers_and_the_placement_ladder() {
+        let server = MockServer::start().await;
+        mount_current_delivery_snapshot(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 42,
+                "full_name": "owner/repo"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut active = publication_finding(
+            "active-1",
+            "src/lib.rs",
+            "The unchecked value reaches the protected operation.",
+        );
+        active.severity = Severity::Error;
+        let mut carried = publication_finding(
+            "carried-1",
+            "src/carried.rs",
+            "The carried finding remains open.",
+        );
+        carried.body = format!(
+            "{} The carried finding remains open.",
+            crate::filter::CARRIED_MARKER
+        );
+        let summary_only = publication_finding(
+            "summary-1",
+            crate::envelope::CHANGE_METADATA_PATH,
+            "The metadata finding belongs in the summary.",
+        );
+        let resolved = publication_finding(
+            "resolved-1",
+            "src/resolved.rs",
+            "The resolved finding remains identifiable.",
+        );
+        let suppressed = publication_finding(
+            "suppressed-1",
+            "src/suppressed.rs",
+            "The suppressed finding remains identifiable.",
+        );
+        let mut envelope = delivery_envelope_with_findings(
+            "aaaaaaaaaaaa",
+            "cccccccccccc",
+            vec![active, carried, summary_only],
+        );
+        envelope.resolved.push(resolved);
+        envelope.suppressed_findings.push(SuppressedFinding {
+            finding: suppressed,
+            reason: SuppressionReason::BelowConfidence,
+        });
+        let snapshot = delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc");
+        let plan = test_github(&server)
+            .build_publication_plan(crate::forge::GitHubPublicationPlanRequest {
+                envelope: &envelope,
+                snapshot: &snapshot,
+                publication_diff: Some(&placement_diff()),
+                should_comment: true,
+                duplicate_of_baseline: false,
+                annotate_findings: false,
+                advisory: CheckState::Success,
+                gate: CheckState::Failure,
+            })
+            .await
+            .unwrap();
+        let serialized = serde_json::to_value(&plan).unwrap();
+        let operations = serialized["operations"].as_array().unwrap();
+        assert_eq!(operations[0]["kind"], "compositeReview");
+        assert_eq!(operations[0]["action"], "publish");
+        assert_eq!(operations[0]["initialAttempt"]["comments"][0]["line"], 7);
+        assert_eq!(
+            operations[0]["placementFallbackAttempt"]["comments"][0]["path"],
+            "src/lib.rs"
+        );
+        assert!(operations[0]["summaryFallbackAttempt"]["body"].is_string());
+        let findings = operations[0]["findings"].as_array().unwrap();
+        assert_eq!(findings[0]["initialOutcome"], "inline");
+        assert_eq!(
+            findings[0]["fallbackIntent"],
+            serde_json::json!(["relocatedInline", "fileComment"])
+        );
+        assert_eq!(findings[1]["initialOutcome"], "carried");
+        assert_eq!(findings[2]["initialOutcome"], "summaryOnly");
+        assert_eq!(findings[3]["initialOutcome"], "resolved");
+        assert_eq!(findings[4]["initialOutcome"], "suppressed");
+        assert_eq!(operations[1]["kind"], "fileCommentFallback");
+        assert_eq!(operations[1]["findingId"], "active-1");
+        assert_eq!(
+            operations[1]["activation"],
+            "compositeReviewPlacementFailed"
+        );
+        assert_eq!(operations[2]["kind"], "advisoryCheck");
+        assert_eq!(operations[2]["conclusion"], "success");
+        assert_eq!(operations[3]["kind"], "gateCheck");
+        assert_eq!(operations[3]["conclusion"], "failure");
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests.iter().all(|request| {
+            !matches!(
+                request.method,
+                wiremock::http::Method::POST
+                    | wiremock::http::Method::PATCH
+                    | wiremock::http::Method::PUT
+                    | wiremock::http::Method::DELETE
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn publication_plan_routes_check_annotation_presentation_without_review_delivery() {
+        let server = MockServer::start().await;
+        mount_current_delivery_snapshot(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 42,
+                "full_name": "owner/repo"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut finding = publication_finding(
+            "annotation-1",
+            "src/lib.rs",
+            "The unchecked value reaches the protected operation.",
+        );
+        finding.severity = Severity::Error;
+        let envelope =
+            delivery_envelope_with_findings("aaaaaaaaaaaa", "cccccccccccc", vec![finding]);
+        let snapshot = delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc");
+        let plan = test_github(&server)
+            .build_publication_plan(crate::forge::GitHubPublicationPlanRequest {
+                envelope: &envelope,
+                snapshot: &snapshot,
+                publication_diff: Some(&placement_diff()),
+                should_comment: true,
+                duplicate_of_baseline: false,
+                annotate_findings: true,
+                advisory: CheckState::Success,
+                gate: CheckState::Failure,
+            })
+            .await
+            .unwrap();
+        let operations = serde_json::to_value(plan).unwrap()["operations"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(operations.len(), 3);
+        assert_eq!(operations[0]["kind"], "compositeReview");
+        assert_eq!(operations[0]["action"], "omit");
+        assert!(operations[0].get("initialAttempt").is_none());
+        assert_eq!(
+            operations[0]["findings"][0]["initialOutcome"],
+            "checkAnnotation"
+        );
+        assert_eq!(operations[1]["kind"], "advisoryCheck");
+        assert_eq!(operations[1]["annotations"][0]["path"], "src/lib.rs");
+        assert_eq!(operations[1]["annotations"][0]["startLine"], 7);
+        assert_eq!(operations[2]["kind"], "gateCheck");
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests.iter().all(|request| {
+            !matches!(
+                request.method,
+                wiremock::http::Method::POST
+                    | wiremock::http::Method::PATCH
+                    | wiremock::http::Method::PUT
+                    | wiremock::http::Method::DELETE
+            )
+        }));
     }
 
     #[tokio::test]

@@ -1233,6 +1233,164 @@ async fn remote_review_without_publish_never_mutates_github_even_in_hosted_ci() 
     );
 }
 
+#[tokio::test]
+async fn github_publication_plan_is_byte_stable_private_and_never_mutates_the_forge() {
+    let server = MockServer::start().await;
+    mount_github_complete_diff(&server, 7).await;
+    mount_static_github_pr(&server).await;
+    let directory = tempfile::tempdir().unwrap();
+    disable_review_for_hosted_publication(directory.path(), true);
+    let first_plan = directory.path().join("publication-plan-1.json");
+    let second_plan = directory.path().join("publication-plan-2.json");
+
+    for plan_path in [&first_plan, &second_plan] {
+        let envelope_path = plan_path.with_extension("envelope.json");
+        postil()
+            .current_dir(directory.path())
+            .env("GITHUB_API_URL", server.uri())
+            .env("GITHUB_TOKEN", "gh-test-token")
+            .env("POSTIL_EXPECTED_GITHUB_REPO_ID", "42")
+            .args([
+                "review",
+                "--repo",
+                "acme/api",
+                "--pr",
+                "7",
+                "--sha",
+                "aaaaaaaa",
+                "--base-sha",
+                "bbbbbbbb",
+                "--publication-plan-output",
+            ])
+            .arg(plan_path)
+            .args(["--output", "json", "--output-file"])
+            .arg(envelope_path)
+            .assert()
+            .code(0);
+    }
+
+    let first = std::fs::read(&first_plan).unwrap();
+    let second = std::fs::read(&second_plan).unwrap();
+    assert_eq!(first, second);
+    let plan: Value = serde_json::from_slice(&first).unwrap();
+    assert_eq!(plan["version"], 1);
+    assert_eq!(plan["forge"], "github");
+    assert_eq!(plan["repository"]["id"], 42);
+    assert_eq!(plan["repository"]["fullName"], "acme/api");
+    assert_eq!(plan["pullRequestNumber"], 7);
+    assert_eq!(plan["reviewedSnapshot"]["headSha"], "aaaaaaaa");
+    assert_eq!(plan["reviewedSnapshot"]["mergeBaseSha"], "bbbbbbbb");
+    assert_eq!(plan["reviewedSnapshot"]["targetSha"], "bbbbbbbb");
+    assert!(
+        plan["intentDigest"]
+            .as_str()
+            .is_some_and(|digest| digest.starts_with("sha256:") && digest.len() == 71)
+    );
+    assert_eq!(plan["operations"][0]["kind"], "compositeReview");
+    assert_eq!(plan["operations"][0]["action"], "publish");
+    assert_eq!(plan["operations"][1]["kind"], "advisoryCheck");
+    assert_eq!(plan["operations"][1]["conclusion"], "success");
+    assert_eq!(plan["operations"][2]["kind"], "gateCheck");
+    assert_eq!(plan["operations"][2]["conclusion"], "success");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&first_plan).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    let planning_requests = server.received_requests().await.unwrap();
+    assert!(
+        planning_requests.iter().all(|request| {
+            !matches!(
+                request.method,
+                wiremock::http::Method::POST
+                    | wiremock::http::Method::PATCH
+                    | wiremock::http::Method::PUT
+                    | wiremock::http::Method::DELETE
+            )
+        }),
+        "publication planning attempted a GitHub mutation: {planning_requests:?}"
+    );
+
+    mount_successful_hosted_check_patches(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/api/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 77,
+            "commit_id": "aaaaaaaa"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    postil()
+        .current_dir(directory.path())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .args([
+            "review",
+            "--publish",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--sha",
+            "aaaaaaaa",
+            "--base-sha",
+            "bbbbbbbb",
+            "--check-run-id",
+            "901",
+            "--gate-check-run-id",
+            "902",
+            "--output",
+            "json",
+            "--output-file",
+        ])
+        .arg(directory.path().join("published-envelope.json"))
+        .assert()
+        .code(0);
+    let all_requests = server.received_requests().await.unwrap();
+    assert!(all_requests.iter().any(|request| {
+        matches!(
+            request.method,
+            wiremock::http::Method::POST
+                | wiremock::http::Method::PATCH
+                | wiremock::http::Method::PUT
+                | wiremock::http::Method::DELETE
+        )
+    }));
+}
+
+#[test]
+fn publication_plan_rejects_non_github_and_local_review_modes_before_io() {
+    let directory = tempfile::tempdir().unwrap();
+    for extra in [vec!["--forge", "gitlab"], vec!["--staged"]] {
+        let mut command = postil();
+        command.current_dir(directory.path()).args([
+            "review",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--sha",
+            "aaaaaaaa",
+            "--base-sha",
+            "bbbbbbbb",
+            "--publication-plan-output",
+            "publication-plan.json",
+        ]);
+        command
+            .args(extra)
+            .assert()
+            .code(2)
+            .stderr(predicates::str::contains(
+                "requires a remote GitHub pull request",
+            ));
+    }
+}
+
 #[test]
 fn publication_looking_environment_variables_are_rejected() {
     for variable in ["POSTIL_PUBLISH", "POSTIL_NO_POST"] {

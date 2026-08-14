@@ -141,6 +141,21 @@ pub enum Command {
         /// Leave the merge-gate check pending for a controlling service to complete.
         #[arg(long, requires = "publish")]
         defer_gate_check: bool,
+        /// Write an immutable GitHub publication plan without mutating the forge.
+        #[arg(
+            long,
+            hide = true,
+            value_name = "PATH",
+            requires_all = ["repo", "pr", "sha", "base_sha"],
+            conflicts_with_all = [
+                "publish",
+                "no_post",
+                "check_run_id",
+                "gate_check_run_id",
+                "defer_gate_check"
+            ]
+        )]
+        publication_plan_output: Option<PathBuf>,
     },
     /// Reply to an @postil mention on a pull request or issue (interactive bot).
     Respond {
@@ -351,6 +366,85 @@ mod tests {
                 "1",
                 "--publish",
                 "--no-post",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn publication_plan_is_hidden_snapshot_bound_and_separate_from_mutation() {
+        let parsed = Cli::try_parse_from([
+            "postil",
+            "review",
+            "--repo",
+            "postil-dev/postil",
+            "--pr",
+            "1",
+            "--sha",
+            "aaaaaaaa",
+            "--base-sha",
+            "bbbbbbbb",
+            "--publication-plan-output",
+            "publication-plan.json",
+        ])
+        .unwrap();
+        let Command::Review {
+            publication_plan_output,
+            publish,
+            ..
+        } = parsed.command
+        else {
+            panic!("expected review command");
+        };
+        assert_eq!(
+            publication_plan_output.as_deref(),
+            Some(std::path::Path::new("publication-plan.json"))
+        );
+        assert!(!publish);
+
+        let help = Cli::command()
+            .find_subcommand_mut("review")
+            .expect("review subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(!help.contains("publication-plan-output"));
+
+        for extra in [
+            vec!["--publish"],
+            vec!["--no-post"],
+            vec!["--check-run-id", "901"],
+            vec!["--gate-check-run-id", "902"],
+        ] {
+            let mut arguments = vec![
+                "postil",
+                "review",
+                "--repo",
+                "postil-dev/postil",
+                "--pr",
+                "1",
+                "--sha",
+                "aaaaaaaa",
+                "--base-sha",
+                "bbbbbbbb",
+                "--publication-plan-output",
+                "publication-plan.json",
+            ];
+            arguments.extend(extra);
+            assert!(Cli::try_parse_from(arguments).is_err());
+        }
+
+        assert!(
+            Cli::try_parse_from([
+                "postil",
+                "review",
+                "--repo",
+                "postil-dev/postil",
+                "--pr",
+                "1",
+                "--sha",
+                "aaaaaaaa",
+                "--publication-plan-output",
+                "publication-plan.json",
             ])
             .is_err()
         );

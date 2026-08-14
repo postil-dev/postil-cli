@@ -391,6 +391,7 @@ pub struct ReviewArgs {
     pub bounded: bool,
     pub no_post: bool,
     pub defer_gate_check: bool,
+    pub publication_plan_output: Option<PathBuf>,
 }
 
 impl ReviewArgs {
@@ -486,6 +487,26 @@ pub async fn run(args: ReviewArgs) -> Result<i32> {
     }
     if args.output_file.is_some() && args.resolved_output_format().is_none() {
         return Err(anyhow!("--output-file requires --output or --output-json"));
+    }
+    if args.publication_plan_output.is_some() {
+        anyhow::ensure!(
+            args.forge == ForgeKind::GitHub
+                && args.repo.is_some()
+                && args.pr.is_some()
+                && args.sha.is_some()
+                && args.base_sha.is_some()
+                && !args.staged
+                && args.base.is_none()
+                && args.diff_file.is_none(),
+            "--publication-plan-output requires a remote GitHub pull request with explicit --repo, --pr, --sha, and --base-sha"
+        );
+        anyhow::ensure!(
+            args.no_post
+                && args.check_run_id.is_none()
+                && args.gate_check_run_id.is_none()
+                && !args.defer_gate_check,
+            "--publication-plan-output cannot be combined with forge mutation options"
+        );
     }
     let mut cfg = Config::load(&cwd, args.config.as_deref())?;
     if let Some(m) = &args.model {
@@ -696,24 +717,8 @@ async fn run_remote<F: Forge>(
                 envelope,
                 publication_diff,
             } = review;
+            let (review_state, gate_state) = remote_check_states(&envelope);
             let check_completion = if let Some((a, g)) = &checks {
-                let gate_state = if envelope.gate.failing {
-                    CheckState::Failure
-                } else {
-                    CheckState::Success
-                };
-                // `postil/review` reports whether a review verdict exists. It
-                // fails when inference is operationally incomplete, independent
-                // of whether `postil/gate` is configured to stand aside.
-                let operational = envelope.findings.iter().any(|f| {
-                    f.path == crate::envelope::OPERATIONAL_PATH
-                        || f.path == crate::envelope::PROVIDER_PATH
-                });
-                let review_state = if operational {
-                    CheckState::Failure
-                } else {
-                    CheckState::Success
-                };
                 complete_remote_checks(
                     forge,
                     a,
@@ -768,17 +773,13 @@ async fn run_remote<F: Forge>(
                 Some(&meta),
                 review_started.elapsed().as_millis() as u64,
             );
+            let (review_state, gate_state) = remote_check_states(&envelope);
             let check_completion = if let Some((a, g)) = &checks {
-                let gate_state = if envelope.gate.failing {
-                    CheckState::Failure
-                } else {
-                    CheckState::Success
-                };
                 complete_remote_checks(
                     forge,
                     a,
                     g,
-                    CheckState::Failure,
+                    review_state,
                     (!args.defer_gate_check).then_some(gate_state),
                     &envelope,
                     &meta,
@@ -832,6 +833,24 @@ async fn run_remote<F: Forge>(
 
 fn strict_hosted_github_publication(args: &ReviewArgs) -> bool {
     crate::config::hosted_mode() && args.forge == ForgeKind::GitHub && !args.no_post
+}
+
+fn remote_check_states(envelope: &Envelope) -> (CheckState, CheckState) {
+    let operational = envelope.findings.iter().any(|finding| {
+        finding.path == crate::envelope::OPERATIONAL_PATH
+            || finding.path == crate::envelope::PROVIDER_PATH
+    });
+    let advisory = if operational {
+        CheckState::Failure
+    } else {
+        CheckState::Success
+    };
+    let gate = if envelope.gate.failing {
+        CheckState::Failure
+    } else {
+        CheckState::Success
+    };
+    (advisory, gate)
 }
 
 async fn require_current_snapshot<F: Forge>(
@@ -2786,6 +2805,40 @@ async fn finish<F: Forge>(
         output::print_pretty(&envelope);
     }
 
+    let duplicate_of_baseline = load_baseline(args)
+        .ok()
+        .is_some_and(|baseline| visible_finding_sets_equal(&baseline, &envelope.findings));
+    let intentional_no_comment = crate::forge::only_operational_findings(&envelope.findings)
+        || (!envelope.findings.is_empty() && envelope.findings.iter().all(filter::is_carried));
+    let should_comment = (!envelope.silent
+        || matches!(cfg.on_clean, crate::config::OnClean::Comment))
+        && !duplicate_of_baseline
+        && !intentional_no_comment;
+
+    if let Some(path) = &args.publication_plan_output {
+        let forge = forge.context("publication planning requires a GitHub forge")?;
+        let PublicationContext {
+            snapshot: expected_snapshot,
+            diff: publication_diff,
+        } = publication.context("publication planning is missing its immutable PR snapshot")?;
+        let (advisory, gate) = remote_check_states(&envelope);
+        let plan = forge
+            .build_publication_plan(crate::forge::GitHubPublicationPlanRequest {
+                envelope: &envelope,
+                snapshot: expected_snapshot,
+                publication_diff,
+                should_comment,
+                duplicate_of_baseline,
+                annotate_findings: cfg.finding_presentation
+                    == FindingPresentation::CheckAnnotations,
+                advisory,
+                gate,
+            })
+            .await?;
+        crate::forge::write_github_publication_plan(path, &plan)?;
+        return Ok(if envelope.gate.failing { 1 } else { 0 });
+    }
+
     if let Some(forge) = forge
         && !args.no_post
     {
@@ -2807,15 +2860,6 @@ async fn finish<F: Forge>(
             crate::forge::write_review_publication_receipt_from_env(&receipt)?;
             return Ok(if envelope.gate.failing { 1 } else { 0 });
         }
-        let duplicate_of_baseline = load_baseline(args)
-            .ok()
-            .is_some_and(|baseline| visible_finding_sets_equal(&baseline, &envelope.findings));
-        let intentional_no_comment = crate::forge::only_operational_findings(&envelope.findings)
-            || (!envelope.findings.is_empty() && envelope.findings.iter().all(filter::is_carried));
-        let should_comment = (!envelope.silent
-            || matches!(cfg.on_clean, crate::config::OnClean::Comment))
-            && !duplicate_of_baseline
-            && !intentional_no_comment;
         if !should_comment {
             let mut receipt = forge.plan_review_publication(&envelope, expected_snapshot);
             if duplicate_of_baseline {

@@ -461,6 +461,233 @@ pub enum FindingPublicationOutcome {
     FileComment,
 }
 
+/// Immutable desired GitHub state emitted for the service-owned publication
+/// controller. The digest covers the complete canonical intent except for the
+/// digest field itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitHubPublicationPlan {
+    pub version: u8,
+    pub forge: String,
+    pub repository: PublicationPlanRepository,
+    pub pull_request_number: u64,
+    pub reviewed_snapshot: PublicationPlanSnapshot,
+    pub receipt_id: String,
+    pub operations: Vec<PublicationPlanOperation>,
+    pub intent_digest: String,
+}
+
+pub struct GitHubPublicationPlanRequest<'a> {
+    pub envelope: &'a Envelope,
+    pub snapshot: &'a PrMeta,
+    pub publication_diff: Option<&'a crate::diff::Diff>,
+    pub should_comment: bool,
+    pub duplicate_of_baseline: bool,
+    pub annotate_findings: bool,
+    pub advisory: CheckState,
+    pub gate: CheckState,
+}
+
+impl GitHubPublicationPlan {
+    pub const VERSION: u8 = 1;
+
+    pub(crate) fn new(
+        repository: PublicationPlanRepository,
+        pull_request_number: u64,
+        reviewed_snapshot: PublicationPlanSnapshot,
+        receipt_id: String,
+        operations: Vec<PublicationPlanOperation>,
+    ) -> Result<Self> {
+        let mut plan = Self {
+            version: Self::VERSION,
+            forge: "github".to_string(),
+            repository,
+            pull_request_number,
+            reviewed_snapshot,
+            receipt_id,
+            operations,
+            intent_digest: String::new(),
+        };
+        plan.intent_digest = plan.canonical_intent_digest()?;
+        Ok(plan)
+    }
+
+    fn canonical_intent_digest(&self) -> Result<String> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct CanonicalIntent<'a> {
+            version: u8,
+            forge: &'a str,
+            repository: &'a PublicationPlanRepository,
+            pull_request_number: u64,
+            reviewed_snapshot: &'a PublicationPlanSnapshot,
+            receipt_id: &'a str,
+            operations: &'a [PublicationPlanOperation],
+        }
+
+        let canonical = serde_json::to_vec(&CanonicalIntent {
+            version: self.version,
+            forge: &self.forge,
+            repository: &self.repository,
+            pull_request_number: self.pull_request_number,
+            reviewed_snapshot: &self.reviewed_snapshot,
+            receipt_id: &self.receipt_id,
+            operations: &self.operations,
+        })
+        .context("serializing canonical GitHub publication intent")?;
+        Ok(format!(
+            "sha256:{}",
+            crate::repository_search::hex_digest(Sha256::digest(canonical))
+        ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicationPlanRepository {
+    pub id: u64,
+    pub full_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicationPlanSnapshot {
+    pub head_sha: String,
+    pub merge_base_sha: String,
+    pub target_sha: String,
+    pub pull_request_title_sha256: String,
+    pub pull_request_body_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicationPlanOperation {
+    pub operation_key: String,
+    #[serde(flatten)]
+    pub desired: PublicationPlanOperationKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum PublicationPlanOperationKind {
+    CompositeReview {
+        action: PublicationPlanReviewAction,
+        receipt_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        initial_attempt: Option<PublicationPlanReviewAttempt>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        placement_fallback_attempt: Option<PublicationPlanReviewAttempt>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        summary_fallback_attempt: Option<PublicationPlanReviewAttempt>,
+        findings: Vec<PublicationPlanFinding>,
+    },
+    FileCommentFallback {
+        finding_id: String,
+        activation: PublicationPlanFallbackActivation,
+        payload: PublicationPlanFileComment,
+    },
+    AdvisoryCheck {
+        name: String,
+        head_sha: String,
+        conclusion: String,
+        title: String,
+        summary: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        annotations: Vec<PublicationPlanCheckAnnotation>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        details_url: Option<String>,
+    },
+    GateCheck {
+        name: String,
+        head_sha: String,
+        conclusion: String,
+        title: String,
+        summary: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        details_url: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PublicationPlanReviewAction {
+    Publish,
+    Omit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicationPlanReviewAttempt {
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub comments: Vec<PublicationPlanReviewComment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicationPlanReviewComment {
+    pub path: String,
+    pub line: u32,
+    pub side: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_side: Option<String>,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicationPlanFileComment {
+    pub body: String,
+    pub commit_id: String,
+    pub path: String,
+    pub subject_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicationPlanFinding {
+    pub finding_id: String,
+    pub stable_identity: bool,
+    pub path: String,
+    pub line: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<u32>,
+    pub initial_outcome: FindingPublicationOutcome,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_intent: Vec<PublicationPlanFindingFallback>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PublicationPlanFindingFallback {
+    RelocatedInline,
+    FileComment,
+    SummaryOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PublicationPlanFallbackActivation {
+    CompositeReviewPlacementFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicationPlanCheckAnnotation {
+    pub path: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub annotation_level: String,
+    pub title: String,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReviewPublicationSummary {
     pub active_inline: usize,
@@ -543,23 +770,32 @@ pub fn write_review_publication_receipt_from_env(receipt: &ReviewPublicationRece
 }
 
 fn write_review_publication_receipt(path: &Path, receipt: &ReviewPublicationReceipt) -> Result<()> {
+    write_private_json_atomically(path, receipt, "publication receipt")
+}
+
+pub fn write_github_publication_plan(path: &Path, plan: &GitHubPublicationPlan) -> Result<()> {
+    write_private_json_atomically(path, plan, "GitHub publication plan")
+}
+
+fn write_private_json_atomically<T: Serialize>(
+    path: &Path,
+    value: &T,
+    artifact: &str,
+) -> Result<()> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
-        .ok_or_else(|| anyhow::anyhow!("publication receipt path must name a file"))?;
-    ensure!(
-        parent.is_dir(),
-        "publication receipt directory does not exist"
-    );
+        .ok_or_else(|| anyhow::anyhow!("{artifact} path must name a file"))?;
+    ensure!(parent.is_dir(), "{artifact} directory does not exist");
     if let Ok(metadata) = fs::symlink_metadata(path) {
         ensure!(
             !metadata.file_type().is_symlink(),
-            "publication receipt path must not be a symlink"
+            "{artifact} path must not be a symlink"
         );
     }
     let file_name = path
         .file_name()
-        .ok_or_else(|| anyhow::anyhow!("publication receipt path must name a file"))?;
+        .ok_or_else(|| anyhow::anyhow!("{artifact} path must name a file"))?;
     let temporary = parent.join(format!(
         ".{}.{}.tmp",
         file_name.to_string_lossy(),
@@ -576,16 +812,19 @@ fn write_review_publication_receipt(path: &Path, receipt: &ReviewPublicationRece
     let result = (|| -> Result<()> {
         let mut file = options
             .open(&temporary)
-            .context("creating private publication receipt")?;
-        serde_json::to_writer(&mut file, receipt).context("serializing publication receipt")?;
+            .with_context(|| format!("creating private {artifact}"))?;
+        serde_json::to_writer(&mut file, value)
+            .with_context(|| format!("serializing {artifact}"))?;
         file.write_all(b"\n")
-            .context("writing publication receipt")?;
-        file.sync_all().context("syncing publication receipt")?;
-        fs::rename(&temporary, path).context("atomically publishing publication receipt")?;
+            .with_context(|| format!("writing {artifact}"))?;
+        file.sync_all()
+            .with_context(|| format!("syncing {artifact}"))?;
+        fs::rename(&temporary, path)
+            .with_context(|| format!("atomically publishing {artifact}"))?;
         #[cfg(unix)]
         fs::File::open(parent)
             .and_then(|directory| directory.sync_all())
-            .context("syncing publication receipt directory")?;
+            .with_context(|| format!("syncing {artifact} directory"))?;
         Ok(())
     })();
     if result.is_err() {
@@ -612,6 +851,12 @@ pub trait Forge {
         snapshot: &PrMeta,
     ) -> ReviewPublicationReceipt {
         untracked_review_publication_receipt("forge", envelope, &snapshot.head_sha)
+    }
+    async fn build_publication_plan(
+        &self,
+        _request: GitHubPublicationPlanRequest<'_>,
+    ) -> Result<GitHubPublicationPlan> {
+        anyhow::bail!("publication planning is not supported for this forge")
     }
     async fn fetch_pr_meta(&self) -> Result<PrMeta>;
     /// Unified diff of the immutable snapshot returned by `fetch_pr_meta`.
@@ -1289,6 +1534,120 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    fn sample_publication_plan(
+        head_sha: &str,
+        review_body: &str,
+        finding_id: &str,
+        gate_conclusion: &str,
+    ) -> GitHubPublicationPlan {
+        GitHubPublicationPlan::new(
+            PublicationPlanRepository {
+                id: 42,
+                full_name: "acme/api".into(),
+            },
+            7,
+            PublicationPlanSnapshot {
+                head_sha: head_sha.into(),
+                merge_base_sha: "bbbbbbbb".into(),
+                target_sha: "cccccccc".into(),
+                pull_request_title_sha256: "sha256:title".into(),
+                pull_request_body_sha256: "sha256:body".into(),
+            },
+            "github-review-v2:receipt".into(),
+            vec![
+                PublicationPlanOperation {
+                    operation_key: "review-key".into(),
+                    desired: PublicationPlanOperationKind::CompositeReview {
+                        action: PublicationPlanReviewAction::Publish,
+                        receipt_id: "github-review-v2:receipt".into(),
+                        initial_attempt: Some(PublicationPlanReviewAttempt {
+                            body: review_body.into(),
+                            comments: vec![],
+                        }),
+                        placement_fallback_attempt: None,
+                        summary_fallback_attempt: None,
+                        findings: vec![PublicationPlanFinding {
+                            finding_id: finding_id.into(),
+                            stable_identity: true,
+                            path: "src/lib.rs".into(),
+                            line: 10,
+                            end_line: None,
+                            initial_outcome: FindingPublicationOutcome::Inline,
+                            fallback_intent: vec![PublicationPlanFindingFallback::FileComment],
+                        }],
+                    },
+                },
+                PublicationPlanOperation {
+                    operation_key: "gate-key".into(),
+                    desired: PublicationPlanOperationKind::GateCheck {
+                        name: "postil/gate".into(),
+                        head_sha: head_sha.into(),
+                        conclusion: gate_conclusion.into(),
+                        title: "Merge gate".into(),
+                        summary: "Gate summary".into(),
+                        details_url: None,
+                    },
+                },
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn publication_plan_is_private_atomic_deterministic_and_intent_bound() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("publication-plan.json");
+        let plan = sample_publication_plan("aaaaaaaa", "Review body", "finding-1", "failure");
+        write_github_publication_plan(&path, &plan).unwrap();
+        let first = std::fs::read(&path).unwrap();
+        write_github_publication_plan(&path, &plan).unwrap();
+        let second = std::fs::read(&path).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            serde_json::from_slice::<GitHubPublicationPlan>(&first).unwrap(),
+            plan
+        );
+        assert!(plan.intent_digest.starts_with("sha256:"));
+        assert_eq!(plan.intent_digest.len(), "sha256:".len() + 64);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        for changed in [
+            sample_publication_plan("dddddddd", "Review body", "finding-1", "failure"),
+            sample_publication_plan("aaaaaaaa", "Changed body", "finding-1", "failure"),
+            sample_publication_plan("aaaaaaaa", "Review body", "finding-2", "failure"),
+            sample_publication_plan("aaaaaaaa", "Review body", "finding-1", "success"),
+        ] {
+            assert_ne!(changed.intent_digest, plan.intent_digest);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_plan_refuses_symlink_and_directory_targets() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let plan = sample_publication_plan("aaaaaaaa", "Review body", "finding-1", "failure");
+        let destination = directory.path().join("destination.json");
+        std::fs::write(&destination, "unchanged").unwrap();
+        let link = directory.path().join("publication-plan.json");
+        symlink(&destination, &link).unwrap();
+        let error = write_github_publication_plan(&link, &plan).unwrap_err();
+        assert!(error.to_string().contains("must not be a symlink"));
+        assert_eq!(std::fs::read_to_string(destination).unwrap(), "unchanged");
+
+        let target_directory = directory.path().join("target-directory");
+        std::fs::create_dir(&target_directory).unwrap();
+        assert!(write_github_publication_plan(&target_directory, &plan).is_err());
     }
 
     #[tokio::test]

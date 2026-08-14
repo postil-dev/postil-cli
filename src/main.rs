@@ -54,6 +54,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
             publish,
             no_post,
             defer_gate_check,
+            publication_plan_output,
         } => {
             let local_mode = staged || base.is_some() || diff_file.is_some();
             let kind = match forge {
@@ -89,6 +90,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
                 bounded,
                 no_post: !publication_enabled(publish, no_post)?,
                 defer_gate_check,
+                publication_plan_output,
             })
             .await
         }
