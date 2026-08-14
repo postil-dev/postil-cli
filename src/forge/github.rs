@@ -15,12 +15,13 @@ use super::{
     ReviewPublicationReceipt, ReviewPublicationSummary, SummaryContext, ThreadKind, check_summary,
     check_title, only_operational_findings, valid_details_url,
 };
-use crate::diff::{DiffSnapshot, DiffSpool, WorkspaceBudget};
+use crate::diff::{Diff, DiffIndex, DiffSnapshot, DiffSpool, WorkspaceBudget};
 use crate::envelope::{Envelope, Finding, Severity};
 use crate::filter;
 
 pub const EXPECTED_REPOSITORY_ID_ENV: &str = "POSTIL_EXPECTED_GITHUB_REPO_ID";
 const GITHUB_MAX_ANNOTATIONS_PER_REQUEST: usize = 50;
+const FILE_LEVEL_COMMENT_MARKER: &str = "<!-- postil-placement:file -->";
 
 // Filtering caps visible findings before forge publication, so one completed
 // check update always fits GitHub's annotation request limit. Raising the
@@ -116,11 +117,34 @@ impl GitHub {
         )
     }
 
+    fn review_summary_with_unplaced_findings(
+        &self,
+        envelope: &Envelope,
+        receipt: &ReviewPublicationReceipt,
+        unplaced: &[&Finding],
+    ) -> String {
+        let mut summary = self.review_summary_for_receipt(envelope, receipt);
+        for finding in unplaced {
+            let (finding_id, _) = finding_receipt_id(finding);
+            summary.push_str(&format!(
+                "\n\nLocation: `{}:{}`\n\n{}",
+                super::safe_code_text(&finding.path),
+                finding.line,
+                append_marker(
+                    &super::finding_comment_body(finding, true),
+                    &finding_marker(&finding_id),
+                ),
+            ));
+        }
+        summary
+    }
+
     async fn finalize_review_summary(
         &self,
         envelope: &Envelope,
         receipt: &ReviewPublicationReceipt,
         marker: &str,
+        snapshot: &PrMeta,
     ) -> Result<()> {
         let review_id = receipt
             .review_id
@@ -131,13 +155,14 @@ impl GitHub {
         let summary = self.review_summary_for_receipt(envelope, receipt);
         let body = bounded_review_body(&summary, marker, self.details_url.as_deref());
         let response = self
-            .send_write_retryable(
+            .send_snapshot_write_retryable(
                 self.request(
                     reqwest::Method::PUT,
                     self.url(&format!("/pulls/{}/reviews/{review_id}", self.pr)),
                 )
                 .json(&json!({ "body": body })),
                 "review summary update",
+                snapshot,
             )
             .await?;
         Self::check_ok(response, "review summary update").await?;
@@ -149,9 +174,10 @@ impl GitHub {
         envelope: &Envelope,
         receipt: &ReviewPublicationReceipt,
         marker: &str,
+        snapshot: &PrMeta,
     ) {
         if self
-            .finalize_review_summary(envelope, receipt, marker)
+            .finalize_review_summary(envelope, receipt, marker, snapshot)
             .await
             .is_err()
         {
@@ -259,7 +285,7 @@ impl GitHub {
         request: reqwest::RequestBuilder,
         what: &str,
     ) -> Result<reqwest::Response> {
-        self.send_retryable_inner(request, what, false).await
+        self.send_retryable_inner(request, what, false, None).await
     }
 
     async fn send_write_retryable(
@@ -267,7 +293,17 @@ impl GitHub {
         request: reqwest::RequestBuilder,
         what: &str,
     ) -> Result<reqwest::Response> {
-        self.send_retryable_inner(request, what, true).await
+        self.send_retryable_inner(request, what, true, None).await
+    }
+
+    async fn send_snapshot_write_retryable(
+        &self,
+        request: reqwest::RequestBuilder,
+        what: &str,
+        snapshot: &PrMeta,
+    ) -> Result<reqwest::Response> {
+        self.send_retryable_inner(request, what, true, Some(snapshot))
+            .await
     }
 
     async fn send_retryable_inner(
@@ -275,11 +311,19 @@ impl GitHub {
         request: reqwest::RequestBuilder,
         what: &str,
         fence_each_attempt: bool,
+        expected_snapshot: Option<&PrMeta>,
     ) -> Result<reqwest::Response> {
         const RETRIES: u32 = 2;
         const TOTAL_BUDGET: Duration = Duration::from_secs(55);
         let operation_started_at = std::time::Instant::now();
         for retry in 0..=RETRIES {
+            if let Some(expected_snapshot) = expected_snapshot
+                && !Box::pin(self.snapshot_is_current(expected_snapshot)).await?
+            {
+                return Err(anyhow!(
+                    "GitHub {what} skipped because the PR snapshot changed"
+                ));
+            }
             if fence_each_attempt {
                 self.verify_repository_identity_before_write().await?;
             }
@@ -487,11 +531,16 @@ impl GitHub {
         &self,
         body: &serde_json::Value,
         marker: &str,
-        head_sha: &str,
+        snapshot: &PrMeta,
         what: &str,
     ) -> Result<ReviewDelivery> {
         const RETRIES: u32 = 2;
         for retry in 0..=RETRIES {
+            if !self.snapshot_is_current(snapshot).await? {
+                return Err(anyhow!(
+                    "GitHub review delivery skipped because the PR snapshot changed"
+                ));
+            }
             self.verify_repository_identity_before_write().await?;
             let response = self
                 .request(
@@ -509,7 +558,7 @@ impl GitHub {
                     return Ok(ReviewDelivery::Response(response));
                 }
                 Ok(response) => {
-                    if let Some(review) = self.find_review(marker, head_sha).await? {
+                    if let Some(review) = self.find_review(marker, &snapshot.head_sha).await? {
                         return Ok(ReviewDelivery::Reconciled(review));
                     }
                     if retry == RETRIES {
@@ -517,7 +566,7 @@ impl GitHub {
                     }
                 }
                 Err(error) => {
-                    if let Some(review) = self.find_review(marker, head_sha).await? {
+                    if let Some(review) = self.find_review(marker, &snapshot.head_sha).await? {
                         return Ok(ReviewDelivery::Reconciled(review));
                     }
                     if retry == RETRIES {
@@ -644,10 +693,13 @@ impl GitHub {
     /// Failure here is not a publication failure. A review that cannot read the
     /// existing comments posts everything it found, which is the behaviour this
     /// dedup replaces.
-    async fn published_finding_markers(&self) -> std::collections::HashSet<String> {
+    async fn published_finding_comments(
+        &self,
+        head_sha: &str,
+    ) -> std::collections::HashMap<String, PublishedReviewComment> {
         const PAGE_SIZE: usize = 100;
         const MAX_PAGES: usize = 20;
-        let mut markers = std::collections::HashSet::new();
+        let mut comments_by_marker = std::collections::HashMap::new();
         for page in 1..=MAX_PAGES {
             let request = self.request(
                 reqwest::Method::GET,
@@ -657,27 +709,134 @@ impl GitHub {
                 )),
             );
             let Ok(response) = self.send_retryable(request, "inline comment dedup").await else {
-                return markers;
+                return comments_by_marker;
             };
             let Ok(response) = Self::check_ok(response, "inline comment dedup").await else {
-                return markers;
+                return comments_by_marker;
             };
             let Ok(comments): Result<Vec<PublishedReviewComment>> =
                 super::bounded_response_json(response, "GitHub inline comment dedup").await
             else {
-                return markers;
+                return comments_by_marker;
             };
             let page_len = comments.len();
             for comment in comments {
-                if let Some(marker) = finding_marker_in(&comment.body) {
-                    markers.insert(marker);
+                if comment.commit_id.as_deref() == Some(head_sha)
+                    && let Some(marker) = finding_marker_in(&comment.body)
+                {
+                    comments_by_marker.insert(marker, comment);
                 }
             }
             if page_len < PAGE_SIZE {
                 break;
             }
         }
-        markers
+        comments_by_marker
+    }
+
+    async fn find_review_comment(
+        &self,
+        marker: &str,
+        head_sha: &str,
+    ) -> Result<Option<PublishedReviewComment>> {
+        const PAGE_SIZE: usize = 100;
+        const MAX_PAGES: usize = 20;
+        for page in 1..=MAX_PAGES {
+            let response = self
+                .send_retryable(
+                    self.request(
+                        reqwest::Method::GET,
+                        self.url(&format!(
+                            "/pulls/{}/comments?per_page={PAGE_SIZE}&page={page}",
+                            self.pr
+                        )),
+                    ),
+                    "file-level review comment reconciliation",
+                )
+                .await?;
+            let comments: Vec<PublishedReviewComment> = super::bounded_response_json(
+                Self::check_ok(response, "file-level review comment reconciliation").await?,
+                "GitHub file-level review comment reconciliation",
+            )
+            .await?;
+            let page_len = comments.len();
+            if let Some(comment) = comments.into_iter().find(|comment| {
+                comment.body.contains(marker) && comment.commit_id.as_deref() == Some(head_sha)
+            }) {
+                return Ok(Some(comment));
+            }
+            if page_len < PAGE_SIZE {
+                return Ok(None);
+            }
+        }
+        Err(anyhow!(
+            "GitHub file-level review comment reconciliation exceeded {MAX_PAGES} pages"
+        ))
+    }
+
+    async fn post_file_comment_reconciled(
+        &self,
+        body: &serde_json::Value,
+        marker: &str,
+        snapshot: &PrMeta,
+    ) -> Result<PublishedReviewComment> {
+        const RETRIES: u32 = 2;
+        for retry in 0..=RETRIES {
+            if !self.snapshot_is_current(snapshot).await? {
+                return Err(anyhow!(
+                    "GitHub file-level review comment delivery skipped because the PR snapshot changed"
+                ));
+            }
+            self.verify_repository_identity_before_write().await?;
+            let response = self
+                .request(
+                    reqwest::Method::POST,
+                    self.url(&format!("/pulls/{}/comments", self.pr)),
+                )
+                .json(body)
+                .send()
+                .await;
+            match response {
+                Ok(response) if response.status().is_success() => {
+                    let comment: PublishedReviewComment =
+                        super::bounded_response_json(response, "GitHub file-level review comment")
+                            .await?;
+                    ensure!(
+                        comment.commit_id.as_deref() == Some(snapshot.head_sha.as_str()),
+                        "GitHub file-level review comment response did not identify the reviewed head"
+                    );
+                    return Ok(comment);
+                }
+                Ok(response)
+                    if github_retryable_response(response.status(), response.headers()) =>
+                {
+                    if let Some(comment) =
+                        self.find_review_comment(marker, &snapshot.head_sha).await?
+                    {
+                        return Ok(comment);
+                    }
+                    if retry == RETRIES {
+                        Self::check_ok(response, "file-level review comment").await?;
+                    }
+                }
+                Ok(response) => {
+                    Self::check_ok(response, "file-level review comment").await?;
+                }
+                Err(error) => {
+                    if let Some(comment) =
+                        self.find_review_comment(marker, &snapshot.head_sha).await?
+                    {
+                        return Ok(comment);
+                    }
+                    if retry == RETRIES {
+                        return Err(error)
+                            .context("posting file-level review comment after reconciliation");
+                    }
+                }
+            }
+            tokio::time::sleep(github_transport_retry_delay(retry)).await;
+        }
+        unreachable!("bounded GitHub file-level comment loop always returns")
     }
 
     async fn post_comment_reconciled(&self, number: u64, body: &str, marker: &str) -> Result<()> {
@@ -1545,6 +1704,8 @@ struct PublishedReviewComment {
     id: u64,
     #[serde(default)]
     body: String,
+    #[serde(default)]
+    commit_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1700,10 +1861,11 @@ impl Forge for GitHub {
         &self,
         envelope: &Envelope,
         snapshot: &PrMeta,
+        publication_diff: Option<&Diff>,
     ) -> Result<ReviewPublicationReceipt> {
         let findings = &envelope.findings;
         let head_sha = snapshot.head_sha.as_str();
-        let planned_receipt = self.plan_review_publication(envelope, snapshot);
+        let mut planned_receipt = self.plan_review_publication(envelope, snapshot);
         if only_operational_findings(findings) {
             return Ok(planned_receipt);
         }
@@ -1724,8 +1886,19 @@ impl Forge for GitHub {
         // A re-review of an unchanged head re-detects what the last review
         // found. Those findings arrive fresh rather than carried, so the carry
         // filter above cannot see them; their markers already on the PR can.
-        let published = self.published_finding_markers().await;
-        let comments: Vec<_> = findings
+        let published = self.published_finding_comments(head_sha).await;
+        let mut observed_comment_count = 0usize;
+        for publication in &mut planned_receipt.findings {
+            let marker = finding_marker(&publication.finding_id);
+            let Some(comment) = published.get(&marker) else {
+                continue;
+            };
+            publication.initial_outcome = FindingPublicationOutcome::Carried;
+            publication.inline_rejected = false;
+            publication.comment_id = Some(comment.id.to_string());
+            observed_comment_count += 1;
+        }
+        let publishable_findings: Vec<_> = findings
             .iter()
             // Carried findings already have comments from the previous review.
             .filter(|f| !filter::is_carried(f))
@@ -1735,34 +1908,33 @@ impl Forge for GitHub {
             .filter(|f| !super::is_synthetic_path(&f.path))
             .filter(|f| {
                 let (finding_id, _) = finding_receipt_id(f);
-                !published.contains(&finding_marker(&finding_id))
+                !published.contains_key(&finding_marker(&finding_id))
             })
-            .map(|f| {
-                let (finding_id, _) = finding_receipt_id(f);
-                let mut c = json!({
-                    "path": f.path,
-                    "line": f.line,
-                    "side": "RIGHT",
-                    "body": append_marker(
-                        &super::finding_comment_body(f, true),
-                        &finding_marker(&finding_id),
-                    ),
-                });
-                if let Some(end) = f.end_line
-                    && end > f.line
-                {
-                    c["start_line"] = json!(f.line);
-                    c["line"] = json!(end);
-                    c["start_side"] = json!("RIGHT");
-                }
-                c
-            })
+            .collect();
+        let comments: Vec<_> = publishable_findings
+            .iter()
+            .map(|finding| initial_review_comment(finding))
             .collect();
         let summary = self.review_summary_for_receipt(envelope, &planned_receipt);
         if comments.is_empty() && summary.is_empty() {
             return Ok(planned_receipt);
         }
         let marker = review_marker(&planned_receipt.receipt_id);
+        let has_new_summary_finding = findings
+            .iter()
+            .any(|finding| !filter::is_carried(finding) && super::is_synthetic_path(&finding.path));
+        let all_comments_already_published = observed_comment_count > 0
+            && publishable_findings.is_empty()
+            && !has_new_summary_finding;
+        if publishable_findings.is_empty()
+            && all_comments_already_published
+            && let Some(review) = self.find_review(&marker, head_sha).await?
+        {
+            planned_receipt.review_id = review.id.map(|id| id.to_string());
+            self.finalize_review_summary_if_possible(envelope, &planned_receipt, &marker, snapshot)
+                .await;
+            return Ok(planned_receipt);
+        }
         let marked_summary = bounded_review_body(&summary, &marker, self.details_url.as_deref());
         let has_planned_inline = planned_receipt
             .findings
@@ -1775,76 +1947,294 @@ impl Forge for GitHub {
             "comments": comments,
         });
         let delivery = self
-            .send_review_reconciled(&body, &marker, head_sha, "review post")
+            .send_review_reconciled(&body, &marker, snapshot, "review post")
             .await?;
-        let resp = match delivery {
+        let mut recovered_partial_review = None;
+        let response = match delivery {
             ReviewDelivery::Reconciled(review) => {
                 let receipt = self
-                    .materialize_review_receipt(planned_receipt, review)
+                    .materialize_review_receipt(planned_receipt.clone(), review.clone())
                     .await?;
-                if has_planned_inline {
-                    self.finalize_review_summary_if_possible(envelope, &receipt, &marker)
+                if receipt_covers_findings(&receipt, &publishable_findings) {
+                    if has_planned_inline {
+                        self.finalize_review_summary_if_possible(
+                            envelope, &receipt, &marker, snapshot,
+                        )
                         .await;
+                    }
+                    return Ok(receipt);
                 }
-                return Ok(receipt);
+                recovered_partial_review = Some(review);
+                None
             }
-            ReviewDelivery::Response(response) => response,
+            ReviewDelivery::Response(response) if response.status().is_success() => {
+                let review: PublishedReview =
+                    super::bounded_response_json(response, "GitHub published review").await?;
+                let receipt = self
+                    .materialize_review_receipt(planned_receipt.clone(), review.clone())
+                    .await?;
+                if receipt_covers_findings(&receipt, &publishable_findings) {
+                    if has_planned_inline {
+                        self.finalize_review_summary_if_possible(
+                            envelope, &receipt, &marker, snapshot,
+                        )
+                        .await;
+                    }
+                    return Ok(receipt);
+                }
+                recovered_partial_review = Some(review);
+                None
+            }
+            ReviewDelivery::Response(response) => Some(response),
         };
-        if resp.status().is_success() {
-            let review: PublishedReview =
-                super::bounded_response_json(resp, "GitHub published review").await?;
-            let receipt = self
-                .materialize_review_receipt(planned_receipt, review)
-                .await?;
-            if has_planned_inline {
-                self.finalize_review_summary_if_possible(envelope, &receipt, &marker)
-                    .await;
+        if let Some(resp) = response {
+            let status = resp.status();
+            let request_id =
+                github_request_id(resp.headers()).unwrap_or_else(|| "none".to_string());
+            if status != reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+                return Err(anyhow!(
+                    "GitHub review post failed: {status} (request id {request_id})"
+                ));
             }
-            return Ok(receipt);
-        }
-        let status = resp.status();
-        let request_id = github_request_id(resp.headers()).unwrap_or_else(|| "none".to_string());
-        if status != reqwest::StatusCode::UNPROCESSABLE_ENTITY {
-            return Err(anyhow!(
-                "GitHub review post failed: {status} (request id {request_id})"
-            ));
+
+            let rejection_body =
+                super::bounded_response_text(resp, "GitHub rejected review").await?;
+            if !github_review_rejected_line(&rejection_body) {
+                return Err(anyhow!(
+                    "GitHub review post failed validation: {status} (request id {request_id})"
+                ));
+            }
+
+            eprintln!(
+                "postil: github operation=review-post status=422 category=unresolved-line request_id={} recovery=placement-ladder",
+                request_id,
+            );
+        } else {
+            eprintln!(
+                "postil: github operation=review-reconciliation status=partial recovery=placement-ladder"
+            );
         }
 
-        eprintln!(
-            "postil: github operation=review-post status=422 category=unresolved-line request_id={} recovery=summary-only",
-            request_id,
+        let owned_publication_diff = if publication_diff.is_none() {
+            let snapshot = self
+                .fetch_diff(snapshot)
+                .await
+                .context("fetching complete diff for GitHub placement fallback")?;
+            Some(crate::diff::parse(snapshot.as_str()))
+        } else {
+            None
+        };
+        let publication_diff = publication_diff
+            .or(owned_publication_diff.as_ref())
+            .context("GitHub placement fallback is missing the complete pull-request diff")?;
+        let placement_index = DiffIndex::build(publication_diff);
+        let mut line_findings = Vec::new();
+        let mut file_findings = Vec::new();
+        let mut summary_findings = Vec::new();
+        for finding in &publishable_findings {
+            let Some(path) = publication_file_path(publication_diff, &finding.path) else {
+                summary_findings.push(*finding);
+                continue;
+            };
+            if let Some(line) = placement_index.nearest_new_side_line(path, finding.line) {
+                line_findings.push((*finding, path, line));
+            } else {
+                file_findings.push((*finding, path));
+            }
+        }
+
+        let mut fallback_receipt = planned_receipt;
+        for (finding, _) in &file_findings {
+            set_publication_outcome(
+                &mut fallback_receipt,
+                finding,
+                FindingPublicationOutcome::FileComment,
+                false,
+            )?;
+        }
+        for finding in &summary_findings {
+            set_publication_outcome(
+                &mut fallback_receipt,
+                finding,
+                FindingPublicationOutcome::SummaryOnly,
+                true,
+            )?;
+        }
+        let fallback_summary = self.review_summary_with_unplaced_findings(
+            envelope,
+            &fallback_receipt,
+            &summary_findings,
         );
-        let rejected_receipt = rejected_inline_receipt(planned_receipt);
-        let fallback_summary = self.review_summary_for_receipt(envelope, &rejected_receipt);
-        let summary_only = json!({
-            "commit_id": head_sha,
-            "event": "COMMENT",
-            "body": bounded_review_body(
+        let fallback_summary = if summary_findings.is_empty() {
+            bounded_review_body(
                 if fallback_summary.is_empty() {
-                    "Postil completed the review, but GitHub could not attach its inline comments."
+                    "Postil completed the review."
                 } else {
                     &fallback_summary
                 },
                 &marker,
                 self.details_url.as_deref(),
-            ),
+            )
+        } else {
+            required_review_body(&fallback_summary, &marker)?
+        };
+        let mut fallback_body = json!({
+            "commit_id": head_sha,
+            "event": "COMMENT",
+            "body": fallback_summary,
         });
-        let fallback = self
-            .send_review_reconciled(&summary_only, &marker, head_sha, "summary-only review post")
-            .await?;
-        match fallback {
-            ReviewDelivery::Reconciled(review) => {
-                self.materialize_review_receipt(rejected_receipt, review)
-                    .await
+        if !line_findings.is_empty() {
+            fallback_body["comments"] = json!(
+                line_findings
+                    .iter()
+                    .map(|(finding, path, line)| fallback_line_comment(finding, path, *line))
+                    .collect::<Vec<_>>()
+            );
+        }
+        let fallback = if let Some(review) = recovered_partial_review {
+            ReviewDelivery::Reconciled(review)
+        } else {
+            match self.find_review(&marker, head_sha).await? {
+                Some(review) => ReviewDelivery::Reconciled(review),
+                None => {
+                    self.send_review_reconciled(
+                        &fallback_body,
+                        &marker,
+                        snapshot,
+                        "placement fallback review post",
+                    )
+                    .await?
+                }
+            }
+        };
+        let mut receipt = match fallback {
+            ReviewDelivery::Reconciled(review) => Some(
+                self.materialize_review_receipt(fallback_receipt.clone(), review)
+                    .await?,
+            ),
+            ReviewDelivery::Response(response) if response.status().is_success() => {
+                let review: PublishedReview =
+                    super::bounded_response_json(response, "GitHub placement fallback review")
+                        .await?;
+                Some(
+                    self.materialize_review_receipt(fallback_receipt.clone(), review)
+                        .await?,
+                )
             }
             ReviewDelivery::Response(response) => {
-                let response = Self::check_ok(response, "summary-only review post").await?;
-                let review: PublishedReview =
-                    super::bounded_response_json(response, "GitHub summary-only review").await?;
-                self.materialize_review_receipt(rejected_receipt, review)
-                    .await
+                let status = response.status();
+                let request_id =
+                    github_request_id(response.headers()).unwrap_or_else(|| "none".to_string());
+                let body =
+                    super::bounded_response_text(response, "GitHub rejected fallback review")
+                        .await?;
+                if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY
+                    && !line_findings.is_empty()
+                    && github_review_rejected_line(&body)
+                {
+                    eprintln!(
+                        "postil: github operation=placement-fallback status=422 category=unresolved-line request_id={} recovery=file-comments",
+                        request_id,
+                    );
+                    None
+                } else {
+                    return Err(anyhow!(
+                        "GitHub placement fallback review failed: {status} (request id {request_id})"
+                    ));
+                }
+            }
+        };
+
+        if let Some(materialized) = receipt.as_mut() {
+            for (finding, path, _) in line_findings.drain(..) {
+                if receipt_has_finding_comment(materialized, finding) {
+                    continue;
+                }
+                set_publication_outcome(
+                    materialized,
+                    finding,
+                    FindingPublicationOutcome::FileComment,
+                    false,
+                )?;
+                file_findings.push((finding, path));
             }
         }
+
+        if receipt.is_none() {
+            for (finding, path, _) in line_findings.drain(..) {
+                set_publication_outcome(
+                    &mut fallback_receipt,
+                    finding,
+                    FindingPublicationOutcome::FileComment,
+                    false,
+                )?;
+                file_findings.push((finding, path));
+            }
+            let fallback_summary = self.review_summary_with_unplaced_findings(
+                envelope,
+                &fallback_receipt,
+                &summary_findings,
+            );
+            let fallback_summary = if summary_findings.is_empty() {
+                bounded_review_body(&fallback_summary, &marker, self.details_url.as_deref())
+            } else {
+                required_review_body(&fallback_summary, &marker)?
+            };
+            let summary_body = json!({
+                "commit_id": head_sha,
+                "event": "COMMENT",
+                "body": fallback_summary,
+            });
+            let delivery = self
+                .send_review_reconciled(
+                    &summary_body,
+                    &marker,
+                    snapshot,
+                    "file-comment fallback review post",
+                )
+                .await?;
+            let materialized = match delivery {
+                ReviewDelivery::Reconciled(review) => {
+                    self.materialize_review_receipt(fallback_receipt.clone(), review)
+                        .await?
+                }
+                ReviewDelivery::Response(response) => {
+                    let response =
+                        Self::check_ok(response, "file-comment fallback review post").await?;
+                    let review: PublishedReview = super::bounded_response_json(
+                        response,
+                        "GitHub file-comment fallback review",
+                    )
+                    .await?;
+                    self.materialize_review_receipt(fallback_receipt.clone(), review)
+                        .await?
+                }
+            };
+            receipt = Some(materialized);
+        }
+
+        let mut receipt = receipt.context("GitHub placement fallback omitted its receipt")?;
+        super::write_review_publication_receipt_from_env(&durable_partial_receipt(&receipt))?;
+        for (finding, path) in file_findings {
+            let (finding_id, _) = finding_receipt_id(finding);
+            let finding_marker = finding_marker(&finding_id);
+            let payload = file_level_comment(finding, path, head_sha);
+            let comment = self
+                .post_file_comment_reconciled(&payload, &finding_marker, snapshot)
+                .await?;
+            let publication = receipt
+                .findings
+                .iter_mut()
+                .find(|publication| publication.finding_id == finding_id)
+                .context("GitHub file-level comment omitted its publication receipt")?;
+            publication.initial_outcome = FindingPublicationOutcome::FileComment;
+            publication.inline_rejected = false;
+            publication.comment_id = Some(comment.id.to_string());
+            super::write_review_publication_receipt_from_env(&durable_partial_receipt(&receipt))?;
+        }
+        self.finalize_review_summary_if_possible(envelope, &receipt, &marker, snapshot)
+            .await;
+        Ok(receipt)
     }
 
     async fn start_checks(&self, head_sha: &str) -> Result<(String, String)> {
@@ -2150,6 +2540,139 @@ fn planned_review_receipt(envelope: &Envelope, head_sha: &str) -> ReviewPublicat
     }
 }
 
+fn initial_review_comment(finding: &Finding) -> serde_json::Value {
+    let (finding_id, _) = finding_receipt_id(finding);
+    let mut comment = json!({
+        "path": finding.path,
+        "line": finding.line,
+        "side": "RIGHT",
+        "body": append_marker(
+            &super::finding_comment_body(finding, true),
+            &finding_marker(&finding_id),
+        ),
+    });
+    if let Some(end) = finding.end_line
+        && end > finding.line
+    {
+        comment["start_line"] = json!(finding.line);
+        comment["line"] = json!(end);
+        comment["start_side"] = json!("RIGHT");
+    }
+    comment
+}
+
+fn fallback_line_comment(finding: &Finding, path: &str, line: u32) -> serde_json::Value {
+    let (finding_id, _) = finding_receipt_id(finding);
+    let mut body = String::new();
+    if path != finding.path {
+        body.push_str(&format!(
+            "This finding refers to `{}:{}`, outside the changed lines in this file.\n\n",
+            super::safe_code_text(&finding.path),
+            finding.line,
+        ));
+    } else if line != finding.line {
+        body.push_str(&format!(
+            "This finding refers to line {}, outside the changed lines.\n\n",
+            finding.line,
+        ));
+    }
+    body.push_str(&super::finding_comment_body(finding, true));
+    json!({
+        "path": path,
+        "line": line,
+        "side": "RIGHT",
+        "body": append_marker(&body, &finding_marker(&finding_id)),
+    })
+}
+
+fn file_level_comment(finding: &Finding, path: &str, head_sha: &str) -> serde_json::Value {
+    let (finding_id, _) = finding_receipt_id(finding);
+    let body = format!(
+        "Original location: `{}:{}`\n\n{}",
+        super::safe_code_text(&finding.path),
+        finding.line,
+        super::finding_comment_body(finding, true),
+    );
+    let body = append_marker(&body, FILE_LEVEL_COMMENT_MARKER);
+    json!({
+        "body": append_marker(&body, &finding_marker(&finding_id)),
+        "commit_id": head_sha,
+        "path": path,
+        "subject_type": "file",
+    })
+}
+
+fn publication_file_path<'a>(diff: &'a Diff, finding_path: &str) -> Option<&'a str> {
+    diff.files
+        .iter()
+        .find(|file| file.path == finding_path)
+        .map(|file| file.path.as_str())
+        .or_else(|| {
+            diff.files
+                .iter()
+                .find(|file| !file.deleted && file.old_path == finding_path)
+                .map(|file| file.path.as_str())
+        })
+}
+
+fn set_publication_outcome(
+    receipt: &mut ReviewPublicationReceipt,
+    finding: &Finding,
+    outcome: FindingPublicationOutcome,
+    inline_rejected: bool,
+) -> Result<()> {
+    let (finding_id, _) = finding_receipt_id(finding);
+    let publication = receipt
+        .findings
+        .iter_mut()
+        .find(|publication| publication.finding_id == finding_id)
+        .context("GitHub placement fallback omitted a finding publication receipt")?;
+    publication.initial_outcome = outcome;
+    publication.inline_rejected = inline_rejected;
+    publication.comment_id = None;
+    Ok(())
+}
+
+fn receipt_covers_findings(receipt: &ReviewPublicationReceipt, findings: &[&Finding]) -> bool {
+    findings
+        .iter()
+        .all(|finding| receipt_has_finding_comment(receipt, finding))
+}
+
+fn receipt_has_finding_comment(receipt: &ReviewPublicationReceipt, finding: &Finding) -> bool {
+    let (finding_id, _) = finding_receipt_id(finding);
+    receipt
+        .findings
+        .iter()
+        .find(|publication| publication.finding_id == finding_id)
+        .is_some_and(|publication| publication.comment_id.is_some())
+}
+
+fn github_review_rejected_line(body: &str) -> bool {
+    let normalized = body.to_ascii_lowercase();
+    if normalized.contains("line could not be resolved")
+        || normalized.contains("line must be part of the diff")
+    {
+        return true;
+    }
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("errors")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+        })
+        .is_some_and(|errors| {
+            errors.iter().any(|error| {
+                matches!(
+                    error.get("field").and_then(serde_json::Value::as_str),
+                    Some("line" | "start_line")
+                ) && error.get("code").and_then(serde_json::Value::as_str) == Some("invalid")
+            })
+        })
+}
+
 fn publication_summary(receipt: &ReviewPublicationReceipt) -> ReviewPublicationSummary {
     let mut summary = ReviewPublicationSummary::default();
     for finding in &receipt.findings {
@@ -2158,6 +2681,10 @@ fn publication_summary(receipt: &ReviewPublicationReceipt) -> ReviewPublicationS
                 summary.active_inline += 1;
             }
             FindingPublicationOutcome::Inline => {}
+            FindingPublicationOutcome::FileComment if finding.comment_id.is_some() => {
+                summary.file_comments += 1;
+            }
+            FindingPublicationOutcome::FileComment => {}
             FindingPublicationOutcome::CheckAnnotation => summary.summary_only += 1,
             FindingPublicationOutcome::SummaryOnly => summary.summary_only += 1,
             FindingPublicationOutcome::Carried => summary.carried += 1,
@@ -2172,15 +2699,16 @@ fn publication_summary(receipt: &ReviewPublicationReceipt) -> ReviewPublicationS
     summary
 }
 
-fn rejected_inline_receipt(mut receipt: ReviewPublicationReceipt) -> ReviewPublicationReceipt {
-    for finding in &mut receipt.findings {
-        if finding.initial_outcome == FindingPublicationOutcome::Inline {
-            finding.initial_outcome = FindingPublicationOutcome::SummaryOnly;
-            finding.inline_rejected = true;
-            finding.comment_id = None;
+fn durable_partial_receipt(receipt: &ReviewPublicationReceipt) -> ReviewPublicationReceipt {
+    let mut durable = receipt.clone();
+    for finding in &mut durable.findings {
+        if finding.initial_outcome == FindingPublicationOutcome::FileComment
+            && finding.comment_id.is_none()
+        {
+            finding.initial_outcome = FindingPublicationOutcome::Unknown;
         }
     }
-    receipt
+    durable
 }
 
 fn finding_marker(finding_id: &str) -> String {
@@ -2236,6 +2764,15 @@ fn bounded_review_body(body: &str, marker: &str, details_url: Option<&str>) -> S
         }
     }
     append_marker(OVERSIZED_REVIEW_MESSAGE, marker)
+}
+
+fn required_review_body(body: &str, marker: &str) -> Result<String> {
+    let marked = append_marker(body, marker);
+    ensure!(
+        marked.len() <= MAX_REVIEW_BODY_BYTES,
+        "GitHub review summary cannot represent every unplaced finding within its size limit"
+    );
+    Ok(marked)
 }
 
 fn comment_marker(number: u64, body: &str) -> String {
@@ -2338,6 +2875,48 @@ mod tests {
             evidence: Some("let value = risky();".into()),
             id: Some(id.into()),
         }
+    }
+
+    fn placement_diff() -> crate::diff::Diff {
+        crate::diff::parse(
+            "diff --git a/src/lib.rs b/src/lib.rs\n\
+             --- a/src/lib.rs\n\
+             +++ b/src/lib.rs\n\
+             @@ -10 +10,3 @@\n\
+              context\n\
+             +added one\n\
+             +added two\n",
+        )
+    }
+
+    fn file_only_placement_diff() -> crate::diff::Diff {
+        crate::diff::parse(
+            "diff --git a/src/lib.rs b/src/lib.rs\n\
+             index 9daeafb..0f15a6e 100644\n\
+             Binary files a/src/lib.rs and b/src/lib.rs differ\n",
+        )
+    }
+
+    fn unrelated_placement_diff() -> crate::diff::Diff {
+        crate::diff::parse(
+            "diff --git a/src/other.rs b/src/other.rs\n\
+             --- a/src/other.rs\n\
+             +++ b/src/other.rs\n\
+             @@ -1 +1 @@\n\
+             -old();\n\
+             +new();\n",
+        )
+    }
+
+    fn two_file_placement_diff() -> crate::diff::Diff {
+        crate::diff::parse(
+            "diff --git a/src/first.bin b/src/first.bin\n\
+             index 9daeafb..0f15a6e 100644\n\
+             Binary files a/src/first.bin and b/src/first.bin differ\n\
+             diff --git a/src/second.bin b/src/second.bin\n\
+             index 9daeafb..0f15a6e 100644\n\
+             Binary files a/src/second.bin and b/src/second.bin differ\n",
+        )
     }
 
     fn repository_search_terms() -> Vec<crate::repository_search::SearchTerm> {
@@ -2485,6 +3064,7 @@ mod tests {
     #[tokio::test]
     async fn github_review_reconciles_before_retrying_uncertain_post() {
         let server = MockServer::start().await;
+        mount_current_delivery_snapshot(&server).await;
         Mock::given(method("POST"))
             .and(path("/repos/owner/repo/pulls/1/reviews"))
             .respond_with(ResponseTemplate::new(500))
@@ -2496,7 +3076,7 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(serde_json::json!([{
                     "body": "summary\n\n<!-- postil-review:test -->",
-                    "commit_id": "abcdef12"
+                    "commit_id": "aaaaaaaaaaaa"
                 }])),
             )
             .expect(1)
@@ -2505,15 +3085,16 @@ mod tests {
         let github = test_github(&server);
         let body = serde_json::json!({
             "body": "summary\n\n<!-- postil-review:test -->",
-            "commit_id": "abcdef12",
+            "commit_id": "aaaaaaaaaaaa",
             "event": "COMMENT"
         });
+        let snapshot = delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc");
 
         let response = github
             .send_review_reconciled(
                 &body,
                 "<!-- postil-review:test -->",
-                "abcdef12",
+                &snapshot,
                 "review post",
             )
             .await
@@ -2615,7 +3196,6 @@ mod tests {
             .expect(0)
             .mount(&server)
             .await;
-
         let github = test_github(&server);
         let content = github
             .fetch_repository_file_if_present("head123", "config/review.toml")
@@ -3061,6 +3641,14 @@ mod tests {
             .await;
     }
 
+    async fn mount_no_existing_review(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(server)
+            .await;
+    }
+
     #[tokio::test]
     async fn github_receipt_separates_inline_summary_carried_resolved_and_suppressed() {
         let server = MockServer::start().await;
@@ -3117,6 +3705,7 @@ mod tests {
             .post_review(
                 &envelope,
                 &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                None,
             )
             .await
             .unwrap();
@@ -3223,6 +3812,7 @@ mod tests {
             .post_review(
                 &envelope,
                 &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                None,
             )
             .await
             .unwrap();
@@ -3280,6 +3870,7 @@ mod tests {
             .post_review(
                 &envelope,
                 &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                None,
             )
             .await
             .unwrap();
@@ -3303,9 +3894,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn github_422_receipt_records_rejected_inline_and_summary_only_fallback() {
+    async fn github_line_rejection_retries_on_the_nearest_changed_line() {
         let server = MockServer::start().await;
         mount_current_delivery_snapshot(&server).await;
+        mount_no_existing_review(&server).await;
         let calls = Arc::new(AtomicUsize::new(0));
         let response_calls = Arc::clone(&calls);
         Mock::given(method("POST"))
@@ -3313,15 +3905,34 @@ mod tests {
             .respond_with(move |_request: &wiremock::Request| {
                 if response_calls.fetch_add(1, Ordering::SeqCst) == 0 {
                     ResponseTemplate::new(422)
+                        .set_body_json(serde_json::json!({"message": "Line could not be resolved"}))
                 } else {
                     ResponseTemplate::new(200).set_body_json(serde_json::json!({
                         "id": 78,
-                        "commit_id": "aaaaaaaaaaaa",
-                        "comments": []
+                        "commit_id": "aaaaaaaaaaaa"
                     }))
                 }
             })
             .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1/reviews/78/comments"))
+            .and(query_param("per_page", "100"))
+            .and(query_param("page", "1"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "id": 601,
+                    "body": super::finding_marker("inline-1")
+                }])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/repos/owner/repo/pulls/1/reviews/78"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
             .mount(&server)
             .await;
         let envelope = delivery_envelope_with_findings(
@@ -3336,20 +3947,19 @@ mod tests {
 
         let mut github = test_github(&server);
         github.details_url = Some("https://postil.dev/orgs/acme/runs/run-1".into());
+        let diff = placement_diff();
         let receipt = github
             .post_review(
                 &envelope,
                 &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                Some(&diff),
             )
             .await
             .unwrap();
         let finding = &receipt.findings[0];
-        assert_eq!(
-            finding.initial_outcome,
-            FindingPublicationOutcome::SummaryOnly
-        );
-        assert!(finding.inline_rejected);
-        assert!(finding.comment_id.is_none());
+        assert_eq!(finding.initial_outcome, FindingPublicationOutcome::Inline);
+        assert!(!finding.inline_rejected);
+        assert_eq!(finding.comment_id.as_deref(), Some("601"));
 
         let requests = server.received_requests().await.unwrap();
         let posts: Vec<_> = requests
@@ -3357,14 +3967,766 @@ mod tests {
             .filter(|request| request.method == reqwest::Method::POST)
             .collect();
         let fallback: serde_json::Value = serde_json::from_slice(&posts[1].body).unwrap();
+        let comments = fallback["comments"].as_array().unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0]["path"], "src/lib.rs");
+        assert_eq!(comments[0]["line"], 10);
+        assert_eq!(comments[0]["side"], "RIGHT");
+        assert!(comments[0].get("start_line").is_none());
+        assert!(comments[0].get("start_side").is_none());
+        assert!(
+            comments[0]["body"]
+                .as_str()
+                .unwrap()
+                .contains("This finding refers to line 7, outside the changed lines.")
+        );
+    }
+
+    #[tokio::test]
+    async fn github_line_rejection_falls_back_to_a_file_level_comment() {
+        let server = MockServer::start().await;
+        mount_current_delivery_snapshot(&server).await;
+        mount_no_existing_review(&server).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let response_calls = Arc::clone(&calls);
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(move |_request: &wiremock::Request| {
+                if response_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(422)
+                        .set_body_json(serde_json::json!({"message": "Line could not be resolved"}))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "id": 78,
+                        "commit_id": "aaaaaaaaaaaa",
+                        "comments": []
+                    }))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 601,
+                "body": super::finding_marker("inline-1"),
+                "commit_id": "aaaaaaaaaaaa"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/repos/owner/repo/pulls/1/reviews/78"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let envelope = delivery_envelope_with_findings(
+            "aaaaaaaaaaaa",
+            "cccccccccccc",
+            vec![publication_finding(
+                "inline-1",
+                "src/lib.rs",
+                "A concrete issue.",
+            )],
+        );
+        let diff = file_only_placement_diff();
+
+        let receipt = test_github(&server)
+            .post_review(
+                &envelope,
+                &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                Some(&diff),
+            )
+            .await
+            .unwrap();
+
+        let finding = &receipt.findings[0];
+        assert_eq!(
+            finding.initial_outcome,
+            FindingPublicationOutcome::FileComment
+        );
+        assert!(!finding.inline_rejected);
+        assert_eq!(finding.comment_id.as_deref(), Some("601"));
+        let requests = server.received_requests().await.unwrap();
+        let file_comment: serde_json::Value = requests
+            .iter()
+            .find(|request| {
+                request.method == reqwest::Method::POST
+                    && request.url.path() == "/repos/owner/repo/pulls/1/comments"
+            })
+            .unwrap()
+            .body_json()
+            .unwrap();
+        assert_eq!(file_comment["subject_type"], "file");
+        assert_eq!(file_comment["path"], "src/lib.rs");
+        assert!(file_comment.get("line").is_none());
+        let body = file_comment["body"].as_str().unwrap();
+        assert!(body.contains("Finding inline-1"));
+        assert!(body.contains("A concrete issue."));
+        assert!(body.contains(super::FILE_LEVEL_COMMENT_MARKER));
+        let summary_update: serde_json::Value = requests
+            .iter()
+            .find(|request| request.method == reqwest::Method::PUT)
+            .unwrap()
+            .body_json()
+            .unwrap();
+        assert!(
+            summary_update["body"]
+                .as_str()
+                .unwrap()
+                .contains("1 finding posted as file-level review comment")
+        );
+    }
+
+    #[tokio::test]
+    async fn github_line_rejection_includes_the_full_finding_when_the_file_is_absent() {
+        let server = MockServer::start().await;
+        mount_current_delivery_snapshot(&server).await;
+        mount_no_existing_review(&server).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let response_calls = Arc::clone(&calls);
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(move |_request: &wiremock::Request| {
+                if response_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(422)
+                        .set_body_json(serde_json::json!({"message": "Line could not be resolved"}))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "id": 78,
+                        "commit_id": "aaaaaaaaaaaa",
+                        "comments": []
+                    }))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/comments"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/repos/owner/repo/pulls/1/reviews/78"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let envelope = delivery_envelope_with_findings(
+            "aaaaaaaaaaaa",
+            "cccccccccccc",
+            vec![publication_finding(
+                "inline-1",
+                "src/lib.rs",
+                "A concrete issue.",
+            )],
+        );
+        let diff = unrelated_placement_diff();
+
+        let receipt = test_github(&server)
+            .post_review(
+                &envelope,
+                &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                Some(&diff),
+            )
+            .await
+            .unwrap();
+
+        let finding = &receipt.findings[0];
+        assert_eq!(
+            finding.initial_outcome,
+            FindingPublicationOutcome::SummaryOnly
+        );
+        assert!(finding.inline_rejected);
+        assert!(finding.comment_id.is_none());
+        let requests = server.received_requests().await.unwrap();
+        let review_posts = requests
+            .iter()
+            .filter(|request| {
+                request.method == reqwest::Method::POST
+                    && request.url.path() == "/repos/owner/repo/pulls/1/reviews"
+            })
+            .collect::<Vec<_>>();
+        let fallback: serde_json::Value = review_posts[1].body_json().unwrap();
         assert!(fallback.get("comments").is_none());
         let summary = fallback["body"].as_str().unwrap();
-        assert!(
-            summary
-                .contains("1 finding could not be placed on the changed lines; see review details")
+        assert!(summary.contains("Location: `src/lib.rs:7`"));
+        assert!(summary.contains("Finding inline-1"));
+        assert!(summary.contains("A concrete issue."));
+        assert!(summary.contains(&super::finding_marker("inline-1")));
+    }
+
+    #[tokio::test]
+    async fn github_second_line_rejection_degrades_to_a_file_level_comment() {
+        let server = MockServer::start().await;
+        mount_current_delivery_snapshot(&server).await;
+        mount_no_existing_review(&server).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let response_calls = Arc::clone(&calls);
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(move |_request: &wiremock::Request| {
+                if response_calls.fetch_add(1, Ordering::SeqCst) < 2 {
+                    ResponseTemplate::new(422)
+                        .set_body_json(serde_json::json!({"message": "Line could not be resolved"}))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "id": 78,
+                        "commit_id": "aaaaaaaaaaaa",
+                        "comments": []
+                    }))
+                }
+            })
+            .expect(3)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 601,
+                "body": super::finding_marker("inline-1"),
+                "commit_id": "aaaaaaaaaaaa"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/repos/owner/repo/pulls/1/reviews/78"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let envelope = delivery_envelope_with_findings(
+            "aaaaaaaaaaaa",
+            "cccccccccccc",
+            vec![publication_finding(
+                "inline-1",
+                "src/lib.rs",
+                "A concrete issue.",
+            )],
         );
-        assert!(!summary.contains("inline placement unavailable"));
-        assert!(!summary.contains("Before the next push"));
+        let diff = placement_diff();
+
+        let receipt = test_github(&server)
+            .post_review(
+                &envelope,
+                &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                Some(&diff),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            receipt.findings[0].initial_outcome,
+            FindingPublicationOutcome::FileComment
+        );
+        assert_eq!(receipt.findings[0].comment_id.as_deref(), Some("601"));
+    }
+
+    #[tokio::test]
+    async fn github_partial_file_comment_retry_resumes_the_existing_review() {
+        let server = MockServer::start().await;
+        mount_current_delivery_snapshot(&server).await;
+        let envelope = delivery_envelope_with_findings(
+            "aaaaaaaaaaaa",
+            "cccccccccccc",
+            vec![
+                publication_finding("first", "src/first.bin", "First issue."),
+                publication_finding("second", "src/second.bin", "Second issue."),
+            ],
+        );
+        let planned = super::planned_review_receipt(&envelope, "aaaaaaaaaaaa");
+        let review_marker = super::review_marker(&planned.receipt_id);
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1/comments"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "id": 7,
+                    "body": format!(
+                        "{}\n\n{}",
+                        super::FILE_LEVEL_COMMENT_MARKER,
+                        super::finding_marker("first")
+                    ),
+                    "commit_id": "aaaaaaaaaaaa"
+                }])),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "id": 78,
+                    "body": review_marker,
+                    "commit_id": "aaaaaaaaaaaa"
+                }])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1/reviews/78/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 602,
+                "body": super::finding_marker("second"),
+                "commit_id": "aaaaaaaaaaaa"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/repos/owner/repo/pulls/1/reviews/78"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let diff = two_file_placement_diff();
+
+        let receipt = test_github(&server)
+            .post_review(
+                &envelope,
+                &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                Some(&diff),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(receipt.review_id.as_deref(), Some("78"));
+        assert_eq!(
+            receipt.findings[0].initial_outcome,
+            FindingPublicationOutcome::Carried
+        );
+        assert_eq!(receipt.findings[0].comment_id.as_deref(), Some("7"));
+        assert_eq!(
+            receipt.findings[1].initial_outcome,
+            FindingPublicationOutcome::FileComment
+        );
+        assert_eq!(receipt.findings[1].comment_id.as_deref(), Some("602"));
+        let requests = server.received_requests().await.unwrap();
+        let review_posts = requests
+            .iter()
+            .filter(|request| {
+                request.method == reqwest::Method::POST
+                    && request.url.path() == "/repos/owner/repo/pulls/1/reviews"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(review_posts.len(), 1, "the existing review is resumed");
+        let initial: serde_json::Value = review_posts[0].body_json().unwrap();
+        assert_eq!(initial["comments"].as_array().unwrap().len(), 1);
+        assert_eq!(initial["comments"][0]["path"], "src/second.bin");
+        let summary_update: serde_json::Value = requests
+            .iter()
+            .find(|request| request.method == reqwest::Method::PUT)
+            .unwrap()
+            .body_json()
+            .unwrap();
+        let summary = summary_update["body"].as_str().unwrap();
+        assert!(summary.contains("1 finding posted as file-level review comment"));
+        assert!(!summary.contains("2 findings posted"));
+        assert!(!summary.contains("posted inline"));
+    }
+
+    #[tokio::test]
+    async fn github_partial_review_without_its_line_comment_uses_file_level_delivery() {
+        let server = MockServer::start().await;
+        mount_current_delivery_snapshot(&server).await;
+        let envelope = delivery_envelope_with_findings(
+            "aaaaaaaaaaaa",
+            "cccccccccccc",
+            vec![publication_finding(
+                "inline-1",
+                "src/lib.rs",
+                "A concrete issue.",
+            )],
+        );
+        let planned = super::planned_review_receipt(&envelope, "aaaaaaaaaaaa");
+        let review_marker = super::review_marker(&planned.receipt_id);
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "id": 78,
+                    "body": review_marker,
+                    "commit_id": "aaaaaaaaaaaa"
+                }])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1/reviews/78/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 601,
+                "body": super::finding_marker("inline-1"),
+                "commit_id": "aaaaaaaaaaaa"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/repos/owner/repo/pulls/1/reviews/78"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let diff = placement_diff();
+
+        let receipt = test_github(&server)
+            .post_review(
+                &envelope,
+                &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                Some(&diff),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            receipt.findings[0].initial_outcome,
+            FindingPublicationOutcome::FileComment
+        );
+        assert_eq!(receipt.findings[0].comment_id.as_deref(), Some("601"));
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| {
+                    request.method == reqwest::Method::POST
+                        && request.url.path() == "/repos/owner/repo/pulls/1/reviews"
+                })
+                .count(),
+            1
+        );
+        let file_comment: serde_json::Value = requests
+            .iter()
+            .find(|request| {
+                request.method == reqwest::Method::POST
+                    && request.url.path() == "/repos/owner/repo/pulls/1/comments"
+            })
+            .unwrap()
+            .body_json()
+            .unwrap();
+        assert_eq!(file_comment["subject_type"], "file");
+        assert_eq!(file_comment["path"], "src/lib.rs");
+    }
+
+    #[tokio::test]
+    async fn github_generic_validation_failure_does_not_trigger_placement_fallback() {
+        let server = MockServer::start().await;
+        mount_current_delivery_snapshot(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(ResponseTemplate::new(422).set_body_json(serde_json::json!({
+                "message": "Validation Failed",
+                "errors": [{"field": "body", "code": "invalid"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let envelope = delivery_envelope_with_findings(
+            "aaaaaaaaaaaa",
+            "cccccccccccc",
+            vec![publication_finding(
+                "inline-1",
+                "src/lib.rs",
+                "A concrete issue.",
+            )],
+        );
+        let diff = placement_diff();
+
+        let error = test_github(&server)
+            .post_review(
+                &envelope,
+                &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                Some(&diff),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("failed validation"));
+    }
+
+    #[tokio::test]
+    async fn github_unplaced_finding_must_fit_in_the_review_summary() {
+        let server = MockServer::start().await;
+        mount_current_delivery_snapshot(&server).await;
+        mount_no_existing_review(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(ResponseTemplate::new(422).set_body_json(serde_json::json!({
+                "message": "Line could not be resolved"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let findings = (0..50)
+            .map(|index| {
+                let mut body = "x".repeat(crate::envelope::FINDING_PUBLIC_BODY_MAX_CHARS - 1);
+                body.push('.');
+                publication_finding(
+                    &format!("inline-{index}"),
+                    &format!("src/missing-{index}.rs"),
+                    &body,
+                )
+            })
+            .collect();
+        let envelope = delivery_envelope_with_findings("aaaaaaaaaaaa", "cccccccccccc", findings);
+        let diff = unrelated_placement_diff();
+
+        let error = test_github(&server)
+            .post_review(
+                &envelope,
+                &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                Some(&diff),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("cannot represent every unplaced finding"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn github_file_comment_response_must_identify_the_reviewed_head() {
+        let server = MockServer::start().await;
+        mount_current_delivery_snapshot(&server).await;
+        mount_no_existing_review(&server).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let response_calls = Arc::clone(&calls);
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(move |_request: &wiremock::Request| {
+                if response_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(422)
+                        .set_body_json(serde_json::json!({"message": "Line could not be resolved"}))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "id": 78,
+                        "commit_id": "aaaaaaaaaaaa",
+                        "comments": []
+                    }))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 601,
+                "body": super::finding_marker("inline-1")
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let envelope = delivery_envelope_with_findings(
+            "aaaaaaaaaaaa",
+            "cccccccccccc",
+            vec![publication_finding(
+                "inline-1",
+                "src/lib.rs",
+                "A concrete issue.",
+            )],
+        );
+        let diff = file_only_placement_diff();
+
+        let error = test_github(&server)
+            .post_review(
+                &envelope,
+                &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                Some(&diff),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("did not identify the reviewed head")
+        );
+    }
+
+    #[tokio::test]
+    async fn github_rechecks_the_snapshot_before_each_file_comment() {
+        let server = MockServer::start().await;
+        mount_no_existing_review(&server).await;
+        let pr_reads = Arc::new(AtomicUsize::new(0));
+        let pr_response_reads = Arc::clone(&pr_reads);
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1"))
+            .respond_with(move |_request: &wiremock::Request| {
+                let current = pr_response_reads.fetch_add(1, Ordering::SeqCst) < 4;
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "title": "t", "body": "b", "state": "open", "merged": false,
+                    "head": {"sha": if current { "aaaaaaaaaaaa" } else { "dddddddddddd" }},
+                    "base": {"sha": "bbbbbbbbbbbb"},
+                    "changed_files": 2
+                }))
+            })
+            .expect(5)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/repos/owner/repo/compare/bbbbbbbbbbbb...aaaaaaaaaaaa",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "merge_base_commit": {"sha": "cccccccccccc"},
+                "files": []
+            })))
+            .expect(4)
+            .mount(&server)
+            .await;
+        let review_calls = Arc::new(AtomicUsize::new(0));
+        let review_response_calls = Arc::clone(&review_calls);
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(move |_request: &wiremock::Request| {
+                if review_response_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(422)
+                        .set_body_json(serde_json::json!({"message": "Line could not be resolved"}))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "id": 78,
+                        "commit_id": "aaaaaaaaaaaa",
+                        "comments": []
+                    }))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 601,
+                "body": super::finding_marker("first"),
+                "commit_id": "aaaaaaaaaaaa"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let envelope = delivery_envelope_with_findings(
+            "aaaaaaaaaaaa",
+            "cccccccccccc",
+            vec![
+                publication_finding("first", "src/first.bin", "First issue."),
+                publication_finding("second", "src/second.bin", "Second issue."),
+            ],
+        );
+        let diff = two_file_placement_diff();
+
+        let error = test_github(&server)
+            .post_review(
+                &envelope,
+                &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                Some(&diff),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("PR snapshot changed"));
+    }
+
+    #[test]
+    fn github_file_level_comment_preserves_a_renamed_original_location() {
+        let mut finding = publication_finding("renamed", "src/old.rs", "A concrete issue.");
+        finding.line = 19;
+        let diff = crate::diff::parse(
+            "diff --git a/src/old.rs b/src/new.rs\n\
+             similarity index 100%\n\
+             rename from src/old.rs\n\
+             rename to src/new.rs\n",
+        );
+        let path = super::publication_file_path(&diff, &finding.path).unwrap();
+
+        let payload = super::file_level_comment(&finding, path, "aaaaaaaaaaaa");
+
+        assert_eq!(payload["path"], "src/new.rs");
+        assert!(
+            payload["body"]
+                .as_str()
+                .unwrap()
+                .contains("Original location: `src/old.rs:19`")
+        );
+    }
+
+    #[test]
+    fn pending_file_comments_are_unknown_in_durable_partial_receipts() {
+        let envelope = delivery_envelope_with_findings(
+            "aaaaaaaaaaaa",
+            "cccccccccccc",
+            vec![
+                publication_finding("first", "src/first.bin", "First issue."),
+                publication_finding("second", "src/second.bin", "Second issue."),
+            ],
+        );
+        let mut receipt = super::planned_review_receipt(&envelope, "aaaaaaaaaaaa");
+        receipt.findings[0].initial_outcome = FindingPublicationOutcome::FileComment;
+        receipt.findings[0].comment_id = Some("601".into());
+        receipt.findings[1].initial_outcome = FindingPublicationOutcome::FileComment;
+
+        let durable = super::durable_partial_receipt(&receipt);
+
+        assert_eq!(
+            durable.findings[0].initial_outcome,
+            FindingPublicationOutcome::FileComment
+        );
+        assert_eq!(durable.findings[0].comment_id.as_deref(), Some("601"));
+        assert_eq!(
+            durable.findings[1].initial_outcome,
+            FindingPublicationOutcome::Unknown
+        );
+        assert!(durable.findings[1].comment_id.is_none());
+    }
+
+    #[test]
+    fn github_line_rejection_classification_is_narrow() {
+        assert!(super::github_review_rejected_line(
+            r#"{"message":"Line could not be resolved"}"#
+        ));
+        assert!(super::github_review_rejected_line(
+            r#"{"message":"Validation Failed","errors":[{"field":"start_line","code":"invalid"}]}"#
+        ));
+        assert!(!super::github_review_rejected_line(
+            r#"{"message":"Validation Failed","errors":[{"field":"body","code":"invalid"}]}"#
+        ));
     }
 
     #[tokio::test]
@@ -3422,6 +4784,7 @@ mod tests {
             .post_review(
                 &envelope,
                 &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                None,
             )
             .await
             .unwrap();
@@ -3646,6 +5009,7 @@ mod tests {
             .post_review(
                 &delivery_envelope("aaaaaaaa", "cccccccc"),
                 &delivery_snapshot("aaaaaaaa", "bbbbbbbb", "cccccccc"),
+                None,
             )
             .await
             .unwrap();
@@ -3833,6 +5197,7 @@ mod tests {
             .post_review(
                 &envelope,
                 &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                None,
             )
             .await
             .unwrap_err();
@@ -3895,7 +5260,10 @@ mod tests {
         let snapshot = delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc");
         let envelope =
             delivery_envelope_with_findings("aaaaaaaaaaaa", "cccccccccccc", vec![finding]);
-        let review_error = github.post_review(&envelope, &snapshot).await.unwrap_err();
+        let review_error = github
+            .post_review(&envelope, &snapshot, None)
+            .await
+            .unwrap_err();
         assert!(review_error.to_string().contains("PR snapshot changed"));
         let check_error = github
             .complete_checks(
@@ -3973,7 +5341,10 @@ mod tests {
             delivery_envelope_with_findings("aaaaaaaaaaaa", "cccccccccccc", vec![finding]);
         let snapshot = delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc");
 
-        let review_error = github.post_review(&envelope, &snapshot).await.unwrap_err();
+        let review_error = github
+            .post_review(&envelope, &snapshot, None)
+            .await
+            .unwrap_err();
         assert!(review_error.to_string().contains("PR snapshot changed"));
         let check_error = github
             .complete_checks(
@@ -4077,6 +5448,7 @@ mod tests {
             .post_review(
                 &envelope,
                 &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                None,
             )
             .await
             .unwrap_err();
@@ -4106,10 +5478,14 @@ mod tests {
             .await;
         Mock::given(method("POST"))
             .and(path("/repos/owner/repo/pulls/1/reviews"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": 99,
-                "comments": []
-            })))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = request.body_json().expect("review body");
+                ResponseTemplate::new(200).set_body_json(published_review_response(
+                    &body,
+                    99,
+                    "aaaaaaaaaaaa",
+                ))
+            })
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -4192,6 +5568,7 @@ mod tests {
             .post_review(
                 &envelope,
                 &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                None,
             )
             .await
             .unwrap();
@@ -4437,6 +5814,31 @@ mod tests {
         }
     }
 
+    fn published_review_response(
+        request_body: &serde_json::Value,
+        review_id: u64,
+        commit_id: &str,
+    ) -> serde_json::Value {
+        let comments = request_body["comments"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .map(|(index, comment)| {
+                serde_json::json!({
+                    "id": index + 1,
+                    "body": comment["body"],
+                    "commit_id": commit_id,
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "id": review_id,
+            "commit_id": commit_id,
+            "comments": comments,
+        })
+    }
+
     async fn mount_dedup_snapshot(server: &MockServer) {
         Mock::given(method("GET"))
             .and(path("/repos/owner/repo/pulls/1"))
@@ -4463,6 +5865,64 @@ mod tests {
             .await;
     }
 
+    #[tokio::test]
+    async fn github_stops_review_summary_retries_when_the_snapshot_changes() {
+        let server = MockServer::start().await;
+        let pr_reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let captured_reads = pr_reads.clone();
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1"))
+            .respond_with(move |_request: &wiremock::Request| {
+                let title = if captured_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
+                {
+                    "t"
+                } else {
+                    "changed"
+                };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "title": title, "body": "b", "state": "open", "merged": false,
+                    "head": {"sha": "aaaaaaaaaaaa"}, "base": {"sha": "bbbbbbbbbbbb"},
+                    "changed_files": 1
+                }))
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/repos/owner/repo/compare/bbbbbbbbbbbb...aaaaaaaaaaaa",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "merge_base_commit": {"sha": "cccccccccccc"}, "files": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/repos/owner/repo/pulls/1/reviews/99"))
+            .respond_with(ResponseTemplate::new(503).insert_header("retry-after", "1"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let envelope =
+            delivery_envelope_with_findings("aaaaaaaaaaaa", "cccccccccccc", vec![dedup_finding()]);
+        let mut receipt = super::planned_review_receipt(&envelope, "aaaaaaaaaaaa");
+        receipt.review_id = Some("99".into());
+        let marker = super::review_marker(&receipt.receipt_id);
+        let error = dedup_github(&server)
+            .finalize_review_summary(
+                &envelope,
+                &receipt,
+                &marker,
+                &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("PR snapshot changed"));
+        assert_eq!(pr_reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
     /// A second review of an unchanged head re-detects what the first found.
     /// Those findings are fresh, not carried, so only the marker already on the
     /// pull request can tell the run its comment is a duplicate.
@@ -4480,14 +5940,36 @@ mod tests {
                 .first()
                 .expect("one finding in the envelope"),
         );
+        let planned = super::planned_review_receipt(&envelope, "aaaaaaaaaaaa");
+        let review_marker = super::review_marker(&planned.receipt_id);
         Mock::given(method("GET"))
             .and(path("/repos/owner/repo/pulls/1/comments"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(serde_json::json!([{
                     "id": 7,
                     "body": format!("**{}**\n\n{}", finding.title, finding_marker(&finding_id)),
+                    "commit_id": "aaaaaaaaaaaa",
+                    "subject_type": "line"
                 }])),
             )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "id": 11,
+                    "body": review_marker,
+                    "commit_id": "aaaaaaaaaaaa"
+                }])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/repos/owner/repo/pulls/1/reviews/11"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
             .mount(&server)
             .await;
         let posted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
@@ -4495,30 +5977,47 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/repos/owner/repo/pulls/1/reviews"))
             .respond_with(move |request: &wiremock::Request| {
-                captured
-                    .lock()
-                    .expect("capture lock")
-                    .push(request.body_json().expect("review body"));
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": 11}))
+                let body: serde_json::Value = request.body_json().expect("review body");
+                captured.lock().expect("capture lock").push(body.clone());
+                ResponseTemplate::new(200).set_body_json(published_review_response(
+                    &body,
+                    11,
+                    "aaaaaaaaaaaa",
+                ))
             })
+            .expect(0)
             .mount(&server)
             .await;
 
-        github
+        let receipt = github
             .post_review(
                 &envelope,
                 &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                None,
             )
             .await
-            .expect("the review still posts its summary");
+            .expect("the existing review and comment reconcile");
 
-        let bodies = posted.lock().expect("capture lock");
-        let body = bodies.first().expect("one review posted");
-        assert_eq!(
-            body["comments"].as_array().map_or(0, Vec::len),
-            0,
-            "the duplicate inline comment is not reposted"
+        assert!(
+            posted.lock().expect("capture lock").is_empty(),
+            "the duplicate review is not reposted"
         );
+        assert_eq!(receipt.review_id.as_deref(), Some("11"));
+        assert_eq!(receipt.findings[0].comment_id.as_deref(), Some("7"));
+        assert_eq!(
+            receipt.findings[0].initial_outcome,
+            FindingPublicationOutcome::Carried
+        );
+        let requests = server.received_requests().await.unwrap();
+        let summary_update: serde_json::Value = requests
+            .iter()
+            .find(|request| request.method == reqwest::Method::PUT)
+            .unwrap()
+            .body_json()
+            .unwrap();
+        let summary = summary_update["body"].as_str().unwrap();
+        assert!(!summary.contains("posted inline"));
+        assert!(!summary.contains("posted as file-level"));
     }
 
     #[tokio::test]
@@ -4540,11 +6039,13 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/repos/owner/repo/pulls/1/reviews"))
             .respond_with(move |request: &wiremock::Request| {
-                captured
-                    .lock()
-                    .expect("capture lock")
-                    .push(request.body_json().expect("review body"));
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": 11}))
+                let body: serde_json::Value = request.body_json().expect("review body");
+                captured.lock().expect("capture lock").push(body.clone());
+                ResponseTemplate::new(200).set_body_json(published_review_response(
+                    &body,
+                    11,
+                    "aaaaaaaaaaaa",
+                ))
             })
             .mount(&server)
             .await;
@@ -4555,6 +6056,7 @@ mod tests {
             .post_review(
                 &envelope,
                 &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                None,
             )
             .await
             .expect("review posts");
@@ -4583,11 +6085,13 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/repos/owner/repo/pulls/1/reviews"))
             .respond_with(move |request: &wiremock::Request| {
-                captured
-                    .lock()
-                    .expect("capture lock")
-                    .push(request.body_json().expect("review body"));
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": 11}))
+                let body: serde_json::Value = request.body_json().expect("review body");
+                captured.lock().expect("capture lock").push(body.clone());
+                ResponseTemplate::new(200).set_body_json(published_review_response(
+                    &body,
+                    11,
+                    "aaaaaaaaaaaa",
+                ))
             })
             .mount(&server)
             .await;
@@ -4598,6 +6102,7 @@ mod tests {
             .post_review(
                 &envelope,
                 &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                None,
             )
             .await
             .expect("review posts");

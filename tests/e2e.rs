@@ -640,7 +640,14 @@ struct ReconciledReviewListResponder {
 }
 
 #[derive(Clone)]
-struct PublishedReviewResponder;
+struct PublishedReviewResponder {
+    comments: Arc<Mutex<Vec<Value>>>,
+}
+
+#[derive(Clone)]
+struct PublishedReviewCommentsResponder {
+    comments: Arc<Mutex<Vec<Value>>>,
+}
 
 struct OutputBudgetResponder;
 
@@ -848,15 +855,32 @@ impl Respond for PublishedReviewResponder {
                 json!({
                     "id": 500 + index,
                     "body": comment["body"],
+                    "commit_id": request_body["commit_id"],
                 })
             })
             .collect::<Vec<_>>();
+        *self.comments.lock().unwrap() = comments;
         ResponseTemplate::new(200).set_body_json(json!({
             "id": 77,
             "commit_id": request_body["commit_id"],
-            "comments": comments,
         }))
     }
+}
+
+impl Respond for PublishedReviewCommentsResponder {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(self.comments.lock().unwrap().clone())
+    }
+}
+
+fn published_review_responders() -> (PublishedReviewResponder, PublishedReviewCommentsResponder) {
+    let comments = Arc::new(Mutex::new(Vec::new()));
+    (
+        PublishedReviewResponder {
+            comments: Arc::clone(&comments),
+        },
+        PublishedReviewCommentsResponder { comments },
+    )
 }
 
 async fn mount_github_complete_diff(server: &MockServer, pr: u64) {
@@ -10270,7 +10294,7 @@ async fn hosted_silent_review_does_not_require_a_later_comment_freshness_check()
 }
 
 #[tokio::test]
-async fn github_unresolved_inline_line_falls_back_once_to_summary_only() {
+async fn github_unresolved_inline_line_retries_on_a_changed_line() {
     let server = MockServer::start().await;
     mount_github_complete_diff(&server, 7).await;
     Mock::given(method("POST"))
@@ -10316,14 +10340,36 @@ async fn github_unresolved_inline_line_falls_back_once_to_summary_only() {
         .with_priority(1)
         .mount(&server)
         .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (published_review, published_comments) = published_review_responders();
     Mock::given(method("POST"))
         .and(path("/repos/acme/api/pulls/7/reviews"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .respond_with(published_review)
         .with_priority(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7/reviews/77/comments"))
+        .and(query_param("per_page", "100"))
+        .and(query_param("page", "1"))
+        .respond_with(published_comments)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/repos/acme/api/pulls/7/reviews/77"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
         .mount(&server)
         .await;
 
     let dir = tempfile::tempdir().unwrap();
+    let receipt_path = dir.path().join("publication-receipt.json");
     let out = postil()
         .current_dir(dir.path())
         .env("POSTIL_API_BASE", server.uri())
@@ -10333,6 +10379,7 @@ async fn github_unresolved_inline_line_falls_back_once_to_summary_only() {
             "POSTIL_DETAILS_URL",
             "https://postil.dev/orgs/acme/runs/run-1",
         )
+        .env("POSTIL_PUBLICATION_RECEIPT_PATH", &receipt_path)
         .args([
             "review",
             "--publish",
@@ -10347,7 +10394,7 @@ async fn github_unresolved_inline_line_falls_back_once_to_summary_only() {
 
     let stderr = String::from_utf8_lossy(&out.get_output().stderr);
     assert!(stderr.contains("category=unresolved-line"));
-    assert!(stderr.contains("recovery=summary-only"));
+    assert!(stderr.contains("recovery=placement-ladder"));
     let requests = server.received_requests().await.unwrap();
     let review_bodies = requests
         .iter()
@@ -10359,13 +10406,24 @@ async fn github_unresolved_inline_line_falls_back_once_to_summary_only() {
         .collect::<Vec<_>>();
     assert_eq!(review_bodies.len(), 2);
     assert!(review_bodies[0].get("comments").is_some());
-    assert!(review_bodies[1].get("comments").is_none());
-    let fallback_summary = review_bodies[1]["body"].as_str().unwrap();
+    let fallback_comments = review_bodies[1]["comments"].as_array().unwrap();
+    assert_eq!(fallback_comments.len(), 1);
+    assert_eq!(fallback_comments[0]["path"], "src/auth.rs");
+    assert_eq!(fallback_comments[0]["line"], 41);
+    assert_eq!(fallback_comments[0]["side"], "RIGHT");
+    assert!(fallback_comments[0].get("start_line").is_none());
     assert!(
-        fallback_summary
-            .contains("1 finding could not be placed on the changed lines; see review details")
+        !review_bodies[1]["body"]
+            .as_str()
+            .unwrap()
+            .contains("inline placement unavailable")
     );
-    assert!(!fallback_summary.contains("inline placement unavailable"));
+    let receipt: Value = serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+    assert_eq!(receipt["version"], 2);
+    assert_eq!(receipt["channel"], "reviewComments");
+    assert_eq!(receipt["reviewId"], "77");
+    assert_eq!(receipt["findings"][0]["initialOutcome"], "inline");
+    assert_eq!(receipt["findings"][0]["commentId"], "500");
 }
 
 #[tokio::test]
@@ -10532,9 +10590,18 @@ async fn github_flow_posts_review_and_completes_both_checks() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .mount(&server)
         .await;
+    let (published_review, published_comments) = published_review_responders();
     Mock::given(method("POST"))
         .and(path("/repos/acme/api/pulls/7/reviews"))
-        .respond_with(PublishedReviewResponder)
+        .respond_with(published_review)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7/reviews/77/comments"))
+        .and(query_param("per_page", "100"))
+        .and(query_param("page", "1"))
+        .respond_with(published_comments)
+        .expect(2)
         .mount(&server)
         .await;
     Mock::given(method("PUT"))

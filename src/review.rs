@@ -422,6 +422,19 @@ struct RemoteReviewInput<'a> {
     repository_source: RepositorySource<'a>,
 }
 
+struct RemoteReviewResult {
+    envelope: Envelope,
+    /// Complete pull-request diff retained for forge placement fallback. An
+    /// incremental review cannot establish the complete PR file surface.
+    publication_diff: Option<diff::Diff>,
+}
+
+#[derive(Clone, Copy)]
+struct PublicationContext<'a> {
+    snapshot: &'a PrMeta,
+    diff: Option<&'a diff::Diff>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReviewFailureKind {
     Provider,
@@ -678,7 +691,11 @@ async fn run_remote<F: Forge>(
     )
     .await;
     match result {
-        Ok(envelope) => {
+        Ok(review) => {
+            let RemoteReviewResult {
+                envelope,
+                publication_diff,
+            } = review;
             let check_completion = if let Some((a, g)) = &checks {
                 let gate_state = if envelope.gate.failing {
                     CheckState::Failure
@@ -723,7 +740,10 @@ async fn run_remote<F: Forge>(
                 envelope,
                 Some(forge),
                 Some(review_started),
-                Some(&meta),
+                Some(PublicationContext {
+                    snapshot: &meta,
+                    diff: publication_diff.as_ref(),
+                }),
                 strict_publication,
             )
             .await;
@@ -784,7 +804,10 @@ async fn run_remote<F: Forge>(
                 envelope,
                 Some(forge),
                 Some(review_started),
-                Some(&meta),
+                Some(PublicationContext {
+                    snapshot: &meta,
+                    diff: None,
+                }),
                 strict_publication,
             )
             .await;
@@ -897,7 +920,7 @@ async fn remote_review<F: Forge>(
     forge: &F,
     repo: &str,
     input: RemoteReviewInput<'_>,
-) -> Result<Envelope> {
+) -> Result<RemoteReviewResult> {
     let RemoteReviewInput {
         meta,
         review_started,
@@ -976,7 +999,9 @@ async fn remote_review<F: Forge>(
     } else {
         (diff_snapshot, scope, force_model)
     };
-    review_diff(
+    let publication_diff = matches!(scope, filter::ReconcileScope::Full { .. })
+        .then(|| diff::parse(diff_snapshot.as_str()));
+    let envelope = review_diff(
         cfg,
         args,
         ReviewInput {
@@ -992,7 +1017,11 @@ async fn remote_review<F: Forge>(
             repository_source,
         },
     )
-    .await
+    .await?;
+    Ok(RemoteReviewResult {
+        envelope,
+        publication_diff,
+    })
 }
 
 fn load_baseline(args: &ReviewArgs) -> Result<Vec<Finding>> {
@@ -2735,7 +2764,7 @@ async fn finish<F: Forge>(
     envelope: Envelope,
     forge: Option<&F>,
     hosted_budget_started_at: Option<Instant>,
-    expected_snapshot: Option<&PrMeta>,
+    publication: Option<PublicationContext<'_>>,
     strict_publication: bool,
 ) -> Result<i32> {
     // Persist artifacts before any forge I/O: a posting hiccup must not
@@ -2756,8 +2785,10 @@ async fn finish<F: Forge>(
     if let Some(forge) = forge
         && !args.no_post
     {
-        let expected_snapshot =
-            expected_snapshot.context("remote publication is missing its immutable PR snapshot")?;
+        let PublicationContext {
+            snapshot: expected_snapshot,
+            diff: publication_diff,
+        } = publication.context("remote publication is missing its immutable PR snapshot")?;
         if cfg.finding_presentation == FindingPresentation::CheckAnnotations {
             let mut receipt = forge.plan_review_publication(&envelope, expected_snapshot);
             receipt.channel = crate::forge::ReviewPublicationChannel::CheckAnnotations;
@@ -2788,6 +2819,7 @@ async fn finish<F: Forge>(
                     if matches!(
                         finding.initial_outcome,
                         crate::forge::FindingPublicationOutcome::Inline
+                            | crate::forge::FindingPublicationOutcome::FileComment
                             | crate::forge::FindingPublicationOutcome::SummaryOnly
                     ) {
                         finding.initial_outcome = crate::forge::FindingPublicationOutcome::Carried;
@@ -2832,7 +2864,7 @@ async fn finish<F: Forge>(
         let posted = run_with_hosted_budget(
             hosted_budget_started_at,
             REVIEW_POST_TIMEOUT_SECS,
-            forge.post_review(&envelope, expected_snapshot),
+            forge.post_review(&envelope, expected_snapshot, publication_diff),
             "posting review comment",
         )
         .await;

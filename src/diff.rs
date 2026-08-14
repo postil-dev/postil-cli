@@ -969,6 +969,30 @@ impl DiffIndex {
             .is_some_and(|rs| rs.iter().any(|r| r.contains(&line)))
     }
 
+    /// Return the closest groundable new-side line in `path` to `requested`.
+    ///
+    /// Each hunk contributes only its clamped endpoint or `requested` itself,
+    /// so lookup remains proportional to the number of indexed ranges rather
+    /// than the number of lines they cover. Equal-distance candidates resolve
+    /// to the lower line.
+    pub fn nearest_new_side_line(&self, path: &str, requested: u32) -> Option<u32> {
+        if !self.complete {
+            return None;
+        }
+        self.ranges.get(path)?.iter().fold(None, |nearest, range| {
+            let candidate = requested.max(*range.start()).min(*range.end());
+            match nearest {
+                Some(line)
+                    if (line.abs_diff(requested), line)
+                        <= (candidate.abs_diff(requested), candidate) =>
+                {
+                    Some(line)
+                }
+                _ => Some(candidate),
+            }
+        })
+    }
+
     /// True when both endpoints are on the new side of one diff hunk. Forge
     /// APIs reject multiline comments that cross hunk boundaries even when the
     /// individual line numbers both appear elsewhere in the file diff.
@@ -6077,6 +6101,20 @@ diff --git a/img.png b/img.png
 Binary files a/img.png and b/img.png differ
 ";
 
+    const MULTI_HUNK_SAMPLE: &str = "\
+diff --git a/src/multi.rs b/src/multi.rs
+--- a/src/multi.rs
++++ b/src/multi.rs
+@@ -10 +10,3 @@
+ line ten
++added eleven
++added twelve
+@@ -20 +20,3 @@
+ line twenty
++added twenty-one
++added twenty-two
+";
+
     #[test]
     fn empty_snapshot_is_a_valid_review_input() {
         let snapshot = DiffSnapshot::from_bytes(b"").unwrap();
@@ -6351,6 +6389,43 @@ Binary files a/img.png and b/img.png differ
         assert!(idx.contains_old("gone.txt", 1));
         assert!(idx.touches("src/lib.rs", 1, 10));
         assert!(!idx.touches("src/lib.rs", 1, 9));
+    }
+
+    #[test]
+    fn nearest_new_side_line_returns_the_requested_line_in_range() {
+        let index = DiffIndex::build(&parse(MULTI_HUNK_SAMPLE));
+
+        assert_eq!(index.nearest_new_side_line("src/multi.rs", 11), Some(11));
+    }
+
+    #[test]
+    fn nearest_new_side_line_clamps_before_and_after_ranges() {
+        let index = DiffIndex::build(&parse(MULTI_HUNK_SAMPLE));
+
+        assert_eq!(index.nearest_new_side_line("src/multi.rs", 1), Some(10));
+        assert_eq!(index.nearest_new_side_line("src/multi.rs", 99), Some(22));
+    }
+
+    #[test]
+    fn nearest_new_side_line_breaks_between_range_ties_toward_the_lower_line() {
+        let index = DiffIndex::build(&parse(MULTI_HUNK_SAMPLE));
+
+        assert_eq!(index.nearest_new_side_line("src/multi.rs", 16), Some(12));
+    }
+
+    #[test]
+    fn nearest_new_side_line_returns_none_for_a_missing_path() {
+        let index = DiffIndex::build(&parse(MULTI_HUNK_SAMPLE));
+
+        assert_eq!(index.nearest_new_side_line("src/missing.rs", 11), None);
+    }
+
+    #[test]
+    fn nearest_new_side_line_returns_none_for_deleted_and_binary_files() {
+        let index = DiffIndex::build(&parse(SAMPLE));
+
+        assert_eq!(index.nearest_new_side_line("gone.txt", 1), None);
+        assert_eq!(index.nearest_new_side_line("img.png", 1), None);
     }
 
     #[test]

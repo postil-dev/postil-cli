@@ -456,11 +456,15 @@ pub enum FindingPublicationOutcome {
     /// Delivery succeeded, but the forge response could not establish the
     /// per-finding publication channel.
     Unknown,
+    /// The finding was published as a review comment attached to the changed
+    /// file rather than to one line in that file.
+    FileComment,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReviewPublicationSummary {
     pub active_inline: usize,
+    pub file_comments: usize,
     pub summary_only: usize,
     pub rejected_inline: usize,
     pub carried: usize,
@@ -623,6 +627,7 @@ pub trait Forge {
         &self,
         envelope: &Envelope,
         snapshot: &PrMeta,
+        publication_diff: Option<&crate::diff::Diff>,
     ) -> Result<ReviewPublicationReceipt>;
     /// Ensure both check runs exist (in_progress); returns (advisory_id, gate_id).
     async fn start_checks(&self, head_sha: &str) -> Result<(String, String)>;
@@ -989,6 +994,14 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
                     "{} {} posted inline",
                     publication.active_inline,
                     plural(publication.active_inline, "finding", "findings"),
+                ));
+            }
+            if publication.file_comments > 0 {
+                delivery.push(format!(
+                    "{} {} posted as file-level review {}",
+                    publication.file_comments,
+                    plural(publication.file_comments, "finding", "findings"),
+                    plural(publication.file_comments, "comment", "comments"),
                 ));
             }
             if publication.rejected_inline > 0 {
@@ -1838,6 +1851,19 @@ mod tests {
             "2 findings were not posted inline, including 1 that could not be placed on the changed lines"
         ));
         assert!(!mixed_without_details_link.contains("review details"));
+
+        let file_level = check_summary(
+            &env,
+            true,
+            SummaryContext {
+                publication: Some(ReviewPublicationSummary {
+                    file_comments: 2,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        assert!(file_level.contains("2 findings posted as file-level review comments"));
     }
 
     #[test]

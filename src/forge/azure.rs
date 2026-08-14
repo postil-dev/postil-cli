@@ -465,6 +465,7 @@ impl Forge for Azure {
         &self,
         envelope: &Envelope,
         snapshot: &PrMeta,
+        _publication_diff: Option<&crate::diff::Diff>,
     ) -> Result<ReviewPublicationReceipt> {
         let findings = &envelope.findings;
         let receipt = untracked_review_publication_receipt("azure", envelope, &snapshot.head_sha);
