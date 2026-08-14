@@ -21,6 +21,7 @@ use crate::envelope::{Envelope, Finding, Severity, SuppressionReason};
 pub const MAX_FORGE_METADATA_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_FORGE_CHANGED_FILES: usize = 20_000;
 pub const PUBLICATION_RECEIPT_PATH_ENV: &str = "POSTIL_PUBLICATION_RECEIPT_PATH";
+pub const GITHUB_PUBLICATION_PLAN_CONTRACT: &str = "github-publication-v1";
 
 pub fn checked_metadata_total(current: usize, additional: usize, context: &str) -> Result<usize> {
     let total = current
@@ -469,15 +470,23 @@ pub enum FindingPublicationOutcome {
 pub struct GitHubPublicationPlan {
     pub version: u8,
     pub forge: String,
+    pub controller_generation: String,
+    pub input_identity: String,
+    pub review_output_digest: String,
     pub repository: PublicationPlanRepository,
-    pub pull_request_number: u64,
+    pub pull_request_number: String,
     pub reviewed_snapshot: PublicationPlanSnapshot,
-    pub receipt_id: String,
+    pub lifecycle_receipt: PublicationPlanLifecycleReceipt,
+    pub operation_count: u32,
+    pub operation_manifest_digest: String,
     pub operations: Vec<PublicationPlanOperation>,
+    pub gate_analysis: PublicationPlanGateAnalysis,
     pub intent_digest: String,
 }
 
 pub struct GitHubPublicationPlanRequest<'a> {
+    pub controller_generation: &'a str,
+    pub input_identity: &'a str,
     pub envelope: &'a Envelope,
     pub snapshot: &'a PrMeta,
     pub publication_diff: Option<&'a crate::diff::Diff>,
@@ -488,24 +497,87 @@ pub struct GitHubPublicationPlanRequest<'a> {
     pub gate: CheckState,
 }
 
+pub(crate) struct GitHubPublicationPlanIdentity {
+    pub controller_generation: String,
+    pub input_identity: String,
+    pub review_output_digest: String,
+    pub repository: PublicationPlanRepository,
+    pub pull_request_number: String,
+    pub reviewed_snapshot: PublicationPlanSnapshot,
+}
+
 impl GitHubPublicationPlan {
     pub const VERSION: u8 = 1;
+    pub const MAX_OPERATIONS: usize = 126;
+    pub const MAX_DEPENDENCY_EDGES: usize = 1_024;
 
     pub(crate) fn new(
-        repository: PublicationPlanRepository,
-        pull_request_number: u64,
-        reviewed_snapshot: PublicationPlanSnapshot,
-        receipt_id: String,
+        identity: GitHubPublicationPlanIdentity,
+        lifecycle_receipt: PublicationPlanLifecycleReceipt,
         operations: Vec<PublicationPlanOperation>,
+        gate_analysis: PublicationPlanGateAnalysis,
     ) -> Result<Self> {
-        let mut plan = Self {
-            version: Self::VERSION,
-            forge: "github".to_string(),
+        let GitHubPublicationPlanIdentity {
+            controller_generation,
+            input_identity,
+            review_output_digest,
             repository,
             pull_request_number,
             reviewed_snapshot,
-            receipt_id,
+        } = identity;
+        ensure_publication_decimal_identifier("repository id", &repository.id)?;
+        ensure_publication_decimal_identifier("pull request number", &pull_request_number)?;
+        ensure_publication_decimal_identifier("controller generation", &controller_generation)?;
+        ensure_publication_sha256_identity("input identity", &input_identity)?;
+        ensure_publication_sha256_identity("review output digest", &review_output_digest)?;
+        ensure!(
+            operations.len() <= Self::MAX_OPERATIONS,
+            "publication-plan operation count must not exceed {}",
+            Self::MAX_OPERATIONS
+        );
+        let dependency_edge_count = operations.iter().try_fold(0usize, |count, operation| {
+            count
+                .checked_add(operation.dependencies.len())
+                .context("publication-plan dependency edge count overflowed")
+        })?;
+        ensure!(
+            dependency_edge_count <= Self::MAX_DEPENDENCY_EDGES,
+            "publication-plan dependency edge count must not exceed {}",
+            Self::MAX_DEPENDENCY_EDGES
+        );
+        ensure!(
+            lifecycle_receipt.input_identity == input_identity,
+            "publication-plan lifecycle receipt input identity must match the plan input identity"
+        );
+        ensure!(
+            lifecycle_receipt.recompute_digest()? == lifecycle_receipt.digest,
+            "publication-plan lifecycle receipt digest does not match its canonical content"
+        );
+        for operation in &operations {
+            ensure!(
+                publication_plan_desired_digest(&operation.desired)? == operation.desired_digest,
+                "publication-plan operation {} desired digest does not match its canonical payload",
+                operation.operation_key
+            );
+        }
+        validate_publication_operation_graph(&operations)?;
+        let operation_count = u32::try_from(operations.len())
+            .context("publication-plan operation count exceeds the contract limit")?;
+        let operation_manifest_digest = operation_manifest_digest(&operations)?;
+        let mut plan = Self {
+            version: Self::VERSION,
+            forge: "github".to_string(),
+            controller_generation,
+            input_identity,
+            review_output_digest,
+            repository,
+            pull_request_number,
+            reviewed_snapshot,
+            lifecycle_receipt,
+            operation_count,
+            operation_manifest_digest,
             operations,
+            gate_analysis,
             intent_digest: String::new(),
         };
         plan.intent_digest = plan.canonical_intent_digest()?;
@@ -518,21 +590,33 @@ impl GitHubPublicationPlan {
         struct CanonicalIntent<'a> {
             version: u8,
             forge: &'a str,
+            controller_generation: &'a str,
+            input_identity: &'a str,
+            review_output_digest: &'a str,
             repository: &'a PublicationPlanRepository,
-            pull_request_number: u64,
+            pull_request_number: &'a str,
             reviewed_snapshot: &'a PublicationPlanSnapshot,
-            receipt_id: &'a str,
+            lifecycle_receipt: &'a PublicationPlanLifecycleReceipt,
+            operation_count: u32,
+            operation_manifest_digest: &'a str,
             operations: &'a [PublicationPlanOperation],
+            gate_analysis: &'a PublicationPlanGateAnalysis,
         }
 
         let canonical = serde_json::to_vec(&CanonicalIntent {
             version: self.version,
             forge: &self.forge,
+            controller_generation: &self.controller_generation,
+            input_identity: &self.input_identity,
+            review_output_digest: &self.review_output_digest,
             repository: &self.repository,
-            pull_request_number: self.pull_request_number,
+            pull_request_number: &self.pull_request_number,
             reviewed_snapshot: &self.reviewed_snapshot,
-            receipt_id: &self.receipt_id,
+            lifecycle_receipt: &self.lifecycle_receipt,
+            operation_count: self.operation_count,
+            operation_manifest_digest: &self.operation_manifest_digest,
             operations: &self.operations,
+            gate_analysis: &self.gate_analysis,
         })
         .context("serializing canonical GitHub publication intent")?;
         Ok(format!(
@@ -540,12 +624,159 @@ impl GitHubPublicationPlan {
             crate::repository_search::hex_digest(Sha256::digest(canonical))
         ))
     }
+
+    pub fn recompute_intent_digest(&self) -> Result<String> {
+        self.canonical_intent_digest()
+    }
+
+    pub fn recompute_operation_manifest_digest(&self) -> Result<String> {
+        operation_manifest_digest(&self.operations)
+    }
+}
+
+fn operation_manifest_digest(operations: &[PublicationPlanOperation]) -> Result<String> {
+    let canonical = serde_json::to_vec(operations)
+        .context("serializing canonical GitHub publication operation manifest")?;
+    Ok(format!(
+        "sha256:{}",
+        crate::repository_search::hex_digest(Sha256::digest(canonical))
+    ))
+}
+
+fn validate_publication_operation_graph(operations: &[PublicationPlanOperation]) -> Result<()> {
+    let mut ordinals_by_key = std::collections::HashMap::with_capacity(operations.len());
+    for (index, operation) in operations.iter().enumerate() {
+        ensure!(
+            operation.ordinal as usize == index + 1,
+            "publication-plan operation ordinals must be contiguous and one-based"
+        );
+        ensure!(
+            !operation.operation_key.is_empty(),
+            "publication-plan operation keys must not be empty"
+        );
+        ensure!(
+            ordinals_by_key
+                .insert(operation.operation_key.as_str(), operation.ordinal)
+                .is_none(),
+            "publication-plan operation keys must be unique"
+        );
+    }
+
+    for operation in operations {
+        let mut declared_dependencies = std::collections::HashSet::new();
+        for dependency in &operation.dependencies {
+            ensure!(
+                declared_dependencies.insert(dependency.as_str()),
+                "publication-plan operation dependencies must be unique"
+            );
+            let dependency_ordinal =
+                ordinals_by_key.get(dependency.as_str()).with_context(|| {
+                    format!(
+                        "publication-plan operation {} depends on missing operation {dependency}",
+                        operation.operation_key
+                    )
+                })?;
+            ensure!(
+                *dependency_ordinal < operation.ordinal,
+                "publication-plan operation {} has a forward, self, or cyclic dependency on {dependency}",
+                operation.operation_key
+            );
+        }
+        ensure!(
+            !operation.activation.any_of.is_empty(),
+            "publication-plan operations require at least one activation condition"
+        );
+        for condition in &operation.activation.any_of {
+            let referenced_keys: &[String] = match condition {
+                PublicationPlanActivationCondition::SemanticPlacementRejected {
+                    dependency_operation_key,
+                    ..
+                }
+                | PublicationPlanActivationCondition::PartialReviewObserved {
+                    dependency_operation_key,
+                    ..
+                } => std::slice::from_ref(dependency_operation_key),
+                PublicationPlanActivationCondition::ReviewSelectionTerminal {
+                    selected_review_operation_keys,
+                } => selected_review_operation_keys,
+                PublicationPlanActivationCondition::Always
+                | PublicationPlanActivationCondition::MarkerAbsent { .. }
+                | PublicationPlanActivationCondition::FindingContentDiffers { .. } => &[],
+            };
+            for referenced_key in referenced_keys {
+                ensure!(
+                    declared_dependencies.contains(referenced_key.as_str()),
+                    "publication-plan activation for {} references undeclared dependency {referenced_key}",
+                    operation.operation_key
+                );
+            }
+        }
+        match &operation.desired {
+            PublicationPlanOperationKind::AdvisoryCheckComplete { created_check, .. } => {
+                ensure!(
+                    declared_dependencies.contains(created_check.dependency_operation_key.as_str()),
+                    "publication-plan advisory completion references undeclared create dependency {}",
+                    created_check.dependency_operation_key
+                );
+            }
+            PublicationPlanOperationKind::ReviewSummaryUpdate {
+                terminal_operations,
+                cases,
+                ..
+            } => {
+                for terminal in terminal_operations {
+                    ensure!(
+                        declared_dependencies.contains(terminal.operation_key.as_str()),
+                        "publication-plan review summary references undeclared terminal dependency {}",
+                        terminal.operation_key
+                    );
+                }
+                for case in cases {
+                    ensure!(
+                        declared_dependencies.contains(case.selected_review_operation_key.as_str()),
+                        "publication-plan review summary references undeclared selected review dependency {}",
+                        case.selected_review_operation_key
+                    );
+                }
+            }
+            PublicationPlanOperationKind::ReviewCreate { .. }
+            | PublicationPlanOperationKind::FileCommentFallback { .. }
+            | PublicationPlanOperationKind::FindingCommentUpdate { .. }
+            | PublicationPlanOperationKind::AdvisoryCheckCreate { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_publication_decimal_identifier(name: &str, value: &str) -> Result<()> {
+    ensure!(
+        !value.is_empty()
+            && value.bytes().all(|byte| byte.is_ascii_digit())
+            && value != "0"
+            && !value.starts_with('0')
+            && value.parse::<i64>().is_ok(),
+        "publication-plan {name} must be a positive canonical decimal string within signed 64-bit storage"
+    );
+    Ok(())
+}
+
+pub(crate) fn ensure_publication_sha256_identity(name: &str, value: &str) -> Result<()> {
+    ensure!(
+        value.strip_prefix("sha256:").is_some_and(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }),
+        "publication-plan {name} must be sha256: followed by 64 lowercase hexadecimal characters"
+    );
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PublicationPlanRepository {
-    pub id: u64,
+    pub id: String,
     pub full_name: String,
 }
 
@@ -562,9 +793,53 @@ pub struct PublicationPlanSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PublicationPlanOperation {
+    pub ordinal: u32,
     pub operation_key: String,
+    pub dependencies: Vec<String>,
+    pub activation: PublicationPlanOperationActivation,
+    pub reconciliation: PublicationPlanOperationReconciliation,
+    pub desired_digest: String,
     #[serde(flatten)]
     pub desired: PublicationPlanOperationKind,
+}
+
+impl PublicationPlanOperation {
+    pub(crate) fn new(
+        ordinal: u32,
+        operation_key: String,
+        dependencies: Vec<String>,
+        activation: PublicationPlanOperationActivation,
+        reconciliation: PublicationPlanOperationReconciliation,
+        desired: PublicationPlanOperationKind,
+    ) -> Result<Self> {
+        if let Some(observed_remote_id) = reconciliation.observed_remote_id.as_deref() {
+            ensure_publication_decimal_identifier("observed remote id", observed_remote_id)?;
+        }
+        if let PublicationPlanOperationKind::FindingCommentUpdate {
+            observed_comment_id,
+            ..
+        } = &desired
+        {
+            ensure_publication_decimal_identifier("observed comment id", observed_comment_id)?;
+        }
+        let desired_digest = publication_plan_desired_digest(&desired)?;
+        Ok(Self {
+            ordinal,
+            operation_key,
+            dependencies,
+            activation,
+            reconciliation,
+            desired_digest,
+            desired,
+        })
+    }
+}
+
+fn publication_plan_desired_digest(desired: &PublicationPlanOperationKind) -> Result<String> {
+    Ok(format!(
+        "sha256:{}",
+        crate::repository_search::hex_digest(Sha256::digest(serde_json::to_vec(desired)?))
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -574,26 +849,40 @@ pub struct PublicationPlanOperation {
     rename_all_fields = "camelCase"
 )]
 pub enum PublicationPlanOperationKind {
-    CompositeReview {
-        action: PublicationPlanReviewAction,
-        receipt_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        initial_attempt: Option<PublicationPlanReviewAttempt>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        placement_fallback_attempt: Option<PublicationPlanReviewAttempt>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        summary_fallback_attempt: Option<PublicationPlanReviewAttempt>,
-        findings: Vec<PublicationPlanFinding>,
+    ReviewCreate {
+        attempt: PublicationPlanReviewAttemptKind,
+        logical_review_identity: String,
+        payload: PublicationPlanReviewCreatePayload,
     },
     FileCommentFallback {
         finding_id: String,
-        activation: PublicationPlanFallbackActivation,
         payload: PublicationPlanFileComment,
     },
-    AdvisoryCheck {
+    FindingCommentUpdate {
+        finding_id: String,
+        observed_comment_id: String,
+        expected_markers: Vec<String>,
+        body: String,
+        body_sha256: String,
+    },
+    ReviewSummaryUpdate {
+        logical_review_identity: String,
+        terminal_operations: Vec<PublicationPlanTerminalOperation>,
+        cases: Vec<PublicationPlanReviewSummaryCase>,
+    },
+    AdvisoryCheckCreate {
         name: String,
         head_sha: String,
-        conclusion: String,
+        status: PublicationPlanCheckStatus,
+        external_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        details_url: Option<String>,
+    },
+    AdvisoryCheckComplete {
+        name: String,
+        head_sha: String,
+        created_check: PublicationPlanOperationResultReference,
+        conclusion: PublicationPlanCheckConclusion,
         title: String,
         summary: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -601,30 +890,165 @@ pub enum PublicationPlanOperationKind {
         #[serde(skip_serializing_if = "Option::is_none")]
         details_url: Option<String>,
     },
-    GateCheck {
-        name: String,
-        head_sha: String,
-        conclusion: String,
-        title: String,
-        summary: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        details_url: Option<String>,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum PublicationPlanReviewAction {
-    Publish,
-    Omit,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PublicationPlanReviewAttempt {
+pub struct PublicationPlanOperationResultReference {
+    pub dependency_operation_key: String,
+    pub result_field: PublicationPlanOperationResultField,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PublicationPlanOperationResultField {
+    RemoteId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationPlanCheckStatus {
+    InProgress,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationPlanCheckConclusion {
+    Success,
+    Failure,
+    Neutral,
+}
+
+impl From<CheckState> for PublicationPlanCheckConclusion {
+    fn from(state: CheckState) -> Self {
+        match state {
+            CheckState::Success => Self::Success,
+            CheckState::Failure => Self::Failure,
+            CheckState::Neutral => Self::Neutral,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicationPlanGateAnalysis {
+    pub ownership: PublicationPlanGateOwnership,
+    pub authoritative: bool,
+    pub organization_gate_mode_required: bool,
+    pub name: String,
+    pub head_sha: String,
+    pub analyzed_conclusion: PublicationPlanCheckConclusion,
+    pub title: String,
+    pub summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PublicationPlanGateOwnership {
+    Service,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicationPlanReviewCreatePayload {
+    pub commit_id: String,
+    pub event: String,
     pub body: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub comments: Vec<PublicationPlanReviewComment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicationPlanReviewSummaryCase {
+    pub selected_review_operation_key: String,
+    pub selected_review_outcomes: Vec<PublicationPlanReviewCreateOutcome>,
+    pub file_comment_count: u32,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PublicationPlanReviewCreateOutcome {
+    Created,
+    ReconciledExisting,
+    PartialObserved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PublicationPlanReviewAttemptKind {
+    Initial,
+    RelocatedInline,
+    SummaryOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PublicationPlanTerminalOutcome {
+    Applied,
+    ReconciledExisting,
+    NotRequiredMarkerPresent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicationPlanTerminalOperation {
+    pub operation_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
+    pub requires_remote_id: bool,
+    pub accepted_outcomes: Vec<PublicationPlanTerminalOutcome>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicationPlanOperationActivation {
+    pub any_of: Vec<PublicationPlanActivationCondition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "condition",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum PublicationPlanActivationCondition {
+    Always,
+    MarkerAbsent {
+        guard: PublicationPlanMarkerAbsenceGuard,
+    },
+    SemanticPlacementRejected {
+        dependency_operation_key: String,
+        http_status: u16,
+        classification: PublicationPlanPlacementClassification,
+        marker_absence: PublicationPlanMarkerAbsenceGuard,
+    },
+    PartialReviewObserved {
+        dependency_operation_key: String,
+        review_markers: Vec<String>,
+        finding_marker_absence: PublicationPlanMarkerAbsenceGuard,
+    },
+    FindingContentDiffers {
+        observed_comment_id: String,
+        expected_markers: Vec<String>,
+    },
+    ReviewSelectionTerminal {
+        selected_review_operation_keys: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicationPlanOperationReconciliation {
+    pub logical_identity: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub markers: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_remote_id: Option<String>,
+    pub exclusive: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -661,6 +1085,22 @@ pub struct PublicationPlanFinding {
     pub initial_outcome: FindingPublicationOutcome,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallback_intent: Vec<PublicationPlanFindingFallback>,
+    pub content_digest: String,
+    pub marker: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compatible_markers: Vec<String>,
+    pub desired_body: String,
+    pub desired_body_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_comment_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_body_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_outcome: Option<FindingPublicationOutcome>,
+    pub reconciliation: PublicationPlanFindingReconciliation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suppression_reason: Option<SuppressionReason>,
+    pub duplicate_provenance: PublicationPlanDuplicateProvenance,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -673,8 +1113,118 @@ pub enum PublicationPlanFindingFallback {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum PublicationPlanFallbackActivation {
-    CompositeReviewPlacementFailed,
+pub enum PublicationPlanFindingReconciliation {
+    Create,
+    Retain,
+    Replace,
+    Omit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PublicationPlanDuplicateProvenance {
+    None,
+    Baseline,
+    SuppressedRootCause,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PublicationPlanPlacementClassification {
+    InvalidReviewCommentPlacement,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicationPlanMarkerAbsenceGuard {
+    pub markers: Vec<String>,
+    pub head_sha: String,
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicationPlanLifecycleReceipt {
+    pub version: u8,
+    pub input_identity: String,
+    pub channel: ReviewPublicationChannel,
+    pub receipt_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compatible_receipt_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_review_id: Option<String>,
+    pub duplicate_of_baseline: bool,
+    pub findings: Vec<PublicationPlanFinding>,
+    pub digest: String,
+}
+
+impl PublicationPlanLifecycleReceipt {
+    pub const VERSION: u8 = 1;
+
+    pub(crate) fn new(
+        input_identity: String,
+        channel: ReviewPublicationChannel,
+        receipt_id: String,
+        mut compatible_receipt_ids: Vec<String>,
+        observed_review_id: Option<String>,
+        duplicate_of_baseline: bool,
+        mut findings: Vec<PublicationPlanFinding>,
+    ) -> Result<Self> {
+        ensure_publication_sha256_identity("lifecycle input identity", &input_identity)?;
+        if let Some(observed_review_id) = observed_review_id.as_deref() {
+            ensure_publication_decimal_identifier("observed review id", observed_review_id)?;
+        }
+        for finding in &findings {
+            if let Some(observed_comment_id) = finding.observed_comment_id.as_deref() {
+                ensure_publication_decimal_identifier("observed comment id", observed_comment_id)?;
+            }
+        }
+        compatible_receipt_ids.sort();
+        compatible_receipt_ids.dedup();
+        findings.sort_by(|left, right| left.finding_id.cmp(&right.finding_id));
+        let mut receipt = Self {
+            version: Self::VERSION,
+            input_identity,
+            channel,
+            receipt_id,
+            compatible_receipt_ids,
+            observed_review_id,
+            duplicate_of_baseline,
+            findings,
+            digest: String::new(),
+        };
+        receipt.digest = receipt.recompute_digest()?;
+        Ok(receipt)
+    }
+
+    pub fn recompute_digest(&self) -> Result<String> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct CanonicalLifecycleReceipt<'a> {
+            version: u8,
+            input_identity: &'a str,
+            channel: ReviewPublicationChannel,
+            receipt_id: &'a str,
+            compatible_receipt_ids: &'a [String],
+            observed_review_id: &'a Option<String>,
+            duplicate_of_baseline: bool,
+            findings: &'a [PublicationPlanFinding],
+        }
+        let canonical = serde_json::to_vec(&CanonicalLifecycleReceipt {
+            version: self.version,
+            input_identity: &self.input_identity,
+            channel: self.channel,
+            receipt_id: &self.receipt_id,
+            compatible_receipt_ids: &self.compatible_receipt_ids,
+            observed_review_id: &self.observed_review_id,
+            duplicate_of_baseline: self.duplicate_of_baseline,
+            findings: &self.findings,
+        })?;
+        Ok(format!(
+            "sha256:{}",
+            crate::repository_search::hex_digest(Sha256::digest(canonical))
+        ))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -721,11 +1271,10 @@ pub fn untracked_review_publication_receipt(
             digest.update(finding.path.as_bytes());
             digest.update(finding.line.to_be_bytes());
             digest.update(finding.title.as_bytes());
-            let hash = digest.finalize();
             (
                 format!(
-                    "legacy-v1:{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-                    hash[0], hash[1], hash[2], hash[3], hash[4], hash[5]
+                    "legacy-v2:{}",
+                    crate::repository_search::hex_digest(digest.finalize())
                 ),
                 false,
             )
@@ -738,6 +1287,7 @@ pub fn untracked_review_publication_receipt(
             comment_id: None,
         });
     }
+    findings.sort_by(|left, right| left.finding_id.cmp(&right.finding_id));
     let mut digest = Sha256::new();
     digest.update(b"review-receipt-v2\0");
     digest.update(forge.as_bytes());
@@ -745,17 +1295,29 @@ pub fn untracked_review_publication_receipt(
     for finding in &findings {
         digest.update(finding.finding_id.as_bytes());
     }
-    let hash = digest.finalize();
     ReviewPublicationReceipt {
         version: ReviewPublicationReceipt::VERSION,
         channel: ReviewPublicationChannel::ReviewComments,
         receipt_id: format!(
-            "{forge}-review-v2:{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-            hash[0], hash[1], hash[2], hash[3], hash[4], hash[5]
+            "{forge}-review-v2:{}",
+            crate::repository_search::hex_digest(digest.finalize())
         ),
         review_id: None,
         findings,
     }
+}
+
+pub(crate) fn publication_finding_sort_key(finding: &Finding) -> String {
+    finding.id.clone().unwrap_or_else(|| {
+        format!(
+            "{}\0{:010}\0{:010}\0{}\0{}",
+            finding.path,
+            finding.line,
+            finding.end_line.unwrap_or(finding.line),
+            finding.kind.as_str(),
+            finding.title,
+        )
+    })
 }
 
 pub fn write_review_publication_receipt_from_env(receipt: &ReviewPublicationReceipt) -> Result<()> {
@@ -777,15 +1339,41 @@ pub fn write_github_publication_plan(path: &Path, plan: &GitHubPublicationPlan) 
     write_private_json_atomically(path, plan, "GitHub publication plan")
 }
 
+pub(crate) fn write_github_publication_plan_to_writer(
+    mut writer: impl Write,
+    plan: &GitHubPublicationPlan,
+) -> Result<()> {
+    let bytes = serialize_json_artifact(plan, "GitHub publication plan")?;
+    writer
+        .write_all(&bytes)
+        .context("writing GitHub publication plan")?;
+    writer.flush().context("flushing GitHub publication plan")
+}
+
 fn write_private_json_atomically<T: Serialize>(
     path: &Path,
     value: &T,
     artifact: &str,
 ) -> Result<()> {
+    let bytes = serialize_json_artifact(value, artifact)?;
+    write_private_bytes_atomically(path, &bytes, artifact)
+}
+
+fn serialize_json_artifact<T: Serialize>(value: &T, artifact: &str) -> Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec(value).with_context(|| format!("serializing {artifact}"))?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn write_private_bytes_atomically(path: &Path, bytes: &[u8], artifact: &str) -> Result<()> {
     let parent = path
         .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
         .ok_or_else(|| anyhow::anyhow!("{artifact} path must name a file"))?;
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
     ensure!(parent.is_dir(), "{artifact} directory does not exist");
     if let Ok(metadata) = fs::symlink_metadata(path) {
         ensure!(
@@ -813,9 +1401,7 @@ fn write_private_json_atomically<T: Serialize>(
         let mut file = options
             .open(&temporary)
             .with_context(|| format!("creating private {artifact}"))?;
-        serde_json::to_writer(&mut file, value)
-            .with_context(|| format!("serializing {artifact}"))?;
-        file.write_all(b"\n")
+        file.write_all(bytes)
             .with_context(|| format!("writing {artifact}"))?;
         file.sync_all()
             .with_context(|| format!("syncing {artifact}"))?;
@@ -1298,14 +1884,15 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
     // are actionable review results, so keep their bounded detail visible in
     // the review summary instead of reducing them to a count and dashboard
     // link.
-    let synthetic_findings: Vec<_> = envelope
+    let mut synthetic_findings: Vec<_> = envelope
         .findings
         .iter()
         .filter(|finding| is_synthetic_path(&finding.path))
         .filter(|finding| !is_operational_path(&finding.path))
         .filter(|finding| !crate::filter::is_carried(finding))
-        .take(3)
         .collect();
+    synthetic_findings.sort_by_key(|finding| publication_finding_sort_key(finding));
+    synthetic_findings.truncate(3);
     if !synthetic_findings.is_empty() {
         s.push('\n');
         for finding in &synthetic_findings {
@@ -1336,7 +1923,7 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
             ));
         }
     }
-    let eligible: Vec<_> = envelope
+    let mut eligible: Vec<_> = envelope
         .suppressed_findings
         .iter()
         .filter(|suppressed| {
@@ -1346,6 +1933,7 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
             ) && !crate::envelope::is_ephemeral_anchor(&suppressed.finding.path)
         })
         .collect();
+    eligible.sort_by_key(|suppressed| publication_finding_sort_key(&suppressed.finding));
     let disclosed: Vec<_> = eligible.iter().take(5).copied().collect();
     if !disclosed.is_empty() {
         if rich {
@@ -1540,77 +2128,213 @@ mod tests {
         head_sha: &str,
         review_body: &str,
         finding_id: &str,
-        gate_conclusion: &str,
+        gate_conclusion: PublicationPlanCheckConclusion,
     ) -> GitHubPublicationPlan {
-        GitHubPublicationPlan::new(
-            PublicationPlanRepository {
-                id: 42,
-                full_name: "acme/api".into(),
-            },
-            7,
-            PublicationPlanSnapshot {
-                head_sha: head_sha.into(),
-                merge_base_sha: "bbbbbbbb".into(),
-                target_sha: "cccccccc".into(),
-                pull_request_title_sha256: "sha256:title".into(),
-                pull_request_body_sha256: "sha256:body".into(),
-            },
+        let finding = PublicationPlanFinding {
+            finding_id: finding_id.into(),
+            stable_identity: true,
+            path: "src/lib.rs".into(),
+            line: 10,
+            end_line: None,
+            initial_outcome: FindingPublicationOutcome::Inline,
+            fallback_intent: vec![PublicationPlanFindingFallback::FileComment],
+            content_digest: "sha256:finding".into(),
+            marker: "<!-- postil-finding:v2:finding -->".into(),
+            compatible_markers: vec![],
+            desired_body: "Finding body".into(),
+            desired_body_sha256: "sha256:body".into(),
+            observed_comment_id: None,
+            observed_body_sha256: None,
+            observed_outcome: None,
+            reconciliation: PublicationPlanFindingReconciliation::Create,
+            suppression_reason: None,
+            duplicate_provenance: PublicationPlanDuplicateProvenance::None,
+        };
+        let lifecycle_receipt = PublicationPlanLifecycleReceipt::new(
+            format!("sha256:{}", "1".repeat(64)),
+            ReviewPublicationChannel::ReviewComments,
             "github-review-v2:receipt".into(),
-            vec![
-                PublicationPlanOperation {
-                    operation_key: "review-key".into(),
-                    desired: PublicationPlanOperationKind::CompositeReview {
-                        action: PublicationPlanReviewAction::Publish,
-                        receipt_id: "github-review-v2:receipt".into(),
-                        initial_attempt: Some(PublicationPlanReviewAttempt {
-                            body: review_body.into(),
-                            comments: vec![],
-                        }),
-                        placement_fallback_attempt: None,
-                        summary_fallback_attempt: None,
-                        findings: vec![PublicationPlanFinding {
-                            finding_id: finding_id.into(),
-                            stable_identity: true,
-                            path: "src/lib.rs".into(),
-                            line: 10,
-                            end_line: None,
-                            initial_outcome: FindingPublicationOutcome::Inline,
-                            fallback_intent: vec![PublicationPlanFindingFallback::FileComment],
-                        }],
-                    },
+            vec![],
+            None,
+            false,
+            vec![finding.clone()],
+        )
+        .unwrap();
+        let review_operation = PublicationPlanOperation::new(
+            1,
+            "review-key".into(),
+            vec![],
+            PublicationPlanOperationActivation {
+                any_of: vec![PublicationPlanActivationCondition::Always],
+            },
+            PublicationPlanOperationReconciliation {
+                logical_identity: "review-identity".into(),
+                markers: vec!["<!-- postil-review:v2:review -->".into()],
+                observed_remote_id: None,
+                exclusive: true,
+            },
+            PublicationPlanOperationKind::ReviewCreate {
+                attempt: PublicationPlanReviewAttemptKind::Initial,
+                logical_review_identity: "review-identity".into(),
+                payload: PublicationPlanReviewCreatePayload {
+                    commit_id: head_sha.into(),
+                    event: "COMMENT".into(),
+                    body: review_body.into(),
+                    comments: vec![],
                 },
-                PublicationPlanOperation {
-                    operation_key: "gate-key".into(),
-                    desired: PublicationPlanOperationKind::GateCheck {
-                        name: "postil/gate".into(),
-                        head_sha: head_sha.into(),
-                        conclusion: gate_conclusion.into(),
-                        title: "Merge gate".into(),
-                        summary: "Gate summary".into(),
-                        details_url: None,
-                    },
+            },
+        )
+        .unwrap();
+        GitHubPublicationPlan::new(
+            GitHubPublicationPlanIdentity {
+                controller_generation: "1".into(),
+                input_identity: format!("sha256:{}", "1".repeat(64)),
+                review_output_digest: format!("sha256:{}", "2".repeat(64)),
+                repository: PublicationPlanRepository {
+                    id: "42".into(),
+                    full_name: "acme/api".into(),
                 },
-            ],
+                pull_request_number: "7".into(),
+                reviewed_snapshot: PublicationPlanSnapshot {
+                    head_sha: head_sha.into(),
+                    merge_base_sha: "bbbbbbbb".into(),
+                    target_sha: "cccccccc".into(),
+                    pull_request_title_sha256: "sha256:title".into(),
+                    pull_request_body_sha256: "sha256:body".into(),
+                },
+            },
+            lifecycle_receipt,
+            vec![review_operation],
+            PublicationPlanGateAnalysis {
+                ownership: PublicationPlanGateOwnership::Service,
+                authoritative: false,
+                organization_gate_mode_required: true,
+                name: "postil/gate".into(),
+                head_sha: head_sha.into(),
+                analyzed_conclusion: gate_conclusion,
+                title: "Merge gate".into(),
+                summary: "Gate summary".into(),
+                details_url: None,
+            },
         )
         .unwrap()
+    }
+
+    fn rebuild_publication_plan(
+        template: &GitHubPublicationPlan,
+        operations: Vec<PublicationPlanOperation>,
+    ) -> Result<GitHubPublicationPlan> {
+        GitHubPublicationPlan::new(
+            GitHubPublicationPlanIdentity {
+                controller_generation: template.controller_generation.clone(),
+                input_identity: template.input_identity.clone(),
+                review_output_digest: template.review_output_digest.clone(),
+                repository: template.repository.clone(),
+                pull_request_number: template.pull_request_number.clone(),
+                reviewed_snapshot: template.reviewed_snapshot.clone(),
+            },
+            template.lifecycle_receipt.clone(),
+            operations,
+            template.gate_analysis.clone(),
+        )
+    }
+
+    fn dependent_publication_operation(
+        template: &PublicationPlanOperation,
+        operation_key: &str,
+        dependency_operation_key: &str,
+    ) -> PublicationPlanOperation {
+        let mut operation = template.clone();
+        operation.ordinal = 2;
+        operation.operation_key = operation_key.into();
+        operation.dependencies = vec![dependency_operation_key.into()];
+        operation.activation = PublicationPlanOperationActivation {
+            any_of: vec![
+                PublicationPlanActivationCondition::ReviewSelectionTerminal {
+                    selected_review_operation_keys: vec![dependency_operation_key.into()],
+                },
+            ],
+        };
+        operation.reconciliation.logical_identity = format!("{operation_key}-identity");
+        operation
+    }
+
+    fn bounded_publication_operations(
+        template: &PublicationPlanOperation,
+        operation_count: usize,
+        dependency_edge_count: usize,
+    ) -> Vec<PublicationPlanOperation> {
+        let mut remaining_edges = dependency_edge_count;
+        let mut operations = Vec::with_capacity(operation_count);
+        for index in 0..operation_count {
+            let operation_key = format!("operation-{index}");
+            let edge_count = remaining_edges.min(index);
+            let dependencies = (0..edge_count)
+                .map(|dependency_index| format!("operation-{dependency_index}"))
+                .collect();
+            remaining_edges -= edge_count;
+
+            let mut operation = template.clone();
+            operation.ordinal = u32::try_from(index + 1).unwrap();
+            operation.operation_key = operation_key.clone();
+            operation.dependencies = dependencies;
+            operation.activation = PublicationPlanOperationActivation {
+                any_of: vec![PublicationPlanActivationCondition::Always],
+            };
+            operation.reconciliation.logical_identity = format!("{operation_key}-identity");
+            operations.push(operation);
+        }
+        assert_eq!(remaining_edges, 0, "fixture has enough dependency capacity");
+        operations
     }
 
     #[test]
     fn publication_plan_is_private_atomic_deterministic_and_intent_bound() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("publication-plan.json");
-        let plan = sample_publication_plan("aaaaaaaa", "Review body", "finding-1", "failure");
+        let plan = sample_publication_plan(
+            "aaaaaaaa",
+            "Review body",
+            "finding-1",
+            PublicationPlanCheckConclusion::Failure,
+        );
         write_github_publication_plan(&path, &plan).unwrap();
         let first = std::fs::read(&path).unwrap();
         write_github_publication_plan(&path, &plan).unwrap();
         let second = std::fs::read(&path).unwrap();
         assert_eq!(first, second);
+        let mut piped = Vec::new();
+        write_github_publication_plan_to_writer(&mut piped, &plan).unwrap();
+        assert_eq!(piped, first);
+        assert_eq!(piped.last(), Some(&b'\n'));
         assert_eq!(
             serde_json::from_slice::<GitHubPublicationPlan>(&first).unwrap(),
             plan
         );
+        let serialized: serde_json::Value = serde_json::from_slice(&first).unwrap();
+        assert_eq!(serialized["repository"]["id"], "42");
+        assert_eq!(serialized["pullRequestNumber"], "7");
+        assert_eq!(
+            serialized["inputIdentity"],
+            format!("sha256:{}", "1".repeat(64))
+        );
+        assert_eq!(
+            serialized["reviewOutputDigest"],
+            format!("sha256:{}", "2".repeat(64))
+        );
+        assert_eq!(serialized["operationCount"], 1);
+        assert_eq!(plan.operation_count, plan.operations.len() as u32);
+        assert_eq!(
+            plan.recompute_operation_manifest_digest().unwrap(),
+            plan.operation_manifest_digest
+        );
         assert!(plan.intent_digest.starts_with("sha256:"));
         assert_eq!(plan.intent_digest.len(), "sha256:".len() + 64);
+        assert_eq!(plan.recompute_intent_digest().unwrap(), plan.intent_digest);
+        assert_eq!(
+            plan.lifecycle_receipt.recompute_digest().unwrap(),
+            plan.lifecycle_receipt.digest
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1621,13 +2345,466 @@ mod tests {
         }
 
         for changed in [
-            sample_publication_plan("dddddddd", "Review body", "finding-1", "failure"),
-            sample_publication_plan("aaaaaaaa", "Changed body", "finding-1", "failure"),
-            sample_publication_plan("aaaaaaaa", "Review body", "finding-2", "failure"),
-            sample_publication_plan("aaaaaaaa", "Review body", "finding-1", "success"),
+            sample_publication_plan(
+                "dddddddd",
+                "Review body",
+                "finding-1",
+                PublicationPlanCheckConclusion::Failure,
+            ),
+            sample_publication_plan(
+                "aaaaaaaa",
+                "Changed body",
+                "finding-1",
+                PublicationPlanCheckConclusion::Failure,
+            ),
+            sample_publication_plan(
+                "aaaaaaaa",
+                "Review body",
+                "finding-2",
+                PublicationPlanCheckConclusion::Failure,
+            ),
+            sample_publication_plan(
+                "aaaaaaaa",
+                "Review body",
+                "finding-1",
+                PublicationPlanCheckConclusion::Success,
+            ),
         ] {
             assert_ne!(changed.intent_digest, plan.intent_digest);
         }
+
+        let mut stored_digest_only = plan.clone();
+        stored_digest_only.intent_digest = "sha256:untrusted".into();
+        assert_eq!(
+            stored_digest_only.recompute_intent_digest().unwrap(),
+            plan.intent_digest,
+            "the stored intent digest is outside its own canonical boundary"
+        );
+        let mut repository_changed = plan.clone();
+        repository_changed.repository.id = "43".into();
+        assert_ne!(
+            repository_changed.recompute_intent_digest().unwrap(),
+            plan.intent_digest
+        );
+        let mut pull_request_changed = plan.clone();
+        pull_request_changed.pull_request_number = "8".into();
+        assert_ne!(
+            pull_request_changed.recompute_intent_digest().unwrap(),
+            plan.intent_digest
+        );
+        let mut lifecycle_changed = plan.clone();
+        lifecycle_changed.lifecycle_receipt.findings[0].desired_body = "Changed finding".into();
+        assert_ne!(
+            lifecycle_changed
+                .lifecycle_receipt
+                .recompute_digest()
+                .unwrap(),
+            plan.lifecycle_receipt.digest
+        );
+        assert_ne!(
+            lifecycle_changed.recompute_intent_digest().unwrap(),
+            plan.intent_digest
+        );
+        let mut operation_changed = plan.clone();
+        let PublicationPlanOperationKind::ReviewCreate { payload, .. } =
+            &mut operation_changed.operations[0].desired
+        else {
+            panic!("sample plan must contain a review create");
+        };
+        payload.body = "Changed operation payload".into();
+        assert_ne!(
+            operation_changed
+                .recompute_operation_manifest_digest()
+                .unwrap(),
+            plan.operation_manifest_digest
+        );
+        let mut stored_manifest_only = plan.clone();
+        stored_manifest_only.operation_manifest_digest = "sha256:untrusted".into();
+        assert_eq!(
+            stored_manifest_only
+                .recompute_operation_manifest_digest()
+                .unwrap(),
+            plan.operation_manifest_digest,
+            "the stored manifest digest is outside its own canonical boundary"
+        );
+        assert_ne!(
+            stored_manifest_only.recompute_intent_digest().unwrap(),
+            plan.intent_digest,
+            "the manifest seal is inside the plan intent boundary"
+        );
+    }
+
+    #[test]
+    fn publication_plan_rejects_noncanonical_numeric_identifiers() {
+        for repository_id in ["", "0", "01", "9223372036854775808", "18446744073709551615"] {
+            assert!(ensure_publication_decimal_identifier("repository id", repository_id).is_err());
+        }
+        for pull_request_number in ["", "0", "07", "-7"] {
+            assert!(
+                ensure_publication_decimal_identifier("pull request number", pull_request_number)
+                    .is_err()
+            );
+        }
+        assert!(
+            ensure_publication_decimal_identifier("repository id", "9223372036854775807").is_ok()
+        );
+        assert!(
+            ensure_publication_sha256_identity(
+                "input identity",
+                &format!("sha256:{}", "a".repeat(64)),
+            )
+            .is_ok()
+        );
+        for identity in [
+            "",
+            "sha256:",
+            &format!("sha256:{}", "a".repeat(63)),
+            &format!("sha256:{}", "A".repeat(64)),
+            &format!("sha256:{}", "g".repeat(64)),
+        ] {
+            assert!(ensure_publication_sha256_identity("input identity", identity).is_err());
+        }
+
+        let plan = sample_publication_plan(
+            "aaaaaaaa",
+            "Review body",
+            "finding-1",
+            PublicationPlanCheckConclusion::Failure,
+        );
+        assert!(
+            GitHubPublicationPlan::new(
+                GitHubPublicationPlanIdentity {
+                    controller_generation: "generation-1".into(),
+                    input_identity: plan.input_identity.clone(),
+                    review_output_digest: plan.review_output_digest.clone(),
+                    repository: plan.repository.clone(),
+                    pull_request_number: plan.pull_request_number.clone(),
+                    reviewed_snapshot: plan.reviewed_snapshot.clone(),
+                },
+                plan.lifecycle_receipt.clone(),
+                plan.operations.clone(),
+                plan.gate_analysis.clone(),
+            )
+            .is_err()
+        );
+
+        assert!(
+            PublicationPlanLifecycleReceipt::new(
+                plan.input_identity.clone(),
+                plan.lifecycle_receipt.channel,
+                plan.lifecycle_receipt.receipt_id.clone(),
+                plan.lifecycle_receipt.compatible_receipt_ids.clone(),
+                Some("9223372036854775808".into()),
+                plan.lifecycle_receipt.duplicate_of_baseline,
+                plan.lifecycle_receipt.findings.clone(),
+            )
+            .is_err()
+        );
+        let mut finding_with_oversized_id = plan.lifecycle_receipt.findings[0].clone();
+        finding_with_oversized_id.observed_comment_id = Some("9223372036854775808".into());
+        assert!(
+            PublicationPlanLifecycleReceipt::new(
+                plan.input_identity.clone(),
+                plan.lifecycle_receipt.channel,
+                plan.lifecycle_receipt.receipt_id.clone(),
+                vec![],
+                None,
+                false,
+                vec![finding_with_oversized_id],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn publication_plan_constructor_accepts_only_a_sealed_topological_operation_graph() {
+        let template = sample_publication_plan(
+            "aaaaaaaa",
+            "Review body",
+            "finding-1",
+            PublicationPlanCheckConclusion::Success,
+        );
+        let first = template.operations[0].clone();
+        let second = dependent_publication_operation(&first, "summary-key", "review-key");
+        let valid = rebuild_publication_plan(&template, vec![first.clone(), second.clone()])
+            .expect("a contiguous topological operation graph is valid");
+        assert_eq!(valid.operation_count, 2);
+        assert_eq!(
+            valid.recompute_operation_manifest_digest().unwrap(),
+            valid.operation_manifest_digest
+        );
+        assert_eq!(
+            valid.recompute_intent_digest().unwrap(),
+            valid.intent_digest
+        );
+
+        let mut duplicate = second.clone();
+        duplicate.operation_key = first.operation_key.clone();
+        assert!(
+            rebuild_publication_plan(&template, vec![first.clone(), duplicate])
+                .unwrap_err()
+                .to_string()
+                .contains("keys must be unique")
+        );
+
+        let mut missing = second.clone();
+        missing.dependencies = vec!["missing-key".into()];
+        missing.activation = PublicationPlanOperationActivation {
+            any_of: vec![PublicationPlanActivationCondition::Always],
+        };
+        assert!(
+            rebuild_publication_plan(&template, vec![first.clone(), missing])
+                .unwrap_err()
+                .to_string()
+                .contains("depends on missing operation")
+        );
+
+        let mut forward_first = first.clone();
+        forward_first.dependencies = vec![second.operation_key.clone()];
+        assert!(
+            rebuild_publication_plan(&template, vec![forward_first, second.clone()])
+                .unwrap_err()
+                .to_string()
+                .contains("forward, self, or cyclic dependency")
+        );
+
+        let mut cyclic_first = first.clone();
+        cyclic_first.dependencies = vec![second.operation_key.clone()];
+        let mut cyclic_second = second.clone();
+        cyclic_second.dependencies = vec![first.operation_key.clone()];
+        assert!(
+            rebuild_publication_plan(&template, vec![cyclic_first, cyclic_second])
+                .unwrap_err()
+                .to_string()
+                .contains("forward, self, or cyclic dependency")
+        );
+
+        let mut self_dependent = first.clone();
+        self_dependent.dependencies = vec![first.operation_key.clone()];
+        assert!(
+            rebuild_publication_plan(&template, vec![self_dependent])
+                .unwrap_err()
+                .to_string()
+                .contains("forward, self, or cyclic dependency")
+        );
+
+        let mut undeclared_activation = second.clone();
+        undeclared_activation.dependencies.clear();
+        assert!(
+            rebuild_publication_plan(&template, vec![first.clone(), undeclared_activation])
+                .unwrap_err()
+                .to_string()
+                .contains("references undeclared dependency")
+        );
+
+        let mut empty_activation = first.clone();
+        empty_activation.activation.any_of.clear();
+        assert!(
+            rebuild_publication_plan(&template, vec![empty_activation])
+                .unwrap_err()
+                .to_string()
+                .contains("require at least one activation condition")
+        );
+
+        let mut stale_desired_digest = first.clone();
+        let PublicationPlanOperationKind::ReviewCreate { payload, .. } =
+            &mut stale_desired_digest.desired
+        else {
+            panic!("sample plan must contain a review create");
+        };
+        payload.body = "Changed without resealing".into();
+        assert!(
+            rebuild_publication_plan(&template, vec![stale_desired_digest])
+                .unwrap_err()
+                .to_string()
+                .contains("desired digest does not match")
+        );
+
+        let advisory_completion = PublicationPlanOperation::new(
+            2,
+            "advisory-complete".into(),
+            vec![],
+            PublicationPlanOperationActivation {
+                any_of: vec![PublicationPlanActivationCondition::Always],
+            },
+            PublicationPlanOperationReconciliation {
+                logical_identity: "advisory-complete".into(),
+                markers: vec![],
+                observed_remote_id: None,
+                exclusive: true,
+            },
+            PublicationPlanOperationKind::AdvisoryCheckComplete {
+                name: "postil/review".into(),
+                head_sha: "aaaaaaaa".into(),
+                created_check: PublicationPlanOperationResultReference {
+                    dependency_operation_key: first.operation_key.clone(),
+                    result_field: PublicationPlanOperationResultField::RemoteId,
+                },
+                conclusion: PublicationPlanCheckConclusion::Success,
+                title: "Review".into(),
+                summary: "Review complete.".into(),
+                annotations: vec![],
+                details_url: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            rebuild_publication_plan(&template, vec![first.clone(), advisory_completion])
+                .unwrap_err()
+                .to_string()
+                .contains("undeclared create dependency")
+        );
+
+        let mut ordinal_zero = first.clone();
+        ordinal_zero.ordinal = 0;
+        assert!(
+            rebuild_publication_plan(&template, vec![ordinal_zero])
+                .unwrap_err()
+                .to_string()
+                .contains("contiguous and one-based")
+        );
+
+        let mut ordinal_gap = second;
+        ordinal_gap.ordinal = 3;
+        assert!(
+            rebuild_publication_plan(&template, vec![first, ordinal_gap])
+                .unwrap_err()
+                .to_string()
+                .contains("contiguous and one-based")
+        );
+    }
+
+    #[test]
+    fn publication_plan_enforces_operation_and_dependency_edge_bounds() {
+        let template = sample_publication_plan(
+            "aaaaaaaa",
+            "Review body",
+            "finding-1",
+            PublicationPlanCheckConclusion::Success,
+        );
+        let operation_template = &template.operations[0];
+
+        let maximum_operations = bounded_publication_operations(
+            operation_template,
+            GitHubPublicationPlan::MAX_OPERATIONS,
+            0,
+        );
+        assert_eq!(
+            rebuild_publication_plan(&template, maximum_operations)
+                .unwrap()
+                .operation_count,
+            126
+        );
+        let too_many_operations = bounded_publication_operations(
+            operation_template,
+            GitHubPublicationPlan::MAX_OPERATIONS + 1,
+            0,
+        );
+        assert!(
+            rebuild_publication_plan(&template, too_many_operations)
+                .unwrap_err()
+                .to_string()
+                .contains("operation count must not exceed 126")
+        );
+
+        let maximum_edges = bounded_publication_operations(
+            operation_template,
+            GitHubPublicationPlan::MAX_OPERATIONS,
+            GitHubPublicationPlan::MAX_DEPENDENCY_EDGES,
+        );
+        assert!(rebuild_publication_plan(&template, maximum_edges).is_ok());
+        let too_many_edges = bounded_publication_operations(
+            operation_template,
+            GitHubPublicationPlan::MAX_OPERATIONS,
+            GitHubPublicationPlan::MAX_DEPENDENCY_EDGES + 1,
+        );
+        assert!(
+            rebuild_publication_plan(&template, too_many_edges)
+                .unwrap_err()
+                .to_string()
+                .contains("dependency edge count must not exceed 1024")
+        );
+    }
+
+    #[test]
+    fn publication_plan_check_wire_values_are_closed_enums() {
+        assert_eq!(
+            serde_json::to_value(PublicationPlanCheckStatus::InProgress).unwrap(),
+            serde_json::json!("in_progress")
+        );
+        assert_eq!(
+            serde_json::to_value(PublicationPlanCheckConclusion::Success).unwrap(),
+            serde_json::json!("success")
+        );
+        assert_eq!(
+            serde_json::to_value(PublicationPlanCheckConclusion::Failure).unwrap(),
+            serde_json::json!("failure")
+        );
+        assert_eq!(
+            serde_json::to_value(PublicationPlanCheckConclusion::Neutral).unwrap(),
+            serde_json::json!("neutral")
+        );
+        assert!(serde_json::from_str::<PublicationPlanCheckStatus>("\"queued\"").is_err());
+        assert!(serde_json::from_str::<PublicationPlanCheckConclusion>("\"cancelled\"").is_err());
+    }
+
+    #[test]
+    fn publication_operation_manifest_seals_complete_ordered_records() {
+        let plan = sample_publication_plan(
+            "aaaaaaaa",
+            "Review body",
+            "finding-1",
+            PublicationPlanCheckConclusion::Failure,
+        );
+        let baseline = plan.operation_manifest_digest.clone();
+        let assert_changed = |changed: &GitHubPublicationPlan| {
+            assert_ne!(
+                changed.recompute_operation_manifest_digest().unwrap(),
+                baseline
+            );
+        };
+
+        let mut changed = plan.clone();
+        changed.operations[0].ordinal = 2;
+        assert_changed(&changed);
+
+        let mut changed = plan.clone();
+        changed.operations[0].operation_key.push_str("-changed");
+        assert_changed(&changed);
+
+        let mut changed = plan.clone();
+        changed.operations[0]
+            .dependencies
+            .push("dependency-key".into());
+        assert_changed(&changed);
+
+        let mut changed = plan.clone();
+        changed.operations[0].activation.any_of.clear();
+        assert_changed(&changed);
+
+        let mut changed = plan.clone();
+        changed.operations[0]
+            .reconciliation
+            .logical_identity
+            .push_str("-changed");
+        assert_changed(&changed);
+
+        let mut changed = plan.clone();
+        changed.operations[0].desired_digest = "sha256:changed".into();
+        assert_changed(&changed);
+
+        let mut changed = plan.clone();
+        let PublicationPlanOperationKind::ReviewCreate {
+            attempt,
+            logical_review_identity,
+            ..
+        } = &mut changed.operations[0].desired
+        else {
+            panic!("sample plan must contain a review create");
+        };
+        *attempt = PublicationPlanReviewAttemptKind::SummaryOnly;
+        logical_review_identity.push_str("-changed");
+        assert_changed(&changed);
     }
 
     #[cfg(unix)]
@@ -1636,7 +2813,12 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let directory = tempfile::tempdir().unwrap();
-        let plan = sample_publication_plan("aaaaaaaa", "Review body", "finding-1", "failure");
+        let plan = sample_publication_plan(
+            "aaaaaaaa",
+            "Review body",
+            "finding-1",
+            PublicationPlanCheckConclusion::Failure,
+        );
         let destination = directory.path().join("destination.json");
         std::fs::write(&destination, "unchanged").unwrap();
         let link = directory.path().join("publication-plan.json");

@@ -392,6 +392,8 @@ pub struct ReviewArgs {
     pub no_post: bool,
     pub defer_gate_check: bool,
     pub publication_plan_output: Option<PathBuf>,
+    pub publication_generation: Option<String>,
+    pub publication_input_identity: Option<String>,
 }
 
 impl ReviewArgs {
@@ -506,6 +508,27 @@ pub async fn run(args: ReviewArgs) -> Result<i32> {
                 && args.gate_check_run_id.is_none()
                 && !args.defer_gate_check,
             "--publication-plan-output cannot be combined with forge mutation options"
+        );
+        let generation = args
+            .publication_generation
+            .as_deref()
+            .context("--publication-plan-output requires --publication-generation")?;
+        crate::forge::ensure_publication_decimal_identifier("controller generation", generation)
+            .context("invalid --publication-generation")?;
+        let input_identity = args
+            .publication_input_identity
+            .as_deref()
+            .context("--publication-plan-output requires --publication-input-identity")?;
+        crate::forge::ensure_publication_sha256_identity("input identity", input_identity)
+            .context("invalid --publication-input-identity")?;
+    } else {
+        anyhow::ensure!(
+            args.publication_generation.is_none(),
+            "--publication-generation requires --publication-plan-output"
+        );
+        anyhow::ensure!(
+            args.publication_input_identity.is_none(),
+            "--publication-input-identity requires --publication-plan-output"
         );
     }
     let mut cfg = Config::load(&cwd, args.config.as_deref())?;
@@ -2790,6 +2813,8 @@ async fn finish<F: Forge>(
     publication: Option<PublicationContext<'_>>,
     strict_publication: bool,
 ) -> Result<i32> {
+    let publication_plan_to_stdout =
+        args.publication_plan_output.as_deref() == Some(Path::new("-"));
     // Persist artifacts before any forge I/O: a posting hiccup must not
     // discard the completed review's SARIF or envelope output.
     if let Some(path) = &args.sarif {
@@ -2798,10 +2823,14 @@ async fn finish<F: Forge>(
             .with_context(|| format!("writing SARIF to {}", path.display()))?;
     }
 
-    if let Some(format) = args.resolved_output_format() {
+    if let Some(format) = args.resolved_output_format()
+        && (args.output_file.is_some() || !publication_plan_to_stdout)
+    {
         output::write_envelope(&envelope, format, args.output_file.as_deref())?;
     }
-    if args.resolved_output_format().is_none() || args.output_file.is_some() {
+    if !publication_plan_to_stdout
+        && (args.resolved_output_format().is_none() || args.output_file.is_some())
+    {
         output::print_pretty(&envelope);
     }
 
@@ -2824,6 +2853,14 @@ async fn finish<F: Forge>(
         let (advisory, gate) = remote_check_states(&envelope);
         let plan = forge
             .build_publication_plan(crate::forge::GitHubPublicationPlanRequest {
+                controller_generation: args
+                    .publication_generation
+                    .as_deref()
+                    .context("publication planning is missing its generation identity")?,
+                input_identity: args
+                    .publication_input_identity
+                    .as_deref()
+                    .context("publication planning is missing its input identity")?,
                 envelope: &envelope,
                 snapshot: expected_snapshot,
                 publication_diff,
@@ -2835,7 +2872,11 @@ async fn finish<F: Forge>(
                 gate,
             })
             .await?;
-        crate::forge::write_github_publication_plan(path, &plan)?;
+        if publication_plan_to_stdout {
+            crate::forge::write_github_publication_plan_to_writer(std::io::stdout().lock(), &plan)?;
+        } else {
+            crate::forge::write_github_publication_plan(path, &plan)?;
+        }
         return Ok(if envelope.gate.failing { 1 } else { 0 });
     }
 

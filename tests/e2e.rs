@@ -11,6 +11,9 @@ use serde_json::{Value, json};
 use wiremock::matchers::{body_string_contains, header, method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer as WireMockServer, Request, Respond, ResponseTemplate};
 
+const PUBLICATION_INPUT_IDENTITY: &str =
+    "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+
 struct MockServer(WireMockServer);
 
 impl std::ops::Deref for MockServer {
@@ -1238,13 +1241,30 @@ async fn github_publication_plan_is_byte_stable_private_and_never_mutates_the_fo
     let server = MockServer::start().await;
     mount_github_complete_diff(&server, 7).await;
     mount_static_github_pr(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7/comments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
     let directory = tempfile::tempdir().unwrap();
     disable_review_for_hosted_publication(directory.path(), true);
-    let first_plan = directory.path().join("publication-plan-1.json");
+    let first_plan_name = "publication-plan-1.json";
+    let first_plan = directory.path().join(first_plan_name);
     let second_plan = directory.path().join("publication-plan-2.json");
+    let second_envelope = directory.path().join("publication-plan-2.envelope.json");
 
-    for plan_path in [&first_plan, &second_plan] {
-        let envelope_path = plan_path.with_extension("envelope.json");
+    for (plan_path, envelope_path) in [
+        (
+            std::path::Path::new(first_plan_name),
+            std::path::Path::new("publication-plan-1.envelope.json"),
+        ),
+        (second_plan.as_path(), second_envelope.as_path()),
+    ] {
         postil()
             .current_dir(directory.path())
             .env("GITHUB_API_URL", server.uri())
@@ -1263,6 +1283,8 @@ async fn github_publication_plan_is_byte_stable_private_and_never_mutates_the_fo
                 "--publication-plan-output",
             ])
             .arg(plan_path)
+            .args(["--publication-generation", "1"])
+            .args(["--publication-input-identity", PUBLICATION_INPUT_IDENTITY])
             .args(["--output", "json", "--output-file"])
             .arg(envelope_path)
             .assert()
@@ -1272,12 +1294,71 @@ async fn github_publication_plan_is_byte_stable_private_and_never_mutates_the_fo
     let first = std::fs::read(&first_plan).unwrap();
     let second = std::fs::read(&second_plan).unwrap();
     assert_eq!(first, second);
+    let piped = postil()
+        .current_dir(directory.path())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .env("POSTIL_EXPECTED_GITHUB_REPO_ID", "42")
+        .args([
+            "review",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--sha",
+            "aaaaaaaa",
+            "--base-sha",
+            "bbbbbbbb",
+            "--publication-plan-output",
+            "-",
+            "--publication-generation",
+            "1",
+            "--publication-input-identity",
+            PUBLICATION_INPUT_IDENTITY,
+            "--output",
+            "json",
+        ])
+        .assert()
+        .code(0)
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(piped, first);
+    assert_eq!(piped.last(), Some(&b'\n'));
+    assert!(!directory.path().join("-").exists());
+    for envelope_path in [
+        directory.path().join("publication-plan-1.envelope.json"),
+        second_envelope,
+    ] {
+        assert!(
+            !std::fs::read_to_string(envelope_path)
+                .unwrap()
+                .contains(PUBLICATION_INPUT_IDENTITY),
+            "the service-supplied input identity must remain private to the plan artifact"
+        );
+    }
+    assert!(!std::fs::read_dir(directory.path()).unwrap().any(|entry| {
+        let name = entry.unwrap().file_name();
+        let name = name.to_string_lossy();
+        name.starts_with(".publication-plan-1.json.") && name.ends_with(".tmp")
+    }));
     let plan: Value = serde_json::from_slice(&first).unwrap();
     assert_eq!(plan["version"], 1);
     assert_eq!(plan["forge"], "github");
-    assert_eq!(plan["repository"]["id"], 42);
+    assert_eq!(plan["controllerGeneration"], "1");
+    assert_eq!(plan["inputIdentity"], PUBLICATION_INPUT_IDENTITY);
+    assert_eq!(
+        plan["lifecycleReceipt"]["inputIdentity"],
+        PUBLICATION_INPUT_IDENTITY
+    );
+    assert!(
+        plan["reviewOutputDigest"]
+            .as_str()
+            .is_some_and(|digest| digest.starts_with("sha256:") && digest.len() == 71)
+    );
+    assert_eq!(plan["repository"]["id"], "42");
     assert_eq!(plan["repository"]["fullName"], "acme/api");
-    assert_eq!(plan["pullRequestNumber"], 7);
+    assert_eq!(plan["pullRequestNumber"], "7");
     assert_eq!(plan["reviewedSnapshot"]["headSha"], "aaaaaaaa");
     assert_eq!(plan["reviewedSnapshot"]["mergeBaseSha"], "bbbbbbbb");
     assert_eq!(plan["reviewedSnapshot"]["targetSha"], "bbbbbbbb");
@@ -1286,12 +1367,48 @@ async fn github_publication_plan_is_byte_stable_private_and_never_mutates_the_fo
             .as_str()
             .is_some_and(|digest| digest.starts_with("sha256:") && digest.len() == 71)
     );
-    assert_eq!(plan["operations"][0]["kind"], "compositeReview");
-    assert_eq!(plan["operations"][0]["action"], "publish");
-    assert_eq!(plan["operations"][1]["kind"], "advisoryCheck");
-    assert_eq!(plan["operations"][1]["conclusion"], "success");
-    assert_eq!(plan["operations"][2]["kind"], "gateCheck");
-    assert_eq!(plan["operations"][2]["conclusion"], "success");
+    assert_eq!(
+        plan["operationCount"],
+        plan["operations"].as_array().unwrap().len()
+    );
+    assert!(
+        plan["operationManifestDigest"]
+            .as_str()
+            .is_some_and(|digest| digest.starts_with("sha256:") && digest.len() == 71)
+    );
+    assert_eq!(plan["operations"][0]["kind"], "advisoryCheckCreate");
+    assert_eq!(plan["operations"][0]["name"], "postil/review");
+    assert_eq!(plan["operations"][1]["kind"], "reviewCreate");
+    assert_eq!(plan["operations"][1]["attempt"], "initial");
+    assert_eq!(plan["operations"][2]["kind"], "reviewSummaryUpdate");
+    assert_eq!(plan["operations"][3]["kind"], "advisoryCheckComplete");
+    assert_eq!(plan["operations"][3]["name"], "postil/review");
+    assert_eq!(plan["operations"][3]["conclusion"], "success");
+    assert_eq!(
+        plan["operations"][3]["createdCheck"]["dependencyOperationKey"],
+        plan["operations"][0]["operationKey"]
+    );
+    assert_eq!(
+        plan["operations"][3]["dependencies"],
+        json!([
+            plan["operations"][0]["operationKey"].clone(),
+            plan["operations"][2]["operationKey"].clone()
+        ])
+    );
+    assert!(
+        plan["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|operation| {
+                operation["kind"] != "gateCheck" && operation["name"] != "postil/gate"
+            })
+    );
+    assert_eq!(plan["gateAnalysis"]["ownership"], "service");
+    assert_eq!(plan["gateAnalysis"]["authoritative"], false);
+    assert_eq!(plan["gateAnalysis"]["organizationGateModeRequired"], true);
+    assert_eq!(plan["gateAnalysis"]["name"], "postil/gate");
+    assert_eq!(plan["gateAnalysis"]["analyzedConclusion"], "success");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1364,6 +1481,42 @@ async fn github_publication_plan_is_byte_stable_private_and_never_mutates_the_fo
 }
 
 #[test]
+fn publication_plan_capability_probe_is_exact_and_external_io_free() {
+    let directory = tempfile::tempdir().unwrap();
+    postil()
+        .current_dir(directory.path())
+        .env("POSTIL_API_BASE", "http://127.0.0.1:1")
+        .env("GITHUB_API_URL", "http://127.0.0.1:1")
+        .args([
+            "capabilities",
+            "--publication-plan-contract",
+            "github-publication-v1",
+        ])
+        .assert()
+        .code(0)
+        .stdout("github-publication-v1\n")
+        .stderr("");
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+
+    postil()
+        .current_dir(directory.path())
+        .env("POSTIL_API_BASE", "http://127.0.0.1:1")
+        .env("GITHUB_API_URL", "http://127.0.0.1:1")
+        .args([
+            "capabilities",
+            "--publication-plan-contract",
+            "github-publication-v2",
+        ])
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr(predicates::str::contains(
+            "supported contract: github-publication-v1",
+        ));
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+}
+
+#[test]
 fn publication_plan_rejects_non_github_and_local_review_modes_before_io() {
     let directory = tempfile::tempdir().unwrap();
     for extra in [vec!["--forge", "gitlab"], vec!["--staged"]] {
@@ -1380,6 +1533,10 @@ fn publication_plan_rejects_non_github_and_local_review_modes_before_io() {
             "bbbbbbbb",
             "--publication-plan-output",
             "publication-plan.json",
+            "--publication-generation",
+            "1",
+            "--publication-input-identity",
+            PUBLICATION_INPUT_IDENTITY,
         ]);
         command
             .args(extra)
@@ -1387,6 +1544,37 @@ fn publication_plan_rejects_non_github_and_local_review_modes_before_io() {
             .code(2)
             .stderr(predicates::str::contains(
                 "requires a remote GitHub pull request",
+            ));
+    }
+
+    for invalid_identity in [
+        "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "sha256:1",
+        "not-a-digest",
+    ] {
+        postil()
+            .current_dir(directory.path())
+            .args([
+                "review",
+                "--repo",
+                "acme/api",
+                "--pr",
+                "7",
+                "--sha",
+                "aaaaaaaa",
+                "--base-sha",
+                "bbbbbbbb",
+                "--publication-plan-output",
+                "publication-plan.json",
+                "--publication-generation",
+                "1",
+                "--publication-input-identity",
+                invalid_identity,
+            ])
+            .assert()
+            .code(2)
+            .stderr(predicates::str::contains(
+                "invalid --publication-input-identity",
             ));
     }
 }
@@ -10567,7 +10755,8 @@ async fn github_unresolved_inline_line_retries_on_a_changed_line() {
         .await;
 
     let dir = tempfile::tempdir().unwrap();
-    let receipt_path = dir.path().join("publication-receipt.json");
+    let receipt_name = "publication-receipt.json";
+    let receipt_path = dir.path().join(receipt_name);
     let out = postil()
         .current_dir(dir.path())
         .env("POSTIL_API_BASE", server.uri())
@@ -10577,7 +10766,7 @@ async fn github_unresolved_inline_line_retries_on_a_changed_line() {
             "POSTIL_DETAILS_URL",
             "https://postil.dev/orgs/acme/runs/run-1",
         )
-        .env("POSTIL_PUBLICATION_RECEIPT_PATH", &receipt_path)
+        .env("POSTIL_PUBLICATION_RECEIPT_PATH", receipt_name)
         .args([
             "review",
             "--publish",
@@ -10622,6 +10811,23 @@ async fn github_unresolved_inline_line_retries_on_a_changed_line() {
     assert_eq!(receipt["reviewId"], "77");
     assert_eq!(receipt["findings"][0]["initialOutcome"], "inline");
     assert_eq!(receipt["findings"][0]["commentId"], "500");
+    assert!(!std::fs::read_dir(dir.path()).unwrap().any(|entry| {
+        let name = entry.unwrap().file_name();
+        let name = name.to_string_lossy();
+        name.starts_with(".publication-receipt.json.") && name.ends_with(".tmp")
+    }));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&receipt_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
 }
 
 #[tokio::test]
