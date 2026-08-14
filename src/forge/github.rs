@@ -3065,7 +3065,11 @@ mod tests {
     async fn github_receipt_separates_inline_summary_carried_resolved_and_suppressed() {
         let server = MockServer::start().await;
         mount_current_delivery_snapshot(&server).await;
-        let inline = publication_finding("inline-1", "src/lib.rs", "A concrete issue.");
+        let inline = publication_finding(
+            "inline-1",
+            "src/lib.rs",
+            "The expression `time() - kube_pod_start_time > 60d` measures pod age.",
+        );
         let synthetic = publication_finding(
             "summary-1",
             crate::envelope::PR_DESCRIPTION_PATH,
@@ -3164,6 +3168,9 @@ mod tests {
         .unwrap();
         let initial_summary = review["body"].as_str().unwrap();
         assert!(!initial_summary.contains("posted inline"));
+        let inline_body = review["comments"][0]["body"].as_str().unwrap();
+        assert!(inline_body.contains("`time() - kube_pod_start_time > 60d`"));
+        assert!(!inline_body.contains("&gt; 60d`"));
         let update: serde_json::Value = serde_json::from_slice(
             &requests
                 .iter()
