@@ -115,6 +115,7 @@ pub(crate) struct AdjudicationCandidate<'a> {
 pub(crate) struct AdjudicationApplication {
     pub kept: Vec<Finding>,
     pub kept_indices: Vec<usize>,
+    pub unresolved_indices: Vec<usize>,
     pub resolved_indices: Vec<usize>,
     pub suppressed: Vec<SuppressedFinding>,
 }
@@ -1288,6 +1289,7 @@ pub(crate) fn apply_results(
         .collect::<HashMap<_, _>>();
     let mut kept = Vec::new();
     let mut kept_indices = Vec::new();
+    let mut unresolved_indices = Vec::new();
     let mut resolved_indices = Vec::new();
     let mut suppressed = Vec::new();
     for (index, (mut finding, id)) in findings.into_iter().zip(candidate_ids).enumerate() {
@@ -1308,6 +1310,7 @@ pub(crate) fn apply_results(
             }
             (AdjudicationProvenance::Model, AdjudicationDisposition::PreserveUnresolved) => {
                 kept_indices.push(index);
+                unresolved_indices.push(index);
                 kept.push(finding);
             }
             (
@@ -1315,6 +1318,7 @@ pub(crate) fn apply_results(
                 AdjudicationDisposition::PreserveUnresolved,
             ) => {
                 kept_indices.push(index);
+                unresolved_indices.push(index);
                 kept.push(finding);
             }
             (AdjudicationProvenance::Model, AdjudicationDisposition::SuppressRefuted) => {
@@ -1337,6 +1341,7 @@ pub(crate) fn apply_results(
     Ok(AdjudicationApplication {
         kept,
         kept_indices,
+        unresolved_indices,
         resolved_indices,
         suppressed,
     })
@@ -2658,6 +2663,7 @@ mod tests {
             assert_eq!(kept.evidence, original.evidence);
         }
         assert_eq!(applied.kept_indices, vec![0, 1]);
+        assert_eq!(applied.unresolved_indices, vec![0, 1]);
         assert!(applied.resolved_indices.is_empty());
         assert!(applied.suppressed.is_empty());
     }
@@ -2725,6 +2731,7 @@ mod tests {
         assert_eq!(applied.kept[1].body, unresolved.body);
         assert_eq!(applied.kept[1].evidence, unresolved.evidence);
         assert_eq!(applied.kept_indices, vec![0, 2]);
+        assert_eq!(applied.unresolved_indices, vec![2]);
         assert_eq!(applied.resolved_indices, vec![1]);
         assert_eq!(
             applied.suppressed[0].reason,

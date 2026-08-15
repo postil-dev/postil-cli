@@ -11,16 +11,31 @@ use std::io::Write;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::{
-    CheckRunIds, CheckState, FindingPublicationOutcome, FindingPublicationReceipt, Forge, PrMeta,
-    ReviewPublicationReceipt, ReviewPublicationSummary, SummaryContext, ThreadKind, check_summary,
-    check_title, only_operational_findings, valid_details_url,
+    CheckRunIds, CheckState, FindingPublicationOutcome, FindingPublicationReceipt, Forge,
+    GitHubPublicationPlan, GitHubPublicationPlanIdentity, GitHubPublicationPlanRequest, PrMeta,
+    PublicationPlanActivationCondition, PublicationPlanCheckAnnotation,
+    PublicationPlanCheckConclusion, PublicationPlanCheckStatus, PublicationPlanDuplicateProvenance,
+    PublicationPlanFileComment, PublicationPlanFinding, PublicationPlanFindingFallback,
+    PublicationPlanFindingReconciliation, PublicationPlanGateAnalysis,
+    PublicationPlanGateOwnership, PublicationPlanLifecycleReceipt,
+    PublicationPlanMarkerAbsenceGuard, PublicationPlanOperation,
+    PublicationPlanOperationActivation, PublicationPlanOperationKind,
+    PublicationPlanOperationReconciliation, PublicationPlanOperationResultField,
+    PublicationPlanOperationResultReference, PublicationPlanPlacementClassification,
+    PublicationPlanRepository, PublicationPlanReviewAttemptKind, PublicationPlanReviewComment,
+    PublicationPlanReviewCreateOutcome, PublicationPlanReviewCreatePayload,
+    PublicationPlanReviewSummaryCase, PublicationPlanSnapshot, PublicationPlanTerminalOperation,
+    PublicationPlanTerminalOutcome, ReviewPublicationReceipt, ReviewPublicationSummary,
+    SummaryContext, ThreadKind, check_summary, check_title, only_operational_findings,
+    valid_details_url,
 };
-use crate::diff::{DiffSnapshot, DiffSpool, WorkspaceBudget};
+use crate::diff::{Diff, DiffIndex, DiffSnapshot, DiffSpool, WorkspaceBudget};
 use crate::envelope::{Envelope, Finding, Severity};
 use crate::filter;
 
 pub const EXPECTED_REPOSITORY_ID_ENV: &str = "POSTIL_EXPECTED_GITHUB_REPO_ID";
 const GITHUB_MAX_ANNOTATIONS_PER_REQUEST: usize = 50;
+const FILE_LEVEL_COMMENT_MARKER: &str = "<!-- postil-placement:file -->";
 
 // Filtering caps visible findings before forge publication, so one completed
 // check update always fits GitHub's annotation request limit. Raising the
@@ -116,11 +131,34 @@ impl GitHub {
         )
     }
 
+    fn review_summary_with_unplaced_findings(
+        &self,
+        envelope: &Envelope,
+        receipt: &ReviewPublicationReceipt,
+        unplaced: &[&Finding],
+    ) -> String {
+        let mut summary = self.review_summary_for_receipt(envelope, receipt);
+        for finding in unplaced {
+            let (finding_id, _) = finding_receipt_id(finding);
+            summary.push_str(&format!(
+                "\n\nLocation: `{}:{}`\n\n{}",
+                super::safe_code_text(&finding.path),
+                finding.line,
+                append_marker(
+                    &super::finding_comment_body(finding, true),
+                    &finding_marker(&finding_id),
+                ),
+            ));
+        }
+        summary
+    }
+
     async fn finalize_review_summary(
         &self,
         envelope: &Envelope,
         receipt: &ReviewPublicationReceipt,
         marker: &str,
+        snapshot: &PrMeta,
     ) -> Result<()> {
         let review_id = receipt
             .review_id
@@ -131,13 +169,14 @@ impl GitHub {
         let summary = self.review_summary_for_receipt(envelope, receipt);
         let body = bounded_review_body(&summary, marker, self.details_url.as_deref());
         let response = self
-            .send_write_retryable(
+            .send_snapshot_write_retryable(
                 self.request(
                     reqwest::Method::PUT,
                     self.url(&format!("/pulls/{}/reviews/{review_id}", self.pr)),
                 )
                 .json(&json!({ "body": body })),
                 "review summary update",
+                snapshot,
             )
             .await?;
         Self::check_ok(response, "review summary update").await?;
@@ -149,9 +188,10 @@ impl GitHub {
         envelope: &Envelope,
         receipt: &ReviewPublicationReceipt,
         marker: &str,
+        snapshot: &PrMeta,
     ) {
         if self
-            .finalize_review_summary(envelope, receipt, marker)
+            .finalize_review_summary(envelope, receipt, marker, snapshot)
             .await
             .is_err()
         {
@@ -224,6 +264,56 @@ impl GitHub {
         Ok(())
     }
 
+    async fn publication_plan_repository_identity(&self) -> Result<RepositoryIdentity> {
+        let response = self
+            .send_retryable(
+                self.request(reqwest::Method::GET, self.url("")),
+                "publication-plan repository identity",
+            )
+            .await?;
+        let identity: RepositoryIdentity = super::bounded_response_json(
+            Self::check_ok(response, "publication-plan repository identity").await?,
+            "GitHub publication-plan repository identity",
+        )
+        .await?;
+        let expected_name = format!("{}/{}", self.owner, self.repo);
+        ensure!(
+            identity.id > 0 && identity.full_name.eq_ignore_ascii_case(&expected_name),
+            "GitHub repository identity changed; refusing publication planning"
+        );
+        if let Some(expected_id) = self.expected_repository_id {
+            ensure!(
+                identity.id == expected_id,
+                "GitHub repository identity changed; refusing publication planning"
+            );
+        }
+        Ok(identity)
+    }
+
+    async fn reconcile_published_finding_markers(
+        &self,
+        receipt: &mut ReviewPublicationReceipt,
+        envelope: &Envelope,
+        head_sha: &str,
+    ) -> std::collections::HashMap<String, PublishedReviewComment> {
+        let published = self.published_finding_comments(head_sha).await;
+        for publication in &mut receipt.findings {
+            let Ok(finding) = publication_plan_finding(envelope, &publication.finding_id) else {
+                continue;
+            };
+            let Some(comment) = finding_marker_candidates(finding)
+                .iter()
+                .find_map(|marker| published.get(marker))
+            else {
+                continue;
+            };
+            publication.initial_outcome = FindingPublicationOutcome::Carried;
+            publication.inline_rejected = false;
+            publication.comment_id = Some(comment.id.to_string());
+        }
+        published
+    }
+
     async fn fetch_pr_state(&self) -> Result<PrResponse> {
         let response = self
             .send_retryable(
@@ -259,7 +349,7 @@ impl GitHub {
         request: reqwest::RequestBuilder,
         what: &str,
     ) -> Result<reqwest::Response> {
-        self.send_retryable_inner(request, what, false).await
+        self.send_retryable_inner(request, what, false, None).await
     }
 
     async fn send_write_retryable(
@@ -267,7 +357,17 @@ impl GitHub {
         request: reqwest::RequestBuilder,
         what: &str,
     ) -> Result<reqwest::Response> {
-        self.send_retryable_inner(request, what, true).await
+        self.send_retryable_inner(request, what, true, None).await
+    }
+
+    async fn send_snapshot_write_retryable(
+        &self,
+        request: reqwest::RequestBuilder,
+        what: &str,
+        snapshot: &PrMeta,
+    ) -> Result<reqwest::Response> {
+        self.send_retryable_inner(request, what, true, Some(snapshot))
+            .await
     }
 
     async fn send_retryable_inner(
@@ -275,11 +375,19 @@ impl GitHub {
         request: reqwest::RequestBuilder,
         what: &str,
         fence_each_attempt: bool,
+        expected_snapshot: Option<&PrMeta>,
     ) -> Result<reqwest::Response> {
         const RETRIES: u32 = 2;
         const TOTAL_BUDGET: Duration = Duration::from_secs(55);
         let operation_started_at = std::time::Instant::now();
         for retry in 0..=RETRIES {
+            if let Some(expected_snapshot) = expected_snapshot
+                && !Box::pin(self.snapshot_is_current(expected_snapshot)).await?
+            {
+                return Err(anyhow!(
+                    "GitHub {what} skipped because the PR snapshot changed"
+                ));
+            }
             if fence_each_attempt {
                 self.verify_repository_identity_before_write().await?;
             }
@@ -443,7 +551,12 @@ impl GitHub {
         unreachable!("bounded check-run create loop always returns")
     }
 
-    async fn find_review(&self, marker: &str, head_sha: &str) -> Result<Option<PublishedReview>> {
+    async fn find_review(
+        &self,
+        markers: &[String],
+        head_sha: &str,
+        allow_correlated_legacy_marker: bool,
+    ) -> Result<Option<PublishedReview>> {
         const PAGE_SIZE: usize = 100;
         const MAX_PAGES: usize = 20;
         for page in 1..=MAX_PAGES {
@@ -467,10 +580,13 @@ impl GitHub {
             let page_len = reviews.len();
             if let Some(review) = reviews.into_iter().find(|review| {
                 review.commit_id.as_deref() == Some(head_sha)
-                    && review
-                        .body
-                        .as_deref()
-                        .is_some_and(|body| body.contains(marker))
+                    && review.body.as_deref().is_some_and(|body| {
+                        markers.iter().any(|marker| body.contains(marker))
+                            || (allow_correlated_legacy_marker
+                                && review_marker_in(body).is_some_and(|marker| {
+                                    marker.starts_with("<!-- postil-review:v1:")
+                                }))
+                    })
             }) {
                 return Ok(Some(review));
             }
@@ -487,11 +603,16 @@ impl GitHub {
         &self,
         body: &serde_json::Value,
         marker: &str,
-        head_sha: &str,
+        snapshot: &PrMeta,
         what: &str,
     ) -> Result<ReviewDelivery> {
         const RETRIES: u32 = 2;
         for retry in 0..=RETRIES {
+            if !self.snapshot_is_current(snapshot).await? {
+                return Err(anyhow!(
+                    "GitHub review delivery skipped because the PR snapshot changed"
+                ));
+            }
             self.verify_repository_identity_before_write().await?;
             let response = self
                 .request(
@@ -509,7 +630,10 @@ impl GitHub {
                     return Ok(ReviewDelivery::Response(response));
                 }
                 Ok(response) => {
-                    if let Some(review) = self.find_review(marker, head_sha).await? {
+                    if let Some(review) = self
+                        .find_review(&[marker.to_string()], &snapshot.head_sha, false)
+                        .await?
+                    {
                         return Ok(ReviewDelivery::Reconciled(review));
                     }
                     if retry == RETRIES {
@@ -517,7 +641,10 @@ impl GitHub {
                     }
                 }
                 Err(error) => {
-                    if let Some(review) = self.find_review(marker, head_sha).await? {
+                    if let Some(review) = self
+                        .find_review(&[marker.to_string()], &snapshot.head_sha, false)
+                        .await?
+                    {
                         return Ok(ReviewDelivery::Reconciled(review));
                     }
                     if retry == RETRIES {
@@ -583,10 +710,13 @@ impl GitHub {
             if finding.initial_outcome != FindingPublicationOutcome::Inline {
                 continue;
             }
-            let marker = finding_marker(&finding.finding_id);
+            let markers = [
+                finding_marker(&finding.finding_id),
+                legacy_finding_marker(&finding.finding_id),
+            ];
             if let Some(comment) = comments
                 .iter()
-                .find(|comment| comment.body.contains(&marker))
+                .find(|comment| markers.iter().any(|marker| comment.body.contains(marker)))
             {
                 finding.comment_id = Some(comment.id.to_string());
             } else {
@@ -644,10 +774,13 @@ impl GitHub {
     /// Failure here is not a publication failure. A review that cannot read the
     /// existing comments posts everything it found, which is the behaviour this
     /// dedup replaces.
-    async fn published_finding_markers(&self) -> std::collections::HashSet<String> {
+    async fn published_finding_comments(
+        &self,
+        head_sha: &str,
+    ) -> std::collections::HashMap<String, PublishedReviewComment> {
         const PAGE_SIZE: usize = 100;
         const MAX_PAGES: usize = 20;
-        let mut markers = std::collections::HashSet::new();
+        let mut comments_by_marker = std::collections::HashMap::new();
         for page in 1..=MAX_PAGES {
             let request = self.request(
                 reqwest::Method::GET,
@@ -657,27 +790,134 @@ impl GitHub {
                 )),
             );
             let Ok(response) = self.send_retryable(request, "inline comment dedup").await else {
-                return markers;
+                return comments_by_marker;
             };
             let Ok(response) = Self::check_ok(response, "inline comment dedup").await else {
-                return markers;
+                return comments_by_marker;
             };
             let Ok(comments): Result<Vec<PublishedReviewComment>> =
                 super::bounded_response_json(response, "GitHub inline comment dedup").await
             else {
-                return markers;
+                return comments_by_marker;
             };
             let page_len = comments.len();
             for comment in comments {
-                if let Some(marker) = finding_marker_in(&comment.body) {
-                    markers.insert(marker);
+                if comment.commit_id.as_deref() == Some(head_sha)
+                    && let Some(marker) = finding_marker_in(&comment.body)
+                {
+                    comments_by_marker.insert(marker, comment);
                 }
             }
             if page_len < PAGE_SIZE {
                 break;
             }
         }
-        markers
+        comments_by_marker
+    }
+
+    async fn find_review_comment(
+        &self,
+        marker: &str,
+        head_sha: &str,
+    ) -> Result<Option<PublishedReviewComment>> {
+        const PAGE_SIZE: usize = 100;
+        const MAX_PAGES: usize = 20;
+        for page in 1..=MAX_PAGES {
+            let response = self
+                .send_retryable(
+                    self.request(
+                        reqwest::Method::GET,
+                        self.url(&format!(
+                            "/pulls/{}/comments?per_page={PAGE_SIZE}&page={page}",
+                            self.pr
+                        )),
+                    ),
+                    "file-level review comment reconciliation",
+                )
+                .await?;
+            let comments: Vec<PublishedReviewComment> = super::bounded_response_json(
+                Self::check_ok(response, "file-level review comment reconciliation").await?,
+                "GitHub file-level review comment reconciliation",
+            )
+            .await?;
+            let page_len = comments.len();
+            if let Some(comment) = comments.into_iter().find(|comment| {
+                comment.body.contains(marker) && comment.commit_id.as_deref() == Some(head_sha)
+            }) {
+                return Ok(Some(comment));
+            }
+            if page_len < PAGE_SIZE {
+                return Ok(None);
+            }
+        }
+        Err(anyhow!(
+            "GitHub file-level review comment reconciliation exceeded {MAX_PAGES} pages"
+        ))
+    }
+
+    async fn post_file_comment_reconciled(
+        &self,
+        body: &serde_json::Value,
+        marker: &str,
+        snapshot: &PrMeta,
+    ) -> Result<PublishedReviewComment> {
+        const RETRIES: u32 = 2;
+        for retry in 0..=RETRIES {
+            if !self.snapshot_is_current(snapshot).await? {
+                return Err(anyhow!(
+                    "GitHub file-level review comment delivery skipped because the PR snapshot changed"
+                ));
+            }
+            self.verify_repository_identity_before_write().await?;
+            let response = self
+                .request(
+                    reqwest::Method::POST,
+                    self.url(&format!("/pulls/{}/comments", self.pr)),
+                )
+                .json(body)
+                .send()
+                .await;
+            match response {
+                Ok(response) if response.status().is_success() => {
+                    let comment: PublishedReviewComment =
+                        super::bounded_response_json(response, "GitHub file-level review comment")
+                            .await?;
+                    ensure!(
+                        comment.commit_id.as_deref() == Some(snapshot.head_sha.as_str()),
+                        "GitHub file-level review comment response did not identify the reviewed head"
+                    );
+                    return Ok(comment);
+                }
+                Ok(response)
+                    if github_retryable_response(response.status(), response.headers()) =>
+                {
+                    if let Some(comment) =
+                        self.find_review_comment(marker, &snapshot.head_sha).await?
+                    {
+                        return Ok(comment);
+                    }
+                    if retry == RETRIES {
+                        Self::check_ok(response, "file-level review comment").await?;
+                    }
+                }
+                Ok(response) => {
+                    Self::check_ok(response, "file-level review comment").await?;
+                }
+                Err(error) => {
+                    if let Some(comment) =
+                        self.find_review_comment(marker, &snapshot.head_sha).await?
+                    {
+                        return Ok(comment);
+                    }
+                    if retry == RETRIES {
+                        return Err(error)
+                            .context("posting file-level review comment after reconciliation");
+                    }
+                }
+            }
+            tokio::time::sleep(github_transport_retry_delay(retry)).await;
+        }
+        unreachable!("bounded GitHub file-level comment loop always returns")
     }
 
     async fn post_comment_reconciled(&self, number: u64, body: &str, marker: &str) -> Result<()> {
@@ -1344,7 +1584,7 @@ fn gate_summary(envelope: &Envelope) -> String {
         );
     }
 
-    let failing: Vec<_> = envelope
+    let mut failing_findings = envelope
         .findings
         .iter()
         .filter(|f| {
@@ -1358,6 +1598,10 @@ fn gate_summary(envelope: &Envelope) -> String {
                 false,
             )
         })
+        .collect::<Vec<_>>();
+    failing_findings.sort_by_key(|finding| super::publication_finding_sort_key(finding));
+    let failing: Vec<_> = failing_findings
+        .into_iter()
         .map(|f| {
             let publication = crate::envelope::forge_safe_finding_publication_text(f);
             format!(
@@ -1545,6 +1789,8 @@ struct PublishedReviewComment {
     id: u64,
     #[serde(default)]
     body: String,
+    #[serde(default)]
+    commit_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1557,10 +1803,87 @@ enum ReviewDelivery {
     Reconciled(PublishedReview),
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct RepositoryIdentity {
     id: u64,
     full_name: String,
+}
+
+#[derive(Clone)]
+struct PlannedCheckOutput {
+    name: &'static str,
+    state: CheckState,
+    title: String,
+    summary: String,
+    annotations: Vec<PublicationPlanCheckAnnotation>,
+}
+
+fn planned_check_outputs(
+    envelope: &Envelope,
+    advisory: CheckState,
+    gate: Option<CheckState>,
+    annotate_findings: bool,
+    details_url: Option<String>,
+) -> Vec<PlannedCheckOutput> {
+    let annotations = if annotate_findings {
+        let mut findings = envelope
+            .findings
+            .iter()
+            .filter(|finding| !filter::is_carried(finding))
+            .filter(|finding| !super::is_synthetic_path(&finding.path))
+            .collect::<Vec<_>>();
+        findings.sort_by_key(|finding| super::publication_finding_sort_key(finding));
+        findings
+            .into_iter()
+            .map(|finding| {
+                let publication = crate::envelope::forge_safe_finding_publication_text(finding);
+                PublicationPlanCheckAnnotation {
+                    path: finding.path.clone(),
+                    start_line: finding.line,
+                    end_line: finding.end_line.unwrap_or(finding.line),
+                    annotation_level: match finding.severity {
+                        Severity::Info => "notice",
+                        Severity::Warn => "warning",
+                        Severity::Error => "failure",
+                    }
+                    .to_string(),
+                    title: publication.title,
+                    message: publication.body,
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    debug_assert!(annotations.len() <= GITHUB_MAX_ANNOTATIONS_PER_REQUEST);
+
+    let advisory_summary = check_summary(
+        envelope,
+        true,
+        SummaryContext {
+            details_url,
+            prevention_hint: false,
+            prevention_commands: vec![],
+            publication: None,
+        },
+    );
+    let mut checks = vec![PlannedCheckOutput {
+        name: "postil/review",
+        state: advisory,
+        title: super::cap_check_title(&check_title(envelope)),
+        summary: super::cap_check_summary(&advisory_summary),
+        annotations,
+    }];
+    if let Some(gate) = gate {
+        checks.push(PlannedCheckOutput {
+            name: "postil/gate",
+            state: gate,
+            title: super::cap_check_title(gate_title(envelope)),
+            summary: super::cap_check_summary(&gate_summary(envelope)),
+            annotations: vec![],
+        });
+    }
+    checks
 }
 
 impl Forge for GitHub {
@@ -1580,6 +1903,923 @@ impl Forge for GitHub {
         snapshot: &PrMeta,
     ) -> ReviewPublicationReceipt {
         planned_review_receipt(envelope, &snapshot.head_sha)
+    }
+
+    async fn build_publication_plan(
+        &self,
+        request: GitHubPublicationPlanRequest<'_>,
+    ) -> Result<GitHubPublicationPlan> {
+        let GitHubPublicationPlanRequest {
+            controller_generation,
+            input_identity,
+            envelope,
+            snapshot,
+            publication_diff,
+            should_comment,
+            duplicate_of_baseline,
+            annotate_findings,
+            advisory,
+            gate,
+        } = request;
+        ensure!(
+            self.snapshot_is_current(snapshot).await?,
+            "GitHub publication planning skipped because the pull request snapshot changed"
+        );
+        let repository = self.publication_plan_repository_identity().await?;
+        let target_sha = snapshot
+            .target_sha
+            .as_deref()
+            .context("GitHub publication planning requires a target snapshot")?;
+        let repository_id = repository.id.to_string();
+        let pull_request_number = self.pr.to_string();
+        let mut receipt = self.plan_review_publication(envelope, snapshot);
+        if annotate_findings {
+            receipt.channel = super::ReviewPublicationChannel::CheckAnnotations;
+            for finding in &mut receipt.findings {
+                if finding.initial_outcome == FindingPublicationOutcome::Inline {
+                    finding.initial_outcome = FindingPublicationOutcome::CheckAnnotation;
+                }
+            }
+        } else if duplicate_of_baseline {
+            for finding in &mut receipt.findings {
+                if matches!(
+                    finding.initial_outcome,
+                    FindingPublicationOutcome::Inline
+                        | FindingPublicationOutcome::FileComment
+                        | FindingPublicationOutcome::SummaryOnly
+                ) {
+                    finding.initial_outcome = FindingPublicationOutcome::Carried;
+                }
+            }
+        }
+        let desired_receipt = receipt.clone();
+        let review_output_digest =
+            publication_plan_review_output_digest(PublicationPlanReviewOutputInput {
+                controller_generation,
+                input_identity,
+                repository_id: &repository_id,
+                pull_request_number: &pull_request_number,
+                snapshot,
+                envelope,
+                receipt: &desired_receipt,
+                should_comment,
+                duplicate_of_baseline,
+                annotate_findings,
+                advisory,
+                gate,
+                details_url: self.details_url.as_deref(),
+            })?;
+        let key_scope = PublicationPlanKeyScope {
+            repository_id: &repository_id,
+            pull_request_number: &pull_request_number,
+            head_sha: &snapshot.head_sha,
+            controller_generation,
+            input_identity,
+            review_output_digest: &review_output_digest,
+        };
+        let logical_review_identity = publication_plan_logical_review_identity(key_scope);
+        let initial_review_operation_key = publication_plan_operation_key(
+            key_scope,
+            PublicationPlanOperationKeyKind::InitialReviewCreate,
+            None,
+        );
+        let relocated_review_operation_key = publication_plan_operation_key(
+            key_scope,
+            PublicationPlanOperationKeyKind::RelocatedReviewCreate,
+            None,
+        );
+        let summary_review_operation_key = publication_plan_operation_key(
+            key_scope,
+            PublicationPlanOperationKeyKind::SummaryReviewCreate,
+            None,
+        );
+        let advisory_create_operation_key = publication_plan_operation_key(
+            key_scope,
+            PublicationPlanOperationKeyKind::AdvisoryCheckCreate,
+            None,
+        );
+        let advisory_complete_operation_key = publication_plan_operation_key(
+            key_scope,
+            PublicationPlanOperationKeyKind::AdvisoryCheckComplete,
+            None,
+        );
+        let marker = review_marker(&receipt.receipt_id);
+        let compatible_receipt_ids =
+            legacy_planned_review_receipt_ids(envelope, &snapshot.head_sha)
+                .into_iter()
+                .filter(|receipt_id| receipt_id != &receipt.receipt_id)
+                .collect::<Vec<_>>();
+        let mut review_markers = vec![marker.clone()];
+        review_markers.extend(
+            compatible_receipt_ids
+                .iter()
+                .map(|receipt_id| legacy_review_marker(receipt_id)),
+        );
+
+        let mut initial_review_payload = None;
+        let mut relocated_review_payload = None;
+        let mut summary_review_payload = None;
+        let mut fallback_intent =
+            std::collections::HashMap::<String, Vec<PublicationPlanFindingFallback>>::new();
+        let mut finding_update_operations = Vec::new();
+        let mut published = std::collections::HashMap::new();
+        let mut line_findings = Vec::<(&Finding, String, u32)>::new();
+        let mut file_findings = Vec::<(&Finding, String)>::new();
+        let mut summary_findings = Vec::<&Finding>::new();
+        let mut relocated_receipt = None;
+        let mut summary_receipt = None;
+
+        if should_comment && !annotate_findings {
+            published = self
+                .reconcile_published_finding_markers(&mut receipt, envelope, &snapshot.head_sha)
+                .await;
+            let publishable_findings = publication_plan_publishable_findings(envelope, &published);
+            let summary = self.review_summary_for_receipt(envelope, &receipt);
+            let comments = publishable_findings
+                .iter()
+                .map(|finding| publication_plan_review_comment(&initial_review_comment(finding)))
+                .collect::<Result<Vec<_>>>()?;
+            if !comments.is_empty() || !summary.is_empty() {
+                initial_review_payload = Some(PublicationPlanReviewCreatePayload {
+                    commit_id: snapshot.head_sha.clone(),
+                    event: "COMMENT".to_string(),
+                    body: bounded_review_body(&summary, &marker, self.details_url.as_deref()),
+                    comments,
+                });
+            }
+
+            if !publishable_findings.is_empty() {
+                let owned_publication_diff = if publication_diff.is_none() {
+                    Some(
+                        self.fetch_diff(snapshot)
+                            .await
+                            .context("fetching complete diff for GitHub publication planning")?,
+                    )
+                } else {
+                    None
+                };
+                let parsed_publication_diff = owned_publication_diff
+                    .as_ref()
+                    .map(|diff| crate::diff::parse(diff.as_str()));
+                let publication_diff = publication_diff
+                    .or(parsed_publication_diff.as_ref())
+                    .context(
+                        "GitHub publication planning is missing the complete pull-request diff",
+                    )?;
+                let placement_index = DiffIndex::build(publication_diff);
+                for finding in &publishable_findings {
+                    let (finding_id, _) = finding_receipt_id(finding);
+                    let Some(path) = publication_file_path(publication_diff, &finding.path) else {
+                        fallback_intent.insert(
+                            finding_id,
+                            vec![PublicationPlanFindingFallback::SummaryOnly],
+                        );
+                        summary_findings.push(*finding);
+                        continue;
+                    };
+                    if let Some(line) = placement_index.nearest_new_side_line(path, finding.line) {
+                        fallback_intent.insert(
+                            finding_id,
+                            vec![
+                                PublicationPlanFindingFallback::RelocatedInline,
+                                PublicationPlanFindingFallback::FileComment,
+                            ],
+                        );
+                        line_findings.push((*finding, path.to_string(), line));
+                    } else {
+                        fallback_intent.insert(
+                            finding_id,
+                            vec![PublicationPlanFindingFallback::FileComment],
+                        );
+                        file_findings.push((*finding, path.to_string()));
+                    }
+                }
+
+                let mut fallback_receipt = receipt.clone();
+                for (finding, _) in &file_findings {
+                    set_publication_outcome(
+                        &mut fallback_receipt,
+                        finding,
+                        FindingPublicationOutcome::FileComment,
+                        false,
+                    )?;
+                }
+                for finding in &summary_findings {
+                    set_publication_outcome(
+                        &mut fallback_receipt,
+                        finding,
+                        FindingPublicationOutcome::SummaryOnly,
+                        true,
+                    )?;
+                }
+                let fallback_summary = self.review_summary_with_unplaced_findings(
+                    envelope,
+                    &fallback_receipt,
+                    &summary_findings,
+                );
+                let fallback_summary = if summary_findings.is_empty() {
+                    bounded_review_body(
+                        if fallback_summary.is_empty() {
+                            "Postil completed the review."
+                        } else {
+                            &fallback_summary
+                        },
+                        &marker,
+                        self.details_url.as_deref(),
+                    )
+                } else {
+                    required_review_body(&fallback_summary, &marker)?
+                };
+                relocated_review_payload = Some(PublicationPlanReviewCreatePayload {
+                    commit_id: snapshot.head_sha.clone(),
+                    event: "COMMENT".to_string(),
+                    body: fallback_summary,
+                    comments: line_findings
+                        .iter()
+                        .map(|(finding, path, line)| {
+                            publication_plan_review_comment(&fallback_line_comment(
+                                finding, path, *line,
+                            ))
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                });
+
+                relocated_receipt = Some(fallback_receipt.clone());
+                let mut file_fallback_receipt = fallback_receipt;
+                for (finding, _, _) in &line_findings {
+                    set_publication_outcome(
+                        &mut file_fallback_receipt,
+                        finding,
+                        FindingPublicationOutcome::FileComment,
+                        false,
+                    )?;
+                }
+                if !line_findings.is_empty() {
+                    let summary = self.review_summary_with_unplaced_findings(
+                        envelope,
+                        &file_fallback_receipt,
+                        &summary_findings,
+                    );
+                    summary_review_payload = Some(PublicationPlanReviewCreatePayload {
+                        commit_id: snapshot.head_sha.clone(),
+                        event: "COMMENT".to_string(),
+                        body: if summary_findings.is_empty() {
+                            bounded_review_body(&summary, &marker, self.details_url.as_deref())
+                        } else {
+                            required_review_body(&summary, &marker)?
+                        },
+                        comments: vec![],
+                    });
+                }
+                summary_receipt = Some(file_fallback_receipt);
+            }
+        }
+
+        let observed_review_id = if should_comment && !annotate_findings {
+            let has_correlated_finding = receipt
+                .findings
+                .iter()
+                .any(|finding| finding.comment_id.is_some());
+            let observed_review = self
+                .find_review(&review_markers, &snapshot.head_sha, has_correlated_finding)
+                .await?;
+            if let Some(observed_marker) = observed_review
+                .as_ref()
+                .and_then(|review| review.body.as_deref())
+                .and_then(review_marker_in)
+                && !review_markers.contains(&observed_marker)
+            {
+                review_markers.push(observed_marker);
+            }
+            observed_review.and_then(|review| review.id.map(|id| id.to_string()))
+        } else {
+            None
+        };
+        receipt.review_id.clone_from(&observed_review_id);
+
+        let line_placements = line_findings
+            .iter()
+            .map(|(finding, path, line)| (finding_receipt_id(finding).0, (path.as_str(), *line)))
+            .collect::<std::collections::HashMap<_, _>>();
+        let file_placements = file_findings
+            .iter()
+            .map(|(finding, path)| (finding_receipt_id(finding).0, path.as_str()))
+            .chain(
+                line_findings
+                    .iter()
+                    .map(|(finding, path, _)| (finding_receipt_id(finding).0, path.as_str())),
+            )
+            .collect::<std::collections::HashMap<_, _>>();
+        let findings = receipt
+            .findings
+            .iter()
+            .map(|publication| {
+                let finding = publication_plan_finding(envelope, &publication.finding_id)?;
+                let desired_core = super::finding_comment_body(finding, true);
+                let current_marker = finding_marker(&publication.finding_id);
+                let desired_body = append_marker(&desired_core, &current_marker);
+                let mut desired_bodies = vec![desired_body.clone()];
+                if let Some((path, line)) = line_placements.get(&publication.finding_id) {
+                    desired_bodies.push(
+                        fallback_line_comment(finding, path, *line)["body"]
+                            .as_str()
+                            .context("GitHub relocated finding plan omitted its body")?
+                            .to_string(),
+                    );
+                }
+                if let Some(path) = file_placements.get(&publication.finding_id) {
+                    desired_bodies.push(
+                        file_level_comment(finding, path, &snapshot.head_sha)["body"]
+                            .as_str()
+                            .context("GitHub file finding plan omitted its body")?
+                            .to_string(),
+                    );
+                }
+                let observed = published_comment_for_finding(&published, finding);
+                let observed_matches = observed.is_some_and(|comment| {
+                    desired_bodies.iter().any(|desired| {
+                        without_finding_marker(&comment.body) == without_finding_marker(desired)
+                    })
+                });
+                let desired_initial_outcome = desired_receipt
+                    .findings
+                    .iter()
+                    .find(|desired| desired.finding_id == publication.finding_id)
+                    .map(|desired| desired.initial_outcome)
+                    .context("GitHub lifecycle receipt omitted its desired finding outcome")?;
+                let suppression_reason = envelope
+                    .suppressed_findings
+                    .iter()
+                    .find(|suppressed| {
+                        finding_receipt_id(&suppressed.finding).0 == publication.finding_id
+                    })
+                    .map(|suppressed| suppressed.reason);
+                let duplicate_provenance = if suppression_reason
+                    == Some(crate::envelope::SuppressionReason::DuplicateRootCause)
+                {
+                    PublicationPlanDuplicateProvenance::SuppressedRootCause
+                } else if duplicate_of_baseline
+                    && matches!(
+                        desired_initial_outcome,
+                        FindingPublicationOutcome::Carried
+                            | FindingPublicationOutcome::Inline
+                            | FindingPublicationOutcome::SummaryOnly
+                    )
+                {
+                    PublicationPlanDuplicateProvenance::Baseline
+                } else {
+                    PublicationPlanDuplicateProvenance::None
+                };
+                let reconciliation = if observed_matches {
+                    PublicationPlanFindingReconciliation::Retain
+                } else if observed.is_some() {
+                    PublicationPlanFindingReconciliation::Replace
+                } else if should_comment
+                    && !annotate_findings
+                    && desired_initial_outcome == FindingPublicationOutcome::Inline
+                {
+                    PublicationPlanFindingReconciliation::Create
+                } else {
+                    PublicationPlanFindingReconciliation::Omit
+                };
+                if reconciliation == PublicationPlanFindingReconciliation::Replace {
+                    let observed = observed
+                        .context("GitHub finding replacement omitted its observed comment")?;
+                    let replacement_body = if observed.body.contains(FILE_LEVEL_COMMENT_MARKER) {
+                        let path = file_placements
+                            .get(&publication.finding_id)
+                            .copied()
+                            .unwrap_or(finding.path.as_str());
+                        file_level_comment(finding, path, &snapshot.head_sha)["body"]
+                            .as_str()
+                            .context("GitHub file finding replacement omitted its body")?
+                            .to_string()
+                    } else if let Some((path, line)) = line_placements.get(&publication.finding_id)
+                    {
+                        fallback_line_comment(finding, path, *line)["body"]
+                            .as_str()
+                            .context("GitHub relocated finding replacement omitted its body")?
+                            .to_string()
+                    } else {
+                        desired_body.clone()
+                    };
+                    let operation_key = publication_plan_operation_key(
+                        key_scope,
+                        PublicationPlanOperationKeyKind::FindingCommentUpdate,
+                        Some(&publication.finding_id),
+                    );
+                    let expected_markers = finding_marker_candidates(finding);
+                    finding_update_operations.push(PublicationPlanOperation::new(
+                        0,
+                        operation_key.clone(),
+                        vec![],
+                        PublicationPlanOperationActivation {
+                            any_of: vec![
+                                PublicationPlanActivationCondition::FindingContentDiffers {
+                                    observed_comment_id: observed.id.to_string(),
+                                    expected_markers: expected_markers.clone(),
+                                },
+                            ],
+                        },
+                        PublicationPlanOperationReconciliation {
+                            logical_identity: operation_key,
+                            markers: expected_markers.clone(),
+                            observed_remote_id: Some(observed.id.to_string()),
+                            exclusive: true,
+                        },
+                        PublicationPlanOperationKind::FindingCommentUpdate {
+                            finding_id: publication.finding_id.clone(),
+                            observed_comment_id: observed.id.to_string(),
+                            expected_markers,
+                            body_sha256: publication_plan_body_digest(&replacement_body),
+                            body: replacement_body,
+                        },
+                    )?);
+                }
+                let compatible_markers = finding_marker_candidates(finding)
+                    .into_iter()
+                    .filter(|candidate| candidate != &current_marker)
+                    .collect();
+                Ok(PublicationPlanFinding {
+                    finding_id: publication.finding_id.clone(),
+                    stable_identity: publication.stable_identity,
+                    path: finding.path.clone(),
+                    line: finding.line,
+                    end_line: finding.end_line,
+                    initial_outcome: desired_initial_outcome,
+                    fallback_intent: fallback_intent
+                        .get(&publication.finding_id)
+                        .cloned()
+                        .unwrap_or_default(),
+                    content_digest: publication_plan_finding_content_digest(finding),
+                    marker: current_marker,
+                    compatible_markers,
+                    desired_body_sha256: publication_plan_body_digest(&desired_body),
+                    desired_body,
+                    observed_comment_id: observed.map(|comment| comment.id.to_string()),
+                    observed_body_sha256: observed
+                        .map(|comment| publication_plan_body_digest(&comment.body)),
+                    observed_outcome: observed.map(|comment| {
+                        if comment.body.contains(FILE_LEVEL_COMMENT_MARKER) {
+                            FindingPublicationOutcome::FileComment
+                        } else {
+                            desired_initial_outcome
+                        }
+                    }),
+                    reconciliation,
+                    suppression_reason,
+                    duplicate_provenance,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let lifecycle_receipt = PublicationPlanLifecycleReceipt::new(
+            input_identity.to_string(),
+            receipt.channel,
+            receipt.receipt_id.clone(),
+            compatible_receipt_ids,
+            observed_review_id,
+            duplicate_of_baseline,
+            findings.clone(),
+        )?;
+
+        let review_guard = PublicationPlanMarkerAbsenceGuard {
+            markers: review_markers.clone(),
+            head_sha: snapshot.head_sha.clone(),
+            required: true,
+        };
+        let review_reconciliation = || PublicationPlanOperationReconciliation {
+            logical_identity: logical_review_identity.clone(),
+            markers: review_markers.clone(),
+            observed_remote_id: receipt.review_id.clone(),
+            exclusive: true,
+        };
+        let advisory_external_id = self.check_external_id("postil/review", &snapshot.head_sha);
+        let mut operations = vec![PublicationPlanOperation::new(
+            0,
+            advisory_create_operation_key.clone(),
+            vec![],
+            PublicationPlanOperationActivation {
+                any_of: vec![PublicationPlanActivationCondition::Always],
+            },
+            PublicationPlanOperationReconciliation {
+                logical_identity: advisory_external_id.clone(),
+                markers: vec![],
+                observed_remote_id: None,
+                exclusive: true,
+            },
+            PublicationPlanOperationKind::AdvisoryCheckCreate {
+                name: "postil/review".to_string(),
+                head_sha: snapshot.head_sha.clone(),
+                status: PublicationPlanCheckStatus::InProgress,
+                external_id: advisory_external_id,
+                details_url: self.details_url.clone(),
+            },
+        )?];
+        let mut review_operation_keys = Vec::new();
+        if let Some(payload) = initial_review_payload {
+            operations.push(PublicationPlanOperation::new(
+                0,
+                initial_review_operation_key.clone(),
+                vec![],
+                PublicationPlanOperationActivation {
+                    any_of: vec![PublicationPlanActivationCondition::MarkerAbsent {
+                        guard: review_guard.clone(),
+                    }],
+                },
+                review_reconciliation(),
+                PublicationPlanOperationKind::ReviewCreate {
+                    attempt: PublicationPlanReviewAttemptKind::Initial,
+                    logical_review_identity: logical_review_identity.clone(),
+                    payload,
+                },
+            )?);
+            review_operation_keys.push(initial_review_operation_key.clone());
+        }
+        if let Some(payload) = relocated_review_payload {
+            operations.push(PublicationPlanOperation::new(
+                0,
+                relocated_review_operation_key.clone(),
+                vec![initial_review_operation_key.clone()],
+                PublicationPlanOperationActivation {
+                    any_of: vec![PublicationPlanActivationCondition::SemanticPlacementRejected {
+                        dependency_operation_key: initial_review_operation_key.clone(),
+                        http_status: 422,
+                        classification:
+                            PublicationPlanPlacementClassification::InvalidReviewCommentPlacement,
+                        marker_absence: review_guard.clone(),
+                    }],
+                },
+                review_reconciliation(),
+                PublicationPlanOperationKind::ReviewCreate {
+                    attempt: PublicationPlanReviewAttemptKind::RelocatedInline,
+                    logical_review_identity: logical_review_identity.clone(),
+                    payload,
+                },
+            )?);
+            review_operation_keys.push(relocated_review_operation_key.clone());
+        }
+        if let Some(payload) = summary_review_payload {
+            operations.push(PublicationPlanOperation::new(
+                0,
+                summary_review_operation_key.clone(),
+                vec![relocated_review_operation_key.clone()],
+                PublicationPlanOperationActivation {
+                    any_of: vec![PublicationPlanActivationCondition::SemanticPlacementRejected {
+                        dependency_operation_key: relocated_review_operation_key.clone(),
+                        http_status: 422,
+                        classification:
+                            PublicationPlanPlacementClassification::InvalidReviewCommentPlacement,
+                        marker_absence: review_guard.clone(),
+                    }],
+                },
+                review_reconciliation(),
+                PublicationPlanOperationKind::ReviewCreate {
+                    attempt: PublicationPlanReviewAttemptKind::SummaryOnly,
+                    logical_review_identity: logical_review_identity.clone(),
+                    payload,
+                },
+            )?);
+            review_operation_keys.push(summary_review_operation_key.clone());
+        }
+
+        finding_update_operations.sort_by(|left, right| {
+            publication_plan_operation_finding_id(left)
+                .cmp(&publication_plan_operation_finding_id(right))
+        });
+        let finding_update_keys = finding_update_operations
+            .iter()
+            .filter_map(|operation| match &operation.desired {
+                PublicationPlanOperationKind::FindingCommentUpdate { .. } => {
+                    Some(operation.operation_key.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        let mut fallback_findings = file_findings
+            .iter()
+            .map(|(finding, path)| (*finding, path.clone(), false))
+            .chain(
+                line_findings
+                    .iter()
+                    .map(|(finding, path, _)| (*finding, path.clone(), true)),
+            )
+            .collect::<Vec<_>>();
+        fallback_findings
+            .sort_by_key(|(finding, _, _)| super::publication_finding_sort_key(finding));
+        let mut file_operation_metadata = Vec::new();
+        for (finding, path, relocated) in fallback_findings {
+            let (finding_id, _) = finding_receipt_id(finding);
+            let operation_key = publication_plan_operation_key(
+                key_scope,
+                PublicationPlanOperationKeyKind::FileCommentFallback,
+                Some(&finding_id),
+            );
+            let finding_markers = finding_marker_candidates(finding);
+            let marker_absence = PublicationPlanMarkerAbsenceGuard {
+                markers: finding_markers.clone(),
+                head_sha: snapshot.head_sha.clone(),
+                required: true,
+            };
+            let semantic_dependency = if relocated {
+                relocated_review_operation_key.clone()
+            } else {
+                initial_review_operation_key.clone()
+            };
+            let mut activation = vec![
+                PublicationPlanActivationCondition::SemanticPlacementRejected {
+                    dependency_operation_key: semantic_dependency.clone(),
+                    http_status: 422,
+                    classification:
+                        PublicationPlanPlacementClassification::InvalidReviewCommentPlacement,
+                    marker_absence: marker_absence.clone(),
+                },
+                PublicationPlanActivationCondition::PartialReviewObserved {
+                    dependency_operation_key: initial_review_operation_key.clone(),
+                    review_markers: review_markers.clone(),
+                    finding_marker_absence: marker_absence.clone(),
+                },
+            ];
+            let mut dependencies = vec![initial_review_operation_key.clone()];
+            if relocated {
+                activation.push(PublicationPlanActivationCondition::PartialReviewObserved {
+                    dependency_operation_key: relocated_review_operation_key.clone(),
+                    review_markers: review_markers.clone(),
+                    finding_marker_absence: marker_absence.clone(),
+                });
+                dependencies.push(relocated_review_operation_key.clone());
+            }
+            let payload = publication_plan_file_comment(&file_level_comment(
+                finding,
+                &path,
+                &snapshot.head_sha,
+            ))?;
+            operations.push(PublicationPlanOperation::new(
+                0,
+                operation_key.clone(),
+                dependencies,
+                PublicationPlanOperationActivation { any_of: activation },
+                PublicationPlanOperationReconciliation {
+                    logical_identity: operation_key.clone(),
+                    markers: finding_markers,
+                    observed_remote_id: None,
+                    exclusive: true,
+                },
+                PublicationPlanOperationKind::FileCommentFallback {
+                    finding_id: finding_id.clone(),
+                    payload,
+                },
+            )?);
+            file_operation_metadata.push((finding_id, relocated, operation_key));
+        }
+        operations.append(&mut finding_update_operations);
+
+        let mut terminal_operations = file_operation_metadata
+            .iter()
+            .map(
+                |(finding_id, _, operation_key)| PublicationPlanTerminalOperation {
+                    operation_key: operation_key.clone(),
+                    finding_id: Some(finding_id.clone()),
+                    requires_remote_id: true,
+                    accepted_outcomes: vec![
+                        PublicationPlanTerminalOutcome::Applied,
+                        PublicationPlanTerminalOutcome::ReconciledExisting,
+                        PublicationPlanTerminalOutcome::NotRequiredMarkerPresent,
+                    ],
+                },
+            )
+            .collect::<Vec<_>>();
+        terminal_operations.extend(finding_update_keys.iter().map(|operation_key| {
+            PublicationPlanTerminalOperation {
+                operation_key: operation_key.clone(),
+                finding_id: operations
+                    .iter()
+                    .find(|operation| operation.operation_key == *operation_key)
+                    .and_then(publication_plan_operation_finding_id)
+                    .map(str::to_string),
+                requires_remote_id: true,
+                accepted_outcomes: vec![
+                    PublicationPlanTerminalOutcome::Applied,
+                    PublicationPlanTerminalOutcome::ReconciledExisting,
+                ],
+            }
+        }));
+        let mut summary_cases = Vec::new();
+        let mut add_summary_cases =
+            |selected_review_operation_key: &str,
+             base_receipt: &ReviewPublicationReceipt,
+             variable_file_ids: &[String],
+             required_file_ids: &[String]| {
+                for variable_count in 0..=variable_file_ids.len() {
+                    let mut candidate = base_receipt.clone();
+                    for (finding_id, _, _) in &file_operation_metadata {
+                        let applied = required_file_ids.contains(finding_id)
+                            || variable_file_ids
+                                .iter()
+                                .take(variable_count)
+                                .any(|candidate| candidate == finding_id);
+                        if let Some(publication) = candidate
+                            .findings
+                            .iter_mut()
+                            .find(|publication| publication.finding_id == *finding_id)
+                        {
+                            publication.initial_outcome = if applied {
+                                FindingPublicationOutcome::FileComment
+                            } else {
+                                FindingPublicationOutcome::Inline
+                            };
+                        }
+                    }
+                    for finding in &mut candidate.findings {
+                        if matches!(
+                            finding.initial_outcome,
+                            FindingPublicationOutcome::Inline
+                                | FindingPublicationOutcome::FileComment
+                        ) && finding.comment_id.is_none()
+                        {
+                            finding.comment_id = Some("required".to_string());
+                        }
+                    }
+                    let selected_review_outcomes = if variable_count == 0 {
+                        vec![
+                            PublicationPlanReviewCreateOutcome::Created,
+                            PublicationPlanReviewCreateOutcome::ReconciledExisting,
+                        ]
+                    } else {
+                        vec![PublicationPlanReviewCreateOutcome::PartialObserved]
+                    };
+                    summary_cases.push(PublicationPlanReviewSummaryCase {
+                        selected_review_operation_key: selected_review_operation_key.to_string(),
+                        selected_review_outcomes,
+                        file_comment_count: u32::try_from(required_file_ids.len() + variable_count)
+                            .expect("bounded finding count fits in u32"),
+                        body: bounded_review_body(
+                            &self.review_summary_for_receipt(envelope, &candidate),
+                            &marker,
+                            self.details_url.as_deref(),
+                        ),
+                    });
+                }
+            };
+        let all_file_ids = file_operation_metadata
+            .iter()
+            .map(|(finding_id, _, _)| finding_id.clone())
+            .collect::<Vec<_>>();
+        let relocated_file_ids = file_operation_metadata
+            .iter()
+            .filter(|(_, relocated, _)| *relocated)
+            .map(|(finding_id, _, _)| finding_id.clone())
+            .collect::<Vec<_>>();
+        let direct_file_ids = file_operation_metadata
+            .iter()
+            .filter(|(_, relocated, _)| !*relocated)
+            .map(|(finding_id, _, _)| finding_id.clone())
+            .collect::<Vec<_>>();
+        if review_operation_keys.contains(&initial_review_operation_key) {
+            add_summary_cases(&initial_review_operation_key, &receipt, &all_file_ids, &[]);
+        }
+        if review_operation_keys.contains(&relocated_review_operation_key)
+            && let Some(base_receipt) = relocated_receipt.as_ref()
+        {
+            add_summary_cases(
+                &relocated_review_operation_key,
+                base_receipt,
+                &relocated_file_ids,
+                &direct_file_ids,
+            );
+        }
+        if review_operation_keys.contains(&summary_review_operation_key)
+            && let Some(base_receipt) = summary_receipt.as_ref()
+        {
+            add_summary_cases(
+                &summary_review_operation_key,
+                base_receipt,
+                &[],
+                &all_file_ids,
+            );
+        }
+        let summary_update_operation_key = publication_plan_operation_key(
+            key_scope,
+            PublicationPlanOperationKeyKind::ReviewSummaryUpdate,
+            None,
+        );
+        let mut summary_update_emitted = false;
+        if !summary_cases.is_empty() {
+            let mut dependencies = review_operation_keys.clone();
+            dependencies.extend(
+                file_operation_metadata
+                    .iter()
+                    .map(|(_, _, operation_key)| operation_key.clone()),
+            );
+            dependencies.extend(finding_update_keys.clone());
+            dependencies.sort();
+            dependencies.dedup();
+            operations.push(PublicationPlanOperation::new(
+                0,
+                summary_update_operation_key.clone(),
+                dependencies,
+                PublicationPlanOperationActivation {
+                    any_of: vec![
+                        PublicationPlanActivationCondition::ReviewSelectionTerminal {
+                            selected_review_operation_keys: review_operation_keys.clone(),
+                        },
+                    ],
+                },
+                review_reconciliation(),
+                PublicationPlanOperationKind::ReviewSummaryUpdate {
+                    logical_review_identity: logical_review_identity.clone(),
+                    terminal_operations,
+                    cases: summary_cases,
+                },
+            )?);
+            summary_update_emitted = true;
+        }
+        let checks = planned_check_outputs(
+            envelope,
+            advisory,
+            Some(gate),
+            annotate_findings,
+            self.details_url.clone(),
+        );
+        let advisory_check = checks
+            .iter()
+            .find(|check| check.name == "postil/review")
+            .context("GitHub publication planning omitted advisory analysis")?;
+        let advisory_dependencies = publication_plan_advisory_completion_dependencies(
+            &operations,
+            &advisory_create_operation_key,
+            summary_update_emitted.then_some(summary_update_operation_key.as_str()),
+        );
+        operations.push(PublicationPlanOperation::new(
+            0,
+            advisory_complete_operation_key.clone(),
+            advisory_dependencies,
+            PublicationPlanOperationActivation {
+                any_of: vec![PublicationPlanActivationCondition::Always],
+            },
+            PublicationPlanOperationReconciliation {
+                logical_identity: advisory_complete_operation_key,
+                markers: vec![],
+                observed_remote_id: None,
+                exclusive: true,
+            },
+            PublicationPlanOperationKind::AdvisoryCheckComplete {
+                name: advisory_check.name.to_string(),
+                head_sha: snapshot.head_sha.clone(),
+                created_check: PublicationPlanOperationResultReference {
+                    dependency_operation_key: advisory_create_operation_key,
+                    result_field: PublicationPlanOperationResultField::RemoteId,
+                },
+                conclusion: PublicationPlanCheckConclusion::from(advisory_check.state),
+                title: advisory_check.title.clone(),
+                summary: advisory_check.summary.clone(),
+                annotations: advisory_check.annotations.clone(),
+                details_url: self.details_url.clone(),
+            },
+        )?);
+        for (index, operation) in operations.iter_mut().enumerate() {
+            operation.ordinal = u32::try_from(index + 1)
+                .context("GitHub publication plan operation ordinal overflowed")?;
+        }
+        let gate_check = checks
+            .iter()
+            .find(|check| check.name == "postil/gate")
+            .context("GitHub publication planning omitted gate analysis")?;
+        let gate_analysis = PublicationPlanGateAnalysis {
+            ownership: PublicationPlanGateOwnership::Service,
+            authoritative: false,
+            organization_gate_mode_required: true,
+            name: gate_check.name.to_string(),
+            head_sha: snapshot.head_sha.clone(),
+            analyzed_conclusion: PublicationPlanCheckConclusion::from(gate_check.state),
+            title: gate_check.title.clone(),
+            summary: gate_check.summary.clone(),
+            details_url: self.details_url.clone(),
+        };
+
+        GitHubPublicationPlan::new(
+            GitHubPublicationPlanIdentity {
+                controller_generation: controller_generation.to_string(),
+                input_identity: input_identity.to_string(),
+                review_output_digest,
+                repository: PublicationPlanRepository {
+                    id: repository_id,
+                    full_name: repository.full_name,
+                },
+                pull_request_number,
+                reviewed_snapshot: PublicationPlanSnapshot {
+                    head_sha: snapshot.head_sha.clone(),
+                    merge_base_sha: snapshot.base_sha.clone(),
+                    target_sha: target_sha.to_string(),
+                    pull_request_title_sha256: publication_plan_text_digest(&snapshot.title),
+                    pull_request_body_sha256: publication_plan_text_digest(&snapshot.body),
+                },
+            },
+            lifecycle_receipt,
+            operations,
+            gate_analysis,
+        )
     }
 
     async fn fetch_pr_meta(&self) -> Result<PrMeta> {
@@ -1700,10 +2940,11 @@ impl Forge for GitHub {
         &self,
         envelope: &Envelope,
         snapshot: &PrMeta,
+        publication_diff: Option<&Diff>,
     ) -> Result<ReviewPublicationReceipt> {
         let findings = &envelope.findings;
         let head_sha = snapshot.head_sha.as_str();
-        let planned_receipt = self.plan_review_publication(envelope, snapshot);
+        let mut planned_receipt = self.plan_review_publication(envelope, snapshot);
         if only_operational_findings(findings) {
             return Ok(planned_receipt);
         }
@@ -1724,45 +2965,50 @@ impl Forge for GitHub {
         // A re-review of an unchanged head re-detects what the last review
         // found. Those findings arrive fresh rather than carried, so the carry
         // filter above cannot see them; their markers already on the PR can.
-        let published = self.published_finding_markers().await;
-        let comments: Vec<_> = findings
+        let published = self
+            .reconcile_published_finding_markers(&mut planned_receipt, envelope, head_sha)
+            .await;
+        let observed_comment_count = planned_receipt
+            .findings
             .iter()
-            // Carried findings already have comments from the previous review.
-            .filter(|f| !filter::is_carried(f))
-            // Synthetic-path findings (PR description, fail-closed markers) have
-            // no real file line to anchor an inline comment; they surface only in
-            // the summary body.
-            .filter(|f| !super::is_synthetic_path(&f.path))
-            .filter(|f| {
-                let (finding_id, _) = finding_receipt_id(f);
-                !published.contains(&finding_marker(&finding_id))
+            .filter(|publication| {
+                publication.initial_outcome == FindingPublicationOutcome::Carried
+                    && publication.comment_id.is_some()
             })
-            .map(|f| {
-                let (finding_id, _) = finding_receipt_id(f);
-                let mut c = json!({
-                    "path": f.path,
-                    "line": f.line,
-                    "side": "RIGHT",
-                    "body": append_marker(
-                        &super::finding_comment_body(f, true),
-                        &finding_marker(&finding_id),
-                    ),
-                });
-                if let Some(end) = f.end_line
-                    && end > f.line
-                {
-                    c["start_line"] = json!(f.line);
-                    c["line"] = json!(end);
-                    c["start_side"] = json!("RIGHT");
-                }
-                c
-            })
+            .count();
+        let publishable_findings = publication_plan_publishable_findings(envelope, &published);
+        let comments: Vec<_> = publishable_findings
+            .iter()
+            .map(|finding| initial_review_comment(finding))
             .collect();
         let summary = self.review_summary_for_receipt(envelope, &planned_receipt);
         if comments.is_empty() && summary.is_empty() {
             return Ok(planned_receipt);
         }
         let marker = review_marker(&planned_receipt.receipt_id);
+        let mut review_markers = vec![marker.clone()];
+        review_markers.extend(
+            legacy_planned_review_receipt_ids(envelope, head_sha)
+                .iter()
+                .map(|receipt_id| legacy_review_marker(receipt_id)),
+        );
+        let has_new_summary_finding = findings
+            .iter()
+            .any(|finding| !filter::is_carried(finding) && super::is_synthetic_path(&finding.path));
+        let all_comments_already_published = observed_comment_count > 0
+            && publishable_findings.is_empty()
+            && !has_new_summary_finding;
+        if publishable_findings.is_empty()
+            && all_comments_already_published
+            && let Some(review) = self
+                .find_review(&review_markers, head_sha, observed_comment_count > 0)
+                .await?
+        {
+            planned_receipt.review_id = review.id.map(|id| id.to_string());
+            self.finalize_review_summary_if_possible(envelope, &planned_receipt, &marker, snapshot)
+                .await;
+            return Ok(planned_receipt);
+        }
         let marked_summary = bounded_review_body(&summary, &marker, self.details_url.as_deref());
         let has_planned_inline = planned_receipt
             .findings
@@ -1775,76 +3021,297 @@ impl Forge for GitHub {
             "comments": comments,
         });
         let delivery = self
-            .send_review_reconciled(&body, &marker, head_sha, "review post")
+            .send_review_reconciled(&body, &marker, snapshot, "review post")
             .await?;
-        let resp = match delivery {
+        let mut recovered_partial_review = None;
+        let response = match delivery {
             ReviewDelivery::Reconciled(review) => {
                 let receipt = self
-                    .materialize_review_receipt(planned_receipt, review)
+                    .materialize_review_receipt(planned_receipt.clone(), review.clone())
                     .await?;
-                if has_planned_inline {
-                    self.finalize_review_summary_if_possible(envelope, &receipt, &marker)
+                if receipt_covers_findings(&receipt, &publishable_findings) {
+                    if has_planned_inline {
+                        self.finalize_review_summary_if_possible(
+                            envelope, &receipt, &marker, snapshot,
+                        )
                         .await;
+                    }
+                    return Ok(receipt);
                 }
-                return Ok(receipt);
+                recovered_partial_review = Some(review);
+                None
             }
-            ReviewDelivery::Response(response) => response,
+            ReviewDelivery::Response(response) if response.status().is_success() => {
+                let review: PublishedReview =
+                    super::bounded_response_json(response, "GitHub published review").await?;
+                let receipt = self
+                    .materialize_review_receipt(planned_receipt.clone(), review.clone())
+                    .await?;
+                if receipt_covers_findings(&receipt, &publishable_findings) {
+                    if has_planned_inline {
+                        self.finalize_review_summary_if_possible(
+                            envelope, &receipt, &marker, snapshot,
+                        )
+                        .await;
+                    }
+                    return Ok(receipt);
+                }
+                recovered_partial_review = Some(review);
+                None
+            }
+            ReviewDelivery::Response(response) => Some(response),
         };
-        if resp.status().is_success() {
-            let review: PublishedReview =
-                super::bounded_response_json(resp, "GitHub published review").await?;
-            let receipt = self
-                .materialize_review_receipt(planned_receipt, review)
-                .await?;
-            if has_planned_inline {
-                self.finalize_review_summary_if_possible(envelope, &receipt, &marker)
-                    .await;
+        if let Some(resp) = response {
+            let status = resp.status();
+            let request_id =
+                github_request_id(resp.headers()).unwrap_or_else(|| "none".to_string());
+            if status != reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+                return Err(anyhow!(
+                    "GitHub review post failed: {status} (request id {request_id})"
+                ));
             }
-            return Ok(receipt);
-        }
-        let status = resp.status();
-        let request_id = github_request_id(resp.headers()).unwrap_or_else(|| "none".to_string());
-        if status != reqwest::StatusCode::UNPROCESSABLE_ENTITY {
-            return Err(anyhow!(
-                "GitHub review post failed: {status} (request id {request_id})"
-            ));
+
+            let rejection_body =
+                super::bounded_response_text(resp, "GitHub rejected review").await?;
+            if !github_review_rejected_line(&rejection_body) {
+                return Err(anyhow!(
+                    "GitHub review post failed validation: {status} (request id {request_id})"
+                ));
+            }
+
+            eprintln!(
+                "postil: github operation=review-post status=422 category=unresolved-line request_id={} recovery=placement-ladder",
+                request_id,
+            );
+        } else {
+            eprintln!(
+                "postil: github operation=review-reconciliation status=partial recovery=placement-ladder"
+            );
         }
 
-        eprintln!(
-            "postil: github operation=review-post status=422 category=unresolved-line request_id={} recovery=summary-only",
-            request_id,
+        let owned_publication_diff = if publication_diff.is_none() {
+            let snapshot = self
+                .fetch_diff(snapshot)
+                .await
+                .context("fetching complete diff for GitHub placement fallback")?;
+            Some(crate::diff::parse(snapshot.as_str()))
+        } else {
+            None
+        };
+        let publication_diff = publication_diff
+            .or(owned_publication_diff.as_ref())
+            .context("GitHub placement fallback is missing the complete pull-request diff")?;
+        let placement_index = DiffIndex::build(publication_diff);
+        let mut line_findings = Vec::new();
+        let mut file_findings = Vec::new();
+        let mut summary_findings = Vec::new();
+        for finding in &publishable_findings {
+            let Some(path) = publication_file_path(publication_diff, &finding.path) else {
+                summary_findings.push(*finding);
+                continue;
+            };
+            if let Some(line) = placement_index.nearest_new_side_line(path, finding.line) {
+                line_findings.push((*finding, path, line));
+            } else {
+                file_findings.push((*finding, path));
+            }
+        }
+
+        let mut fallback_receipt = planned_receipt;
+        for (finding, _) in &file_findings {
+            set_publication_outcome(
+                &mut fallback_receipt,
+                finding,
+                FindingPublicationOutcome::FileComment,
+                false,
+            )?;
+        }
+        for finding in &summary_findings {
+            set_publication_outcome(
+                &mut fallback_receipt,
+                finding,
+                FindingPublicationOutcome::SummaryOnly,
+                true,
+            )?;
+        }
+        let fallback_summary = self.review_summary_with_unplaced_findings(
+            envelope,
+            &fallback_receipt,
+            &summary_findings,
         );
-        let rejected_receipt = rejected_inline_receipt(planned_receipt);
-        let fallback_summary = self.review_summary_for_receipt(envelope, &rejected_receipt);
-        let summary_only = json!({
-            "commit_id": head_sha,
-            "event": "COMMENT",
-            "body": bounded_review_body(
+        let fallback_summary = if summary_findings.is_empty() {
+            bounded_review_body(
                 if fallback_summary.is_empty() {
-                    "Postil completed the review, but GitHub could not attach its inline comments."
+                    "Postil completed the review."
                 } else {
                     &fallback_summary
                 },
                 &marker,
                 self.details_url.as_deref(),
-            ),
+            )
+        } else {
+            required_review_body(&fallback_summary, &marker)?
+        };
+        let mut fallback_body = json!({
+            "commit_id": head_sha,
+            "event": "COMMENT",
+            "body": fallback_summary,
         });
-        let fallback = self
-            .send_review_reconciled(&summary_only, &marker, head_sha, "summary-only review post")
-            .await?;
-        match fallback {
-            ReviewDelivery::Reconciled(review) => {
-                self.materialize_review_receipt(rejected_receipt, review)
-                    .await
+        if !line_findings.is_empty() {
+            fallback_body["comments"] = json!(
+                line_findings
+                    .iter()
+                    .map(|(finding, path, line)| fallback_line_comment(finding, path, *line))
+                    .collect::<Vec<_>>()
+            );
+        }
+        let fallback = if let Some(review) = recovered_partial_review {
+            ReviewDelivery::Reconciled(review)
+        } else {
+            match self
+                .find_review(&review_markers, head_sha, observed_comment_count > 0)
+                .await?
+            {
+                Some(review) => ReviewDelivery::Reconciled(review),
+                None => {
+                    self.send_review_reconciled(
+                        &fallback_body,
+                        &marker,
+                        snapshot,
+                        "placement fallback review post",
+                    )
+                    .await?
+                }
+            }
+        };
+        let mut receipt = match fallback {
+            ReviewDelivery::Reconciled(review) => Some(
+                self.materialize_review_receipt(fallback_receipt.clone(), review)
+                    .await?,
+            ),
+            ReviewDelivery::Response(response) if response.status().is_success() => {
+                let review: PublishedReview =
+                    super::bounded_response_json(response, "GitHub placement fallback review")
+                        .await?;
+                Some(
+                    self.materialize_review_receipt(fallback_receipt.clone(), review)
+                        .await?,
+                )
             }
             ReviewDelivery::Response(response) => {
-                let response = Self::check_ok(response, "summary-only review post").await?;
-                let review: PublishedReview =
-                    super::bounded_response_json(response, "GitHub summary-only review").await?;
-                self.materialize_review_receipt(rejected_receipt, review)
-                    .await
+                let status = response.status();
+                let request_id =
+                    github_request_id(response.headers()).unwrap_or_else(|| "none".to_string());
+                let body =
+                    super::bounded_response_text(response, "GitHub rejected fallback review")
+                        .await?;
+                if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY
+                    && !line_findings.is_empty()
+                    && github_review_rejected_line(&body)
+                {
+                    eprintln!(
+                        "postil: github operation=placement-fallback status=422 category=unresolved-line request_id={} recovery=file-comments",
+                        request_id,
+                    );
+                    None
+                } else {
+                    return Err(anyhow!(
+                        "GitHub placement fallback review failed: {status} (request id {request_id})"
+                    ));
+                }
+            }
+        };
+
+        if let Some(materialized) = receipt.as_mut() {
+            for (finding, path, _) in line_findings.drain(..) {
+                if receipt_has_finding_comment(materialized, finding) {
+                    continue;
+                }
+                set_publication_outcome(
+                    materialized,
+                    finding,
+                    FindingPublicationOutcome::FileComment,
+                    false,
+                )?;
+                file_findings.push((finding, path));
             }
         }
+
+        if receipt.is_none() {
+            for (finding, path, _) in line_findings.drain(..) {
+                set_publication_outcome(
+                    &mut fallback_receipt,
+                    finding,
+                    FindingPublicationOutcome::FileComment,
+                    false,
+                )?;
+                file_findings.push((finding, path));
+            }
+            let fallback_summary = self.review_summary_with_unplaced_findings(
+                envelope,
+                &fallback_receipt,
+                &summary_findings,
+            );
+            let fallback_summary = if summary_findings.is_empty() {
+                bounded_review_body(&fallback_summary, &marker, self.details_url.as_deref())
+            } else {
+                required_review_body(&fallback_summary, &marker)?
+            };
+            let summary_body = json!({
+                "commit_id": head_sha,
+                "event": "COMMENT",
+                "body": fallback_summary,
+            });
+            let delivery = self
+                .send_review_reconciled(
+                    &summary_body,
+                    &marker,
+                    snapshot,
+                    "file-comment fallback review post",
+                )
+                .await?;
+            let materialized = match delivery {
+                ReviewDelivery::Reconciled(review) => {
+                    self.materialize_review_receipt(fallback_receipt.clone(), review)
+                        .await?
+                }
+                ReviewDelivery::Response(response) => {
+                    let response =
+                        Self::check_ok(response, "file-comment fallback review post").await?;
+                    let review: PublishedReview = super::bounded_response_json(
+                        response,
+                        "GitHub file-comment fallback review",
+                    )
+                    .await?;
+                    self.materialize_review_receipt(fallback_receipt.clone(), review)
+                        .await?
+                }
+            };
+            receipt = Some(materialized);
+        }
+
+        let mut receipt = receipt.context("GitHub placement fallback omitted its receipt")?;
+        super::write_review_publication_receipt_from_env(&durable_partial_receipt(&receipt))?;
+        for (finding, path) in file_findings {
+            let (finding_id, _) = finding_receipt_id(finding);
+            let finding_marker = finding_marker(&finding_id);
+            let payload = file_level_comment(finding, path, head_sha);
+            let comment = self
+                .post_file_comment_reconciled(&payload, &finding_marker, snapshot)
+                .await?;
+            let publication = receipt
+                .findings
+                .iter_mut()
+                .find(|publication| publication.finding_id == finding_id)
+                .context("GitHub file-level comment omitted its publication receipt")?;
+            publication.initial_outcome = FindingPublicationOutcome::FileComment;
+            publication.inline_rejected = false;
+            publication.comment_id = Some(comment.id.to_string());
+            super::write_review_publication_receipt_from_env(&durable_partial_receipt(&receipt))?;
+        }
+        self.finalize_review_summary_if_possible(envelope, &receipt, &marker, snapshot)
+            .await;
+        Ok(receipt)
     }
 
     async fn start_checks(&self, head_sha: &str) -> Result<(String, String)> {
@@ -1921,96 +3388,63 @@ impl Forge for GitHub {
             CheckState::Failure => "failure",
             CheckState::Neutral => "neutral",
         };
-        let annotations: Vec<_> = if annotate_findings {
-            envelope
-                .findings
-                .iter()
-                // Carried findings remain visible on the review that introduced
-                // them. Re-annotating can also target a stale line range.
-                .filter(|f| !filter::is_carried(f))
-                // Synthetic-path findings have no real file line to annotate;
-                // they are already carried in the check-run summary body.
-                .filter(|f| !super::is_synthetic_path(&f.path))
-                .map(|f| {
-                    let publication = crate::envelope::forge_safe_finding_publication_text(f);
-                    json!({
-                        "path": f.path,
-                        "start_line": f.line,
-                        "end_line": f.end_line.unwrap_or(f.line),
-                        "annotation_level": match f.severity {
-                            Severity::Info => "notice",
-                            Severity::Warn => "warning",
-                            Severity::Error => "failure",
-                        },
-                        "title": publication.title,
-                        "message": publication.body,
-                    })
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        debug_assert!(annotations.len() <= GITHUB_MAX_ANNOTATIONS_PER_REQUEST);
-        let mut checks = vec![(check_ids.advisory, advisory, "postil/review", true)];
-        if let Some(gate) = gate {
-            checks.push((check_ids.gate, gate, "postil/gate", false));
-        }
+        let checks = planned_check_outputs(
+            envelope,
+            advisory,
+            gate,
+            annotate_findings,
+            self.details_url.clone(),
+        );
         let mut results = stream::iter(checks.into_iter().enumerate().map(
-            |(index, (id, state, name, with_annotations))| {
-                let annotations = &annotations;
-                async move {
-                    let gate_note = if name == "postil/gate" {
-                        gate_summary(envelope)
-                    } else {
-                        check_summary(
-                            envelope,
-                            true,
-                            SummaryContext {
-                                details_url: self.details_url.clone(),
-                                prevention_hint: false,
-                                prevention_commands: vec![],
-                                publication: None,
-                            },
-                        )
-                    };
-                    let title = if name == "postil/gate" {
-                        gate_title(envelope).to_string()
-                    } else {
-                        check_title(envelope)
-                    };
-                    let mut output = json!({
-                        // GitHub rejects title >255 and summary >65535 with HTTP 422,
-                        // which would abort posting both checks. Cap both defensively.
-                        "title": super::cap_check_title(&title),
-                        "summary": super::cap_check_summary(&gate_note),
-                    });
-                    if annotate_findings && with_annotations && !annotations.is_empty() {
-                        output["annotations"] = json!(annotations);
-                    }
-                    let mut body = json!({
-                        "status": "completed",
-                        "conclusion": conclusion(state),
-                        "output": output,
-                    });
-                    self.add_details_url(&mut body);
-                    let result = match self
-                        .send_write_retryable(
-                            self.request(
-                                reqwest::Method::PATCH,
-                                self.url(&format!("/check-runs/{id}")),
-                            )
-                            .json(&body),
-                            &format!("complete {name}"),
-                        )
-                        .await
-                    {
-                        Ok(response) => Self::check_ok(response, "check-run complete")
-                            .await
-                            .map(|_| ()),
-                        Err(error) => Err(error),
-                    };
-                    (index, name, result)
+            |(index, planned)| async move {
+                let id = if planned.name == "postil/review" {
+                    check_ids.advisory
+                } else {
+                    check_ids.gate
+                };
+                let mut output = json!({
+                    "title": planned.title,
+                    "summary": planned.summary,
+                });
+                if !planned.annotations.is_empty() {
+                    output["annotations"] = json!(
+                        planned
+                            .annotations
+                            .iter()
+                            .map(|annotation| json!({
+                                "path": annotation.path,
+                                "start_line": annotation.start_line,
+                                "end_line": annotation.end_line,
+                                "annotation_level": annotation.annotation_level,
+                                "title": annotation.title,
+                                "message": annotation.message,
+                            }))
+                            .collect::<Vec<_>>()
+                    );
                 }
+                let mut body = json!({
+                    "status": "completed",
+                    "conclusion": conclusion(planned.state),
+                    "output": output,
+                });
+                self.add_details_url(&mut body);
+                let result = match self
+                    .send_write_retryable(
+                        self.request(
+                            reqwest::Method::PATCH,
+                            self.url(&format!("/check-runs/{id}")),
+                        )
+                        .json(&body),
+                        &format!("complete {}", planned.name),
+                    )
+                    .await
+                {
+                    Ok(response) => Self::check_ok(response, "check-run complete")
+                        .await
+                        .map(|_| ()),
+                    Err(error) => Err(error),
+                };
+                (index, planned.name, result)
             },
         ))
         .buffer_unordered(2)
@@ -2080,13 +3514,32 @@ fn finding_receipt_id(finding: &Finding) -> (String, bool) {
     if let Some(evidence) = finding.evidence.as_deref() {
         digest.update(evidence.as_bytes());
     }
-    let hash = digest.finalize();
     (
         format!(
-            "legacy-v1:{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-            hash[0], hash[1], hash[2], hash[3], hash[4], hash[5]
+            "legacy-v2:{}",
+            crate::repository_search::hex_digest(digest.finalize())
         ),
         false,
+    )
+}
+
+fn legacy_finding_receipt_id(finding: &Finding) -> String {
+    if let Some(id) = finding.id.as_deref().filter(|id| !id.is_empty()) {
+        return id.to_string();
+    }
+    let mut digest = Sha256::new();
+    digest.update(finding.path.as_bytes());
+    digest.update(finding.line.to_be_bytes());
+    digest.update(finding.end_line.unwrap_or(finding.line).to_be_bytes());
+    digest.update(finding.kind.as_str().as_bytes());
+    digest.update(finding.title.as_bytes());
+    if let Some(evidence) = finding.evidence.as_deref() {
+        digest.update(evidence.as_bytes());
+    }
+    let hash = digest.finalize();
+    format!(
+        "legacy-v1:{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        hash[0], hash[1], hash[2], hash[3], hash[4], hash[5]
     )
 }
 
@@ -2129,6 +3582,7 @@ fn planned_review_receipt(envelope: &Envelope, head_sha: &str) -> ReviewPublicat
     findings.extend(envelope.suppressed_findings.iter().map(|suppressed| {
         finding_receipt(&suppressed.finding, FindingPublicationOutcome::Suppressed)
     }));
+    findings.sort_by(|left, right| left.finding_id.cmp(&right.finding_id));
 
     let mut digest = Sha256::new();
     digest.update(b"github-review-receipt-v2\0");
@@ -2137,17 +3591,549 @@ fn planned_review_receipt(envelope: &Envelope, head_sha: &str) -> ReviewPublicat
         digest.update(finding.finding_id.as_bytes());
         digest.update([finding.initial_outcome as u8]);
     }
-    let hash = digest.finalize();
     ReviewPublicationReceipt {
         version: ReviewPublicationReceipt::VERSION,
         channel: super::ReviewPublicationChannel::ReviewComments,
         receipt_id: format!(
-            "github-review-v2:{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-            hash[0], hash[1], hash[2], hash[3], hash[4], hash[5]
+            "github-review-v2:{}",
+            crate::repository_search::hex_digest(digest.finalize())
         ),
         review_id: None,
         findings,
     }
+}
+
+fn legacy_planned_review_receipt_ids(envelope: &Envelope, head_sha: &str) -> Vec<String> {
+    let mut findings = Vec::new();
+    for finding in envelope
+        .findings
+        .iter()
+        .filter(|finding| !super::is_operational_path(&finding.path))
+    {
+        let outcome = if filter::is_carried(finding) {
+            FindingPublicationOutcome::Carried
+        } else if super::is_synthetic_path(&finding.path) {
+            FindingPublicationOutcome::SummaryOnly
+        } else {
+            FindingPublicationOutcome::Inline
+        };
+        findings.push((legacy_finding_receipt_id(finding), outcome));
+    }
+    findings.extend(envelope.resolved.iter().map(|finding| {
+        (
+            legacy_finding_receipt_id(finding),
+            FindingPublicationOutcome::Resolved,
+        )
+    }));
+    findings.extend(envelope.suppressed_findings.iter().map(|suppressed| {
+        (
+            legacy_finding_receipt_id(&suppressed.finding),
+            FindingPublicationOutcome::Suppressed,
+        )
+    }));
+    let receipt_id = |findings: &[(String, FindingPublicationOutcome)]| {
+        let mut digest = Sha256::new();
+        digest.update(b"github-review-receipt-v2\0");
+        digest.update(head_sha.as_bytes());
+        for (finding_id, outcome) in findings {
+            digest.update(finding_id.as_bytes());
+            digest.update([*outcome as u8]);
+        }
+        let hash = digest.finalize();
+        format!(
+            "github-review-v2:{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            hash[0], hash[1], hash[2], hash[3], hash[4], hash[5]
+        )
+    };
+    findings.sort_by(|left, right| left.0.cmp(&right.0));
+    let canonical_order = receipt_id(&findings);
+    vec![canonical_order]
+}
+
+fn publication_plan_text_digest(value: &str) -> String {
+    format!(
+        "sha256:{}",
+        crate::repository_search::hex_digest(Sha256::digest(value.as_bytes()))
+    )
+}
+
+fn publication_plan_finding_content_digest(finding: &Finding) -> String {
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct CanonicalFindingPublication<'a> {
+        path: &'a str,
+        line: u32,
+        end_line: Option<u32>,
+        severity: Severity,
+        kind: crate::envelope::Kind,
+        confidence: f64,
+        title: &'a str,
+        body: &'a str,
+    }
+    let canonical = serde_json::to_vec(&CanonicalFindingPublication {
+        path: &finding.path,
+        line: finding.line,
+        end_line: finding.end_line,
+        severity: finding.severity,
+        kind: finding.kind,
+        confidence: finding.confidence,
+        title: &finding.title,
+        body: &finding.body,
+    })
+    .expect("canonical finding publication is serializable");
+    publication_plan_text_digest(std::str::from_utf8(&canonical).expect("JSON is UTF-8"))
+}
+
+struct PublicationPlanReviewOutputInput<'a> {
+    controller_generation: &'a str,
+    input_identity: &'a str,
+    repository_id: &'a str,
+    pull_request_number: &'a str,
+    snapshot: &'a PrMeta,
+    envelope: &'a Envelope,
+    receipt: &'a ReviewPublicationReceipt,
+    should_comment: bool,
+    duplicate_of_baseline: bool,
+    annotate_findings: bool,
+    advisory: CheckState,
+    gate: CheckState,
+    details_url: Option<&'a str>,
+}
+
+fn publication_plan_review_output_digest(
+    input: PublicationPlanReviewOutputInput<'_>,
+) -> Result<String> {
+    let PublicationPlanReviewOutputInput {
+        controller_generation,
+        input_identity,
+        repository_id,
+        pull_request_number,
+        snapshot,
+        envelope,
+        receipt,
+        should_comment,
+        duplicate_of_baseline,
+        annotate_findings,
+        advisory,
+        gate,
+        details_url,
+    } = input;
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct CanonicalFindingInput {
+        finding_id: String,
+        content_digest: String,
+        initial_outcome: FindingPublicationOutcome,
+        suppression_reason: Option<crate::envelope::SuppressionReason>,
+    }
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct CanonicalInput<'a> {
+        controller_generation: &'a str,
+        input_identity: &'a str,
+        repository_id: &'a str,
+        pull_request_number: &'a str,
+        head_sha: &'a str,
+        merge_base_sha: &'a str,
+        target_sha: &'a str,
+        pull_request_title_sha256: String,
+        pull_request_body_sha256: String,
+        should_comment: bool,
+        duplicate_of_baseline: bool,
+        annotate_findings: bool,
+        advisory: &'a str,
+        gate: &'a str,
+        details_url: Option<&'a str>,
+        findings: Vec<CanonicalFindingInput>,
+    }
+    let check_state = |state| match state {
+        CheckState::Success => "success",
+        CheckState::Failure => "failure",
+        CheckState::Neutral => "neutral",
+    };
+    let mut findings = receipt
+        .findings
+        .iter()
+        .map(|publication| {
+            let finding = publication_plan_finding(envelope, &publication.finding_id)?;
+            let suppression_reason = envelope
+                .suppressed_findings
+                .iter()
+                .find(|suppressed| {
+                    finding_receipt_id(&suppressed.finding).0 == publication.finding_id
+                })
+                .map(|suppressed| suppressed.reason);
+            Ok(CanonicalFindingInput {
+                finding_id: publication.finding_id.clone(),
+                content_digest: publication_plan_finding_content_digest(finding),
+                initial_outcome: publication.initial_outcome,
+                suppression_reason,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    findings.sort_by(|left, right| left.finding_id.cmp(&right.finding_id));
+    let canonical = serde_json::to_vec(&CanonicalInput {
+        controller_generation,
+        input_identity,
+        repository_id,
+        pull_request_number,
+        head_sha: &snapshot.head_sha,
+        merge_base_sha: &snapshot.base_sha,
+        target_sha: snapshot
+            .target_sha
+            .as_deref()
+            .context("GitHub publication planning requires a target snapshot")?,
+        pull_request_title_sha256: publication_plan_text_digest(&snapshot.title),
+        pull_request_body_sha256: publication_plan_text_digest(&snapshot.body),
+        should_comment,
+        duplicate_of_baseline,
+        annotate_findings,
+        advisory: check_state(advisory),
+        gate: check_state(gate),
+        details_url,
+        findings,
+    })?;
+    Ok(format!(
+        "sha256:{}",
+        crate::repository_search::hex_digest(Sha256::digest(canonical))
+    ))
+}
+
+#[derive(Clone, Copy)]
+struct PublicationPlanKeyScope<'a> {
+    repository_id: &'a str,
+    pull_request_number: &'a str,
+    head_sha: &'a str,
+    controller_generation: &'a str,
+    input_identity: &'a str,
+    review_output_digest: &'a str,
+}
+
+fn publication_plan_operation_key(
+    scope: PublicationPlanKeyScope<'_>,
+    kind: PublicationPlanOperationKeyKind,
+    finding_id: Option<&str>,
+) -> String {
+    let kind = kind.as_str();
+    let mut digest = Sha256::new();
+    digest.update(b"github-publication-operation-v1\0");
+    for value in [
+        scope.repository_id,
+        scope.pull_request_number,
+        scope.head_sha,
+        scope.controller_generation,
+        scope.input_identity,
+        scope.review_output_digest,
+        kind,
+    ] {
+        digest.update(value.as_bytes());
+        digest.update([0]);
+    }
+    if let Some(finding_id) = finding_id {
+        digest.update(finding_id.as_bytes());
+    }
+    format!(
+        "github-publication-v1:{kind}:sha256:{}",
+        crate::repository_search::hex_digest(digest.finalize())
+    )
+}
+
+fn publication_plan_advisory_completion_dependencies(
+    preceding_operations: &[PublicationPlanOperation],
+    create_operation_key: &str,
+    summary_update_operation_key: Option<&str>,
+) -> Vec<String> {
+    summary_update_operation_key.map_or_else(
+        || {
+            preceding_operations
+                .iter()
+                .map(|operation| operation.operation_key.clone())
+                .collect()
+        },
+        |operation_key| vec![create_operation_key.to_string(), operation_key.to_string()],
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublicationPlanOperationKeyKind {
+    InitialReviewCreate,
+    RelocatedReviewCreate,
+    SummaryReviewCreate,
+    FileCommentFallback,
+    FindingCommentUpdate,
+    ReviewSummaryUpdate,
+    AdvisoryCheckCreate,
+    AdvisoryCheckComplete,
+}
+
+impl PublicationPlanOperationKeyKind {
+    #[cfg(test)]
+    const ALL: [Self; 8] = [
+        Self::InitialReviewCreate,
+        Self::RelocatedReviewCreate,
+        Self::SummaryReviewCreate,
+        Self::FileCommentFallback,
+        Self::FindingCommentUpdate,
+        Self::ReviewSummaryUpdate,
+        Self::AdvisoryCheckCreate,
+        Self::AdvisoryCheckComplete,
+    ];
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::InitialReviewCreate => "initial-review-create",
+            Self::RelocatedReviewCreate => "relocated-review-create",
+            Self::SummaryReviewCreate => "summary-review-create",
+            Self::FileCommentFallback => "file-comment-fallback",
+            Self::FindingCommentUpdate => "finding-comment-update",
+            Self::ReviewSummaryUpdate => "review-summary-update",
+            Self::AdvisoryCheckCreate => "advisory-check-create",
+            Self::AdvisoryCheckComplete => "advisory-check-complete",
+        }
+    }
+}
+
+fn publication_plan_operation_finding_id(operation: &PublicationPlanOperation) -> Option<&str> {
+    match &operation.desired {
+        PublicationPlanOperationKind::FileCommentFallback { finding_id, .. }
+        | PublicationPlanOperationKind::FindingCommentUpdate { finding_id, .. } => Some(finding_id),
+        _ => None,
+    }
+}
+
+fn publication_plan_logical_review_identity(scope: PublicationPlanKeyScope<'_>) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"github-publication-logical-review-v1\0");
+    for value in [
+        scope.repository_id,
+        scope.pull_request_number,
+        scope.head_sha,
+        scope.controller_generation,
+        scope.input_identity,
+        scope.review_output_digest,
+    ] {
+        digest.update(value.as_bytes());
+        digest.update([0]);
+    }
+    format!(
+        "github-publication-v1:review:sha256:{}",
+        crate::repository_search::hex_digest(digest.finalize())
+    )
+}
+
+fn publication_plan_publishable_findings<'a>(
+    envelope: &'a Envelope,
+    published: &std::collections::HashMap<String, PublishedReviewComment>,
+) -> Vec<&'a Finding> {
+    let mut findings = envelope
+        .findings
+        .iter()
+        .filter(|finding| !filter::is_carried(finding))
+        .filter(|finding| !super::is_synthetic_path(&finding.path))
+        .filter(|finding| {
+            !finding_marker_candidates(finding)
+                .iter()
+                .any(|marker| published.contains_key(marker))
+        })
+        .collect::<Vec<_>>();
+    findings.sort_by_key(|finding| super::publication_finding_sort_key(finding));
+    findings
+}
+
+fn publication_plan_finding<'a>(envelope: &'a Envelope, finding_id: &str) -> Result<&'a Finding> {
+    envelope
+        .findings
+        .iter()
+        .chain(envelope.resolved.iter())
+        .chain(
+            envelope
+                .suppressed_findings
+                .iter()
+                .map(|suppressed| &suppressed.finding),
+        )
+        .find(|finding| finding_receipt_id(finding).0 == finding_id)
+        .with_context(|| format!("GitHub publication plan omitted finding identity {finding_id}"))
+}
+
+fn publication_plan_review_comment(
+    value: &serde_json::Value,
+) -> Result<PublicationPlanReviewComment> {
+    Ok(PublicationPlanReviewComment {
+        path: value["path"]
+            .as_str()
+            .context("GitHub review comment plan omitted its path")?
+            .to_string(),
+        line: value["line"]
+            .as_u64()
+            .and_then(|line| u32::try_from(line).ok())
+            .context("GitHub review comment plan omitted its line")?,
+        side: value["side"]
+            .as_str()
+            .context("GitHub review comment plan omitted its side")?
+            .to_string(),
+        start_line: value["start_line"]
+            .as_u64()
+            .and_then(|line| u32::try_from(line).ok()),
+        start_side: value["start_side"].as_str().map(str::to_string),
+        body: value["body"]
+            .as_str()
+            .context("GitHub review comment plan omitted its body")?
+            .to_string(),
+    })
+}
+
+fn publication_plan_file_comment(value: &serde_json::Value) -> Result<PublicationPlanFileComment> {
+    Ok(PublicationPlanFileComment {
+        body: value["body"]
+            .as_str()
+            .context("GitHub file-comment plan omitted its body")?
+            .to_string(),
+        commit_id: value["commit_id"]
+            .as_str()
+            .context("GitHub file-comment plan omitted its commit id")?
+            .to_string(),
+        path: value["path"]
+            .as_str()
+            .context("GitHub file-comment plan omitted its path")?
+            .to_string(),
+        subject_type: value["subject_type"]
+            .as_str()
+            .context("GitHub file-comment plan omitted its subject type")?
+            .to_string(),
+    })
+}
+
+fn initial_review_comment(finding: &Finding) -> serde_json::Value {
+    let (finding_id, _) = finding_receipt_id(finding);
+    let mut comment = json!({
+        "path": finding.path,
+        "line": finding.line,
+        "side": "RIGHT",
+        "body": append_marker(
+            &super::finding_comment_body(finding, true),
+            &finding_marker(&finding_id),
+        ),
+    });
+    if let Some(end) = finding.end_line
+        && end > finding.line
+    {
+        comment["start_line"] = json!(finding.line);
+        comment["line"] = json!(end);
+        comment["start_side"] = json!("RIGHT");
+    }
+    comment
+}
+
+fn fallback_line_comment(finding: &Finding, path: &str, line: u32) -> serde_json::Value {
+    let (finding_id, _) = finding_receipt_id(finding);
+    let mut body = String::new();
+    if path != finding.path {
+        body.push_str(&format!(
+            "This finding refers to `{}:{}`, outside the changed lines in this file.\n\n",
+            super::safe_code_text(&finding.path),
+            finding.line,
+        ));
+    } else if line != finding.line {
+        body.push_str(&format!(
+            "This finding refers to line {}, outside the changed lines.\n\n",
+            finding.line,
+        ));
+    }
+    body.push_str(&super::finding_comment_body(finding, true));
+    json!({
+        "path": path,
+        "line": line,
+        "side": "RIGHT",
+        "body": append_marker(&body, &finding_marker(&finding_id)),
+    })
+}
+
+fn file_level_comment(finding: &Finding, path: &str, head_sha: &str) -> serde_json::Value {
+    let (finding_id, _) = finding_receipt_id(finding);
+    let body = format!(
+        "Original location: `{}:{}`\n\n{}",
+        super::safe_code_text(&finding.path),
+        finding.line,
+        super::finding_comment_body(finding, true),
+    );
+    let body = append_marker(&body, FILE_LEVEL_COMMENT_MARKER);
+    json!({
+        "body": append_marker(&body, &finding_marker(&finding_id)),
+        "commit_id": head_sha,
+        "path": path,
+        "subject_type": "file",
+    })
+}
+
+fn publication_file_path<'a>(diff: &'a Diff, finding_path: &str) -> Option<&'a str> {
+    diff.files
+        .iter()
+        .find(|file| file.path == finding_path)
+        .map(|file| file.path.as_str())
+        .or_else(|| {
+            diff.files
+                .iter()
+                .find(|file| !file.deleted && file.old_path == finding_path)
+                .map(|file| file.path.as_str())
+        })
+}
+
+fn set_publication_outcome(
+    receipt: &mut ReviewPublicationReceipt,
+    finding: &Finding,
+    outcome: FindingPublicationOutcome,
+    inline_rejected: bool,
+) -> Result<()> {
+    let (finding_id, _) = finding_receipt_id(finding);
+    let publication = receipt
+        .findings
+        .iter_mut()
+        .find(|publication| publication.finding_id == finding_id)
+        .context("GitHub placement fallback omitted a finding publication receipt")?;
+    publication.initial_outcome = outcome;
+    publication.inline_rejected = inline_rejected;
+    publication.comment_id = None;
+    Ok(())
+}
+
+fn receipt_covers_findings(receipt: &ReviewPublicationReceipt, findings: &[&Finding]) -> bool {
+    findings
+        .iter()
+        .all(|finding| receipt_has_finding_comment(receipt, finding))
+}
+
+fn receipt_has_finding_comment(receipt: &ReviewPublicationReceipt, finding: &Finding) -> bool {
+    let (finding_id, _) = finding_receipt_id(finding);
+    receipt
+        .findings
+        .iter()
+        .find(|publication| publication.finding_id == finding_id)
+        .is_some_and(|publication| publication.comment_id.is_some())
+}
+
+fn github_review_rejected_line(body: &str) -> bool {
+    let normalized = body.to_ascii_lowercase();
+    if normalized.contains("line could not be resolved")
+        || normalized.contains("line must be part of the diff")
+    {
+        return true;
+    }
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("errors")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+        })
+        .is_some_and(|errors| {
+            errors.iter().any(|error| {
+                matches!(
+                    error.get("field").and_then(serde_json::Value::as_str),
+                    Some("line" | "start_line")
+                ) && error.get("code").and_then(serde_json::Value::as_str) == Some("invalid")
+            })
+        })
 }
 
 fn publication_summary(receipt: &ReviewPublicationReceipt) -> ReviewPublicationSummary {
@@ -2158,6 +4144,10 @@ fn publication_summary(receipt: &ReviewPublicationReceipt) -> ReviewPublicationS
                 summary.active_inline += 1;
             }
             FindingPublicationOutcome::Inline => {}
+            FindingPublicationOutcome::FileComment if finding.comment_id.is_some() => {
+                summary.file_comments += 1;
+            }
+            FindingPublicationOutcome::FileComment => {}
             FindingPublicationOutcome::CheckAnnotation => summary.summary_only += 1,
             FindingPublicationOutcome::SummaryOnly => summary.summary_only += 1,
             FindingPublicationOutcome::Carried => summary.carried += 1,
@@ -2172,18 +4162,27 @@ fn publication_summary(receipt: &ReviewPublicationReceipt) -> ReviewPublicationS
     summary
 }
 
-fn rejected_inline_receipt(mut receipt: ReviewPublicationReceipt) -> ReviewPublicationReceipt {
-    for finding in &mut receipt.findings {
-        if finding.initial_outcome == FindingPublicationOutcome::Inline {
-            finding.initial_outcome = FindingPublicationOutcome::SummaryOnly;
-            finding.inline_rejected = true;
-            finding.comment_id = None;
+fn durable_partial_receipt(receipt: &ReviewPublicationReceipt) -> ReviewPublicationReceipt {
+    let mut durable = receipt.clone();
+    for finding in &mut durable.findings {
+        if finding.initial_outcome == FindingPublicationOutcome::FileComment
+            && finding.comment_id.is_none()
+        {
+            finding.initial_outcome = FindingPublicationOutcome::Unknown;
         }
     }
-    receipt
+    durable
 }
 
 fn finding_marker(finding_id: &str) -> String {
+    let hash = Sha256::digest(finding_id.as_bytes());
+    format!(
+        "<!-- postil-finding:v2:{} -->",
+        crate::repository_search::hex_digest(hash)
+    )
+}
+
+fn legacy_finding_marker(finding_id: &str) -> String {
     let hash = Sha256::digest(finding_id.as_bytes());
     format!(
         "<!-- postil-finding:v1:{:02x}{:02x}{:02x}{:02x}{:02x}{:02x} -->",
@@ -2191,20 +4190,52 @@ fn finding_marker(finding_id: &str) -> String {
     )
 }
 
+fn finding_marker_candidates(finding: &Finding) -> Vec<String> {
+    let (finding_id, _) = finding_receipt_id(finding);
+    let legacy_id = legacy_finding_receipt_id(finding);
+    let mut markers = vec![
+        finding_marker(&finding_id),
+        legacy_finding_marker(&finding_id),
+    ];
+    if legacy_id != finding_id {
+        markers.push(legacy_finding_marker(&legacy_id));
+    }
+    markers
+}
+
 fn review_marker(receipt_id: &str) -> String {
     let mut digest = Sha256::new();
     digest.update(receipt_id.as_bytes());
     let hash = digest.finalize();
+    format!(
+        "<!-- postil-review:v2:{} -->",
+        crate::repository_search::hex_digest(hash)
+    )
+}
+
+fn legacy_review_marker(receipt_id: &str) -> String {
+    let hash = Sha256::digest(receipt_id.as_bytes());
     format!(
         "<!-- postil-review:v1:{:02x}{:02x}{:02x}{:02x}{:02x}{:02x} -->",
         hash[0], hash[1], hash[2], hash[3], hash[4], hash[5]
     )
 }
 
+fn review_marker_in(body: &str) -> Option<String> {
+    let start = ["<!-- postil-review:v2:", "<!-- postil-review:v1:"]
+        .into_iter()
+        .filter_map(|open| body.rfind(open))
+        .max()?;
+    let end = body[start..].find("-->")? + start + "-->".len();
+    Some(body[start..end].to_string())
+}
+
 /// The finding marker a published comment body ends with, if any.
 fn finding_marker_in(body: &str) -> Option<String> {
-    const OPEN: &str = "<!-- postil-finding:v1:";
-    let start = body.rfind(OPEN)?;
+    let start = ["<!-- postil-finding:v2:", "<!-- postil-finding:v1:"]
+        .into_iter()
+        .filter_map(|open| body.rfind(open))
+        .max()?;
     let end = body[start..].find("-->")? + start + "-->".len();
     Some(body[start..end].to_string())
 }
@@ -2215,6 +4246,28 @@ fn append_marker(body: &str, marker: &str) -> String {
     } else {
         format!("{body}\n\n{marker}")
     }
+}
+
+fn without_finding_marker(body: &str) -> &str {
+    let Some(marker) = finding_marker_in(body) else {
+        return body.trim_end();
+    };
+    body.strip_suffix(&marker)
+        .map(str::trim_end)
+        .unwrap_or_else(|| body.trim_end())
+}
+
+fn publication_plan_body_digest(body: &str) -> String {
+    publication_plan_text_digest(body)
+}
+
+fn published_comment_for_finding<'a>(
+    published: &'a std::collections::HashMap<String, PublishedReviewComment>,
+    finding: &Finding,
+) -> Option<&'a PublishedReviewComment> {
+    finding_marker_candidates(finding)
+        .iter()
+        .find_map(|marker| published.get(marker))
 }
 
 const MAX_REVIEW_BODY_BYTES: usize = 60_000;
@@ -2236,6 +4289,15 @@ fn bounded_review_body(body: &str, marker: &str, details_url: Option<&str>) -> S
         }
     }
     append_marker(OVERSIZED_REVIEW_MESSAGE, marker)
+}
+
+fn required_review_body(body: &str, marker: &str) -> Result<String> {
+    let marked = append_marker(body, marker);
+    ensure!(
+        marked.len() <= MAX_REVIEW_BODY_BYTES,
+        "GitHub review summary cannot represent every unplaced finding within its size limit"
+    );
+    Ok(marked)
 }
 
 fn comment_marker(number: u64, body: &str) -> String {
@@ -2260,7 +4322,12 @@ mod tests {
     use crate::envelope::{
         Envelope, Finding, Gate, Kind, Severity, SuppressedFinding, SuppressionReason, Usage,
     };
-    use crate::forge::{CheckRunIds, CheckState, FindingPublicationOutcome, Forge, PrMeta};
+    use crate::forge::{
+        CheckRunIds, CheckState, FindingPublicationOutcome, Forge, PrMeta,
+        PublicationPlanActivationCondition, PublicationPlanCheckStatus, PublicationPlanOperation,
+        PublicationPlanOperationActivation, PublicationPlanOperationKind,
+        PublicationPlanOperationReconciliation,
+    };
     use reqwest::header::{HeaderMap, HeaderValue};
     use std::sync::{
         Arc,
@@ -2269,6 +4336,24 @@ mod tests {
     use std::time::{Duration, Instant};
     use wiremock::matchers::{method, path, path_regex, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const PUBLICATION_INPUT_IDENTITY: &str =
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+
+    fn publication_plan_key_scope<'a>(
+        head_sha: &'a str,
+        input_identity: &'a str,
+        review_output_digest: &'a str,
+    ) -> super::PublicationPlanKeyScope<'a> {
+        super::PublicationPlanKeyScope {
+            repository_id: "42",
+            pull_request_number: "7",
+            head_sha,
+            controller_generation: "1",
+            input_identity,
+            review_output_digest,
+        }
+    }
 
     fn delivery_envelope(head_sha: &str, base_sha: &str) -> Envelope {
         Envelope {
@@ -2338,6 +4423,48 @@ mod tests {
             evidence: Some("let value = risky();".into()),
             id: Some(id.into()),
         }
+    }
+
+    fn placement_diff() -> crate::diff::Diff {
+        crate::diff::parse(
+            "diff --git a/src/lib.rs b/src/lib.rs\n\
+             --- a/src/lib.rs\n\
+             +++ b/src/lib.rs\n\
+             @@ -10 +10,3 @@\n\
+              context\n\
+             +added one\n\
+             +added two\n",
+        )
+    }
+
+    fn file_only_placement_diff() -> crate::diff::Diff {
+        crate::diff::parse(
+            "diff --git a/src/lib.rs b/src/lib.rs\n\
+             index 9daeafb..0f15a6e 100644\n\
+             Binary files a/src/lib.rs and b/src/lib.rs differ\n",
+        )
+    }
+
+    fn unrelated_placement_diff() -> crate::diff::Diff {
+        crate::diff::parse(
+            "diff --git a/src/other.rs b/src/other.rs\n\
+             --- a/src/other.rs\n\
+             +++ b/src/other.rs\n\
+             @@ -1 +1 @@\n\
+             -old();\n\
+             +new();\n",
+        )
+    }
+
+    fn two_file_placement_diff() -> crate::diff::Diff {
+        crate::diff::parse(
+            "diff --git a/src/first.bin b/src/first.bin\n\
+             index 9daeafb..0f15a6e 100644\n\
+             Binary files a/src/first.bin and b/src/first.bin differ\n\
+             diff --git a/src/second.bin b/src/second.bin\n\
+             index 9daeafb..0f15a6e 100644\n\
+             Binary files a/src/second.bin and b/src/second.bin differ\n",
+        )
     }
 
     fn repository_search_terms() -> Vec<crate::repository_search::SearchTerm> {
@@ -2485,6 +4612,7 @@ mod tests {
     #[tokio::test]
     async fn github_review_reconciles_before_retrying_uncertain_post() {
         let server = MockServer::start().await;
+        mount_current_delivery_snapshot(&server).await;
         Mock::given(method("POST"))
             .and(path("/repos/owner/repo/pulls/1/reviews"))
             .respond_with(ResponseTemplate::new(500))
@@ -2496,7 +4624,7 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(serde_json::json!([{
                     "body": "summary\n\n<!-- postil-review:test -->",
-                    "commit_id": "abcdef12"
+                    "commit_id": "aaaaaaaaaaaa"
                 }])),
             )
             .expect(1)
@@ -2505,15 +4633,16 @@ mod tests {
         let github = test_github(&server);
         let body = serde_json::json!({
             "body": "summary\n\n<!-- postil-review:test -->",
-            "commit_id": "abcdef12",
+            "commit_id": "aaaaaaaaaaaa",
             "event": "COMMENT"
         });
+        let snapshot = delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc");
 
         let response = github
             .send_review_reconciled(
                 &body,
                 "<!-- postil-review:test -->",
-                "abcdef12",
+                &snapshot,
                 "review post",
             )
             .await
@@ -2615,7 +4744,6 @@ mod tests {
             .expect(0)
             .mount(&server)
             .await;
-
         let github = test_github(&server);
         let content = github
             .fetch_repository_file_if_present("head123", "config/review.toml")
@@ -3038,6 +5166,274 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn publication_plan_operation_keys_match_every_key_safe_contract_shape() {
+        let expected = [
+            (
+                "initial-review-create",
+                "05d5806e72114f105b5b1e2809be8651811a3e527d89f7455c20dedbf32f24ce",
+            ),
+            (
+                "relocated-review-create",
+                "178636b4f224fdfb105833cde04ca2f5b1cf74bf407b9ab2dd23938198467058",
+            ),
+            (
+                "summary-review-create",
+                "7ca44380841305baacfac07805bc41c4b308f95acd0278b3e5ed3bfca4f7d8a0",
+            ),
+            (
+                "file-comment-fallback",
+                "6e61767bbe33ef6d754950c5bcce236fbeb92df235005db907731caa96e047dc",
+            ),
+            (
+                "finding-comment-update",
+                "875e393c65ef65394d4e73148f3369bad46f1d23d064cb906b3a8a69feb38d2f",
+            ),
+            (
+                "review-summary-update",
+                "e575a792bbe3c702f35bd4218263a9cf160b841c1e898c8045802530d56cac5f",
+            ),
+            (
+                "advisory-check-create",
+                "3be1458de77b6d90c70ead018e3897dddf217dc3bb5c0a68ba51b3f4129556d4",
+            ),
+            (
+                "advisory-check-complete",
+                "2c9ec6990843d0012a5489aa99a2fec170326e1a36f48a38fc51a73b42af33d7",
+            ),
+        ];
+        for (kind, (expected_kind, expected_digest)) in super::PublicationPlanOperationKeyKind::ALL
+            .into_iter()
+            .zip(expected)
+        {
+            assert_eq!(kind.as_str(), expected_kind);
+            let finding_id = matches!(
+                kind,
+                super::PublicationPlanOperationKeyKind::FileCommentFallback
+                    | super::PublicationPlanOperationKeyKind::FindingCommentUpdate
+            )
+            .then_some("finding-1");
+            let key = super::publication_plan_operation_key(
+                publication_plan_key_scope(
+                    "head-1",
+                    PUBLICATION_INPUT_IDENTITY,
+                    "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+                ),
+                kind,
+                finding_id,
+            );
+            assert_eq!(
+                key,
+                format!("github-publication-v1:{expected_kind}:sha256:{expected_digest}")
+            );
+            assert!(!key.contains('/'));
+        }
+    }
+
+    #[test]
+    fn advisory_check_completion_depends_on_creation_and_terminal_review_work() {
+        let operation = |operation_key: &str| {
+            PublicationPlanOperation::new(
+                0,
+                operation_key.into(),
+                vec![],
+                PublicationPlanOperationActivation {
+                    any_of: vec![PublicationPlanActivationCondition::Always],
+                },
+                PublicationPlanOperationReconciliation {
+                    logical_identity: operation_key.into(),
+                    markers: vec![],
+                    observed_remote_id: None,
+                    exclusive: true,
+                },
+                PublicationPlanOperationKind::AdvisoryCheckCreate {
+                    name: "postil/review".into(),
+                    head_sha: "aaaaaaaaaaaa".into(),
+                    status: PublicationPlanCheckStatus::InProgress,
+                    external_id: "postil:postil/review:aaaaaaaaaaaa".into(),
+                    details_url: None,
+                },
+            )
+            .unwrap()
+        };
+        let preceding = vec![
+            operation("advisory-create"),
+            operation("finding-update"),
+            operation("file-fallback"),
+        ];
+
+        assert_eq!(
+            super::publication_plan_advisory_completion_dependencies(
+                &preceding,
+                "advisory-create",
+                None,
+            ),
+            vec!["advisory-create", "finding-update", "file-fallback"]
+        );
+        assert_eq!(
+            super::publication_plan_advisory_completion_dependencies(
+                &preceding,
+                "advisory-create",
+                Some("review-summary-update"),
+            ),
+            vec!["advisory-create", "review-summary-update"]
+        );
+    }
+
+    #[test]
+    fn same_head_rereviews_bind_remote_identity_to_generation_and_content() {
+        let envelope = delivery_envelope_with_findings(
+            "aaaaaaaaaaaa",
+            "cccccccccccc",
+            vec![publication_finding(
+                "finding-1",
+                "src/lib.rs",
+                "Original finding body.",
+            )],
+        );
+        let snapshot = delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc");
+        let receipt = super::planned_review_receipt(&envelope, &snapshot.head_sha);
+        let identity = |generation: &str, snapshot: &PrMeta, envelope: &Envelope, gate| {
+            super::publication_plan_review_output_digest(super::PublicationPlanReviewOutputInput {
+                controller_generation: generation,
+                input_identity: PUBLICATION_INPUT_IDENTITY,
+                repository_id: "42",
+                pull_request_number: "7",
+                snapshot,
+                envelope,
+                receipt: &receipt,
+                should_comment: true,
+                duplicate_of_baseline: false,
+                annotate_findings: false,
+                advisory: CheckState::Success,
+                gate,
+                details_url: None,
+            })
+            .unwrap()
+        };
+        let baseline = identity("1", &snapshot, &envelope, CheckState::Success);
+        let mut changed_title = snapshot.clone();
+        changed_title.title = "Changed title".into();
+        let mut changed_body = snapshot.clone();
+        changed_body.body = "Changed pull request body".into();
+        let mut changed_finding = envelope.clone();
+        changed_finding.findings[0].body = "Changed finding body.".into();
+        let mut changed_confidence = envelope.clone();
+        changed_confidence.findings[0].confidence = 0.73;
+        let variants = [
+            identity("2", &snapshot, &envelope, CheckState::Success),
+            identity("1", &changed_title, &envelope, CheckState::Success),
+            identity("1", &changed_body, &envelope, CheckState::Success),
+            identity("1", &snapshot, &changed_finding, CheckState::Success),
+            identity("1", &snapshot, &changed_confidence, CheckState::Success),
+            identity("1", &snapshot, &envelope, CheckState::Failure),
+        ];
+        for variant in variants {
+            assert_ne!(variant, baseline);
+            let variant_scope = publication_plan_key_scope(
+                &snapshot.head_sha,
+                PUBLICATION_INPUT_IDENTITY,
+                &variant,
+            );
+            let baseline_scope = publication_plan_key_scope(
+                &snapshot.head_sha,
+                PUBLICATION_INPUT_IDENTITY,
+                &baseline,
+            );
+            assert_ne!(
+                super::publication_plan_logical_review_identity(variant_scope),
+                super::publication_plan_logical_review_identity(baseline_scope)
+            );
+            assert_ne!(
+                super::publication_plan_operation_key(
+                    variant_scope,
+                    super::PublicationPlanOperationKeyKind::InitialReviewCreate,
+                    None,
+                ),
+                super::publication_plan_operation_key(
+                    baseline_scope,
+                    super::PublicationPlanOperationKeyKind::InitialReviewCreate,
+                    None,
+                )
+            );
+        }
+
+        let changed_input_identity =
+            "sha256:3333333333333333333333333333333333333333333333333333333333333333";
+        let changed_input_output =
+            super::publication_plan_review_output_digest(super::PublicationPlanReviewOutputInput {
+                controller_generation: "1",
+                input_identity: changed_input_identity,
+                repository_id: "42",
+                pull_request_number: "7",
+                snapshot: &snapshot,
+                envelope: &envelope,
+                receipt: &receipt,
+                should_comment: true,
+                duplicate_of_baseline: false,
+                annotate_findings: false,
+                advisory: CheckState::Success,
+                gate: CheckState::Success,
+                details_url: None,
+            })
+            .unwrap();
+        assert_ne!(changed_input_output, baseline);
+        assert_ne!(
+            super::publication_plan_operation_key(
+                publication_plan_key_scope(
+                    &snapshot.head_sha,
+                    changed_input_identity,
+                    &changed_input_output,
+                ),
+                super::PublicationPlanOperationKeyKind::InitialReviewCreate,
+                None,
+            ),
+            super::publication_plan_operation_key(
+                publication_plan_key_scope(
+                    &snapshot.head_sha,
+                    PUBLICATION_INPUT_IDENTITY,
+                    &baseline,
+                ),
+                super::PublicationPlanOperationKeyKind::InitialReviewCreate,
+                None,
+            )
+        );
+    }
+
+    #[test]
+    fn durable_markers_are_strong_and_accept_released_compatibility_shapes() {
+        let finding = publication_finding("finding-1", "src/lib.rs", "Body.");
+        let finding_markers = super::finding_marker_candidates(&finding);
+        assert_eq!(finding_markers.len(), 2);
+        assert!(finding_markers[0].starts_with("<!-- postil-finding:v2:"));
+        assert_eq!(
+            finding_markers[0].len(),
+            "<!-- postil-finding:v2: -->".len() + 64
+        );
+        assert!(finding_markers[1].starts_with("<!-- postil-finding:v1:"));
+        assert_eq!(
+            finding_markers[1].len(),
+            "<!-- postil-finding:v1: -->".len() + 12
+        );
+
+        let current_receipt = super::planned_review_receipt(
+            &delivery_envelope_with_findings("aaaaaaaaaaaa", "cccccccccccc", vec![finding]),
+            "aaaaaaaaaaaa",
+        );
+        let current_review_marker = super::review_marker(&current_receipt.receipt_id);
+        assert!(current_review_marker.starts_with("<!-- postil-review:v2:"));
+        assert_eq!(
+            current_review_marker.len(),
+            "<!-- postil-review:v2: -->".len() + 64
+        );
+        let released_marker = super::legacy_review_marker("github-review-v2:0123456789ab");
+        assert!(released_marker.starts_with("<!-- postil-review:v1:"));
+        assert_eq!(
+            released_marker.len(),
+            "<!-- postil-review:v1: -->".len() + 12
+        );
+    }
+
     async fn mount_current_delivery_snapshot(server: &MockServer) {
         Mock::given(method("GET"))
             .and(path("/repos/owner/repo/pulls/1"))
@@ -3059,6 +5455,691 @@ mod tests {
             })))
             .mount(server)
             .await;
+    }
+
+    async fn mount_no_existing_review(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn publication_plan_reuses_review_checks_markers_and_the_placement_ladder() {
+        let server = MockServer::start().await;
+        mount_current_delivery_snapshot(&server).await;
+        mount_no_existing_review(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 42,
+                "full_name": "owner/repo"
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let mut active = publication_finding(
+            "active-1",
+            "src/lib.rs",
+            "The unchecked value reaches the protected operation.",
+        );
+        active.severity = Severity::Error;
+        let mut carried = publication_finding(
+            "carried-1",
+            "src/carried.rs",
+            "The carried finding remains open.",
+        );
+        carried.body = format!(
+            "{} The carried finding remains open.",
+            crate::filter::CARRIED_MARKER
+        );
+        let summary_only = publication_finding(
+            "summary-1",
+            crate::envelope::CHANGE_METADATA_PATH,
+            "The metadata finding belongs in the summary.",
+        );
+        let resolved = publication_finding(
+            "resolved-1",
+            "src/resolved.rs",
+            "The resolved finding remains identifiable.",
+        );
+        let suppressed = publication_finding(
+            "suppressed-1",
+            "src/suppressed.rs",
+            "The suppressed finding remains identifiable.",
+        );
+        let mut envelope = delivery_envelope_with_findings(
+            "aaaaaaaaaaaa",
+            "cccccccccccc",
+            vec![active, carried, summary_only],
+        );
+        envelope.resolved.push(resolved);
+        envelope.suppressed_findings.push(SuppressedFinding {
+            finding: suppressed,
+            reason: SuppressionReason::BelowConfidence,
+        });
+        let snapshot = delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc");
+        let planner = || {
+            let mut github = test_github(&server);
+            github.details_url = Some("https://postil.dev/orgs/acme/runs/run-1".into());
+            github
+        };
+        let plan = planner()
+            .build_publication_plan(crate::forge::GitHubPublicationPlanRequest {
+                controller_generation: "1",
+                input_identity: PUBLICATION_INPUT_IDENTITY,
+                envelope: &envelope,
+                snapshot: &snapshot,
+                publication_diff: Some(&placement_diff()),
+                should_comment: true,
+                duplicate_of_baseline: false,
+                annotate_findings: false,
+                advisory: CheckState::Success,
+                gate: CheckState::Failure,
+            })
+            .await
+            .unwrap();
+        let mut reordered_envelope = envelope.clone();
+        reordered_envelope.findings.reverse();
+        reordered_envelope.resolved.reverse();
+        reordered_envelope.suppressed_findings.reverse();
+        let reordered_plan = planner()
+            .build_publication_plan(crate::forge::GitHubPublicationPlanRequest {
+                controller_generation: "1",
+                input_identity: PUBLICATION_INPUT_IDENTITY,
+                envelope: &reordered_envelope,
+                snapshot: &snapshot,
+                publication_diff: Some(&placement_diff()),
+                should_comment: true,
+                duplicate_of_baseline: false,
+                annotate_findings: false,
+                advisory: CheckState::Success,
+                gate: CheckState::Failure,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&plan).unwrap(),
+            serde_json::to_vec(&reordered_plan).unwrap(),
+            "provider finding order must not affect publication intent"
+        );
+        let serialized = serde_json::to_value(&plan).unwrap();
+        let operations = serialized["operations"].as_array().unwrap();
+        assert_eq!(
+            operations
+                .iter()
+                .map(|operation| operation["kind"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                "advisoryCheckCreate",
+                "reviewCreate",
+                "reviewCreate",
+                "reviewCreate",
+                "fileCommentFallback",
+                "reviewSummaryUpdate",
+                "advisoryCheckComplete",
+            ]
+        );
+        assert_eq!(operations[0]["ordinal"], 1);
+        assert_eq!(operations[1]["ordinal"], 2);
+        assert_eq!(operations[2]["ordinal"], 3);
+        assert_eq!(operations[0]["name"], "postil/review");
+        assert_eq!(operations[0]["headSha"], "aaaaaaaaaaaa");
+        assert_eq!(operations[0]["status"], "in_progress");
+        assert_eq!(
+            operations[0]["externalId"],
+            "postil:run-1:postil/review:aaaaaaaaaaaa"
+        );
+        assert_eq!(
+            operations[0]["detailsUrl"],
+            "https://postil.dev/orgs/acme/runs/run-1"
+        );
+        assert_eq!(operations[1]["attempt"], "initial");
+        assert_eq!(operations[2]["attempt"], "relocatedInline");
+        assert_eq!(operations[3]["attempt"], "summaryOnly");
+        assert_eq!(operations[1]["payload"]["comments"][0]["line"], 7);
+        assert_eq!(
+            operations[2]["payload"]["comments"][0]["path"],
+            "src/lib.rs"
+        );
+        assert!(operations[3]["payload"]["body"].is_string());
+        let logical_review_identity = operations[1]["logicalReviewIdentity"].as_str().unwrap();
+        for operation in &operations[1..4] {
+            assert_eq!(operation["logicalReviewIdentity"], logical_review_identity);
+            assert_eq!(
+                operation["reconciliation"]["logicalIdentity"],
+                logical_review_identity
+            );
+            assert_eq!(operation["reconciliation"]["exclusive"], true);
+            assert_eq!(
+                operation["reconciliation"]["markers"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                2
+            );
+        }
+        assert_eq!(
+            operations[2]["activation"]["anyOf"][0]["condition"],
+            "semanticPlacementRejected"
+        );
+        assert_eq!(operations[2]["activation"]["anyOf"][0]["httpStatus"], 422);
+        assert_eq!(
+            operations[2]["activation"]["anyOf"][0]["classification"],
+            "invalidReviewCommentPlacement"
+        );
+        assert_eq!(
+            operations[2]["activation"]["anyOf"][0]["markerAbsence"],
+            operations[1]["activation"]["anyOf"][0]["guard"]
+        );
+        assert_eq!(
+            operations[3]["activation"]["anyOf"][0]["markerAbsence"],
+            operations[1]["activation"]["anyOf"][0]["guard"]
+        );
+        let findings = serialized["lifecycleReceipt"]["findings"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            findings
+                .iter()
+                .map(|finding| finding["findingId"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                "active-1",
+                "carried-1",
+                "resolved-1",
+                "summary-1",
+                "suppressed-1"
+            ]
+        );
+        assert_eq!(findings[0]["initialOutcome"], "inline");
+        assert_eq!(
+            findings[0]["fallbackIntent"],
+            serde_json::json!(["relocatedInline", "fileComment"])
+        );
+        assert_eq!(findings[1]["initialOutcome"], "carried");
+        assert_eq!(findings[2]["initialOutcome"], "resolved");
+        assert_eq!(findings[3]["initialOutcome"], "summaryOnly");
+        assert_eq!(findings[4]["initialOutcome"], "suppressed");
+        assert_eq!(findings[4]["suppressionReason"], "belowConfidence");
+        assert!(
+            serialized["lifecycleReceipt"]["digest"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:")
+        );
+        assert_eq!(operations[4]["findingId"], "active-1");
+        assert_eq!(
+            operations[4]["activation"]["anyOf"][0]["condition"],
+            "semanticPlacementRejected"
+        );
+        assert_eq!(
+            operations[4]["activation"]["anyOf"][1]["condition"],
+            "partialReviewObserved"
+        );
+        assert_eq!(
+            operations[4]["activation"]["anyOf"][1]["findingMarkerAbsence"]["markers"],
+            operations[4]["reconciliation"]["markers"]
+        );
+        assert_eq!(
+            operations[5]["terminalOperations"][0]["findingId"],
+            "active-1"
+        );
+        assert_eq!(
+            operations[5]["terminalOperations"][0]["requiresRemoteId"],
+            true
+        );
+        assert_eq!(operations[5]["cases"][0]["fileCommentCount"], 0);
+        assert_eq!(operations[5]["cases"][1]["fileCommentCount"], 1);
+        assert_eq!(
+            operations[5]["cases"][1]["selectedReviewOutcomes"],
+            serde_json::json!(["partialObserved"])
+        );
+        assert_eq!(operations[6]["name"], "postil/review");
+        assert_eq!(operations[6]["conclusion"], "success");
+        assert_eq!(
+            operations[6]["dependencies"],
+            serde_json::json!([
+                operations[0]["operationKey"].clone(),
+                operations[5]["operationKey"].clone()
+            ])
+        );
+        assert_eq!(
+            operations[6]["createdCheck"]["dependencyOperationKey"],
+            operations[0]["operationKey"]
+        );
+        assert_eq!(operations[6]["createdCheck"]["resultField"], "remoteId");
+        assert_eq!(serialized["repository"]["id"], "42");
+        assert_eq!(serialized["pullRequestNumber"], "1");
+        assert_eq!(serialized["gateAnalysis"]["ownership"], "service");
+        assert_eq!(serialized["gateAnalysis"]["authoritative"], false);
+        assert_eq!(
+            serialized["gateAnalysis"]["organizationGateModeRequired"],
+            true
+        );
+        assert_eq!(serialized["gateAnalysis"]["name"], "postil/gate");
+        assert_eq!(serialized["gateAnalysis"]["analyzedConclusion"], "failure");
+        assert!(operations.iter().all(|operation| {
+            operation["kind"] != "gateCheck" && operation["name"] != "postil/gate"
+        }));
+        assert_eq!(plan.recompute_intent_digest().unwrap(), plan.intent_digest);
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests.iter().all(|request| {
+            !matches!(
+                request.method,
+                wiremock::http::Method::POST
+                    | wiremock::http::Method::PATCH
+                    | wiremock::http::Method::PUT
+                    | wiremock::http::Method::DELETE
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn publication_plan_recovers_a_partial_review_without_an_alternative_create() {
+        let server = MockServer::start().await;
+        mount_current_delivery_snapshot(&server).await;
+        let first = publication_finding(
+            "first",
+            "src/lib.rs",
+            "The first finding was observed in the partial review.",
+        );
+        let second = publication_finding(
+            "second",
+            "src/lib.rs",
+            "The second finding is missing from the partial review.",
+        );
+        let envelope = delivery_envelope_with_findings(
+            "aaaaaaaaaaaa",
+            "cccccccccccc",
+            vec![second, first.clone()],
+        );
+        let legacy_review_marker = "<!-- postil-review:v1:0123456789ab -->".to_string();
+        let first_body = super::initial_review_comment(&first)["body"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 42,
+                "full_name": "owner/repo"
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1/comments"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "id": 501,
+                    "body": first_body,
+                    "commit_id": "aaaaaaaaaaaa"
+                }])),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "id": 77,
+                    "body": legacy_review_marker.clone(),
+                    "commit_id": "aaaaaaaaaaaa"
+                }])),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let snapshot = delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc");
+        let build = || async {
+            test_github(&server)
+                .build_publication_plan(crate::forge::GitHubPublicationPlanRequest {
+                    controller_generation: "3",
+                    input_identity: PUBLICATION_INPUT_IDENTITY,
+                    envelope: &envelope,
+                    snapshot: &snapshot,
+                    publication_diff: Some(&placement_diff()),
+                    should_comment: true,
+                    duplicate_of_baseline: false,
+                    annotate_findings: false,
+                    advisory: CheckState::Success,
+                    gate: CheckState::Success,
+                })
+                .await
+                .unwrap()
+        };
+        let first_plan = build().await;
+        let second_plan = build().await;
+        assert_eq!(
+            serde_json::to_vec(&first_plan).unwrap(),
+            serde_json::to_vec(&second_plan).unwrap()
+        );
+        let plan = serde_json::to_value(first_plan).unwrap();
+        let findings = plan["lifecycleReceipt"]["findings"].as_array().unwrap();
+        assert_eq!(findings[0]["findingId"], "first");
+        assert_eq!(findings[0]["observedCommentId"], "501");
+        assert_eq!(findings[0]["observedOutcome"], "inline");
+        assert_eq!(findings[0]["reconciliation"], "retain");
+        assert_eq!(findings[1]["findingId"], "second");
+        assert!(findings[1].get("observedCommentId").is_none());
+        assert_eq!(plan["lifecycleReceipt"]["observedReviewId"], "77");
+
+        let operations = plan["operations"].as_array().unwrap();
+        let review_operations = &operations[1..4];
+        let logical_identity = review_operations[0]["logicalReviewIdentity"].clone();
+        let shared_markers = review_operations[0]["reconciliation"]["markers"].clone();
+        assert!(
+            shared_markers
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(legacy_review_marker))
+        );
+        let exact_marker_guard = review_operations[0]["activation"]["anyOf"][0]["guard"].clone();
+        for operation in review_operations {
+            assert_eq!(operation["logicalReviewIdentity"], logical_identity);
+            assert_eq!(operation["reconciliation"]["markers"], shared_markers);
+            assert_eq!(operation["reconciliation"]["observedRemoteId"], "77");
+            assert_eq!(operation["reconciliation"]["exclusive"], true);
+        }
+        assert_eq!(
+            review_operations[1]["activation"]["anyOf"][0]["markerAbsence"],
+            exact_marker_guard
+        );
+        assert_eq!(
+            review_operations[2]["activation"]["anyOf"][0]["markerAbsence"],
+            exact_marker_guard
+        );
+
+        let file_fallback = operations
+            .iter()
+            .find(|operation| operation["kind"] == "fileCommentFallback")
+            .unwrap();
+        assert_eq!(file_fallback["findingId"], "second");
+        let partial_conditions = file_fallback["activation"]["anyOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|condition| condition["condition"] == "partialReviewObserved")
+            .collect::<Vec<_>>();
+        assert_eq!(partial_conditions.len(), 2);
+        for condition in partial_conditions {
+            assert_eq!(condition["reviewMarkers"], shared_markers);
+            assert_eq!(
+                condition["findingMarkerAbsence"]["markers"],
+                file_fallback["reconciliation"]["markers"]
+            );
+            assert_eq!(condition["findingMarkerAbsence"]["required"], true);
+        }
+
+        let final_summary = operations
+            .iter()
+            .find(|operation| operation["kind"] == "reviewSummaryUpdate")
+            .unwrap();
+        assert!(
+            final_summary["dependencies"]
+                .as_array()
+                .unwrap()
+                .contains(&file_fallback["operationKey"])
+        );
+        assert_eq!(
+            final_summary["terminalOperations"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            final_summary["terminalOperations"][0]["findingId"],
+            "second"
+        );
+        let partial_case = final_summary["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| {
+                case["selectedReviewOperationKey"] == review_operations[0]["operationKey"]
+                    && case["selectedReviewOutcomes"] == serde_json::json!(["partialObserved"])
+                    && case["fileCommentCount"] == 1
+            })
+            .expect("partial observation has a truthful final summary case");
+        assert!(
+            partial_case["body"]
+                .as_str()
+                .unwrap()
+                .contains("file-level")
+        );
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests.iter().all(|request| {
+            !matches!(
+                request.method,
+                wiremock::http::Method::POST
+                    | wiremock::http::Method::PATCH
+                    | wiremock::http::Method::PUT
+                    | wiremock::http::Method::DELETE
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn publication_plan_updates_stale_same_head_finding_content() {
+        let server = MockServer::start().await;
+        mount_current_delivery_snapshot(&server).await;
+        let finding = publication_finding(
+            "stable-finding",
+            "src/lib.rs",
+            "The desired finding body is current.",
+        );
+        let envelope =
+            delivery_envelope_with_findings("aaaaaaaaaaaa", "cccccccccccc", vec![finding.clone()]);
+        let receipt = super::planned_review_receipt(&envelope, "aaaaaaaaaaaa");
+        let review_marker = super::review_marker(&receipt.receipt_id);
+        let stale_body = super::append_marker(
+            "**Stale finding title**\n\nThe old finding prose is obsolete.",
+            &super::finding_marker("stable-finding"),
+        );
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 42,
+                "full_name": "owner/repo"
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1/comments"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "id": 501,
+                    "body": stale_body,
+                    "commit_id": "aaaaaaaaaaaa"
+                }])),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "id": 77,
+                    "body": review_marker,
+                    "commit_id": "aaaaaaaaaaaa"
+                }])),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        let snapshot = delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc");
+        let first_plan = test_github(&server)
+            .build_publication_plan(crate::forge::GitHubPublicationPlanRequest {
+                controller_generation: "4",
+                input_identity: PUBLICATION_INPUT_IDENTITY,
+                envelope: &envelope,
+                snapshot: &snapshot,
+                publication_diff: Some(&placement_diff()),
+                should_comment: true,
+                duplicate_of_baseline: false,
+                annotate_findings: false,
+                advisory: CheckState::Success,
+                gate: CheckState::Success,
+            })
+            .await
+            .unwrap();
+        let mut changed_envelope = envelope.clone();
+        changed_envelope.findings[0].body = "A later same-head finding body is desired.".into();
+        let changed_plan = test_github(&server)
+            .build_publication_plan(crate::forge::GitHubPublicationPlanRequest {
+                controller_generation: "4",
+                input_identity: PUBLICATION_INPUT_IDENTITY,
+                envelope: &changed_envelope,
+                snapshot: &snapshot,
+                publication_diff: Some(&placement_diff()),
+                should_comment: true,
+                duplicate_of_baseline: false,
+                annotate_findings: false,
+                advisory: CheckState::Success,
+                gate: CheckState::Success,
+            })
+            .await
+            .unwrap();
+
+        let first = serde_json::to_value(&first_plan).unwrap();
+        let changed = serde_json::to_value(&changed_plan).unwrap();
+        let finding_receipt = &first["lifecycleReceipt"]["findings"][0];
+        assert_eq!(finding_receipt["findingId"], "stable-finding");
+        assert_eq!(finding_receipt["observedCommentId"], "501");
+        assert_eq!(finding_receipt["reconciliation"], "replace");
+        assert_ne!(
+            finding_receipt["desiredBodySha256"],
+            finding_receipt["observedBodySha256"]
+        );
+        let update = first["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|operation| operation["kind"] == "findingCommentUpdate")
+            .unwrap();
+        assert_eq!(update["findingId"], "stable-finding");
+        assert_eq!(update["observedCommentId"], "501");
+        assert_eq!(update["reconciliation"]["observedRemoteId"], "501");
+        assert_eq!(update["expectedMarkers"].as_array().unwrap().len(), 2);
+        let final_summary = first["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|operation| operation["kind"] == "reviewSummaryUpdate")
+            .unwrap();
+        assert!(
+            final_summary["dependencies"]
+                .as_array()
+                .unwrap()
+                .contains(&update["operationKey"])
+        );
+
+        let changed_update = changed["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|operation| operation["kind"] == "findingCommentUpdate")
+            .unwrap();
+        assert_eq!(first["inputIdentity"], changed["inputIdentity"]);
+        assert_ne!(first["reviewOutputDigest"], changed["reviewOutputDigest"]);
+        assert_ne!(update["operationKey"], changed_update["operationKey"]);
+        assert_ne!(update["desiredDigest"], changed_update["desiredDigest"]);
+        assert_ne!(first["intentDigest"], changed["intentDigest"]);
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests.iter().all(|request| {
+            !matches!(
+                request.method,
+                wiremock::http::Method::POST
+                    | wiremock::http::Method::PATCH
+                    | wiremock::http::Method::PUT
+                    | wiremock::http::Method::DELETE
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn publication_plan_routes_check_annotation_presentation_without_review_delivery() {
+        let server = MockServer::start().await;
+        mount_current_delivery_snapshot(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 42,
+                "full_name": "owner/repo"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut finding = publication_finding(
+            "annotation-1",
+            "src/lib.rs",
+            "The unchecked value reaches the protected operation.",
+        );
+        finding.severity = Severity::Error;
+        let envelope =
+            delivery_envelope_with_findings("aaaaaaaaaaaa", "cccccccccccc", vec![finding]);
+        let snapshot = delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc");
+        let plan = test_github(&server)
+            .build_publication_plan(crate::forge::GitHubPublicationPlanRequest {
+                controller_generation: "1",
+                input_identity: PUBLICATION_INPUT_IDENTITY,
+                envelope: &envelope,
+                snapshot: &snapshot,
+                publication_diff: Some(&placement_diff()),
+                should_comment: true,
+                duplicate_of_baseline: false,
+                annotate_findings: true,
+                advisory: CheckState::Success,
+                gate: CheckState::Failure,
+            })
+            .await
+            .unwrap();
+        let operations = serde_json::to_value(plan).unwrap()["operations"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(operations.len(), 2);
+        assert_eq!(operations[0]["kind"], "advisoryCheckCreate");
+        assert_eq!(operations[1]["kind"], "advisoryCheckComplete");
+        assert_eq!(operations[1]["annotations"][0]["path"], "src/lib.rs");
+        assert_eq!(operations[1]["annotations"][0]["startLine"], 7);
+        assert_eq!(
+            operations[1]["dependencies"],
+            serde_json::json!([operations[0]["operationKey"].clone()])
+        );
+        assert!(
+            operations
+                .iter()
+                .all(|operation| operation["kind"] != "gateCheck")
+        );
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests.iter().all(|request| {
+            !matches!(
+                request.method,
+                wiremock::http::Method::POST
+                    | wiremock::http::Method::PATCH
+                    | wiremock::http::Method::PUT
+                    | wiremock::http::Method::DELETE
+            )
+        }));
     }
 
     #[tokio::test]
@@ -3117,6 +6198,7 @@ mod tests {
             .post_review(
                 &envelope,
                 &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                None,
             )
             .await
             .unwrap();
@@ -3223,6 +6305,7 @@ mod tests {
             .post_review(
                 &envelope,
                 &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                None,
             )
             .await
             .unwrap();
@@ -3280,6 +6363,7 @@ mod tests {
             .post_review(
                 &envelope,
                 &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                None,
             )
             .await
             .unwrap();
@@ -3298,14 +6382,15 @@ mod tests {
         let body = initial["body"].as_str().unwrap();
         assert!(body.contains(super::OVERSIZED_REVIEW_MESSAGE));
         assert!(!body.contains("Review details"));
-        assert!(body.contains("<!-- postil-review:v1:"));
+        assert!(body.contains("<!-- postil-review:v2:"));
         assert!(body.len() <= super::MAX_REVIEW_BODY_BYTES);
     }
 
     #[tokio::test]
-    async fn github_422_receipt_records_rejected_inline_and_summary_only_fallback() {
+    async fn github_line_rejection_retries_on_the_nearest_changed_line() {
         let server = MockServer::start().await;
         mount_current_delivery_snapshot(&server).await;
+        mount_no_existing_review(&server).await;
         let calls = Arc::new(AtomicUsize::new(0));
         let response_calls = Arc::clone(&calls);
         Mock::given(method("POST"))
@@ -3313,15 +6398,34 @@ mod tests {
             .respond_with(move |_request: &wiremock::Request| {
                 if response_calls.fetch_add(1, Ordering::SeqCst) == 0 {
                     ResponseTemplate::new(422)
+                        .set_body_json(serde_json::json!({"message": "Line could not be resolved"}))
                 } else {
                     ResponseTemplate::new(200).set_body_json(serde_json::json!({
                         "id": 78,
-                        "commit_id": "aaaaaaaaaaaa",
-                        "comments": []
+                        "commit_id": "aaaaaaaaaaaa"
                     }))
                 }
             })
             .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1/reviews/78/comments"))
+            .and(query_param("per_page", "100"))
+            .and(query_param("page", "1"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "id": 601,
+                    "body": super::finding_marker("inline-1")
+                }])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/repos/owner/repo/pulls/1/reviews/78"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
             .mount(&server)
             .await;
         let envelope = delivery_envelope_with_findings(
@@ -3334,20 +6438,21 @@ mod tests {
             )],
         );
 
-        let receipt = test_github(&server)
+        let mut github = test_github(&server);
+        github.details_url = Some("https://postil.dev/orgs/acme/runs/run-1".into());
+        let diff = placement_diff();
+        let receipt = github
             .post_review(
                 &envelope,
                 &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                Some(&diff),
             )
             .await
             .unwrap();
         let finding = &receipt.findings[0];
-        assert_eq!(
-            finding.initial_outcome,
-            FindingPublicationOutcome::SummaryOnly
-        );
-        assert!(finding.inline_rejected);
-        assert!(finding.comment_id.is_none());
+        assert_eq!(finding.initial_outcome, FindingPublicationOutcome::Inline);
+        assert!(!finding.inline_rejected);
+        assert_eq!(finding.comment_id.as_deref(), Some("601"));
 
         let requests = server.received_requests().await.unwrap();
         let posts: Vec<_> = requests
@@ -3355,11 +6460,766 @@ mod tests {
             .filter(|request| request.method == reqwest::Method::POST)
             .collect();
         let fallback: serde_json::Value = serde_json::from_slice(&posts[1].body).unwrap();
+        let comments = fallback["comments"].as_array().unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0]["path"], "src/lib.rs");
+        assert_eq!(comments[0]["line"], 10);
+        assert_eq!(comments[0]["side"], "RIGHT");
+        assert!(comments[0].get("start_line").is_none());
+        assert!(comments[0].get("start_side").is_none());
+        assert!(
+            comments[0]["body"]
+                .as_str()
+                .unwrap()
+                .contains("This finding refers to line 7, outside the changed lines.")
+        );
+    }
+
+    #[tokio::test]
+    async fn github_line_rejection_falls_back_to_a_file_level_comment() {
+        let server = MockServer::start().await;
+        mount_current_delivery_snapshot(&server).await;
+        mount_no_existing_review(&server).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let response_calls = Arc::clone(&calls);
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(move |_request: &wiremock::Request| {
+                if response_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(422)
+                        .set_body_json(serde_json::json!({"message": "Line could not be resolved"}))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "id": 78,
+                        "commit_id": "aaaaaaaaaaaa",
+                        "comments": []
+                    }))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 601,
+                "body": super::finding_marker("inline-1"),
+                "commit_id": "aaaaaaaaaaaa"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/repos/owner/repo/pulls/1/reviews/78"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let envelope = delivery_envelope_with_findings(
+            "aaaaaaaaaaaa",
+            "cccccccccccc",
+            vec![publication_finding(
+                "inline-1",
+                "src/lib.rs",
+                "A concrete issue.",
+            )],
+        );
+        let diff = file_only_placement_diff();
+
+        let receipt = test_github(&server)
+            .post_review(
+                &envelope,
+                &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                Some(&diff),
+            )
+            .await
+            .unwrap();
+
+        let finding = &receipt.findings[0];
+        assert_eq!(
+            finding.initial_outcome,
+            FindingPublicationOutcome::FileComment
+        );
+        assert!(!finding.inline_rejected);
+        assert_eq!(finding.comment_id.as_deref(), Some("601"));
+        let requests = server.received_requests().await.unwrap();
+        let file_comment: serde_json::Value = requests
+            .iter()
+            .find(|request| {
+                request.method == reqwest::Method::POST
+                    && request.url.path() == "/repos/owner/repo/pulls/1/comments"
+            })
+            .unwrap()
+            .body_json()
+            .unwrap();
+        assert_eq!(file_comment["subject_type"], "file");
+        assert_eq!(file_comment["path"], "src/lib.rs");
+        assert!(file_comment.get("line").is_none());
+        let body = file_comment["body"].as_str().unwrap();
+        assert!(body.contains("Finding inline-1"));
+        assert!(body.contains("A concrete issue."));
+        assert!(body.contains(super::FILE_LEVEL_COMMENT_MARKER));
+        let summary_update: serde_json::Value = requests
+            .iter()
+            .find(|request| request.method == reqwest::Method::PUT)
+            .unwrap()
+            .body_json()
+            .unwrap();
+        assert!(
+            summary_update["body"]
+                .as_str()
+                .unwrap()
+                .contains("1 finding posted as file-level review comment")
+        );
+    }
+
+    #[tokio::test]
+    async fn github_line_rejection_includes_the_full_finding_when_the_file_is_absent() {
+        let server = MockServer::start().await;
+        mount_current_delivery_snapshot(&server).await;
+        mount_no_existing_review(&server).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let response_calls = Arc::clone(&calls);
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(move |_request: &wiremock::Request| {
+                if response_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(422)
+                        .set_body_json(serde_json::json!({"message": "Line could not be resolved"}))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "id": 78,
+                        "commit_id": "aaaaaaaaaaaa",
+                        "comments": []
+                    }))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/comments"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/repos/owner/repo/pulls/1/reviews/78"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let envelope = delivery_envelope_with_findings(
+            "aaaaaaaaaaaa",
+            "cccccccccccc",
+            vec![publication_finding(
+                "inline-1",
+                "src/lib.rs",
+                "A concrete issue.",
+            )],
+        );
+        let diff = unrelated_placement_diff();
+
+        let receipt = test_github(&server)
+            .post_review(
+                &envelope,
+                &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                Some(&diff),
+            )
+            .await
+            .unwrap();
+
+        let finding = &receipt.findings[0];
+        assert_eq!(
+            finding.initial_outcome,
+            FindingPublicationOutcome::SummaryOnly
+        );
+        assert!(finding.inline_rejected);
+        assert!(finding.comment_id.is_none());
+        let requests = server.received_requests().await.unwrap();
+        let review_posts = requests
+            .iter()
+            .filter(|request| {
+                request.method == reqwest::Method::POST
+                    && request.url.path() == "/repos/owner/repo/pulls/1/reviews"
+            })
+            .collect::<Vec<_>>();
+        let fallback: serde_json::Value = review_posts[1].body_json().unwrap();
         assert!(fallback.get("comments").is_none());
         let summary = fallback["body"].as_str().unwrap();
-        assert!(summary.contains("1 finding in review details"));
-        assert!(summary.contains("inline placement unavailable"));
-        assert!(!summary.contains("Before the next push"));
+        assert!(summary.contains("Location: `src/lib.rs:7`"));
+        assert!(summary.contains("Finding inline-1"));
+        assert!(summary.contains("A concrete issue."));
+        assert!(summary.contains(&super::finding_marker("inline-1")));
+    }
+
+    #[tokio::test]
+    async fn github_second_line_rejection_degrades_to_a_file_level_comment() {
+        let server = MockServer::start().await;
+        mount_current_delivery_snapshot(&server).await;
+        mount_no_existing_review(&server).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let response_calls = Arc::clone(&calls);
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(move |_request: &wiremock::Request| {
+                if response_calls.fetch_add(1, Ordering::SeqCst) < 2 {
+                    ResponseTemplate::new(422)
+                        .set_body_json(serde_json::json!({"message": "Line could not be resolved"}))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "id": 78,
+                        "commit_id": "aaaaaaaaaaaa",
+                        "comments": []
+                    }))
+                }
+            })
+            .expect(3)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 601,
+                "body": super::finding_marker("inline-1"),
+                "commit_id": "aaaaaaaaaaaa"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/repos/owner/repo/pulls/1/reviews/78"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let envelope = delivery_envelope_with_findings(
+            "aaaaaaaaaaaa",
+            "cccccccccccc",
+            vec![publication_finding(
+                "inline-1",
+                "src/lib.rs",
+                "A concrete issue.",
+            )],
+        );
+        let diff = placement_diff();
+
+        let receipt = test_github(&server)
+            .post_review(
+                &envelope,
+                &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                Some(&diff),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            receipt.findings[0].initial_outcome,
+            FindingPublicationOutcome::FileComment
+        );
+        assert_eq!(receipt.findings[0].comment_id.as_deref(), Some("601"));
+    }
+
+    #[tokio::test]
+    async fn github_partial_file_comment_retry_resumes_the_existing_review() {
+        let server = MockServer::start().await;
+        mount_current_delivery_snapshot(&server).await;
+        let envelope = delivery_envelope_with_findings(
+            "aaaaaaaaaaaa",
+            "cccccccccccc",
+            vec![
+                publication_finding("first", "src/first.bin", "First issue."),
+                publication_finding("second", "src/second.bin", "Second issue."),
+            ],
+        );
+        let planned = super::planned_review_receipt(&envelope, "aaaaaaaaaaaa");
+        let review_marker = super::review_marker(&planned.receipt_id);
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1/comments"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "id": 7,
+                    "body": format!(
+                        "{}\n\n{}",
+                        super::FILE_LEVEL_COMMENT_MARKER,
+                        super::finding_marker("first")
+                    ),
+                    "commit_id": "aaaaaaaaaaaa"
+                }])),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "id": 78,
+                    "body": review_marker,
+                    "commit_id": "aaaaaaaaaaaa"
+                }])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1/reviews/78/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 602,
+                "body": super::finding_marker("second"),
+                "commit_id": "aaaaaaaaaaaa"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/repos/owner/repo/pulls/1/reviews/78"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let diff = two_file_placement_diff();
+
+        let receipt = test_github(&server)
+            .post_review(
+                &envelope,
+                &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                Some(&diff),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(receipt.review_id.as_deref(), Some("78"));
+        assert_eq!(
+            receipt.findings[0].initial_outcome,
+            FindingPublicationOutcome::Carried
+        );
+        assert_eq!(receipt.findings[0].comment_id.as_deref(), Some("7"));
+        assert_eq!(
+            receipt.findings[1].initial_outcome,
+            FindingPublicationOutcome::FileComment
+        );
+        assert_eq!(receipt.findings[1].comment_id.as_deref(), Some("602"));
+        let requests = server.received_requests().await.unwrap();
+        let review_posts = requests
+            .iter()
+            .filter(|request| {
+                request.method == reqwest::Method::POST
+                    && request.url.path() == "/repos/owner/repo/pulls/1/reviews"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(review_posts.len(), 1, "the existing review is resumed");
+        let initial: serde_json::Value = review_posts[0].body_json().unwrap();
+        assert_eq!(initial["comments"].as_array().unwrap().len(), 1);
+        assert_eq!(initial["comments"][0]["path"], "src/second.bin");
+        let summary_update: serde_json::Value = requests
+            .iter()
+            .find(|request| request.method == reqwest::Method::PUT)
+            .unwrap()
+            .body_json()
+            .unwrap();
+        let summary = summary_update["body"].as_str().unwrap();
+        assert!(summary.contains("1 finding posted as file-level review comment"));
+        assert!(!summary.contains("2 findings posted"));
+        assert!(!summary.contains("posted inline"));
+    }
+
+    #[tokio::test]
+    async fn github_partial_review_without_its_line_comment_uses_file_level_delivery() {
+        let server = MockServer::start().await;
+        mount_current_delivery_snapshot(&server).await;
+        let envelope = delivery_envelope_with_findings(
+            "aaaaaaaaaaaa",
+            "cccccccccccc",
+            vec![publication_finding(
+                "inline-1",
+                "src/lib.rs",
+                "A concrete issue.",
+            )],
+        );
+        let planned = super::planned_review_receipt(&envelope, "aaaaaaaaaaaa");
+        let review_marker = super::review_marker(&planned.receipt_id);
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "id": 78,
+                    "body": review_marker,
+                    "commit_id": "aaaaaaaaaaaa"
+                }])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1/reviews/78/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 601,
+                "body": super::finding_marker("inline-1"),
+                "commit_id": "aaaaaaaaaaaa"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/repos/owner/repo/pulls/1/reviews/78"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let diff = placement_diff();
+
+        let receipt = test_github(&server)
+            .post_review(
+                &envelope,
+                &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                Some(&diff),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            receipt.findings[0].initial_outcome,
+            FindingPublicationOutcome::FileComment
+        );
+        assert_eq!(receipt.findings[0].comment_id.as_deref(), Some("601"));
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| {
+                    request.method == reqwest::Method::POST
+                        && request.url.path() == "/repos/owner/repo/pulls/1/reviews"
+                })
+                .count(),
+            1
+        );
+        let file_comment: serde_json::Value = requests
+            .iter()
+            .find(|request| {
+                request.method == reqwest::Method::POST
+                    && request.url.path() == "/repos/owner/repo/pulls/1/comments"
+            })
+            .unwrap()
+            .body_json()
+            .unwrap();
+        assert_eq!(file_comment["subject_type"], "file");
+        assert_eq!(file_comment["path"], "src/lib.rs");
+    }
+
+    #[tokio::test]
+    async fn github_generic_validation_failure_does_not_trigger_placement_fallback() {
+        let server = MockServer::start().await;
+        mount_current_delivery_snapshot(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(ResponseTemplate::new(422).set_body_json(serde_json::json!({
+                "message": "Validation Failed",
+                "errors": [{"field": "body", "code": "invalid"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let envelope = delivery_envelope_with_findings(
+            "aaaaaaaaaaaa",
+            "cccccccccccc",
+            vec![publication_finding(
+                "inline-1",
+                "src/lib.rs",
+                "A concrete issue.",
+            )],
+        );
+        let diff = placement_diff();
+
+        let error = test_github(&server)
+            .post_review(
+                &envelope,
+                &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                Some(&diff),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("failed validation"));
+    }
+
+    #[tokio::test]
+    async fn github_unplaced_finding_must_fit_in_the_review_summary() {
+        let server = MockServer::start().await;
+        mount_current_delivery_snapshot(&server).await;
+        mount_no_existing_review(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(ResponseTemplate::new(422).set_body_json(serde_json::json!({
+                "message": "Line could not be resolved"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let findings = (0..50)
+            .map(|index| {
+                let mut body = "x".repeat(crate::envelope::FINDING_PUBLIC_BODY_MAX_CHARS - 1);
+                body.push('.');
+                publication_finding(
+                    &format!("inline-{index}"),
+                    &format!("src/missing-{index}.rs"),
+                    &body,
+                )
+            })
+            .collect();
+        let envelope = delivery_envelope_with_findings("aaaaaaaaaaaa", "cccccccccccc", findings);
+        let diff = unrelated_placement_diff();
+
+        let error = test_github(&server)
+            .post_review(
+                &envelope,
+                &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                Some(&diff),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("cannot represent every unplaced finding"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn github_file_comment_response_must_identify_the_reviewed_head() {
+        let server = MockServer::start().await;
+        mount_current_delivery_snapshot(&server).await;
+        mount_no_existing_review(&server).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let response_calls = Arc::clone(&calls);
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(move |_request: &wiremock::Request| {
+                if response_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(422)
+                        .set_body_json(serde_json::json!({"message": "Line could not be resolved"}))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "id": 78,
+                        "commit_id": "aaaaaaaaaaaa",
+                        "comments": []
+                    }))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 601,
+                "body": super::finding_marker("inline-1")
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let envelope = delivery_envelope_with_findings(
+            "aaaaaaaaaaaa",
+            "cccccccccccc",
+            vec![publication_finding(
+                "inline-1",
+                "src/lib.rs",
+                "A concrete issue.",
+            )],
+        );
+        let diff = file_only_placement_diff();
+
+        let error = test_github(&server)
+            .post_review(
+                &envelope,
+                &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                Some(&diff),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("did not identify the reviewed head")
+        );
+    }
+
+    #[tokio::test]
+    async fn github_rechecks_the_snapshot_before_each_file_comment() {
+        let server = MockServer::start().await;
+        mount_no_existing_review(&server).await;
+        let pr_reads = Arc::new(AtomicUsize::new(0));
+        let pr_response_reads = Arc::clone(&pr_reads);
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1"))
+            .respond_with(move |_request: &wiremock::Request| {
+                let current = pr_response_reads.fetch_add(1, Ordering::SeqCst) < 4;
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "title": "t", "body": "b", "state": "open", "merged": false,
+                    "head": {"sha": if current { "aaaaaaaaaaaa" } else { "dddddddddddd" }},
+                    "base": {"sha": "bbbbbbbbbbbb"},
+                    "changed_files": 2
+                }))
+            })
+            .expect(5)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/repos/owner/repo/compare/bbbbbbbbbbbb...aaaaaaaaaaaa",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "merge_base_commit": {"sha": "cccccccccccc"},
+                "files": []
+            })))
+            .expect(4)
+            .mount(&server)
+            .await;
+        let review_calls = Arc::new(AtomicUsize::new(0));
+        let review_response_calls = Arc::clone(&review_calls);
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(move |_request: &wiremock::Request| {
+                if review_response_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(422)
+                        .set_body_json(serde_json::json!({"message": "Line could not be resolved"}))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "id": 78,
+                        "commit_id": "aaaaaaaaaaaa",
+                        "comments": []
+                    }))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/1/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 601,
+                "body": super::finding_marker("first"),
+                "commit_id": "aaaaaaaaaaaa"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let envelope = delivery_envelope_with_findings(
+            "aaaaaaaaaaaa",
+            "cccccccccccc",
+            vec![
+                publication_finding("first", "src/first.bin", "First issue."),
+                publication_finding("second", "src/second.bin", "Second issue."),
+            ],
+        );
+        let diff = two_file_placement_diff();
+
+        let error = test_github(&server)
+            .post_review(
+                &envelope,
+                &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                Some(&diff),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("PR snapshot changed"));
+    }
+
+    #[test]
+    fn github_file_level_comment_preserves_a_renamed_original_location() {
+        let mut finding = publication_finding("renamed", "src/old.rs", "A concrete issue.");
+        finding.line = 19;
+        let diff = crate::diff::parse(
+            "diff --git a/src/old.rs b/src/new.rs\n\
+             similarity index 100%\n\
+             rename from src/old.rs\n\
+             rename to src/new.rs\n",
+        );
+        let path = super::publication_file_path(&diff, &finding.path).unwrap();
+
+        let payload = super::file_level_comment(&finding, path, "aaaaaaaaaaaa");
+
+        assert_eq!(payload["path"], "src/new.rs");
+        assert!(
+            payload["body"]
+                .as_str()
+                .unwrap()
+                .contains("Original location: `src/old.rs:19`")
+        );
+    }
+
+    #[test]
+    fn pending_file_comments_are_unknown_in_durable_partial_receipts() {
+        let envelope = delivery_envelope_with_findings(
+            "aaaaaaaaaaaa",
+            "cccccccccccc",
+            vec![
+                publication_finding("first", "src/first.bin", "First issue."),
+                publication_finding("second", "src/second.bin", "Second issue."),
+            ],
+        );
+        let mut receipt = super::planned_review_receipt(&envelope, "aaaaaaaaaaaa");
+        receipt.findings[0].initial_outcome = FindingPublicationOutcome::FileComment;
+        receipt.findings[0].comment_id = Some("601".into());
+        receipt.findings[1].initial_outcome = FindingPublicationOutcome::FileComment;
+
+        let durable = super::durable_partial_receipt(&receipt);
+
+        assert_eq!(
+            durable.findings[0].initial_outcome,
+            FindingPublicationOutcome::FileComment
+        );
+        assert_eq!(durable.findings[0].comment_id.as_deref(), Some("601"));
+        assert_eq!(
+            durable.findings[1].initial_outcome,
+            FindingPublicationOutcome::Unknown
+        );
+        assert!(durable.findings[1].comment_id.is_none());
+    }
+
+    #[test]
+    fn github_line_rejection_classification_is_narrow() {
+        assert!(super::github_review_rejected_line(
+            r#"{"message":"Line could not be resolved"}"#
+        ));
+        assert!(super::github_review_rejected_line(
+            r#"{"message":"Validation Failed","errors":[{"field":"start_line","code":"invalid"}]}"#
+        ));
+        assert!(!super::github_review_rejected_line(
+            r#"{"message":"Validation Failed","errors":[{"field":"body","code":"invalid"}]}"#
+        ));
     }
 
     #[tokio::test]
@@ -3417,6 +7277,7 @@ mod tests {
             .post_review(
                 &envelope,
                 &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                None,
             )
             .await
             .unwrap();
@@ -3641,6 +7502,7 @@ mod tests {
             .post_review(
                 &delivery_envelope("aaaaaaaa", "cccccccc"),
                 &delivery_snapshot("aaaaaaaa", "bbbbbbbb", "cccccccc"),
+                None,
             )
             .await
             .unwrap();
@@ -3828,6 +7690,7 @@ mod tests {
             .post_review(
                 &envelope,
                 &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                None,
             )
             .await
             .unwrap_err();
@@ -3890,7 +7753,10 @@ mod tests {
         let snapshot = delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc");
         let envelope =
             delivery_envelope_with_findings("aaaaaaaaaaaa", "cccccccccccc", vec![finding]);
-        let review_error = github.post_review(&envelope, &snapshot).await.unwrap_err();
+        let review_error = github
+            .post_review(&envelope, &snapshot, None)
+            .await
+            .unwrap_err();
         assert!(review_error.to_string().contains("PR snapshot changed"));
         let check_error = github
             .complete_checks(
@@ -3968,7 +7834,10 @@ mod tests {
             delivery_envelope_with_findings("aaaaaaaaaaaa", "cccccccccccc", vec![finding]);
         let snapshot = delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc");
 
-        let review_error = github.post_review(&envelope, &snapshot).await.unwrap_err();
+        let review_error = github
+            .post_review(&envelope, &snapshot, None)
+            .await
+            .unwrap_err();
         assert!(review_error.to_string().contains("PR snapshot changed"));
         let check_error = github
             .complete_checks(
@@ -4072,6 +7941,7 @@ mod tests {
             .post_review(
                 &envelope,
                 &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                None,
             )
             .await
             .unwrap_err();
@@ -4101,10 +7971,14 @@ mod tests {
             .await;
         Mock::given(method("POST"))
             .and(path("/repos/owner/repo/pulls/1/reviews"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": 99,
-                "comments": []
-            })))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = request.body_json().expect("review body");
+                ResponseTemplate::new(200).set_body_json(published_review_response(
+                    &body,
+                    99,
+                    "aaaaaaaaaaaa",
+                ))
+            })
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -4187,6 +8061,7 @@ mod tests {
             .post_review(
                 &envelope,
                 &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                None,
             )
             .await
             .unwrap();
@@ -4432,6 +8307,31 @@ mod tests {
         }
     }
 
+    fn published_review_response(
+        request_body: &serde_json::Value,
+        review_id: u64,
+        commit_id: &str,
+    ) -> serde_json::Value {
+        let comments = request_body["comments"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .map(|(index, comment)| {
+                serde_json::json!({
+                    "id": index + 1,
+                    "body": comment["body"],
+                    "commit_id": commit_id,
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "id": review_id,
+            "commit_id": commit_id,
+            "comments": comments,
+        })
+    }
+
     async fn mount_dedup_snapshot(server: &MockServer) {
         Mock::given(method("GET"))
             .and(path("/repos/owner/repo/pulls/1"))
@@ -4458,6 +8358,64 @@ mod tests {
             .await;
     }
 
+    #[tokio::test]
+    async fn github_stops_review_summary_retries_when_the_snapshot_changes() {
+        let server = MockServer::start().await;
+        let pr_reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let captured_reads = pr_reads.clone();
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1"))
+            .respond_with(move |_request: &wiremock::Request| {
+                let title = if captured_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
+                {
+                    "t"
+                } else {
+                    "changed"
+                };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "title": title, "body": "b", "state": "open", "merged": false,
+                    "head": {"sha": "aaaaaaaaaaaa"}, "base": {"sha": "bbbbbbbbbbbb"},
+                    "changed_files": 1
+                }))
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/repos/owner/repo/compare/bbbbbbbbbbbb...aaaaaaaaaaaa",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "merge_base_commit": {"sha": "cccccccccccc"}, "files": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/repos/owner/repo/pulls/1/reviews/99"))
+            .respond_with(ResponseTemplate::new(503).insert_header("retry-after", "1"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let envelope =
+            delivery_envelope_with_findings("aaaaaaaaaaaa", "cccccccccccc", vec![dedup_finding()]);
+        let mut receipt = super::planned_review_receipt(&envelope, "aaaaaaaaaaaa");
+        receipt.review_id = Some("99".into());
+        let marker = super::review_marker(&receipt.receipt_id);
+        let error = dedup_github(&server)
+            .finalize_review_summary(
+                &envelope,
+                &receipt,
+                &marker,
+                &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("PR snapshot changed"));
+        assert_eq!(pr_reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
     /// A second review of an unchanged head re-detects what the first found.
     /// Those findings are fresh, not carried, so only the marker already on the
     /// pull request can tell the run its comment is a duplicate.
@@ -4475,14 +8433,36 @@ mod tests {
                 .first()
                 .expect("one finding in the envelope"),
         );
+        let planned = super::planned_review_receipt(&envelope, "aaaaaaaaaaaa");
+        let review_marker = super::review_marker(&planned.receipt_id);
         Mock::given(method("GET"))
             .and(path("/repos/owner/repo/pulls/1/comments"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(serde_json::json!([{
                     "id": 7,
                     "body": format!("**{}**\n\n{}", finding.title, finding_marker(&finding_id)),
+                    "commit_id": "aaaaaaaaaaaa",
+                    "subject_type": "line"
                 }])),
             )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1/reviews"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "id": 11,
+                    "body": review_marker,
+                    "commit_id": "aaaaaaaaaaaa"
+                }])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/repos/owner/repo/pulls/1/reviews/11"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
             .mount(&server)
             .await;
         let posted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
@@ -4490,30 +8470,47 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/repos/owner/repo/pulls/1/reviews"))
             .respond_with(move |request: &wiremock::Request| {
-                captured
-                    .lock()
-                    .expect("capture lock")
-                    .push(request.body_json().expect("review body"));
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": 11}))
+                let body: serde_json::Value = request.body_json().expect("review body");
+                captured.lock().expect("capture lock").push(body.clone());
+                ResponseTemplate::new(200).set_body_json(published_review_response(
+                    &body,
+                    11,
+                    "aaaaaaaaaaaa",
+                ))
             })
+            .expect(0)
             .mount(&server)
             .await;
 
-        github
+        let receipt = github
             .post_review(
                 &envelope,
                 &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                None,
             )
             .await
-            .expect("the review still posts its summary");
+            .expect("the existing review and comment reconcile");
 
-        let bodies = posted.lock().expect("capture lock");
-        let body = bodies.first().expect("one review posted");
-        assert_eq!(
-            body["comments"].as_array().map_or(0, Vec::len),
-            0,
-            "the duplicate inline comment is not reposted"
+        assert!(
+            posted.lock().expect("capture lock").is_empty(),
+            "the duplicate review is not reposted"
         );
+        assert_eq!(receipt.review_id.as_deref(), Some("11"));
+        assert_eq!(receipt.findings[0].comment_id.as_deref(), Some("7"));
+        assert_eq!(
+            receipt.findings[0].initial_outcome,
+            FindingPublicationOutcome::Carried
+        );
+        let requests = server.received_requests().await.unwrap();
+        let summary_update: serde_json::Value = requests
+            .iter()
+            .find(|request| request.method == reqwest::Method::PUT)
+            .unwrap()
+            .body_json()
+            .unwrap();
+        let summary = summary_update["body"].as_str().unwrap();
+        assert!(!summary.contains("posted inline"));
+        assert!(!summary.contains("posted as file-level"));
     }
 
     #[tokio::test]
@@ -4535,11 +8532,13 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/repos/owner/repo/pulls/1/reviews"))
             .respond_with(move |request: &wiremock::Request| {
-                captured
-                    .lock()
-                    .expect("capture lock")
-                    .push(request.body_json().expect("review body"));
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": 11}))
+                let body: serde_json::Value = request.body_json().expect("review body");
+                captured.lock().expect("capture lock").push(body.clone());
+                ResponseTemplate::new(200).set_body_json(published_review_response(
+                    &body,
+                    11,
+                    "aaaaaaaaaaaa",
+                ))
             })
             .mount(&server)
             .await;
@@ -4550,6 +8549,7 @@ mod tests {
             .post_review(
                 &envelope,
                 &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                None,
             )
             .await
             .expect("review posts");
@@ -4578,11 +8578,13 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/repos/owner/repo/pulls/1/reviews"))
             .respond_with(move |request: &wiremock::Request| {
-                captured
-                    .lock()
-                    .expect("capture lock")
-                    .push(request.body_json().expect("review body"));
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": 11}))
+                let body: serde_json::Value = request.body_json().expect("review body");
+                captured.lock().expect("capture lock").push(body.clone());
+                ResponseTemplate::new(200).set_body_json(published_review_response(
+                    &body,
+                    11,
+                    "aaaaaaaaaaaa",
+                ))
             })
             .mount(&server)
             .await;
@@ -4593,6 +8595,7 @@ mod tests {
             .post_review(
                 &envelope,
                 &delivery_snapshot("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"),
+                None,
             )
             .await
             .expect("review posts");

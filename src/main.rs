@@ -2,7 +2,9 @@ use clap::Parser;
 
 #[cfg(feature = "qualification-candidate")]
 use postil_cli::attribution;
-use postil_cli::cli::{Cli, Command, ForgeArg, HookAction, publication_enabled};
+use postil_cli::cli::{
+    Cli, Command, ForgeArg, HookAction, publication_enabled, publication_plan_contract_capability,
+};
 use postil_cli::config::{Config, qualification_metadata, starter_config};
 use postil_cli::review::{ForgeKind, ReviewArgs};
 use postil_cli::{doctor, hook, login, plan, respond, review};
@@ -22,6 +24,15 @@ async fn main() {
 
 async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
     match cli.command {
+        Command::Capabilities {
+            publication_plan_contract,
+        } => {
+            println!(
+                "{}",
+                publication_plan_contract_capability(&publication_plan_contract)?
+            );
+            Ok(0)
+        }
         Command::QualificationMetadata => {
             println!("{}", serde_json::to_string(&qualification_metadata())?);
             Ok(0)
@@ -54,6 +65,9 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
             publish,
             no_post,
             defer_gate_check,
+            publication_plan_output,
+            publication_generation,
+            publication_input_identity,
         } => {
             let local_mode = staged || base.is_some() || diff_file.is_some();
             let kind = match forge {
@@ -89,6 +103,9 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
                 bounded,
                 no_post: !publication_enabled(publish, no_post)?,
                 defer_gate_check,
+                publication_plan_output,
+                publication_generation,
+                publication_input_identity,
             })
             .await
         }

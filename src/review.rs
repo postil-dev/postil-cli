@@ -391,6 +391,9 @@ pub struct ReviewArgs {
     pub bounded: bool,
     pub no_post: bool,
     pub defer_gate_check: bool,
+    pub publication_plan_output: Option<PathBuf>,
+    pub publication_generation: Option<String>,
+    pub publication_input_identity: Option<String>,
 }
 
 impl ReviewArgs {
@@ -420,6 +423,19 @@ struct RemoteReviewInput<'a> {
     meta: &'a PrMeta,
     review_started: Instant,
     repository_source: RepositorySource<'a>,
+}
+
+struct RemoteReviewResult {
+    envelope: Envelope,
+    /// Complete pull-request diff retained for forge placement fallback. An
+    /// incremental review cannot establish the complete PR file surface.
+    publication_diff: Option<diff::Diff>,
+}
+
+#[derive(Clone, Copy)]
+struct PublicationContext<'a> {
+    snapshot: &'a PrMeta,
+    diff: Option<&'a diff::Diff>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -473,6 +489,47 @@ pub async fn run(args: ReviewArgs) -> Result<i32> {
     }
     if args.output_file.is_some() && args.resolved_output_format().is_none() {
         return Err(anyhow!("--output-file requires --output or --output-json"));
+    }
+    if args.publication_plan_output.is_some() {
+        anyhow::ensure!(
+            args.forge == ForgeKind::GitHub
+                && args.repo.is_some()
+                && args.pr.is_some()
+                && args.sha.is_some()
+                && args.base_sha.is_some()
+                && !args.staged
+                && args.base.is_none()
+                && args.diff_file.is_none(),
+            "--publication-plan-output requires a remote GitHub pull request with explicit --repo, --pr, --sha, and --base-sha"
+        );
+        anyhow::ensure!(
+            args.no_post
+                && args.check_run_id.is_none()
+                && args.gate_check_run_id.is_none()
+                && !args.defer_gate_check,
+            "--publication-plan-output cannot be combined with forge mutation options"
+        );
+        let generation = args
+            .publication_generation
+            .as_deref()
+            .context("--publication-plan-output requires --publication-generation")?;
+        crate::forge::ensure_publication_decimal_identifier("controller generation", generation)
+            .context("invalid --publication-generation")?;
+        let input_identity = args
+            .publication_input_identity
+            .as_deref()
+            .context("--publication-plan-output requires --publication-input-identity")?;
+        crate::forge::ensure_publication_sha256_identity("input identity", input_identity)
+            .context("invalid --publication-input-identity")?;
+    } else {
+        anyhow::ensure!(
+            args.publication_generation.is_none(),
+            "--publication-generation requires --publication-plan-output"
+        );
+        anyhow::ensure!(
+            args.publication_input_identity.is_none(),
+            "--publication-input-identity requires --publication-plan-output"
+        );
     }
     let mut cfg = Config::load(&cwd, args.config.as_deref())?;
     if let Some(m) = &args.model {
@@ -678,25 +735,13 @@ async fn run_remote<F: Forge>(
     )
     .await;
     match result {
-        Ok(envelope) => {
+        Ok(review) => {
+            let RemoteReviewResult {
+                envelope,
+                publication_diff,
+            } = review;
+            let (review_state, gate_state) = remote_check_states(&envelope);
             let check_completion = if let Some((a, g)) = &checks {
-                let gate_state = if envelope.gate.failing {
-                    CheckState::Failure
-                } else {
-                    CheckState::Success
-                };
-                // `postil/review` reports whether a review verdict exists. It
-                // fails when inference is operationally incomplete, independent
-                // of whether `postil/gate` is configured to stand aside.
-                let operational = envelope.findings.iter().any(|f| {
-                    f.path == crate::envelope::OPERATIONAL_PATH
-                        || f.path == crate::envelope::PROVIDER_PATH
-                });
-                let review_state = if operational {
-                    CheckState::Failure
-                } else {
-                    CheckState::Success
-                };
                 complete_remote_checks(
                     forge,
                     a,
@@ -723,7 +768,10 @@ async fn run_remote<F: Forge>(
                 envelope,
                 Some(forge),
                 Some(review_started),
-                Some(&meta),
+                Some(PublicationContext {
+                    snapshot: &meta,
+                    diff: publication_diff.as_ref(),
+                }),
                 strict_publication,
             )
             .await;
@@ -748,17 +796,13 @@ async fn run_remote<F: Forge>(
                 Some(&meta),
                 review_started.elapsed().as_millis() as u64,
             );
+            let (review_state, gate_state) = remote_check_states(&envelope);
             let check_completion = if let Some((a, g)) = &checks {
-                let gate_state = if envelope.gate.failing {
-                    CheckState::Failure
-                } else {
-                    CheckState::Success
-                };
                 complete_remote_checks(
                     forge,
                     a,
                     g,
-                    CheckState::Failure,
+                    review_state,
                     (!args.defer_gate_check).then_some(gate_state),
                     &envelope,
                     &meta,
@@ -784,7 +828,10 @@ async fn run_remote<F: Forge>(
                 envelope,
                 Some(forge),
                 Some(review_started),
-                Some(&meta),
+                Some(PublicationContext {
+                    snapshot: &meta,
+                    diff: None,
+                }),
                 strict_publication,
             )
             .await;
@@ -809,6 +856,24 @@ async fn run_remote<F: Forge>(
 
 fn strict_hosted_github_publication(args: &ReviewArgs) -> bool {
     crate::config::hosted_mode() && args.forge == ForgeKind::GitHub && !args.no_post
+}
+
+fn remote_check_states(envelope: &Envelope) -> (CheckState, CheckState) {
+    let operational = envelope.findings.iter().any(|finding| {
+        finding.path == crate::envelope::OPERATIONAL_PATH
+            || finding.path == crate::envelope::PROVIDER_PATH
+    });
+    let advisory = if operational {
+        CheckState::Failure
+    } else {
+        CheckState::Success
+    };
+    let gate = if envelope.gate.failing {
+        CheckState::Failure
+    } else {
+        CheckState::Success
+    };
+    (advisory, gate)
 }
 
 async fn require_current_snapshot<F: Forge>(
@@ -897,7 +962,7 @@ async fn remote_review<F: Forge>(
     forge: &F,
     repo: &str,
     input: RemoteReviewInput<'_>,
-) -> Result<Envelope> {
+) -> Result<RemoteReviewResult> {
     let RemoteReviewInput {
         meta,
         review_started,
@@ -976,7 +1041,9 @@ async fn remote_review<F: Forge>(
     } else {
         (diff_snapshot, scope, force_model)
     };
-    review_diff(
+    let publication_diff = matches!(scope, filter::ReconcileScope::Full { .. })
+        .then(|| diff::parse(diff_snapshot.as_str()));
+    let envelope = review_diff(
         cfg,
         args,
         ReviewInput {
@@ -992,7 +1059,11 @@ async fn remote_review<F: Forge>(
             repository_source,
         },
     )
-    .await
+    .await?;
+    Ok(RemoteReviewResult {
+        envelope,
+        publication_diff,
+    })
 }
 
 fn load_baseline(args: &ReviewArgs) -> Result<Vec<Finding>> {
@@ -2323,6 +2394,10 @@ async fn review_diff_at(
                                     preserve_unadjudicated_findings(all_adjudication_candidates)
                                 }
                             };
+                            suppress_fresh_unresolved_repository_claims(
+                                &mut application,
+                                fresh_candidate_count,
+                            );
                             for (candidate_index, finding) in application
                                 .kept_indices
                                 .iter()
@@ -2735,9 +2810,11 @@ async fn finish<F: Forge>(
     envelope: Envelope,
     forge: Option<&F>,
     hosted_budget_started_at: Option<Instant>,
-    expected_snapshot: Option<&PrMeta>,
+    publication: Option<PublicationContext<'_>>,
     strict_publication: bool,
 ) -> Result<i32> {
+    let publication_plan_to_stdout =
+        args.publication_plan_output.as_deref() == Some(Path::new("-"));
     // Persist artifacts before any forge I/O: a posting hiccup must not
     // discard the completed review's SARIF or envelope output.
     if let Some(path) = &args.sarif {
@@ -2746,18 +2823,70 @@ async fn finish<F: Forge>(
             .with_context(|| format!("writing SARIF to {}", path.display()))?;
     }
 
-    if let Some(format) = args.resolved_output_format() {
+    if let Some(format) = args.resolved_output_format()
+        && (args.output_file.is_some() || !publication_plan_to_stdout)
+    {
         output::write_envelope(&envelope, format, args.output_file.as_deref())?;
     }
-    if args.resolved_output_format().is_none() || args.output_file.is_some() {
+    if !publication_plan_to_stdout
+        && (args.resolved_output_format().is_none() || args.output_file.is_some())
+    {
         output::print_pretty(&envelope);
+    }
+
+    let duplicate_of_baseline = load_baseline(args)
+        .ok()
+        .is_some_and(|baseline| visible_finding_sets_equal(&baseline, &envelope.findings));
+    let intentional_no_comment = crate::forge::only_operational_findings(&envelope.findings)
+        || (!envelope.findings.is_empty() && envelope.findings.iter().all(filter::is_carried));
+    let should_comment = (!envelope.silent
+        || matches!(cfg.on_clean, crate::config::OnClean::Comment))
+        && !duplicate_of_baseline
+        && !intentional_no_comment;
+
+    if let Some(path) = &args.publication_plan_output {
+        let forge = forge.context("publication planning requires a GitHub forge")?;
+        let PublicationContext {
+            snapshot: expected_snapshot,
+            diff: publication_diff,
+        } = publication.context("publication planning is missing its immutable PR snapshot")?;
+        let (advisory, gate) = remote_check_states(&envelope);
+        let plan = forge
+            .build_publication_plan(crate::forge::GitHubPublicationPlanRequest {
+                controller_generation: args
+                    .publication_generation
+                    .as_deref()
+                    .context("publication planning is missing its generation identity")?,
+                input_identity: args
+                    .publication_input_identity
+                    .as_deref()
+                    .context("publication planning is missing its input identity")?,
+                envelope: &envelope,
+                snapshot: expected_snapshot,
+                publication_diff,
+                should_comment,
+                duplicate_of_baseline,
+                annotate_findings: cfg.finding_presentation
+                    == FindingPresentation::CheckAnnotations,
+                advisory,
+                gate,
+            })
+            .await?;
+        if publication_plan_to_stdout {
+            crate::forge::write_github_publication_plan_to_writer(std::io::stdout().lock(), &plan)?;
+        } else {
+            crate::forge::write_github_publication_plan(path, &plan)?;
+        }
+        return Ok(if envelope.gate.failing { 1 } else { 0 });
     }
 
     if let Some(forge) = forge
         && !args.no_post
     {
-        let expected_snapshot =
-            expected_snapshot.context("remote publication is missing its immutable PR snapshot")?;
+        let PublicationContext {
+            snapshot: expected_snapshot,
+            diff: publication_diff,
+        } = publication.context("remote publication is missing its immutable PR snapshot")?;
         if cfg.finding_presentation == FindingPresentation::CheckAnnotations {
             let mut receipt = forge.plan_review_publication(&envelope, expected_snapshot);
             receipt.channel = crate::forge::ReviewPublicationChannel::CheckAnnotations;
@@ -2772,15 +2901,6 @@ async fn finish<F: Forge>(
             crate::forge::write_review_publication_receipt_from_env(&receipt)?;
             return Ok(if envelope.gate.failing { 1 } else { 0 });
         }
-        let duplicate_of_baseline = load_baseline(args)
-            .ok()
-            .is_some_and(|baseline| visible_finding_sets_equal(&baseline, &envelope.findings));
-        let intentional_no_comment = crate::forge::only_operational_findings(&envelope.findings)
-            || (!envelope.findings.is_empty() && envelope.findings.iter().all(filter::is_carried));
-        let should_comment = (!envelope.silent
-            || matches!(cfg.on_clean, crate::config::OnClean::Comment))
-            && !duplicate_of_baseline
-            && !intentional_no_comment;
         if !should_comment {
             let mut receipt = forge.plan_review_publication(&envelope, expected_snapshot);
             if duplicate_of_baseline {
@@ -2788,6 +2908,7 @@ async fn finish<F: Forge>(
                     if matches!(
                         finding.initial_outcome,
                         crate::forge::FindingPublicationOutcome::Inline
+                            | crate::forge::FindingPublicationOutcome::FileComment
                             | crate::forge::FindingPublicationOutcome::SummaryOnly
                     ) {
                         finding.initial_outcome = crate::forge::FindingPublicationOutcome::Carried;
@@ -2832,7 +2953,7 @@ async fn finish<F: Forge>(
         let posted = run_with_hosted_budget(
             hosted_budget_started_at,
             REVIEW_POST_TIMEOUT_SECS,
-            forge.post_review(&envelope, expected_snapshot),
+            forge.post_review(&envelope, expected_snapshot, publication_diff),
             "posting review comment",
         )
         .await;
@@ -3004,9 +3125,41 @@ fn preserve_unadjudicated_findings(
     crate::adjudication::AdjudicationApplication {
         kept_indices: (0..findings.len()).collect(),
         kept: findings,
+        unresolved_indices: Vec::new(),
         resolved_indices: Vec::new(),
         suppressed: Vec::new(),
     }
+}
+
+fn suppress_fresh_unresolved_repository_claims(
+    application: &mut crate::adjudication::AdjudicationApplication,
+    fresh_candidate_count: usize,
+) {
+    let mut kept = Vec::with_capacity(application.kept.len());
+    let mut kept_indices = Vec::with_capacity(application.kept_indices.len());
+    for (candidate_index, finding) in application
+        .kept_indices
+        .drain(..)
+        .zip(application.kept.drain(..))
+    {
+        let unsupported = candidate_index < fresh_candidate_count
+            && application.unresolved_indices.contains(&candidate_index)
+            && finding.repository_claim.is_some();
+        if unsupported {
+            application.suppressed.push(SuppressedFinding {
+                finding,
+                reason: SuppressionReason::RepositoryClaimUnsupported,
+            });
+        } else {
+            kept_indices.push(candidate_index);
+            kept.push(finding);
+        }
+    }
+    application.kept = kept;
+    application.kept_indices = kept_indices;
+    application
+        .unresolved_indices
+        .retain(|index| application.kept_indices.contains(index));
 }
 
 fn error_envelope(
@@ -3745,6 +3898,57 @@ mod tests {
         assert!(!baseline_has_carryable_findings(&[
             crate::envelope::provider_error_finding("fixture provider failure"),
         ]));
+    }
+
+    #[test]
+    fn only_fresh_unresolved_repository_claims_are_suppressed() {
+        let claim = RepositoryClaim {
+            kind: RepositoryClaimKind::Absence,
+            resources: vec!["widget".into()],
+            values: vec![],
+            versions: vec![],
+            paths: vec![],
+            identifiers: vec![],
+        };
+        let mut fresh_repository_claim = finding("src/fresh.rs", 1, "widget is absent");
+        fresh_repository_claim.repository_claim = Some(claim.clone());
+        let fresh_local_finding = finding("src/local.rs", 2, "authorization is bypassed");
+        let mut baseline_repository_claim = finding("src/baseline.rs", 3, "widget is absent");
+        baseline_repository_claim.repository_claim = Some(claim);
+        let mut application = crate::adjudication::AdjudicationApplication {
+            kept: vec![
+                fresh_repository_claim.clone(),
+                fresh_local_finding.clone(),
+                baseline_repository_claim.clone(),
+            ],
+            kept_indices: vec![0, 1, 2],
+            unresolved_indices: vec![0, 1, 2],
+            resolved_indices: vec![],
+            suppressed: vec![],
+        };
+
+        suppress_fresh_unresolved_repository_claims(&mut application, 2);
+
+        assert_eq!(application.kept_indices, vec![1, 2]);
+        assert_eq!(application.unresolved_indices, vec![1, 2]);
+        assert_eq!(application.kept.len(), 2);
+        assert!(same_visible_finding(
+            &application.kept[0],
+            &fresh_local_finding
+        ));
+        assert!(same_visible_finding(
+            &application.kept[1],
+            &baseline_repository_claim
+        ));
+        assert_eq!(application.suppressed.len(), 1);
+        assert!(same_visible_finding(
+            &application.suppressed[0].finding,
+            &fresh_repository_claim
+        ));
+        assert_eq!(
+            application.suppressed[0].reason,
+            SuppressionReason::RepositoryClaimUnsupported
+        );
     }
 
     #[test]

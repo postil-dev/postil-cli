@@ -11,6 +11,9 @@ use serde_json::{Value, json};
 use wiremock::matchers::{body_string_contains, header, method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer as WireMockServer, Request, Respond, ResponseTemplate};
 
+const PUBLICATION_INPUT_IDENTITY: &str =
+    "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+
 struct MockServer(WireMockServer);
 
 impl std::ops::Deref for MockServer {
@@ -118,6 +121,43 @@ impl Respond for DefaultAdjudicator {
         } else {
             ResponseTemplate::new(200).set_body_json(scorer_text(&content))
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RefuteFromReceiptAdjudicator;
+
+impl Respond for RefuteFromReceiptAdjudicator {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let request_body: Value = request.body_json().unwrap();
+        let payload: Value = serde_json::from_str(
+            request_body["messages"]
+                .as_array()
+                .and_then(|messages| messages.last())
+                .and_then(|message| message["content"].as_str())
+                .unwrap(),
+        )
+        .unwrap();
+        let candidate = payload["candidates"].as_array().unwrap().first().unwrap();
+        let candidate_id = candidate["candidateId"].as_str().unwrap();
+        let evidence = payload["diffCorpusReceipt"]["candidateCitations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|receipt| receipt["candidateId"] == candidate_id)
+            .and_then(|receipt| receipt["refutationEvidence"]["source"].as_str())
+            .expect("repository claim fixture must expose exact replacement evidence");
+        ResponseTemplate::new(200).set_body_json(scorer_text(
+            &json!([{
+                "candidateId": candidate_id,
+                "status": "refuted",
+                "revisedTitle": "",
+                "revisedBody": "",
+                "evidence": evidence,
+                "duplicateOf": null
+            }])
+            .to_string(),
+        ))
     }
 }
 
@@ -640,7 +680,14 @@ struct ReconciledReviewListResponder {
 }
 
 #[derive(Clone)]
-struct PublishedReviewResponder;
+struct PublishedReviewResponder {
+    comments: Arc<Mutex<Vec<Value>>>,
+}
+
+#[derive(Clone)]
+struct PublishedReviewCommentsResponder {
+    comments: Arc<Mutex<Vec<Value>>>,
+}
 
 struct OutputBudgetResponder;
 
@@ -848,15 +895,32 @@ impl Respond for PublishedReviewResponder {
                 json!({
                     "id": 500 + index,
                     "body": comment["body"],
+                    "commit_id": request_body["commit_id"],
                 })
             })
             .collect::<Vec<_>>();
+        *self.comments.lock().unwrap() = comments;
         ResponseTemplate::new(200).set_body_json(json!({
             "id": 77,
             "commit_id": request_body["commit_id"],
-            "comments": comments,
         }))
     }
+}
+
+impl Respond for PublishedReviewCommentsResponder {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(self.comments.lock().unwrap().clone())
+    }
+}
+
+fn published_review_responders() -> (PublishedReviewResponder, PublishedReviewCommentsResponder) {
+    let comments = Arc::new(Mutex::new(Vec::new()));
+    (
+        PublishedReviewResponder {
+            comments: Arc::clone(&comments),
+        },
+        PublishedReviewCommentsResponder { comments },
+    )
 }
 
 async fn mount_github_complete_diff(server: &MockServer, pr: u64) {
@@ -1170,6 +1234,349 @@ async fn remote_review_without_publish_never_mutates_github_even_in_hosted_ci() 
         }),
         "remote review without --publish attempted a GitHub mutation: {requests:?}"
     );
+}
+
+#[tokio::test]
+async fn github_publication_plan_is_byte_stable_private_and_never_mutates_the_forge() {
+    let server = MockServer::start().await;
+    mount_github_complete_diff(&server, 7).await;
+    mount_static_github_pr(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7/comments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+    let directory = tempfile::tempdir().unwrap();
+    disable_review_for_hosted_publication(directory.path(), true);
+    let first_plan_name = "publication-plan-1.json";
+    let first_plan = directory.path().join(first_plan_name);
+    let second_plan = directory.path().join("publication-plan-2.json");
+    let second_envelope = directory.path().join("publication-plan-2.envelope.json");
+
+    for (plan_path, envelope_path) in [
+        (
+            std::path::Path::new(first_plan_name),
+            std::path::Path::new("publication-plan-1.envelope.json"),
+        ),
+        (second_plan.as_path(), second_envelope.as_path()),
+    ] {
+        postil()
+            .current_dir(directory.path())
+            .env("GITHUB_API_URL", server.uri())
+            .env("GITHUB_TOKEN", "gh-test-token")
+            .env("POSTIL_EXPECTED_GITHUB_REPO_ID", "42")
+            .args([
+                "review",
+                "--repo",
+                "acme/api",
+                "--pr",
+                "7",
+                "--sha",
+                "aaaaaaaa",
+                "--base-sha",
+                "bbbbbbbb",
+                "--publication-plan-output",
+            ])
+            .arg(plan_path)
+            .args(["--publication-generation", "1"])
+            .args(["--publication-input-identity", PUBLICATION_INPUT_IDENTITY])
+            .args(["--output", "json", "--output-file"])
+            .arg(envelope_path)
+            .assert()
+            .code(0);
+    }
+
+    let first = std::fs::read(&first_plan).unwrap();
+    let second = std::fs::read(&second_plan).unwrap();
+    assert_eq!(first, second);
+    let piped = postil()
+        .current_dir(directory.path())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .env("POSTIL_EXPECTED_GITHUB_REPO_ID", "42")
+        .args([
+            "review",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--sha",
+            "aaaaaaaa",
+            "--base-sha",
+            "bbbbbbbb",
+            "--publication-plan-output",
+            "-",
+            "--publication-generation",
+            "1",
+            "--publication-input-identity",
+            PUBLICATION_INPUT_IDENTITY,
+            "--output",
+            "json",
+        ])
+        .assert()
+        .code(0)
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(piped, first);
+    assert_eq!(piped.last(), Some(&b'\n'));
+    assert!(!directory.path().join("-").exists());
+    for envelope_path in [
+        directory.path().join("publication-plan-1.envelope.json"),
+        second_envelope,
+    ] {
+        assert!(
+            !std::fs::read_to_string(envelope_path)
+                .unwrap()
+                .contains(PUBLICATION_INPUT_IDENTITY),
+            "the service-supplied input identity must remain private to the plan artifact"
+        );
+    }
+    assert!(!std::fs::read_dir(directory.path()).unwrap().any(|entry| {
+        let name = entry.unwrap().file_name();
+        let name = name.to_string_lossy();
+        name.starts_with(".publication-plan-1.json.") && name.ends_with(".tmp")
+    }));
+    let plan: Value = serde_json::from_slice(&first).unwrap();
+    assert_eq!(plan["version"], 1);
+    assert_eq!(plan["forge"], "github");
+    assert_eq!(plan["controllerGeneration"], "1");
+    assert_eq!(plan["inputIdentity"], PUBLICATION_INPUT_IDENTITY);
+    assert_eq!(
+        plan["lifecycleReceipt"]["inputIdentity"],
+        PUBLICATION_INPUT_IDENTITY
+    );
+    assert!(
+        plan["reviewOutputDigest"]
+            .as_str()
+            .is_some_and(|digest| digest.starts_with("sha256:") && digest.len() == 71)
+    );
+    assert_eq!(plan["repository"]["id"], "42");
+    assert_eq!(plan["repository"]["fullName"], "acme/api");
+    assert_eq!(plan["pullRequestNumber"], "7");
+    assert_eq!(plan["reviewedSnapshot"]["headSha"], "aaaaaaaa");
+    assert_eq!(plan["reviewedSnapshot"]["mergeBaseSha"], "bbbbbbbb");
+    assert_eq!(plan["reviewedSnapshot"]["targetSha"], "bbbbbbbb");
+    assert!(
+        plan["intentDigest"]
+            .as_str()
+            .is_some_and(|digest| digest.starts_with("sha256:") && digest.len() == 71)
+    );
+    assert_eq!(
+        plan["operationCount"],
+        plan["operations"].as_array().unwrap().len()
+    );
+    assert!(
+        plan["operationManifestDigest"]
+            .as_str()
+            .is_some_and(|digest| digest.starts_with("sha256:") && digest.len() == 71)
+    );
+    assert_eq!(plan["operations"][0]["kind"], "advisoryCheckCreate");
+    assert_eq!(plan["operations"][0]["name"], "postil/review");
+    assert_eq!(plan["operations"][1]["kind"], "reviewCreate");
+    assert_eq!(plan["operations"][1]["attempt"], "initial");
+    assert_eq!(plan["operations"][2]["kind"], "reviewSummaryUpdate");
+    assert_eq!(plan["operations"][3]["kind"], "advisoryCheckComplete");
+    assert_eq!(plan["operations"][3]["name"], "postil/review");
+    assert_eq!(plan["operations"][3]["conclusion"], "success");
+    assert_eq!(
+        plan["operations"][3]["createdCheck"]["dependencyOperationKey"],
+        plan["operations"][0]["operationKey"]
+    );
+    assert_eq!(
+        plan["operations"][3]["dependencies"],
+        json!([
+            plan["operations"][0]["operationKey"].clone(),
+            plan["operations"][2]["operationKey"].clone()
+        ])
+    );
+    assert!(
+        plan["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|operation| {
+                operation["kind"] != "gateCheck" && operation["name"] != "postil/gate"
+            })
+    );
+    assert_eq!(plan["gateAnalysis"]["ownership"], "service");
+    assert_eq!(plan["gateAnalysis"]["authoritative"], false);
+    assert_eq!(plan["gateAnalysis"]["organizationGateModeRequired"], true);
+    assert_eq!(plan["gateAnalysis"]["name"], "postil/gate");
+    assert_eq!(plan["gateAnalysis"]["analyzedConclusion"], "success");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&first_plan).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    let planning_requests = server.received_requests().await.unwrap();
+    assert!(
+        planning_requests.iter().all(|request| {
+            !matches!(
+                request.method,
+                wiremock::http::Method::POST
+                    | wiremock::http::Method::PATCH
+                    | wiremock::http::Method::PUT
+                    | wiremock::http::Method::DELETE
+            )
+        }),
+        "publication planning attempted a GitHub mutation: {planning_requests:?}"
+    );
+
+    mount_successful_hosted_check_patches(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/repos/acme/api/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": 77,
+            "commit_id": "aaaaaaaa"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    postil()
+        .current_dir(directory.path())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .args([
+            "review",
+            "--publish",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--sha",
+            "aaaaaaaa",
+            "--base-sha",
+            "bbbbbbbb",
+            "--check-run-id",
+            "901",
+            "--gate-check-run-id",
+            "902",
+            "--output",
+            "json",
+            "--output-file",
+        ])
+        .arg(directory.path().join("published-envelope.json"))
+        .assert()
+        .code(0);
+    let all_requests = server.received_requests().await.unwrap();
+    assert!(all_requests.iter().any(|request| {
+        matches!(
+            request.method,
+            wiremock::http::Method::POST
+                | wiremock::http::Method::PATCH
+                | wiremock::http::Method::PUT
+                | wiremock::http::Method::DELETE
+        )
+    }));
+}
+
+#[test]
+fn publication_plan_capability_probe_is_exact_and_external_io_free() {
+    let directory = tempfile::tempdir().unwrap();
+    postil()
+        .current_dir(directory.path())
+        .env("POSTIL_API_BASE", "http://127.0.0.1:1")
+        .env("GITHUB_API_URL", "http://127.0.0.1:1")
+        .args([
+            "capabilities",
+            "--publication-plan-contract",
+            "github-publication-v1",
+        ])
+        .assert()
+        .code(0)
+        .stdout("github-publication-v1\n")
+        .stderr("");
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+
+    postil()
+        .current_dir(directory.path())
+        .env("POSTIL_API_BASE", "http://127.0.0.1:1")
+        .env("GITHUB_API_URL", "http://127.0.0.1:1")
+        .args([
+            "capabilities",
+            "--publication-plan-contract",
+            "github-publication-v2",
+        ])
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr(predicates::str::contains(
+            "supported contract: github-publication-v1",
+        ));
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn publication_plan_rejects_non_github_and_local_review_modes_before_io() {
+    let directory = tempfile::tempdir().unwrap();
+    for extra in [vec!["--forge", "gitlab"], vec!["--staged"]] {
+        let mut command = postil();
+        command.current_dir(directory.path()).args([
+            "review",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--sha",
+            "aaaaaaaa",
+            "--base-sha",
+            "bbbbbbbb",
+            "--publication-plan-output",
+            "publication-plan.json",
+            "--publication-generation",
+            "1",
+            "--publication-input-identity",
+            PUBLICATION_INPUT_IDENTITY,
+        ]);
+        command
+            .args(extra)
+            .assert()
+            .code(2)
+            .stderr(predicates::str::contains(
+                "requires a remote GitHub pull request",
+            ));
+    }
+
+    for invalid_identity in [
+        "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "sha256:1",
+        "not-a-digest",
+    ] {
+        postil()
+            .current_dir(directory.path())
+            .args([
+                "review",
+                "--repo",
+                "acme/api",
+                "--pr",
+                "7",
+                "--sha",
+                "aaaaaaaa",
+                "--base-sha",
+                "bbbbbbbb",
+                "--publication-plan-output",
+                "publication-plan.json",
+                "--publication-generation",
+                "1",
+                "--publication-input-identity",
+                invalid_identity,
+            ])
+            .assert()
+            .code(2)
+            .stderr(predicates::str::contains(
+                "invalid --publication-input-identity",
+            ));
+    }
 }
 
 #[test]
@@ -2689,9 +3096,10 @@ async fn adjudication_provider_failure_preserves_findings_and_baseline_blocker()
         &server,
         json!([{
             "path": "src/auth.rs", "line": 42, "severity": "warn", "kind": "risk",
-            "confidence": 0.99, "title": "Validate query input",
-            "body": "The query executes attacker-controlled input without validation.",
-            "evidence": "exec_query(&token);"
+            "confidence": 0.99, "title": "Authorization validator is absent",
+            "body": "The repository does not contain `validate_query_input`.",
+            "evidence": "exec_query(&token);",
+            "repositoryContext": {"claim": "absence", "identifiers": ["validate_query_input"]}
         }]),
     )
     .await;
@@ -2754,7 +3162,7 @@ async fn adjudication_provider_failure_preserves_findings_and_baseline_blocker()
             .as_array()
             .unwrap()
             .iter()
-            .any(|finding| { finding["title"] == "Validate query input" })
+            .any(|finding| { finding["title"] == "Authorization validator is absent" })
     );
     assert!(
         envelope["findings"]
@@ -2803,9 +3211,10 @@ async fn malformed_adjudication_output_blocks_under_advisory_provider_policy() {
         &server,
         json!([{
             "path": "src/auth.rs", "line": 42, "severity": "warn", "kind": "risk",
-            "confidence": 0.99, "title": "Validate query input",
-            "body": "The query executes attacker-controlled input without validation.",
-            "evidence": "exec_query(&token);"
+            "confidence": 0.99, "title": "Authorization validator is absent",
+            "body": "The repository does not contain `validate_query_input`.",
+            "evidence": "exec_query(&token);",
+            "repositoryContext": {"claim": "absence", "identifiers": ["validate_query_input"]}
         }]),
     )
     .await;
@@ -2834,7 +3243,8 @@ async fn malformed_adjudication_output_blocks_under_advisory_provider_policy() {
             .unwrap()
             .iter()
             .any(|finding| {
-                finding["path"] == "src/auth.rs" && finding["title"] == "Validate query input"
+                finding["path"] == "src/auth.rs"
+                    && finding["title"] == "Authorization validator is absent"
             })
     );
     assert!(
@@ -10270,7 +10680,7 @@ async fn hosted_silent_review_does_not_require_a_later_comment_freshness_check()
 }
 
 #[tokio::test]
-async fn github_unresolved_inline_line_falls_back_once_to_summary_only() {
+async fn github_unresolved_inline_line_retries_on_a_changed_line() {
     let server = MockServer::start().await;
     mount_github_complete_diff(&server, 7).await;
     Mock::given(method("POST"))
@@ -10316,19 +10726,47 @@ async fn github_unresolved_inline_line_falls_back_once_to_summary_only() {
         .with_priority(1)
         .mount(&server)
         .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (published_review, published_comments) = published_review_responders();
     Mock::given(method("POST"))
         .and(path("/repos/acme/api/pulls/7/reviews"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .respond_with(published_review)
         .with_priority(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7/reviews/77/comments"))
+        .and(query_param("per_page", "100"))
+        .and(query_param("page", "1"))
+        .respond_with(published_comments)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/repos/acme/api/pulls/7/reviews/77"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(1)
         .mount(&server)
         .await;
 
     let dir = tempfile::tempdir().unwrap();
+    let receipt_name = "publication-receipt.json";
+    let receipt_path = dir.path().join(receipt_name);
     let out = postil()
         .current_dir(dir.path())
         .env("POSTIL_API_BASE", server.uri())
         .env("GITHUB_API_URL", server.uri())
         .env("GITHUB_TOKEN", "gh-test-token")
+        .env(
+            "POSTIL_DETAILS_URL",
+            "https://postil.dev/orgs/acme/runs/run-1",
+        )
+        .env("POSTIL_PUBLICATION_RECEIPT_PATH", receipt_name)
         .args([
             "review",
             "--publish",
@@ -10343,7 +10781,7 @@ async fn github_unresolved_inline_line_falls_back_once_to_summary_only() {
 
     let stderr = String::from_utf8_lossy(&out.get_output().stderr);
     assert!(stderr.contains("category=unresolved-line"));
-    assert!(stderr.contains("recovery=summary-only"));
+    assert!(stderr.contains("recovery=placement-ladder"));
     let requests = server.received_requests().await.unwrap();
     let review_bodies = requests
         .iter()
@@ -10355,7 +10793,41 @@ async fn github_unresolved_inline_line_falls_back_once_to_summary_only() {
         .collect::<Vec<_>>();
     assert_eq!(review_bodies.len(), 2);
     assert!(review_bodies[0].get("comments").is_some());
-    assert!(review_bodies[1].get("comments").is_none());
+    let fallback_comments = review_bodies[1]["comments"].as_array().unwrap();
+    assert_eq!(fallback_comments.len(), 1);
+    assert_eq!(fallback_comments[0]["path"], "src/auth.rs");
+    assert_eq!(fallback_comments[0]["line"], 41);
+    assert_eq!(fallback_comments[0]["side"], "RIGHT");
+    assert!(fallback_comments[0].get("start_line").is_none());
+    assert!(
+        !review_bodies[1]["body"]
+            .as_str()
+            .unwrap()
+            .contains("inline placement unavailable")
+    );
+    let receipt: Value = serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+    assert_eq!(receipt["version"], 2);
+    assert_eq!(receipt["channel"], "reviewComments");
+    assert_eq!(receipt["reviewId"], "77");
+    assert_eq!(receipt["findings"][0]["initialOutcome"], "inline");
+    assert_eq!(receipt["findings"][0]["commentId"], "500");
+    assert!(!std::fs::read_dir(dir.path()).unwrap().any(|entry| {
+        let name = entry.unwrap().file_name();
+        let name = name.to_string_lossy();
+        name.starts_with(".publication-receipt.json.") && name.ends_with(".tmp")
+    }));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&receipt_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
 }
 
 #[tokio::test]
@@ -10522,9 +10994,18 @@ async fn github_flow_posts_review_and_completes_both_checks() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
         .mount(&server)
         .await;
+    let (published_review, published_comments) = published_review_responders();
     Mock::given(method("POST"))
         .and(path("/repos/acme/api/pulls/7/reviews"))
-        .respond_with(PublishedReviewResponder)
+        .respond_with(published_review)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7/reviews/77/comments"))
+        .and(query_param("per_page", "100"))
+        .and(query_param("page", "1"))
+        .respond_with(published_comments)
+        .expect(2)
         .mount(&server)
         .await;
     Mock::given(method("PUT"))
@@ -11339,7 +11820,198 @@ async fn full_rereview_resolves_false_absence_from_unchanged_repository_source()
 }
 
 #[tokio::test]
-async fn fresh_repository_claims_remain_open_for_unavailable_and_exhausted_receipts() {
+async fn same_hunk_groups_replacement_refutes_false_deletion_claim() {
+    const PATH: &str = "ansible/group_vars/atlas.yml";
+    const OLD_LINE: &str = "groups: [atlas_packages_base]";
+    const REPLACEMENT: &str = "groups: [atlas_packages_base, atlas_packages_test]";
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("single finding adjudicator"))
+        .respond_with(RefuteFromReceiptAdjudicator)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    mock_review(
+        &server,
+        json!([{
+            "path": PATH,
+            "line": 120,
+            "severity": "warn",
+            "kind": "uncertainty",
+            "confidence": 0.91,
+            "title": "The groups entry was deleted",
+            "body": "The `groups` entry was deleted without its replacement `atlas_packages_test`.",
+            "evidence": "policy: atlas",
+            "repositoryContext": {
+                "claim": "mismatch",
+                "resources": ["groups"],
+                "values": ["atlas_packages_test"],
+                "versions": [],
+                "paths": [],
+                "identifiers": []
+            }
+        }]),
+    )
+    .await;
+
+    let directory = tempfile::tempdir().unwrap();
+    let diff = directory.path().join("groups-replacement.diff");
+    std::fs::write(
+        &diff,
+        format!(
+            "diff --git a/{PATH} b/{PATH}\n--- a/{PATH}\n+++ b/{PATH}\n@@ -120,4 +120,4 @@\n-policy: legacy\n+policy: atlas\n stable: true\n owner: atlas\n-{OLD_LINE}\n+{REPLACEMENT}\n"
+        ),
+    )
+    .unwrap();
+
+    let output = postil()
+        .current_dir(directory.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+    let envelope: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+
+    assert_eq!(envelope["findings"], json!([]));
+    assert_eq!(envelope["suppressedFindings"][0]["finding"]["path"], PATH);
+    assert_eq!(
+        envelope["suppressedFindings"][0]["finding"]["title"],
+        "The groups entry was deleted"
+    );
+    assert_eq!(envelope["suppressedFindings"][0]["reason"], "nonActionable");
+    assert_eq!(envelope["counts"]["warn"], 0);
+    assert_eq!(envelope["counts"]["suppressed"], 1);
+    assert_eq!(envelope["gate"]["failing"], false);
+
+    let requests = server.received_requests().await.unwrap();
+    let adjudication: Value = requests
+        .iter()
+        .find(|request| request_system_contains(request, "single finding adjudicator"))
+        .unwrap()
+        .body_json()
+        .unwrap();
+    let payload: Value = serde_json::from_str(
+        adjudication["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        payload["diffCorpusReceipt"]["candidateCitations"][0]["refutationEvidenceComplete"],
+        true
+    );
+    assert_eq!(
+        payload["diffCorpusReceipt"]["candidateCitations"][0]["refutationEvidence"]["source"],
+        REPLACEMENT
+    );
+}
+
+#[tokio::test]
+async fn cross_file_package_existence_refutes_false_absence_claim() {
+    const CLAIM_PATH: &str = "ci/package-policy.yml";
+    const PACKAGE_PATH: &str = "packages/atlas/manifest.yml";
+    const REPLACEMENT: &str = "name: atlas_packages_base";
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("single finding adjudicator"))
+        .respond_with(RefuteFromReceiptAdjudicator)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    mock_review(
+        &server,
+        json!([{
+            "path": CLAIM_PATH,
+            "line": 24,
+            "severity": "warn",
+            "kind": "uncertainty",
+            "confidence": 0.88,
+            "title": "The atlas package is absent",
+            "body": "The repository does not contain `atlas_packages_base`.",
+            "evidence": "package: atlas_packages_candidate",
+            "repositoryContext": {
+                "claim": "absence",
+                "resources": ["atlas package"],
+                "values": ["atlas_packages_base"],
+                "versions": [],
+                "paths": [],
+                "identifiers": []
+            }
+        }]),
+    )
+    .await;
+
+    let directory = tempfile::tempdir().unwrap();
+    let diff = directory.path().join("package-existence.diff");
+    std::fs::write(
+        &diff,
+        format!(
+            "diff --git a/{CLAIM_PATH} b/{CLAIM_PATH}\n--- a/{CLAIM_PATH}\n+++ b/{CLAIM_PATH}\n@@ -24,1 +24,1 @@\n-package: atlas_packages_legacy\n+package: atlas_packages_candidate\ndiff --git a/{PACKAGE_PATH} b/{PACKAGE_PATH}\n--- a/{PACKAGE_PATH}\n+++ b/{PACKAGE_PATH}\n@@ -1,2 +1,2 @@\n-type: legacy package\n-name: atlas_packages_legacy\n+type: atlas package\n+{REPLACEMENT}\n"
+        ),
+    )
+    .unwrap();
+
+    let output = postil()
+        .current_dir(directory.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+    let envelope: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+
+    assert_eq!(envelope["findings"], json!([]));
+    assert_eq!(
+        envelope["suppressedFindings"][0]["finding"]["path"],
+        CLAIM_PATH
+    );
+    assert_eq!(
+        envelope["suppressedFindings"][0]["finding"]["title"],
+        "The atlas package is absent"
+    );
+    assert_eq!(envelope["suppressedFindings"][0]["reason"], "nonActionable");
+    assert_eq!(envelope["counts"]["warn"], 0);
+    assert_eq!(envelope["counts"]["suppressed"], 1);
+    assert_eq!(envelope["gate"]["failing"], false);
+
+    let requests = server.received_requests().await.unwrap();
+    let adjudication: Value = requests
+        .iter()
+        .find(|request| request_system_contains(request, "single finding adjudicator"))
+        .unwrap()
+        .body_json()
+        .unwrap();
+    let payload: Value = serde_json::from_str(
+        adjudication["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        payload["diffCorpusReceipt"]["candidateCitations"][0]["refutationEvidenceComplete"],
+        true
+    );
+    assert_eq!(
+        payload["diffCorpusReceipt"]["candidateCitations"][0]["refutationEvidence"]["path"],
+        PACKAGE_PATH
+    );
+    assert_eq!(
+        payload["diffCorpusReceipt"]["candidateCitations"][0]["refutationEvidence"]["source"],
+        REPLACEMENT
+    );
+}
+
+#[tokio::test]
+async fn fresh_unresolved_repository_claims_are_suppressed() {
     for (name, repository, resources, state) in [
         (
             "unavailable",
@@ -11378,15 +12050,12 @@ async fn fresh_repository_claims_remain_open_for_unavailable_and_exhausted_recei
             command.arg("--diff-file").arg(&diff);
         }
         command.args(["--output", "json"]);
-        let out = command.assert().code(1);
+        let out = command.assert().code(0);
         let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
         assert_eq!(envelope["repositorySearch"]["state"], state, "{name}");
-        assert_eq!(envelope["counts"]["suppressed"], 0, "{name}");
-        assert_eq!(
-            envelope["findings"][0]["title"], "Widget dependency is absent",
-            "{name}"
-        );
-        assert_eq!(envelope["gate"]["failing"], true, "{name}");
+        assert_eq!(envelope["counts"]["suppressed"], 1, "{name}");
+        assert_eq!(envelope["findings"], json!([]), "{name}");
+        assert_eq!(envelope["gate"]["failing"], false, "{name}");
     }
 }
 

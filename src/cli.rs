@@ -56,6 +56,12 @@ pub enum ForgeArg {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)] // Review carries the full flag set by design.
 pub enum Command {
+    /// Probe machine-readable CLI capabilities without external access.
+    Capabilities {
+        /// Require and print an exact publication-plan contract identifier.
+        #[arg(long, value_name = "IDENTIFIER")]
+        publication_plan_contract: String,
+    },
     /// Print immutable qualification metadata embedded in this binary.
     #[command(hide = true)]
     QualificationMetadata,
@@ -141,6 +147,44 @@ pub enum Command {
         /// Leave the merge-gate check pending for a controlling service to complete.
         #[arg(long, requires = "publish")]
         defer_gate_check: bool,
+        /// Write an immutable GitHub publication plan without mutating the forge.
+        #[arg(
+            long,
+            hide = true,
+            value_name = "PATH",
+            requires_all = [
+                "repo",
+                "pr",
+                "sha",
+                "base_sha",
+                "publication_generation",
+                "publication_input_identity"
+            ],
+            conflicts_with_all = [
+                "publish",
+                "no_post",
+                "check_run_id",
+                "gate_check_run_id",
+                "defer_gate_check"
+            ]
+        )]
+        publication_plan_output: Option<PathBuf>,
+        /// Service-owned generation identity for publication planning.
+        #[arg(
+            long,
+            hide = true,
+            value_name = "IDENTITY",
+            requires = "publication_plan_output"
+        )]
+        publication_generation: Option<String>,
+        /// Service-supplied immutable input identity for publication planning.
+        #[arg(
+            long,
+            hide = true,
+            value_name = "SHA256",
+            requires = "publication_plan_output"
+        )]
+        publication_input_identity: Option<String>,
     },
     /// Reply to an @postil mention on a pull request or issue (interactive bot).
     Respond {
@@ -214,6 +258,15 @@ pub enum Command {
     Logout,
 }
 
+pub fn publication_plan_contract_capability(required: &str) -> anyhow::Result<&'static str> {
+    anyhow::ensure!(
+        required == crate::forge::GITHUB_PUBLICATION_PLAN_CONTRACT,
+        "unsupported publication-plan contract {required:?}; supported contract: {}",
+        crate::forge::GITHUB_PUBLICATION_PLAN_CONTRACT
+    );
+    Ok(crate::forge::GITHUB_PUBLICATION_PLAN_CONTRACT)
+}
+
 #[derive(Subcommand)]
 pub enum HookAction {
     /// Install a pre-push hook that reviews outgoing commits.
@@ -227,7 +280,33 @@ pub enum HookAction {
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::{Cli, Command};
+    use super::{Cli, Command, publication_plan_contract_capability};
+
+    const PUBLICATION_INPUT_IDENTITY: &str =
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+
+    #[test]
+    fn publication_plan_capability_requires_the_exact_contract() {
+        let parsed = Cli::try_parse_from([
+            "postil",
+            "capabilities",
+            "--publication-plan-contract",
+            "github-publication-v1",
+        ])
+        .unwrap();
+        let Command::Capabilities {
+            publication_plan_contract,
+        } = parsed.command
+        else {
+            panic!("expected capabilities command");
+        };
+        assert_eq!(publication_plan_contract, "github-publication-v1");
+        assert_eq!(
+            publication_plan_contract_capability(&publication_plan_contract).unwrap(),
+            "github-publication-v1"
+        );
+        assert!(publication_plan_contract_capability("github-publication-v2").is_err());
+    }
 
     #[test]
     fn review_bounded_is_an_explicit_action_flag_with_concise_help() {
@@ -351,6 +430,174 @@ mod tests {
                 "1",
                 "--publish",
                 "--no-post",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn publication_plan_is_hidden_snapshot_bound_and_separate_from_mutation() {
+        let parsed = Cli::try_parse_from([
+            "postil",
+            "review",
+            "--repo",
+            "postil-dev/postil",
+            "--pr",
+            "1",
+            "--sha",
+            "aaaaaaaa",
+            "--base-sha",
+            "bbbbbbbb",
+            "--publication-plan-output",
+            "publication-plan.json",
+            "--publication-generation",
+            "1",
+            "--publication-input-identity",
+            PUBLICATION_INPUT_IDENTITY,
+        ])
+        .unwrap();
+        let Command::Review {
+            publication_plan_output,
+            publication_generation,
+            publication_input_identity,
+            publish,
+            ..
+        } = parsed.command
+        else {
+            panic!("expected review command");
+        };
+        assert_eq!(
+            publication_plan_output.as_deref(),
+            Some(std::path::Path::new("publication-plan.json"))
+        );
+        assert_eq!(publication_generation.as_deref(), Some("1"));
+        assert_eq!(
+            publication_input_identity.as_deref(),
+            Some(PUBLICATION_INPUT_IDENTITY)
+        );
+        assert!(!publish);
+
+        let help = Cli::command()
+            .find_subcommand_mut("review")
+            .expect("review subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(!help.contains("publication-plan-output"));
+
+        for extra in [
+            vec!["--publish"],
+            vec!["--no-post"],
+            vec!["--check-run-id", "901"],
+            vec!["--gate-check-run-id", "902"],
+        ] {
+            let mut arguments = vec![
+                "postil",
+                "review",
+                "--repo",
+                "postil-dev/postil",
+                "--pr",
+                "1",
+                "--sha",
+                "aaaaaaaa",
+                "--base-sha",
+                "bbbbbbbb",
+                "--publication-plan-output",
+                "publication-plan.json",
+                "--publication-generation",
+                "1",
+                "--publication-input-identity",
+                PUBLICATION_INPUT_IDENTITY,
+            ];
+            arguments.extend(extra);
+            assert!(Cli::try_parse_from(arguments).is_err());
+        }
+
+        assert!(
+            Cli::try_parse_from([
+                "postil",
+                "review",
+                "--repo",
+                "postil-dev/postil",
+                "--pr",
+                "1",
+                "--sha",
+                "aaaaaaaa",
+                "--publication-plan-output",
+                "publication-plan.json",
+                "--publication-generation",
+                "1",
+                "--publication-input-identity",
+                PUBLICATION_INPUT_IDENTITY,
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "postil",
+                "review",
+                "--repo",
+                "postil-dev/postil",
+                "--pr",
+                "1",
+                "--sha",
+                "aaaaaaaa",
+                "--base-sha",
+                "bbbbbbbb",
+                "--publication-plan-output",
+                "publication-plan.json",
+                "--publication-generation",
+                "1",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "postil",
+                "review",
+                "--repo",
+                "postil-dev/postil",
+                "--pr",
+                "1",
+                "--sha",
+                "aaaaaaaa",
+                "--base-sha",
+                "bbbbbbbb",
+                "--publication-plan-output",
+                "publication-plan.json",
+                "--publication-input-identity",
+                PUBLICATION_INPUT_IDENTITY,
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "postil",
+                "review",
+                "--publication-input-identity",
+                PUBLICATION_INPUT_IDENTITY,
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "postil",
+                "review",
+                "--repo",
+                "postil-dev/postil",
+                "--pr",
+                "1",
+                "--sha",
+                "aaaaaaaa",
+                "--base-sha",
+                "bbbbbbbb",
+                "--publication-plan-output",
+                "publication-plan.json",
+                "--publication-generation",
+                "1",
+                "--publication-input-identity",
+                PUBLICATION_INPUT_IDENTITY,
+                "--publication-input-identity",
+                PUBLICATION_INPUT_IDENTITY,
             ])
             .is_err()
         );

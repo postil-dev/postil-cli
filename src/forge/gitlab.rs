@@ -485,6 +485,7 @@ impl Forge for GitLab {
         &self,
         envelope: &Envelope,
         snapshot: &PrMeta,
+        _publication_diff: Option<&crate::diff::Diff>,
     ) -> Result<ReviewPublicationReceipt> {
         let findings = &envelope.findings;
         let receipt = untracked_review_publication_receipt("gitlab", envelope, &snapshot.head_sha);
