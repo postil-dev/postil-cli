@@ -80,9 +80,10 @@ export const MEASURED_RUN_TO_RUN_SPREAD = {
   gateVerdictPp: 12.9,
 } as const;
 
-/** Mean provider cost per case may rise at most this fraction above baseline
- * before the gate fails. Provider pricing and routing drift more than model
- * behavior does, so this tolerance is wider than the detection tolerances. */
+/** Mean provider cost per case above this fraction is reported for inspection.
+ * One live run cannot separate variable provider output length and routing
+ * from a call-plan regression, while the CLI's per-operation cap remains the
+ * deterministic release safety boundary. */
 export const MEAN_COST_MAX_INCREASE_RATIO = 0.25;
 
 /** p95 review latency may rise at most this fraction above baseline. Wide
@@ -107,6 +108,9 @@ const liveReportSchema = z.object({
   summary: z.object({
     model: z.string(),
     reviewMode: z.enum(["exhaustive", "bounded"]),
+    providerContractEnforced: z.boolean(),
+    screeningProfileSha256: z.string().nullable(),
+    upstreamProviderIdentity: z.string().nullable(),
     fixtureCorpusSha256: z.string(),
     evaluatorSha256: z.string(),
     totalCases: z.number().int().nonnegative(),
@@ -135,6 +139,9 @@ const baselineProfileSchema = z.discriminatedUnion("populated", [
     generatedAt: z.string(),
     reviewMode: z.enum(["exhaustive", "bounded"]),
     sourceRunAt: z.string(),
+    providerContractEnforced: z.boolean(),
+    screeningProfileSha256: z.string().nullable(),
+    upstreamProviderIdentity: z.string().nullable(),
     totalCases: z.number().int().positive(),
     scoredCases: z.number().int().positive(),
     detectionRate: z.number().min(0).max(1),
@@ -166,6 +173,9 @@ export type BaselineProfile = z.infer<typeof baselineProfileSchema>;
 export interface ObservedMetrics {
   model: string;
   reviewMode: "exhaustive" | "bounded";
+  providerContractEnforced: boolean;
+  screeningProfileSha256: string | null;
+  upstreamProviderIdentity: string | null;
   fixtureCorpusSha256: string;
   evaluatorSha256: string;
   ranAt: string;
@@ -224,6 +234,9 @@ export function extractObservedMetrics(report: LiveReportForComparison): Observe
   return {
     model: s.model,
     reviewMode: s.reviewMode,
+    providerContractEnforced: s.providerContractEnforced,
+    screeningProfileSha256: s.screeningProfileSha256,
+    upstreamProviderIdentity: s.upstreamProviderIdentity,
     fixtureCorpusSha256: s.fixtureCorpusSha256,
     evaluatorSha256: s.evaluatorSha256,
     ranAt: s.ranAt,
@@ -303,12 +316,21 @@ export function compareMetrics(baseline: Extract<BaselineProfile, { populated: t
   });
 
   const costCeiling = baseline.meanCostUsdPerCase * (1 + MEAN_COST_MAX_INCREASE_RATIO);
+  const costComparable = baseline.providerContractEnforced &&
+    observed.providerContractEnforced &&
+    baseline.screeningProfileSha256 !== null &&
+    baseline.upstreamProviderIdentity !== null &&
+    baseline.screeningProfileSha256 === observed.screeningProfileSha256 &&
+    baseline.upstreamProviderIdentity === observed.upstreamProviderIdentity;
   rows.push({
     metric: "mean cost per case",
     baseline: usd(baseline.meanCostUsdPerCase),
     observed: usd(observed.meanCostUsdPerCase),
     verdict: observed.meanCostUsdPerCase <= costCeiling ? "PASS" : "FAIL",
-    detail: `ceiling ${usd(costCeiling)} (baseline x ${(1 + MEAN_COST_MAX_INCREASE_RATIO).toFixed(2)})`,
+    detail: costComparable
+      ? `ceiling ${usd(costCeiling)} (baseline x ${(1 + MEAN_COST_MAX_INCREASE_RATIO).toFixed(2)})`
+      : "provider contract differs or is not enforced; trend only",
+    informational: !costComparable,
   });
 
   const latencyCeiling = baseline.latencyMs.p95 * (1 + LATENCY_P95_MAX_INCREASE_RATIO);
@@ -361,9 +383,8 @@ export function formatComparisonTable(rows: readonly MetricVerdict[]): string {
     lines.push(
       "",
       `Outside its usual range, but not blocking: ${noisy.map((row) => row.metric).join(", ")}. ` +
-        `One run cannot separate this from provider nondeterminism (${MEASURED_RUN_TO_RUN_SPREAD.runs} runs ` +
-        `of one unchanged binary spanned ${MEASURED_RUN_TO_RUN_SPREAD.gateVerdictPp}pp of gate verdict ` +
-        `correctness). Worth reading across several releases, not acting on alone.`,
+        "One run cannot separate these signals from provider nondeterminism. Worth reading across " +
+        "several releases, not acting on alone.",
     );
   }
   return lines.join("\n");
@@ -415,6 +436,9 @@ async function main() {
       generatedAt: new Date().toISOString(),
       reviewMode: observed.reviewMode,
       sourceRunAt: observed.ranAt,
+      providerContractEnforced: observed.providerContractEnforced,
+      screeningProfileSha256: observed.screeningProfileSha256,
+      upstreamProviderIdentity: observed.upstreamProviderIdentity,
       totalCases: observed.totalCases,
       scoredCases: observed.scoredCases,
       detectionRate: observed.detectionRate,
