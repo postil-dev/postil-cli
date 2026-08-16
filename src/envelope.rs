@@ -417,13 +417,21 @@ pub(crate) fn validate_finding_public_language(finding: &Finding) -> Result<(), 
 }
 
 pub(crate) fn publication_exposes_evidence_boundary(finding: &Finding) -> bool {
+    publication_evidence_boundary_category(finding).is_some()
+}
+
+pub(crate) fn publication_evidence_boundary_category(finding: &Finding) -> Option<&'static str> {
     let prose = format!("{}. {}", finding.title, finding.body).to_ascii_lowercase();
-    prose_exposes_evidence_boundary(&prose)
+    prose_evidence_boundary_category(&prose)
 }
 
 fn prose_exposes_evidence_boundary(prose: &str) -> bool {
+    prose_evidence_boundary_category(prose).is_some()
+}
+
+fn prose_evidence_boundary_category(prose: &str) -> Option<&'static str> {
     let prose = prose.to_ascii_lowercase();
-    [
+    if [
         "diff-grounded",
         "grounded in the diff",
         "in the diff",
@@ -445,8 +453,15 @@ fn prose_exposes_evidence_boundary(prose: &str) -> bool {
     ]
     .iter()
     .any(|phrase| prose.contains(phrase))
-        || prose_delegates_evidence_collection(&prose)
-        || prose_exposes_review_artifact_boundary(&prose)
+    {
+        Some("reviewArtifactPhrase")
+    } else if prose_delegates_evidence_collection(&prose) {
+        Some("delegatedEvidenceCollection")
+    } else if prose_exposes_review_artifact_boundary(&prose) {
+        Some("reviewArtifactBoundary")
+    } else {
+        None
+    }
 }
 
 fn prose_delegates_evidence_collection(prose: &str) -> bool {
@@ -463,6 +478,10 @@ fn prose_delegates_evidence_collection(prose: &str) -> bool {
         .any(|clause| {
             let direct_search = clause.split(',').any(|segment| {
                 let segment = segment.trim_start();
+                let segment = segment
+                    .strip_prefix("or ")
+                    .or_else(|| segment.strip_prefix("and "))
+                    .unwrap_or(segment);
                 [
                     "search the repository",
                     "search the codebase",
@@ -471,6 +490,7 @@ fn prose_delegates_evidence_collection(prose: &str) -> bool {
                     "run `rg` ",
                     "inspect the repository",
                     "inspect the codebase",
+                    "inspect the deployment manifest",
                 ]
                 .iter()
                 .any(|phrase| segment.starts_with(phrase))
@@ -517,6 +537,10 @@ fn prose_delegates_evidence_collection(prose: &str) -> bool {
                 " repository",
                 " codebase",
                 " unchanged",
+                " elsewhere",
+                " call path",
+                " internally",
+                " location",
                 " other file",
                 " other manifest",
                 " whether",
@@ -525,6 +549,10 @@ fn prose_delegates_evidence_collection(prose: &str) -> bool {
             .any(|marker| clause.contains(marker));
             let imperative_investigation = clause.split(',').any(|segment| {
                 let segment = segment.trim_start();
+                let segment = segment
+                    .strip_prefix("or ")
+                    .or_else(|| segment.strip_prefix("and "))
+                    .unwrap_or(segment);
                 [
                     "check ",
                     "confirm ",
@@ -690,6 +718,18 @@ fn prose_exposes_review_artifact_boundary(prose: &str) -> bool {
 /// such as sentence completeness and size limits. Those remain validation
 /// errors.
 pub(crate) fn normalize_finding_publication(finding: &mut Finding) {
+    if matches!(
+        prose_evidence_boundary_category(&finding.title),
+        Some("reviewArtifactPhrase" | "reviewArtifactBoundary")
+    ) {
+        finding.title = normalize_review_artifact_references(&finding.title);
+    }
+    if matches!(
+        prose_evidence_boundary_category(&finding.body),
+        Some("reviewArtifactPhrase" | "reviewArtifactBoundary")
+    ) {
+        finding.body = normalize_review_artifact_references(&finding.body);
+    }
     finding.title = sanitize_publication_title(&finding.title);
     finding.body = finding
         .body
@@ -698,6 +738,146 @@ pub(crate) fn normalize_finding_publication(finding: &mut Finding) {
         .map(|(index, line)| normalize_publication_body_line(line, index))
         .collect::<Vec<_>>()
         .join("\n");
+}
+
+fn normalize_review_artifact_references(value: &str) -> String {
+    [
+        ("grounded in the diff", "established by the changed code"),
+        ("in this diff", "in this change"),
+        ("in the diff", "in the changed code"),
+        ("this diff", "this change"),
+        ("the diff", "the changed code"),
+        ("supplied diff", "changed code"),
+        ("provided diff", "changed code"),
+        ("provided changes", "changed code"),
+        ("supplied changes", "changed code"),
+        ("available context", "changed code"),
+        ("supplied context", "changed code"),
+        ("diff-grounded", "directly evidenced"),
+        ("this pull request", "this change"),
+        ("the pull request", "the change"),
+        ("a pull request", "a change"),
+        ("this merge request", "this change"),
+        ("the merge request", "the change"),
+        ("a merge request", "a change"),
+        ("this patch", "this change"),
+        ("the patch", "the change"),
+        ("a current patch", "the current change"),
+        ("current patch", "current change"),
+        ("this pr", "this change"),
+        ("the pr", "the change"),
+        ("a pr", "a change"),
+        ("this mr", "this change"),
+        ("the mr", "the change"),
+        ("a mr", "a change"),
+        ("changeset", "change"),
+        ("change-set", "change"),
+        ("change set", "change"),
+        ("review input", "changed code"),
+        ("review material", "changed code"),
+    ]
+    .into_iter()
+    .fold(value.to_string(), |text, (phrase, replacement)| {
+        replace_review_artifact_reference(&text, phrase, replacement)
+    })
+}
+
+fn replace_review_artifact_reference(value: &str, needle: &str, replacement: &str) -> String {
+    let lowercase = value.to_ascii_lowercase();
+    let mut output = String::with_capacity(value.len());
+    let bytes = value.as_bytes();
+    let needle_bytes = needle.as_bytes();
+    let is_word = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let mut output_cursor = 0usize;
+    let mut search_cursor = 0usize;
+    while let Some(relative) = lowercase[search_cursor..].find(needle) {
+        let start = search_cursor + relative;
+        let end = start + needle.len();
+        let starts_inside_word = needle_bytes.first().copied().is_some_and(is_word)
+            && start > 0
+            && bytes.get(start - 1).copied().is_some_and(is_word);
+        let ends_inside_word = needle_bytes.last().copied().is_some_and(is_word)
+            && bytes.get(end).copied().is_some_and(is_word);
+        if starts_inside_word || ends_inside_word {
+            search_cursor = start + 1;
+            continue;
+        }
+        if review_artifact_reference_has_product_suffix(value, needle, end) {
+            search_cursor = end;
+            continue;
+        }
+        output.push_str(&value[output_cursor..start]);
+        let starts_sentence = value[..start]
+            .chars()
+            .rev()
+            .find(|character| !character.is_whitespace())
+            .is_none_or(|character| matches!(character, '.' | '!' | '?' | '。' | '！' | '？'));
+        if starts_sentence {
+            let mut characters = replacement.chars();
+            if let Some(first) = characters.next() {
+                output.push(first.to_ascii_uppercase());
+                output.extend(characters);
+            }
+        } else {
+            output.push_str(replacement);
+        }
+        output_cursor = end;
+        search_cursor = end;
+    }
+    output.push_str(&value[output_cursor..]);
+    output
+}
+
+fn review_artifact_reference_has_product_suffix(value: &str, needle: &str, end: usize) -> bool {
+    let artifact = needle.split_ascii_whitespace().last().unwrap_or_default();
+    if !matches!(artifact, "patch" | "pr" | "mr" | "request") {
+        return false;
+    }
+    let mut suffix = value[end..].trim_start();
+    let lowercase_suffix = suffix.to_ascii_lowercase();
+    if lowercase_suffix.starts_with("'s") {
+        suffix = suffix[2..].trim_start();
+    } else if lowercase_suffix.starts_with("’s") {
+        suffix = suffix["’s".len()..].trim_start();
+    }
+    let word = suffix
+        .trim_start_matches(|character: char| !character.is_ascii_alphanumeric())
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(
+        word.as_str(),
+        "api"
+            | "body"
+            | "decoder"
+            | "description"
+            | "document"
+            | "encoder"
+            | "endpoint"
+            | "event"
+            | "events"
+            | "format"
+            | "handler"
+            | "level"
+            | "media"
+            | "metadata"
+            | "method"
+            | "number"
+            | "operation"
+            | "parser"
+            | "release"
+            | "request"
+            | "response"
+            | "representation"
+            | "route"
+            | "series"
+            | "title"
+            | "type"
+            | "validation"
+            | "version"
+            | "webhook"
+    )
 }
 
 fn normalize_publication_body_line(value: &str, index: usize) -> String {
@@ -1901,6 +2081,109 @@ mod tests {
         assert!(!finding.body.contains("&gt; 60d`"));
         assert!(finding.body.contains("&lt;details&gt;"));
         assert_eq!(validate_finding_publication(&finding), Ok(()));
+    }
+
+    #[test]
+    fn fresh_finding_normalization_states_review_artifacts_as_code_changes() {
+        let mut finding = finding(Severity::Error, 0.9);
+        finding.title = "This patch removes the authorization guard".into();
+        finding.body = "The previous implementation was safe. In the diff, the PR removes the authorization guard before `applyBulkEdit`; restore the guard before applying privileged changes.".into();
+
+        normalize_finding_publication(&mut finding);
+
+        assert_eq!(finding.title, "This change removes the authorization guard");
+        assert_eq!(
+            finding.body,
+            "The previous implementation was safe. In the changed code, the change removes the authorization guard before `applyBulkEdit`; restore the guard before applying privileged changes."
+        );
+        assert_eq!(validate_finding_publication(&finding), Ok(()));
+        assert!(!publication_exposes_evidence_boundary(&finding));
+    }
+
+    #[test]
+    fn fresh_finding_normalization_does_not_hide_delegated_repository_work() {
+        for body in [
+            "Please inspect the repository to verify whether other callers retain the guard.",
+            "Verify that `applyBulkEdit` internally enforces the same permission check.",
+            "No defect is established, or verify all callers preserve `currency`.",
+            "The parser does not drop `currency`. Verify all callers preserve it, or add a follow-up task for manual review.",
+        ] {
+            let mut finding = finding(Severity::Warn, 0.9);
+            finding.body = body.into();
+            let original = finding.body.clone();
+
+            normalize_finding_publication(&mut finding);
+
+            assert_eq!(finding.body, original);
+            assert_eq!(
+                publication_evidence_boundary_category(&finding),
+                Some("delegatedEvidenceCollection")
+            );
+            assert!(validate_finding_publication(&finding).is_err());
+        }
+    }
+
+    #[test]
+    fn fresh_finding_normalization_keeps_manifest_inspection_unpublishable() {
+        let mut finding = finding(Severity::Warn, 0.9);
+        finding.body =
+            "No sibling update appears in this diff; inspect the deployment manifest.".into();
+
+        normalize_finding_publication(&mut finding);
+
+        assert_eq!(
+            finding.body,
+            "No sibling update appears in this change; inspect the deployment manifest."
+        );
+        assert_eq!(
+            publication_evidence_boundary_category(&finding),
+            Some("delegatedEvidenceCollection")
+        );
+        assert!(validate_finding_publication(&finding).is_err());
+    }
+
+    #[test]
+    fn fresh_finding_normalization_keeps_delegated_alternatives_unpublishable() {
+        let mut finding = finding(Severity::Error, 0.9);
+        finding.body = "The response dropped `currency`, which breaks the response contract. Verify all callers no longer reference `currency`, or reintroduce `currency` behind a versioned endpoint.".into();
+        let original = finding.body.clone();
+
+        normalize_finding_publication(&mut finding);
+
+        assert_eq!(finding.body, original);
+        assert_eq!(
+            publication_evidence_boundary_category(&finding),
+            Some("delegatedEvidenceCollection")
+        );
+        assert!(validate_finding_publication(&finding).is_err());
+    }
+
+    #[test]
+    fn fresh_finding_normalization_preserves_product_artifact_terms() {
+        for (body, expected) in [
+            (
+                "The PR API requires `head_sha`, and this patch removes the field.",
+                "The PR API requires `head_sha`, and this change removes the field.",
+            ),
+            (
+                "THE PR'S API requires `head_sha`, and this patch removes the field.",
+                "THE PR'S API requires `head_sha`, and this change removes the field.",
+            ),
+            (
+                "THE PR’S API requires `head_sha`, and this patch removes the field.",
+                "THE PR’S API requires `head_sha`, and this change removes the field.",
+            ),
+        ] {
+            let mut finding = finding(Severity::Error, 0.9);
+            finding.title = "This patch removes the authorization guard".into();
+            finding.body = body.into();
+
+            normalize_finding_publication(&mut finding);
+
+            assert_eq!(finding.title, "This change removes the authorization guard");
+            assert_eq!(finding.body, expected);
+            assert_eq!(validate_finding_publication(&finding), Ok(()));
+        }
     }
 
     #[test]

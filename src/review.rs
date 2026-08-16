@@ -198,12 +198,23 @@ fn review_batch_validation_reason(
     annotated: &str,
     content_policy_prompt: Option<&str>,
 ) -> Option<ReviewBatchValidationReason> {
-    if crate::repository_search::publication_exposes_evidence_boundary(finding) {
+    if let Some(category) = crate::envelope::publication_evidence_boundary_category(finding) {
+        let repair = match category {
+            "delegatedEvidenceCollection" => {
+                "do not delegate repository inspection to a human; declare the exact absence or mismatch through `repositoryContext` so Postil can search the complete reviewed head, or retract the finding"
+            }
+            "reviewArtifactPhrase" | "reviewArtifactBoundary" => {
+                "remove review-process terms such as `diff`, `patch`, `PR`, `MR`, `review input`, and `provided context`, state the defect directly from the concrete repository construct with an actionable fix, and retract the finding if the supplied evidence is insufficient"
+            }
+            _ => {
+                "state the defect directly from the concrete repository construct with an actionable fix, or retract the finding"
+            }
+        };
         return Some(ReviewBatchValidationReason {
-            category: "repositoryClaimPublication",
+            category,
             repair_detail: format!(
-                "finding at {}:{} delegates evidence collection or describes review-input boundaries; cite the concrete repository construct and state an actionable fix",
-                finding.path, finding.line
+                "finding at {}:{} uses review-process language; {repair}",
+                finding.path, finding.line,
             ),
         });
     }
@@ -343,6 +354,10 @@ fn review_batch_validation_reasons(
         return None;
     }
     let safe_detail = [
+        "reviewArtifactPhrase",
+        "delegatedEvidenceCollection",
+        "reviewArtifactBoundary",
+        "repositoryClaim",
         "publicationContract",
         "missingEvidenceAnchor",
         "ambiguousEvidence",
@@ -4168,7 +4183,16 @@ mod tests {
         finding.evidence = Some("changed();".to_string());
 
         let reason = review_batch_validation_reason(&finding, annotated, None).unwrap();
-        assert_eq!(reason.category, "repositoryClaimPublication");
+        assert_eq!(reason.category, "reviewArtifactPhrase");
+        assert!(reason.repair_detail.contains("remove review-process terms such as `diff`, `patch`, `PR`, `MR`, `review input`, and `provided context`"));
+        assert!(
+            reason
+                .repair_detail
+                .contains("retract the finding if the supplied evidence is insufficient")
+        );
+
+        let failure = review_batch_validation_reasons(&[finding], annotated, None).unwrap();
+        assert_eq!(failure.safe_detail(), "reviewArtifactPhrase=1");
     }
 
     #[test]
