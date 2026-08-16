@@ -3297,12 +3297,12 @@ mod tests {
         let below_floor = format!("Benchmark pull request{}", "x".repeat(442));
 
         let local_budgets = batch_budgets_for_title(&local_edge);
-        assert_eq!(local_budgets.synthesis, 4_495);
-        assert_eq!(local_budgets.source, 4_496);
+        assert_eq!(local_budgets.synthesis, 4_177);
+        assert_eq!(local_budgets.source, 4_178);
         assert!(review_batch_budgets_are_usable(local_budgets));
         let ci_budgets = batch_budgets_for_title(&ci_edge);
-        assert_eq!(ci_budgets.synthesis, 4_479);
-        assert_eq!(ci_budgets.source, 4_480);
+        assert_eq!(ci_budgets.synthesis, 4_161);
+        assert_eq!(ci_budgets.source, 4_162);
         assert!(review_batch_budgets_are_usable(ci_budgets));
         assert_eq!(
             ci_budgets.stabilized_for_rendering(),
@@ -3314,7 +3314,7 @@ mod tests {
         let below_floor_budgets = batch_budgets_for_title(&below_floor);
         assert_eq!(
             below_floor_budgets.synthesis,
-            diff::MIN_REVIEW_BATCH_BYTES - 1
+            diff::MIN_REVIEW_BATCH_BYTES - 319
         );
         assert!(!review_batch_budgets_are_usable(below_floor_budgets));
     }

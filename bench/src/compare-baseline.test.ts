@@ -38,6 +38,7 @@ function fakeReport(overrides: {
   observedProviderCostUsdDecimal?: string;
   results?: LiveReportForComparison["results"];
   detected?: number;
+  providerContractEnforced?: boolean;
 } = {}): LiveReportForComparison {
   const results: LiveReportForComparison["results"] = overrides.results ?? [
     { id: "must-block-1", type: "defect", scored: true, truthSeverity: "error", durationMs: 1000, exitCode: 1 },
@@ -50,6 +51,9 @@ function fakeReport(overrides: {
     summary: {
       model: "z-ai/glm-5.2",
       reviewMode: "exhaustive",
+      providerContractEnforced: overrides.providerContractEnforced ?? false,
+      screeningProfileSha256: overrides.providerContractEnforced === true ? "profile-sha" : null,
+      upstreamProviderIdentity: overrides.providerContractEnforced === true ? "PinnedProvider" : null,
       fixtureCorpusSha256: "corpus-sha",
       evaluatorSha256: "evaluator-sha",
       totalCases: results.length,
@@ -69,6 +73,9 @@ const populatedBaseline: Extract<BaselineProfile, { populated: true }> = {
   generatedAt: "2026-01-01T00:00:00.000Z",
   reviewMode: "exhaustive",
   sourceRunAt: "2026-01-01T00:00:00.000Z",
+  providerContractEnforced: false,
+  screeningProfileSha256: null,
+  upstreamProviderIdentity: null,
   totalCases: 70,
   scoredCases: 70,
   detectionRate: 0.95,
@@ -235,10 +242,51 @@ describe("compareMetrics", () => {
     expect(comparison.ok).toBe(true);
   });
 
-  test("fails when mean cost rises past the ratio budget", () => {
+  test("reports mean cost past the ratio budget without blocking", () => {
     const observed = { ...extractObservedMetrics(fakeReport()), meanCostUsdPerCase: populatedBaseline.meanCostUsdPerCase * (1 + MEAN_COST_MAX_INCREASE_RATIO) + 0.001 };
     const comparison = compareMetrics(populatedBaseline, observed);
-    expect(comparison.rows.find((row) => row.metric === "mean cost per case")?.verdict).toBe("FAIL");
+    const row = comparison.rows.find((candidate) => candidate.metric === "mean cost per case");
+    expect(row?.verdict).toBe("FAIL");
+    expect(row?.informational).toBe(true);
+    expect(comparison.ok).toBe(true);
+  });
+
+  test("blocks a cost regression under the same enforced provider contract", () => {
+    const baseline = {
+      ...populatedBaseline,
+      providerContractEnforced: true,
+      screeningProfileSha256: "profile-sha",
+      upstreamProviderIdentity: "PinnedProvider",
+    };
+    const observed = {
+      ...extractObservedMetrics(fakeReport({ providerContractEnforced: true })),
+      meanCostUsdPerCase:
+        baseline.meanCostUsdPerCase * (1 + MEAN_COST_MAX_INCREASE_RATIO) + 0.001,
+    };
+    const comparison = compareMetrics(baseline, observed);
+    const row = comparison.rows.find((candidate) => candidate.metric === "mean cost per case");
+    expect(row?.verdict).toBe("FAIL");
+    expect(row?.informational).toBe(false);
+    expect(comparison.ok).toBe(false);
+  });
+
+  test("does not treat missing provider identity as a comparable contract", () => {
+    const baseline = {
+      ...populatedBaseline,
+      providerContractEnforced: true,
+      screeningProfileSha256: null,
+      upstreamProviderIdentity: null,
+    };
+    const observed = {
+      ...extractObservedMetrics(fakeReport()),
+      providerContractEnforced: true,
+      meanCostUsdPerCase:
+        baseline.meanCostUsdPerCase * (1 + MEAN_COST_MAX_INCREASE_RATIO) + 0.001,
+    };
+    const comparison = compareMetrics(baseline, observed);
+    const row = comparison.rows.find((candidate) => candidate.metric === "mean cost per case");
+    expect(row?.informational).toBe(true);
+    expect(comparison.ok).toBe(true);
   });
 
   test("fails when p95 latency rises past the ratio budget", () => {

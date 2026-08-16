@@ -144,10 +144,14 @@ pub fn review_contract(cfg: &Config) -> String {
          `.postil/change-metadata`. Findings citing other lines are discarded as \
          ungrounded.\n\
          \n\
-         Every finding MUST include `repositoryContext`: `none` is diff-local; `absence` names the \
-         missing construct; `mismatch` names a target in resources, paths, or identifiers and an \
-         expected value in values or versions. Populated arrays are conjunctive and refute only \
-         when matched in one file. Repository claims require the complete reviewed head. Public \
+         Every finding MUST include `repositoryContext`. Use `none` whenever the exact cited \
+         changed line is sufficient to establish the defect, even if unchanged code elsewhere \
+         could also be relevant. Use `absence` only when the conclusion depends on a construct \
+         missing from the complete reviewed head. Use `mismatch` only when the conclusion depends \
+         on a repository target having an expected value not established by the cited changed \
+         line; name that target in resources, paths, or identifiers and the expected value in \
+         values or versions. Populated arrays are conjunctive and refute only when matched in one \
+         file. Repository claims require the complete reviewed head. Public \
          text names the concrete construct \
          and correction, never review-input boundaries such as `in the diff`, retrieval mechanics, \
          delegated evidence collection, or guessed files.\n",
@@ -539,6 +543,20 @@ mod tests {
             assert!(prompt.contains("report only a concrete defect"));
             assert!(prompt.contains("never classify it as contentPolicy"));
         }
+    }
+
+    #[test]
+    fn generator_reserves_repository_claims_for_repository_dependent_conclusions() {
+        let prompt = system_prompt(&Config::default(), trusted_date());
+        assert!(prompt.contains(
+            "Use `none` whenever the exact cited changed line is sufficient to establish the defect"
+        ));
+        assert!(prompt.contains(
+            "Use `absence` only when the conclusion depends on a construct missing from the complete reviewed head"
+        ));
+        assert!(prompt.contains(
+            "Use `mismatch` only when the conclusion depends on a repository target having an expected value"
+        ));
     }
 
     #[test]

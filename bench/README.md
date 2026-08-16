@@ -454,9 +454,13 @@ classification), mean provider cost per case, and p95 review latency. Each
 metric has its own tolerance (see the exported `*_MAX_*` constants at the top
 of `compare-baseline.ts`).
 
-Three of those metrics block a release: detection rate, mean cost per case, and
-p95 latency. False/unrelated findings and gate-verdict correctness are reported
-but never block, because one run cannot measure them precisely enough to act on.
+Detection rate and p95 latency always block a release when they cross their
+tolerances. Mean provider cost blocks only when the baseline and current run
+share the same enforced provider profile; without that identity, the comparison
+is a trend report. False/unrelated findings and gate-verdict correctness are
+reported but never block, because one run cannot measure them precisely enough
+to act on. The CLI's per-operation cost cap remains the deterministic spending
+boundary.
 Six runs of a single unchanged binary against this corpus, four on managed
 routing and two pinned to the qualified upstream provider, spanned 4 to 7 false
 findings and 12.9 percentage points of gate-verdict correctness, against
@@ -466,7 +470,7 @@ the provider did not remove it: the widest false-finding count came from a
 pinned run. Detection rate over the same six runs spanned 3.5 points, which
 leaves a threshold that still catches a real regression.
 
-Read the two reported metrics across releases rather than acting on a single
+Read the non-blocking metrics across releases rather than acting on a single
 run. Making them blocking again means reducing the noise rather than tightening
 the number: comparing a median across repeated runs is the direct fix, at
 proportionally more cost and wall-clock per release. A gate that fails at
