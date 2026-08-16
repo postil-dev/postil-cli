@@ -14,6 +14,7 @@ import {
   runLive,
   resolveLiveTimeoutOverrides,
   scorerOperationalFailure,
+  targetSuppressionReasons,
   validateLiveRunId,
 } from "./live";
 
@@ -49,6 +50,32 @@ async function onlyCaseAttempt(runRoot: string): Promise<string> {
 }
 
 describe("live benchmark review mode", () => {
+  test("reports why an authored target was suppressed", () => {
+    const truth = {
+      clean: false,
+      path: "src/api/orders/route.ts",
+      startLine: 31,
+      endLine: 31,
+      severity: "error",
+    };
+    const finding = {
+      path: truth.path,
+      line: truth.startLine,
+      severity: "warn" as const,
+      confidence: 0.8,
+      kind: "risk" as const,
+      title: "Restore the response field",
+      body: "The response field is missing.",
+    };
+
+    expect(targetSuppressionReasons({
+      suppressedFindings: [
+        { finding, reason: "repositoryClaimUnsupported" },
+        { finding: { ...finding, line: 40 }, reason: "belowThreshold" },
+      ],
+    }, truth)).toEqual(["repositoryClaimUnsupported"]);
+  });
+
   test("forwards explicit timeout overrides to the isolated child and records them", async () => {
     const root = await mkdtemp(join(tmpdir(), "postil-live-timeout-forwarding-"));
     const names = [

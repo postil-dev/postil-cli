@@ -201,7 +201,7 @@ fn review_batch_validation_reason(
     if let Some(category) = crate::envelope::publication_evidence_boundary_category(finding) {
         let repair = match category {
             "delegatedEvidenceCollection" => {
-                "do not delegate repository inspection to a human; declare the exact absence or mismatch through `repositoryContext` so Postil can search the complete reviewed head, or retract the finding"
+                "if the cited changed line already establishes the defect, state it directly and omit `repositoryContext`; otherwise do not delegate repository inspection to a human, declare the exact absence or mismatch through `repositoryContext` so Postil can search the complete reviewed head, or retract the finding"
             }
             "reviewArtifactPhrase" | "reviewArtifactBoundary" => {
                 "remove review-process terms such as `diff`, `patch`, `PR`, `MR`, `review input`, and `provided context`, state the defect directly from the concrete repository construct with an actionable fix, and retract the finding if the supplied evidence is insufficient"
@@ -4193,6 +4193,29 @@ mod tests {
 
         let failure = review_batch_validation_reasons(&[finding], annotated, None).unwrap();
         assert_eq!(failure.safe_detail(), "reviewArtifactPhrase=1");
+    }
+
+    #[test]
+    fn delegated_evidence_repair_preserves_directly_established_defects() {
+        let annotated = "### src/lib.rs\n@@ fixture @@\n    7 + changed();\n";
+        let mut finding = finding(
+            "src/lib.rs",
+            7,
+            "Verify that `applyBulkEdit` internally enforces the permission check.",
+        );
+        finding.evidence = Some("changed();".to_string());
+
+        let reason = review_batch_validation_reason(&finding, annotated, None).unwrap();
+
+        assert_eq!(reason.category, "delegatedEvidenceCollection");
+        assert!(reason.repair_detail.contains(
+            "if the cited changed line already establishes the defect, state it directly and omit `repositoryContext`"
+        ));
+        assert!(
+            reason
+                .repair_detail
+                .contains("declare the exact absence or mismatch through `repositoryContext`")
+        );
     }
 
     #[test]

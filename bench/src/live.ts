@@ -149,6 +149,9 @@ export interface LiveCaseResult {
   observedProviderCostUsdDecimal: string | null;
   costAccountingComplete: boolean;
   reviewCoverage: Envelope["reviewCoverage"] | null;
+  /** Suppression reasons for findings that overlapped the authored target.
+   * Diagnostic only: suppressed findings never count as detections. */
+  suppressedTargetReasons?: string[];
   exitCode: number | undefined;
   error?: string;
   /** Captured stderr of the binary run. Used internally to classify transient
@@ -541,6 +544,7 @@ async function runLiveCase(
     observedProviderCostUsdDecimal: null,
     costAccountingComplete: false,
     reviewCoverage: null,
+    suppressedTargetReasons: [],
     exitCode: undefined,
   };
 
@@ -824,10 +828,9 @@ function scoreCase(base: LiveCaseResult, truth: GroundTruth, env: Envelope): Liv
     return base;
   }
 
-  const match = findings.find((finding) =>
-    finding.path === truth.path &&
-    Math.min(finding.line, finding.endLine ?? finding.line) <= truth.endLine! &&
-    Math.max(finding.line, finding.endLine ?? finding.line) >= truth.startLine!);
+  base.suppressedTargetReasons = targetSuppressionReasons(env, truth);
+
+  const match = findings.find((finding) => findingMatchesTruth(finding, truth));
   base.detected = Boolean(match);
   if (match) {
     base.foundSeverity = match.severity;
@@ -840,6 +843,25 @@ function scoreCase(base: LiveCaseResult, truth: GroundTruth, env: Envelope): Liv
   // Every finding that is not the matched true positive is a false positive.
   base.falsePositives = findings.length - (match ? 1 : 0);
   return base;
+}
+
+function findingMatchesTruth(
+  finding: Pick<Envelope["findings"][number], "path" | "line" | "endLine">,
+  truth: GroundTruth,
+): boolean {
+  return finding.path === truth.path &&
+    Math.min(finding.line, finding.endLine ?? finding.line) <= truth.endLine! &&
+    Math.max(finding.line, finding.endLine ?? finding.line) >= truth.startLine!;
+}
+
+export function targetSuppressionReasons(
+  env: Pick<Envelope, "suppressedFindings">,
+  truth: GroundTruth,
+): string[] {
+  if (truth.clean) return [];
+  return env.suppressedFindings
+    .filter(({ finding }) => findingMatchesTruth(finding, truth))
+    .map(({ reason }) => reason);
 }
 
 function groundTruthOf(c: ReturnType<typeof benchmarkCase.parse>): GroundTruth {
@@ -1013,7 +1035,10 @@ export function formatLiveReport(report: LiveReport): string {
         ? `${r.truthSeverity}->${r.foundSeverity}${severityTag(r)} conf=${fmt(r.confidence)}`
         : `${r.truthSeverity}`;
       const fp = r.falsePositives > 0 ? ` +${r.falsePositives} FP` : "";
-      lines.push(`${tag} ${r.id}: ${sev}${fp}`);
+      const suppressed = r.detected || !r.suppressedTargetReasons?.length
+        ? ""
+        : ` suppressed-target=${r.suppressedTargetReasons.join(",")}`;
+      lines.push(`${tag} ${r.id}: ${sev}${fp}${suppressed}`);
     }
   }
   return lines.join("\n");

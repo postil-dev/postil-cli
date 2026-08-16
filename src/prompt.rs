@@ -144,9 +144,9 @@ pub fn review_contract(cfg: &Config) -> String {
          `.postil/change-metadata`. Findings citing other lines are discarded as \
          ungrounded.\n\
          \n\
-         `repositoryContext` is optional and defaults to a diff-local finding. Omit it whenever \
-         the exact cited changed line is sufficient to establish the defect, even if unchanged \
-         code elsewhere could also be relevant. Include it only when the conclusion depends on \
+         `repositoryContext` is optional. Omit it for bugs the cited line establishes, including \
+         removed fields, bypassed guards, boundary errors, or lifecycle defects; caller or consumer \
+         impact alone doesn't require it. Include it only when the conclusion depends on \
          repository-wide evidence, using `claim: absence` for a construct missing from the \
          complete reviewed head or `claim: mismatch` for a repository target whose expected \
          value is not established by the cited changed line. When included, name the target in \
@@ -547,12 +547,11 @@ mod tests {
     #[test]
     fn generator_omits_repository_claims_for_diff_local_conclusions() {
         let prompt = system_prompt(&Config::default(), trusted_date());
-        assert!(
-            prompt.contains("`repositoryContext` is optional and defaults to a diff-local finding")
-        );
+        assert!(prompt.contains("`repositoryContext` is optional"));
         assert!(prompt.contains(
-            "Omit it whenever the exact cited changed line is sufficient to establish the defect"
+            "Omit it for bugs the cited line establishes, including removed fields, bypassed guards, boundary errors, or lifecycle defects"
         ));
+        assert!(prompt.contains("caller or consumer impact alone doesn't require it"));
         assert!(
             prompt.contains(
                 "Include it only when the conclusion depends on repository-wide evidence"
