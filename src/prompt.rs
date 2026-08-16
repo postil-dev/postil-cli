@@ -144,14 +144,15 @@ pub fn review_contract(cfg: &Config) -> String {
          `.postil/change-metadata`. Findings citing other lines are discarded as \
          ungrounded.\n\
          \n\
-         Every finding MUST include `repositoryContext`. Use `none` whenever the exact cited \
-         changed line is sufficient to establish the defect, even if unchanged code elsewhere \
-         could also be relevant. Use `absence` only when the conclusion depends on a construct \
-         missing from the complete reviewed head. Use `mismatch` only when the conclusion depends \
-         on a repository target having an expected value not established by the cited changed \
-         line; name that target in resources, paths, or identifiers and the expected value in \
-         values or versions. Populated arrays are conjunctive and refute only when matched in one \
-         file. Repository claims require the complete reviewed head. Public \
+         `repositoryContext` is optional and defaults to a diff-local finding. Omit it whenever \
+         the exact cited changed line is sufficient to establish the defect, even if unchanged \
+         code elsewhere could also be relevant. Include it only when the conclusion depends on \
+         repository-wide evidence, using `claim: absence` for a construct missing from the \
+         complete reviewed head or `claim: mismatch` for a repository target whose expected \
+         value is not established by the cited changed line. When included, name the target in \
+         `resources`, `paths`, or `identifiers` and the expected value in `values` or `versions`; \
+         include all five arrays even when empty. Populated arrays are conjunctive and refute \
+         only when matched in one file. Repository claims require the complete reviewed head. Public \
          text names the concrete construct \
          and correction, never review-input boundaries such as `in the diff`, retrieval mechanics, \
          delegated evidence collection, or guessed files.\n",
@@ -223,8 +224,6 @@ pub fn system_prompt(cfg: &Config, current_utc_date: Date) -> String {
           \"findings\": [{\"path\": \"file path from the diff\", \"line\": <new-file line>,\n \
           \"endLine\": <optional>, \"severity\": \"info|warn|error\",\n \
           \"kind\": \"risk|humanEscalation|guardrail|uncertainty|contentPolicy\", \"confidence\": <0..1>,\n \
-          \"repositoryContext\": {\"claim\": \"none|absence|mismatch\", \"resources\": [], \"values\": [],\n \
-          \"versions\": [], \"paths\": [], \"identifiers\": []},\n \
           \"title\": \"short imperative title\", \"body\": \"specific, evidence-based markdown\",\n \
           \"evidence\": \"exact non-empty new-side text from the cited line\"}]}\n\
          \n\
@@ -546,17 +545,19 @@ mod tests {
     }
 
     #[test]
-    fn generator_reserves_repository_claims_for_repository_dependent_conclusions() {
+    fn generator_omits_repository_claims_for_diff_local_conclusions() {
         let prompt = system_prompt(&Config::default(), trusted_date());
+        assert!(
+            prompt.contains("`repositoryContext` is optional and defaults to a diff-local finding")
+        );
         assert!(prompt.contains(
-            "Use `none` whenever the exact cited changed line is sufficient to establish the defect"
+            "Omit it whenever the exact cited changed line is sufficient to establish the defect"
         ));
-        assert!(prompt.contains(
-            "Use `absence` only when the conclusion depends on a construct missing from the complete reviewed head"
-        ));
-        assert!(prompt.contains(
-            "Use `mismatch` only when the conclusion depends on a repository target having an expected value"
-        ));
+        assert!(
+            prompt.contains(
+                "Include it only when the conclusion depends on repository-wide evidence"
+            )
+        );
     }
 
     #[test]
@@ -649,8 +650,6 @@ mod tests {
               \"findings\": [{\"path\": \"file path from the diff\", \"line\": <new-file line>,\n \
               \"endLine\": <optional>, \"severity\": \"info|warn|error\",\n \
               \"kind\": \"risk|humanEscalation|guardrail|uncertainty|contentPolicy\", \"confidence\": <0..1>,\n \
-              \"repositoryContext\": {\"claim\": \"none|absence|mismatch\", \"resources\": [], \"values\": [],\n \
-              \"versions\": [], \"paths\": [], \"identifiers\": []},\n \
               \"title\": \"short imperative title\", \"body\": \"specific, evidence-based markdown\",\n \
               \"evidence\": \"exact non-empty new-side text from the cited line\"}]}\n\
              \n\

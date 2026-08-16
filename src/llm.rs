@@ -510,6 +510,7 @@ struct RawFinding {
     severity: String,
     #[serde(default)]
     kind: Option<String>,
+    #[serde(default)]
     repository_context: RawRepositoryContext,
     #[serde(default = "default_confidence")]
     confidence: f64,
@@ -523,6 +524,7 @@ struct RawFinding {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawRepositoryContext {
+    #[serde(default)]
     claim: RawRepositoryClaimKind,
     #[serde(default)]
     resources: Vec<String>,
@@ -8568,17 +8570,31 @@ mod tests {
     }
 
     #[test]
-    fn rejects_findings_without_explicit_repository_context() {
-        let missing = r#"{
+    fn defaults_omitted_repository_context_to_diff_local() {
+        let omitted = r#"{
             "summary": "",
             "findings": [{
                 "path": "config.yaml",
                 "line": 1,
                 "severity": "warn",
-                "body": "The counterpart remains on the old version."
+                "body": "The changed value is invalid."
             }]
         }"#;
-        assert!(parse_review(missing).is_err());
+        let parsed = parse_review(omitted).unwrap();
+        assert!(matches!(
+            parsed.findings[0].repository_context.claim,
+            RawRepositoryClaimKind::None
+        ));
+
+        let empty = omitted.replace(
+            "\"body\": \"The changed value is invalid.\"",
+            "\"repositoryContext\": {},\n                \"body\": \"The changed value is invalid.\"",
+        );
+        let parsed = parse_review(&empty).unwrap();
+        assert!(matches!(
+            parsed.findings[0].repository_context.claim,
+            RawRepositoryClaimKind::None
+        ));
 
         let explicit = r#"{
             "summary": "",
