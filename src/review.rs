@@ -3206,11 +3206,14 @@ fn error_envelope(
             crate::envelope::IncompleteReviewReason::IncompleteInput,
         )
     } else if invalid_output || !advisory_operational_error {
-        fail_closed_finding(
-            review_failure
-                .and_then(|failure| failure.scorer_error.as_deref())
-                .unwrap_or("scorer output did not satisfy the admitted contract"),
-        )
+        // Only a recorded scorer error is genuinely about model output. Every
+        // other failure here reaches this branch with its cause in `err`, so
+        // report that instead of asserting a scorer contract that may never
+        // have been exercised.
+        match review_failure.and_then(|failure| failure.scorer_error.as_deref()) {
+            Some(scorer_error) => fail_closed_finding(scorer_error),
+            None => crate::envelope::operational_failure_finding(&format!("{err:#}")),
+        }
     } else {
         crate::envelope::provider_error_finding(&format!("{err:#}"))
     }];
@@ -3384,6 +3387,54 @@ mod tests {
             target_sha: Some("target".to_string()),
             changed_files: Some(1),
         }
+    }
+
+    #[test]
+    fn non_model_failures_report_their_own_cause() {
+        let envelope = error_envelope(
+            &Config::default(),
+            &anyhow::anyhow!(
+                "hosted review admission projects 11455328 micro-dollars of provider \
+                 exposure, exceeding the 1000000 micro-dollar operation cap"
+            ),
+            "head",
+            Some(&pr_meta()),
+            1,
+        );
+        let finding = &envelope.findings[0];
+        assert_eq!(finding.path, crate::envelope::OPERATIONAL_PATH);
+        assert_eq!(finding.title, "Review could not be completed");
+        assert!(
+            finding.body.contains("micro-dollar operation cap"),
+            "the real cause must reach the reader: {}",
+            finding.body
+        );
+        assert!(
+            !finding.body.contains("scorer"),
+            "a failure that never ran the scorer must not blame it: {}",
+            finding.body
+        );
+        assert!(envelope.gate.failing);
+    }
+
+    #[test]
+    fn recorded_scorer_failures_still_report_the_scorer() {
+        let envelope = error_envelope(
+            &Config::default(),
+            &rich_scorer_failure(ReviewFailureKind::InvalidOutput),
+            "head",
+            Some(&pr_meta()),
+            1,
+        );
+        let finding = &envelope.findings[0];
+        assert_eq!(finding.title, "Model output could not be validated");
+        assert!(
+            finding
+                .body
+                .contains("scorer output invalid after schema repair"),
+            "the recorded scorer error must be preserved: {}",
+            finding.body
+        );
     }
 
     #[test]
