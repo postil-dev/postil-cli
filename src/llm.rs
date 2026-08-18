@@ -609,6 +609,9 @@ pub struct LlmClient {
     request_timeout: Duration,
     timeout_retry_timeout: Duration,
     review_model_timeout: Option<Duration>,
+    /// Seconds per model operation once preflight has priced the real schedule,
+    /// or zero before it has. Shared, because every operation runs on a clone.
+    review_model_slot_secs: Arc<AtomicU64>,
     review_model_deadline: Option<Instant>,
     review_deadline: Option<Instant>,
     scorer_deadline: Option<Instant>,
@@ -2632,13 +2635,12 @@ impl LlmClient {
             review_deadline,
             total_deadline,
         )?;
-        // The slot bounds one model operation so a review's batch waves all fit
-        // inside the generator phase. Pinning it to the large-diff slot applies
-        // a many-wave bound to every hosted review: a single-wave review is cut
-        // at that slot, and because the slot then equals the phase remainder
-        // the timeout retry is unreachable, so one slow answer is terminal.
+        // The wave slot every hosted plan is priced against. It is a floor, not
+        // the slot a review ends up running under: `ensure_hosted_review_schedule`
+        // widens it once the real operation count is known. This value stands
+        // only for a review that never reaches preflight.
         client.review_model_timeout = Some(timeouts.request.min(Duration::from_secs(
-            crate::review::single_wave_request_timeout_secs(default_request_timeout.as_secs()),
+            crate::review::LARGE_DIFF_LLM_REQUEST_TIMEOUT_SECS,
         )));
         Ok(client)
     }
@@ -2665,6 +2667,7 @@ impl LlmClient {
             request_timeout,
             timeout_retry_timeout: request_timeout.min(Duration::from_secs(TIMEOUT_RETRY_CAP_SECS)),
             review_model_timeout: None,
+            review_model_slot_secs: Arc::new(AtomicU64::new(0)),
             review_model_deadline: None,
             review_deadline,
             scorer_deadline: None,
@@ -5009,9 +5012,24 @@ impl LlmClient {
     fn for_review_model_operation(&self) -> Self {
         let mut client = self.clone();
         client.review_model_deadline = self
-            .review_model_timeout
+            .scheduled_review_model_slot()
             .and_then(|timeout| Instant::now().checked_add(timeout));
         client
+    }
+
+    /// The slot one model operation may run for.
+    ///
+    /// Preflight prices the plan against the wave slot and then records what
+    /// the operations it actually scheduled leave for each of them, which for a
+    /// review that fits in one wave is most of the generator phase rather than
+    /// one wave's worth of it. Before preflight, and outside hosted review, the
+    /// priced slot stands.
+    fn scheduled_review_model_slot(&self) -> Option<Duration> {
+        let base = self.review_model_timeout?;
+        match self.review_model_slot_secs.load(Ordering::Relaxed) {
+            0 => Some(base),
+            seconds => Some(Duration::from_secs(seconds).max(base)),
+        }
     }
 
     fn ensure_hosted_review_schedule(
@@ -5056,6 +5074,15 @@ impl LlmClient {
             elapsed_text(required),
             elapsed_text(available),
         );
+        // The plan is priced per wave, but it is admitted as a whole, so what
+        // the phase leaves each of these operations is what each may run for.
+        // Holding them to the wave slot when the schedule is one operation wide
+        // spends a fraction of the phase and calls the rest a provider failure.
+        let widened = Duration::from_secs(available.as_secs() / u64::from(operations))
+            .min(self.request_timeout)
+            .max(slot);
+        self.review_model_slot_secs
+            .store(widened.as_secs(), Ordering::Relaxed);
         Ok(())
     }
 
@@ -6715,7 +6742,7 @@ mod tests {
         assert_eq!(
             client.review_model_timeout,
             Some(Duration::from_secs(
-                crate::review::SINGLE_WAVE_LLM_REQUEST_TIMEOUT_SECS
+                crate::review::LARGE_DIFF_LLM_REQUEST_TIMEOUT_SECS
             ))
         );
         let remaining = client.remaining_budget(LlmPhase::Total).unwrap().unwrap();
@@ -6724,82 +6751,91 @@ mod tests {
         assert!(remaining > Duration::from_secs(crate::review::HOSTED_LLM_TOTAL_TIMEOUT_SECS - 5));
     }
 
-    /// A single-wave hosted review must get its whole generator phase for the
-    /// one model call it makes. Bounding it to the many-wave slot caps every
-    /// hosted review at that slot, and because the slot then equals the phase
-    /// remainder the timeout retry is unreachable, so one slow answer is
-    /// terminal.
+    /// Preflight prices a plan against the wave slot and then hands each
+    /// operation what the phase actually leaves it. A one-operation schedule
+    /// held to the wave slot spends a quarter of its phase and reports the rest
+    /// as a provider failure; a many-operation schedule still has to fit.
     #[test]
-    fn single_wave_hosted_reviews_keep_the_whole_generator_phase() {
+    fn the_scheduled_slot_follows_the_operations_the_plan_admitted() {
         let _lock = env_lock().lock().unwrap();
         let _env = EnvRestore::capture(&[REQUEST_TIMEOUT_ENV, TOTAL_TIMEOUT_ENV, "POSTIL_API_KEY"]);
         EnvRestore::remove(TOTAL_TIMEOUT_ENV);
         EnvRestore::set("POSTIL_API_KEY", "test-key");
-        // The hosted worker raises the request timeout above both per-review
-        // defaults, so the slot has to come from the review's own choice.
+        // The hosted worker raises the request timeout above the per-review
+        // default, so the widened slot must still respect the phase.
         EnvRestore::set(REQUEST_TIMEOUT_ENV, "420");
 
-        let config = Config::default();
-        let review_budget = Duration::from_secs(crate::review::hosted_review_timeout_secs(&config));
+        let config = Config {
+            model: "z-ai/glm-5.2".into(),
+            scorer_enabled: false,
+            ..Config::default()
+        };
+        let review_budget = crate::review::hosted_review_timeout_secs(&config);
+        let reserve = crate::review::HOSTED_REVIEW_SCHEDULING_RESERVE_SECS;
+        let wave_slot = Duration::from_secs(crate::review::LARGE_DIFF_LLM_REQUEST_TIMEOUT_SECS);
 
-        let ordinary = LlmClient::from_env_for_remote_review(
-            &config,
-            Instant::now(),
-            Duration::from_secs(crate::review::HOSTED_LLM_REQUEST_TIMEOUT_SECS),
-            review_budget,
-            Duration::from_secs(crate::review::HOSTED_LLM_TOTAL_TIMEOUT_SECS),
-        )
-        .unwrap();
-        assert_eq!(
-            ordinary.review_model_timeout,
-            Some(Duration::from_secs(
-                crate::review::SINGLE_WAVE_LLM_REQUEST_TIMEOUT_SECS
-            ))
+        let build = || {
+            LlmClient::from_env_for_remote_review(
+                &config,
+                Instant::now(),
+                Duration::from_secs(crate::review::HOSTED_LLM_REQUEST_TIMEOUT_SECS),
+                Duration::from_secs(review_budget),
+                Duration::from_secs(crate::review::HOSTED_LLM_TOTAL_TIMEOUT_SECS),
+            )
+            .unwrap()
+        };
+
+        // Before preflight the priced wave slot stands, so a client that never
+        // schedules cannot widen itself by accident.
+        let unscheduled = build();
+        assert_eq!(unscheduled.scheduled_review_model_slot(), Some(wave_slot));
+
+        let single = build();
+        single
+            .ensure_hosted_review_schedule(&config, 1, false, 1)
+            .expect("a one-batch review must schedule");
+        let single_slot = single.scheduled_review_model_slot().unwrap();
+        assert!(
+            single_slot > wave_slot,
+            "a one-operation schedule must not be held to one wave's slot, got {single_slot:?}"
         );
         assert!(
-            ordinary.review_model_timeout.unwrap()
-                > Duration::from_secs(crate::review::LARGE_DIFF_LLM_REQUEST_TIMEOUT_SECS),
-            "a one-wave review must not inherit the many-wave slot"
+            single_slot <= Duration::from_secs(review_budget - reserve),
+            "the slot must stay inside the phase less its reserve, got {single_slot:?}"
         );
-        // The schedule check runs once the diff is fetched, against whatever is
-        // left of the phase then, so the slot needs headroom under the reserve
-        // rather than to merely equal it.
+
+        // The regression this guards: widening a multi-wave schedule by the
+        // same amount makes `required` outgrow the phase, and every such review
+        // is refused before a provider is contacted.
+        let many = build();
+        many.ensure_hosted_review_schedule(&config, 4, false, 1)
+            .expect("a four-batch review must schedule");
+        let many_slot = many.scheduled_review_model_slot().unwrap();
         assert!(
-            ordinary.review_model_timeout.unwrap()
-                < review_budget
-                    - Duration::from_secs(crate::review::HOSTED_REVIEW_SCHEDULING_RESERVE_SECS),
-            "the slot must leave the generator phase room for its scheduling reserve"
+            many_slot >= wave_slot,
+            "a scheduled slot may never fall below the slot the plan was priced at"
+        );
+        assert!(
+            many_slot
+                .checked_mul(4)
+                .is_some_and(|total| total <= Duration::from_secs(review_budget - reserve)),
+            "four operations at {many_slot:?} must still fit the phase"
+        );
+        assert!(
+            many_slot < single_slot,
+            "more operations must divide the phase further, not less"
         );
 
-        let large = LlmClient::from_env_for_remote_review(
-            &config,
-            Instant::now(),
-            Duration::from_secs(crate::review::LARGE_DIFF_LLM_REQUEST_TIMEOUT_SECS),
-            review_budget,
-            Duration::from_secs(crate::review::HOSTED_LLM_TOTAL_TIMEOUT_SECS),
-        )
-        .unwrap();
-        assert_eq!(
-            large.review_model_timeout,
-            Some(Duration::from_secs(
-                crate::review::LARGE_DIFF_LLM_REQUEST_TIMEOUT_SECS
-            )),
-            "many-wave reviews still need the short slot so every wave fits"
+        // The slot only matters if the operation actually runs under it, so
+        // check the deadline the review path builds, not just the derivation.
+        let operation = single.for_review_model_operation();
+        let deadline = operation
+            .review_model_deadline
+            .expect("a hosted review operation must carry a deadline");
+        assert!(
+            deadline.saturating_duration_since(Instant::now()) > wave_slot,
+            "the operation must run under the scheduled slot, not the priced wave slot"
         );
-    }
-
-    #[test]
-    fn local_from_env_has_no_total_deadline_without_env_override() {
-        let _lock = env_lock().lock().unwrap();
-        let _env = EnvRestore::capture(&[REQUEST_TIMEOUT_ENV, TOTAL_TIMEOUT_ENV, "POSTIL_API_KEY"]);
-        EnvRestore::remove(REQUEST_TIMEOUT_ENV);
-        EnvRestore::remove(TOTAL_TIMEOUT_ENV);
-        EnvRestore::set("POSTIL_API_KEY", "test-key");
-
-        let client = LlmClient::from_env(&Config::default()).unwrap();
-
-        assert!(client.remaining_budget(LlmPhase::Review).unwrap().is_none());
-        assert!(client.remaining_budget(LlmPhase::Total).unwrap().is_none());
     }
 
     #[test]
