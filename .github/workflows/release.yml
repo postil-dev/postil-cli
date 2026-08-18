@@ -3,6 +3,15 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      bench_live_override_reason:
+        description: >-
+          Publish even when the live benchmark misses its floor, recording this
+          reason on the run. Leave empty to require the benchmark to pass. The
+          baseline is never rewritten; an accepted miss stays visible as a miss.
+        required: false
+        default: ""
 
 jobs:
   validate-tag:
@@ -113,15 +122,43 @@ jobs:
 
       - name: Compare against the recorded baseline
         id: compare-baseline
+        # Failure is decided by the next step so an operator-supplied reason can
+        # accept a miss. Recording the miss and rewriting the baseline are
+        # different acts, and only the first one happens here.
+        continue-on-error: true
         working-directory: bench
         run: bun run bench:compare -- --result "${{ runner.temp }}/bench-live-report.json"
 
-      - name: Report benchmark regression
-        if: steps.compare-baseline.outcome == 'failure'
+      - name: Enforce the benchmark floor
+        env:
+          OVERRIDE_REASON: ${{ inputs.bench_live_override_reason }}
+          COMPARISON: ${{ steps.compare-baseline.outcome }}
         run: |
-          echo "::error::Release blocked by a benchmark regression. See the 'Compare against the recorded baseline' step above for the failing metric(s)."
-          echo "## Release blocked" >> "$GITHUB_STEP_SUMMARY"
-          echo "The live benchmark regressed past tolerance against \`bench/baseline.json\`. See the 'Compare against the recorded baseline' step log for the failing metric(s)." >> "$GITHUB_STEP_SUMMARY"
+          set -euo pipefail
+          if [[ "${COMPARISON}" == "success" ]]; then
+            echo "The live benchmark met its floor."
+            exit 0
+          fi
+          if [[ -z "${OVERRIDE_REASON}" ]]; then
+            echo "::error::Release blocked by a benchmark regression. See the 'Compare against the recorded baseline' step above for the failing metric(s)."
+            {
+              echo "## Release blocked"
+              echo
+              echo "The live benchmark regressed past tolerance against \`bench/baseline.json\`."
+              echo "See the 'Compare against the recorded baseline' step log for the failing metric(s)."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "::warning title=Benchmark floor missed and accepted::${OVERRIDE_REASON}"
+          {
+            echo "## Benchmark floor missed and accepted"
+            echo
+            echo "The live benchmark missed its floor and this release was published anyway."
+            echo
+            echo "**Reason:** ${OVERRIDE_REASON}"
+            echo
+            echo "\`bench/baseline.json\` is unchanged, so the next release faces the same floor."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   build:
     needs: [validate-tag, bench-live]
