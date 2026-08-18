@@ -211,7 +211,28 @@ struct QualificationProfileDigestMaterial<'a> {
     repeated_runs: u32,
 }
 
+/// Ceiling on what a hosted operation may actually spend, accumulated across
+/// provider attempts as they are reserved. This matches the per-review
+/// reservation the service holds, so a review can never consume more of an
+/// organization's allowance than was set aside for it.
 pub const HOSTED_OPERATION_COST_CAP_MICROS: u64 = 1_000_000;
+
+/// Ceiling on what a hosted review may *project* before it runs. Admission
+/// prices a worst case rather than an estimate: the full bounded selection of
+/// `MAX_HOSTED_SELECTED_BATCHES` batches, every logical call the watchdog plan
+/// allows, and a hostile maximum-size retry payload on each one, at the
+/// admitted price bounds. The shipped profile projects roughly 15.6 dollars
+/// while a review actually spends on the order of 0.01 dollars, so the two
+/// quantities differ by three orders of magnitude and cannot share a limit.
+///
+/// Holding the projection to the spend cap rejects every review before provider
+/// contact, whatever its size, and surfaces as a model failure rather than a
+/// budget decision. Spend stays bounded by
+/// `HOSTED_OPERATION_COST_CAP_MICROS` above, which this deliberately does not
+/// relax; `hosted_review_plan_is_admitted_at_shipped_price_bounds` prices the
+/// shipped profile at its real bounds so a projection that outgrows this
+/// ceiling fails a test instead of every production review.
+pub const HOSTED_ADMISSION_PROJECTION_CAP_MICROS: u64 = 25_000_000;
 pub const QUALIFICATION_MAX_AGE_DAYS: u32 = 30;
 const QUALIFICATION_MAX_AGE_SECONDS: u64 = QUALIFICATION_MAX_AGE_DAYS as u64 * 24 * 60 * 60;
 const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;

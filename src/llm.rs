@@ -19,7 +19,10 @@ use time::Date;
 
 use crate::adjudication::{AdjudicationResult, MAX_ADJUDICATION_OUTPUT_TOKENS};
 use crate::api_key;
-use crate::config::{ApiFormat, Config, HOSTED_OPERATION_COST_CAP_MICROS, ModelPriceBound};
+use crate::config::{
+    ApiFormat, Config, HOSTED_ADMISSION_PROJECTION_CAP_MICROS, HOSTED_OPERATION_COST_CAP_MICROS,
+    ModelPriceBound,
+};
 use crate::envelope::{
     Finding, Kind, ModelIncident, ModelIncidentCategory, ModelIncidentPhase, ModelIncidentRecovery,
     ModelUsage, ModelUsageCostSource, ModelUsagePhase, ModelUsageRole, ProviderCost,
@@ -2169,8 +2172,8 @@ impl LlmClient {
             .collect::<Vec<_>>()
             .join(", ");
         ensure!(
-            exposure.projected_cost_micros <= HOSTED_OPERATION_COST_CAP_MICROS,
-            "hosted {operation} admission projects {} micro-dollars of provider exposure across {} attempts, {} serialized input bytes, and {} output tokens (per-model micro-dollars: {model_costs}), exceeding the {HOSTED_OPERATION_COST_CAP_MICROS} micro-dollar operation cap",
+            exposure.projected_cost_micros <= HOSTED_ADMISSION_PROJECTION_CAP_MICROS,
+            "hosted {operation} admission projects {} micro-dollars of provider exposure across {} attempts, {} serialized input bytes, and {} output tokens (per-model micro-dollars: {model_costs}), exceeding the {HOSTED_ADMISSION_PROJECTION_CAP_MICROS} micro-dollar admission projection cap",
             exposure.projected_cost_micros,
             exposure.attempts,
             exposure.input_bytes,
@@ -8040,6 +8043,64 @@ mod tests {
         assert_eq!(client.admission.lock().unwrap().attempts, 0);
     }
 
+    /// The shipped provisional hosted profile must actually clear the operation
+    /// cost cap. The neighbouring plan test prices every token at one micro per
+    /// million, so it cannot observe the cap at all; this one uses the real
+    /// admitted price bounds, which is the only way a cap that rejects every
+    /// production review shows up as a test failure rather than an outage.
+    #[test]
+    fn hosted_review_plan_is_admitted_at_shipped_price_bounds() {
+        let config = Config {
+            model: "z-ai/glm-5.2".into(),
+            scorer_enabled: false,
+            ..Config::default()
+        };
+        let mut client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        client.request_decorations.hosted_price_bounds = Some(Arc::new(HashMap::from([(
+            "z-ai/glm-5.2".into(),
+            ModelPriceBound {
+                model: "z-ai/glm-5.2".into(),
+                input_micros_per_million_tokens: 1_400_000,
+                output_micros_per_million_tokens: 4_400_000,
+            },
+        )])));
+        let users =
+            vec!["bounded candidate".to_string(); crate::review::MAX_HOSTED_SELECTED_BATCHES];
+        let output_tokens = vec![REVIEW_MAX_TOKENS; crate::review::MAX_HOSTED_SELECTED_BATCHES];
+        let manifest = "m".repeat(96_000);
+        let admission = client
+            .preflight_review_plan_with_output_limits(
+                &config,
+                crate::review::MAX_HOSTED_SELECTED_BATCHES,
+                "system",
+                ReviewPreflightPrompts {
+                    first_users: &users,
+                    later_users: &users,
+                    output_tokens: &output_tokens,
+                    scorer_system: "scorer system",
+                    current_utc_date: trusted_date(),
+                },
+                ReviewPlanSchedule {
+                    planner: Some((&manifest, 1)),
+                    batch_concurrency: 1,
+                },
+            )
+            .expect("the shipped hosted profile must be admissible");
+        assert!(
+            admission.projected_cost_micros <= HOSTED_ADMISSION_PROJECTION_CAP_MICROS,
+            "projected {} exceeds the {} admission cap",
+            admission.projected_cost_micros,
+            HOSTED_ADMISSION_PROJECTION_CAP_MICROS
+        );
+    }
+
     #[test]
     fn maximum_hosted_plan_matches_watchdog_and_transport_arithmetic() {
         let config = Config {
@@ -8282,10 +8343,10 @@ mod tests {
                     attempts: 6,
                     input_bytes: 12_345,
                     output_tokens: 678,
-                    projected_cost_micros: HOSTED_OPERATION_COST_CAP_MICROS + 1,
+                    projected_cost_micros: HOSTED_ADMISSION_PROJECTION_CAP_MICROS + 1,
                     model_costs_micros: BTreeMap::from([(
                         "provider/model".to_string(),
-                        HOSTED_OPERATION_COST_CAP_MICROS + 1,
+                        HOSTED_ADMISSION_PROJECTION_CAP_MICROS + 1,
                     )]),
                 },
             )
@@ -8294,7 +8355,10 @@ mod tests {
         assert!(message.contains("provider exposure across 6 attempts"));
         assert!(message.contains("12345 serialized input bytes"));
         assert!(message.contains("678 output tokens"));
-        assert!(message.contains(r#""provider/model"=1000001"#));
+        assert!(message.contains(&format!(
+            r#""provider/model"={}"#,
+            HOSTED_ADMISSION_PROJECTION_CAP_MICROS + 1
+        )));
     }
 
     #[test]
@@ -8332,7 +8396,7 @@ mod tests {
         );
         assert_eq!(exposure.projected_cost_micros, 1_056);
 
-        exposure.projected_cost_micros = HOSTED_OPERATION_COST_CAP_MICROS + 1;
+        exposure.projected_cost_micros = HOSTED_ADMISSION_PROJECTION_CAP_MICROS + 1;
         let error = LlmClient::build(
             &Config::default(),
             "test-key".into(),

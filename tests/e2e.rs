@@ -2640,10 +2640,13 @@ async fn hosted_cost_rejection_precedes_durable_plan_registration() {
             "generatorChain": [model],
             "consensus": 1,
             "scorerChain": [model],
+            // Priced well above any admissible profile so the plan is rejected
+            // on cost. The shipped bounds project inside the admission ceiling,
+            // so a realistic price here would exercise the happy path instead.
             "modelPriceBounds": [{
                 "model": model,
-                "inputMicrosPerMillionTokens": 1_000_000,
-                "outputMicrosPerMillionTokens": 1_000_000
+                "inputMicrosPerMillionTokens": 100_000_000,
+                "outputMicrosPerMillionTokens": 100_000_000
             }]
         }))
         .unwrap(),
@@ -2672,7 +2675,7 @@ async fn hosted_cost_rejection_precedes_durable_plan_registration() {
         .code(2);
     let stderr = String::from_utf8_lossy(&out.get_output().stderr);
     assert!(stderr.contains("hosted review admission projects"));
-    assert!(stderr.contains("operation cap"));
+    assert!(stderr.contains("admission projection cap"));
     assert!(out.get_output().stdout.is_empty());
     assert!(
         registration_server
