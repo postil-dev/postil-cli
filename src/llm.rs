@@ -2633,13 +2633,13 @@ impl LlmClient {
             total_deadline,
         )?;
         // The slot bounds one model operation so a review's batch waves all fit
-        // inside the generator phase. `default_request_timeout` already carries
-        // the per-review answer: the short large-diff slot when the review is
-        // spread across many waves, the full hosted request timeout when it is
-        // not. Pinning the slot to the large-diff constant instead applies a
-        // many-wave bound to a single-wave review, which caps every hosted model
-        // call at that constant and makes any slower answer terminal.
-        client.review_model_timeout = Some(timeouts.request.min(default_request_timeout));
+        // inside the generator phase. Pinning it to the large-diff slot applies
+        // a many-wave bound to every hosted review: a single-wave review is cut
+        // at that slot, and because the slot then equals the phase remainder
+        // the timeout retry is unreachable, so one slow answer is terminal.
+        client.review_model_timeout = Some(timeouts.request.min(Duration::from_secs(
+            crate::review::single_wave_request_timeout_secs(default_request_timeout.as_secs()),
+        )));
         Ok(client)
     }
 
@@ -6715,7 +6715,7 @@ mod tests {
         assert_eq!(
             client.review_model_timeout,
             Some(Duration::from_secs(
-                crate::review::HOSTED_LLM_REQUEST_TIMEOUT_SECS
+                crate::review::SINGLE_WAVE_LLM_REQUEST_TIMEOUT_SECS
             ))
         );
         let remaining = client.remaining_budget(LlmPhase::Total).unwrap().unwrap();
@@ -6753,7 +6753,7 @@ mod tests {
         assert_eq!(
             ordinary.review_model_timeout,
             Some(Duration::from_secs(
-                crate::review::HOSTED_LLM_REQUEST_TIMEOUT_SECS
+                crate::review::SINGLE_WAVE_LLM_REQUEST_TIMEOUT_SECS
             ))
         );
         assert!(
@@ -6761,9 +6761,14 @@ mod tests {
                 > Duration::from_secs(crate::review::LARGE_DIFF_LLM_REQUEST_TIMEOUT_SECS),
             "a one-wave review must not inherit the many-wave slot"
         );
+        // The schedule check runs once the diff is fetched, against whatever is
+        // left of the phase then, so the slot needs headroom under the reserve
+        // rather than to merely equal it.
         assert!(
-            ordinary.review_model_timeout.unwrap() <= review_budget,
-            "the slot must stay inside the generator phase it is spent from"
+            ordinary.review_model_timeout.unwrap()
+                < review_budget
+                    - Duration::from_secs(crate::review::HOSTED_REVIEW_SCHEDULING_RESERVE_SECS),
+            "the slot must leave the generator phase room for its scheduling reserve"
         );
 
         let large = LlmClient::from_env_for_remote_review(
