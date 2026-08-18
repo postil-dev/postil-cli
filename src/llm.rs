@@ -6826,6 +6826,20 @@ mod tests {
             "more operations must divide the phase further, not less"
         );
 
+        // Batches run concurrently, so a four-batch review is one wave and its
+        // slot is the one-operation slot, not a quarter of it. Running them one
+        // at a time is what put each batch under a slot the review model's tail
+        // latency does not fit.
+        let concurrent = build();
+        concurrent
+            .ensure_hosted_review_schedule(&config, 4, false, 4)
+            .expect("four batches at concurrency four must schedule");
+        assert_eq!(
+            concurrent.scheduled_review_model_slot(),
+            Some(single_slot),
+            "one wave of four batches must get the same slot as one batch"
+        );
+
         // The slot only matters if the operation actually runs under it, so
         // check the deadline the review path builds, not just the derivation.
         let operation = single.for_review_model_operation();

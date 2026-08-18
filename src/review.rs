@@ -1802,11 +1802,13 @@ async fn review_diff_at(
                                 .any(|id| !candidates.mandatory_ids.contains(id)))
                         .then_some((candidates.manifest.as_str(), remaining))
                     });
-                    let admitted_concurrency = if deterministic_large_review {
-                        large_diff_batch_concurrency(cfg)
-                    } else {
-                        1
-                    };
+                    // Batch requests carry their own prompts and are collected by
+                    // index, so nothing orders them. `max_hosted_review_batches`
+                    // already prices capacity at this concurrency; running them
+                    // one at a time instead divides the phase by the batch count
+                    // and puts each batch under a slot the review model's tail
+                    // latency does not fit.
+                    let admitted_concurrency = large_diff_batch_concurrency(cfg);
                     let scorer_system = prompt::scorer_system_prompt(cfg, current_utc_date);
                     let admission = client.preflight_review_plan_with_output_limits(
                         cfg,
@@ -1996,11 +1998,10 @@ async fn review_diff_at(
                     ));
                     request_index += 1;
                 }
-                let concurrency = if deterministic_large_review {
-                    large_diff_batch_concurrency(cfg)
-                } else {
-                    1
-                };
+                // Must match the concurrency admission priced the schedule at,
+                // or the phase is divided into a different number of waves than
+                // the plan was checked against.
+                let concurrency = large_diff_batch_concurrency(cfg);
                 let scorer_batch_evidence_budget = (MAX_SCORER_EVIDENCE_CORPUS_BYTES
                     / total_requests.max(1))
                 .min(MAX_SCORER_BATCH_EVIDENCE_BYTES);
