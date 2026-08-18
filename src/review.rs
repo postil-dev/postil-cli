@@ -64,14 +64,6 @@ pub(crate) const HOSTED_LLM_REQUEST_TIMEOUT_SECS: u64 = 240;
 /// bounded by this slot. Admission prices complete batch waves and sequential
 /// cascades against the review-phase deadline.
 pub(crate) const LARGE_DIFF_LLM_REQUEST_TIMEOUT_SECS: u64 = 60;
-/// The slot a review that fits in a single batch wave gets for its one model
-/// operation. The large-diff slot above is sized so many waves fit; spending it
-/// on a single wave ends the review the first time the model answers slower
-/// than a fraction of the phase it was given. This sits above the review
-/// model's observed tail latency and below the generator phase less its
-/// scheduling reserve, which `ensure_hosted_review_schedule` enforces against
-/// the deadline that actually remains once the diff has been fetched.
-pub(crate) const SINGLE_WAVE_LLM_REQUEST_TIMEOUT_SECS: u64 = 180;
 pub(crate) const HOSTED_LLM_REVIEW_TIMEOUT_SECS: u64 = 420;
 pub(crate) const HOSTED_REVIEW_SCHEDULING_RESERVE_SECS: u64 = 30;
 const FORGE_READ_TIMEOUT_SECS: u64 = 60;
@@ -163,16 +155,6 @@ pub(crate) fn large_diff_batch_concurrency(cfg: &Config) -> usize {
         1
     };
     (MAX_LARGE_DIFF_CONCURRENCY / consensus_width).max(1)
-}
-
-/// A review spread across many waves keeps the slot each wave was priced
-/// against; anything else is a single wave and gets the single-wave slot.
-pub(crate) fn single_wave_request_timeout_secs(review_request_timeout_secs: u64) -> u64 {
-    if review_request_timeout_secs <= LARGE_DIFF_LLM_REQUEST_TIMEOUT_SECS {
-        review_request_timeout_secs
-    } else {
-        SINGLE_WAVE_LLM_REQUEST_TIMEOUT_SECS.min(review_request_timeout_secs)
-    }
 }
 
 fn hosted_request_timeout_secs(deterministic_large_review: bool) -> u64 {
