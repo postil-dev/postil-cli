@@ -2632,8 +2632,13 @@ impl LlmClient {
             review_deadline,
             total_deadline,
         )?;
+        // The slot bounds one model operation so a review's batch waves all fit
+        // inside the generator phase. Pinning it to the large-diff slot applies
+        // a many-wave bound to every hosted review: a single-wave review is cut
+        // at that slot, and because the slot then equals the phase remainder
+        // the timeout retry is unreachable, so one slow answer is terminal.
         client.review_model_timeout = Some(timeouts.request.min(Duration::from_secs(
-            crate::review::LARGE_DIFF_LLM_REQUEST_TIMEOUT_SECS,
+            crate::review::single_wave_request_timeout_secs(default_request_timeout.as_secs()),
         )));
         Ok(client)
     }
@@ -6710,13 +6715,77 @@ mod tests {
         assert_eq!(
             client.review_model_timeout,
             Some(Duration::from_secs(
-                crate::review::LARGE_DIFF_LLM_REQUEST_TIMEOUT_SECS
+                crate::review::SINGLE_WAVE_LLM_REQUEST_TIMEOUT_SECS
             ))
         );
         let remaining = client.remaining_budget(LlmPhase::Total).unwrap().unwrap();
 
         assert!(remaining <= Duration::from_secs(crate::review::HOSTED_LLM_TOTAL_TIMEOUT_SECS));
         assert!(remaining > Duration::from_secs(crate::review::HOSTED_LLM_TOTAL_TIMEOUT_SECS - 5));
+    }
+
+    /// A single-wave hosted review must get its whole generator phase for the
+    /// one model call it makes. Bounding it to the many-wave slot caps every
+    /// hosted review at that slot, and because the slot then equals the phase
+    /// remainder the timeout retry is unreachable, so one slow answer is
+    /// terminal.
+    #[test]
+    fn single_wave_hosted_reviews_keep_the_whole_generator_phase() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvRestore::capture(&[REQUEST_TIMEOUT_ENV, TOTAL_TIMEOUT_ENV, "POSTIL_API_KEY"]);
+        EnvRestore::remove(TOTAL_TIMEOUT_ENV);
+        EnvRestore::set("POSTIL_API_KEY", "test-key");
+        // The hosted worker raises the request timeout above both per-review
+        // defaults, so the slot has to come from the review's own choice.
+        EnvRestore::set(REQUEST_TIMEOUT_ENV, "420");
+
+        let config = Config::default();
+        let review_budget = Duration::from_secs(crate::review::hosted_review_timeout_secs(&config));
+
+        let ordinary = LlmClient::from_env_for_remote_review(
+            &config,
+            Instant::now(),
+            Duration::from_secs(crate::review::HOSTED_LLM_REQUEST_TIMEOUT_SECS),
+            review_budget,
+            Duration::from_secs(crate::review::HOSTED_LLM_TOTAL_TIMEOUT_SECS),
+        )
+        .unwrap();
+        assert_eq!(
+            ordinary.review_model_timeout,
+            Some(Duration::from_secs(
+                crate::review::SINGLE_WAVE_LLM_REQUEST_TIMEOUT_SECS
+            ))
+        );
+        assert!(
+            ordinary.review_model_timeout.unwrap()
+                > Duration::from_secs(crate::review::LARGE_DIFF_LLM_REQUEST_TIMEOUT_SECS),
+            "a one-wave review must not inherit the many-wave slot"
+        );
+        // The schedule check runs once the diff is fetched, against whatever is
+        // left of the phase then, so the slot needs headroom under the reserve
+        // rather than to merely equal it.
+        assert!(
+            ordinary.review_model_timeout.unwrap()
+                < review_budget
+                    - Duration::from_secs(crate::review::HOSTED_REVIEW_SCHEDULING_RESERVE_SECS),
+            "the slot must leave the generator phase room for its scheduling reserve"
+        );
+
+        let large = LlmClient::from_env_for_remote_review(
+            &config,
+            Instant::now(),
+            Duration::from_secs(crate::review::LARGE_DIFF_LLM_REQUEST_TIMEOUT_SECS),
+            review_budget,
+            Duration::from_secs(crate::review::HOSTED_LLM_TOTAL_TIMEOUT_SECS),
+        )
+        .unwrap();
+        assert_eq!(
+            large.review_model_timeout,
+            Some(Duration::from_secs(
+                crate::review::LARGE_DIFF_LLM_REQUEST_TIMEOUT_SECS
+            )),
+            "many-wave reviews still need the short slot so every wave fits"
+        );
     }
 
     #[test]
