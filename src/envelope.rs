@@ -1735,6 +1735,40 @@ pub(crate) fn incomplete_review_finding(reason: IncompleteReviewReason) -> Findi
     }
 }
 
+/// The synthetic finding emitted when a review stopped before producing a
+/// verdict for a reason that is not model output: an admission limit, a
+/// configuration problem, or an unexpected internal error. Postil still fails
+/// closed, but the cause is reported as itself. Attributing such a failure to
+/// model output sends every reader looking at the model when the model was
+/// never called.
+pub fn operational_failure_finding(detail: &str) -> Finding {
+    let detail = detail.trim();
+    let opening = "Postil could not complete this review, so no verdict was issued.";
+    let body = if detail.is_empty() || prose_exposes_evidence_boundary(detail) {
+        opening.to_string()
+    } else {
+        format!("{opening}\n\nDetail: {detail}")
+    };
+    Finding {
+        path: OPERATIONAL_PATH.to_string(),
+        line: 1,
+        end_line: None,
+        severity: Severity::Error,
+        kind: Kind::Uncertainty,
+        confidence: 1.0,
+        title: "Review could not be completed".to_string(),
+        body,
+        evidence: None,
+        id: None,
+        generator_confidence: None,
+        scorer_confidence: None,
+        generator_kind: None,
+        scorer_kind: None,
+        scorer_reason: None,
+        repository_claim: None,
+    }
+}
+
 /// The synthetic finding emitted when the model produced unusable output.
 /// Postil fails closed: a review that could not be trusted is an error, not a pass.
 pub fn fail_closed_finding(detail: &str) -> Finding {
