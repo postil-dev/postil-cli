@@ -613,20 +613,23 @@ describe("pair qualification configuration", () => {
       generatorModel: "z-ai/glm-5.2",
       scorerModel: "openai/gpt-5-mini",
     };
+    // Priced an order of magnitude above any admissible profile so the plan is
+    // refused on projected exposure. Realistic bounds project inside the
+    // admission ceiling and would exercise the happy path instead.
     const pricing = new Map([
       [runtimePair.generatorModel, {
         providerIdentity: "PinnedProvider",
-        promptUsdPerToken: 0.00028434,
-        completionUsdPerToken: 0.00089364,
-        inputMicrosPerMillionTokens: 284_340,
-        outputMicrosPerMillionTokens: 893_640,
+        promptUsdPerToken: 0.0028434,
+        completionUsdPerToken: 0.0089364,
+        inputMicrosPerMillionTokens: 2_843_400,
+        outputMicrosPerMillionTokens: 8_936_400,
       }],
       [runtimePair.scorerModel, {
         providerIdentity: "PinnedProvider",
-        promptUsdPerToken: 0.00028434,
-        completionUsdPerToken: 0.00089364,
-        inputMicrosPerMillionTokens: 284_340,
-        outputMicrosPerMillionTokens: 893_640,
+        promptUsdPerToken: 0.0028434,
+        completionUsdPerToken: 0.0089364,
+        inputMicrosPerMillionTokens: 2_843_400,
+        outputMicrosPerMillionTokens: 8_936_400,
       }],
     ]);
     try {
@@ -649,7 +652,7 @@ describe("pair qualification configuration", () => {
         apiFormat: "openai-compatible",
         costCapUsdDecimal: "70",
         upstreamProvider: "PinnedProvider",
-      })).rejects.toThrow("exceeding the 1000000 micro-dollar operation cap");
+      })).rejects.toThrow("micro-dollar admission projection cap");
     } finally {
       if (inheritedModelKey === undefined) delete process.env.MODEL_API_KEY;
       else process.env.MODEL_API_KEY = inheritedModelKey;
