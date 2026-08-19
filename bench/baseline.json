@@ -23,6 +23,25 @@
         "p50": 9311,
         "p95": 31563
       }
+    },
+    "openai/gpt-5.6-luna": {
+      "populated": true,
+      "generatedAt": "2026-08-19T14:50:35.108Z",
+      "reviewMode": "exhaustive",
+      "sourceRunAt": "2026-08-19T14:50:35.108Z",
+      "providerContractEnforced": true,
+      "screeningProfileSha256": "52fd3e2a85ffd715c00c33cc2d3664da84237cdfc2a19cb2671f0d5cbc9c93b5",
+      "upstreamProviderIdentity": "Azure",
+      "totalCases": 70,
+      "scoredCases": 70,
+      "detectionRate": 0.8947368421052632,
+      "falsePositives": 0,
+      "gateVerdictCorrectness": 0.8285714285714286,
+      "meanCostUsdPerCase": 0.0007770375714285714,
+      "latencyMs": {
+        "p50": 8649,
+        "p95": 17559
+      }
     }
   }
 }
