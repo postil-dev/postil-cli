@@ -657,6 +657,16 @@ struct LlmTimeouts {
 
 /// Retries per model on transient provider errors before the cascade moves on.
 pub(crate) const TRANSIENT_RETRIES: u32 = 2;
+/// Ceiling on budget-funded retries of a retryable provider status, so a
+/// provider that rejects instantly cannot spin the whole phase away in a tight
+/// loop even when every wait fits.
+pub(crate) const MAX_BUDGETED_TRANSIENT_RETRIES: u32 = 12;
+/// Longest single wait between budget-funded retries. `Retry-After` still wins
+/// when the provider supplies one.
+const MAX_TRANSIENT_BACKOFF: Duration = Duration::from_secs(20);
+/// Time a retry must leave for the attempt it funds. Without it the last retry
+/// sleeps until the deadline and the request it waited for never runs.
+const RETRY_ATTEMPT_RESERVE: Duration = Duration::from_secs(15);
 /// A fresh request can recover when the caller's request timeout, rather than
 /// the provider's response, ended an otherwise viable routed completion. The
 /// shared total deadline remains authoritative, so this cannot extend a hosted
@@ -1520,10 +1530,36 @@ fn provider_retry_delay(retry: u32) -> Duration {
 }
 
 fn provider_retry_delay_with_sample(retry: u32, sample: u64) -> Duration {
-    let ceiling_ms = 2_000_u64.saturating_mul(u64::from(retry.max(1)));
+    // Linear for the first attempts, then doubling, so a rate limit that lasts
+    // minutes is waited out rather than burned through in seconds.
+    let ceiling_ms = if retry <= TRANSIENT_RETRIES {
+        2_000_u64.saturating_mul(u64::from(retry.max(1)))
+    } else {
+        let doublings = retry - TRANSIENT_RETRIES;
+        2_000_u64
+            .saturating_mul(u64::from(TRANSIENT_RETRIES))
+            .saturating_mul(1_u64 << doublings.min(6))
+    }
+    .min(MAX_TRANSIENT_BACKOFF.as_millis() as u64);
     let floor_ms = ceiling_ms / 2;
     let jitter_ms = sample % (ceiling_ms - floor_ms + 1);
     Duration::from_millis(floor_ms + jitter_ms)
+}
+
+/// Whether another attempt at a retryable status is affordable.
+///
+/// The fixed allowance always applies. Past it the phase's own remaining budget
+/// decides, because a review holding minutes of budget that abandons a
+/// transient rate limit after seconds reports a provider outage it was funded
+/// to wait out. An unbudgeted caller keeps the fixed allowance.
+fn transient_retry_affordable(retries: u32, wait: Duration, remaining: Option<Duration>) -> bool {
+    if retries < TRANSIENT_RETRIES {
+        return true;
+    }
+    if retries >= MAX_BUDGETED_TRANSIENT_RETRIES {
+        return false;
+    }
+    remaining.is_some_and(|left| wait.saturating_add(RETRY_ATTEMPT_RESERVE) <= left)
 }
 
 fn timeout_status(status: u16) -> bool {
@@ -4620,17 +4656,23 @@ impl LlmClient {
                         );
                         return Err(anyhow::Error::new(ProviderHttpFailure(status)).context(detail));
                     }
-                    if retryable_status(status.as_u16()) && retries < TRANSIENT_RETRIES {
-                        retries += 1;
-                        let wait = response
+                    let transient_wait = retryable_status(status.as_u16()).then(|| {
+                        response
                             .retry_after
-                            .unwrap_or_else(|| provider_retry_delay(retries));
+                            .unwrap_or_else(|| provider_retry_delay(retries + 1))
+                    });
+                    if let Some(wait) = transient_wait
+                        && transient_retry_affordable(retries, wait, self.remaining_budget(phase)?)
+                    {
+                        retries += 1;
                         eprintln!(
                             "postil: model {} returned retryable HTTP {status} after {}, retrying in {} \
-                             (retry {retries}/{TRANSIENT_RETRIES})",
+                             (retry {retries}/{MAX_BUDGETED_TRANSIENT_RETRIES}, budget {})",
                             log_text(model),
                             elapsed_text(attempt_started_at.elapsed()),
-                            elapsed_text(wait)
+                            elapsed_text(wait),
+                            self.remaining_budget(phase)?
+                                .map_or_else(|| "unbounded".to_string(), elapsed_text)
                         );
                         self.sleep_with_budget(phase, wait).await?;
                         attempt_timeout = self.request_timeout;
@@ -9986,5 +10028,84 @@ mod tests {
         assert_eq!(scorer_max_tokens(20), Some(3_136));
         assert_eq!(scorer_max_tokens(21), None);
         assert_eq!(scorer_max_tokens(usize::MAX), None);
+    }
+}
+
+#[cfg(test)]
+mod transient_retry_budget_tests {
+    use super::*;
+
+    #[test]
+    fn the_fixed_allowance_applies_without_a_budget() {
+        // An unbudgeted caller keeps exactly the old behaviour.
+        assert!(transient_retry_affordable(0, Duration::from_secs(2), None));
+        assert!(transient_retry_affordable(1, Duration::from_secs(4), None));
+        assert!(!transient_retry_affordable(
+            TRANSIENT_RETRIES,
+            Duration::from_secs(4),
+            None
+        ));
+    }
+
+    #[test]
+    fn a_review_with_budget_keeps_retrying_past_the_fixed_allowance() {
+        // The outage this fixes: a review holding minutes abandoned a
+        // transient rate limit after about five seconds.
+        let plenty = Some(Duration::from_secs(326));
+        assert!(transient_retry_affordable(
+            TRANSIENT_RETRIES,
+            Duration::from_secs(8),
+            plenty
+        ));
+        assert!(transient_retry_affordable(
+            6,
+            Duration::from_secs(20),
+            plenty
+        ));
+    }
+
+    #[test]
+    fn a_retry_that_would_not_leave_time_to_use_it_is_refused() {
+        // Waiting until the deadline and never issuing the request it waited
+        // for spends the budget for nothing.
+        let nearly_gone = Some(RETRY_ATTEMPT_RESERVE + Duration::from_secs(1));
+        assert!(transient_retry_affordable(
+            TRANSIENT_RETRIES,
+            Duration::from_secs(1),
+            nearly_gone
+        ));
+        assert!(!transient_retry_affordable(
+            TRANSIENT_RETRIES,
+            Duration::from_secs(5),
+            nearly_gone
+        ));
+    }
+
+    #[test]
+    fn budget_funded_retries_stop_at_the_ceiling() {
+        let unlimited = Some(Duration::from_secs(86_400));
+        assert!(transient_retry_affordable(
+            MAX_BUDGETED_TRANSIENT_RETRIES - 1,
+            Duration::from_secs(1),
+            unlimited,
+        ));
+        assert!(!transient_retry_affordable(
+            MAX_BUDGETED_TRANSIENT_RETRIES,
+            Duration::from_secs(1),
+            unlimited,
+        ));
+    }
+
+    #[test]
+    fn backoff_grows_past_the_fixed_allowance_and_is_capped() {
+        let early = provider_retry_delay_with_sample(1, 0);
+        let later = provider_retry_delay_with_sample(TRANSIENT_RETRIES + 3, 0);
+        assert!(later > early, "backoff must grow for a persistent limit");
+        for retry in 1..=MAX_BUDGETED_TRANSIENT_RETRIES {
+            assert!(
+                provider_retry_delay_with_sample(retry, u64::MAX) <= MAX_TRANSIENT_BACKOFF,
+                "retry {retry} exceeded the backoff ceiling",
+            );
+        }
     }
 }
