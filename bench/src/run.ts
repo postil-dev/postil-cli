@@ -50,6 +50,7 @@
 //   --run-id <id>           optional live-screen artifact namespace
 
 import { createHash, randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 import { cases } from "../fixtures/cases";
@@ -219,6 +220,20 @@ function liveConcurrency(args: string[]): number {
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_LIVE_CONCURRENCY;
 }
 
+/** The generator the binary under test actually ships, read from the same
+ * `config.toml` the build bakes in. Restating the id in a caller lets the
+ * benchmark certify a model the release does not contain: the release gate
+ * carried `REVIEW_MODEL: z-ai/glm-5.2` in workflow YAML and kept scoring that
+ * model after the shipped default moved, passing against the old baseline. */
+export function shippedDefaultModel(
+  configPath = resolve(import.meta.dir, "..", "..", "config.toml"),
+): string | undefined {
+  const raw = readFileSync(configPath, "utf8");
+  const match = /^\s*default_model\s*=\s*"([^"]*)"/mu.exec(raw);
+  const model = match?.[1]?.trim();
+  return model === undefined || model.length === 0 ? undefined : model;
+}
+
 export function generatedLiveScreenRunId(now = new Date(), uuid = randomUUID()): string {
   const stamp = now.toISOString().replace(/[:.]/gu, "-");
   return `screen-${stamp}-${uuid}`;
@@ -312,7 +327,8 @@ async function main() {
   }
 
   if (live) {
-    const model = process.env.REVIEW_MODEL ?? flagValue(args, "--model");
+    const model = process.env.REVIEW_MODEL ?? flagValue(args, "--model") ??
+      shippedDefaultModel();
     if (!model?.trim()) {
       throw new Error("live benchmark needs an explicit model: set REVIEW_MODEL or --model");
     }

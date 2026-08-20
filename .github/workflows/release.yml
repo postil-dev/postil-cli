@@ -116,7 +116,6 @@ jobs:
       - name: Run diff-file live benchmark
         working-directory: bench
         env:
-          REVIEW_MODEL: z-ai/glm-5.2
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: bun run bench:live -- --run-id "release-${{ github.ref_name }}" --json-out "${{ runner.temp }}/bench-live-report.json"
 

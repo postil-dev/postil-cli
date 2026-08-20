@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { link, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
@@ -18,6 +20,7 @@ import {
   parseLiveModelsFailureReport,
   prepareExplicitOutputs,
   selectLiveScreeningCases,
+  shippedDefaultModel,
   validateScreeningEnvironment,
   validateModeSpecificFlags,
   validateLiveScreenContract,
@@ -475,5 +478,32 @@ describe("benchmark output lifecycle", () => {
     expect(await child.exited).toBe(1);
     expect(await new Response(child.stderr).text()).toContain("--manifest-out requires a path");
     expect(await Bun.file(report).exists()).toBe(false);
+  });
+});
+
+describe("shipped default model", () => {
+  test("reads the generator the binary bakes in", () => {
+    const path = join(tmpdir(), `postil-config-${randomUUID()}.toml`);
+    writeFileSync(path, 'version = 3\ndefault_model = "provider/shipped"\ncascade = []\n');
+    expect(shippedDefaultModel(path)).toBe("provider/shipped");
+    rmSync(path);
+  });
+
+  test("treats an empty default as absent so the caller still errors", () => {
+    const path = join(tmpdir(), `postil-config-${randomUUID()}.toml`);
+    writeFileSync(path, 'version = 3\ndefault_model = ""\n');
+    expect(shippedDefaultModel(path)).toBeUndefined();
+    rmSync(path);
+  });
+
+  test("matches the repository config, so the release gate cannot score another model", () => {
+    // The release workflow used to restate the id in YAML and kept scoring the
+    // previous generator after the shipped default moved.
+    const workflow = readFileSync(
+      resolve(import.meta.dir, "..", "..", ".github", "workflows", "release.yml"),
+      "utf8",
+    );
+    expect(workflow).not.toContain("REVIEW_MODEL:");
+    expect(shippedDefaultModel()).toBeDefined();
   });
 });
