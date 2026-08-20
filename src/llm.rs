@@ -683,6 +683,7 @@ pub(crate) fn conservative_context_tokens(model: &str) -> usize {
         "z-ai/glm-5.2"
         | "moonshotai/kimi-k2.7-code"
         | "openai/gpt-5-mini"
+        | "openai/gpt-5.6-luna"
         | "mistralai/mistral-small-3.2-24b-instruct" => 128_000,
         // Unknown BYOK endpoints get a conservative floor rather than an
         // optimistic provider-specific assumption.
@@ -9611,7 +9612,7 @@ mod tests {
         }
 
         let config = Config {
-            model: "z-ai/glm-5.2".into(),
+            model: "openai/gpt-5.6-luna".into(),
             cascade: Vec::new(),
             consensus: 1,
             scorer_enabled: false,
@@ -9630,15 +9631,21 @@ mod tests {
             None,
         )
         .unwrap();
-        let body =
-            client.request_body("z-ai/glm-5.2", "system", "user", 100, 0.0, LlmPhase::Review);
-        assert_eq!(body["provider"]["order"], json!(["Fireworks"]));
+        let body = client.request_body(
+            "openai/gpt-5.6-luna",
+            "system",
+            "user",
+            100,
+            0.0,
+            LlmPhase::Review,
+        );
+        assert_eq!(body["provider"]["order"], json!(["Azure"]));
         assert_eq!(body["provider"]["allow_fallbacks"], false);
         assert_eq!(body["provider"]["data_collection"], "deny");
         assert_eq!(body["provider"]["zdr"], true);
         assert_eq!(
             body["provider"]["max_price"],
-            json!({ "prompt": 1.4, "completion": 4.4 })
+            json!({ "prompt": 0.22, "completion": 1.32 })
         );
 
         let drifted = Config {

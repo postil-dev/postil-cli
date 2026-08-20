@@ -5778,7 +5778,7 @@ fn provisional_hosted_config_uses_only_the_baked_roster() {
         .success();
     let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
 
-    assert!(stdout.contains("model.name: z-ai/glm-5.2"));
+    assert!(stdout.contains("model.name: openai/gpt-5.6-luna"));
     assert!(stdout.contains("model.cascade: []"));
     assert!(stdout.contains("model.scorer: "));
     assert!(stdout.contains("model.apiBase: https://openrouter.ai:443/api/v1"));

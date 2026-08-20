@@ -3236,7 +3236,7 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
     #[test]
     fn hosted_candidate_matches_the_qualification_profile() {
         let defaults = model_defaults();
-        assert_eq!(defaults.default_model, "z-ai/glm-5.2");
+        assert_eq!(defaults.default_model, "openai/gpt-5.6-luna");
         assert!(defaults.cascade.is_empty());
         assert!(defaults.scorer_model.is_empty());
         assert!(defaults.scorer_fallback.is_empty());
@@ -3263,15 +3263,15 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
             provisional_hosted_profile_for_config(&config),
             Some(profile.clone())
         );
-        assert_eq!(profile.upstream_provider_identity, "Fireworks");
-        assert_eq!(profile.generator_chain, vec!["z-ai/glm-5.2"]);
+        assert_eq!(profile.upstream_provider_identity, "Azure");
+        assert_eq!(profile.generator_chain, vec!["openai/gpt-5.6-luna"]);
         assert!(profile.scorer_chain.is_empty());
         assert_eq!(
             profile.model_price_bounds,
             vec![ModelPriceBound {
-                model: "z-ai/glm-5.2".to_string(),
-                input_micros_per_million_tokens: 1_400_000,
-                output_micros_per_million_tokens: 4_400_000,
+                model: "openai/gpt-5.6-luna".to_string(),
+                input_micros_per_million_tokens: 220_000,
+                output_micros_per_million_tokens: 1_320_000,
             }]
         );
 
