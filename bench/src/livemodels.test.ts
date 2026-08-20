@@ -1323,7 +1323,10 @@ describe("managed admission workflow", () => {
     ).text();
     expect(release).toMatch(/validate-tag:\n[\s\S]*?fetch-depth: 0[\s\S]*?bun-version: 1\.3\.14[\s\S]*?bun install --frozen-lockfile[\s\S]*?bun run verify-admission[\s\S]*?\n  bench-live:\n/u);
     expect(release).toMatch(/bench-live:\n\s+needs: validate-tag\n/u);
-    expect(release).toContain("REVIEW_MODEL: z-ai/glm-5.2");
+    // The gate must score whatever the binary ships. Restating the id here
+    // pinned it to one model, so the release that changed the shipped default
+    // still benchmarked the previous one and passed against its old baseline.
+    expect(release).not.toContain("REVIEW_MODEL:");
     expect(release).toContain("OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}");
     expect(release).toContain("bun run bench:live --");
     expect(release).toContain("bun run bench:compare --");
