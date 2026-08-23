@@ -12307,6 +12307,7 @@ async fn same_head_with_open_baseline_falls_back_to_full_review() {
     assert_eq!(env["suppressedFindings"][0]["reason"], "nonActionable");
     assert_ne!(env["modelUsed"], "none (empty diff)");
     assert_eq!(env["gate"]["failing"], false);
+    assert_eq!(env["sinceSha"], Value::Null);
 
     let requests = server.received_requests().await.unwrap();
     assert!(
@@ -12456,6 +12457,11 @@ async fn stale_incremental_baseline_falls_back_to_full_review() {
     );
     assert_eq!(env["gate"]["failing"], false);
     assert_ne!(env["modelUsed"], "none (empty diff)");
+    assert_eq!(
+        env["sinceSha"],
+        Value::Null,
+        "a full review reported an incremental baseline it did not measure against"
+    );
 
     let requests = server.received_requests().await.unwrap();
     assert!(

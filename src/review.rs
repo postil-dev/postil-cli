@@ -1875,7 +1875,7 @@ async fn review_diff_at(
                             cfg,
                             meta,
                             head_sha,
-                            args.since_sha.clone(),
+                            incremental.then(|| args.since_sha.clone()).flatten(),
                             admission,
                             ReviewCoverage {
                                 mode: if bounded {
@@ -2795,7 +2795,10 @@ async fn review_diff_at(
         duration_ms: review_started.elapsed().as_millis() as u64,
         base_sha: meta.map(|m| m.base_sha.clone()),
         head_sha,
-        since_sha: args.since_sha.clone(),
+        // `sinceSha` names the baseline this review was measured against, so it
+        // is absent on a full review. A requested baseline that the run could
+        // not use is not the reviewed baseline.
+        since_sha: incremental.then(|| args.since_sha.clone()).flatten(),
     })
 }
 
