@@ -56,6 +56,31 @@ impl std::fmt::Display for IncompleteReviewInput {
 
 impl std::error::Error for IncompleteReviewInput {}
 
+/// Marks a refusal that is specific to the requested incremental baseline: the
+/// head no longer descends from it, or the forge truncated the compare. The
+/// complete change at the same head is still reviewable, so a caller may
+/// recover by falling back to a full review instead of failing the run.
+#[derive(Debug)]
+pub struct IncrementalDiffUnavailable;
+
+impl std::fmt::Display for IncrementalDiffUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("incremental diff is unavailable for this baseline")
+    }
+}
+
+impl std::error::Error for IncrementalDiffUnavailable {}
+
+pub fn incremental_diff_unavailable(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(IncrementalDiffUnavailable).context(message.into())
+}
+
+pub fn is_incremental_diff_unavailable(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<IncrementalDiffUnavailable>().is_some())
+}
+
 #[derive(Debug)]
 pub struct RepositoryIdentityFailure(pub String);
 
@@ -2972,6 +2997,29 @@ mod tests {
             "forge rejected credentials",
         ));
         assert!(is_incomplete_review_input(&unauthorized));
+    }
+
+    #[test]
+    fn incremental_baseline_refusals_stay_recognizable_after_classification() {
+        let refusal = incremental_diff_unavailable(
+            "GitHub incremental compare no longer descends from the requested baseline",
+        );
+        assert!(is_incremental_diff_unavailable(&refusal));
+        assert!(
+            refusal
+                .to_string()
+                .contains("no longer descends from the requested baseline")
+        );
+
+        // The caller inspects the error only after classification wraps it, so
+        // the marker has to survive the added context layers.
+        let classified = classify_review_input_error(refusal).context("incremental diff fetch");
+        assert!(is_incremental_diff_unavailable(&classified));
+        assert!(is_incomplete_review_input(&classified));
+
+        // A forge outage is not a baseline problem and must still fail the run.
+        let outage = classify_review_input_error(service_failure("compare fetch failed"));
+        assert!(!is_incremental_diff_unavailable(&outage));
     }
 
     #[test]

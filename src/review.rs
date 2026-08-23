@@ -988,24 +988,53 @@ async fn remote_review<F: Forge>(
     let has_carryable_baseline = baseline_has_carryable_findings(&baseline);
     let incremental = args.since_sha.as_deref();
     let (diff_snapshot, scope, force_model) = match incremental {
-        Some(since) if since != head_sha => run_with_hosted_budget(
-            Some(review_started),
-            FORGE_READ_TIMEOUT_SECS,
-            forge.fetch_diff_since(since, head_sha),
-            "fetching incremental diff",
-        )
-        .await
-        .map_err(crate::forge::classify_review_input_error)
-        .context("incremental diff fetch")
-        .map(|diff| {
-            (
-                diff,
-                filter::ReconcileScope::Incremental {
-                    trust: filter::ReviewTrust::Failed,
-                },
-                false,
+        Some(since) if since != head_sha => {
+            let incremental_diff = run_with_hosted_budget(
+                Some(review_started),
+                FORGE_READ_TIMEOUT_SECS,
+                forge.fetch_diff_since(since, head_sha),
+                "fetching incremental diff",
             )
-        })?,
+            .await
+            .map_err(crate::forge::classify_review_input_error)
+            .context("incremental diff fetch");
+            match incremental_diff {
+                Ok(diff) => (
+                    diff,
+                    filter::ReconcileScope::Incremental {
+                        trust: filter::ReviewTrust::Failed,
+                    },
+                    false,
+                ),
+                // The baseline itself is unusable: the head no longer descends
+                // from it (a rebase or force-push), or the forge truncated the
+                // compare. Retrying cannot recover a baseline that is gone, and
+                // the incremental path must keep refusing a diff that would
+                // understate coverage, so review the complete change at the
+                // same head instead of failing the run.
+                Err(error) if crate::forge::is_incremental_diff_unavailable(&error) => {
+                    eprintln!(
+                        "postil: incremental baseline {since} is unusable ({error:#}); reviewing the complete change instead"
+                    );
+                    (
+                        run_with_hosted_budget(
+                            Some(review_started),
+                            full_diff_timeout_secs(meta),
+                            forge.fetch_diff(meta),
+                            "fetching full fallback diff",
+                        )
+                        .await
+                        .map_err(crate::forge::classify_review_input_error)
+                        .context("full diff fallback fetch")?,
+                        filter::ReconcileScope::Full {
+                            trust: filter::ReviewTrust::Failed,
+                        },
+                        true,
+                    )
+                }
+                Err(error) => return Err(error),
+            }
+        }
         Some(_) => (
             diff::DiffSnapshot::from_bytes(b"")?,
             filter::ReconcileScope::Incremental {
