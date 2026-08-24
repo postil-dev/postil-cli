@@ -6446,10 +6446,12 @@ async fn hidden_atomic_attribution_rejects_provider_substitution() {
         .failure()
         .stderr(
             predicates::str::contains("atomic attribution response identity does not match").and(
-                predicates::str::contains("postil:atomic-attribution-terminal:v1:"),
+                predicates::str::contains(
+                    "postil:atomic-attribution-terminal:v1:{\"category\":\"response-identity-mismatch\"",
+                ),
             ),
         );
-    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
 }
 
 #[tokio::test]
