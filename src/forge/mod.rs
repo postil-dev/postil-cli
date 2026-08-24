@@ -3026,6 +3026,7 @@ mod tests {
     fn forge_summary_keeps_incomplete_review_reasons_generic() {
         for reason in [
             crate::envelope::IncompleteReviewReason::IncompleteInput,
+            crate::envelope::IncompleteReviewReason::LocalIncrementalFullComparisonUnavailable,
             crate::envelope::IncompleteReviewReason::ReservedInput,
             crate::envelope::IncompleteReviewReason::InsufficientContextBudget,
             crate::envelope::IncompleteReviewReason::InvalidModelFanOut,
