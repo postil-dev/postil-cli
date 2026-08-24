@@ -2915,17 +2915,22 @@ impl Forge for GitHub {
             "GitHub compare response",
         )
         .await?;
-        ensure!(
-            compare.merge_base_commit.sha == since_sha,
-            "GitHub incremental compare no longer descends from the requested baseline; refusing an incomplete review"
-        );
+        // Both refusals below are properties of the requested baseline rather
+        // than of the change itself, so they carry the marker that lets the
+        // caller review the complete change instead of failing the run.
+        if compare.merge_base_commit.sha != since_sha {
+            return Err(super::incremental_diff_unavailable(
+                "GitHub incremental compare no longer descends from the requested baseline; refusing an incomplete review",
+            ));
+        }
         // GitHub documents that compare responses include at most 300 files
         // and expose no complete file count. Exactly 300 is therefore
         // ambiguous and must fail closed.
-        ensure!(
-            compare.files.len() < 300,
-            "GitHub compare reached the 300-file response cap; refusing an incomplete incremental review"
-        );
+        if compare.files.len() >= 300 {
+            return Err(super::incremental_diff_unavailable(
+                "GitHub compare reached the 300-file response cap; refusing an incomplete incremental review",
+            ));
+        }
         self.build_complete_diff(
             compare.files,
             since_sha,
@@ -7613,6 +7618,40 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("no longer descends"));
+        assert!(crate::forge::is_incremental_diff_unavailable(&error));
+    }
+
+    #[tokio::test]
+    async fn github_incremental_diff_rejects_a_capped_compare_response() {
+        let server = MockServer::start().await;
+        let files: Vec<_> = (0..300)
+            .map(|index| {
+                serde_json::json!({
+                    "filename": format!("src/file{index}.rs"),
+                    "status": "modified",
+                    "changes": 1
+                })
+            })
+            .collect();
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/compare/aaaaaaaa...bbbbbbbb"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "merge_base_commit": {"sha": "aaaaaaaa"},
+                "files": files
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let error = match test_github(&server)
+            .fetch_diff_since("aaaaaaaa", "bbbbbbbb")
+            .await
+        {
+            Ok(_) => panic!("capped incremental compare was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("300-file response cap"));
+        assert!(crate::forge::is_incremental_diff_unavailable(&error));
     }
 
     #[tokio::test]

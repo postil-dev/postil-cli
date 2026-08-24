@@ -12307,6 +12307,7 @@ async fn same_head_with_open_baseline_falls_back_to_full_review() {
     assert_eq!(env["suppressedFindings"][0]["reason"], "nonActionable");
     assert_ne!(env["modelUsed"], "none (empty diff)");
     assert_eq!(env["gate"]["failing"], false);
+    assert_eq!(env["sinceSha"], Value::Null);
 
     let requests = server.received_requests().await.unwrap();
     assert!(
@@ -12389,6 +12390,157 @@ async fn same_head_without_open_baseline_keeps_empty_diff_noop() {
         2,
         "empty no-op fetched more than the immutable PR snapshot"
     );
+}
+
+#[tokio::test]
+async fn stale_incremental_baseline_falls_back_to_full_review() {
+    let server = MockServer::start().await;
+    mount_github_complete_diff(&server, 7).await;
+    // A rebase or force-push leaves the recorded baseline off the head's
+    // ancestry, so the incremental compare cannot describe the change.
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/compare/cccccccc...aaaaaaaa"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "merge_base_commit": {"sha": "dddddddd"},
+            "files": []
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "t", "body": null,
+            "state": "open", "merged": false,
+            "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"}, "changed_files": 1
+        })))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .args([
+            "review",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--sha",
+            "aaaaaaaa",
+            "--since-sha",
+            "cccccccc",
+            "--no-post",
+            "--output-json",
+        ])
+        .assert()
+        .code(0);
+    let env: Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+    assert_eq!(env["findings"], json!([]));
+    assert!(
+        !env["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["path"] == ".postil/model-output"),
+        "stale baseline produced an operational failure instead of a review"
+    );
+    assert_eq!(env["gate"]["failing"], false);
+    assert_ne!(env["modelUsed"], "none (empty diff)");
+    assert_eq!(
+        env["sinceSha"],
+        Value::Null,
+        "a full review reported an incremental baseline it did not measure against"
+    );
+
+    let requests = server.received_requests().await.unwrap();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.url.path() == "/repos/acme/api/pulls/7/files"),
+        "fallback did not acquire the complete change"
+    );
+    let llm_request = requests
+        .iter()
+        .find(|request| request.url.path() == "/chat/completions")
+        .unwrap();
+    let body: Value = llm_request.body_json().unwrap();
+    assert!(
+        !body["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("This is an INCREMENTAL review"),
+        "fallback reviewed the change as incremental"
+    );
+}
+
+#[tokio::test]
+async fn incremental_forge_outage_still_fails_the_review() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/compare/cccccccc...aaaaaaaa"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/repos/acme/api/compare/b+\.\.\.a+$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "merge_base_commit": {"sha": "bbbbbbbb"},
+            "files": []
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7/files"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "t", "body": null,
+            "state": "open", "merged": false,
+            "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"}, "changed_files": 1
+        })))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .args([
+            "review",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--sha",
+            "aaaaaaaa",
+            "--since-sha",
+            "cccccccc",
+            "--no-post",
+            "--output-json",
+        ])
+        .assert()
+        .code(1);
+    let env: Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+    assert_eq!(env["findings"][0]["path"], ".postil/provider");
+    assert_eq!(env["gate"]["failing"], true);
 }
 
 #[tokio::test]

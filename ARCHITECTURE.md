@@ -119,7 +119,9 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   the head commit, target-branch commit, and computed merge base separately. Truncated transports and
   metadata mismatches fail closed. GitHub
   reconstructs full reviews from merge-base/head file content after exhausting the declared
-  changed-file count, and rejects an ambiguous 300-file incremental compare. Bitbucket exhausts
+  changed-file count, and rejects an ambiguous 300-file incremental compare. A rejected
+  incremental compare, whether the head no longer descends from the requested baseline or the
+  response reached the file cap, falls back in-run to a full review of the same head. Bitbucket exhausts
   paginated diffstat and reconstructs bounded source content from the compared commits.
   Azure has no PR-diff endpoint, so it exhausts the authoritative change marker and
   reconstructs a unified diff from changed-file content with `similar`. The gate check is
