@@ -9,16 +9,23 @@
 //! `chmod`'d afterward, so there is no window where the token is briefly
 //! world-readable.
 
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
-pub const CREDENTIALS_VERSION: u32 = 1;
+pub const CREDENTIALS_VERSION: u32 = 2;
+pub const LEGACY_CREDENTIALS_VERSION: u32 = 1;
+// The refresh exchange has separately bounded send and body-read phases. A
+// second local process waits long enough for both before asking the caller to
+// retry, so concurrent agent runs converge on one token rotation.
+const CREDENTIAL_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(45);
+const CREDENTIAL_LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(25);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Credentials {
@@ -26,6 +33,18 @@ pub struct Credentials {
     pub token: String,
     #[serde(rename = "expiresAt")]
     pub expires_at: String,
+    #[serde(
+        default,
+        rename = "refreshToken",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub refresh_token: Option<String>,
+    #[serde(
+        default,
+        rename = "refreshExpiresAt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub refresh_expires_at: Option<String>,
     #[serde(rename = "apiBase")]
     pub api_base: String,
     pub org: String,
@@ -37,14 +56,36 @@ impl Credentials {
     /// already expired rather than trusted, so a corrupted file never grants
     /// silent access.
     pub fn is_expired(&self) -> bool {
-        match time::OffsetDateTime::parse(
-            &self.expires_at,
-            &time::format_description::well_known::Rfc3339,
-        ) {
-            Ok(expires_at) => expires_at <= time::OffsetDateTime::now_utc(),
+        self.expires_within(std::time::Duration::ZERO)
+    }
+
+    pub fn expires_within(&self, margin: std::time::Duration) -> bool {
+        let Ok(margin) = time::Duration::try_from(margin) else {
+            return true;
+        };
+        match parse_timestamp(&self.expires_at) {
+            Ok(expires_at) => expires_at <= time::OffsetDateTime::now_utc() + margin,
             Err(_) => true,
         }
     }
+
+    pub fn refresh_is_expired(&self) -> bool {
+        match self.refresh_expires_at.as_deref().map(parse_timestamp) {
+            Some(Ok(expires_at)) => expires_at <= time::OffsetDateTime::now_utc(),
+            Some(Err(_)) | None => true,
+        }
+    }
+
+    pub fn can_refresh(&self) -> bool {
+        self.refresh_token
+            .as_deref()
+            .is_some_and(|token| !token.trim().is_empty())
+            && !self.refresh_is_expired()
+    }
+}
+
+fn parse_timestamp(value: &str) -> Result<time::OffsetDateTime, time::error::Parse> {
+    time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
 }
 
 /// The real, XDG-resolved path used by `postil login`/`postil logout` and by
@@ -74,6 +115,14 @@ pub fn read(path: &Path) -> Result<Option<Credentials>> {
     };
     let credentials: Credentials =
         serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+    anyhow::ensure!(
+        matches!(
+            credentials.version,
+            LEGACY_CREDENTIALS_VERSION | CREDENTIALS_VERSION
+        ),
+        "unsupported credentials version {}; run `postil login` again",
+        credentials.version
+    );
     Ok(Some(credentials))
 }
 
@@ -95,6 +144,14 @@ pub fn write(path: &Path, credentials: &Credentials) -> Result<()> {
         let mut file = options
             .open(&temp_path)
             .context("creating private credentials file")?;
+        anyhow::ensure!(
+            matches!(
+                credentials.version,
+                LEGACY_CREDENTIALS_VERSION | CREDENTIALS_VERSION
+            ),
+            "unsupported credentials version {}",
+            credentials.version
+        );
         serde_json::to_writer_pretty(&mut file, credentials).context("serializing credentials")?;
         file.write_all(b"\n").context("writing credentials")?;
         file.sync_all().context("syncing credentials")?;
@@ -105,6 +162,61 @@ pub fn write(path: &Path, credentials: &Credentials) -> Result<()> {
         let _ = fs::remove_file(&temp_path);
     }
     result
+}
+
+/// A kernel-backed, cross-process lock shared by every stored-login mutation.
+/// Keeping the lock file in place avoids stale-file recovery: the operating
+/// system releases the exclusive lock when the handle closes or its process
+/// exits.
+pub struct CredentialLock {
+    _file: File,
+}
+
+impl CredentialLock {
+    pub async fn acquire(credentials_path: &Path) -> Result<Self> {
+        let parent = credentials_path
+            .parent()
+            .context("credentials path must have a parent directory")?;
+        create_private_dir(parent)?;
+        let file_name = credentials_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("credentials path must have a file name")?;
+        let path = parent.join(format!(".{file_name}.refresh.lock"));
+        let file = open_private_lock_file(&path)?;
+        let deadline = tokio::time::Instant::now() + CREDENTIAL_LOCK_WAIT;
+
+        loop {
+            match file.try_lock_exclusive() {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if tokio::time::Instant::now() >= deadline {
+                        anyhow::bail!(
+                            "another postil process is updating the stored login; try again"
+                        );
+                    }
+                    tokio::time::sleep(CREDENTIAL_LOCK_RETRY).await;
+                }
+                Err(error) => return Err(error).context("locking stored login"),
+            }
+        }
+    }
+}
+
+fn open_private_lock_file(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options.open(path).context("creating stored login lock")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = fs::Permissions::from_mode(0o600);
+        file.set_permissions(permissions)
+            .context("securing stored login lock")?;
+    }
+    Ok(file)
 }
 
 /// Idempotent: removing an already-absent file is success, matching the
@@ -140,6 +252,8 @@ mod tests {
             version: CREDENTIALS_VERSION,
             token: "pcli_test-token-not-a-real-secret".to_string(),
             expires_at: expires_at.to_string(),
+            refresh_token: Some("pcli_test-refresh-not-a-real-secret".to_string()),
+            refresh_expires_at: Some("2999-01-01T00:00:00.000Z".to_string()),
             api_base: "https://postil.dev/api/inference/v1".to_string(),
             org: "runatlas-is".to_string(),
             model: "z-ai/glm-5.2".to_string(),
@@ -222,5 +336,70 @@ mod tests {
     #[test]
     fn unparsable_expiry_fails_closed_as_expired() {
         assert!(sample("not-a-timestamp").is_expired());
+    }
+
+    #[test]
+    fn reads_a_v1_access_only_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        fs::write(
+            &path,
+            r#"{"version":1,"token":"pcli_test-token-not-a-real-secret","expiresAt":"2999-01-01T00:00:00.000Z","apiBase":"https://postil.dev/api/inference/v1","org":"runatlas-is","model":"z-ai/glm-5.2"}"#,
+        )
+        .unwrap();
+        let credentials = read(&path).unwrap().unwrap();
+        assert_eq!(credentials.version, 1);
+        assert!(credentials.refresh_token.is_none());
+        assert!(credentials.refresh_expires_at.is_none());
+    }
+
+    #[test]
+    fn preserves_v1_for_an_access_only_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("postil").join("credentials.json");
+        let mut credentials = sample("2999-01-01T00:00:00.000Z");
+        credentials.version = 1;
+        credentials.refresh_token = None;
+        credentials.refresh_expires_at = None;
+        write(&path, &credentials).unwrap();
+        let raw = fs::read_to_string(path).unwrap();
+        assert!(raw.contains("\"version\": 1"));
+        assert!(!raw.contains("refreshToken"));
+    }
+
+    #[test]
+    fn rejects_unknown_future_credential_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        let mut credentials = sample("2999-01-01T00:00:00.000Z");
+        credentials.version = CREDENTIALS_VERSION + 1;
+        fs::write(&path, serde_json::to_string(&credentials).unwrap()).unwrap();
+        let error = read(&path).expect_err("future credential versions must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported credentials version")
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stored_login_lock_file_has_owner_only_permission_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let credentials_path = dir.path().join("postil").join("credentials.json");
+        write(&credentials_path, &sample("2999-01-01T00:00:00.000Z")).unwrap();
+        let lock = CredentialLock::acquire(&credentials_path).await.unwrap();
+        drop(lock);
+        let lock_path = credentials_path
+            .parent()
+            .unwrap()
+            .join(".credentials.json.refresh.lock");
+        let mode = fs::metadata(lock_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "stored login lock file must be mode 0600, got {mode:o}"
+        );
     }
 }

@@ -2602,8 +2602,8 @@ impl LlmClient {
 
     /// Local and interactive clients have no built-in total deadline. They only
     /// get one when POSTIL_LLM_TOTAL_TIMEOUT_SECS is explicitly set.
-    pub fn from_env(cfg: &Config) -> Result<Self> {
-        let api_key = resolve_api_key()?;
+    pub async fn from_env(cfg: &Config) -> Result<Self> {
+        let api_key = resolve_api_key().await?;
         let timeouts = LlmTimeouts::from_env(DEFAULT_REQUEST_TIMEOUT_SECS, None)?;
         let total_deadline = timeouts.total.map(|duration| Instant::now() + duration);
         Self::build(
@@ -2615,14 +2615,14 @@ impl LlmClient {
         )
     }
 
-    pub(crate) fn from_env_for_remote_review(
+    pub(crate) async fn from_env_for_remote_review(
         cfg: &Config,
         total_budget_started_at: Instant,
         default_request_timeout: Duration,
         default_review_timeout: Duration,
         default_total_timeout: Duration,
     ) -> Result<Self> {
-        let api_key = resolve_api_key()?;
+        let api_key = resolve_api_key().await?;
         let timeouts = LlmTimeouts::from_env(
             default_request_timeout.as_secs(),
             Some(default_total_timeout.as_secs()),
@@ -5650,16 +5650,17 @@ impl LlmTimeouts {
     }
 }
 
-fn resolve_api_key() -> Result<String> {
+async fn resolve_api_key() -> Result<String> {
     // Checked first, and independently of the credentials-path lookup below,
     // so an explicit key still works in a minimal environment with no HOME
     // or XDG_CONFIG_HOME -- exactly what worked before login existed.
-    if let Some(key) = api_key::resolve_from_process_env() {
-        return Ok(key);
-    }
-    let credentials_path = crate::credentials::default_path()
-        .context("resolving the postil login credentials path")?;
-    match api_key::resolve_effective(&credentials_path)? {
+    let explicit_key = api_key::resolve_from_process_env();
+    let stored_login = async {
+        let credentials_path = crate::credentials::default_path()
+            .context("resolving the postil login credentials path")?;
+        crate::login::resolve_stored_token(&credentials_path).await
+    };
+    match api_key::resolve_explicit_or_stored(explicit_key, stored_login).await? {
         Some(key) => Ok(key),
         None => {
             let key_names = api_key::names_text();
@@ -6772,13 +6773,13 @@ mod tests {
         EnvRestore::remove(TOTAL_TIMEOUT_ENV);
         EnvRestore::set("POSTIL_API_KEY", "test-key");
 
-        let client = LlmClient::from_env_for_remote_review(
+        let client = futures::executor::block_on(LlmClient::from_env_for_remote_review(
             &Config::default(),
             Instant::now(),
             Duration::from_secs(crate::review::HOSTED_LLM_REQUEST_TIMEOUT_SECS),
             Duration::from_secs(crate::review::HOSTED_LLM_REVIEW_TIMEOUT_SECS),
             Duration::from_secs(crate::review::HOSTED_LLM_TOTAL_TIMEOUT_SECS),
-        )
+        ))
         .unwrap();
         assert_eq!(
             client.review_model_timeout,
@@ -6816,13 +6817,13 @@ mod tests {
         let wave_slot = Duration::from_secs(crate::review::LARGE_DIFF_LLM_REQUEST_TIMEOUT_SECS);
 
         let build = || {
-            LlmClient::from_env_for_remote_review(
+            futures::executor::block_on(LlmClient::from_env_for_remote_review(
                 &config,
                 Instant::now(),
                 Duration::from_secs(crate::review::HOSTED_LLM_REQUEST_TIMEOUT_SECS),
                 Duration::from_secs(review_budget),
                 Duration::from_secs(crate::review::HOSTED_LLM_TOTAL_TIMEOUT_SECS),
-            )
+            ))
             .unwrap()
         };
 
@@ -8743,13 +8744,13 @@ mod tests {
 
         let elapsed = Duration::from_secs(10);
         let started_at = Instant::now() - elapsed;
-        let client = LlmClient::from_env_for_remote_review(
+        let client = futures::executor::block_on(LlmClient::from_env_for_remote_review(
             &Config::default(),
             started_at,
             Duration::from_secs(crate::review::HOSTED_LLM_REQUEST_TIMEOUT_SECS),
             Duration::from_secs(crate::review::HOSTED_LLM_REVIEW_TIMEOUT_SECS),
             Duration::from_secs(crate::review::HOSTED_LLM_TOTAL_TIMEOUT_SECS),
-        )
+        ))
         .unwrap();
         let remaining = client.remaining_budget(LlmPhase::Total).unwrap().unwrap();
 
