@@ -5,7 +5,7 @@
   "apiFormat": "openai-compatible",
   "generatorChain": ["openai/gpt-5.6-luna"],
   "consensus": 1,
-  "scorerChain": [],
+  "scorerChain": ["openai/gpt-5.6-luna"],
   "modelPriceBounds": [
     {
       "model": "openai/gpt-5.6-luna",

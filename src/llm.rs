@@ -8214,9 +8214,17 @@ mod tests {
     /// production review shows up as a test failure rather than an outage.
     #[test]
     fn hosted_review_plan_is_admitted_at_shipped_price_bounds() {
+        let profile: crate::config::QualificationCandidateProfile =
+            serde_json::from_str(include_str!("../provisional-models.json")).unwrap();
         let config = Config {
-            model: "z-ai/glm-5.2".into(),
-            scorer_enabled: false,
+            model: profile.generator_chain[0].clone(),
+            cascade: profile.generator_chain[1..].to_vec(),
+            consensus: profile.consensus,
+            scorer_enabled: !profile.scorer_chain.is_empty(),
+            scorer: profile.scorer_chain.first().cloned().unwrap_or_default(),
+            scorer_fallback: profile.scorer_chain.get(1).cloned().unwrap_or_default(),
+            api_base: profile.api_base,
+            api_format: profile.api_format,
             ..Config::default()
         };
         let mut client = LlmClient::build(
@@ -8227,14 +8235,13 @@ mod tests {
             None,
         )
         .unwrap();
-        client.request_decorations.hosted_price_bounds = Some(Arc::new(HashMap::from([(
-            "z-ai/glm-5.2".into(),
-            ModelPriceBound {
-                model: "z-ai/glm-5.2".into(),
-                input_micros_per_million_tokens: 1_400_000,
-                output_micros_per_million_tokens: 4_400_000,
-            },
-        )])));
+        client.request_decorations.hosted_price_bounds = Some(Arc::new(
+            profile
+                .model_price_bounds
+                .into_iter()
+                .map(|bound| (bound.model.clone(), bound))
+                .collect(),
+        ));
         let users =
             vec!["bounded candidate".to_string(); crate::review::MAX_HOSTED_SELECTED_BATCHES];
         let output_tokens = vec![REVIEW_MAX_TOKENS; crate::review::MAX_HOSTED_SELECTED_BATCHES];
@@ -9872,8 +9879,8 @@ mod tests {
             model: "openai/gpt-5.6-luna".into(),
             cascade: Vec::new(),
             consensus: 1,
-            scorer_enabled: false,
-            scorer: String::new(),
+            scorer_enabled: true,
+            scorer: "openai/gpt-5.6-luna".into(),
             scorer_fallback: String::new(),
             api_base: "https://openrouter.ai:443/api/v1".into(),
             api_format: ApiFormat::OpenaiCompatible,
