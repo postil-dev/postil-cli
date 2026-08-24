@@ -448,7 +448,7 @@ mod tests {
             "status": "approved",
             "token": "pcli_test-token-not-a-real-secret",
             "expiresAt": "2999-01-01T00:00:00.000Z",
-            "refreshToken": "pcli_test-refresh-not-a-real-secret",
+            "refreshToken": "fixture-refresh-not-a-credential",
             "refreshExpiresAt": "2999-12-01T00:00:00.000Z",
             "apiBase": "https://postil.dev/api/inference/v1",
             "org": {"slug": "runatlas-is", "name": "RunAtlas"},
@@ -696,7 +696,7 @@ mod tests {
                 version: credentials::CREDENTIALS_VERSION,
                 token: "pcli_test-token-not-a-real-secret".to_string(),
                 expires_at: "2999-01-01T00:00:00.000Z".to_string(),
-                refresh_token: Some("pcli_test-refresh-not-a-real-secret".to_string()),
+                refresh_token: Some("fixture-refresh-not-a-credential".to_string()),
                 refresh_expires_at: Some("2999-12-01T00:00:00.000Z".to_string()),
                 api_base: "https://postil.dev/api/inference/v1".to_string(),
                 org: "runatlas-is".to_string(),
@@ -768,7 +768,7 @@ mod tests {
             version: credentials::CREDENTIALS_VERSION,
             token: "pcli_test-old-access-not-a-real-secret".to_string(),
             expires_at: expires_at.to_string(),
-            refresh_token: Some("pcli_test-old-refresh-not-a-real-secret".to_string()),
+            refresh_token: Some("fixture-old-refresh-not-a-credential".to_string()),
             refresh_expires_at: Some("2999-12-01T00:00:00.000Z".to_string()),
             api_base: "https://postil.dev/api/inference/v1".to_string(),
             org: "runatlas-is".to_string(),
@@ -785,7 +785,7 @@ mod tests {
         serde_json::json!({
             "token": "pcli_test-new-access-not-a-real-secret",
             "expiresAt": "2999-01-01T00:00:00.000Z",
-            "refreshToken": "pcli_test-new-refresh-not-a-real-secret",
+            "refreshToken": "fixture-new-refresh-not-a-credential",
             "refreshExpiresAt": "2999-12-01T00:00:00.000Z"
         })
     }
@@ -818,7 +818,7 @@ mod tests {
         assert_eq!(stored.token, "pcli_test-new-access-not-a-real-secret");
         assert_eq!(
             stored.refresh_token.as_deref(),
-            Some("pcli_test-new-refresh-not-a-real-secret")
+            Some("fixture-new-refresh-not-a-credential")
         );
     }
 

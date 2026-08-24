@@ -231,7 +231,7 @@ mod tests {
             version: credentials::CREDENTIALS_VERSION,
             token: "pcli_test-access-not-a-real-secret".to_string(),
             expires_at: "2999-01-01T00:00:00.000Z".to_string(),
-            refresh_token: Some("pcli_test-refresh-not-a-real-secret".to_string()),
+            refresh_token: Some("fixture-refresh-not-a-credential".to_string()),
             refresh_expires_at: Some("2999-12-01T00:00:00.000Z".to_string()),
             api_base: "https://postil.dev/api/inference/v1".to_string(),
             org: "runatlas-is".to_string(),
