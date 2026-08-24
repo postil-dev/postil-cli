@@ -170,17 +170,6 @@ impl std::fmt::Display for AtomicAttributionIdentityFailure {
 
 impl std::error::Error for AtomicAttributionIdentityFailure {}
 
-impl AtomicAttributionIdentityFailure {
-    /// Content-free wording for retry logs: the echo either never arrived or
-    /// named a different route, and neither case reveals response text.
-    fn echo_reason(&self) -> &'static str {
-        match self {
-            Self::Missing => "missing",
-            Self::Mismatch => "mismatched",
-        }
-    }
-}
-
 #[cfg(feature = "qualification-candidate")]
 #[derive(Debug)]
 struct AtomicAttributionInvalidOutput;
@@ -4480,7 +4469,16 @@ impl LlmClient {
                                     log_text(model),
                                     error
                                         .downcast_ref::<AtomicAttributionIdentityFailure>()
-                                        .map_or("unusable", |failure| failure.echo_reason()),
+                                        // Content-free wording: neither case
+                                        // reveals response text.
+                                        .map_or("unusable", |failure| match failure {
+                                            AtomicAttributionIdentityFailure::Missing => {
+                                                "missing"
+                                            }
+                                            AtomicAttributionIdentityFailure::Mismatch => {
+                                                "mismatched"
+                                            }
+                                        }),
                                     elapsed_text(wait)
                                 );
                                 self.sleep_with_budget(phase, wait).await?;
@@ -9634,15 +9632,6 @@ mod tests {
             classified
                 .downcast_ref::<AtomicAttributionIdentityFailure>()
                 .is_some()
-        );
-
-        assert_eq!(
-            AtomicAttributionIdentityFailure::Missing.echo_reason(),
-            "missing"
-        );
-        assert_eq!(
-            AtomicAttributionIdentityFailure::Mismatch.echo_reason(),
-            "mismatched"
         );
     }
 
