@@ -771,7 +771,7 @@ impl DiffIndex {
         if count > 0 {
             self.ranges.insert(
                 crate::envelope::CHANGE_METADATA_PATH.to_string(),
-                vec![1..=count],
+                std::iter::once(1..=count).collect(),
             );
         }
     }
@@ -7909,9 +7909,10 @@ diff --git a/two.rs b/two.rs
         index.add_rendered_evidence(&batch);
 
         assert!(index.rendered_evidence.is_empty());
+        let full_metadata_range: Vec<_> = std::iter::once(1..=100_000).collect();
         assert_eq!(
             index.rendered_exact_ranges.get("src/generated.ts"),
-            Some(&vec![1..=100_000])
+            Some(&full_metadata_range)
         );
         assert!(DiffIndex::selected_exact_line(
             &index.rendered_exact_ranges,

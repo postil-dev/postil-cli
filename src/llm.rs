@@ -142,7 +142,10 @@ pub struct Answer {
 #[derive(Debug)]
 pub struct ModelError {
     error: anyhow::Error,
-    usage: Usage,
+    // Boxed to keep the whole error within clippy's `result_large_err` bound:
+    // `Usage` carries provider cost decimals and dominates the struct size,
+    // and this error is the `Err` variant of most provider-facing results.
+    usage: Box<Usage>,
     model_usage: Vec<ModelUsage>,
     model_incidents: Vec<ModelIncident>,
     usage_accounting_complete: bool,
@@ -210,7 +213,7 @@ impl ModelError {
     fn new(error: anyhow::Error, usage: Usage, usage_accounting_complete: bool) -> Self {
         Self {
             error,
-            usage,
+            usage: Box::new(usage),
             model_usage: Vec::new(),
             model_incidents: Vec::new(),
             usage_accounting_complete,
@@ -218,7 +221,7 @@ impl ModelError {
     }
 
     pub fn usage(&self) -> Usage {
-        self.usage
+        *self.usage
     }
 
     pub fn model_usage(&self) -> &[ModelUsage] {
@@ -2268,7 +2271,7 @@ impl LlmClient {
                 Err(error) => {
                     let incident = error.incident(ModelIncidentPhase::Planner);
                     accounting_complete &= error.usage_accounting_complete;
-                    add_usage(&mut aggregate_usage, error.usage);
+                    add_usage(&mut aggregate_usage, *error.usage);
                     aggregate_incidents.extend(error.model_incidents.clone());
                     aggregate_model_usage.extend(error.model_usage);
                     aggregate_incidents.push(incident);
@@ -2838,8 +2841,8 @@ impl LlmClient {
                         failed_incidents.push(e.incident(ModelIncidentPhase::Review));
                         usage_accounting_complete &= e.usage_accounting_complete;
                         failed_model_usage.extend(e.model_usage.clone());
-                        add_usage(&mut failed_usage, e.usage);
-                        e.usage = failed_usage;
+                        add_usage(&mut failed_usage, *e.usage);
+                        *e.usage = failed_usage;
                         last_err = Some(e);
                     }
                     Err(e) => {
@@ -2957,8 +2960,8 @@ impl LlmClient {
                         failed_model_usage.extend(e.model_usage.clone());
                         let elapsed = elapsed_text(started_at.elapsed());
                         if e.is_deadline_exceeded() {
-                            add_usage(&mut failed_usage, e.usage);
-                            e.usage = failed_usage;
+                            add_usage(&mut failed_usage, *e.usage);
+                            *e.usage = failed_usage;
                             eprintln!(
                                 "postil: model {model_log} stopped after {elapsed}: {e}; cascade fallback is disabled after deadline exhaustion"
                             );
@@ -2988,8 +2991,8 @@ impl LlmClient {
                                 safe_model_error_category(&e)
                             );
                         }
-                        add_usage(&mut failed_usage, e.usage);
-                        e.usage = failed_usage;
+                        add_usage(&mut failed_usage, *e.usage);
+                        *e.usage = failed_usage;
                         last_err = Some(e);
                     }
                 }
@@ -3157,8 +3160,8 @@ impl LlmClient {
                     failed_model_usage.extend(e.model_usage.clone());
                     let elapsed = elapsed_text(started_at.elapsed());
                     if e.is_deadline_exceeded() {
-                        add_usage(&mut failed_usage, e.usage);
-                        e.usage = failed_usage;
+                        add_usage(&mut failed_usage, *e.usage);
+                        *e.usage = failed_usage;
                         eprintln!(
                             "postil: scorer {model_log} stopped after {elapsed}: {e}; scorer fallback is disabled after deadline exhaustion"
                         );
@@ -3186,8 +3189,8 @@ impl LlmClient {
                             safe_model_error_category(&e)
                         );
                     }
-                    add_usage(&mut failed_usage, e.usage);
-                    e.usage = failed_usage;
+                    add_usage(&mut failed_usage, *e.usage);
+                    *e.usage = failed_usage;
                     last_err = Some(e);
                 }
             }
@@ -3320,8 +3323,8 @@ impl LlmClient {
                     failed_model_usage.extend(error.model_usage.clone());
                     let elapsed = elapsed_text(started_at.elapsed());
                     if error.is_deadline_exceeded() {
-                        add_usage(&mut failed_usage, error.usage);
-                        error.usage = failed_usage;
+                        add_usage(&mut failed_usage, *error.usage);
+                        *error.usage = failed_usage;
                         error.model_usage = failed_model_usage;
                         error.model_incidents = failed_incidents;
                         return Err(error);
@@ -3338,8 +3341,8 @@ impl LlmClient {
                             safe_model_error_category(&error)
                         );
                     }
-                    add_usage(&mut failed_usage, error.usage);
-                    error.usage = failed_usage;
+                    add_usage(&mut failed_usage, *error.usage);
+                    *error.usage = failed_usage;
                     last_err = Some(error);
                 }
             }
@@ -3413,8 +3416,8 @@ impl LlmClient {
                     failed_model_usage.extend(error.model_usage.clone());
                     let elapsed = elapsed_text(started_at.elapsed());
                     if error.is_deadline_exceeded() {
-                        add_usage(&mut failed_usage, error.usage);
-                        error.usage = failed_usage;
+                        add_usage(&mut failed_usage, *error.usage);
+                        *error.usage = failed_usage;
                         error.model_usage = failed_model_usage;
                         error.model_incidents = failed_incidents;
                         error.usage_accounting_complete = usage_accounting_complete;
@@ -3432,8 +3435,8 @@ impl LlmClient {
                             safe_model_error_category(&error)
                         );
                     }
-                    add_usage(&mut failed_usage, error.usage);
-                    error.usage = failed_usage;
+                    add_usage(&mut failed_usage, *error.usage);
+                    *error.usage = failed_usage;
                     last_err = Some(error);
                 }
             }
