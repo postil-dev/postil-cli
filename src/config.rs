@@ -470,6 +470,20 @@ fn validate_profile_model_price_bounds(
     for model in scorer_chain {
         validate_model_id(&format!("{label} scorer chain"), model)?;
     }
+    let unique_generators = generator_chain
+        .iter()
+        .collect::<std::collections::HashSet<_>>();
+    anyhow::ensure!(
+        unique_generators.len() == generator_chain.len(),
+        "{label} generator chain must not repeat models"
+    );
+    let unique_scorers = scorer_chain
+        .iter()
+        .collect::<std::collections::HashSet<_>>();
+    anyhow::ensure!(
+        unique_scorers.len() == scorer_chain.len(),
+        "{label} scorer chain must not repeat models"
+    );
     let mut expected_models = generator_chain.to_vec();
     expected_models.extend_from_slice(scorer_chain);
     expected_models.sort();
@@ -3238,9 +3252,13 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
         let defaults = model_defaults();
         assert_eq!(defaults.default_model, "openai/gpt-5.6-luna");
         assert!(defaults.cascade.is_empty());
-        assert!(defaults.scorer_model.is_empty());
+        assert!(defaults.scorer_enabled);
+        assert_eq!(defaults.scorer_model, "openai/gpt-5.6-luna");
         assert!(defaults.scorer_fallback.is_empty());
-        assert!(defaults.scorer_qualification_candidates.is_empty());
+        assert_eq!(
+            defaults.scorer_qualification_candidates,
+            vec!["openai/gpt-5.6-luna"]
+        );
     }
 
     #[test]
@@ -3249,9 +3267,9 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
         let config = Config {
             model: profile.generator_chain[0].clone(),
             cascade: profile.generator_chain[1..].to_vec(),
-            scorer: String::new(),
+            scorer: profile.scorer_chain[0].clone(),
             scorer_fallback: String::new(),
-            scorer_enabled: false,
+            scorer_enabled: true,
             api_base: profile.api_base.clone(),
             api_format: profile.api_format,
             consensus: profile.consensus,
@@ -3265,7 +3283,7 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
         );
         assert_eq!(profile.upstream_provider_identity, "Azure");
         assert_eq!(profile.generator_chain, vec!["openai/gpt-5.6-luna"]);
-        assert!(profile.scorer_chain.is_empty());
+        assert_eq!(profile.scorer_chain, vec!["openai/gpt-5.6-luna"]);
         assert_eq!(
             profile.model_price_bounds,
             vec![ModelPriceBound {
@@ -3295,6 +3313,64 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
         ] {
             assert!(provisional_hosted_profile_for_config(&altered).is_none());
             assert!(altered.require_model_for(true, true).is_err());
+        }
+    }
+
+    #[test]
+    fn provisional_hosted_profile_allows_one_model_in_generator_and_scorer_roles() {
+        let profile = parse_provisional_hosted_profile(
+            r#"{
+                "benchmarkProviderIdentity": "openrouter:managed-routing",
+                "upstreamProviderIdentity": "Azure",
+                "apiBase": "https://openrouter.ai:443/api/v1",
+                "apiFormat": "openai-compatible",
+                "generatorChain": ["provider/shared"],
+                "consensus": 1,
+                "scorerChain": ["provider/shared"],
+                "modelPriceBounds": [{
+                    "model": "provider/shared",
+                    "inputMicrosPerMillionTokens": 1,
+                    "outputMicrosPerMillionTokens": 1
+                }]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(profile.generator_chain, vec!["provider/shared"]);
+        assert_eq!(profile.scorer_chain, vec!["provider/shared"]);
+        assert_eq!(profile.model_price_bounds.len(), 1);
+    }
+
+    #[test]
+    fn provisional_hosted_profile_rejects_duplicate_models_within_a_chain() {
+        let valid = serde_json::json!({
+            "benchmarkProviderIdentity": "openrouter:managed-routing",
+            "upstreamProviderIdentity": "Azure",
+            "apiBase": "https://openrouter.ai:443/api/v1",
+            "apiFormat": "openai-compatible",
+            "generatorChain": ["provider/generator"],
+            "consensus": 1,
+            "scorerChain": ["provider/scorer"],
+            "modelPriceBounds": [
+                {"model": "provider/generator", "inputMicrosPerMillionTokens": 1, "outputMicrosPerMillionTokens": 1},
+                {"model": "provider/scorer", "inputMicrosPerMillionTokens": 1, "outputMicrosPerMillionTokens": 1}
+            ]
+        });
+        for (field, expected) in [
+            ("generatorChain", "generator chain must not repeat models"),
+            ("scorerChain", "scorer chain must not repeat models"),
+        ] {
+            let mut duplicate = valid.clone();
+            duplicate[field] = if field == "generatorChain" {
+                serde_json::json!(["provider/generator", "provider/generator"])
+            } else {
+                serde_json::json!(["provider/scorer", "provider/scorer"])
+            };
+            assert!(
+                parse_provisional_hosted_profile(&duplicate.to_string())
+                    .unwrap_err()
+                    .to_string()
+                    .contains(expected)
+            );
         }
     }
 

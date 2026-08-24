@@ -253,11 +253,11 @@ describe("parseModels", () => {
     expect(parseModels(" a/model, ,b/model,a/model ", [])).toEqual(["a/model", "b/model"]);
   });
 
-  test("does not invent an embedded scorer candidate when scoring is disabled", async () => {
+  test("uses the embedded Luna scorer qualification candidate", async () => {
     const defaults = await loadEmbeddedScorerDefaults();
-    expect(defaults.enabled).toBe(false);
-    expect(defaults.qualification_candidates).toEqual([]);
-    expect(parseModels(undefined, defaults.qualification_candidates)).toEqual([]);
+    expect(defaults.enabled).toBe(true);
+    expect(defaults.qualification_candidates).toEqual(["openai/gpt-5.6-luna"]);
+    expect(parseModels(undefined, defaults.qualification_candidates)).toEqual(["openai/gpt-5.6-luna"]);
   });
 });
 

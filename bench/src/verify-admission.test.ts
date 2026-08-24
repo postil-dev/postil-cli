@@ -44,13 +44,44 @@ async function temporaryDirectory(): Promise<string> {
 }
 
 describe("admission attestation verification", () => {
-  test("verifies the repository provisional hosted release profile", async () => {
+  test("accepts a shared model across provisional generator and scorer roles", async () => {
     const repositoryRoot = join(import.meta.dir, "..", "..");
+    const profile = JSON.parse(await readFile(join(repositoryRoot, "provisional-models.json"), "utf8")) as {
+      generatorChain: string[];
+      scorerChain: string[];
+      modelPriceBounds: Array<{ model: string }>;
+    };
+    expect(profile.generatorChain).toEqual(["openai/gpt-5.6-luna"]);
+    expect(profile.scorerChain).toEqual(["openai/gpt-5.6-luna"]);
+    expect(profile.modelPriceBounds.map((bound) => bound.model)).toEqual(["openai/gpt-5.6-luna"]);
     expect(await verifyProvisionalRelease(
       join(repositoryRoot, "qualified-models.json"),
       join(repositoryRoot, "config.toml"),
       join(repositoryRoot, "provisional-models.json"),
     )).toBe("provisional");
+  });
+
+  test("rejects duplicate models within either provisional chain", async () => {
+    const repositoryRoot = join(import.meta.dir, "..", "..");
+    const directory = await temporaryDirectory();
+    const manifest = join(directory, "qualified-models.json");
+    const config = join(directory, "config.toml");
+    const profilePath = join(directory, "provisional-models.json");
+    await writeFile(manifest, await readFile(join(repositoryRoot, "qualified-models.json")));
+    await writeFile(config, await readFile(join(repositoryRoot, "config.toml")));
+    const baseline = JSON.parse(
+      await readFile(join(repositoryRoot, "provisional-models.json"), "utf8"),
+    ) as { generatorChain: string[]; scorerChain: string[] };
+
+    for (const [field, message] of [
+      ["generatorChain", "generator chain must not repeat models"],
+      ["scorerChain", "scorer chain must not repeat models"],
+    ] as const) {
+      const profile = structuredClone(baseline);
+      profile[field] = ["openai/gpt-5.6-luna", "openai/gpt-5.6-luna"];
+      await writeFile(profilePath, JSON.stringify(profile));
+      await expect(verifyProvisionalRelease(manifest, config, profilePath)).rejects.toThrow(message);
+    }
   });
 
   test("keeps attestation verification active after a profile is formally admitted", async () => {
@@ -91,9 +122,16 @@ describe("admission attestation verification", () => {
     await writeFile(config, await readFile(join(repositoryRoot, "config.toml")));
     const altered = JSON.parse(
       await readFile(join(repositoryRoot, "provisional-models.json"), "utf8"),
-    ) as { generatorChain: string[]; modelPriceBounds: Array<{ model: string }> };
+    ) as {
+      generatorChain: string[];
+      modelPriceBounds: Array<{
+        model: string;
+        inputMicrosPerMillionTokens: number;
+        outputMicrosPerMillionTokens: number;
+      }>;
+    };
     altered.generatorChain = ["other/model"];
-    altered.modelPriceBounds[0]!.model = "other/model";
+    altered.modelPriceBounds.push({ ...altered.modelPriceBounds[0]!, model: "other/model" });
     await writeFile(profile, JSON.stringify(altered));
 
     await expect(verifyProvisionalRelease(manifest, config, profile)).rejects.toThrow(
