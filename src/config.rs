@@ -484,10 +484,11 @@ fn validate_profile_model_price_bounds(
         unique_scorers.len() == scorer_chain.len(),
         "{label} scorer chain must not repeat models"
     );
-    let mut expected_models = generator_chain.to_vec();
-    expected_models.extend_from_slice(scorer_chain);
-    expected_models.sort();
-    expected_models.dedup();
+    let expected_models = generator_chain
+        .iter()
+        .chain(scorer_chain)
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
     let mut previous_model: Option<&str> = None;
     for bound in model_price_bounds {
         validate_model_id(&format!("{label} model price bound"), &bound.model)?;
@@ -497,7 +498,7 @@ fn validate_profile_model_price_bounds(
         );
         previous_model = Some(&bound.model);
         anyhow::ensure!(
-            expected_models.binary_search(&bound.model).is_ok(),
+            expected_models.contains(&bound.model),
             "{label} model price bound references an unknown model"
         );
         anyhow::ensure!(
@@ -512,6 +513,7 @@ fn validate_profile_model_price_bounds(
         .iter()
         .map(|bound| bound.model.clone())
         .collect::<Vec<_>>();
+    let expected_models = expected_models.into_iter().collect::<Vec<_>>();
     anyhow::ensure!(
         bounded_models == expected_models,
         "{label} model price bounds must exactly cover the generator and scorer models"
