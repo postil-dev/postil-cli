@@ -112,7 +112,7 @@ describe("admission attestation verification", () => {
     )).toBe("verified");
   });
 
-  test("rejects a provisional profile that diverges from embedded defaults", async () => {
+  test("rejects a price-complete provisional profile that diverges from embedded defaults", async () => {
     const repositoryRoot = join(import.meta.dir, "..", "..");
     const directory = await temporaryDirectory();
     const manifest = join(directory, "qualified-models.json");
@@ -131,7 +131,13 @@ describe("admission attestation verification", () => {
       }>;
     };
     altered.generatorChain = ["other/model"];
+    // Keep both role models fully priced so the assertion reaches the exact
+    // embedded-default comparison instead of failing an earlier bound check.
     altered.modelPriceBounds.push({ ...altered.modelPriceBounds[0]!, model: "other/model" });
+    expect(altered.modelPriceBounds.map((bound) => bound.model)).toEqual([
+      "openai/gpt-5.6-luna",
+      "other/model",
+    ]);
     await writeFile(profile, JSON.stringify(altered));
 
     await expect(verifyProvisionalRelease(manifest, config, profile)).rejects.toThrow(
