@@ -173,7 +173,7 @@ impl std::error::Error for AtomicAttributionIdentityFailure {}
 impl AtomicAttributionIdentityFailure {
     /// Content-free wording for retry logs: the echo either never arrived or
     /// named a different route, and neither case reveals response text.
-    fn echo_reason(self) -> &'static str {
+    fn echo_reason(&self) -> &'static str {
         match self {
             Self::Missing => "missing",
             Self::Mismatch => "mismatched",
