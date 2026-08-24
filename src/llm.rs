@@ -170,6 +170,17 @@ impl std::fmt::Display for AtomicAttributionIdentityFailure {
 
 impl std::error::Error for AtomicAttributionIdentityFailure {}
 
+impl AtomicAttributionIdentityFailure {
+    /// Content-free wording for retry logs: the echo either never arrived or
+    /// named a different route, and neither case reveals response text.
+    fn echo_reason(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Mismatch => "mismatched",
+        }
+    }
+}
+
 #[cfg(feature = "qualification-candidate")]
 #[derive(Debug)]
 struct AtomicAttributionInvalidOutput;
@@ -4443,12 +4454,40 @@ impl LlmClient {
                     if response.status.is_success() {
                         let actual_identity =
                             route_provider.map(|_| actual_response_identity(&response.text));
-                        if let Some(expected_provider) = route_provider {
-                            validate_routed_response_identity(
+                        // A pinned route that answers without echoing its
+                        // identity is as transient as a gateway 5xx: the
+                        // response is never accepted, but the attempt is
+                        // retried on the shared transient budget before the
+                        // identity failure becomes terminal.
+                        if let Some(expected_provider) = route_provider
+                            && let Err(error) = validate_routed_response_identity(
                                 actual_identity.as_ref(),
                                 model,
                                 expected_provider,
-                            )?;
+                            )
+                        {
+                            if let Some(response_usage) = summary.usage {
+                                add_usage(usage, response_usage);
+                            } else {
+                                *usage_accounting_complete = false;
+                            }
+                            if retries < TRANSIENT_RETRIES {
+                                retries += 1;
+                                let wait = provider_retry_delay(retries);
+                                eprintln!(
+                                    "postil: model {} returned a routed response whose identity echo is {} after {elapsed}, retrying in {} \
+                                     (retry {retries}/{TRANSIENT_RETRIES})",
+                                    log_text(model),
+                                    error
+                                        .downcast_ref::<AtomicAttributionIdentityFailure>()
+                                        .map_or("unusable", |failure| failure.echo_reason()),
+                                    elapsed_text(wait)
+                                );
+                                self.sleep_with_budget(phase, wait).await?;
+                                attempt_timeout = self.request_timeout;
+                                continue;
+                            }
+                            return Err(error);
                         }
                         eprintln!(
                             "postil: llm response phase={} model={} attempt={} status={} elapsed={} bytes={} request_id={} response_id={} returned_model={} provider={} choices={} finish={} usage={} prompt_tokens={} completion_tokens={} reasoning_tokens={} category={}",
@@ -9576,12 +9615,223 @@ mod tests {
                     matches!(failure, AtomicAttributionIdentityFailure::Mismatch)
                 })
         );
+        let partial_echo = (Some("provider/model".to_string()), None);
+        let half_missing =
+            validate_routed_response_identity(Some(&partial_echo), "provider/model", "Fireworks")
+                .unwrap_err();
+        assert!(
+            half_missing
+                .downcast_ref::<AtomicAttributionIdentityFailure>()
+                .is_some_and(|failure| matches!(
+                    failure,
+                    AtomicAttributionIdentityFailure::Missing
+                ))
+        );
+
         let classified = classify_chat_error(mismatch);
         assert!(classified.downcast_ref::<ProviderError>().is_none());
         assert!(
             classified
                 .downcast_ref::<AtomicAttributionIdentityFailure>()
                 .is_some()
+        );
+
+        assert_eq!(
+            AtomicAttributionIdentityFailure::Missing.echo_reason(),
+            "missing"
+        );
+        assert_eq!(
+            AtomicAttributionIdentityFailure::Mismatch.echo_reason(),
+            "mismatched"
+        );
+    }
+
+    fn pinned_route_client(server: &MockServer) -> LlmClient {
+        let config = Config {
+            api_base: server.uri(),
+            api_format: ApiFormat::OpenaiCompatible,
+            model: "provider/model".into(),
+            scorer_enabled: false,
+            uncertainty_resolution: false,
+            concise_findings: false,
+            ..Config::default()
+        };
+        let mut client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(2),
+            None,
+            None,
+        )
+        .unwrap();
+        client.request_decorations.pinned_upstream_provider = Some("Fireworks".into());
+        *client.http.lock().unwrap() = Some(reqwest::Client::new());
+        client
+    }
+
+    #[tokio::test]
+    async fn pinned_route_retries_a_dropped_identity_echo_and_accepts_the_matching_retry() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"finish_reason": "stop", "message": {"content": "unattributed"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+            })))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "provider/model",
+                "provider": "Fireworks",
+                "choices": [{"finish_reason": "stop", "message": {"content": "attributed"}}],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 3}
+            })))
+            .with_priority(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = pinned_route_client(&server);
+
+        let mut usage = Usage::default();
+        let mut call_usage = Vec::new();
+        let mut usage_accounting_complete = true;
+        let success = client
+            .chat_inner(
+                "provider/model",
+                None,
+                "system",
+                "user",
+                &mut usage,
+                &mut call_usage,
+                &mut usage_accounting_complete,
+                180,
+                0.0,
+                LlmPhase::Review,
+                LlmCallPhase::Initial,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(success.content, "attributed");
+        assert_eq!(success.returned_model.as_deref(), Some("provider/model"));
+        assert_eq!(success.provider.as_deref(), Some("Fireworks"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        assert_eq!(
+            call_usage
+                .iter()
+                .map(|event| (event.attempt, event.prompt_tokens, event.completion_tokens))
+                .collect::<Vec<_>>(),
+            vec![(Some(1), 10, 2), (Some(2), 12, 3)]
+        );
+        assert_eq!(usage.prompt_tokens, 22);
+        assert_eq!(usage.completion_tokens, 5);
+        assert!(usage_accounting_complete);
+        assert_eq!(client.admission.lock().unwrap().attempts, 2);
+        assert_eq!(client.admission.lock().unwrap().reported_token_spend, 27);
+    }
+
+    #[tokio::test]
+    async fn a_persistently_missing_identity_echo_stays_terminal_after_the_transient_budget() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"finish_reason": "stop", "message": {"content": "unattributed"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+            })))
+            .expect(u64::from(TRANSIENT_RETRIES) + 1)
+            .mount(&server)
+            .await;
+        let client = pinned_route_client(&server);
+
+        let mut usage = Usage::default();
+        let mut call_usage = Vec::new();
+        let mut usage_accounting_complete = true;
+        let error = match client
+            .chat_inner(
+                "provider/model",
+                None,
+                "system",
+                "user",
+                &mut usage,
+                &mut call_usage,
+                &mut usage_accounting_complete,
+                180,
+                0.0,
+                LlmPhase::Review,
+                LlmCallPhase::Initial,
+                None,
+            )
+            .await
+        {
+            Ok(_) => panic!("a response without an identity echo was accepted"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .downcast_ref::<AtomicAttributionIdentityFailure>()
+                .is_some_and(|failure| matches!(
+                    failure,
+                    AtomicAttributionIdentityFailure::Missing
+                ))
+        );
+        let attempts = TRANSIENT_RETRIES as usize + 1;
+        assert_eq!(server.received_requests().await.unwrap().len(), attempts);
+        assert_eq!(call_usage.len(), attempts);
+        assert!(usage_accounting_complete);
+        assert_eq!(client.admission.lock().unwrap().attempts, attempts);
+    }
+
+    #[cfg(feature = "qualification-candidate")]
+    #[tokio::test]
+    async fn exhausted_identity_echo_retries_keep_the_terminal_attribution_diagnostic() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{
+                    "finish_reason": "stop",
+                    "message": {"content": "{\"sameDefect\":true,\"reason\":\"same defect\"}"}
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+            })))
+            .expect(u64::from(TRANSIENT_RETRIES) + 1)
+            .mount(&server)
+            .await;
+        let client = pinned_route_client(&server);
+
+        let error = client
+            .attribute_same_defect(
+                "provider/model",
+                "Fireworks",
+                "system",
+                "user",
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap_err();
+
+        let diagnostic = error.atomic_attribution_terminal_diagnostic();
+        assert!(matches!(
+            diagnostic.category,
+            crate::attribution::AttributionTerminalCategory::ResponseIdentityMissing
+        ));
+        assert_eq!(diagnostic.identity_present, Some(false));
+        assert_eq!(diagnostic.identity_matched, None);
+        assert_eq!(
+            diagnostic.provider_attempt_count,
+            Some(TRANSIENT_RETRIES as usize + 1)
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            TRANSIENT_RETRIES as usize + 1
         );
     }
 
