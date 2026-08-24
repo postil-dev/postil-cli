@@ -718,6 +718,19 @@ fn supersedes(base: &Finding, new: &Finding) -> bool {
     {
         return base.path == new.path && base.id.is_some() && base.id == new.id;
     }
+    let base_machine_claim = base
+        .machine_claim
+        .as_ref()
+        .map(crate::machine_claim::claim_identity_sha256);
+    let new_machine_claim = new
+        .machine_claim
+        .as_ref()
+        .map(crate::machine_claim::claim_identity_sha256);
+    if (base_machine_claim.is_some() || new_machine_claim.is_some())
+        && base_machine_claim != new_machine_claim
+    {
+        return false;
+    }
     if defect_identity(base) == defect_identity(new) && new.severity >= base.severity {
         return true;
     }
@@ -727,12 +740,24 @@ fn supersedes(base: &Finding, new: &Finding) -> bool {
         && new.severity >= base.severity
 }
 
-fn defect_identity(finding: &Finding) -> (String, crate::envelope::Kind, String, Option<String>) {
+type DefectIdentity = (
+    String,
+    crate::envelope::Kind,
+    String,
+    Option<String>,
+    Option<String>,
+);
+
+fn defect_identity(finding: &Finding) -> DefectIdentity {
     (
         finding.path.to_ascii_lowercase(),
         finding.kind,
         finding.title.trim().to_ascii_lowercase(),
         finding.evidence.clone(),
+        finding
+            .machine_claim
+            .as_ref()
+            .map(crate::machine_claim::claim_identity_sha256),
     )
 }
 
@@ -760,12 +785,7 @@ fn touch_addresses(index: &DiffIndex, f: &Finding, scope: ReconcileScope) -> boo
 
 fn push_carried(
     carried: &mut Vec<Finding>,
-    identities: &mut std::collections::HashSet<(
-        String,
-        crate::envelope::Kind,
-        String,
-        Option<String>,
-    )>,
+    identities: &mut std::collections::HashSet<DefectIdentity>,
     mut finding: Finding,
 ) {
     if !is_carried(&finding) {
@@ -798,6 +818,12 @@ pub fn reconcile(
         if superseded {
             // A fresh, same-issue finding stands in for the baseline; the new
             // copy is already in `new_findings` and will reach the gate.
+            continue;
+        }
+        // A typed carried claim is settled only by the exact-head verifier.
+        // Generic touched-line reconciliation cannot clear it.
+        if f.machine_claim_deferred {
+            push_carried(&mut carried, &mut carried_identities, f.clone());
             continue;
         }
         if let ReconcileScope::Incremental { trust } = scope
@@ -865,6 +891,8 @@ mod tests {
             scorer_kind: None,
             scorer_reason: None,
             repository_claim: None,
+            machine_claim: None,
+            machine_claim_deferred: false,
             title: "t".into(),
             body: "b".into(),
             evidence: Some("x".into()),
@@ -1137,6 +1165,65 @@ mod tests {
         assert!(rec.carried[0].body.starts_with("[carried"));
         assert_eq!(rec.carried[1].path, ".postil/content-policy.md");
         assert!(rec.carried[1].body.starts_with("[carried"));
+    }
+
+    #[test]
+    fn reconcile_never_clears_a_deferred_machine_claim_without_source_refutation() {
+        let idx = index_for("src/identity.rs", 10, 3);
+        let mut baseline = f("src/identity.rs", 11, Severity::Info, 0.9);
+        baseline.machine_claim = Some(crate::envelope::MachineClaim {
+            kind: crate::envelope::MachineClaimKind::RustCopyMoveOut,
+            path: "src/identity.rs".into(),
+            symbol: "crate::identity::IdentityFailure".into(),
+            expected_signature: None,
+        });
+        baseline.machine_claim_deferred = true;
+        let mut unrelated = f("src/identity.rs", 11, Severity::Error, 0.95);
+        unrelated.title = baseline.title.clone();
+
+        let rec = reconcile(
+            std::slice::from_ref(&baseline),
+            &idx,
+            &[unrelated],
+            ReconcileScope::Incremental {
+                trust: ReviewTrust::Exhaustive,
+            },
+        );
+
+        assert!(rec.resolved.is_empty());
+        assert_eq!(rec.carried.len(), 1);
+        assert_eq!(rec.carried[0].machine_claim, baseline.machine_claim);
+        assert!(rec.carried[0].machine_claim_deferred);
+    }
+
+    #[test]
+    fn canonical_machine_claims_supersede_formatting_variants() {
+        let mut baseline = f("src/identity.rs", 11, Severity::Info, 0.9);
+        baseline.machine_claim = Some(crate::envelope::MachineClaim {
+            kind: crate::envelope::MachineClaimKind::SignatureMismatch,
+            path: "src/identity.rs".into(),
+            symbol: "crate::identity::check".into(),
+            expected_signature: Some(crate::envelope::MachineSignature {
+                receiver: crate::envelope::MachineReceiver::None,
+                parameters: vec!["std::vec::Vec < u8 >".into()],
+                returns: "bool".into(),
+                is_async: false,
+                is_unsafe: false,
+            }),
+        });
+        let mut fresh = baseline.clone();
+        fresh.severity = Severity::Error;
+        fresh.machine_claim.as_mut().unwrap().expected_signature =
+            Some(crate::envelope::MachineSignature {
+                receiver: crate::envelope::MachineReceiver::None,
+                parameters: vec!["std::vec::Vec<u8>".into()],
+                returns: "bool".into(),
+                is_async: false,
+                is_unsafe: false,
+            });
+
+        assert!(supersedes(&baseline, &fresh));
+        assert_eq!(defect_identity(&baseline), defect_identity(&fresh));
     }
 
     #[test]

@@ -1646,6 +1646,8 @@ mod tests {
             scorer_kind: None,
             scorer_reason: None,
             repository_claim: None,
+            machine_claim: None,
+            machine_claim_deferred: false,
             title: title.into(),
             body: body.into(),
             evidence: Some("uses: action@old".into()),

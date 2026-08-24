@@ -1125,6 +1125,7 @@ dependencies = [
  "sha1",
  "sha2",
  "similar",
+ "syn",
  "tempfile",
  "time",
  "tokio",

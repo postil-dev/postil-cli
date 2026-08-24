@@ -146,6 +146,8 @@ mod tests {
             scorer_kind: None,
             scorer_reason: None,
             repository_claim: None,
+            machine_claim: None,
+            machine_claim_deferred: false,
             title: "Keep the stable finding metadata".to_string(),
             body,
             evidence: Some("changed_call();".to_string()),

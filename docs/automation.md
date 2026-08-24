@@ -4,7 +4,7 @@
 
 `postil review --output json` and `--output yaml` emit the complete versioned review envelope. `--output csv` emits a flattened findings table with review and gate fields repeated on each row. `--output-file <path>` keeps structured output separate from human-readable output.
 
-The JSON and YAML envelope contains the summary, findings, resolved findings, policy counts, gate result, model and scorer metadata, token usage, per-model usage, and reviewed SHAs. `usageAccountingComplete` is false when a provider request can have unknown billed usage.
+The JSON and YAML envelope contains the summary, findings, resolved findings, policy counts, gate result, model and scorer metadata, token usage, per-model usage, and reviewed SHAs. A finding can include a typed `machineClaim`; `claimVerification` records its exact-head, hash-only source receipt, and `machineClaimDeferred` marks a carried claim that remains visible without blocking. Both fields are optional during deserialization. `usageAccountingComplete` is false when a provider request can have unknown billed usage.
 
 `--sarif <path>` writes SARIF 2.1.0 for code-scanning ingestion.
 

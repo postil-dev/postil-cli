@@ -144,18 +144,20 @@ pub fn review_contract(cfg: &Config) -> String {
          `.postil/change-metadata`. Findings citing other lines are discarded as \
          ungrounded.\n\
          \n\
-         `repositoryContext` is optional. Omit it for bugs the cited line establishes, including \
-         removed fields, bypassed guards, boundary errors, or lifecycle defects; caller or consumer \
-         impact alone doesn't require it. Include it only when the conclusion depends on \
-         repository-wide evidence, using `claim: absence` for a construct missing from the \
-         complete reviewed head or `claim: mismatch` for a repository target whose expected \
-         value is not established by the cited changed line. When included, name the target in \
-         `resources`, `paths`, or `identifiers` and the expected value in `values` or `versions`; \
-         include all five arrays even when empty. Populated arrays are conjunctive and refute \
-         only when matched in one file. Repository claims require the complete reviewed head. Public \
-         text names the concrete construct \
-         and correction, never review-input boundaries such as `in the diff`, retrieval mechanics, \
-         delegated evidence collection, or guessed files.\n",
+         `repositoryContext` is optional. Omit it when the cited line proves the bug, including \
+         removed fields, bypassed guards, boundary errors, and lifecycle defects; caller impact \
+         alone does not require it. Use it only for a conclusion that depends on complete-head \
+         absence or mismatch. Include all five arrays: targets belong in resources, paths, or \
+         identifiers and expected values in values or versions. Populated arrays are conjunctive. \
+         Public text names the defect and fix, never review boundaries, retrieval, delegation, or \
+         guessed files.\n\
+         \n\
+         `machineClaim` excludes repositoryContext. Rust kinds: rust.copy_move_out, symbol.absent, \
+         signature.mismatch. Path: src/lib.rs, src/main.rs, or non-bin src/<modules>.rs; symbol: \
+         crate-qualified. signature.mismatch alone sets expectedSignature: receiver \
+         none|shared|mutable|value, parameters, returns, async, unsafe. Types: paths, references, \
+         tuples, slices, generics. Omit for macros, generated code, inference, traits, or \
+         compilation. Public text omits verification.\n",
     );
     if !cfg.focus.is_empty() {
         p.push_str(&format!(
@@ -224,6 +226,7 @@ pub fn system_prompt(cfg: &Config, current_utc_date: Date) -> String {
           \"findings\": [{\"path\": \"file path from the diff\", \"line\": <new-file line>,\n \
           \"endLine\": <optional>, \"severity\": \"info|warn|error\",\n \
           \"kind\": \"risk|humanEscalation|guardrail|uncertainty|contentPolicy\", \"confidence\": <0..1>,\n \
+          \"machineClaim\": <optional typed source claim>,\n \
           \"title\": \"short imperative title\", \"body\": \"specific, evidence-based markdown\",\n \
           \"evidence\": \"exact non-empty new-side text from the cited line\"}]}\n\
          \n\
@@ -549,14 +552,24 @@ mod tests {
         let prompt = system_prompt(&Config::default(), trusted_date());
         assert!(prompt.contains("`repositoryContext` is optional"));
         assert!(prompt.contains(
-            "Omit it for bugs the cited line establishes, including removed fields, bypassed guards, boundary errors, or lifecycle defects"
+            "Omit it when the cited line proves the bug, including removed fields, bypassed guards, boundary errors, and lifecycle defects"
         ));
-        assert!(prompt.contains("caller or consumer impact alone doesn't require it"));
-        assert!(
-            prompt.contains(
-                "Include it only when the conclusion depends on repository-wide evidence"
-            )
-        );
+        assert!(prompt.contains("caller impact alone does not require it"));
+        assert!(prompt.contains("depends on complete-head absence or mismatch"));
+        assert!(prompt.contains("Public text names the defect and fix"));
+    }
+
+    #[test]
+    fn generator_machine_claim_contract_is_bounded_and_explicit() {
+        let prompt = system_prompt(&Config::default(), trusted_date());
+        for kind in ["rust.copy_move_out", "symbol.absent", "signature.mismatch"] {
+            assert!(prompt.contains(kind));
+        }
+        assert!(prompt.contains("src/lib.rs, src/main.rs, or non-bin src/<modules>.rs"));
+        assert!(prompt.contains("symbol: crate-qualified"));
+        assert!(prompt.contains("`machineClaim` excludes repositoryContext"));
+        assert!(prompt.contains("macros, generated code, inference, traits"));
+        assert!(prompt.contains("Public text omits verification"));
     }
 
     #[test]
@@ -649,6 +662,7 @@ mod tests {
               \"findings\": [{\"path\": \"file path from the diff\", \"line\": <new-file line>,\n \
               \"endLine\": <optional>, \"severity\": \"info|warn|error\",\n \
               \"kind\": \"risk|humanEscalation|guardrail|uncertainty|contentPolicy\", \"confidence\": <0..1>,\n \
+              \"machineClaim\": <optional typed source claim>,\n \
               \"title\": \"short imperative title\", \"body\": \"specific, evidence-based markdown\",\n \
               \"evidence\": \"exact non-empty new-side text from the cited line\"}]}\n\
              \n\
