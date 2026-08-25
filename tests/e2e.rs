@@ -2150,7 +2150,7 @@ async fn native_anthropic_findings_use_explicit_native_scorer() {
         .body_json()
         .unwrap();
     assert_eq!(generator["output_config"], json!({"effort": "low"}));
-    assert_eq!(scorer["thinking"], json!({"type": "disabled"}));
+    assert_eq!(scorer["output_config"], json!({"effort": "low"}));
 }
 
 #[tokio::test]
@@ -6037,7 +6037,7 @@ fn hosted_config_ignores_repository_model_provider_and_scorer() {
     assert!(stdout.contains("model.scorer: "));
     assert!(!stdout.contains("model.scorer: openai/gpt-5.6-luna"));
     assert!(stdout.contains("model.reasoningEffort: low"));
-    assert!(stdout.contains("model.scorerReasoningEffort: none"));
+    assert!(stdout.contains("model.scorerReasoningEffort: low"));
     assert!(stdout.contains("model.apiBase: https://openrouter.ai/api/v1"));
     assert!(stdout.contains("model.apiFormat: openai-compatible"));
     assert!(stdout.contains("model.consensus: 1"));
@@ -6071,7 +6071,7 @@ fn provisional_hosted_config_uses_only_the_baked_roster() {
     assert!(stdout.contains("model.cascade: []"));
     assert!(stdout.contains("model.scorer: openai/gpt-5.6-luna"));
     assert!(stdout.contains("model.reasoningEffort: low"));
-    assert!(stdout.contains("model.scorerReasoningEffort: none"));
+    assert!(stdout.contains("model.scorerReasoningEffort: low"));
     assert!(stdout.contains("model.apiBase: https://openrouter.ai:443/api/v1"));
     assert!(stdout.contains("model.apiFormat: openai-compatible"));
     assert!(stdout.contains("model.consensus: 1"));
@@ -6129,7 +6129,7 @@ async fn local_review_reports_grounded_finding_and_gates() {
     let adjudication: Value = requests[1].body_json().unwrap();
     assert_eq!(request["max_tokens"], 8_000);
     assert_eq!(request["reasoning"], json!({"effort": "low"}));
-    assert_eq!(adjudication["reasoning"], json!({"effort": "none"}));
+    assert_eq!(adjudication["reasoning"], json!({"effort": "low"}));
     assert_eq!(request["messages"].as_array().unwrap().len(), 2);
     let prompt_bytes = request["messages"]
         .as_array()
@@ -6634,7 +6634,7 @@ fn models_and_config_explain_the_embedded_default() {
     assert!(models.contains("Reviewer reasoning effort: low"));
     assert!(models.contains("Local scorer: disabled"));
     assert!(models.contains("Hosted scorer candidate: openai/gpt-5.6-luna"));
-    assert!(models.contains("Hosted scorer reasoning effort: none"));
+    assert!(models.contains("Hosted scorer reasoning effort: low"));
     assert!(models.contains("does not maintain a fixed local model-ID allowlist"));
     assert!(models.contains("OpenAI-compatible endpoints accept any non-empty endpoint model ID"));
     assert!(models.contains("OpenRouter commonly uses provider/model"));
@@ -6665,7 +6665,7 @@ fn models_and_config_explain_the_embedded_default() {
     assert!(config.contains("model.reasoningEffort: low"));
     assert!(config.contains("model.reasoningEffort.source: embedded default"));
     assert!(config.contains("model.scorer.enabled: false"));
-    assert!(config.contains("model.scorerReasoningEffort: none"));
+    assert!(config.contains("model.scorerReasoningEffort: low"));
     assert!(config.contains("model.scorerReasoningEffort.source: embedded default"));
 }
 

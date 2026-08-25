@@ -1339,6 +1339,16 @@ describe("managed admission workflow", () => {
     // still benchmarked the previous one and passed against its old baseline.
     expect(release).not.toContain("REVIEW_MODEL:");
     expect(release).toContain("OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}");
+    expect(release).not.toContain("POSTIL_SCORER_EVAL_MODELS:");
+    expect(release).toContain('POSTIL_SCORER_EVAL_REPEATS: "3"');
+    expect(release).toContain("POSTIL_SCORER_EVAL_UPSTREAM_PROVIDER: Azure");
+    expect(release).toContain("bun run scorer-eval --json-out");
+    expect(release).toMatch(
+      /name: Upload the scorer gate report\n\s+if: always\(\)[\s\S]*if-no-files-found: warn[\s\S]*retention-days: 30/u,
+    );
+    expect(release.indexOf("bun run scorer-eval --json-out")).toBeLessThan(
+      release.indexOf("bun run bench:live --"),
+    );
     expect(release).toContain("bun run bench:live --");
     expect(release).toContain("bun run bench:compare --");
     expect(release).toMatch(/build:\n\s+needs: \[validate-tag, bench-live\]/u);

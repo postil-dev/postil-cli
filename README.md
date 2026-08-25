@@ -35,7 +35,7 @@ postil hook install                      # add a pre-push review
 
 Bare local review selects staged changes first, then committed changes since the current branch's locally known default branch, then tracked working-tree changes, and finally an empty clean diff. Symbolic remote HEAD plus conventional `main`, `master`, and `trunk` refs are recognized without fetching. If no default branch can be resolved for a repository with commits, Postil fails closed and asks for `--base`, `--staged`, or `--diff-file` instead of reporting a partial review as clean. It sends the selected diff to the configured inference endpoint, but does not modify the working tree, index, or refs and does not write comments or checks to a forge unless `--publish` is supplied.
 
-`postil models` answers model-selection questions offline without reading credentials or contacting a provider. No model setting is required: it identifies the embedded default, explains the model-ID contracts for OpenAI-compatible and native Anthropic endpoints, separates local protocol compatibility from hosted qualification, and gives exact `postil doctor` and override commands. The Luna reviewer uses `low` reasoning effort. Local scoring stays disabled until `REVIEW_SCORER_MODEL` names a scorer; the hosted scorer candidate uses `none`. `postil review` exits `0` when the gate passes, `1` when it fails, and `2` when it cannot produce a review envelope. Interactive terminals show concise progress; `--no-progress` or `POSTIL_NO_PROGRESS=1` replaces animation with concise static milestones, while `--verbose` enables complete provider, retry, and batch telemetry.
+`postil models` answers model-selection questions offline without reading credentials or contacting a provider. No model setting is required: it identifies the embedded default, explains the model-ID contracts for OpenAI-compatible and native Anthropic endpoints, separates local protocol compatibility from hosted qualification, and gives exact `postil doctor` and override commands. The Luna reviewer and hosted scorer candidate use `low` reasoning effort. Local scoring stays disabled until `REVIEW_SCORER_MODEL` names a scorer. `postil review` exits `0` when the gate passes, `1` when it fails, and `2` when it cannot produce a review envelope. Interactive terminals show concise progress; `--no-progress` or `POSTIL_NO_PROGRESS=1` replaces animation with concise static milestones, while `--verbose` enables complete provider, retry, and batch telemetry.
 
 ## Review a pull request
 
@@ -66,7 +66,7 @@ gate:
   onError: block
 model:
   reasoningEffort: low
-  scorerReasoningEffort: none
+  scorerReasoningEffort: low
 ```
 
 Unknown keys are rejected. Repository configuration cannot redirect a deployment credential to another API host unless the operator explicitly permits that behavior. The embedded local preset uses `openai/gpt-5.6-luna`; local scoring is disabled until explicitly configured. Hosted profile selection remains service-controlled.

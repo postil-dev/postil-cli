@@ -5277,7 +5277,11 @@ fn apply_openrouter_scorer_contract(body: &mut serde_json::Value, expected_len: 
         .as_object_mut()
         .expect("provider routing configuration is an object")
         .insert("require_parameters".to_string(), json!(true));
-    body["reasoning"]["exclude"] = json!(true);
+    // A disabled reasoning request has no reasoning payload to exclude. Keep
+    // that provider contract minimal instead of sending redundant controls.
+    if body["reasoning"]["effort"] != "none" {
+        body["reasoning"]["exclude"] = json!(true);
+    }
     body["response_format"] = json!({
         "type": "json_schema",
         "json_schema": {
@@ -9555,7 +9559,7 @@ mod tests {
         );
         assert_eq!(
             scorer["reasoning"],
-            json!({"effort": "none", "exclude": true})
+            json!({"effort": "low", "exclude": true})
         );
         assert!(scorer["reasoning"].get("enabled").is_none());
         assert_eq!(scorer["provider"]["require_parameters"], true);
@@ -9611,6 +9615,27 @@ mod tests {
         assert_eq!(generator["reasoning"], json!({"effort": "low"}));
         assert!(generator.get("response_format").is_none());
         assert!(generator["provider"].get("require_parameters").is_none());
+
+        let no_reasoning_client = LlmClient::build(
+            &Config {
+                scorer_reasoning_effort: ReasoningEffort::None,
+                ..Config::default()
+            },
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        let no_reasoning_scorer = no_reasoning_client.request_body(
+            "provider/scorer",
+            "system",
+            "user",
+            400,
+            0.0,
+            LlmPhase::Scorer { expected_len: 1 },
+        );
+        assert_eq!(no_reasoning_scorer["reasoning"], json!({"effort": "none"}));
     }
 
     #[test]
@@ -10166,7 +10191,7 @@ mod tests {
             LlmPhase::Scorer { expected_len: 1 },
         );
         assert!(openai_body.get("provider").is_none());
-        assert_eq!(openai_body["reasoning"], json!({"effort": "none"}));
+        assert_eq!(openai_body["reasoning"], json!({"effort": "low"}));
         assert!(openai_body.get("response_format").is_none());
 
         let anthropic = LlmClient::build(
@@ -10191,9 +10216,9 @@ mod tests {
             LlmPhase::Scorer { expected_len: 1 },
         );
         assert!(anthropic_body.get("provider").is_none());
-        assert_eq!(anthropic_body["thinking"], json!({"type": "disabled"}));
-        assert!(anthropic_body.get("output_config").is_none());
-        assert_eq!(anthropic_body["temperature"], 0.0);
+        assert!(anthropic_body.get("thinking").is_none());
+        assert_eq!(anthropic_body["output_config"], json!({"effort": "low"}));
+        assert!(anthropic_body.get("temperature").is_none());
         assert!(anthropic_body.get("response_format").is_none());
         assert_eq!(anthropic_body["system"], "system");
     }

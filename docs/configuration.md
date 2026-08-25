@@ -38,7 +38,7 @@ model:
   reasoningEffort: low           # max, xhigh, high, medium, low, minimal, or none
   cascade: []                    # qualified fallbacks only
   # scorer: provider/qualified-scorer
-  scorerReasoningEffort: none
+  scorerReasoningEffort: low
   consensus: 1
 ```
 
@@ -97,4 +97,4 @@ postil doctor
 
 `postil config` prints the resolved non-secret configuration and separate provenance for the model, reviewer reasoning effort, and scorer reasoning effort. `postil doctor` validates endpoint reachability, credential acceptance, and repository setup without printing credential values. Both commands identify renewable logins, access expiry, refresh inactivity expiry, and legacy access-only logins.
 
-Use `--reasoning-effort` and `--scorer-reasoning-effort` for one review. These flags override the matching environment variables, which override `model.reasoningEffort` and `model.scorerReasoningEffort`. The built-in reviewer and scorer defaults are `low` and `none`, respectively. Every request carries the resolved value, including retries and repair calls.
+Use `--reasoning-effort` and `--scorer-reasoning-effort` for one review. These flags override the matching environment variables, which override `model.reasoningEffort` and `model.scorerReasoningEffort`. The built-in reviewer and scorer defaults are both `low`. Every request carries the resolved value, including retries and repair calls.

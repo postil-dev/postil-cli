@@ -2766,7 +2766,7 @@ scorer = { enabled = true, default_model = "provider/scorer", reasoning_effort =
         assert_eq!(c.model_source, "embedded default");
         assert_eq!(c.reasoning_effort, ReasoningEffort::Low);
         assert_eq!(c.reasoning_effort_source, "embedded default");
-        assert_eq!(c.scorer_reasoning_effort, ReasoningEffort::None);
+        assert_eq!(c.scorer_reasoning_effort, ReasoningEffort::Low);
         assert_eq!(c.scorer_reasoning_effort_source, "embedded default");
         assert!(c.concise_findings);
         assert!(!c.scorer_enabled);
@@ -3058,7 +3058,7 @@ scorer = { enabled = true, default_model = "provider/scorer", reasoning_effort =
         assert_eq!(c.model, model_defaults().default_model);
         assert_eq!(c.cascade, model_defaults().cascade);
         assert_eq!(c.reasoning_effort, ReasoningEffort::Low);
-        assert_eq!(c.scorer_reasoning_effort, ReasoningEffort::None);
+        assert_eq!(c.scorer_reasoning_effort, ReasoningEffort::Low);
         assert!(c.scorer.is_empty());
     }
 
@@ -3694,6 +3694,7 @@ scorer = { enabled = true, default_model = "provider/scorer", reasoning_effort =
         assert!(defaults.cascade.is_empty());
         assert!(defaults.scorer_enabled);
         assert_eq!(defaults.scorer_model, "openai/gpt-5.6-luna");
+        assert_eq!(defaults.scorer_reasoning_effort, ReasoningEffort::Low);
         assert!(defaults.scorer_fallback.is_empty());
         assert_eq!(
             defaults.scorer_qualification_candidates,
