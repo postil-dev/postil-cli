@@ -79,9 +79,12 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   executable vendor hunks require direct source evidence. Low-risk hunks receive
   semantic credit only from selected proof batches that retain the exact repository
   path, hunk identity, every changed line, and a substantive added line in the final
-  model request. Missing
-  direct capacity, proof evidence, or complete receipt coverage fails before plan
-  registration or provider contact. When
+  model request. The route fills its fixed capacity in stable metadata, risk, and path
+  order. A hunk receives direct credit only when every direct batch is selected;
+  otherwise it receives eligible exact semantic credit or remains unreviewed. The
+  selected schedule still runs when receipt coverage is incomplete, preserves valid
+  findings from selected evidence, and adds an error-severity operational finding that
+  keeps review trust and the merge gate failed. When
   `POSTIL_LARGE_REVIEW_PLAN_ENDPOINT` and `POSTIL_LARGE_REVIEW_PLAN_TOKEN` are set, the
   CLI registers a versioned deterministic request plan with the authenticated loopback
   endpoint before any provider call. A missing, rejected, or unreachable registration
@@ -252,10 +255,11 @@ additions (violations are `kind: contentPolicy`). Content policy is on by defaul
    irreducible owner decision, not uncertainty about a concrete defect. Admin overrides
    apply to that kind-only decision rather than ordinary risk findings.
 9. Review resource or request-budget exhaustion cannot produce a clean verdict. An
-   incomplete deterministic receipt fails before durable plan registration or model
-   contact. Other preflight exhaustion emits the generic internal `Review incomplete`
-   operational finding without model contact. Both preserve the hosted global deadline
-   and keep full-review reconciliation untrustworthy.
+   incomplete deterministic receipt registers and runs only its immutable bounded
+   schedule, then emits an operational coverage finding and keeps full-review
+   reconciliation untrustworthy. Other preflight exhaustion emits the generic internal
+   `Review incomplete` operational finding without model contact. Both preserve the
+   hosted global deadline and cannot produce a clean gate verdict.
 10. Bounded JSON metadata pages use a 32 MiB per-page cap and a 64 MiB aggregate
     metadata cap. Source files and reconstructed diffs stream beyond that page limit
     into one 512 MiB operation workspace shared by acquired source snapshots,
@@ -271,11 +275,12 @@ additions (violations are `kind: contentPolicy`). Content policy is on by defaul
 12. Every completed review envelope records source-batch coverage when batching runs.
     Deterministic large reviews also record a plan hash and direct, semantic, and
     unreviewed hunk counts. Every normalized hunk has exactly one disposition; evidence
-    identifiers bind the exact hunk digest, and any unreviewed hunk rejects the plan
-    before registration or provider contact. Semantic coverage cannot resolve baseline
-    findings. Bounded reviews expose selected and total source-batch counts in compact
-    output. Planner fallback remains audit metadata and does not expose provider failure
-    details to a PR.
+    identifiers bind the exact hunk digest, and the plan hash binds the selected batch
+    order and payloads. Any unreviewed hunk forces failed review trust and a blocking
+    synthetic finding after the selected provider calls. Incomplete coverage cannot
+    resolve baseline findings. Bounded reviews expose selected and total source-batch
+    counts in compact output. Planner fallback remains audit metadata and does not expose
+    provider failure details to a PR.
 13. Operational and provider virtual anchors expire after each run. Reviewable
     PR-description and change-metadata anchors carry across unrelated incremental
     reviews, and a same-head rerun with either anchor falls back to a full review.

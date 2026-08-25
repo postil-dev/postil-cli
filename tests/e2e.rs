@@ -2674,6 +2674,71 @@ fn qualification_candidate_admits_complete_large_review_inside_watchdog_capacity
 
 #[cfg(feature = "qualification-candidate")]
 #[test]
+fn qualification_candidate_reports_incomplete_bounded_coverage_without_provider_contact() {
+    use std::fmt::Write as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff_path = dir.path().join("large-incomplete.diff");
+    let mut diff = String::new();
+    for file in 0..30 {
+        let path = format!("src/auth/permission-{file}.ts");
+        writeln!(
+            diff,
+            "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1,2 +1,2 @@\n-if (!actor.can('admin')) throw new Error('Forbidden');\n+await privilegedWrite(input_{file});\n {}",
+            "x".repeat(20_000),
+        )
+        .unwrap();
+    }
+    std::fs::write(&diff_path, diff).unwrap();
+
+    let metadata = postil_cli::config::qualification_metadata();
+    let model = "openai/gpt-5-mini";
+    let profile_path = dir.path().join("candidate.json");
+    std::fs::write(
+        &profile_path,
+        serde_json::to_vec(&json!({
+            "benchmarkProviderIdentity": postil_cli::config::MANAGED_OPENROUTER_PROVIDER_IDENTITY,
+            "upstreamProviderIdentity": "test-provider",
+            "upstreamProviderRoute": "test-provider",
+            "apiBase": metadata.default_api_base,
+            "apiFormat": metadata.default_api_format,
+            "generatorChain": [model],
+            "consensus": 1,
+            "scorerChain": [model],
+            "modelPriceBounds": [{
+                "model": model,
+                "inputMicrosPerMillionTokens": 1,
+                "outputMicrosPerMillionTokens": 1
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let out = postil()
+        .current_dir(dir.path())
+        .env("CI", "true")
+        .env("GITHUB_API_URL", "http://127.0.0.1:9")
+        .env("POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY", "1")
+        .env("POSTIL_QUALIFICATION_CANDIDATE_PROFILE", &profile_path)
+        .env("POSTIL_QUALIFICATION_PLAN_ONLY", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff_path)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let coverage = &envelope["reviewCoverage"];
+    assert_eq!(coverage["mode"], "bounded");
+    assert!(coverage["receipt"]["unreviewedHunks"].as_u64().unwrap() > 0);
+    assert!(coverage["selectedBatches"].as_u64().unwrap() <= 24);
+    assert!(envelope.get("reviewAdmission").is_some());
+    assert_eq!(envelope["modelUsed"], "none (qualification plan)");
+    assert!(envelope.get("modelUsage").is_none());
+}
+
+#[cfg(feature = "qualification-candidate")]
+#[test]
 fn qualification_candidate_splits_json_escaped_batches_within_model_context() {
     let dir = tempfile::tempdir().unwrap();
     let diff_path = dir.path().join("escaped.diff");
@@ -4003,25 +4068,35 @@ async fn unverifiable_git_binary_patch_fails_before_provider_contact() {
 }
 
 #[tokio::test]
-async fn oversized_security_hunk_fails_before_provider_contact() {
+async fn oversized_security_hunk_runs_bounded_review_and_fails_closed() {
     use std::fmt::Write as _;
 
     let server = MockServer::start().await;
+    let registration_token = "oversized-security-plan-token";
+    Mock::given(method("POST"))
+        .and(path("/durable-plan"))
+        .and(header(
+            "authorization",
+            format!("Bearer {registration_token}"),
+        ))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .respond_with(|request: &wiremock::Request| {
             let body = String::from_utf8_lossy(&request.body);
-            let findings = if body.contains("dangerous_final_call") {
+            let findings = if body.contains("dangerous_selected_call") {
                 let evidence =
-                    prompt_evidence(request, "src/auth.rs", 10_000, "dangerous_final_call");
+                    prompt_evidence(request, "src/auth.rs", 1, "dangerous_selected_call");
                 json!([{
                     "path": "src/auth.rs",
-                    "line": 10_000,
+                    "line": 1,
                     "severity": "warn",
                     "kind": "risk",
                     "confidence": 0.95,
-                    "title": "Validate the final call",
-                    "body": "The final call receives untrusted input. Validate it before use.",
+                    "title": "Validate the selected call",
+                    "body": "The selected call receives untrusted input. Validate it before use.",
                     "evidence": evidence
                 }])
             } else {
@@ -4038,7 +4113,13 @@ async fn oversized_security_hunk_fails_before_provider_contact() {
         "diff --git a/src/auth.rs b/src/auth.rs\n--- a/src/auth.rs\n+++ b/src/auth.rs\n@@ -0,0 +1,10000 @@"
     )
     .unwrap();
-    for line in 1..10_000 {
+    writeln!(
+        source,
+        "+dangerous_selected_call(user_input); // {}",
+        "x".repeat(3_500),
+    )
+    .unwrap();
+    for line in 2..=10_000 {
         writeln!(
             source,
             "+let reviewed_{line:05} = validate(input_{line:05}); // {}",
@@ -4046,29 +4127,72 @@ async fn oversized_security_hunk_fails_before_provider_contact() {
         )
         .unwrap();
     }
-    source.push_str("+dangerous_final_call(user_input);\n");
     assert!(source.len() > 32 * 1024 * 1024);
 
     let dir = tempfile::tempdir().unwrap();
     let diff = dir.path().join("large-source.diff");
     std::fs::write(&diff, source).unwrap();
+    std::fs::write(
+        dir.path().join(".postil.yaml"),
+        "gate:\n  failOn: never\n  onError: advisory\n",
+    )
+    .unwrap();
     let out = postil()
         .current_dir(dir.path())
         .env("POSTIL_API_BASE", server.uri())
+        .env(
+            "POSTIL_LARGE_REVIEW_PLAN_ENDPOINT",
+            format!("{}/durable-plan", server.uri()),
+        )
+        .env("POSTIL_LARGE_REVIEW_PLAN_TOKEN", registration_token)
         .env("POSTIL_DISABLE_SCORER", "1")
         .args(["review", "--diff-file"])
         .arg(&diff)
         .args(["--output", "json"])
         .assert()
-        .code(2);
+        .code(1);
 
-    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
-    assert!(
-        stderr.contains("mandatory hunk src/auth.rs:1 cannot fit the 24 batch large-review limit"),
-        "{stderr}"
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let coverage = &envelope["reviewCoverage"];
+    let receipt = &coverage["receipt"];
+    assert_eq!(coverage["mode"], "bounded");
+    assert_eq!(receipt["semanticHunks"], 0);
+    assert!(receipt["unreviewedHunks"].as_u64().unwrap() > 0);
+    assert_eq!(
+        receipt["directHunks"].as_u64().unwrap()
+            + receipt["semanticHunks"].as_u64().unwrap()
+            + receipt["unreviewedHunks"].as_u64().unwrap(),
+        receipt["totalHunks"].as_u64().unwrap()
     );
+    assert!(coverage["selectedBatches"].as_u64().unwrap() <= 24);
+    assert!(
+        coverage["selectedBatches"].as_u64().unwrap() < coverage["totalBatches"].as_u64().unwrap()
+    );
+    assert_eq!(envelope["gate"]["failing"], true);
+    let findings = envelope["findings"].as_array().unwrap();
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding["title"] == "Validate the selected call")
+    );
+    assert!(findings.iter().any(|finding| {
+        finding["title"] == "Large review coverage is incomplete" && finding["severity"] == "error"
+    }));
+
     let requests = server.received_requests().await.unwrap();
-    assert!(requests.is_empty());
+    assert_eq!(requests[0].url.path(), "/durable-plan");
+    let registration: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(registration["selectedBatches"], 24);
+    assert_eq!(registration["unreviewedHunks"], receipt["unreviewedHunks"]);
+    assert_eq!(
+        registration["planSha256"],
+        coverage["receipt"]["planSha256"]
+    );
+    let source_requests = requests
+        .iter()
+        .filter(|request| is_source_review_request(request))
+        .count();
+    assert_eq!(source_requests, 24);
 }
 
 #[tokio::test]
@@ -4244,7 +4368,7 @@ async fn automatic_large_diff_route_reviews_losslessly_compacted_low_signal_hunk
 }
 
 #[tokio::test]
-async fn mandatory_raw_dependency_and_vendor_overflow_fails_before_provider_contact() {
+async fn mandatory_raw_dependency_and_vendor_overflow_runs_within_capacity() {
     use std::fmt::Write as _;
 
     let server = MockServer::start().await;
@@ -4279,16 +4403,30 @@ async fn mandatory_raw_dependency_and_vendor_overflow_fails_before_provider_cont
         .arg(&diff)
         .args(["--output", "json"])
         .assert()
-        .code(2);
+        .code(1);
 
-    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
-    assert!(stderr.contains("mandatory hunk"));
-    assert!(stderr.contains("cannot fit the 24 batch large-review limit"));
-    assert!(server.received_requests().await.unwrap().is_empty());
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let coverage = &envelope["reviewCoverage"];
+    assert_eq!(coverage["mode"], "bounded");
+    assert!(coverage["receipt"]["unreviewedHunks"].as_u64().unwrap() > 0);
+    assert_eq!(envelope["gate"]["failing"], true);
+    assert!(
+        envelope["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| {
+                finding["title"] == "Large review coverage is incomplete"
+                    && finding["severity"] == "error"
+            })
+    );
+    let requests = server.received_requests().await.unwrap();
+    assert!(!requests.is_empty());
+    assert!(requests.len() <= 24);
 }
 
 #[tokio::test]
-async fn automatic_large_diff_route_rejects_unreviewed_hunks_before_provider_contact() {
+async fn automatic_large_diff_route_registers_and_reviews_incomplete_coverage() {
     use std::fmt::Write as _;
 
     let server = MockServer::start().await;
@@ -4345,6 +4483,36 @@ async fn automatic_large_diff_route_rejects_unreviewed_hunks_before_provider_con
     let dir = tempfile::tempdir().unwrap();
     let diff = dir.path().join("automatic-large.diff");
     std::fs::write(&diff, source).unwrap();
+    let baseline_path = dir.path().join("baseline.json");
+    std::fs::write(
+        &baseline_path,
+        json!({
+            "version": 1,
+            "summary": "",
+            "silent": false,
+            "findings": [{
+                "path": "src/churn/file-0.ts",
+                "line": 1,
+                "severity": "error",
+                "kind": "risk",
+                "confidence": 0.9,
+                "title": "Keep the prior finding open",
+                "body": "The prior finding remains open until a complete review resolves it.",
+                "evidence": "const value = 0;"
+            }],
+            "resolved": [],
+            "counts": {"info": 0, "warn": 0, "error": 1, "suppressed": 0},
+            "confidenceBuckets": [0, 0, 0, 0, 1],
+            "gate": {"failOn": "error", "failing": true},
+            "modelUsed": "model",
+            "usage": {"promptTokens": 0, "completionTokens": 0},
+            "baseSha": null,
+            "headSha": null,
+            "sinceSha": null
+        })
+        .to_string(),
+    )
+    .unwrap();
     let out = postil()
         .current_dir(dir.path())
         .env("POSTIL_API_BASE", server.uri())
@@ -4357,15 +4525,56 @@ async fn automatic_large_diff_route_rejects_unreviewed_hunks_before_provider_con
         .env("REVIEW_MODEL", "mistralai/mistral-small-3.2-24b-instruct")
         .args(["review", "--diff-file"])
         .arg(&diff)
+        .arg("--baseline")
+        .arg(&baseline_path)
         .args(["--output", "json"])
         .assert()
-        .code(2);
+        .code(1);
 
     let stderr = String::from_utf8_lossy(&out.get_output().stderr);
-    assert!(stderr.contains("normalized hunks unreviewed"), "{stderr}");
-    assert!(stderr.contains("no provider request was made"), "{stderr}");
+    assert!(stderr.contains("unreviewed_hunks="), "{stderr}");
     assert!(!stderr.contains(registration_token));
-    assert!(server.received_requests().await.unwrap().is_empty());
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let coverage = &envelope["reviewCoverage"];
+    assert_eq!(coverage["mode"], "bounded");
+    assert!(coverage["receipt"]["unreviewedHunks"].as_u64().unwrap() > 0);
+    assert_eq!(envelope["gate"]["failing"], true);
+    assert!(
+        envelope["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| {
+                finding["title"] == "Large review coverage is incomplete"
+                    && finding["severity"] == "error"
+            })
+    );
+    assert!(
+        envelope["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| {
+                finding["title"] == "Keep the prior finding open"
+                    && finding["body"]
+                        .as_str()
+                        .is_some_and(|body| body.starts_with("[carried from previous review]"))
+            })
+    );
+    assert_eq!(envelope["resolved"], json!([]));
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests[0].url.path(), "/durable-plan");
+    let registration: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(
+        registration["unreviewedHunks"],
+        coverage["receipt"]["unreviewedHunks"]
+    );
+    let source_requests = requests
+        .iter()
+        .filter(|request| is_source_review_request(request))
+        .count();
+    assert!(source_requests > 0);
+    assert!(source_requests <= 24);
 }
 
 #[tokio::test]
