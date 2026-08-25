@@ -1433,7 +1433,8 @@ impl ModelBatchSpool {
     /// normalized hunk receives exactly one receipt disposition. Mandatory
     /// security, control-plane, dependency, and executable-vendor evidence is
     /// admitted first; remaining capacity is filled by stable risk and path
-    /// order. A mandatory hunk that cannot fit fails before provider contact.
+    /// order. Evidence beyond the hard request limit remains explicitly
+    /// unreviewed instead of preventing the selected schedule from running.
     pub fn deterministic_bounded_receipt(
         &mut self,
         selected_limit: usize,
@@ -1498,12 +1499,12 @@ impl ModelBatchSpool {
                 .then_with(|| left.hunk.digest.cmp(&right.hunk.digest))
         });
 
-        let mut selected = self.metadata_batch_ids.clone();
-        anyhow::ensure!(
-            selected.len() <= selected_limit,
-            "mandatory dependency and artifact evidence needs {} batches, exceeding the {selected_limit} batch large-review limit",
-            selected.len()
-        );
+        let mut selected = self
+            .metadata_batch_ids
+            .iter()
+            .take(selected_limit)
+            .copied()
+            .collect::<BTreeSet<_>>();
         for candidate in ranked.iter().filter(|candidate| candidate.mandatory) {
             anyhow::ensure!(
                 !candidate.direct_batch_ids.is_empty(),
@@ -1511,14 +1512,12 @@ impl ModelBatchSpool {
                 candidate.hunk.path,
                 candidate.hunk.new_start
             );
-            let additional = candidate.direct_batch_ids.difference(&selected).count();
-            anyhow::ensure!(
-                selected.len().saturating_add(additional) <= selected_limit,
-                "mandatory hunk {}:{} cannot fit the {selected_limit} batch large-review limit; no provider request was made",
-                candidate.hunk.path,
-                candidate.hunk.new_start
-            );
-            selected.extend(candidate.direct_batch_ids.iter().copied());
+            for id in &candidate.direct_batch_ids {
+                if selected.len() >= selected_limit {
+                    break;
+                }
+                selected.insert(*id);
+            }
         }
         for candidate in ranked.iter().filter(|candidate| !candidate.mandatory) {
             let direct_additional = candidate.direct_batch_ids.difference(&selected).count();
@@ -1560,6 +1559,13 @@ impl ModelBatchSpool {
                 && selected.len().saturating_add(semantic_additional) <= selected_limit
             {
                 selected.insert(id);
+            } else {
+                for id in &candidate.direct_batch_ids {
+                    if selected.len() >= selected_limit {
+                        break;
+                    }
+                    selected.insert(*id);
+                }
             }
         }
 
@@ -1604,10 +1610,17 @@ impl ModelBatchSpool {
             "bounded coverage receipt contains a duplicate hunk disposition"
         );
 
+        let selected_batch_text = self.batch_text_by_id(&selected)?;
         let mut hasher = Sha256::new();
+        hasher.update(b"postil-deterministic-bounded-plan-v2\0");
         hasher.update(format!("limit={selected_limit}\n").as_bytes());
         for id in &selected {
-            hasher.update(format!("batch={id}\n").as_bytes());
+            let batch = selected_batch_text
+                .get(id)
+                .expect("selected batch text was validated against the spool");
+            hasher.update((*id as u64).to_le_bytes());
+            hasher.update((batch.len() as u64).to_le_bytes());
+            hasher.update(batch.as_bytes());
         }
         for entry in &entries {
             hasher.update(entry.hunk.canonical().as_bytes());
@@ -7984,17 +7997,16 @@ diff --git a/two.rs b/two.rs
             false,
         )
         .unwrap();
-        let error = batches.deterministic_bounded_receipt(1).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("mandatory hunk vendor/tools/runner:1")
-        );
-        assert!(
-            error
-                .to_string()
-                .contains("cannot fit the 1 batch large-review limit")
-        );
+        let receipt = batches.deterministic_bounded_receipt(1).unwrap();
+        assert_eq!(receipt.selected_batch_ids.len(), 1);
+        assert_eq!(receipt.entries.len(), 1);
+        assert_eq!(receipt.direct_hunks(), 0);
+        assert_eq!(receipt.semantic_hunks(), 0);
+        assert_eq!(receipt.unreviewed_hunks(), 1);
+        assert!(matches!(
+            receipt.entries[0].disposition,
+            HunkDisposition::Unreviewed { .. }
+        ));
     }
 
     #[test]
@@ -8246,16 +8258,62 @@ diff --git a/two.rs b/two.rs
     }
 
     #[test]
-    fn deterministic_large_plan_rejects_an_unselected_security_hunk() {
+    fn deterministic_large_plan_is_stable_when_mandatory_hunks_exceed_capacity() {
         let source = deterministic_large_fixture(25);
+        let first = deterministic_receipt_for(&source);
+        let second = deterministic_receipt_for(&source);
+
+        assert_eq!(first, second);
+        assert_eq!(
+            first.selected_batch_ids.len(),
+            crate::review::MAX_LARGE_DIFF_SELECTED_BATCHES
+        );
+        assert!(first.direct_hunks() > 0);
+        assert!(first.unreviewed_hunks() > 0);
+        assert_eq!(
+            first.direct_hunks() + first.semantic_hunks() + first.unreviewed_hunks(),
+            first.entries.len()
+        );
+    }
+
+    #[test]
+    fn deterministic_large_plan_bounds_excess_metadata_and_mandatory_source() {
+        use std::fmt::Write as _;
+
+        let mut source = String::new();
+        for package in 0..81 {
+            let path = format!("packages/package-{package}/package-lock.json");
+            writeln!(
+                source,
+                "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1,2 +1,2 @@\n \"dependency-{package}\": {{\n-  \"version\": \"1.0.0\"\n+  \"version\": \"2.0.0\""
+            )
+            .unwrap();
+        }
+        for file in 0..8 {
+            let path = format!("vendor/lib/Runner-{file}.java");
+            writeln!(
+                source,
+                "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-int value = {file};\n+int value = {}; // {}",
+                file + 1,
+                "x".repeat(20_000),
+            )
+            .unwrap();
+        }
+
         let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
         let mut prepared = prepare_review(&snapshot).unwrap();
         let mut batches = spool_model_batches(&mut prepared, 16_000, 4_096, false).unwrap();
-        let error = batches
-            .deterministic_bounded_receipt(crate::review::MAX_LARGE_DIFF_SELECTED_BATCHES)
-            .unwrap_err();
-        assert!(error.to_string().contains("mandatory hunk"));
-        assert!(error.to_string().contains("cannot fit"));
+        assert!(batches.metadata_batch_ids.len() > 5);
+        let receipt = batches.deterministic_bounded_receipt(5).unwrap();
+
+        assert_eq!(receipt.selected_batch_ids.len(), 5);
+        assert!(
+            receipt
+                .selected_batch_ids
+                .is_subset(&batches.metadata_batch_ids)
+        );
+        assert_eq!(receipt.entries.len(), 8);
+        assert_eq!(receipt.unreviewed_hunks(), 8);
     }
 
     #[test]

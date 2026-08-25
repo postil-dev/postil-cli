@@ -1711,6 +1711,7 @@ async fn review_diff_at(
     let mut findings: Vec<Finding> = Vec::new();
     let mut suppressed_findings = Vec::new();
     let mut review_trust = filter::ReviewTrust::Failed;
+    let mut incomplete_large_review_hunks = 0u32;
     let mut scorer_model: Option<String> = None;
     let mut scorer_error: Option<String> = None;
     let mut scorer_disagreements: Option<u32> = None;
@@ -1837,11 +1838,6 @@ async fn review_diff_at(
                     .then(|| batches.deterministic_bounded_receipt(large_diff_selected_limit))
                     .transpose()?;
                 if let Some(receipt) = &large_diff_receipt {
-                    anyhow::ensure!(
-                        receipt.unreviewed_hunks() == 0,
-                        "deterministic large-review plan leaves {} normalized hunks unreviewed within its {large_diff_selected_limit}-request limit; no provider request was made",
-                        receipt.unreviewed_hunks()
-                    );
                     eprintln!(
                         "postil: deterministic large-review plan={} direct_hunks={} semantic_hunks={} unreviewed_hunks={} selected_batches={}/{} concurrency={} request_timeout={}s review_budget={}s",
                         receipt.plan_sha256,
@@ -1871,6 +1867,9 @@ async fn review_diff_at(
                         })
                     })
                     .transpose()?;
+                incomplete_large_review_hunks = large_receipt_summary
+                    .as_ref()
+                    .map_or(0, |receipt| receipt.unreviewed_hunks);
                 let deterministic_large_review = large_diff_receipt.is_some();
                 let mut durable_plan_registration =
                     if let Some(registrar) = DurablePlanRegistrar::from_env()? {
@@ -2392,7 +2391,7 @@ async fn review_diff_at(
                         // carries baseline evidence outside the selected input.
                         // A changed citation expires only when a completed model
                         // request covered its coordinate and did not reproduce it.
-                        review_trust = if batch_failed {
+                        review_trust = if batch_failed || incomplete_large_review_hunks > 0 {
                             filter::ReviewTrust::Failed
                         } else if risk_selected_review {
                             filter::ReviewTrust::Bounded
@@ -2439,7 +2438,7 @@ async fn review_diff_at(
                         let mut all_adjudication_candidates = kept.clone();
                         let fresh_candidate_count = all_adjudication_candidates.len();
                         let mut baseline_candidate_indices = Vec::new();
-                        if full_rereview {
+                        if full_rereview && incomplete_large_review_hunks == 0 {
                             for (baseline_index, previous) in baseline.iter().enumerate() {
                                 // The complete direct diff may prove an exact citation was
                                 // deleted even when bounded source selection omitted its batch.
@@ -2792,6 +2791,12 @@ async fn review_diff_at(
                 if let Some(failure) = batch_failure {
                     findings.push(failure);
                 }
+                if incomplete_large_review_hunks > 0 {
+                    review_trust = filter::ReviewTrust::Failed;
+                    findings.push(crate::envelope::incomplete_large_review_finding(
+                        incomplete_large_review_hunks,
+                    ));
+                }
             }
         }
     }
@@ -2843,13 +2848,18 @@ async fn review_diff_at(
     suppressed = suppressed.saturating_add(repository_suppressed.len() as u32);
     suppressed_findings.extend(repository_suppressed);
 
-    let machine_application = apply_machine_claim_policy(
+    let mut machine_application = apply_machine_claim_policy(
         &mut findings,
         &mut baseline,
         &adjudication_preserved_baseline,
         claim_verification.as_ref(),
         repository_revision.as_deref(),
     );
+    if incomplete_large_review_hunks > 0 {
+        // Exact-head verification remains useful for fresh findings, but an
+        // incomplete review cannot close any carried baseline entry.
+        baseline.append(&mut machine_application.resolved);
+    }
     suppressed = suppressed.saturating_add(machine_application.suppressed.len() as u32);
     suppressed_findings.extend(machine_application.suppressed);
 
@@ -2922,17 +2932,18 @@ async fn review_diff_at(
         .iter()
         .map(|kind| kind.as_str().to_string())
         .collect();
-    let gate_failing = findings.iter().any(|f| {
-        if gate_disabled {
-            false
-        } else if f.path == crate::envelope::OPERATIONAL_PATH {
-            true
-        } else if f.path == crate::envelope::PROVIDER_PATH {
-            !advisory_on_error
-        } else {
-            crate::envelope::finding_blocks_gate(f, gate_fail_on, &gate_block_on_kinds, false)
-        }
-    });
+    let gate_failing = incomplete_large_review_hunks > 0
+        || findings.iter().any(|f| {
+            if gate_disabled {
+                false
+            } else if f.path == crate::envelope::OPERATIONAL_PATH {
+                true
+            } else if f.path == crate::envelope::PROVIDER_PATH {
+                !advisory_on_error
+            } else {
+                crate::envelope::finding_blocks_gate(f, gate_fail_on, &gate_block_on_kinds, false)
+            }
+        });
     let silent = findings.is_empty();
     // Raw summaries are validated for agreement with raw structured output,
     // then discarded. Presentation is derived from the final reconciled set so
@@ -3735,6 +3746,10 @@ fn error_envelope(
             incomplete_input.then_some(crate::envelope::IncompleteReviewReason::IncompleteInput)
         });
     let review_failure = err.downcast_ref::<ReviewFailure>();
+    let incomplete_large_review_hunks = review_failure
+        .and_then(|failure| failure.review_coverage.as_ref())
+        .and_then(|coverage| coverage.receipt.as_ref())
+        .map_or(0, |receipt| receipt.unreviewed_hunks);
     let invalid_output =
         review_failure.is_some_and(|failure| failure.kind == ReviewFailureKind::InvalidOutput);
     let advisory_operational_error = review_failure
@@ -3750,7 +3765,7 @@ fn error_envelope(
                 .downcast_ref::<reqwest::Error>()
                 .is_some_and(|error| error.is_connect() || error.is_timeout())
         });
-    let findings = vec![if let Some(reason) = incomplete_reason {
+    let mut findings = vec![if let Some(reason) = incomplete_reason {
         crate::envelope::incomplete_review_finding(reason)
     } else if invalid_output || !advisory_operational_error {
         // Only a recorded scorer error is genuinely about model output. Every
@@ -3764,11 +3779,16 @@ fn error_envelope(
     } else {
         crate::envelope::provider_error_finding(&format!("{err:#}"))
     }];
+    if incomplete_large_review_hunks > 0 {
+        findings.push(crate::envelope::incomplete_large_review_finding(
+            incomplete_large_review_hunks,
+        ));
+    }
     let counts = Envelope::counts_of(&findings, 0);
     let buckets = Envelope::buckets_of(&findings);
     let gate_disabled = cfg.gate_fail_on.as_str().eq_ignore_ascii_case("never");
-    let blocking =
-        !gate_disabled && (!advisory_operational_error || cfg.gate_on_error == OnError::Block);
+    let blocking = incomplete_large_review_hunks > 0
+        || (!gate_disabled && (!advisory_operational_error || cfg.gate_on_error == OnError::Block));
     let mut model_usage = review_failure
         .map(|failure| failure.model_usage.clone())
         .unwrap_or_default();
@@ -4012,6 +4032,13 @@ mod tests {
     }
 
     fn rich_scorer_failure(kind: ReviewFailureKind) -> anyhow::Error {
+        rich_scorer_failure_with_receipt(kind, None)
+    }
+
+    fn rich_scorer_failure_with_receipt(
+        kind: ReviewFailureKind,
+        receipt: Option<ReviewCoverageReceipt>,
+    ) -> anyhow::Error {
         ReviewFailure {
             kind,
             detail: "hosted scorer could not complete the admitted profile".to_string(),
@@ -4069,7 +4096,7 @@ mod tests {
                 selected_batches: 5,
                 total_batches: 9,
                 planner_fallback: false,
-                receipt: None,
+                receipt,
             }),
             review_admission: Some(ReviewAdmission {
                 provider_attempts: 12,
@@ -4132,6 +4159,44 @@ mod tests {
         );
         assert_eq!(envelope.model_usage.len(), 2);
         assert_eq!(envelope.review_admission.unwrap().provider_attempts, 12);
+    }
+
+    #[test]
+    fn incomplete_coverage_stays_blocking_when_the_provider_also_fails() {
+        let cfg = Config {
+            gate_fail_on: crate::config::GateLevel::Never,
+            gate_on_error: OnError::Advisory,
+            ..Config::default()
+        };
+        let error = rich_scorer_failure_with_receipt(
+            ReviewFailureKind::Provider,
+            Some(ReviewCoverageReceipt {
+                plan_sha256: "a".repeat(64),
+                total_hunks: 1,
+                direct_hunks: 0,
+                semantic_hunks: 0,
+                unreviewed_hunks: 1,
+            }),
+        );
+        let envelope = error_envelope(&cfg, &error, "head", Some(&pr_meta()), 99);
+
+        assert!(envelope.gate.failing);
+        assert!(envelope.findings.iter().any(|finding| {
+            finding.path == crate::envelope::PROVIDER_PATH
+                && finding.title == "Model provider unavailable"
+        }));
+        assert!(envelope.findings.iter().any(|finding| {
+            finding.path == crate::envelope::OPERATIONAL_PATH
+                && finding.title == "Large review coverage is incomplete"
+        }));
+        assert_eq!(
+            envelope
+                .review_coverage
+                .as_ref()
+                .and_then(|coverage| coverage.receipt.as_ref())
+                .map(|receipt| receipt.unreviewed_hunks),
+            Some(1)
+        );
     }
 
     #[test]

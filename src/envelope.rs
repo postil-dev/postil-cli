@@ -1870,6 +1870,41 @@ pub(crate) fn incomplete_review_finding(reason: IncompleteReviewReason) -> Findi
     }
 }
 
+/// The synthetic finding emitted when a deterministic large review runs its
+/// complete selected schedule but the hard request limit leaves normalized
+/// hunks without direct or exact semantic coverage.
+pub(crate) fn incomplete_large_review_finding(unreviewed_hunks: u32) -> Finding {
+    let noun = if unreviewed_hunks == 1 {
+        "hunk"
+    } else {
+        "hunks"
+    };
+    Finding {
+        path: OPERATIONAL_PATH.to_string(),
+        line: 1,
+        end_line: None,
+        severity: Severity::Error,
+        kind: Kind::Uncertainty,
+        confidence: 1.0,
+        title: "Large review coverage is incomplete".to_string(),
+        body: format!(
+            "Deterministic large-review coverage left {unreviewed_hunks} normalized {noun} \
+             unreviewed within the hard request limit. Findings from completed requests \
+             remain available, but this result cannot be trusted as a pass."
+        ),
+        evidence: None,
+        id: None,
+        generator_confidence: None,
+        scorer_confidence: None,
+        generator_kind: None,
+        scorer_kind: None,
+        scorer_reason: None,
+        repository_claim: None,
+        machine_claim: None,
+        machine_claim_deferred: false,
+    }
+}
+
 /// The synthetic finding emitted when a review stopped before producing a
 /// verdict for a reason that is not model output: an admission limit, a
 /// configuration problem, or an unexpected internal error. Postil still fails
@@ -2042,6 +2077,16 @@ mod tests {
             finding.body,
             "Postil could not validate the configured model response against cited code evidence. No clean verdict was issued.\n\nDetail: model reported 2 finding(s) without a valid code-evidence citation."
         );
+        assert_eq!(validate_finding_public_language(&finding), Ok(()));
+        assert_eq!(validate_finding_publication(&finding), Ok(()));
+    }
+
+    #[test]
+    fn incomplete_large_review_finding_is_publishable_and_fail_closed() {
+        let finding = incomplete_large_review_finding(3);
+        assert_eq!(finding.severity, Severity::Error);
+        assert_eq!(finding.path, OPERATIONAL_PATH);
+        assert!(finding.body.contains("left 3 normalized hunks unreviewed"));
         assert_eq!(validate_finding_public_language(&finding), Ok(()));
         assert_eq!(validate_finding_publication(&finding), Ok(()));
     }
