@@ -530,6 +530,8 @@ mod tests {
             scorer_kind: None,
             scorer_reason: None,
             repository_claim: None,
+            machine_claim: None,
+            machine_claim_deferred: false,
             title: "Resolve the uncertain behavior".to_string(),
             body: body.to_string(),
             evidence: None,

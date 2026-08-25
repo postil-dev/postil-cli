@@ -23,7 +23,7 @@ Release binaries cover Linux x86_64 and ARM64 with glibc or musl, plus macOS on 
 Authenticate once for hosted inference against your organization's entitlement, or bring your own model key:
 
 ```sh
-postil login                             # zero-config: stores a credential for hosted inference
+postil login                             # zero-config: stores a renewable login for hosted inference
 # or: export MODEL_API_KEY=...           # OpenRouter is the default endpoint
 postil doctor                            # validate the endpoint and repository
 postil review                            # review staged, branch, or tracked working-tree changes

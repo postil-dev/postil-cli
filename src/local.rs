@@ -851,6 +851,8 @@ mod tests {
                 paths: vec![],
                 identifiers: vec![],
             }),
+            machine_claim: None,
+            machine_claim_deferred: false,
             title: "Repository state".into(),
             body: "The immutable index tree contains the reviewed value.".into(),
             evidence: Some("version: staged-one".into()),

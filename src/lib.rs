@@ -18,6 +18,7 @@ pub mod hook;
 pub mod llm;
 pub mod local;
 pub mod login;
+pub(crate) mod machine_claim;
 pub mod output;
 pub mod plan;
 pub(crate) mod progress;

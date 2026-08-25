@@ -51,7 +51,7 @@ Ignore patterns remove matching paths before grounding, batching, and large-revi
 | Variable | Purpose |
 | --- | --- |
 | `POSTIL_API_KEY`, `OPENROUTER_API_KEY`, `MODEL_API_KEY`, `LLM_API_KEY` | Model provider credential, checked in that order |
-| `POSTIL_LOGIN_SERVER` | Postil web app used by `postil login`/`postil logout`; defaults to `https://postil.dev` |
+| `POSTIL_LOGIN_SERVER` | Postil web app used by `postil login`, refresh, and `postil logout`; defaults to `https://postil.dev` |
 | `POSTIL_API_BASE` | Model endpoint selected by the operator |
 | `POSTIL_API_FORMAT` | `openai-compatible` or `anthropic` |
 | `POSTIL_ENDPOINT_AUTH_HEADER`, `POSTIL_ENDPOINT_AUTH_VALUE` | Additional private-gateway authentication |
@@ -80,7 +80,7 @@ postil login
 postil logout
 ```
 
-`postil login` authenticates against postil.dev over a device-authorization flow (open the printed URL, enter the code) and stores a credential at `${XDG_CONFIG_HOME:-~/.config}/postil/credentials.json`, mode `0600` in a `0700` directory. That credential is a fallback: it is used only when none of `POSTIL_API_KEY`, `OPENROUTER_API_KEY`, `MODEL_API_KEY`, or `LLM_API_KEY` is set. Its `apiBase` and model provide a baseline below trusted project configuration and environment overrides. `postil logout` revokes the credential server-side and removes the local file even if that call fails. An expired credential produces one instruction to run `postil login` again rather than a provider authentication error.
+`postil login` authenticates against postil.dev over a device-authorization flow (open the printed URL, enter the code) and stores a renewable credential at `${XDG_CONFIG_HOME:-~/.config}/postil/credentials.json`, mode `0600` in a `0700` directory. That credential is a fallback: it is used only when none of `POSTIL_API_KEY`, `OPENROUTER_API_KEY`, `MODEL_API_KEY`, or `LLM_API_KEY` is set. Its `apiBase` and model provide a baseline below trusted project configuration and environment overrides. When the stored login is used, Postil rotates the access credential before it expires and persists the replacement; explicit API keys never trigger a refresh. `postil logout` revokes the stored refresh credential server-side and removes the local file even if that call fails. A legacy access-only login, an expired refresh inactivity window, or a rejected refresh produces one instruction to run `postil login` again rather than a provider authentication error. Temporary refresh failures retain the stored credential and ask the user to try again.
 
 ## Inspect and initialize
 
@@ -90,6 +90,6 @@ postil config
 postil doctor
 ```
 
-`postil config` prints the resolved non-secret configuration and separate provenance for the model, reviewer reasoning effort, and scorer reasoning effort. `postil doctor` validates endpoint reachability, credential acceptance, and repository setup without printing credential values, and reports whether a login credential is present and when it expires.
+`postil config` prints the resolved non-secret configuration and separate provenance for the model, reviewer reasoning effort, and scorer reasoning effort. `postil doctor` validates endpoint reachability, credential acceptance, and repository setup without printing credential values. Both commands identify renewable logins, access expiry, refresh inactivity expiry, and legacy access-only logins.
 
 Use `--reasoning-effort` and `--scorer-reasoning-effort` for one review. These flags override the matching environment variables, which override `model.reasoningEffort` and `model.scorerReasoningEffort`. The built-in reviewer and scorer defaults are `low` and `none`, respectively. Every request carries the resolved value, including retries and repair calls.

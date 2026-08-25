@@ -25,6 +25,7 @@
   "src/llm.rs",
   "src/local.rs",
   "src/login.rs",
+  "src/machine_claim.rs",
   "src/main.rs",
   "src/output.rs",
   "src/plan.rs",

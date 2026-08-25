@@ -1071,6 +1071,209 @@ impl GitHub {
         }
     }
 
+    pub(crate) async fn verify_machine_claims_at_head(
+        &self,
+        head_sha: &str,
+        claims: &[crate::envelope::MachineClaim],
+    ) -> crate::envelope::ClaimVerificationReceipt {
+        let deadline = crate::repository_search::github_aggregate_deadline();
+        match tokio::time::timeout(
+            deadline,
+            self.machine_claim_source_at_head(head_sha, claims),
+        )
+        .await
+        {
+            Err(_) => crate::machine_claim::exhausted_receipt(Some(head_sha), claims),
+            Ok(Ok(snapshot)) => crate::machine_claim::verify_snapshot(snapshot, claims),
+            Ok(Err(error))
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<MachineClaimSourceExhausted>()
+                        .is_some()
+                }) =>
+            {
+                crate::machine_claim::exhausted_receipt(Some(head_sha), claims)
+            }
+            Ok(Err(_)) => crate::machine_claim::unavailable_receipt(Some(head_sha), claims),
+        }
+    }
+
+    async fn machine_claim_source_at_head(
+        &self,
+        head_sha: &str,
+        claims: &[crate::envelope::MachineClaim],
+    ) -> Result<crate::machine_claim::MachineSourceSnapshot> {
+        ensure!(
+            crate::repository_search::valid_full_object_id(head_sha),
+            "machine claim verification requires a full commit SHA"
+        );
+        if claims.len() > crate::machine_claim::MAX_CLAIMS {
+            return Err(anyhow::Error::new(MachineClaimSourceExhausted));
+        }
+        let response = self
+            .request(
+                reqwest::Method::GET,
+                self.url(&format!("/git/commits/{head_sha}")),
+            )
+            .send()
+            .await
+            .context("fetching machine claim commit")?;
+        let commit: GitCommitResponse = super::bounded_response_json(
+            Self::check_ok(response, "machine claim commit").await?,
+            "GitHub machine claim commit",
+        )
+        .await?;
+        ensure!(
+            commit.sha.eq_ignore_ascii_case(head_sha),
+            "machine claim commit did not match the reviewed head"
+        );
+        ensure!(
+            crate::repository_search::valid_full_object_id(&commit.tree.sha),
+            "machine claim commit returned an invalid tree id"
+        );
+
+        let mut tree_url =
+            reqwest::Url::parse(&self.url(&format!("/git/trees/{}", commit.tree.sha)))
+                .context("building machine claim tree URL")?;
+        tree_url.query_pairs_mut().append_pair("recursive", "1");
+        let response = self
+            .request(reqwest::Method::GET, tree_url.to_string())
+            .send()
+            .await
+            .context("fetching machine claim tree")?;
+        let tree: GitTreeResponse = super::bounded_response_json(
+            Self::check_ok(response, "machine claim tree").await?,
+            "GitHub machine claim tree",
+        )
+        .await?;
+        ensure!(
+            tree.sha.eq_ignore_ascii_case(&commit.tree.sha),
+            "machine claim tree did not match the reviewed head"
+        );
+        ensure!(!tree.truncated, "machine claim tree was incomplete");
+        if tree.tree.len() > crate::machine_claim::MAX_TREE_ENTRIES {
+            return Err(anyhow::Error::new(MachineClaimSourceExhausted));
+        }
+
+        let mut seen_paths = HashSet::with_capacity(tree.tree.len());
+        let mut snapshot_entries = Vec::new();
+        let mut rust_blobs = Vec::new();
+        let mut total_source_bytes = 0usize;
+        for entry in tree.tree {
+            ensure!(
+                super::valid_repository_path(&entry.path) && seen_paths.insert(entry.path.clone()),
+                "machine claim tree returned an unsafe or duplicate path"
+            );
+            ensure!(
+                crate::repository_search::valid_full_object_id(&entry.sha),
+                "machine claim tree returned an invalid object id"
+            );
+            match (entry.kind.as_str(), entry.mode.as_str()) {
+                ("tree", "040000") => {
+                    ensure!(entry.size.is_none(), "machine claim tree entry had a size");
+                }
+                ("blob", "100644" | "100755" | "120000") => {
+                    let size = entry
+                        .size
+                        .context("machine claim tree blob omitted its size")?;
+                    snapshot_entries.push(crate::repository_search::RepositorySnapshotEntry {
+                        path: entry.path.clone(),
+                        object_id: entry.sha.clone(),
+                        mode: entry.mode.clone(),
+                        kind: crate::repository_search::RepositorySnapshotEntryKind::Blob,
+                        size: Some(size),
+                    });
+                    if entry.path.starts_with("src/") && entry.path.ends_with(".rs") {
+                        ensure!(
+                            entry.mode != "120000",
+                            "machine claim source path is a symlink"
+                        );
+                        if !crate::machine_claim::regular_rust_source_entry(
+                            &entry.path,
+                            &entry.mode,
+                        ) {
+                            continue;
+                        }
+                        let size = usize::try_from(size)
+                            .map_err(|_| anyhow::Error::new(MachineClaimSourceExhausted))?;
+                        if size > crate::machine_claim::MAX_SOURCE_FILE_BYTES {
+                            return Err(anyhow::Error::new(MachineClaimSourceExhausted));
+                        }
+                        total_source_bytes = total_source_bytes
+                            .checked_add(size)
+                            .ok_or_else(|| anyhow::Error::new(MachineClaimSourceExhausted))?;
+                        if total_source_bytes > crate::machine_claim::MAX_SOURCE_BYTES {
+                            return Err(anyhow::Error::new(MachineClaimSourceExhausted));
+                        }
+                        rust_blobs.push((entry.path, entry.sha, size));
+                    }
+                }
+                ("commit", "160000") => {
+                    ensure!(entry.size.is_none(), "machine claim gitlink had a size");
+                    snapshot_entries.push(crate::repository_search::RepositorySnapshotEntry {
+                        path: entry.path,
+                        object_id: entry.sha,
+                        mode: entry.mode,
+                        kind: crate::repository_search::RepositorySnapshotEntryKind::Gitlink,
+                        size: None,
+                    });
+                }
+                _ => {
+                    return Err(anyhow!(
+                        "machine claim tree returned an unsupported object type or mode"
+                    ));
+                }
+            }
+        }
+        if rust_blobs.len() > crate::machine_claim::MAX_SOURCE_FILES {
+            return Err(anyhow::Error::new(MachineClaimSourceExhausted));
+        }
+        snapshot_entries.sort_by(|left, right| left.path.cmp(&right.path));
+        let tree_sha256 = crate::repository_search::tree_sha256(&snapshot_entries);
+        rust_blobs.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let mut files = Vec::with_capacity(rust_blobs.len());
+        for (path, object_id, expected_size) in rust_blobs {
+            let response = self
+                .request(
+                    reqwest::Method::GET,
+                    self.url(&format!("/git/blobs/{object_id}")),
+                )
+                .header("Accept", "application/vnd.github.raw+json")
+                .send()
+                .await
+                .with_context(|| format!("fetching machine claim source object for {path}"))?;
+            let mut response = Self::check_ok(response, "machine claim source object").await?;
+            let bytes = super::bounded_response_bytes_with_limit(
+                &mut response,
+                "GitHub machine claim source object",
+                crate::machine_claim::MAX_SOURCE_FILE_BYTES,
+            )
+            .await?;
+            ensure!(
+                bytes.len() == expected_size,
+                "machine claim source object size changed"
+            );
+            let mut object_hash =
+                crate::repository_search::GitObjectHash::new("blob", expected_size as u64);
+            object_hash.update(&bytes);
+            ensure!(
+                object_hash.matches(&object_id),
+                "machine claim source object did not match its tree identity"
+            );
+            files.push(crate::machine_claim::MachineSourceFile {
+                path,
+                source: String::from_utf8(bytes)
+                    .context("machine claim source object is not valid UTF-8")?,
+            });
+        }
+        Ok(crate::machine_claim::MachineSourceSnapshot {
+            head_sha: head_sha.to_ascii_lowercase(),
+            tree_sha256,
+            files,
+        })
+    }
+
     async fn search_repository_at_head_inner(
         &self,
         head_sha: &str,
@@ -1639,6 +1842,17 @@ impl std::fmt::Display for RepositorySearchExhausted {
 }
 
 impl std::error::Error for RepositorySearchExhausted {}
+
+#[derive(Debug)]
+struct MachineClaimSourceExhausted;
+
+impl std::fmt::Display for MachineClaimSourceExhausted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("machine claim source budget exhausted")
+    }
+}
+
+impl std::error::Error for MachineClaimSourceExhausted {}
 
 struct RepositorySearchBudget {
     started_at: Instant,
@@ -4276,6 +4490,7 @@ mod tests {
             review_coverage: None,
             review_admission: None,
             repository_search: Default::default(),
+            claim_verification: None,
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: Some(base_sha.into()),
@@ -4314,6 +4529,8 @@ mod tests {
             scorer_kind: None,
             scorer_reason: None,
             repository_claim: None,
+            machine_claim: None,
+            machine_claim_deferred: false,
             title: format!("Finding {id}"),
             body: body.into(),
             evidence: Some("let value = risky();".into()),
@@ -4642,6 +4859,97 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("500"));
+    }
+
+    #[tokio::test]
+    async fn machine_claim_verification_reads_only_exact_head_tree_objects() {
+        let server = MockServer::start().await;
+        let head = "a".repeat(40);
+        let tree = "b".repeat(40);
+        let source = b"mod identity { pub struct IdentityFailure; impl ::core::marker::Copy for IdentityFailure {} impl Clone for IdentityFailure { fn clone(&self) -> Self { *self } } }\n";
+        let blob = crate::repository_search::git_blob_sha1(source);
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/owner/repo/git/commits/{head}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sha": head,
+                "tree": {"sha": tree}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/owner/repo/git/trees/{tree}")))
+            .and(query_param("recursive", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sha": tree,
+                "truncated": false,
+                "tree": [{
+                    "path": "src/lib.rs",
+                    "mode": "100644",
+                    "type": "blob",
+                    "sha": blob,
+                    "size": source.len()
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/owner/repo/git/blobs/{blob}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(source.to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let claim = crate::envelope::MachineClaim {
+            kind: crate::envelope::MachineClaimKind::RustCopyMoveOut,
+            path: "src/lib.rs".into(),
+            symbol: "crate::identity::IdentityFailure".into(),
+            expected_signature: None,
+        };
+
+        let receipt = test_github(&server)
+            .verify_machine_claims_at_head(&head, &[claim])
+            .await;
+
+        assert_eq!(
+            receipt.state,
+            crate::envelope::ClaimVerificationState::Complete
+        );
+        assert_eq!(receipt.head_sha.as_deref(), Some(head.as_str()));
+        assert!(receipt.tree_sha256.is_some());
+        assert_eq!(
+            receipt.claims[0].verdict,
+            crate::envelope::ClaimVerificationVerdict::Refuted
+        );
+    }
+
+    #[tokio::test]
+    async fn machine_claim_verification_is_unavailable_without_exact_head_source() {
+        let server = MockServer::start().await;
+        let head = "a".repeat(40);
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/owner/repo/git/commits/{head}")))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let claim = crate::envelope::MachineClaim {
+            kind: crate::envelope::MachineClaimKind::SymbolAbsent,
+            path: "src/identity.rs".into(),
+            symbol: "crate::identity::IdentityFailure".into(),
+            expected_signature: None,
+        };
+
+        let receipt = test_github(&server)
+            .verify_machine_claims_at_head(&head, &[claim])
+            .await;
+
+        assert_eq!(
+            receipt.state,
+            crate::envelope::ClaimVerificationState::Unavailable
+        );
+        assert_eq!(receipt.head_sha.as_deref(), Some(head.as_str()));
+        assert!(receipt.tree_sha256.is_none());
     }
 
     #[tokio::test]
@@ -7527,6 +7835,8 @@ mod tests {
             scorer_kind: None,
             scorer_reason: None,
             repository_claim: None,
+            machine_claim: None,
+            machine_claim_deferred: false,
             title: "Finding".into(),
             body: "A concrete issue.".into(),
             evidence: None,
@@ -7592,6 +7902,8 @@ mod tests {
             scorer_kind: None,
             scorer_reason: None,
             repository_claim: None,
+            machine_claim: None,
+            machine_claim_deferred: false,
             title: "Finding".into(),
             body: "A concrete issue.".into(),
             evidence: None,
@@ -7674,6 +7986,8 @@ mod tests {
             scorer_kind: None,
             scorer_reason: None,
             repository_claim: None,
+            machine_claim: None,
+            machine_claim_deferred: false,
             title: "Finding".into(),
             body: "A concrete issue.".into(),
             evidence: None,
@@ -7778,6 +8092,8 @@ mod tests {
             scorer_kind: None,
             scorer_reason: None,
             repository_claim: None,
+            machine_claim: None,
+            machine_claim_deferred: false,
             title: "Finding".into(),
             body: "A concrete issue.".into(),
             evidence: None,
@@ -7870,6 +8186,8 @@ mod tests {
             scorer_kind: None,
             scorer_reason: None,
             repository_claim: None,
+            machine_claim: None,
+            machine_claim_deferred: false,
             title: "Preserve the complete finding".into(),
             body: format!("{}.", "a".repeat(226)),
             evidence: Some("let vulnerable = true;".into()),
@@ -7899,6 +8217,7 @@ mod tests {
             review_coverage: None,
             review_admission: None,
             repository_search: Default::default(),
+            claim_verification: None,
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: Some("cccccccccccc".into()),
@@ -8039,6 +8358,8 @@ mod tests {
             scorer_kind: None,
             scorer_reason: None,
             repository_claim: None,
+            machine_claim: None,
+            machine_claim_deferred: false,
             title: "Human judgment required".into(),
             body: "Concrete compatibility concern.".into(),
             evidence: None,
@@ -8068,6 +8389,7 @@ mod tests {
             review_coverage: None,
             review_admission: None,
             repository_search: Default::default(),
+            claim_verification: None,
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
@@ -8106,6 +8428,7 @@ mod tests {
             review_coverage: None,
             review_admission: None,
             repository_search: Default::default(),
+            claim_verification: None,
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
@@ -8136,6 +8459,8 @@ mod tests {
             scorer_kind: None,
             scorer_reason: None,
             repository_claim: None,
+            machine_claim: None,
+            machine_claim_deferred: false,
             title: "rgwConfig may not be a recognized field".into(),
             body: "The chart may silently ignore this block.".into(),
             evidence: None,

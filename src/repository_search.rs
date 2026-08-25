@@ -2310,6 +2310,8 @@ mod tests {
             scorer_kind: None,
             scorer_reason: None,
             repository_claim: Some(claim),
+            machine_claim: None,
+            machine_claim_deferred: false,
             title: "Repository claim".into(),
             body: "The reviewed head has no matching value; add the required counterpart.".into(),
             evidence: Some("value: new".into()),

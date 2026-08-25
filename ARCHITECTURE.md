@@ -98,6 +98,14 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   Only a complete receipt with no positive counterexample supports a universal claim.
   Incomplete repository evidence cannot confirm a fresh claim, so the claim is suppressed;
   a prior-ledger claim remains open until exact-head adjudication resolves it.
+  Typed Rust source claims cover Copy move-out premises, exact symbol absence, and normalized
+  signature mismatch. The source verifier parses bounded regular Rust module blobs under `src/`,
+  including `src/lib.rs` and `src/main.rs` but excluding separate `src/bin` crate roots, from the
+  immutable reviewed GitHub tree with `syn`; it does not compile, execute, expand macros, follow
+  symlinks, or infer names. Complete receipts bind the verifier version, head and tree identities,
+  normalized claim hash, verdict, and hash-only source evidence. Fresh claims without a conclusive
+  receipt are suppressed. Carried claims require an exact-head refutation to resolve and otherwise
+  remain visible as deferred, nonblocking findings.
   Every surviving generated candidate, plus applicable baseline candidates during a full
   rereview, enters one bounded adjudication operation before scoring and publication. The
   operation admits the complete candidate set or fails closed before provider contact. Its
@@ -278,6 +286,12 @@ additions (violations are `kind: contentPolicy`). Content policy is on by defaul
     cannot expand or enter schema repair. Confirmation and refutation require exact supplied
     evidence; repository-wide conclusions additionally require a complete receipt for the exact
     snapshot. Public rewrites describe only the defect, impact, and correction.
+16. Typed machine claims never substitute model prose for source proof. Verification parses a
+    bounded immutable Rust source snapshot without compilation or execution, rejects ambiguous
+    symbols and unsupported syntax, and emits only hash-bound evidence. A fresh unsupported,
+    unresolved, unavailable, exhausted, or refuted claim cannot reach the gate. A carried claim
+    remains visible but nonblocking until an exact-head refutation resolves it. Fresh independently
+    generated claims still require a supported receipt.
 
 ## Residual prompt-injection surface
 

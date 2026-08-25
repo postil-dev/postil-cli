@@ -114,6 +114,14 @@ pub struct Finding {
         default
     )]
     pub repository_claim: Option<RepositoryClaim>,
+    /// Optional deterministic source premise that Postil can verify against
+    /// the immutable reviewed repository without compiling or executing it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub machine_claim: Option<MachineClaim>,
+    /// Carried machine claims stay visible when current source cannot settle
+    /// them, but they do not block until a fresh supported receipt exists.
+    #[serde(skip_serializing_if = "is_false", default)]
+    pub machine_claim_deferred: bool,
     pub title: String,
     pub body: String,
     /// Exact new-side text canonicalized from the cited prompt line. This is
@@ -125,6 +133,115 @@ pub struct Finding {
     /// Hash of (head_sha, kind, normalized_path, normalized_line, normalized_title, duplicate_index).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MachineClaimKind {
+    #[serde(rename = "rust.copy_move_out")]
+    RustCopyMoveOut,
+    #[serde(rename = "symbol.absent")]
+    SymbolAbsent,
+    #[serde(rename = "signature.mismatch")]
+    SignatureMismatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MachineReceiver {
+    None,
+    Shared,
+    Mutable,
+    Value,
+}
+
+/// Bounded function shape accepted by `signature.mismatch`.
+///
+/// Parameter and return types use a deliberately small Rust type grammar:
+/// paths, references without explicit lifetimes, tuples, slices, and generic
+/// type arguments composed from those forms.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineSignature {
+    pub receiver: MachineReceiver,
+    #[serde(default)]
+    pub parameters: Vec<String>,
+    pub returns: String,
+    #[serde(rename = "async", default, skip_serializing_if = "is_false")]
+    pub is_async: bool,
+    #[serde(rename = "unsafe", default, skip_serializing_if = "is_false")]
+    pub is_unsafe: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineClaim {
+    pub kind: MachineClaimKind,
+    /// Exact regular Rust source file in the immutable repository tree.
+    pub path: String,
+    /// Exact `crate::`-qualified type, item, trait member, or inherent method.
+    pub symbol: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub expected_signature: Option<MachineSignature>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ClaimVerificationState {
+    Complete,
+    Exhausted,
+    #[default]
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ClaimVerificationVerdict {
+    Supported,
+    Refuted,
+    Unresolved,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ClaimEvidenceRole {
+    CopyDerive,
+    CopyImplementation,
+    SymbolDefinition,
+    Signature,
+    SourceScope,
+}
+
+/// Hash-only source evidence. No repository source text is serialized.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaimVerificationEvidence {
+    pub role: ClaimEvidenceRole,
+    pub path_sha256: String,
+    pub source_sha256: String,
+    pub span_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifiedMachineClaim {
+    pub claim_input_sha256: String,
+    pub verdict: ClaimVerificationVerdict,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<ClaimVerificationEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaimVerificationReceipt {
+    pub verifier: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub head_sha: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tree_sha256: Option<String>,
+    pub state: ClaimVerificationState,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<VerifiedMachineClaim>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1182,6 +1299,10 @@ pub enum SuppressionReason {
     /// A repository-wide absence or mismatch claim was not supported by one
     /// complete immutable-head receipt, or a positive counterexample refuted it.
     RepositoryClaimUnsupported,
+    /// A deterministic exact-head source proof contradicted the claim.
+    MachineClaimRefuted,
+    /// The source verifier could not produce a bounded conclusive proof.
+    MachineClaimUnverified,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1578,6 +1699,10 @@ pub struct Envelope {
     /// mismatch claims. Historical v1 envelopes deserialize as unavailable.
     #[serde(default)]
     pub repository_search: RepositorySearchReceipt,
+    /// Bounded deterministic source verification for typed machine claims.
+    /// Historical v1 envelopes omit this additive field.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub claim_verification: Option<ClaimVerificationReceipt>,
     /// False when any sent provider request can have unknown billed usage,
     /// including timeouts and ambiguous transport failures.
     #[serde(default)]
@@ -1626,6 +1751,9 @@ pub fn finding_blocks_gate(
     block_on_kinds: &[String],
     provider_error_is_advisory: bool,
 ) -> bool {
+    if finding.machine_claim_deferred {
+        return false;
+    }
     if fail_on.eq_ignore_ascii_case("never") {
         return false;
     }
@@ -1693,6 +1821,7 @@ pub fn is_ephemeral_anchor(path: &str) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IncompleteReviewReason {
     IncompleteInput,
+    LocalIncrementalFullComparisonUnavailable,
     ReservedInput,
     InsufficientContextBudget,
     InvalidModelFanOut,
@@ -1702,6 +1831,9 @@ pub(crate) fn incomplete_review_finding(reason: IncompleteReviewReason) -> Findi
     let body = match reason {
         IncompleteReviewReason::IncompleteInput => {
             "Postil could not acquire the complete immutable change from the forge, so no clean verdict was issued. Retry after the forge can supply it."
+        }
+        IncompleteReviewReason::LocalIncrementalFullComparisonUnavailable => {
+            "An incremental local review touched the file of a carried error finding, but this input cannot reconstruct the complete comparison needed to re-adjudicate it. No clean verdict was issued. Review the pull request or rerun locally with `--base <ref>` without `--since-sha`."
         }
         IncompleteReviewReason::ReservedInput => {
             "The change uses a path reserved for Postil's synthetic review evidence, so repository content cannot be separated safely from operational findings. No clean verdict was issued. Rename the conflicting path before retrying."
@@ -1730,6 +1862,8 @@ pub(crate) fn incomplete_review_finding(reason: IncompleteReviewReason) -> Findi
         scorer_kind: None,
         scorer_reason: None,
         repository_claim: None,
+        machine_claim: None,
+        machine_claim_deferred: false,
     }
 }
 
@@ -1764,6 +1898,8 @@ pub fn operational_failure_finding(detail: &str) -> Finding {
         scorer_kind: None,
         scorer_reason: None,
         repository_claim: None,
+        machine_claim: None,
+        machine_claim_deferred: false,
     }
 }
 
@@ -1795,6 +1931,8 @@ pub fn fail_closed_finding(detail: &str) -> Finding {
         scorer_kind: None,
         scorer_reason: None,
         repository_claim: None,
+        machine_claim: None,
+        machine_claim_deferred: false,
     }
 }
 
@@ -1830,6 +1968,8 @@ pub fn narrated_risk_finding(summary: &str) -> Finding {
         scorer_kind: None,
         scorer_reason: None,
         repository_claim: None,
+        machine_claim: None,
+        machine_claim_deferred: false,
     }
 }
 
@@ -1854,6 +1994,8 @@ pub fn provider_error_finding(_detail: &str) -> Finding {
         scorer_kind: None,
         scorer_reason: None,
         repository_claim: None,
+        machine_claim: None,
+        machine_claim_deferred: false,
     }
 }
 
@@ -1867,6 +2009,10 @@ mod tests {
             (
                 IncompleteReviewReason::IncompleteInput,
                 "complete immutable change",
+            ),
+            (
+                IncompleteReviewReason::LocalIncrementalFullComparisonUnavailable,
+                "complete comparison",
             ),
             (IncompleteReviewReason::ReservedInput, "path reserved"),
             (
@@ -2026,6 +2172,8 @@ mod tests {
             scorer_kind: None,
             scorer_reason: None,
             repository_claim: None,
+            machine_claim: None,
+            machine_claim_deferred: false,
             title: "t".into(),
             body: "b".into(),
             evidence: None,
@@ -2379,6 +2527,25 @@ mod tests {
         assert_eq!(contextual_value["repositoryContext"]["claim"], "absence");
         assert!(contextual_value.get("repositoryClaim").is_none());
 
+        let mut machine_finding = finding(Severity::Warn, 0.8);
+        machine_finding.machine_claim = Some(MachineClaim {
+            kind: MachineClaimKind::RustCopyMoveOut,
+            path: "src/identity.rs".into(),
+            symbol: "crate::identity::IdentityFailure".into(),
+            expected_signature: None,
+        });
+        let machine_value = serde_json::to_value(&machine_finding).unwrap();
+        assert_eq!(machine_value["machineClaim"]["kind"], "rust.copy_move_out");
+        assert!(machine_value.get("machineClaimDeferred").is_none());
+        let mut legacy_machine_value = machine_value;
+        legacy_machine_value
+            .as_object_mut()
+            .unwrap()
+            .remove("machineClaim");
+        let legacy_machine_finding: Finding = serde_json::from_value(legacy_machine_value).unwrap();
+        assert!(legacy_machine_finding.machine_claim.is_none());
+        assert!(!legacy_machine_finding.machine_claim_deferred);
+
         let mut env = Envelope {
             version: 1,
             summary: String::new(),
@@ -2403,6 +2570,7 @@ mod tests {
             review_coverage: None,
             review_admission: None,
             repository_search: RepositorySearchReceipt::default(),
+            claim_verification: None,
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
@@ -2452,6 +2620,7 @@ mod tests {
             historical.repository_search.state,
             RepositorySearchState::Unavailable
         );
+        assert!(historical.claim_verification.is_none());
 
         v.as_object_mut().unwrap().remove("modelIncidents");
         let decoded: Envelope = serde_json::from_value(v).unwrap();
