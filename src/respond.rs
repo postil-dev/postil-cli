@@ -297,7 +297,7 @@ async fn respond_with<F: Forge>(
 
     let system = prompt::respond_system_prompt(cfg, current_utc_date);
     let user = respond_user_prompt(&context, comment);
-    let client = LlmClient::from_env(cfg)?;
+    let client = LlmClient::from_env(cfg).await?;
     client.preflight_respond_plan(cfg, &system, &user)?;
     let answer = client
         .answer(cfg, &system, &user, validate_respond_output)

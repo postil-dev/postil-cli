@@ -1,16 +1,15 @@
 //! Inference API-key resolution shared by CLI runtime checks.
 //!
 //! [`resolve_from_process_env`] resolves only the four explicit env vars, in
-//! priority order. [`resolve_effective`] adds one more source below all
-//! four: a stored `postil login` credential, used only when none of the env
-//! vars is set. See `config.rs`'s module doc for the full precedence
-//! statement.
+//! priority order. Stored-login resolution is invoked only when none of the
+//! four is set. See `config.rs`'s module doc for the full precedence statement.
 
-use std::path::Path;
+use std::future::Future;
 
 use anyhow::Result;
 
-use crate::credentials::{self, Credentials};
+#[cfg(test)]
+use crate::credentials::Credentials;
 
 pub(crate) const API_KEY_ENV_VARS: [&str; 4] = [
     "POSTIL_API_KEY",
@@ -33,20 +32,7 @@ pub(crate) fn resolve_with(mut lookup: impl FnMut(&str) -> Option<String>) -> Op
         .find_map(|name| lookup(name).filter(|value| !value.trim().is_empty()))
 }
 
-/// Bearer key resolved for inference, falling back to a stored `postil
-/// login` credential when none of the four explicit env vars is set.
-/// `Ok(None)` means neither source has a key; callers turn that into their
-/// own "set a key or run `postil login`" message. An expired stored
-/// credential is reported here as an error, so the caller surfaces one
-/// actionable instruction instead of a confusing upstream auth failure once
-/// the request reaches the provider.
-pub(crate) fn resolve_effective(credentials_path: &Path) -> Result<Option<String>> {
-    resolve_effective_with(
-        |name| std::env::var(name).ok(),
-        || credentials::read(credentials_path),
-    )
-}
-
+#[cfg(test)]
 pub(crate) fn resolve_effective_with(
     env_lookup: impl FnMut(&str) -> Option<String>,
     credential_lookup: impl FnOnce() -> Result<Option<Credentials>>,
@@ -64,10 +50,29 @@ pub(crate) fn resolve_effective_with(
     Ok(Some(credentials.token))
 }
 
+/// Resolves an explicit key without polling the stored-login future. This
+/// keeps BYOK invocations independent of both the credential file and the
+/// Postil authentication service.
+pub(crate) async fn resolve_explicit_or_stored<F>(
+    explicit: Option<String>,
+    stored: F,
+) -> Result<Option<String>>
+where
+    F: Future<Output = Result<Option<String>>>,
+{
+    match explicit {
+        Some(key) => Ok(Some(key)),
+        None => stored.await,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::credentials;
     use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn resolve(pairs: &[(&str, &str)]) -> Option<String> {
         let values: HashMap<&str, &str> = pairs.iter().copied().collect();
@@ -112,6 +117,8 @@ mod tests {
             version: credentials::CREDENTIALS_VERSION,
             token: "pcli_stored-token-not-a-real-secret".to_string(),
             expires_at: expires_at.to_string(),
+            refresh_token: None,
+            refresh_expires_at: None,
             api_base: "https://postil.dev/api/inference/v1".to_string(),
             org: "runatlas-is".to_string(),
             model: "z-ai/glm-5.2".to_string(),
@@ -167,5 +174,19 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("postil login"));
         assert!(!message.contains("pcli_stored-token-not-a-real-secret"));
+    }
+
+    #[tokio::test]
+    async fn explicit_key_bypasses_stored_login_refresh() {
+        let refreshed = Arc::new(AtomicBool::new(false));
+        let invoked = refreshed.clone();
+        let resolved = resolve_explicit_or_stored(Some("explicit-key".to_string()), async move {
+            invoked.store(true, Ordering::SeqCst);
+            Ok(Some("stored-key".to_string()))
+        })
+        .await
+        .unwrap();
+        assert_eq!(resolved.as_deref(), Some("explicit-key"));
+        assert!(!refreshed.load(Ordering::SeqCst));
     }
 }
