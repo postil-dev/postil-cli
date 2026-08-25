@@ -47,8 +47,8 @@ Ignore patterns remove matching paths before grounding, batching, and large-revi
 | Variable | Purpose |
 | --- | --- |
 | `POSTIL_API_KEY`, `OPENROUTER_API_KEY`, `MODEL_API_KEY`, `LLM_API_KEY` | Model provider credential, checked in that order |
-| `POSTIL_LOGIN_SERVER` | Postil web app used by `postil login`, refresh, and `postil logout`; defaults to `https://postil.dev` |
-| `POSTIL_API_BASE` | Model endpoint selected by the operator |
+| `POSTIL_LOGIN_SERVER` | Postil web app used to issue a new login; defaults to `https://postil.dev`. Refresh and logout use the stored issuing server and reject a conflicting explicit value. |
+| `POSTIL_API_BASE` | Model endpoint selected by the operator. A value that differs from a stored login's endpoint requires an explicit API key. |
 | `POSTIL_API_FORMAT` | `openai-compatible` or `anthropic` |
 | `POSTIL_ENDPOINT_AUTH_HEADER`, `POSTIL_ENDPOINT_AUTH_VALUE` | Additional private-gateway authentication |
 | `POSTIL_ALLOW_PRIVATE_API_BASE` | Explicitly permit a local or private-network endpoint |
@@ -74,7 +74,11 @@ postil login
 postil logout
 ```
 
-`postil login` authenticates against postil.dev over a device-authorization flow (open the printed URL, enter the code) and stores a renewable credential at `${XDG_CONFIG_HOME:-~/.config}/postil/credentials.json`, mode `0600` in a `0700` directory. That credential is a fallback: it is used only when none of `POSTIL_API_KEY`, `OPENROUTER_API_KEY`, `MODEL_API_KEY`, or `LLM_API_KEY` is set. When it is used, Postil rotates the access credential before it expires and persists the replacement; explicit API keys never trigger a refresh. Its `apiBase` and model select the request unless `POSTIL_API_BASE`/`REVIEW_MODEL` are set, which still win. `postil logout` revokes the stored refresh credential server-side and removes the local file even if that call fails. A legacy access-only login, an expired refresh inactivity window, or a rejected refresh produces one instruction to run `postil login` again rather than a provider authentication error. Temporary refresh failures retain the stored credential and ask the user to try again.
+`postil login` authenticates against the configured login server over a device-authorization flow (open the printed URL, enter the code) and stores a renewable credential at `${XDG_CONFIG_HOME:-~/.config}/postil/credentials.json`, mode `0600` in a `0700` directory. An ambiguous polling failure retries the same device code so the service can recover the already-issued pair during its 60-second recovery window. The credential records its canonical issuing server. Refresh and logout use that stored issuer; a conflicting explicit `POSTIL_LOGIN_SERVER` fails before any login credential is sent. Issuer-free credentials from older CLI versions infer `https://postil.dev` only when their normalized `apiBase` is the canonical Postil inference endpoint. An issuer-free credential for any custom endpoint requires `postil login` again before refresh or logout.
+
+The stored credential is a fallback used only when none of `POSTIL_API_KEY`, `OPENROUTER_API_KEY`, `MODEL_API_KEY`, or `LLM_API_KEY` is set. Postil rotates it before access expiry and persists the replacement; explicit API keys never trigger a refresh. Its `apiBase` is the only endpoint that may receive its bearer. A different `POSTIL_API_BASE` fails before network access unless an explicit API key is set. `REVIEW_MODEL` may still select a model at the stored endpoint. A legacy access-only login, an expired refresh inactivity window, or a rejected refresh instructs the user to run `postil login` again. A valid `Retry-After` value on a temporary refresh rate limit is reported in seconds. Missing or malformed values use a generic retry message, and all temporary refresh failures retain the credential.
+
+`postil logout` removes the active local credential only after remote revocation succeeds. A failed revocation retains its sole retry handle and asks the user to run `postil logout` again. A new login stages the newly issued family and any overwritten family in a private pending-revocation queue before replacing the active credential. A local replacement failure therefore retains the new remote family's revocation handle. Pending retries never block normal review work and never follow `POSTIL_LOGIN_SERVER` overrides.
 
 ## Inspect and initialize
 

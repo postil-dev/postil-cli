@@ -56,6 +56,14 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   OpenRouter's response `usage.cost` is preserved as canonical decimal dollars without
   floating-point conversion; rounded micro-dollars remain a display/index field.
   Endpoints that omit cost retain token-only accounting with unavailable provenance.
+- `credentials.rs` and `login.rs`: local device-login storage and session lifecycle.
+  Renewable credentials bind refresh and logout to a canonical issuing server, and the
+  inference bearer is accepted only for its stored API base. Legacy credentials infer the
+  public issuer only when their stored API base is the canonical Postil endpoint. Atomic
+  owner-only writes stage newly issued and overwritten session families in a
+  pending-revocation queue before replacing the active credential. Background retries
+  contact only each family's persisted issuer. Logout retains the active revocation handle
+  until the issuing server accepts revocation.
 - `review.rs`: orchestration; enforces acquisition, model-aware context, request,
   provider-attempt, output-token, and worst-case token-exposure budgets before calls;
   one UTF-8 byte counts as one projected token rather than using an optimistic ratio.
@@ -147,7 +155,8 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   Exception to precedence: `model.apiBase` from a config file is ignored by
   default (a repo could redirect the base URL that receives the inference
   credential); honored only with `POSTIL_ALLOW_CONFIG_API_BASE=1`. The
-  `POSTIL_API_BASE` environment variable is always applied. `model.apiFormat` and
+  `POSTIL_API_BASE` environment variable is applied to BYOK requests. A different
+  endpoint cannot receive a stored login bearer. `model.apiFormat` and
   `POSTIL_API_FORMAT` select `openai-compatible` (default) or `anthropic`.
   Hosted admission matches the complete ordered generator/scorer configuration and
   consensus width to one immutable qualification profile. Each profile binds benchmark

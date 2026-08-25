@@ -13,7 +13,8 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
-use crate::credentials::{self, Credentials};
+use crate::config::normalize_api_base;
+use crate::credentials::{self, Credentials, PendingRevocation};
 use crate::llm::secure_http_client;
 
 /// Overrides the Postil web app the device-flow calls target. Distinct from
@@ -21,6 +22,7 @@ use crate::llm::secure_http_client;
 /// inference gateway itself, not the auth endpoints.
 const LOGIN_SERVER_ENV: &str = "POSTIL_LOGIN_SERVER";
 const DEFAULT_LOGIN_SERVER: &str = "https://postil.dev";
+const DEFAULT_LOGIN_API_BASE: &str = "https://postil.dev/api/inference/v1";
 
 /// The server caps polling at 200 attempts and then returns 410 regardless;
 /// this is only a client-side backstop against a stuck loop if that cap is
@@ -29,27 +31,138 @@ const MAX_POLL_ATTEMPTS: u32 = 220;
 const ACCESS_REFRESH_MARGIN: Duration = Duration::from_secs(5 * 60);
 const REFRESH_RESPONSE_MAX_BYTES: usize = 16 * 1024;
 const REFRESH_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const REVOCATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
-fn login_server() -> String {
-    std::env::var(LOGIN_SERVER_ENV)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_LOGIN_SERVER.to_string())
+fn canonicalize_issuer(value: &str) -> Result<String> {
+    anyhow::ensure!(
+        !value.trim().is_empty(),
+        "login server URL must not be empty"
+    );
+    let mut url =
+        reqwest::Url::parse(value.trim()).context("login server must be an absolute URL")?;
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https"),
+        "login server must use HTTP or HTTPS"
+    );
+    anyhow::ensure!(
+        url.username().is_empty() && url.password().is_none(),
+        "login server must not contain credentials"
+    );
+    anyhow::ensure!(
+        url.host_str().is_some_and(|hostname| !hostname.is_empty()),
+        "login server must include a hostname"
+    );
+    anyhow::ensure!(
+        url.query().is_none() && url.fragment().is_none(),
+        "login server must not contain a query or fragment"
+    );
+    let path = url.path().trim_end_matches('/').to_string();
+    url.set_path(if path.is_empty() { "/" } else { &path });
+    Ok(url.as_str().trim_end_matches('/').to_string())
+}
+
+fn login_server_override() -> Result<Option<String>> {
+    let Some(_) = std::env::var_os(LOGIN_SERVER_ENV) else {
+        return Ok(None);
+    };
+    let value = std::env::var(LOGIN_SERVER_ENV)
+        .with_context(|| format!("{LOGIN_SERVER_ENV} must contain a valid URL"))?;
+    canonicalize_issuer(&value)
+        .with_context(|| format!("invalid {LOGIN_SERVER_ENV}"))
+        .map(Some)
+}
+
+fn login_server() -> Result<String> {
+    login_server_override()?.map_or_else(|| canonicalize_issuer(DEFAULT_LOGIN_SERVER), Ok)
+}
+
+fn stored_issuer(credentials: &Credentials) -> Result<String> {
+    if let Some(issuer) = credentials.issuer.as_deref() {
+        return canonicalize_issuer(issuer)
+            .context("the stored login issuer is invalid; run `postil login` again");
+    }
+
+    let stored_api_base = normalize_api_base(&credentials.api_base)
+        .context("the stored login API base is invalid; run `postil login` again")?;
+    let canonical_api_base = normalize_api_base(DEFAULT_LOGIN_API_BASE)
+        .expect("the embedded Postil API base must be valid");
+    anyhow::ensure!(
+        stored_api_base == canonical_api_base,
+        "the stored legacy login has no issuing server and its API base is not the canonical Postil endpoint; run `postil login` again"
+    );
+    canonicalize_issuer(DEFAULT_LOGIN_SERVER)
+}
+
+fn require_matching_issuer(
+    credentials: &Credentials,
+    configured_issuer: Option<&str>,
+) -> Result<String> {
+    let issuer = stored_issuer(credentials)?;
+    if let Some(configured_issuer) = configured_issuer {
+        let configured_issuer = canonicalize_issuer(configured_issuer)
+            .with_context(|| format!("invalid {LOGIN_SERVER_ENV}"))?;
+        anyhow::ensure!(
+            configured_issuer == issuer,
+            "{LOGIN_SERVER_ENV} does not match the stored login issuer; unset it to use this login, or run `postil login` to replace the login for that server"
+        );
+    }
+    Ok(issuer)
+}
+
+fn require_matching_api_base(credentials: &Credentials, resolved_api_base: &str) -> Result<()> {
+    let stored_api_base = normalize_api_base(&credentials.api_base)
+        .context("the stored login API base is invalid; run `postil login` again")?;
+    let resolved_api_base =
+        normalize_api_base(resolved_api_base).context("the resolved model API base is invalid")?;
+    if stored_api_base != resolved_api_base {
+        let key_names = crate::api_key::names_text();
+        anyhow::bail!(
+            "the stored postil login is bound to {}; the resolved model API base is {}. Set an explicit key with {}, or remove the API base override to use this login",
+            credentials.api_base,
+            resolved_api_base,
+            key_names
+        );
+    }
+    Ok(())
 }
 
 pub async fn run_login(org: Option<String>) -> Result<i32> {
-    let server = login_server();
+    let server = login_server()?;
     let client = secure_http_client(&server).context("building the postil login HTTP client")?;
     let path = credentials::default_path()?;
     login_with(&client, &server, org.as_deref(), &path).await
 }
 
 pub async fn run_logout() -> Result<i32> {
-    let server = login_server();
-    let client = secure_http_client(&server).context("building the postil logout HTTP client")?;
+    let configured_issuer = login_server_override()?;
     let path = credentials::default_path()?;
-    logout_with(&client, &server, &path).await
+    logout_with_mode(ClientMode::Secure, configured_issuer.as_deref(), &path).await
+}
+
+#[derive(Clone, Copy)]
+enum ClientMode<'a> {
+    Secure,
+    #[cfg(test)]
+    Provided(&'a reqwest::Client),
+    Reuse {
+        client: &'a reqwest::Client,
+        issuer: &'a str,
+    },
+}
+
+impl ClientMode<'_> {
+    fn for_issuer(self, issuer: &str) -> Result<reqwest::Client> {
+        match self {
+            #[cfg(test)]
+            Self::Provided(client) => Ok(client.clone()),
+            Self::Reuse {
+                client,
+                issuer: client_issuer,
+            } if client_issuer == issuer => Ok(client.clone()),
+            Self::Secure | Self::Reuse { .. } => secure_http_client(issuer)
+                .context("building an HTTP client for stored login issuer"),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,6 +216,7 @@ async fn login_with(
     org: Option<&str>,
     credentials_path: &Path,
 ) -> Result<i32> {
+    let server = canonicalize_issuer(server)?;
     let mut start_body = serde_json::json!({ "clientVersion": env!("CARGO_PKG_VERSION") });
     // The device/start contract takes no org field today; sending it as an
     // extra, ignorable JSON key is a forward-compatible hint only. Org
@@ -111,7 +225,7 @@ async fn login_with(
     if let Some(org) = org {
         start_body["org"] = serde_json::Value::String(org.to_string());
     }
-    let start_url = format!("{}/api/cli/device/start", server.trim_end_matches('/'));
+    let start_url = format!("{server}/api/cli/device/start");
     let start_response = client
         .post(&start_url)
         .json(&start_body)
@@ -139,21 +253,24 @@ async fn login_with(
     eprintln!("postil: waiting for approval...");
 
     let interval = Duration::from_secs(interval_secs(start.interval));
-    let token_url = format!("{}/api/cli/device/token", server.trim_end_matches('/'));
+    let token_url = format!("{server}/api/cli/device/token");
     for _ in 0..MAX_POLL_ATTEMPTS {
         tokio::time::sleep(interval).await;
-        let response = client
+        let response = match client
             .post(&token_url)
             .json(&serde_json::json!({ "deviceCode": start.device_code }))
             .send()
             .await
-            .context("polling postil login status")?;
+        {
+            Ok(response) => response,
+            Err(_) => continue,
+        };
         match response.status().as_u16() {
             200 => {
-                let approved: DeviceTokenApproved = response
-                    .json()
-                    .await
-                    .context("parsing postil login approval response")?;
+                let approved: DeviceTokenApproved = match response.json().await {
+                    Ok(approved) => approved,
+                    Err(_) => continue,
+                };
                 let DeviceTokenApproved {
                     token,
                     expires_at,
@@ -163,10 +280,11 @@ async fn login_with(
                     org,
                     model,
                 } = approved;
-                let renewable = match (refresh_token, refresh_expires_at) {
+                let mut renewable = match (refresh_token, refresh_expires_at) {
                     (Some(refresh_token), Some(refresh_expires_at)) => {
                         let credentials = Credentials {
                             version: credentials::CREDENTIALS_VERSION,
+                            issuer: Some(server.clone()),
                             token,
                             expires_at,
                             refresh_token: Some(refresh_token),
@@ -174,13 +292,15 @@ async fn login_with(
                             api_base,
                             org: org.slug,
                             model,
+                            pending_revocations: Vec::new(),
                         };
                         validate_refresh_response(&credentials)
                             .context("validating postil login approval response")?;
                         credentials
                     }
                     (None, None) => Credentials {
-                        version: credentials::LEGACY_CREDENTIALS_VERSION,
+                        version: credentials::CREDENTIALS_VERSION,
+                        issuer: Some(server.clone()),
                         token,
                         expires_at,
                         refresh_token: None,
@@ -188,14 +308,23 @@ async fn login_with(
                         api_base,
                         org: org.slug,
                         model,
+                        pending_revocations: Vec::new(),
                     },
                     _ => anyhow::bail!(
                         "the postil login approval response has incomplete renewable credentials"
                     ),
                 };
                 let renewable_login = renewable.refresh_token.is_some();
-                let _lock = credentials::CredentialLock::acquire(credentials_path).await?;
-                credentials::write(credentials_path, &renewable)?;
+                let pending_count = persist_approved_login_with(
+                    ClientMode::Reuse {
+                        client,
+                        issuer: &server,
+                    },
+                    credentials_path,
+                    &mut renewable,
+                    credentials::write,
+                )
+                .await?;
                 if renewable_login {
                     eprintln!(
                         "postil: logged in to {} ({}): renewable until inactive after {}",
@@ -212,9 +341,13 @@ async fn login_with(
                         org.name, renewable.org
                     );
                 }
+                if pending_count > 0 {
+                    eprintln!("postil: a previous login is pending revocation and will be retried");
+                }
                 return Ok(0);
             }
             428 => continue,
+            408 | 429 | 500..=599 => continue,
             403 => {
                 eprintln!("postil: login request was denied");
                 return Ok(1);
@@ -239,64 +372,134 @@ fn interval_secs(server_interval: u64) -> u64 {
     server_interval.clamp(1, 30)
 }
 
+#[cfg(test)]
 async fn logout_with(
     client: &reqwest::Client,
-    server: &str,
+    configured_issuer: &str,
+    credentials_path: &Path,
+) -> Result<i32> {
+    logout_with_mode(
+        ClientMode::Provided(client),
+        Some(configured_issuer),
+        credentials_path,
+    )
+    .await
+}
+
+async fn logout_with_mode(
+    client_mode: ClientMode<'_>,
+    configured_issuer: Option<&str>,
     credentials_path: &Path,
 ) -> Result<i32> {
     let _lock = credentials::CredentialLock::acquire(credentials_path).await?;
-    match credentials::read(credentials_path) {
-        Ok(Some(creds)) => {
-            let logout_url = format!("{}/api/cli/logout", server.trim_end_matches('/'));
-            let request = client.post(&logout_url).bearer_auth(&creds.token);
-            let request = if let Some(refresh_token) = creds
-                .refresh_token
-                .as_deref()
-                .filter(|token| !token.trim().is_empty())
-            {
-                request.json(&serde_json::json!({ "refreshToken": refresh_token }))
-            } else {
-                request
-            };
-            match request.send().await {
-                Ok(response) if response.status().is_success() => {}
-                Ok(response) => eprintln!(
-                    "postil: logout request returned {}; removing the local credential anyway",
-                    response.status()
-                ),
-                Err(_) => eprintln!(
-                    "postil: could not reach postil to revoke the credential; removing the local credential anyway"
-                ),
-            }
+    let Some(mut stored) = credentials::read(credentials_path)? else {
+        let mut pending = credentials::read_pending(credentials_path)?;
+        if pending.is_empty() {
+            eprintln!("postil: not logged in");
+            return Ok(0);
         }
-        Ok(None) => eprintln!("postil: not logged in"),
-        Err(_) => eprintln!("postil: stored credentials were unreadable; removing them anyway"),
+        let remaining =
+            drain_pending_without_active_locked(client_mode, credentials_path, &mut pending)
+                .await?;
+        if remaining == 0 {
+            eprintln!("postil: pending session revocations completed; no login is stored");
+            return Ok(0);
+        }
+        eprintln!("postil: a previous session could not be revoked; run `postil logout` again");
+        return Ok(1);
+    };
+
+    let issuer = require_matching_issuer(&stored, configured_issuer)?;
+    let mut detached = credentials::read_pending(credentials_path)?;
+    if !detached.is_empty() {
+        stored.pending_revocations.append(&mut detached);
+        deduplicate_revocations(&mut stored.pending_revocations);
+        credentials::write(credentials_path, &stored)?;
     }
-    // Removal happens regardless of what happened above: a developer running
-    // `postil logout` wants the local secret gone even if the network is down.
+
+    let current = revocation_for(&stored)?;
+    if !revoke(client_mode, &current).await {
+        eprintln!(
+            "postil: could not revoke the stored login at its issuing server; credentials were kept. Run `postil logout` again"
+        );
+        return Ok(1);
+    }
+
+    debug_assert_eq!(issuer, current.issuer);
+    let remaining =
+        drain_pending_for_active_locked(client_mode, credentials_path, &mut stored).await?;
+    if remaining == 0 {
+        credentials::remove(credentials_path)?;
+        credentials::write_pending(credentials_path, &[])?;
+        eprintln!("postil: logged out");
+        return Ok(0);
+    }
+
+    credentials::write_pending(credentials_path, &stored.pending_revocations)?;
     credentials::remove(credentials_path)?;
-    eprintln!("postil: logged out");
-    Ok(0)
+    eprintln!(
+        "postil: the current login was revoked, but a previous session is still pending revocation; run `postil logout` again"
+    );
+    Ok(1)
 }
 
 /// Resolves a stored login for a hosted request. Explicit API-key environment
 /// variables are handled by the caller before this function is reached, so a
 /// BYOK invocation never reads, locks, or refreshes a local Postil login.
-pub(crate) async fn resolve_stored_token(credentials_path: &Path) -> Result<Option<String>> {
-    let server = login_server();
-    let client = secure_http_client(&server).context("building the postil refresh HTTP client")?;
-    resolve_stored_token_with(&client, &server, credentials_path).await
+pub(crate) async fn resolve_stored_token(
+    credentials_path: &Path,
+    resolved_api_base: &str,
+) -> Result<Option<String>> {
+    let configured_issuer = login_server_override()?;
+    let result = resolve_stored_token_with_mode(
+        ClientMode::Secure,
+        configured_issuer.as_deref(),
+        credentials_path,
+        resolved_api_base,
+    )
+    .await;
+    if result.is_ok() {
+        spawn_pending_revocation_drain(credentials_path);
+    }
+    result
 }
 
+#[cfg(test)]
 async fn resolve_stored_token_with(
     client: &reqwest::Client,
-    server: &str,
+    configured_issuer: &str,
     credentials_path: &Path,
+) -> Result<Option<String>> {
+    let resolved_api_base = credentials::read(credentials_path)?
+        .map(|credentials| credentials.api_base)
+        .unwrap_or_default();
+    resolve_stored_token_with_mode(
+        ClientMode::Provided(client),
+        Some(configured_issuer),
+        credentials_path,
+        &resolved_api_base,
+    )
+    .await
+}
+
+async fn resolve_stored_token_with_mode(
+    client_mode: ClientMode<'_>,
+    configured_issuer: Option<&str>,
+    credentials_path: &Path,
+    resolved_api_base: &str,
 ) -> Result<Option<String>> {
     let Some(credentials) = credentials::read(credentials_path)? else {
         return Ok(None);
     };
-    if credentials.refresh_token.is_some() && !credentials.can_refresh() {
+    require_matching_api_base(&credentials, resolved_api_base)?;
+    if credentials.refresh_token.is_none() {
+        if credentials.is_expired() {
+            anyhow::bail!("the stored postil login credential expired; run `postil login` again");
+        }
+        return Ok(Some(credentials.token));
+    }
+    require_matching_issuer(&credentials, configured_issuer)?;
+    if !credentials.can_refresh() {
         anyhow::bail!("the stored postil login can no longer be renewed; run `postil login` again");
     }
     if !credentials.expires_within(ACCESS_REFRESH_MARGIN) {
@@ -307,7 +510,9 @@ async fn resolve_stored_token_with(
     let Some(credentials) = credentials::read(credentials_path)? else {
         return Ok(None);
     };
-    if credentials.refresh_token.is_some() && !credentials.can_refresh() {
+    require_matching_api_base(&credentials, resolved_api_base)?;
+    let issuer = require_matching_issuer(&credentials, configured_issuer)?;
+    if !credentials.can_refresh() {
         anyhow::bail!("the stored postil login can no longer be renewed; run `postil login` again");
     }
     if !credentials.expires_within(ACCESS_REFRESH_MARGIN) {
@@ -317,9 +522,11 @@ async fn resolve_stored_token_with(
         anyhow::bail!("the stored postil login credential expired; run `postil login` again");
     };
 
-    let refreshed = refresh_token_with(client, server, refresh_token).await?;
+    let client = client_mode.for_issuer(&issuer)?;
+    let refreshed = refresh_token_with(&client, &issuer, refresh_token).await?;
     let replacement = Credentials {
         version: credentials::CREDENTIALS_VERSION,
+        issuer: Some(issuer),
         token: refreshed.token,
         expires_at: refreshed.expires_at,
         refresh_token: Some(refreshed.refresh_token),
@@ -327,10 +534,189 @@ async fn resolve_stored_token_with(
         api_base: credentials.api_base,
         org: credentials.org,
         model: credentials.model,
+        pending_revocations: credentials.pending_revocations,
     };
     validate_refresh_response(&replacement)?;
     credentials::write(credentials_path, &replacement)?;
     Ok(Some(replacement.token))
+}
+
+fn revocation_for(credentials: &Credentials) -> Result<PendingRevocation> {
+    anyhow::ensure!(
+        !credentials.token.trim().is_empty(),
+        "the stored login cannot be revoked because its access credential is invalid; run `postil login` again"
+    );
+    Ok(PendingRevocation {
+        issuer: stored_issuer(credentials)?,
+        token: credentials.token.clone(),
+        refresh_token: credentials
+            .refresh_token
+            .as_deref()
+            .filter(|token| !token.trim().is_empty())
+            .map(str::to_string),
+    })
+}
+
+fn deduplicate_revocations(revocations: &mut Vec<PendingRevocation>) {
+    let mut unique = Vec::with_capacity(revocations.len());
+    for revocation in revocations.drain(..) {
+        if !unique.contains(&revocation) {
+            unique.push(revocation);
+        }
+    }
+    *revocations = unique;
+}
+
+async fn persist_approved_login_with<F>(
+    client_mode: ClientMode<'_>,
+    credentials_path: &Path,
+    approved: &mut Credentials,
+    write_active: F,
+) -> Result<usize>
+where
+    F: FnOnce(&Path, &Credentials) -> Result<()>,
+{
+    let _lock = credentials::CredentialLock::acquire(credentials_path).await?;
+    let new_revocation = revocation_for(approved)?;
+    let mut pending = credentials::read_pending(credentials_path)?;
+    pending.push(new_revocation.clone());
+    deduplicate_revocations(&mut pending);
+    if let Err(write_error) = credentials::write_pending(credentials_path, &pending) {
+        if revoke(client_mode, &new_revocation).await {
+            return Err(write_error)
+                .context("could not retain the new login locally; its remote session was revoked");
+        }
+        return Err(write_error).context(
+            "could not retain the new login or its revocation handle locally; the remote session may remain active",
+        );
+    }
+    if let Some(existing) = credentials::read(credentials_path)? {
+        pending.extend(existing.pending_revocations.iter().cloned());
+        pending.push(revocation_for(&existing)?);
+    }
+    deduplicate_revocations(&mut pending);
+    credentials::write_pending(credentials_path, &pending)?;
+    approved.pending_revocations = pending;
+    write_active(credentials_path, approved)?;
+    let pending_count =
+        match drain_pending_for_active_locked(client_mode, credentials_path, approved).await {
+            Ok(count) => count,
+            Err(_) => approved.pending_revocations.len(),
+        };
+    Ok(pending_count)
+}
+
+fn revocation_matches_active(revocation: &PendingRevocation, active: &Credentials) -> Result<bool> {
+    if canonicalize_issuer(&revocation.issuer)? != stored_issuer(active)? {
+        return Ok(false);
+    }
+    if revocation.token == active.token {
+        return Ok(true);
+    }
+    Ok(revocation
+        .refresh_token
+        .as_deref()
+        .is_some_and(|pending| active.refresh_token.as_deref() == Some(pending)))
+}
+
+async fn revoke(client_mode: ClientMode<'_>, revocation: &PendingRevocation) -> bool {
+    if revocation.token.trim().is_empty() {
+        return false;
+    }
+    let Ok(issuer) = canonicalize_issuer(&revocation.issuer) else {
+        return false;
+    };
+    let Ok(client) = client_mode.for_issuer(&issuer) else {
+        return false;
+    };
+    let logout_url = format!("{issuer}/api/cli/logout");
+    let request = client.post(&logout_url).bearer_auth(&revocation.token);
+    let request = if let Some(refresh_token) = revocation
+        .refresh_token
+        .as_deref()
+        .filter(|token| !token.trim().is_empty())
+    {
+        request.json(&serde_json::json!({ "refreshToken": refresh_token }))
+    } else {
+        request
+    };
+    matches!(
+        tokio::time::timeout(REVOCATION_REQUEST_TIMEOUT, request.send()).await,
+        Ok(Ok(response)) if response.status().is_success()
+    )
+}
+
+async fn drain_pending_for_active_locked(
+    client_mode: ClientMode<'_>,
+    credentials_path: &Path,
+    active: &mut Credentials,
+) -> Result<usize> {
+    let mut detached = credentials::read_pending(credentials_path)?;
+    if !detached.is_empty() {
+        active.pending_revocations.append(&mut detached);
+        deduplicate_revocations(&mut active.pending_revocations);
+        credentials::write(credentials_path, active)?;
+        let _ = credentials::write_pending(credentials_path, &[]);
+    }
+
+    for revocation in active.pending_revocations.clone() {
+        match revocation_matches_active(&revocation, active) {
+            Ok(true) => {
+                active
+                    .pending_revocations
+                    .retain(|item| item != &revocation);
+                credentials::write(credentials_path, active)?;
+                continue;
+            }
+            Ok(false) => {}
+            Err(_) => continue,
+        }
+        if revoke(client_mode, &revocation).await {
+            active
+                .pending_revocations
+                .retain(|item| item != &revocation);
+            credentials::write(credentials_path, active)?;
+        }
+    }
+    Ok(active.pending_revocations.len())
+}
+
+async fn drain_pending_without_active_locked(
+    client_mode: ClientMode<'_>,
+    credentials_path: &Path,
+    pending: &mut Vec<PendingRevocation>,
+) -> Result<usize> {
+    deduplicate_revocations(pending);
+    for revocation in pending.clone() {
+        if revoke(client_mode, &revocation).await {
+            pending.retain(|item| item != &revocation);
+            credentials::write_pending(credentials_path, pending)?;
+        }
+    }
+    Ok(pending.len())
+}
+
+fn spawn_pending_revocation_drain(credentials_path: &Path) {
+    let credentials_path = credentials_path.to_path_buf();
+    tokio::spawn(async move {
+        let _ = drain_pending_revocations(&credentials_path).await;
+    });
+}
+
+async fn drain_pending_revocations(credentials_path: &Path) -> Result<()> {
+    let _lock = credentials::CredentialLock::acquire(credentials_path).await?;
+    match credentials::read(credentials_path)? {
+        Some(mut active) => {
+            drain_pending_for_active_locked(ClientMode::Secure, credentials_path, &mut active)
+                .await?;
+        }
+        None => {
+            let mut pending = credentials::read_pending(credentials_path)?;
+            drain_pending_without_active_locked(ClientMode::Secure, credentials_path, &mut pending)
+                .await?;
+        }
+    }
+    Ok(())
 }
 
 async fn refresh_token_with(
@@ -350,7 +736,24 @@ async fn refresh_token_with(
     .map_err(|_| anyhow!("could not refresh the stored postil login; try again"))?
     .map_err(|_| anyhow!("could not refresh the stored postil login; try again"))?;
     let status = response.status();
-    if status.is_server_error() || matches!(status.as_u16(), 408 | 429) {
+    if status.as_u16() == 429 {
+        if let Some(retry_after) = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| {
+                !value.is_empty()
+                    && value.bytes().all(|byte| byte.is_ascii_digit())
+                    && value.parse::<u64>().is_ok()
+            })
+        {
+            anyhow::bail!(
+                "could not refresh the stored postil login; retry after {retry_after} seconds"
+            );
+        }
+        anyhow::bail!("could not refresh the stored postil login; try again");
+    }
+    if status.is_server_error() || status.as_u16() == 408 {
         anyhow::bail!("could not refresh the stored postil login; try again");
     }
     if !status.is_success() {
@@ -504,6 +907,7 @@ mod tests {
         assert_eq!(exit, 0);
         let stored = credentials::read(&credentials_path).unwrap().unwrap();
         assert_eq!(stored.token, "pcli_test-token-not-a-real-secret");
+        assert_eq!(stored.issuer.as_deref(), Some(server.uri().as_str()));
         assert_eq!(stored.org, "runatlas-is");
         assert_eq!(stored.model, "z-ai/glm-5.2");
         assert_eq!(
@@ -580,7 +984,7 @@ mod tests {
         );
 
         let stored = credentials::read(&credentials_path).unwrap().unwrap();
-        assert_eq!(stored.version, 1);
+        assert_eq!(stored.version, credentials::CREDENTIALS_VERSION);
         assert!(stored.refresh_token.is_none());
         assert!(stored.refresh_expires_at.is_none());
     }
@@ -620,6 +1024,163 @@ mod tests {
         assert_eq!(exit, 0);
         assert_eq!(responder.calls.load(Ordering::SeqCst), 3);
         assert!(credentials::read(&credentials_path).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn login_retries_an_ambiguous_server_failure_with_the_same_device_code() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/cli/device/start"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(start_body()))
+            .mount(&server)
+            .await;
+        let responder = SequentialTokenResponder {
+            calls: Arc::new(AtomicUsize::new(0)),
+            responses: Arc::new(vec![
+                (500, serde_json::json!({"status": "uncertain"})),
+                (200, approved_body()),
+            ]),
+        };
+        Mock::given(method("POST"))
+            .and(path("/api/cli/device/token"))
+            .respond_with(responder.clone())
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let credentials_path = dir.path().join("postil").join("credentials.json");
+        assert_eq!(
+            login_with(
+                &reqwest::Client::new(),
+                &server.uri(),
+                None,
+                &credentials_path,
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(responder.calls.load(Ordering::SeqCst), 2);
+        let requests = server.received_requests().await.unwrap();
+        let device_codes = requests
+            .iter()
+            .filter(|request| request.url.path() == "/api/cli/device/token")
+            .map(|request| request.body_json::<serde_json::Value>().unwrap()["deviceCode"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            device_codes,
+            vec![
+                serde_json::json!("test-device-code"),
+                serde_json::json!("test-device-code")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn login_write_failure_retains_the_new_family_revocation_handle() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let credentials_path = dir.path().join("postil").join("credentials.json");
+        let mut approved = stored_credentials_at(&server.uri(), "2999-01-01T00:00:00.000Z");
+        approved.token = "pcli_test-token-not-a-real-secret".to_string();
+        approved.refresh_token = Some("fixture-refresh-not-a-credential".to_string());
+        let client = reqwest::Client::new();
+        let error = persist_approved_login_with(
+            ClientMode::Provided(&client),
+            &credentials_path,
+            &mut approved,
+            |_path, _credentials| anyhow::bail!("simulated active credential write failure"),
+        )
+        .await
+        .expect_err("installing the active credential should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("simulated active credential write failure")
+        );
+        assert!(credentials::read(&credentials_path).unwrap().is_none());
+        let pending = credentials::read_pending(&credentials_path).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].issuer, server.uri());
+        assert_eq!(pending[0].token, "pcli_test-token-not-a-real-secret");
+        assert_eq!(
+            pending[0].refresh_token.as_deref(),
+            Some("fixture-refresh-not-a-credential")
+        );
+    }
+
+    #[tokio::test]
+    async fn relogin_retains_a_failed_old_family_revocation_until_retry_succeeds() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/cli/device/start"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(start_body()))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/cli/device/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(approved_body()))
+            .mount(&server)
+            .await;
+        let revocations = SequentialTokenResponder {
+            calls: Arc::new(AtomicUsize::new(0)),
+            responses: Arc::new(vec![
+                (503, serde_json::json!({"status": "retry"})),
+                (200, serde_json::json!({"status": "revoked"})),
+            ]),
+        };
+        Mock::given(method("POST"))
+            .and(path("/api/cli/logout"))
+            .respond_with(revocations.clone())
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let credentials_path = dir.path().join("postil").join("credentials.json");
+        credentials::write(
+            &credentials_path,
+            &stored_credentials_at(&server.uri(), "2999-01-01T00:00:00.000Z"),
+        )
+        .unwrap();
+        let client = reqwest::Client::new();
+
+        assert_eq!(
+            login_with(&client, &server.uri(), None, &credentials_path)
+                .await
+                .unwrap(),
+            0
+        );
+        let mut stored = credentials::read(&credentials_path).unwrap().unwrap();
+        assert_eq!(stored.token, "pcli_test-token-not-a-real-secret");
+        assert_eq!(stored.pending_revocations.len(), 1);
+        assert_eq!(
+            stored.pending_revocations[0].refresh_token.as_deref(),
+            Some("fixture-old-refresh-not-a-credential")
+        );
+        assert_eq!(stored.pending_revocations[0].issuer, server.uri());
+
+        let _lock = credentials::CredentialLock::acquire(&credentials_path)
+            .await
+            .unwrap();
+        assert_eq!(
+            drain_pending_for_active_locked(
+                ClientMode::Provided(&client),
+                &credentials_path,
+                &mut stored,
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        assert!(
+            credentials::read(&credentials_path)
+                .unwrap()
+                .unwrap()
+                .pending_revocations
+                .is_empty()
+        );
+        assert_eq!(revocations.calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -682,11 +1243,27 @@ mod tests {
         assert!(credentials::read(&credentials_path).unwrap().is_none());
     }
 
+    #[test]
+    fn issuer_normalization_removes_default_ports_and_trailing_slashes() {
+        assert_eq!(
+            canonicalize_issuer(" HTTPS://Example.COM:443/auth/// ").unwrap(),
+            "https://example.com/auth"
+        );
+        assert_eq!(
+            canonicalize_issuer("http://Example.COM:80/").unwrap(),
+            "http://example.com"
+        );
+    }
+
     #[tokio::test]
-    async fn logout_removes_credentials_even_when_the_server_call_fails() {
-        // No mock mounted for /api/cli/logout at all: every request to this
-        // server 404s, standing in for "the network call failed."
+    async fn transient_logout_failure_preserves_the_revocation_handle() {
         let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/cli/logout"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
 
         let dir = tempfile::tempdir().unwrap();
         let credentials_path = dir.path().join("postil").join("credentials.json");
@@ -694,6 +1271,7 @@ mod tests {
             &credentials_path,
             &Credentials {
                 version: credentials::CREDENTIALS_VERSION,
+                issuer: Some(server.uri()),
                 token: "pcli_test-token-not-a-real-secret".to_string(),
                 expires_at: "2999-01-01T00:00:00.000Z".to_string(),
                 refresh_token: Some("fixture-refresh-not-a-credential".to_string()),
@@ -701,6 +1279,7 @@ mod tests {
                 api_base: "https://postil.dev/api/inference/v1".to_string(),
                 org: "runatlas-is".to_string(),
                 model: "z-ai/glm-5.2".to_string(),
+                pending_revocations: Vec::new(),
             },
         )
         .unwrap();
@@ -708,8 +1287,86 @@ mod tests {
         let exit = logout_with(&reqwest::Client::new(), &server.uri(), &credentials_path)
             .await
             .unwrap();
-        assert_eq!(exit, 0);
-        assert!(!credentials_path.exists());
+        assert_eq!(exit, 1);
+        assert!(credentials_path.exists());
+        let stored = credentials::read(&credentials_path).unwrap().unwrap();
+        assert_eq!(
+            stored.refresh_token.as_deref(),
+            Some("fixture-refresh-not-a-credential")
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_issuer_conflict_sends_no_refresh_or_logout_credential() {
+        let issuing_server = MockServer::start().await;
+        let conflicting_server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let credentials_path = dir.path().join("postil").join("credentials.json");
+        let original = stored_credentials_at(&issuing_server.uri(), "2020-01-01T00:00:00.000Z");
+        credentials::write(&credentials_path, &original).unwrap();
+        let client = reqwest::Client::new();
+        let conflicting_issuer = format!("{}/", conflicting_server.uri());
+
+        let refresh_error = resolve_stored_token_with_mode(
+            ClientMode::Provided(&client),
+            Some(&conflicting_issuer),
+            &credentials_path,
+            &original.api_base,
+        )
+        .await
+        .expect_err("a conflicting issuer must stop refresh");
+        let logout_error = logout_with_mode(
+            ClientMode::Provided(&client),
+            Some(&conflicting_issuer),
+            &credentials_path,
+        )
+        .await
+        .expect_err("a conflicting issuer must stop logout");
+
+        assert!(refresh_error.to_string().contains(LOGIN_SERVER_ENV));
+        assert!(refresh_error.to_string().contains("postil login"));
+        assert!(logout_error.to_string().contains(LOGIN_SERVER_ENV));
+        assert!(issuing_server.received_requests().await.unwrap().is_empty());
+        assert!(
+            conflicting_server
+                .received_requests()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            credentials::read(&credentials_path).unwrap().unwrap(),
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn api_base_conflict_sends_no_stored_credential() {
+        let issuing_server = MockServer::start().await;
+        let other_api = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let credentials_path = dir.path().join("postil").join("credentials.json");
+        let original = stored_credentials_at(&issuing_server.uri(), "2020-01-01T00:00:00.000Z");
+        credentials::write(&credentials_path, &original).unwrap();
+
+        let error = resolve_stored_token_with_mode(
+            ClientMode::Provided(&reqwest::Client::new()),
+            None,
+            &credentials_path,
+            &other_api.uri(),
+        )
+        .await
+        .expect_err("a stored bearer must remain bound to its API base");
+
+        let message = error.to_string();
+        assert!(message.contains("bound to"));
+        assert!(message.contains("explicit key"));
+        assert!(issuing_server.received_requests().await.unwrap().is_empty());
+        assert!(other_api.received_requests().await.unwrap().is_empty());
+        assert_eq!(
+            credentials::read(&credentials_path).unwrap().unwrap(),
+            original
+        );
     }
 
     #[tokio::test]
@@ -737,7 +1394,7 @@ mod tests {
         let credentials_path = dir.path().join("postil").join("credentials.json");
         credentials::write(
             &credentials_path,
-            &stored_credentials("2999-01-01T00:00:00.000Z"),
+            &stored_credentials_at(&server.uri(), "2999-01-01T00:00:00.000Z"),
         )
         .unwrap();
         let held_lock = credentials::CredentialLock::acquire(&credentials_path)
@@ -766,6 +1423,7 @@ mod tests {
     fn stored_credentials(expires_at: &str) -> Credentials {
         Credentials {
             version: credentials::CREDENTIALS_VERSION,
+            issuer: Some(DEFAULT_LOGIN_SERVER.to_string()),
             token: "pcli_test-old-access-not-a-real-secret".to_string(),
             expires_at: expires_at.to_string(),
             refresh_token: Some("fixture-old-refresh-not-a-credential".to_string()),
@@ -773,7 +1431,14 @@ mod tests {
             api_base: "https://postil.dev/api/inference/v1".to_string(),
             org: "runatlas-is".to_string(),
             model: "z-ai/glm-5.2".to_string(),
+            pending_revocations: Vec::new(),
         }
+    }
+
+    fn stored_credentials_at(issuer: &str, expires_at: &str) -> Credentials {
+        let mut credentials = stored_credentials(expires_at);
+        credentials.issuer = Some(canonicalize_issuer(issuer).unwrap());
+        credentials
     }
 
     fn write_legacy_credentials(path: &Path, credentials: &Credentials) {
@@ -802,19 +1467,25 @@ mod tests {
         let credentials_path = dir.path().join("postil").join("credentials.json");
         credentials::write(
             &credentials_path,
-            &stored_credentials("2020-01-01T00:00:00.000Z"),
+            &stored_credentials_at(&server.uri(), "2020-01-01T00:00:00.000Z"),
         )
         .unwrap();
 
-        let resolved =
-            resolve_stored_token_with(&reqwest::Client::new(), &server.uri(), &credentials_path)
-                .await
-                .unwrap();
+        let client = reqwest::Client::new();
+        let resolved = resolve_stored_token_with_mode(
+            ClientMode::Provided(&client),
+            None,
+            &credentials_path,
+            "https://postil.dev/api/inference/v1",
+        )
+        .await
+        .unwrap();
         assert_eq!(
             resolved.as_deref(),
             Some("pcli_test-new-access-not-a-real-secret")
         );
         let stored = credentials::read(&credentials_path).unwrap().unwrap();
+        assert_eq!(stored.issuer.as_deref(), Some(server.uri().as_str()));
         assert_eq!(stored.token, "pcli_test-new-access-not-a-real-secret");
         assert_eq!(
             stored.refresh_token.as_deref(),
@@ -836,7 +1507,11 @@ mod tests {
             .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let credentials_path = dir.path().join("postil").join("credentials.json");
-        credentials::write(&credentials_path, &stored_credentials(&expires_at)).unwrap();
+        credentials::write(
+            &credentials_path,
+            &stored_credentials_at(&server.uri(), &expires_at),
+        )
+        .unwrap();
 
         resolve_stored_token_with(&reqwest::Client::new(), &server.uri(), &credentials_path)
             .await
@@ -872,7 +1547,7 @@ mod tests {
         let credentials_path = dir.path().join("postil").join("credentials.json");
         credentials::write(
             &credentials_path,
-            &stored_credentials("2020-01-01T00:00:00.000Z"),
+            &stored_credentials_at(&server.uri(), "2020-01-01T00:00:00.000Z"),
         )
         .unwrap();
         let client = reqwest::Client::new();
@@ -903,7 +1578,7 @@ mod tests {
             .await;
         let dir = tempfile::tempdir().unwrap();
         let credentials_path = dir.path().join("postil").join("credentials.json");
-        let original = stored_credentials("2020-01-01T00:00:00.000Z");
+        let original = stored_credentials_at(&server.uri(), "2020-01-01T00:00:00.000Z");
         credentials::write(&credentials_path, &original).unwrap();
 
         let error =
@@ -929,7 +1604,7 @@ mod tests {
             .await;
         let dir = tempfile::tempdir().unwrap();
         let credentials_path = dir.path().join("postil").join("credentials.json");
-        let original = stored_credentials("2020-01-01T00:00:00.000Z");
+        let original = stored_credentials_at(&server.uri(), "2020-01-01T00:00:00.000Z");
         credentials::write(&credentials_path, &original).unwrap();
 
         let error =
@@ -954,7 +1629,7 @@ mod tests {
             .await;
         let dir = tempfile::tempdir().unwrap();
         let credentials_path = dir.path().join("postil").join("credentials.json");
-        let original = stored_credentials("2020-01-01T00:00:00.000Z");
+        let original = stored_credentials_at(&server.uri(), "2020-01-01T00:00:00.000Z");
         credentials::write(&credentials_path, &original).unwrap();
 
         let error =
@@ -970,18 +1645,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_record_without_issuer_is_bound_to_the_public_default() {
+        let override_server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let credentials_path = dir.path().join("postil").join("credentials.json");
+        let mut legacy_refresh = stored_credentials("2020-01-01T00:00:00.000Z");
+        legacy_refresh.version = credentials::LEGACY_REFRESH_CREDENTIALS_VERSION;
+        legacy_refresh.issuer = None;
+        credentials::write(&credentials_path, &legacy_refresh).unwrap();
+
+        assert_eq!(
+            stored_issuer(&legacy_refresh).unwrap(),
+            DEFAULT_LOGIN_SERVER
+        );
+        let error = resolve_stored_token_with(
+            &reqwest::Client::new(),
+            &override_server.uri(),
+            &credentials_path,
+        )
+        .await
+        .expect_err("an old refresh credential must not follow an issuer override");
+
+        assert!(error.to_string().contains(LOGIN_SERVER_ENV));
+        assert!(error.to_string().contains("postil login"));
+        assert!(
+            override_server
+                .received_requests()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            credentials::read(&credentials_path).unwrap().unwrap(),
+            legacy_refresh
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_refresh_record_without_issuer_fails_before_network() {
+        let custom_server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let credentials_path = dir.path().join("postil").join("credentials.json");
+        let mut legacy_refresh = stored_credentials("2020-01-01T00:00:00.000Z");
+        legacy_refresh.version = credentials::LEGACY_REFRESH_CREDENTIALS_VERSION;
+        legacy_refresh.issuer = None;
+        legacy_refresh.api_base = format!("{}/api/inference/v1", custom_server.uri());
+        credentials::write(&credentials_path, &legacy_refresh).unwrap();
+
+        let error = resolve_stored_token_with_mode(
+            ClientMode::Provided(&reqwest::Client::new()),
+            None,
+            &credentials_path,
+            &legacy_refresh.api_base,
+        )
+        .await
+        .expect_err("an issuer-free custom refresh credential must require login");
+
+        assert!(error.to_string().contains("no issuing server"));
+        assert!(error.to_string().contains("postil login"));
+        assert!(custom_server.received_requests().await.unwrap().is_empty());
+        assert_eq!(
+            credentials::read(&credentials_path).unwrap().unwrap(),
+            legacy_refresh
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_access_record_without_issuer_refuses_logout_before_network() {
+        let custom_server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let credentials_path = dir.path().join("postil").join("credentials.json");
+        let mut legacy_access = stored_credentials("2999-01-01T00:00:00.000Z");
+        legacy_access.version = 1;
+        legacy_access.issuer = None;
+        legacy_access.refresh_token = None;
+        legacy_access.refresh_expires_at = None;
+        legacy_access.api_base = format!("{}/api/inference/v1", custom_server.uri());
+        write_legacy_credentials(&credentials_path, &legacy_access);
+
+        let error = logout_with_mode(
+            ClientMode::Provided(&reqwest::Client::new()),
+            None,
+            &credentials_path,
+        )
+        .await
+        .expect_err("an issuer-free custom access credential must require login");
+
+        assert!(error.to_string().contains("no issuing server"));
+        assert!(error.to_string().contains("postil login"));
+        assert!(custom_server.received_requests().await.unwrap().is_empty());
+        assert_eq!(
+            credentials::read(&credentials_path).unwrap().unwrap(),
+            legacy_access
+        );
+    }
+
+    #[tokio::test]
     async fn expired_v1_login_requires_relogin() {
         let dir = tempfile::tempdir().unwrap();
         let credentials_path = dir.path().join("postil").join("credentials.json");
         let mut legacy = stored_credentials("2020-01-01T00:00:00.000Z");
         legacy.version = 1;
+        legacy.issuer = None;
         legacy.refresh_token = None;
         legacy.refresh_expires_at = None;
         write_legacy_credentials(&credentials_path, &legacy);
 
         let error = resolve_stored_token_with(
             &reqwest::Client::new(),
-            "http://127.0.0.1:9",
+            DEFAULT_LOGIN_SERVER,
             &credentials_path,
         )
         .await
@@ -995,13 +1767,14 @@ mod tests {
         let credentials_path = dir.path().join("postil").join("credentials.json");
         let mut legacy = stored_credentials("2999-01-01T00:00:00.000Z");
         legacy.version = 1;
+        legacy.issuer = None;
         legacy.refresh_token = None;
         legacy.refresh_expires_at = None;
         write_legacy_credentials(&credentials_path, &legacy);
 
         let resolved = resolve_stored_token_with(
             &reqwest::Client::new(),
-            "http://127.0.0.1:9",
+            "https://self-hosted.example.test",
             &credentials_path,
         )
         .await
@@ -1022,7 +1795,7 @@ mod tests {
 
         let error = resolve_stored_token_with(
             &reqwest::Client::new(),
-            "http://127.0.0.1:9",
+            DEFAULT_LOGIN_SERVER,
             &credentials_path,
         )
         .await
@@ -1043,11 +1816,12 @@ mod tests {
         let credentials_path = dir.path().join("postil").join("credentials.json");
         credentials::write(
             &credentials_path,
-            &stored_credentials("2020-01-01T00:00:00.000Z"),
+            &stored_credentials_at(&server.uri(), "2020-01-01T00:00:00.000Z"),
         )
         .unwrap();
 
-        logout_with(&reqwest::Client::new(), &server.uri(), &credentials_path)
+        let client = reqwest::Client::new();
+        logout_with_mode(ClientMode::Provided(&client), None, &credentials_path)
             .await
             .unwrap();
         assert!(!credentials_path.exists());
@@ -1072,7 +1846,7 @@ mod tests {
             .await;
         let dir = tempfile::tempdir().unwrap();
         let credentials_path = dir.path().join("postil").join("credentials.json");
-        let mut legacy = stored_credentials("2999-01-01T00:00:00.000Z");
+        let mut legacy = stored_credentials_at(&server.uri(), "2999-01-01T00:00:00.000Z");
         legacy.version = 1;
         legacy.refresh_token = None;
         legacy.refresh_expires_at = None;
@@ -1094,24 +1868,63 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/cli/token/refresh"))
-            .respond_with(ResponseTemplate::new(429).set_body_string("retry later"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "3527")
+                    .set_body_string("retry later"),
+            )
             .mount(&server)
             .await;
         let dir = tempfile::tempdir().unwrap();
         let credentials_path = dir.path().join("postil").join("credentials.json");
-        let original = stored_credentials("2020-01-01T00:00:00.000Z");
+        let original = stored_credentials_at(&server.uri(), "2020-01-01T00:00:00.000Z");
         credentials::write(&credentials_path, &original).unwrap();
 
         let error =
             resolve_stored_token_with(&reqwest::Client::new(), &server.uri(), &credentials_path)
                 .await
                 .expect_err("rate-limited refreshes must fail closed without relogin");
-        assert!(error.to_string().contains("try again"));
+        assert!(error.to_string().contains("retry after 3527 seconds"));
         assert!(!error.to_string().contains("run `postil login` again"));
         assert_eq!(
             credentials::read(&credentials_path).unwrap().unwrap(),
             original
         );
+    }
+
+    #[tokio::test]
+    async fn malformed_or_missing_retry_after_uses_a_safe_generic_error() {
+        for retry_after in [None, Some("tomorrow"), Some("18446744073709551616")] {
+            let server = MockServer::start().await;
+            let response = ResponseTemplate::new(429).set_body_string("retry later");
+            let response = match retry_after {
+                Some(value) => response.insert_header("Retry-After", value),
+                None => response,
+            };
+            Mock::given(method("POST"))
+                .and(path("/api/cli/token/refresh"))
+                .respond_with(response)
+                .mount(&server)
+                .await;
+            let dir = tempfile::tempdir().unwrap();
+            let credentials_path = dir.path().join("postil").join("credentials.json");
+            let original = stored_credentials_at(&server.uri(), "2020-01-01T00:00:00.000Z");
+            credentials::write(&credentials_path, &original).unwrap();
+
+            let error = resolve_stored_token_with(
+                &reqwest::Client::new(),
+                &server.uri(),
+                &credentials_path,
+            )
+            .await
+            .expect_err("an unusable Retry-After must fail safely");
+            assert!(error.to_string().contains("try again"));
+            assert!(!error.to_string().contains("retry after"));
+            assert_eq!(
+                credentials::read(&credentials_path).unwrap().unwrap(),
+                original
+            );
+        }
     }
 
     #[tokio::test]
@@ -1124,7 +1937,7 @@ mod tests {
             .await;
         let dir = tempfile::tempdir().unwrap();
         let credentials_path = dir.path().join("postil").join("credentials.json");
-        let original = stored_credentials("2020-01-01T00:00:00.000Z");
+        let original = stored_credentials_at(&server.uri(), "2020-01-01T00:00:00.000Z");
         credentials::write(&credentials_path, &original).unwrap();
 
         let error =
@@ -1157,7 +1970,8 @@ mod tests {
         });
         let dir = tempfile::tempdir().unwrap();
         let credentials_path = dir.path().join("postil").join("credentials.json");
-        let original = stored_credentials("2020-01-01T00:00:00.000Z");
+        let original =
+            stored_credentials_at(&format!("http://{address}"), "2020-01-01T00:00:00.000Z");
         credentials::write(&credentials_path, &original).unwrap();
 
         let error = resolve_stored_token_with(

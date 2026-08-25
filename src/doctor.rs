@@ -62,7 +62,7 @@ pub async fn run(cfg: &Config) -> Result<Vec<Check>> {
         Ok(Some(key))
     } else {
         match credentials_path.as_ref() {
-            Ok(path) => login::resolve_stored_token(path).await,
+            Ok(path) => login::resolve_stored_token(path, &cfg.api_base).await,
             Err(error) => Err(anyhow::anyhow!("{error:#}")),
         }
     };
@@ -229,6 +229,7 @@ mod tests {
     fn stored_login() -> Credentials {
         Credentials {
             version: credentials::CREDENTIALS_VERSION,
+            issuer: Some("https://postil.dev".to_string()),
             token: "pcli_test-access-not-a-real-secret".to_string(),
             expires_at: "2999-01-01T00:00:00.000Z".to_string(),
             refresh_token: Some("fixture-refresh-not-a-credential".to_string()),
@@ -236,6 +237,7 @@ mod tests {
             api_base: "https://postil.dev/api/inference/v1".to_string(),
             org: "runatlas-is".to_string(),
             model: "z-ai/glm-5.2".to_string(),
+            pending_revocations: Vec::new(),
         }
     }
 

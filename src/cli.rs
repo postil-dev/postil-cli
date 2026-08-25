@@ -247,14 +247,14 @@ pub enum Command {
         #[command(subcommand)]
         action: HookAction,
     },
-    /// Authenticate against postil.dev for zero-config hosted inference.
+    /// Authenticate through a Postil login server.
     Login {
         /// Organization to select during approval. The browser approval page
         /// is authoritative for membership; this only pre-fills a hint.
         #[arg(long)]
         org: Option<String>,
     },
-    /// Remove the stored login credential and revoke it server-side.
+    /// Revoke the stored login server-side, then remove it locally.
     Logout,
 }
 

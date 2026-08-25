@@ -5,7 +5,7 @@
 //! developer secret bound to one machine, not project configuration. The
 //! bearer token inside spends an organization's hosted-inference
 //! entitlement, so both the containing directory (0700) and the file itself
-//! (0600) get their final permission bits set at creation time -- never
+//! (0600) get their final permission bits set at creation time, never
 //! `chmod`'d afterward, so there is no window where the token is briefly
 //! world-readable.
 
@@ -19,8 +19,10 @@ use anyhow::{Context, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
-pub const CREDENTIALS_VERSION: u32 = 2;
+pub const CREDENTIALS_VERSION: u32 = 3;
 pub const LEGACY_CREDENTIALS_VERSION: u32 = 1;
+pub const LEGACY_REFRESH_CREDENTIALS_VERSION: u32 = 2;
+const PENDING_REVOCATIONS_VERSION: u32 = 1;
 // The refresh exchange has separately bounded send and body-read phases. A
 // second local process waits long enough for both before asking the caller to
 // retry, so concurrent agent runs converge on one token rotation.
@@ -28,8 +30,22 @@ const CREDENTIAL_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs
 const CREDENTIAL_LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(25);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingRevocation {
+    pub issuer: String,
+    pub token: String,
+    #[serde(
+        default,
+        rename = "refreshToken",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub refresh_token: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Credentials {
     pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
     pub token: String,
     #[serde(rename = "expiresAt")]
     pub expires_at: String,
@@ -49,6 +65,18 @@ pub struct Credentials {
     pub api_base: String,
     pub org: String,
     pub model: String,
+    #[serde(
+        default,
+        rename = "pendingRevocations",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub pending_revocations: Vec<PendingRevocation>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PendingRevocations {
+    version: u32,
+    revocations: Vec<PendingRevocation>,
 }
 
 impl Credentials {
@@ -118,9 +146,18 @@ pub fn read(path: &Path) -> Result<Option<Credentials>> {
     anyhow::ensure!(
         matches!(
             credentials.version,
-            LEGACY_CREDENTIALS_VERSION | CREDENTIALS_VERSION
+            LEGACY_CREDENTIALS_VERSION | LEGACY_REFRESH_CREDENTIALS_VERSION | CREDENTIALS_VERSION
         ),
         "unsupported credentials version {}; run `postil login` again",
+        credentials.version
+    );
+    anyhow::ensure!(
+        credentials.version != CREDENTIALS_VERSION
+            || credentials
+                .issuer
+                .as_deref()
+                .is_some_and(|issuer| !issuer.trim().is_empty()),
+        "credentials version {} is missing its issuer; run `postil login` again",
         credentials.version
     );
     Ok(Some(credentials))
@@ -130,11 +167,77 @@ pub fn read(path: &Path) -> Result<Option<Credentials>> {
 /// bits already set, filled, `fsync`'d, then renamed into place, so a reader
 /// never observes a partially written or briefly world-readable file.
 pub fn write(path: &Path, credentials: &Credentials) -> Result<()> {
-    let parent = path
+    anyhow::ensure!(
+        matches!(
+            credentials.version,
+            LEGACY_CREDENTIALS_VERSION | LEGACY_REFRESH_CREDENTIALS_VERSION | CREDENTIALS_VERSION
+        ),
+        "unsupported credentials version {}",
+        credentials.version
+    );
+    anyhow::ensure!(
+        credentials.version != CREDENTIALS_VERSION
+            || credentials
+                .issuer
+                .as_deref()
+                .is_some_and(|issuer| !issuer.trim().is_empty()),
+        "credentials version {} is missing its issuer",
+        credentials.version
+    );
+    write_private_json(path, credentials, "credentials")
+}
+
+pub fn read_pending(credentials_path: &Path) -> Result<Vec<PendingRevocation>> {
+    let path = pending_path(credentials_path)?;
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading {}", path.display()));
+        }
+    };
+    let pending: PendingRevocations =
+        serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+    anyhow::ensure!(
+        pending.version == PENDING_REVOCATIONS_VERSION,
+        "unsupported pending revocations version {}",
+        pending.version
+    );
+    Ok(pending.revocations)
+}
+
+pub fn write_pending(credentials_path: &Path, revocations: &[PendingRevocation]) -> Result<()> {
+    let path = pending_path(credentials_path)?;
+    if revocations.is_empty() {
+        return remove(&path);
+    }
+    write_private_json(
+        &path,
+        &PendingRevocations {
+            version: PENDING_REVOCATIONS_VERSION,
+            revocations: revocations.to_vec(),
+        },
+        "pending revocations",
+    )
+}
+
+fn pending_path(credentials_path: &Path) -> Result<PathBuf> {
+    let parent = credentials_path
         .parent()
         .context("credentials path must have a parent directory")?;
+    Ok(parent.join("pending-revocations.json"))
+}
+
+fn write_private_json<T: Serialize>(path: &Path, value: &T, description: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("{description} path must have a parent directory"))?;
     create_private_dir(parent)?;
-    let temp_path = parent.join(format!(".credentials.{}.tmp", std::process::id()));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .with_context(|| format!("{description} path must have a file name"))?;
+    let temp_path = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
     let _ = fs::remove_file(&temp_path);
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -143,25 +246,32 @@ pub fn write(path: &Path, credentials: &Credentials) -> Result<()> {
     let result = (|| -> Result<()> {
         let mut file = options
             .open(&temp_path)
-            .context("creating private credentials file")?;
-        anyhow::ensure!(
-            matches!(
-                credentials.version,
-                LEGACY_CREDENTIALS_VERSION | CREDENTIALS_VERSION
-            ),
-            "unsupported credentials version {}",
-            credentials.version
-        );
-        serde_json::to_writer_pretty(&mut file, credentials).context("serializing credentials")?;
-        file.write_all(b"\n").context("writing credentials")?;
-        file.sync_all().context("syncing credentials")?;
-        fs::rename(&temp_path, path).context("installing credentials file")?;
+            .with_context(|| format!("creating private {description} file"))?;
+        serde_json::to_writer_pretty(&mut file, value)
+            .with_context(|| format!("serializing {description}"))?;
+        file.write_all(b"\n")
+            .with_context(|| format!("writing {description}"))?;
+        file.sync_all()
+            .with_context(|| format!("syncing {description}"))?;
+        fs::rename(&temp_path, path).with_context(|| format!("installing {description} file"))?;
+        sync_parent_dir(parent).with_context(|| format!("syncing {description} directory"))?;
         Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp_path);
     }
     result
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(parent: &Path) -> Result<()> {
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_parent: &Path) -> Result<()> {
+    Ok(())
 }
 
 /// A kernel-backed, cross-process lock shared by every stored-login mutation.
@@ -250,6 +360,7 @@ mod tests {
     fn sample(expires_at: &str) -> Credentials {
         Credentials {
             version: CREDENTIALS_VERSION,
+            issuer: Some("https://postil.dev".to_string()),
             token: "pcli_test-token-not-a-real-secret".to_string(),
             expires_at: expires_at.to_string(),
             refresh_token: Some("fixture-refresh-not-a-credential".to_string()),
@@ -257,6 +368,7 @@ mod tests {
             api_base: "https://postil.dev/api/inference/v1".to_string(),
             org: "runatlas-is".to_string(),
             model: "z-ai/glm-5.2".to_string(),
+            pending_revocations: Vec::new(),
         }
     }
 
@@ -349,8 +461,42 @@ mod tests {
         .unwrap();
         let credentials = read(&path).unwrap().unwrap();
         assert_eq!(credentials.version, 1);
+        assert!(credentials.issuer.is_none());
         assert!(credentials.refresh_token.is_none());
         assert!(credentials.refresh_expires_at.is_none());
+        assert!(credentials.pending_revocations.is_empty());
+    }
+
+    #[test]
+    fn reads_a_v2_refresh_credential_without_an_issuer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        fs::write(
+            &path,
+            r#"{"version":2,"token":"pcli_test-token-not-a-real-secret","expiresAt":"2999-01-01T00:00:00.000Z","refreshToken":"fixture-refresh-not-a-credential","refreshExpiresAt":"2999-12-01T00:00:00.000Z","apiBase":"https://postil.dev/api/inference/v1","org":"runatlas-is","model":"z-ai/glm-5.2"}"#,
+        )
+        .unwrap();
+        let credentials = read(&path).unwrap().unwrap();
+        assert_eq!(credentials.version, LEGACY_REFRESH_CREDENTIALS_VERSION);
+        assert!(credentials.issuer.is_none());
+        assert!(credentials.can_refresh());
+    }
+
+    #[test]
+    fn rejects_a_current_refresh_credential_without_an_issuer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        fs::write(
+            &path,
+            format!(
+                r#"{{"version":{CREDENTIALS_VERSION},"token":"pcli_test-token-not-a-real-secret","expiresAt":"2999-01-01T00:00:00.000Z","refreshToken":"fixture-refresh-not-a-credential","refreshExpiresAt":"2999-12-01T00:00:00.000Z","apiBase":"https://postil.dev/api/inference/v1","org":"runatlas-is","model":"z-ai/glm-5.2"}}"#
+            ),
+        )
+        .unwrap();
+
+        let error = read(&path).expect_err("current credentials must carry their issuer");
+        assert!(error.to_string().contains("missing its issuer"));
+        assert!(error.to_string().contains("postil login"));
     }
 
     #[test]
@@ -359,12 +505,14 @@ mod tests {
         let path = dir.path().join("postil").join("credentials.json");
         let mut credentials = sample("2999-01-01T00:00:00.000Z");
         credentials.version = 1;
+        credentials.issuer = None;
         credentials.refresh_token = None;
         credentials.refresh_expires_at = None;
         write(&path, &credentials).unwrap();
         let raw = fs::read_to_string(path).unwrap();
         assert!(raw.contains("\"version\": 1"));
         assert!(!raw.contains("refreshToken"));
+        assert!(!raw.contains("issuer"));
     }
 
     #[test]
@@ -401,5 +549,40 @@ mod tests {
             mode, 0o600,
             "stored login lock file must be mode 0600, got {mode:o}"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pending_revocations_are_private_and_atomically_replaced() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let credentials_path = dir.path().join("postil").join("credentials.json");
+        let first = PendingRevocation {
+            issuer: "https://postil.dev".to_string(),
+            token: "pcli_first-access-not-a-real-secret".to_string(),
+            refresh_token: Some("fixture-first-refresh-not-a-credential".to_string()),
+        };
+        let replacement = PendingRevocation {
+            issuer: "https://login.example.test".to_string(),
+            token: "pcli_second-access-not-a-real-secret".to_string(),
+            refresh_token: None,
+        };
+
+        write_pending(&credentials_path, std::slice::from_ref(&first)).unwrap();
+        write_pending(&credentials_path, std::slice::from_ref(&replacement)).unwrap();
+
+        assert_eq!(read_pending(&credentials_path).unwrap(), vec![replacement]);
+        let pending_path = credentials_path
+            .parent()
+            .unwrap()
+            .join("pending-revocations.json");
+        let mode = fs::metadata(&pending_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "pending revocations file must be mode 0600, got {mode:o}"
+        );
+        let temp_name = format!(".pending-revocations.json.{}.tmp", std::process::id());
+        assert!(!pending_path.parent().unwrap().join(temp_name).exists());
     }
 }

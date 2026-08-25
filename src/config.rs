@@ -14,9 +14,10 @@
 //! valid, unexpired credential exists at
 //! `${XDG_CONFIG_HOME:-~/.config}/postil/credentials.json`,
 //! `login::resolve_stored_token` supplies its bearer key and its `apiBase`/
-//! `model` replace the values resolved above -- unless `POSTIL_API_BASE` /
-//! `REVIEW_MODEL` are set, which still win, applied first in this same
-//! function. An expired or unreadable stored credential is left alone here;
+//! `model` replace the values resolved above. `REVIEW_MODEL` may still replace
+//! the model. `POSTIL_API_BASE` may replace the endpoint only when an explicit
+//! API key is also set; a stored login remains bound to its issuing endpoint.
+//! An expired or unreadable stored credential is left alone here;
 //! `resolve_api_key` reports it as one actionable "run `postil login` again"
 //! error, while `postil config` reports the stored-login state without needing
 //! a live key.
@@ -1471,10 +1472,11 @@ impl Config {
 
     /// A first-time `postil login` user gets working defaults with zero
     /// `.postil.yaml`: when no explicit key env var is set, a stored
-    /// credential supplies `apiBase` and `model`, unless `POSTIL_API_BASE`/
-    /// `REVIEW_MODEL` (just applied above) already overrode them. The
-    /// cascade is cleared along with `model`, since a leftover BYOK cascade
-    /// names models the hosted gateway does not operate.
+    /// credential supplies `apiBase` and `model`, unless `POSTIL_API_BASE` or
+    /// `REVIEW_MODEL` (just applied above) already overrode them. Runtime
+    /// credential resolution rejects an endpoint override when no explicit
+    /// API key is set. The cascade is cleared along with `model`, since a
+    /// leftover BYOK cascade names models the hosted gateway does not operate.
     ///
     /// This applies even when the credential is expired: routing
     /// (`apiBase`/`model`) is not a secret, and populating it here is what
@@ -1959,7 +1961,7 @@ fn repository_model_config_locked() -> bool {
             .unwrap_or(false)
 }
 
-fn normalize_api_base(value: &str) -> Result<String> {
+pub(crate) fn normalize_api_base(value: &str) -> Result<String> {
     let url = reqwest::Url::parse(value).context("model API base must be an absolute URL")?;
     anyhow::ensure!(
         matches!(url.scheme(), "http" | "https"),

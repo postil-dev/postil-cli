@@ -1172,6 +1172,147 @@ fn postil() -> Command {
 }
 
 #[tokio::test]
+async fn transient_logout_failure_keeps_the_local_revocation_handle() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/cli/logout"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let config_home = dir.path().join("config");
+    let credentials_dir = config_home.join("postil");
+    std::fs::create_dir_all(&credentials_dir).unwrap();
+    let credentials_path = credentials_dir.join("credentials.json");
+    std::fs::write(
+        &credentials_path,
+        serde_json::to_vec(&json!({
+            "version": 3,
+            "issuer": server.uri(),
+            "token": "pcli_e2e-access-not-a-real-secret",
+            "expiresAt": "2999-01-01T00:00:00.000Z",
+            "refreshToken": "fixture-e2e-refresh-not-a-credential",
+            "refreshExpiresAt": "2999-12-01T00:00:00.000Z",
+            "apiBase": "https://postil.dev/api/inference/v1",
+            "org": "example",
+            "model": "example/model"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let assertion = postil()
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("POSTIL_LOGIN_SERVER", format!("{}/", server.uri()))
+        .arg("logout")
+        .assert()
+        .code(1);
+    let stderr = String::from_utf8(assertion.get_output().stderr.clone()).unwrap();
+
+    assert!(stderr.contains("credentials were kept"));
+    assert!(stderr.contains("postil logout"));
+    assert!(!stderr.contains("logged out"));
+    let stored: Value = serde_json::from_slice(&std::fs::read(credentials_path).unwrap()).unwrap();
+    assert!(stored["refreshToken"].is_string());
+}
+
+#[tokio::test]
+async fn stored_login_refuses_an_api_base_override_before_network() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let config_home = dir.path().join("config");
+    let credentials_dir = config_home.join("postil");
+    std::fs::create_dir_all(&credentials_dir).unwrap();
+    std::fs::write(
+        credentials_dir.join("credentials.json"),
+        serde_json::to_vec(&json!({
+            "version": 3,
+            "issuer": "https://postil.dev",
+            "token": "pcli_e2e-access-not-a-real-secret",
+            "expiresAt": "2999-01-01T00:00:00.000Z",
+            "refreshToken": "fixture-e2e-refresh-not-a-credential",
+            "refreshExpiresAt": "2999-12-01T00:00:00.000Z",
+            "apiBase": "https://postil.dev/api/inference/v1",
+            "org": "example",
+            "model": "openai/gpt-5-mini"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let diff = write_diff(dir.path());
+
+    let output = postil()
+        .current_dir(dir.path())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("POSTIL_API_BASE", server.uri())
+        .env_remove("POSTIL_API_KEY")
+        .env_remove("OPENROUTER_API_KEY")
+        .env_remove("MODEL_API_KEY")
+        .env_remove("LLM_API_KEY")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+    assert!(stderr.contains("stored postil login is bound to"));
+    assert!(stderr.contains("explicit key"));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn explicit_byok_key_remains_valid_with_an_api_base_override() {
+    let server = MockServer::start().await;
+    let provider_key = fixture_credential("provider");
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(header("authorization", format!("Bearer {provider_key}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"content": "{\"summary\":\"\",\"findings\":[]}"}
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let config_home = dir.path().join("config");
+    let credentials_dir = config_home.join("postil");
+    std::fs::create_dir_all(&credentials_dir).unwrap();
+    std::fs::write(
+        credentials_dir.join("credentials.json"),
+        serde_json::to_vec(&json!({
+            "version": 3,
+            "issuer": "https://postil.dev",
+            "token": "pcli_e2e-access-not-a-real-secret",
+            "expiresAt": "2999-01-01T00:00:00.000Z",
+            "refreshToken": "fixture-e2e-refresh-not-a-credential",
+            "refreshExpiresAt": "2999-12-01T00:00:00.000Z",
+            "apiBase": "https://postil.dev/api/inference/v1",
+            "org": "example",
+            "model": "openai/gpt-5-mini"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let diff = write_diff(dir.path());
+
+    postil()
+        .current_dir(dir.path())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("POSTIL_API_BASE", server.uri())
+        .env("MODEL_API_KEY", provider_key)
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+}
+
+#[tokio::test]
 async fn local_review_stays_local_without_a_forge_token_in_ci() {
     let server = MockServer::start().await;
     let dir = tempfile::tempdir().unwrap();

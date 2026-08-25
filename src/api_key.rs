@@ -115,6 +115,7 @@ mod tests {
     fn stored_credential(expires_at: &str) -> Credentials {
         Credentials {
             version: credentials::CREDENTIALS_VERSION,
+            issuer: Some("https://postil.dev".to_string()),
             token: "pcli_stored-token-not-a-real-secret".to_string(),
             expires_at: expires_at.to_string(),
             refresh_token: None,
@@ -122,6 +123,7 @@ mod tests {
             api_base: "https://postil.dev/api/inference/v1".to_string(),
             org: "runatlas-is".to_string(),
             model: "z-ai/glm-5.2".to_string(),
+            pending_revocations: Vec::new(),
         }
     }
 

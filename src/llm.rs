@@ -2603,7 +2603,7 @@ impl LlmClient {
     /// Local and interactive clients have no built-in total deadline. They only
     /// get one when POSTIL_LLM_TOTAL_TIMEOUT_SECS is explicitly set.
     pub async fn from_env(cfg: &Config) -> Result<Self> {
-        let api_key = resolve_api_key().await?;
+        let api_key = resolve_api_key(&cfg.api_base).await?;
         let timeouts = LlmTimeouts::from_env(DEFAULT_REQUEST_TIMEOUT_SECS, None)?;
         let total_deadline = timeouts.total.map(|duration| Instant::now() + duration);
         Self::build(
@@ -2622,7 +2622,7 @@ impl LlmClient {
         default_review_timeout: Duration,
         default_total_timeout: Duration,
     ) -> Result<Self> {
-        let api_key = resolve_api_key().await?;
+        let api_key = resolve_api_key(&cfg.api_base).await?;
         let timeouts = LlmTimeouts::from_env(
             default_request_timeout.as_secs(),
             Some(default_total_timeout.as_secs()),
@@ -5650,7 +5650,7 @@ impl LlmTimeouts {
     }
 }
 
-async fn resolve_api_key() -> Result<String> {
+async fn resolve_api_key(api_base: &str) -> Result<String> {
     // Checked first, and independently of the credentials-path lookup below,
     // so an explicit key still works in a minimal environment with no HOME
     // or XDG_CONFIG_HOME -- exactly what worked before login existed.
@@ -5658,7 +5658,7 @@ async fn resolve_api_key() -> Result<String> {
     let stored_login = async {
         let credentials_path = crate::credentials::default_path()
             .context("resolving the postil login credentials path")?;
-        crate::login::resolve_stored_token(&credentials_path).await
+        crate::login::resolve_stored_token(&credentials_path, api_base).await
     };
     match api_key::resolve_explicit_or_stored(explicit_key, stored_login).await? {
         Some(key) => Ok(key),
