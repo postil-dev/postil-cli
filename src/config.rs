@@ -1192,7 +1192,7 @@ impl Config {
     /// Resolve config for a repo root. `explicit` (from --config) bypasses discovery.
     pub fn load(root: &Path, explicit: Option<&Path>) -> Result<Config> {
         #[cfg(test)]
-        let _environment_guard = tests::env_lock().lock().unwrap();
+        let _environment_guard = crate::test_env_lock().lock().unwrap();
         let mut cfg = Config::default();
         // Login supplies a local baseline, below trusted project configuration
         // and environment overrides but above the embedded provider defaults.
@@ -1334,9 +1334,9 @@ impl Config {
         }
         if let Some(m) = f.model {
             if hosted_mode {
-                eprintln!(
+                crate::progress::notice(format_args!(
                     "postil: ignoring repository model configuration in hosted mode; hosted inference selects the provider and model roster"
-                );
+                ));
             } else {
                 if let Some(n) = m.name {
                     self.model = n;
@@ -1371,11 +1371,11 @@ impl Config {
                     if allow_api_base {
                         self.api_base = b;
                     } else {
-                        eprintln!(
+                        crate::progress::notice(format_args!(
                             "postil: ignoring model.apiBase from config ({b:?}); set \
                              POSTIL_ALLOW_CONFIG_API_BASE=1 to honor it, or use the \
                              POSTIL_API_BASE environment variable"
-                        );
+                        ));
                     }
                 }
                 if let Some(format) = m.api_format {
@@ -1665,7 +1665,7 @@ impl Config {
         }
         anyhow::ensure!(
             !generator_chain.is_empty(),
-            "no review model is configured; remove the empty override to use default {}, or run `postil models` for tested presets and override syntax",
+            "no review model is configured; remove the empty override to use default {}, or run `postil models` for supported model IDs, qualification status, and override syntax",
             default_model()
         );
         if hosted {
@@ -2217,8 +2217,8 @@ pub const BUILTIN_CONTENT_POLICY: &str = include_str!("builtin-content-policy.md
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_env_lock as env_lock;
     use std::io::Write;
-    use std::sync::Mutex;
 
     struct EnvRestore {
         name: &'static str,
@@ -2257,11 +2257,6 @@ mod tests {
                 },
             }
         }
-    }
-
-    pub(super) fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
     }
 
     /// Pin tests that exercise local repository model configuration to the
@@ -2902,6 +2897,8 @@ scorer = { enabled = true, default_model = "provider/scorer", reasoning_effort =
                 version: credentials::CREDENTIALS_VERSION,
                 token: "pcli_fixture-not-a-real-secret".into(),
                 expires_at: "2999-01-01T00:00:00.000Z".into(),
+                refresh_token: None,
+                refresh_expires_at: None,
                 api_base: "https://postil.dev/api/inference/v1".into(),
                 org: "fixture".into(),
                 model: "hosted/model".into(),
@@ -2941,6 +2938,8 @@ scorer = { enabled = true, default_model = "provider/scorer", reasoning_effort =
                 version: credentials::CREDENTIALS_VERSION,
                 token: "pcli_fixture-not-a-real-secret".into(),
                 expires_at: "2999-01-01T00:00:00.000Z".into(),
+                refresh_token: None,
+                refresh_expires_at: None,
                 api_base: "https://postil.dev/api/inference/v1".into(),
                 org: "fixture".into(),
                 model: "hosted/model".into(),

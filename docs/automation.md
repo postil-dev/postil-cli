@@ -8,6 +8,8 @@ The JSON and YAML envelope contains the summary, findings, resolved findings, po
 
 `--sarif <path>` writes SARIF 2.1.0 for code-scanning ingestion.
 
+Machine data written to stdout never includes progress controls. Interactive terminals collapse routine telemetry into concise progress only when stdout is human-readable. `--output-file` and `--sarif` keep that human progress because their machine artifacts go to files. `--no-progress` or `POSTIL_NO_PROGRESS=1` replaces animation with concise static milestones. `--verbose` enables complete provider, retry, and batch telemetry. Non-TTY and machine-output contexts retain complete telemetry automatically.
+
 ## Incremental review
 
 ```sh

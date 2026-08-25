@@ -78,7 +78,7 @@ pub enum Command {
     },
     /// Review a diff: a PR/MR on a forge, or local changes.
     #[command(
-        after_help = "Examples:\n  postil review\n  postil review --staged\n  postil review --base origin/main\n\nBare local review selects, in order: staged changes; committed changes since the current branch remote's default branch; tracked working-tree changes; then an empty clean diff. Explicit --staged, --base, and --diff-file keep their exact behavior.\n\nUse `postil models` to see tested presets and override syntax."
+        after_help = "Examples:\n  postil review\n  postil review --staged\n  postil review --base origin/main\n\nBare local review selects, in order: staged changes; committed changes since the current branch remote's default branch; tracked working-tree changes; then an empty clean diff. Locally known symbolic remote HEAD, main, master, and trunk refs are recognized without fetching. If no default branch can be resolved, Postil fails closed and asks for --base, --staged, or --diff-file. Explicit source flags are mutually exclusive and keep their exact behavior.\n\nUse `postil models` to see supported model-ID contracts, embedded defaults, qualification, and override syntax."
     )]
     Review {
         /// Code host for remote review. Inferred as github when --repo is set.
@@ -97,13 +97,13 @@ pub enum Command {
         #[arg(long)]
         base_sha: Option<String>,
         /// Review staged changes (git diff --cached).
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["base", "diff_file"])]
         staged: bool,
         /// Review changes since a base ref (git diff base...HEAD).
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["staged", "diff_file"])]
         base: Option<String>,
         /// Review a unified diff from a file.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["staged", "base"])]
         diff_file: Option<PathBuf>,
         /// Existing advisory check-run id to complete (hosted callers).
         #[arg(long)]
@@ -147,6 +147,9 @@ pub enum Command {
         /// Keep detailed provider, retry, and batch telemetry in interactive terminals.
         #[arg(long)]
         verbose: bool,
+        /// Disable animation while keeping concise human progress milestones.
+        #[arg(long)]
+        no_progress: bool,
         /// Use deterministic semantic synthesis and model-assisted risk selection to cap large reviews at five source batches; report bounded coverage.
         #[arg(long)]
         bounded: bool,
@@ -198,7 +201,7 @@ pub enum Command {
         )]
         publication_input_identity: Option<String>,
     },
-    /// List tested embedded presets and exact local override syntax.
+    /// Explain supported model IDs, embedded defaults, qualification, and overrides.
     Models,
     /// Replay stored envelopes under a candidate config: what would change?
     Plan {
@@ -355,6 +358,41 @@ mod tests {
         assert!(help.contains("--reasoning-effort <EFFORT>"));
         assert!(help.contains("--scorer-reasoning-effort <EFFORT>"));
         assert!(help.contains("max|xhigh|high|medium|low|minimal|none"));
+    }
+
+    #[test]
+    fn local_review_sources_are_mutually_exclusive() {
+        for arguments in [
+            vec!["postil", "review", "--staged", "--base", "main"],
+            vec!["postil", "review", "--staged", "--diff-file", "change.diff"],
+            vec![
+                "postil",
+                "review",
+                "--base",
+                "main",
+                "--diff-file",
+                "change.diff",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(arguments).is_err());
+        }
+    }
+
+    #[test]
+    fn no_progress_keeps_concise_human_milestones() {
+        let parsed = Cli::try_parse_from(["postil", "review", "--no-progress"]).unwrap();
+        let Command::Review { no_progress, .. } = parsed.command else {
+            panic!("expected review command");
+        };
+        assert!(no_progress);
+
+        let help = Cli::command()
+            .find_subcommand_mut("review")
+            .expect("review subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--no-progress"));
+        assert!(help.contains("concise human progress milestones"));
     }
 
     #[test]

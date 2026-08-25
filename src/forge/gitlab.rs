@@ -494,7 +494,9 @@ impl Forge for GitLab {
         }
         let mr = self.mr().await?;
         if !mr_matches_snapshot(&mr, snapshot) {
-            eprintln!("postil: gitlab review delivery skipped because the merge request changed");
+            crate::progress::notice(format_args!(
+                "postil: gitlab review delivery skipped because the merge request changed"
+            ));
             return Ok(receipt);
         }
         let summary = self.review_summary(envelope);
@@ -557,7 +559,9 @@ impl Forge for GitLab {
     ) -> Result<()> {
         let current = self.mr().await?;
         if !mr_matches_snapshot(&current, snapshot) {
-            eprintln!("postil: gitlab status delivery skipped because the merge request changed");
+            crate::progress::notice(format_args!(
+                "postil: gitlab status delivery skipped because the merge request changed"
+            ));
             return Ok(());
         }
         let head = envelope

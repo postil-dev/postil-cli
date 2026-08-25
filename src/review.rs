@@ -425,6 +425,7 @@ pub struct ReviewArgs {
     pub reasoning_effort: Option<String>,
     pub scorer_reasoning_effort: Option<String>,
     pub verbose: bool,
+    pub no_progress: bool,
     pub bounded: bool,
     pub no_post: bool,
     pub defer_gate_check: bool,
@@ -440,6 +441,11 @@ impl ReviewArgs {
         } else {
             self.output
         }
+    }
+
+    fn writes_machine_stdout(&self) -> bool {
+        (self.resolved_output_format().is_some() && self.output_file.is_none())
+            || self.publication_plan_output.as_deref() == Some(Path::new("-"))
     }
 }
 
@@ -467,6 +473,51 @@ struct RemoteReviewResult {
     /// Complete pull-request diff retained for forge placement fallback. An
     /// incremental review cannot establish the complete PR file surface.
     publication_diff: Option<diff::Diff>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReviewOutcome {
+    exit_code: i32,
+    completion: crate::progress::ReviewCompletion,
+}
+
+impl ReviewOutcome {
+    fn from_envelope(envelope: &Envelope) -> Self {
+        use crate::progress::ReviewCompletion;
+
+        let completion = if envelope
+            .findings
+            .iter()
+            .any(|finding| finding.path == crate::envelope::PROVIDER_PATH)
+        {
+            ReviewCompletion::ProviderIncomplete
+        } else if envelope.findings.iter().any(|finding| {
+            finding.path == crate::envelope::OPERATIONAL_PATH
+                && matches!(
+                    finding.title.as_str(),
+                    "Model output could not be validated"
+                        | "Model narrated risk without structured findings"
+                )
+        }) {
+            ReviewCompletion::ModelOutputIncomplete
+        } else if envelope
+            .findings
+            .iter()
+            .any(|finding| finding.path == crate::envelope::OPERATIONAL_PATH)
+        {
+            ReviewCompletion::OperationalIncomplete
+        } else if envelope.gate.failing {
+            ReviewCompletion::BlockingFindings
+        } else if envelope.findings.is_empty() {
+            ReviewCompletion::Clean
+        } else {
+            ReviewCompletion::AdvisoryFindings
+        };
+        Self {
+            exit_code: i32::from(envelope.gate.failing),
+            completion,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -534,86 +585,90 @@ impl std::error::Error for ReviewFailure {}
 
 pub async fn run(args: ReviewArgs) -> Result<i32> {
     let cwd = std::env::current_dir()?;
-    if args.output_json {
-        eprintln!("warning: --output-json is deprecated; use --output json instead");
-    }
-    if args.output_file.is_some() && args.resolved_output_format().is_none() {
-        return Err(anyhow!("--output-file requires --output or --output-json"));
-    }
-    if args.publication_plan_output.is_some() {
-        anyhow::ensure!(
-            args.forge == ForgeKind::GitHub
-                && args.repo.is_some()
-                && args.pr.is_some()
-                && args.sha.is_some()
-                && args.base_sha.is_some()
-                && !args.staged
-                && args.base.is_none()
-                && args.diff_file.is_none(),
-            "--publication-plan-output requires a remote GitHub pull request with explicit --repo, --pr, --sha, and --base-sha"
-        );
-        anyhow::ensure!(
-            args.no_post
-                && args.check_run_id.is_none()
-                && args.gate_check_run_id.is_none()
-                && !args.defer_gate_check,
-            "--publication-plan-output cannot be combined with forge mutation options"
-        );
-        let generation = args
-            .publication_generation
-            .as_deref()
-            .context("--publication-plan-output requires --publication-generation")?;
-        crate::forge::ensure_publication_decimal_identifier("controller generation", generation)
-            .context("invalid --publication-generation")?;
-        let input_identity = args
-            .publication_input_identity
-            .as_deref()
-            .context("--publication-plan-output requires --publication-input-identity")?;
-        crate::forge::ensure_publication_sha256_identity("input identity", input_identity)
-            .context("invalid --publication-input-identity")?;
-    } else {
-        anyhow::ensure!(
-            args.publication_generation.is_none(),
-            "--publication-generation requires --publication-plan-output"
-        );
-        anyhow::ensure!(
-            args.publication_input_identity.is_none(),
-            "--publication-input-identity requires --publication-plan-output"
-        );
-    }
-    let mut cfg = Config::load(&cwd, args.config.as_deref())?;
-    if let Some(m) = &args.model {
-        cfg.model = m.clone();
-        cfg.model_source = "command line".to_string();
-    }
-    if let Some(effort) = &args.reasoning_effort {
-        cfg.reasoning_effort = ReasoningEffort::parse("--reasoning-effort", effort)?;
-        cfg.reasoning_effort_source = "command line".to_string();
-    }
-    if let Some(effort) = &args.scorer_reasoning_effort {
-        cfg.scorer_reasoning_effort = ReasoningEffort::parse("--scorer-reasoning-effort", effort)?;
-        cfg.scorer_reasoning_effort_source = "command line".to_string();
-    }
-    cfg.require_model()?;
-    if let Some(fo) = &args.fail_on {
-        cfg.gate_fail_on =
-            GateLevel::parse(fo).ok_or_else(|| anyhow!("invalid --fail-on {fo:?}"))?;
-    }
     let progress = crate::progress::start_review(
-        args.resolved_output_format().is_some() || args.sarif.is_some(),
+        args.writes_machine_stdout(),
         args.verbose,
         crate::config::hosted_runtime_mode(),
+        args.no_progress,
     );
-    if !args.no_post
-        && cfg.finding_presentation == FindingPresentation::CheckAnnotations
-        && args.forge != ForgeKind::GitHub
-    {
-        return Err(anyhow!(
-            "review.findingPresentation checkAnnotations requires GitHub publication"
-        ));
-    }
-
     let review = async {
+        if args.output_json {
+            notice!("warning: --output-json is deprecated; use --output json instead");
+        }
+        if args.output_file.is_some() && args.resolved_output_format().is_none() {
+            return Err(anyhow!("--output-file requires --output or --output-json"));
+        }
+        if args.publication_plan_output.is_some() {
+            anyhow::ensure!(
+                args.forge == ForgeKind::GitHub
+                    && args.repo.is_some()
+                    && args.pr.is_some()
+                    && args.sha.is_some()
+                    && args.base_sha.is_some()
+                    && !args.staged
+                    && args.base.is_none()
+                    && args.diff_file.is_none(),
+                "--publication-plan-output requires a remote GitHub pull request with explicit --repo, --pr, --sha, and --base-sha"
+            );
+            anyhow::ensure!(
+                args.no_post
+                    && args.check_run_id.is_none()
+                    && args.gate_check_run_id.is_none()
+                    && !args.defer_gate_check,
+                "--publication-plan-output cannot be combined with forge mutation options"
+            );
+            let generation = args
+                .publication_generation
+                .as_deref()
+                .context("--publication-plan-output requires --publication-generation")?;
+            crate::forge::ensure_publication_decimal_identifier(
+                "controller generation",
+                generation,
+            )
+            .context("invalid --publication-generation")?;
+            let input_identity = args
+                .publication_input_identity
+                .as_deref()
+                .context("--publication-plan-output requires --publication-input-identity")?;
+            crate::forge::ensure_publication_sha256_identity("input identity", input_identity)
+                .context("invalid --publication-input-identity")?;
+        } else {
+            anyhow::ensure!(
+                args.publication_generation.is_none(),
+                "--publication-generation requires --publication-plan-output"
+            );
+            anyhow::ensure!(
+                args.publication_input_identity.is_none(),
+                "--publication-input-identity requires --publication-plan-output"
+            );
+        }
+        let mut cfg = Config::load(&cwd, args.config.as_deref())?;
+        if let Some(m) = &args.model {
+            cfg.model = m.clone();
+            cfg.model_source = "command line".to_string();
+        }
+        if let Some(effort) = &args.reasoning_effort {
+            cfg.reasoning_effort = ReasoningEffort::parse("--reasoning-effort", effort)?;
+            cfg.reasoning_effort_source = "command line".to_string();
+        }
+        if let Some(effort) = &args.scorer_reasoning_effort {
+            cfg.scorer_reasoning_effort =
+                ReasoningEffort::parse("--scorer-reasoning-effort", effort)?;
+            cfg.scorer_reasoning_effort_source = "command line".to_string();
+        }
+        cfg.require_model()?;
+        if let Some(fo) = &args.fail_on {
+            cfg.gate_fail_on =
+                GateLevel::parse(fo).ok_or_else(|| anyhow!("invalid --fail-on {fo:?}"))?;
+        }
+        if !args.no_post
+            && cfg.finding_presentation == FindingPresentation::CheckAnnotations
+            && args.forge != ForgeKind::GitHub
+        {
+            return Err(anyhow!(
+                "review.findingPresentation checkAnnotations requires GitHub publication"
+            ));
+        }
         match args.forge {
             ForgeKind::Local => run_local(&args, &cfg, &cwd).await,
             ForgeKind::GitHub => {
@@ -642,12 +697,15 @@ pub async fn run(args: ReviewArgs) -> Result<i32> {
         result = review => result,
         _ = tokio::signal::ctrl_c() => Err(anyhow!("review interrupted")),
     };
-    if let Ok(code) = result {
-        progress.finish(code);
-        Ok(code)
-    } else {
-        drop(progress);
-        result
+    match result {
+        Ok(outcome) => {
+            progress.finish(outcome.completion);
+            Ok(outcome.exit_code)
+        }
+        Err(error) => {
+            progress.finish(crate::progress::ReviewCompletion::OperationalIncomplete);
+            Err(error)
+        }
     }
 }
 
@@ -663,7 +721,7 @@ fn require_pr(args: &ReviewArgs) -> Result<u64> {
         .ok_or_else(|| anyhow!("--pr <number> is required for remote review"))
 }
 
-async fn run_local(args: &ReviewArgs, cfg: &Config, repo_root: &Path) -> Result<i32> {
+async fn run_local(args: &ReviewArgs, cfg: &Config, repo_root: &Path) -> Result<ReviewOutcome> {
     let head_sha = if args.diff_file.is_some() {
         None
     } else {
@@ -695,7 +753,7 @@ async fn run_local(args: &ReviewArgs, cfg: &Config, repo_root: &Path) -> Result<
     let touched_carried_error = cfg.enabled
         && args.since_sha.is_some()
         && carried_error_outside_anchor_file_is_touched(&baseline, &local_snapshot.diff);
-    let supports_full_fallback = matches!(&source, LocalSource::Base(_));
+    let supports_full_fallback = matches!(&selection.source, LocalSource::Base(_));
     let fail_closed_baseline =
         (touched_carried_error && !supports_full_fallback).then(|| baseline.clone());
     // This is a fail-closed placeholder, not the completed review's trust.
@@ -788,7 +846,7 @@ async fn run_remote<F: Forge>(
     forge: &F,
     repo: &str,
     repository_source: RepositorySource<'_>,
-) -> Result<i32> {
+) -> Result<ReviewOutcome> {
     let review_started = std::time::Instant::now();
     let strict_publication = strict_hosted_github_publication(args);
     let meta = run_with_hosted_budget(
@@ -947,7 +1005,7 @@ async fn run_remote<F: Forge>(
             // Emit the envelope and SARIF before delivery. Hosted GitHub runs
             // require every applicable publication step; other invocations
             // retain their gate-derived result when the forge is unavailable.
-            let code = if envelope.gate.failing { 1 } else { 0 };
+            let outcome = ReviewOutcome::from_envelope(&envelope);
             let finish_result = finish(
                 args,
                 cfg,
@@ -971,7 +1029,7 @@ async fn run_remote<F: Forge>(
                         Err(post_err)
                     } else {
                         notice!("postil: could not post the error review ({post_err:#})");
-                        Ok(code)
+                        Ok(outcome)
                     }
                 }
             };
@@ -1069,8 +1127,8 @@ fn retain_publication_failure(
 
 fn combine_required_publication(
     check_failure: Option<anyhow::Error>,
-    finish_result: Result<i32>,
-) -> Result<i32> {
+    finish_result: Result<ReviewOutcome>,
+) -> Result<ReviewOutcome> {
     match (check_failure, finish_result) {
         (None, result) => result,
         (Some(check_error), Ok(_)) => {
@@ -2977,7 +3035,8 @@ async fn finish<F: Forge>(
     hosted_budget_started_at: Option<Instant>,
     publication: Option<PublicationContext<'_>>,
     strict_publication: bool,
-) -> Result<i32> {
+) -> Result<ReviewOutcome> {
+    let outcome = ReviewOutcome::from_envelope(&envelope);
     let publication_plan_to_stdout =
         args.publication_plan_output.as_deref() == Some(Path::new("-"));
     // Persist artifacts before any forge I/O: a posting hiccup must not
@@ -3043,7 +3102,7 @@ async fn finish<F: Forge>(
         } else {
             crate::forge::write_github_publication_plan(path, &plan)?;
         }
-        return Ok(if envelope.gate.failing { 1 } else { 0 });
+        return Ok(outcome);
     }
 
     if let Some(forge) = forge
@@ -3065,7 +3124,7 @@ async fn finish<F: Forge>(
                 }
             }
             crate::forge::write_review_publication_receipt_from_env(&receipt)?;
-            return Ok(if envelope.gate.failing { 1 } else { 0 });
+            return Ok(outcome);
         }
         if !should_comment {
             let mut receipt = forge.plan_review_publication(&envelope, expected_snapshot);
@@ -3084,7 +3143,7 @@ async fn finish<F: Forge>(
                 }
             }
             crate::forge::write_review_publication_receipt_from_env(&receipt)?;
-            return Ok(if envelope.gate.failing { 1 } else { 0 });
+            return Ok(outcome);
         }
         let freshness = if let Some(started_at) = hosted_budget_started_at {
             snapshot_is_current(forge, expected_snapshot, started_at).await
@@ -3102,7 +3161,7 @@ async fn finish<F: Forge>(
                 notice!(
                     "postil: publication skipped because the pull request snapshot changed after review"
                 );
-                return Ok(if envelope.gate.failing { 1 } else { 0 });
+                return Ok(outcome);
             }
             Err(error) if strict_publication => {
                 return Err(error).context(
@@ -3113,7 +3172,7 @@ async fn finish<F: Forge>(
                 notice!(
                     "postil: publication skipped because snapshot freshness could not be verified ({error:#})"
                 );
-                return Ok(if envelope.gate.failing { 1 } else { 0 });
+                return Ok(outcome);
             }
         }
         let posted = run_with_hosted_budget(
@@ -3138,7 +3197,7 @@ async fn finish<F: Forge>(
             }
         }
     }
-    Ok(if envelope.gate.failing { 1 } else { 0 })
+    Ok(outcome)
 }
 
 async fn run_with_hosted_budget<T>(
@@ -3604,9 +3663,9 @@ mod tests {
             .unwrap()
         };
 
-        let local_edge = format!("Benchmark pull request{}", "x".repeat(42));
-        let ci_edge = format!("Benchmark pull request{}", "x".repeat(58));
-        let below_floor = format!("Benchmark pull request{}", "x".repeat(442));
+        let local_edge = format!("Benchmark pull request{}", "x".repeat(13));
+        let ci_edge = format!("Benchmark pull request{}", "x".repeat(29));
+        let below_floor = format!("Benchmark pull request{}", "x".repeat(413));
 
         let local_budgets = batch_budgets_for_title(&local_edge);
         assert_eq!(local_budgets.synthesis, 4_116);
@@ -3709,6 +3768,10 @@ mod tests {
             finding.body
         );
         assert!(envelope.gate.failing);
+        assert_eq!(
+            ReviewOutcome::from_envelope(&envelope).completion,
+            crate::progress::ReviewCompletion::OperationalIncomplete
+        );
     }
 
     #[test]
@@ -3728,6 +3791,10 @@ mod tests {
                 .contains("scorer output invalid after schema repair"),
             "the recorded scorer error must be preserved: {}",
             finding.body
+        );
+        assert_eq!(
+            ReviewOutcome::from_envelope(&envelope).completion,
+            crate::progress::ReviewCompletion::ModelOutputIncomplete
         );
     }
 
@@ -3862,6 +3929,12 @@ mod tests {
         let envelope = error_envelope(&cfg, &error, "head", Some(&pr_meta()), 99);
         assert_eq!(envelope.findings[0].path, crate::envelope::PROVIDER_PATH);
         assert!(!envelope.gate.failing);
+        let outcome = ReviewOutcome::from_envelope(&envelope);
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(
+            outcome.completion,
+            crate::progress::ReviewCompletion::ProviderIncomplete
+        );
         assert_eq!(envelope.model_usage.len(), 2);
         assert_eq!(envelope.review_admission.unwrap().provider_attempts, 12);
     }
@@ -3877,6 +3950,41 @@ mod tests {
         assert_eq!(envelope.findings[0].path, crate::envelope::OPERATIONAL_PATH);
         assert!(envelope.gate.failing);
         assert!(envelope.summary.contains("failing closed"));
+    }
+
+    #[test]
+    fn ordinary_envelopes_distinguish_clean_advisory_and_blocking_completion() {
+        let mut envelope = error_envelope(
+            &Config::default(),
+            &anyhow::anyhow!("fixture operational error"),
+            "head",
+            Some(&pr_meta()),
+            1,
+        );
+        envelope.findings[0].path = "src/lib.rs".to_string();
+        envelope.findings[0].title = "Ordinary review finding".to_string();
+        envelope.gate.failing = false;
+        let advisory = ReviewOutcome::from_envelope(&envelope);
+        assert_eq!(advisory.exit_code, 0);
+        assert_eq!(
+            advisory.completion,
+            crate::progress::ReviewCompletion::AdvisoryFindings
+        );
+
+        envelope.gate.failing = true;
+        let blocking = ReviewOutcome::from_envelope(&envelope);
+        assert_eq!(blocking.exit_code, 1);
+        assert_eq!(
+            blocking.completion,
+            crate::progress::ReviewCompletion::BlockingFindings
+        );
+
+        envelope.findings.clear();
+        envelope.gate.failing = false;
+        assert_eq!(
+            ReviewOutcome::from_envelope(&envelope).completion,
+            crate::progress::ReviewCompletion::Clean
+        );
     }
 
     #[test]
@@ -4147,7 +4255,14 @@ mod tests {
         let retained = retain_publication_failure(true, completion, "fixture warning")
             .unwrap()
             .expect("strict hosted publication retains the timeout");
-        let error = combine_required_publication(Some(retained), Ok(0)).unwrap_err();
+        let error = combine_required_publication(
+            Some(retained),
+            Ok(ReviewOutcome {
+                exit_code: 0,
+                completion: crate::progress::ReviewCompletion::Clean,
+            }),
+        )
+        .unwrap_err();
 
         assert!(format!("{error:#}").contains("completing check runs timed out"));
         assert!(

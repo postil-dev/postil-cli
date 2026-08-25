@@ -17,16 +17,36 @@ pub struct OutputSuspension {
     redraw: bool,
 }
 
-pub fn start_review(machine_output: bool, verbose: bool, hosted: bool) -> ProgressGuard {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewCompletion {
+    Clean,
+    AdvisoryFindings,
+    BlockingFindings,
+    ProviderIncomplete,
+    ModelOutputIncomplete,
+    OperationalIncomplete,
+}
+
+pub fn start_review(
+    machine_output: bool,
+    verbose: bool,
+    hosted: bool,
+    no_progress: bool,
+) -> ProgressGuard {
     let ci = std::env::var_os("CI").is_some();
     let debug =
         std::env::var_os("RUST_LOG").is_some() || std::env::var_os("POSTIL_DEBUG").is_some();
     let tty = std::io::stdout().is_terminal() && std::io::stderr().is_terminal();
     let dumb = std::env::var("TERM").ok().as_deref() == Some("dumb");
     let no_color = std::env::var_os("NO_COLOR").is_some();
+    let static_progress = no_progress
+        || std::env::var_os("POSTIL_NO_PROGRESS").is_some_and(|value| !value.is_empty());
     let suppress = tty && !machine_output && !verbose && !hosted && !ci && !debug;
     SUPPRESS_TELEMETRY.store(suppress, Ordering::Relaxed);
-    REDRAW.store(suppress && !dumb && !no_color, Ordering::Relaxed);
+    REDRAW.store(
+        suppress && !static_progress && !dumb && !no_color,
+        Ordering::Relaxed,
+    );
     DEGRADED.store(false, Ordering::Relaxed);
     if suppress {
         if REDRAW.load(Ordering::Relaxed) {
@@ -82,12 +102,12 @@ impl Drop for OutputSuspension {
 }
 
 impl ProgressGuard {
-    pub fn finish(mut self, exit_code: i32) {
+    pub fn finish(mut self, completion: ReviewCompletion) {
         if self.active {
             clear();
             eprintln!(
                 "postil: {}",
-                completion_message(exit_code, DEGRADED.load(Ordering::Relaxed))
+                completion_message(completion, DEGRADED.load(Ordering::Relaxed))
             );
             self.active = false;
         }
@@ -105,12 +125,23 @@ impl Drop for ProgressGuard {
     }
 }
 
-fn completion_message(exit_code: i32, degraded: bool) -> &'static str {
-    match (exit_code, degraded) {
-        (0, false) => "review complete",
-        (0, true) => "review complete with warnings",
-        (_, false) => "review found blocking findings",
-        (_, true) => "review found blocking findings; warnings were also reported",
+fn completion_message(completion: ReviewCompletion, degraded: bool) -> String {
+    let message = match completion {
+        ReviewCompletion::Clean => "review complete; no findings",
+        ReviewCompletion::AdvisoryFindings => "review complete; advisory findings reported",
+        ReviewCompletion::BlockingFindings => "review found blocking findings",
+        ReviewCompletion::ProviderIncomplete => "review incomplete; model provider unavailable",
+        ReviewCompletion::ModelOutputIncomplete => {
+            "review incomplete; model output could not be validated"
+        }
+        ReviewCompletion::OperationalIncomplete => {
+            "review incomplete; an operational error prevented completion"
+        }
+    };
+    if degraded {
+        format!("{message}; warnings were also reported")
+    } else {
+        message.to_string()
     }
 }
 
@@ -130,14 +161,49 @@ fn clear() {
 
 #[cfg(test)]
 mod tests {
-    use super::completion_message;
+    use super::{ReviewCompletion, completion_message};
 
     #[test]
-    fn degraded_reviews_never_use_the_plain_completion_message() {
-        assert_eq!(completion_message(0, true), "review complete with warnings");
+    fn degraded_reviews_preserve_the_specific_completion_state() {
         assert_eq!(
-            completion_message(1, true),
+            completion_message(ReviewCompletion::Clean, true),
+            "review complete; no findings; warnings were also reported"
+        );
+        assert_eq!(
+            completion_message(ReviewCompletion::BlockingFindings, true),
             "review found blocking findings; warnings were also reported"
+        );
+        assert_eq!(
+            completion_message(ReviewCompletion::ProviderIncomplete, true),
+            "review incomplete; model provider unavailable; warnings were also reported"
+        );
+    }
+
+    #[test]
+    fn completion_states_distinguish_verdicts_from_incomplete_reviews() {
+        assert_eq!(
+            completion_message(ReviewCompletion::Clean, false),
+            "review complete; no findings"
+        );
+        assert_eq!(
+            completion_message(ReviewCompletion::AdvisoryFindings, false),
+            "review complete; advisory findings reported"
+        );
+        assert_eq!(
+            completion_message(ReviewCompletion::BlockingFindings, false),
+            "review found blocking findings"
+        );
+        assert_eq!(
+            completion_message(ReviewCompletion::ProviderIncomplete, false),
+            "review incomplete; model provider unavailable"
+        );
+        assert_eq!(
+            completion_message(ReviewCompletion::ModelOutputIncomplete, false),
+            "review incomplete; model output could not be validated"
+        );
+        assert_eq!(
+            completion_message(ReviewCompletion::OperationalIncomplete, false),
+            "review incomplete; an operational error prevented completion"
         );
     }
 }

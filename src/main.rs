@@ -6,8 +6,8 @@ use postil_cli::cli::{
     Cli, Command, ForgeArg, HookAction, publication_enabled, publication_plan_contract_capability,
 };
 use postil_cli::config::{
-    Config, REASONING_EFFORT_VALUES, default_reasoning_effort, default_scorer_reasoning_effort,
-    qualification_metadata, starter_config,
+    Config, REASONING_EFFORT_VALUES, default_reasoning_effort, default_scorer_model,
+    default_scorer_reasoning_effort, qualification_metadata, starter_config,
 };
 use postil_cli::review::{ForgeKind, ReviewArgs};
 use postil_cli::{doctor, hook, login, plan, review};
@@ -67,6 +67,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
             reasoning_effort,
             scorer_reasoning_effort,
             verbose,
+            no_progress,
             bounded,
             publish,
             no_post,
@@ -109,6 +110,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
                 reasoning_effort,
                 scorer_reasoning_effort,
                 verbose,
+                no_progress,
                 bounded,
                 no_post: !publication_enabled(publish, no_post)?,
                 defer_gate_check,
@@ -119,28 +121,63 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
             .await
         }
         Command::Models => {
+            let qualification = qualification_metadata();
             let cascade = postil_cli::config::default_cascade();
             let cascade_text = if cascade.is_empty() {
                 "none".to_string()
             } else {
                 cascade.join(" -> ")
             };
-            println!("Postil model presets");
+            println!("Postil model support (offline)");
+            println!("  No model setting is required.");
             println!(
-                "  Luna (tested default): {}",
+                "  Embedded local reviewer (Luna): {}",
                 postil_cli::config::default_model()
             );
+            println!("  Reviewer source: embedded default");
             println!("  Fallback cascade: {cascade_text}");
             println!(
                 "  Reviewer reasoning effort: {}",
                 default_reasoning_effort().as_str()
             );
+            println!("  Local scorer: disabled (set REVIEW_SCORER_MODEL to enable)");
+            println!("  Hosted scorer candidate: {}", default_scorer_model());
             println!(
-                "  Scorer reasoning effort: {}",
+                "  Hosted scorer reasoning effort: {}",
                 default_scorer_reasoning_effort().as_str()
             );
             println!("  Accepted reasoning efforts: {REASONING_EFFORT_VALUES}");
-            println!("\nOverride once: postil review --model provider/model");
+            println!("\nAccepted local model IDs");
+            println!("  Postil does not maintain a fixed local model-ID allowlist.");
+            println!(
+                "  OpenAI-compatible endpoints accept any non-empty endpoint model ID and pass it unchanged; OpenRouter commonly uses provider/model."
+            );
+            println!(
+                "  Native Anthropic endpoints accept any non-empty Anthropic endpoint model ID and pass it unchanged, such as claude-* IDs."
+            );
+            println!(
+                "  Local compatibility means Postil can construct the endpoint protocol; it does not mean the model is hosted-qualified."
+            );
+            println!("\nHosted qualification");
+            if let Some(profile) = qualification.admitted_profile.as_ref() {
+                println!("  Embedded qualified profile: {}", profile.id);
+                println!(
+                    "  Qualified reviewer IDs: {}",
+                    profile.generator_chain.join(" -> ")
+                );
+                println!(
+                    "  Qualified scorer IDs: {}",
+                    if profile.scorer_chain.is_empty() {
+                        "none".to_string()
+                    } else {
+                        profile.scorer_chain.join(" -> ")
+                    }
+                );
+            } else {
+                println!("  Hosted qualified model IDs: none (no embedded qualified profile)");
+            }
+            println!("\nCheck the configured endpoint and model: postil doctor");
+            println!("Override once: postil review --model provider/model");
             println!(
                 "Override reasoning once: postil review --reasoning-effort high --scorer-reasoning-effort none"
             );
@@ -148,7 +185,12 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
             println!(
                 "Persist reasoning: REVIEW_REASONING_EFFORT=high REVIEW_SCORER_REASONING_EFFORT=none postil review"
             );
-            println!("Config keys: model.reasoningEffort and model.scorerReasoningEffort");
+            println!(
+                "Native Anthropic config: set model.apiBase, model.apiFormat: anthropic, and model.name, then run postil doctor"
+            );
+            println!(
+                "Config keys: model.name, model.reasoningEffort, and model.scorerReasoningEffort"
+            );
             Ok(0)
         }
         Command::Plan { envelopes, config } => {
@@ -216,6 +258,7 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
             );
             println!("model.cascade: {:?}", cfg.cascade);
             println!("model.scorer: {}", cfg.scorer);
+            println!("model.scorer.enabled: {}", cfg.scorer_enabled());
             println!(
                 "model.scorerReasoningEffort: {}",
                 cfg.scorer_reasoning_effort.as_str()

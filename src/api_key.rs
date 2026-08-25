@@ -24,7 +24,7 @@ pub(crate) fn names_text() -> String {
 
 pub(crate) fn credential_help() -> String {
     format!(
-        "default model is {}; run `postil login` for hosted inference or set one of {}; see `postil models` for tested presets and override syntax",
+        "default model is {}; run `postil login` for hosted inference or set one of {}; see `postil models` for supported model IDs, embedded defaults, qualification status, and override syntax",
         crate::config::default_model(),
         names_text()
     )

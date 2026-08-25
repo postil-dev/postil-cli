@@ -1,8 +1,9 @@
 //! End-to-end tests: the real binary against mocked LLM and forge endpoints.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use assert_cmd::Command;
 #[cfg(feature = "qualification-candidate")]
@@ -1106,45 +1107,168 @@ async fn mount_azure_merge_base(server: &MockServer) {
         .await;
 }
 
-fn postil() -> Command {
+fn isolated_config_home() -> &'static Path {
+    static HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
+    HOME.get_or_init(|| tempfile::tempdir().unwrap()).path()
+}
+
+const ISOLATED_POSTIL_ENV: &[&str] = &[
+    "CI",
+    "GITHUB_ACTIONS",
+    "GITHUB_REPOSITORY",
+    "REVIEW_MODEL",
+    "REVIEW_MODEL_CASCADE",
+    "REVIEW_MODEL_CONSENSUS",
+    "REVIEW_REASONING_EFFORT",
+    "REVIEW_SCORER_MODEL",
+    "REVIEW_SCORER_MODEL_CASCADE",
+    "REVIEW_SCORER_REASONING_EFFORT",
+    "POSTIL_DISABLE_SCORER",
+    "POSTIL_ALLOW_CONFIG_API_BASE",
+    "POSTIL_UNCERTAINTY_RESOLUTION",
+    "POSTIL_CONCISE_FINDINGS",
+    "POSTIL_NO_PROGRESS",
+    "POSTIL_DEBUG",
+    "RUST_LOG",
+    "NO_COLOR",
+    "POSTIL_HOSTED_MODE",
+    "POSTIL_PROVISIONAL_HOSTED_ROSTER",
+    "POSTIL_EXPECTED_GITHUB_REPO_ID",
+    "POSTIL_QUALIFICATION_CANDIDATE_PROFILE",
+    "POSTIL_BENCH_SCREEN_PROFILE",
+    "POSTIL_QUALIFICATION_PLAN_ONLY",
+    "POSTIL_QUALIFICATION_CAPTURE_API_BASE",
+    "POSTIL_IGNORE_REPOSITORY_MODEL_CONFIG",
+    "POSTIL_BENCH_FORCE_BOUNDED_SELECTION",
+    "POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY",
+    "POSTIL_LLM_REQUEST_TIMEOUT_SECS",
+    "POSTIL_LLM_TOTAL_TIMEOUT_SECS",
+    "MODEL_API_KEY",
+    "LLM_API_KEY",
+    "OPENROUTER_API_KEY",
+    "POSTIL_API_KEY",
+    "POSTIL_API_BASE",
+    "POSTIL_API_FORMAT",
+    "POSTIL_ENDPOINT_AUTH_HEADER",
+    "POSTIL_ENDPOINT_AUTH_VALUE",
+    "POSTIL_LARGE_REVIEW_PLAN_ENDPOINT",
+    "POSTIL_LARGE_REVIEW_PLAN_TOKEN",
+    "POSTIL_ALLOW_PRIVATE_API_BASE",
+    "POSTIL_DETAILS_URL",
+    "POSTIL_PREVENTION_HINT",
+    "POSTIL_PREVENTION_COMMANDS_JSON",
+    "POSTIL_PUBLICATION_RECEIPT_PATH",
+    "POSTIL_LOGIN_SERVER",
+    "POSTIL_PUBLISH",
+    "POSTIL_NO_POST",
+    "AZURE_DEVOPS_API_URL",
+    "AZURE_DEVOPS_TOKEN",
+    "BITBUCKET_API_URL",
+    "BITBUCKET_TOKEN",
+    "BITBUCKET_USER",
+    "GITHUB_API_URL",
+    "GITHUB_TOKEN",
+    "GITHUB_SERVER_URL",
+    "GITLAB_API_URL",
+    "GITLAB_TOKEN",
+    "POSTIL_ENABLE_BITBUCKET_INCREMENTAL",
+];
+
+fn isolated_postil() -> Command {
     let mut cmd = Command::cargo_bin("postil").unwrap();
     // Isolate from developer environment and repo config discovery.
-    cmd.env_remove("REVIEW_MODEL")
-        .env_remove("REVIEW_MODEL_CASCADE")
-        .env_remove("REVIEW_REASONING_EFFORT")
-        .env_remove("REVIEW_SCORER_MODEL")
-        .env_remove("REVIEW_SCORER_MODEL_CASCADE")
-        .env_remove("REVIEW_SCORER_REASONING_EFFORT")
-        .env_remove("POSTIL_DISABLE_SCORER")
-        .env_remove("POSTIL_UNCERTAINTY_RESOLUTION")
-        .env_remove("POSTIL_CONCISE_FINDINGS")
-        .env_remove("POSTIL_HOSTED_MODE")
-        .env_remove("POSTIL_EXPECTED_GITHUB_REPO_ID")
-        .env_remove("POSTIL_QUALIFICATION_CANDIDATE_PROFILE")
-        .env_remove("POSTIL_QUALIFICATION_PLAN_ONLY")
-        .env_remove("POSTIL_BENCH_FORCE_BOUNDED_SELECTION")
-        .env_remove("POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY")
-        .env_remove("POSTIL_LLM_REQUEST_TIMEOUT_SECS")
-        .env_remove("POSTIL_LLM_TOTAL_TIMEOUT_SECS")
-        .env_remove("MODEL_API_KEY")
-        .env_remove("LLM_API_KEY")
-        .env_remove("OPENROUTER_API_KEY")
-        .env_remove("POSTIL_API_KEY")
-        .env_remove("POSTIL_API_BASE")
-        .env_remove("POSTIL_API_FORMAT")
-        .env_remove("POSTIL_ENDPOINT_AUTH_HEADER")
-        .env_remove("POSTIL_ENDPOINT_AUTH_VALUE")
-        .env_remove("POSTIL_LARGE_REVIEW_PLAN_ENDPOINT")
-        .env_remove("POSTIL_LARGE_REVIEW_PLAN_TOKEN")
-        .env_remove("POSTIL_ALLOW_PRIVATE_API_BASE")
-        .env_remove("POSTIL_DETAILS_URL")
-        .env_remove("POSTIL_PREVENTION_HINT")
-        .env_remove("POSTIL_PREVENTION_COMMANDS_JSON")
-        .env_remove("POSTIL_PUBLISH")
-        .env_remove("POSTIL_NO_POST")
-        .env_remove("GITHUB_SERVER_URL")
-        .env_remove("POSTIL_ENABLE_BITBUCKET_INCREMENTAL")
-        .env("REVIEW_MODEL", "openai/gpt-5-mini")
+    for name in ISOLATED_POSTIL_ENV {
+        cmd.env_remove(name);
+    }
+    cmd.env("XDG_CONFIG_HOME", isolated_config_home());
+    cmd
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScriptFlavor {
+    UtilLinux,
+    Bsd,
+}
+
+#[cfg(unix)]
+fn native_script_flavor() -> ScriptFlavor {
+    if cfg!(target_os = "linux") {
+        ScriptFlavor::UtilLinux
+    } else {
+        ScriptFlavor::Bsd
+    }
+}
+
+#[cfg(unix)]
+fn shell_quote(argument: &str) -> String {
+    format!("'{}'", argument.replace('\'', "'\"'\"'"))
+}
+
+#[cfg(unix)]
+fn script_arguments(flavor: ScriptFlavor, program: &str, arguments: &[String]) -> Vec<String> {
+    match flavor {
+        ScriptFlavor::UtilLinux => vec![
+            "-qefc".to_string(),
+            std::iter::once(program)
+                .chain(arguments.iter().map(String::as_str))
+                .map(shell_quote)
+                .collect::<Vec<_>>()
+                .join(" "),
+            "/dev/null".to_string(),
+        ],
+        ScriptFlavor::Bsd => std::iter::once("-q".to_string())
+            .chain(std::iter::once("/dev/null".to_string()))
+            .chain(std::iter::once(program.to_string()))
+            .chain(arguments.iter().cloned())
+            .collect(),
+    }
+}
+
+#[cfg(unix)]
+fn isolated_script(program: &str, arguments: &[String]) -> std::process::Command {
+    let mut command = std::process::Command::new("script");
+    for name in ISOLATED_POSTIL_ENV {
+        command.env_remove(name);
+    }
+    command
+        .env("XDG_CONFIG_HOME", isolated_config_home())
+        .args(script_arguments(native_script_flavor(), program, arguments));
+    command
+}
+
+#[cfg(unix)]
+#[test]
+fn pty_script_arguments_cover_util_linux_and_bsd_syntax() {
+    let arguments = vec![
+        "review".to_string(),
+        "--base".to_string(),
+        "topic's base".to_string(),
+    ];
+    assert_eq!(
+        script_arguments(ScriptFlavor::UtilLinux, "/tmp/postil binary", &arguments),
+        vec![
+            "-qefc",
+            "'/tmp/postil binary' 'review' '--base' 'topic'\"'\"'s base'",
+            "/dev/null",
+        ]
+    );
+    assert_eq!(
+        script_arguments(ScriptFlavor::Bsd, "/tmp/postil binary", &arguments),
+        vec![
+            "-q",
+            "/dev/null",
+            "/tmp/postil binary",
+            "review",
+            "--base",
+            "topic's base",
+        ]
+    );
+}
+
+fn postil() -> Command {
+    let mut cmd = isolated_postil();
+    cmd.env("REVIEW_MODEL", "openai/gpt-5-mini")
         .env("MODEL_API_KEY", fixture_credential("provider"))
         // Mock providers bind loopback. Production and normal CLI invocations
         // reject private API endpoints unless this explicit local-only escape
@@ -5912,8 +6036,7 @@ fn bare_review_keeps_redirected_output_free_of_terminal_control_sequences() {
             .unwrap()
             .success()
     );
-    let output = Command::cargo_bin("postil")
-        .unwrap()
+    let output = isolated_postil()
         .current_dir(dir.path())
         .env_remove("CI")
         .env_remove("POSTIL_HOSTED_MODE")
@@ -5945,8 +6068,7 @@ fn bare_review_clears_progress_before_pretty_output_in_a_pty() {
         .get_program()
         .to_string_lossy()
         .into_owned();
-    let output = std::process::Command::new("script")
-        .args(["-qefc", &format!("'{binary}' review"), "/dev/null"])
+    let output = isolated_script(&binary, &["review".to_string()])
         .current_dir(dir.path())
         .env("TERM", "xterm")
         .env_remove("CI")
@@ -5974,8 +6096,67 @@ fn bare_review_clears_progress_before_pretty_output_in_a_pty() {
 }
 
 #[cfg(unix)]
+#[test]
+fn file_artifacts_keep_human_progress_and_pretty_output_in_a_pty() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let binary = Command::cargo_bin("postil")
+        .unwrap()
+        .get_program()
+        .to_string_lossy()
+        .into_owned();
+    let envelope = dir.path().join("review.json");
+    let sarif = dir.path().join("review.sarif.json");
+
+    for arguments in [
+        vec![
+            "review".to_string(),
+            "--output".to_string(),
+            "json".to_string(),
+            "--output-file".to_string(),
+            envelope.display().to_string(),
+        ],
+        vec![
+            "review".to_string(),
+            "--sarif".to_string(),
+            sarif.display().to_string(),
+        ],
+    ] {
+        let output = isolated_script(&binary, &arguments)
+            .current_dir(dir.path())
+            .env("TERM", "xterm")
+            .env_remove("CI")
+            .env_remove("POSTIL_HOSTED_MODE")
+            .env_remove("RUST_LOG")
+            .env_remove("POSTIL_DEBUG")
+            .env_remove("NO_COLOR")
+            .env_remove("POSTIL_NO_PROGRESS")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let rendered = String::from_utf8_lossy(&output.stdout);
+        assert!(rendered.contains("Reviewing changes"), "{rendered:?}");
+        assert!(
+            rendered.contains("✓ postil: no merge-relevant findings"),
+            "{rendered:?}"
+        );
+    }
+
+    serde_json::from_slice::<Value>(&std::fs::read(envelope).unwrap()).unwrap();
+    let sarif: Value = serde_json::from_slice(&std::fs::read(sarif).unwrap()).unwrap();
+    assert_eq!(sarif["version"], "2.1.0");
+}
+
+#[cfg(unix)]
 #[tokio::test]
-async fn github_telemetry_is_hidden_only_for_interactive_reviews() {
+async fn interactive_progress_controls_animation_separately_from_telemetry() {
     let server = MockServer::start().await;
     mount_github_complete_diff(&server, 7).await;
     mount_static_github_pr(&server).await;
@@ -5987,23 +6168,27 @@ async fn github_telemetry_is_hidden_only_for_interactive_reviews() {
         .to_string_lossy()
         .into_owned();
 
-    let interactive = std::process::Command::new("script")
-        .args([
-            "-qefc",
-            &format!("'{binary}' review --repo acme/api --pr 7"),
-            "/dev/null",
-        ])
-        .current_dir(dir.path())
-        .env("TERM", "xterm")
-        .env("GITHUB_API_URL", server.uri())
-        .env("GITHUB_TOKEN", "gh-test-token")
-        .env_remove("CI")
-        .env_remove("POSTIL_HOSTED_MODE")
-        .env_remove("RUST_LOG")
-        .env_remove("POSTIL_DEBUG")
-        .env_remove("NO_COLOR")
-        .output()
-        .unwrap();
+    let interactive = isolated_script(
+        &binary,
+        &[
+            "review".to_string(),
+            "--repo".to_string(),
+            "acme/api".to_string(),
+            "--pr".to_string(),
+            "7".to_string(),
+        ],
+    )
+    .current_dir(dir.path())
+    .env("TERM", "xterm")
+    .env("GITHUB_API_URL", server.uri())
+    .env("GITHUB_TOKEN", "gh-test-token")
+    .env_remove("CI")
+    .env_remove("POSTIL_HOSTED_MODE")
+    .env_remove("RUST_LOG")
+    .env_remove("POSTIL_DEBUG")
+    .env_remove("NO_COLOR")
+    .output()
+    .unwrap();
     assert!(interactive.status.success());
     let rendered = String::from_utf8_lossy(&interactive.stdout);
     assert!(rendered.contains("Reviewing changes"));
@@ -6027,6 +6212,154 @@ async fn github_telemetry_is_hidden_only_for_interactive_reviews() {
         telemetry.contains("postil: github operation="),
         "machine review omitted GitHub telemetry: {telemetry:?}"
     );
+
+    for (arguments, no_progress_environment) in [
+        (
+            vec![
+                "review".to_string(),
+                "--repo".to_string(),
+                "acme/api".to_string(),
+                "--pr".to_string(),
+                "7".to_string(),
+                "--no-progress".to_string(),
+            ],
+            None,
+        ),
+        (
+            vec![
+                "review".to_string(),
+                "--repo".to_string(),
+                "acme/api".to_string(),
+                "--pr".to_string(),
+                "7".to_string(),
+            ],
+            Some("1"),
+        ),
+    ] {
+        let mut automation = isolated_script(&binary, &arguments);
+        automation
+            .current_dir(dir.path())
+            .env("TERM", "xterm")
+            .env("GITHUB_API_URL", server.uri())
+            .env("GITHUB_TOKEN", "gh-test-token")
+            .env_remove("CI")
+            .env_remove("POSTIL_HOSTED_MODE")
+            .env_remove("RUST_LOG")
+            .env_remove("POSTIL_DEBUG")
+            .env_remove("NO_COLOR")
+            .env_remove("POSTIL_NO_PROGRESS");
+        if let Some(value) = no_progress_environment {
+            automation.env("POSTIL_NO_PROGRESS", value);
+        }
+        let static_progress = automation.output().unwrap();
+        assert!(static_progress.status.success());
+        let static_progress = String::from_utf8_lossy(&static_progress.stdout);
+        assert!(
+            static_progress.contains("postil: reviewing changes..."),
+            "{static_progress:?}"
+        );
+        assert!(
+            static_progress.contains("postil: review complete; no findings"),
+            "{static_progress:?}"
+        );
+        assert!(!static_progress.contains("\x1b[2K"), "{static_progress:?}");
+        assert!(
+            !static_progress.contains("postil: github operation="),
+            "static human progress exposed routine GitHub telemetry: {static_progress:?}"
+        );
+    }
+
+    let verbose = isolated_script(
+        &binary,
+        &[
+            "review".to_string(),
+            "--repo".to_string(),
+            "acme/api".to_string(),
+            "--pr".to_string(),
+            "7".to_string(),
+            "--verbose".to_string(),
+        ],
+    )
+    .current_dir(dir.path())
+    .env("TERM", "xterm")
+    .env("GITHUB_API_URL", server.uri())
+    .env("GITHUB_TOKEN", "gh-test-token")
+    .env_remove("CI")
+    .env_remove("POSTIL_HOSTED_MODE")
+    .env_remove("RUST_LOG")
+    .env_remove("POSTIL_DEBUG")
+    .env_remove("NO_COLOR")
+    .env_remove("POSTIL_NO_PROGRESS")
+    .output()
+    .unwrap();
+    assert!(verbose.status.success());
+    let verbose = String::from_utf8_lossy(&verbose.stdout);
+    assert!(
+        verbose.contains("postil: github operation="),
+        "verbose interactive review omitted GitHub telemetry: {verbose:?}"
+    );
+    assert!(!verbose.contains("Reviewing changes"), "{verbose:?}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn no_progress_keeps_provider_telemetry_collapsed_until_verbose() {
+    let server = MockServer::start().await;
+    mock_review(&server, json!([])).await;
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let binary = Command::cargo_bin("postil")
+        .unwrap()
+        .get_program()
+        .to_string_lossy()
+        .into_owned();
+
+    let run = |mode: &str| {
+        let mut command = isolated_script(
+            &binary,
+            &[
+                "review".to_string(),
+                "--diff-file".to_string(),
+                diff.display().to_string(),
+                mode.to_string(),
+            ],
+        );
+        command
+            .current_dir(dir.path())
+            .env("TERM", "xterm")
+            .env("POSTIL_API_BASE", server.uri())
+            .env("POSTIL_ALLOW_PRIVATE_API_BASE", "1")
+            .env("REVIEW_MODEL", "generator-model")
+            .env("MODEL_API_KEY", fixture_credential("provider"))
+            .env("POSTIL_DISABLE_SCORER", "1")
+            .env_remove("CI")
+            .env_remove("POSTIL_HOSTED_MODE")
+            .env_remove("RUST_LOG")
+            .env_remove("POSTIL_DEBUG")
+            .env_remove("NO_COLOR")
+            .env_remove("POSTIL_NO_PROGRESS")
+            .output()
+            .unwrap()
+    };
+
+    let static_progress = run("--no-progress");
+    assert!(static_progress.status.success());
+    let static_progress = String::from_utf8_lossy(&static_progress.stdout);
+    assert!(static_progress.contains("postil: reviewing changes..."));
+    assert!(static_progress.contains("postil: review complete; no findings"));
+    assert!(!static_progress.contains("postil: llm attempt"));
+    assert!(!static_progress.contains("postil: queued source request"));
+    assert!(!static_progress.contains("\x1b[2K"));
+
+    let verbose = run("--verbose");
+    assert!(verbose.status.success());
+    let verbose = String::from_utf8_lossy(&verbose.stdout);
+    assert!(verbose.contains("postil: llm attempt"), "{verbose:?}");
+    assert!(
+        verbose.contains("postil: queued source request"),
+        "{verbose:?}"
+    );
+    assert!(!verbose.contains("Reviewing changes"), "{verbose:?}");
 }
 
 #[cfg(unix)]
@@ -6047,8 +6380,7 @@ fn bare_review_keeps_warnings_visible_and_marks_degraded_completion_in_a_pty() {
         .get_program()
         .to_string_lossy()
         .into_owned();
-    let output = std::process::Command::new("script")
-        .args(["-qefc", &format!("'{binary}' review"), "/dev/null"])
+    let output = isolated_script(&binary, &["review".to_string()])
         .current_dir(dir.path())
         .env("TERM", "xterm")
         .env_remove("CI")
@@ -6062,7 +6394,7 @@ fn bare_review_keeps_warnings_visible_and_marks_degraded_completion_in_a_pty() {
     assert!(rendered.contains("Reviewing changes"));
     assert!(rendered.contains("\x1b[2K"));
     assert!(rendered.contains("untracked files were not reviewed"));
-    assert!(rendered.contains("review complete with warnings"));
+    assert!(rendered.contains("review complete; no findings; warnings were also reported"));
 }
 
 #[cfg(unix)]
@@ -6082,8 +6414,7 @@ fn bare_review_respects_no_color_in_a_pty() {
         .get_program()
         .to_string_lossy()
         .into_owned();
-    let output = std::process::Command::new("script")
-        .args(["-qefc", &format!("'{binary}' review"), "/dev/null"])
+    let output = isolated_script(&binary, &["review".to_string()])
         .current_dir(dir.path())
         .env("TERM", "xterm")
         .env("NO_COLOR", "1")
@@ -6102,13 +6433,52 @@ fn bare_review_respects_no_color_in_a_pty() {
     assert!(rendered.contains("review complete"));
 }
 
+#[cfg(unix)]
+#[test]
+fn interactive_early_errors_replace_progress_with_an_incomplete_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = Command::cargo_bin("postil")
+        .unwrap()
+        .get_program()
+        .to_string_lossy()
+        .into_owned();
+    let output = isolated_script(
+        &binary,
+        &[
+            "review".to_string(),
+            "--output-file".to_string(),
+            dir.path().join("review.json").display().to_string(),
+        ],
+    )
+    .current_dir(dir.path())
+    .env("TERM", "xterm")
+    .env_remove("CI")
+    .env_remove("POSTIL_HOSTED_MODE")
+    .env_remove("RUST_LOG")
+    .env_remove("NO_COLOR")
+    .output()
+    .unwrap();
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    assert!(rendered.contains("Reviewing changes"), "{rendered:?}");
+    assert!(
+        rendered.contains("review incomplete; an operational error prevented completion"),
+        "{rendered:?}"
+    );
+    assert!(
+        rendered.contains("--output-file requires --output or --output-json"),
+        "{rendered:?}"
+    );
+}
+
 #[test]
 fn models_and_config_explain_the_embedded_default() {
     let dir = tempfile::tempdir().unwrap();
-    let models = Command::cargo_bin("postil")
-        .unwrap()
-        .env_remove("REVIEW_REASONING_EFFORT")
-        .env_remove("REVIEW_SCORER_REASONING_EFFORT")
+    let models = isolated_postil()
+        .env("MODEL_API_KEY", "models-secret-sentinel")
+        .env(
+            "POSTIL_API_BASE",
+            "https://models-secret-sentinel.invalid/v1",
+        )
         .args(["models"])
         .assert()
         .success()
@@ -6116,17 +6486,32 @@ fn models_and_config_explain_the_embedded_default() {
         .stdout
         .clone();
     let models = String::from_utf8(models).unwrap();
-    assert!(models.contains("Luna (tested default): openai/gpt-5.6-luna"));
+    assert!(models.contains("Postil model support (offline)"));
+    assert!(models.contains("No model setting is required"));
+    assert!(models.contains("Embedded local reviewer (Luna): openai/gpt-5.6-luna"));
+    assert!(models.contains("Reviewer source: embedded default"));
     assert!(models.contains("Reviewer reasoning effort: low"));
-    assert!(models.contains("Scorer reasoning effort: none"));
+    assert!(models.contains("Local scorer: disabled"));
+    assert!(models.contains("Hosted scorer candidate: openai/gpt-5.6-luna"));
+    assert!(models.contains("Hosted scorer reasoning effort: none"));
+    assert!(models.contains("does not maintain a fixed local model-ID allowlist"));
+    assert!(models.contains("OpenAI-compatible endpoints accept any non-empty endpoint model ID"));
+    assert!(models.contains("OpenRouter commonly uses provider/model"));
+    assert!(
+        models.contains(
+            "Native Anthropic endpoints accept any non-empty Anthropic endpoint model ID"
+        )
+    );
+    assert!(models.contains("does not mean the model is hosted-qualified"));
+    assert!(models.contains("Hosted qualified model IDs: none (no embedded qualified profile)"));
     assert!(models.contains("max|xhigh|high|medium|low|minimal|none"));
+    assert!(models.contains("postil doctor"));
     assert!(models.contains("postil review --model provider/model"));
-    assert!(models.contains("model.reasoningEffort and model.scorerReasoningEffort"));
-    let config = Command::cargo_bin("postil")
-        .unwrap()
+    assert!(models.contains("model.apiFormat: anthropic"));
+    assert!(models.contains("model.name, model.reasoningEffort, and model.scorerReasoningEffort"));
+    assert!(!models.contains("models-secret-sentinel"));
+    let config = isolated_postil()
         .current_dir(dir.path())
-        .env_remove("REVIEW_REASONING_EFFORT")
-        .env_remove("REVIEW_SCORER_REASONING_EFFORT")
         .args(["config"])
         .assert()
         .success()
@@ -6138,8 +6523,20 @@ fn models_and_config_explain_the_embedded_default() {
     assert!(config.contains("model.name: openai/gpt-5.6-luna"));
     assert!(config.contains("model.reasoningEffort: low"));
     assert!(config.contains("model.reasoningEffort.source: embedded default"));
+    assert!(config.contains("model.scorer.enabled: false"));
     assert!(config.contains("model.scorerReasoningEffort: none"));
     assert!(config.contains("model.scorerReasoningEffort.source: embedded default"));
+}
+
+#[test]
+fn conflicting_local_sources_are_usage_errors() {
+    for arguments in [
+        vec!["review", "--staged", "--base", "main"],
+        vec!["review", "--staged", "--diff-file", "change.diff"],
+        vec!["review", "--base", "main", "--diff-file", "change.diff"],
+    ] {
+        isolated_postil().args(arguments).assert().code(2);
+    }
 }
 
 #[test]
@@ -8259,8 +8656,7 @@ async fn deprecated_output_json_alias_prints_json_with_warning() {
 
 #[test]
 fn review_help_documents_machine_output_flags() {
-    let out = Command::cargo_bin("postil")
-        .unwrap()
+    let out = isolated_postil()
         .args(["review", "--help"])
         .assert()
         .success();
@@ -8274,8 +8670,7 @@ fn review_help_documents_machine_output_flags() {
 
 #[test]
 fn review_rejects_unknown_output_format() {
-    Command::cargo_bin("postil")
-        .unwrap()
+    isolated_postil()
         .args(["review", "--output", "xml"])
         .assert()
         .failure()
@@ -13815,26 +14210,21 @@ async fn gitlab_diff_pagination_follows_authoritative_next_page_to_exhaustion() 
 #[test]
 fn init_writes_starter_and_config_shows_provenance() {
     let dir = tempfile::tempdir().unwrap();
-    Command::cargo_bin("postil")
-        .unwrap()
+    isolated_postil()
         .current_dir(dir.path())
         .args(["init"])
         .assert()
         .success();
     assert!(dir.path().join(".postil.yaml").is_file());
     // Second init refuses without --force.
-    Command::cargo_bin("postil")
-        .unwrap()
+    isolated_postil()
         .current_dir(dir.path())
         .args(["init"])
         .assert()
         .code(2);
 
-    let out = Command::cargo_bin("postil")
-        .unwrap()
+    let out = isolated_postil()
         .current_dir(dir.path())
-        .env_remove("REVIEW_MODEL")
-        .env_remove("POSTIL_API_BASE")
         .args(["config"])
         .assert()
         .success();
@@ -13846,8 +14236,7 @@ fn init_writes_starter_and_config_shows_provenance() {
 
 #[test]
 fn qualification_metadata_cli_emits_service_authority_fields() {
-    let output = Command::cargo_bin("postil")
-        .unwrap()
+    let output = isolated_postil()
         .args(["qualification-metadata"])
         .assert()
         .success()
@@ -13871,11 +14260,8 @@ fn coderabbit_config_is_translated() {
         "reviews:\n  profile: chill\n  path_filters:\n    - \"!**/generated/**\"\n",
     )
     .unwrap();
-    let out = Command::cargo_bin("postil")
-        .unwrap()
+    let out = isolated_postil()
         .current_dir(dir.path())
-        .env_remove("REVIEW_MODEL")
-        .env_remove("POSTIL_API_BASE")
         .args(["config"])
         .assert()
         .success();
@@ -13912,8 +14298,7 @@ fn plan_replays_envelopes_deterministically() {
     )
     .unwrap();
 
-    let out = Command::cargo_bin("postil")
-        .unwrap()
+    let out = isolated_postil()
         .current_dir(dir.path())
         .args(["plan", "--envelopes"])
         .arg(&envelopes)

@@ -473,7 +473,9 @@ impl Forge for Azure {
             return Ok(receipt);
         }
         if !self.snapshot_is_current(snapshot).await? {
-            eprintln!("postil: azure review delivery skipped because the pull request changed");
+            crate::progress::notice(format_args!(
+                "postil: azure review delivery skipped because the pull request changed"
+            ));
             return Ok(receipt);
         }
         let summary = self.review_summary(envelope);
@@ -536,7 +538,9 @@ impl Forge for Azure {
         _annotate_findings: bool,
     ) -> Result<()> {
         if !self.snapshot_is_current(snapshot).await? {
-            eprintln!("postil: azure status delivery skipped because the pull request changed");
+            crate::progress::notice(format_args!(
+                "postil: azure status delivery skipped because the pull request changed"
+            ));
             return Ok(());
         }
         let head = envelope.head_sha.clone().unwrap_or_default();

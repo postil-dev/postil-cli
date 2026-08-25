@@ -67,6 +67,7 @@ Ignore patterns remove matching paths before grounding, batching, and large-revi
 | `REVIEW_SCORER_MODEL_CASCADE` | One scorer fallback model |
 | `POSTIL_UNCERTAINTY_RESOLUTION` | Override uncertainty resolution with `true`/`false` or `1`/`0` |
 | `POSTIL_CONCISE_FINDINGS` | Override concise findings with `true`/`false` or `1`/`0` |
+| `POSTIL_NO_PROGRESS` | Disable animated progress and retain concise human milestones when set |
 | `POSTIL_LLM_REQUEST_TIMEOUT_SECS` | Per-attempt model request timeout; defaults to 480 seconds |
 | `POSTIL_LLM_TOTAL_TIMEOUT_SECS` | Optional total local-review model deadline |
 | `POSTIL_DETAILS_URL` | HTTP(S) details link for forge check runs |

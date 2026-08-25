@@ -519,7 +519,9 @@ impl Forge for Bitbucket {
             return Ok(receipt);
         }
         if !self.snapshot_is_current(snapshot).await? {
-            eprintln!("postil: bitbucket review delivery skipped because the pull request changed");
+            crate::progress::notice(format_args!(
+                "postil: bitbucket review delivery skipped because the pull request changed"
+            ));
             return Ok(receipt);
         }
         let summary = self.review_summary(envelope);
@@ -584,7 +586,9 @@ impl Forge for Bitbucket {
         _annotate_findings: bool,
     ) -> Result<()> {
         if !self.snapshot_is_current(snapshot).await? {
-            eprintln!("postil: bitbucket status delivery skipped because the pull request changed");
+            crate::progress::notice(format_args!(
+                "postil: bitbucket status delivery skipped because the pull request changed"
+            ));
             return Ok(());
         }
         let head = envelope

@@ -5155,6 +5155,15 @@ fn apply_anthropic_reasoning(body: &mut serde_json::Value, effort: ReasoningEffo
             unreachable!("Anthropic minimal effort is rejected while resolving request settings")
         }
         _ => {
+            if body
+                .get("temperature")
+                .and_then(serde_json::Value::as_f64)
+                .is_some_and(|temperature| temperature != 1.0)
+            {
+                body.as_object_mut()
+                    .expect("Anthropic request body is an object")
+                    .remove("temperature");
+            }
             body["output_config"] = json!({ "effort": effort.as_str() });
         }
     }
@@ -6468,7 +6477,7 @@ mod tests {
     }
     use crate::config::Config;
     use crate::envelope::{Kind, Severity};
-    use std::sync::{Mutex, OnceLock};
+    use crate::test_env_lock as env_lock;
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -6636,11 +6645,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
     }
 
     #[test]
@@ -9873,6 +9877,7 @@ mod tests {
         assert!(anthropic_body.get("provider").is_none());
         assert_eq!(anthropic_body["thinking"], json!({"type": "disabled"}));
         assert!(anthropic_body.get("output_config").is_none());
+        assert_eq!(anthropic_body["temperature"], 0.0);
         assert!(anthropic_body.get("response_format").is_none());
         assert_eq!(anthropic_body["system"], "system");
     }
@@ -9938,6 +9943,20 @@ mod tests {
         );
         assert_eq!(reviewer["output_config"], json!({"effort": "high"}));
         assert!(reviewer.get("thinking").is_none());
+        assert!(reviewer.get("temperature").is_none());
+        let reviewer_with_default_temperature = client.request_body(
+            "provider/model",
+            "system",
+            "user",
+            100,
+            1.0,
+            LlmPhase::Review,
+        );
+        assert_eq!(reviewer_with_default_temperature["temperature"], 1.0);
+        assert_eq!(
+            reviewer_with_default_temperature["output_config"],
+            json!({"effort": "high"})
+        );
         let scorer = client.request_body(
             "provider/model",
             "system",
@@ -9948,6 +9967,7 @@ mod tests {
         );
         assert_eq!(scorer["thinking"], json!({"type": "disabled"}));
         assert!(scorer.get("output_config").is_none());
+        assert_eq!(scorer["temperature"], 0.0);
 
         let error = LlmClient::build(
             &Config {
