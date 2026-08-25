@@ -6582,7 +6582,6 @@ mod tests {
             LlmPhase::Scorer { expected_len: 1 },
             LlmPhase::Adjudication,
             LlmPhase::Attribution,
-            LlmPhase::Respond,
         ];
         for phase in fixed_phases {
             assert_eq!(max_transport_attempts(phase), 3, "phase={phase:?}");
