@@ -5,19 +5,36 @@ import { resolve } from "node:path";
 import { cases } from "../fixtures/cases";
 import {
   DETECTION_RATE_MAX_DROP_PP,
-  FALSE_FINDINGS_MAX_INCREASE,
-  GATE_VERDICT_MAX_DROP_PP,
-  LATENCY_P95_MAX_INCREASE_RATIO,
-  MEAN_COST_MAX_INCREASE_RATIO,
+  aggregateObservedMetrics,
+  assertDistinctRunIdentities,
+  assertDistinctRawReportDigests,
+  assertExpectedRunIdentities,
+  assertReportsBoundToInputs,
+  assertValidReleaseReport,
   compareMetrics,
+  exactMeanCostWithinTolerance,
   extractObservedMetrics,
   formatComparisonTable,
+  formatRebaselineGuidance,
+  median,
+  parseCliArguments,
   percentile,
   type BaselineProfile,
   type LiveReportForComparison,
 } from "./compare-baseline";
 import { benchmarkCase } from "./harness";
-import { evaluatorSourceSha256 } from "./live";
+import {
+  ADMISSION_API_BASE,
+  evaluatorSourceSha256,
+  screeningProfileMetadata,
+} from "./live";
+import {
+  formatCanonicalDecimal,
+  parseCanonicalDecimal,
+  providerContractSha256,
+  sumCanonicalDecimals,
+  type ProviderContractEvidence,
+} from "./livemodels-score";
 
 test("committed baseline authority matches the current benchmark sources", async () => {
   const baseline = JSON.parse(
@@ -33,268 +50,583 @@ test("committed baseline authority matches the current benchmark sources", async
   expect(baseline.corpus.evaluatorSha256).toBe(await evaluatorSourceSha256());
 });
 
-function fakeReport(overrides: {
-  falsePositives?: number;
-  observedProviderCostUsdDecimal?: string;
-  results?: LiveReportForComparison["results"];
+const PROVIDER_CONTRACT: ProviderContractEvidence = {
+  version: 1,
+  benchmarkProviderIdentity: "openrouter:managed-routing",
+  upstreamProviderIdentity: "Azure",
+  upstreamProviderRoute: "azure/eu",
+  dataCollection: "deny",
+  zeroDataRetention: true,
+  allowFallbacks: false,
+  generatorRequireParameters: false,
+  scorerRequireParameters: true,
+  maxPricePinned: true,
+  maxPriceUnits: "USD per million tokens",
+  modelPriceBounds: [{
+    model: "openai/gpt-5.6-luna",
+    roles: ["generator", "scorer"],
+    inputMicrosPerMillionTokens: 400_000,
+    outputMicrosPerMillionTokens: 1_600_000,
+  }],
+};
+
+const HASHES = {
+  binary: "1".repeat(64),
+  corpus: "2".repeat(64),
+  evaluator: "3".repeat(64),
+  profile: "4".repeat(64),
+  contract: providerContractSha256(PROVIDER_CONTRACT),
+} as const;
+
+interface FakeReportOptions {
   detected?: number;
-  providerContractEnforced?: boolean;
-} = {}): LiveReportForComparison {
-  const results: LiveReportForComparison["results"] = overrides.results ?? [
-    { id: "must-block-1", type: "defect", scored: true, truthSeverity: "error", durationMs: 1000, exitCode: 1 },
-    { id: "must-block-2", type: "defect", scored: true, truthSeverity: "error", durationMs: 2000, exitCode: 1 },
-    { id: "advisory-1", type: "defect", scored: true, truthSeverity: "warn", durationMs: 1500, exitCode: 0 },
-    { id: "clean-1", type: "clean", scored: true, truthSeverity: null, durationMs: 500, exitCode: 0 },
-  ];
-  const defectCases = results.filter((r) => r.type === "defect").length;
+  falsePositives?: number;
+  costPerCase?: string;
+  durationMultiplier?: number;
+  ranAt?: string;
+  runId?: string;
+}
+
+let fakeRunSequence = 0;
+
+function fakeReport(options: FakeReportOptions = {}): LiveReportForComparison {
+  fakeRunSequence += 1;
+  const detected = options.detected ?? 54;
+  const falsePositives = options.falsePositives ?? 0;
+  const costPerCase = options.costPerCase ?? "0.001";
+  const durationMultiplier = options.durationMultiplier ?? 100;
+  const results: LiveReportForComparison["results"] = Array.from({ length: 70 }, (_, index) => {
+    const defect = index < 57;
+    const truthSeverity = defect ? (index < 47 ? "error" : "warn") : null;
+    const caseDetected = defect ? index < detected : null;
+    return {
+      id: `${defect ? "defect" : "clean"}-${String(index + 1).padStart(2, "0")}`,
+      type: defect ? "defect" : "clean",
+      scored: true,
+      detected: caseDetected,
+      truthSeverity,
+      falsePositives: index === 0 ? falsePositives : 0,
+      durationMs: (index + 1) * durationMultiplier,
+      observedProviderCostUsdDecimal: costPerCase,
+      costAccountingComplete: true,
+      exitCode: truthSeverity === "error" && caseDetected === true ? 1 : 0,
+    };
+  });
+  const observedProviderCostUsdDecimal = formatCanonicalDecimal(sumCanonicalDecimals(
+    results.map(() => parseCanonicalDecimal(costPerCase)),
+  ));
+
   return {
     summary: {
-      model: "z-ai/glm-5.2",
+      runId: options.runId ?? `fixture-run-${fakeRunSequence}`,
+      model: "openai/gpt-5.6-luna",
+      binarySha256: HASHES.binary,
+      providerIdentity: "openrouter:managed-routing",
+      apiBase: ADMISSION_API_BASE,
+      apiFormat: "openai-compatible",
+      scorerMode: "disabled",
+      scorerModel: null,
       reviewMode: "exhaustive",
-      providerContractEnforced: overrides.providerContractEnforced ?? false,
-      screeningProfileSha256: overrides.providerContractEnforced === true ? "profile-sha" : null,
-      upstreamProviderIdentity: overrides.providerContractEnforced === true ? "PinnedProvider" : null,
-      fixtureCorpusSha256: "corpus-sha",
-      evaluatorSha256: "evaluator-sha",
-      totalCases: results.length,
-      scoredCases: results.filter((r) => r.scored).length,
-      defectCases,
-      detected: overrides.detected ?? defectCases,
-      falsePositives: overrides.falsePositives ?? 0,
-      observedProviderCostUsdDecimal: overrides.observedProviderCostUsdDecimal ?? "0.004",
-      ranAt: "2026-01-01T00:00:00.000Z",
+      evidenceScope: "full-corpus",
+      selectedCaseIds: [],
+      providerContractEnforced: true,
+      screeningProfileSha256: HASHES.profile,
+      upstreamProviderIdentity: "Azure",
+      upstreamProviderRoute: "azure/eu",
+      providerContractSha256: HASHES.contract,
+      providerContract: structuredClone(PROVIDER_CONTRACT),
+      fixtureCorpusSha256: HASHES.corpus,
+      evaluatorSha256: HASHES.evaluator,
+      timeoutOverrides: {
+        requestSeconds: null,
+        totalSeconds: null,
+        caseProcessMilliseconds: 180_000,
+      },
+      totalCases: 70,
+      scoredCases: 70,
+      defectCases: 57,
+      cleanCases: 13,
+      detected,
+      falsePositives,
+      detectionRate: `${detected}/57`,
+      observedProviderCostUsdDecimal,
+      costAccountingComplete: true,
+      errors: 0,
+      ranAt: options.ranAt ?? new Date(Date.UTC(2026, 7, 25, 0, 0, fakeRunSequence)).toISOString(),
     },
     results,
   };
 }
 
+function cloneReport(report: LiveReportForComparison): LiveReportForComparison {
+  return structuredClone(report);
+}
+
+async function inputBoundReport(): Promise<LiveReportForComparison> {
+  const report = fakeReport();
+  const parsedCases = cases.map((input) => benchmarkCase.parse(input));
+  let detected = 0;
+  report.results = parsedCases.map((fixture, index) => {
+    const finding = fixture.groundTruth.findings[0];
+    const defect = finding !== undefined;
+    const caseDetected = defect && detected < 54;
+    if (caseDetected) detected += 1;
+    return {
+      id: fixture.id,
+      type: defect ? "defect" : "clean",
+      scored: true,
+      detected: defect ? caseDetected : null,
+      truthSeverity: finding?.severity ?? null,
+      falsePositives: 0,
+      durationMs: (index + 1) * 100,
+      observedProviderCostUsdDecimal: "0.001",
+      costAccountingComplete: true,
+      exitCode: caseDetected && finding?.severity === "error" ? 1 : 0,
+    };
+  });
+  const screeningProfilePath = resolve(import.meta.dir, "..", "..", "provisional-models.json");
+  const [binary, evaluatorSha256, profile] = await Promise.all([
+    readFile(process.execPath),
+    evaluatorSourceSha256(),
+    screeningProfileMetadata(screeningProfilePath),
+  ]);
+  Object.assign(report.summary, {
+    binarySha256: createHash("sha256").update(binary).digest("hex"),
+    fixtureCorpusSha256: createHash("sha256")
+      .update(JSON.stringify(parsedCases))
+      .digest("hex"),
+    evaluatorSha256,
+    screeningProfileSha256: profile.sha256,
+    upstreamProviderIdentity: profile.upstreamProviderIdentity,
+    upstreamProviderRoute: profile.upstreamProviderRoute,
+    providerContractSha256: profile.providerContractSha256,
+    providerContract: profile.providerContract,
+    totalCases: parsedCases.length,
+    scoredCases: parsedCases.length,
+    defectCases: parsedCases.filter((fixture) => fixture.groundTruth.findings.length > 0).length,
+    cleanCases: parsedCases.filter((fixture) => fixture.groundTruth.findings.length === 0).length,
+    detected,
+    falsePositives: 0,
+    detectionRate: `${detected}/${parsedCases.filter((fixture) => fixture.groundTruth.findings.length > 0).length}`,
+    observedProviderCostUsdDecimal: formatCanonicalDecimal(sumCanonicalDecimals(
+      parsedCases.map(() => parseCanonicalDecimal("0.001")),
+    )),
+    errors: 0,
+  });
+  return report;
+}
+
 const populatedBaseline: Extract<BaselineProfile, { populated: true }> = {
   populated: true,
-  generatedAt: "2026-01-01T00:00:00.000Z",
+  generatedAt: "2026-08-25T00:00:00.000Z",
   reviewMode: "exhaustive",
-  sourceRunAt: "2026-01-01T00:00:00.000Z",
-  providerContractEnforced: false,
-  screeningProfileSha256: null,
-  upstreamProviderIdentity: null,
+  sourceRunAt: "2026-08-25T00:00:00.000Z",
+  providerContractEnforced: true,
+  screeningProfileSha256: HASHES.profile,
+  upstreamProviderIdentity: "Azure",
   totalCases: 70,
   scoredCases: 70,
-  detectionRate: 0.95,
-  falsePositives: 2,
-  gateVerdictCorrectness: 0.97,
-  meanCostUsdPerCase: 0.003,
-  latencyMs: { p50: 4000, p95: 9000 },
+  detectionRate: 54 / 57,
+  falsePositives: 0,
+  gateVerdictCorrectness: 1,
+  meanCostUsdPerCase: 0.001,
+  maximumRunCostUsdDecimal: "0.07",
+  costCaseCount: 70,
+  latencyMs: { p50: 3500, p95: 6700 },
 };
 
-describe("percentile", () => {
-  test("nearest-rank over a sorted sample", () => {
-    const sorted = [10, 20, 30, 40, 50];
-    expect(percentile(sorted, 50)).toBe(30);
-    expect(percentile(sorted, 95)).toBe(50);
-    expect(percentile(sorted, 1)).toBe(10);
-  });
-
-  test("single-element sample returns that element at any percentile", () => {
-    expect(percentile([42], 50)).toBe(42);
+describe("sample math", () => {
+  test("uses nearest-rank percentiles", () => {
+    expect(percentile([10, 20, 30, 40, 50], 50)).toBe(30);
+    expect(percentile([10, 20, 30, 40, 50], 95)).toBe(50);
     expect(percentile([42], 95)).toBe(42);
-  });
-
-  test("rejects an empty sample", () => {
     expect(() => percentile([], 50)).toThrow("empty sample");
   });
-});
 
-describe("extractObservedMetrics", () => {
-  test("derives detection rate, gate-verdict correctness, cost, and latency from a live report", () => {
-    const metrics = extractObservedMetrics(fakeReport());
-    // 2 defects, 2 detected.
-    expect(metrics.detectionRate).toBeCloseTo(1, 5);
-    // All four scored cases: two must-block exit 1 (correct), one advisory
-    // exit 0 (correct), one clean exit 0 (correct) => 4/4 correct.
-    expect(metrics.gateVerdictCorrectness).toBeCloseTo(1, 5);
-    expect(metrics.meanCostUsdPerCase).toBeCloseTo(0.004 / 4, 6);
-    expect(metrics.latencyMs.p50).toBeGreaterThan(0);
-    expect(metrics.latencyMs.p95).toBe(2000);
+  test("computes a median without depending on input order", () => {
+    expect(median([52, 54, 53])).toBe(53);
+    expect(median([54, 52, 53])).toBe(53);
+    expect(() => median([])).toThrow("empty sample");
   });
 
-  test("scores a wrongly-blocked advisory case as an incorrect gate verdict", () => {
-    const report = fakeReport({
-      results: [
-        { id: "must-block-1", type: "defect", scored: true, truthSeverity: "error", durationMs: 1000, exitCode: 1 },
-        // An advisory (warn) case that the model over-blocked: exit 1 when it
-        // should have exited 0.
-        { id: "advisory-1", type: "defect", scored: true, truthSeverity: "warn", durationMs: 1500, exitCode: 1 },
-      ],
-    });
-    const metrics = extractObservedMetrics(report);
-    expect(metrics.gateVerdictCorrectness).toBeCloseTo(0.5, 5);
-  });
+  test("uses the median per-run nearest-rank p95 and maximum per-run mean cost", () => {
+    const observed = aggregateObservedMetrics([
+      fakeReport({ durationMultiplier: 1, costPerCase: "0.001" }),
+      fakeReport({ durationMultiplier: 100, costPerCase: "0.003" }),
+      fakeReport({ durationMultiplier: 10, costPerCase: "0.002" }),
+    ]);
 
-  test("excludes unscored (errored) cases from gate-verdict and latency scoring", () => {
-    const report = fakeReport({
-      results: [
-        { id: "must-block-1", type: "defect", scored: true, truthSeverity: "error", durationMs: 1000, exitCode: 1 },
-        { id: "errored-1", type: "defect", scored: false, truthSeverity: "error", durationMs: null, exitCode: undefined },
-      ],
-    });
-    const metrics = extractObservedMetrics(report);
-    expect(metrics.gateVerdictCorrectness).toBeCloseTo(1, 5);
-    expect(metrics.latencyMs.p50).toBe(1000);
-  });
-
-  test("names an all-unscored run an operational failure, not a regression", () => {
-    // A release blocked because the model got worse and one blocked because the
-    // run never reached the model need different responses from whoever reads
-    // the log, so the message has to say which happened.
-    const report = fakeReport({
-      results: [
-        { id: "errored-1", type: "defect", scored: false, truthSeverity: "error", durationMs: null, exitCode: undefined },
-        { id: "errored-2", type: "defect", scored: false, truthSeverity: "error", durationMs: null, exitCode: undefined },
-      ],
-    });
-    expect(() => extractObservedMetrics(report)).toThrow(
-      "scored none of its 2 cases",
-    );
-    expect(() => extractObservedMetrics(report)).toThrow(
-      "operational failure rather than a quality regression",
-    );
+    expect(observed.latencyMs.p95).toBe(670);
+    expect(observed.ranges.p95LatencyMs).toEqual({ min: 67, max: 6700 });
+    expect(observed.meanCostUsdPerCase).toBeCloseTo(0.003, 10);
+    expect(observed.ranges.meanCostUsdPerCase.min).toBeCloseTo(0.001, 10);
+    expect(observed.ranges.meanCostUsdPerCase.max).toBeCloseTo(0.003, 10);
+    expect(
+      compareMetrics(populatedBaseline, observed).rows.find(
+        (row) => row.metric === "maximum mean cost per case",
+      )?.verdict,
+    ).toBe("FAIL");
   });
 });
 
-describe("compareMetrics", () => {
-  test("passes when observed metrics match baseline exactly", () => {
-    const baseline = { ...populatedBaseline, detectionRate: 1, gateVerdictCorrectness: 1 };
-    const observed = extractObservedMetrics(fakeReport({
-      falsePositives: baseline.falsePositives,
-      observedProviderCostUsdDecimal: String(baseline.meanCostUsdPerCase * 4),
-    }));
-    const comparison = compareMetrics(baseline, observed);
-    expect(comparison.ok).toBe(true);
-    expect(comparison.rows.every((row) => row.verdict === "PASS")).toBe(true);
+describe("release report validation", () => {
+  test("accepts one complete full-corpus report", () => {
+    expect(() => assertValidReleaseReport(fakeReport())).not.toThrow();
+    expect(extractObservedMetrics(fakeReport()).reportCount).toBe(1);
   });
 
-  test("fails when detection rate drops more than the tolerance", () => {
-    const baseline = { ...populatedBaseline, detectionRate: 0.98 };
-    const observed = extractObservedMetrics(fakeReport({
-      detected: 1,
-      results: [
-        { id: "must-block-1", type: "defect", scored: true, truthSeverity: "error", durationMs: 1000, exitCode: 1 },
-        { id: "must-block-2", type: "defect", scored: true, truthSeverity: "error", durationMs: 1000, exitCode: 0 },
-      ],
-    }));
-    expect(observed.detectionRate).toBeCloseTo(0.5, 5);
-    expect(0.98 - observed.detectionRate).toBeGreaterThan(DETECTION_RATE_MAX_DROP_PP / 100);
-    const comparison = compareMetrics(baseline, observed);
+  test("rejects 69 of 70 scored cases", () => {
+    const report = cloneReport(fakeReport());
+    report.summary.scoredCases = 69;
+    report.results[69]!.scored = false;
+    report.results[69]!.durationMs = null;
+    expect(() => assertValidReleaseReport(report)).toThrow("scoredCases must equal totalCases");
+  });
+
+  test("rejects any operational error", () => {
+    const report = cloneReport(fakeReport());
+    report.summary.errors = 1;
+    expect(() => assertValidReleaseReport(report)).toThrow("errors must be 0");
+  });
+
+  test("rejects a missing scored-case exit code", () => {
+    const report = cloneReport(fakeReport());
+    (report.results[12] as { exitCode?: number }).exitCode = undefined;
+    expect(() => assertValidReleaseReport(report)).toThrow(
+      "every scored result must have CLI exit code 0 or 1",
+    );
+  });
+
+  test("rejects incomplete summary or per-result cost accounting", () => {
+    const incompleteSummary = cloneReport(fakeReport());
+    incompleteSummary.summary.costAccountingComplete = false;
+    expect(() => assertValidReleaseReport(incompleteSummary)).toThrow(
+      "summary cost accounting must be complete",
+    );
+
+    const incompleteResult = cloneReport(fakeReport());
+    incompleteResult.results[12]!.costAccountingComplete = false;
+    expect(() => assertValidReleaseReport(incompleteResult)).toThrow(
+      "every result must have complete cost accounting",
+    );
+
+    const missingResultCost = cloneReport(fakeReport());
+    missingResultCost.results[12]!.observedProviderCostUsdDecimal = null;
+    expect(() => assertValidReleaseReport(missingResultCost)).toThrow(
+      "every result must have canonical observed provider cost",
+    );
+  });
+
+  test("rejects noncanonical costs and a summary that does not equal the result total", () => {
+    const noncanonical = cloneReport(fakeReport());
+    noncanonical.results[0]!.observedProviderCostUsdDecimal = "0.0010";
+    expect(() => assertValidReleaseReport(noncanonical)).toThrow("canonical nonnegative decimal");
+
+    const inconsistent = cloneReport(fakeReport());
+    inconsistent.summary.observedProviderCostUsdDecimal = "0.071";
+    expect(() => assertValidReleaseReport(inconsistent)).toThrow("does not match result total");
+  });
+
+  test("rejects non-release scope, provider contract, hash, and identity fields", () => {
+    const invalidReports: Array<[string, (report: LiveReportForComparison) => void]> = [
+      ["reviewMode must be exhaustive", (report) => { report.summary.reviewMode = "bounded"; }],
+      ["evidenceScope must be full-corpus", (report) => { report.summary.evidenceScope = "selected-cases"; }],
+      ["selectedCaseIds must be empty", (report) => { report.summary.selectedCaseIds = ["defect-01"]; }],
+      ["providerContractEnforced must be true", (report) => { report.summary.providerContractEnforced = false; }],
+      ["binarySha256 must be exactly 64", (report) => { report.summary.binarySha256 = "A".repeat(64); }],
+      ["fixtureCorpusSha256 must be exactly 64", (report) => { report.summary.fixtureCorpusSha256 = "short"; }],
+      ["evaluatorSha256 must be exactly 64", (report) => { report.summary.evaluatorSha256 = "short"; }],
+      ["screeningProfileSha256 must be exactly 64", (report) => { report.summary.screeningProfileSha256 = "short"; }],
+      ["providerContractSha256 must be exactly 64", (report) => { report.summary.providerContractSha256 = "short"; }],
+      ["providerIdentity must be nonempty", (report) => {
+        (report.summary as { providerIdentity: string }).providerIdentity = "";
+      }],
+      ["upstreamProviderIdentity must be nonempty", (report) => { report.summary.upstreamProviderIdentity = ""; }],
+      ["upstreamProviderRoute must be nonempty", (report) => { report.summary.upstreamProviderRoute = " "; }],
+      ["apiBase must be nonempty", (report) => {
+        (report.summary as { apiBase: string }).apiBase = "";
+      }],
+      ["apiFormat must be nonempty", (report) => {
+        (report.summary as { apiFormat: string }).apiFormat = "";
+      }],
+    ];
+
+    for (const [message, mutate] of invalidReports) {
+      const report = cloneReport(fakeReport());
+      mutate(report);
+      expect(() => assertValidReleaseReport(report)).toThrow(message);
+    }
+  });
+
+  test("binds provider identity, route, models, and digest to the exact contract", () => {
+    const identityMismatch = cloneReport(fakeReport());
+    (identityMismatch.summary as { providerIdentity: string }).providerIdentity = "custom";
+    expect(() => assertValidReleaseReport(identityMismatch)).toThrow(
+      "providerIdentity must match the enforced provider contract",
+    );
+
+    const routeMismatch = cloneReport(fakeReport());
+    routeMismatch.summary.upstreamProviderRoute = "azure/us";
+    expect(() => assertValidReleaseReport(routeMismatch)).toThrow(
+      "upstreamProviderRoute must match the enforced provider contract",
+    );
+
+    const contractMismatch = cloneReport(fakeReport());
+    contractMismatch.summary.providerContract.modelPriceBounds[0]!.outputMicrosPerMillionTokens += 1;
+    expect(() => assertValidReleaseReport(contractMismatch)).toThrow(
+      "providerContractSha256 must match the enforced provider contract",
+    );
+
+    const modelMismatch = cloneReport(fakeReport());
+    modelMismatch.summary.model = "openai/other";
+    expect(() => assertValidReleaseReport(modelMismatch)).toThrow(
+      "review model must have a generator price bound",
+    );
+  });
+
+  test("binds reports to the supplied binary, corpus, evaluator, and screening profile", async () => {
+    const report = await inputBoundReport();
+    const screeningProfilePath = resolve(import.meta.dir, "..", "..", "provisional-models.json");
+    await expect(
+      assertReportsBoundToInputs([report], process.execPath, screeningProfilePath),
+    ).resolves.toBeUndefined();
+
+    report.summary.binarySha256 = "f".repeat(64);
+    await expect(
+      assertReportsBoundToInputs([report], process.execPath, screeningProfilePath),
+    ).rejects.toThrow("binarySha256 is not bound to the supplied release input");
+  });
+
+  test("rejects a non-release API even when its fields are nonempty", () => {
+    const report = cloneReport(fakeReport());
+    (report.summary as { apiBase: string }).apiBase = "https://not-openrouter.invalid/v1";
+    (report.summary as { apiFormat: string }).apiFormat = "arbitrary";
+    expect(() => assertValidReleaseReport(report)).toThrow(
+      "provider API must be the managed OpenRouter release endpoint",
+    );
+  });
+});
+
+describe("three-report aggregation", () => {
+  test("52/54/53 passes the detection floor", () => {
+    const observed = aggregateObservedMetrics([
+      fakeReport({ detected: 52 }),
+      fakeReport({ detected: 54 }),
+      fakeReport({ detected: 53 }),
+    ]);
+    expect(observed.detectionRate).toBe(53 / 57);
+    expect(populatedBaseline.detectionRate - observed.detectionRate).toBeLessThan(
+      DETECTION_RATE_MAX_DROP_PP / 100,
+    );
+    const comparison = compareMetrics(populatedBaseline, observed);
+    expect(comparison.rows.find((row) => row.metric === "median detection rate")?.verdict).toBe("PASS");
+    expect(comparison.ok).toBe(true);
+  });
+
+  test("52/54/52 fails the detection floor", () => {
+    const observed = aggregateObservedMetrics([
+      fakeReport({ detected: 52 }),
+      fakeReport({ detected: 54 }),
+      fakeReport({ detected: 52 }),
+    ]);
+    expect(observed.detectionRate).toBe(52 / 57);
+    const comparison = compareMetrics(populatedBaseline, observed);
+    expect(comparison.rows.find((row) => row.metric === "median detection rate")?.verdict).toBe("FAIL");
     expect(comparison.ok).toBe(false);
-    expect(comparison.rows.find((row) => row.metric === "detection rate")?.verdict).toBe("FAIL");
   });
 
-  test("tolerates a detection-rate drop within the percentage-point budget", () => {
-    // Baseline 69/70, observed 68/70: a ~1.4pp drop, inside the 2pp budget.
-    const baseline = { ...populatedBaseline, detectionRate: 69 / 70 };
-    const observed = extractObservedMetrics(fakeReport()); // detectionRate 1.0 here; force via override below
-    const nearlyEqual = { ...observed, detectionRate: 68 / 70 };
-    const comparison = compareMetrics(baseline, nearlyEqual);
-    expect(comparison.rows.find((row) => row.metric === "detection rate")?.verdict).toBe("PASS");
+  test("is independent of report order", () => {
+    const reports = [
+      fakeReport({ detected: 52, falsePositives: 3, ranAt: "2026-08-25T00:00:01.000Z" }),
+      fakeReport({ detected: 54, falsePositives: 1, ranAt: "2026-08-25T00:00:03.000Z" }),
+      fakeReport({ detected: 53, falsePositives: 2, ranAt: "2026-08-25T00:00:02.000Z" }),
+    ] as const;
+    expect(aggregateObservedMetrics(reports)).toEqual(
+      aggregateObservedMetrics([reports[2], reports[0], reports[1]]),
+    );
   });
 
-  test("reports false/unrelated findings past the budget without blocking", () => {
-    // Six runs of one unchanged binary spanned 4 to 7 false findings against a
-    // budget of baseline + 2, so this threshold marks a run worth reading, not
-    // a release worth stopping.
-    const observed = extractObservedMetrics(fakeReport({
-      falsePositives: populatedBaseline.falsePositives + FALSE_FINDINGS_MAX_INCREASE + 1,
-    }));
+  test("rejects a cohort mismatch", () => {
+    const mismatched = cloneReport(fakeReport());
+    mismatched.summary.binarySha256 = "6".repeat(64);
+    expect(() => aggregateObservedMetrics([fakeReport(), mismatched, fakeReport()])).toThrow(
+      "cohort mismatch for summary.binarySha256",
+    );
+  });
+
+  test("rejects repeated logical run identities even when raw files differ", () => {
+    const first = fakeReport();
+    const reformatted = cloneReport(first);
+    const rewritten = cloneReport(first);
+    expect(() => assertDistinctRunIdentities([first, reformatted, rewritten])).toThrow(
+      "distinct benchmark run IDs",
+    );
+    expect(() => assertExpectedRunIdentities([first], ["different-run"])).toThrow(
+      "does not match its expected run identity",
+    );
+    expect(() => aggregateObservedMetrics([first, reformatted, rewritten])).toThrow(
+      "distinct benchmark run IDs",
+    );
+  });
+
+  test("keeps false findings and gate correctness informational with the observed range", () => {
+    const observed = aggregateObservedMetrics([
+      fakeReport({ falsePositives: 3 }),
+      fakeReport({ falsePositives: 5 }),
+      fakeReport({ falsePositives: 4 }),
+    ]);
     const comparison = compareMetrics(populatedBaseline, observed);
-    const row = comparison.rows.find((r) => r.metric === "false/unrelated findings");
-    expect(row?.verdict).toBe("FAIL");
-    expect(row?.informational).toBe(true);
+    const falseFindingRow = comparison.rows.find(
+      (row) => row.metric === "median false/unrelated findings",
+    );
+    const gateRow = comparison.rows.find(
+      (row) => row.metric === "median gate verdict correctness",
+    );
+    expect(falseFindingRow?.verdict).toBe("FAIL");
+    expect(falseFindingRow?.informational).toBe(true);
+    expect(falseFindingRow?.detail).toContain("range 3-5");
+    expect(gateRow?.informational).toBe(true);
+    expect(gateRow?.detail).toContain("range");
     expect(comparison.ok).toBe(true);
+    expect(formatComparisonTable(comparison.rows)).toContain(
+      "Outside its usual range, but not blocking",
+    );
   });
 
-  test("says so in the table when a reported metric leaves its usual range", () => {
-    const observed = extractObservedMetrics(fakeReport({
-      falsePositives: populatedBaseline.falsePositives + FALSE_FINDINGS_MAX_INCREASE + 1,
-    }));
-    const table = formatComparisonTable(compareMetrics(populatedBaseline, observed).rows);
-    expect(table).toContain("Outside its usual range, but not blocking");
-    expect(table).toContain("false/unrelated findings");
-  });
-
-  test("a detection-rate drop still blocks the release", () => {
-    // The one metric whose spread across those runs (3.5pp) stayed inside a
-    // threshold that can still catch a real regression.
-    const observed = {
-      ...extractObservedMetrics(fakeReport()),
-      detectionRate: populatedBaseline.detectionRate - (DETECTION_RATE_MAX_DROP_PP / 100) - 0.01,
-    };
+  test("cost remains blocking when the provider profile differs", () => {
+    const observed = aggregateObservedMetrics([
+      fakeReport({ costPerCase: "1" }),
+      fakeReport({ costPerCase: "1" }),
+      fakeReport({ costPerCase: "1" }),
+    ]);
+    observed.screeningProfileSha256 = "f".repeat(64);
     const comparison = compareMetrics(populatedBaseline, observed);
-    expect(comparison.rows.find((r) => r.metric === "detection rate")?.verdict).toBe("FAIL");
+    const cost = comparison.rows.find((row) => row.metric === "maximum mean cost per case");
+    expect(cost?.verdict).toBe("FAIL");
+    expect(cost?.informational).not.toBe(true);
     expect(comparison.ok).toBe(false);
   });
 
-  test("reports a gate-verdict drop past the tolerance without blocking", () => {
-    const baseline = { ...populatedBaseline, gateVerdictCorrectness: 1 };
-    const observed = { ...extractObservedMetrics(fakeReport()), gateVerdictCorrectness: 1 - (GATE_VERDICT_MAX_DROP_PP / 100) - 0.01 };
-    const comparison = compareMetrics(baseline, observed);
-    const row = comparison.rows.find((r) => r.metric === "gate verdict correctness");
-    expect(row?.verdict).toBe("FAIL");
-    expect(row?.informational).toBe(true);
-    expect(comparison.ok).toBe(true);
+  test("compares the blocking cost ceiling without IEEE-754 rounding", () => {
+    expect(exactMeanCostWithinTolerance("8.75", 70, "7", 70)).toBe(true);
+    expect(exactMeanCostWithinTolerance("8.750000000000000007", 70, "7", 70)).toBe(false);
+  });
+});
+
+describe("CLI report selection", () => {
+  const releaseInputs = [
+    "--binary", "target/release/postil",
+    "--screen-profile", "provisional-models.json",
+  ];
+
+  test("accepts exactly one or three distinct --result paths", () => {
+    expect(parseCliArguments([
+      ...releaseInputs,
+      "--expected-run-id", "one",
+      "--result", "one.json",
+    ]).resultPaths).toEqual(["one.json"]);
+    expect(parseCliArguments([
+      ...releaseInputs,
+      "--expected-run-id", "one",
+      "--expected-run-id", "two",
+      "--expected-run-id", "three",
+      "--result", "one.json",
+      "--result", "two.json",
+      "--result", "three.json",
+    ]).resultPaths).toEqual(["one.json", "two.json", "three.json"]);
   });
 
-  test("reports mean cost past the ratio budget without blocking", () => {
-    const observed = { ...extractObservedMetrics(fakeReport()), meanCostUsdPerCase: populatedBaseline.meanCostUsdPerCase * (1 + MEAN_COST_MAX_INCREASE_RATIO) + 0.001 };
-    const comparison = compareMetrics(populatedBaseline, observed);
-    const row = comparison.rows.find((candidate) => candidate.metric === "mean cost per case");
-    expect(row?.verdict).toBe("FAIL");
-    expect(row?.informational).toBe(true);
-    expect(comparison.ok).toBe(true);
+  test("rejects every other report count", () => {
+    expect(() => parseCliArguments([])).toThrow("exactly 1 or 3");
+    expect(() => parseCliArguments(["--result", "one", "--result", "two"])).toThrow(
+      "exactly 1 or 3",
+    );
+    expect(() => parseCliArguments([
+      "--result", "one",
+      "--result", "two",
+      "--result", "three",
+      "--result", "four",
+    ])).toThrow("exactly 1 or 3");
   });
 
-  test("blocks a cost regression under the same enforced provider contract", () => {
-    const baseline = {
-      ...populatedBaseline,
-      providerContractEnforced: true,
-      screeningProfileSha256: "profile-sha",
-      upstreamProviderIdentity: "PinnedProvider",
-    };
-    const observed = {
-      ...extractObservedMetrics(fakeReport({ providerContractEnforced: true })),
-      meanCostUsdPerCase:
-        baseline.meanCostUsdPerCase * (1 + MEAN_COST_MAX_INCREASE_RATIO) + 0.001,
-    };
-    const comparison = compareMetrics(baseline, observed);
-    const row = comparison.rows.find((candidate) => candidate.metric === "mean cost per case");
-    expect(row?.verdict).toBe("FAIL");
-    expect(row?.informational).toBe(false);
-    expect(comparison.ok).toBe(false);
+  test("rejects duplicate paths and duplicate raw reports", () => {
+    expect(() => parseCliArguments([
+      ...releaseInputs,
+      "--expected-run-id", "one",
+      "--expected-run-id", "two",
+      "--expected-run-id", "three",
+      "--result", "one.json",
+      "--result", "./one.json",
+      "--result", "three.json",
+    ])).toThrow("path must be distinct");
+    expect(() => assertDistinctRawReportDigests([
+      "a".repeat(64),
+      "b".repeat(64),
+      "a".repeat(64),
+    ])).toThrow("distinct raw SHA-256 digests");
   });
 
-  test("does not treat missing provider identity as a comparable contract", () => {
-    const baseline = {
-      ...populatedBaseline,
-      providerContractEnforced: true,
-      screeningProfileSha256: null,
-      upstreamProviderIdentity: null,
-    };
-    const observed = {
-      ...extractObservedMetrics(fakeReport()),
-      providerContractEnforced: true,
-      meanCostUsdPerCase:
-        baseline.meanCostUsdPerCase * (1 + MEAN_COST_MAX_INCREASE_RATIO) + 0.001,
-    };
-    const comparison = compareMetrics(baseline, observed);
-    const row = comparison.rows.find((candidate) => candidate.metric === "mean cost per case");
-    expect(row?.informational).toBe(true);
-    expect(comparison.ok).toBe(true);
+  test("requires the same three-sample estimator for rebaselining", () => {
+    expect(() => parseCliArguments([
+      ...releaseInputs,
+      "--expected-run-id", "one",
+      "--result", "one.json",
+      "--record",
+    ])).toThrow("--record requires exactly three --result reports");
+    expect(parseCliArguments([
+      ...releaseInputs,
+      "--expected-run-id", "one",
+      "--expected-run-id", "two",
+      "--expected-run-id", "three",
+      "--result", "one.json",
+      "--result", "two.json",
+      "--result", "three.json",
+      "--record",
+    ]).record).toBe(true);
   });
 
-  test("fails when p95 latency rises past the ratio budget", () => {
-    const observed = {
-      ...extractObservedMetrics(fakeReport()),
-      latencyMs: { p50: 1000, p95: populatedBaseline.latencyMs.p95 * (1 + LATENCY_P95_MAX_INCREASE_RATIO) + 1 },
-    };
-    const comparison = compareMetrics(populatedBaseline, observed);
-    expect(comparison.rows.find((row) => row.metric === "p95 latency (ms)")?.verdict).toBe("FAIL");
+  test("requires explicit release binary and screening profile inputs", () => {
+    expect(() => parseCliArguments([
+      "--expected-run-id", "one",
+      "--result", "one.json",
+    ])).toThrow(
+      "requires --binary",
+    );
+    expect(() => parseCliArguments([
+      "--binary", "postil",
+      "--expected-run-id", "one",
+      "--result", "one.json",
+    ])).toThrow("requires --screen-profile");
+    expect(() => parseCliArguments([
+      ...releaseInputs,
+      "--result", "one.json",
+    ])).toThrow("one --expected-run-id per --result report");
+  });
+
+  test("prints an executable three-report rebaseline command only for a complete cohort", () => {
+    expect(formatRebaselineGuidance({
+      binaryPath: "target/release/postil",
+      screeningProfilePath: "provisional models.json",
+      expectedRunIds: ["one", "two", "three"],
+      resultPaths: ["one.json", "two report.json", "three.json"],
+    })).toBe([
+      "  bun run bench:compare -- \\",
+      "    --binary 'target/release/postil' \\",
+      "    --screen-profile 'provisional models.json' \\",
+      "    --expected-run-id 'one' \\",
+      "    --expected-run-id 'two' \\",
+      "    --expected-run-id 'three' \\",
+      "    --result 'one.json' \\",
+      "    --result 'two report.json' \\",
+      "    --result 'three.json' \\",
+      "    --record",
+    ].join("\n"));
+
+    expect(formatRebaselineGuidance({
+      binaryPath: "target/release/postil",
+      screeningProfilePath: "provisional-models.json",
+      expectedRunIds: ["one"],
+      resultPaths: ["one.json"],
+    })).toContain("collect three independent complete reports");
   });
 });

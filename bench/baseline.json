@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "corpus": {
     "fixtureCorpusSha256": "8e4c2cb9ad5a7efdfe6a875566d20133e905155b6f693a873595adf6c069e065",
-    "evaluatorSha256": "02f4ad84bd86d1f65aafc7dcc077981972a95fdd0f5ab5140f5ea98ba9372797"
+    "evaluatorSha256": "1d6f9fecda01e6e8066f8fefd4a1b2955014575ce07542819b6f506d48dae595"
   },
   "profiles": {
     "z-ai/glm-5.2": {
@@ -38,6 +38,8 @@
       "falsePositives": 0,
       "gateVerdictCorrectness": 0.8428571428571429,
       "meanCostUsdPerCase": 0.0008315965428571429,
+      "maximumRunCostUsdDecimal": "0.058211758",
+      "costCaseCount": 70,
       "latencyMs": {
         "p50": 5659,
         "p95": 9530

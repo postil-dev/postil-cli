@@ -376,9 +376,9 @@ exercise the scorer and must retain its exact identity and usage record.
 It refuses to run without `POSTIL_API_KEY`, `OPENROUTER_API_KEY`, `MODEL_API_KEY`,
 or `LLM_API_KEY` and never logs or prints the key value. Live mode spends real
 tokens and depends on an external provider, so it is **not run on ordinary
-pushes or pull requests**; the release pipeline runs a full-corpus live pass
-against `bench/baseline.json` before every tagged release (see "Release gate"
-below). Every live run writes its JSON report under
+pushes or pull requests**. The release pipeline runs three sequential
+full-corpus live samples against `bench/baseline.json` before every tagged
+release (see "Release gate" below). Every live run writes its JSON report under
 `.runs/live/<run-id>/` (gitignored), beside raw per-attempt stdout and stderr.
 Set `--run-id <id>` or `POSTIL_BENCH_SCREEN_RUN_ID` to name the immutable
 namespace; an omitted ID gets a unique generated value. Reusing an ID fails
@@ -458,62 +458,85 @@ nondeterministic. Treat them as internal evidence, not a published benchmark.
 
 ## Release gate
 
-The `Release` workflow runs a full-corpus diff-file live pass against the Luna
-profile in `provisional-models.json` and the exact release binary before it
-builds any other target, then checks the result with `bun run bench:compare`.
-A material regression blocks the release: `build` depends on the `bench-live`
-job.
+The `Release` workflow runs three uniquely named, sequential full-corpus
+diff-file samples against the Luna profile in `provisional-models.json`. Every
+sample uses the same preserved release binary. All three samples are attempted
+even when one fails, and the workflow uploads every completed raw report before
+comparison. A failed sample, missing report, or failed comparison blocks the
+release because `build` depends on the `bench-live` job.
 
-`compare-baseline.ts` computes five metrics from the live report and compares
-each against the matching model entry in `bench/baseline.json`: authored-target
-detection rate, false/unrelated finding count, gate-verdict correctness (does
-the CLI's exit code agree with the authored must-block/advisory/clean
-classification), mean provider cost per case, and p95 review latency. Each
-metric has its own tolerance (see the exported `*_MAX_*` constants at the top
-of `compare-baseline.ts`).
+The comparator accepts exactly one or three distinct `--result` paths. Three
+paths must also contain byte-distinct reports with distinct immutable run IDs
+and timestamps. Byte identity is established by SHA-256 over each raw file.
+Every report must be exhaustive full-corpus evidence with an empty
+`selectedCaseIds`, an enforced provider contract, no operational errors, and
+all cases scored. Summary and per-result cost accounting must be complete.
+Every cost is a canonical nonnegative decimal, and the summary cost must equal
+the exact sum of result costs. Binary, fixture-corpus, evaluator, screening
+profile, and provider-contract hashes are exact 64-character lowercase SHA-256
+values. Provider identity, route, API, and scorer configuration fields must be
+present and internally consistent. The comparator requires explicit release
+binary and screening-profile paths, then recomputes the binary, fixture corpus,
+evaluator source, screening profile, provider contract, and exact case cohort
+instead of trusting hashes asserted by the reports.
 
-Detection rate and p95 latency always block a release when they cross their
-tolerances. Mean provider cost blocks only when the baseline and current run
-share the same enforced provider profile; without that identity, the comparison
-is a trend report. False/unrelated findings and gate-verdict correctness are
-reported but never block, because one run cannot measure them precisely enough
-to act on. The CLI's per-operation cost cap remains the deterministic spending
-boundary.
-Six runs of a single unchanged binary against this corpus, four on managed
-routing and two pinned to the qualified upstream provider, spanned 4 to 7 false
-findings and 12.9 percentage points of gate-verdict correctness, against
-thresholds of 2 findings and 2 points. Every request goes out at temperature 0,
-so this is the provider's own nondeterminism rather than sampling, and pinning
-the provider did not remove it: the widest false-finding count came from a
-pinned run. Detection rate over the same six runs spanned 3.5 points, which
-leaves a threshold that still catches a real regression.
+A three-report comparison also requires identical binary, corpus, evaluator,
+model, provider, API, scorer, route, profile, contract, timeout, fixture
+identity, and case-count fields across the cohort. Structural, operational,
+digest, and cohort failures block before metric comparison. The one-report
+mode applies the same fail-closed report validation.
 
-Read the non-blocking metrics across releases rather than acting on a single
-run. Making them blocking again means reducing the noise rather than tightening
-the number: comparing a median across repeated runs is the direct fix, at
-proportionally more cost and wall-clock per release. A gate that fails at
-random is worse than no gate, because it teaches everyone to bypass it.
+`compare-baseline.ts` compares five aggregate metrics against the matching
+model entry in `bench/baseline.json`: median authored-target detection rate,
+median false/unrelated finding count, median gate-verdict correctness, maximum
+per-run mean provider cost per case, and median per-run nearest-rank p95 review
+latency. Each metric has its own tolerance in the exported `*_MAX_*` constants.
+Detection rate and p95 latency block when they cross their tolerances. Maximum
+mean cost always blocks and is compared as an exact decimal ratio; a provider
+profile mismatch invalidates the comparison instead of making cost
+informational. False/unrelated findings and gate-verdict correctness remain
+informational; their medians and complete observed ranges appear in the table.
+The CLI's per-operation cost cap remains the deterministic spending boundary.
 
-The baseline
-also records the fixture-corpus and evaluator-source SHA-256 digests the live
-report already computes; a mismatch fails loudly instead of comparing metrics
-across an unrelated fixture set.
+The baseline records fixture-corpus and evaluator-source SHA-256 digests, the
+expected complete case count, exact provider profile, and the maximum sampled
+run cost as a canonical decimal with its case count. A mismatch blocks
+comparison across unrelated or incomplete evidence.
 
 ```sh
-# Compare an existing report against the committed baseline.
-bun run bench:compare -- --result <path-to-report.json>
-bun run bench:compare -- --run-id <run-id>   # resolves .runs/live/<run-id>/report.json
-
-# Re-baseline deliberately, after confirming the new numbers are an accepted
-# tradeoff (a model change, a fixture change, an intentional pipeline change):
-REVIEW_MODEL=openai/gpt-5.6-luna bun run bench:live -- \
+# Compare one complete report for a local check.
+bun run bench:compare -- \
+  --binary <path-to-release-binary> \
   --screen-profile ../provisional-models.json \
-  --json-out live-report.json
-bun run bench:compare -- --result live-report.json --record
+  --expected-run-id <report-run-id> \
+  --result <path-to-report.json>
+
+# Run the release comparison over three complete reports.
+bun run bench:compare -- \
+  --binary <path-to-release-binary> \
+  --screen-profile ../provisional-models.json \
+  --expected-run-id <report-run-id-1> \
+  --expected-run-id <report-run-id-2> \
+  --expected-run-id <report-run-id-3> \
+  --result <path-to-report-1.json> \
+  --result <path-to-report-2.json> \
+  --result <path-to-report-3.json>
+
+# Re-baseline explicitly from three independent complete reports with the same
+# binary, profile, and corpus.
+bun run bench:compare -- \
+  --binary <path-to-release-binary> \
+  --screen-profile ../provisional-models.json \
+  --expected-run-id <report-run-id-1> \
+  --expected-run-id <report-run-id-2> \
+  --expected-run-id <report-run-id-3> \
+  --result <path-to-report-1.json> \
+  --result <path-to-report-2.json> \
+  --result <path-to-report-3.json> \
+  --record
 ```
 
-`--record` is the only thing that writes `bench/baseline.json`; nothing else
-updates it implicitly. When the gate fails in CI, the printed table shows
-baseline vs. observed vs. verdict for every metric, so the failing metric and
-by how much is visible directly in the job log without downloading the report
-artifact.
+`--record` accepts exactly three reports and is the only operation that writes
+`bench/baseline.json`. The release workflow never records a baseline. The
+comparison table shows baseline, aggregate observation, verdict, and sample
+range directly in the job log.
