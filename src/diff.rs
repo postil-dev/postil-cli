@@ -1507,9 +1507,11 @@ impl ModelBatchSpool {
                 candidate.hunk.path,
                 candidate.hunk.new_start
             );
-            let additional = candidate.direct_batch_ids.difference(&selected).count();
-            if selected.len().saturating_add(additional) <= selected_limit {
-                selected.extend(candidate.direct_batch_ids.iter().copied());
+            for id in &candidate.direct_batch_ids {
+                if selected.len() >= selected_limit {
+                    break;
+                }
+                selected.insert(*id);
             }
         }
         for id in &self.metadata_batch_ids {
