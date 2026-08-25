@@ -5749,6 +5749,7 @@ fn hosted_config_ignores_repository_model_provider_and_scorer() {
     assert!(stdout.contains("model.name: "));
     assert!(stdout.contains("model.cascade: []"));
     assert!(stdout.contains("model.scorer: "));
+    assert!(!stdout.contains("model.scorer: openai/gpt-5.6-luna"));
     assert!(stdout.contains("model.apiBase: https://openrouter.ai/api/v1"));
     assert!(stdout.contains("model.apiFormat: openai-compatible"));
     assert!(stdout.contains("model.consensus: 1"));
@@ -5780,7 +5781,7 @@ fn provisional_hosted_config_uses_only_the_baked_roster() {
 
     assert!(stdout.contains("model.name: openai/gpt-5.6-luna"));
     assert!(stdout.contains("model.cascade: []"));
-    assert!(stdout.contains("model.scorer: "));
+    assert!(stdout.contains("model.scorer: openai/gpt-5.6-luna"));
     assert!(stdout.contains("model.apiBase: https://openrouter.ai:443/api/v1"));
     assert!(stdout.contains("model.apiFormat: openai-compatible"));
     assert!(stdout.contains("model.consensus: 1"));

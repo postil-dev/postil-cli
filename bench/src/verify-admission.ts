@@ -218,11 +218,14 @@ export async function verifyProvisionalRelease(
   const profile = provisionalProfileSchema.parse(
     JSON.parse(await readFile(provisionalProfilePath, "utf8")),
   );
-  const expectedModels = [...profile.generatorChain, ...profile.scorerChain].sort();
-  const boundedModels = profile.modelPriceBounds.map((bound) => bound.model);
-  if (new Set(expectedModels).size !== expectedModels.length) {
-    throw new Error("provisional hosted model chains must be unique");
+  if (new Set(profile.generatorChain).size !== profile.generatorChain.length) {
+    throw new Error("provisional hosted generator chain must not repeat models");
   }
+  if (new Set(profile.scorerChain).size !== profile.scorerChain.length) {
+    throw new Error("provisional hosted scorer chain must not repeat models");
+  }
+  const expectedModels = [...new Set([...profile.generatorChain, ...profile.scorerChain])].sort();
+  const boundedModels = profile.modelPriceBounds.map((bound) => bound.model);
   if (
     boundedModels.length !== expectedModels.length ||
     boundedModels.some((model, index) => model !== expectedModels[index])

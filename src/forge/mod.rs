@@ -2044,6 +2044,10 @@ fn suppression_reason(reason: SuppressionReason) -> &'static str {
         }
         SuppressionReason::DerivedFromSuppressed => "built on a finding suppressed as mis-anchored",
         SuppressionReason::RepositoryClaimUnsupported => "repository-wide claim is not publishable",
+        SuppressionReason::MachineClaimRefuted => "source premise was deterministically refuted",
+        SuppressionReason::MachineClaimUnverified => {
+            "source premise could not be verified within deterministic bounds"
+        }
     }
 }
 
@@ -3060,6 +3064,8 @@ mod tests {
             scorer_kind: None,
             scorer_reason: None,
             repository_claim: None,
+            machine_claim: None,
+            machine_claim_deferred: false,
             title: "Unsanitized input reaches query".into(),
             body: "user_input flows into exec_query.".into(),
             evidence: None,
@@ -3092,6 +3098,7 @@ mod tests {
             review_coverage: None,
             review_admission: None,
             repository_search: Default::default(),
+            claim_verification: None,
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
@@ -3213,6 +3220,7 @@ mod tests {
             review_coverage: None,
             review_admission: None,
             repository_search: Default::default(),
+            claim_verification: None,
             usage_accounting_complete: true,
             duration_ms: 1_250,
             base_sha: None,
@@ -3567,6 +3575,7 @@ mod tests {
             review_coverage: None,
             review_admission: None,
             repository_search: Default::default(),
+            claim_verification: None,
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
@@ -3634,6 +3643,7 @@ mod tests {
             review_coverage: None,
             review_admission: None,
             repository_search: Default::default(),
+            claim_verification: None,
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
@@ -3683,6 +3693,7 @@ mod tests {
             review_coverage: None,
             review_admission: None,
             repository_search: Default::default(),
+            claim_verification: None,
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
