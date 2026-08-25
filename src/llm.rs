@@ -19,9 +19,13 @@ use time::Date;
 
 use crate::adjudication::{AdjudicationResult, MAX_ADJUDICATION_OUTPUT_TOKENS};
 use crate::api_key;
+
+macro_rules! eprintln {
+    ($($argument:tt)*) => { crate::progress::telemetry(format_args!($($argument)*)) };
+}
 use crate::config::{
     ApiFormat, Config, HOSTED_ADMISSION_PROJECTION_CAP_MICROS, HOSTED_OPERATION_COST_CAP_MICROS,
-    ModelPriceBound,
+    ModelPriceBound, ReasoningEffort,
 };
 use crate::envelope::{
     Finding, Kind, ModelIncident, ModelIncidentCategory, ModelIncidentPhase, ModelIncidentRecovery,
@@ -128,15 +132,6 @@ pub struct AtomicAttributionResponseIdentity {
 struct RawAtomicAttribution {
     same_defect: bool,
     reason: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct Answer {
-    pub content: String,
-    pub model_used: String,
-    pub usage: Usage,
-    pub models: Vec<ModelUsage>,
-    pub usage_accounting_complete: bool,
 }
 
 #[derive(Debug)]
@@ -402,10 +397,6 @@ pub(crate) fn add_usage(total: &mut Usage, usage: Usage) {
     };
 }
 
-fn has_billable_usage(usage: Usage) -> bool {
-    usage.prompt_tokens > 0 || usage.completion_tokens > 0 || usage.provider_cost.is_some()
-}
-
 fn add_response_usage(
     usage: &mut Usage,
     prompt_tokens: u64,
@@ -449,20 +440,6 @@ fn safe_model_error_category(error: &ModelError) -> &'static str {
     } else if error.is_timeout() {
         "timeout"
     } else if error.is_provider() {
-        "provider"
-    } else {
-        "invalid-output"
-    }
-}
-
-fn safe_anyhow_category(error: &anyhow::Error) -> &'static str {
-    if error.downcast_ref::<DeadlineExceeded>().is_some() {
-        "deadline"
-    } else if reqwest_error(error).is_some_and(reqwest::Error::is_timeout)
-        || error.downcast_ref::<RequestTimedOut>().is_some()
-    {
-        "timeout"
-    } else if error.downcast_ref::<ProviderError>().is_some() {
         "provider"
     } else {
         "invalid-output"
@@ -632,6 +609,8 @@ pub struct LlmClient {
 struct RequestDecorations {
     api_base: String,
     api_format: ApiFormat,
+    reasoning_effort: ReasoningEffort,
+    scorer_reasoning_effort: ReasoningEffort,
     require_openrouter_privacy: bool,
     hosted_price_bounds: Option<Arc<HashMap<String, ModelPriceBound>>>,
     pinned_upstream_provider: Option<String>,
@@ -662,11 +641,14 @@ struct LlmTimeouts {
 
 /// Retries per model on transient provider errors before the cascade moves on.
 pub(crate) const TRANSIENT_RETRIES: u32 = 2;
-/// A fresh request can recover when the caller's request timeout, rather than
-/// the provider's response, ended an otherwise viable routed completion. The
-/// shared total deadline remains authoritative, so this cannot extend a hosted
-/// review beyond its worker budget.
-const TIMEOUT_RETRIES: u32 = 1;
+/// Maximum total transient retries available to a budgeted review.
+/// The fixed allowance uses the first two, leaving ten budget-funded retries
+/// and at most thirteen attempts for one logical review call.
+pub(crate) const MAX_BUDGETED_TRANSIENT_RETRIES: u32 = 12;
+const MIN_BUDGETED_RETRY_WAIT: Duration = Duration::from_secs(1);
+const MAX_SYNTHESIZED_RETRY_BACKOFF: Duration = Duration::from_secs(20);
+/// The minimum time reserved for the request funded by a budgeted wait.
+const RETRY_ATTEMPT_RESERVE: Duration = Duration::from_secs(15);
 const EMPTY_RESPONSE_RETRIES: u32 = 1;
 const EXHAUSTED_OUTPUT_RETRIES: u32 = 1;
 const TIMEOUT_RETRY_CAP_SECS: u64 = 90;
@@ -675,7 +657,6 @@ pub(crate) const REVIEW_MAX_OUTPUT_TOKENS: u32 = 16_000;
 const EXHAUSTED_OUTPUT_RETRY_MAX_TOKENS: u32 = REVIEW_MAX_OUTPUT_TOKENS;
 const MAX_REVIEW_RETRY_PREVIOUS_BYTES: usize = 16_384;
 const MAX_REVIEW_RETRY_REASON_BYTES: usize = 16_384;
-const PROVIDER_RETRY_DELAY_CAP_SECS: u64 = 30;
 
 /// Unqualified models receive a bounded review budget. A larger bound belongs
 /// in explicit admitted-model metadata after that model proves it needs one.
@@ -708,11 +689,13 @@ pub(crate) struct ReviewPlanSchedule<'a> {
     pub planner: Option<(&'a str, usize)>,
     pub batch_concurrency: usize,
 }
-pub(crate) const MAX_PROVIDER_ATTEMPTS: usize = 216;
 pub(crate) const MAX_REPORTED_TOKEN_SPEND: usize = 20_000_000;
 const MAX_PROVIDER_INPUT_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_PROVIDER_REQUEST_BYTES: usize = 256 * 1024;
-pub(crate) const MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE: usize = 2_000_000;
+// Review admission includes the full thirteen-attempt transport path for each
+// logical review call. Keep the output ceiling above the five-batch hosted
+// plan while the aggregate token and cost caps remain authoritative.
+pub(crate) const MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE: usize = 10_000_000;
 // Hosted planning reserves one initial and one correction call for every
 // selected model request plus the maximum enabled resolution and compression
 // passes. The selected-batch limit is derived after all model fan-out is known.
@@ -722,8 +705,12 @@ const MAX_LOGICAL_CALLS_PER_SCORER_MODEL: usize = 2;
 const MAX_LOGICAL_CALLS_PER_RESOLUTION_MODEL: usize = 2;
 const MAX_LOGICAL_CALLS_PER_BREVITY_MODEL: usize = 1;
 const MAX_TRANSPORT_ATTEMPTS_PER_CALL: usize = TRANSIENT_RETRIES as usize + 1;
+const MAX_REVIEW_TRANSPORT_ATTEMPTS_PER_CALL: usize = MAX_BUDGETED_TRANSIENT_RETRIES as usize + 1;
+pub(crate) const MAX_PROVIDER_ATTEMPTS: usize =
+    MAX_HOSTED_PLANNED_CALLS_BY_WATCHDOG * MAX_REVIEW_TRANSPORT_ATTEMPTS_PER_CALL;
 const _: () = assert!(
-    MAX_HOSTED_PLANNED_CALLS_BY_WATCHDOG * MAX_TRANSPORT_ATTEMPTS_PER_CALL <= MAX_PROVIDER_ATTEMPTS
+    MAX_HOSTED_PLANNED_CALLS_BY_WATCHDOG * MAX_REVIEW_TRANSPORT_ATTEMPTS_PER_CALL
+        <= MAX_PROVIDER_ATTEMPTS
 );
 const MAX_MODEL_RESPONSE_BYTES: usize = 512 * 1024;
 const SCORER_BASE_MAX_TOKENS: u32 = 256;
@@ -731,10 +718,6 @@ const SCORER_MAX_TOKENS_PER_FINDING: u32 = 144;
 const SCORER_REPAIR_BYTES_PER_OUTPUT_TOKEN: usize = 4;
 pub(crate) const SCORER_MAX_FINDINGS: usize = 20;
 const REPAIR_ERROR_MAX_BYTES: usize = 1_024;
-// The publication contract targets 1,200 characters and hard-stops at 2,400.
-// Keep generation bounded too, so an invalid model cannot spend an article's
-// worth of output tokens before the validator rejects it.
-const RESPOND_MAX_TOKENS: u32 = 1024;
 const PLANNER_MAX_TOKENS: u32 = 1024;
 fn planned_review_models(cfg: &Config) -> Vec<String> {
     if cfg.consensus > 1 {
@@ -1298,6 +1281,16 @@ fn base_request_body(
 
 impl RequestDecorations {
     fn from_config(cfg: &Config) -> Result<Self> {
+        if cfg.api_format == ApiFormat::Anthropic {
+            ensure!(
+                cfg.reasoning_effort != ReasoningEffort::Minimal,
+                "model.reasoningEffort minimal is unsupported by the Anthropic request format; accepted Anthropic values: max|xhigh|high|medium|low|none"
+            );
+            ensure!(
+                cfg.scorer_reasoning_effort != ReasoningEffort::Minimal,
+                "model.scorerReasoningEffort minimal is unsupported by the Anthropic request format; accepted Anthropic values: max|xhigh|high|medium|low|none"
+            );
+        }
         let screening_profile = crate::config::benchmark_screening_profile_for_config(cfg)?;
         let hosted_price_bounds = if crate::config::hosted_runtime_mode() {
             ensure_hosted_provider_contract(cfg.api_format, &cfg.api_base)?;
@@ -1347,6 +1340,8 @@ impl RequestDecorations {
         Ok(Self {
             api_base: cfg.api_base.trim_end_matches('/').to_string(),
             api_format: cfg.api_format,
+            reasoning_effort: cfg.reasoning_effort,
+            scorer_reasoning_effort: cfg.scorer_reasoning_effort,
             require_openrouter_privacy: is_canonical_openrouter_base(&cfg.api_base)
                 && (crate::config::hosted_runtime_mode()
                     || crate::config::benchmark_screening_mode()
@@ -1377,6 +1372,10 @@ impl RequestDecorations {
                     max_tokens,
                     temperature,
                 );
+                apply_openrouter_reasoning(
+                    &mut body,
+                    phase.reasoning_effort(self.reasoning_effort, self.scorer_reasoning_effort),
+                );
                 apply_openrouter_privacy(&mut body, self.require_openrouter_privacy);
                 let canonical_openrouter = is_canonical_openrouter_base(&self.api_base);
                 if let Some(provider) = self.pinned_upstream_provider.as_deref() {
@@ -1399,14 +1398,21 @@ impl RequestDecorations {
                 }
                 body
             }
-            ApiFormat::Anthropic => base_request_body(
-                self.api_format,
-                model,
-                system,
-                user,
-                max_tokens,
-                temperature,
-            ),
+            ApiFormat::Anthropic => {
+                let mut body = base_request_body(
+                    self.api_format,
+                    model,
+                    system,
+                    user,
+                    max_tokens,
+                    temperature,
+                );
+                apply_anthropic_reasoning(
+                    &mut body,
+                    phase.reasoning_effort(self.reasoning_effort, self.scorer_reasoning_effort),
+                );
+                body
+            }
         }
     }
 }
@@ -1525,10 +1531,63 @@ fn provider_retry_delay(retry: u32) -> Duration {
 }
 
 fn provider_retry_delay_with_sample(retry: u32, sample: u64) -> Duration {
-    let ceiling_ms = 2_000_u64.saturating_mul(u64::from(retry.max(1)));
+    let ceiling_ms = if retry <= TRANSIENT_RETRIES {
+        2_000_u64.saturating_mul(u64::from(retry.max(1)))
+    } else {
+        let doublings = retry - TRANSIENT_RETRIES;
+        2_000_u64
+            .saturating_mul(u64::from(TRANSIENT_RETRIES))
+            .saturating_mul(1_u64 << doublings.min(6))
+    }
+    .min(MAX_SYNTHESIZED_RETRY_BACKOFF.as_millis() as u64);
     let floor_ms = ceiling_ms / 2;
     let jitter_ms = sample % (ceiling_ms - floor_ms + 1);
     Duration::from_millis(floor_ms + jitter_ms)
+}
+
+fn budgeted_review_retry(phase: LlmPhase) -> bool {
+    matches!(phase, LlmPhase::Review)
+}
+
+fn max_transport_attempts(phase: LlmPhase) -> u32 {
+    if budgeted_review_retry(phase) {
+        MAX_REVIEW_TRANSPORT_ATTEMPTS_PER_CALL as u32
+    } else {
+        MAX_TRANSPORT_ATTEMPTS_PER_CALL as u32
+    }
+}
+
+fn budgeted_retry_wait(retry_after: Option<Duration>, retry: u32) -> Duration {
+    retry_after
+        .unwrap_or_else(|| provider_retry_delay(retry))
+        .max(MIN_BUDGETED_RETRY_WAIT)
+}
+
+fn transient_retry_wait(retry_after: Option<Duration>, phase: LlmPhase, retries: u32) -> Duration {
+    if budgeted_review_retry(phase) && retries >= TRANSIENT_RETRIES {
+        budgeted_retry_wait(retry_after, retries + 1)
+    } else {
+        retry_after.unwrap_or_else(|| provider_retry_delay(retries + 1))
+    }
+}
+
+/// Whether the next transient retry can be funded without consuming the time
+/// needed to issue the request it is intended to recover.
+fn transient_retry_affordable(
+    phase: LlmPhase,
+    retries: u32,
+    wait: Duration,
+    remaining: Option<Duration>,
+) -> bool {
+    if retries < TRANSIENT_RETRIES {
+        return true;
+    }
+    budgeted_review_retry(phase)
+        && retries < MAX_BUDGETED_TRANSIENT_RETRIES
+        && remaining.is_some_and(|left| {
+            wait.checked_add(RETRY_ATTEMPT_RESERVE)
+                .is_some_and(|required| required <= left)
+        })
 }
 
 fn timeout_status(status: u16) -> bool {
@@ -1553,7 +1612,6 @@ enum LlmPhase {
     Adjudication,
     #[cfg_attr(not(feature = "qualification-candidate"), allow(dead_code))]
     Attribution,
-    Respond,
     #[cfg_attr(not(test), allow(dead_code))]
     Total,
 }
@@ -1581,7 +1639,6 @@ impl LlmPhase {
             Self::Scorer { .. } => "scorer",
             Self::Adjudication => "finding-adjudication",
             Self::Attribution => "attribution",
-            Self::Respond => "respond",
             Self::Total => "total",
         }
     }
@@ -1595,7 +1652,19 @@ impl LlmPhase {
             Self::Scorer { .. } => ModelUsageRole::FindingScorer,
             Self::Adjudication => ModelUsageRole::FindingScorer,
             Self::Attribution => ModelUsageRole::FindingScorer,
-            Self::Respond => ModelUsageRole::MentionResponder,
+        }
+    }
+
+    fn reasoning_effort(
+        self,
+        reviewer: ReasoningEffort,
+        scorer: ReasoningEffort,
+    ) -> ReasoningEffort {
+        match self {
+            Self::Planner | Self::Review | Self::Resolution | Self::Brevity | Self::Total => {
+                reviewer
+            }
+            Self::Scorer { .. } | Self::Adjudication | Self::Attribution => scorer,
         }
     }
 
@@ -1737,7 +1806,6 @@ impl std::fmt::Display for DeadlineExceeded {
             | LlmPhase::Scorer { .. }
             | LlmPhase::Adjudication
             | LlmPhase::Attribution
-            | LlmPhase::Respond
             | LlmPhase::Total => f.write_str("LLM total deadline exceeded"),
         }
     }
@@ -1829,6 +1897,7 @@ impl LlmClient {
         temperature: f64,
         phase: LlmPhase,
     ) -> Result<PlannedRequestPath> {
+        let max_attempts = max_transport_attempts(phase) as usize;
         let initial_body =
             self.request_body(model, system, user, initial_max_tokens, temperature, phase);
         let initial_bytes = serialized_provider_request_bytes(
@@ -1842,10 +1911,7 @@ impl LlmClient {
         let expanded_tokens = phase.exhausted_output_retry_max_tokens(initial_max_tokens);
         if expanded_tokens == initial_max_tokens {
             return Ok(PlannedRequestPath {
-                attempts: vec![
-                    (initial_bytes, initial_max_tokens as usize);
-                    MAX_TRANSPORT_ATTEMPTS_PER_CALL
-                ],
+                attempts: vec![(initial_bytes, initial_max_tokens as usize); max_attempts],
             });
         }
         let expanded_body =
@@ -1861,11 +1927,11 @@ impl LlmClient {
             expanded_bytes >= initial_bytes,
             "expanded output request serialized smaller than its initial request"
         );
-        let mut attempts = Vec::with_capacity(MAX_TRANSPORT_ATTEMPTS_PER_CALL);
+        let mut attempts = Vec::with_capacity(max_attempts);
         attempts.push((initial_bytes, initial_max_tokens as usize));
         attempts.extend(std::iter::repeat_n(
             (expanded_bytes, expanded_tokens as usize),
-            MAX_TRANSPORT_ATTEMPTS_PER_CALL.saturating_sub(1),
+            max_attempts.saturating_sub(1),
         ));
         Ok(PlannedRequestPath { attempts })
     }
@@ -2191,35 +2257,6 @@ impl LlmClient {
         ReviewAdmission::try_from(exposure)
     }
 
-    pub(crate) fn preflight_respond_plan(
-        &self,
-        cfg: &Config,
-        system: &str,
-        user: &str,
-    ) -> Result<ReviewAdmission> {
-        let Some(bounds) = &self.request_decorations.hosted_price_bounds else {
-            return Ok(ReviewAdmission::default());
-        };
-        let models = cfg.model_chain();
-        ensure!(!models.is_empty(), "hosted respond has no admitted model");
-        let mut exposure = PlannedExposure::default();
-        for model in models {
-            let price = bounds.get(&model).ok_or_else(|| {
-                anyhow!("hosted respond model {model:?} has no admitted price bound")
-            })?;
-            let path = self.planned_request_path(
-                &model,
-                system,
-                user,
-                RESPOND_MAX_TOKENS,
-                0.1,
-                LlmPhase::Respond,
-            )?;
-            exposure.add_path(&path, price)?;
-        }
-        self.validate_hosted_exposure("respond", &exposure)
-    }
-
     pub async fn plan_review_batches(
         &self,
         cfg: &Config,
@@ -2444,9 +2481,10 @@ impl LlmClient {
             logical_calls <= MAX_HOSTED_PLANNED_CALLS_BY_WATCHDOG,
             "complete hosted review needs {logical_calls} logical model calls, exceeding the {MAX_HOSTED_PLANNED_CALLS_BY_WATCHDOG}-call watchdog plan"
         );
-        // Admission includes every executable logical call and the exact
-        // three-attempt transport path. Output expansion replaces a retry; it
-        // does not add a fourth request.
+        // Admission includes every executable logical call and its exact
+        // phase-specific transport path. Review calls can use thirteen
+        // attempts; non-Review paths use three. Output expansion replaces a
+        // retry; it does not add another request.
         let mut exposure = PlannedExposure::default();
         for model in &review_models {
             let price = bounds
@@ -2605,7 +2643,7 @@ impl LlmClient {
     /// Local and interactive clients have no built-in total deadline. They only
     /// get one when POSTIL_LLM_TOTAL_TIMEOUT_SECS is explicitly set.
     pub async fn from_env(cfg: &Config) -> Result<Self> {
-        let api_key = resolve_api_key().await?;
+        let api_key = resolve_api_key(&cfg.api_base).await?;
         let timeouts = LlmTimeouts::from_env(DEFAULT_REQUEST_TIMEOUT_SECS, None)?;
         let total_deadline = timeouts.total.map(|duration| Instant::now() + duration);
         Self::build(
@@ -2624,7 +2662,7 @@ impl LlmClient {
         default_review_timeout: Duration,
         default_total_timeout: Duration,
     ) -> Result<Self> {
-        let api_key = resolve_api_key().await?;
+        let api_key = resolve_api_key(&cfg.api_base).await?;
         let timeouts = LlmTimeouts::from_env(
             default_request_timeout.as_secs(),
             Some(default_total_timeout.as_secs()),
@@ -3010,102 +3048,6 @@ impl LlmClient {
                     ModelError::new(anyhow!("empty model chain"), failed_usage, true)
                 }))
         }
-    }
-
-    /// Interactive answer validated by the caller's publication contract.
-    /// Invalid model content consumes and preserves its usage before the next
-    /// configured model is tried.
-    pub async fn answer<F>(
-        &self,
-        cfg: &Config,
-        system: &str,
-        user: &str,
-        validate: F,
-    ) -> Result<Answer>
-    where
-        F: Fn(&str) -> Result<String>,
-    {
-        let mut usage = Usage::default();
-        let mut models = Vec::new();
-        let mut last_err = None;
-        let mut usage_accounting_complete = true;
-        let chain = cfg.model_chain();
-        let chain_len = chain.len();
-        for (index, model) in chain.into_iter().enumerate() {
-            let mut model_usage = Usage::default();
-            let mut call_usage = Vec::new();
-            let mut model_accounting_complete = true;
-            match self
-                .chat(
-                    &model,
-                    system,
-                    user,
-                    &mut model_usage,
-                    &mut call_usage,
-                    &mut model_accounting_complete,
-                    RESPOND_MAX_TOKENS,
-                    LlmPhase::Respond,
-                    LlmCallPhase::Initial,
-                )
-                .await
-            {
-                Ok(content) => {
-                    usage_accounting_complete &= model_accounting_complete;
-                    add_usage(&mut usage, model_usage);
-                    models.append(&mut call_usage);
-                    match validate(&content) {
-                        Ok(content) => {
-                            return Ok(Answer {
-                                content,
-                                model_used: model,
-                                usage,
-                                models,
-                                usage_accounting_complete,
-                            });
-                        }
-                        Err(error) => {
-                            let disposition = if index + 1 < chain_len {
-                                "trying the next model"
-                            } else {
-                                "no fallback models remain"
-                            };
-                            eprintln!(
-                                "postil: model {} produced an invalid reply; {disposition} category={}",
-                                log_text(&model),
-                                safe_anyhow_category(&error),
-                            );
-                            last_err = Some(error.context("model reply failed publication checks"));
-                        }
-                    }
-                }
-                Err(e) => {
-                    // Usage parsed from a provider response is complete even
-                    // when the response has no usable answer. A transport
-                    // failure with no response usage is ambiguous.
-                    if !model_accounting_complete || !has_billable_usage(model_usage) {
-                        usage_accounting_complete = false;
-                    }
-                    eprintln!(
-                        "postil: model {} failed category={}",
-                        log_text(&model),
-                        safe_anyhow_category(&e)
-                    );
-                    // Provider failures that report no tokens have no billable
-                    // usage to attribute. Omit them rather than emitting a
-                    // misleading accounting entry; token-bearing failures are
-                    // retained and priced by the hosted control plane.
-                    if has_billable_usage(model_usage) {
-                        add_usage(&mut usage, model_usage);
-                    }
-                    models.append(&mut call_usage);
-                    if e.downcast_ref::<DeadlineExceeded>().is_some() {
-                        return Err(e);
-                    }
-                    last_err = Some(e);
-                }
-            }
-        }
-        Err(last_err.unwrap_or_else(|| anyhow!("empty model chain")))
     }
 
     pub async fn score_findings(
@@ -4361,10 +4303,16 @@ impl LlmClient {
             Self::ensure_atomic_attribution_request_size(&body)?;
         }
         let mut retries = 0u32;
-        let mut timeout_retries = 0u32;
         let mut empty_response_retries = 0u32;
         let mut exhausted_output_retries = 0u32;
         let mut attempt_timeout = self.request_timeout;
+        let attempt_limit = if budgeted_review_retry(phase)
+            && (self.review_deadline.is_some() || self.review_model_deadline.is_some())
+        {
+            MAX_REVIEW_TRANSPORT_ATTEMPTS_PER_CALL as u32
+        } else {
+            MAX_TRANSPORT_ATTEMPTS_PER_CALL as u32
+        };
         loop {
             if matches!(phase, LlmPhase::Review | LlmPhase::Adjudication) {
                 self.ensure_review_request_fits_context(model, &body, request_max_tokens)?;
@@ -4379,7 +4327,7 @@ impl LlmClient {
                 phase.as_str(),
                 log_text(model),
                 retries + 1,
-                TRANSIENT_RETRIES + 1,
+                attempt_limit,
                 elapsed_text(timeout),
                 remaining
                     .map(elapsed_text)
@@ -4402,18 +4350,22 @@ impl LlmClient {
                     *usage_accounting_complete = false;
                     call_usage
                         .push(self.model_usage_event(model, phase, call_phase, attempt, None));
-                    if timeout_retries < TIMEOUT_RETRIES && retries < TRANSIENT_RETRIES {
+                    let wait = transient_retry_wait(None, phase, retries);
+                    let remaining = self.remaining_budget(phase)?;
+                    if transient_retry_affordable(phase, retries, wait, remaining) {
                         retries += 1;
-                        timeout_retries += 1;
-                        let wait = provider_retry_delay(retries);
                         eprintln!(
                             "postil: model {} hit a request timeout after {}, retrying in {} \
-                             (timeout retry {timeout_retries}/{TIMEOUT_RETRIES}; retry {retries}/{TRANSIENT_RETRIES})",
+                             (retry {retries}/{attempt_limit}; budget_remaining={})",
                             log_text(model),
                             elapsed_text(attempt_started_at.elapsed()),
-                            elapsed_text(wait)
+                            elapsed_text(wait),
+                            remaining
+                                .map(elapsed_text)
+                                .unwrap_or_else(|| "unbounded".to_string())
                         );
-                        self.sleep_with_budget(phase, wait).await?;
+                        self.sleep_with_captured_budget(phase, wait, remaining)
+                            .await?;
                         attempt_timeout = self.timeout_retry_timeout;
                         continue;
                     }
@@ -4634,25 +4586,26 @@ impl LlmClient {
                         *usage_accounting_complete = false;
                     }
                     let status = response.status;
-                    if timeout_status(status.as_u16())
-                        && timeout_retries < TIMEOUT_RETRIES
-                        && retries < TRANSIENT_RETRIES
-                    {
-                        retries += 1;
-                        timeout_retries += 1;
-                        let wait = response
-                            .retry_after
-                            .unwrap_or_else(|| provider_retry_delay(retries));
-                        eprintln!(
-                            "postil: model {} returned timeout HTTP {status} after {}, retrying in {} \
-                             (timeout retry {timeout_retries}/{TIMEOUT_RETRIES}; retry {retries}/{TRANSIENT_RETRIES})",
-                            log_text(model),
-                            elapsed_text(attempt_started_at.elapsed()),
-                            elapsed_text(wait)
-                        );
-                        self.sleep_with_budget(phase, wait).await?;
-                        attempt_timeout = self.timeout_retry_timeout;
-                        continue;
+                    if timeout_status(status.as_u16()) {
+                        let wait = transient_retry_wait(response.retry_after, phase, retries);
+                        let remaining = self.remaining_budget(phase)?;
+                        if transient_retry_affordable(phase, retries, wait, remaining) {
+                            retries += 1;
+                            eprintln!(
+                                "postil: model {} returned timeout HTTP {status} after {}, retrying in {} \
+                                 (retry {retries}/{attempt_limit}; budget_remaining={})",
+                                log_text(model),
+                                elapsed_text(attempt_started_at.elapsed()),
+                                elapsed_text(wait),
+                                remaining
+                                    .map(elapsed_text)
+                                    .unwrap_or_else(|| "unbounded".to_string())
+                            );
+                            self.sleep_with_captured_budget(phase, wait, remaining)
+                                .await?;
+                            attempt_timeout = self.timeout_retry_timeout;
+                            continue;
+                        }
                     }
                     if timeout_status(status.as_u16()) {
                         let detail = provider_http_status_detail(
@@ -4662,21 +4615,26 @@ impl LlmClient {
                         );
                         return Err(anyhow::Error::new(ProviderHttpFailure(status)).context(detail));
                     }
-                    if retryable_status(status.as_u16()) && retries < TRANSIENT_RETRIES {
-                        retries += 1;
-                        let wait = response
-                            .retry_after
-                            .unwrap_or_else(|| provider_retry_delay(retries));
-                        eprintln!(
-                            "postil: model {} returned retryable HTTP {status} after {}, retrying in {} \
-                             (retry {retries}/{TRANSIENT_RETRIES})",
-                            log_text(model),
-                            elapsed_text(attempt_started_at.elapsed()),
-                            elapsed_text(wait)
-                        );
-                        self.sleep_with_budget(phase, wait).await?;
-                        attempt_timeout = self.request_timeout;
-                        continue;
+                    if retryable_status(status.as_u16()) {
+                        let wait = transient_retry_wait(response.retry_after, phase, retries);
+                        let remaining = self.remaining_budget(phase)?;
+                        if transient_retry_affordable(phase, retries, wait, remaining) {
+                            retries += 1;
+                            eprintln!(
+                                "postil: model {} returned retryable HTTP {status} after {}, retrying in {} \
+                                 (retry {retries}/{attempt_limit}; budget_remaining={})",
+                                log_text(model),
+                                elapsed_text(attempt_started_at.elapsed()),
+                                elapsed_text(wait),
+                                remaining
+                                    .map(elapsed_text)
+                                    .unwrap_or_else(|| "unbounded".to_string())
+                            );
+                            self.sleep_with_captured_budget(phase, wait, remaining)
+                                .await?;
+                            attempt_timeout = self.request_timeout;
+                            continue;
+                        }
                     }
                     return Err(anyhow::Error::new(ProviderHttpFailure(status)).context(
                         provider_http_status_detail(
@@ -4686,45 +4644,55 @@ impl LlmClient {
                         ),
                     ));
                 }
-                Err(error)
-                    if reqwest_error(&error).is_some_and(reqwest::Error::is_timeout)
-                        && timeout_retries < TIMEOUT_RETRIES
-                        && retries < TRANSIENT_RETRIES =>
-                {
+                Err(error) if reqwest_error(&error).is_some_and(reqwest::Error::is_timeout) => {
                     *usage_accounting_complete = false;
                     call_usage
                         .push(self.model_usage_event(model, phase, call_phase, attempt, None));
-                    retries += 1;
-                    timeout_retries += 1;
-                    let wait = provider_retry_delay(retries);
-                    eprintln!(
-                        "postil: model {} hit a request timeout after {}, retrying in {} \
-                         (timeout retry {timeout_retries}/{TIMEOUT_RETRIES}; retry {retries}/{TRANSIENT_RETRIES})",
-                        log_text(model),
-                        elapsed_text(attempt_started_at.elapsed()),
-                        elapsed_text(wait)
-                    );
-                    self.sleep_with_budget(phase, wait).await?;
-                    attempt_timeout = self.timeout_retry_timeout;
+                    let wait = transient_retry_wait(None, phase, retries);
+                    let remaining = self.remaining_budget(phase)?;
+                    if transient_retry_affordable(phase, retries, wait, remaining) {
+                        retries += 1;
+                        eprintln!(
+                            "postil: model {} hit a request timeout after {}, retrying in {} \
+                             (retry {retries}/{attempt_limit}; budget_remaining={})",
+                            log_text(model),
+                            elapsed_text(attempt_started_at.elapsed()),
+                            elapsed_text(wait),
+                            remaining
+                                .map(elapsed_text)
+                                .unwrap_or_else(|| "unbounded".to_string())
+                        );
+                        self.sleep_with_captured_budget(phase, wait, remaining)
+                            .await?;
+                        attempt_timeout = self.timeout_retry_timeout;
+                        continue;
+                    }
+                    return Err(RequestTimedOut.into());
                 }
-                Err(error)
-                    if reqwest_error(&error).is_some_and(reqwest::Error::is_connect)
-                        && retries < TRANSIENT_RETRIES =>
-                {
+                Err(error) if reqwest_error(&error).is_some_and(reqwest::Error::is_connect) => {
                     *usage_accounting_complete = false;
                     call_usage
                         .push(self.model_usage_event(model, phase, call_phase, attempt, None));
-                    retries += 1;
-                    let wait = provider_retry_delay(retries);
-                    eprintln!(
-                        "postil: model {} hit a retryable connection error after {}, retrying in {} \
-                         (retry {retries}/{TRANSIENT_RETRIES})",
-                        log_text(model),
-                        elapsed_text(attempt_started_at.elapsed()),
-                        elapsed_text(wait)
-                    );
-                    self.sleep_with_budget(phase, wait).await?;
-                    attempt_timeout = self.request_timeout;
+                    let wait = transient_retry_wait(None, phase, retries);
+                    let remaining = self.remaining_budget(phase)?;
+                    if transient_retry_affordable(phase, retries, wait, remaining) {
+                        retries += 1;
+                        eprintln!(
+                            "postil: model {} hit a retryable connection error after {}, retrying in {} \
+                             (retry {retries}/{attempt_limit}; budget_remaining={})",
+                            log_text(model),
+                            elapsed_text(attempt_started_at.elapsed()),
+                            elapsed_text(wait),
+                            remaining
+                                .map(elapsed_text)
+                                .unwrap_or_else(|| "unbounded".to_string())
+                        );
+                        self.sleep_with_captured_budget(phase, wait, remaining)
+                            .await?;
+                        attempt_timeout = self.request_timeout;
+                        continue;
+                    }
+                    return Err(error.context("request to model endpoint failed"));
                 }
                 Err(error) => {
                     *usage_accounting_complete = false;
@@ -5137,7 +5105,7 @@ impl LlmClient {
             | LlmPhase::Scorer { .. }
             | LlmPhase::Adjudication
             | LlmPhase::Attribution => self.scorer_deadline.or(self.total_deadline),
-            LlmPhase::Respond | LlmPhase::Total => self.total_deadline,
+            LlmPhase::Total => self.total_deadline,
         };
         let deadline = if matches!(phase, LlmPhase::Planner | LlmPhase::Review) {
             match (phase_deadline, self.review_model_deadline) {
@@ -5170,7 +5138,18 @@ impl LlmClient {
     }
 
     async fn sleep_with_budget(&self, phase: LlmPhase, duration: Duration) -> Result<()> {
-        let Some(remaining) = self.remaining_budget(phase)? else {
+        let remaining = self.remaining_budget(phase)?;
+        self.sleep_with_captured_budget(phase, duration, remaining)
+            .await
+    }
+
+    async fn sleep_with_captured_budget(
+        &self,
+        phase: LlmPhase,
+        duration: Duration,
+        remaining: Option<Duration>,
+    ) -> Result<()> {
+        let Some(remaining) = remaining else {
             tokio::time::sleep(duration).await;
             return Ok(());
         };
@@ -5260,6 +5239,33 @@ fn apply_openrouter_price_ceiling(body: &mut serde_json::Value, bound: &ModelPri
     );
 }
 
+fn apply_openrouter_reasoning(body: &mut serde_json::Value, effort: ReasoningEffort) {
+    body["reasoning"] = json!({ "effort": effort.as_str() });
+}
+
+fn apply_anthropic_reasoning(body: &mut serde_json::Value, effort: ReasoningEffort) {
+    match effort {
+        ReasoningEffort::None => {
+            body["thinking"] = json!({ "type": "disabled" });
+        }
+        ReasoningEffort::Minimal => {
+            unreachable!("Anthropic minimal effort is rejected while resolving request settings")
+        }
+        _ => {
+            if body
+                .get("temperature")
+                .and_then(serde_json::Value::as_f64)
+                .is_some_and(|temperature| temperature != 1.0)
+            {
+                body.as_object_mut()
+                    .expect("Anthropic request body is an object")
+                    .remove("temperature");
+            }
+            body["output_config"] = json!({ "effort": effort.as_str() });
+        }
+    }
+}
+
 fn apply_openrouter_scorer_contract(body: &mut serde_json::Value, expected_len: usize) {
     debug_assert!(expected_len <= SCORER_MAX_FINDINGS);
     let provider = body
@@ -5271,10 +5277,7 @@ fn apply_openrouter_scorer_contract(body: &mut serde_json::Value, expected_len: 
         .as_object_mut()
         .expect("provider routing configuration is an object")
         .insert("require_parameters".to_string(), json!(true));
-    body["reasoning"] = json!({
-        "effort": "none",
-        "exclude": true,
-    });
+    body["reasoning"]["exclude"] = json!(true);
     body["response_format"] = json!({
         "type": "json_schema",
         "json_schema": {
@@ -5334,7 +5337,7 @@ fn apply_openrouter_atomic_attribution_contract(
         .as_object_mut()
         .expect("provider routing configuration is an object");
     provider.insert("require_parameters".to_string(), json!(true));
-    body["reasoning"] = json!({ "effort": "none", "exclude": true });
+    body["reasoning"]["exclude"] = json!(true);
     body["response_format"] = json!({
         "type": "json_schema",
         "json_schema": {
@@ -5421,7 +5424,7 @@ fn retry_after_duration_at(headers: &HeaderMap, now: std::time::SystemTime) -> O
             .unwrap_or_default()
     };
 
-    Some(duration.min(Duration::from_secs(PROVIDER_RETRY_DELAY_CAP_SECS)))
+    Some(duration)
 }
 
 fn safe_header_value(value: Option<&HeaderValue>) -> Option<String> {
@@ -5652,7 +5655,7 @@ impl LlmTimeouts {
     }
 }
 
-async fn resolve_api_key() -> Result<String> {
+async fn resolve_api_key(api_base: &str) -> Result<String> {
     // Checked first, and independently of the credentials-path lookup below,
     // so an explicit key still works in a minimal environment with no HOME
     // or XDG_CONFIG_HOME -- exactly what worked before login existed.
@@ -5660,16 +5663,14 @@ async fn resolve_api_key() -> Result<String> {
     let stored_login = async {
         let credentials_path = crate::credentials::default_path()
             .context("resolving the postil login credentials path")?;
-        crate::login::resolve_stored_token(&credentials_path).await
+        crate::login::resolve_stored_token(&credentials_path, api_base).await
     };
     match api_key::resolve_explicit_or_stored(explicit_key, stored_login).await? {
         Some(key) => Ok(key),
-        None => {
-            let key_names = api_key::names_text();
-            Err(anyhow!(
-                "no API key: set {key_names}, or run `postil login`. Postil never proxies your inference without one of these."
-            ))
-        }
+        None => Err(anyhow!(
+            "no API key: {}. Postil never proxies your inference without one of these.",
+            api_key::credential_help()
+        )),
     }
 }
 
@@ -6571,9 +6572,112 @@ mod tests {
             Duration::from_secs(4)
         );
     }
+
+    #[test]
+    fn retry_attempt_limits_are_phase_specific() {
+        let fixed_phases = [
+            LlmPhase::Planner,
+            LlmPhase::Resolution,
+            LlmPhase::Brevity,
+            LlmPhase::Scorer { expected_len: 1 },
+            LlmPhase::Adjudication,
+            LlmPhase::Attribution,
+        ];
+        for phase in fixed_phases {
+            assert_eq!(max_transport_attempts(phase), 3, "phase={phase:?}");
+        }
+        assert_eq!(max_transport_attempts(LlmPhase::Review), 13);
+    }
+
+    #[test]
+    fn budgeted_waits_have_a_floor_and_provider_hints_remain_authoritative() {
+        assert_eq!(
+            budgeted_retry_wait(Some(Duration::ZERO), TRANSIENT_RETRIES + 1),
+            MIN_BUDGETED_RETRY_WAIT
+        );
+        assert_eq!(
+            budgeted_retry_wait(Some(Duration::from_secs(37)), TRANSIENT_RETRIES + 1),
+            Duration::from_secs(37)
+        );
+        assert_eq!(
+            provider_retry_delay_with_sample(MAX_BUDGETED_TRANSIENT_RETRIES, 10_000),
+            MAX_SYNTHESIZED_RETRY_BACKOFF
+        );
+    }
+
+    #[test]
+    fn budgeted_retry_reserves_the_next_attempt_and_unbudgeted_review_stops_at_three() {
+        let phase = LlmPhase::Review;
+        assert!(transient_retry_affordable(
+            phase,
+            TRANSIENT_RETRIES,
+            Duration::from_secs(1),
+            Some(RETRY_ATTEMPT_RESERVE + Duration::from_secs(1)),
+        ));
+        assert!(!transient_retry_affordable(
+            phase,
+            TRANSIENT_RETRIES,
+            Duration::from_secs(2),
+            Some(RETRY_ATTEMPT_RESERVE + Duration::from_secs(1)),
+        ));
+        assert!(!transient_retry_affordable(
+            phase,
+            TRANSIENT_RETRIES,
+            Duration::from_secs(1),
+            None,
+        ));
+        assert!(!transient_retry_affordable(
+            phase,
+            MAX_BUDGETED_TRANSIENT_RETRIES,
+            Duration::from_secs(1),
+            Some(Duration::from_secs(86_400)),
+        ));
+    }
+
+    #[test]
+    fn hosted_exposure_prices_review_and_non_review_phases() {
+        let config = Config {
+            model: "provider/model".into(),
+            scorer_enabled: false,
+            uncertainty_resolution: false,
+            concise_findings: false,
+            ..Config::default()
+        };
+        let client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        let price = ModelPriceBound {
+            model: config.model.clone(),
+            input_micros_per_million_tokens: 1,
+            output_micros_per_million_tokens: 1,
+        };
+        let review = client
+            .planned_review_request_paths(&config.model, "system", "user", REVIEW_MAX_TOKENS)
+            .unwrap();
+        let resolution = client
+            .planned_request_path(
+                &config.model,
+                "system",
+                "user",
+                1_024,
+                0.0,
+                LlmPhase::Resolution,
+            )
+            .unwrap();
+        assert_eq!(
+            request_paths_exposure(&review, &price).unwrap().attempts,
+            26
+        );
+        assert_eq!(resolution.attempts.len(), 3);
+    }
     use crate::config::Config;
     use crate::envelope::{Kind, Severity};
-    use std::sync::{Mutex, OnceLock};
+    use crate::test_env_lock as env_lock;
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -6741,11 +6845,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
     }
 
     #[test]
@@ -7174,12 +7273,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             admission.output_tokens,
-            u64::from(REVIEW_MAX_TOKENS + 2 * REVIEW_MAX_OUTPUT_TOKENS)
+            (u64::from(REVIEW_MAX_TOKENS)
+                + (MAX_REVIEW_TRANSPORT_ATTEMPTS_PER_CALL as u64 - 1)
+                    * u64::from(REVIEW_MAX_OUTPUT_TOKENS))
                 * MAX_LOGICAL_CALLS_PER_REVIEW_MODEL as u64
                 + u64::from(MAX_ADJUDICATION_OUTPUT_TOKENS)
                     * MAX_TRANSPORT_ATTEMPTS_PER_CALL as u64
         );
-        assert_eq!(admission.provider_attempts, 9);
+        assert_eq!(admission.provider_attempts, 29);
         let plan = client
             .plan_review_batches(
                 &config,
@@ -7862,50 +7963,6 @@ mod tests {
     }
 
     #[test]
-    fn hosted_respond_preflight_accounts_for_every_fallback_before_calls() {
-        let config = Config {
-            model: "provider/primary".into(),
-            cascade: vec!["provider/fallback".into()],
-            ..Config::default()
-        };
-        let mut client = LlmClient::build(
-            &config,
-            "test-key".into(),
-            Duration::from_secs(1),
-            None,
-            None,
-        )
-        .unwrap();
-        client.request_decorations.hosted_price_bounds = Some(Arc::new(HashMap::from([
-            (
-                "provider/primary".into(),
-                ModelPriceBound {
-                    model: "provider/primary".into(),
-                    input_micros_per_million_tokens: 1,
-                    output_micros_per_million_tokens: 1,
-                },
-            ),
-            (
-                "provider/fallback".into(),
-                ModelPriceBound {
-                    model: "provider/fallback".into(),
-                    input_micros_per_million_tokens: 1,
-                    output_micros_per_million_tokens: 1,
-                },
-            ),
-        ])));
-        let admission = client
-            .preflight_respond_plan(&config, "system", "bounded user context")
-            .unwrap();
-        assert_eq!(admission.provider_attempts, 6);
-        assert_eq!(
-            admission.output_tokens,
-            u64::from(RESPOND_MAX_TOKENS + 2 * RESPOND_MAX_TOKENS * 2) * 2
-        );
-        assert_eq!(client.admission.lock().unwrap().attempts, 0);
-    }
-
-    #[test]
     fn exhausted_output_retry_ceiling_is_phase_aware() {
         assert_eq!(
             LlmPhase::Review.exhausted_output_retry_max_tokens(REVIEW_MAX_TOKENS),
@@ -7914,10 +7971,6 @@ mod tests {
         assert_eq!(
             LlmPhase::Planner.exhausted_output_retry_max_tokens(PLANNER_MAX_TOKENS),
             PLANNER_MAX_TOKENS * 2
-        );
-        assert_eq!(
-            LlmPhase::Respond.exhausted_output_retry_max_tokens(RESPOND_MAX_TOKENS),
-            RESPOND_MAX_TOKENS * 2
         );
         let scorer_tokens = scorer_max_tokens(SCORER_MAX_FINDINGS).unwrap();
         assert_eq!(
@@ -8011,7 +8064,9 @@ mod tests {
                 },
             )
             .unwrap();
-        let review_per_model = u64::from(REVIEW_MAX_TOKENS + 2 * REVIEW_MAX_OUTPUT_TOKENS)
+        let review_per_model = (u64::from(REVIEW_MAX_TOKENS)
+            + (MAX_REVIEW_TRANSPORT_ATTEMPTS_PER_CALL as u64 - 1)
+                * u64::from(REVIEW_MAX_OUTPUT_TOKENS))
             * MAX_LOGICAL_CALLS_PER_REVIEW_MODEL as u64;
         let scorer_per_model = u64::from(scorer_max_tokens(SCORER_MAX_FINDINGS).unwrap())
             * MAX_TRANSPORT_ATTEMPTS_PER_CALL as u64
@@ -8033,8 +8088,8 @@ mod tests {
                 + u64::from(MAX_ADJUDICATION_OUTPUT_TOKENS)
                     * MAX_TRANSPORT_ATTEMPTS_PER_CALL as u64
         );
-        assert_eq!(admission.provider_attempts, 117);
-        assert_eq!(admission.projected_cost_micros, 234);
+        assert_eq!(admission.provider_attempts, 157);
+        assert_eq!(admission.projected_cost_micros, 314);
     }
 
     #[test]
@@ -8087,12 +8142,12 @@ mod tests {
         assert_eq!(
             admission.output_tokens,
             u64::from(REVIEW_MAX_OUTPUT_TOKENS)
-                * MAX_TRANSPORT_ATTEMPTS_PER_CALL as u64
+                * MAX_REVIEW_TRANSPORT_ATTEMPTS_PER_CALL as u64
                 * MAX_LOGICAL_CALLS_PER_REVIEW_MODEL as u64
                 + u64::from(MAX_ADJUDICATION_OUTPUT_TOKENS)
                     * MAX_TRANSPORT_ATTEMPTS_PER_CALL as u64
         );
-        assert_eq!(admission.provider_attempts, 9);
+        assert_eq!(admission.provider_attempts, 29);
     }
 
     #[test]
@@ -8188,7 +8243,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             admission.output_tokens,
-            u64::from(REVIEW_MAX_TOKENS + 2 * REVIEW_MAX_OUTPUT_TOKENS)
+            (u64::from(REVIEW_MAX_TOKENS)
+                + (MAX_REVIEW_TRANSPORT_ATTEMPTS_PER_CALL as u64 - 1)
+                    * u64::from(REVIEW_MAX_OUTPUT_TOKENS))
                 * MAX_LOGICAL_CALLS_PER_REVIEW_MODEL as u64
                 * crate::review::MAX_HOSTED_SELECTED_BATCHES as u64
                 + u64::from(PLANNER_MAX_TOKENS + 2 * PLANNER_MAX_TOKENS * 2)
@@ -8204,7 +8261,7 @@ mod tests {
                 + u64::from(MAX_ADJUDICATION_OUTPUT_TOKENS)
                     * MAX_TRANSPORT_ATTEMPTS_PER_CALL as u64
         );
-        assert_eq!(admission.provider_attempts, 84);
+        assert_eq!(admission.provider_attempts, 184);
         assert_eq!(client.admission.lock().unwrap().attempts, 0);
     }
 
@@ -8296,8 +8353,8 @@ mod tests {
         assert!(logical_calls <= MAX_HOSTED_PLANNED_CALLS_BY_WATCHDOG);
         assert!(logical_calls * MAX_TRANSPORT_ATTEMPTS_PER_CALL <= MAX_PROVIDER_ATTEMPTS);
         assert_eq!(
-            MAX_HOSTED_PLANNED_CALLS_BY_WATCHDOG * MAX_TRANSPORT_ATTEMPTS_PER_CALL,
-            192
+            MAX_HOSTED_PLANNED_CALLS_BY_WATCHDOG * MAX_REVIEW_TRANSPORT_ATTEMPTS_PER_CALL,
+            MAX_PROVIDER_ATTEMPTS
         );
     }
 
@@ -8453,13 +8510,13 @@ mod tests {
                 output_micros_per_million_tokens: 1,
             },
         )])));
-        let prompts = vec!["candidate".to_string(); 25];
+        let prompts = vec!["candidate".to_string(); 7];
         let output_tokens = vec![REVIEW_MAX_TOKENS; prompts.len()];
 
         client
             .preflight_review_plan_with_output_limits(
                 &config,
-                24,
+                6,
                 "system",
                 ReviewPreflightPrompts {
                     first_users: &prompts,
@@ -8470,14 +8527,14 @@ mod tests {
                 },
                 ReviewPlanSchedule {
                     planner: None,
-                    batch_concurrency: 4,
+                    batch_concurrency: 1,
                 },
             )
             .unwrap();
         let error = client
             .preflight_review_plan_with_output_limits(
                 &config,
-                25,
+                7,
                 "system",
                 ReviewPreflightPrompts {
                     first_users: &prompts,
@@ -8488,7 +8545,7 @@ mod tests {
                 },
                 ReviewPlanSchedule {
                     planner: None,
-                    batch_concurrency: 4,
+                    batch_concurrency: 1,
                 },
             )
             .unwrap_err();
@@ -9014,7 +9071,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_retry_after_parses_delta_seconds_and_caps_local_waits() {
+    fn provider_retry_after_preserves_provider_delta_seconds() {
         let mut headers = HeaderMap::new();
         headers.insert(reqwest::header::RETRY_AFTER, HeaderValue::from_static("0"));
         assert_eq!(retry_after_duration(&headers), Some(Duration::ZERO));
@@ -9031,7 +9088,7 @@ mod tests {
         );
         assert_eq!(
             retry_after_duration(&headers),
-            Some(Duration::from_secs(PROVIDER_RETRY_DELAY_CAP_SECS))
+            Some(Duration::from_secs(999))
         );
     }
 
@@ -9062,14 +9119,12 @@ mod tests {
 
         headers.insert(
             reqwest::header::RETRY_AFTER,
-            HeaderValue::from_str(&httpdate::fmt_http_date(
-                now + Duration::from_secs(PROVIDER_RETRY_DELAY_CAP_SECS),
-            ))
-            .unwrap(),
+            HeaderValue::from_str(&httpdate::fmt_http_date(now + Duration::from_secs(999)))
+                .unwrap(),
         );
         assert_eq!(
             retry_after_duration_at(&headers, now),
-            Some(Duration::from_secs(PROVIDER_RETRY_DELAY_CAP_SECS))
+            Some(Duration::from_secs(999))
         );
 
         headers.insert(
@@ -9481,7 +9536,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_openrouter_scorer_uses_no_reasoning_effort_and_requires_strict_schema() {
+    fn canonical_openrouter_uses_role_defaults_and_scorer_strict_schema() {
         let client = LlmClient::build(
             &Config::default(),
             "test-key".into(),
@@ -9553,7 +9608,7 @@ mod tests {
             0.1,
             LlmPhase::Review,
         );
-        assert!(generator.get("reasoning").is_none());
+        assert_eq!(generator["reasoning"], json!({"effort": "low"}));
         assert!(generator.get("response_format").is_none());
         assert!(generator["provider"].get("require_parameters").is_none());
     }
@@ -9576,7 +9631,7 @@ mod tests {
             0.0,
             LlmPhase::Resolution,
         );
-        assert!(resolution.get("reasoning").is_none());
+        assert_eq!(resolution["reasoning"], json!({"effort": "low"}));
         assert!(resolution.get("response_format").is_none());
         assert!(resolution["provider"].get("require_parameters").is_none());
     }
@@ -9746,6 +9801,118 @@ mod tests {
         assert!(usage_accounting_complete);
         assert_eq!(client.admission.lock().unwrap().attempts, 2);
         assert_eq!(client.admission.lock().unwrap().reported_token_spend, 27);
+    }
+
+    #[tokio::test]
+    async fn budgeted_review_retries_source_and_synthesis_past_the_fixed_allowance() {
+        for route in [ReviewRequestRoute::Source, ReviewRequestRoute::Synthesis] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "0"))
+                .with_priority(1)
+                .up_to_n_times(3)
+                .expect(3)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "choices": [{
+                        "finish_reason": "stop",
+                        "message": {"content": "{\"summary\":\"\",\"findings\":[]}"}
+                    }],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+                })))
+                .with_priority(2)
+                .expect(1)
+                .mount(&server)
+                .await;
+            let config = Config {
+                api_base: server.uri(),
+                api_format: ApiFormat::OpenaiCompatible,
+                model: "provider/model".into(),
+                scorer_enabled: false,
+                uncertainty_resolution: false,
+                concise_findings: false,
+                ..Config::default()
+            };
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let client = LlmClient::build(
+                &config,
+                "test-key".into(),
+                Duration::from_secs(1),
+                Some(deadline),
+                Some(deadline),
+            )
+            .unwrap();
+            *client.http.lock().unwrap() = Some(reqwest::Client::new());
+
+            let result = client
+                .review_validated_with_safe_output_limit(
+                    &config,
+                    "system",
+                    "user",
+                    REVIEW_MAX_TOKENS,
+                    route,
+                    |_| Ok(()),
+                )
+                .await
+                .unwrap();
+            assert!(result.findings.is_empty());
+            assert_eq!(server.received_requests().await.unwrap().len(), 4);
+            assert_eq!(
+                result
+                    .model_usage
+                    .iter()
+                    .map(|event| event.attempt)
+                    .collect::<Vec<_>>(),
+                vec![Some(1), Some(2), Some(3), Some(4)]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unbudgeted_source_review_keeps_three_transient_attempts() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "0"))
+            .expect(3)
+            .mount(&server)
+            .await;
+        let config = Config {
+            api_base: server.uri(),
+            api_format: ApiFormat::OpenaiCompatible,
+            model: "provider/model".into(),
+            scorer_enabled: false,
+            uncertainty_resolution: false,
+            concise_findings: false,
+            ..Config::default()
+        };
+        let client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        *client.http.lock().unwrap() = Some(reqwest::Client::new());
+
+        let error = client
+            .review_validated_with_safe_output_limit(
+                &config,
+                "system",
+                "user",
+                REVIEW_MAX_TOKENS,
+                ReviewRequestRoute::Source,
+                |_| Ok(()),
+            )
+            .await
+            .unwrap_err();
+        assert!(!error.is_timeout());
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
     }
 
     #[tokio::test]
@@ -9973,7 +10140,7 @@ mod tests {
     }
 
     #[test]
-    fn byok_openai_and_direct_anthropic_request_bodies_have_no_hosted_routing_fields() {
+    fn byok_openai_and_direct_anthropic_requests_send_role_reasoning_without_hosted_routing() {
         let _lock = env_lock().lock().unwrap();
         let _env = EnvRestore::capture(&["POSTIL_HOSTED_MODE"]);
         EnvRestore::remove("POSTIL_HOSTED_MODE");
@@ -9999,7 +10166,7 @@ mod tests {
             LlmPhase::Scorer { expected_len: 1 },
         );
         assert!(openai_body.get("provider").is_none());
-        assert!(openai_body.get("reasoning").is_none());
+        assert_eq!(openai_body["reasoning"], json!({"effort": "none"}));
         assert!(openai_body.get("response_format").is_none());
 
         let anthropic = LlmClient::build(
@@ -10024,9 +10191,116 @@ mod tests {
             LlmPhase::Scorer { expected_len: 1 },
         );
         assert!(anthropic_body.get("provider").is_none());
-        assert!(anthropic_body.get("reasoning").is_none());
+        assert_eq!(anthropic_body["thinking"], json!({"type": "disabled"}));
+        assert!(anthropic_body.get("output_config").is_none());
+        assert_eq!(anthropic_body["temperature"], 0.0);
         assert!(anthropic_body.get("response_format").is_none());
         assert_eq!(anthropic_body["system"], "system");
+    }
+
+    #[test]
+    fn every_openrouter_phase_uses_its_role_specific_effort() {
+        let client = LlmClient::build(
+            &Config {
+                reasoning_effort: ReasoningEffort::Xhigh,
+                scorer_reasoning_effort: ReasoningEffort::Medium,
+                ..Config::default()
+            },
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+
+        for phase in [
+            LlmPhase::Planner,
+            LlmPhase::Review,
+            LlmPhase::Resolution,
+            LlmPhase::Brevity,
+            LlmPhase::Total,
+        ] {
+            let body = client.request_body("provider/model", "system", "user", 100, 0.0, phase);
+            assert_eq!(body["reasoning"], json!({"effort": "xhigh"}));
+        }
+        for phase in [
+            LlmPhase::Scorer { expected_len: 1 },
+            LlmPhase::Adjudication,
+            LlmPhase::Attribution,
+        ] {
+            let body = client.request_body("provider/model", "system", "user", 100, 0.0, phase);
+            assert_eq!(body["reasoning"]["effort"], "medium");
+        }
+    }
+
+    #[test]
+    fn native_anthropic_maps_supported_efforts_and_rejects_minimal() {
+        let client = LlmClient::build(
+            &Config {
+                api_format: ApiFormat::Anthropic,
+                api_base: "https://api.anthropic.com/v1".into(),
+                reasoning_effort: ReasoningEffort::High,
+                scorer_reasoning_effort: ReasoningEffort::None,
+                ..Config::default()
+            },
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        let reviewer = client.request_body(
+            "provider/model",
+            "system",
+            "user",
+            100,
+            0.0,
+            LlmPhase::Review,
+        );
+        assert_eq!(reviewer["output_config"], json!({"effort": "high"}));
+        assert!(reviewer.get("thinking").is_none());
+        assert!(reviewer.get("temperature").is_none());
+        let reviewer_with_default_temperature = client.request_body(
+            "provider/model",
+            "system",
+            "user",
+            100,
+            1.0,
+            LlmPhase::Review,
+        );
+        assert_eq!(reviewer_with_default_temperature["temperature"], 1.0);
+        assert_eq!(
+            reviewer_with_default_temperature["output_config"],
+            json!({"effort": "high"})
+        );
+        let scorer = client.request_body(
+            "provider/model",
+            "system",
+            "user",
+            100,
+            0.0,
+            LlmPhase::Scorer { expected_len: 1 },
+        );
+        assert_eq!(scorer["thinking"], json!({"type": "disabled"}));
+        assert!(scorer.get("output_config").is_none());
+        assert_eq!(scorer["temperature"], 0.0);
+
+        let error = LlmClient::build(
+            &Config {
+                api_format: ApiFormat::Anthropic,
+                api_base: "https://api.anthropic.com/v1".into(),
+                reasoning_effort: ReasoningEffort::Minimal,
+                ..Config::default()
+            },
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .err()
+        .expect("unsupported effort must fail before a request is built");
+        assert!(error.to_string().contains("reasoningEffort minimal"));
+        assert!(error.to_string().contains("max|xhigh|high|medium|low|none"));
     }
 
     #[test]

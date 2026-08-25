@@ -330,7 +330,12 @@ describe("pair qualification configuration", () => {
         "structured_outputs",
         "temperature",
       ]],
-      ["provider/generator-fallback", ["max_tokens", "temperature"]],
+      ["provider/generator-fallback", [
+        "max_tokens",
+        "reasoning",
+        "reasoning_effort",
+        "temperature",
+      ]],
       ["provider/scorer-fallback", [
         "max_tokens",
         "reasoning",
@@ -605,57 +610,66 @@ describe("pair qualification configuration", () => {
 
   });
 
-  test("rejects runtime-shaped exact pair exposure above the hard cap", async () => {
+  test("isolates runtime-shaped preflight and routes any provider escape to loopback", async () => {
     const root = await mkdtemp(resolve(tmpdir(), "postil-runtime-preflight-"));
-    const cases = fixtureInputs.map((input) => benchmarkCase.parse(input));
-    const inheritedModelKey = process.env.MODEL_API_KEY;
-    const runtimePair: QualificationPair = {
-      generatorModel: "z-ai/glm-5.2",
-      scorerModel: "openai/gpt-5-mini",
-    };
-    // Priced an order of magnitude above any admissible profile so the plan is
-    // refused on projected exposure. Realistic bounds project inside the
-    // admission ceiling and would exercise the happy path instead.
+    const binary = resolve(root, "fixture-postil");
+    const cases = fixtureInputs.slice(0, 2).map((input) => benchmarkCase.parse(input));
+    const runtimePair = normalizeQualificationPairs([pair])[0]!;
     const pricing = new Map([
       [runtimePair.generatorModel, {
         providerIdentity: "PinnedProvider",
-        promptUsdPerToken: 0.0028434,
-        completionUsdPerToken: 0.0089364,
-        inputMicrosPerMillionTokens: 2_843_400,
-        outputMicrosPerMillionTokens: 8_936_400,
+        promptUsdPerToken: 0.000001,
+        completionUsdPerToken: 0.000002,
+        inputMicrosPerMillionTokens: 1_000_000,
+        outputMicrosPerMillionTokens: 2_000_000,
       }],
       [runtimePair.scorerModel, {
         providerIdentity: "PinnedProvider",
-        promptUsdPerToken: 0.0028434,
-        completionUsdPerToken: 0.0089364,
-        inputMicrosPerMillionTokens: 2_843_400,
-        outputMicrosPerMillionTokens: 8_936_400,
+        promptUsdPerToken: 0.000001,
+        completionUsdPerToken: 0.000002,
+        inputMicrosPerMillionTokens: 1_000_000,
+        outputMicrosPerMillionTokens: 2_000_000,
       }],
     ]);
+    await writeFile(binary, `#!/usr/bin/env node
+const fail = (message) => { console.error(message); process.exit(97); };
+if (process.env.POSTIL_QUALIFICATION_PLAN_ONLY !== "1") fail("plan-only mode was not set");
+if (process.env.POSTIL_QUALIFICATION_CAPTURE_API_BASE !== "http://127.0.0.1:9") {
+  fail("plan-only preflight escaped loopback capture");
+}
+if (process.env.POSTIL_API_KEY !== "postil-plan-only-fixture") {
+  fail("the explicit fixture credential was not forwarded");
+}
+for (const name of ["MODEL_API_KEY", "LLM_API_KEY", "OPENROUTER_API_KEY", "POSTIL_ENDPOINT_AUTH_VALUE"]) {
+  if (process.env[name] !== undefined) fail("ambient credential reached plan-only preflight: " + name);
+}
+console.log(JSON.stringify({
+  version: 1, summary: "", silent: true, findings: [], resolved: [],
+  counts: { info: 0, warn: 0, error: 0, suppressed: 0, ungrounded: 0 },
+  confidenceBuckets: [0, 0, 0, 0, 0],
+  gate: { failOn: "error", failing: false, blockOnKinds: [] },
+  modelUsed: "none (qualification plan)", usage: { promptTokens: 0, completionTokens: 0 },
+  reviewCoverage: { mode: "exhaustive", selectedBatches: 1, totalBatches: 1 },
+  reviewAdmission: { providerAttempts: 6, serializedInputBytes: 5000, outputTokens: 180, projectedCostMicros: 1000000 },
+  durationMs: 0, baseSha: null, headSha: null, sinceSha: null
+}));
+`);
+    await chmod(binary, 0o700);
     try {
-      process.env.MODEL_API_KEY = "postil-plan-only-fixture";
-      const cargoTarget = process.env.CARGO_TARGET_DIR;
-      const binary = process.env.POSTIL_BIN === undefined
-        ? cargoTarget === undefined
-          ? resolve(import.meta.dir, "..", "..", "target", "release", "postil")
-          : resolve(cargoTarget, "release", "postil")
-        : resolve(process.env.POSTIL_BIN);
-      const normalizedPair = normalizeQualificationPairs([runtimePair])[0]!;
       await expect(assertRuntimeShapedQualificationPreflight({
         binary,
         rootDir: root,
         cases,
-        pairs: [normalizedPair],
-        repeats: 9,
+        pairs: [runtimePair],
+        repeats: 3,
         pricing,
         apiBase: normalizeApiBase("https://openrouter.ai/api/v1"),
         apiFormat: "openai-compatible",
-        costCapUsdDecimal: "70",
+        costCapUsdDecimal: "1",
         upstreamProvider: "PinnedProvider",
-      })).rejects.toThrow("micro-dollar admission projection cap");
+        credentialEnvironment: { POSTIL_API_KEY: "postil-plan-only-fixture" },
+      })).rejects.toThrow("runtime-shaped qualification spend");
     } finally {
-      if (inheritedModelKey === undefined) delete process.env.MODEL_API_KEY;
-      else process.env.MODEL_API_KEY = inheritedModelKey;
       await rm(root, { recursive: true, force: true });
     }
   }, 60_000);
@@ -664,7 +678,6 @@ describe("pair qualification configuration", () => {
     const root = await mkdtemp(resolve(tmpdir(), "postil-runtime-preflight-failure-"));
     const binary = resolve(root, "fixture-postil");
     const startsPath = resolve(root, "starts.log");
-    const inheritedModelKey = process.env.MODEL_API_KEY;
     await writeFile(binary, `#!/usr/bin/env node
 import { appendFileSync, closeSync, openSync } from "node:fs";
 import { resolve } from "node:path";
@@ -692,7 +705,6 @@ process.exit(0);
 `);
     await chmod(binary, 0o700);
     try {
-      process.env.MODEL_API_KEY = "postil-plan-only-fixture";
       const cases = fixtureInputs.slice(0, 8).map((input) => benchmarkCase.parse(input));
       const pricing = new Map([
         [pair.generatorModel, {
@@ -721,6 +733,7 @@ process.exit(0);
         apiFormat: "openai-compatible",
         costCapUsdDecimal: "55",
         upstreamProvider: "PinnedProvider",
+        credentialEnvironment: { POSTIL_API_KEY: "postil-plan-only-fixture" },
       })).rejects.toThrow("deliberate preflight failure");
       const starts = (await readFile(startsPath, "utf8")).trim().split("\n");
       const finishes = (await readFile(resolve(root, "finishes.log"), "utf8"))
@@ -733,8 +746,6 @@ process.exit(0);
       expect(finishes.every((identity) => starts.includes(identity))).toBe(true);
       await expect(lstat(resolve(root, "preflight"))).rejects.toThrow();
     } finally {
-      if (inheritedModelKey === undefined) delete process.env.MODEL_API_KEY;
-      else process.env.MODEL_API_KEY = inheritedModelKey;
       await rm(root, { recursive: true, force: true });
     }
   }, 20_000);

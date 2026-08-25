@@ -77,6 +77,9 @@ pub enum Command {
         config: Option<PathBuf>,
     },
     /// Review a diff: a PR/MR on a forge, or local changes.
+    #[command(
+        after_help = "Examples:\n  postil review\n  postil review --staged\n  postil review --base origin/main\n\nBare local review selects, in order: staged changes; committed changes since the current branch remote's default branch; tracked working-tree changes; then an empty clean diff. Locally known symbolic remote HEAD, main, master, and trunk refs are recognized without fetching. If no default branch can be resolved, Postil fails closed and asks for --base, --staged, or --diff-file. Explicit source flags are mutually exclusive and keep their exact behavior.\n\nUse `postil models` to see supported model-ID contracts, embedded defaults, qualification, and override syntax."
+    )]
     Review {
         /// Code host for remote review. Inferred as github when --repo is set.
         #[arg(long, value_enum)]
@@ -94,13 +97,13 @@ pub enum Command {
         #[arg(long)]
         base_sha: Option<String>,
         /// Review staged changes (git diff --cached).
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["base", "diff_file"])]
         staged: bool,
         /// Review changes since a base ref (git diff base...HEAD).
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["staged", "diff_file"])]
         base: Option<String>,
         /// Review a unified diff from a file.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["staged", "base"])]
         diff_file: Option<PathBuf>,
         /// Existing advisory check-run id to complete (hosted callers).
         #[arg(long)]
@@ -135,6 +138,18 @@ pub enum Command {
         /// Model override (else REVIEW_MODEL, else config, else default).
         #[arg(long)]
         model: Option<String>,
+        /// Reviewer reasoning effort: max|xhigh|high|medium|low|minimal|none (else REVIEW_REASONING_EFFORT, else config, else low).
+        #[arg(long, value_name = "EFFORT")]
+        reasoning_effort: Option<String>,
+        /// Scorer reasoning effort: max|xhigh|high|medium|low|minimal|none (else REVIEW_SCORER_REASONING_EFFORT, else config, else none).
+        #[arg(long, value_name = "EFFORT")]
+        scorer_reasoning_effort: Option<String>,
+        /// Keep detailed provider, retry, and batch telemetry in interactive terminals.
+        #[arg(long)]
+        verbose: bool,
+        /// Disable animation while keeping concise human progress milestones.
+        #[arg(long)]
+        no_progress: bool,
         /// Use deterministic semantic synthesis and model-assisted risk selection to cap large reviews at five source batches; report bounded coverage.
         #[arg(long)]
         bounded: bool,
@@ -186,37 +201,8 @@ pub enum Command {
         )]
         publication_input_identity: Option<String>,
     },
-    /// Reply to an @postil mention on a pull request or issue (interactive bot).
-    Respond {
-        /// Code host. GitHub and GitLab support PRs/MRs and issues; Bitbucket
-        /// and Azure DevOps support pull requests only.
-        #[arg(long, value_enum, default_value = "github")]
-        forge: ForgeArg,
-        /// Repository as owner/name.
-        #[arg(long)]
-        repo: Option<String>,
-        /// Pull request number the mention is on.
-        #[arg(long)]
-        pr: Option<u64>,
-        /// Issue number the mention is on.
-        #[arg(long)]
-        issue: Option<u64>,
-        /// The maintainer's message text (the mention body). Falls back to the
-        /// POSTIL_COMMENT environment variable — prefer that for automation:
-        /// argv is visible in `ps` and clap would reject text starting with `-`.
-        #[arg(long, allow_hyphen_values = true)]
-        comment: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
-        #[arg(long)]
-        model: Option<String>,
-        /// Post the reply to the selected forge. Replies are printed locally by default.
-        #[arg(long, conflicts_with = "no_post")]
-        publish: bool,
-        /// Deprecated compatibility flag. Replies are local-only by default.
-        #[arg(long, hide = true, conflicts_with = "publish")]
-        no_post: bool,
-    },
+    /// Explain supported model IDs, embedded defaults, qualification, and overrides.
+    Models,
     /// Replay stored envelopes under a candidate config: what would change?
     Plan {
         /// Directory of envelope JSON files from previous reviews.
@@ -247,14 +233,14 @@ pub enum Command {
         #[command(subcommand)]
         action: HookAction,
     },
-    /// Authenticate against postil.dev for zero-config hosted inference.
+    /// Authenticate through a Postil login server.
     Login {
         /// Organization to select during approval. The browser approval page
         /// is authoritative for membership; this only pre-fills a hint.
         #[arg(long)]
         org: Option<String>,
     },
-    /// Remove the stored login credential and revoke it server-side.
+    /// Revoke the stored login server-side, then remove it locally.
     Logout,
 }
 
@@ -325,6 +311,88 @@ mod tests {
         assert!(help.contains(
             "Use deterministic semantic synthesis and model-assisted risk selection to cap large reviews at five source batches; report bounded coverage"
         ));
+    }
+
+    #[test]
+    fn review_help_makes_bare_selection_and_model_discovery_explicit() {
+        let help = Cli::command()
+            .find_subcommand_mut("review")
+            .expect("review subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("postil review\n"));
+        assert!(help.contains("staged changes; committed changes"));
+        assert!(help.contains("postil models"));
+        let root = Cli::command().render_long_help().to_string();
+        assert!(root.contains("models"));
+        assert!(!root.contains("respond"));
+    }
+
+    #[test]
+    fn review_accepts_role_specific_reasoning_effort_flags() {
+        let parsed = Cli::try_parse_from([
+            "postil",
+            "review",
+            "--reasoning-effort",
+            "xhigh",
+            "--scorer-reasoning-effort",
+            "none",
+        ])
+        .unwrap();
+        let Command::Review {
+            reasoning_effort,
+            scorer_reasoning_effort,
+            ..
+        } = parsed.command
+        else {
+            panic!("expected review command");
+        };
+        assert_eq!(reasoning_effort.as_deref(), Some("xhigh"));
+        assert_eq!(scorer_reasoning_effort.as_deref(), Some("none"));
+
+        let help = Cli::command()
+            .find_subcommand_mut("review")
+            .expect("review subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--reasoning-effort <EFFORT>"));
+        assert!(help.contains("--scorer-reasoning-effort <EFFORT>"));
+        assert!(help.contains("max|xhigh|high|medium|low|minimal|none"));
+    }
+
+    #[test]
+    fn local_review_sources_are_mutually_exclusive() {
+        for arguments in [
+            vec!["postil", "review", "--staged", "--base", "main"],
+            vec!["postil", "review", "--staged", "--diff-file", "change.diff"],
+            vec![
+                "postil",
+                "review",
+                "--base",
+                "main",
+                "--diff-file",
+                "change.diff",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(arguments).is_err());
+        }
+    }
+
+    #[test]
+    fn no_progress_keeps_concise_human_milestones() {
+        let parsed = Cli::try_parse_from(["postil", "review", "--no-progress"]).unwrap();
+        let Command::Review { no_progress, .. } = parsed.command else {
+            panic!("expected review command");
+        };
+        assert!(no_progress);
+
+        let help = Cli::command()
+            .find_subcommand_mut("review")
+            .expect("review subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--no-progress"));
+        assert!(help.contains("concise human progress milestones"));
     }
 
     #[test]

@@ -4,9 +4,9 @@ Postil speaks either an OpenAI-compatible chat-completions interface or the nati
 
 ## Model admission
 
-The CLI has no implicit model or fallback chain. Set `REVIEW_MODEL` to a model that passes the repository benchmark for the intended review profile. Set `REVIEW_MODEL_CASCADE` only to other qualified models. Scoring is disabled unless `REVIEW_SCORER_MODEL` names a qualified scorer. `REVIEW_SCORER_MODEL_CASCADE` accepts one qualified scorer fallback.
+Local review defaults to the embedded `openai/gpt-5.6-luna` reviewer with no fallback chain or scorer, so no model setting is required. Reviewer requests use `low` reasoning effort. Local scoring is disabled unless `REVIEW_SCORER_MODEL` names a scorer. The embedded hosted scorer candidate is `openai/gpt-5.6-luna` at `none` effort. `postil models` reports these roles, the accepted endpoint model-ID contracts, embedded qualification status, accepted effort values, and exact `postil doctor` and override commands without reading credentials or contacting a provider. Local use has no fixed model-ID allowlist: Postil passes a non-empty model ID unchanged to the configured OpenAI-compatible or native Anthropic endpoint. Endpoint protocol compatibility does not imply hosted qualification. Hosted deployments admit only complete qualified profiles. `REVIEW_SCORER_MODEL_CASCADE` accepts one qualified scorer fallback.
 
-Hosted deployments admit only complete profiles listed in the embedded `qualified-models.json` qualification manifest. A profile binds the canonical API base, provider API format, ordered generator chain, consensus width, ordered scorer chain, exact Bun evaluator runtime, qualification source commit, a 30-day authority window, at least three complete runs, and SHA-256 digests for the review contract, evaluator contract, fixture set, and benchmark report. The manifest also binds the exact `config.toml` digest. Hosted configuration must match one unexpired profile exactly; the expiry second is excluded. An empty, degraded, stale, or mismatched profile rejects inference.
+Hosted deployments admit only complete profiles listed in the embedded `qualified-models.json` qualification manifest. A profile binds the canonical API base, provider API format, ordered generator chain, consensus width, ordered scorer chain, exact Bun evaluator runtime, qualification source commit, a 30-day authority window, at least three complete runs, and SHA-256 digests for the review contract, evaluator contract, fixture set, and benchmark report. The manifest also binds the exact `config.toml` digest, including the reviewer and scorer reasoning defaults. Hosted configuration must match one unexpired profile exactly, so an effort override that differs from those qualified defaults is rejected. The expiry second is excluded. An empty, degraded, stale, or mismatched profile rejects inference.
 
 Every nonempty manifest has a committed `qualified-models.attestation.json` bundle. CI and release validation use [`gh attestation verify`](https://cli.github.com/manual/gh_attestation_verify) to require SLSA provenance from the exact `postil-dev/postil-cli` admission workflow, `refs/heads/main` source ref, source and signer commit, issued by GitHub OIDC through public Sigstore on a GitHub-hosted runner. The source commit must be an ancestor of the candidate commit, and only the manifest and bundle may differ. A verified Sigstore timestamp must match the signed issue time and remain within the authority window. The bundle authenticates the exact manifest bytes. Checksums inside the report and manifest provide integrity evidence, not producer authentication. The binary metadata exposes the manifest issue time, exclusive expiry time, and maximum age as top-level values. An empty manifest exposes null authority metadata, needs no bundle, and admits no model.
 
@@ -33,6 +33,8 @@ postil doctor
 
 These requests authenticate with `Authorization: Bearer`.
 
+OpenAI-compatible requests carry the [OpenRouter reasoning configuration](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens) as `reasoning.effort`. The accepted values are `max`, `xhigh`, `high`, `medium`, `low`, `minimal`, and `none`. This field is sent to OpenRouter and custom OpenAI-compatible endpoints on every request. Postil does not drop or downgrade it, so custom endpoints must implement the extension.
+
 ## Anthropic Messages API
 
 ```sh
@@ -43,7 +45,7 @@ export REVIEW_MODEL=provider-qualified-anthropic-model
 postil doctor
 ```
 
-Native Anthropic requests use `x-api-key` and `anthropic-version`. Set `REVIEW_SCORER_MODEL` to a model available through the same endpoint when scoring is required.
+Native Anthropic requests use `x-api-key` and `anthropic-version`. Reviewer and scorer values from `max` through `low` map to `output_config.effort`; incompatible non-default temperature values are omitted from those requests. `none` maps to disabled thinking and retains the request temperature. The Anthropic request format has no `minimal` mapping, so Postil rejects that value locally before provider access. Individual Anthropic models can support a subset of the remaining effort values. Set `REVIEW_SCORER_MODEL` to a model available through the same endpoint when scoring is required.
 
 ## Local endpoints
 

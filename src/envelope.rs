@@ -1533,7 +1533,6 @@ pub enum ModelUsageRole {
     ReviewPlanner,
     ReviewGenerator,
     FindingScorer,
-    MentionResponder,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1557,7 +1556,6 @@ pub enum ModelIncidentPhase {
     Planner,
     Review,
     Scorer,
-    Respond,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

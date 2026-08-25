@@ -61,6 +61,27 @@ describe("admission attestation verification", () => {
     )).toBe("provisional");
   });
 
+  test("binds reviewer and scorer reasoning efforts to the model-defaults digest", async () => {
+    const repositoryRoot = join(import.meta.dir, "..", "..");
+    const original = await readFile(join(repositoryRoot, "config.toml"), "utf8");
+    for (const altered of [
+      original.replace('reasoning_effort = "low"', 'reasoning_effort = "high"'),
+      original.replace('reasoning_effort = "none"', 'reasoning_effort = "low"'),
+    ]) {
+      const directory = await temporaryDirectory();
+      const manifest = join(directory, "qualified-models.json");
+      const config = join(directory, "config.toml");
+      await writeFile(manifest, await readFile(join(repositoryRoot, "qualified-models.json")));
+      await writeFile(config, altered);
+
+      await expect(verifyProvisionalRelease(
+        manifest,
+        config,
+        join(repositoryRoot, "provisional-models.json"),
+      )).rejects.toThrow("empty qualification manifest does not match embedded model defaults");
+    }
+  });
+
   test("rejects duplicate models within either provisional chain", async () => {
     const repositoryRoot = join(import.meta.dir, "..", "..");
     const directory = await temporaryDirectory();

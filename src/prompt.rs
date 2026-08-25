@@ -326,44 +326,6 @@ pub(crate) fn sanitize_scorer_input(value: &str) -> String {
         .collect()
 }
 
-/// System prompt for the interactive bot answering a maintainer's mention.
-/// The small JSON envelope keeps generated prose behind a deterministic
-/// publication check before it can reach a forge.
-pub fn respond_system_prompt(cfg: &Config, current_utc_date: Date) -> String {
-    let mut p = String::from(
-        "You are Postil, replying to a maintainer who mentioned you on a pull request or \
-         issue. Answer the actual question directly. Ground every claim in the diff or thread \
-         you are given, and cite file:line when you reference code. If something cannot be \
-         determined from the supplied context, say so plainly rather than guessing. No filler, \
-         praise, preamble, or restatement of the question. You do not open pull requests or push \
-         commits; if asked to, explain that you review and answer only.\n\
-         \n\
-         Keep an ordinary reply at or below 1,200 characters. A re-review reply is a compact \
-         review, not an article: report only actionable merge risks, give each risk in one \
-         concise item with its file:line evidence and next action, and say briefly when no such \
-         risk is present. Do not add an overview, implementation tour, correctness section, \
-         generic risk inventory, or verdict. Do not use Markdown headings. Use no more than three \
-         list items.\n\
-         Do not emit active @mentions, raw HTML or HTML comments, details blocks, Markdown \
-         tables, or images.\n\
-         \n\
-         Return ONLY one JSON object with exactly this shape and no markdown fence or surrounding \
-         prose:\n\
-         {\"answer\":\"concise GitHub-flavored Markdown\",\"diagram\":null}\n\
-         The answer must be non-empty and diagram must always be null. Generated diagrams and \
-         Mermaid are not accepted. The publication validator rejects output over 2,400 characters \
-         or 24 nonblank lines, extra fields, Markdown headings, more than three list items, and \
-         unsafe Markdown.",
-    );
-    p.push_str(&trusted_current_date_context(current_utc_date));
-    if let Some(rules) = &cfg.guardrails {
-        p.push_str("\n\nRepository guardrails you may reference:\n");
-        let rules = bounded_untrusted_prompt_text(rules, MAX_GUARDRAIL_PROMPT_BYTES / 2);
-        p.push_str(&rules);
-    }
-    p
-}
-
 const MAX_PR_BODY_PROMPT_CHARS: usize = 2_000;
 
 fn bounded_pr_body(body: Option<&str>) -> Option<String> {
@@ -616,24 +578,6 @@ mod tests {
     #[test]
     fn scorer_input_removes_high_expansion_control_characters() {
         assert_eq!(sanitize_scorer_input("a\0b\u{001f}c\n\t"), "a b c\n\t");
-    }
-
-    #[test]
-    fn respond_prompt_requires_a_compact_structured_reply() {
-        let p = respond_system_prompt(&Config::default(), trusted_date());
-        assert_eq!(p.matches("UTC date 2026-08-10; later=future.").count(), 1);
-        assert!(!p.contains("UTC date 2026-08-11; later=future."));
-        assert!(p.contains("at or below 1,200 characters"));
-        assert!(p.contains("not an article"));
-        assert!(p.contains("{\"answer\":\"concise GitHub-flavored Markdown\",\"diagram\":null}"));
-        assert!(p.contains("diagram must always be null"));
-        assert!(p.contains("Mermaid are not accepted"));
-        assert!(!p.contains("When justified"));
-        assert!(!p.contains("materially clarifies"));
-        assert!(p.contains("Do not add an overview"));
-        assert!(p.contains("Do not use Markdown headings"));
-        assert!(p.contains("no more than three list items"));
-        assert!(p.contains("Do not emit active @mentions"));
     }
 
     #[test]

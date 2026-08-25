@@ -22,6 +22,14 @@ pub(crate) fn names_text() -> String {
     API_KEY_ENV_VARS.join(", ")
 }
 
+pub(crate) fn credential_help() -> String {
+    format!(
+        "default model is {}; run `postil login` for hosted inference or set one of {}; see `postil models` for supported model IDs, embedded defaults, qualification status, and override syntax",
+        crate::config::default_model(),
+        names_text()
+    )
+}
+
 pub(crate) fn resolve_from_process_env() -> Option<String> {
     resolve_with(|name| std::env::var(name).ok())
 }
@@ -115,6 +123,7 @@ mod tests {
     fn stored_credential(expires_at: &str) -> Credentials {
         Credentials {
             version: credentials::CREDENTIALS_VERSION,
+            issuer: Some("https://postil.dev".to_string()),
             token: "pcli_stored-token-not-a-real-secret".to_string(),
             expires_at: expires_at.to_string(),
             refresh_token: None,
@@ -122,6 +131,7 @@ mod tests {
             api_base: "https://postil.dev/api/inference/v1".to_string(),
             org: "runatlas-is".to_string(),
             model: "z-ai/glm-5.2".to_string(),
+            pending_revocations: Vec::new(),
         }
     }
 

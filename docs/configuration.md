@@ -1,12 +1,14 @@
 # Configuration
 
-Postil resolves settings in this order:
+Postil resolves model settings in this order:
 
 1. Command-line flags
 2. Environment variables
 3. `.postil.yaml`, `.postil.yml`, or `.postil.json`
-4. Translated `.coderabbit.yaml` settings
+4. Stored `postil login` routing
 5. Built-in defaults
+
+Translated `.coderabbit.yaml` settings can supply review policy but do not select a model.
 
 Unknown keys fail validation so a misspelling cannot silently weaken a review.
 
@@ -33,8 +35,10 @@ contentPolicy:
   enabled: true
 model:
   name: provider/qualified-model
+  reasoningEffort: low           # max, xhigh, high, medium, low, minimal, or none
   cascade: []                    # qualified fallbacks only
   # scorer: provider/qualified-scorer
+  scorerReasoningEffort: none
   consensus: 1
 ```
 
@@ -47,20 +51,23 @@ Ignore patterns remove matching paths before grounding, batching, and large-revi
 | Variable | Purpose |
 | --- | --- |
 | `POSTIL_API_KEY`, `OPENROUTER_API_KEY`, `MODEL_API_KEY`, `LLM_API_KEY` | Model provider credential, checked in that order |
-| `POSTIL_LOGIN_SERVER` | Postil web app used by `postil login`, refresh, and `postil logout`; defaults to `https://postil.dev` |
-| `POSTIL_API_BASE` | Model endpoint selected by the operator |
+| `POSTIL_LOGIN_SERVER` | Postil web app used to issue a new login; defaults to `https://postil.dev`. Refresh and logout use the stored issuing server and reject a conflicting explicit value. |
+| `POSTIL_API_BASE` | Model endpoint selected by the operator. A value that differs from a stored login's endpoint requires an explicit API key. |
 | `POSTIL_API_FORMAT` | `openai-compatible` or `anthropic` |
 | `POSTIL_ENDPOINT_AUTH_HEADER`, `POSTIL_ENDPOINT_AUTH_VALUE` | Additional private-gateway authentication |
 | `POSTIL_ALLOW_PRIVATE_API_BASE` | Explicitly permit a local or private-network endpoint |
 | `POSTIL_ALLOW_CONFIG_API_BASE` | Honor a repository-controlled `model.apiBase` |
 | `POSTIL_IGNORE_REPOSITORY_MODEL_CONFIG` | Keep trusted local/hosted model selection independent of repository model fields |
 | `REVIEW_MODEL` | Primary model override |
+| `REVIEW_REASONING_EFFORT` | Reviewer reasoning effort: `max`, `xhigh`, `high`, `medium`, `low`, `minimal`, or `none` |
 | `REVIEW_MODEL_CASCADE` | Comma-separated fallback models |
 | `REVIEW_MODEL_CONSENSUS` | Number of models from the generator chain to run concurrently; agreeing findings are retained |
 | `REVIEW_SCORER_MODEL` | Scorer model override |
+| `REVIEW_SCORER_REASONING_EFFORT` | Scorer and adjudication reasoning effort: `max`, `xhigh`, `high`, `medium`, `low`, `minimal`, or `none` |
 | `REVIEW_SCORER_MODEL_CASCADE` | One scorer fallback model |
 | `POSTIL_UNCERTAINTY_RESOLUTION` | Override uncertainty resolution with `true`/`false` or `1`/`0` |
 | `POSTIL_CONCISE_FINDINGS` | Override concise findings with `true`/`false` or `1`/`0` |
+| `POSTIL_NO_PROGRESS` | Disable animated progress and retain concise human milestones when set |
 | `POSTIL_LLM_REQUEST_TIMEOUT_SECS` | Per-attempt model request timeout; defaults to 480 seconds |
 | `POSTIL_LLM_TOTAL_TIMEOUT_SECS` | Optional total local-review model deadline |
 | `POSTIL_DETAILS_URL` | HTTP(S) details link for forge check runs |
@@ -74,7 +81,11 @@ postil login
 postil logout
 ```
 
-`postil login` authenticates against postil.dev over a device-authorization flow (open the printed URL, enter the code) and stores a renewable credential at `${XDG_CONFIG_HOME:-~/.config}/postil/credentials.json`, mode `0600` in a `0700` directory. That credential is a fallback: it is used only when none of `POSTIL_API_KEY`, `OPENROUTER_API_KEY`, `MODEL_API_KEY`, or `LLM_API_KEY` is set. When it is used, Postil rotates the access credential before it expires and persists the replacement; explicit API keys never trigger a refresh. Its `apiBase` and model select the request unless `POSTIL_API_BASE`/`REVIEW_MODEL` are set, which still win. `postil logout` revokes the stored refresh credential server-side and removes the local file even if that call fails. A legacy access-only login, an expired refresh inactivity window, or a rejected refresh produces one instruction to run `postil login` again rather than a provider authentication error. Temporary refresh failures retain the stored credential and ask the user to try again.
+`postil login` authenticates against the configured login server over a device-authorization flow (open the printed URL, enter the code) and stores a renewable credential at `${XDG_CONFIG_HOME:-~/.config}/postil/credentials.json`, mode `0600` in a `0700` directory. An ambiguous polling failure retries the same device code so the service can recover the already-issued pair during its 60-second recovery window. The credential records its canonical issuing server. Refresh and logout use that stored issuer; a conflicting explicit `POSTIL_LOGIN_SERVER` fails before any login credential is sent. Issuer-free credentials from older CLI versions infer `https://postil.dev` only when their normalized `apiBase` is the canonical Postil inference endpoint. An issuer-free credential for any custom endpoint requires `postil login` again before refresh or logout.
+
+The stored credential is a fallback used only when none of `POSTIL_API_KEY`, `OPENROUTER_API_KEY`, `MODEL_API_KEY`, or `LLM_API_KEY` is set. Postil rotates it before access expiry and persists the replacement; explicit API keys never trigger a refresh. Its `apiBase` is the only endpoint that may receive its bearer. A different `POSTIL_API_BASE` fails before network access unless an explicit API key is set. `REVIEW_MODEL` may still select a model at the stored endpoint. A legacy access-only login, an expired refresh inactivity window, or a rejected refresh instructs the user to run `postil login` again. A valid `Retry-After` value on a temporary refresh rate limit is reported in seconds. Missing or malformed values use a generic retry message, and all temporary refresh failures retain the credential.
+
+`postil logout` removes the active local credential only after remote revocation succeeds. A failed revocation retains its sole retry handle and asks the user to run `postil logout` again. A new login stages the newly issued family and any overwritten family in a private pending-revocation queue before replacing the active credential. A local replacement failure therefore retains the new remote family's revocation handle. Pending retries never block normal review work and never follow `POSTIL_LOGIN_SERVER` overrides.
 
 ## Inspect and initialize
 
@@ -84,4 +95,6 @@ postil config
 postil doctor
 ```
 
-`postil config` prints the resolved non-secret configuration and its sources. `postil doctor` validates endpoint reachability, credential acceptance, and repository setup without printing credential values. Both commands identify renewable logins, access expiry, refresh inactivity expiry, and legacy access-only logins.
+`postil config` prints the resolved non-secret configuration and separate provenance for the model, reviewer reasoning effort, and scorer reasoning effort. `postil doctor` validates endpoint reachability, credential acceptance, and repository setup without printing credential values. Both commands identify renewable logins, access expiry, refresh inactivity expiry, and legacy access-only logins.
+
+Use `--reasoning-effort` and `--scorer-reasoning-effort` for one review. These flags override the matching environment variables, which override `model.reasoningEffort` and `model.scorerReasoningEffort`. The built-in reviewer and scorer defaults are `low` and `none`, respectively. Every request carries the resolved value, including retries and repair calls.

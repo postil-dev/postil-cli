@@ -8,6 +8,8 @@ The JSON and YAML envelope contains the summary, findings, resolved findings, po
 
 `--sarif <path>` writes SARIF 2.1.0 for code-scanning ingestion.
 
+Machine data written to stdout never includes progress controls. Interactive terminals collapse routine telemetry into concise progress only when stdout is human-readable. `--output-file` and `--sarif` keep that human progress because their machine artifacts go to files. `--no-progress` or `POSTIL_NO_PROGRESS=1` replaces animation with concise static milestones. `--verbose` enables complete provider, retry, and batch telemetry. Non-TTY and machine-output contexts retain complete telemetry automatically.
+
 ## Incremental review
 
 ```sh
@@ -31,19 +33,6 @@ postil plan --envelopes .cache/envelopes --config .postil.candidate.yaml
 ```
 
 The report shows which findings become visible or suppressed and which gate results change.
-
-## Interactive replies
-
-`postil respond` answers a mention on a pull request. GitHub and GitLab also support issue mentions. It does not open pull requests or push commits.
-Posting the reply requires `--publish`; without it, the reply is printed locally.
-CI detection and environment variables do not authorize a forge write.
-
-```sh
-POSTIL_COMMENT='@postil is this safe?' \
-postil respond --repo owner/repository --pr 123 --publish
-```
-
-Pass comment text through `POSTIL_COMMENT` in automation because command-line arguments are visible to other local processes.
 
 ## Usage receipts
 

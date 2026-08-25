@@ -26,8 +26,7 @@ use super::{
     PublicationPlanReviewCreateOutcome, PublicationPlanReviewCreatePayload,
     PublicationPlanReviewSummaryCase, PublicationPlanSnapshot, PublicationPlanTerminalOperation,
     PublicationPlanTerminalOutcome, ReviewPublicationReceipt, ReviewPublicationSummary,
-    SummaryContext, ThreadKind, check_summary, check_title, only_operational_findings,
-    valid_details_url,
+    SummaryContext, check_summary, check_title, only_operational_findings, valid_details_url,
 };
 use crate::diff::{Diff, DiffIndex, DiffSnapshot, DiffSpool, WorkspaceBudget};
 use crate::envelope::{Envelope, Finding, Severity};
@@ -36,6 +35,18 @@ use crate::filter;
 pub const EXPECTED_REPOSITORY_ID_ENV: &str = "POSTIL_EXPECTED_GITHUB_REPO_ID";
 const GITHUB_MAX_ANNOTATIONS_PER_REQUEST: usize = 50;
 const FILE_LEVEL_COMMENT_MARKER: &str = "<!-- postil-placement:file -->";
+
+macro_rules! github_telemetry {
+    ($($argument:tt)*) => {
+        crate::progress::telemetry(format_args!($($argument)*))
+    };
+}
+
+macro_rules! github_notice {
+    ($($argument:tt)*) => {
+        crate::progress::notice(format_args!($($argument)*))
+    };
+}
 
 // Filtering caps visible findings before forge publication, so one completed
 // check update always fits GitHub's annotation request limit. Raising the
@@ -195,7 +206,7 @@ impl GitHub {
             .await
             .is_err()
         {
-            eprintln!(
+            github_notice!(
                 "postil: github operation=review-summary-update status=incomplete recovery=truthful-initial-summary"
             );
         }
@@ -406,7 +417,7 @@ impl GitHub {
             let response = match response {
                 Ok(response) => response,
                 Err(error) => {
-                    eprintln!(
+                    github_telemetry!(
                         "postil: github operation={} attempt={}/{} category=transport-error elapsed_ms={} budget_remaining_ms={}",
                         what.replace(' ', "-"),
                         attempt,
@@ -432,7 +443,7 @@ impl GitHub {
             let status = response.status();
             let request_id =
                 github_request_id(response.headers()).unwrap_or_else(|| "none".to_string());
-            eprintln!(
+            github_telemetry!(
                 "postil: github operation={} attempt={}/{} status={} elapsed_ms={} request_id={} rate_remaining={} retry_after_secs={}",
                 what.replace(' ', "-"),
                 attempt,
@@ -454,7 +465,7 @@ impl GitHub {
             if delay.is_zero() {
                 return Ok(response);
             }
-            eprintln!(
+            github_telemetry!(
                 "postil: github operation={} retrying_in_secs={} retry={}/{}",
                 what.replace(' ', "-"),
                 delay.as_secs(),
@@ -726,48 +737,11 @@ impl GitHub {
         Ok(receipt)
     }
 
-    async fn comment_exists(&self, number: u64, marker: &str) -> Result<bool> {
-        const PAGE_SIZE: usize = 100;
-        const MAX_PAGES: usize = 20;
-        for page in 1..=MAX_PAGES {
-            let response = self
-                .send_retryable(
-                    self.request(
-                        reqwest::Method::GET,
-                        self.url(&format!(
-                            "/issues/{number}/comments?per_page={PAGE_SIZE}&page={page}&sort=created&direction=desc"
-                        )),
-                    ),
-                    "comment reconciliation",
-                )
-                .await?;
-            let comments: Vec<PublishedComment> = super::bounded_response_json(
-                Self::check_ok(response, "comment reconciliation").await?,
-                "GitHub comment reconciliation",
-            )
-            .await?;
-            let page_len = comments.len();
-            if comments
-                .into_iter()
-                .any(|comment| comment.body.contains(marker))
-            {
-                return Ok(true);
-            }
-            if page_len < PAGE_SIZE {
-                return Ok(false);
-            }
-        }
-        Err(anyhow!(
-            "GitHub comment reconciliation exceeded {MAX_PAGES} pages; refusing an unsafe retry"
-        ))
-    }
-
     /// Finding markers already carried by inline comments on this pull request.
     ///
     /// A finding's id is a hash over the head SHA, kind, path, line, and title,
     /// so an identical marker is the same finding at the same place on the same
-    /// commit. Two reviews of one head — a push review followed by an `@postil`
-    /// mention, say — legitimately re-detect the same issue, and without this
+    /// commit. Two reviews of one head legitimately re-detect the same issue, and without this
     /// the second run posts a second copy of every comment the first already
     /// left.
     ///
@@ -918,47 +892,6 @@ impl GitHub {
             tokio::time::sleep(github_transport_retry_delay(retry)).await;
         }
         unreachable!("bounded GitHub file-level comment loop always returns")
-    }
-
-    async fn post_comment_reconciled(&self, number: u64, body: &str, marker: &str) -> Result<()> {
-        const RETRIES: u32 = 2;
-        for retry in 0..=RETRIES {
-            self.verify_repository_identity_before_write().await?;
-            let response = self
-                .request(
-                    reqwest::Method::POST,
-                    self.url(&format!("/issues/{number}/comments")),
-                )
-                .json(&json!({ "body": body }))
-                .send()
-                .await;
-            match response {
-                Ok(response) if response.status().is_success() => return Ok(()),
-                Ok(response)
-                    if github_retryable_response(response.status(), response.headers()) =>
-                {
-                    if self.comment_exists(number, marker).await? {
-                        return Ok(());
-                    }
-                    if retry == RETRIES {
-                        Self::check_ok(response, "comment post").await?;
-                    }
-                }
-                Ok(response) => {
-                    Self::check_ok(response, "comment post").await?;
-                }
-                Err(error) => {
-                    if self.comment_exists(number, marker).await? {
-                        return Ok(());
-                    }
-                    if retry == RETRIES {
-                        return Err(error).context("posting comment after reconciliation");
-                    }
-                }
-            }
-            tokio::time::sleep(github_transport_retry_delay(retry)).await;
-        }
-        unreachable!("bounded GitHub comment loop always returns")
     }
 
     async fn pull_files(&self, expected: usize) -> Result<Vec<PullFile>> {
@@ -2005,11 +1938,6 @@ struct PublishedReviewComment {
     body: String,
     #[serde(default)]
     commit_id: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct PublishedComment {
-    body: String,
 }
 
 enum ReviewDelivery {
@@ -3298,12 +3226,12 @@ impl Forge for GitHub {
                 ));
             }
 
-            eprintln!(
+            github_telemetry!(
                 "postil: github operation=review-post status=422 category=unresolved-line request_id={} recovery=placement-ladder",
                 request_id,
             );
         } else {
-            eprintln!(
+            github_telemetry!(
                 "postil: github operation=review-reconciliation status=partial recovery=placement-ladder"
             );
         }
@@ -3428,7 +3356,7 @@ impl Forge for GitHub {
                     && !line_findings.is_empty()
                     && github_review_rejected_line(&body)
                 {
-                    eprintln!(
+                    github_telemetry!(
                         "postil: github operation=placement-fallback status=422 category=unresolved-line request_id={} recovery=file-comments",
                         request_id,
                     );
@@ -3687,32 +3615,6 @@ impl Forge for GitHub {
             ));
         }
         Ok(())
-    }
-
-    /// Title and body of an issue or PR (the issues API covers both, so `kind`
-    /// is not needed here).
-    async fn fetch_thread(&self, number: u64, _kind: ThreadKind) -> Result<(String, String)> {
-        let resp = self
-            .send_retryable(
-                self.request(reqwest::Method::GET, self.url(&format!("/issues/{number}"))),
-                "issue fetch",
-            )
-            .await?;
-        let v: serde_json::Value = super::bounded_response_json(
-            Self::check_ok(resp, "issue fetch").await?,
-            "GitHub issue",
-        )
-        .await?;
-        let title = v["title"].as_str().unwrap_or_default().to_string();
-        let body = v["body"].as_str().unwrap_or_default().to_string();
-        Ok((title, body))
-    }
-
-    /// Post a top-level comment on an issue or PR (the bot's reply to a mention).
-    async fn post_comment(&self, number: u64, _kind: ThreadKind, body: &str) -> Result<()> {
-        let marker = comment_marker(number, body);
-        self.post_comment_reconciled(number, &append_marker(body, &marker), &marker)
-            .await
     }
 }
 
@@ -4519,17 +4421,6 @@ fn required_review_body(body: &str, marker: &str) -> Result<String> {
     Ok(marked)
 }
 
-fn comment_marker(number: u64, body: &str) -> String {
-    let mut digest = Sha256::new();
-    digest.update(number.to_be_bytes());
-    digest.update(body.as_bytes());
-    let hash = digest.finalize();
-    format!(
-        "<!-- postil-comment:{:02x}{:02x}{:02x}{:02x}{:02x}{:02x} -->",
-        hash[0], hash[1], hash[2], hash[3], hash[4], hash[5]
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -4871,37 +4762,6 @@ mod tests {
             .unwrap();
 
         assert!(matches!(response, super::ReviewDelivery::Reconciled(_)));
-    }
-
-    #[tokio::test]
-    async fn github_comment_reconciles_before_retrying_uncertain_post() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/repos/owner/repo/issues/9/comments"))
-            .respond_with(ResponseTemplate::new(500))
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/repos/owner/repo/issues/9/comments"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
-                    "body": "reply\n\n<!-- postil-comment:test -->"
-                }])),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-        let github = test_github(&server);
-
-        github
-            .post_comment_reconciled(
-                9,
-                "reply\n\n<!-- postil-comment:test -->",
-                "<!-- postil-comment:test -->",
-            )
-            .await
-            .unwrap();
     }
 
     fn test_github(server: &MockServer) -> GitHub {
@@ -7726,56 +7586,6 @@ mod tests {
             expected_repository_id: Some(expected_repository_id),
             ..test_github(server)
         }
-    }
-
-    #[tokio::test]
-    async fn github_repository_identity_fence_rejects_a_renamed_repository() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/repos/owner/repo"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": 42,
-                "full_name": "owner/renamed"
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/repos/owner/repo/issues/9/comments"))
-            .respond_with(ResponseTemplate::new(201))
-            .expect(0)
-            .mount(&server)
-            .await;
-
-        let error = fenced_test_github(&server, 42)
-            .post_comment_reconciled(9, "reply", "marker")
-            .await
-            .unwrap_err();
-        assert!(crate::forge::is_repository_identity_failure(&error));
-    }
-
-    #[tokio::test]
-    async fn github_repository_identity_fence_rejects_a_fork_id_for_base_publication() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/repos/owner/repo"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": 42,
-                "full_name": "owner/repo"
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/repos/owner/repo/issues/9/comments"))
-            .respond_with(ResponseTemplate::new(201))
-            .expect(0)
-            .mount(&server)
-            .await;
-
-        let error = fenced_test_github(&server, 99)
-            .post_comment_reconciled(9, "reply", "marker")
-            .await
-            .unwrap_err();
-        assert!(crate::forge::is_repository_identity_failure(&error));
     }
 
     #[tokio::test]
