@@ -153,7 +153,7 @@ fn csv_field(field: String) -> String {
 }
 
 pub fn print_pretty(envelope: &Envelope) {
-    let color = std::io::stderr().is_terminal();
+    let color = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     let mut out = String::new();
 
     if envelope.silent {

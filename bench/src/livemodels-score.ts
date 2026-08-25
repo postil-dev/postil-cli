@@ -94,7 +94,7 @@ export interface AttributionEvidenceReference {
 
 export interface UsageCostEvidence {
   model: string;
-  role: "reviewPlanner" | "reviewGenerator" | "findingScorer" | "mentionResponder" | null;
+  role: "reviewPlanner" | "reviewGenerator" | "findingScorer" | null;
   phase: "initial" | "schemaRepair" | "semanticRetry" | null;
   callOrdinal: number | null;
   attempt: number | null;

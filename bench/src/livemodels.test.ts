@@ -330,7 +330,12 @@ describe("pair qualification configuration", () => {
         "structured_outputs",
         "temperature",
       ]],
-      ["provider/generator-fallback", ["max_tokens", "temperature"]],
+      ["provider/generator-fallback", [
+        "max_tokens",
+        "reasoning",
+        "reasoning_effort",
+        "temperature",
+      ]],
       ["provider/scorer-fallback", [
         "max_tokens",
         "reasoning",

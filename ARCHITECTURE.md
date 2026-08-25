@@ -137,13 +137,11 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   object mode, path, blob object ID, and gitlink path and object ID. Symlink blobs are searched as
   link text and are never followed. A snapshot containing a gitlink remains incomplete because
   content inside the referenced repository is outside the snapshot.
-- `respond.rs`: interactive bot (`postil respond`): answers an @postil mention on a PR
-  or issue, grounded in the diff/issue, and posts one reply. Review-and-answer only; it
-  never opens PRs or pushes commits.
 - `sarif.rs`: envelope → SARIF 2.1.0 for code-scanning ingestion (`--sarif`).
-- `config.rs`: precedence (flags > env > .postil.* > .coderabbit.yaml > defaults),
+- `config.rs`: model precedence (flags > env > .postil.* > stored login > defaults),
   `deny_unknown_fields` so typos fail loudly. Also resolves `guardrails` and
   `content_policy`, the two prompt-injected repo policy sources (see below).
+  Translated `.coderabbit.yaml` settings supply review policy but do not select a model.
   Exception to precedence: `model.apiBase` from a config file is ignored by
   default (a repo could redirect the base URL that receives the inference
   credential); honored only with `POSTIL_ALLOW_CONFIG_API_BASE=1`. The

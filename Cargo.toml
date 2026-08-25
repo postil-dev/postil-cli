@@ -39,7 +39,7 @@ sha2 = "0.11.0"
 similar = "3.1.1"
 tempfile = "3.27.0"
 time = { version = "0.3.54", features = ["parsing", "formatting"] }
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "process", "time"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "process", "signal", "time"] }
 toml = "1.1.2"
 yaml_serde = "0.10.4"
 

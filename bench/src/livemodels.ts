@@ -2405,7 +2405,7 @@ export function qualificationRequiredParameters(
   };
   for (const pair of pairs) {
     for (const model of qualificationGeneratorModels(pair)) {
-      add(model, ["max_tokens", "temperature"]);
+      add(model, ["max_tokens", "reasoning", "reasoning_effort", "temperature"]);
     }
     for (const model of qualificationScorerModels(pair)) {
       add(model, [

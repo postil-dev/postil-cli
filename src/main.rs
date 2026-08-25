@@ -5,9 +5,12 @@ use postil_cli::attribution;
 use postil_cli::cli::{
     Cli, Command, ForgeArg, HookAction, publication_enabled, publication_plan_contract_capability,
 };
-use postil_cli::config::{Config, qualification_metadata, starter_config};
+use postil_cli::config::{
+    Config, REASONING_EFFORT_VALUES, default_reasoning_effort, default_scorer_reasoning_effort,
+    qualification_metadata, starter_config,
+};
 use postil_cli::review::{ForgeKind, ReviewArgs};
-use postil_cli::{doctor, hook, login, plan, respond, review};
+use postil_cli::{doctor, hook, login, plan, review};
 
 #[tokio::main]
 async fn main() {
@@ -61,6 +64,9 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
             fail_on,
             config,
             model,
+            reasoning_effort,
+            scorer_reasoning_effort,
+            verbose,
             bounded,
             publish,
             no_post,
@@ -100,6 +106,9 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
                 fail_on,
                 config,
                 model,
+                reasoning_effort,
+                scorer_reasoning_effort,
+                verbose,
                 bounded,
                 no_post: !publication_enabled(publish, no_post)?,
                 defer_gate_check,
@@ -109,35 +118,38 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
             })
             .await
         }
-        Command::Respond {
-            forge,
-            repo,
-            pr,
-            issue,
-            comment,
-            config,
-            model,
-            publish,
-            no_post,
-        } => {
-            let kind = match forge {
-                ForgeArg::Github => ForgeKind::GitHub,
-                ForgeArg::Gitlab => ForgeKind::GitLab,
-                ForgeArg::Bitbucket => ForgeKind::Bitbucket,
-                ForgeArg::Azure => ForgeKind::Azure,
-                ForgeArg::Local => ForgeKind::Local,
+        Command::Models => {
+            let cascade = postil_cli::config::default_cascade();
+            let cascade_text = if cascade.is_empty() {
+                "none".to_string()
+            } else {
+                cascade.join(" -> ")
             };
-            respond::run(respond::RespondArgs {
-                forge: kind,
-                repo,
-                pr,
-                issue,
-                comment,
-                config,
-                model,
-                no_post: !publication_enabled(publish, no_post)?,
-            })
-            .await
+            println!("Postil model presets");
+            println!(
+                "  Luna (tested default): {}",
+                postil_cli::config::default_model()
+            );
+            println!("  Fallback cascade: {cascade_text}");
+            println!(
+                "  Reviewer reasoning effort: {}",
+                default_reasoning_effort().as_str()
+            );
+            println!(
+                "  Scorer reasoning effort: {}",
+                default_scorer_reasoning_effort().as_str()
+            );
+            println!("  Accepted reasoning efforts: {REASONING_EFFORT_VALUES}");
+            println!("\nOverride once: postil review --model provider/model");
+            println!(
+                "Override reasoning once: postil review --reasoning-effort high --scorer-reasoning-effort none"
+            );
+            println!("Override persistently: REVIEW_MODEL=provider/model postil review");
+            println!(
+                "Persist reasoning: REVIEW_REASONING_EFFORT=high REVIEW_SCORER_REASONING_EFFORT=none postil review"
+            );
+            println!("Config keys: model.reasoningEffort and model.scorerReasoningEffort");
+            Ok(0)
         }
         Command::Plan { envelopes, config } => {
             let cwd = std::env::current_dir()?;
@@ -196,8 +208,22 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
                 }
             );
             println!("model.name: {}", cfg.model);
+            println!("model.source: {}", cfg.model_source);
+            println!("model.reasoningEffort: {}", cfg.reasoning_effort.as_str());
+            println!(
+                "model.reasoningEffort.source: {}",
+                cfg.reasoning_effort_source
+            );
             println!("model.cascade: {:?}", cfg.cascade);
             println!("model.scorer: {}", cfg.scorer);
+            println!(
+                "model.scorerReasoningEffort: {}",
+                cfg.scorer_reasoning_effort.as_str()
+            );
+            println!(
+                "model.scorerReasoningEffort.source: {}",
+                cfg.scorer_reasoning_effort_source
+            );
             println!("model.apiBase: {}", cfg.api_base);
             println!("model.apiFormat: {}", cfg.api_format.as_str());
             println!("model.consensus: {}", cfg.consensus);

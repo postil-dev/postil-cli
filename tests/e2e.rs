@@ -464,26 +464,6 @@ fn llm_text(text: &str) -> Value {
     })
 }
 
-fn respond_payload(answer: &str, diagram: Option<&str>) -> String {
-    json!({"answer": answer, "diagram": diagram}).to_string()
-}
-
-fn respond_text(answer: &str) -> Value {
-    llm_text(&respond_payload(answer, None))
-}
-
-fn respond_article_slop() -> String {
-    let prefix = "I reviewed the full diff. Here's my assessment.\n\n\
-## What this PR does\n\nA broad implementation tour.\n\n\
-## Correctness\n\nSeveral paragraphs of non-actionable narration.\n\n\
-## Issues and risks\n\n\
-1. First item.\n2. Second item.\n3. Third item.\n\
-4. Fourth item.\n5. Fifth item.\n6. Sixth item.\n\n\
-## Verdict\n\nA long conclusion.\n\n";
-    let padding = 7_186 - prefix.chars().count();
-    format!("{prefix}{}", "x".repeat(padding))
-}
-
 fn anthropic_content(findings: Value, input_tokens: u64, output_tokens: u64) -> Value {
     let findings = explicit_repository_context(findings);
     let summary = if findings.as_array().is_none_or(|items| items.is_empty()) {
@@ -1131,8 +1111,10 @@ fn postil() -> Command {
     // Isolate from developer environment and repo config discovery.
     cmd.env_remove("REVIEW_MODEL")
         .env_remove("REVIEW_MODEL_CASCADE")
+        .env_remove("REVIEW_REASONING_EFFORT")
         .env_remove("REVIEW_SCORER_MODEL")
         .env_remove("REVIEW_SCORER_MODEL_CASCADE")
+        .env_remove("REVIEW_SCORER_REASONING_EFFORT")
         .env_remove("POSTIL_DISABLE_SCORER")
         .env_remove("POSTIL_UNCERTAINTY_RESOLUTION")
         .env_remove("POSTIL_CONCISE_FINDINGS")
@@ -1659,6 +1641,8 @@ async fn native_anthropic_review_uses_messages_shape_auth_and_usage() {
     assert_eq!(body["messages"].as_array().unwrap().len(), 1);
     assert_eq!(body["messages"][0]["role"], "user");
     assert_eq!(body["max_tokens"], 8_000);
+    assert_eq!(body["output_config"], json!({"effort": "low"}));
+    assert!(body.get("thinking").is_none());
     assert!(body.get("choices").is_none());
 }
 
@@ -1887,6 +1871,21 @@ async fn native_anthropic_findings_use_explicit_native_scorer() {
     assert_eq!(envelope["findings"][0]["scorerConfidence"], 0.82);
     assert_eq!(envelope["usage"]["promptTokens"], 52);
     assert_eq!(envelope["usage"]["completionTokens"], 22);
+    let requests = server.received_requests().await.unwrap();
+    let generator: Value = requests
+        .iter()
+        .find(|request| String::from_utf8_lossy(&request.body).contains("claude-sonnet-4-6"))
+        .unwrap()
+        .body_json()
+        .unwrap();
+    let scorer: Value = requests
+        .iter()
+        .find(|request| String::from_utf8_lossy(&request.body).contains("claude-haiku-4-5"))
+        .unwrap()
+        .body_json()
+        .unwrap();
+    assert_eq!(generator["output_config"], json!({"effort": "low"}));
+    assert_eq!(scorer["thinking"], json!({"type": "disabled"}));
 }
 
 #[tokio::test]
@@ -1956,7 +1955,14 @@ async fn openai_successful_scorer_with_zero_usage_marks_accounting_incomplete() 
         .env("POSTIL_API_BASE", server.uri())
         .env("REVIEW_MODEL", "generator-model")
         .env("REVIEW_SCORER_MODEL", "scorer-model")
-        .args(["review", "--diff-file"])
+        .args([
+            "review",
+            "--reasoning-effort",
+            "medium",
+            "--scorer-reasoning-effort",
+            "high",
+            "--diff-file",
+        ])
         .arg(&diff)
         .arg("--output-json")
         .assert()
@@ -1969,6 +1975,21 @@ async fn openai_successful_scorer_with_zero_usage_marks_accounting_incomplete() 
     assert!(stderr.contains(
         "llm usage accounting incomplete phase=scorer model=scorer-model attempt=1 reason=nonpositive"
     ));
+    let requests = server.received_requests().await.unwrap();
+    let generator: Value = requests
+        .iter()
+        .find(|request| String::from_utf8_lossy(&request.body).contains("generator-model"))
+        .unwrap()
+        .body_json()
+        .unwrap();
+    let scorer: Value = requests
+        .iter()
+        .find(|request| String::from_utf8_lossy(&request.body).contains("scorer-model"))
+        .unwrap()
+        .body_json()
+        .unwrap();
+    assert_eq!(generator["reasoning"], json!({"effort": "medium"}));
+    assert_eq!(scorer["reasoning"], json!({"effort": "high"}));
 }
 
 #[tokio::test]
@@ -5731,7 +5752,7 @@ fn hosted_config_ignores_repository_model_provider_and_scorer() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join(".postil.yaml"),
-        "model:\n  name: anthropic/claude-opus-4.1\n  cascade: [attacker/fallback]\n  scorer: anthropic/claude-haiku-4.5\n  apiBase: https://attacker.invalid/v1\n  apiFormat: anthropic\n  consensus: 3\n",
+        "model:\n  name: anthropic/claude-opus-4.1\n  reasoningEffort: max\n  cascade: [attacker/fallback]\n  scorer: anthropic/claude-haiku-4.5\n  scorerReasoningEffort: high\n  apiBase: https://attacker.invalid/v1\n  apiFormat: anthropic\n  consensus: 3\n",
     )
     .unwrap();
 
@@ -5750,6 +5771,8 @@ fn hosted_config_ignores_repository_model_provider_and_scorer() {
     assert!(stdout.contains("model.cascade: []"));
     assert!(stdout.contains("model.scorer: "));
     assert!(!stdout.contains("model.scorer: openai/gpt-5.6-luna"));
+    assert!(stdout.contains("model.reasoningEffort: low"));
+    assert!(stdout.contains("model.scorerReasoningEffort: none"));
     assert!(stdout.contains("model.apiBase: https://openrouter.ai/api/v1"));
     assert!(stdout.contains("model.apiFormat: openai-compatible"));
     assert!(stdout.contains("model.consensus: 1"));
@@ -5763,7 +5786,7 @@ fn provisional_hosted_config_uses_only_the_baked_roster() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join(".postil.yaml"),
-        "model:\n  name: attacker/model\n  cascade: [attacker/fallback]\n  scorer: attacker/scorer\n  apiBase: https://attacker.invalid/v1\n  apiFormat: anthropic\n  consensus: 3\n",
+        "model:\n  name: attacker/model\n  reasoningEffort: max\n  cascade: [attacker/fallback]\n  scorer: attacker/scorer\n  scorerReasoningEffort: high\n  apiBase: https://attacker.invalid/v1\n  apiFormat: anthropic\n  consensus: 3\n",
     )
     .unwrap();
 
@@ -5782,6 +5805,8 @@ fn provisional_hosted_config_uses_only_the_baked_roster() {
     assert!(stdout.contains("model.name: openai/gpt-5.6-luna"));
     assert!(stdout.contains("model.cascade: []"));
     assert!(stdout.contains("model.scorer: openai/gpt-5.6-luna"));
+    assert!(stdout.contains("model.reasoningEffort: low"));
+    assert!(stdout.contains("model.scorerReasoningEffort: none"));
     assert!(stdout.contains("model.apiBase: https://openrouter.ai:443/api/v1"));
     assert!(stdout.contains("model.apiFormat: openai-compatible"));
     assert!(stdout.contains("model.consensus: 1"));
@@ -5812,8 +5837,7 @@ async fn local_review_reports_grounded_finding_and_gates() {
     assert_eq!(env["gate"]["failing"], true);
     assert_eq!(env["counts"]["error"], 1);
     // Embedded scoring is disabled unless the user explicitly configures it.
-    assert_eq!(env["usage"]["promptTokens"], 130);
-    assert_eq!(env["usage"]["completionTokens"], 60);
+    // Complete finding adjudication still uses the generator under the scorer role.
     assert_eq!(env["usageAccountingComplete"], true);
     let model_usage = env["modelUsage"].as_array().unwrap();
     assert_eq!(model_usage.len(), 2);
@@ -5823,7 +5847,10 @@ async fn local_review_reports_grounded_finding_and_gates() {
     assert_eq!(model_usage[0]["attempt"], 1);
     assert_eq!(model_usage[0]["accountingComplete"], true);
     assert_eq!(model_usage[1]["role"], "findingScorer");
+    assert_eq!(model_usage[1]["phase"], "initial");
     assert_eq!(model_usage[1]["callOrdinal"], 2);
+    assert_eq!(model_usage[1]["attempt"], 1);
+    assert_eq!(model_usage[1]["accountingComplete"], true);
     assert_eq!(
         model_usage
             .iter()
@@ -5834,7 +5861,10 @@ async fn local_review_reports_grounded_finding_and_gates() {
 
     let requests = server.received_requests().await.unwrap();
     let request: Value = requests[0].body_json().unwrap();
+    let adjudication: Value = requests[1].body_json().unwrap();
     assert_eq!(request["max_tokens"], 8_000);
+    assert_eq!(request["reasoning"], json!({"effort": "low"}));
+    assert_eq!(adjudication["reasoning"], json!({"effort": "none"}));
     assert_eq!(request["messages"].as_array().unwrap().len(), 2);
     let prompt_bytes = request["messages"]
         .as_array()
@@ -5856,13 +5886,358 @@ fn review_without_an_explicit_model_exits_before_provider_access() {
         .current_dir(dir.path())
         .env_remove("REVIEW_MODEL")
         .env_remove("REVIEW_MODEL_CASCADE")
+        .env_remove("MODEL_API_KEY")
+        .env_remove("LLM_API_KEY")
+        .env_remove("OPENROUTER_API_KEY")
+        .env_remove("POSTIL_API_KEY")
         .args(["review", "--diff-file"])
         .arg(&diff)
         .assert()
         .code(2);
 
     let stderr = String::from_utf8_lossy(&out.get_output().stderr);
-    assert!(stderr.contains("no review model is configured"));
+    assert!(stderr.contains("no API key"));
+    assert!(stderr.contains("openai/gpt-5.6-luna"));
+    assert!(stderr.contains("postil models"));
+}
+
+#[test]
+fn bare_review_keeps_redirected_output_free_of_terminal_control_sequences() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let output = Command::cargo_bin("postil")
+        .unwrap()
+        .current_dir(dir.path())
+        .env_remove("CI")
+        .env_remove("POSTIL_HOSTED_MODE")
+        .env_remove("RUST_LOG")
+        .env_remove("NO_COLOR")
+        .arg("review")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let combined = [output.stdout, output.stderr].concat();
+    assert!(!String::from_utf8_lossy(&combined).contains("\x1b["));
+    assert!(!String::from_utf8_lossy(&combined).contains("Reviewing changes"));
+}
+
+#[cfg(unix)]
+#[test]
+fn bare_review_clears_progress_before_pretty_output_in_a_pty() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let binary = Command::cargo_bin("postil")
+        .unwrap()
+        .get_program()
+        .to_string_lossy()
+        .into_owned();
+    let output = std::process::Command::new("script")
+        .args(["-qefc", &format!("'{binary}' review"), "/dev/null"])
+        .current_dir(dir.path())
+        .env("TERM", "xterm")
+        .env_remove("CI")
+        .env_remove("POSTIL_HOSTED_MODE")
+        .env_remove("RUST_LOG")
+        .env_remove("NO_COLOR")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    let summary = rendered
+        .find("✓ postil: no merge-relevant findings")
+        .expect("pretty output was not rendered");
+    let before_summary = &rendered[..summary];
+    let spinner = before_summary
+        .rfind("Reviewing changes...")
+        .expect("progress was not rendered");
+    let clear = before_summary
+        .rfind("\r\x1b[2K")
+        .expect("progress was not cleared");
+    assert!(
+        clear > spinner,
+        "pretty output began before the progress line was cleared: {rendered:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn github_telemetry_is_hidden_only_for_interactive_reviews() {
+    let server = MockServer::start().await;
+    mount_github_complete_diff(&server, 7).await;
+    mount_static_github_pr(&server).await;
+    let dir = tempfile::tempdir().unwrap();
+    disable_review_for_hosted_publication(dir.path(), false);
+    let binary = Command::cargo_bin("postil")
+        .unwrap()
+        .get_program()
+        .to_string_lossy()
+        .into_owned();
+
+    let interactive = std::process::Command::new("script")
+        .args([
+            "-qefc",
+            &format!("'{binary}' review --repo acme/api --pr 7"),
+            "/dev/null",
+        ])
+        .current_dir(dir.path())
+        .env("TERM", "xterm")
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .env_remove("CI")
+        .env_remove("POSTIL_HOSTED_MODE")
+        .env_remove("RUST_LOG")
+        .env_remove("POSTIL_DEBUG")
+        .env_remove("NO_COLOR")
+        .output()
+        .unwrap();
+    assert!(interactive.status.success());
+    let rendered = String::from_utf8_lossy(&interactive.stdout);
+    assert!(rendered.contains("Reviewing changes"));
+    assert!(
+        !rendered.contains("postil: github operation="),
+        "interactive review exposed routine GitHub telemetry: {rendered:?}"
+    );
+
+    let machine = postil()
+        .current_dir(dir.path())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .args([
+            "review", "--repo", "acme/api", "--pr", "7", "--output", "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(machine.status.success());
+    let telemetry = String::from_utf8_lossy(&machine.stderr);
+    assert!(
+        telemetry.contains("postil: github operation="),
+        "machine review omitted GitHub telemetry: {telemetry:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn bare_review_keeps_warnings_visible_and_marks_degraded_completion_in_a_pty() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::write(dir.path().join("untracked.txt"), "review me\n").unwrap();
+    let binary = Command::cargo_bin("postil")
+        .unwrap()
+        .get_program()
+        .to_string_lossy()
+        .into_owned();
+    let output = std::process::Command::new("script")
+        .args(["-qefc", &format!("'{binary}' review"), "/dev/null"])
+        .current_dir(dir.path())
+        .env("TERM", "xterm")
+        .env_remove("CI")
+        .env_remove("POSTIL_HOSTED_MODE")
+        .env_remove("RUST_LOG")
+        .env_remove("NO_COLOR")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    assert!(rendered.contains("Reviewing changes"));
+    assert!(rendered.contains("\x1b[2K"));
+    assert!(rendered.contains("untracked files were not reviewed"));
+    assert!(rendered.contains("review complete with warnings"));
+}
+
+#[cfg(unix)]
+#[test]
+fn bare_review_respects_no_color_in_a_pty() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let binary = Command::cargo_bin("postil")
+        .unwrap()
+        .get_program()
+        .to_string_lossy()
+        .into_owned();
+    let output = std::process::Command::new("script")
+        .args(["-qefc", &format!("'{binary}' review"), "/dev/null"])
+        .current_dir(dir.path())
+        .env("TERM", "xterm")
+        .env("NO_COLOR", "1")
+        .env_remove("CI")
+        .env_remove("POSTIL_HOSTED_MODE")
+        .env_remove("RUST_LOG")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    assert!(rendered.contains("reviewing changes"));
+    assert!(
+        !rendered.contains("\x1b["),
+        "NO_COLOR output contained terminal controls: {rendered:?}"
+    );
+    assert!(rendered.contains("review complete"));
+}
+
+#[test]
+fn models_and_config_explain_the_embedded_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let models = Command::cargo_bin("postil")
+        .unwrap()
+        .env_remove("REVIEW_REASONING_EFFORT")
+        .env_remove("REVIEW_SCORER_REASONING_EFFORT")
+        .args(["models"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let models = String::from_utf8(models).unwrap();
+    assert!(models.contains("Luna (tested default): openai/gpt-5.6-luna"));
+    assert!(models.contains("Reviewer reasoning effort: low"));
+    assert!(models.contains("Scorer reasoning effort: none"));
+    assert!(models.contains("max|xhigh|high|medium|low|minimal|none"));
+    assert!(models.contains("postil review --model provider/model"));
+    assert!(models.contains("model.reasoningEffort and model.scorerReasoningEffort"));
+    let config = Command::cargo_bin("postil")
+        .unwrap()
+        .current_dir(dir.path())
+        .env_remove("REVIEW_REASONING_EFFORT")
+        .env_remove("REVIEW_SCORER_REASONING_EFFORT")
+        .args(["config"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let config = String::from_utf8(config).unwrap();
+    assert!(config.contains("model.source: embedded default"));
+    assert!(config.contains("model.name: openai/gpt-5.6-luna"));
+    assert!(config.contains("model.reasoningEffort: low"));
+    assert!(config.contains("model.reasoningEffort.source: embedded default"));
+    assert!(config.contains("model.scorerReasoningEffort: none"));
+    assert!(config.contains("model.scorerReasoningEffort.source: embedded default"));
+}
+
+#[test]
+fn config_reports_separate_environment_reasoning_provenance() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".postil.yaml"),
+        "model:\n  reasoningEffort: medium\n  scorerReasoningEffort: high\n",
+    )
+    .unwrap();
+    let output = postil()
+        .current_dir(dir.path())
+        .env("REVIEW_REASONING_EFFORT", "xhigh")
+        .env("REVIEW_SCORER_REASONING_EFFORT", "minimal")
+        .args(["config"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let output = String::from_utf8(output).unwrap();
+    assert!(output.contains("model.reasoningEffort: xhigh"));
+    assert!(output.contains("model.reasoningEffort.source: environment"));
+    assert!(output.contains("model.scorerReasoningEffort: minimal"));
+    assert!(output.contains("model.scorerReasoningEffort.source: environment"));
+}
+
+#[tokio::test]
+async fn cli_reasoning_effort_overrides_environment_and_config_in_provider_request() {
+    let server = MockServer::start().await;
+    mock_review(&server, json!([])).await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".postil.yaml"),
+        "model:\n  reasoningEffort: medium\n",
+    )
+    .unwrap();
+    let diff = write_diff(dir.path());
+
+    postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_REASONING_EFFORT", "high")
+        .args(["review", "--reasoning-effort", "xhigh", "--diff-file"])
+        .arg(&diff)
+        .assert()
+        .success();
+
+    let requests = server.received_requests().await.unwrap();
+    let request: Value = requests[0].body_json().unwrap();
+    assert_eq!(request["reasoning"], json!({"effort": "xhigh"}));
+}
+
+#[tokio::test]
+async fn invalid_cli_reasoning_effort_fails_before_provider_access() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+
+    let output = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .args(["review", "--reasoning-effort", "turbo", "--diff-file"])
+        .arg(&diff)
+        .assert()
+        .code(2)
+        .get_output()
+        .stderr
+        .clone();
+
+    let stderr = String::from_utf8(output).unwrap();
+    assert!(stderr.contains("invalid --reasoning-effort \"turbo\""));
+    assert!(stderr.contains("max|xhigh|high|medium|low|minimal|none"));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn native_anthropic_minimal_effort_fails_before_provider_access() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+
+    let output = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_API_FORMAT", "anthropic")
+        .args(["review", "--reasoning-effort", "minimal", "--diff-file"])
+        .arg(&diff)
+        .assert()
+        .code(2)
+        .get_output()
+        .stderr
+        .clone();
+
+    let stderr = String::from_utf8(output).unwrap();
+    assert!(stderr.contains("minimal is unsupported by the Anthropic request format"));
+    assert!(stderr.contains("max|xhigh|high|medium|low|none"));
+    assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -13118,898 +13493,12 @@ async fn azure_flow_reconstructs_diff_and_posts_thread() {
 }
 
 #[tokio::test]
-async fn respond_to_pr_mention_posts_grounded_reply() {
-    let server = MockServer::start().await;
-    mount_github_complete_diff(&server, 5).await;
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(respond_text(
-            "Line 41 interpolates `user_input` straight into the query; that is the \
-             injection risk. Parameterize it.",
-        )))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/repos/acme/api/pulls/5"))
-        .and(header("Accept", "application/vnd.github.v3.diff"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(DIFF))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/repos/acme/api/pulls/5"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "title": "Add login", "body": "PR body",
-            "state": "open", "merged": false,
-            "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"}, "changed_files": 1
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/repos/acme/api/issues/5/comments"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({})))
-        .mount(&server)
-        .await;
-
-    let dir = tempfile::tempdir().unwrap();
-    postil()
-        .current_dir(dir.path())
-        .env("POSTIL_API_BASE", server.uri())
-        .env("GITHUB_API_URL", server.uri())
-        .env("GITHUB_TOKEN", "gh-test-token")
-        .args([
-            "respond",
-            "--publish",
-            "--repo",
-            "acme/api",
-            "--pr",
-            "5",
-            "--comment",
-            "@postil is this safe?",
-        ])
-        .assert()
-        .success();
-
-    let reqs = server.received_requests().await.unwrap();
-    let comment = reqs
-        .iter()
-        .find(|r| r.url.path() == "/repos/acme/api/issues/5/comments")
-        .expect("reply posted");
-    let body: Value = comment.body_json().unwrap();
-    let text = body["body"].as_str().unwrap();
-    assert!(text.contains("injection risk"));
-    assert!(!text.contains("Postil ·"));
-}
-
-#[tokio::test]
-async fn respond_without_publish_prints_locally_and_never_comments() {
-    let server = MockServer::start().await;
-    mount_github_complete_diff(&server, 5).await;
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(respond_text(
-            "Line 41 passes untrusted input to the query. Parameterize it.",
-        )))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/repos/acme/api/pulls/5"))
-        .and(header("Accept", "application/vnd.github.v3.diff"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(DIFF))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/repos/acme/api/pulls/5"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "title": "Add login", "body": "PR body",
-            "state": "open", "merged": false,
-            "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"}, "changed_files": 1
-        })))
-        .mount(&server)
-        .await;
-
-    let dir = tempfile::tempdir().unwrap();
-    let output = postil()
-        .current_dir(dir.path())
-        .env("CI", "true")
-        .env("GITHUB_ACTIONS", "true")
-        .env("POSTIL_API_BASE", server.uri())
-        .env("GITHUB_API_URL", server.uri())
-        .env("GITHUB_TOKEN", "gh-test-token")
-        .args([
-            "respond",
-            "--repo",
-            "acme/api",
-            "--pr",
-            "5",
-            "--comment",
-            "@postil is this safe?",
-        ])
-        .assert()
-        .success();
-
-    assert!(String::from_utf8_lossy(&output.get_output().stdout).contains("Parameterize it."));
-    let requests = server.received_requests().await.unwrap();
-    assert!(!requests.iter().any(|request| {
-        request.method == wiremock::http::Method::POST
-            && request.url.path() == "/repos/acme/api/issues/5/comments"
-    }));
-}
-
-#[tokio::test]
-async fn respond_truncation_retries_without_publishing_partial_text() {
-    let server = MockServer::start().await;
-    let partial_answer = "Partial answer must never publish.";
-    mount_github_complete_diff(&server, 5).await;
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .respond_with(SequentialReviewResponder {
-            calls: Arc::new(AtomicUsize::new(0)),
-            responses: Arc::new(vec![
-                json!({
-                    "choices": [{"finish_reason": "length", "message": {"content":
-                        respond_payload(partial_answer, None)
-                    }}],
-                    "usage": {"prompt_tokens": 40, "completion_tokens": 1024}
-                }),
-                respond_text("Parameterize `user_input` before executing the query."),
-            ]),
-        })
-        .expect(2)
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/repos/acme/api/pulls/5"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "title": "Add login", "body": "PR body",
-            "state": "open", "merged": false,
-            "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"}, "changed_files": 1
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/repos/acme/api/issues/5/comments"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({})))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let dir = tempfile::tempdir().unwrap();
-    postil()
-        .current_dir(dir.path())
-        .env("POSTIL_API_BASE", server.uri())
-        .env("GITHUB_API_URL", server.uri())
-        .env("GITHUB_TOKEN", "gh-test-token")
-        .env("REVIEW_MODEL", "primary-model")
-        .args([
-            "respond",
-            "--publish",
-            "--repo",
-            "acme/api",
-            "--pr",
-            "5",
-            "--comment",
-            "@postil is this safe?",
-        ])
-        .assert()
-        .success();
-
-    let requests = server.received_requests().await.unwrap();
-    let model_requests = requests
-        .iter()
-        .filter(|request| request.url.path() == "/chat/completions")
-        .collect::<Vec<_>>();
-    assert_eq!(model_requests.len(), 2);
-    let first: Value = model_requests[0].body_json().unwrap();
-    let second: Value = model_requests[1].body_json().unwrap();
-    assert_eq!(first["max_tokens"], 1024);
-    assert_eq!(second["max_tokens"], 2048);
-    assert_eq!(first["messages"], second["messages"]);
-    assert!(
-        !serde_json::to_string(&second)
-            .unwrap()
-            .contains(partial_answer)
-    );
-    let comment = requests
-        .iter()
-        .find(|request| request.url.path() == "/repos/acme/api/issues/5/comments")
-        .expect("reply posted");
-    let body: Value = comment.body_json().unwrap();
-    assert!(body["body"].as_str().unwrap().contains("Parameterize"));
-    assert!(!body["body"].as_str().unwrap().contains(partial_answer));
-}
-
-#[tokio::test]
-async fn repeated_respond_truncation_fails_without_publishing() {
-    let server = MockServer::start().await;
-    let partial_answer = "Partial answer must never publish.";
-    mount_github_complete_diff(&server, 5).await;
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [{"finish_reason": "length", "message": {"content":
-                respond_payload(partial_answer, None)
-            }}],
-            "usage": {"prompt_tokens": 40, "completion_tokens": 1024}
-        })))
-        .expect(2)
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/repos/acme/api/pulls/5"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "title": "Add login", "body": "PR body",
-            "state": "open", "merged": false,
-            "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"}, "changed_files": 1
-        })))
-        .mount(&server)
-        .await;
-
-    let dir = tempfile::tempdir().unwrap();
-    let out = postil()
-        .current_dir(dir.path())
-        .env("POSTIL_API_BASE", server.uri())
-        .env("GITHUB_API_URL", server.uri())
-        .env("GITHUB_TOKEN", "gh-test-token")
-        .env("REVIEW_MODEL", "primary-model")
-        .args([
-            "respond",
-            "--publish",
-            "--repo",
-            "acme/api",
-            "--pr",
-            "5",
-            "--comment",
-            "@postil is this safe?",
-        ])
-        .assert()
-        .failure();
-
-    assert!(!String::from_utf8_lossy(&out.get_output().stdout).contains(partial_answer));
-    let requests = server.received_requests().await.unwrap();
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|request| request.url.path() == "/chat/completions")
-            .count(),
-        2
-    );
-    assert!(
-        requests
-            .iter()
-            .all(|request| request.url.path() != "/repos/acme/api/issues/5/comments")
-    );
-}
-
-#[tokio::test]
-async fn respond_rejects_article_shape_and_preserves_usage_across_fallback() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let server = MockServer::start().await;
-    let slop = respond_article_slop();
-    assert_eq!(slop.chars().count(), 7_186);
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .and(body_string_contains("article-model"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [{"finish_reason": "stop", "message": {"content": slop}}],
-            "usage": {"prompt_tokens": 30, "completion_tokens": 900}
-        })))
-        .expect(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .and(body_string_contains("compact-model"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [{"finish_reason": "stop", "message": {"content": respond_payload(
-                "`src/queue.rs:18` retries forever. Add a terminal state before merge.",
-                None,
-            )}}],
-            "usage": {"prompt_tokens": 20, "completion_tokens": 15}
-        })))
-        .expect(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/repos/acme/api/issues/9"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "title": "Queue retry", "body": "Review the retry behavior."
-        })))
-        .mount(&server)
-        .await;
-
-    let dir = tempfile::tempdir().unwrap();
-    let receipt_path = dir.path().join("respond-usage.json");
-    let out = postil()
-        .current_dir(dir.path())
-        .env("POSTIL_API_BASE", server.uri())
-        .env("GITHUB_API_URL", server.uri())
-        .env("GITHUB_TOKEN", "gh-test-token")
-        .env("REVIEW_MODEL", "article-model")
-        .env("REVIEW_MODEL_CASCADE", "compact-model")
-        .env("POSTIL_USAGE_RECEIPT_PATH", &receipt_path)
-        .args([
-            "respond",
-            "--repo",
-            "acme/api",
-            "--issue",
-            "9",
-            "--comment",
-            "@postil review this",
-            "--no-post",
-        ])
-        .assert()
-        .success();
-
-    let stdout = String::from_utf8_lossy(&out.get_output().stdout);
-    assert!(stdout.contains("Add a terminal state"));
-    assert!(!stdout.contains("What this PR does"));
-    assert!(!stdout.contains("Postil ·"));
-    let receipt: Value = serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
-    assert_eq!(receipt["promptTokens"], 50);
-    assert_eq!(receipt["completionTokens"], 915);
-    assert_eq!(receipt["models"][0]["model"], "article-model");
-    assert_eq!(receipt["models"][1]["model"], "compact-model");
-    assert_eq!(
-        std::fs::metadata(&receipt_path)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o600,
-    );
-}
-
-#[tokio::test]
-async fn respond_rejects_generated_mermaid_even_when_requested() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .and(body_string_contains("diagram-model"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(llm_text(&respond_payload(
-                "The request is queued before a worker handles it.",
-                Some("flowchart LR\n  API --> Queue\n  Queue --> Worker"),
-            ))),
-        )
-        .expect(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .and(body_string_contains("compact-model"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(respond_text(
-            "The API writes the job to the queue before a worker claims it.",
-        )))
-        .expect(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/repos/acme/api/issues/10"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "title": "Queue flow", "body": "How does work reach a worker?"
-        })))
-        .mount(&server)
-        .await;
-
-    let dir = tempfile::tempdir().unwrap();
-    let out = postil()
-        .current_dir(dir.path())
-        .env("POSTIL_API_BASE", server.uri())
-        .env("GITHUB_API_URL", server.uri())
-        .env("GITHUB_TOKEN", "gh-test-token")
-        .env("REVIEW_MODEL", "diagram-model")
-        .env("REVIEW_MODEL_CASCADE", "compact-model")
-        .args([
-            "respond",
-            "--repo",
-            "acme/api",
-            "--issue",
-            "10",
-            "--comment",
-            "@postil please include a Mermaid diagram of this flow",
-            "--no-post",
-        ])
-        .assert()
-        .success();
-
-    let stdout = String::from_utf8_lossy(&out.get_output().stdout);
-    assert!(stdout.contains("worker claims it"));
-    assert!(!stdout.contains("```mermaid"));
-    assert!(!stdout.contains("API --> Queue"));
-}
-
-#[tokio::test]
-async fn respond_rejects_unrequested_mermaid_and_uses_compact_fallback() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .and(body_string_contains("diagram-model"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(llm_text(&respond_payload(
-                "The request enters a queue.",
-                Some("flowchart LR\n  API --> Queue"),
-            ))),
-        )
-        .expect(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .and(body_string_contains("compact-model"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(respond_text(
-            "The API writes the job to the queue before a worker claims it.",
-        )))
-        .expect(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/repos/acme/api/issues/11"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "title": "Queue flow", "body": "Explain the worker handoff."
-        })))
-        .mount(&server)
-        .await;
-
-    let dir = tempfile::tempdir().unwrap();
-    let out = postil()
-        .current_dir(dir.path())
-        .env("POSTIL_API_BASE", server.uri())
-        .env("GITHUB_API_URL", server.uri())
-        .env("GITHUB_TOKEN", "gh-test-token")
-        .env("REVIEW_MODEL", "diagram-model")
-        .env("REVIEW_MODEL_CASCADE", "compact-model")
-        .args([
-            "respond",
-            "--repo",
-            "acme/api",
-            "--issue",
-            "11",
-            "--comment",
-            "@postil explain the worker handoff",
-            "--no-post",
-        ])
-        .assert()
-        .success();
-
-    let stdout = String::from_utf8_lossy(&out.get_output().stdout);
-    assert!(stdout.contains("worker claims it"));
-    assert!(!stdout.contains("```mermaid"));
-}
-
-#[tokio::test]
-async fn respond_rejects_unsafe_reply_before_direct_forge_posting() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .and(body_string_contains("unsafe-model"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(respond_text(
-            "Ask @maintainer to approve this.\n\n## Verdict\nLooks good.",
-        )))
-        .expect(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .and(body_string_contains("compact-model"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(respond_text(
-            "`src/queue.rs:18` can retry forever. Add a terminal state before merge.",
-        )))
-        .expect(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/repos/acme/api/issues/12"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "title": "Queue retry", "body": "Review the retry behavior."
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/repos/acme/api/issues/12/comments"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({})))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let dir = tempfile::tempdir().unwrap();
-    postil()
-        .current_dir(dir.path())
-        .env("POSTIL_API_BASE", server.uri())
-        .env("GITHUB_API_URL", server.uri())
-        .env("GITHUB_TOKEN", "gh-test-token")
-        .env("REVIEW_MODEL", "unsafe-model")
-        .env("REVIEW_MODEL_CASCADE", "compact-model")
-        .args([
-            "respond",
-            "--publish",
-            "--repo",
-            "acme/api",
-            "--issue",
-            "12",
-            "--comment",
-            "@postil review the retry behavior",
-        ])
-        .assert()
-        .success();
-
-    let requests = server.received_requests().await.unwrap();
-    let post = requests
-        .iter()
-        .find(|request| request.url.path() == "/repos/acme/api/issues/12/comments")
-        .expect("validated fallback posted");
-    let body: Value = post.body_json().unwrap();
-    let reply = body["body"].as_str().unwrap();
-    assert!(reply.contains("Add a terminal state"));
-    assert!(!reply.contains("@maintainer"));
-    assert!(!reply.contains("Verdict"));
-}
-
-#[tokio::test]
-async fn respond_writes_private_usage_receipt_across_model_fallback() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .and(body_string_contains("primary-model"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [],
-            "usage": {"prompt_tokens": 10, "completion_tokens": 2}
-        })))
-        .expect(2)
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .and(body_string_contains("backup-model"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [{"finish_reason": "stop", "message": {"content": respond_payload("Use a bounded worker pool.", None)}}],
-            "usage": {"prompt_tokens": 20, "completion_tokens": 3, "cost": 0.00000049}
-        })))
-        .expect(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/repos/acme/api/issues/9"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "title": "Timeouts", "body": "Requests hang under load."
-        })))
-        .mount(&server)
-        .await;
-
-    let dir = tempfile::tempdir().unwrap();
-    let receipt_path = dir.path().join("respond-usage.json");
-    std::fs::write(
-        &receipt_path,
-        b"stale receipt from an interrupted attempt\n",
-    )
-    .unwrap();
-    let out = postil()
-        .current_dir(dir.path())
-        .env("POSTIL_API_BASE", server.uri())
-        .env("GITHUB_API_URL", server.uri())
-        .env("GITHUB_TOKEN", "gh-test-token")
-        .env("REVIEW_MODEL", "primary-model")
-        .env("REVIEW_MODEL_CASCADE", "backup-model")
-        .env("POSTIL_USAGE_RECEIPT_PATH", &receipt_path)
-        .args([
-            "respond",
-            "--repo",
-            "acme/api",
-            "--issue",
-            "9",
-            "--comment",
-            "@postil how should this be bounded?",
-            "--no-post",
-        ])
-        .assert()
-        .success();
-
-    let stdout = String::from_utf8_lossy(&out.get_output().stdout);
-    assert!(stdout.contains("Use a bounded worker pool."));
-    assert!(!stdout.contains("promptTokens"));
-    let receipt: Value = serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
-    assert_eq!(receipt["version"], 2);
-    assert_eq!(receipt["models"][0]["role"], "mentionResponder");
-    assert_eq!(receipt["models"][0]["phase"], "initial");
-    assert!(receipt["models"][0]["callOrdinal"].is_number());
-    assert!(receipt["models"][0]["attempt"].is_number());
-    assert!(receipt["models"][0]["accountingComplete"].is_boolean());
-    assert_eq!(receipt["operation"], "respond");
-    assert_eq!(receipt["usageAccountingComplete"], true);
-    assert_eq!(receipt["promptTokens"], 40);
-    assert_eq!(receipt["completionTokens"], 7);
-    assert_eq!(receipt["models"][0]["model"], "primary-model");
-    assert_eq!(receipt["models"][0]["promptTokens"], 10);
-    assert_eq!(receipt["models"][0]["completionTokens"], 2);
-    assert_eq!(receipt["models"][1]["model"], "primary-model");
-    assert_eq!(receipt["models"][1]["promptTokens"], 10);
-    assert_eq!(receipt["models"][1]["completionTokens"], 2);
-    assert_eq!(receipt["models"][2]["model"], "backup-model");
-    assert_eq!(receipt["models"][2]["promptTokens"], 20);
-    assert_eq!(receipt["models"][2]["completionTokens"], 3);
-    assert_eq!(receipt["models"][2]["costProviderDecimal"], "0.00000049");
-    assert_eq!(receipt["models"][2]["costMicros"], 0);
-    assert_eq!(receipt["models"][2]["costSource"], "providerReported");
-    assert_eq!(
-        std::fs::metadata(&receipt_path)
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o600,
-    );
-}
-
-#[tokio::test]
-async fn respond_marks_receipt_incomplete_after_ambiguous_fallback() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .and(body_string_contains("primary-model"))
-        .respond_with(ResponseTemplate::new(503))
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .and(body_string_contains("backup-model"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [{"finish_reason": "stop", "message": {"content": respond_payload("Retry with a bounded backoff.", None)}}],
-            "usage": {"prompt_tokens": 20, "completion_tokens": 3}
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/repos/acme/api/issues/10"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "title": "Retries", "body": "Requests fail intermittently."
-        })))
-        .mount(&server)
-        .await;
-
-    let dir = tempfile::tempdir().unwrap();
-    let receipt_path = dir.path().join("respond-usage.json");
-    postil()
-        .current_dir(dir.path())
-        .env("POSTIL_API_BASE", server.uri())
-        .env("GITHUB_API_URL", server.uri())
-        .env("GITHUB_TOKEN", "gh-test-token")
-        .env("REVIEW_MODEL", "primary-model")
-        .env("REVIEW_MODEL_CASCADE", "backup-model")
-        .env("POSTIL_USAGE_RECEIPT_PATH", &receipt_path)
-        .args([
-            "respond",
-            "--repo",
-            "acme/api",
-            "--issue",
-            "10",
-            "--comment",
-            "@postil how should this retry?",
-            "--no-post",
-        ])
-        .assert()
-        .success();
-
-    let receipt: Value = serde_json::from_slice(&std::fs::read(receipt_path).unwrap()).unwrap();
-    assert_eq!(receipt["usageAccountingComplete"], false);
-    assert_eq!(receipt["models"].as_array().unwrap().len(), 4);
-    assert_eq!(receipt["models"][3]["model"], "backup-model");
-}
-
-#[tokio::test]
-async fn respond_marks_receipt_incomplete_after_internal_retry_succeeds() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .and(body_string_contains("primary-model"))
-        .respond_with(ResponseTemplate::new(408).set_body_string("request timed out"))
-        .up_to_n_times(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .and(body_string_contains("primary-model"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [{"finish_reason": "stop", "message": {"content": respond_payload("Use a bounded retry.", None)}}],
-            "usage": {"prompt_tokens": 20, "completion_tokens": 3}
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/repos/acme/api/issues/11"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "title": "Retries", "body": "Requests fail intermittently."
-        })))
-        .mount(&server)
-        .await;
-
-    let dir = tempfile::tempdir().unwrap();
-    let receipt_path = dir.path().join("respond-usage.json");
-    postil()
-        .current_dir(dir.path())
-        .env("POSTIL_API_BASE", server.uri())
-        .env("GITHUB_API_URL", server.uri())
-        .env("GITHUB_TOKEN", "gh-test-token")
-        .env("REVIEW_MODEL", "primary-model")
-        .env("REVIEW_MODEL_CASCADE", "")
-        .env("POSTIL_USAGE_RECEIPT_PATH", &receipt_path)
-        .args([
-            "respond",
-            "--repo",
-            "acme/api",
-            "--issue",
-            "11",
-            "--comment",
-            "@postil how should this retry?",
-            "--no-post",
-        ])
-        .assert()
-        .success();
-
-    let receipt: Value = serde_json::from_slice(&std::fs::read(receipt_path).unwrap()).unwrap();
-    assert_eq!(receipt["usageAccountingComplete"], false);
-    assert_eq!(receipt["models"].as_array().unwrap().len(), 2);
-    assert_eq!(receipt["models"][0]["model"], "primary-model");
-    assert_eq!(
-        server
-            .received_requests()
-            .await
-            .unwrap()
-            .iter()
-            .filter(|request| { request.url.path() == "/chat/completions" })
-            .count(),
-        2
-    );
-}
-
-#[tokio::test]
-async fn respond_to_issue_mention_uses_issue_body() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(respond_text(
-            "This looks like a connection-pool exhaustion under load, not a logic bug.",
-        )))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/repos/acme/api/issues/9"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "title": "Timeouts under load",
-            "body": "Requests hang after ~200 concurrent users."
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/repos/acme/api/issues/9/comments"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({})))
-        .mount(&server)
-        .await;
-
-    let dir = tempfile::tempdir().unwrap();
-    postil()
-        .current_dir(dir.path())
-        .env("POSTIL_API_BASE", server.uri())
-        .env("GITHUB_API_URL", server.uri())
-        .env("GITHUB_TOKEN", "gh-test-token")
-        .args([
-            "respond",
-            "--publish",
-            "--repo",
-            "acme/api",
-            "--issue",
-            "9",
-            "--comment",
-            "@postil what do you think is happening?",
-        ])
-        .assert()
-        .success();
-
-    let reqs = server.received_requests().await.unwrap();
-    // The model was given the issue body as grounding.
-    let llm = reqs
-        .iter()
-        .find(|r| r.url.path() == "/chat/completions")
-        .unwrap();
-    let sent: Value = llm.body_json().unwrap();
-    let user_msg = sent["messages"][1]["content"].as_str().unwrap();
-    assert!(user_msg.contains("200 concurrent users"));
-    assert!(reqs.iter().any(|r| {
-        r.method == wiremock::http::Method::POST
-            && r.url.path() == "/repos/acme/api/issues/9/comments"
-    }));
-}
-
-#[tokio::test]
-async fn respond_gitlab_mr_mention_posts_note() {
-    let server = MockServer::start().await;
-    mount_gitlab_source_files(&server).await;
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(respond_text(
-            "Line 41 interpolates `user_input` into the query; parameterize it.",
-        )))
-        .mount(&server)
-        .await;
-    // MR metadata (title/description + diff refs) for grounding.
-    Mock::given(method("GET"))
-        .and(path_regex(r"^/projects/.+/merge_requests/5$"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "title": "Add login",
-            "description": "MR body",
-            "state": "opened", "diff_refs": {"base_sha": "b", "start_sha": "s", "head_sha": "h"}
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path_regex(r"^/projects/.+/merge_requests/5/versions$"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
-            "state": "collected", "real_size": "1"
-        }])))
-        .mount(&server)
-        .await;
-    // MR file diffs (paginated; one short page ends iteration).
-    Mock::given(method("GET"))
-        .and(path_regex(r"^/projects/.+/merge_requests/5/diffs$"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
-            "old_path": "src/auth.rs", "new_path": "src/auth.rs",
-            "diff": "@@ -40,6 +40,8 @@ fn login() {\n context line\n+let token = format!(\"{}\", user_input);\n+exec_query(&token);\n trailing context\n",
-            "new_file": false, "deleted_file": false
-        }])))
-        .mount(&server)
-        .await;
-    // The reply note endpoint.
-    Mock::given(method("POST"))
-        .and(path_regex(r"^/projects/.+/merge_requests/5/notes$"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({})))
-        .mount(&server)
-        .await;
-
-    let dir = tempfile::tempdir().unwrap();
-    postil()
-        .current_dir(dir.path())
-        .env("POSTIL_API_BASE", server.uri())
-        .env("GITLAB_API_URL", server.uri())
-        .env("GITLAB_TOKEN", fixture_credential("gitlab"))
-        .args([
-            "respond",
-            "--publish",
-            "--forge",
-            "gitlab",
-            "--repo",
-            "acme/api",
-            "--pr",
-            "5",
-            "--comment",
-            "@postil is this safe?",
-        ])
-        .assert()
-        .success();
-
-    let reqs = server.received_requests().await.unwrap();
-    let note = reqs
-        .iter()
-        .find(|r| {
-            r.method == wiremock::http::Method::POST
-                && r.url.path().ends_with("/merge_requests/5/notes")
-        })
-        .expect("reply note posted to the MR");
-    let body: Value = note.body_json().unwrap();
-    let text = body["body"].as_str().unwrap();
-    assert!(text.contains("parameterize"));
-    assert!(!text.contains("Postil ·"));
-}
-
-#[tokio::test]
 async fn gitlab_diff_pagination_follows_authoritative_next_page_to_exhaustion() {
     let server = MockServer::start().await;
     mount_gitlab_source_files(&server).await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(respond_text(
-            "The late-page change is included in the review context.",
-        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
         .mount(&server)
         .await;
     Mock::given(method("GET"))
@@ -14082,246 +13571,24 @@ async fn gitlab_diff_pagination_follows_authoritative_next_page_to_exhaustion() 
         .env("GITLAB_API_URL", server.uri())
         .env("GITLAB_TOKEN", fixture_credential("gitlab"))
         .args([
-            "respond",
-            "--forge",
-            "gitlab",
-            "--repo",
-            "acme/api",
-            "--pr",
-            "6",
-            "--comment",
-            "@postil review this",
+            "review", "--forge", "gitlab", "--repo", "acme/api", "--pr", "6",
         ])
         .assert()
         .success();
     let requests = server.received_requests().await.unwrap();
-    let model = requests
+    let reviewed_last_page = requests
         .iter()
-        .find(|request| request.url.path() == "/chat/completions")
-        .unwrap();
-    let body: Value = model.body_json().unwrap();
-    let model_context = body["messages"][1]["content"].as_str().unwrap();
+        .filter(|request| request.url.path() == "/chat/completions")
+        .any(|request| {
+            let body: Value = request.body_json().unwrap();
+            body["messages"][1]["content"]
+                .as_str()
+                .is_some_and(|context| context.contains("AUTHORITATIVE_LAST_PAGE"))
+        });
     assert!(
-        model_context.contains("AUTHORITATIVE_LAST_PAGE"),
-        "final paginated evidence missing from bounded context: {model_context}"
+        reviewed_last_page,
+        "final paginated evidence was missing from every review batch"
     );
-}
-
-#[tokio::test]
-async fn respond_gitlab_issue_mention_uses_issue_body() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(respond_text(
-            "This looks like connection-pool exhaustion under load, not a logic bug.",
-        )))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path_regex(r"^/projects/.+/issues/9$"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "title": "Timeouts under load",
-            "description": "Requests hang after ~200 concurrent users."
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path_regex(r"^/projects/.+/issues/9/notes$"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({})))
-        .mount(&server)
-        .await;
-
-    let dir = tempfile::tempdir().unwrap();
-    postil()
-        .current_dir(dir.path())
-        .env("POSTIL_API_BASE", server.uri())
-        .env("GITLAB_API_URL", server.uri())
-        .env("GITLAB_TOKEN", fixture_credential("gitlab"))
-        .args([
-            "respond",
-            "--publish",
-            "--forge",
-            "gitlab",
-            "--repo",
-            "acme/api",
-            "--issue",
-            "9",
-            "--comment",
-            "@postil what is happening?",
-        ])
-        .assert()
-        .success();
-
-    let reqs = server.received_requests().await.unwrap();
-    // The model was grounded on the issue body.
-    let llm = reqs
-        .iter()
-        .find(|r| r.url.path() == "/chat/completions")
-        .unwrap();
-    let sent: Value = llm.body_json().unwrap();
-    let user_msg = sent["messages"][1]["content"].as_str().unwrap();
-    assert!(user_msg.contains("200 concurrent users"));
-    // The reply landed on the issue notes endpoint, not the MR one.
-    assert!(reqs.iter().any(|r| {
-        r.method == wiremock::http::Method::POST && r.url.path().ends_with("/issues/9/notes")
-    }));
-}
-
-#[tokio::test]
-async fn respond_bitbucket_pr_mention_posts_comment() {
-    let server = MockServer::start().await;
-    mount_bitbucket_complete_diff(&server).await;
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(respond_text(
-            "Line 41 interpolates `user_input`; that is the injection risk.",
-        )))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/repositories/acme/api/pullrequests/7"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "title": "Add login",
-            "summary": {"raw": "PR body"},
-            "state": "OPEN", "source": {"commit": {"hash": "aaaaaaaa"}},
-            "destination": {"commit": {"hash": "bbbbbbbb"}}
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/repositories/acme/api/pullrequests/7/diff"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(DIFF))
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/repositories/acme/api/pullrequests/7/comments"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(json!({})))
-        .mount(&server)
-        .await;
-
-    let dir = tempfile::tempdir().unwrap();
-    postil()
-        .current_dir(dir.path())
-        .env("POSTIL_API_BASE", server.uri())
-        .env("BITBUCKET_API_URL", server.uri())
-        .env("BITBUCKET_TOKEN", "bb-test-token")
-        .env_remove("BITBUCKET_USER")
-        .args([
-            "respond",
-            "--publish",
-            "--forge",
-            "bitbucket",
-            "--repo",
-            "acme/api",
-            "--pr",
-            "7",
-            "--comment",
-            "@postil is this safe?",
-        ])
-        .assert()
-        .success();
-
-    let reqs = server.received_requests().await.unwrap();
-    let comment = reqs
-        .iter()
-        .find(|r| {
-            r.method == wiremock::http::Method::POST
-                && r.url.path() == "/repositories/acme/api/pullrequests/7/comments"
-        })
-        .expect("reply comment posted to the PR");
-    let body: Value = comment.body_json().unwrap();
-    let text = body["content"]["raw"].as_str().unwrap();
-    assert!(text.contains("injection risk"));
-    assert!(!text.contains("Postil ·"));
-}
-
-#[tokio::test]
-async fn respond_azure_pr_mention_posts_thread() {
-    let server = MockServer::start().await;
-    mount_azure_merge_base(&server).await;
-    let old_content = "fn login() {\n    let token = sanitize(user_input);\n}\n";
-    let new_content = "fn login() {\n    let token = user_input;\n}\n";
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(respond_text(
-            "Line 2 drops the sanitize() call; that is the risk.",
-        )))
-        .mount(&server)
-        .await;
-    let pr_path = "/myorg/myproj/_apis/git/repositories/myrepo/pullRequests/7";
-    Mock::given(method("GET"))
-        .and(path(pr_path))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "title": "Add login", "description": "PR body",
-            "status": "active", "lastMergeSourceCommit": {"commitId": "HEAD"},
-            "lastMergeTargetCommit": {"commitId": "BASE"}
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path(
-            "/myorg/myproj/_apis/git/repositories/myrepo/diffs/commits",
-        ))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "changes": [{"item": {"path": "/src/auth.rs", "isFolder": false}, "changeType": "edit"}],
-            "allChangesIncluded": true
-        })))
-        .mount(&server)
-        .await;
-    let items_path = "/myorg/myproj/_apis/git/repositories/myrepo/items";
-    Mock::given(method("GET"))
-        .and(path(items_path))
-        .and(query_param("version", "BASE"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(old_content))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path(items_path))
-        .and(query_param("version", "HEAD"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(new_content))
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path(
-            "/myorg/myproj/_apis/git/repositories/myrepo/pullRequests/7/threads",
-        ))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
-        .mount(&server)
-        .await;
-
-    let dir = tempfile::tempdir().unwrap();
-    postil()
-        .current_dir(dir.path())
-        .env("POSTIL_API_BASE", server.uri())
-        .env("AZURE_DEVOPS_API_URL", server.uri())
-        .env("AZURE_DEVOPS_TOKEN", "az-test-pat")
-        .args([
-            "respond",
-            "--publish",
-            "--forge",
-            "azure",
-            "--repo",
-            "myorg/myproj/myrepo",
-            "--pr",
-            "7",
-            "--comment",
-            "@postil is this safe?",
-        ])
-        .assert()
-        .success();
-
-    let reqs = server.received_requests().await.unwrap();
-    let thread = reqs
-        .iter()
-        .find(|r| {
-            r.method == wiremock::http::Method::POST
-                && r.url.path().ends_with("/pullRequests/7/threads")
-        })
-        .expect("reply thread posted to the PR");
-    let body: Value = thread.body_json().unwrap();
-    let text = body["comments"][0]["content"].as_str().unwrap();
-    assert!(text.contains("risk"));
-    assert!(!text.contains("Postil ·"));
 }
 
 #[test]

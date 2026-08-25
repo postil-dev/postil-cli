@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use futures::StreamExt;
 
-use crate::config::{Config, FindingPresentation, GateLevel, OnError};
+use crate::config::{Config, FindingPresentation, GateLevel, OnError, ReasoningEffort};
 use crate::diff;
 use crate::durable_plan::{DurablePlanRegistrar, DurableReviewPlan};
 use crate::envelope::{
@@ -26,6 +26,14 @@ use crate::repository_search::RepositorySource;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use time::{Date, OffsetDateTime};
+
+macro_rules! eprintln {
+    ($($argument:tt)*) => { crate::progress::telemetry(format_args!($($argument)*)) };
+}
+
+macro_rules! notice {
+    ($($argument:tt)*) => { crate::progress::notice(format_args!($($argument)*)) };
+}
 
 /// Each model request stays bounded. Large reviews continue through sequential
 /// source windows; actual provider-attempt, deadline, and spend guards remain
@@ -403,6 +411,9 @@ pub struct ReviewArgs {
     pub fail_on: Option<String>,
     pub config: Option<PathBuf>,
     pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub scorer_reasoning_effort: Option<String>,
+    pub verbose: bool,
     pub bounded: bool,
     pub no_post: bool,
     pub defer_gate_check: bool,
@@ -549,12 +560,26 @@ pub async fn run(args: ReviewArgs) -> Result<i32> {
     let mut cfg = Config::load(&cwd, args.config.as_deref())?;
     if let Some(m) = &args.model {
         cfg.model = m.clone();
+        cfg.model_source = "command line".to_string();
+    }
+    if let Some(effort) = &args.reasoning_effort {
+        cfg.reasoning_effort = ReasoningEffort::parse("--reasoning-effort", effort)?;
+        cfg.reasoning_effort_source = "command line".to_string();
+    }
+    if let Some(effort) = &args.scorer_reasoning_effort {
+        cfg.scorer_reasoning_effort = ReasoningEffort::parse("--scorer-reasoning-effort", effort)?;
+        cfg.scorer_reasoning_effort_source = "command line".to_string();
     }
     cfg.require_model()?;
     if let Some(fo) = &args.fail_on {
         cfg.gate_fail_on =
             GateLevel::parse(fo).ok_or_else(|| anyhow!("invalid --fail-on {fo:?}"))?;
     }
+    let progress = crate::progress::start_review(
+        args.resolved_output_format().is_some() || args.sarif.is_some(),
+        args.verbose,
+        crate::config::hosted_runtime_mode(),
+    );
     if !args.no_post
         && cfg.finding_presentation == FindingPresentation::CheckAnnotations
         && args.forge != ForgeKind::GitHub
@@ -564,28 +589,41 @@ pub async fn run(args: ReviewArgs) -> Result<i32> {
         ));
     }
 
-    match args.forge {
-        ForgeKind::Local => run_local(&args, &cfg, &cwd).await,
-        ForgeKind::GitHub => {
-            let repo = require_repo(&args)?;
-            let forge = GitHub::new(&repo, require_pr(&args)?)?;
-            run_remote(&args, &cfg, &forge, &repo, RepositorySource::GitHub(&forge)).await
+    let review = async {
+        match args.forge {
+            ForgeKind::Local => run_local(&args, &cfg, &cwd).await,
+            ForgeKind::GitHub => {
+                let repo = require_repo(&args)?;
+                let forge = GitHub::new(&repo, require_pr(&args)?)?;
+                run_remote(&args, &cfg, &forge, &repo, RepositorySource::GitHub(&forge)).await
+            }
+            ForgeKind::GitLab => {
+                let repo = require_repo(&args)?;
+                let forge = GitLab::new(&repo, require_pr(&args)?)?;
+                run_remote(&args, &cfg, &forge, &repo, RepositorySource::Unavailable).await
+            }
+            ForgeKind::Bitbucket => {
+                let repo = require_repo(&args)?;
+                let forge = Bitbucket::new(&repo, require_pr(&args)?)?;
+                run_remote(&args, &cfg, &forge, &repo, RepositorySource::Unavailable).await
+            }
+            ForgeKind::Azure => {
+                let repo = require_repo(&args)?;
+                let forge = Azure::new(&repo, require_pr(&args)?)?;
+                run_remote(&args, &cfg, &forge, &repo, RepositorySource::Unavailable).await
+            }
         }
-        ForgeKind::GitLab => {
-            let repo = require_repo(&args)?;
-            let forge = GitLab::new(&repo, require_pr(&args)?)?;
-            run_remote(&args, &cfg, &forge, &repo, RepositorySource::Unavailable).await
-        }
-        ForgeKind::Bitbucket => {
-            let repo = require_repo(&args)?;
-            let forge = Bitbucket::new(&repo, require_pr(&args)?)?;
-            run_remote(&args, &cfg, &forge, &repo, RepositorySource::Unavailable).await
-        }
-        ForgeKind::Azure => {
-            let repo = require_repo(&args)?;
-            let forge = Azure::new(&repo, require_pr(&args)?)?;
-            run_remote(&args, &cfg, &forge, &repo, RepositorySource::Unavailable).await
-        }
+    };
+    let result = tokio::select! {
+        result = review => result,
+        _ = tokio::signal::ctrl_c() => Err(anyhow!("review interrupted")),
+    };
+    if let Ok(code) = result {
+        progress.finish(code);
+        Ok(code)
+    } else {
+        drop(progress);
+        result
     }
 }
 
@@ -602,19 +640,33 @@ fn require_pr(args: &ReviewArgs) -> Result<u64> {
 }
 
 async fn run_local(args: &ReviewArgs, cfg: &Config, repo_root: &Path) -> Result<i32> {
-    let source = if let Some(path) = &args.diff_file {
-        LocalSource::DiffFile(path.clone())
-    } else if args.staged {
-        LocalSource::Staged
-    } else if let Some(base) = &args.base {
-        LocalSource::Base(base.clone())
+    let head_sha = if args.diff_file.is_some() {
+        None
     } else {
-        return Err(anyhow!(
-            "local review needs one of --staged, --base <ref>, or --diff-file <path>"
-        ));
+        local::head_sha(repo_root).await?
     };
-    let head_sha = local::head_sha().await;
-    let local_snapshot = local::acquire(&source, head_sha.as_deref(), repo_root).await?;
+    let selection = if let Some(path) = &args.diff_file {
+        local::AutoSelection {
+            source: LocalSource::DiffFile(path.clone()),
+            warning: None,
+        }
+    } else if args.staged {
+        local::AutoSelection {
+            source: LocalSource::Staged,
+            warning: None,
+        }
+    } else if let Some(base) = &args.base {
+        local::AutoSelection {
+            source: LocalSource::Base(base.clone()),
+            warning: None,
+        }
+    } else {
+        local::auto_select(repo_root, head_sha.as_deref()).await?
+    };
+    if let Some(warning) = selection.warning {
+        crate::progress::notice(format_args!("postil: {warning}"));
+    }
+    let local_snapshot = local::acquire(&selection.source, head_sha.as_deref(), repo_root).await?;
     let baseline = load_baseline(args)?;
     // This is a fail-closed placeholder, not the completed review's trust.
     // review_diff replaces it with Failed, Bounded, or Exhaustive after the
@@ -731,7 +783,7 @@ async fn run_remote<F: Forge>(
                     );
                 }
                 // CI tokens without checks:write still get review + exit code.
-                eprintln!("postil: cannot create check runs ({e:#}); continuing without");
+                notice!("postil: cannot create check runs ({e:#}); continuing without");
                 None
             }
         }
@@ -859,7 +911,7 @@ async fn run_remote<F: Forge>(
                     if strict_publication {
                         Err(post_err)
                     } else {
-                        eprintln!("postil: could not post the error review ({post_err:#})");
+                        notice!("postil: could not post the error review ({post_err:#})");
                         Ok(code)
                     }
                 }
@@ -950,7 +1002,7 @@ fn retain_publication_failure(
         Err(error) if required => Ok(Some(error)),
         Err(error) if crate::forge::is_repository_identity_failure(&error) => Err(error),
         Err(error) => {
-            eprintln!("postil: {warning} ({error:#})");
+            notice!("postil: {warning} ({error:#})");
             Ok(None)
         }
     }
@@ -2879,6 +2931,7 @@ async fn finish<F: Forge>(
     if !publication_plan_to_stdout
         && (args.resolved_output_format().is_none() || args.output_file.is_some())
     {
+        let _progress_suspension = crate::progress::suspend_for_output();
         output::print_pretty(&envelope);
     }
 
@@ -2981,7 +3034,7 @@ async fn finish<F: Forge>(
                 ));
             }
             Ok(false) => {
-                eprintln!(
+                notice!(
                     "postil: publication skipped because the pull request snapshot changed after review"
                 );
                 return Ok(if envelope.gate.failing { 1 } else { 0 });
@@ -2992,7 +3045,7 @@ async fn finish<F: Forge>(
                 );
             }
             Err(error) => {
-                eprintln!(
+                notice!(
                     "postil: publication skipped because snapshot freshness could not be verified ({error:#})"
                 );
                 return Ok(if envelope.gate.failing { 1 } else { 0 });
@@ -3016,7 +3069,7 @@ async fn finish<F: Forge>(
                 if strict_publication {
                     return Err(e).context("required hosted review publication failed");
                 }
-                eprintln!("postil: could not post review comment ({e:#})");
+                notice!("postil: could not post review comment ({e:#})");
             }
         }
     }

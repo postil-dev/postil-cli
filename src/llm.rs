@@ -19,9 +19,13 @@ use time::Date;
 
 use crate::adjudication::{AdjudicationResult, MAX_ADJUDICATION_OUTPUT_TOKENS};
 use crate::api_key;
+
+macro_rules! eprintln {
+    ($($argument:tt)*) => { crate::progress::telemetry(format_args!($($argument)*)) };
+}
 use crate::config::{
     ApiFormat, Config, HOSTED_ADMISSION_PROJECTION_CAP_MICROS, HOSTED_OPERATION_COST_CAP_MICROS,
-    ModelPriceBound,
+    ModelPriceBound, ReasoningEffort,
 };
 use crate::envelope::{
     Finding, Kind, ModelIncident, ModelIncidentCategory, ModelIncidentPhase, ModelIncidentRecovery,
@@ -128,15 +132,6 @@ pub struct AtomicAttributionResponseIdentity {
 struct RawAtomicAttribution {
     same_defect: bool,
     reason: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct Answer {
-    pub content: String,
-    pub model_used: String,
-    pub usage: Usage,
-    pub models: Vec<ModelUsage>,
-    pub usage_accounting_complete: bool,
 }
 
 #[derive(Debug)]
@@ -402,10 +397,6 @@ pub(crate) fn add_usage(total: &mut Usage, usage: Usage) {
     };
 }
 
-fn has_billable_usage(usage: Usage) -> bool {
-    usage.prompt_tokens > 0 || usage.completion_tokens > 0 || usage.provider_cost.is_some()
-}
-
 fn add_response_usage(
     usage: &mut Usage,
     prompt_tokens: u64,
@@ -449,20 +440,6 @@ fn safe_model_error_category(error: &ModelError) -> &'static str {
     } else if error.is_timeout() {
         "timeout"
     } else if error.is_provider() {
-        "provider"
-    } else {
-        "invalid-output"
-    }
-}
-
-fn safe_anyhow_category(error: &anyhow::Error) -> &'static str {
-    if error.downcast_ref::<DeadlineExceeded>().is_some() {
-        "deadline"
-    } else if reqwest_error(error).is_some_and(reqwest::Error::is_timeout)
-        || error.downcast_ref::<RequestTimedOut>().is_some()
-    {
-        "timeout"
-    } else if error.downcast_ref::<ProviderError>().is_some() {
         "provider"
     } else {
         "invalid-output"
@@ -630,6 +607,8 @@ pub struct LlmClient {
 struct RequestDecorations {
     api_base: String,
     api_format: ApiFormat,
+    reasoning_effort: ReasoningEffort,
+    scorer_reasoning_effort: ReasoningEffort,
     require_openrouter_privacy: bool,
     hosted_price_bounds: Option<Arc<HashMap<String, ModelPriceBound>>>,
     pinned_upstream_provider: Option<String>,
@@ -729,10 +708,6 @@ const SCORER_MAX_TOKENS_PER_FINDING: u32 = 144;
 const SCORER_REPAIR_BYTES_PER_OUTPUT_TOKEN: usize = 4;
 pub(crate) const SCORER_MAX_FINDINGS: usize = 20;
 const REPAIR_ERROR_MAX_BYTES: usize = 1_024;
-// The publication contract targets 1,200 characters and hard-stops at 2,400.
-// Keep generation bounded too, so an invalid model cannot spend an article's
-// worth of output tokens before the validator rejects it.
-const RESPOND_MAX_TOKENS: u32 = 1024;
 const PLANNER_MAX_TOKENS: u32 = 1024;
 fn planned_review_models(cfg: &Config) -> Vec<String> {
     if cfg.consensus > 1 {
@@ -1296,6 +1271,16 @@ fn base_request_body(
 
 impl RequestDecorations {
     fn from_config(cfg: &Config) -> Result<Self> {
+        if cfg.api_format == ApiFormat::Anthropic {
+            ensure!(
+                cfg.reasoning_effort != ReasoningEffort::Minimal,
+                "model.reasoningEffort minimal is unsupported by the Anthropic request format; accepted Anthropic values: max|xhigh|high|medium|low|none"
+            );
+            ensure!(
+                cfg.scorer_reasoning_effort != ReasoningEffort::Minimal,
+                "model.scorerReasoningEffort minimal is unsupported by the Anthropic request format; accepted Anthropic values: max|xhigh|high|medium|low|none"
+            );
+        }
         let screening_profile = crate::config::benchmark_screening_profile_for_config(cfg)?;
         let hosted_price_bounds = if crate::config::hosted_runtime_mode() {
             ensure_hosted_provider_contract(cfg.api_format, &cfg.api_base)?;
@@ -1345,6 +1330,8 @@ impl RequestDecorations {
         Ok(Self {
             api_base: cfg.api_base.trim_end_matches('/').to_string(),
             api_format: cfg.api_format,
+            reasoning_effort: cfg.reasoning_effort,
+            scorer_reasoning_effort: cfg.scorer_reasoning_effort,
             require_openrouter_privacy: is_canonical_openrouter_base(&cfg.api_base)
                 && (crate::config::hosted_runtime_mode()
                     || crate::config::benchmark_screening_mode()
@@ -1375,6 +1362,10 @@ impl RequestDecorations {
                     max_tokens,
                     temperature,
                 );
+                apply_openrouter_reasoning(
+                    &mut body,
+                    phase.reasoning_effort(self.reasoning_effort, self.scorer_reasoning_effort),
+                );
                 apply_openrouter_privacy(&mut body, self.require_openrouter_privacy);
                 let canonical_openrouter = is_canonical_openrouter_base(&self.api_base);
                 if let Some(provider) = self.pinned_upstream_provider.as_deref() {
@@ -1397,14 +1388,21 @@ impl RequestDecorations {
                 }
                 body
             }
-            ApiFormat::Anthropic => base_request_body(
-                self.api_format,
-                model,
-                system,
-                user,
-                max_tokens,
-                temperature,
-            ),
+            ApiFormat::Anthropic => {
+                let mut body = base_request_body(
+                    self.api_format,
+                    model,
+                    system,
+                    user,
+                    max_tokens,
+                    temperature,
+                );
+                apply_anthropic_reasoning(
+                    &mut body,
+                    phase.reasoning_effort(self.reasoning_effort, self.scorer_reasoning_effort),
+                );
+                body
+            }
         }
     }
 }
@@ -1551,7 +1549,6 @@ enum LlmPhase {
     Adjudication,
     #[cfg_attr(not(feature = "qualification-candidate"), allow(dead_code))]
     Attribution,
-    Respond,
     #[cfg_attr(not(test), allow(dead_code))]
     Total,
 }
@@ -1579,7 +1576,6 @@ impl LlmPhase {
             Self::Scorer { .. } => "scorer",
             Self::Adjudication => "finding-adjudication",
             Self::Attribution => "attribution",
-            Self::Respond => "respond",
             Self::Total => "total",
         }
     }
@@ -1593,7 +1589,19 @@ impl LlmPhase {
             Self::Scorer { .. } => ModelUsageRole::FindingScorer,
             Self::Adjudication => ModelUsageRole::FindingScorer,
             Self::Attribution => ModelUsageRole::FindingScorer,
-            Self::Respond => ModelUsageRole::MentionResponder,
+        }
+    }
+
+    fn reasoning_effort(
+        self,
+        reviewer: ReasoningEffort,
+        scorer: ReasoningEffort,
+    ) -> ReasoningEffort {
+        match self {
+            Self::Planner | Self::Review | Self::Resolution | Self::Brevity | Self::Total => {
+                reviewer
+            }
+            Self::Scorer { .. } | Self::Adjudication | Self::Attribution => scorer,
         }
     }
 
@@ -1735,7 +1743,6 @@ impl std::fmt::Display for DeadlineExceeded {
             | LlmPhase::Scorer { .. }
             | LlmPhase::Adjudication
             | LlmPhase::Attribution
-            | LlmPhase::Respond
             | LlmPhase::Total => f.write_str("LLM total deadline exceeded"),
         }
     }
@@ -2187,35 +2194,6 @@ impl LlmClient {
             exposure.output_tokens
         );
         ReviewAdmission::try_from(exposure)
-    }
-
-    pub(crate) fn preflight_respond_plan(
-        &self,
-        cfg: &Config,
-        system: &str,
-        user: &str,
-    ) -> Result<ReviewAdmission> {
-        let Some(bounds) = &self.request_decorations.hosted_price_bounds else {
-            return Ok(ReviewAdmission::default());
-        };
-        let models = cfg.model_chain();
-        ensure!(!models.is_empty(), "hosted respond has no admitted model");
-        let mut exposure = PlannedExposure::default();
-        for model in models {
-            let price = bounds.get(&model).ok_or_else(|| {
-                anyhow!("hosted respond model {model:?} has no admitted price bound")
-            })?;
-            let path = self.planned_request_path(
-                &model,
-                system,
-                user,
-                RESPOND_MAX_TOKENS,
-                0.1,
-                LlmPhase::Respond,
-            )?;
-            exposure.add_path(&path, price)?;
-        }
-        self.validate_hosted_exposure("respond", &exposure)
     }
 
     pub async fn plan_review_batches(
@@ -3008,102 +2986,6 @@ impl LlmClient {
                     ModelError::new(anyhow!("empty model chain"), failed_usage, true)
                 }))
         }
-    }
-
-    /// Interactive answer validated by the caller's publication contract.
-    /// Invalid model content consumes and preserves its usage before the next
-    /// configured model is tried.
-    pub async fn answer<F>(
-        &self,
-        cfg: &Config,
-        system: &str,
-        user: &str,
-        validate: F,
-    ) -> Result<Answer>
-    where
-        F: Fn(&str) -> Result<String>,
-    {
-        let mut usage = Usage::default();
-        let mut models = Vec::new();
-        let mut last_err = None;
-        let mut usage_accounting_complete = true;
-        let chain = cfg.model_chain();
-        let chain_len = chain.len();
-        for (index, model) in chain.into_iter().enumerate() {
-            let mut model_usage = Usage::default();
-            let mut call_usage = Vec::new();
-            let mut model_accounting_complete = true;
-            match self
-                .chat(
-                    &model,
-                    system,
-                    user,
-                    &mut model_usage,
-                    &mut call_usage,
-                    &mut model_accounting_complete,
-                    RESPOND_MAX_TOKENS,
-                    LlmPhase::Respond,
-                    LlmCallPhase::Initial,
-                )
-                .await
-            {
-                Ok(content) => {
-                    usage_accounting_complete &= model_accounting_complete;
-                    add_usage(&mut usage, model_usage);
-                    models.append(&mut call_usage);
-                    match validate(&content) {
-                        Ok(content) => {
-                            return Ok(Answer {
-                                content,
-                                model_used: model,
-                                usage,
-                                models,
-                                usage_accounting_complete,
-                            });
-                        }
-                        Err(error) => {
-                            let disposition = if index + 1 < chain_len {
-                                "trying the next model"
-                            } else {
-                                "no fallback models remain"
-                            };
-                            eprintln!(
-                                "postil: model {} produced an invalid reply; {disposition} category={}",
-                                log_text(&model),
-                                safe_anyhow_category(&error),
-                            );
-                            last_err = Some(error.context("model reply failed publication checks"));
-                        }
-                    }
-                }
-                Err(e) => {
-                    // Usage parsed from a provider response is complete even
-                    // when the response has no usable answer. A transport
-                    // failure with no response usage is ambiguous.
-                    if !model_accounting_complete || !has_billable_usage(model_usage) {
-                        usage_accounting_complete = false;
-                    }
-                    eprintln!(
-                        "postil: model {} failed category={}",
-                        log_text(&model),
-                        safe_anyhow_category(&e)
-                    );
-                    // Provider failures that report no tokens have no billable
-                    // usage to attribute. Omit them rather than emitting a
-                    // misleading accounting entry; token-bearing failures are
-                    // retained and priced by the hosted control plane.
-                    if has_billable_usage(model_usage) {
-                        add_usage(&mut usage, model_usage);
-                    }
-                    models.append(&mut call_usage);
-                    if e.downcast_ref::<DeadlineExceeded>().is_some() {
-                        return Err(e);
-                    }
-                    last_err = Some(e);
-                }
-            }
-        }
-        Err(last_err.unwrap_or_else(|| anyhow!("empty model chain")))
     }
 
     pub async fn score_findings(
@@ -5135,7 +5017,7 @@ impl LlmClient {
             | LlmPhase::Scorer { .. }
             | LlmPhase::Adjudication
             | LlmPhase::Attribution => self.scorer_deadline.or(self.total_deadline),
-            LlmPhase::Respond | LlmPhase::Total => self.total_deadline,
+            LlmPhase::Total => self.total_deadline,
         };
         let deadline = if matches!(phase, LlmPhase::Planner | LlmPhase::Review) {
             match (phase_deadline, self.review_model_deadline) {
@@ -5258,6 +5140,24 @@ fn apply_openrouter_price_ceiling(body: &mut serde_json::Value, bound: &ModelPri
     );
 }
 
+fn apply_openrouter_reasoning(body: &mut serde_json::Value, effort: ReasoningEffort) {
+    body["reasoning"] = json!({ "effort": effort.as_str() });
+}
+
+fn apply_anthropic_reasoning(body: &mut serde_json::Value, effort: ReasoningEffort) {
+    match effort {
+        ReasoningEffort::None => {
+            body["thinking"] = json!({ "type": "disabled" });
+        }
+        ReasoningEffort::Minimal => {
+            unreachable!("Anthropic minimal effort is rejected while resolving request settings")
+        }
+        _ => {
+            body["output_config"] = json!({ "effort": effort.as_str() });
+        }
+    }
+}
+
 fn apply_openrouter_scorer_contract(body: &mut serde_json::Value, expected_len: usize) {
     debug_assert!(expected_len <= SCORER_MAX_FINDINGS);
     let provider = body
@@ -5269,10 +5169,7 @@ fn apply_openrouter_scorer_contract(body: &mut serde_json::Value, expected_len: 
         .as_object_mut()
         .expect("provider routing configuration is an object")
         .insert("require_parameters".to_string(), json!(true));
-    body["reasoning"] = json!({
-        "effort": "none",
-        "exclude": true,
-    });
+    body["reasoning"]["exclude"] = json!(true);
     body["response_format"] = json!({
         "type": "json_schema",
         "json_schema": {
@@ -5332,7 +5229,7 @@ fn apply_openrouter_atomic_attribution_contract(
         .as_object_mut()
         .expect("provider routing configuration is an object");
     provider.insert("require_parameters".to_string(), json!(true));
-    body["reasoning"] = json!({ "effort": "none", "exclude": true });
+    body["reasoning"]["exclude"] = json!(true);
     body["response_format"] = json!({
         "type": "json_schema",
         "json_schema": {
@@ -5661,12 +5558,10 @@ fn resolve_api_key() -> Result<String> {
         .context("resolving the postil login credentials path")?;
     match api_key::resolve_effective(&credentials_path)? {
         Some(key) => Ok(key),
-        None => {
-            let key_names = api_key::names_text();
-            Err(anyhow!(
-                "no API key: set {key_names}, or run `postil login`. Postil never proxies your inference without one of these."
-            ))
-        }
+        None => Err(anyhow!(
+            "no API key: {}. Postil never proxies your inference without one of these.",
+            api_key::credential_help()
+        )),
     }
 }
 
@@ -7857,50 +7752,6 @@ mod tests {
     }
 
     #[test]
-    fn hosted_respond_preflight_accounts_for_every_fallback_before_calls() {
-        let config = Config {
-            model: "provider/primary".into(),
-            cascade: vec!["provider/fallback".into()],
-            ..Config::default()
-        };
-        let mut client = LlmClient::build(
-            &config,
-            "test-key".into(),
-            Duration::from_secs(1),
-            None,
-            None,
-        )
-        .unwrap();
-        client.request_decorations.hosted_price_bounds = Some(Arc::new(HashMap::from([
-            (
-                "provider/primary".into(),
-                ModelPriceBound {
-                    model: "provider/primary".into(),
-                    input_micros_per_million_tokens: 1,
-                    output_micros_per_million_tokens: 1,
-                },
-            ),
-            (
-                "provider/fallback".into(),
-                ModelPriceBound {
-                    model: "provider/fallback".into(),
-                    input_micros_per_million_tokens: 1,
-                    output_micros_per_million_tokens: 1,
-                },
-            ),
-        ])));
-        let admission = client
-            .preflight_respond_plan(&config, "system", "bounded user context")
-            .unwrap();
-        assert_eq!(admission.provider_attempts, 6);
-        assert_eq!(
-            admission.output_tokens,
-            u64::from(RESPOND_MAX_TOKENS + 2 * RESPOND_MAX_TOKENS * 2) * 2
-        );
-        assert_eq!(client.admission.lock().unwrap().attempts, 0);
-    }
-
-    #[test]
     fn exhausted_output_retry_ceiling_is_phase_aware() {
         assert_eq!(
             LlmPhase::Review.exhausted_output_retry_max_tokens(REVIEW_MAX_TOKENS),
@@ -7909,10 +7760,6 @@ mod tests {
         assert_eq!(
             LlmPhase::Planner.exhausted_output_retry_max_tokens(PLANNER_MAX_TOKENS),
             PLANNER_MAX_TOKENS * 2
-        );
-        assert_eq!(
-            LlmPhase::Respond.exhausted_output_retry_max_tokens(RESPOND_MAX_TOKENS),
-            RESPOND_MAX_TOKENS * 2
         );
         let scorer_tokens = scorer_max_tokens(SCORER_MAX_FINDINGS).unwrap();
         assert_eq!(
@@ -9465,7 +9312,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_openrouter_scorer_uses_no_reasoning_effort_and_requires_strict_schema() {
+    fn canonical_openrouter_uses_role_defaults_and_scorer_strict_schema() {
         let client = LlmClient::build(
             &Config::default(),
             "test-key".into(),
@@ -9537,7 +9384,7 @@ mod tests {
             0.1,
             LlmPhase::Review,
         );
-        assert!(generator.get("reasoning").is_none());
+        assert_eq!(generator["reasoning"], json!({"effort": "low"}));
         assert!(generator.get("response_format").is_none());
         assert!(generator["provider"].get("require_parameters").is_none());
     }
@@ -9560,7 +9407,7 @@ mod tests {
             0.0,
             LlmPhase::Resolution,
         );
-        assert!(resolution.get("reasoning").is_none());
+        assert_eq!(resolution["reasoning"], json!({"effort": "low"}));
         assert!(resolution.get("response_format").is_none());
         assert!(resolution["provider"].get("require_parameters").is_none());
     }
@@ -9957,7 +9804,7 @@ mod tests {
     }
 
     #[test]
-    fn byok_openai_and_direct_anthropic_request_bodies_have_no_hosted_routing_fields() {
+    fn byok_openai_and_direct_anthropic_requests_send_role_reasoning_without_hosted_routing() {
         let _lock = env_lock().lock().unwrap();
         let _env = EnvRestore::capture(&["POSTIL_HOSTED_MODE"]);
         EnvRestore::remove("POSTIL_HOSTED_MODE");
@@ -9983,7 +9830,7 @@ mod tests {
             LlmPhase::Scorer { expected_len: 1 },
         );
         assert!(openai_body.get("provider").is_none());
-        assert!(openai_body.get("reasoning").is_none());
+        assert_eq!(openai_body["reasoning"], json!({"effort": "none"}));
         assert!(openai_body.get("response_format").is_none());
 
         let anthropic = LlmClient::build(
@@ -10008,9 +9855,100 @@ mod tests {
             LlmPhase::Scorer { expected_len: 1 },
         );
         assert!(anthropic_body.get("provider").is_none());
-        assert!(anthropic_body.get("reasoning").is_none());
+        assert_eq!(anthropic_body["thinking"], json!({"type": "disabled"}));
+        assert!(anthropic_body.get("output_config").is_none());
         assert!(anthropic_body.get("response_format").is_none());
         assert_eq!(anthropic_body["system"], "system");
+    }
+
+    #[test]
+    fn every_openrouter_phase_uses_its_role_specific_effort() {
+        let client = LlmClient::build(
+            &Config {
+                reasoning_effort: ReasoningEffort::Xhigh,
+                scorer_reasoning_effort: ReasoningEffort::Medium,
+                ..Config::default()
+            },
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+
+        for phase in [
+            LlmPhase::Planner,
+            LlmPhase::Review,
+            LlmPhase::Resolution,
+            LlmPhase::Brevity,
+            LlmPhase::Total,
+        ] {
+            let body = client.request_body("provider/model", "system", "user", 100, 0.0, phase);
+            assert_eq!(body["reasoning"], json!({"effort": "xhigh"}));
+        }
+        for phase in [
+            LlmPhase::Scorer { expected_len: 1 },
+            LlmPhase::Adjudication,
+            LlmPhase::Attribution,
+        ] {
+            let body = client.request_body("provider/model", "system", "user", 100, 0.0, phase);
+            assert_eq!(body["reasoning"]["effort"], "medium");
+        }
+    }
+
+    #[test]
+    fn native_anthropic_maps_supported_efforts_and_rejects_minimal() {
+        let client = LlmClient::build(
+            &Config {
+                api_format: ApiFormat::Anthropic,
+                api_base: "https://api.anthropic.com/v1".into(),
+                reasoning_effort: ReasoningEffort::High,
+                scorer_reasoning_effort: ReasoningEffort::None,
+                ..Config::default()
+            },
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        let reviewer = client.request_body(
+            "provider/model",
+            "system",
+            "user",
+            100,
+            0.0,
+            LlmPhase::Review,
+        );
+        assert_eq!(reviewer["output_config"], json!({"effort": "high"}));
+        assert!(reviewer.get("thinking").is_none());
+        let scorer = client.request_body(
+            "provider/model",
+            "system",
+            "user",
+            100,
+            0.0,
+            LlmPhase::Scorer { expected_len: 1 },
+        );
+        assert_eq!(scorer["thinking"], json!({"type": "disabled"}));
+        assert!(scorer.get("output_config").is_none());
+
+        let error = LlmClient::build(
+            &Config {
+                api_format: ApiFormat::Anthropic,
+                api_base: "https://api.anthropic.com/v1".into(),
+                reasoning_effort: ReasoningEffort::Minimal,
+                ..Config::default()
+            },
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .err()
+        .expect("unsupported effort must fail before a request is built");
+        assert!(error.to_string().contains("reasoningEffort minimal"));
+        assert!(error.to_string().contains("max|xhigh|high|medium|low|none"));
     }
 
     #[test]

@@ -21,8 +21,8 @@ use sha2::Digest;
 use std::io::Write;
 
 use super::{
-    CheckRunIds, CheckState, Forge, PrMeta, ReviewPublicationReceipt, ThreadKind, check_summary,
-    check_title, untracked_review_publication_receipt,
+    CheckRunIds, CheckState, Forge, PrMeta, ReviewPublicationReceipt, check_summary, check_title,
+    untracked_review_publication_receipt,
 };
 use crate::diff::{DiffSnapshot, DiffSpool, WorkspaceBudget};
 use crate::envelope::{Envelope, Finding};
@@ -633,42 +633,6 @@ impl Forge for Bitbucket {
             )
             .await?;
         Ok(merge_base == expected.base_sha)
-    }
-
-    /// Title and description of a PR. Bitbucket Cloud's issue tracker is a
-    /// separate, often-disabled product with a different object shape we cannot
-    /// verify against a live instance, so respond is scoped to pull requests.
-    async fn fetch_thread(&self, _number: u64, kind: ThreadKind) -> Result<(String, String)> {
-        // TODO(respond): Bitbucket issue-tracker comments
-        // (`/issues/{id}` + `/issues/{id}/comments`) are unverified; scope to PRs.
-        if kind == ThreadKind::Issue {
-            return Err(anyhow!(
-                "postil respond on Bitbucket supports --pr only (issue tracker not supported)"
-            ));
-        }
-        let pr = self.pr_meta().await?;
-        Ok((pr.title, pr.summary.map(|s| s.raw).unwrap_or_default()))
-    }
-
-    /// Post a top-level comment on a PR (the bot's reply to a mention).
-    async fn post_comment(&self, number: u64, kind: ThreadKind, body: &str) -> Result<()> {
-        // TODO(respond): Bitbucket issue-tracker comments are unverified; scope to PRs.
-        if kind == ThreadKind::Issue {
-            return Err(anyhow!(
-                "postil respond on Bitbucket supports --pr only (issue tracker not supported)"
-            ));
-        }
-        let resp = self
-            .request(
-                reqwest::Method::POST,
-                self.url(&format!("/pullrequests/{number}/comments")),
-            )
-            .json(&json!({ "content": { "raw": body } }))
-            .send()
-            .await
-            .context("posting comment")?;
-        Self::check_ok(resp, "comment post").await?;
-        Ok(())
     }
 }
 

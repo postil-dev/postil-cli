@@ -32,19 +32,6 @@ postil plan --envelopes .cache/envelopes --config .postil.candidate.yaml
 
 The report shows which findings become visible or suppressed and which gate results change.
 
-## Interactive replies
-
-`postil respond` answers a mention on a pull request. GitHub and GitLab also support issue mentions. It does not open pull requests or push commits.
-Posting the reply requires `--publish`; without it, the reply is printed locally.
-CI detection and environment variables do not authorize a forge write.
-
-```sh
-POSTIL_COMMENT='@postil is this safe?' \
-postil respond --repo owner/repository --pr 123 --publish
-```
-
-Pass comment text through `POSTIL_COMMENT` in automation because command-line arguments are visible to other local processes.
-
 ## Usage receipts
 
 Hosted workers can set `POSTIL_USAGE_RECEIPT_PATH` to a worker-owned path. A successful response writes a mode-`0600` version 2 JSON receipt before forge delivery. Every provider attempt includes its role, phase, operation-wide call ordinal, transport attempt, token counts, accounting-completeness flag, cost source, canonical provider-reported decimal cost when present, and rounded micro-dollar display value. The caller owns receipt deletion. Receipt consumers must accept the additional `costProviderDecimal` field before deploying this CLI.

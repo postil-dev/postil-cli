@@ -409,17 +409,6 @@ pub struct CheckRunIds<'a> {
     pub gate: &'a str,
 }
 
-/// What a `respond` thread number points at. GitHub's issues API covers both,
-/// so it ignores this; GitLab/Bitbucket/Azure key issues and PRs on different
-/// endpoints, so they branch on it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ThreadKind {
-    /// A pull request / merge request.
-    Pull,
-    /// An issue / work item on the forge's issue tracker.
-    Issue,
-}
-
 /// Versioned result of one review publication attempt. Finding outcomes are
 /// keyed by the envelope's stable finding ID so the hosted service can join
 /// the immutable delivery result to later thread lifecycle observations.
@@ -1509,15 +1498,6 @@ pub trait Forge {
             && current.base_sha == expected.base_sha
             && current.target_sha == expected.target_sha)
     }
-
-    /// Title and body of the issue/PR/MR a maintainer mentioned Postil on, used
-    /// to ground the answer (`postil respond`). `kind` disambiguates the number
-    /// for forges whose issues and pulls live on different endpoints.
-    async fn fetch_thread(&self, number: u64, kind: ThreadKind) -> Result<(String, String)>;
-
-    /// Post a top-level comment (Postil's reply to a mention). `kind` selects the
-    /// issue- vs pull-level endpoint where the forge separates them.
-    async fn post_comment(&self, number: u64, kind: ThreadKind, body: &str) -> Result<()>;
 }
 
 /// GitHub rejects a check-run `output.summary` over 65535 chars and a `title`

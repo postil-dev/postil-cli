@@ -1987,57 +1987,6 @@ fn hosted_risk_tokens(line: &str) -> Vec<String> {
     tokens
 }
 
-/// Build one bounded, line-grounded context for an interactive answer. Every
-/// source window contributes semantic evidence; large inputs are reduced with
-/// the same bounded fan-in used by review synthesis rather than byte truncation.
-pub fn bounded_respond_context(
-    snapshot: &DiffSnapshot,
-    max_bytes: usize,
-    max_manifest_bytes: usize,
-) -> Result<(String, bool)> {
-    let mut prepared = prepare_review(snapshot)?;
-    let reserved_anchor = prepared.reserved_anchor;
-    let mut batches = spool_model_batches(&mut prepared, max_bytes, max_manifest_bytes, false)?;
-    if batches.count == 0 {
-        return Ok((String::new(), reserved_anchor));
-    }
-    let mut first: Option<String> = None;
-    let mut digests = Vec::with_capacity(batches.count.min(1_024));
-    while let Some(batch) = batches.next_batch()? {
-        if let Some(previous) = first.take() {
-            if digests.is_empty() {
-                digests.push(semantic_digest(&previous));
-            }
-            digests.push(semantic_digest(&batch));
-        } else if digests.is_empty() {
-            first = Some(batch);
-        } else {
-            digests.push(semantic_digest(&batch));
-        }
-    }
-    if digests.is_empty() {
-        return Ok((first.expect("one batch was counted"), reserved_anchor));
-    }
-    let mut level = 1usize;
-    loop {
-        let chunks = pack_semantic_digests(&digests, level, max_bytes)?;
-        if chunks.len() == 1 {
-            return Ok((
-                chunks.into_iter().next().expect("checked above"),
-                reserved_anchor,
-            ));
-        }
-        anyhow::ensure!(
-            chunks.len() < digests.len(),
-            "interactive context synthesis did not reduce its bounded fan-in"
-        );
-        digests = chunks;
-        level = level
-            .checked_add(1)
-            .context("interactive synthesis level overflowed")?;
-    }
-}
-
 pub fn spool_model_batches(
     prepared: &mut PreparedReview,
     max_batch_bytes: usize,
@@ -6962,36 +6911,6 @@ diff --git a/src/multi.rs b/src/multi.rs
         let second = compacted.find("Source window 2:").unwrap();
         let third = compacted.find("Source window 3:").unwrap();
         assert!(first < second && second < third);
-    }
-
-    #[test]
-    fn interactive_context_streams_distant_evidence_without_byte_truncation() {
-        use std::fmt::Write as _;
-
-        let mut source = String::from(
-            "diff --git a/src/flow.rs b/src/flow.rs\n--- a/src/flow.rs\n+++ b/src/flow.rs\n@@ -0,0 +1,400 @@\n",
-        );
-        for line in 1..=400 {
-            if line == 1 {
-                source.push_str("+let checked = validate_pair(input);\n");
-            } else if line == 400 {
-                source.push_str("+dangerous_sink(original);\n");
-            } else {
-                writeln!(
-                    source,
-                    "+let padding_{line} = ordinary; // {}",
-                    "x".repeat(1_000)
-                )
-                .unwrap();
-            }
-        }
-        let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
-        let (context, reserved) = bounded_respond_context(&snapshot, 120_000, 24_000).unwrap();
-        assert!(!reserved);
-        assert!(context.len() <= 120_000);
-        assert!(context.contains("validate_pair(input)"));
-        assert!(context.contains("dangerous_sink(original)"));
-        assert!(!context.contains("diff truncated"));
     }
 
     #[test]
