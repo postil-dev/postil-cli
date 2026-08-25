@@ -12,13 +12,13 @@
 //! `MODEL_API_KEY`, and `LLM_API_KEY` (first set wins) all take priority over
 //! a stored `postil login` credential. When none of those four is set and a
 //! valid, unexpired credential exists at
-//! `${XDG_CONFIG_HOME:-~/.config}/postil/credentials.json`, its token becomes
-//! the bearer key (see `api_key::resolve_effective`) and its `apiBase`/
+//! `${XDG_CONFIG_HOME:-~/.config}/postil/credentials.json`,
+//! `login::resolve_stored_token` supplies its bearer key and its `apiBase`/
 //! `model` replace the values resolved above -- unless `POSTIL_API_BASE` /
 //! `REVIEW_MODEL` are set, which still win, applied first in this same
 //! function. An expired or unreadable stored credential is left alone here;
 //! `resolve_api_key` reports it as one actionable "run `postil login` again"
-//! error instead of blocking commands, like `postil config`, that never need
+//! error, while `postil config` reports the stored-login state without needing
 //! a live key.
 
 use std::path::{Path, PathBuf};

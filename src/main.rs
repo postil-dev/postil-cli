@@ -201,6 +201,8 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
             println!("model.apiBase: {}", cfg.api_base);
             println!("model.apiFormat: {}", cfg.api_format.as_str());
             println!("model.consensus: {}", cfg.consensus);
+            let login = doctor::login_status();
+            println!("login.status: {}", login.detail);
             Ok(0)
         }
         Command::Init { force } => {

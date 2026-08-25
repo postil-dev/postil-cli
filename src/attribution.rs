@@ -243,7 +243,7 @@ async fn run_inner(input_path: &Path, config_path: Option<&Path>) -> Result<i32>
         cfg.scorer == input.model,
         "atomic attribution model must equal the configured primary scorer"
     );
-    let client = LlmClient::from_env(&cfg)?;
+    let client = LlmClient::from_env(&cfg).await?;
     let system = system_prompt();
     let user = user_prompt(&input)?;
     let review = client

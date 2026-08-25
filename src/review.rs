@@ -1755,16 +1755,19 @@ async fn review_diff_at(
                     None
                 };
                 let client = match llm_budget_started_at {
-                    Some(started_at) => LlmClient::from_env_for_remote_review(
-                        cfg,
-                        started_at,
-                        Duration::from_secs(hosted_request_timeout_secs(
-                            deterministic_large_review,
-                        )),
-                        Duration::from_secs(hosted_review_timeout_secs(cfg)),
-                        Duration::from_secs(HOSTED_LLM_TOTAL_TIMEOUT_SECS),
-                    )?,
-                    None => LlmClient::from_env(cfg)?,
+                    Some(started_at) => {
+                        LlmClient::from_env_for_remote_review(
+                            cfg,
+                            started_at,
+                            Duration::from_secs(hosted_request_timeout_secs(
+                                deterministic_large_review,
+                            )),
+                            Duration::from_secs(hosted_review_timeout_secs(cfg)),
+                            Duration::from_secs(HOSTED_LLM_TOTAL_TIMEOUT_SECS),
+                        )
+                        .await?
+                    }
+                    None => LlmClient::from_env(cfg).await?,
                 };
                 let planned_batch_count = large_diff_receipt.as_ref().map_or_else(
                     || {
