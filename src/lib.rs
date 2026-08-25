@@ -18,11 +18,18 @@ pub mod hook;
 pub mod llm;
 pub mod local;
 pub mod login;
+pub(crate) mod machine_claim;
 pub mod output;
 pub mod plan;
+pub(crate) mod progress;
 pub mod prompt;
 pub(crate) mod repository_search;
 pub(crate) mod resolve;
-pub mod respond;
 pub mod review;
 pub mod sarif;
+
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}

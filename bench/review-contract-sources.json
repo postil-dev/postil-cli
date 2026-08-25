@@ -25,13 +25,14 @@
   "src/llm.rs",
   "src/local.rs",
   "src/login.rs",
+  "src/machine_claim.rs",
   "src/main.rs",
   "src/output.rs",
   "src/plan.rs",
+  "src/progress.rs",
   "src/prompt.rs",
   "src/repository_search.rs",
   "src/resolve.rs",
-  "src/respond.rs",
   "src/review.rs",
   "src/sarif.rs"
 ]

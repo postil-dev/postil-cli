@@ -26,8 +26,7 @@ use super::{
     PublicationPlanReviewCreateOutcome, PublicationPlanReviewCreatePayload,
     PublicationPlanReviewSummaryCase, PublicationPlanSnapshot, PublicationPlanTerminalOperation,
     PublicationPlanTerminalOutcome, ReviewPublicationReceipt, ReviewPublicationSummary,
-    SummaryContext, ThreadKind, check_summary, check_title, only_operational_findings,
-    valid_details_url,
+    SummaryContext, check_summary, check_title, only_operational_findings, valid_details_url,
 };
 use crate::diff::{Diff, DiffIndex, DiffSnapshot, DiffSpool, WorkspaceBudget};
 use crate::envelope::{Envelope, Finding, Severity};
@@ -36,6 +35,18 @@ use crate::filter;
 pub const EXPECTED_REPOSITORY_ID_ENV: &str = "POSTIL_EXPECTED_GITHUB_REPO_ID";
 const GITHUB_MAX_ANNOTATIONS_PER_REQUEST: usize = 50;
 const FILE_LEVEL_COMMENT_MARKER: &str = "<!-- postil-placement:file -->";
+
+macro_rules! github_telemetry {
+    ($($argument:tt)*) => {
+        crate::progress::telemetry(format_args!($($argument)*))
+    };
+}
+
+macro_rules! github_notice {
+    ($($argument:tt)*) => {
+        crate::progress::notice(format_args!($($argument)*))
+    };
+}
 
 // Filtering caps visible findings before forge publication, so one completed
 // check update always fits GitHub's annotation request limit. Raising the
@@ -195,7 +206,7 @@ impl GitHub {
             .await
             .is_err()
         {
-            eprintln!(
+            github_notice!(
                 "postil: github operation=review-summary-update status=incomplete recovery=truthful-initial-summary"
             );
         }
@@ -406,7 +417,7 @@ impl GitHub {
             let response = match response {
                 Ok(response) => response,
                 Err(error) => {
-                    eprintln!(
+                    github_telemetry!(
                         "postil: github operation={} attempt={}/{} category=transport-error elapsed_ms={} budget_remaining_ms={}",
                         what.replace(' ', "-"),
                         attempt,
@@ -432,7 +443,7 @@ impl GitHub {
             let status = response.status();
             let request_id =
                 github_request_id(response.headers()).unwrap_or_else(|| "none".to_string());
-            eprintln!(
+            github_telemetry!(
                 "postil: github operation={} attempt={}/{} status={} elapsed_ms={} request_id={} rate_remaining={} retry_after_secs={}",
                 what.replace(' ', "-"),
                 attempt,
@@ -454,7 +465,7 @@ impl GitHub {
             if delay.is_zero() {
                 return Ok(response);
             }
-            eprintln!(
+            github_telemetry!(
                 "postil: github operation={} retrying_in_secs={} retry={}/{}",
                 what.replace(' ', "-"),
                 delay.as_secs(),
@@ -726,48 +737,11 @@ impl GitHub {
         Ok(receipt)
     }
 
-    async fn comment_exists(&self, number: u64, marker: &str) -> Result<bool> {
-        const PAGE_SIZE: usize = 100;
-        const MAX_PAGES: usize = 20;
-        for page in 1..=MAX_PAGES {
-            let response = self
-                .send_retryable(
-                    self.request(
-                        reqwest::Method::GET,
-                        self.url(&format!(
-                            "/issues/{number}/comments?per_page={PAGE_SIZE}&page={page}&sort=created&direction=desc"
-                        )),
-                    ),
-                    "comment reconciliation",
-                )
-                .await?;
-            let comments: Vec<PublishedComment> = super::bounded_response_json(
-                Self::check_ok(response, "comment reconciliation").await?,
-                "GitHub comment reconciliation",
-            )
-            .await?;
-            let page_len = comments.len();
-            if comments
-                .into_iter()
-                .any(|comment| comment.body.contains(marker))
-            {
-                return Ok(true);
-            }
-            if page_len < PAGE_SIZE {
-                return Ok(false);
-            }
-        }
-        Err(anyhow!(
-            "GitHub comment reconciliation exceeded {MAX_PAGES} pages; refusing an unsafe retry"
-        ))
-    }
-
     /// Finding markers already carried by inline comments on this pull request.
     ///
     /// A finding's id is a hash over the head SHA, kind, path, line, and title,
     /// so an identical marker is the same finding at the same place on the same
-    /// commit. Two reviews of one head — a push review followed by an `@postil`
-    /// mention, say — legitimately re-detect the same issue, and without this
+    /// commit. Two reviews of one head legitimately re-detect the same issue, and without this
     /// the second run posts a second copy of every comment the first already
     /// left.
     ///
@@ -918,47 +892,6 @@ impl GitHub {
             tokio::time::sleep(github_transport_retry_delay(retry)).await;
         }
         unreachable!("bounded GitHub file-level comment loop always returns")
-    }
-
-    async fn post_comment_reconciled(&self, number: u64, body: &str, marker: &str) -> Result<()> {
-        const RETRIES: u32 = 2;
-        for retry in 0..=RETRIES {
-            self.verify_repository_identity_before_write().await?;
-            let response = self
-                .request(
-                    reqwest::Method::POST,
-                    self.url(&format!("/issues/{number}/comments")),
-                )
-                .json(&json!({ "body": body }))
-                .send()
-                .await;
-            match response {
-                Ok(response) if response.status().is_success() => return Ok(()),
-                Ok(response)
-                    if github_retryable_response(response.status(), response.headers()) =>
-                {
-                    if self.comment_exists(number, marker).await? {
-                        return Ok(());
-                    }
-                    if retry == RETRIES {
-                        Self::check_ok(response, "comment post").await?;
-                    }
-                }
-                Ok(response) => {
-                    Self::check_ok(response, "comment post").await?;
-                }
-                Err(error) => {
-                    if self.comment_exists(number, marker).await? {
-                        return Ok(());
-                    }
-                    if retry == RETRIES {
-                        return Err(error).context("posting comment after reconciliation");
-                    }
-                }
-            }
-            tokio::time::sleep(github_transport_retry_delay(retry)).await;
-        }
-        unreachable!("bounded GitHub comment loop always returns")
     }
 
     async fn pull_files(&self, expected: usize) -> Result<Vec<PullFile>> {
@@ -1136,6 +1069,209 @@ impl GitHub {
                 crate::repository_search::unavailable_with_terms(Some(head_sha), &fallback_terms)
             }
         }
+    }
+
+    pub(crate) async fn verify_machine_claims_at_head(
+        &self,
+        head_sha: &str,
+        claims: &[crate::envelope::MachineClaim],
+    ) -> crate::envelope::ClaimVerificationReceipt {
+        let deadline = crate::repository_search::github_aggregate_deadline();
+        match tokio::time::timeout(
+            deadline,
+            self.machine_claim_source_at_head(head_sha, claims),
+        )
+        .await
+        {
+            Err(_) => crate::machine_claim::exhausted_receipt(Some(head_sha), claims),
+            Ok(Ok(snapshot)) => crate::machine_claim::verify_snapshot(snapshot, claims),
+            Ok(Err(error))
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<MachineClaimSourceExhausted>()
+                        .is_some()
+                }) =>
+            {
+                crate::machine_claim::exhausted_receipt(Some(head_sha), claims)
+            }
+            Ok(Err(_)) => crate::machine_claim::unavailable_receipt(Some(head_sha), claims),
+        }
+    }
+
+    async fn machine_claim_source_at_head(
+        &self,
+        head_sha: &str,
+        claims: &[crate::envelope::MachineClaim],
+    ) -> Result<crate::machine_claim::MachineSourceSnapshot> {
+        ensure!(
+            crate::repository_search::valid_full_object_id(head_sha),
+            "machine claim verification requires a full commit SHA"
+        );
+        if claims.len() > crate::machine_claim::MAX_CLAIMS {
+            return Err(anyhow::Error::new(MachineClaimSourceExhausted));
+        }
+        let response = self
+            .request(
+                reqwest::Method::GET,
+                self.url(&format!("/git/commits/{head_sha}")),
+            )
+            .send()
+            .await
+            .context("fetching machine claim commit")?;
+        let commit: GitCommitResponse = super::bounded_response_json(
+            Self::check_ok(response, "machine claim commit").await?,
+            "GitHub machine claim commit",
+        )
+        .await?;
+        ensure!(
+            commit.sha.eq_ignore_ascii_case(head_sha),
+            "machine claim commit did not match the reviewed head"
+        );
+        ensure!(
+            crate::repository_search::valid_full_object_id(&commit.tree.sha),
+            "machine claim commit returned an invalid tree id"
+        );
+
+        let mut tree_url =
+            reqwest::Url::parse(&self.url(&format!("/git/trees/{}", commit.tree.sha)))
+                .context("building machine claim tree URL")?;
+        tree_url.query_pairs_mut().append_pair("recursive", "1");
+        let response = self
+            .request(reqwest::Method::GET, tree_url.to_string())
+            .send()
+            .await
+            .context("fetching machine claim tree")?;
+        let tree: GitTreeResponse = super::bounded_response_json(
+            Self::check_ok(response, "machine claim tree").await?,
+            "GitHub machine claim tree",
+        )
+        .await?;
+        ensure!(
+            tree.sha.eq_ignore_ascii_case(&commit.tree.sha),
+            "machine claim tree did not match the reviewed head"
+        );
+        ensure!(!tree.truncated, "machine claim tree was incomplete");
+        if tree.tree.len() > crate::machine_claim::MAX_TREE_ENTRIES {
+            return Err(anyhow::Error::new(MachineClaimSourceExhausted));
+        }
+
+        let mut seen_paths = HashSet::with_capacity(tree.tree.len());
+        let mut snapshot_entries = Vec::new();
+        let mut rust_blobs = Vec::new();
+        let mut total_source_bytes = 0usize;
+        for entry in tree.tree {
+            ensure!(
+                super::valid_repository_path(&entry.path) && seen_paths.insert(entry.path.clone()),
+                "machine claim tree returned an unsafe or duplicate path"
+            );
+            ensure!(
+                crate::repository_search::valid_full_object_id(&entry.sha),
+                "machine claim tree returned an invalid object id"
+            );
+            match (entry.kind.as_str(), entry.mode.as_str()) {
+                ("tree", "040000") => {
+                    ensure!(entry.size.is_none(), "machine claim tree entry had a size");
+                }
+                ("blob", "100644" | "100755" | "120000") => {
+                    let size = entry
+                        .size
+                        .context("machine claim tree blob omitted its size")?;
+                    snapshot_entries.push(crate::repository_search::RepositorySnapshotEntry {
+                        path: entry.path.clone(),
+                        object_id: entry.sha.clone(),
+                        mode: entry.mode.clone(),
+                        kind: crate::repository_search::RepositorySnapshotEntryKind::Blob,
+                        size: Some(size),
+                    });
+                    if entry.path.starts_with("src/") && entry.path.ends_with(".rs") {
+                        ensure!(
+                            entry.mode != "120000",
+                            "machine claim source path is a symlink"
+                        );
+                        if !crate::machine_claim::regular_rust_source_entry(
+                            &entry.path,
+                            &entry.mode,
+                        ) {
+                            continue;
+                        }
+                        let size = usize::try_from(size)
+                            .map_err(|_| anyhow::Error::new(MachineClaimSourceExhausted))?;
+                        if size > crate::machine_claim::MAX_SOURCE_FILE_BYTES {
+                            return Err(anyhow::Error::new(MachineClaimSourceExhausted));
+                        }
+                        total_source_bytes = total_source_bytes
+                            .checked_add(size)
+                            .ok_or_else(|| anyhow::Error::new(MachineClaimSourceExhausted))?;
+                        if total_source_bytes > crate::machine_claim::MAX_SOURCE_BYTES {
+                            return Err(anyhow::Error::new(MachineClaimSourceExhausted));
+                        }
+                        rust_blobs.push((entry.path, entry.sha, size));
+                    }
+                }
+                ("commit", "160000") => {
+                    ensure!(entry.size.is_none(), "machine claim gitlink had a size");
+                    snapshot_entries.push(crate::repository_search::RepositorySnapshotEntry {
+                        path: entry.path,
+                        object_id: entry.sha,
+                        mode: entry.mode,
+                        kind: crate::repository_search::RepositorySnapshotEntryKind::Gitlink,
+                        size: None,
+                    });
+                }
+                _ => {
+                    return Err(anyhow!(
+                        "machine claim tree returned an unsupported object type or mode"
+                    ));
+                }
+            }
+        }
+        if rust_blobs.len() > crate::machine_claim::MAX_SOURCE_FILES {
+            return Err(anyhow::Error::new(MachineClaimSourceExhausted));
+        }
+        snapshot_entries.sort_by(|left, right| left.path.cmp(&right.path));
+        let tree_sha256 = crate::repository_search::tree_sha256(&snapshot_entries);
+        rust_blobs.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let mut files = Vec::with_capacity(rust_blobs.len());
+        for (path, object_id, expected_size) in rust_blobs {
+            let response = self
+                .request(
+                    reqwest::Method::GET,
+                    self.url(&format!("/git/blobs/{object_id}")),
+                )
+                .header("Accept", "application/vnd.github.raw+json")
+                .send()
+                .await
+                .with_context(|| format!("fetching machine claim source object for {path}"))?;
+            let mut response = Self::check_ok(response, "machine claim source object").await?;
+            let bytes = super::bounded_response_bytes_with_limit(
+                &mut response,
+                "GitHub machine claim source object",
+                crate::machine_claim::MAX_SOURCE_FILE_BYTES,
+            )
+            .await?;
+            ensure!(
+                bytes.len() == expected_size,
+                "machine claim source object size changed"
+            );
+            let mut object_hash =
+                crate::repository_search::GitObjectHash::new("blob", expected_size as u64);
+            object_hash.update(&bytes);
+            ensure!(
+                object_hash.matches(&object_id),
+                "machine claim source object did not match its tree identity"
+            );
+            files.push(crate::machine_claim::MachineSourceFile {
+                path,
+                source: String::from_utf8(bytes)
+                    .context("machine claim source object is not valid UTF-8")?,
+            });
+        }
+        Ok(crate::machine_claim::MachineSourceSnapshot {
+            head_sha: head_sha.to_ascii_lowercase(),
+            tree_sha256,
+            files,
+        })
     }
 
     async fn search_repository_at_head_inner(
@@ -1707,6 +1843,17 @@ impl std::fmt::Display for RepositorySearchExhausted {
 
 impl std::error::Error for RepositorySearchExhausted {}
 
+#[derive(Debug)]
+struct MachineClaimSourceExhausted;
+
+impl std::fmt::Display for MachineClaimSourceExhausted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("machine claim source budget exhausted")
+    }
+}
+
+impl std::error::Error for MachineClaimSourceExhausted {}
+
 struct RepositorySearchBudget {
     started_at: Instant,
     requests: usize,
@@ -1791,11 +1938,6 @@ struct PublishedReviewComment {
     body: String,
     #[serde(default)]
     commit_id: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct PublishedComment {
-    body: String,
 }
 
 enum ReviewDelivery {
@@ -3084,12 +3226,12 @@ impl Forge for GitHub {
                 ));
             }
 
-            eprintln!(
+            github_telemetry!(
                 "postil: github operation=review-post status=422 category=unresolved-line request_id={} recovery=placement-ladder",
                 request_id,
             );
         } else {
-            eprintln!(
+            github_telemetry!(
                 "postil: github operation=review-reconciliation status=partial recovery=placement-ladder"
             );
         }
@@ -3214,7 +3356,7 @@ impl Forge for GitHub {
                     && !line_findings.is_empty()
                     && github_review_rejected_line(&body)
                 {
-                    eprintln!(
+                    github_telemetry!(
                         "postil: github operation=placement-fallback status=422 category=unresolved-line request_id={} recovery=file-comments",
                         request_id,
                     );
@@ -3473,32 +3615,6 @@ impl Forge for GitHub {
             ));
         }
         Ok(())
-    }
-
-    /// Title and body of an issue or PR (the issues API covers both, so `kind`
-    /// is not needed here).
-    async fn fetch_thread(&self, number: u64, _kind: ThreadKind) -> Result<(String, String)> {
-        let resp = self
-            .send_retryable(
-                self.request(reqwest::Method::GET, self.url(&format!("/issues/{number}"))),
-                "issue fetch",
-            )
-            .await?;
-        let v: serde_json::Value = super::bounded_response_json(
-            Self::check_ok(resp, "issue fetch").await?,
-            "GitHub issue",
-        )
-        .await?;
-        let title = v["title"].as_str().unwrap_or_default().to_string();
-        let body = v["body"].as_str().unwrap_or_default().to_string();
-        Ok((title, body))
-    }
-
-    /// Post a top-level comment on an issue or PR (the bot's reply to a mention).
-    async fn post_comment(&self, number: u64, _kind: ThreadKind, body: &str) -> Result<()> {
-        let marker = comment_marker(number, body);
-        self.post_comment_reconciled(number, &append_marker(body, &marker), &marker)
-            .await
     }
 }
 
@@ -4305,17 +4421,6 @@ fn required_review_body(body: &str, marker: &str) -> Result<String> {
     Ok(marked)
 }
 
-fn comment_marker(number: u64, body: &str) -> String {
-    let mut digest = Sha256::new();
-    digest.update(number.to_be_bytes());
-    digest.update(body.as_bytes());
-    let hash = digest.finalize();
-    format!(
-        "<!-- postil-comment:{:02x}{:02x}{:02x}{:02x}{:02x}{:02x} -->",
-        hash[0], hash[1], hash[2], hash[3], hash[4], hash[5]
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -4385,6 +4490,7 @@ mod tests {
             review_coverage: None,
             review_admission: None,
             repository_search: Default::default(),
+            claim_verification: None,
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: Some(base_sha.into()),
@@ -4423,6 +4529,8 @@ mod tests {
             scorer_kind: None,
             scorer_reason: None,
             repository_claim: None,
+            machine_claim: None,
+            machine_claim_deferred: false,
             title: format!("Finding {id}"),
             body: body.into(),
             evidence: Some("let value = risky();".into()),
@@ -4656,37 +4764,6 @@ mod tests {
         assert!(matches!(response, super::ReviewDelivery::Reconciled(_)));
     }
 
-    #[tokio::test]
-    async fn github_comment_reconciles_before_retrying_uncertain_post() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/repos/owner/repo/issues/9/comments"))
-            .respond_with(ResponseTemplate::new(500))
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/repos/owner/repo/issues/9/comments"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
-                    "body": "reply\n\n<!-- postil-comment:test -->"
-                }])),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-        let github = test_github(&server);
-
-        github
-            .post_comment_reconciled(
-                9,
-                "reply\n\n<!-- postil-comment:test -->",
-                "<!-- postil-comment:test -->",
-            )
-            .await
-            .unwrap();
-    }
-
     fn test_github(server: &MockServer) -> GitHub {
         GitHub {
             http: reqwest::Client::new(),
@@ -4782,6 +4859,97 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("500"));
+    }
+
+    #[tokio::test]
+    async fn machine_claim_verification_reads_only_exact_head_tree_objects() {
+        let server = MockServer::start().await;
+        let head = "a".repeat(40);
+        let tree = "b".repeat(40);
+        let source = b"mod identity { pub struct IdentityFailure; impl ::core::marker::Copy for IdentityFailure {} impl Clone for IdentityFailure { fn clone(&self) -> Self { *self } } }\n";
+        let blob = crate::repository_search::git_blob_sha1(source);
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/owner/repo/git/commits/{head}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sha": head,
+                "tree": {"sha": tree}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/owner/repo/git/trees/{tree}")))
+            .and(query_param("recursive", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sha": tree,
+                "truncated": false,
+                "tree": [{
+                    "path": "src/lib.rs",
+                    "mode": "100644",
+                    "type": "blob",
+                    "sha": blob,
+                    "size": source.len()
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/owner/repo/git/blobs/{blob}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(source.to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let claim = crate::envelope::MachineClaim {
+            kind: crate::envelope::MachineClaimKind::RustCopyMoveOut,
+            path: "src/lib.rs".into(),
+            symbol: "crate::identity::IdentityFailure".into(),
+            expected_signature: None,
+        };
+
+        let receipt = test_github(&server)
+            .verify_machine_claims_at_head(&head, &[claim])
+            .await;
+
+        assert_eq!(
+            receipt.state,
+            crate::envelope::ClaimVerificationState::Complete
+        );
+        assert_eq!(receipt.head_sha.as_deref(), Some(head.as_str()));
+        assert!(receipt.tree_sha256.is_some());
+        assert_eq!(
+            receipt.claims[0].verdict,
+            crate::envelope::ClaimVerificationVerdict::Refuted
+        );
+    }
+
+    #[tokio::test]
+    async fn machine_claim_verification_is_unavailable_without_exact_head_source() {
+        let server = MockServer::start().await;
+        let head = "a".repeat(40);
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/owner/repo/git/commits/{head}")))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let claim = crate::envelope::MachineClaim {
+            kind: crate::envelope::MachineClaimKind::SymbolAbsent,
+            path: "src/identity.rs".into(),
+            symbol: "crate::identity::IdentityFailure".into(),
+            expected_signature: None,
+        };
+
+        let receipt = test_github(&server)
+            .verify_machine_claims_at_head(&head, &[claim])
+            .await;
+
+        assert_eq!(
+            receipt.state,
+            crate::envelope::ClaimVerificationState::Unavailable
+        );
+        assert_eq!(receipt.head_sha.as_deref(), Some(head.as_str()));
+        assert!(receipt.tree_sha256.is_none());
     }
 
     #[tokio::test]
@@ -7421,56 +7589,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn github_repository_identity_fence_rejects_a_renamed_repository() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/repos/owner/repo"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": 42,
-                "full_name": "owner/renamed"
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/repos/owner/repo/issues/9/comments"))
-            .respond_with(ResponseTemplate::new(201))
-            .expect(0)
-            .mount(&server)
-            .await;
-
-        let error = fenced_test_github(&server, 42)
-            .post_comment_reconciled(9, "reply", "marker")
-            .await
-            .unwrap_err();
-        assert!(crate::forge::is_repository_identity_failure(&error));
-    }
-
-    #[tokio::test]
-    async fn github_repository_identity_fence_rejects_a_fork_id_for_base_publication() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/repos/owner/repo"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": 42,
-                "full_name": "owner/repo"
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/repos/owner/repo/issues/9/comments"))
-            .respond_with(ResponseTemplate::new(201))
-            .expect(0)
-            .mount(&server)
-            .await;
-
-        let error = fenced_test_github(&server, 99)
-            .post_comment_reconciled(9, "reply", "marker")
-            .await
-            .unwrap_err();
-        assert!(crate::forge::is_repository_identity_failure(&error));
-    }
-
-    #[tokio::test]
     async fn github_repository_identity_fence_publishes_only_for_the_same_pr_snapshot() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -7717,6 +7835,8 @@ mod tests {
             scorer_kind: None,
             scorer_reason: None,
             repository_claim: None,
+            machine_claim: None,
+            machine_claim_deferred: false,
             title: "Finding".into(),
             body: "A concrete issue.".into(),
             evidence: None,
@@ -7782,6 +7902,8 @@ mod tests {
             scorer_kind: None,
             scorer_reason: None,
             repository_claim: None,
+            machine_claim: None,
+            machine_claim_deferred: false,
             title: "Finding".into(),
             body: "A concrete issue.".into(),
             evidence: None,
@@ -7864,6 +7986,8 @@ mod tests {
             scorer_kind: None,
             scorer_reason: None,
             repository_claim: None,
+            machine_claim: None,
+            machine_claim_deferred: false,
             title: "Finding".into(),
             body: "A concrete issue.".into(),
             evidence: None,
@@ -7968,6 +8092,8 @@ mod tests {
             scorer_kind: None,
             scorer_reason: None,
             repository_claim: None,
+            machine_claim: None,
+            machine_claim_deferred: false,
             title: "Finding".into(),
             body: "A concrete issue.".into(),
             evidence: None,
@@ -8060,6 +8186,8 @@ mod tests {
             scorer_kind: None,
             scorer_reason: None,
             repository_claim: None,
+            machine_claim: None,
+            machine_claim_deferred: false,
             title: "Preserve the complete finding".into(),
             body: format!("{}.", "a".repeat(226)),
             evidence: Some("let vulnerable = true;".into()),
@@ -8089,6 +8217,7 @@ mod tests {
             review_coverage: None,
             review_admission: None,
             repository_search: Default::default(),
+            claim_verification: None,
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: Some("cccccccccccc".into()),
@@ -8229,6 +8358,8 @@ mod tests {
             scorer_kind: None,
             scorer_reason: None,
             repository_claim: None,
+            machine_claim: None,
+            machine_claim_deferred: false,
             title: "Human judgment required".into(),
             body: "Concrete compatibility concern.".into(),
             evidence: None,
@@ -8258,6 +8389,7 @@ mod tests {
             review_coverage: None,
             review_admission: None,
             repository_search: Default::default(),
+            claim_verification: None,
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
@@ -8296,6 +8428,7 @@ mod tests {
             review_coverage: None,
             review_admission: None,
             repository_search: Default::default(),
+            claim_verification: None,
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
@@ -8326,6 +8459,8 @@ mod tests {
             scorer_kind: None,
             scorer_reason: None,
             repository_claim: None,
+            machine_claim: None,
+            machine_claim_deferred: false,
             title: "rgwConfig may not be a recognized field".into(),
             body: "The chart may silently ignore this block.".into(),
             evidence: None,

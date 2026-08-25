@@ -153,7 +153,7 @@ fn csv_field(field: String) -> String {
 }
 
 pub fn print_pretty(envelope: &Envelope) {
-    let color = std::io::stderr().is_terminal();
+    let color = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     let mut out = String::new();
 
     if envelope.silent {
@@ -315,6 +315,8 @@ mod tests {
             scorer_kind: Some(Kind::HumanEscalation),
             scorer_reason: Some("The changed branch can skip authorization.".into()),
             repository_claim: None,
+            machine_claim: None,
+            machine_claim_deferred: false,
             title: "Authorization branch can be skipped".into(),
             body: "The fallback path returns before the policy check.".into(),
             evidence: Some("return Ok(response);".into()),
@@ -391,6 +393,7 @@ mod tests {
                 projected_cost_micros: 900,
             }),
             repository_search: Default::default(),
+            claim_verification: None,
             usage_accounting_complete: true,
             duration_ms: 4567,
             base_sha: Some("base".into()),
@@ -437,6 +440,8 @@ mod tests {
             scorer_kind: None,
             scorer_reason: None,
             repository_claim: None,
+            machine_claim: None,
+            machine_claim_deferred: false,
             title: "\x1b[2Jhijacked title".into(),
             body: "line one\n\x1b[31mFAKE ALL CLEAR\x1b[0m\nline three".into(),
             evidence: None,
@@ -466,6 +471,7 @@ mod tests {
             review_coverage: None,
             review_admission: None,
             repository_search: Default::default(),
+            claim_verification: None,
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,
@@ -531,6 +537,7 @@ mod tests {
             }),
             review_admission: None,
             repository_search: Default::default(),
+            claim_verification: None,
             usage_accounting_complete: true,
             duration_ms: 0,
             base_sha: None,

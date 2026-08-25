@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use futures::StreamExt;
 
-use crate::config::{Config, FindingPresentation, GateLevel, OnError};
+use crate::config::{Config, FindingPresentation, GateLevel, OnError, ReasoningEffort};
 use crate::diff;
 use crate::durable_plan::{DurablePlanRegistrar, DurableReviewPlan};
 use crate::envelope::{
@@ -26,6 +26,14 @@ use crate::repository_search::RepositorySource;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use time::{Date, OffsetDateTime};
+
+macro_rules! eprintln {
+    ($($argument:tt)*) => { crate::progress::telemetry(format_args!($($argument)*)) };
+}
+
+macro_rules! notice {
+    ($($argument:tt)*) => { crate::progress::notice(format_args!($($argument)*)) };
+}
 
 /// Each model request stays bounded. Large reviews continue through sequential
 /// source windows; actual provider-attempt, deadline, and spend guards remain
@@ -249,6 +257,17 @@ fn review_batch_validation_reason(
             ),
         });
     }
+    if let Some(claim) = finding.machine_claim.as_ref()
+        && (finding.repository_claim.is_some() || !crate::machine_claim::claim_is_valid(claim))
+    {
+        return Some(ReviewBatchValidationReason {
+            category: "machineClaim",
+            repair_detail: format!(
+                "finding at {}:{} has an invalid machineClaim declaration; do not combine it with repositoryContext, use one supported kind, an exact regular Rust path and crate-qualified symbol, and the bounded expectedSignature shape only for signature.mismatch",
+                finding.path, finding.line
+            ),
+        });
+    }
 
     if diff::review_batch_contains_exact_evidence(
         annotated,
@@ -403,6 +422,10 @@ pub struct ReviewArgs {
     pub fail_on: Option<String>,
     pub config: Option<PathBuf>,
     pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub scorer_reasoning_effort: Option<String>,
+    pub verbose: bool,
+    pub no_progress: bool,
     pub bounded: bool,
     pub no_post: bool,
     pub defer_gate_check: bool,
@@ -418,6 +441,11 @@ impl ReviewArgs {
         } else {
             self.output
         }
+    }
+
+    fn writes_machine_stdout(&self) -> bool {
+        (self.resolved_output_format().is_some() && self.output_file.is_none())
+            || self.publication_plan_output.as_deref() == Some(Path::new("-"))
     }
 }
 
@@ -447,6 +475,51 @@ struct RemoteReviewResult {
     publication_diff: Option<diff::Diff>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReviewOutcome {
+    exit_code: i32,
+    completion: crate::progress::ReviewCompletion,
+}
+
+impl ReviewOutcome {
+    fn from_envelope(envelope: &Envelope) -> Self {
+        use crate::progress::ReviewCompletion;
+
+        let completion = if envelope
+            .findings
+            .iter()
+            .any(|finding| finding.path == crate::envelope::PROVIDER_PATH)
+        {
+            ReviewCompletion::ProviderIncomplete
+        } else if envelope.findings.iter().any(|finding| {
+            finding.path == crate::envelope::OPERATIONAL_PATH
+                && matches!(
+                    finding.title.as_str(),
+                    "Model output could not be validated"
+                        | "Model narrated risk without structured findings"
+                )
+        }) {
+            ReviewCompletion::ModelOutputIncomplete
+        } else if envelope
+            .findings
+            .iter()
+            .any(|finding| finding.path == crate::envelope::OPERATIONAL_PATH)
+        {
+            ReviewCompletion::OperationalIncomplete
+        } else if envelope.gate.failing {
+            ReviewCompletion::BlockingFindings
+        } else if envelope.findings.is_empty() {
+            ReviewCompletion::Clean
+        } else {
+            ReviewCompletion::AdvisoryFindings
+        };
+        Self {
+            exit_code: i32::from(envelope.gate.failing),
+            completion,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct PublicationContext<'a> {
     snapshot: &'a PrMeta,
@@ -458,6 +531,19 @@ enum ReviewFailureKind {
     Provider,
     InvalidOutput,
 }
+
+#[derive(Debug)]
+struct LocalIncrementalFullComparisonUnavailable;
+
+impl std::fmt::Display for LocalIncrementalFullComparisonUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "local incremental input cannot reconstruct the complete comparison required to re-adjudicate a carried error finding",
+        )
+    }
+}
+
+impl std::error::Error for LocalIncrementalFullComparisonUnavailable {}
 
 fn classify_exhausted_scorer_failure(
     incidents: &[ModelIncident],
@@ -499,92 +585,126 @@ impl std::error::Error for ReviewFailure {}
 
 pub async fn run(args: ReviewArgs) -> Result<i32> {
     let cwd = std::env::current_dir()?;
-    if args.output_json {
-        eprintln!("warning: --output-json is deprecated; use --output json instead");
-    }
-    if args.output_file.is_some() && args.resolved_output_format().is_none() {
-        return Err(anyhow!("--output-file requires --output or --output-json"));
-    }
-    if args.publication_plan_output.is_some() {
-        anyhow::ensure!(
-            args.forge == ForgeKind::GitHub
-                && args.repo.is_some()
-                && args.pr.is_some()
-                && args.sha.is_some()
-                && args.base_sha.is_some()
-                && !args.staged
-                && args.base.is_none()
-                && args.diff_file.is_none(),
-            "--publication-plan-output requires a remote GitHub pull request with explicit --repo, --pr, --sha, and --base-sha"
-        );
-        anyhow::ensure!(
-            args.no_post
-                && args.check_run_id.is_none()
-                && args.gate_check_run_id.is_none()
-                && !args.defer_gate_check,
-            "--publication-plan-output cannot be combined with forge mutation options"
-        );
-        let generation = args
-            .publication_generation
-            .as_deref()
-            .context("--publication-plan-output requires --publication-generation")?;
-        crate::forge::ensure_publication_decimal_identifier("controller generation", generation)
+    let progress = crate::progress::start_review(
+        args.writes_machine_stdout(),
+        args.verbose,
+        crate::config::hosted_runtime_mode(),
+        args.no_progress,
+    );
+    let review = async {
+        if args.output_json {
+            notice!("warning: --output-json is deprecated; use --output json instead");
+        }
+        if args.output_file.is_some() && args.resolved_output_format().is_none() {
+            return Err(anyhow!("--output-file requires --output or --output-json"));
+        }
+        if args.publication_plan_output.is_some() {
+            anyhow::ensure!(
+                args.forge == ForgeKind::GitHub
+                    && args.repo.is_some()
+                    && args.pr.is_some()
+                    && args.sha.is_some()
+                    && args.base_sha.is_some()
+                    && !args.staged
+                    && args.base.is_none()
+                    && args.diff_file.is_none(),
+                "--publication-plan-output requires a remote GitHub pull request with explicit --repo, --pr, --sha, and --base-sha"
+            );
+            anyhow::ensure!(
+                args.no_post
+                    && args.check_run_id.is_none()
+                    && args.gate_check_run_id.is_none()
+                    && !args.defer_gate_check,
+                "--publication-plan-output cannot be combined with forge mutation options"
+            );
+            let generation = args
+                .publication_generation
+                .as_deref()
+                .context("--publication-plan-output requires --publication-generation")?;
+            crate::forge::ensure_publication_decimal_identifier(
+                "controller generation",
+                generation,
+            )
             .context("invalid --publication-generation")?;
-        let input_identity = args
-            .publication_input_identity
-            .as_deref()
-            .context("--publication-plan-output requires --publication-input-identity")?;
-        crate::forge::ensure_publication_sha256_identity("input identity", input_identity)
-            .context("invalid --publication-input-identity")?;
-    } else {
-        anyhow::ensure!(
-            args.publication_generation.is_none(),
-            "--publication-generation requires --publication-plan-output"
-        );
-        anyhow::ensure!(
-            args.publication_input_identity.is_none(),
-            "--publication-input-identity requires --publication-plan-output"
-        );
-    }
-    let mut cfg = Config::load(&cwd, args.config.as_deref())?;
-    if let Some(m) = &args.model {
-        cfg.model = m.clone();
-    }
-    cfg.require_model()?;
-    if let Some(fo) = &args.fail_on {
-        cfg.gate_fail_on =
-            GateLevel::parse(fo).ok_or_else(|| anyhow!("invalid --fail-on {fo:?}"))?;
-    }
-    if !args.no_post
-        && cfg.finding_presentation == FindingPresentation::CheckAnnotations
-        && args.forge != ForgeKind::GitHub
-    {
-        return Err(anyhow!(
-            "review.findingPresentation checkAnnotations requires GitHub publication"
-        ));
-    }
-
-    match args.forge {
-        ForgeKind::Local => run_local(&args, &cfg, &cwd).await,
-        ForgeKind::GitHub => {
-            let repo = require_repo(&args)?;
-            let forge = GitHub::new(&repo, require_pr(&args)?)?;
-            run_remote(&args, &cfg, &forge, &repo, RepositorySource::GitHub(&forge)).await
+            let input_identity = args
+                .publication_input_identity
+                .as_deref()
+                .context("--publication-plan-output requires --publication-input-identity")?;
+            crate::forge::ensure_publication_sha256_identity("input identity", input_identity)
+                .context("invalid --publication-input-identity")?;
+        } else {
+            anyhow::ensure!(
+                args.publication_generation.is_none(),
+                "--publication-generation requires --publication-plan-output"
+            );
+            anyhow::ensure!(
+                args.publication_input_identity.is_none(),
+                "--publication-input-identity requires --publication-plan-output"
+            );
         }
-        ForgeKind::GitLab => {
-            let repo = require_repo(&args)?;
-            let forge = GitLab::new(&repo, require_pr(&args)?)?;
-            run_remote(&args, &cfg, &forge, &repo, RepositorySource::Unavailable).await
+        let mut cfg = Config::load(&cwd, args.config.as_deref())?;
+        if let Some(m) = &args.model {
+            cfg.model = m.clone();
+            cfg.model_source = "command line".to_string();
         }
-        ForgeKind::Bitbucket => {
-            let repo = require_repo(&args)?;
-            let forge = Bitbucket::new(&repo, require_pr(&args)?)?;
-            run_remote(&args, &cfg, &forge, &repo, RepositorySource::Unavailable).await
+        if let Some(effort) = &args.reasoning_effort {
+            cfg.reasoning_effort = ReasoningEffort::parse("--reasoning-effort", effort)?;
+            cfg.reasoning_effort_source = "command line".to_string();
         }
-        ForgeKind::Azure => {
-            let repo = require_repo(&args)?;
-            let forge = Azure::new(&repo, require_pr(&args)?)?;
-            run_remote(&args, &cfg, &forge, &repo, RepositorySource::Unavailable).await
+        if let Some(effort) = &args.scorer_reasoning_effort {
+            cfg.scorer_reasoning_effort =
+                ReasoningEffort::parse("--scorer-reasoning-effort", effort)?;
+            cfg.scorer_reasoning_effort_source = "command line".to_string();
+        }
+        cfg.require_model()?;
+        if let Some(fo) = &args.fail_on {
+            cfg.gate_fail_on =
+                GateLevel::parse(fo).ok_or_else(|| anyhow!("invalid --fail-on {fo:?}"))?;
+        }
+        if !args.no_post
+            && cfg.finding_presentation == FindingPresentation::CheckAnnotations
+            && args.forge != ForgeKind::GitHub
+        {
+            return Err(anyhow!(
+                "review.findingPresentation checkAnnotations requires GitHub publication"
+            ));
+        }
+        match args.forge {
+            ForgeKind::Local => run_local(&args, &cfg, &cwd).await,
+            ForgeKind::GitHub => {
+                let repo = require_repo(&args)?;
+                let forge = GitHub::new(&repo, require_pr(&args)?)?;
+                run_remote(&args, &cfg, &forge, &repo, RepositorySource::GitHub(&forge)).await
+            }
+            ForgeKind::GitLab => {
+                let repo = require_repo(&args)?;
+                let forge = GitLab::new(&repo, require_pr(&args)?)?;
+                run_remote(&args, &cfg, &forge, &repo, RepositorySource::Unavailable).await
+            }
+            ForgeKind::Bitbucket => {
+                let repo = require_repo(&args)?;
+                let forge = Bitbucket::new(&repo, require_pr(&args)?)?;
+                run_remote(&args, &cfg, &forge, &repo, RepositorySource::Unavailable).await
+            }
+            ForgeKind::Azure => {
+                let repo = require_repo(&args)?;
+                let forge = Azure::new(&repo, require_pr(&args)?)?;
+                run_remote(&args, &cfg, &forge, &repo, RepositorySource::Unavailable).await
+            }
+        }
+    };
+    let result = tokio::select! {
+        result = review => result,
+        _ = tokio::signal::ctrl_c() => Err(anyhow!("review interrupted")),
+    };
+    match result {
+        Ok(outcome) => {
+            progress.finish(outcome.completion);
+            Ok(outcome.exit_code)
+        }
+        Err(error) => {
+            progress.finish(crate::progress::ReviewCompletion::OperationalIncomplete);
+            Err(error)
         }
     }
 }
@@ -601,25 +721,49 @@ fn require_pr(args: &ReviewArgs) -> Result<u64> {
         .ok_or_else(|| anyhow!("--pr <number> is required for remote review"))
 }
 
-async fn run_local(args: &ReviewArgs, cfg: &Config, repo_root: &Path) -> Result<i32> {
-    let source = if let Some(path) = &args.diff_file {
-        LocalSource::DiffFile(path.clone())
-    } else if args.staged {
-        LocalSource::Staged
-    } else if let Some(base) = &args.base {
-        LocalSource::Base(base.clone())
+async fn run_local(args: &ReviewArgs, cfg: &Config, repo_root: &Path) -> Result<ReviewOutcome> {
+    let head_sha = if args.diff_file.is_some() {
+        None
     } else {
-        return Err(anyhow!(
-            "local review needs one of --staged, --base <ref>, or --diff-file <path>"
-        ));
+        local::head_sha(repo_root).await?
     };
-    let head_sha = local::head_sha().await;
-    let local_snapshot = local::acquire(&source, head_sha.as_deref(), repo_root).await?;
+    let selection = if let Some(path) = &args.diff_file {
+        local::AutoSelection {
+            source: LocalSource::DiffFile(path.clone()),
+            warning: None,
+        }
+    } else if args.staged {
+        local::AutoSelection {
+            source: LocalSource::Staged,
+            warning: None,
+        }
+    } else if let Some(base) = &args.base {
+        local::AutoSelection {
+            source: LocalSource::Base(base.clone()),
+            warning: None,
+        }
+    } else {
+        local::auto_select(repo_root, head_sha.as_deref()).await?
+    };
+    if let Some(warning) = selection.warning {
+        crate::progress::notice(format_args!("postil: {warning}"));
+    }
+    let local_snapshot = local::acquire(&selection.source, head_sha.as_deref(), repo_root).await?;
     let baseline = load_baseline(args)?;
+    let touched_carried_error = cfg.enabled
+        && args.since_sha.is_some()
+        && carried_error_outside_anchor_file_is_touched(&baseline, &local_snapshot.diff);
+    let supports_full_fallback = matches!(&selection.source, LocalSource::Base(_));
+    let fail_closed_baseline =
+        (touched_carried_error && !supports_full_fallback).then(|| baseline.clone());
     // This is a fail-closed placeholder, not the completed review's trust.
     // review_diff replaces it with Failed, Bounded, or Exhaustive after the
     // selected requests finish; an early model failure deliberately keeps it.
-    let scope = if args.since_sha.is_some() {
+    let scope = if touched_carried_error && supports_full_fallback {
+        filter::ReconcileScope::Full {
+            trust: filter::ReviewTrust::Failed,
+        }
+    } else if args.since_sha.is_some() {
         filter::ReconcileScope::Incremental {
             trust: filter::ReviewTrust::Failed,
         }
@@ -629,34 +773,45 @@ async fn run_local(args: &ReviewArgs, cfg: &Config, repo_root: &Path) -> Result<
         }
     };
     let review_started = std::time::Instant::now();
-    let result = review_diff(
-        cfg,
-        args,
-        ReviewInput {
-            diff_snapshot: &local_snapshot.diff,
-            meta: None,
-            head_sha: head_sha.clone(),
-            repository_revision: local_snapshot.repository_revision.clone(),
-            repo: None,
-            baseline,
-            scope,
-            force_model: false,
-            llm_budget_started_at: None,
-            repository_source: if local_snapshot.repository_revision.is_some() {
-                RepositorySource::Local(repo_root)
-            } else {
-                RepositorySource::Unavailable
+    let result = if touched_carried_error && !supports_full_fallback {
+        Err(anyhow::Error::new(
+            LocalIncrementalFullComparisonUnavailable,
+        ))
+    } else {
+        review_diff(
+            cfg,
+            args,
+            ReviewInput {
+                diff_snapshot: &local_snapshot.diff,
+                meta: None,
+                head_sha: head_sha.clone(),
+                repository_revision: local_snapshot.repository_revision.clone(),
+                repo: None,
+                baseline,
+                scope,
+                force_model: touched_carried_error,
+                llm_budget_started_at: None,
+                repository_source: if local_snapshot.repository_revision.is_some() {
+                    RepositorySource::Local(repo_root)
+                } else {
+                    RepositorySource::Unavailable
+                },
             },
-        },
-    )
-    .await;
-    let envelope = match result {
+        )
+        .await
+    };
+    let mut envelope = match result {
         Ok(envelope) => envelope,
         // Only a completed review that failed operationally has enough
         // review state to produce a truthful error envelope. Input,
         // planning, registration, and client-construction failures occur
         // before provider access and retain the CLI error contract (exit 2).
-        Err(error) if error.downcast_ref::<ReviewFailure>().is_some() => {
+        Err(error)
+            if error.downcast_ref::<ReviewFailure>().is_some()
+                || error
+                    .downcast_ref::<LocalIncrementalFullComparisonUnavailable>()
+                    .is_some() =>
+        {
             eprintln!("postil: review failed before completion ({error:#})");
             error_envelope(
                 cfg,
@@ -668,6 +823,20 @@ async fn run_local(args: &ReviewArgs, cfg: &Config, repo_root: &Path) -> Result<
         }
         Err(error) => return Err(error),
     };
+    if let Some(baseline) = fail_closed_baseline {
+        let index = diff::DiffIndex::build(&diff::parse(local_snapshot.diff.as_str()));
+        let reconciliation = filter::reconcile(
+            &baseline,
+            &index,
+            &[],
+            filter::ReconcileScope::Full {
+                trust: filter::ReviewTrust::Failed,
+            },
+        );
+        envelope.findings.extend(reconciliation.carried);
+        envelope.counts = Envelope::counts_of(&envelope.findings, 0);
+        envelope.confidence_buckets = Envelope::buckets_of(&envelope.findings);
+    }
     finish(args, cfg, envelope, None::<&GitHub>, None, None, false).await
 }
 
@@ -677,7 +846,7 @@ async fn run_remote<F: Forge>(
     forge: &F,
     repo: &str,
     repository_source: RepositorySource<'_>,
-) -> Result<i32> {
+) -> Result<ReviewOutcome> {
     let review_started = std::time::Instant::now();
     let strict_publication = strict_hosted_github_publication(args);
     let meta = run_with_hosted_budget(
@@ -731,7 +900,7 @@ async fn run_remote<F: Forge>(
                     );
                 }
                 // CI tokens without checks:write still get review + exit code.
-                eprintln!("postil: cannot create check runs ({e:#}); continuing without");
+                notice!("postil: cannot create check runs ({e:#}); continuing without");
                 None
             }
         }
@@ -836,7 +1005,7 @@ async fn run_remote<F: Forge>(
             // Emit the envelope and SARIF before delivery. Hosted GitHub runs
             // require every applicable publication step; other invocations
             // retain their gate-derived result when the forge is unavailable.
-            let code = if envelope.gate.failing { 1 } else { 0 };
+            let outcome = ReviewOutcome::from_envelope(&envelope);
             let finish_result = finish(
                 args,
                 cfg,
@@ -859,8 +1028,8 @@ async fn run_remote<F: Forge>(
                     if strict_publication {
                         Err(post_err)
                     } else {
-                        eprintln!("postil: could not post the error review ({post_err:#})");
-                        Ok(code)
+                        notice!("postil: could not post the error review ({post_err:#})");
+                        Ok(outcome)
                     }
                 }
             };
@@ -950,7 +1119,7 @@ fn retain_publication_failure(
         Err(error) if required => Ok(Some(error)),
         Err(error) if crate::forge::is_repository_identity_failure(&error) => Err(error),
         Err(error) => {
-            eprintln!("postil: {warning} ({error:#})");
+            notice!("postil: {warning} ({error:#})");
             Ok(None)
         }
     }
@@ -958,8 +1127,8 @@ fn retain_publication_failure(
 
 fn combine_required_publication(
     check_failure: Option<anyhow::Error>,
-    finish_result: Result<i32>,
-) -> Result<i32> {
+    finish_result: Result<ReviewOutcome>,
+) -> Result<ReviewOutcome> {
     match (check_failure, finish_result) {
         (None, result) => result,
         (Some(check_error), Ok(_)) => {
@@ -1065,7 +1234,8 @@ async fn remote_review<F: Forge>(
     let (diff_snapshot, scope, force_model) = if cfg.enabled
         && has_carryable_baseline
         && matches!(scope, filter::ReconcileScope::Incremental { .. })
-        && diff_snapshot.as_str().trim().is_empty()
+        && (diff_snapshot.as_str().trim().is_empty()
+            || carried_error_outside_anchor_file_is_touched(&baseline, &diff_snapshot))
     {
         (
             run_with_hosted_budget(
@@ -1134,7 +1304,7 @@ fn generate_finding_ids(findings: &mut [Finding], head_sha: Option<&str>) {
         // Normalize the finding data
         let normalized_path = finding.path.to_lowercase();
         let normalized_title = finding.title.trim().to_lowercase();
-        let identity = if let Some(evidence) = finding.evidence.as_deref() {
+        let mut identity = if let Some(evidence) = finding.evidence.as_deref() {
             format!(
                 "evidence\x00{}\x00{}\x00{}\x00{}",
                 finding.kind.as_str(),
@@ -1160,6 +1330,10 @@ fn generate_finding_ids(findings: &mut [Finding], head_sha: Option<&str>) {
                 normalized_title
             )
         };
+        if let Some(claim) = finding.machine_claim.as_ref() {
+            identity.push_str("\0machine-claim\0");
+            identity.push_str(&crate::machine_claim::claim_identity_sha256(claim));
+        }
 
         // Generate SHA256 hash
         let mut hasher = Sha256::new();
@@ -2200,28 +2374,7 @@ async fn review_diff_at(
                     model_used = batch_models.join(", ");
                 }
                 if total_requests > 0 {
-                    let mut deduplicated = Vec::<Finding>::new();
-                    let mut positions: HashMap<_, usize> = HashMap::new();
-                    for finding in raw_findings {
-                        let key = (
-                            finding.path.clone(),
-                            finding.kind.as_str().to_string(),
-                            finding.title.trim().to_ascii_lowercase(),
-                            finding.evidence.clone(),
-                        );
-                        if let Some(position) = positions.get(&key).copied() {
-                            let existing = &mut deduplicated[position];
-                            if (finding.severity, finding.confidence)
-                                > (existing.severity, existing.confidence)
-                            {
-                                *existing = finding;
-                            }
-                        } else {
-                            positions.insert(key, deduplicated.len());
-                            deduplicated.push(finding);
-                        }
-                    }
-                    let raw_findings = deduplicated;
+                    let raw_findings = deduplicate_generated_findings(raw_findings);
                     let grounded_candidate_count = raw_findings.len();
                     let mut generator_filter_cfg = cfg.clone();
                     generator_filter_cfg.max_findings = generator_max_findings;
@@ -2665,6 +2818,12 @@ async fn review_diff_at(
             .await
         }
     };
+    let claim_verification = crate::machine_claim::verify(
+        &repository_source,
+        repository_revision.as_deref(),
+        findings.iter().chain(baseline.iter()),
+    )
+    .await;
     let repository_suppressed = suppress_refuted_repository_claims(
         &mut findings,
         &repository_search,
@@ -2672,6 +2831,16 @@ async fn review_diff_at(
     );
     suppressed = suppressed.saturating_add(repository_suppressed.len() as u32);
     suppressed_findings.extend(repository_suppressed);
+
+    let machine_application = apply_machine_claim_policy(
+        &mut findings,
+        &mut baseline,
+        &adjudication_preserved_baseline,
+        claim_verification.as_ref(),
+        repository_revision.as_deref(),
+    );
+    suppressed = suppressed.saturating_add(machine_application.suppressed.len() as u32);
+    suppressed_findings.extend(machine_application.suppressed);
 
     // A question the reviewer never answered cannot block a merge. This runs
     // after uncertainty resolution so a finding that went and checked keeps the
@@ -2769,6 +2938,7 @@ async fn review_diff_at(
 
     let mut resolved = rec.resolved;
     resolved.extend(adjudication_resolved);
+    resolved.extend(machine_application.resolved);
 
     Ok(Envelope {
         version: 1,
@@ -2794,6 +2964,7 @@ async fn review_diff_at(
         review_coverage,
         review_admission,
         repository_search,
+        claim_verification,
         usage_accounting_complete,
         duration_ms: review_started.elapsed().as_millis() as u64,
         base_sha: meta.map(|m| m.base_sha.clone()),
@@ -2843,6 +3014,7 @@ fn qualification_plan_envelope(
         review_coverage: Some(review_coverage),
         review_admission: Some(review_admission),
         repository_search: crate::repository_search::unavailable(head_sha.as_deref()),
+        claim_verification: None,
         usage_accounting_complete: true,
         duration_ms,
         base_sha: meta.map(|value| value.base_sha.clone()),
@@ -2863,7 +3035,8 @@ async fn finish<F: Forge>(
     hosted_budget_started_at: Option<Instant>,
     publication: Option<PublicationContext<'_>>,
     strict_publication: bool,
-) -> Result<i32> {
+) -> Result<ReviewOutcome> {
+    let outcome = ReviewOutcome::from_envelope(&envelope);
     let publication_plan_to_stdout =
         args.publication_plan_output.as_deref() == Some(Path::new("-"));
     // Persist artifacts before any forge I/O: a posting hiccup must not
@@ -2882,6 +3055,7 @@ async fn finish<F: Forge>(
     if !publication_plan_to_stdout
         && (args.resolved_output_format().is_none() || args.output_file.is_some())
     {
+        let _progress_suspension = crate::progress::suspend_for_output();
         output::print_pretty(&envelope);
     }
 
@@ -2928,7 +3102,7 @@ async fn finish<F: Forge>(
         } else {
             crate::forge::write_github_publication_plan(path, &plan)?;
         }
-        return Ok(if envelope.gate.failing { 1 } else { 0 });
+        return Ok(outcome);
     }
 
     if let Some(forge) = forge
@@ -2950,7 +3124,7 @@ async fn finish<F: Forge>(
                 }
             }
             crate::forge::write_review_publication_receipt_from_env(&receipt)?;
-            return Ok(if envelope.gate.failing { 1 } else { 0 });
+            return Ok(outcome);
         }
         if !should_comment {
             let mut receipt = forge.plan_review_publication(&envelope, expected_snapshot);
@@ -2969,7 +3143,7 @@ async fn finish<F: Forge>(
                 }
             }
             crate::forge::write_review_publication_receipt_from_env(&receipt)?;
-            return Ok(if envelope.gate.failing { 1 } else { 0 });
+            return Ok(outcome);
         }
         let freshness = if let Some(started_at) = hosted_budget_started_at {
             snapshot_is_current(forge, expected_snapshot, started_at).await
@@ -2984,10 +3158,10 @@ async fn finish<F: Forge>(
                 ));
             }
             Ok(false) => {
-                eprintln!(
+                notice!(
                     "postil: publication skipped because the pull request snapshot changed after review"
                 );
-                return Ok(if envelope.gate.failing { 1 } else { 0 });
+                return Ok(outcome);
             }
             Err(error) if strict_publication => {
                 return Err(error).context(
@@ -2995,10 +3169,10 @@ async fn finish<F: Forge>(
                 );
             }
             Err(error) => {
-                eprintln!(
+                notice!(
                     "postil: publication skipped because snapshot freshness could not be verified ({error:#})"
                 );
-                return Ok(if envelope.gate.failing { 1 } else { 0 });
+                return Ok(outcome);
             }
         }
         let posted = run_with_hosted_budget(
@@ -3019,11 +3193,11 @@ async fn finish<F: Forge>(
                 if strict_publication {
                     return Err(e).context("required hosted review publication failed");
                 }
-                eprintln!("postil: could not post review comment ({e:#})");
+                notice!("postil: could not post review comment ({e:#})");
             }
         }
     }
-    Ok(if envelope.gate.failing { 1 } else { 0 })
+    Ok(outcome)
 }
 
 async fn run_with_hosted_budget<T>(
@@ -3090,6 +3264,27 @@ fn baseline_has_carryable_findings(findings: &[Finding]) -> bool {
         .any(|finding| !crate::envelope::is_ephemeral_anchor(&finding.path))
 }
 
+/// A carried repository Error can be fixed away from its original anchor. When
+/// the incremental change touches that file but not the anchor itself, only the
+/// complete comparison can provide enough evidence to adjudicate the prior
+/// finding without treating incremental model silence as a resolution.
+fn carried_error_outside_anchor_file_is_touched(
+    baseline: &[Finding],
+    snapshot: &diff::DiffSnapshot,
+) -> bool {
+    let changed = diff::parse(snapshot.as_str());
+    let index = diff::DiffIndex::build(&changed);
+    baseline.iter().any(|finding| {
+        finding.severity == crate::envelope::Severity::Error
+            && !crate::envelope::is_reserved_anchor(&finding.path)
+            && changed
+                .files
+                .iter()
+                .any(|file| file.path == finding.path || file.old_path == finding.path)
+            && !index.contains_old(&finding.path, finding.line)
+    })
+}
+
 /// Reserve every baseline finding that could enter full re-review adjudication
 /// before generating fresh findings. The later candidate set can be smaller
 /// when a fresh finding supersedes a baseline entry, but it must never be
@@ -3147,6 +3342,90 @@ fn suppress_refuted_repository_claims(
     suppressed
 }
 
+struct MachineClaimApplication {
+    suppressed: Vec<SuppressedFinding>,
+    resolved: Vec<Finding>,
+}
+
+fn apply_machine_claim_policy(
+    findings: &mut Vec<Finding>,
+    baseline: &mut Vec<Finding>,
+    adjudication_preserved_baseline: &[Finding],
+    receipt: Option<&crate::envelope::ClaimVerificationReceipt>,
+    expected_head_sha: Option<&str>,
+) -> MachineClaimApplication {
+    use crate::envelope::ClaimVerificationVerdict;
+
+    let mut suppressed = Vec::new();
+    let mut resolved = Vec::new();
+    let mut kept_findings = Vec::with_capacity(findings.len());
+    for mut finding in findings.drain(..) {
+        let Some(claim) = finding.machine_claim.as_ref() else {
+            kept_findings.push(finding);
+            continue;
+        };
+        let verdict = crate::machine_claim::receipt_verdict(receipt, claim, expected_head_sha);
+        let preserved_baseline = adjudication_preserved_baseline
+            .iter()
+            .any(|baseline| same_visible_finding(baseline, &finding));
+        if preserved_baseline {
+            if verdict == Some(ClaimVerificationVerdict::Refuted) {
+                resolved.push(finding);
+            } else {
+                finding.machine_claim_deferred = true;
+                finding.severity = crate::envelope::Severity::Info;
+                kept_findings.push(finding);
+            }
+            continue;
+        }
+        match verdict {
+            Some(ClaimVerificationVerdict::Supported) => {
+                finding.machine_claim_deferred = false;
+                kept_findings.push(finding);
+            }
+            Some(ClaimVerificationVerdict::Refuted) => suppressed.push(SuppressedFinding {
+                finding,
+                reason: SuppressionReason::MachineClaimRefuted,
+            }),
+            Some(ClaimVerificationVerdict::Unresolved | ClaimVerificationVerdict::Unsupported)
+            | None => suppressed.push(SuppressedFinding {
+                finding,
+                reason: SuppressionReason::MachineClaimUnverified,
+            }),
+        }
+    }
+    *findings = kept_findings;
+
+    let mut kept_baseline = Vec::with_capacity(baseline.len());
+    for mut finding in baseline.drain(..) {
+        let Some(claim) = finding.machine_claim.as_ref() else {
+            kept_baseline.push(finding);
+            continue;
+        };
+        if crate::machine_claim::receipt_verdict(receipt, claim, expected_head_sha)
+            == Some(ClaimVerificationVerdict::Refuted)
+        {
+            resolved.push(finding);
+            continue;
+        }
+        if adjudication_preserved_baseline
+            .iter()
+            .any(|preserved| same_visible_finding(preserved, &finding))
+        {
+            continue;
+        }
+        finding.machine_claim_deferred = true;
+        finding.severity = crate::envelope::Severity::Info;
+        kept_baseline.push(finding);
+    }
+    *baseline = kept_baseline;
+
+    MachineClaimApplication {
+        suppressed,
+        resolved,
+    }
+}
+
 fn same_visible_finding(a: &Finding, b: &Finding) -> bool {
     a.path == b.path
         && a.line == b.line
@@ -3154,8 +3433,41 @@ fn same_visible_finding(a: &Finding, b: &Finding) -> bool {
         && a.severity == b.severity
         && a.kind == b.kind
         && a.confidence.to_bits() == b.confidence.to_bits()
+        && a.machine_claim
+            .as_ref()
+            .map(crate::machine_claim::claim_identity_sha256)
+            == b.machine_claim
+                .as_ref()
+                .map(crate::machine_claim::claim_identity_sha256)
         && a.title == b.title
         && visible_body(&a.body) == visible_body(&b.body)
+}
+
+fn deduplicate_generated_findings(raw_findings: Vec<Finding>) -> Vec<Finding> {
+    let mut deduplicated = Vec::<Finding>::new();
+    let mut positions: HashMap<_, usize> = HashMap::new();
+    for finding in raw_findings {
+        let key = (
+            finding.path.clone(),
+            finding.kind.as_str().to_string(),
+            finding.title.trim().to_ascii_lowercase(),
+            finding.evidence.clone(),
+            finding
+                .machine_claim
+                .as_ref()
+                .map(crate::machine_claim::claim_identity_sha256),
+        );
+        if let Some(position) = positions.get(&key).copied() {
+            let existing = &mut deduplicated[position];
+            if (finding.severity, finding.confidence) > (existing.severity, existing.confidence) {
+                *existing = finding;
+            }
+        } else {
+            positions.insert(key, deduplicated.len());
+            deduplicated.push(finding);
+        }
+    }
+    deduplicated
 }
 
 fn visible_body(body: &str) -> &str {
@@ -3221,6 +3533,12 @@ fn error_envelope(
     duration_ms: u64,
 ) -> Envelope {
     let incomplete_input = crate::forge::is_incomplete_review_input(err);
+    let incomplete_reason = err
+        .downcast_ref::<LocalIncrementalFullComparisonUnavailable>()
+        .map(|_| crate::envelope::IncompleteReviewReason::LocalIncrementalFullComparisonUnavailable)
+        .or_else(|| {
+            incomplete_input.then_some(crate::envelope::IncompleteReviewReason::IncompleteInput)
+        });
     let review_failure = err.downcast_ref::<ReviewFailure>();
     let invalid_output =
         review_failure.is_some_and(|failure| failure.kind == ReviewFailureKind::InvalidOutput);
@@ -3237,10 +3555,8 @@ fn error_envelope(
                 .downcast_ref::<reqwest::Error>()
                 .is_some_and(|error| error.is_connect() || error.is_timeout())
         });
-    let findings = vec![if incomplete_input {
-        crate::envelope::incomplete_review_finding(
-            crate::envelope::IncompleteReviewReason::IncompleteInput,
-        )
+    let findings = vec![if let Some(reason) = incomplete_reason {
+        crate::envelope::incomplete_review_finding(reason)
     } else if invalid_output || !advisory_operational_error {
         // Only a recorded scorer error is genuinely about model output. Every
         // other failure here reaches this branch with its cause in `err`, so
@@ -3304,6 +3620,7 @@ fn error_envelope(
         review_coverage: review_failure.and_then(|failure| failure.review_coverage.clone()),
         review_admission: review_failure.and_then(|failure| failure.review_admission),
         repository_search: crate::repository_search::unavailable(Some(head_sha)),
+        claim_verification: None,
         usage_accounting_complete: review_failure
             .is_none_or(|failure| failure.usage_accounting_complete),
         duration_ms,
@@ -3346,17 +3663,17 @@ mod tests {
             .unwrap()
         };
 
-        let local_edge = format!("Benchmark pull request{}", "x".repeat(42));
-        let ci_edge = format!("Benchmark pull request{}", "x".repeat(58));
-        let below_floor = format!("Benchmark pull request{}", "x".repeat(442));
+        let local_edge = format!("Benchmark pull request{}", "x".repeat(13));
+        let ci_edge = format!("Benchmark pull request{}", "x".repeat(29));
+        let below_floor = format!("Benchmark pull request{}", "x".repeat(413));
 
         let local_budgets = batch_budgets_for_title(&local_edge);
-        assert_eq!(local_budgets.synthesis, 4_227);
-        assert_eq!(local_budgets.source, 4_228);
+        assert_eq!(local_budgets.synthesis, 4_116);
+        assert_eq!(local_budgets.source, 4_117);
         assert!(review_batch_budgets_are_usable(local_budgets));
         let ci_budgets = batch_budgets_for_title(&ci_edge);
-        assert_eq!(ci_budgets.synthesis, 4_211);
-        assert_eq!(ci_budgets.source, 4_212);
+        assert_eq!(ci_budgets.synthesis, 4_100);
+        assert_eq!(ci_budgets.source, 4_101);
         assert!(review_batch_budgets_are_usable(ci_budgets));
         assert_eq!(
             ci_budgets.stabilized_for_rendering(),
@@ -3368,7 +3685,7 @@ mod tests {
         let below_floor_budgets = batch_budgets_for_title(&below_floor);
         assert_eq!(
             below_floor_budgets.synthesis,
-            diff::MIN_REVIEW_BATCH_BYTES - 269
+            diff::MIN_REVIEW_BATCH_BYTES - 380
         );
         assert!(!review_batch_budgets_are_usable(below_floor_budgets));
     }
@@ -3451,6 +3768,10 @@ mod tests {
             finding.body
         );
         assert!(envelope.gate.failing);
+        assert_eq!(
+            ReviewOutcome::from_envelope(&envelope).completion,
+            crate::progress::ReviewCompletion::OperationalIncomplete
+        );
     }
 
     #[test]
@@ -3470,6 +3791,10 @@ mod tests {
                 .contains("scorer output invalid after schema repair"),
             "the recorded scorer error must be preserved: {}",
             finding.body
+        );
+        assert_eq!(
+            ReviewOutcome::from_envelope(&envelope).completion,
+            crate::progress::ReviewCompletion::ModelOutputIncomplete
         );
     }
 
@@ -3604,6 +3929,12 @@ mod tests {
         let envelope = error_envelope(&cfg, &error, "head", Some(&pr_meta()), 99);
         assert_eq!(envelope.findings[0].path, crate::envelope::PROVIDER_PATH);
         assert!(!envelope.gate.failing);
+        let outcome = ReviewOutcome::from_envelope(&envelope);
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(
+            outcome.completion,
+            crate::progress::ReviewCompletion::ProviderIncomplete
+        );
         assert_eq!(envelope.model_usage.len(), 2);
         assert_eq!(envelope.review_admission.unwrap().provider_attempts, 12);
     }
@@ -3619,6 +3950,41 @@ mod tests {
         assert_eq!(envelope.findings[0].path, crate::envelope::OPERATIONAL_PATH);
         assert!(envelope.gate.failing);
         assert!(envelope.summary.contains("failing closed"));
+    }
+
+    #[test]
+    fn ordinary_envelopes_distinguish_clean_advisory_and_blocking_completion() {
+        let mut envelope = error_envelope(
+            &Config::default(),
+            &anyhow::anyhow!("fixture operational error"),
+            "head",
+            Some(&pr_meta()),
+            1,
+        );
+        envelope.findings[0].path = "src/lib.rs".to_string();
+        envelope.findings[0].title = "Ordinary review finding".to_string();
+        envelope.gate.failing = false;
+        let advisory = ReviewOutcome::from_envelope(&envelope);
+        assert_eq!(advisory.exit_code, 0);
+        assert_eq!(
+            advisory.completion,
+            crate::progress::ReviewCompletion::AdvisoryFindings
+        );
+
+        envelope.gate.failing = true;
+        let blocking = ReviewOutcome::from_envelope(&envelope);
+        assert_eq!(blocking.exit_code, 1);
+        assert_eq!(
+            blocking.completion,
+            crate::progress::ReviewCompletion::BlockingFindings
+        );
+
+        envelope.findings.clear();
+        envelope.gate.failing = false;
+        assert_eq!(
+            ReviewOutcome::from_envelope(&envelope).completion,
+            crate::progress::ReviewCompletion::Clean
+        );
     }
 
     #[test]
@@ -3697,6 +4063,8 @@ mod tests {
             scorer_kind: None,
             scorer_reason: None,
             repository_claim: None,
+            machine_claim: None,
+            machine_claim_deferred: false,
             title: title.to_string(),
             body: body.to_string(),
             evidence: None,
@@ -3887,7 +4255,14 @@ mod tests {
         let retained = retain_publication_failure(true, completion, "fixture warning")
             .unwrap()
             .expect("strict hosted publication retains the timeout");
-        let error = combine_required_publication(Some(retained), Ok(0)).unwrap_err();
+        let error = combine_required_publication(
+            Some(retained),
+            Ok(ReviewOutcome {
+                exit_code: 0,
+                completion: crate::progress::ReviewCompletion::Clean,
+            }),
+        )
+        .unwrap_err();
 
         assert!(format!("{error:#}").contains("completing check runs timed out"));
         assert!(
@@ -3960,6 +4335,92 @@ mod tests {
     }
 
     #[test]
+    fn stable_ids_include_canonical_machine_claim_identity() {
+        let head_sha = "0123456789abcdef0123456789abcdef01234567";
+        let mut first = finding_with_title(
+            "src/identity.rs",
+            42,
+            "Signature mismatch",
+            "The signature differs.",
+        );
+        first.machine_claim = Some(crate::envelope::MachineClaim {
+            kind: crate::envelope::MachineClaimKind::SignatureMismatch,
+            path: "src/identity.rs".into(),
+            symbol: "crate::identity::check".into(),
+            expected_signature: Some(crate::envelope::MachineSignature {
+                receiver: crate::envelope::MachineReceiver::None,
+                parameters: vec!["std::vec::Vec < u8 >".into()],
+                returns: "bool".into(),
+                is_async: false,
+                is_unsafe: false,
+            }),
+        });
+        let mut equivalent = first.clone();
+        equivalent
+            .machine_claim
+            .as_mut()
+            .unwrap()
+            .expected_signature
+            .as_mut()
+            .unwrap()
+            .parameters = vec!["std::vec::Vec<u8>".into()];
+        let mut distinct = equivalent.clone();
+        distinct.machine_claim.as_mut().unwrap().symbol = "crate::identity::other".into();
+
+        generate_finding_ids(std::slice::from_mut(&mut first), Some(head_sha));
+        generate_finding_ids(std::slice::from_mut(&mut equivalent), Some(head_sha));
+        generate_finding_ids(std::slice::from_mut(&mut distinct), Some(head_sha));
+
+        assert_eq!(first.id, equivalent.id);
+        assert_ne!(first.id, distinct.id);
+    }
+
+    #[test]
+    fn generated_dedup_keeps_sibling_findings_with_distinct_machine_claims() {
+        let mut first = finding_with_title(
+            "src/identity.rs",
+            42,
+            "Signature mismatch",
+            "The signature differs.",
+        );
+        first.evidence = Some("fn check()".into());
+        first.machine_claim = Some(crate::envelope::MachineClaim {
+            kind: crate::envelope::MachineClaimKind::SignatureMismatch,
+            path: "src/identity.rs".into(),
+            symbol: "crate::identity::first".into(),
+            expected_signature: Some(crate::envelope::MachineSignature {
+                receiver: crate::envelope::MachineReceiver::None,
+                parameters: Vec::new(),
+                returns: "bool".into(),
+                is_async: false,
+                is_unsafe: false,
+            }),
+        });
+        let mut distinct = first.clone();
+        distinct.machine_claim.as_mut().unwrap().symbol = "crate::identity::second".into();
+        let mut equivalent = first.clone();
+        equivalent
+            .machine_claim
+            .as_mut()
+            .unwrap()
+            .expected_signature
+            .as_mut()
+            .unwrap()
+            .returns = " bool ".into();
+
+        let deduplicated = deduplicate_generated_findings(vec![first, distinct, equivalent]);
+
+        assert_eq!(deduplicated.len(), 2);
+        let identities = deduplicated
+            .iter()
+            .map(|finding| {
+                crate::machine_claim::claim_identity_sha256(finding.machine_claim.as_ref().unwrap())
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(identities.len(), 2);
+    }
+
+    #[test]
     fn visible_finding_comparison_ignores_carry_marker_and_order() {
         let previous = vec![finding("a.rs", 10, "first"), finding("b.rs", 20, "second")];
         let current = vec![
@@ -4000,6 +4461,44 @@ mod tests {
         assert!(!baseline_has_carryable_findings(&[
             crate::envelope::provider_error_finding("fixture provider failure"),
         ]));
+    }
+
+    #[test]
+    fn carried_error_escalation_excludes_anchor_warnings_synthetic_and_untouched_findings() {
+        let snapshot = diff::DiffSnapshot::from_bytes(
+            b"diff --git a/src/auth.rs b/src/auth.rs\n--- a/src/auth.rs\n+++ b/src/auth.rs\n@@ -40 +40 @@\n-old authorization\n+new authorization\n",
+        )
+        .unwrap();
+        let error = finding("src/auth.rs", 10, "prior blocker");
+        assert!(carried_error_outside_anchor_file_is_touched(
+            std::slice::from_ref(&error),
+            &snapshot
+        ));
+
+        let anchored = finding("src/auth.rs", 40, "anchored blocker");
+        assert!(!carried_error_outside_anchor_file_is_touched(
+            &[anchored],
+            &snapshot
+        ));
+
+        let mut warning = error.clone();
+        warning.severity = Severity::Warn;
+        assert!(!carried_error_outside_anchor_file_is_touched(
+            &[warning],
+            &snapshot
+        ));
+
+        let synthetic = finding(crate::envelope::CHANGE_METADATA_PATH, 1, "metadata blocker");
+        assert!(!carried_error_outside_anchor_file_is_touched(
+            &[synthetic],
+            &snapshot
+        ));
+
+        let untouched = finding("src/db.rs", 10, "database blocker");
+        assert!(!carried_error_outside_anchor_file_is_touched(
+            &[untouched],
+            &snapshot
+        ));
     }
 
     #[test]
@@ -4097,6 +4596,200 @@ mod tests {
         let mut fresh = vec![baseline];
         assert!(suppress_refuted_repository_claims(&mut fresh, &receipt, &[]).is_empty());
         assert_eq!(fresh.len(), 1);
+    }
+
+    fn machine_claim(
+        kind: crate::envelope::MachineClaimKind,
+        symbol: &str,
+    ) -> crate::envelope::MachineClaim {
+        crate::envelope::MachineClaim {
+            kind,
+            path: "src/identity.rs".into(),
+            symbol: symbol.into(),
+            expected_signature: None,
+        }
+    }
+
+    fn machine_receipt(
+        head_sha: &str,
+        source: &str,
+        claims: &[crate::envelope::MachineClaim],
+    ) -> crate::envelope::ClaimVerificationReceipt {
+        crate::machine_claim::verify_snapshot(
+            crate::machine_claim::MachineSourceSnapshot {
+                head_sha: head_sha.into(),
+                tree_sha256: "b".repeat(64),
+                files: vec![
+                    crate::machine_claim::MachineSourceFile {
+                        path: "src/lib.rs".into(),
+                        source: "mod identity;\n".into(),
+                    },
+                    crate::machine_claim::MachineSourceFile {
+                        path: "src/identity.rs".into(),
+                        source: source.into(),
+                    },
+                ],
+            },
+            claims,
+        )
+    }
+
+    #[test]
+    fn adjudication_rejection_is_not_resurrected_by_a_supported_machine_claim() {
+        let source_claim = machine_claim(
+            crate::envelope::MachineClaimKind::RustCopyMoveOut,
+            "crate::identity::IdentityFailure",
+        );
+        let receipt = machine_receipt(
+            &"a".repeat(40),
+            "pub struct IdentityFailure;\n",
+            std::slice::from_ref(&source_claim),
+        );
+        let mut rejected = finding("src/identity.rs", 1, "rejected machine claim");
+        rejected.machine_claim = Some(source_claim);
+        let ordinary = finding("src/identity.rs", 3, "ordinary finding");
+        let application = crate::adjudication::AdjudicationApplication {
+            kept: vec![ordinary.clone()],
+            kept_indices: vec![1],
+            unresolved_indices: Vec::new(),
+            resolved_indices: vec![0],
+            suppressed: vec![SuppressedFinding {
+                finding: rejected.clone(),
+                reason: SuppressionReason::BelowConfidence,
+            }],
+        };
+        let mut findings = application.kept;
+        let machine_application = apply_machine_claim_policy(
+            &mut findings,
+            &mut Vec::new(),
+            &[],
+            Some(&receipt),
+            Some(&"a".repeat(40)),
+        );
+
+        assert_eq!(findings.len(), 1);
+        assert!(same_visible_finding(&findings[0], &ordinary));
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| same_visible_finding(finding, &rejected))
+        );
+        assert!(machine_application.suppressed.is_empty());
+        assert!(machine_application.resolved.is_empty());
+    }
+
+    #[test]
+    fn fresh_machine_claim_policy_suppresses_refuted_and_unverified_claims() {
+        let head_sha = "a".repeat(40);
+        let refuted_claim = machine_claim(
+            crate::envelope::MachineClaimKind::RustCopyMoveOut,
+            "crate::identity::CopyFailure",
+        );
+        let supported_claim = machine_claim(
+            crate::envelope::MachineClaimKind::RustCopyMoveOut,
+            "crate::identity::MoveFailure",
+        );
+        let receipt = machine_receipt(
+            &head_sha,
+            "pub struct CopyFailure;\nimpl ::core::marker::Copy for CopyFailure {}\nimpl Clone for CopyFailure { fn clone(&self) -> Self { *self } }\npub struct MoveFailure;\n",
+            &[refuted_claim.clone(), supported_claim.clone()],
+        );
+        let mut refuted = finding("src/identity.rs", 1, "copy value is moved");
+        refuted.machine_claim = Some(refuted_claim);
+        let mut supported = finding("src/identity.rs", 2, "non-copy value is moved");
+        supported.machine_claim = Some(supported_claim);
+        let mut findings = vec![refuted, supported.clone()];
+        let mut baseline = Vec::new();
+
+        let application = apply_machine_claim_policy(
+            &mut findings,
+            &mut baseline,
+            &[],
+            Some(&receipt),
+            Some(&head_sha),
+        );
+        assert_eq!(findings.len(), 1);
+        assert!(same_visible_finding(&findings[0], &supported));
+        assert_eq!(application.suppressed.len(), 1);
+        assert_eq!(
+            application.suppressed[0].reason,
+            SuppressionReason::MachineClaimRefuted
+        );
+
+        let mut stale_findings = vec![supported];
+        let stale = "c".repeat(40);
+        let stale_application = apply_machine_claim_policy(
+            &mut stale_findings,
+            &mut Vec::new(),
+            &[],
+            Some(&receipt),
+            Some(&stale),
+        );
+        assert!(stale_findings.is_empty());
+        assert_eq!(
+            stale_application.suppressed[0].reason,
+            SuppressionReason::MachineClaimUnverified
+        );
+    }
+
+    #[test]
+    fn carried_machine_claims_resolve_only_from_fresh_refutation() {
+        let head_sha = "a".repeat(40);
+        let refuted_claim = machine_claim(
+            crate::envelope::MachineClaimKind::RustCopyMoveOut,
+            "crate::identity::CopyFailure",
+        );
+        let supported_claim = machine_claim(
+            crate::envelope::MachineClaimKind::RustCopyMoveOut,
+            "crate::identity::MoveFailure",
+        );
+        let receipt = machine_receipt(
+            &head_sha,
+            "pub struct CopyFailure;\nimpl ::core::marker::Copy for CopyFailure {}\nimpl Clone for CopyFailure { fn clone(&self) -> Self { *self } }\npub struct MoveFailure;\n",
+            &[refuted_claim.clone(), supported_claim.clone()],
+        );
+        let mut refuted = finding("src/identity.rs", 1, "copy value is moved");
+        refuted.machine_claim = Some(refuted_claim);
+        let mut deferred = finding("src/identity.rs", 2, "non-copy value is moved");
+        deferred.machine_claim = Some(supported_claim);
+        let original_deferred = deferred.clone();
+        let mut baseline = vec![refuted.clone(), deferred];
+        let mut findings = Vec::new();
+
+        let application = apply_machine_claim_policy(
+            &mut findings,
+            &mut baseline,
+            &[],
+            Some(&receipt),
+            Some(&head_sha),
+        );
+        assert_eq!(application.resolved.len(), 1);
+        assert!(same_visible_finding(&application.resolved[0], &refuted));
+        assert_eq!(baseline.len(), 1);
+        assert!(baseline[0].machine_claim_deferred);
+        assert_eq!(baseline[0].severity, Severity::Info);
+        assert!(!crate::envelope::finding_blocks_gate(
+            &baseline[0],
+            "info",
+            &["risk".into()],
+            false
+        ));
+        assert_eq!(baseline[0].title, original_deferred.title);
+
+        let mut preserved_findings = vec![refuted.clone()];
+        let preserved_application = apply_machine_claim_policy(
+            &mut preserved_findings,
+            &mut Vec::new(),
+            std::slice::from_ref(&refuted),
+            Some(&receipt),
+            Some(&head_sha),
+        );
+        assert!(preserved_findings.is_empty());
+        assert_eq!(preserved_application.resolved.len(), 1);
+        assert!(same_visible_finding(
+            &preserved_application.resolved[0],
+            &refuted
+        ));
     }
 
     fn score(index: usize, confidence: f64, kind: Kind) -> FindingScore {

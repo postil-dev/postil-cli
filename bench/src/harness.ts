@@ -443,7 +443,7 @@ export const envelopeV1 = z.object({
     .array(
       z.object({
         model: z.string().min(1),
-        role: z.enum(["reviewPlanner", "reviewGenerator", "findingScorer", "mentionResponder"]).optional(),
+        role: z.enum(["reviewPlanner", "reviewGenerator", "findingScorer"]).optional(),
         phase: z.enum(["initial", "schemaRepair", "semanticRetry"]).optional(),
         callOrdinal: z.number().int().positive().optional(),
         attempt: z.number().int().positive().optional(),
@@ -459,7 +459,7 @@ export const envelopeV1 = z.object({
   modelIncidents: z
     .array(
       z.object({
-        phase: z.enum(["planner", "review", "scorer", "respond"]),
+        phase: z.enum(["planner", "review", "scorer"]),
         category: z.enum(["providerError", "invalidOutput", "timeout", "deadline"]),
         recovered: z.boolean(),
         recovery: z.enum(["repair", "fallback"]).optional(),

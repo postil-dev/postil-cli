@@ -328,7 +328,6 @@ fn open_private_lock_file(path: &Path) -> Result<File> {
     }
     Ok(file)
 }
-
 /// Idempotent: removing an already-absent file is success, matching the
 /// server-side logout endpoint's own idempotence.
 pub fn remove(path: &Path) -> Result<()> {
@@ -449,7 +448,6 @@ mod tests {
     fn unparsable_expiry_fails_closed_as_expired() {
         assert!(sample("not-a-timestamp").is_expired());
     }
-
     #[test]
     fn reads_a_v1_access_only_credential() {
         let dir = tempfile::tempdir().unwrap();

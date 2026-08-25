@@ -144,18 +144,20 @@ pub fn review_contract(cfg: &Config) -> String {
          `.postil/change-metadata`. Findings citing other lines are discarded as \
          ungrounded.\n\
          \n\
-         `repositoryContext` is optional. Omit it for bugs the cited line establishes, including \
-         removed fields, bypassed guards, boundary errors, or lifecycle defects; caller or consumer \
-         impact alone doesn't require it. Include it only when the conclusion depends on \
-         repository-wide evidence, using `claim: absence` for a construct missing from the \
-         complete reviewed head or `claim: mismatch` for a repository target whose expected \
-         value is not established by the cited changed line. When included, name the target in \
-         `resources`, `paths`, or `identifiers` and the expected value in `values` or `versions`; \
-         include all five arrays even when empty. Populated arrays are conjunctive and refute \
-         only when matched in one file. Repository claims require the complete reviewed head. Public \
-         text names the concrete construct \
-         and correction, never review-input boundaries such as `in the diff`, retrieval mechanics, \
-         delegated evidence collection, or guessed files.\n",
+         `repositoryContext` is optional. Omit it when the cited line proves the bug, including \
+         removed fields, bypassed guards, boundary errors, and lifecycle defects; caller impact \
+         alone does not require it. Use it only for a conclusion that depends on complete-head \
+         absence or mismatch. Include all five arrays: targets belong in resources, paths, or \
+         identifiers and expected values in values or versions. Populated arrays are conjunctive. \
+         Public text names the defect and fix, never review boundaries, retrieval, delegation, or \
+         guessed files.\n\
+         \n\
+         `machineClaim` XOR repositoryContext. kind=rust.copy_move_out|symbol.absent|signature.mismatch; \
+         path=src/{lib.rs,main.rs,<non-bin modules>.rs}; symbol=crate::...; signature.mismatch \
+         expectedSignature={receiver:none|shared|mutable|value,parameters,returns,async,unsafe}; \
+         type=unshadowed primitive|crate/std/core path<type,...>|&type|tuple|slice|!; no lifetimes; \
+         leading :: only std/core; preserve. Omit resolution/expansion/compile-dependent claims. \
+         Hide verification.\n",
     );
     if !cfg.focus.is_empty() {
         p.push_str(&format!(
@@ -224,6 +226,7 @@ pub fn system_prompt(cfg: &Config, current_utc_date: Date) -> String {
           \"findings\": [{\"path\": \"file path from the diff\", \"line\": <new-file line>,\n \
           \"endLine\": <optional>, \"severity\": \"info|warn|error\",\n \
           \"kind\": \"risk|humanEscalation|guardrail|uncertainty|contentPolicy\", \"confidence\": <0..1>,\n \
+          \"machineClaim\": <optional typed source claim>,\n \
           \"title\": \"short imperative title\", \"body\": \"specific, evidence-based markdown\",\n \
           \"evidence\": \"exact non-empty new-side text from the cited line\"}]}\n\
          \n\
@@ -321,44 +324,6 @@ pub(crate) fn sanitize_scorer_input(value: &str) -> String {
             }
         })
         .collect()
-}
-
-/// System prompt for the interactive bot answering a maintainer's mention.
-/// The small JSON envelope keeps generated prose behind a deterministic
-/// publication check before it can reach a forge.
-pub fn respond_system_prompt(cfg: &Config, current_utc_date: Date) -> String {
-    let mut p = String::from(
-        "You are Postil, replying to a maintainer who mentioned you on a pull request or \
-         issue. Answer the actual question directly. Ground every claim in the diff or thread \
-         you are given, and cite file:line when you reference code. If something cannot be \
-         determined from the supplied context, say so plainly rather than guessing. No filler, \
-         praise, preamble, or restatement of the question. You do not open pull requests or push \
-         commits; if asked to, explain that you review and answer only.\n\
-         \n\
-         Keep an ordinary reply at or below 1,200 characters. A re-review reply is a compact \
-         review, not an article: report only actionable merge risks, give each risk in one \
-         concise item with its file:line evidence and next action, and say briefly when no such \
-         risk is present. Do not add an overview, implementation tour, correctness section, \
-         generic risk inventory, or verdict. Do not use Markdown headings. Use no more than three \
-         list items.\n\
-         Do not emit active @mentions, raw HTML or HTML comments, details blocks, Markdown \
-         tables, or images.\n\
-         \n\
-         Return ONLY one JSON object with exactly this shape and no markdown fence or surrounding \
-         prose:\n\
-         {\"answer\":\"concise GitHub-flavored Markdown\",\"diagram\":null}\n\
-         The answer must be non-empty and diagram must always be null. Generated diagrams and \
-         Mermaid are not accepted. The publication validator rejects output over 2,400 characters \
-         or 24 nonblank lines, extra fields, Markdown headings, more than three list items, and \
-         unsafe Markdown.",
-    );
-    p.push_str(&trusted_current_date_context(current_utc_date));
-    if let Some(rules) = &cfg.guardrails {
-        p.push_str("\n\nRepository guardrails you may reference:\n");
-        let rules = bounded_untrusted_prompt_text(rules, MAX_GUARDRAIL_PROMPT_BYTES / 2);
-        p.push_str(&rules);
-    }
-    p
 }
 
 const MAX_PR_BODY_PROMPT_CHARS: usize = 2_000;
@@ -549,14 +514,31 @@ mod tests {
         let prompt = system_prompt(&Config::default(), trusted_date());
         assert!(prompt.contains("`repositoryContext` is optional"));
         assert!(prompt.contains(
-            "Omit it for bugs the cited line establishes, including removed fields, bypassed guards, boundary errors, or lifecycle defects"
+            "Omit it when the cited line proves the bug, including removed fields, bypassed guards, boundary errors, and lifecycle defects"
         ));
-        assert!(prompt.contains("caller or consumer impact alone doesn't require it"));
-        assert!(
-            prompt.contains(
-                "Include it only when the conclusion depends on repository-wide evidence"
-            )
-        );
+        assert!(prompt.contains("caller impact alone does not require it"));
+        assert!(prompt.contains("depends on complete-head absence or mismatch"));
+        assert!(prompt.contains("Public text names the defect and fix"));
+    }
+
+    #[test]
+    fn generator_machine_claim_contract_is_bounded_and_explicit() {
+        let prompt = system_prompt(&Config::default(), trusted_date());
+        for kind in ["rust.copy_move_out", "symbol.absent", "signature.mismatch"] {
+            assert!(prompt.contains(kind));
+        }
+        assert!(prompt.contains("path=src/{lib.rs,main.rs,<non-bin modules>.rs}"));
+        assert!(prompt.contains("symbol=crate::..."));
+        assert!(prompt.contains("`machineClaim` XOR repositoryContext"));
+        assert!(prompt.contains(
+            "expectedSignature={receiver:none|shared|mutable|value,parameters,returns,async,unsafe}"
+        ));
+        assert!(prompt.contains("crate/std/core path<type,...>"));
+        assert!(prompt.contains("|&type|tuple|slice|!"));
+        assert!(prompt.contains("leading :: only std/core; preserve"));
+        assert!(prompt.contains("type=unshadowed primitive"));
+        assert!(prompt.contains("resolution/expansion/compile-dependent"));
+        assert!(prompt.contains("Hide verification"));
     }
 
     #[test]
@@ -599,24 +581,6 @@ mod tests {
     }
 
     #[test]
-    fn respond_prompt_requires_a_compact_structured_reply() {
-        let p = respond_system_prompt(&Config::default(), trusted_date());
-        assert_eq!(p.matches("UTC date 2026-08-10; later=future.").count(), 1);
-        assert!(!p.contains("UTC date 2026-08-11; later=future."));
-        assert!(p.contains("at or below 1,200 characters"));
-        assert!(p.contains("not an article"));
-        assert!(p.contains("{\"answer\":\"concise GitHub-flavored Markdown\",\"diagram\":null}"));
-        assert!(p.contains("diagram must always be null"));
-        assert!(p.contains("Mermaid are not accepted"));
-        assert!(!p.contains("When justified"));
-        assert!(!p.contains("materially clarifies"));
-        assert!(p.contains("Do not add an overview"));
-        assert!(p.contains("Do not use Markdown headings"));
-        assert!(p.contains("no more than three list items"));
-        assert!(p.contains("Do not emit active @mentions"));
-    }
-
-    #[test]
     fn system_prompt_omits_content_policy_when_inactive() {
         let mut cfg = Config::default();
         cfg.content_policy = None;
@@ -649,6 +613,7 @@ mod tests {
               \"findings\": [{\"path\": \"file path from the diff\", \"line\": <new-file line>,\n \
               \"endLine\": <optional>, \"severity\": \"info|warn|error\",\n \
               \"kind\": \"risk|humanEscalation|guardrail|uncertainty|contentPolicy\", \"confidence\": <0..1>,\n \
+              \"machineClaim\": <optional typed source claim>,\n \
               \"title\": \"short imperative title\", \"body\": \"specific, evidence-based markdown\",\n \
               \"evidence\": \"exact non-empty new-side text from the cited line\"}]}\n\
              \n\

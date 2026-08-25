@@ -1,5 +1,6 @@
 version = 3
 default_model = "openai/gpt-5.6-luna"
+reasoning_effort = "low"
 cascade = []
 consensus = 1
 api_base = "https://openrouter.ai/api/v1"
@@ -8,5 +9,6 @@ api_format = "openai-compatible"
 [scorer]
 enabled = true
 default_model = "openai/gpt-5.6-luna"
+reasoning_effort = "none"
 fallback = ""
 qualification_candidates = ["openai/gpt-5.6-luna"]

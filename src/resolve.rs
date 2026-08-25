@@ -106,9 +106,9 @@ pub(crate) async fn resolve_uncertainties(
         {
             Ok(Ok(files)) => files,
             Ok(Err(error)) => {
-                eprintln!(
+                crate::progress::notice(format_args!(
                     "postil: uncertainty resolution is continuing with diff evidence after repository file acquisition failed: {error:#}"
-                );
+                ));
                 Vec::new()
             }
             Err(_) => {
@@ -158,9 +158,9 @@ pub(crate) async fn resolve_uncertainties(
                 pass.model_incidents
                     .extend_from_slice(error.model_incidents());
                 pass.usage_accounting_complete &= error.usage_accounting_complete();
-                eprintln!(
+                crate::progress::notice(format_args!(
                     "postil: uncertainty resolution failed open and kept the original finding"
-                );
+                ));
                 None
             }
         };
@@ -187,12 +187,12 @@ pub(crate) async fn resolve_uncertainties(
     }
     pass.suppressed_findings.reverse();
     if confirmed > 0 || unresolved > 0 || !pass.suppressed_findings.is_empty() {
-        eprintln!(
+        crate::progress::telemetry(format_args!(
             "postil: uncertainty resolution confirmed={} refuted={} unresolved={}",
             confirmed,
             pass.suppressed_findings.len(),
             unresolved
-        );
+        ));
     }
     pass
 }
@@ -530,6 +530,8 @@ mod tests {
             scorer_kind: None,
             scorer_reason: None,
             repository_claim: None,
+            machine_claim: None,
+            machine_claim_deferred: false,
             title: "Resolve the uncertain behavior".to_string(),
             body: body.to_string(),
             evidence: None,

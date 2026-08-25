@@ -1,12 +1,14 @@
 # Configuration
 
-Postil resolves settings in this order:
+Postil resolves model settings in this order:
 
 1. Command-line flags
 2. Environment variables
 3. `.postil.yaml`, `.postil.yml`, or `.postil.json`
-4. Translated `.coderabbit.yaml` settings
+4. Stored `postil login` routing
 5. Built-in defaults
+
+Translated `.coderabbit.yaml` settings can supply review policy but do not select a model.
 
 Unknown keys fail validation so a misspelling cannot silently weaken a review.
 
@@ -33,8 +35,10 @@ contentPolicy:
   enabled: true
 model:
   name: provider/qualified-model
+  reasoningEffort: low           # max, xhigh, high, medium, low, minimal, or none
   cascade: []                    # qualified fallbacks only
   # scorer: provider/qualified-scorer
+  scorerReasoningEffort: none
   consensus: 1
 ```
 
@@ -55,12 +59,15 @@ Ignore patterns remove matching paths before grounding, batching, and large-revi
 | `POSTIL_ALLOW_CONFIG_API_BASE` | Honor a repository-controlled `model.apiBase` |
 | `POSTIL_IGNORE_REPOSITORY_MODEL_CONFIG` | Keep trusted local/hosted model selection independent of repository model fields |
 | `REVIEW_MODEL` | Primary model override |
+| `REVIEW_REASONING_EFFORT` | Reviewer reasoning effort: `max`, `xhigh`, `high`, `medium`, `low`, `minimal`, or `none` |
 | `REVIEW_MODEL_CASCADE` | Comma-separated fallback models |
 | `REVIEW_MODEL_CONSENSUS` | Number of models from the generator chain to run concurrently; agreeing findings are retained |
 | `REVIEW_SCORER_MODEL` | Scorer model override |
+| `REVIEW_SCORER_REASONING_EFFORT` | Scorer and adjudication reasoning effort: `max`, `xhigh`, `high`, `medium`, `low`, `minimal`, or `none` |
 | `REVIEW_SCORER_MODEL_CASCADE` | One scorer fallback model |
 | `POSTIL_UNCERTAINTY_RESOLUTION` | Override uncertainty resolution with `true`/`false` or `1`/`0` |
 | `POSTIL_CONCISE_FINDINGS` | Override concise findings with `true`/`false` or `1`/`0` |
+| `POSTIL_NO_PROGRESS` | Disable animated progress and retain concise human milestones when set |
 | `POSTIL_LLM_REQUEST_TIMEOUT_SECS` | Per-attempt model request timeout; defaults to 480 seconds |
 | `POSTIL_LLM_TOTAL_TIMEOUT_SECS` | Optional total local-review model deadline |
 | `POSTIL_DETAILS_URL` | HTTP(S) details link for forge check runs |
@@ -88,4 +95,6 @@ postil config
 postil doctor
 ```
 
-`postil config` prints the resolved non-secret configuration and its sources. `postil doctor` validates endpoint reachability, credential acceptance, and repository setup without printing credential values. Both commands identify renewable logins, access expiry, refresh inactivity expiry, and legacy access-only logins.
+`postil config` prints the resolved non-secret configuration and separate provenance for the model, reviewer reasoning effort, and scorer reasoning effort. `postil doctor` validates endpoint reachability, credential acceptance, and repository setup without printing credential values. Both commands identify renewable logins, access expiry, refresh inactivity expiry, and legacy access-only logins.
+
+Use `--reasoning-effort` and `--scorer-reasoning-effort` for one review. These flags override the matching environment variables, which override `model.reasoningEffort` and `model.scorerReasoningEffort`. The built-in reviewer and scorer defaults are `low` and `none`, respectively. Every request carries the resolved value, including retries and repair calls.

@@ -36,10 +36,20 @@ const boundedIdentifierSchema = z.string().trim().min(1).refine(
   "identifier must not contain line breaks",
 );
 const optionalIdentifierSchema = z.union([z.literal(""), boundedIdentifierSchema]);
+const reasoningEffortSchema = z.enum([
+  "max",
+  "xhigh",
+  "high",
+  "medium",
+  "low",
+  "minimal",
+  "none",
+]);
 
 const modelDefaultsSchema = z.object({
   version: z.number().int().positive(),
   default_model: optionalIdentifierSchema,
+  reasoning_effort: reasoningEffortSchema,
   cascade: z.array(boundedIdentifierSchema),
   consensus: z.number().int().positive(),
   api_base: z.literal("https://openrouter.ai/api/v1"),
@@ -47,6 +57,7 @@ const modelDefaultsSchema = z.object({
   scorer: z.object({
     enabled: z.boolean(),
     default_model: optionalIdentifierSchema,
+    reasoning_effort: reasoningEffortSchema,
     fallback: optionalIdentifierSchema,
     qualification_candidates: z.array(boundedIdentifierSchema),
   }).strict(),

@@ -7,9 +7,6 @@
 - Two-check semantics (postil/review advisory, postil/gate blocking); `gate.onError:
   block|advisory` for fail-open on provider outages.
 - Incremental re-review with resolved/carried reconciliation.
-- Interactive bot (`postil respond`): replies to @postil mentions across every forge.
-  GitHub and GitLab cover PRs/MRs and issues; Bitbucket and Azure DevOps cover pull
-  requests. Review-and-answer only — never opens PRs or pushes.
 - SARIF 2.1.0 output (`--sarif`) for code-scanning ingestion.
 - Repo guardrails file (`.postil/guardrails.md`) injected into the prompt; violations
   surface as `kind: guardrail` findings that quote the rule.
@@ -48,10 +45,6 @@
   large PRs.
 - Learning from dismissals: feed comment-resolution outcomes from the hosted platform
   back into per-repo suppression hints.
-- `postil respond` on the Bitbucket issue tracker and Azure DevOps work items (today
-  scoped to PRs there; those comment endpoints use a different base/version we have not
-  confirmed against a live host), and a visible error reply when the hosted bot exhausts
-  its retries (today a dead respond job is only logged).
 - An `/evidence` benchmark: Postil's own silence rate and confirmed-finding rate on
   public OSS PRs, with raw envelopes.
 

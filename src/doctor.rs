@@ -220,7 +220,6 @@ pub fn print_report(checks: &[Check]) -> bool {
     }
     all_ok
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -22,6 +22,14 @@ pub(crate) fn names_text() -> String {
     API_KEY_ENV_VARS.join(", ")
 }
 
+pub(crate) fn credential_help() -> String {
+    format!(
+        "default model is {}; run `postil login` for hosted inference or set one of {}; see `postil models` for supported model IDs, embedded defaults, qualification status, and override syntax",
+        crate::config::default_model(),
+        names_text()
+    )
+}
+
 pub(crate) fn resolve_from_process_env() -> Option<String> {
     resolve_with(|name| std::env::var(name).ok())
 }

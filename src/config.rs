@@ -1,7 +1,8 @@
 //! Resolved review configuration.
 //!
-//! Precedence: CLI flags > environment > `.postil.{yaml,yml,json}` >
-//! `.coderabbit.yaml` (translated) > defaults.
+//! Model precedence: CLI flags > environment > `.postil.{yaml,yml,json}` >
+//! stored login routing > embedded defaults. Translated `.coderabbit.yaml`
+//! settings do not select a model.
 //!
 //! Exception: `model.apiBase` from a config file is repo-controlled, and the
 //! resolved base URL receives the deployment's bearer key. It is ignored by
@@ -14,9 +15,9 @@
 //! valid, unexpired credential exists at
 //! `${XDG_CONFIG_HOME:-~/.config}/postil/credentials.json`,
 //! `login::resolve_stored_token` supplies its bearer key and its `apiBase`/
-//! `model` replace the values resolved above. `REVIEW_MODEL` may still replace
-//! the model. `POSTIL_API_BASE` may replace the endpoint only when an explicit
-//! API key is also set; a stored login remains bound to its issuing endpoint.
+//! `model` provide the baseline below trusted project configuration and
+//! environment overrides. A resolved endpoint override is accepted only with
+//! an explicit API key; a stored login remains bound to its issuing endpoint.
 //! An expired or unreadable stored credential is left alone here;
 //! `resolve_api_key` reports it as one actionable "run `postil login` again"
 //! error, while `postil config` reports the stored-login state without needing
@@ -118,17 +119,61 @@ impl ApiFormat {
     }
 }
 
+pub const REASONING_EFFORT_VALUES: &str = "max|xhigh|high|medium|low|minimal|none";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    Max,
+    Xhigh,
+    High,
+    Medium,
+    Low,
+    Minimal,
+    None,
+}
+
+impl ReasoningEffort {
+    pub fn parse(field: &str, value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "max" => Ok(Self::Max),
+            "xhigh" => Ok(Self::Xhigh),
+            "high" => Ok(Self::High),
+            "medium" => Ok(Self::Medium),
+            "low" => Ok(Self::Low),
+            "minimal" => Ok(Self::Minimal),
+            "none" => Ok(Self::None),
+            _ => anyhow::bail!(
+                "invalid {field} {value:?}; accepted values: {REASONING_EFFORT_VALUES}"
+            ),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Max => "max",
+            Self::Xhigh => "xhigh",
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+            Self::Minimal => "minimal",
+            Self::None => "none",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelDefaults {
     pub version: u64,
     pub source_sha256: String,
     pub default_model: String,
+    pub reasoning_effort: ReasoningEffort,
     pub cascade: Vec<String>,
     pub consensus: usize,
     pub api_base: String,
     pub api_format: ApiFormat,
     pub scorer_enabled: bool,
     pub scorer_model: String,
+    pub scorer_reasoning_effort: ReasoningEffort,
     pub scorer_fallback: String,
     pub scorer_qualification_candidates: Vec<String>,
 }
@@ -240,6 +285,7 @@ const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
 const QUALIFICATION_CANDIDATE_PROFILE_ENV: &str = "POSTIL_QUALIFICATION_CANDIDATE_PROFILE";
 const BENCH_SCREEN_PROFILE_ENV: &str = "POSTIL_BENCH_SCREEN_PROFILE";
 const BENCH_FORCE_BOUNDED_SELECTION_ENV: &str = "POSTIL_BENCH_FORCE_BOUNDED_SELECTION";
+const IGNORE_REPOSITORY_MODEL_CONFIG_ENV: &str = "POSTIL_IGNORE_REPOSITORY_MODEL_CONFIG";
 const PROVISIONAL_HOSTED_ROSTER_ENV: &str = "POSTIL_PROVISIONAL_HOSTED_ROSTER";
 
 #[derive(Debug, Deserialize)]
@@ -247,6 +293,7 @@ const PROVISIONAL_HOSTED_ROSTER_ENV: &str = "POSTIL_PROVISIONAL_HOSTED_ROSTER";
 struct ModelDefaultsFile {
     version: u64,
     default_model: String,
+    reasoning_effort: String,
     cascade: Vec<String>,
     consensus: usize,
     api_base: String,
@@ -259,6 +306,7 @@ struct ModelDefaultsFile {
 struct ScorerDefaultsFile {
     enabled: bool,
     default_model: String,
+    reasoning_effort: String,
     fallback: String,
     qualification_candidates: Vec<String>,
 }
@@ -278,8 +326,16 @@ pub fn default_cascade() -> &'static [String] {
     model_defaults().cascade.as_slice()
 }
 
+pub fn default_reasoning_effort() -> ReasoningEffort {
+    model_defaults().reasoning_effort
+}
+
 pub fn default_scorer_model() -> &'static str {
     model_defaults().scorer_model.as_str()
+}
+
+pub fn default_scorer_reasoning_effort() -> ReasoningEffort {
+    model_defaults().scorer_reasoning_effort
 }
 
 pub fn default_scorer_fallback() -> &'static str {
@@ -407,6 +463,9 @@ fn admitted_profile_for(
 }
 
 pub fn admitted_profile_for_config(config: &Config) -> Option<&'static QualificationProfile> {
+    if !reasoning_efforts_match_embedded_defaults(config) {
+        return None;
+    }
     let generator_chain = config.model_chain();
     let scorer_chain = config.scorer_chain();
     let api_base = normalize_api_base(&config.api_base).ok()?;
@@ -417,6 +476,12 @@ pub fn admitted_profile_for_config(config: &Config) -> Option<&'static Qualifica
             && profile.api_base == api_base
             && profile.api_format == config.api_format
     })
+}
+
+fn reasoning_efforts_match_embedded_defaults(config: &Config) -> bool {
+    let defaults = model_defaults();
+    config.reasoning_effort == defaults.reasoning_effort
+        && config.scorer_reasoning_effort == defaults.scorer_reasoning_effort
 }
 
 fn evaluator_runtime_identity() -> String {
@@ -721,6 +786,9 @@ fn validate_qualification_authority(manifest: &QualificationManifest, now: u64) 
 
 fn parse_model_defaults(raw: &str) -> Result<ModelDefaults> {
     let file: ModelDefaultsFile = toml::from_str(raw)?;
+    let reasoning_effort = ReasoningEffort::parse("reasoning_effort", &file.reasoning_effort)?;
+    let scorer_reasoning_effort =
+        ReasoningEffort::parse("scorer.reasoning_effort", &file.scorer.reasoning_effort)?;
     anyhow::ensure!(
         file.version > 0,
         "model defaults version must be greater than zero"
@@ -786,12 +854,14 @@ fn parse_model_defaults(raw: &str) -> Result<ModelDefaults> {
         version: file.version,
         source_sha256: sha256_hex(raw),
         default_model: file.default_model,
+        reasoning_effort,
         cascade: file.cascade,
         consensus: file.consensus,
         api_base: file.api_base,
         api_format: file.api_format,
         scorer_enabled: file.scorer.enabled,
         scorer_model: file.scorer.default_model,
+        scorer_reasoning_effort,
         scorer_fallback: file.scorer.fallback,
         scorer_qualification_candidates: file.scorer.qualification_candidates,
     })
@@ -980,8 +1050,14 @@ pub struct Config {
     /// also meet the calibrated 0.30 gate confidence floor. Default: [HumanEscalation].
     pub block_on_kinds: Vec<Kind>,
     pub model: String,
+    pub reasoning_effort: ReasoningEffort,
+    /// Winning source for reviewer reasoning effort, shown by `postil config`.
+    pub reasoning_effort_source: String,
     pub cascade: Vec<String>,
     pub scorer: String,
+    pub scorer_reasoning_effort: ReasoningEffort,
+    /// Winning source for scorer reasoning effort, shown by `postil config`.
+    pub scorer_reasoning_effort_source: String,
     pub scorer_fallback: String,
     /// Embedded scoring remains disabled until a candidate passes the repeated
     /// qualification gate. BYOK can select a scorer and one fallback.
@@ -1003,6 +1079,8 @@ pub struct Config {
     pub content_policy_disabled: bool,
     /// Where the config came from, for `postil config` provenance.
     pub source: String,
+    /// Winning source for the generator chain, shown by `postil config`.
+    pub model_source: String,
 }
 
 impl Default for Config {
@@ -1023,9 +1101,13 @@ impl Default for Config {
             gate_fail_on: GateLevel::Severity(Severity::Error),
             gate_on_error: OnError::Block,
             block_on_kinds: vec![Kind::HumanEscalation],
-            model: String::new(),
-            cascade: Vec::new(),
+            model: defaults.default_model.clone(),
+            reasoning_effort: defaults.reasoning_effort,
+            reasoning_effort_source: "embedded default".to_string(),
+            cascade: defaults.cascade.clone(),
             scorer: String::new(),
+            scorer_reasoning_effort: defaults.scorer_reasoning_effort,
+            scorer_reasoning_effort_source: "embedded default".to_string(),
             scorer_fallback: String::new(),
             scorer_enabled: false,
             api_base: defaults.api_base.clone(),
@@ -1035,6 +1117,7 @@ impl Default for Config {
             content_policy: Some(BUILTIN_CONTENT_POLICY.to_string()),
             content_policy_disabled: false,
             source: "defaults".to_string(),
+            model_source: "embedded default".to_string(),
         }
     }
 }
@@ -1084,8 +1167,10 @@ pub struct GateSection {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ModelSection {
     pub name: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub cascade: Option<Vec<String>>,
     pub scorer: Option<String>,
+    pub scorer_reasoning_effort: Option<String>,
     pub api_base: Option<String>,
     pub api_format: Option<ApiFormat>,
     pub consensus: Option<usize>,
@@ -1108,27 +1193,29 @@ impl Config {
     /// Resolve config for a repo root. `explicit` (from --config) bypasses discovery.
     pub fn load(root: &Path, explicit: Option<&Path>) -> Result<Config> {
         #[cfg(test)]
-        let _environment_guard = tests::env_lock().lock().unwrap();
-        let mut cfg = if let Some(path) = explicit {
-            let mut c = Self::from_postil_file(path)
+        let _environment_guard = crate::test_env_lock().lock().unwrap();
+        let mut cfg = Config::default();
+        // Login supplies a local baseline, below trusted project configuration
+        // and environment overrides but above the embedded provider defaults.
+        cfg.apply_stored_login_credential();
+        if let Some(path) = explicit {
+            let file = Self::read_postil_file(path)
                 .with_context(|| format!("reading config {}", path.display()))?;
-            c.source = path.display().to_string();
-            c
+            cfg.apply_file(file)?;
+            cfg.source = path.display().to_string();
         } else if let Some(path) =
             find_first(root, &[".postil.yaml", ".postil.yml", ".postil.json"])
         {
-            let mut c = Self::from_postil_file(&path)
+            let file = Self::read_postil_file(&path)
                 .with_context(|| format!("reading config {}", path.display()))?;
-            c.source = rel_name(&path);
-            c
+            cfg.apply_file(file)?;
+            cfg.source = rel_name(&path);
         } else if let Some(path) = find_first(root, &[".coderabbit.yaml", ".coderabbit.yml"]) {
-            let mut c = Self::from_coderabbit(&path)
+            let translated = Self::from_coderabbit(&path)
                 .with_context(|| format!("translating {}", path.display()))?;
-            c.source = format!("{} (translated)", rel_name(&path));
-            c
-        } else {
-            Config::default()
-        };
+            cfg.apply_translated_config(translated);
+            cfg.source = format!("{} (translated)", rel_name(&path));
+        }
         cfg.apply_env()?;
         validate_benchmark_bounded_selection(&cfg)?;
         // Repo guardrails are a separate file so they can be long-form prose.
@@ -1159,7 +1246,7 @@ impl Config {
         Ok(cfg)
     }
 
-    fn from_postil_file(path: &Path) -> Result<Config> {
+    fn read_postil_file(path: &Path) -> Result<FileConfig> {
         let raw = std::fs::read_to_string(path)?;
         let file: FileConfig = if path.extension().is_some_and(|e| e == "json") {
             serde_json::from_str(&raw)?
@@ -1167,9 +1254,7 @@ impl Config {
             parse_yaml_value(&raw)?;
             yaml_serde::from_str(&raw)?
         };
-        let mut cfg = Config::default();
-        cfg.apply_file(file)?;
-        Ok(cfg)
+        Ok(file)
     }
 
     pub fn apply_file(&mut self, f: FileConfig) -> Result<()> {
@@ -1250,12 +1335,18 @@ impl Config {
         }
         if let Some(m) = f.model {
             if hosted_mode {
-                eprintln!(
+                crate::progress::notice(format_args!(
                     "postil: ignoring repository model configuration in hosted mode; hosted inference selects the provider and model roster"
-                );
+                ));
             } else {
                 if let Some(n) = m.name {
                     self.model = n;
+                    self.model_source = "trusted project config".to_string();
+                }
+                if let Some(effort) = m.reasoning_effort {
+                    self.reasoning_effort =
+                        ReasoningEffort::parse("model.reasoningEffort", &effort)?;
+                    self.reasoning_effort_source = "trusted project config".to_string();
                 }
                 if let Some(c) = m.cascade {
                     self.cascade = c;
@@ -1264,6 +1355,11 @@ impl Config {
                     self.scorer = s;
                     self.scorer_fallback.clear();
                     self.scorer_enabled = true;
+                }
+                if let Some(effort) = m.scorer_reasoning_effort {
+                    self.scorer_reasoning_effort =
+                        ReasoningEffort::parse("model.scorerReasoningEffort", &effort)?;
+                    self.scorer_reasoning_effort_source = "trusted project config".to_string();
                 }
                 if let Some(b) = m.api_base {
                     // `model.apiBase` from `.postil.yaml` is repo-controlled, and the
@@ -1276,11 +1372,11 @@ impl Config {
                     if allow_api_base {
                         self.api_base = b;
                     } else {
-                        eprintln!(
+                        crate::progress::notice(format_args!(
                             "postil: ignoring model.apiBase from config ({b:?}); set \
                              POSTIL_ALLOW_CONFIG_API_BASE=1 to honor it, or use the \
                              POSTIL_API_BASE environment variable"
-                        );
+                        ));
                     }
                 }
                 if let Some(format) = m.api_format {
@@ -1347,6 +1443,12 @@ impl Config {
         Ok(cfg)
     }
 
+    fn apply_translated_config(&mut self, translated: Config) {
+        self.enabled = translated.enabled;
+        self.ignore = translated.ignore;
+        self.min_confidence = translated.min_confidence;
+    }
+
     fn apply_env(&mut self) -> Result<()> {
         if let Ok(value) = std::env::var("POSTIL_CONCISE_FINDINGS")
             && !value.trim().is_empty()
@@ -1370,6 +1472,19 @@ impl Config {
                 ),
             };
         }
+        if let Ok(value) = std::env::var("REVIEW_REASONING_EFFORT")
+            && !value.trim().is_empty()
+        {
+            self.reasoning_effort = ReasoningEffort::parse("REVIEW_REASONING_EFFORT", &value)?;
+            self.reasoning_effort_source = "environment".to_string();
+        }
+        if let Ok(value) = std::env::var("REVIEW_SCORER_REASONING_EFFORT")
+            && !value.trim().is_empty()
+        {
+            self.scorer_reasoning_effort =
+                ReasoningEffort::parse("REVIEW_SCORER_REASONING_EFFORT", &value)?;
+            self.scorer_reasoning_effort_source = "environment".to_string();
+        }
         if hosted_mode() {
             if let Some(profile) = admitted_profile_for(model_defaults(), qualification_manifest())
             {
@@ -1381,6 +1496,7 @@ impl Config {
                 self.scorer_enabled = !profile.scorer_chain.is_empty();
                 self.api_base = profile.api_base.clone();
                 self.api_format = profile.api_format;
+                self.model_source = "hosted qualification profile".to_string();
             } else if provisional_hosted_roster_enabled() {
                 let profile = provisional_hosted_profile();
                 self.model = profile.generator_chain[0].clone();
@@ -1391,6 +1507,7 @@ impl Config {
                 self.scorer_enabled = !profile.scorer_chain.is_empty();
                 self.api_base = profile.api_base.clone();
                 self.api_format = profile.api_format;
+                self.model_source = "hosted provisional profile".to_string();
             }
             return Ok(());
         }
@@ -1405,12 +1522,14 @@ impl Config {
             self.scorer_enabled = true;
             self.api_base = profile.api_base;
             self.api_format = profile.api_format;
+            self.model_source = "qualification candidate profile".to_string();
             return Ok(());
         }
         if let Ok(m) = std::env::var("REVIEW_MODEL")
-            && !m.is_empty()
+            && !m.trim().is_empty()
         {
             self.model = m;
+            self.model_source = "environment".to_string();
         }
         if let Ok(c) = std::env::var("REVIEW_MODEL_CASCADE")
             && !c.is_empty()
@@ -1466,17 +1585,15 @@ impl Config {
         {
             self.api_format = ApiFormat::parse(&format)?;
         }
-        self.apply_stored_login_credential();
         Ok(())
     }
 
-    /// A first-time `postil login` user gets working defaults with zero
-    /// `.postil.yaml`: when no explicit key env var is set, a stored
-    /// credential supplies `apiBase` and `model`, unless `POSTIL_API_BASE` or
-    /// `REVIEW_MODEL` (just applied above) already overrode them. Runtime
-    /// credential resolution rejects an endpoint override when no explicit
-    /// API key is set. The cascade is cleared along with `model`, since a
-    /// leftover BYOK cascade names models the hosted gateway does not operate.
+    /// A stored `postil login` credential supplies a local fallback API base
+    /// and model. Project configuration and environment variables are applied
+    /// after this method and therefore retain their documented precedence.
+    /// Runtime credential resolution rejects an endpoint override when no
+    /// explicit API key is set. The cascade is cleared with the model because
+    /// a BYOK fallback chain does not describe the hosted gateway.
     ///
     /// This applies even when the credential is expired: routing
     /// (`apiBase`/`model`) is not a secret, and populating it here is what
@@ -1485,23 +1602,21 @@ impl Config {
     /// resolution in `resolve_api_key` is the sole place that enforces and
     /// reports expiry -- it still refuses the token regardless of what
     /// happens here.
-    fn apply_stored_login_credential(&mut self) {
+    fn apply_stored_login_credential(&mut self) -> bool {
         if api_key::resolve_from_process_env().is_some() {
-            return;
+            return false;
         }
         let Ok(path) = credentials::default_path() else {
-            return;
+            return false;
         };
         let Ok(Some(creds)) = credentials::read(&path) else {
-            return;
+            return false;
         };
-        if std::env::var("POSTIL_API_BASE").is_err() {
-            self.api_base = creds.api_base;
-        }
-        if std::env::var("REVIEW_MODEL").is_err() {
-            self.model = creds.model;
-            self.cascade.clear();
-        }
+        self.api_base = creds.api_base;
+        self.model = creds.model;
+        self.cascade.clear();
+        self.model_source = "stored login".to_string();
+        true
     }
 
     /// All models to try, in order, deduplicated.
@@ -1542,9 +1657,20 @@ impl Config {
             return Ok(());
         }
         let generator_chain = self.model_chain();
+        if self.api_format == ApiFormat::Anthropic {
+            anyhow::ensure!(
+                self.reasoning_effort != ReasoningEffort::Minimal,
+                "model.reasoningEffort minimal is unsupported by the Anthropic request format; accepted Anthropic values: max|xhigh|high|medium|low|none"
+            );
+            anyhow::ensure!(
+                self.scorer_reasoning_effort != ReasoningEffort::Minimal,
+                "model.scorerReasoningEffort minimal is unsupported by the Anthropic request format; accepted Anthropic values: max|xhigh|high|medium|low|none"
+            );
+        }
         anyhow::ensure!(
             !generator_chain.is_empty(),
-            "no review model is configured; pass --model, set REVIEW_MODEL, or set model.name in a trusted local config"
+            "no review model is configured; remove the empty override to use default {}, or run `postil models` for supported model IDs, qualification status, and override syntax",
+            default_model()
         );
         if hosted {
             let manifest = qualification_manifest();
@@ -1555,6 +1681,7 @@ impl Config {
                         && profile.consensus == self.consensus
                         && profile.scorer_chain == scorer_chain
                         && profile.api_format == self.api_format
+                        && reasoning_efforts_match_embedded_defaults(self)
                         && normalize_api_base(&self.api_base).ok().as_deref()
                             == Some(profile.api_base.as_str())
                 }) || (provisional && provisional_hosted_profile_for_config(self).is_some()),
@@ -1761,7 +1888,8 @@ pub(crate) fn benchmark_screening_profile_for_config(
             && profile.consensus == config.consensus
             && profile.scorer_chain == config.scorer_chain()
             && profile.api_base == api_base
-            && profile.api_format == config.api_format,
+            && profile.api_format == config.api_format
+            && reasoning_efforts_match_embedded_defaults(config),
         "benchmark screening profile does not exactly match the resolved review configuration"
     );
     Ok(Some(profile))
@@ -1860,7 +1988,8 @@ pub(crate) fn qualification_candidate_profile_for_config(
             && profile.consensus == config.consensus
             && profile.scorer_chain == config.scorer_chain()
             && profile.api_base == api_base
-            && profile.api_format == config.api_format,
+            && profile.api_format == config.api_format
+            && reasoning_efforts_match_embedded_defaults(config),
         "qualification candidate profile does not exactly match the resolved review configuration"
     );
     Ok(Some(profile))
@@ -1905,6 +2034,7 @@ fn provisional_hosted_profile_for_config(config: &Config) -> Option<Qualificatio
         || config.consensus != profile.consensus
         || config.api_format != profile.api_format
         || api_base != profile.api_base
+        || !reasoning_efforts_match_embedded_defaults(config)
     {
         return None;
     }
@@ -1956,7 +2086,7 @@ fn repository_model_config_locked() -> bool {
     hosted_runtime_mode()
         || benchmark_screening_mode()
         || benchmark_force_bounded_selection_requested()
-        || std::env::var("POSTIL_IGNORE_REPOSITORY_MODEL_CONFIG")
+        || std::env::var(IGNORE_REPOSITORY_MODEL_CONFIG_ENV)
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
 }
@@ -2039,8 +2169,10 @@ gate:
 
 model:
   name: __DEFAULT_MODEL__
+  reasoningEffort: __DEFAULT_REASONING_EFFORT__ # max | xhigh | high | medium | low | minimal | none
   cascade:
 __DEFAULT_CASCADE__  # scorer: provider/model  # explicit BYOK opt-in; embedded scoring is disabled
+  scorerReasoningEffort: __DEFAULT_SCORER_REASONING_EFFORT__
   # apiBase: https://openrouter.ai/api/v1   # OpenAI-compatible or Anthropic endpoint base URL.
   # apiFormat: openai-compatible             # openai-compatible (default) or anthropic.
   #                                         # Ignored from config by default (a repo could redirect
@@ -2066,6 +2198,14 @@ pub fn starter_config() -> &'static str {
             .collect::<String>();
         STARTER_CONFIG_TEMPLATE
             .replace("__DEFAULT_MODEL__", &yaml_scalar(&defaults.model))
+            .replace(
+                "__DEFAULT_REASONING_EFFORT__",
+                defaults.reasoning_effort.as_str(),
+            )
+            .replace(
+                "__DEFAULT_SCORER_REASONING_EFFORT__",
+                defaults.scorer_reasoning_effort.as_str(),
+            )
             .replace("__DEFAULT_CASCADE__", &cascade)
     })
 }
@@ -2081,8 +2221,8 @@ pub const BUILTIN_CONTENT_POLICY: &str = include_str!("builtin-content-policy.md
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_env_lock as env_lock;
     use std::io::Write;
-    use std::sync::Mutex;
 
     struct EnvRestore {
         name: &'static str,
@@ -2102,6 +2242,12 @@ mod tests {
                 std::env::set_var(name, value);
             }
         }
+
+        fn remove(name: &str) {
+            unsafe {
+                std::env::remove_var(name);
+            }
+        }
     }
 
     impl Drop for EnvRestore {
@@ -2117,9 +2263,44 @@ mod tests {
         }
     }
 
-    pub(super) fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+    /// Pin tests that exercise local repository model configuration to the
+    /// local runtime contract. The production wrapper intentionally enters
+    /// hosted mode when deployment environment says so, therefore these tests
+    /// must not inherit that process-wide state from another test or harness.
+    struct LocalModelConfigEnv {
+        _hosted: EnvRestore,
+        _candidate: EnvRestore,
+        _screening: EnvRestore,
+        _bounded: EnvRestore,
+        _ignore_repository_models: EnvRestore,
+        _review_reasoning_effort: EnvRestore,
+        _scorer_reasoning_effort: EnvRestore,
+    }
+
+    impl LocalModelConfigEnv {
+        fn clear() -> Self {
+            let environment = Self {
+                _hosted: EnvRestore::capture("POSTIL_HOSTED_MODE"),
+                _candidate: EnvRestore::capture(QUALIFICATION_CANDIDATE_PROFILE_ENV),
+                _screening: EnvRestore::capture(BENCH_SCREEN_PROFILE_ENV),
+                _bounded: EnvRestore::capture(BENCH_FORCE_BOUNDED_SELECTION_ENV),
+                _ignore_repository_models: EnvRestore::capture(IGNORE_REPOSITORY_MODEL_CONFIG_ENV),
+                _review_reasoning_effort: EnvRestore::capture("REVIEW_REASONING_EFFORT"),
+                _scorer_reasoning_effort: EnvRestore::capture("REVIEW_SCORER_REASONING_EFFORT"),
+            };
+            for name in [
+                "POSTIL_HOSTED_MODE",
+                QUALIFICATION_CANDIDATE_PROFILE_ENV,
+                BENCH_SCREEN_PROFILE_ENV,
+                BENCH_FORCE_BOUNDED_SELECTION_ENV,
+                IGNORE_REPOSITORY_MODEL_CONFIG_ENV,
+                "REVIEW_REASONING_EFFORT",
+                "REVIEW_SCORER_REASONING_EFFORT",
+            ] {
+                EnvRestore::remove(name);
+            }
+            environment
+        }
     }
 
     fn write(dir: &Path, name: &str, content: &str) {
@@ -2183,6 +2364,10 @@ mod tests {
         assert_eq!(parsed.source_sha256.len(), 64);
         assert_eq!(parsed.default_model, raw["default_model"].as_str().unwrap());
         assert_eq!(
+            parsed.reasoning_effort.as_str(),
+            raw["reasoning_effort"].as_str().unwrap()
+        );
+        assert_eq!(
             parsed.cascade,
             raw["cascade"]
                 .as_array()
@@ -2194,6 +2379,10 @@ mod tests {
         assert_eq!(
             parsed.scorer_model,
             raw["scorer"]["default_model"].as_str().unwrap()
+        );
+        assert_eq!(
+            parsed.scorer_reasoning_effort.as_str(),
+            raw["scorer"]["reasoning_effort"].as_str().unwrap()
         );
         assert_eq!(
             parsed.scorer_fallback,
@@ -2220,11 +2409,28 @@ mod tests {
         let defaults = model_defaults();
         assert_eq!(default_model(), defaults.default_model);
         assert_eq!(super::default_cascade(), defaults.cascade);
+        assert_eq!(default_reasoning_effort(), defaults.reasoning_effort);
         assert_eq!(default_scorer_model(), defaults.scorer_model);
         assert_eq!(default_scorer_fallback(), defaults.scorer_fallback);
         assert_eq!(
+            default_scorer_reasoning_effort(),
+            defaults.scorer_reasoning_effort
+        );
+        assert_eq!(
             scorer_qualification_candidates(),
             defaults.scorer_qualification_candidates
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_parser_matches_the_openrouter_contract() {
+        for value in ["max", "xhigh", "high", "medium", "low", "minimal", "none"] {
+            let parsed = ReasoningEffort::parse("effort", value).unwrap();
+            assert_eq!(parsed.as_str(), value);
+        }
+        assert_eq!(
+            ReasoningEffort::parse("effort", " XHIGH ").unwrap(),
+            ReasoningEffort::Xhigh
         );
     }
 
@@ -2233,6 +2439,7 @@ mod tests {
         let err = parse_model_defaults(
             r#"version = 1
 default_model = "example/model"
+reasoning_effort = "low"
 cascade = ["example/fallback"]
 consensus = 1
 api_base = "https://openrouter.ai/api/v1"
@@ -2242,6 +2449,7 @@ unexpected_key = "typo"
 [scorer]
 enabled = false
 default_model = "example/scorer"
+reasoning_effort = "none"
 fallback = "example/scorer-fallback"
 qualification_candidates = ["example/scorer"]
 "#,
@@ -2258,41 +2466,45 @@ qualification_candidates = ["example/scorer"]
             (
                 "version = 0\n\
                  default_model = \"example/model\"\n\
+                 reasoning_effort = \"low\"\n\
                  cascade = [\"example/fallback\"]\n\
                  consensus = 1\n\
                  api_base = \"https://openrouter.ai/api/v1\"\n\
                  api_format = \"openai-compatible\"\n\
-                 scorer = { enabled = false, default_model = \"example/scorer\", fallback = \"example/scorer-fallback\", qualification_candidates = [\"example/scorer\"] }\n",
+                 scorer = { enabled = false, default_model = \"example/scorer\", reasoning_effort = \"none\", fallback = \"example/scorer-fallback\", qualification_candidates = [\"example/scorer\"] }\n",
                 "version must be greater than zero",
             ),
             (
                 "version = 1\n\
                  default_model = \"\"\n\
+                 reasoning_effort = \"low\"\n\
                  cascade = [\"example/fallback\"]\n\
                  consensus = 1\n\
                  api_base = \"https://openrouter.ai/api/v1\"\n\
                  api_format = \"openai-compatible\"\n\
-                 scorer = { enabled = false, default_model = \"example/scorer\", fallback = \"example/scorer-fallback\", qualification_candidates = [\"example/scorer\"] }\n",
+                 scorer = { enabled = false, default_model = \"example/scorer\", reasoning_effort = \"none\", fallback = \"example/scorer-fallback\", qualification_candidates = [\"example/scorer\"] }\n",
                 "cascade must be empty when defaultModel is empty",
             ),
             (
                 "version = 1\n\
                  default_model = \"example/model\"\n\
+                 reasoning_effort = \"low\"\n\
                  cascade = [\"\"]\n\
                  consensus = 1\n\
                  api_base = \"https://openrouter.ai/api/v1\"\n\
                  api_format = \"openai-compatible\"\n\
-                 scorer = { enabled = false, default_model = \"example/scorer\", fallback = \"example/scorer-fallback\", qualification_candidates = [\"example/scorer\"] }\n",
+                 scorer = { enabled = false, default_model = \"example/scorer\", reasoning_effort = \"none\", fallback = \"example/scorer-fallback\", qualification_candidates = [\"example/scorer\"] }\n",
                 "cascade entries must not be empty",
             ),
             (
                 "version = 1\n\
                  default_model = \"example/model\"\n\
+                 reasoning_effort = \"low\"\n\
                  cascade = [\"example/fallback\"]\n\
                  consensus = 1\n\
                  api_base = \"https://openrouter.ai/api/v1\"\n\
                  api_format = \"openai-compatible\"\n\
-                 scorer = { enabled = false, default_model = \"\", fallback = \"example/scorer-fallback\", qualification_candidates = [\"example/scorer\"] }\n",
+                 scorer = { enabled = false, default_model = \"\", reasoning_effort = \"none\", fallback = \"example/scorer-fallback\", qualification_candidates = [\"example/scorer\"] }\n",
                 "scorer configuration must be empty when scorer.defaultModel is empty",
             ),
         ];
@@ -2309,11 +2521,12 @@ qualification_candidates = ["example/scorer"]
     fn model_defaults_reject_duplicate_generator_and_scorer_entries() {
         let duplicate_generator = r#"version = 1
 default_model = "provider/model"
+reasoning_effort = "low"
 cascade = ["provider/model"]
 consensus = 2
 api_base = "https://openrouter.ai/api/v1"
 api_format = "openai-compatible"
-scorer = { enabled = true, default_model = "provider/scorer", fallback = "", qualification_candidates = [] }
+scorer = { enabled = true, default_model = "provider/scorer", reasoning_effort = "none", fallback = "", qualification_candidates = [] }
 "#;
         assert!(
             parse_model_defaults(duplicate_generator)
@@ -2324,11 +2537,12 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "", qua
 
         let duplicate_scorer = r#"version = 1
 default_model = "provider/model"
+reasoning_effort = "low"
 cascade = []
 consensus = 1
 api_base = "https://openrouter.ai/api/v1"
 api_format = "openai-compatible"
-scorer = { enabled = true, default_model = "provider/scorer", fallback = "provider/scorer", qualification_candidates = [] }
+scorer = { enabled = true, default_model = "provider/scorer", reasoning_effort = "none", fallback = "provider/scorer", qualification_candidates = [] }
 "#;
         assert!(
             parse_model_defaults(duplicate_scorer)
@@ -2348,11 +2562,16 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
     }
 
     #[test]
-    fn provider_guide_requires_qualified_explicit_models() {
+    fn provider_guide_documents_local_default_and_hosted_admission() {
         let readme = include_str!("../README.md");
         assert!(readme.contains("docs/model-providers.md"));
         let provider_guide = include_str!("../docs/model-providers.md");
-        assert!(provider_guide.contains("no implicit model or fallback chain"));
+        assert!(provider_guide.contains("openai/gpt-5.6-luna"));
+        assert!(provider_guide.contains("postil models"));
+        assert!(provider_guide.contains("reasoning.effort"));
+        assert!(provider_guide.contains("`minimal`"));
+        assert!(provider_guide.contains("`none`"));
+        assert!(provider_guide.contains("output_config.effort"));
         assert!(provider_guide.contains("qualification manifest"));
     }
 
@@ -2539,17 +2758,213 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
     }
 
     #[test]
-    fn defaults_require_an_explicit_model_roster() {
+    fn defaults_use_the_embedded_generator_roster_without_a_scorer() {
         let c = Config::default();
         let defaults = model_defaults();
-        assert!(c.model.is_empty());
-        assert!(c.cascade.is_empty());
-        assert!(c.scorer.is_empty());
+        assert_eq!(c.model, defaults.default_model);
+        assert_eq!(c.cascade, defaults.cascade);
+        assert_eq!(c.model_source, "embedded default");
+        assert_eq!(c.reasoning_effort, ReasoningEffort::Low);
+        assert_eq!(c.reasoning_effort_source, "embedded default");
+        assert_eq!(c.scorer_reasoning_effort, ReasoningEffort::None);
+        assert_eq!(c.scorer_reasoning_effort_source, "embedded default");
         assert!(c.concise_findings);
         assert!(!c.scorer_enabled);
         assert!(c.scorer_chain().is_empty());
-        assert!(c.model_chain().is_empty());
+        assert_eq!(c.model_chain(), vec![defaults.default_model.clone()]);
         assert_eq!(c.api_base, defaults.api_base);
+    }
+
+    #[test]
+    fn empty_model_environment_does_not_claim_provenance() {
+        let _lock = env_lock().lock().unwrap();
+        let _local_environment = LocalModelConfigEnv::clear();
+        let review_model = EnvRestore::capture("REVIEW_MODEL");
+        let review_cascade = EnvRestore::capture("REVIEW_MODEL_CASCADE");
+        EnvRestore::set("REVIEW_MODEL", "   ");
+        EnvRestore::set("REVIEW_MODEL_CASCADE", "");
+        let mut config = Config::default();
+
+        config.apply_env().unwrap();
+
+        assert_eq!(config.model, model_defaults().default_model);
+        assert_eq!(config.model_source, "embedded default");
+        EnvRestore::set("REVIEW_MODEL", "environment/model");
+        config.apply_env().unwrap();
+        assert_eq!(config.model, "environment/model");
+        assert_eq!(config.model_source, "environment");
+        drop(review_cascade);
+        drop(review_model);
+    }
+
+    #[test]
+    fn reasoning_effort_precedence_and_provenance_are_role_specific() {
+        let _lock = env_lock().lock().unwrap();
+        let _local_environment = LocalModelConfigEnv::clear();
+        let file: FileConfig = yaml_serde::from_str(
+            "model:\n  reasoningEffort: medium\n  scorerReasoningEffort: high\n",
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.apply_file(file).unwrap();
+        assert_eq!(config.reasoning_effort, ReasoningEffort::Medium);
+        assert_eq!(config.reasoning_effort_source, "trusted project config");
+        assert_eq!(config.scorer_reasoning_effort, ReasoningEffort::High);
+        assert_eq!(
+            config.scorer_reasoning_effort_source,
+            "trusted project config"
+        );
+
+        EnvRestore::set("REVIEW_REASONING_EFFORT", "xhigh");
+        EnvRestore::set("REVIEW_SCORER_REASONING_EFFORT", "minimal");
+        config.apply_env().unwrap();
+        assert_eq!(config.reasoning_effort, ReasoningEffort::Xhigh);
+        assert_eq!(config.reasoning_effort_source, "environment");
+        assert_eq!(config.scorer_reasoning_effort, ReasoningEffort::Minimal);
+        assert_eq!(config.scorer_reasoning_effort_source, "environment");
+    }
+
+    #[test]
+    fn invalid_reasoning_effort_lists_every_accepted_value() {
+        let _lock = env_lock().lock().unwrap();
+        let _local_environment = LocalModelConfigEnv::clear();
+        let file: FileConfig = yaml_serde::from_str(
+            "model:\n  reasoningEffort: turbo\n  scorerReasoningEffort: none\n",
+        )
+        .unwrap();
+        let error = Config::default().apply_file(file).unwrap_err();
+        assert!(error.to_string().contains("model.reasoningEffort"));
+        assert!(error.to_string().contains(REASONING_EFFORT_VALUES));
+
+        EnvRestore::set("REVIEW_SCORER_REASONING_EFFORT", "turbo");
+        let error = Config::default().apply_env().unwrap_err();
+        assert!(error.to_string().contains("REVIEW_SCORER_REASONING_EFFORT"));
+        assert!(error.to_string().contains(REASONING_EFFORT_VALUES));
+    }
+
+    #[test]
+    fn native_anthropic_rejects_minimal_effort_before_provider_access() {
+        let reviewer = Config {
+            api_format: ApiFormat::Anthropic,
+            reasoning_effort: ReasoningEffort::Minimal,
+            ..Config::default()
+        };
+        let error = reviewer.require_model_for(false, false).unwrap_err();
+        assert!(error.to_string().contains("reasoningEffort minimal"));
+        assert!(error.to_string().contains("max|xhigh|high|medium|low|none"));
+
+        let scorer = Config {
+            api_format: ApiFormat::Anthropic,
+            scorer_reasoning_effort: ReasoningEffort::Minimal,
+            ..Config::default()
+        };
+        let error = scorer.require_model_for(false, false).unwrap_err();
+        assert!(error.to_string().contains("scorerReasoningEffort minimal"));
+        assert!(error.to_string().contains("max|xhigh|high|medium|low|none"));
+    }
+
+    #[test]
+    fn hosted_profile_provenance_replaces_ignored_project_provenance() {
+        let _lock = env_lock().lock().unwrap();
+        let hosted = EnvRestore::capture("POSTIL_HOSTED_MODE");
+        let provisional = EnvRestore::capture(PROVISIONAL_HOSTED_ROSTER_ENV);
+        EnvRestore::set("POSTIL_HOSTED_MODE", "1");
+        EnvRestore::set(PROVISIONAL_HOSTED_ROSTER_ENV, "1");
+        let mut config = Config::default();
+        let file: FileConfig =
+            yaml_serde::from_str("model:\n  name: ignored/project-model\n").unwrap();
+
+        config.apply_file(file).unwrap();
+        assert_eq!(config.model_source, "embedded default");
+        config.apply_env().unwrap();
+
+        assert_eq!(
+            config.model,
+            provisional_hosted_profile().generator_chain[0]
+        );
+        assert_eq!(config.model_source, "hosted provisional profile");
+        drop(provisional);
+        drop(hosted);
+    }
+
+    #[test]
+    fn explicit_provider_keys_do_not_inherit_stored_login_routing() {
+        let _lock = env_lock().lock().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let xdg = EnvRestore::capture("XDG_CONFIG_HOME");
+        let saved_keys = crate::api_key::API_KEY_ENV_VARS.map(EnvRestore::capture);
+        EnvRestore::set("XDG_CONFIG_HOME", directory.path().to_str().unwrap());
+        let path = credentials::default_path().unwrap();
+        credentials::write(
+            &path,
+            &credentials::Credentials {
+                version: credentials::CREDENTIALS_VERSION,
+                issuer: Some("https://postil.dev".into()),
+                token: "pcli_fixture-not-a-real-secret".into(),
+                expires_at: "2999-01-01T00:00:00.000Z".into(),
+                refresh_token: None,
+                refresh_expires_at: None,
+                api_base: "https://postil.dev/api/inference/v1".into(),
+                org: "fixture".into(),
+                model: "hosted/model".into(),
+                pending_revocations: Vec::new(),
+            },
+        )
+        .unwrap();
+        for name in crate::api_key::API_KEY_ENV_VARS {
+            for other in crate::api_key::API_KEY_ENV_VARS {
+                unsafe { std::env::remove_var(other) };
+            }
+            EnvRestore::set(name, "provider-fixture-key");
+            let mut cfg = Config::default();
+            assert!(
+                !cfg.apply_stored_login_credential(),
+                "{name} must suppress login routing"
+            );
+            assert_eq!(cfg.api_base, model_defaults().api_base, "{name}");
+            assert_eq!(cfg.model, model_defaults().default_model, "{name}");
+        }
+        drop(saved_keys);
+        drop(xdg);
+    }
+
+    #[test]
+    fn project_model_provenance_replaces_stored_login_provenance() {
+        let _lock = env_lock().lock().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let xdg = EnvRestore::capture("XDG_CONFIG_HOME");
+        let saved_keys = crate::api_key::API_KEY_ENV_VARS.map(EnvRestore::capture);
+        EnvRestore::set("XDG_CONFIG_HOME", directory.path().to_str().unwrap());
+        for name in crate::api_key::API_KEY_ENV_VARS {
+            unsafe { std::env::remove_var(name) };
+        }
+        credentials::write(
+            &credentials::default_path().unwrap(),
+            &credentials::Credentials {
+                version: credentials::CREDENTIALS_VERSION,
+                issuer: Some("https://postil.dev".into()),
+                token: "pcli_fixture-not-a-real-secret".into(),
+                expires_at: "2999-01-01T00:00:00.000Z".into(),
+                refresh_token: None,
+                refresh_expires_at: None,
+                api_base: "https://postil.dev/api/inference/v1".into(),
+                org: "fixture".into(),
+                model: "hosted/model".into(),
+                pending_revocations: Vec::new(),
+            },
+        )
+        .unwrap();
+        let mut config = Config::default();
+
+        assert!(config.apply_stored_login_credential());
+        assert_eq!(config.model_source, "stored login");
+        let file: FileConfig = yaml_serde::from_str("model:\n  name: project/model\n").unwrap();
+        config.apply_file(file).unwrap();
+        assert_eq!(config.model, "project/model");
+        assert_eq!(config.model_source, "trusted project config");
+
+        drop(saved_keys);
+        drop(xdg);
     }
 
     #[test]
@@ -2640,13 +3055,17 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
         let mut c = Config::default();
         c.apply_file(f).unwrap();
         assert_eq!(c.max_findings, 20);
-        assert!(c.model.is_empty());
-        assert!(c.cascade.is_empty());
+        assert_eq!(c.model, model_defaults().default_model);
+        assert_eq!(c.cascade, model_defaults().cascade);
+        assert_eq!(c.reasoning_effort, ReasoningEffort::Low);
+        assert_eq!(c.scorer_reasoning_effort, ReasoningEffort::None);
         assert!(c.scorer.is_empty());
     }
 
     #[test]
     fn model_scorer_parses_from_postil_config() {
+        let _lock = env_lock().lock().unwrap();
+        let _local_environment = LocalModelConfigEnv::clear();
         let f: FileConfig = yaml_serde::from_str("model:\n  scorer: custom/scorer\n").unwrap();
         let mut c = Config::default();
         c.apply_file(f).unwrap();
@@ -2658,7 +3077,7 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
     #[test]
     fn trusted_runtime_can_ignore_the_complete_repository_model_section() {
         let f: FileConfig = yaml_serde::from_str(
-            "model:\n  name: anthropic/claude-opus-4.1\n  cascade:\n    - attacker/fallback\n  scorer: anthropic/claude-haiku-4.5\n  apiBase: https://attacker.invalid/v1\n  apiFormat: anthropic\n  consensus: 3\n",
+            "model:\n  name: anthropic/claude-opus-4.1\n  reasoningEffort: max\n  cascade:\n    - attacker/fallback\n  scorer: anthropic/claude-haiku-4.5\n  scorerReasoningEffort: high\n  apiBase: https://attacker.invalid/v1\n  apiFormat: anthropic\n  consensus: 3\n",
         )
         .unwrap();
         let mut config = Config::default();
@@ -2667,7 +3086,20 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
         config.apply_file_inner(f, true, true).unwrap();
 
         assert_eq!(config.model_chain(), expected.model_chain());
+        assert_eq!(config.reasoning_effort, expected.reasoning_effort);
+        assert_eq!(
+            config.reasoning_effort_source,
+            expected.reasoning_effort_source
+        );
         assert_eq!(config.scorer, expected.scorer);
+        assert_eq!(
+            config.scorer_reasoning_effort,
+            expected.scorer_reasoning_effort
+        );
+        assert_eq!(
+            config.scorer_reasoning_effort_source,
+            expected.scorer_reasoning_effort_source
+        );
         assert_eq!(config.scorer_chain(), expected.scorer_chain());
         assert_eq!(config.api_base, DEFAULT_API_BASE);
         assert_eq!(config.api_format, ApiFormat::OpenaiCompatible);
@@ -3121,12 +3553,14 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
             version: 1,
             source_sha256: "a".repeat(64),
             default_model: "provider/generator".into(),
+            reasoning_effort: ReasoningEffort::Low,
             cascade: vec!["provider/fallback".into()],
             consensus: 1,
             api_base: "https://models.example/v1".into(),
             api_format: ApiFormat::OpenaiCompatible,
             scorer_enabled: true,
             scorer_model: "provider/scorer".into(),
+            scorer_reasoning_effort: ReasoningEffort::None,
             scorer_fallback: "provider/scorer-fallback".into(),
             scorer_qualification_candidates: Vec::new(),
         };
@@ -3232,6 +3666,8 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
 
     #[test]
     fn native_anthropic_has_no_implicit_scorer_and_honors_explicit_byok_models() {
+        let _lock = env_lock().lock().unwrap();
+        let _local_environment = LocalModelConfigEnv::clear();
         let mut config = Config {
             api_format: ApiFormat::Anthropic,
             ..Config::default()
@@ -3288,6 +3724,12 @@ scorer = { enabled = true, default_model = "provider/scorer", fallback = "provid
         assert_eq!(profile.upstream_provider_identity, "Azure");
         assert_eq!(profile.generator_chain, vec!["openai/gpt-5.6-luna"]);
         assert_eq!(profile.scorer_chain, vec!["openai/gpt-5.6-luna"]);
+        let drifted = Config {
+            reasoning_effort: ReasoningEffort::High,
+            ..config.clone()
+        };
+        assert!(provisional_hosted_profile_for_config(&drifted).is_none());
+        assert!(drifted.require_model_for(true, true).is_err());
         assert_eq!(
             profile.model_price_bounds,
             vec![ModelPriceBound {

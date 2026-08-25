@@ -60,7 +60,9 @@ pub(crate) async fn compress_findings(
                 pass.model_incidents
                     .extend_from_slice(error.model_incidents());
                 pass.usage_accounting_complete &= error.usage_accounting_complete();
-                eprintln!("postil: finding compression failed open and kept the original body");
+                crate::progress::notice(format_args!(
+                    "postil: finding compression failed open and kept the original body"
+                ));
                 None
             }
         };
@@ -146,6 +148,8 @@ mod tests {
             scorer_kind: None,
             scorer_reason: None,
             repository_claim: None,
+            machine_claim: None,
+            machine_claim_deferred: false,
             title: "Keep the stable finding metadata".to_string(),
             body,
             evidence: Some("changed_call();".to_string()),

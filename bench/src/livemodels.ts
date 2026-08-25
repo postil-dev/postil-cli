@@ -97,6 +97,7 @@ export const QUALIFICATION_MAX_AGE_DAYS = 30;
 export const QUALIFICATION_MAX_AGE_SECONDS = QUALIFICATION_MAX_AGE_DAYS * 24 * 60 * 60;
 const MAX_QUALIFICATION_SOURCE_BYTES = 16 * 1024 * 1024;
 const MANAGED_OPENROUTER_API_BASE = "https://openrouter.ai:443/api/v1";
+const PLAN_ONLY_CAPTURE_API_BASE = "http://127.0.0.1:9";
 export const MANAGED_OPENROUTER_PROVIDER_IDENTITY = "openrouter:managed-routing";
 export const LIVE_MODELS_REPORT_SCHEMA_VERSION = 3;
 export const LIVE_MODELS_PRIVATE_EVIDENCE_SCHEMA_VERSION = 1;
@@ -1507,6 +1508,7 @@ export async function assertRuntimeShapedQualificationPreflight(args: {
   apiFormat: "openai-compatible" | "anthropic";
   costCapUsdDecimal: string;
   upstreamProvider: string;
+  credentialEnvironment?: NodeJS.ProcessEnv;
 }): Promise<string> {
   let projectedMicros = 0n;
   const planRoot = join(args.rootDir, "preflight");
@@ -1551,6 +1553,8 @@ export async function assertRuntimeShapedQualificationPreflight(args: {
               args.apiBase,
               args.apiFormat,
               profilePath,
+              PLAN_ONLY_CAPTURE_API_BASE,
+              args.credentialEnvironment,
             );
             env.POSTIL_QUALIFICATION_PLAN_ONLY = "1";
             const { stdout } = await execFile(
@@ -1774,6 +1778,7 @@ export function liveEnv(
   apiFormat: "openai-compatible" | "anthropic" = "openai-compatible",
   candidateProfilePath?: string,
   qualificationCaptureApiBase?: string,
+  sourceEnvironment: NodeJS.ProcessEnv = process.env,
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     PATH: process.env.PATH,
@@ -1809,12 +1814,12 @@ export function liveEnv(
     }
     env.POSTIL_QUALIFICATION_CAPTURE_API_BASE = qualificationCaptureApiBase;
   }
-  const endpointAuth = endpointAuthFromEnvironment(apiFormat);
+  const endpointAuth = endpointAuthFromEnvironment(apiFormat, sourceEnvironment);
   if (endpointAuth) {
     env.POSTIL_ENDPOINT_AUTH_HEADER = endpointAuth.header;
     env.POSTIL_ENDPOINT_AUTH_VALUE = endpointAuth.value;
   }
-  const allowPrivate = process.env.POSTIL_ALLOW_PRIVATE_API_BASE;
+  const allowPrivate = sourceEnvironment.POSTIL_ALLOW_PRIVATE_API_BASE;
   if (allowPrivate !== undefined) {
     if (allowPrivate !== "1" && allowPrivate.toLowerCase() !== "true") {
       throw new Error("POSTIL_ALLOW_PRIVATE_API_BASE must be 1 or true when set");
@@ -1824,7 +1829,7 @@ export function liveEnv(
   // Forward the selected inference-key variable without logging or placing the
   // value on argv. Neutral aliases are also mirrored into POSTIL_API_KEY so
   // older binaries can run from the same benchmark harness.
-  forwardApiKey(env);
+  forwardApiKey(env, sourceEnvironment);
   return env;
 }
 
@@ -2405,7 +2410,7 @@ export function qualificationRequiredParameters(
   };
   for (const pair of pairs) {
     for (const model of qualificationGeneratorModels(pair)) {
-      add(model, ["max_tokens", "temperature"]);
+      add(model, ["max_tokens", "reasoning", "reasoning_effort", "temperature"]);
     }
     for (const model of qualificationScorerModels(pair)) {
       add(model, [
@@ -2423,9 +2428,10 @@ export function qualificationRequiredParameters(
 
 export function endpointAuthFromEnvironment(
   apiFormat: "openai-compatible" | "anthropic",
+  sourceEnvironment: NodeJS.ProcessEnv = process.env,
 ): { header: string; value: string } | null {
-  const rawHeader = process.env.POSTIL_ENDPOINT_AUTH_HEADER;
-  const rawValue = process.env.POSTIL_ENDPOINT_AUTH_VALUE;
+  const rawHeader = sourceEnvironment.POSTIL_ENDPOINT_AUTH_HEADER;
+  const rawValue = sourceEnvironment.POSTIL_ENDPOINT_AUTH_VALUE;
   const header = rawHeader?.trim() || undefined;
   const value = rawValue === "" ? undefined : rawValue;
   if (header === undefined && value === undefined) return null;

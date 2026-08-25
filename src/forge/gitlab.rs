@@ -10,8 +10,8 @@ use serde_json::json;
 use std::io::Write;
 
 use super::{
-    CheckRunIds, CheckState, Forge, PrMeta, ReviewPublicationReceipt, ThreadKind, check_summary,
-    check_title, untracked_review_publication_receipt,
+    CheckRunIds, CheckState, Forge, PrMeta, ReviewPublicationReceipt, check_summary, check_title,
+    untracked_review_publication_receipt,
 };
 use crate::diff::{DiffSnapshot, DiffSpool, WorkspaceBudget};
 use crate::envelope::{Envelope, Finding};
@@ -494,7 +494,9 @@ impl Forge for GitLab {
         }
         let mr = self.mr().await?;
         if !mr_matches_snapshot(&mr, snapshot) {
-            eprintln!("postil: gitlab review delivery skipped because the merge request changed");
+            crate::progress::notice(format_args!(
+                "postil: gitlab review delivery skipped because the merge request changed"
+            ));
             return Ok(receipt);
         }
         let summary = self.review_summary(envelope);
@@ -557,7 +559,9 @@ impl Forge for GitLab {
     ) -> Result<()> {
         let current = self.mr().await?;
         if !mr_matches_snapshot(&current, snapshot) {
-            eprintln!("postil: gitlab status delivery skipped because the merge request changed");
+            crate::progress::notice(format_args!(
+                "postil: gitlab status delivery skipped because the merge request changed"
+            ));
             return Ok(());
         }
         let head = envelope
@@ -595,52 +599,6 @@ impl Forge for GitLab {
     async fn snapshot_is_current(&self, expected: &PrMeta) -> Result<bool> {
         let current = self.mr().await?;
         Ok(mr_matches_snapshot(&current, expected))
-    }
-
-    /// Title and description of an issue or MR. GitLab's issue and merge-request
-    /// objects both expose `title` and `description`, so only the resource path
-    /// differs by `kind`.
-    async fn fetch_thread(&self, number: u64, kind: ThreadKind) -> Result<(String, String)> {
-        let resource = match kind {
-            ThreadKind::Pull => "merge_requests",
-            ThreadKind::Issue => "issues",
-        };
-        let resp = self
-            .request(
-                reqwest::Method::GET,
-                self.url(&format!("/{resource}/{number}")),
-            )
-            .send()
-            .await
-            .context("fetching thread")?;
-        let v: serde_json::Value = super::bounded_response_json(
-            Self::check_ok(resp, "thread fetch").await?,
-            "GitLab thread",
-        )
-        .await?;
-        let title = v["title"].as_str().unwrap_or_default().to_string();
-        let body = v["description"].as_str().unwrap_or_default().to_string();
-        Ok((title, body))
-    }
-
-    /// Post a top-level note on an issue or MR (the bot's reply to a mention).
-    /// Both resources expose `/{resource}/{number}/notes` with a `body` field.
-    async fn post_comment(&self, number: u64, kind: ThreadKind, body: &str) -> Result<()> {
-        let resource = match kind {
-            ThreadKind::Pull => "merge_requests",
-            ThreadKind::Issue => "issues",
-        };
-        let resp = self
-            .request(
-                reqwest::Method::POST,
-                self.url(&format!("/{resource}/{number}/notes")),
-            )
-            .json(&json!({ "body": body }))
-            .send()
-            .await
-            .context("posting note")?;
-        Self::check_ok(resp, "note post").await?;
-        Ok(())
     }
 }
 

@@ -106,6 +106,14 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   Only a complete receipt with no positive counterexample supports a universal claim.
   Incomplete repository evidence cannot confirm a fresh claim, so the claim is suppressed;
   a prior-ledger claim remains open until exact-head adjudication resolves it.
+  Typed Rust source claims cover Copy move-out premises, exact symbol absence, and normalized
+  signature mismatch. The source verifier parses bounded regular Rust module blobs under `src/`,
+  including `src/lib.rs` and `src/main.rs` but excluding separate `src/bin` crate roots, from the
+  immutable reviewed GitHub tree with `syn`; it does not compile, execute, expand macros, follow
+  symlinks, or infer names. Complete receipts bind the verifier version, head and tree identities,
+  normalized claim hash, verdict, and hash-only source evidence. Fresh claims without a conclusive
+  receipt are suppressed. Carried claims require an exact-head refutation to resolve and otherwise
+  remain visible as deferred, nonblocking findings.
   Every surviving generated candidate, plus applicable baseline candidates during a full
   rereview, enters one bounded adjudication operation before scoring and publication. The
   operation admits the complete candidate set or fails closed before provider contact. Its
@@ -145,13 +153,11 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   object mode, path, blob object ID, and gitlink path and object ID. Symlink blobs are searched as
   link text and are never followed. A snapshot containing a gitlink remains incomplete because
   content inside the referenced repository is outside the snapshot.
-- `respond.rs`: interactive bot (`postil respond`): answers an @postil mention on a PR
-  or issue, grounded in the diff/issue, and posts one reply. Review-and-answer only; it
-  never opens PRs or pushes commits.
 - `sarif.rs`: envelope → SARIF 2.1.0 for code-scanning ingestion (`--sarif`).
-- `config.rs`: precedence (flags > env > .postil.* > .coderabbit.yaml > defaults),
+- `config.rs`: model precedence (flags > env > .postil.* > stored login > defaults),
   `deny_unknown_fields` so typos fail loudly. Also resolves `guardrails` and
   `content_policy`, the two prompt-injected repo policy sources (see below).
+  Translated `.coderabbit.yaml` settings supply review policy but do not select a model.
   Exception to precedence: `model.apiBase` from a config file is ignored by
   default (a repo could redirect the base URL that receives the inference
   credential); honored only with `POSTIL_ALLOW_CONFIG_API_BASE=1`. The
@@ -289,6 +295,12 @@ additions (violations are `kind: contentPolicy`). Content policy is on by defaul
     cannot expand or enter schema repair. Confirmation and refutation require exact supplied
     evidence; repository-wide conclusions additionally require a complete receipt for the exact
     snapshot. Public rewrites describe only the defect, impact, and correction.
+16. Typed machine claims never substitute model prose for source proof. Verification parses a
+    bounded immutable Rust source snapshot without compilation or execution, rejects ambiguous
+    symbols and unsupported syntax, and emits only hash-bound evidence. A fresh unsupported,
+    unresolved, unavailable, exhausted, or refuted claim cannot reach the gate. A carried claim
+    remains visible but nonblocking until an exact-head refutation resolves it. Fresh independently
+    generated claims still require a supported receipt.
 
 ## Residual prompt-injection surface
 
