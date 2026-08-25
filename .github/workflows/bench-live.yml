@@ -11,6 +11,9 @@ on:
       upstream_provider:
         description: Exact ZDR provider identity serving every model in the profile
         required: true
+      upstream_provider_route:
+        description: Exact ZDR endpoint route serving every model in the profile
+        required: true
       cost_cap_usd:
         description: Abort when projected qualification spend exceeds this amount
         required: true
@@ -32,6 +35,7 @@ jobs:
       POSTIL_BENCH_MODE: live
       POSTIL_BENCH_PAIRS: ${{ inputs.pairs }}
       POSTIL_BENCH_UPSTREAM_PROVIDER: ${{ inputs.upstream_provider }}
+      POSTIL_BENCH_UPSTREAM_PROVIDER_ROUTE: ${{ inputs.upstream_provider_route }}
       POSTIL_BENCH_REPEATS: "3"
       POSTIL_BENCH_COST_CAP_USD: ${{ inputs.cost_cap_usd }}
       POSTIL_API_BASE: https://openrouter.ai/api/v1
@@ -70,7 +74,7 @@ jobs:
           test -n "$COMPLETION_KEY_SHA256"
 
       - name: Build release binary
-        run: cargo build --quiet --release --features qualification-candidate
+        run: cargo build --quiet --release
 
       - name: Install benchmark dependencies
         working-directory: bench

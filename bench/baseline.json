@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "corpus": {
     "fixtureCorpusSha256": "8e4c2cb9ad5a7efdfe6a875566d20133e905155b6f693a873595adf6c069e065",
-    "evaluatorSha256": "afadb5b9097433000a0c0ee9a81ccb23ecd01cfeb92829421f3e1acb68015c0d"
+    "evaluatorSha256": "02f4ad84bd86d1f65aafc7dcc077981972a95fdd0f5ab5140f5ea98ba9372797"
   },
   "profiles": {
     "z-ai/glm-5.2": {
@@ -26,21 +26,21 @@
     },
     "openai/gpt-5.6-luna": {
       "populated": true,
-      "generatedAt": "2026-08-19T14:50:35.108Z",
+      "generatedAt": "2026-08-25T17:11:56.688Z",
       "reviewMode": "exhaustive",
-      "sourceRunAt": "2026-08-19T14:50:35.108Z",
+      "sourceRunAt": "2026-08-25T17:09:36.499Z",
       "providerContractEnforced": true,
-      "screeningProfileSha256": "52fd3e2a85ffd715c00c33cc2d3664da84237cdfc2a19cb2671f0d5cbc9c93b5",
+      "screeningProfileSha256": "aea05c3f5622cebec480d2a8daf5bb53055bc0160206e6f22e889391ea71fa49",
       "upstreamProviderIdentity": "Azure",
       "totalCases": 70,
       "scoredCases": 70,
-      "detectionRate": 0.8947368421052632,
+      "detectionRate": 0.9473684210526315,
       "falsePositives": 0,
-      "gateVerdictCorrectness": 0.8285714285714286,
-      "meanCostUsdPerCase": 0.0007770375714285714,
+      "gateVerdictCorrectness": 0.8428571428571429,
+      "meanCostUsdPerCase": 0.0008315965428571429,
       "latencyMs": {
-        "p50": 8649,
-        "p95": 17559
+        "p50": 5659,
+        "p95": 9530
       }
     }
   }

@@ -66,6 +66,7 @@ const modelDefaultsSchema = z.object({
 const provisionalProfileSchema = z.object({
   benchmarkProviderIdentity: z.literal("openrouter:managed-routing"),
   upstreamProviderIdentity: boundedIdentifierSchema,
+  upstreamProviderRoute: boundedIdentifierSchema,
   apiBase: z.literal("https://openrouter.ai:443/api/v1"),
   apiFormat: z.literal("openai-compatible"),
   generatorChain: z.array(boundedIdentifierSchema).min(1),

@@ -412,6 +412,8 @@ const suppressedEnvelopeFinding = z.object({
   reason: z.string(),
 });
 
+export const HOSTED_ADMISSION_PROJECTION_CAP_MICROS = 25_000_000;
+
 export const envelopeV1 = z.object({
   version: z.literal(1),
   summary: z.string(),
@@ -483,7 +485,8 @@ export const envelopeV1 = z.object({
     providerAttempts: z.number().int().nonnegative(),
     serializedInputBytes: z.number().int().nonnegative(),
     outputTokens: z.number().int().nonnegative(),
-    projectedCostMicros: z.number().int().nonnegative().max(1_000_000),
+    projectedCostMicros: z.number().int().nonnegative()
+      .max(HOSTED_ADMISSION_PROJECTION_CAP_MICROS),
   }).optional(),
   usageAccountingComplete: z.boolean().optional(),
   durationMs: z.number().int().nonnegative(),
@@ -769,6 +772,8 @@ export async function startMockGithub(c: BenchmarkCase) {
   const requests: RecordedRequest[] = [];
   const checkRunNames = new Map<string, string>(); // id -> check name
   let nextCheckRunId = 1001;
+  let nextReviewId = 2001;
+  let nextReviewCommentId = 3001;
   const pullPath = `/repos/${c.repo}/pulls/${c.pullNumber}`;
   const repositoryPath = `/repos/${c.repo}`;
   const pullFilesPath = `${pullPath}/files`;
@@ -864,8 +869,35 @@ export async function startMockGithub(c: BenchmarkCase) {
     }
 
     if (req.method === "POST" && url.pathname === `${pullPath}/reviews`) {
+      const review = safeJson(body) as {
+        body?: unknown;
+        commit_id?: unknown;
+        comments?: Array<{ body?: unknown }>;
+      } | undefined;
+      const id = nextReviewId;
+      nextReviewId += 1;
+      const comments = (review?.comments ?? []).map((comment) => {
+        const commentId = nextReviewCommentId;
+        nextReviewCommentId += 1;
+        return {
+          id: commentId,
+          body: typeof comment.body === "string" ? comment.body : "",
+          commit_id: c.headSha,
+        };
+      });
       res.writeHead(200, { "content-type": "application/json" });
-      res.end("{}");
+      res.end(JSON.stringify({
+        id,
+        body: typeof review?.body === "string" ? review.body : "",
+        commit_id: typeof review?.commit_id === "string" ? review.commit_id : c.headSha,
+        comments,
+      }));
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === `${pullPath}/comments`) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("[]");
       return;
     }
 

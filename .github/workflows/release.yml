@@ -117,8 +117,11 @@ jobs:
         working-directory: bench
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          POSTIL_BIN: ${{ github.workspace }}/target/release/postil
           POSTIL_SCORER_EVAL_REPEATS: "3"
           POSTIL_SCORER_EVAL_UPSTREAM_PROVIDER: Azure
+          POSTIL_SCORER_EVAL_UPSTREAM_PROVIDER_ROUTE: azure/eu
+          POSTIL_QUALIFICATION_SOURCE_SHA: ${{ github.sha }}
         run: >-
           bun run scorer-eval --json-out
           "${{ runner.temp }}/scorer-eval-report.json"
@@ -128,7 +131,9 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: scorer-eval-report
-          path: ${{ runner.temp }}/scorer-eval-report.json
+          path: |
+            ${{ runner.temp }}/scorer-eval-report.json
+            ${{ runner.temp }}/scorer-eval-report.json.partial
           if-no-files-found: warn
           retention-days: 30
 
@@ -136,7 +141,21 @@ jobs:
         working-directory: bench
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-        run: bun run bench:live -- --run-id "release-${{ github.ref_name }}" --json-out "${{ runner.temp }}/bench-live-report.json"
+        run: >-
+          bun run bench:live -- --screen-profile ../provisional-models.json
+          --run-id "release-${{ github.ref_name }}"
+          --json-out "${{ runner.temp }}/bench-live-report.json"
+
+      - name: Upload the diff-file live report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bench-live-report
+          path: |
+            ${{ runner.temp }}/bench-live-report.json
+            ${{ runner.temp }}/bench-live-report.json.partial
+          if-no-files-found: warn
+          retention-days: 30
 
       - name: Compare against the recorded baseline
         id: compare-baseline

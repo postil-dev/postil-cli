@@ -16,15 +16,20 @@ import {
   FALSE_FINDING_CASES,
   GENERATOR_MODEL,
   SCORER_CASE_EXEC_TIMEOUT_MS,
+  SCORER_CASE_HARNESS_ALLOWANCE_MS,
   SCORER_MAX_CASE_MS,
+  SCORER_REASON_SCHEMA_PATTERN,
   TRUE_FINDING_CASES,
   aggregate,
+  assertCleanScorerEvaluatorStatus,
+  assertScorerEvaluatorFileMatches,
   assertQualificationPreflight,
   falseFinding,
   falseFindingFromSourceRequest,
   firstAddedLineForPath,
   finalizeScorerEvalReport,
   formatReport,
+  generatorRequestMismatchCodes,
   isAdmissionFatalStructuralResult,
   isValidReason,
   isolatedEnv,
@@ -42,20 +47,52 @@ import {
   safeSegment,
   scorerCasePasses,
   scorerCostProviderDecimal,
+  scorerEvalRootDir,
+  scorerEvaluatorDigest,
   providerCostDecimalFromResponse,
   scorerCheckpointPath,
+  strictRequestMismatchCodes,
+  scorerProxyRequestPhase,
   selectEvalCases,
   startScorerProxy,
   scorerStructuralFailureReason,
+  scorerQualificationModels,
+  scorerQualificationRequiredParameters,
   trueFinding,
   writeScorerEvalCheckpoint,
+  writeScorerEvalSetupFailureArtifact,
   type ScorerEvalCase,
   type ScorerEvalReport,
+  type ScorerProxyExpectedContract,
 } from "./scorer-eval";
 
 const fixtures = fixtureInputs.map((input) => benchmarkCase.parse(input));
 const BOUNDED_SCORER_TARGET_PATH = 'src/ui/copy"quoted.ts';
 const TEST_SCORER_MODEL = "z-ai/glm-5.2";
+
+function scorerReportContract(): Pick<
+  ScorerEvalReport,
+  "evaluatorSha256" | "providerContractSha256" | "providerContract"
+> {
+  return {
+    evaluatorSha256: "c".repeat(64),
+    providerContractSha256: "d".repeat(64),
+    providerContract: {
+      version: 1,
+      benchmarkProviderIdentity: "openrouter:managed-routing",
+      upstreamProviderIdentity: "test-provider",
+      upstreamProviderRoute: "test-provider/route",
+      dataCollection: "deny",
+      zeroDataRetention: true,
+      allowFallbacks: false,
+      generatorRequireParameters: false,
+      scorerRequireParameters: true,
+      maxPricePinned: true,
+      maxPriceUnits: "USD per million tokens",
+      modelPriceBounds: [],
+    },
+  };
+}
 
 function postilBinaryPath(): string {
   const cargoTarget = process.env.CARGO_TARGET_DIR;
@@ -104,9 +141,9 @@ function boundedScorerFixture() {
     "",
   ].join("\n");
   const diff = [
-    ...Array.from({ length: 3 }, (_, index) => ordinaryFile(index)),
+    ...Array.from({ length: 15 }, (_, index) => ordinaryFile(index)),
     target,
-    ...Array.from({ length: 2 }, (_, index) => ordinaryFile(index + 3)),
+    ...Array.from({ length: 15 }, (_, index) => ordinaryFile(index + 15)),
   ].join("");
   const base = fixture("huge-low-signal-clean");
   return benchmarkCase.parse({
@@ -207,6 +244,129 @@ function requestBody(req: IncomingMessage): Promise<string> {
   });
 }
 
+const TEST_PROXY_PRICING = {
+  providerIdentity: "Azure",
+  promptUsdPerToken: 0.00000022,
+  completionUsdPerToken: 0.00000132,
+  inputMicrosPerMillionTokens: 220_000,
+  outputMicrosPerMillionTokens: 1_320_000,
+};
+
+function proxyContract(
+  model = "scorer/model",
+  providerIdentity = "Azure",
+  providerRoute = "azure/eu",
+): ScorerProxyExpectedContract {
+  return { model, providerIdentity, providerRoute, pricing: TEST_PROXY_PRICING };
+}
+
+function strictProvider() {
+  return {
+    data_collection: "deny",
+    zdr: true,
+    order: ["azure/eu"],
+    allow_fallbacks: false,
+    require_parameters: true,
+    max_price: { prompt: 0.22, completion: 1.32 },
+  };
+}
+
+function generatorRequest() {
+  const { require_parameters: _requireParameters, ...provider } = strictProvider();
+  return {
+    model: GENERATOR_MODEL,
+    max_tokens: 4_000,
+    temperature: 0.1,
+    reasoning: { effort: "low" },
+    provider,
+    messages: [
+      { role: "system", content: "You are Postil's low-noise code reviewer." },
+      { role: "user", content: "Review this change." },
+    ],
+  };
+}
+
+function scorerRequest(model = "scorer/model") {
+  return {
+    model,
+    max_completion_tokens: 400,
+    reasoning: { effort: "low", exclude: true },
+    provider: strictProvider(),
+    response_format: {
+      type: "json_schema",
+      json_schema: {
+        name: "postil_finding_scores",
+        strict: true,
+        schema: {
+          type: "object",
+          properties: {
+            scores: {
+              type: "array",
+              minItems: 1,
+              maxItems: 1,
+              items: {
+                type: "object",
+                properties: {
+                  confidence: { type: "number", minimum: 0, maximum: 1 },
+                  kind: {
+                    type: "string",
+                    enum: ["risk", "humanEscalation", "guardrail", "uncertainty", "contentPolicy"],
+                  },
+                  reason: {
+                    type: "string",
+                    minLength: 1,
+                    maxLength: 240,
+                    pattern: "^(?:[.!?。！？]|[^\\s\\u0000-\\u001F\\u007F-\\u009F\\u2028\\u2029](?:[^\\u0000-\\u001F\\u007F-\\u009F\\u2028\\u2029]*[.!?。！？]))$",
+                  },
+                },
+                required: ["confidence", "kind", "reason"],
+                additionalProperties: false,
+              },
+            },
+          },
+          required: ["scores"],
+          additionalProperties: false,
+        },
+      },
+    },
+    messages: [
+      { role: "system", content: "You are Postil's independent second-model scorer." },
+      { role: "user", content: "Score this finding." },
+    ],
+  };
+}
+
+function adjudicationRequest(model = "scorer/model") {
+  return {
+    model,
+    max_completion_tokens: 8_000,
+    reasoning: { effort: "low", exclude: true },
+    provider: strictProvider(),
+    messages: [
+      { role: "system", content: "You are Postil's single finding adjudicator." },
+      { role: "user", content: "Adjudicate this finding." },
+    ],
+  };
+}
+
+function genericOpenAiCompatibleRequest(
+  phase: "adjudication" | "scorer",
+  model = "scorer/model",
+) {
+  return {
+    model,
+    max_tokens: 8_000,
+    temperature: 0,
+    reasoning: { effort: "low" },
+    messages: [{
+      role: "system",
+      content: phase === "adjudication"
+        ? "You are Postil's single finding adjudicator."
+        : "You are Postil's independent second-model scorer.",
+    }],
+  };
+}
+
 function adjudicationResponse(body: string): string | null {
   let request: {
     messages?: Array<{ role?: string; content?: string }>;
@@ -270,7 +430,46 @@ describe("parseRepeatCount", () => {
   });
 });
 
+describe("scorer run artifacts", () => {
+  test("binds qualification to clean evaluator source bytes", () => {
+    expect(() => assertCleanScorerEvaluatorStatus("")).not.toThrow();
+    expect(() => assertCleanScorerEvaluatorStatus(" M bench/src/scorer-eval.ts\n")).toThrow(
+      "sources differ from HEAD",
+    );
+    expect(() => assertScorerEvaluatorFileMatches(Buffer.from("same"), Buffer.from("same")))
+      .not.toThrow();
+    expect(() => assertScorerEvaluatorFileMatches(Buffer.from("dirty"), Buffer.from("HEAD")))
+      .toThrow("sources differ from HEAD");
+    const first = scorerEvaluatorDigest([
+      { path: "bench/src/b.ts", contents: Buffer.from("second") },
+      { path: "bench/src/a.ts", contents: Buffer.from("first") },
+    ]);
+    expect(first).toBe(scorerEvaluatorDigest([
+      { path: "bench/src/a.ts", contents: Buffer.from("first") },
+      { path: "bench/src/b.ts", contents: Buffer.from("second") },
+    ]));
+    expect(first).not.toBe(scorerEvaluatorDigest([
+      { path: "bench/src/a.ts", contents: Buffer.from("changed") },
+      { path: "bench/src/b.ts", contents: Buffer.from("second") },
+    ]));
+  });
+
+  test("supports a unique retained run root", () => {
+    expect(scorerEvalRootDir("  ./retained-scorer-run  ")).toBe(
+      resolve("./retained-scorer-run"),
+    );
+    expect(scorerEvalRootDir("   ")).toBe(
+      resolve(import.meta.dir, "..", ".runs", "scorer-eval"),
+    );
+  });
+});
+
 describe("scorer calibration findings", () => {
+  test("preserves the cross-language scorer reason regex exactly", () => {
+    expect(SCORER_REASON_SCHEMA_PATTERN).toHaveLength(112);
+    expect(SCORER_REASON_SCHEMA_PATTERN.charCodeAt(8)).toBe(12_290);
+  });
+
   test("selects fixed true and false fixture sets for comparable runs", () => {
     const selected = selectEvalCases(fixtures);
     expect(selected.map((c) => c.case.id)).toEqual([...TRUE_FINDING_CASES, ...FALSE_FINDING_CASES]);
@@ -279,6 +478,24 @@ describe("scorer calibration findings", () => {
       ...FALSE_FINDING_CASES.map(() => "falseFinding" as const),
     ]);
     expect(selected.every((c) => c.scenario === "falseFinding" || c.case.modelOutput.findings.length > 0)).toBe(true);
+  });
+
+  test("expands only bounded qualification fixtures beyond the five-batch cap", () => {
+    const selected = selectEvalCases(fixtures);
+    const bounded = selected.filter((entry) =>
+      entry.case.admission.expectedCoverage === "bounded"
+    );
+    expect(bounded).toHaveLength(2);
+    for (const entry of bounded) {
+      const files = parseUnifiedDiffFiles(entry.case.diff);
+      expect(files.filter((file) =>
+        file.path.startsWith("src/scorer-qualification-padding/")
+      )).toHaveLength(12);
+      expect(files.some((file) => file.path === entry.case.primaryChange?.path)).toBe(true);
+    }
+    expect(selected.find((entry) => entry.case.id === "billing-double-charge")?.case).toBe(
+      fixture("billing-double-charge"),
+    );
   });
 
   test("true findings reuse recorded fixture evidence but normalize scorer target labels", () => {
@@ -355,6 +572,85 @@ describe("scorer calibration findings", () => {
 });
 
 describe("scorer proxy and isolated runtime", () => {
+  test("routes only trusted model and request-shape combinations", () => {
+    const azureContract = proxyContract();
+    expect(scorerProxyRequestPhase({ model: GENERATOR_MODEL }, azureContract)).toBe("generator");
+    expect(scorerProxyRequestPhase(scorerRequest(), azureContract)).toBe("scorer");
+    expect(scorerProxyRequestPhase(adjudicationRequest(), azureContract)).toBe("adjudication");
+
+    const { max_completion_tokens: _scorerLimit, ...scorerRest } = scorerRequest();
+    const { max_completion_tokens: _adjudicationLimit, ...adjudicationRest } = adjudicationRequest();
+    const openAiContract = proxyContract("scorer/model", "OpenAI", "openai");
+    expect(scorerProxyRequestPhase({
+      ...scorerRest,
+      max_tokens: 400,
+      provider: { ...strictProvider(), order: ["openai"] },
+    }, openAiContract)).toBe("scorer");
+    expect(scorerProxyRequestPhase({
+      ...adjudicationRest,
+      max_tokens: 8_000,
+      provider: { ...strictProvider(), order: ["openai"] },
+    }, openAiContract)).toBe("adjudication");
+    expect(scorerProxyRequestPhase(genericOpenAiCompatibleRequest("scorer"))).toBe("scorer");
+    expect(scorerProxyRequestPhase(genericOpenAiCompatibleRequest("adjudication"))).toBe("adjudication");
+    expect(
+      scorerProxyRequestPhase(genericOpenAiCompatibleRequest("scorer"), azureContract),
+    ).toBeNull();
+    expect(scorerProxyRequestPhase(scorerRequest("other/model"), azureContract)).toBeNull();
+    expect(scorerProxyRequestPhase({
+      ...scorerRequest(),
+      max_tokens: 400,
+    }, azureContract)).toBeNull();
+    expect(scorerProxyRequestPhase({
+      ...scorerRequest(),
+      response_format: {
+        ...scorerRequest().response_format,
+        json_schema: { ...scorerRequest().response_format.json_schema, strict: false },
+      },
+    }, azureContract)).toBeNull();
+    expect(strictRequestMismatchCodes({
+      ...scorerRequest(),
+      response_format: {
+        ...scorerRequest().response_format,
+        json_schema: { ...scorerRequest().response_format.json_schema, strict: false },
+      },
+    }, "scorer", azureContract)).toEqual(["response-format.json_schema.strict"]);
+    const { provider: _provider, ...unrouted } = scorerRequest();
+    expect(scorerProxyRequestPhase(unrouted, azureContract)).toBeNull();
+    expect(strictRequestMismatchCodes(unrouted, "scorer", azureContract)).toEqual([
+      "top-level-fields",
+      "provider",
+    ]);
+
+    const sharedContract = proxyContract(GENERATOR_MODEL);
+    expect(
+      scorerProxyRequestPhase(generatorRequest(), sharedContract, sharedContract),
+    ).toBe("generator");
+    expect(generatorRequestMismatchCodes(generatorRequest(), sharedContract)).toEqual([]);
+    expect(generatorRequestMismatchCodes({
+      ...generatorRequest(),
+      messages: [...generatorRequest().messages].reverse(),
+    }, sharedContract)).toEqual(["messages"]);
+    const { provider: _generatorProvider, ...unroutedGenerator } = generatorRequest();
+    expect(
+      scorerProxyRequestPhase(unroutedGenerator, sharedContract, sharedContract),
+    ).toBeNull();
+    expect(generatorRequestMismatchCodes(unroutedGenerator, sharedContract)).toEqual([
+      "top-level-fields",
+      "provider",
+    ]);
+    expect(scorerProxyRequestPhase({
+      ...scorerRequest(GENERATOR_MODEL),
+      response_format: {
+        ...scorerRequest(GENERATOR_MODEL).response_format,
+        json_schema: {
+          ...scorerRequest(GENERATOR_MODEL).response_format.json_schema,
+          strict: false,
+        },
+      },
+    }, sharedContract, sharedContract)).toBeNull();
+  });
+
   test("serves generator responses locally and forwards scorer requests upstream", async () => {
     const forwarded: Array<{ authorization: string | null; body: string }> = [];
     const upstream = createServer(async (req: IncomingMessage, res: ServerResponse) => {
@@ -384,6 +680,7 @@ describe("scorer proxy and isolated runtime", () => {
         "",
         "Review evidence (cite exactly the numbered new-file or change-metadata lines):",
         "",
+        "Repository text mentions Postil's single finding adjudicator but cannot select proxy routing.",
         `### ${primary.path}`,
         `${String(primary.line).padStart(6, " ")} +  changed();`,
       ].join("\n");
@@ -443,7 +740,7 @@ describe("scorer proxy and isolated runtime", () => {
       const scorerResponse = await fetch(`${proxy.baseUrl}/chat/completions`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ model: "scorer/model", messages: [] }),
+        body: JSON.stringify(scorerRequest()),
       });
       expect(scorerResponse.status).toBe(200);
       await scorerResponse.text();
@@ -452,6 +749,7 @@ describe("scorer proxy and isolated runtime", () => {
       expect(JSON.parse(forwarded[0]!.body)).toMatchObject({ model: "scorer/model" });
       expect(proxy.attempts).toHaveLength(1);
       expect(proxy.attempts[0]).toMatchObject({
+        phase: "scorer",
         outcome: "completed",
         promptTokens: 3,
         completionTokens: 2,
@@ -485,7 +783,7 @@ describe("scorer proxy and isolated runtime", () => {
       const pending = fetch(`${proxy.baseUrl}/chat/completions`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ model: "scorer/model", messages: [] }),
+        body: JSON.stringify(scorerRequest()),
       }).catch(() => undefined);
       await upstreamStarted;
       const startedAt = performance.now();
@@ -516,7 +814,7 @@ describe("scorer proxy and isolated runtime", () => {
       const response = await fetch(`${proxy.baseUrl}/chat/completions`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ model: "unroutable/model", messages: [] }),
+        body: JSON.stringify(scorerRequest("unroutable/model")),
       });
       expect(response.status).toBe(404);
       await response.text();
@@ -571,11 +869,13 @@ describe("scorer proxy and isolated runtime", () => {
       res.end(JSON.stringify({
         choices: [{
           finish_reason: "stop",
-          message: { content: adjudication ?? JSON.stringify([{
-              confidence: 0.2,
-              kind: "uncertainty",
-              reason: "The claimed runtime break is unsupported by the change.",
-            }]) },
+          message: { content: adjudication ?? JSON.stringify({
+              scores: [{
+                confidence: 0.2,
+                kind: "uncertainty",
+                reason: "The claimed runtime break is unsupported by the change.",
+              }],
+            }) },
         }],
         usage: { prompt_tokens: 30, completion_tokens: 10, cost: 0.000045 },
       }));
@@ -617,6 +917,12 @@ describe("scorer proxy and isolated runtime", () => {
           returnedBatchIds: number[];
         }>;
         unexpectedRequests: Array<{ method: string; path: string }>;
+        attempts: Array<{
+          phase: "adjudication" | "scorer";
+          outcome: string;
+          durationMs: number;
+          usageValid: boolean;
+        }>;
       };
       const stdout = await readFile(join(runArtifacts, "stdout.json"), "utf8");
       if (!evaluation.envelopeProduced || evaluation.scorerError !== null) {
@@ -628,6 +934,10 @@ describe("scorer proxy and isolated runtime", () => {
       );
       expect(proxyTelemetry.plannerSelections).toHaveLength(1);
       expect(proxyTelemetry.plannerSelections[0]?.targetBatchId).toBeGreaterThan(0);
+      expect(proxyTelemetry.attempts.map((attempt) => attempt.phase)).toEqual([
+        "adjudication",
+        "scorer",
+      ]);
       expect(evaluation).toMatchObject({
         envelopeProduced: true,
         scorerModel: TEST_SCORER_MODEL,
@@ -719,11 +1029,13 @@ describe("scorer proxy and isolated runtime", () => {
       res.end(JSON.stringify({
         choices: [{
           finish_reason: "stop",
-          message: { content: adjudication ?? JSON.stringify([{
-            confidence,
-            kind: "risk",
-            reason: "The finding receives the deliberately wrong calibration verdict.",
-          }]) },
+          message: { content: adjudication ?? JSON.stringify({
+            scores: [{
+              confidence,
+              kind: "risk",
+              reason: "The finding receives the deliberately wrong calibration verdict.",
+            }],
+          }) },
         }],
         usage: { prompt_tokens: 30, completion_tokens: 10, cost: 0.000045 },
       }));
@@ -865,9 +1177,10 @@ describe("scorer proxy and isolated runtime", () => {
     expect(falseFindingFromSourceRequest("### src/empty.ts\n    1   context only")).toBeNull();
   });
 
-  test("kills child execution just beyond the admission latency bound", async () => {
-    expect(SCORER_CASE_EXEC_TIMEOUT_MS).toBeGreaterThan(SCORER_MAX_CASE_MS);
-    expect(SCORER_CASE_EXEC_TIMEOUT_MS - SCORER_MAX_CASE_MS).toBeLessThanOrEqual(1_000);
+  test("gives both live phases a full admission window before the child safety cutoff", async () => {
+    expect(SCORER_CASE_EXEC_TIMEOUT_MS).toBe(
+      2 * SCORER_MAX_CASE_MS + SCORER_CASE_HARNESS_ALLOWANCE_MS,
+    );
     const startedAt = performance.now();
     const child = await runBoundedChild(
       process.execPath,
@@ -969,6 +1282,31 @@ describe("scorer evaluation checkpoints", () => {
       await finalizeScorerEvalReport(jsonOut, "{\"passed\":true}\n");
       expect(await readFile(jsonOut, "utf8")).toBe("{\"passed\":true}\n");
       expect(await Bun.file(partial).exists()).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("writes a sanitized setup-failure artifact without replacing existing evidence", async () => {
+    const root = await mkdtemp(join(tmpdir(), "postil-scorer-setup-failure-"));
+    const jsonOut = join(root, "report.json");
+    const partial = scorerCheckpointPath(jsonOut);
+    try {
+      await writeScorerEvalSetupFailureArtifact(["--json-out", jsonOut]);
+      const firstRaw = await readFile(partial, "utf8");
+      expect(JSON.parse(firstRaw)).toMatchObject({
+        version: 1,
+        status: "failed",
+        completedCases: 0,
+        totalCases: 0,
+        matrixComplete: false,
+        passed: false,
+        failureCategory: "setup",
+      });
+      expect(firstRaw).not.toContain("error");
+
+      await writeScorerEvalSetupFailureArtifact(["--json-out", jsonOut]);
+      expect(await readFile(partial, "utf8")).toBe(firstRaw);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -1157,12 +1495,17 @@ describe("aggregate", () => {
       scorerConfidence: null,
     });
 
-    expect(aggregate("scorer/model", cases, 1)).toMatchObject({
+    const aggregateResult = aggregate("scorer/model", cases, 1);
+    expect(aggregateResult).toMatchObject({
       timedOutCases: 1,
       structuredFailures: 1,
+      trueFindingCases: TRUE_FINDING_CASES.length - 1,
       admissionFailures: expect.arrayContaining(["1 case timeout(s)"]),
       passed: false,
     });
+    expect(aggregateResult.admissionFailures).not.toEqual(
+      expect.arrayContaining([expect.stringContaining("true risk(s)")]),
+    );
   });
 
   test("fails missing provider usage or incomplete runtime accounting", () => {
@@ -1196,6 +1539,38 @@ describe("aggregate", () => {
 });
 
 describe("qualification utilities", () => {
+  test("uses one route-qualified high-context model across mocked generator and scorer roles", () => {
+    expect(scorerQualificationModels([GENERATOR_MODEL])).toEqual([GENERATOR_MODEL]);
+    expect(scorerQualificationModels(["other/scorer"])).toEqual([
+      GENERATOR_MODEL,
+      "other/scorer",
+    ]);
+  });
+
+  test("requires the exact scorer contract when the mocked generator shares its model", () => {
+    const required = scorerQualificationRequiredParameters([
+      "openai/gpt-5.6-luna",
+    ]);
+    expect(required.get("openai/gpt-5.6-luna")).toEqual([
+      "max_completion_tokens",
+      "reasoning",
+      "reasoning_effort",
+      "response_format",
+      "structured_outputs",
+    ]);
+    expect(
+      scorerQualificationRequiredParameters(["openai/gpt-5.6-luna"], "OpenAI").get(
+        "openai/gpt-5.6-luna",
+      ),
+    ).toEqual([
+      "max_tokens",
+      "reasoning",
+      "reasoning_effort",
+      "response_format",
+      "structured_outputs",
+    ]);
+  });
+
   test("uses nearest-rank percentiles", () => {
     expect(percentile([5, 1, 4, 2, 3], 0.5)).toBe(3);
     expect(percentile([5, 1, 4, 2, 3], 0.95)).toBe(5);
@@ -1249,8 +1624,12 @@ describe("qualification utilities", () => {
     const passing = aggregate("scorer/model", qualificationCases(1), 1);
     const report = (models: typeof passing[]): ScorerEvalReport => ({
       generatedAt: "2026-07-11T00:00:00.000Z",
+      qualificationSourceSha: "a".repeat(40),
+      cliBinarySha256: "b".repeat(64),
       apiBase: "https://example.test/v1",
       upstreamProvider: "test-provider",
+      upstreamProviderRoute: "test-provider/route",
+      ...scorerReportContract(),
       repeats: 1,
       completedCases: 12,
       totalCases: 12,
@@ -1270,8 +1649,12 @@ describe("formatReport", () => {
   test("prints comparable scorer metrics", () => {
     const report: ScorerEvalReport = {
       generatedAt: "2026-07-11T00:00:00.000Z",
+      qualificationSourceSha: "a".repeat(40),
+      cliBinarySha256: "b".repeat(64),
       apiBase: "https://example.test/v1",
       upstreamProvider: "test-provider",
+      upstreamProviderRoute: "test-provider/route",
+      ...scorerReportContract(),
       repeats: 5,
       completedCases: 2,
       totalCases: 2,

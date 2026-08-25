@@ -20,8 +20,8 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --quiet --all-targets -- -D warnings
       - run: cargo test --quiet
-      - run: cargo build --quiet --features qualification-candidate
-      - run: cargo test --quiet --features qualification-candidate
+      - run: cargo build --quiet --no-default-features
+      - run: cargo test --quiet --no-default-features
       - run: cargo build --quiet --release
 
   musl:
@@ -56,7 +56,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
-      - run: cargo build --quiet --release --features qualification-candidate
+      - run: cargo build --quiet --release
       - run: bun install --frozen-lockfile
         working-directory: bench
       - run: bun test

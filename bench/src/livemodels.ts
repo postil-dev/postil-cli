@@ -99,7 +99,8 @@ const MAX_QUALIFICATION_SOURCE_BYTES = 16 * 1024 * 1024;
 const MANAGED_OPENROUTER_API_BASE = "https://openrouter.ai:443/api/v1";
 const PLAN_ONLY_CAPTURE_API_BASE = "http://127.0.0.1:9";
 export const MANAGED_OPENROUTER_PROVIDER_IDENTITY = "openrouter:managed-routing";
-export const LIVE_MODELS_REPORT_SCHEMA_VERSION = 3;
+export const LIVE_MODELS_REPORT_SCHEMA_VERSION = 4;
+export const LEGACY_LIVE_MODELS_REPORT_SCHEMA_VERSION = 3;
 export const LIVE_MODELS_PRIVATE_EVIDENCE_SCHEMA_VERSION = 1;
 export const PROMPT_INJECTION_CLEAN_ADMISSION_CASE_ID = "prompt-injection-comment-clean";
 export const PROMPT_INJECTION_CLEAN_ADMISSION_REPEATS = 3;
@@ -219,6 +220,8 @@ export interface LiveModelsOptions {
   apiFormat?: "openai-compatible" | "anthropic";
   /** Exact OpenRouter upstream provider name, pinned without fallback. */
   upstreamProvider: string;
+  /** Exact OpenRouter endpoint route. Defaults to the response provider identity. */
+  upstreamProviderRoute?: string;
   /** Root directory for per-case run dirs. Defaults to bench/.runs/live-models. */
   rootDir?: string;
   /** Per-case timeout (default DEFAULT_TIMEOUT_MS). */
@@ -243,6 +246,7 @@ export interface LiveModelsReport {
   providerEndpointIdentity: string;
   upstreamProviderPinned: true;
   upstreamProviderIdentity: string;
+  upstreamProviderRoute: string;
   fixtureHash: string;
   reviewContractHash: string;
   evaluatorContractHash: string;
@@ -439,7 +443,7 @@ export function summarizeAttributionEvaluator(result: {
 
 const LIVE_MODELS_REPORT_FIELDS = new Set([
   "schemaVersion", "generatedAt", "qualificationSourceSha", "cliVersion", "apiBase", "apiFormat",
-  "providerEndpointIdentity", "upstreamProviderPinned", "upstreamProviderIdentity", "fixtureHash",
+  "providerEndpointIdentity", "upstreamProviderPinned", "upstreamProviderIdentity", "upstreamProviderRoute", "fixtureHash",
   "reviewContractHash", "evaluatorContractHash", "evaluatorRuntimeIdentity", "configHash", "cliBinaryHash",
   "evidenceHash", "privateEvidenceSha256", "attributionContractHash", "attributionBankHash",
   "attributionEvaluators", "hostedOperationCostCapMicros", "repeats", "profiles", "manifestCandidate",
@@ -462,23 +466,42 @@ export function parseLiveModelsReport(value: unknown): LiveModelsReport {
   if (!("schemaVersion" in value)) {
     throw new Error("live-models report schemaVersion is required; legacy unversioned reports are not accepted");
   }
-  if (value.schemaVersion !== LIVE_MODELS_REPORT_SCHEMA_VERSION) {
+  if (
+    value.schemaVersion !== LIVE_MODELS_REPORT_SCHEMA_VERSION &&
+    value.schemaVersion !== LEGACY_LIVE_MODELS_REPORT_SCHEMA_VERSION
+  ) {
     throw new Error(`unsupported live-models report schemaVersion ${String(value.schemaVersion)}`);
   }
-  const unknown = Object.keys(value).filter((field) => !LIVE_MODELS_REPORT_FIELDS.has(field));
+  if (
+    value.schemaVersion === LEGACY_LIVE_MODELS_REPORT_SCHEMA_VERSION &&
+    "upstreamProviderRoute" in value
+  ) {
+    throw new Error("live-models schema-3 report must not contain upstreamProviderRoute");
+  }
+  const report = value.schemaVersion === LEGACY_LIVE_MODELS_REPORT_SCHEMA_VERSION
+    ? {
+        ...value,
+        schemaVersion: LIVE_MODELS_REPORT_SCHEMA_VERSION,
+        upstreamProviderRoute: value.upstreamProviderIdentity,
+      }
+    : value;
+  const unknown = Object.keys(report).filter((field) => !LIVE_MODELS_REPORT_FIELDS.has(field));
   if (unknown.length > 0) throw new Error(`live-models report has unknown field ${unknown[0]}`);
-  const missing = LIVE_MODELS_REQUIRED_REPORT_FIELDS.filter((field) => !(field in value));
+  const missing = LIVE_MODELS_REQUIRED_REPORT_FIELDS.filter((field) => !(field in report));
   if (missing.length > 0) throw new Error(`live-models report is missing field ${missing[0]}`);
-  if (!Array.isArray(value.cases) || !Array.isArray(value.models) ||
-      !Array.isArray(value.modelAggregates) || !Array.isArray(value.profiles) ||
-      !Array.isArray(value.attributionEvaluators)) {
+  if (typeof report.upstreamProviderRoute !== "string" || report.upstreamProviderRoute.trim() === "") {
+    throw new Error("live-models report upstreamProviderRoute must be a nonempty string");
+  }
+  if (!Array.isArray(report.cases) || !Array.isArray(report.models) ||
+      !Array.isArray(report.modelAggregates) || !Array.isArray(report.profiles) ||
+      !Array.isArray(report.attributionEvaluators)) {
     throw new Error("live-models report collection fields must be arrays");
   }
-  if (typeof value.privateEvidenceSha256 !== "string" || !isSha256(value.privateEvidenceSha256)) {
+  if (typeof report.privateEvidenceSha256 !== "string" || !isSha256(report.privateEvidenceSha256)) {
     throw new Error("live-models report privateEvidenceSha256 must be a SHA-256 digest");
   }
-  assertPublicReportValue(value, "report");
-  return value as unknown as LiveModelsReport;
+  assertPublicReportValue(report, "report");
+  return report as unknown as LiveModelsReport;
 }
 
 function assertPublicReportValue(value: unknown, path: string): void {
@@ -617,6 +640,7 @@ export interface QualificationProfile {
   apiFormat: "openai-compatible" | "anthropic";
   benchmarkProviderIdentity: string | null;
   upstreamProviderIdentity: string;
+  upstreamProviderRoute?: string;
   generatorModels: string[];
   consensus: number;
   scorerModels: string[];
@@ -645,6 +669,7 @@ export interface AdmissionManifestCandidate {
     apiBase: string;
     benchmarkProviderIdentity: string | null;
     upstreamProviderIdentity: string;
+    upstreamProviderRoute?: string;
     generatorChain: string[];
     consensus: number;
     scorerChain: string[];
@@ -665,6 +690,7 @@ export interface QualificationProfileDigestMaterial {
   modelDefaultsSha256: string;
   benchmarkProviderIdentity: string | null;
   upstreamProviderIdentity: string;
+  upstreamProviderRoute?: string;
   apiBase: string;
   apiFormat: "openai-compatible" | "anthropic";
   generatorChain: string[];
@@ -725,6 +751,10 @@ export async function runLiveModels(
   if (upstreamProvider.length === 0) {
     throw new Error("live qualification requires an exact pinned upstream provider identity");
   }
+  const upstreamProviderRoute = (options.upstreamProviderRoute ?? upstreamProvider).trim();
+  if (upstreamProviderRoute.length === 0) {
+    throw new Error("live qualification requires an exact pinned upstream provider route");
+  }
   const rootDir = options.rootDir ?? resolve(import.meta.dir, "..", ".runs", "live-models");
   const suppliedPricing = options.pricing;
   return withImmutableQualificationBinary(options.binary, rootDir, async (immutableBinary) => {
@@ -752,7 +782,8 @@ export async function runLiveModels(
     apiFormat,
     models,
     upstreamProvider,
-    qualificationRequiredParameters(pairs),
+    qualificationRequiredParameters(pairs, upstreamProvider),
+    upstreamProviderRoute,
   ));
   assertPricingProviderIdentity(pricing, models, upstreamProvider);
   const attributionGovernor = new AttributionGovernor(
@@ -771,6 +802,7 @@ export async function runLiveModels(
     apiFormat,
     costCapUsdDecimal,
     upstreamProvider,
+    upstreamProviderRoute,
   });
   const keyName = resolveApiKeyName();
   const completionApiKey = keyName === undefined ? undefined : process.env[keyName];
@@ -861,6 +893,7 @@ export async function runLiveModels(
       apiBase,
       apiFormat,
       upstreamProvider,
+      upstreamProviderRoute,
       requestProxy.apiBase,
     );
     const result = await qualifyAttributionEvaluator({
@@ -911,6 +944,7 @@ export async function runLiveModels(
     repeats,
     modelPriceBounds: modelPriceBoundsFor(pair, pricing),
     upstreamProviderIdentity: upstreamProvider,
+    upstreamProviderRoute,
   }));
   const exactGeneratorCosts = results
     .map((result) => result.costProviderDecimal)
@@ -955,6 +989,7 @@ export async function runLiveModels(
     providerEndpointIdentity: identity,
     upstreamProviderPinned: true,
     upstreamProviderIdentity: upstreamProvider,
+    upstreamProviderRoute,
     fixtureHash,
     reviewContractHash,
     evaluatorContractHash,
@@ -1000,6 +1035,7 @@ export async function runLiveModels(
     providerEndpointIdentity: identity,
     upstreamProviderPinned: true,
     upstreamProviderIdentity: upstreamProvider,
+    upstreamProviderRoute,
     fixtureHash,
     reviewContractHash,
     evaluatorContractHash,
@@ -1286,7 +1322,14 @@ async function runLiveModelCase(
   if (candidateProfilePath !== undefined) {
     await writeFile(
       candidateProfilePath,
-      JSON.stringify(qualificationCandidateDocument(pair, pricing, apiBase, apiFormat, options.upstreamProvider)),
+      JSON.stringify(qualificationCandidateDocument(
+        pair,
+        pricing,
+        apiBase,
+        apiFormat,
+        options.upstreamProvider,
+        options.upstreamProviderRoute,
+      )),
       { mode: 0o600 },
     );
   }
@@ -1453,12 +1496,14 @@ export function qualificationCandidateDocument(
   apiBase: string,
   apiFormat: "openai-compatible" | "anthropic",
   upstreamProvider: string,
+  upstreamProviderRoute = upstreamProvider,
 ) {
   return {
     benchmarkProviderIdentity: benchmarkProviderIdentityFor(apiBase, apiFormat),
     apiBase,
     apiFormat,
     upstreamProviderIdentity: upstreamProvider,
+    upstreamProviderRoute,
     generatorChain: qualificationGeneratorModels(pair),
     consensus: pair.consensus,
     scorerChain: qualificationScorerModels(pair),
@@ -1473,6 +1518,7 @@ export async function prepareAttributionEvaluatorEnvironment(
   apiBase: string,
   apiFormat: "openai-compatible" | "anthropic",
   upstreamProvider: string,
+  upstreamProviderRoute: string,
   qualificationCaptureApiBase: string,
 ): Promise<NodeJS.ProcessEnv> {
   const homeDir = join(pairRoot, "home");
@@ -1482,7 +1528,14 @@ export async function prepareAttributionEvaluatorEnvironment(
   const candidateProfilePath = join(pairRoot, "qualification-candidate.json");
   await writeFile(
     candidateProfilePath,
-    JSON.stringify(qualificationCandidateDocument(pair, pricing, apiBase, apiFormat, upstreamProvider)),
+    JSON.stringify(qualificationCandidateDocument(
+      pair,
+      pricing,
+      apiBase,
+      apiFormat,
+      upstreamProvider,
+      upstreamProviderRoute,
+    )),
     { mode: 0o600 },
   );
   return liveEnv(
@@ -1508,6 +1561,7 @@ export async function assertRuntimeShapedQualificationPreflight(args: {
   apiFormat: "openai-compatible" | "anthropic";
   costCapUsdDecimal: string;
   upstreamProvider: string;
+  upstreamProviderRoute: string;
   credentialEnvironment?: NodeJS.ProcessEnv;
 }): Promise<string> {
   let projectedMicros = 0n;
@@ -1540,7 +1594,14 @@ export async function assertRuntimeShapedQualificationPreflight(args: {
           const profilePath = join(runDir, "qualification-candidate.json");
           await writeFile(
             profilePath,
-            JSON.stringify(qualificationCandidateDocument(pair, args.pricing, args.apiBase, args.apiFormat, args.upstreamProvider)),
+            JSON.stringify(qualificationCandidateDocument(
+              pair,
+              args.pricing,
+              args.apiBase,
+              args.apiFormat,
+              args.upstreamProvider,
+              args.upstreamProviderRoute,
+            )),
             { mode: 0o600 },
           );
           const github = await startMockGithub(c);
@@ -2024,6 +2085,7 @@ function qualificationProfileEvidence(args: Omit<
     apiFormat: args.apiFormat,
     benchmarkProviderIdentity: benchmarkProviderIdentityFor(args.apiBase, args.apiFormat),
     upstreamProviderIdentity: args.upstreamProviderIdentity,
+    upstreamProviderRoute: args.upstreamProviderRoute,
     generatorModels,
     consensus,
     scorerModels: qualificationScorerModels(args.pair),
@@ -2056,6 +2118,9 @@ export function qualificationProfileDigestMaterial(
     modelDefaultsSha256: profile.modelDefaultsSha256,
     benchmarkProviderIdentity: profile.benchmarkProviderIdentity,
     upstreamProviderIdentity: profile.upstreamProviderIdentity,
+    ...(profile.upstreamProviderRoute === undefined
+      ? {}
+      : { upstreamProviderRoute: profile.upstreamProviderRoute }),
     apiBase: profile.apiBase,
     apiFormat: profile.apiFormat,
     generatorChain: profile.generatorModels,
@@ -2369,6 +2434,7 @@ export async function fetchPricing(
   models: string[],
   upstreamProvider: string,
   requiredParametersByModel: ReadonlyMap<string, readonly string[]> = new Map(),
+  upstreamProviderRoute = upstreamProvider,
 ): Promise<Map<string, ModelPricing>> {
   const managedOpenRouter = benchmarkProviderIdentityFor(apiBase, apiFormat) !== null;
   const url = `${apiBase.replace(/\/$/, "")}/${managedOpenRouter ? "endpoints/zdr" : "models"}`;
@@ -2395,13 +2461,28 @@ export async function fetchPricing(
       models,
       upstreamProvider,
       requiredParametersByModel,
+      upstreamProviderRoute,
     )
     : pricingFromCatalog(catalog as OpenRouterModelsResponse, models);
 }
 
 export function qualificationRequiredParameters(
   pairs: QualificationPair[],
+  upstreamProvider = "Azure",
 ): ReadonlyMap<string, readonly string[]> {
+  const generatorParameters = [
+    "max_tokens",
+    "reasoning",
+    "reasoning_effort",
+    "temperature",
+  ] as const;
+  const scorerParameters = [
+    upstreamProvider === "OpenAI" ? "max_tokens" : "max_completion_tokens",
+    "reasoning",
+    "reasoning_effort",
+    "response_format",
+    "structured_outputs",
+  ] as const;
   const parameters = new Map<string, Set<string>>();
   const add = (model: string, required: readonly string[]): void => {
     const modelParameters = parameters.get(model) ?? new Set<string>();
@@ -2410,17 +2491,10 @@ export function qualificationRequiredParameters(
   };
   for (const pair of pairs) {
     for (const model of qualificationGeneratorModels(pair)) {
-      add(model, ["max_tokens", "reasoning", "reasoning_effort", "temperature"]);
+      add(model, generatorParameters);
     }
     for (const model of qualificationScorerModels(pair)) {
-      add(model, [
-        "max_tokens",
-        "reasoning",
-        "reasoning_effort",
-        "response_format",
-        "structured_outputs",
-        "temperature",
-      ]);
+      add(model, scorerParameters);
     }
   }
   return new Map([...parameters].map(([model, required]) => [model, [...required].sort()]));

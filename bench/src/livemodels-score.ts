@@ -60,6 +60,81 @@ export interface ModelPricing {
   outputMicrosPerMillionTokens: number;
 }
 
+export interface ProviderContractEvidence {
+  version: 1;
+  benchmarkProviderIdentity: "openrouter:managed-routing";
+  upstreamProviderIdentity: string;
+  upstreamProviderRoute: string;
+  dataCollection: "deny";
+  zeroDataRetention: true;
+  allowFallbacks: false;
+  generatorRequireParameters: false;
+  scorerRequireParameters: true;
+  maxPricePinned: true;
+  maxPriceUnits: "USD per million tokens";
+  modelPriceBounds: Array<{
+    model: string;
+    roles: Array<"generator" | "scorer">;
+    inputMicrosPerMillionTokens: number;
+    outputMicrosPerMillionTokens: number;
+  }>;
+}
+
+export function providerContractEvidence(
+  upstreamProviderIdentity: string,
+  upstreamProviderRoute: string,
+  pricing: ReadonlyMap<string, Pick<
+    ModelPricing,
+    "inputMicrosPerMillionTokens" | "outputMicrosPerMillionTokens"
+  >>,
+  generatorModels: readonly string[],
+  scorerModels: readonly string[],
+): ProviderContractEvidence {
+  const generatorSet = new Set(generatorModels);
+  const scorerSet = new Set(scorerModels);
+  const models = [...new Set([...generatorModels, ...scorerModels])].sort();
+  const modelPriceBounds = models.map((model) => {
+    const bound = pricing.get(model);
+    if (bound === undefined) throw new Error(`provider contract pricing missing for ${model}`);
+    return {
+      model,
+      roles: [
+        ...(generatorSet.has(model) ? ["generator" as const] : []),
+        ...(scorerSet.has(model) ? ["scorer" as const] : []),
+      ],
+      inputMicrosPerMillionTokens: bound.inputMicrosPerMillionTokens,
+      outputMicrosPerMillionTokens: bound.outputMicrosPerMillionTokens,
+    };
+  });
+  return {
+    version: 1,
+    benchmarkProviderIdentity: "openrouter:managed-routing",
+    upstreamProviderIdentity,
+    upstreamProviderRoute,
+    dataCollection: "deny",
+    zeroDataRetention: true,
+    allowFallbacks: false,
+    generatorRequireParameters: false,
+    scorerRequireParameters: true,
+    maxPricePinned: true,
+    maxPriceUnits: "USD per million tokens",
+    modelPriceBounds,
+  };
+}
+
+export function providerContractSha256(contract: ProviderContractEvidence): string {
+  const canonical = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(canonical);
+    if (typeof value !== "object" || value === null) return value;
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, entry]) => [key, canonical(entry)]),
+    );
+  };
+  return createHash("sha256").update(JSON.stringify(canonical(contract))).digest("hex");
+}
+
 /** Ground truth distilled from a fixture: the authored target defect's file and line, or
  * a clean fixture where the correct review is silence. */
 export interface GroundTruth {
@@ -814,6 +889,7 @@ export interface OpenRouterZdrEndpointsResponse {
   data: Array<{
     model_id: string;
     provider_name?: string;
+    tag?: string;
     status?: number;
     pricing?: { prompt?: string; completion?: string };
     supported_parameters?: string[];
@@ -883,11 +959,21 @@ export function pricingFromZdrCatalog(
   wantedModels: string[],
   expectedProvider: string,
   requiredParametersByModel: ReadonlyMap<string, readonly string[]> = new Map(),
+  expectedProviderRoute = expectedProvider,
 ): Map<string, ModelPricing> {
   const wanted = new Set(wantedModels);
   const candidates = new Map<string, Array<ModelPricing & { provider: string }>>();
   for (const endpoint of catalog.data ?? []) {
-    if (!wanted.has(endpoint.model_id) || endpoint.status !== 0 || endpoint.provider_name !== expectedProvider) continue;
+    const providerMatches = endpoint.provider_name === expectedProvider;
+    const routeMatches = expectedProviderRoute === expectedProvider
+      ? providerMatches
+      : endpoint.tag === expectedProviderRoute;
+    if (
+      !wanted.has(endpoint.model_id) || endpoint.status !== 0 ||
+      !providerMatches || !routeMatches
+    ) {
+      continue;
+    }
     const supportedParameters = endpoint.supported_parameters;
     const requiredParameters = requiredParametersByModel.get(endpoint.model_id) ?? [];
     if (requiredParameters.length > 0 &&

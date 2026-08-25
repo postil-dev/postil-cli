@@ -49,7 +49,7 @@ sensitive development evidence and keep them out of public artifacts.
 ## Running (mock mode: default, CI)
 
 ```sh
-cargo build --quiet --release --features qualification-candidate   # from the repo root
+cargo build --quiet --release   # from the repo root
 cd bench
 bun install
 bun run bench                   # add --json or --json-out report.json for machine output
@@ -108,12 +108,12 @@ missing, mismatched, stale, or invalid bundle rejects a nonempty manifest. The
 empty manifest is exempt because it admits no models. Report and profile
 checksums detect changes; they do not authenticate who produced a candidate.
 
-The workflow builds a qualification-only binary feature that accepts one exact
-candidate profile inside the hermetic benchmark. The feature requires CI,
-managed privacy enforcement, and a loopback mock forge. Release binaries omit
-the feature. Candidate runs therefore execute the production hosted planner,
-request preflight, price ceilings, consensus, and scorer behavior without
-granting unqualified profiles authority in a deployed service.
+The release binary includes a guarded qualification path that accepts one exact
+candidate profile inside the hermetic benchmark. Activation requires CI,
+managed privacy enforcement, and a loopback mock forge. Candidate runs execute
+the production hosted planner, request preflight, price ceilings, consensus,
+and scorer behavior without granting unqualified profiles authority in a
+deployed service.
 
 ```sh
 export MODEL_API_KEY=... # or POSTIL_API_KEY, OPENROUTER_API_KEY, or LLM_API_KEY
@@ -123,12 +123,14 @@ export POSTIL_BENCH_REPEATS=3
 export POSTIL_API_BASE=https://openrouter.ai/api/v1
 export POSTIL_API_FORMAT=openai-compatible
 export POSTIL_BENCH_UPSTREAM_PROVIDER='Exact upstream provider name'
+export POSTIL_BENCH_UPSTREAM_PROVIDER_ROUTE='exact/provider-route'
 bun run bench --json-out report.json --manifest-out ../qualified-models.json
 ```
 
-Live admission emits public report schema version 2. Consumers must call
+Live admission emits public report schema version 4. Consumers must call
 `parseLiveModelsReport`; unversioned reports and unknown schema versions are
-rejected. Public case diagnostics contain counts and SHA-256 digests only.
+rejected. The parser upgrades retained schema-3 reports by defaulting their
+provider route to the recorded provider identity. Public case diagnostics contain counts and SHA-256 digests only.
 Finding prose, target contracts, raw evaluator responses, evaluator reasons,
 and diagnostic text are absent.
 
@@ -174,7 +176,9 @@ Pass it with `--pricing-file prices.json` or
 `POSTIL_BENCH_PRICING_FILE=prices.json`. Prices are positive canonical decimal
 strings that must be exactly representable as integer micros per million
 tokens. Every row names the exact upstream provider passed with
-`--upstream-provider`; a mismatch fails before inference. Each admitted profile carries immutable input and output price bounds
+`--upstream-provider`; `--upstream-provider-route` identifies the exact
+endpoint slug when it differs from the response provider identity. A mismatch
+fails before inference. Each admitted profile carries immutable input and output price bounds
 for its exact generator and scorer model set. The catalog request uses the
 inference credential when no file is supplied and fails closed when any model
 is unpriced. Catalog redirects are rejected so credentials remain bound to the
@@ -197,7 +201,7 @@ Admission requires all of these in every repeat:
 - no clean false blocks and at most 5% clean cases with any finding
 - no execution, structured-output, grounding, statusline, or usage-accounting failure
 - mean pair cost at most $0.04 and mean review latency at most 15 seconds
-- every review costs at most the $1 hosted operation cap
+- every review reports at most $1 of actual provider cost
 - per-repeat p95 latency at most 30 seconds and maximum latency at most 60 seconds
 
 Findings suppressed by the scorer count as detector evidence but cannot satisfy
@@ -239,8 +243,9 @@ plan for every fixture before inference. It includes bounded planner, selected
 source and synthesis requests, scoring, consensus, fallback, repair, and
 bounded post-processing requests. Transport retries reserve exact exposure at
 runtime under the same hard limits. Preflight rejects missing prices, more than six models, a review
-above the $1 hosted operation cap, a total above the configured qualification
-cap, or a cap outside `(0, $70]`. A single model used for more than one role is
+whose worst-case retry projection exceeds $25, a total above the configured qualification
+cap, or a cap outside `(0, $70]`. Runtime independently rejects more than $1 of
+reported provider cost or 20 million reported tokens. A single model used for more than one role is
 priced for each planned invocation.
 Atomic attribution accepts at most three findings anchored in one authored
 region. More is a fidelity failure. Each decision is limited to a 4 KiB input,
@@ -275,22 +280,31 @@ This diagnostic can reject a scorer but cannot admit a production pair; pair
 qualification above is the admission authority.
 
 ```sh
-cargo build --quiet --release --features qualification-candidate
+cargo build --quiet --release
 cd bench
 export MODEL_API_KEY=...          # or LLM_API_KEY / OPENROUTER_API_KEY
 POSTIL_SCORER_EVAL_MODELS=provider/candidate-a,provider/candidate-b \
 POSTIL_SCORER_EVAL_REPEATS=5 \
 POSTIL_SCORER_EVAL_UPSTREAM_PROVIDER=provider-name \
+POSTIL_SCORER_EVAL_UPSTREAM_PROVIDER_ROUTE=provider-route \
+POSTIL_SCORER_EVAL_ROOT_DIR=.runs/scorer-eval/unique-run-id \
   bun run scorer-eval --json-out scorer-eval-report.json
 ```
+
+The provider name is the identity echoed in responses. The optional provider
+route is the exact OpenRouter endpoint slug; it defaults to the provider name.
+Qualification starts only when the evaluator source bundle matches `HEAD`.
+The retained report binds that commit to an evaluator SHA-256 digest, the exact
+release-binary digest, provider identity and route, ZDR and fallback policy,
+and sorted per-model maximum price bounds.
 
 The default candidates come from `config.toml`; the workflow input may override
 them explicitly. Qualification repeats 12 fixtures five times: six unambiguous
 authored target risks and six injected false findings. Admission requires a complete
 matrix, no malformed, repaired, fallback, or reason-contract failures, all
 target risks preserved as published gate failures, at least 80% of false
-findings actually suppressed overall and per fixture, p50/p95/max scorer latency
-at or below 5/10/20 seconds, known live
+findings actually suppressed overall and per fixture, scorer-only p50/p95/max
+latency at or below 5/10/20 seconds, known live
 catalog pricing, and mean scorer cost at or below $0.005 per case. A failed
 candidate makes the command exit nonzero after writing its report. Candidate
 listing alone never enables the embedded scorer. Before any model call, the
@@ -303,10 +317,11 @@ of repair context. Scorer responses also fail
 admission when provider usage is missing or malformed, runtime accounting is
 incomplete, or the assessment is not trimmed single-line text ending in
 sentence punctuation. The prompt targets at most 180 UTF-8 bytes, and the
-parser rejects more than 240 UTF-8 bytes. Each
-case is killed one second
-after the 20-second admission limit, and teardown aborts outstanding provider
-requests. A timeout rejects that candidate immediately rather than running the
+parser rejects more than 240 UTF-8 bytes. Each adjudication and scorer request
+has its own 20-second admission limit. A 45-second outer safety cutoff leaves
+both sequential live phases their full window plus bounded fixture overhead,
+and teardown aborts outstanding provider requests. A timeout rejects that
+candidate immediately rather than running the
 rest of its matrix. Any other admission-fatal structural result, including an
 unroutable provider response, malformed envelope, scorer mismatch, invalid
 reason, incomplete usage, or repair attempt, also stops only that candidate.
@@ -330,16 +345,16 @@ is written to any repo.
 ```sh
 export MODEL_API_KEY=...         # required; never logged or printed
 REVIEW_MODEL=provider/qualified-model bun run bench:live
-# Screen exact fixtures against the provisional GLM route. Repeat --case.
-REVIEW_MODEL=z-ai/glm-5.2 bun run bench:live -- \
-  --run-id glm-5-2-fireworks-screen-1 \
+# Screen exact fixtures against the provisional Luna route. Repeat --case.
+REVIEW_MODEL=openai/gpt-5.6-luna bun run bench:live -- \
+  --run-id luna-azure-eu-screen-1 \
   --screen-profile ../provisional-models.json \
   --case prompt-injection-auth-bypass \
   --case near-duplicate-auth-clean
 # Keep provider calls inside the live screen's 180-second case watchdog.
 POSTIL_LLM_REQUEST_TIMEOUT_SECS=60 POSTIL_LLM_TOTAL_TIMEOUT_SECS=170 \
-  REVIEW_MODEL=z-ai/glm-5.2 bun run bench:live -- \
-  --run-id glm-5-2-fireworks-bounded-timeouts \
+  REVIEW_MODEL=openai/gpt-5.6-luna bun run bench:live -- \
+  --run-id luna-azure-eu-bounded-timeouts \
   --screen-profile ../provisional-models.json \
   --case prompt-injection-auth-bypass
 # A profile with a scorerChain can exercise the production scorer path.
@@ -390,6 +405,9 @@ scorer chain, exact upstream provider, canonical managed endpoint, and price
 ceilings. Requests deny provider data collection, require zero-data retention,
 pin that provider without fallbacks, and enforce the profile prices. The report
 records the selected IDs and marks the evidence as non-admission screening.
+When the harness explicitly disables scoring, screening projects only the
+profile's exact generator role; the unexercised scorer chain remains recorded
+in the profile but does not have to be active in the child process.
 Formal admission rejects `--case`, `--scorer-model`, and `--screen-profile`.
 Every cost total says whether all calls supplied complete provider accounting.
 
@@ -440,11 +458,11 @@ nondeterministic. Treat them as internal evidence, not a published benchmark.
 
 ## Release gate
 
-The `Release` workflow runs a full-corpus diff-file live pass
-(`REVIEW_MODEL=z-ai/glm-5.2 bun run bench:live`) against the plain release
-binary before it builds any target, then checks the result with
-`bun run bench:compare`. A material regression blocks the release: `build`
-depends on the `bench-live` job.
+The `Release` workflow runs a full-corpus diff-file live pass against the Luna
+profile in `provisional-models.json` and the exact release binary before it
+builds any other target, then checks the result with `bun run bench:compare`.
+A material regression blocks the release: `build` depends on the `bench-live`
+job.
 
 `compare-baseline.ts` computes five metrics from the live report and compares
 each against the matching model entry in `bench/baseline.json`: authored-target
@@ -488,7 +506,9 @@ bun run bench:compare -- --run-id <run-id>   # resolves .runs/live/<run-id>/repo
 
 # Re-baseline deliberately, after confirming the new numbers are an accepted
 # tradeoff (a model change, a fixture change, an intentional pipeline change):
-REVIEW_MODEL=z-ai/glm-5.2 bun run bench:live -- --json-out live-report.json
+REVIEW_MODEL=openai/gpt-5.6-luna bun run bench:live -- \
+  --screen-profile ../provisional-models.json \
+  --json-out live-report.json
 bun run bench:compare -- --result live-report.json --record
 ```
 
