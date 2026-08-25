@@ -249,6 +249,17 @@ fn review_batch_validation_reason(
             ),
         });
     }
+    if let Some(claim) = finding.machine_claim.as_ref()
+        && (finding.repository_claim.is_some() || !crate::machine_claim::claim_is_valid(claim))
+    {
+        return Some(ReviewBatchValidationReason {
+            category: "machineClaim",
+            repair_detail: format!(
+                "finding at {}:{} has an invalid machineClaim declaration; do not combine it with repositoryContext, use one supported kind, an exact regular Rust path and crate-qualified symbol, and the bounded expectedSignature shape only for signature.mismatch",
+                finding.path, finding.line
+            ),
+        });
+    }
 
     if diff::review_batch_contains_exact_evidence(
         annotated,
@@ -1134,7 +1145,7 @@ fn generate_finding_ids(findings: &mut [Finding], head_sha: Option<&str>) {
         // Normalize the finding data
         let normalized_path = finding.path.to_lowercase();
         let normalized_title = finding.title.trim().to_lowercase();
-        let identity = if let Some(evidence) = finding.evidence.as_deref() {
+        let mut identity = if let Some(evidence) = finding.evidence.as_deref() {
             format!(
                 "evidence\x00{}\x00{}\x00{}\x00{}",
                 finding.kind.as_str(),
@@ -1160,6 +1171,10 @@ fn generate_finding_ids(findings: &mut [Finding], head_sha: Option<&str>) {
                 normalized_title
             )
         };
+        if let Some(claim) = finding.machine_claim.as_ref() {
+            identity.push_str("\0machine-claim\0");
+            identity.push_str(&crate::machine_claim::claim_identity_sha256(claim));
+        }
 
         // Generate SHA256 hash
         let mut hasher = Sha256::new();
@@ -2200,28 +2215,7 @@ async fn review_diff_at(
                     model_used = batch_models.join(", ");
                 }
                 if total_requests > 0 {
-                    let mut deduplicated = Vec::<Finding>::new();
-                    let mut positions: HashMap<_, usize> = HashMap::new();
-                    for finding in raw_findings {
-                        let key = (
-                            finding.path.clone(),
-                            finding.kind.as_str().to_string(),
-                            finding.title.trim().to_ascii_lowercase(),
-                            finding.evidence.clone(),
-                        );
-                        if let Some(position) = positions.get(&key).copied() {
-                            let existing = &mut deduplicated[position];
-                            if (finding.severity, finding.confidence)
-                                > (existing.severity, existing.confidence)
-                            {
-                                *existing = finding;
-                            }
-                        } else {
-                            positions.insert(key, deduplicated.len());
-                            deduplicated.push(finding);
-                        }
-                    }
-                    let raw_findings = deduplicated;
+                    let raw_findings = deduplicate_generated_findings(raw_findings);
                     let grounded_candidate_count = raw_findings.len();
                     let mut generator_filter_cfg = cfg.clone();
                     generator_filter_cfg.max_findings = generator_max_findings;
@@ -2665,6 +2659,12 @@ async fn review_diff_at(
             .await
         }
     };
+    let claim_verification = crate::machine_claim::verify(
+        &repository_source,
+        repository_revision.as_deref(),
+        findings.iter().chain(baseline.iter()),
+    )
+    .await;
     let repository_suppressed = suppress_refuted_repository_claims(
         &mut findings,
         &repository_search,
@@ -2672,6 +2672,16 @@ async fn review_diff_at(
     );
     suppressed = suppressed.saturating_add(repository_suppressed.len() as u32);
     suppressed_findings.extend(repository_suppressed);
+
+    let machine_application = apply_machine_claim_policy(
+        &mut findings,
+        &mut baseline,
+        &adjudication_preserved_baseline,
+        claim_verification.as_ref(),
+        repository_revision.as_deref(),
+    );
+    suppressed = suppressed.saturating_add(machine_application.suppressed.len() as u32);
+    suppressed_findings.extend(machine_application.suppressed);
 
     // A question the reviewer never answered cannot block a merge. This runs
     // after uncertainty resolution so a finding that went and checked keeps the
@@ -2769,6 +2779,7 @@ async fn review_diff_at(
 
     let mut resolved = rec.resolved;
     resolved.extend(adjudication_resolved);
+    resolved.extend(machine_application.resolved);
 
     Ok(Envelope {
         version: 1,
@@ -2794,6 +2805,7 @@ async fn review_diff_at(
         review_coverage,
         review_admission,
         repository_search,
+        claim_verification,
         usage_accounting_complete,
         duration_ms: review_started.elapsed().as_millis() as u64,
         base_sha: meta.map(|m| m.base_sha.clone()),
@@ -2843,6 +2855,7 @@ fn qualification_plan_envelope(
         review_coverage: Some(review_coverage),
         review_admission: Some(review_admission),
         repository_search: crate::repository_search::unavailable(head_sha.as_deref()),
+        claim_verification: None,
         usage_accounting_complete: true,
         duration_ms,
         base_sha: meta.map(|value| value.base_sha.clone()),
@@ -3147,6 +3160,90 @@ fn suppress_refuted_repository_claims(
     suppressed
 }
 
+struct MachineClaimApplication {
+    suppressed: Vec<SuppressedFinding>,
+    resolved: Vec<Finding>,
+}
+
+fn apply_machine_claim_policy(
+    findings: &mut Vec<Finding>,
+    baseline: &mut Vec<Finding>,
+    adjudication_preserved_baseline: &[Finding],
+    receipt: Option<&crate::envelope::ClaimVerificationReceipt>,
+    expected_head_sha: Option<&str>,
+) -> MachineClaimApplication {
+    use crate::envelope::ClaimVerificationVerdict;
+
+    let mut suppressed = Vec::new();
+    let mut resolved = Vec::new();
+    let mut kept_findings = Vec::with_capacity(findings.len());
+    for mut finding in findings.drain(..) {
+        let Some(claim) = finding.machine_claim.as_ref() else {
+            kept_findings.push(finding);
+            continue;
+        };
+        let verdict = crate::machine_claim::receipt_verdict(receipt, claim, expected_head_sha);
+        let preserved_baseline = adjudication_preserved_baseline
+            .iter()
+            .any(|baseline| same_visible_finding(baseline, &finding));
+        if preserved_baseline {
+            if verdict == Some(ClaimVerificationVerdict::Refuted) {
+                resolved.push(finding);
+            } else {
+                finding.machine_claim_deferred = true;
+                finding.severity = crate::envelope::Severity::Info;
+                kept_findings.push(finding);
+            }
+            continue;
+        }
+        match verdict {
+            Some(ClaimVerificationVerdict::Supported) => {
+                finding.machine_claim_deferred = false;
+                kept_findings.push(finding);
+            }
+            Some(ClaimVerificationVerdict::Refuted) => suppressed.push(SuppressedFinding {
+                finding,
+                reason: SuppressionReason::MachineClaimRefuted,
+            }),
+            Some(ClaimVerificationVerdict::Unresolved | ClaimVerificationVerdict::Unsupported)
+            | None => suppressed.push(SuppressedFinding {
+                finding,
+                reason: SuppressionReason::MachineClaimUnverified,
+            }),
+        }
+    }
+    *findings = kept_findings;
+
+    let mut kept_baseline = Vec::with_capacity(baseline.len());
+    for mut finding in baseline.drain(..) {
+        let Some(claim) = finding.machine_claim.as_ref() else {
+            kept_baseline.push(finding);
+            continue;
+        };
+        if crate::machine_claim::receipt_verdict(receipt, claim, expected_head_sha)
+            == Some(ClaimVerificationVerdict::Refuted)
+        {
+            resolved.push(finding);
+            continue;
+        }
+        if adjudication_preserved_baseline
+            .iter()
+            .any(|preserved| same_visible_finding(preserved, &finding))
+        {
+            continue;
+        }
+        finding.machine_claim_deferred = true;
+        finding.severity = crate::envelope::Severity::Info;
+        kept_baseline.push(finding);
+    }
+    *baseline = kept_baseline;
+
+    MachineClaimApplication {
+        suppressed,
+        resolved,
+    }
+}
+
 fn same_visible_finding(a: &Finding, b: &Finding) -> bool {
     a.path == b.path
         && a.line == b.line
@@ -3154,8 +3251,41 @@ fn same_visible_finding(a: &Finding, b: &Finding) -> bool {
         && a.severity == b.severity
         && a.kind == b.kind
         && a.confidence.to_bits() == b.confidence.to_bits()
+        && a.machine_claim
+            .as_ref()
+            .map(crate::machine_claim::claim_identity_sha256)
+            == b.machine_claim
+                .as_ref()
+                .map(crate::machine_claim::claim_identity_sha256)
         && a.title == b.title
         && visible_body(&a.body) == visible_body(&b.body)
+}
+
+fn deduplicate_generated_findings(raw_findings: Vec<Finding>) -> Vec<Finding> {
+    let mut deduplicated = Vec::<Finding>::new();
+    let mut positions: HashMap<_, usize> = HashMap::new();
+    for finding in raw_findings {
+        let key = (
+            finding.path.clone(),
+            finding.kind.as_str().to_string(),
+            finding.title.trim().to_ascii_lowercase(),
+            finding.evidence.clone(),
+            finding
+                .machine_claim
+                .as_ref()
+                .map(crate::machine_claim::claim_identity_sha256),
+        );
+        if let Some(position) = positions.get(&key).copied() {
+            let existing = &mut deduplicated[position];
+            if (finding.severity, finding.confidence) > (existing.severity, existing.confidence) {
+                *existing = finding;
+            }
+        } else {
+            positions.insert(key, deduplicated.len());
+            deduplicated.push(finding);
+        }
+    }
+    deduplicated
 }
 
 fn visible_body(body: &str) -> &str {
@@ -3304,6 +3434,7 @@ fn error_envelope(
         review_coverage: review_failure.and_then(|failure| failure.review_coverage.clone()),
         review_admission: review_failure.and_then(|failure| failure.review_admission),
         repository_search: crate::repository_search::unavailable(Some(head_sha)),
+        claim_verification: None,
         usage_accounting_complete: review_failure
             .is_none_or(|failure| failure.usage_accounting_complete),
         duration_ms,
@@ -3351,12 +3482,12 @@ mod tests {
         let below_floor = format!("Benchmark pull request{}", "x".repeat(442));
 
         let local_budgets = batch_budgets_for_title(&local_edge);
-        assert_eq!(local_budgets.synthesis, 4_227);
-        assert_eq!(local_budgets.source, 4_228);
+        assert_eq!(local_budgets.synthesis, 4_116);
+        assert_eq!(local_budgets.source, 4_117);
         assert!(review_batch_budgets_are_usable(local_budgets));
         let ci_budgets = batch_budgets_for_title(&ci_edge);
-        assert_eq!(ci_budgets.synthesis, 4_211);
-        assert_eq!(ci_budgets.source, 4_212);
+        assert_eq!(ci_budgets.synthesis, 4_100);
+        assert_eq!(ci_budgets.source, 4_101);
         assert!(review_batch_budgets_are_usable(ci_budgets));
         assert_eq!(
             ci_budgets.stabilized_for_rendering(),
@@ -3368,7 +3499,7 @@ mod tests {
         let below_floor_budgets = batch_budgets_for_title(&below_floor);
         assert_eq!(
             below_floor_budgets.synthesis,
-            diff::MIN_REVIEW_BATCH_BYTES - 269
+            diff::MIN_REVIEW_BATCH_BYTES - 380
         );
         assert!(!review_batch_budgets_are_usable(below_floor_budgets));
     }
@@ -3697,6 +3828,8 @@ mod tests {
             scorer_kind: None,
             scorer_reason: None,
             repository_claim: None,
+            machine_claim: None,
+            machine_claim_deferred: false,
             title: title.to_string(),
             body: body.to_string(),
             evidence: None,
@@ -3960,6 +4093,92 @@ mod tests {
     }
 
     #[test]
+    fn stable_ids_include_canonical_machine_claim_identity() {
+        let head_sha = "0123456789abcdef0123456789abcdef01234567";
+        let mut first = finding_with_title(
+            "src/identity.rs",
+            42,
+            "Signature mismatch",
+            "The signature differs.",
+        );
+        first.machine_claim = Some(crate::envelope::MachineClaim {
+            kind: crate::envelope::MachineClaimKind::SignatureMismatch,
+            path: "src/identity.rs".into(),
+            symbol: "crate::identity::check".into(),
+            expected_signature: Some(crate::envelope::MachineSignature {
+                receiver: crate::envelope::MachineReceiver::None,
+                parameters: vec!["std::vec::Vec < u8 >".into()],
+                returns: "bool".into(),
+                is_async: false,
+                is_unsafe: false,
+            }),
+        });
+        let mut equivalent = first.clone();
+        equivalent
+            .machine_claim
+            .as_mut()
+            .unwrap()
+            .expected_signature
+            .as_mut()
+            .unwrap()
+            .parameters = vec!["std::vec::Vec<u8>".into()];
+        let mut distinct = equivalent.clone();
+        distinct.machine_claim.as_mut().unwrap().symbol = "crate::identity::other".into();
+
+        generate_finding_ids(std::slice::from_mut(&mut first), Some(head_sha));
+        generate_finding_ids(std::slice::from_mut(&mut equivalent), Some(head_sha));
+        generate_finding_ids(std::slice::from_mut(&mut distinct), Some(head_sha));
+
+        assert_eq!(first.id, equivalent.id);
+        assert_ne!(first.id, distinct.id);
+    }
+
+    #[test]
+    fn generated_dedup_keeps_sibling_findings_with_distinct_machine_claims() {
+        let mut first = finding_with_title(
+            "src/identity.rs",
+            42,
+            "Signature mismatch",
+            "The signature differs.",
+        );
+        first.evidence = Some("fn check()".into());
+        first.machine_claim = Some(crate::envelope::MachineClaim {
+            kind: crate::envelope::MachineClaimKind::SignatureMismatch,
+            path: "src/identity.rs".into(),
+            symbol: "crate::identity::first".into(),
+            expected_signature: Some(crate::envelope::MachineSignature {
+                receiver: crate::envelope::MachineReceiver::None,
+                parameters: Vec::new(),
+                returns: "bool".into(),
+                is_async: false,
+                is_unsafe: false,
+            }),
+        });
+        let mut distinct = first.clone();
+        distinct.machine_claim.as_mut().unwrap().symbol = "crate::identity::second".into();
+        let mut equivalent = first.clone();
+        equivalent
+            .machine_claim
+            .as_mut()
+            .unwrap()
+            .expected_signature
+            .as_mut()
+            .unwrap()
+            .returns = " bool ".into();
+
+        let deduplicated = deduplicate_generated_findings(vec![first, distinct, equivalent]);
+
+        assert_eq!(deduplicated.len(), 2);
+        let identities = deduplicated
+            .iter()
+            .map(|finding| {
+                crate::machine_claim::claim_identity_sha256(finding.machine_claim.as_ref().unwrap())
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(identities.len(), 2);
+    }
+
+    #[test]
     fn visible_finding_comparison_ignores_carry_marker_and_order() {
         let previous = vec![finding("a.rs", 10, "first"), finding("b.rs", 20, "second")];
         let current = vec![
@@ -4097,6 +4316,200 @@ mod tests {
         let mut fresh = vec![baseline];
         assert!(suppress_refuted_repository_claims(&mut fresh, &receipt, &[]).is_empty());
         assert_eq!(fresh.len(), 1);
+    }
+
+    fn machine_claim(
+        kind: crate::envelope::MachineClaimKind,
+        symbol: &str,
+    ) -> crate::envelope::MachineClaim {
+        crate::envelope::MachineClaim {
+            kind,
+            path: "src/identity.rs".into(),
+            symbol: symbol.into(),
+            expected_signature: None,
+        }
+    }
+
+    fn machine_receipt(
+        head_sha: &str,
+        source: &str,
+        claims: &[crate::envelope::MachineClaim],
+    ) -> crate::envelope::ClaimVerificationReceipt {
+        crate::machine_claim::verify_snapshot(
+            crate::machine_claim::MachineSourceSnapshot {
+                head_sha: head_sha.into(),
+                tree_sha256: "b".repeat(64),
+                files: vec![
+                    crate::machine_claim::MachineSourceFile {
+                        path: "src/lib.rs".into(),
+                        source: "mod identity;\n".into(),
+                    },
+                    crate::machine_claim::MachineSourceFile {
+                        path: "src/identity.rs".into(),
+                        source: source.into(),
+                    },
+                ],
+            },
+            claims,
+        )
+    }
+
+    #[test]
+    fn adjudication_rejection_is_not_resurrected_by_a_supported_machine_claim() {
+        let source_claim = machine_claim(
+            crate::envelope::MachineClaimKind::RustCopyMoveOut,
+            "crate::identity::IdentityFailure",
+        );
+        let receipt = machine_receipt(
+            &"a".repeat(40),
+            "pub struct IdentityFailure;\n",
+            std::slice::from_ref(&source_claim),
+        );
+        let mut rejected = finding("src/identity.rs", 1, "rejected machine claim");
+        rejected.machine_claim = Some(source_claim);
+        let ordinary = finding("src/identity.rs", 3, "ordinary finding");
+        let application = crate::adjudication::AdjudicationApplication {
+            kept: vec![ordinary.clone()],
+            kept_indices: vec![1],
+            unresolved_indices: Vec::new(),
+            resolved_indices: vec![0],
+            suppressed: vec![SuppressedFinding {
+                finding: rejected.clone(),
+                reason: SuppressionReason::BelowConfidence,
+            }],
+        };
+        let mut findings = application.kept;
+        let machine_application = apply_machine_claim_policy(
+            &mut findings,
+            &mut Vec::new(),
+            &[],
+            Some(&receipt),
+            Some(&"a".repeat(40)),
+        );
+
+        assert_eq!(findings.len(), 1);
+        assert!(same_visible_finding(&findings[0], &ordinary));
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| same_visible_finding(finding, &rejected))
+        );
+        assert!(machine_application.suppressed.is_empty());
+        assert!(machine_application.resolved.is_empty());
+    }
+
+    #[test]
+    fn fresh_machine_claim_policy_suppresses_refuted_and_unverified_claims() {
+        let head_sha = "a".repeat(40);
+        let refuted_claim = machine_claim(
+            crate::envelope::MachineClaimKind::RustCopyMoveOut,
+            "crate::identity::CopyFailure",
+        );
+        let supported_claim = machine_claim(
+            crate::envelope::MachineClaimKind::RustCopyMoveOut,
+            "crate::identity::MoveFailure",
+        );
+        let receipt = machine_receipt(
+            &head_sha,
+            "pub struct CopyFailure;\nimpl ::core::marker::Copy for CopyFailure {}\nimpl Clone for CopyFailure { fn clone(&self) -> Self { *self } }\npub struct MoveFailure;\n",
+            &[refuted_claim.clone(), supported_claim.clone()],
+        );
+        let mut refuted = finding("src/identity.rs", 1, "copy value is moved");
+        refuted.machine_claim = Some(refuted_claim);
+        let mut supported = finding("src/identity.rs", 2, "non-copy value is moved");
+        supported.machine_claim = Some(supported_claim);
+        let mut findings = vec![refuted, supported.clone()];
+        let mut baseline = Vec::new();
+
+        let application = apply_machine_claim_policy(
+            &mut findings,
+            &mut baseline,
+            &[],
+            Some(&receipt),
+            Some(&head_sha),
+        );
+        assert_eq!(findings.len(), 1);
+        assert!(same_visible_finding(&findings[0], &supported));
+        assert_eq!(application.suppressed.len(), 1);
+        assert_eq!(
+            application.suppressed[0].reason,
+            SuppressionReason::MachineClaimRefuted
+        );
+
+        let mut stale_findings = vec![supported];
+        let stale = "c".repeat(40);
+        let stale_application = apply_machine_claim_policy(
+            &mut stale_findings,
+            &mut Vec::new(),
+            &[],
+            Some(&receipt),
+            Some(&stale),
+        );
+        assert!(stale_findings.is_empty());
+        assert_eq!(
+            stale_application.suppressed[0].reason,
+            SuppressionReason::MachineClaimUnverified
+        );
+    }
+
+    #[test]
+    fn carried_machine_claims_resolve_only_from_fresh_refutation() {
+        let head_sha = "a".repeat(40);
+        let refuted_claim = machine_claim(
+            crate::envelope::MachineClaimKind::RustCopyMoveOut,
+            "crate::identity::CopyFailure",
+        );
+        let supported_claim = machine_claim(
+            crate::envelope::MachineClaimKind::RustCopyMoveOut,
+            "crate::identity::MoveFailure",
+        );
+        let receipt = machine_receipt(
+            &head_sha,
+            "pub struct CopyFailure;\nimpl ::core::marker::Copy for CopyFailure {}\nimpl Clone for CopyFailure { fn clone(&self) -> Self { *self } }\npub struct MoveFailure;\n",
+            &[refuted_claim.clone(), supported_claim.clone()],
+        );
+        let mut refuted = finding("src/identity.rs", 1, "copy value is moved");
+        refuted.machine_claim = Some(refuted_claim);
+        let mut deferred = finding("src/identity.rs", 2, "non-copy value is moved");
+        deferred.machine_claim = Some(supported_claim);
+        let original_deferred = deferred.clone();
+        let mut baseline = vec![refuted.clone(), deferred];
+        let mut findings = Vec::new();
+
+        let application = apply_machine_claim_policy(
+            &mut findings,
+            &mut baseline,
+            &[],
+            Some(&receipt),
+            Some(&head_sha),
+        );
+        assert_eq!(application.resolved.len(), 1);
+        assert!(same_visible_finding(&application.resolved[0], &refuted));
+        assert_eq!(baseline.len(), 1);
+        assert!(baseline[0].machine_claim_deferred);
+        assert_eq!(baseline[0].severity, Severity::Info);
+        assert!(!crate::envelope::finding_blocks_gate(
+            &baseline[0],
+            "info",
+            &["risk".into()],
+            false
+        ));
+        assert_eq!(baseline[0].title, original_deferred.title);
+
+        let mut preserved_findings = vec![refuted.clone()];
+        let preserved_application = apply_machine_claim_policy(
+            &mut preserved_findings,
+            &mut Vec::new(),
+            std::slice::from_ref(&refuted),
+            Some(&receipt),
+            Some(&head_sha),
+        );
+        assert!(preserved_findings.is_empty());
+        assert_eq!(preserved_application.resolved.len(), 1);
+        assert!(same_visible_finding(
+            &preserved_application.resolved[0],
+            &refuted
+        ));
     }
 
     fn score(index: usize, confidence: f64, kind: Kind) -> FindingScore {
