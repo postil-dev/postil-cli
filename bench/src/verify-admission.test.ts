@@ -64,9 +64,14 @@ describe("admission attestation verification", () => {
   test("binds reviewer and scorer reasoning efforts to the model-defaults digest", async () => {
     const repositoryRoot = join(import.meta.dir, "..", "..");
     const original = await readFile(join(repositoryRoot, "config.toml"), "utf8");
+    const alteredScorer = original.replace(
+      /(\[scorer\][\s\S]*?reasoning_effort = )"low"/u,
+      '$1"none"',
+    );
+    expect(alteredScorer).not.toBe(original);
     for (const altered of [
       original.replace('reasoning_effort = "low"', 'reasoning_effort = "high"'),
-      original.replace('reasoning_effort = "none"', 'reasoning_effort = "low"'),
+      alteredScorer,
     ]) {
       const directory = await temporaryDirectory();
       const manifest = join(directory, "qualified-models.json");

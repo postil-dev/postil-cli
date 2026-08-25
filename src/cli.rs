@@ -141,7 +141,7 @@ pub enum Command {
         /// Reviewer reasoning effort: max|xhigh|high|medium|low|minimal|none (else REVIEW_REASONING_EFFORT, else config, else low).
         #[arg(long, value_name = "EFFORT")]
         reasoning_effort: Option<String>,
-        /// Scorer reasoning effort: max|xhigh|high|medium|low|minimal|none (else REVIEW_SCORER_REASONING_EFFORT, else config, else none).
+        /// Scorer reasoning effort: max|xhigh|high|medium|low|minimal|none (else REVIEW_SCORER_REASONING_EFFORT, else config, else low).
         #[arg(long, value_name = "EFFORT")]
         scorer_reasoning_effort: Option<String>,
         /// Keep detailed provider, retry, and batch telemetry in interactive terminals.
