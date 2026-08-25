@@ -1303,6 +1303,9 @@ pub enum SuppressionReason {
     MachineClaimRefuted,
     /// The source verifier could not produce a bounded conclusive proof.
     MachineClaimUnverified,
+    /// Compact lockfile metadata cannot establish the claimed platform, OS,
+    /// CPU architecture, ABI, or runtime support conclusion.
+    LockfilePlatformEvidenceInsufficient,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

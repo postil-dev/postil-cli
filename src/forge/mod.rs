@@ -2028,6 +2028,9 @@ fn suppression_reason(reason: SuppressionReason) -> &'static str {
         SuppressionReason::MachineClaimUnverified => {
             "source premise could not be verified within deterministic bounds"
         }
+        SuppressionReason::LockfilePlatformEvidenceInsufficient => {
+            "compact lockfile metadata cannot establish platform support"
+        }
     }
 }
 
