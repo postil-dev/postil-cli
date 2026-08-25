@@ -26,21 +26,21 @@
     },
     "openai/gpt-5.6-luna": {
       "populated": true,
-      "generatedAt": "2026-08-25T16:39:48.601Z",
+      "generatedAt": "2026-08-25T17:11:56.688Z",
       "reviewMode": "exhaustive",
-      "sourceRunAt": "2026-08-25T16:37:11.211Z",
+      "sourceRunAt": "2026-08-25T17:09:36.499Z",
       "providerContractEnforced": true,
       "screeningProfileSha256": "aea05c3f5622cebec480d2a8daf5bb53055bc0160206e6f22e889391ea71fa49",
       "upstreamProviderIdentity": "Azure",
       "totalCases": 70,
       "scoredCases": 70,
-      "detectionRate": 0.9122807017543859,
+      "detectionRate": 0.9473684210526315,
       "falsePositives": 0,
-      "gateVerdictCorrectness": 0.8,
-      "meanCostUsdPerCase": 0.0008069545000000001,
+      "gateVerdictCorrectness": 0.8428571428571429,
+      "meanCostUsdPerCase": 0.0008315965428571429,
       "latencyMs": {
-        "p50": 6066,
-        "p95": 10607
+        "p50": 5659,
+        "p95": 9530
       }
     }
   }
