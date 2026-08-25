@@ -352,6 +352,9 @@ impl SymbolRecord {
 struct SyntaxWorkBudget {
     remaining: usize,
     exhausted: bool,
+    block_depth: usize,
+    nested_impl_in_block: bool,
+    unexpanded_macro_in_block: bool,
 }
 
 impl SyntaxWorkBudget {
@@ -359,6 +362,9 @@ impl SyntaxWorkBudget {
         Self {
             remaining: limit,
             exhausted: false,
+            block_depth: 0,
+            nested_impl_in_block: false,
+            unexpanded_macro_in_block: false,
         }
     }
 
@@ -391,9 +397,35 @@ impl<'ast> Visit<'ast> for SyntaxWorkBudget {
         }
     }
 
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        if self.block_depth > 0 {
+            self.nested_impl_in_block = true;
+        }
+        if self.consume() {
+            syn::visit::visit_item_impl(self, node);
+        }
+    }
+
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        if self.block_depth > 0 {
+            self.unexpanded_macro_in_block = true;
+        }
+        if self.consume() {
+            syn::visit::visit_macro(self, node);
+        }
+    }
+
     fn visit_item(&mut self, node: &'ast Item) {
         if self.consume() {
             syn::visit::visit_item(self, node);
+        }
+    }
+
+    fn visit_block(&mut self, node: &'ast syn::Block) {
+        if self.consume() {
+            self.block_depth += 1;
+            syn::visit::visit_block(self, node);
+            self.block_depth -= 1;
         }
     }
 
@@ -419,7 +451,9 @@ struct ParsedRepository {
     trait_implementation_targets: Vec<String>,
     trait_implementation_target_incomplete: bool,
     macro_modules: BTreeSet<String>,
+    crate_root_macro_namespace_uncertain: bool,
     uncertain_namespace_modules: BTreeSet<String>,
+    unexpanded_macro_in_block: bool,
     parse_incomplete: bool,
     proven_modules: BTreeSet<String>,
     source_scopes: BTreeMap<String, SymbolRecord>,
@@ -524,6 +558,20 @@ impl ParsedRepository {
         if syntax_work.exhausted {
             return;
         }
+        if syntax_work.nested_impl_in_block {
+            // Rust permits an implementation item in a block. It can change
+            // whether a type implements Copy without being part of the
+            // module-level index, so no claim is certifiable from this tree.
+            self.parse_incomplete = true;
+        }
+        if syntax_work.unexpanded_macro_in_block {
+            // A block-local macro can expand to a non-local impl. Keep module
+            // absence proofs available, but do not certify Copy or signature
+            // claims from an index that cannot observe the expansion. The
+            // expansion can also export a macro into the crate root.
+            self.unexpanded_macro_in_block = true;
+            self.crate_root_macro_namespace_uncertain = true;
+        }
         if attrs_are_conditional_or_expansive(&parsed.attrs) {
             self.parse_incomplete = true;
             return;
@@ -608,6 +656,7 @@ impl ParsedRepository {
         for item in items {
             if item_attrs_can_expand_siblings(item) {
                 self.uncertain_namespace_modules.insert(module.to_string());
+                self.crate_root_macro_namespace_uncertain = true;
             }
             match item {
                 Item::Struct(item) => self.record_type(
@@ -674,8 +723,9 @@ impl ParsedRepository {
                 ),
                 Item::Trait(item) => {
                     let trait_symbol = qualified(module, &item.ident);
-                    let conditional =
-                        inherited_conditional || attrs_are_conditional_or_expansive(&item.attrs);
+                    let conditional = inherited_conditional
+                        || attrs_are_conditional_or_expansive(&item.attrs)
+                        || !item.generics.params.is_empty();
                     self.record_named(
                         trait_symbol.clone(),
                         path,
@@ -840,6 +890,13 @@ impl ParsedRepository {
                 ),
                 Item::Macro(item) => {
                     if let Some(ident) = item.ident.as_ref() {
+                        if item
+                            .attrs
+                            .iter()
+                            .any(|attribute| attribute.path().is_ident("macro_export"))
+                        {
+                            self.crate_root_macro_namespace_uncertain = true;
+                        }
                         self.record_named(
                             qualified(module, ident),
                             path,
@@ -851,6 +908,7 @@ impl ParsedRepository {
                         );
                     } else {
                         self.macro_modules.insert(module.to_string());
+                        self.crate_root_macro_namespace_uncertain = true;
                     }
                 }
                 Item::ForeignMod(_) => {
@@ -1039,6 +1097,8 @@ impl ParsedRepository {
         if candidate.kind != SymbolKind::DataType
             || candidate.conditional
             || candidate.generic
+            || self.unexpanded_macro_in_block
+            || self.external_root_shadowing_possible()
             || self.symbol_has_conditional_ancestor(&claim.symbol)
         {
             return proof(hash, ClaimVerificationVerdict::Unsupported, Vec::new());
@@ -1117,6 +1177,7 @@ impl ParsedRepository {
                 .is_some_and(|paths| paths.as_slice() == [claim.path.as_str()])
             || self.symbol_has_conditional_ancestor(&claim.symbol)
             || self.namespace_is_uncertain(target_module)
+            || (target_module == "crate" && self.crate_root_macro_namespace_uncertain)
             || self.macro_modules.iter().any(|module| {
                 target_module == module || target_module.starts_with(&format!("{module}::"))
             })
@@ -1154,14 +1215,32 @@ impl ParsedRepository {
             || self.parse_incomplete
             || self.symbol_has_conditional_ancestor(&claim.symbol)
             || self.namespace_is_uncertain(&claim.symbol)
+            || self.unexpanded_macro_in_block
             || !self.macro_modules.is_empty()
         {
             return proof(hash, ClaimVerificationVerdict::Unsupported, Vec::new());
         }
-        let verdict = if candidate.signature.as_ref() == claim.expected_signature.as_ref() {
+        let candidate_signature = candidate.signature.as_ref().expect("checked above");
+        let expected_signature = claim.expected_signature.as_ref().expect("normalized claim");
+        let signatures_match = candidate_signature == expected_signature
+            || (!self.external_root_shadowing_possible()
+                && signatures_equal_ignoring_external_root_colon(
+                    candidate_signature,
+                    expected_signature,
+                ));
+        let verdict = if signatures_match {
             ClaimVerificationVerdict::Refuted
-        } else {
+        } else if signatures_are_provably_distinct(
+            candidate_signature,
+            expected_signature,
+            !self.primitive_type_shadowing_possible(),
+        ) {
             ClaimVerificationVerdict::Supported
+        } else {
+            // A path can name a type alias or re-export. This verifier does
+            // not perform Rust name resolution, so only differences that are
+            // independent of path resolution can certify a mismatch.
+            ClaimVerificationVerdict::Unsupported
         };
         proof(
             hash,
@@ -1203,6 +1282,23 @@ impl ParsedRepository {
                     records.len() == 1 && records[0].kind == SymbolKind::DataType
                 })
             })
+    }
+
+    fn external_root_shadowing_possible(&self) -> bool {
+        self.symbols.keys().any(|symbol| {
+            symbol.rsplit("::").next().is_some_and(|name| {
+                matches!(name.strip_prefix("r#").unwrap_or(name), "std" | "core")
+            })
+        })
+    }
+
+    fn primitive_type_shadowing_possible(&self) -> bool {
+        self.symbols.keys().any(|symbol| {
+            symbol
+                .rsplit("::")
+                .next()
+                .is_some_and(|name| primitive_type_name(name.strip_prefix("r#").unwrap_or(name)))
+        })
     }
 }
 
@@ -1266,17 +1362,22 @@ fn canonical_signature(signature: &syn::Signature) -> Option<MachineSignature> {
 }
 
 fn canonical_type(value: &Type) -> Option<String> {
+    canonical_type_with_root_spelling(value, true)
+}
+
+fn canonical_type_with_root_spelling(
+    value: &Type,
+    preserve_external_root_colon: bool,
+) -> Option<String> {
     match value {
         Type::Path(value) if value.qself.is_none() => {
             if !resolution_free_type_path(&value.path) {
                 return None;
             }
-            let mut output = value
-                .path
-                .leading_colon
-                .map(|_| "::")
-                .unwrap_or_default()
-                .to_string();
+            let mut output = String::new();
+            if preserve_external_root_colon && value.path.leading_colon.is_some() {
+                output.push_str("::");
+            }
             for (index, segment) in value.path.segments.iter().enumerate() {
                 if index > 0 {
                     output.push_str("::");
@@ -1288,7 +1389,12 @@ fn canonical_type(value: &Type) -> Option<String> {
                         let mut types = Vec::new();
                         for argument in &arguments.args {
                             match argument {
-                                GenericArgument::Type(value) => types.push(canonical_type(value)?),
+                                GenericArgument::Type(value) => {
+                                    types.push(canonical_type_with_root_spelling(
+                                        value,
+                                        preserve_external_root_colon,
+                                    )?)
+                                }
                                 _ => return None,
                             }
                         }
@@ -1308,7 +1414,10 @@ fn canonical_type(value: &Type) -> Option<String> {
                 "&"
             }
             .to_string();
-            output.push_str(&canonical_type(value.elem.as_ref())?);
+            output.push_str(&canonical_type_with_root_spelling(
+                value.elem.as_ref(),
+                preserve_external_root_colon,
+            )?);
             Some(output)
         }
         Type::Tuple(value) => Some(format!(
@@ -1316,17 +1425,186 @@ fn canonical_type(value: &Type) -> Option<String> {
             value
                 .elems
                 .iter()
-                .map(canonical_type)
+                .map(|value| {
+                    canonical_type_with_root_spelling(value, preserve_external_root_colon)
+                })
                 .collect::<Option<Vec<_>>>()?
                 .join(","),
             if value.elems.len() == 1 { "," } else { "" }
         )),
-        Type::Slice(value) => Some(format!("[{}]", canonical_type(value.elem.as_ref())?)),
-        Type::Paren(value) => canonical_type(value.elem.as_ref()),
-        Type::Group(value) => canonical_type(value.elem.as_ref()),
+        Type::Slice(value) => Some(format!(
+            "[{}]",
+            canonical_type_with_root_spelling(value.elem.as_ref(), preserve_external_root_colon,)?,
+        )),
+        Type::Paren(value) => {
+            canonical_type_with_root_spelling(value.elem.as_ref(), preserve_external_root_colon)
+        }
+        Type::Group(value) => {
+            canonical_type_with_root_spelling(value.elem.as_ref(), preserve_external_root_colon)
+        }
         Type::Never(_) => Some("!".to_string()),
         _ => None,
     }
+}
+
+fn signatures_equal_ignoring_external_root_colon(
+    actual: &MachineSignature,
+    expected: &MachineSignature,
+) -> bool {
+    actual.receiver == expected.receiver
+        && actual.is_async == expected.is_async
+        && actual.is_unsafe == expected.is_unsafe
+        && actual.parameters.len() == expected.parameters.len()
+        && actual
+            .parameters
+            .iter()
+            .zip(&expected.parameters)
+            .all(|(actual, expected)| canonical_types_equal_without_root_colon(actual, expected))
+        && canonical_types_equal_without_root_colon(&actual.returns, &expected.returns)
+}
+
+fn canonical_type_ignoring_external_root_colon(value: &str) -> Option<String> {
+    canonical_type_with_root_spelling(&syn::parse_str::<Type>(value).ok()?, false)
+}
+
+fn canonical_types_equal_without_root_colon(actual: &str, expected: &str) -> bool {
+    match (
+        canonical_type_ignoring_external_root_colon(actual),
+        canonical_type_ignoring_external_root_colon(expected),
+    ) {
+        (Some(actual), Some(expected)) => actual == expected,
+        _ => false,
+    }
+}
+
+fn signatures_are_provably_distinct(
+    actual: &MachineSignature,
+    expected: &MachineSignature,
+    primitive_names_are_resolution_free: bool,
+) -> bool {
+    actual.receiver != expected.receiver
+        || actual.is_async != expected.is_async
+        || actual.is_unsafe != expected.is_unsafe
+        || actual.parameters.len() != expected.parameters.len()
+        || actual
+            .parameters
+            .iter()
+            .zip(&expected.parameters)
+            .any(|(actual, expected)| {
+                canonical_types_are_provably_distinct(
+                    actual,
+                    expected,
+                    primitive_names_are_resolution_free,
+                )
+            })
+        || canonical_types_are_provably_distinct(
+            &actual.returns,
+            &expected.returns,
+            primitive_names_are_resolution_free,
+        )
+}
+
+fn canonical_types_are_provably_distinct(
+    actual: &str,
+    expected: &str,
+    primitive_names_are_resolution_free: bool,
+) -> bool {
+    let Ok(actual) = syn::parse_str::<Type>(actual) else {
+        return false;
+    };
+    let Ok(expected) = syn::parse_str::<Type>(expected) else {
+        return false;
+    };
+    types_are_provably_distinct(&actual, &expected, primitive_names_are_resolution_free)
+}
+
+fn types_are_provably_distinct(
+    actual: &Type,
+    expected: &Type,
+    primitive_names_are_resolution_free: bool,
+) -> bool {
+    match (actual, expected) {
+        (Type::Path(actual), Type::Path(expected))
+            if actual.qself.is_none()
+                && expected.qself.is_none()
+                && primitive_names_are_resolution_free
+                && is_unqualified_primitive_path(&actual.path)
+                && is_unqualified_primitive_path(&expected.path) =>
+        {
+            actual.path.segments[0].ident != expected.path.segments[0].ident
+        }
+        (Type::Reference(actual), Type::Reference(expected)) => {
+            actual.mutability.is_some() != expected.mutability.is_some()
+                || types_are_provably_distinct(
+                    actual.elem.as_ref(),
+                    expected.elem.as_ref(),
+                    primitive_names_are_resolution_free,
+                )
+        }
+        (Type::Tuple(actual), Type::Tuple(expected)) => {
+            actual.elems.len() != expected.elems.len()
+                || actual
+                    .elems
+                    .iter()
+                    .zip(&expected.elems)
+                    .any(|(actual, expected)| {
+                        types_are_provably_distinct(
+                            actual,
+                            expected,
+                            primitive_names_are_resolution_free,
+                        )
+                    })
+        }
+        (Type::Slice(actual), Type::Slice(expected)) => types_are_provably_distinct(
+            actual.elem.as_ref(),
+            expected.elem.as_ref(),
+            primitive_names_are_resolution_free,
+        ),
+        (Type::Never(_), Type::Never(_)) => false,
+        (Type::Path(actual), _) | (_, Type::Path(actual))
+            if !primitive_names_are_resolution_free
+                || !is_unqualified_primitive_path(&actual.path) =>
+        {
+            // An opaque named type can resolve to an alias of any other
+            // accepted form, including a path through a re-export.
+            false
+        }
+        (Type::Never(_), _) | (_, Type::Never(_)) => true,
+        (Type::Reference(_), _) | (_, Type::Reference(_)) => true,
+        (Type::Tuple(_), _) | (_, Type::Tuple(_)) => true,
+        (Type::Slice(_), _) | (_, Type::Slice(_)) => true,
+        _ => false,
+    }
+}
+
+fn is_unqualified_primitive_path(path: &syn::Path) -> bool {
+    path.leading_colon.is_none()
+        && path.segments.len() == 1
+        && matches!(path.segments[0].arguments, PathArguments::None)
+        && primitive_type_name(&path.segments[0].ident.to_string())
+}
+
+fn primitive_type_name(name: &str) -> bool {
+    matches!(
+        name,
+        "bool"
+            | "char"
+            | "str"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "f32"
+            | "f64"
+    )
 }
 
 fn resolution_free_type_path(path: &syn::Path) -> bool {
@@ -1336,28 +1614,7 @@ fn resolution_free_type_path(path: &syn::Path) -> bool {
     };
     let remaining = segments.count();
     if remaining == 0 {
-        return path.leading_colon.is_none()
-            && matches!(first.arguments, PathArguments::None)
-            && matches!(
-                first.ident.to_string().as_str(),
-                "bool"
-                    | "char"
-                    | "str"
-                    | "u8"
-                    | "u16"
-                    | "u32"
-                    | "u64"
-                    | "u128"
-                    | "usize"
-                    | "i8"
-                    | "i16"
-                    | "i32"
-                    | "i64"
-                    | "i128"
-                    | "isize"
-                    | "f32"
-                    | "f64"
-            );
+        return is_unqualified_primitive_path(path);
     }
     matches!(first.arguments, PathArguments::None)
         && matches!(first.ident.to_string().as_str(), "crate" | "std" | "core")
@@ -1377,7 +1634,6 @@ fn attrs_are_conditional_or_expansive(attrs: &[Attribute]) -> bool {
     attrs.iter().any(|attribute| {
         let path = attribute.path();
         !(path.is_ident("doc")
-            || (path.is_ident("derive") && derive_uses_only_builtin_macros(attribute))
             || path.is_ident("allow")
             || path.is_ident("warn")
             || path.is_ident("deny")
@@ -1424,7 +1680,7 @@ fn item_attrs_can_expand_siblings(item: &Item) -> bool {
     attrs.iter().any(|attribute| {
         let path = attribute.path();
         if path.is_ident("derive") {
-            return !derive_uses_only_builtin_macros(attribute);
+            return true;
         }
         !(path.is_ident("cfg")
             || path.is_ident("doc")
@@ -1443,32 +1699,6 @@ fn item_attrs_can_expand_siblings(item: &Item) -> bool {
             || path.is_ident("ignore")
             || path.is_ident("should_panic"))
     })
-}
-
-fn derive_uses_only_builtin_macros(attribute: &Attribute) -> bool {
-    attribute
-        .parse_args_with(Punctuated::<syn::Path, Token![,]>::parse_terminated)
-        .is_ok_and(|paths| {
-            paths.iter().all(|path| {
-                let mut segments = path.segments.iter();
-                let Some(name) = segments.next().map(|segment| segment.ident.to_string()) else {
-                    return false;
-                };
-                segments.next().is_none()
-                    && matches!(
-                        name.as_str(),
-                        "Clone"
-                            | "Copy"
-                            | "Debug"
-                            | "Default"
-                            | "Eq"
-                            | "Hash"
-                            | "Ord"
-                            | "PartialEq"
-                            | "PartialOrd"
-                    )
-            })
-        })
 }
 
 fn path_names_copy_derive(path: &syn::Path) -> bool {
@@ -1629,6 +1859,15 @@ mod tests {
         }
     }
 
+    fn root_claim(kind: MachineClaimKind, symbol: &str) -> MachineClaim {
+        MachineClaim {
+            kind,
+            path: "src/lib.rs".into(),
+            symbol: symbol.into(),
+            expected_signature: None,
+        }
+    }
+
     fn snapshot(source: &str) -> MachineSourceSnapshot {
         MachineSourceSnapshot {
             head_sha: "a".repeat(40),
@@ -1643,6 +1882,17 @@ mod tests {
                     source: source.into(),
                 },
             ],
+        }
+    }
+
+    fn root_snapshot(source: &str) -> MachineSourceSnapshot {
+        MachineSourceSnapshot {
+            head_sha: "a".repeat(40),
+            tree_sha256: "b".repeat(64),
+            files: vec![MachineSourceFile {
+                path: "src/lib.rs".into(),
+                source: source.into(),
+            }],
         }
     }
 
@@ -1752,6 +2002,42 @@ mod tests {
     }
 
     #[test]
+    fn nested_copy_impl_makes_move_out_claims_unsupported() {
+        let receipt = verify_snapshot(
+            snapshot(
+                "pub struct IdentityFailure;\nimpl Clone for IdentityFailure { fn clone(&self) -> Self { *self } }\nfn install() { impl ::core::marker::Copy for IdentityFailure {} }\n",
+            ),
+            &[claim(
+                MachineClaimKind::RustCopyMoveOut,
+                "crate::identity::IdentityFailure",
+            )],
+        );
+        assert_eq!(
+            receipt.claims[0].verdict,
+            ClaimVerificationVerdict::Unsupported
+        );
+        assert!(receipt.claims[0].evidence.is_empty());
+    }
+
+    #[test]
+    fn block_macro_that_can_generate_copy_impl_makes_move_out_claims_unsupported() {
+        let receipt = verify_snapshot(
+            snapshot(
+                "pub struct IdentityFailure;\nimpl Clone for IdentityFailure { fn clone(&self) -> Self { *self } }\nmacro_rules! install_copy { () => { impl ::core::marker::Copy for IdentityFailure {} } }\nfn install() { install_copy!(); }\n",
+            ),
+            &[claim(
+                MachineClaimKind::RustCopyMoveOut,
+                "crate::identity::IdentityFailure",
+            )],
+        );
+        assert_eq!(
+            receipt.claims[0].verdict,
+            ClaimVerificationVerdict::Unsupported
+        );
+        assert!(receipt.claims[0].evidence.is_empty());
+    }
+
+    #[test]
     fn imported_copy_impl_cannot_support_a_move_out_claim() {
         let receipt = verify_snapshot(
             MachineSourceSnapshot {
@@ -1830,7 +2116,29 @@ mod tests {
                 receipt.claims[0].verdict,
                 ClaimVerificationVerdict::Unsupported
             );
-            assert!(receipt.claims[0].evidence.is_empty());
+        }
+    }
+
+    #[test]
+    fn absolute_copy_paths_fail_closed_when_extern_crate_aliases_shadow_roots() {
+        for root in ["core", "std"] {
+            let builtin_root = if root == "core" { "std" } else { "core" };
+            let source = format!(
+                "extern crate self as {root};\npub mod marker {{ pub trait Copy {{}} }}\npub struct Failure;\nimpl ::{root}::marker::Copy for Failure {{}}\nfn require_builtin_copy<T: ::{builtin_root}::marker::Copy>() {{}}\npub fn check() {{ require_builtin_copy::<Failure>(); }}\n"
+            );
+            let receipt = verify_snapshot(
+                root_snapshot(&source),
+                &[root_claim(
+                    MachineClaimKind::RustCopyMoveOut,
+                    "crate::Failure",
+                )],
+            );
+
+            assert_eq!(
+                receipt.claims[0].verdict,
+                ClaimVerificationVerdict::Unsupported,
+                "::{root} must not be assumed to name the built-in Copy trait"
+            );
         }
     }
 
@@ -1953,6 +2261,65 @@ mod tests {
             conditional_sibling_attribute.claims[0].verdict,
             ClaimVerificationVerdict::Unsupported
         );
+    }
+
+    #[test]
+    fn macro_exports_taint_crate_root_symbol_absence() {
+        for (source, symbol) in [
+            (
+                "fn install() { #[macro_export] macro_rules! exported_from_block_uninvoked { () => {} } }\n",
+                "crate::exported_from_block_uninvoked",
+            ),
+            (
+                "fn install() { #[macro_export] macro_rules! exported_from_block { () => {} } }\nexported_from_block!();\n",
+                "crate::exported_from_block",
+            ),
+            (
+                "mod nested { #[macro_export] macro_rules! exported_from_nested_uninvoked { () => {} } }\n",
+                "crate::exported_from_nested_uninvoked",
+            ),
+            (
+                "mod nested { #[macro_export] macro_rules! exported_from_nested { () => {} } }\nexported_from_nested!();\n",
+                "crate::exported_from_nested",
+            ),
+            (
+                "macro_rules! install_export { () => { #[macro_export] macro_rules! exported_from_invocation { () => {} } } }\nfn install() { install_export!(); }\n",
+                "crate::exported_from_invocation",
+            ),
+        ] {
+            let receipt = verify_snapshot(
+                root_snapshot(source),
+                &[root_claim(MachineClaimKind::SymbolAbsent, symbol)],
+            );
+
+            assert_eq!(
+                receipt.claims[0].verdict,
+                ClaimVerificationVerdict::Unsupported,
+                "macro expansion or export can create {symbol} in the crate root"
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_looking_derives_taint_namespace_absence_without_resolution() {
+        for source in [
+            "use custom_derive::Copy;\n#[derive(Copy)] pub struct Source;\npub fn generated(_: GeneratedByShadowedDerive) {}\n",
+            "#[derive(Copy)] pub struct Source;\n",
+            "#[derive(Debug)] pub struct Source;\n",
+        ] {
+            let receipt = verify_snapshot(
+                snapshot(source),
+                &[claim(
+                    MachineClaimKind::SymbolAbsent,
+                    "crate::identity::GeneratedByShadowedDerive",
+                )],
+            );
+
+            assert_eq!(
+                receipt.claims[0].verdict,
+                ClaimVerificationVerdict::Unsupported
+            );
+        }
     }
 
     #[test]
@@ -2287,6 +2654,167 @@ mod tests {
             parse_incomplete.claims[0].verdict,
             ClaimVerificationVerdict::Unsupported
         );
+    }
+
+    #[test]
+    fn primitive_aliases_and_imports_cannot_prove_signature_inequality() {
+        for source in [
+            "#[allow(non_camel_case_types)] type u8 = u16;\npub fn actual(_: u8) {}\nconst _: fn(u16) = actual;\n",
+            "mod aliases { pub type Narrow = u16; }\nuse aliases::Narrow as u8;\npub fn actual(_: u8) {}\n",
+        ] {
+            let mut signature = claim(
+                MachineClaimKind::SignatureMismatch,
+                "crate::identity::actual",
+            );
+            signature.expected_signature = Some(MachineSignature {
+                receiver: MachineReceiver::None,
+                parameters: vec!["u16".into()],
+                returns: "()".into(),
+                is_async: false,
+                is_unsafe: false,
+            });
+
+            let receipt = verify_snapshot(snapshot(source), &[signature]);
+
+            assert_eq!(
+                receipt.claims[0].verdict,
+                ClaimVerificationVerdict::Unsupported
+            );
+        }
+    }
+
+    #[test]
+    fn signature_paths_equate_unshadowed_absolute_std_and_refuse_alias_mismatches() {
+        let mut absolute = claim(
+            MachineClaimKind::SignatureMismatch,
+            "crate::identity::vector",
+        );
+        absolute.expected_signature = Some(MachineSignature {
+            receiver: MachineReceiver::None,
+            parameters: Vec::new(),
+            returns: "::std::vec::Vec<u8>".into(),
+            is_async: false,
+            is_unsafe: false,
+        });
+        let absolute = verify_snapshot(
+            snapshot("pub fn vector() -> std::vec::Vec<u8> { Vec::new() }\n"),
+            &[absolute],
+        );
+        assert_eq!(
+            absolute.claims[0].verdict,
+            ClaimVerificationVerdict::Refuted
+        );
+
+        let mut alias_claim = claim(
+            MachineClaimKind::SignatureMismatch,
+            "crate::identity::aliased",
+        );
+        alias_claim.expected_signature = Some(MachineSignature {
+            receiver: MachineReceiver::None,
+            parameters: Vec::new(),
+            returns: "crate::types::Expected".into(),
+            is_async: false,
+            is_unsafe: false,
+        });
+        for definition in [
+            "pub struct Actual; pub type Expected = Actual;\n",
+            "pub struct Actual; pub use self::Actual as Expected;\n",
+        ] {
+            let receipt = verify_snapshot(
+                MachineSourceSnapshot {
+                    head_sha: "a".repeat(40),
+                    tree_sha256: "b".repeat(64),
+                    files: vec![
+                        MachineSourceFile {
+                            path: "src/lib.rs".into(),
+                            source: "mod identity; mod types;\n".into(),
+                        },
+                        MachineSourceFile {
+                            path: "src/identity.rs".into(),
+                            source: "pub fn aliased() -> crate::types::Actual { todo!() }\n".into(),
+                        },
+                        MachineSourceFile {
+                            path: "src/types.rs".into(),
+                            source: definition.into(),
+                        },
+                    ],
+                },
+                &[alias_claim.clone()],
+            );
+            assert_eq!(
+                receipt.claims[0].verdict,
+                ClaimVerificationVerdict::Unsupported
+            );
+        }
+    }
+
+    #[test]
+    fn signature_paths_preserve_shadowed_std_and_core_root_distinctions() {
+        for (source, symbol, returns) in [
+            (
+                "mod std { pub mod vec { pub struct Vec<T>(pub T); } }\npub fn value() -> std::vec::Vec<u8> { loop {} }\n",
+                "crate::identity::value",
+                "::std::vec::Vec<u8>",
+            ),
+            (
+                "mod core { pub mod option { pub enum Option<T> { Some(T) } } }\npub fn value() -> core::option::Option<bool> { loop {} }\n",
+                "crate::identity::value",
+                "::core::option::Option<bool>",
+            ),
+            (
+                "pub trait Shadow<std> { fn value() -> std::Assoc; }\n",
+                "crate::identity::Shadow::value",
+                "::std::Assoc",
+            ),
+            (
+                "pub trait Shadow<core> { fn value() -> core::Assoc; }\n",
+                "crate::identity::Shadow::value",
+                "::core::Assoc",
+            ),
+        ] {
+            let mut signature = claim(MachineClaimKind::SignatureMismatch, symbol);
+            signature.expected_signature = Some(MachineSignature {
+                receiver: MachineReceiver::None,
+                parameters: Vec::new(),
+                returns: returns.into(),
+                is_async: false,
+                is_unsafe: false,
+            });
+
+            let receipt = verify_snapshot(snapshot(source), &[signature]);
+
+            assert_eq!(
+                receipt.claims[0].verdict,
+                ClaimVerificationVerdict::Unsupported,
+                "{returns} must remain distinct when its bare root is shadowed"
+            );
+        }
+    }
+
+    #[test]
+    fn signature_type_grammar_accepts_only_documented_path_roots() {
+        let mut signature = MachineSignature {
+            receiver: MachineReceiver::None,
+            parameters: Vec::new(),
+            returns: "::std::vec::Vec<u8>".into(),
+            is_async: false,
+            is_unsafe: false,
+        };
+        assert!(normalize_signature(&signature).is_some());
+        signature.returns = "::core::option::Option<bool>".into();
+        assert!(normalize_signature(&signature).is_some());
+        signature.returns = "crate::types::Expected".into();
+        assert!(normalize_signature(&signature).is_some());
+
+        for rejected in [
+            "::crate::types::Expected",
+            "String",
+            "Vec<u8>",
+            "alloc::vec::Vec<u8>",
+        ] {
+            signature.returns = rejected.into();
+            assert!(normalize_signature(&signature).is_none(), "{rejected}");
+        }
     }
 
     #[test]

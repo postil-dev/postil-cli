@@ -152,12 +152,12 @@ pub fn review_contract(cfg: &Config) -> String {
          Public text names the defect and fix, never review boundaries, retrieval, delegation, or \
          guessed files.\n\
          \n\
-         `machineClaim` excludes repositoryContext. Rust kinds: rust.copy_move_out, symbol.absent, \
-         signature.mismatch. Path: src/lib.rs, src/main.rs, or non-bin src/<modules>.rs; symbol: \
-         crate-qualified. signature.mismatch alone sets expectedSignature: receiver \
-         none|shared|mutable|value, parameters, returns, async, unsafe. Types: paths, references, \
-         tuples, slices, generics. Omit for macros, generated code, inference, traits, or \
-         compilation. Public text omits verification.\n",
+         `machineClaim` XOR repositoryContext. kind=rust.copy_move_out|symbol.absent|signature.mismatch; \
+         path=src/{lib.rs,main.rs,<non-bin modules>.rs}; symbol=crate::...; signature.mismatch \
+         expectedSignature={receiver:none|shared|mutable|value,parameters,returns,async,unsafe}; \
+         type=unshadowed primitive|crate/std/core path<type,...>|&type|tuple|slice|!; no lifetimes; \
+         leading :: only std/core; preserve. Omit resolution/expansion/compile-dependent claims. \
+         Hide verification.\n",
     );
     if !cfg.focus.is_empty() {
         p.push_str(&format!(
@@ -565,11 +565,18 @@ mod tests {
         for kind in ["rust.copy_move_out", "symbol.absent", "signature.mismatch"] {
             assert!(prompt.contains(kind));
         }
-        assert!(prompt.contains("src/lib.rs, src/main.rs, or non-bin src/<modules>.rs"));
-        assert!(prompt.contains("symbol: crate-qualified"));
-        assert!(prompt.contains("`machineClaim` excludes repositoryContext"));
-        assert!(prompt.contains("macros, generated code, inference, traits"));
-        assert!(prompt.contains("Public text omits verification"));
+        assert!(prompt.contains("path=src/{lib.rs,main.rs,<non-bin modules>.rs}"));
+        assert!(prompt.contains("symbol=crate::..."));
+        assert!(prompt.contains("`machineClaim` XOR repositoryContext"));
+        assert!(prompt.contains(
+            "expectedSignature={receiver:none|shared|mutable|value,parameters,returns,async,unsafe}"
+        ));
+        assert!(prompt.contains("crate/std/core path<type,...>"));
+        assert!(prompt.contains("|&type|tuple|slice|!"));
+        assert!(prompt.contains("leading :: only std/core; preserve"));
+        assert!(prompt.contains("type=unshadowed primitive"));
+        assert!(prompt.contains("resolution/expansion/compile-dependent"));
+        assert!(prompt.contains("Hide verification"));
     }
 
     #[test]
