@@ -4,6 +4,8 @@ import {
   benchmarkCase,
   displayPromptPath,
   evaluateNoReviewPublication,
+  envelopeV1,
+  HOSTED_ADMISSION_PROJECTION_CAP_MICROS,
   modelRequestKind,
   parseUnifiedDiffFiles,
   reviewPromptContainsAddedCoordinate,
@@ -16,6 +18,39 @@ import {
   CLEAN_FIXTURE_COUNT,
   MUST_BLOCK_FIXTURE_COUNT,
 } from "./livemodels-score";
+
+test("accepts a bounded review admission projection above the hosted operation cap", () => {
+  const parsed = envelopeV1.parse({
+    version: 1,
+    summary: "",
+    silent: true,
+    findings: [],
+    resolved: [],
+    counts: { info: 0, warn: 0, error: 0, suppressed: 0, ungrounded: 0 },
+    confidenceBuckets: [0, 0, 0, 0, 0],
+    gate: { failOn: "error", failing: false },
+    modelUsed: "fixture/model",
+    usage: { promptTokens: 0, completionTokens: 0 },
+    reviewAdmission: {
+      providerAttempts: 80,
+      serializedInputBytes: 9_636_851,
+      outputTokens: 481_216,
+      projectedCostMicros: 3_312_931,
+    },
+    durationMs: 0,
+    baseSha: null,
+    headSha: null,
+    sinceSha: null,
+  });
+  expect(parsed.reviewAdmission?.projectedCostMicros).toBe(3_312_931);
+  expect(() => envelopeV1.parse({
+    ...parsed,
+    reviewAdmission: {
+      ...parsed.reviewAdmission,
+      projectedCostMicros: HOSTED_ADMISSION_PROJECTION_CAP_MICROS + 1,
+    },
+  })).toThrow();
+});
 
 test("classifies review routing only from trusted request metadata", () => {
   expect(reviewRequestMetadata({
@@ -412,7 +447,26 @@ describe("benchmark fixtures", () => {
     const github = await startMockGithub(c);
     try {
       expect(evaluateNoReviewPublication(github)).toEqual([]);
-      await fetch(`${github.baseUrl}${github.pullPath}/reviews`, { method: "POST", body: "{}" });
+      const review = await fetch(`${github.baseUrl}${github.pullPath}/reviews`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          commit_id: c.headSha,
+          comments: [{ body: "Finding marker" }],
+        }),
+      }).then((response) => response.json()) as {
+        commit_id: string;
+        comments: Array<{ id: number; body: string; commit_id: string }>;
+      };
+      expect(review.commit_id).toBe(c.headSha);
+      expect(review.comments).toEqual([{
+        id: 3001,
+        body: "Finding marker",
+        commit_id: c.headSha,
+      }]);
+      expect(await fetch(`${github.baseUrl}${github.pullPath}/comments`).then((response) =>
+        response.json()
+      )).toEqual([]);
       await fetch(`${github.baseUrl}${github.pullPath.replace("/pulls/", "/issues/")}/comments`, {
         method: "POST",
         body: "{}",

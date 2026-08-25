@@ -46,6 +46,7 @@ import {
   qualificationCaseRepeats,
   qualificationRequiredParameters,
   qualificationProfileDigest,
+  qualificationProfileDigestMaterial,
   readPinnedQualificationWorktreeFile,
   runLiveModels,
   runQualificationCanariesSequentially,
@@ -315,13 +316,38 @@ describe("pair qualification configuration", () => {
   });
 
   test("derives role-specific provider parameters for every model in a profile", () => {
-    expect(qualificationRequiredParameters([{
+    const pair = {
       generatorModel: "provider/shared",
       generatorCascade: ["provider/generator-fallback"],
       consensus: 2,
       scorerModel: "provider/shared",
       scorerCascade: ["provider/scorer-fallback"],
-    }])).toEqual(new Map([
+    };
+    expect(qualificationRequiredParameters([pair], "Azure")).toEqual(new Map([
+      ["provider/shared", [
+        "max_completion_tokens",
+        "max_tokens",
+        "reasoning",
+        "reasoning_effort",
+        "response_format",
+        "structured_outputs",
+        "temperature",
+      ]],
+      ["provider/generator-fallback", [
+        "max_tokens",
+        "reasoning",
+        "reasoning_effort",
+        "temperature",
+      ]],
+      ["provider/scorer-fallback", [
+        "max_completion_tokens",
+        "reasoning",
+        "reasoning_effort",
+        "response_format",
+        "structured_outputs",
+      ]],
+    ]));
+    expect(qualificationRequiredParameters([pair], "OpenAI")).toEqual(new Map([
       ["provider/shared", [
         "max_tokens",
         "reasoning",
@@ -342,7 +368,6 @@ describe("pair qualification configuration", () => {
         "reasoning_effort",
         "response_format",
         "structured_outputs",
-        "temperature",
       ]],
     ]));
   });
@@ -520,6 +545,7 @@ describe("pair qualification configuration", () => {
         normalizeApiBase("https://openrouter.ai/api/v1"),
         "openai-compatible",
         "PinnedProvider",
+        "pinned/route",
         "http://127.0.0.1:4321",
       );
       const profilePath = env.POSTIL_QUALIFICATION_CANDIDATE_PROFILE;
@@ -527,6 +553,7 @@ describe("pair qualification configuration", () => {
       expect(env.POSTIL_QUALIFICATION_CAPTURE_API_BASE).toBe("http://127.0.0.1:4321");
       expect(await Bun.file(profilePath!).json()).toMatchObject({
         upstreamProviderIdentity: "PinnedProvider",
+        upstreamProviderRoute: "pinned/route",
         scorerChain: [pair.scorerModel],
         modelPriceBounds: [
           { model: pair.generatorModel, inputMicrosPerMillionTokens: 1_000_000, outputMicrosPerMillionTokens: 2_000_000 },
@@ -667,6 +694,7 @@ console.log(JSON.stringify({
         apiFormat: "openai-compatible",
         costCapUsdDecimal: "1",
         upstreamProvider: "PinnedProvider",
+        upstreamProviderRoute: "pinned/route",
         credentialEnvironment: { POSTIL_API_KEY: "postil-plan-only-fixture" },
       })).rejects.toThrow("runtime-shaped qualification spend");
     } finally {
@@ -733,6 +761,7 @@ process.exit(0);
         apiFormat: "openai-compatible",
         costCapUsdDecimal: "55",
         upstreamProvider: "PinnedProvider",
+        upstreamProviderRoute: "pinned/route",
         credentialEnvironment: { POSTIL_API_KEY: "postil-plan-only-fixture" },
       })).rejects.toThrow("deliberate preflight failure");
       const starts = (await readFile(startsPath, "utf8")).trim().split("\n");
@@ -1324,6 +1353,7 @@ describe("managed admission workflow", () => {
     expect(workflow).not.toContain("inputs.api_base");
     expect(workflow).not.toContain("inputs.api_format");
     expect(workflow).not.toContain("POSTIL_BENCH_MODELS");
+    expect(workflow).toContain("POSTIL_BENCH_UPSTREAM_PROVIDER_ROUTE: ${{ inputs.upstream_provider_route }}");
     const ci = await Bun.file(
       resolve(import.meta.dir, "..", "..", ".github", "workflows", "ci.yml"),
     ).text();
@@ -1334,15 +1364,18 @@ describe("managed admission workflow", () => {
     ).text();
     expect(release).toMatch(/validate-tag:\n[\s\S]*?fetch-depth: 0[\s\S]*?bun-version: 1\.3\.14[\s\S]*?bun install --frozen-lockfile[\s\S]*?bun run verify-admission[\s\S]*?\n  bench-live:\n/u);
     expect(release).toMatch(/bench-live:\n\s+needs: validate-tag\n/u);
-    // The gate must score whatever the binary ships. Restating the id here
-    // pinned it to one model, so the release that changed the shipped default
-    // still benchmarked the previous one and passed against its old baseline.
+    // The gate derives its model from the binary's embedded configuration so
+    // caller drift cannot benchmark a model absent from the release.
     expect(release).not.toContain("REVIEW_MODEL:");
     expect(release).toContain("OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}");
     expect(release).not.toContain("POSTIL_SCORER_EVAL_MODELS:");
     expect(release).toContain('POSTIL_SCORER_EVAL_REPEATS: "3"');
     expect(release).toContain("POSTIL_SCORER_EVAL_UPSTREAM_PROVIDER: Azure");
+    expect(release).toContain("POSTIL_SCORER_EVAL_UPSTREAM_PROVIDER_ROUTE: azure/eu");
+    expect(release).toContain("POSTIL_BIN: ${{ github.workspace }}/target/release/postil");
+    expect(release).not.toContain("Build scorer qualification binary");
     expect(release).toContain("bun run scorer-eval --json-out");
+    expect(release).toContain("${{ runner.temp }}/scorer-eval-report.json.partial");
     expect(release).toMatch(
       /name: Upload the scorer gate report\n\s+if: always\(\)[\s\S]*if-no-files-found: warn[\s\S]*retention-days: 30/u,
     );
@@ -1350,6 +1383,9 @@ describe("managed admission workflow", () => {
       release.indexOf("bun run bench:live --"),
     );
     expect(release).toContain("bun run bench:live --");
+    expect(release).toMatch(
+      /name: Upload the diff-file live report\n\s+if: always\(\)[\s\S]*bench-live-report\.json[\s\S]*retention-days: 30/u,
+    );
     expect(release).toContain("bun run bench:compare --");
     expect(release).toMatch(/build:\n\s+needs: \[validate-tag, bench-live\]/u);
     let checkedReferences = 0;
@@ -1456,6 +1492,15 @@ describe("qualification report", () => {
     };
     const profile = { id: qualificationProfileDigest(profileMaterial), ...profileMaterial };
     expect(profile.id).toBe("24cd24ba19e6125b6c1b152c77c0860efffdc87c2f3db3bc9fb6fb70768e35ce");
+    const routeBoundMaterial = {
+      ...profileMaterial,
+      upstreamProviderRoute: "provider/route",
+    };
+    expect(qualificationProfileDigest(routeBoundMaterial)).not.toBe(profile.id);
+    expect(qualificationProfileDigestMaterial(routeBoundMaterial)).toMatchObject({
+      upstreamProviderIdentity: "test-provider",
+      upstreamProviderRoute: "provider/route",
+    });
     const vector = await Bun.file(
       resolve(import.meta.dir, "..", "admission-manifest-candidate-vector.json"),
     ).json();
@@ -1476,7 +1521,7 @@ describe("qualification report", () => {
   test("prints attributable metrics, hashes, provider, and bounded costs", () => {
     const cost = 0.123456;
     const report: LiveModelsReport = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       generatedAt: "2026-07-11T00:00:00.000Z",
       qualificationSourceSha: "9".repeat(40),
       cliVersion: "postil 0.6.1",
@@ -1485,6 +1530,7 @@ describe("qualification report", () => {
       providerEndpointIdentity: "https://example.test:443/v1",
       upstreamProviderPinned: true,
       upstreamProviderIdentity: "PinnedProvider",
+      upstreamProviderRoute: "pinned/route",
       fixtureHash: "a".repeat(64),
       reviewContractHash: "b".repeat(64),
       evaluatorContractHash: "f".repeat(64),
@@ -1569,6 +1615,18 @@ describe("qualification report", () => {
     report.privateEvidenceSha256 = privateEvidenceSha256(privateBundle);
     expect(parseLiveModelsReport(report)).toBe(report);
     expect(() => verifyPrivateEvidenceBundle(privateBundle, report)).not.toThrow();
+    const schemaThree = structuredClone(report) as unknown as Record<string, unknown>;
+    schemaThree.schemaVersion = 3;
+    delete schemaThree.upstreamProviderRoute;
+    expect(parseLiveModelsReport(schemaThree)).toMatchObject({
+      schemaVersion: 4,
+      upstreamProviderRoute: "PinnedProvider",
+    });
+    const contaminatedSchemaThree = structuredClone(report) as unknown as Record<string, unknown>;
+    contaminatedSchemaThree.schemaVersion = 3;
+    expect(() => parseLiveModelsReport(contaminatedSchemaThree)).toThrow(
+      "schema-3 report must not contain upstreamProviderRoute",
+    );
     const legacy = structuredClone(report) as unknown as Record<string, unknown>;
     delete legacy.schemaVersion;
     expect(() => parseLiveModelsReport(legacy)).toThrow(

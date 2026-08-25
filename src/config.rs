@@ -201,6 +201,8 @@ pub struct QualificationProfile {
     #[serde(default)]
     pub benchmark_provider_identity: Option<String>,
     pub upstream_provider_identity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_provider_route: Option<String>,
     pub generator_chain: Vec<String>,
     pub consensus: usize,
     pub scorer_chain: Vec<String>,
@@ -227,6 +229,7 @@ pub struct ModelPriceBound {
 pub(crate) struct QualificationCandidateProfile {
     pub benchmark_provider_identity: String,
     pub upstream_provider_identity: String,
+    pub upstream_provider_route: String,
     pub api_base: String,
     pub api_format: ApiFormat,
     pub generator_chain: Vec<String>,
@@ -242,6 +245,8 @@ struct QualificationProfileDigestMaterial<'a> {
     model_defaults_sha256: &'a str,
     benchmark_provider_identity: &'a Option<String>,
     upstream_provider_identity: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upstream_provider_route: &'a Option<String>,
     api_base: &'a str,
     api_format: ApiFormat,
     generator_chain: &'a [String],
@@ -628,6 +633,9 @@ fn parse_qualification_manifest(raw: &str) -> Result<QualificationManifest> {
             !profile.upstream_provider_identity.trim().is_empty(),
             "qualification profile upstream provider identity must not be empty"
         );
+        if let Some(route) = profile.upstream_provider_route.as_deref() {
+            validate_model_id("qualification profile upstreamProviderRoute", route)?;
+        }
         anyhow::ensure!(
             (1..=profile.generator_chain.len()).contains(&profile.consensus),
             "qualification profile consensus must fit its generator chain"
@@ -901,6 +909,7 @@ fn qualification_profile_digest(profile: &QualificationProfile) -> String {
         model_defaults_sha256: &profile.model_defaults_sha256,
         benchmark_provider_identity: &profile.benchmark_provider_identity,
         upstream_provider_identity: &profile.upstream_provider_identity,
+        upstream_provider_route: &profile.upstream_provider_route,
         api_base: &profile.api_base,
         api_format: profile.api_format,
         generator_chain: &profile.generator_chain,
@@ -1782,7 +1791,7 @@ fn validate_benchmark_bounded_selection_values(
 ) -> Result<()> {
     anyhow::ensure!(
         feature_enabled,
-        "benchmark bounded selection requires the non-default qualification-candidate feature"
+        "benchmark bounded selection requires the qualification-candidate build capability"
     );
     anyhow::ensure!(
         ci == Some("true"),
@@ -1882,17 +1891,49 @@ pub(crate) fn benchmark_screening_profile_for_config(
     let Some(profile) = benchmark_screening_profile()? else {
         return Ok(None);
     };
-    let api_base = normalize_api_base(&config.api_base)?;
+    let mismatches = benchmark_screening_profile_mismatches(&profile, config)?;
     anyhow::ensure!(
-        profile.generator_chain == config.model_chain()
-            && profile.consensus == config.consensus
-            && profile.scorer_chain == config.scorer_chain()
-            && profile.api_base == api_base
-            && profile.api_format == config.api_format
-            && reasoning_efforts_match_embedded_defaults(config),
-        "benchmark screening profile does not exactly match the resolved review configuration"
+        mismatches.is_empty(),
+        "benchmark screening profile does not exactly match the resolved review configuration: {}",
+        mismatches.join(", ")
     );
     Ok(Some(profile))
+}
+
+#[cfg(test)]
+fn benchmark_screening_profile_matches_config(
+    profile: &QualificationCandidateProfile,
+    config: &Config,
+) -> Result<bool> {
+    Ok(benchmark_screening_profile_mismatches(profile, config)?.is_empty())
+}
+
+fn benchmark_screening_profile_mismatches(
+    profile: &QualificationCandidateProfile,
+    config: &Config,
+) -> Result<Vec<&'static str>> {
+    let active_scorer_chain = config.scorer_chain();
+    let normalized_api_base = normalize_api_base(&config.api_base)?;
+    let mut mismatches = Vec::new();
+    if profile.generator_chain != config.model_chain() {
+        mismatches.push("generator chain");
+    }
+    if profile.consensus != config.consensus {
+        mismatches.push("consensus");
+    }
+    if !active_scorer_chain.is_empty() && profile.scorer_chain != active_scorer_chain {
+        mismatches.push("scorer chain");
+    }
+    if profile.api_base != normalized_api_base {
+        mismatches.push("API base");
+    }
+    if profile.api_format != config.api_format {
+        mismatches.push("API format");
+    }
+    if !reasoning_efforts_match_embedded_defaults(config) {
+        mismatches.push("reasoning effort");
+    }
+    Ok(mismatches)
 }
 
 pub(crate) fn qualification_plan_only() -> bool {
@@ -1946,6 +1987,10 @@ fn qualification_candidate_profile() -> Result<Option<QualificationCandidateProf
     validate_model_id(
         "qualification candidate upstreamProviderIdentity",
         &profile.upstream_provider_identity,
+    )?;
+    validate_model_id(
+        "qualification candidate upstreamProviderRoute",
+        &profile.upstream_provider_route,
     )?;
     anyhow::ensure!(
         normalize_api_base(&profile.api_base)? == MANAGED_OPENROUTER_API_BASE
@@ -2024,6 +2069,30 @@ pub(crate) fn provisional_hosted_provider_for_config(config: &Config) -> Option<
     })
 }
 
+fn qualified_provider_route(profile: &QualificationProfile) -> &str {
+    profile
+        .upstream_provider_route
+        .as_deref()
+        .unwrap_or(profile.upstream_provider_identity.as_str())
+}
+
+pub(crate) fn hosted_provider_route_for_config(config: &Config) -> Option<&'static str> {
+    if hosted_mode()
+        && provisional_hosted_roster_enabled()
+        && provisional_hosted_profile_for_config(config).is_some()
+    {
+        return Some(
+            provisional_hosted_profile()
+                .upstream_provider_route
+                .as_str(),
+        );
+    }
+    let profile = hosted_mode()
+        .then(|| admitted_profile_for_config(config))
+        .flatten()?;
+    Some(qualified_provider_route(profile))
+}
+
 fn provisional_hosted_profile_for_config(config: &Config) -> Option<QualificationCandidateProfile> {
     let profile = provisional_hosted_profile();
     let generator_chain = config.model_chain();
@@ -2058,6 +2127,10 @@ fn parse_provisional_hosted_profile(raw: &str) -> Result<QualificationCandidateP
     validate_model_id(
         "provisional hosted upstreamProviderIdentity",
         &profile.upstream_provider_identity,
+    )?;
+    validate_model_id(
+        "provisional hosted upstreamProviderRoute",
+        &profile.upstream_provider_route,
     )?;
     anyhow::ensure!(
         profile.api_base == MANAGED_OPENROUTER_API_BASE
@@ -3474,6 +3547,7 @@ scorer = { enabled = true, default_model = "provider/scorer", reasoning_effort =
             model_defaults_sha256: "c".repeat(64),
             benchmark_provider_identity: Some(MANAGED_OPENROUTER_PROVIDER_IDENTITY.into()),
             upstream_provider_identity: "test-provider".into(),
+            upstream_provider_route: None,
             api_base: "https://openrouter.ai:443/api/v1".into(),
             api_format: ApiFormat::OpenaiCompatible,
             generator_chain: vec!["provider/one".into(), "provider/two".into()],
@@ -3507,6 +3581,43 @@ scorer = { enabled = true, default_model = "provider/scorer", reasoning_effort =
         assert_eq!(
             qualification_profile_digest(&profile),
             "24cd24ba19e6125b6c1b152c77c0860efffdc87c2f3db3bc9fb6fb70768e35ce"
+        );
+
+        let route_bound = QualificationProfile {
+            upstream_provider_route: Some("provider/route".into()),
+            ..profile.clone()
+        };
+        assert_ne!(
+            qualification_profile_digest(&route_bound),
+            qualification_profile_digest(&profile)
+        );
+        assert_eq!(qualified_provider_route(&route_bound), "provider/route");
+        assert_eq!(qualified_provider_route(&profile), "test-provider");
+    }
+
+    #[test]
+    fn qualification_profile_route_is_signed_and_preserved() {
+        let mut raw = valid_qualification_manifest_json();
+        raw["profiles"][0]["upstreamProviderRoute"] = serde_json::json!("azure/eu");
+        let route_bound: QualificationProfile =
+            serde_json::from_value(raw["profiles"][0].clone()).unwrap();
+        raw["profiles"][0]["id"] = serde_json::json!(qualification_profile_digest(&route_bound));
+
+        let manifest = parse_qualification_manifest(&raw.to_string()).unwrap();
+        let admitted = &manifest.profiles[0];
+        assert_eq!(
+            admitted.upstream_provider_route.as_deref(),
+            Some("azure/eu")
+        );
+        assert_eq!(qualified_provider_route(admitted), "azure/eu");
+
+        let mut tampered = raw;
+        tampered["profiles"][0]["upstreamProviderRoute"] = serde_json::json!("azure/us");
+        assert!(
+            parse_qualification_manifest(&tampered.to_string())
+                .unwrap_err()
+                .to_string()
+                .contains("id does not match its canonical digest material")
         );
     }
 
@@ -3572,6 +3683,7 @@ scorer = { enabled = true, default_model = "provider/scorer", reasoning_effort =
             api_base: "https://models.example:443/v1".into(),
             benchmark_provider_identity: Some("provider-route".into()),
             upstream_provider_identity: "test-provider".into(),
+            upstream_provider_route: Some("provider/route".into()),
             generator_chain: vec!["provider/generator".into(), "provider/fallback".into()],
             consensus: 1,
             scorer_chain: vec!["provider/scorer".into(), "provider/scorer-fallback".into()],
@@ -3723,6 +3835,7 @@ scorer = { enabled = true, default_model = "provider/scorer", reasoning_effort =
             Some(profile.clone())
         );
         assert_eq!(profile.upstream_provider_identity, "Azure");
+        assert_eq!(profile.upstream_provider_route, "azure/eu");
         assert_eq!(profile.generator_chain, vec!["openai/gpt-5.6-luna"]);
         assert_eq!(profile.scorer_chain, vec!["openai/gpt-5.6-luna"]);
         let drifted = Config {
@@ -3764,11 +3877,42 @@ scorer = { enabled = true, default_model = "provider/scorer", reasoning_effort =
     }
 
     #[test]
+    fn benchmark_screening_projects_an_exact_profile_when_scoring_is_disabled() {
+        let profile = provisional_hosted_profile();
+        let disabled = Config {
+            model: profile.generator_chain[0].clone(),
+            cascade: profile.generator_chain[1..].to_vec(),
+            scorer_enabled: false,
+            api_base: profile.api_base.clone(),
+            api_format: profile.api_format,
+            consensus: profile.consensus,
+            ..Config::default()
+        };
+        assert!(benchmark_screening_profile_matches_config(profile, &disabled).unwrap());
+
+        let wrong_generator = Config {
+            model: "other/generator".into(),
+            ..disabled.clone()
+        };
+        assert!(!benchmark_screening_profile_matches_config(profile, &wrong_generator).unwrap());
+
+        let wrong_active_scorer = Config {
+            scorer: "other/scorer".into(),
+            scorer_enabled: true,
+            ..disabled
+        };
+        assert!(
+            !benchmark_screening_profile_matches_config(profile, &wrong_active_scorer).unwrap()
+        );
+    }
+
+    #[test]
     fn provisional_hosted_profile_allows_one_model_in_generator_and_scorer_roles() {
         let profile = parse_provisional_hosted_profile(
             r#"{
                 "benchmarkProviderIdentity": "openrouter:managed-routing",
                 "upstreamProviderIdentity": "Azure",
+                "upstreamProviderRoute": "azure/eu",
                 "apiBase": "https://openrouter.ai:443/api/v1",
                 "apiFormat": "openai-compatible",
                 "generatorChain": ["provider/shared"],
@@ -3792,6 +3936,7 @@ scorer = { enabled = true, default_model = "provider/scorer", reasoning_effort =
         let valid = serde_json::json!({
             "benchmarkProviderIdentity": "openrouter:managed-routing",
             "upstreamProviderIdentity": "Azure",
+            "upstreamProviderRoute": "azure/eu",
             "apiBase": "https://openrouter.ai:443/api/v1",
             "apiFormat": "openai-compatible",
             "generatorChain": ["provider/generator"],

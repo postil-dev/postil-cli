@@ -19,6 +19,7 @@ import {
   invalidateExplicitOutputs,
   parseLiveModelsFailureReport,
   prepareExplicitOutputs,
+  qualificationProviderInputs,
   selectLiveScreeningCases,
   shippedDefaultModel,
   validateScreeningEnvironment,
@@ -33,6 +34,21 @@ import { cases } from "../fixtures/cases";
 const temporaryDirectories: string[] = [];
 
 describe("diff-file live screening selection", () => {
+  test("normalizes provider inputs once for execution and evidence", () => {
+    expect(qualificationProviderInputs([], {
+      POSTIL_BENCH_UPSTREAM_PROVIDER: "  Azure  ",
+      POSTIL_BENCH_UPSTREAM_PROVIDER_ROUTE: "  azure/eu  ",
+    })).toEqual({ upstreamProvider: "Azure", upstreamProviderRoute: "azure/eu" });
+    expect(qualificationProviderInputs(["--upstream-provider", " Azure "])).toEqual({
+      upstreamProvider: "Azure",
+      upstreamProviderRoute: "Azure",
+    });
+    expect(() => qualificationProviderInputs([], {
+      POSTIL_BENCH_UPSTREAM_PROVIDER: "Azure",
+      POSTIL_BENCH_UPSTREAM_PROVIDER_ROUTE: "   ",
+    })).toThrow("nonempty upstream provider route");
+  });
+
   test("preserves requested fixture order and leaves the full corpus unchanged by default", () => {
     expect(selectLiveScreeningCases(cases, []).map((entry) => entry.id)).toEqual(
       cases.map((entry) => entry.id),
@@ -107,7 +123,7 @@ async function temporaryDirectory(): Promise<string> {
 
 function emptyReport(privateEvidenceDigest: string): LiveModelsReport {
   return {
-    schemaVersion: 3,
+    schemaVersion: 4,
     generatedAt: "2026-07-16T00:00:00.000Z",
     qualificationSourceSha: "9".repeat(40),
     cliVersion: "postil 0.6.4",
@@ -116,6 +132,7 @@ function emptyReport(privateEvidenceDigest: string): LiveModelsReport {
     providerEndpointIdentity: "openrouter:managed-routing",
     upstreamProviderPinned: true,
     upstreamProviderIdentity: "PinnedProvider",
+    upstreamProviderRoute: "pinned/route",
     fixtureHash: "a".repeat(64),
     reviewContractHash: "b".repeat(64),
     evaluatorContractHash: "c".repeat(64),
@@ -169,6 +186,7 @@ describe("benchmark output lifecycle", () => {
         qualificationSourceSha: "9".repeat(40),
         pairs: [{ generatorModel: "deepseek/deepseek-v4-pro", scorerModel: "z-ai/glm-5.2" }],
         upstreamProvider: "PublicProvider",
+        upstreamProviderRoute: "public/route",
       },
     );
     expect(parseLiveModelsFailureReport(report)).toBe(report);
@@ -183,6 +201,7 @@ describe("benchmark output lifecycle", () => {
       }],
       providerEndpointIdentity: "openrouter:managed-routing",
       upstreamProviderIdentity: "PublicProvider",
+      upstreamProviderRoute: "public/route",
       process: {
         category: "provider-http-503", exitCode: 1, signal: null, killed: false,
         phase: "attribution", providerAttemptCount: 2, identityPresent: true, identityMatched: true,
@@ -211,6 +230,7 @@ describe("benchmark output lifecycle", () => {
         qualificationSourceSha: "8".repeat(40),
         pairs: [{ generatorModel: "deepseek/deepseek-v4-pro", scorerModel: "z-ai/glm-5.2" }],
         upstreamProvider: "PublicProvider",
+        upstreamProviderRoute: "public/route",
       },
     );
     expect(report.process).toEqual({
@@ -238,6 +258,7 @@ describe("benchmark output lifecycle", () => {
         qualificationSourceSha: "8".repeat(40),
         pairs: [{ generatorModel: "deepseek/deepseek-v4-pro", scorerModel: "z-ai/glm-5.2" }],
         upstreamProvider: "PublicProvider",
+        upstreamProviderRoute: "public/route",
       },
     );
     expect(report.process).toEqual({
@@ -265,6 +286,7 @@ describe("benchmark output lifecycle", () => {
         qualificationSourceSha: "7".repeat(40),
         pairs: [{ generatorModel: "deepseek/deepseek-v4-pro", scorerModel: "z-ai/glm-5.2" }],
         upstreamProvider: "PublicProvider",
+        upstreamProviderRoute: "public/route",
       },
     );
     expect(report.process).toEqual({
@@ -288,6 +310,7 @@ describe("benchmark output lifecycle", () => {
       profiles: [{ id: "pair", generatorModels: ["generator"], consensus: 1, scorerModels: ["scorer"] }],
       providerEndpointIdentity: "openrouter:managed-routing",
       upstreamProviderIdentity: "PublicProvider",
+      upstreamProviderRoute: "public/route",
       process: {
         category: "provider-unclassified", exitCode: 1, signal: null, killed: false,
         phase: "attribution", providerAttemptCount: 1,

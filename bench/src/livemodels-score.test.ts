@@ -15,11 +15,14 @@ import {
   parseCanonicalDecimal,
   pricingFromCatalog,
   pricingFromZdrCatalog,
+  providerContractEvidence,
+  providerContractSha256,
   qualificationPairId,
   scoreLiveCase,
   toSiteModelAggregate,
   type LiveModelCaseResult,
   type ModelPricing,
+  type ProviderContractEvidence,
   type QualificationPair,
 } from "./livemodels-score";
 
@@ -52,6 +55,61 @@ const prices = new Map<string, ModelPricing>([
     inputMicrosPerMillionTokens: 1_000_000, outputMicrosPerMillionTokens: 2_000_000,
   }],
 ]);
+
+test("binds exact routing and price pins in retained provider evidence", () => {
+  const contract = providerContractEvidence(
+    "Azure",
+    "azure/eu",
+    prices,
+    [pair.generatorModel],
+    [pair.scorerModel, pair.generatorModel],
+  );
+  expect(contract).toMatchObject({
+    upstreamProviderIdentity: "Azure",
+    upstreamProviderRoute: "azure/eu",
+    dataCollection: "deny",
+    zeroDataRetention: true,
+    allowFallbacks: false,
+    maxPricePinned: true,
+  });
+  expect(contract.modelPriceBounds).toEqual([
+    {
+      model: pair.generatorModel,
+      roles: ["generator", "scorer"],
+      inputMicrosPerMillionTokens: 1_000_000,
+      outputMicrosPerMillionTokens: 2_000_000,
+    },
+    {
+      model: pair.scorerModel,
+      roles: ["scorer"],
+      inputMicrosPerMillionTokens: 1_000_000,
+      outputMicrosPerMillionTokens: 2_000_000,
+    },
+  ]);
+  expect(providerContractSha256(contract)).toHaveLength(64);
+  const reordered: ProviderContractEvidence = {
+    modelPriceBounds: contract.modelPriceBounds.map((bound) => ({
+      outputMicrosPerMillionTokens: bound.outputMicrosPerMillionTokens,
+      roles: bound.roles,
+      inputMicrosPerMillionTokens: bound.inputMicrosPerMillionTokens,
+      model: bound.model,
+    })),
+    maxPriceUnits: contract.maxPriceUnits,
+    maxPricePinned: contract.maxPricePinned,
+    scorerRequireParameters: contract.scorerRequireParameters,
+    generatorRequireParameters: contract.generatorRequireParameters,
+    allowFallbacks: contract.allowFallbacks,
+    zeroDataRetention: contract.zeroDataRetention,
+    dataCollection: contract.dataCollection,
+    upstreamProviderRoute: contract.upstreamProviderRoute,
+    upstreamProviderIdentity: contract.upstreamProviderIdentity,
+    benchmarkProviderIdentity: contract.benchmarkProviderIdentity,
+    version: contract.version,
+  };
+  expect(providerContractSha256(reordered)).toBe(providerContractSha256(contract));
+  expect(providerContractSha256({ ...contract, upstreamProviderRoute: "azure/us" }))
+    .not.toBe(providerContractSha256(contract));
+});
 
 function fixture(
   classification: "mustBlock" | "advisory" | "clean",
@@ -563,11 +621,53 @@ describe("report and pricing utilities", () => {
       provider_name: "Together",
       status: 0,
       pricing: { prompt: "0.000001", completion: "0.000002" },
-      supported_parameters: ["max_tokens", "temperature"],
+      supported_parameters: [
+        "max_completion_tokens",
+        "reasoning",
+        "reasoning_effort",
+        "response_format",
+      ],
     }] }, [pair.scorerModel], "Together", new Map([
-      [pair.scorerModel, ["max_tokens", "response_format", "temperature"]],
+      [pair.scorerModel, [
+        "max_completion_tokens",
+        "reasoning",
+        "reasoning_effort",
+        "response_format",
+        "structured_outputs",
+      ]],
     ]));
     expect(catalog.has(pair.scorerModel)).toBe(false);
+  });
+
+  test("binds pricing to an exact route while retaining the response provider identity", () => {
+    const catalog = pricingFromZdrCatalog({ data: [
+      {
+        model_id: pair.scorerModel,
+        provider_name: "Azure",
+        tag: "azure",
+        status: 0,
+        pricing: { prompt: "0.000001", completion: "0.000002" },
+        supported_parameters: ["max_completion_tokens"],
+      },
+      {
+        model_id: pair.scorerModel,
+        provider_name: "Azure",
+        tag: "azure/eu",
+        status: 0,
+        pricing: { prompt: "0.000003", completion: "0.000004" },
+        supported_parameters: ["max_completion_tokens"],
+      },
+    ] }, [pair.scorerModel], "Azure", new Map([
+      [pair.scorerModel, ["max_completion_tokens"]],
+    ]), "azure/eu");
+
+    expect(catalog.get(pair.scorerModel)).toEqual({
+      providerIdentity: "Azure",
+      promptUsdPerToken: 0.000003,
+      completionUsdPerToken: 0.000004,
+      inputMicrosPerMillionTokens: 3_000_000,
+      outputMicrosPerMillionTokens: 4_000_000,
+    });
   });
 
   test("rejects duplicate requested catalog ids and canonical aliases before pricing", () => {

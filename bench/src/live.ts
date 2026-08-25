@@ -36,7 +36,10 @@ import { benchmarkCase, type BenchmarkCaseInput, envelopeV1, type Envelope } fro
 import {
   formatCanonicalDecimal,
   parseCanonicalDecimal,
+  providerContractEvidence,
+  providerContractSha256,
   sumCanonicalDecimals,
+  type ProviderContractEvidence,
 } from "./livemodels-score";
 
 const execFile = promisify(execFileCb);
@@ -176,6 +179,9 @@ export interface LiveSummary {
   providerContractEnforced: boolean;
   screeningProfileSha256: string | null;
   upstreamProviderIdentity: string | null;
+  upstreamProviderRoute: string | null;
+  providerContractSha256: string | null;
+  providerContract: ProviderContractEvidence | null;
   timeoutOverrides: LiveTimeoutOverrides;
   ranAt: string;
   totalCases: number;
@@ -364,6 +370,9 @@ async function writeLiveRunContract(
 async function screeningProfileMetadata(path: string): Promise<{
   sha256: string;
   upstreamProviderIdentity: string;
+  upstreamProviderRoute: string;
+  providerContractSha256: string;
+  providerContract: ProviderContractEvidence;
 }> {
   const bytes = await readFile(resolve(path));
   const parsed = safeJson(bytes.toString("utf8"));
@@ -371,15 +380,65 @@ async function screeningProfileMetadata(path: string): Promise<{
     ? parsed as Record<string, unknown>
     : null;
   const upstreamProviderIdentity = record?.upstreamProviderIdentity;
+  const upstreamProviderRoute = record?.upstreamProviderRoute;
+  const generatorChain = record?.generatorChain;
+  const scorerChain = record?.scorerChain;
+  const modelPriceBounds = record?.modelPriceBounds;
   if (
     typeof upstreamProviderIdentity !== "string" ||
     upstreamProviderIdentity.trim().length === 0
   ) {
     throw new Error("screening profile must declare a nonempty upstreamProviderIdentity");
   }
+  if (typeof upstreamProviderRoute !== "string" || upstreamProviderRoute.trim().length === 0) {
+    throw new Error("screening profile must declare a nonempty upstreamProviderRoute");
+  }
+  const models = (value: unknown, field: string): string[] => {
+    if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string" || entry.trim() === "")) {
+      throw new Error(`screening profile ${field} must contain model IDs`);
+    }
+    return value as string[];
+  };
+  if (!Array.isArray(modelPriceBounds)) {
+    throw new Error("screening profile modelPriceBounds must be an array");
+  }
+  const pricing = new Map<string, {
+    inputMicrosPerMillionTokens: number;
+    outputMicrosPerMillionTokens: number;
+  }>();
+  for (const bound of modelPriceBounds) {
+    if (typeof bound !== "object" || bound === null || Array.isArray(bound)) {
+      throw new Error("screening profile modelPriceBounds contains an invalid row");
+    }
+    const row = bound as Record<string, unknown>;
+    if (
+      typeof row.model !== "string" || row.model.trim() === "" ||
+      !Number.isSafeInteger(row.inputMicrosPerMillionTokens) ||
+      Number(row.inputMicrosPerMillionTokens) < 1 ||
+      !Number.isSafeInteger(row.outputMicrosPerMillionTokens) ||
+      Number(row.outputMicrosPerMillionTokens) < 1 ||
+      pricing.has(row.model)
+    ) {
+      throw new Error("screening profile modelPriceBounds contains an invalid row");
+    }
+    pricing.set(row.model, {
+      inputMicrosPerMillionTokens: Number(row.inputMicrosPerMillionTokens),
+      outputMicrosPerMillionTokens: Number(row.outputMicrosPerMillionTokens),
+    });
+  }
+  const providerContract = providerContractEvidence(
+    upstreamProviderIdentity,
+    upstreamProviderRoute,
+    pricing,
+    models(generatorChain, "generatorChain"),
+    models(scorerChain, "scorerChain"),
+  );
   return {
     sha256: createHash("sha256").update(bytes).digest("hex"),
     upstreamProviderIdentity,
+    upstreamProviderRoute,
+    providerContractSha256: providerContractSha256(providerContract),
+    providerContract,
   };
 }
 
@@ -390,6 +449,7 @@ export async function evaluatorSourceSha256(): Promise<string> {
     "src/api-key.ts",
     "src/harness.ts",
     "src/live.ts",
+    "src/livemodels-score.ts",
   ];
   const hash = createHash("sha256");
   for (const source of sources) {
@@ -886,7 +946,13 @@ function summarize(
   fixtureCorpusSha256: string,
   evaluatorSha256: string,
   provider: LiveProvider,
-  screeningProfile: { sha256: string; upstreamProviderIdentity: string } | null,
+  screeningProfile: {
+    sha256: string;
+    upstreamProviderIdentity: string;
+    upstreamProviderRoute: string;
+    providerContractSha256: string;
+    providerContract: ProviderContractEvidence;
+  } | null,
   timeoutOverrides: LiveTimeoutOverrides,
 ): LiveSummary {
   const defects = results.filter((r) => r.type === "defect");
@@ -932,6 +998,9 @@ function summarize(
     providerContractEnforced: options.screenProfilePath !== undefined,
     screeningProfileSha256: screeningProfile?.sha256 ?? null,
     upstreamProviderIdentity: screeningProfile?.upstreamProviderIdentity ?? null,
+    upstreamProviderRoute: screeningProfile?.upstreamProviderRoute ?? null,
+    providerContractSha256: screeningProfile?.providerContractSha256 ?? null,
+    providerContract: screeningProfile?.providerContract ?? null,
     timeoutOverrides,
     ranAt: new Date().toISOString(),
     totalCases: results.length,
@@ -993,7 +1062,10 @@ export function formatLiveReport(report: LiveReport): string {
     `Provider contract: ${s.providerContractEnforced ? "enforced" : "not enforced"}`,
     ...(s.upstreamProviderIdentity === null
       ? []
-      : [`Upstream provider: ${s.upstreamProviderIdentity}; profile ${s.screeningProfileSha256}`]),
+      : [
+          `Upstream provider: ${s.upstreamProviderIdentity}; route ${s.upstreamProviderRoute}; ` +
+            `profile ${s.screeningProfileSha256}; contract ${s.providerContractSha256}`,
+        ]),
     `Detection ${s.detectionRate} defects | severity match (exact) ${s.severityMatchExact} | ` +
       `severity match (+/-1 tier) ${s.severityMatchWithinOneTier} | ` +
       `silent-on-clean ${s.silentOnClean} | false-positives ${s.falsePositives}`,

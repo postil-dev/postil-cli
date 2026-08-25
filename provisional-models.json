@@ -1,6 +1,7 @@
 {
   "benchmarkProviderIdentity": "openrouter:managed-routing",
   "upstreamProviderIdentity": "Azure",
+  "upstreamProviderRoute": "azure/eu",
   "apiBase": "https://openrouter.ai:443/api/v1",
   "apiFormat": "openai-compatible",
   "generatorChain": ["openai/gpt-5.6-luna"],

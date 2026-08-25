@@ -113,6 +113,7 @@ export interface LiveModelsFailureReport {
   }>;
   providerEndpointIdentity: typeof MANAGED_OPENROUTER_PROVIDER_IDENTITY;
   upstreamProviderIdentity: string;
+  upstreamProviderRoute: string;
   process: {
     category: LiveModelsFailureCategory;
     exitCode: number | null;
@@ -131,6 +132,26 @@ function flagValue(args: string[], flag: string): string | undefined {
   const index = args.indexOf(flag);
   const value = index === -1 ? undefined : args[index + 1];
   return value?.startsWith("--") === true ? undefined : value;
+}
+
+export function qualificationProviderInputs(
+  args: string[],
+  environment: NodeJS.ProcessEnv = process.env,
+): { upstreamProvider: string; upstreamProviderRoute: string } {
+  const upstreamProvider = (
+    environment.POSTIL_BENCH_UPSTREAM_PROVIDER ?? flagValue(args, "--upstream-provider") ?? ""
+  ).trim();
+  if (!upstreamProvider) {
+    throw new Error("live-models admission needs POSTIL_BENCH_UPSTREAM_PROVIDER or --upstream-provider");
+  }
+  const upstreamProviderRoute = (
+    environment.POSTIL_BENCH_UPSTREAM_PROVIDER_ROUTE ??
+      flagValue(args, "--upstream-provider-route") ?? upstreamProvider
+  ).trim();
+  if (!upstreamProviderRoute) {
+    throw new Error("live-models admission needs a nonempty upstream provider route");
+  }
+  return { upstreamProvider, upstreamProviderRoute };
 }
 
 function repeatedFlagValues(args: string[], flag: string): string[] {
@@ -221,10 +242,8 @@ function liveConcurrency(args: string[]): number {
 }
 
 /** The generator the binary under test actually ships, read from the same
- * `config.toml` the build bakes in. Restating the id in a caller lets the
- * benchmark certify a model the release does not contain: the release gate
- * carried `REVIEW_MODEL: z-ai/glm-5.2` in workflow YAML and kept scoring that
- * model after the shipped default moved, passing against the old baseline. */
+ * `config.toml` the build embeds. Resolving this value from the source prevents
+ * caller configuration drift from benchmarking a model absent from the release. */
 export function shippedDefaultModel(
   configPath = resolve(import.meta.dir, "..", "..", "config.toml"),
 ): string | undefined {
@@ -282,10 +301,7 @@ async function main() {
     const repeatsRaw = process.env.POSTIL_BENCH_REPEATS ?? flagValue(args, "--repeats");
     const apiFormat = qualificationApiFormat(process.env.POSTIL_API_FORMAT);
     const pricingFile = process.env.POSTIL_BENCH_PRICING_FILE ?? flagValue(args, "--pricing-file");
-    const upstreamProvider = process.env.POSTIL_BENCH_UPSTREAM_PROVIDER ?? flagValue(args, "--upstream-provider");
-    if (!upstreamProvider?.trim()) {
-      throw new Error("live-models admission needs POSTIL_BENCH_UPSTREAM_PROVIDER or --upstream-provider");
-    }
+    const { upstreamProvider, upstreamProviderRoute } = qualificationProviderInputs(args);
     const qualificationSourceSha = await resolveQualificationSourceSha(
       resolve(import.meta.dir, "..", ".."),
     );
@@ -299,6 +315,7 @@ async function main() {
         apiBase: process.env.POSTIL_API_BASE,
         apiFormat,
         upstreamProvider,
+        upstreamProviderRoute,
         pricing: pricingFile === undefined ? undefined : await pricingFromFile(pricingFile),
         concurrency,
         costCapUsd: costCapRaw,
@@ -309,6 +326,7 @@ async function main() {
         qualificationSourceSha,
         pairs,
         upstreamProvider,
+        upstreamProviderRoute,
       });
       await writeLiveModelsReport(jsonOut, JSON.stringify(failureReport, null, 2));
       throw error;
@@ -401,6 +419,7 @@ export async function createLiveModelsFailureReport(
     qualificationSourceSha: string;
     pairs: QualificationPair[];
     upstreamProvider: string;
+    upstreamProviderRoute: string;
   },
 ): Promise<LiveModelsFailureReport> {
   const failure = fixedLiveModelsFailure(error);
@@ -415,6 +434,7 @@ export async function createLiveModelsFailureReport(
     })),
     providerEndpointIdentity: MANAGED_OPENROUTER_PROVIDER_IDENTITY,
     upstreamProviderIdentity: options.upstreamProvider,
+    upstreamProviderRoute: options.upstreamProviderRoute,
     process: failure,
   }));
 }
@@ -423,13 +443,14 @@ export function parseLiveModelsFailureReport(value: unknown): LiveModelsFailureR
   if (!isRecord(value)) throw new Error("invalid live-models failure artifact");
   assertExactKeys(value, [
     "artifactType", "qualificationSourceSha", "profiles", "providerEndpointIdentity",
-    "upstreamProviderIdentity", "process",
+    "upstreamProviderIdentity", "upstreamProviderRoute", "process",
   ]);
   if (value.artifactType !== "live-models-failure" ||
       typeof value.qualificationSourceSha !== "string" ||
       !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(value.qualificationSourceSha) ||
       value.providerEndpointIdentity !== MANAGED_OPENROUTER_PROVIDER_IDENTITY ||
       typeof value.upstreamProviderIdentity !== "string" || value.upstreamProviderIdentity.trim() === "" ||
+      typeof value.upstreamProviderRoute !== "string" || value.upstreamProviderRoute.trim() === "" ||
       !Array.isArray(value.profiles) || value.profiles.length === 0 ||
       !isRecord(value.process)) {
     throw new Error("invalid live-models failure artifact");

@@ -382,7 +382,13 @@ fn request_system_contains(request: &Request, needle: &str) -> bool {
 }
 
 fn scorer_content(scores: Value) -> Value {
-    scorer_text(&scores.to_string())
+    // Scorer responses use the strict root object contract; adjudication has
+    // a separate array contract and continues to use scorer_text directly.
+    scorer_text(&json!({"scores": scores}).to_string())
+}
+
+fn scorer_scores_text(scores: Value) -> String {
+    json!({"scores": scores}).to_string()
 }
 
 fn scorer_text(scores: &str) -> Value {
@@ -412,6 +418,7 @@ fn write_atomic_attribution_inputs(
         json!({
             "benchmarkProviderIdentity": postil_cli::config::MANAGED_OPENROUTER_PROVIDER_IDENTITY,
             "upstreamProviderIdentity": "test-provider",
+            "upstreamProviderRoute": "test-provider",
             "apiBase": postil_cli::config::MANAGED_OPENROUTER_API_BASE,
             "apiFormat": "openai-compatible",
             "generatorChain": ["openai/gpt-5-mini"],
@@ -2100,18 +2107,15 @@ async fn native_anthropic_findings_use_explicit_native_scorer() {
     Mock::given(method("POST"))
         .and(path("/messages"))
         .and(body_string_contains("\"model\":\"claude-haiku-4-5\""))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(anthropic_text(
-                &json!([{
-                    "confidence": 0.82,
-                    "kind": "risk",
-                    "reason": "The changed line contains the reported flow."
-                }])
-                .to_string(),
-                5,
-                3,
-            )),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_text(
+            &scorer_scores_text(json!([{
+                "confidence": 0.82,
+                "kind": "risk",
+                "reason": "The changed line contains the reported flow."
+            }])),
+            5,
+            3,
+        )))
         .expect(1)
         .mount(&server)
         .await;
@@ -2198,11 +2202,11 @@ async fn openai_successful_scorer_with_zero_usage_marks_accounting_incomplete() 
     )
     .await;
     let scorer_response = json!({
-        "choices": [{"finish_reason": "stop", "message": {"content": json!([{
+        "choices": [{"finish_reason": "stop", "message": {"content": scorer_scores_text(json!([{
             "confidence": 0.82,
             "kind": "risk",
             "reason": "The changed line contains the reported flow."
-        }]).to_string()}}],
+        }]))}}],
         "usage": {"prompt_tokens": 0, "completion_tokens": 0}
     });
     Mock::given(method("POST"))
@@ -2308,18 +2312,15 @@ async fn anthropic_successful_scorer_with_zero_usage_marks_accounting_incomplete
     Mock::given(method("POST"))
         .and(path("/messages"))
         .and(body_string_contains("\"model\":\"scorer-model\""))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(anthropic_text(
-                &json!([{
-                    "confidence": 0.82,
-                    "kind": "risk",
-                    "reason": "The changed line contains the reported flow."
-                }])
-                .to_string(),
-                0,
-                0,
-            )),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_text(
+            &scorer_scores_text(json!([{
+                "confidence": 0.82,
+                "kind": "risk",
+                "reason": "The changed line contains the reported flow."
+            }])),
+            0,
+            0,
+        )))
         .expect(1)
         .mount(&server)
         .await;
@@ -2552,6 +2553,7 @@ fn qualification_candidate_admits_semantically_complete_bounded_hosted_path_with
         serde_json::to_vec(&json!({
             "benchmarkProviderIdentity": postil_cli::config::MANAGED_OPENROUTER_PROVIDER_IDENTITY,
             "upstreamProviderIdentity": "test-provider",
+            "upstreamProviderRoute": "test-provider",
             "apiBase": metadata.default_api_base,
             "apiFormat": metadata.default_api_format,
             "generatorChain": generator_chain,
@@ -2616,6 +2618,7 @@ fn qualification_candidate_admits_complete_large_review_inside_watchdog_capacity
         serde_json::to_vec(&json!({
             "benchmarkProviderIdentity": postil_cli::config::MANAGED_OPENROUTER_PROVIDER_IDENTITY,
             "upstreamProviderIdentity": "test-provider",
+            "upstreamProviderRoute": "test-provider",
             "apiBase": metadata.default_api_base,
             "apiFormat": metadata.default_api_format,
             "generatorChain": [model],
@@ -2686,6 +2689,7 @@ fn qualification_candidate_splits_json_escaped_batches_within_model_context() {
         serde_json::to_vec(&json!({
             "benchmarkProviderIdentity": postil_cli::config::MANAGED_OPENROUTER_PROVIDER_IDENTITY,
             "upstreamProviderIdentity": "test-provider",
+            "upstreamProviderRoute": "test-provider",
             "apiBase": metadata.default_api_base,
             "apiFormat": metadata.default_api_format,
             "generatorChain": ["openai/gpt-5-mini"],
@@ -2843,6 +2847,7 @@ async fn qualification_candidate_covers_fixture_51_shape_before_plan_registratio
         serde_json::to_vec(&json!({
             "benchmarkProviderIdentity": postil_cli::config::MANAGED_OPENROUTER_PROVIDER_IDENTITY,
             "upstreamProviderIdentity": "Fireworks",
+            "upstreamProviderRoute": "Fireworks",
             "apiBase": metadata.default_api_base,
             "apiFormat": metadata.default_api_format,
             "generatorChain": ["deepseek/deepseek-v4-pro"],
@@ -2921,6 +2926,7 @@ async fn hosted_cost_rejection_precedes_durable_plan_registration() {
         serde_json::to_vec(&json!({
             "benchmarkProviderIdentity": postil_cli::config::MANAGED_OPENROUTER_PROVIDER_IDENTITY,
             "upstreamProviderIdentity": "test-provider",
+            "upstreamProviderRoute": "test-provider",
             "apiBase": metadata.default_api_base,
             "apiFormat": metadata.default_api_format,
             "generatorChain": [model],
@@ -6949,6 +6955,7 @@ async fn hidden_atomic_attribution_repairs_once_with_same_model_and_preserves_ra
         json!({
             "benchmarkProviderIdentity": postil_cli::config::MANAGED_OPENROUTER_PROVIDER_IDENTITY,
             "upstreamProviderIdentity": "test-provider",
+            "upstreamProviderRoute": "test-provider",
             "apiBase": postil_cli::config::MANAGED_OPENROUTER_API_BASE,
             "apiFormat": "openai-compatible",
             "generatorChain": ["openai/gpt-5-mini"],
@@ -7181,6 +7188,7 @@ async fn hidden_atomic_attribution_rejects_oversized_repair_before_second_provid
         json!({
             "benchmarkProviderIdentity": postil_cli::config::MANAGED_OPENROUTER_PROVIDER_IDENTITY,
             "upstreamProviderIdentity": "test-provider",
+            "upstreamProviderRoute": "test-provider",
             "apiBase": postil_cli::config::MANAGED_OPENROUTER_API_BASE,
             "apiFormat": "openai-compatible",
             "generatorChain": ["openai/gpt-5-mini"],
@@ -7613,49 +7621,48 @@ async fn generic_provider_repairs_each_malformed_ordered_scorer_shape() {
         "kind": "risk",
         "reason": "This is a concrete defect."
     }]);
-    let byte_overflow = json!([{
+    let byte_overflow = scorer_scores_text(json!([{
         "confidence": 0.75,
         "kind": "risk",
         "reason": format!("{}。", "界".repeat(80))
-    }])
-    .to_string();
+    }]));
     let cases = [
         (
             "unknown-field",
-            r#"[{"index":0,"confidence":0.75,"kind":"risk","reason":"This is a concrete defect."}]"#.to_string(),
+            r#"{"scores":[{"index":0,"confidence":0.75,"kind":"risk","reason":"This is a concrete defect."}]}"#.to_string(),
         ),
         (
             "negative-confidence",
-            r#"[{"confidence":-1,"kind":"risk","reason":"This is a concrete defect."}]"#.to_string(),
+            r#"{"scores":[{"confidence":-1,"kind":"risk","reason":"This is a concrete defect."}]}"#.to_string(),
         ),
         (
             "high-confidence",
-            r#"[{"confidence":5,"kind":"risk","reason":"This is a concrete defect."}]"#.to_string(),
+            r#"{"scores":[{"confidence":5,"kind":"risk","reason":"This is a concrete defect."}]}"#.to_string(),
         ),
         (
             "raw-nan",
-            r#"[{"confidence":NaN,"kind":"risk","reason":"This is a concrete defect."}]"#.to_string(),
+            r#"{"scores":[{"confidence":NaN,"kind":"risk","reason":"This is a concrete defect."}]}"#.to_string(),
         ),
         (
             "string-nan",
-            r#"[{"confidence":"NaN","kind":"risk","reason":"This is a concrete defect."}]"#.to_string(),
+            r#"{"scores":[{"confidence":"NaN","kind":"risk","reason":"This is a concrete defect."}]}"#.to_string(),
         ),
-        ("missing-entry", "[]".to_string()),
+        ("missing-entry", r#"{"scores":[]}"#.to_string()),
         (
             "duplicate-entry",
-            r#"[{"confidence":0.75,"kind":"risk","reason":"This is a concrete defect."},{"confidence":0.75,"kind":"risk","reason":"This repeats the same input."}]"#.to_string(),
+            r#"{"scores":[{"confidence":0.75,"kind":"risk","reason":"This is a concrete defect."},{"confidence":0.75,"kind":"risk","reason":"This repeats the same input."}]}"#.to_string(),
         ),
         (
             "edge-whitespace",
-            r#"[{"confidence":0.75,"kind":"risk","reason":" Leading whitespace is invalid."}]"#.to_string(),
+            r#"{"scores":[{"confidence":0.75,"kind":"risk","reason":" Leading whitespace is invalid."}]}"#.to_string(),
         ),
         (
             "control-character",
-            r#"[{"confidence":0.75,"kind":"risk","reason":"A control\u0000character is invalid."}]"#.to_string(),
+            r#"{"scores":[{"confidence":0.75,"kind":"risk","reason":"A control\u0000character is invalid."}]}"#.to_string(),
         ),
         (
             "missing-punctuation",
-            r#"[{"confidence":0.75,"kind":"risk","reason":"This reason is incomplete"}]"#.to_string(),
+            r#"{"scores":[{"confidence":0.75,"kind":"risk","reason":"This reason is incomplete"}]}"#.to_string(),
         ),
         ("byte-overflow", byte_overflow),
     ];
@@ -8499,7 +8506,7 @@ async fn scorer_error_fails_open_and_preserves_generator_values() {
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .and(body_string_contains("anthropic/claude-haiku-4.5"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
+        .respond_with(ResponseTemplate::new(200).set_body_json(scorer_content(json!([]))))
         .mount(&server)
         .await;
 

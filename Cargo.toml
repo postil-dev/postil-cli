@@ -1,6 +1,6 @@
 [package]
 name = "postil-cli"
-version = "0.9.1"
+version = "0.9.2"
 edition = "2024"
 description = "Postil: a low-noise AI review gate. Silent on clean PRs, hard gate on real risk."
 license = "Apache-2.0"
@@ -15,9 +15,10 @@ name = "postil_cli"
 path = "src/lib.rs"
 
 [features]
-default = []
-# Builds the hermetic candidate-admission path used by the managed benchmark.
-# Release artifacts do not enable this feature.
+# Release binaries include the hermetic candidate-admission path so model
+# qualification exercises the exact bytes users receive. Runtime activation
+# still requires the guarded CI, loopback capture, and candidate profile inputs.
+default = ["qualification-candidate"]
 qualification-candidate = []
 
 [dependencies]

@@ -541,6 +541,12 @@ struct RawScore {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawScores {
+    scores: Vec<RawScore>,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RawUncertaintyResolution {
     resolution: RawUncertaintyDisposition,
@@ -614,6 +620,7 @@ struct RequestDecorations {
     require_openrouter_privacy: bool,
     hosted_price_bounds: Option<Arc<HashMap<String, ModelPriceBound>>>,
     pinned_upstream_provider: Option<String>,
+    pinned_upstream_provider_route: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -696,6 +703,13 @@ pub(crate) const MAX_PROVIDER_REQUEST_BYTES: usize = 256 * 1024;
 // logical review call. Keep the output ceiling above the five-batch hosted
 // plan while the aggregate token and cost caps remain authoritative.
 pub(crate) const MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE: usize = 10_000_000;
+// Admission prices every executable retry using serialized bytes as a safe
+// upper bound on input tokens. That worst-case projection is distinct from
+// the exact provider-reported usage cap: a bounded schedule can project above
+// the latter without being able to exceed the independent input, output,
+// attempt, or cost ceilings.
+const MAX_PROVIDER_TOKEN_EXPOSURE: usize =
+    MAX_PROVIDER_INPUT_BYTES + MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE;
 // Hosted planning reserves one initial and one correction call for every
 // selected model request plus the maximum enabled resolution and compression
 // passes. The selected-batch limit is derived after all model fan-out is known.
@@ -900,7 +914,7 @@ fn review_validation_retry_user(user: &str, previous: &str, reason: &str) -> Str
 
 fn scorer_repair_system(system: &str) -> String {
     format!(
-        "{system}\n\nYour previous response failed schema validation. Repair only the JSON schema. Kind is a category, so severity values such as info, warn, and error are invalid kinds. Every reason must be concise single-line text of at most {SCORER_REASON_PROMPT_MAX_BYTES} UTF-8 bytes ending in sentence punctuation. Return the complete array and nothing else."
+        "{system}\n\nYour previous response failed schema validation. Repair only the JSON schema. Kind is a category, so severity values such as info, warn, and error are invalid kinds. Every reason must be concise single-line text of at most {SCORER_REASON_PROMPT_MAX_BYTES} UTF-8 bytes ending in sentence punctuation. Return the complete object with exactly the `scores` array and nothing else."
     )
 }
 
@@ -1323,8 +1337,8 @@ impl RequestDecorations {
                         .ok_or_else(|| anyhow!("qualification provider profile is unavailable"))?
                         .upstream_provider_identity,
                 )
-            } else if let Some(profile) = screening_profile {
-                Some(profile.upstream_provider_identity)
+            } else if let Some(profile) = screening_profile.as_ref() {
+                Some(profile.upstream_provider_identity.clone())
             } else if crate::config::hosted_mode() {
                 Some(
                     crate::config::admitted_profile_for_config(cfg)
@@ -1337,6 +1351,20 @@ impl RequestDecorations {
             } else {
                 None
             };
+        let pinned_upstream_provider_route =
+            if let Some(route) = crate::config::hosted_provider_route_for_config(cfg) {
+                Some(route.to_string())
+            } else if crate::config::qualification_candidate_mode() {
+                Some(
+                    crate::config::qualification_candidate_profile_for_config(cfg)?
+                        .ok_or_else(|| anyhow!("qualification provider profile is unavailable"))?
+                        .upstream_provider_route,
+                )
+            } else if let Some(profile) = screening_profile.as_ref() {
+                Some(profile.upstream_provider_route.clone())
+            } else {
+                pinned_upstream_provider.clone()
+            };
         Ok(Self {
             api_base: cfg.api_base.trim_end_matches('/').to_string(),
             api_format: cfg.api_format,
@@ -1348,6 +1376,7 @@ impl RequestDecorations {
                     || env_flag("POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY")),
             hosted_price_bounds,
             pinned_upstream_provider,
+            pinned_upstream_provider_route,
         })
     }
 
@@ -1378,15 +1407,30 @@ impl RequestDecorations {
                 );
                 apply_openrouter_privacy(&mut body, self.require_openrouter_privacy);
                 let canonical_openrouter = is_canonical_openrouter_base(&self.api_base);
-                if let Some(provider) = self.pinned_upstream_provider.as_deref() {
+                if let Some(provider) = self.pinned_upstream_provider_route.as_deref() {
                     apply_openrouter_provider_pin(&mut body, provider);
                 }
-                if canonical_openrouter && let LlmPhase::Scorer { expected_len } = phase {
-                    apply_openrouter_scorer_contract(&mut body, expected_len);
+                if canonical_openrouter {
+                    match phase {
+                        LlmPhase::Scorer { expected_len } => {
+                            apply_openrouter_scorer_contract(
+                                &mut body,
+                                expected_len,
+                                self.pinned_upstream_provider.as_deref(),
+                            );
+                        }
+                        LlmPhase::Adjudication => {
+                            apply_openrouter_adjudication_contract(
+                                &mut body,
+                                self.pinned_upstream_provider.as_deref(),
+                            );
+                        }
+                        _ => {}
+                    }
                 }
                 #[cfg(feature = "qualification-candidate")]
                 if matches!(phase, LlmPhase::Attribution) {
-                    apply_openrouter_atomic_attribution_contract(&mut body, _expected_provider);
+                    apply_openrouter_atomic_attribution_contract(&mut body);
                 }
                 if canonical_openrouter
                     && let Some(bound) = self
@@ -2237,8 +2281,8 @@ impl LlmClient {
             .checked_add(exposure.output_tokens)
             .context("planned token exposure overflowed")?;
         ensure!(
-            token_exposure <= MAX_REPORTED_TOKEN_SPEND,
-            "hosted {operation} admission needs {token_exposure} tokens of exposure, exceeding the {MAX_REPORTED_TOKEN_SPEND} token cap"
+            token_exposure <= MAX_PROVIDER_TOKEN_EXPOSURE,
+            "hosted {operation} admission needs {token_exposure} tokens of exposure, exceeding the {MAX_PROVIDER_TOKEN_EXPOSURE} token exposure cap"
         );
         let model_costs = exposure
             .model_costs_micros
@@ -4887,9 +4931,10 @@ impl LlmClient {
         )?;
         let output_tokens = body
             .get("max_tokens")
+            .or_else(|| body.get("max_completion_tokens"))
             .and_then(serde_json::Value::as_u64)
             .and_then(|value| usize::try_from(value).ok())
-            .ok_or_else(|| anyhow!("model request is missing a bounded max_tokens value"))?;
+            .ok_or_else(|| anyhow!("model request is missing a bounded output token limit"))?;
         let projected_cost_micros = if let Some(bounds) =
             &self.request_decorations.hosted_price_bounds
         {
@@ -4952,8 +4997,8 @@ impl LlmClient {
                 "model provider output exposure hard cap ({MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE} tokens) exceeded"
             );
             ensure!(
-                total_token_exposure <= MAX_REPORTED_TOKEN_SPEND,
-                "model token spend exposure exceeded the {MAX_REPORTED_TOKEN_SPEND} token hard cap"
+                total_token_exposure <= MAX_PROVIDER_TOKEN_EXPOSURE,
+                "model token exposure exceeded the {MAX_PROVIDER_TOKEN_EXPOSURE} token hard cap"
             );
             ensure!(
                 total_projected_cost <= HOSTED_OPERATION_COST_CAP_MICROS,
@@ -5266,8 +5311,18 @@ fn apply_anthropic_reasoning(body: &mut serde_json::Value, effort: ReasoningEffo
     }
 }
 
-fn apply_openrouter_scorer_contract(body: &mut serde_json::Value, expected_len: usize) {
+fn apply_openrouter_scorer_contract(
+    body: &mut serde_json::Value,
+    expected_len: usize,
+    pinned_provider: Option<&str>,
+) {
     debug_assert!(expected_len <= SCORER_MAX_FINDINGS);
+    // Strict scorer routing requires every request parameter to be supported
+    // by the selected endpoint. Reasoning endpoints expose their output limit
+    // through `reasoning.effort`. Azure names the output limit
+    // `max_completion_tokens`; OpenAI names the same limit `max_tokens`.
+    // A redundant temperature would disqualify both endpoint families.
+    apply_openrouter_strict_output_limit(body, "scorer", pinned_provider);
     let provider = body
         .as_object_mut()
         .expect("model request body is an object")
@@ -5288,50 +5343,87 @@ fn apply_openrouter_scorer_contract(body: &mut serde_json::Value, expected_len: 
             "name": "postil_finding_scores",
             "strict": true,
             "schema": {
-                "type": "array",
-                "minItems": expected_len,
-                "maxItems": expected_len,
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "confidence": {
-                            "type": "number",
-                            "minimum": 0,
-                            "maximum": 1,
-                        },
-                        "kind": {
-                            "type": "string",
-                            "enum": [
-                                "risk",
-                                "humanEscalation",
-                                "guardrail",
-                                "uncertainty",
-                                "contentPolicy",
-                            ],
-                        },
-                        "reason": {
-                            "type": "string",
-                            "minLength": 1,
-                            "maxLength": SCORER_REASON_SCHEMA_MAX_CHARS,
-                            "pattern": SCORER_REASON_JSON_PATTERN,
+                "type": "object",
+                "properties": {
+                    "scores": {
+                        "type": "array",
+                        "minItems": expected_len,
+                        "maxItems": expected_len,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "confidence": {
+                                    "type": "number",
+                                    "minimum": 0,
+                                    "maximum": 1,
+                                },
+                                "kind": {
+                                    "type": "string",
+                                    "enum": [
+                                        "risk",
+                                        "humanEscalation",
+                                        "guardrail",
+                                        "uncertainty",
+                                        "contentPolicy",
+                                    ],
+                                },
+                                "reason": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": SCORER_REASON_SCHEMA_MAX_CHARS,
+                                    "pattern": SCORER_REASON_JSON_PATTERN,
+                                },
+                            },
+                            "required": ["confidence", "kind", "reason"],
+                            "additionalProperties": false,
                         },
                     },
-                    "required": ["confidence", "kind", "reason"],
-                    "additionalProperties": false,
                 },
+                "required": ["scores"],
+                "additionalProperties": false,
             },
         },
     });
 }
 
-#[cfg(feature = "qualification-candidate")]
-fn apply_openrouter_atomic_attribution_contract(
+fn apply_openrouter_adjudication_contract(
     body: &mut serde_json::Value,
-    expected_provider: Option<&str>,
+    pinned_provider: Option<&str>,
 ) {
-    if let Some(expected_provider) = expected_provider {
-        apply_openrouter_provider_pin(body, expected_provider);
+    apply_openrouter_strict_output_limit(body, "adjudication", pinned_provider);
+    let provider = body
+        .as_object_mut()
+        .expect("model request body is an object")
+        .entry("provider")
+        .or_insert_with(|| json!({}));
+    provider
+        .as_object_mut()
+        .expect("provider routing configuration is an object")
+        .insert("require_parameters".to_string(), json!(true));
+    if body["reasoning"]["effort"] != "none" {
+        body["reasoning"]["exclude"] = json!(true);
     }
+}
+
+fn apply_openrouter_strict_output_limit(
+    body: &mut serde_json::Value,
+    phase: &str,
+    pinned_provider: Option<&str>,
+) {
+    let request = body
+        .as_object_mut()
+        .expect("model request body is an object");
+    request.remove("temperature");
+    if pinned_provider != Some("OpenAI") {
+        let max_tokens = request.remove("max_tokens").unwrap_or_else(|| {
+            panic!("OpenRouter {phase} request has a bounded output token limit")
+        });
+        request.insert("max_completion_tokens".to_string(), max_tokens);
+    }
+}
+
+#[cfg(feature = "qualification-candidate")]
+fn apply_openrouter_atomic_attribution_contract(body: &mut serde_json::Value) {
     let provider = body
         .as_object_mut()
         .expect("model request body is an object")
@@ -5394,7 +5486,7 @@ fn is_canonical_openrouter_base(api_base: &str) -> bool {
     reqwest::Url::parse(api_base).is_ok_and(|url| {
         url.scheme() == "https"
             && url.host_str() == Some("openrouter.ai")
-            && url.port().is_none()
+            && url.port().is_none_or(|port| port == 443)
             && url.path().trim_end_matches('/') == "/api/v1"
             && url.query().is_none()
             && url.fragment().is_none()
@@ -5962,8 +6054,10 @@ fn safe_review_output_shape(content: &str) -> String {
 }
 
 fn parse_scores(content: &str, expected_len: usize) -> Result<Vec<FindingScore>, String> {
-    let json_str = extract_json_array(content).ok_or("no JSON array found")?;
-    let raw = serde_json::from_str::<Vec<RawScore>>(json_str).map_err(|e| e.to_string())?;
+    let json_str = extract_json_object(content).ok_or("no JSON object found")?;
+    let raw = serde_json::from_str::<RawScores>(json_str)
+        .map_err(|e| e.to_string())?
+        .scores;
     if raw.len() != expected_len {
         return Err(format!(
             "expected {expected_len} score(s), got {}",
@@ -7059,6 +7153,7 @@ mod tests {
         .unwrap();
         client.request_decorations.require_openrouter_privacy = true;
         client.request_decorations.pinned_upstream_provider = Some("p".repeat(12_000));
+        client.request_decorations.pinned_upstream_provider_route = Some("p".repeat(12_000));
         client.request_decorations.hosted_price_bounds = Some(Arc::new(HashMap::from([(
             config.model.clone(),
             ModelPriceBound {
@@ -8223,8 +8318,10 @@ mod tests {
                 output_micros_per_million_tokens: 1,
             },
         )])));
-        let users =
-            vec!["bounded candidate".to_string(); crate::review::MAX_HOSTED_SELECTED_BATCHES];
+        let users = vec![
+            "\"".repeat(crate::review::MAX_HOSTED_REVIEW_BATCH_BYTES);
+            crate::review::MAX_HOSTED_SELECTED_BATCHES
+        ];
         let output_tokens = vec![REVIEW_MAX_TOKENS; crate::review::MAX_HOSTED_SELECTED_BATCHES];
         let manifest = "m".repeat(96_000);
         let admission = client
@@ -8304,8 +8401,10 @@ mod tests {
                 .map(|bound| (bound.model.clone(), bound))
                 .collect(),
         ));
-        let users =
-            vec!["bounded candidate".to_string(); crate::review::MAX_HOSTED_SELECTED_BATCHES];
+        let users = vec![
+            "\"".repeat(crate::review::MAX_HOSTED_REVIEW_BATCH_BYTES);
+            crate::review::MAX_HOSTED_SELECTED_BATCHES
+        ];
         let output_tokens = vec![REVIEW_MAX_TOKENS; crate::review::MAX_HOSTED_SELECTED_BATCHES];
         let manifest = "m".repeat(96_000);
         let admission = client
@@ -8331,6 +8430,11 @@ mod tests {
             "projected {} exceeds the {} admission cap",
             admission.projected_cost_micros,
             HOSTED_ADMISSION_PROJECTION_CAP_MICROS
+        );
+        assert!(
+            admission.serialized_input_bytes + admission.output_tokens
+                > MAX_REPORTED_TOKEN_SPEND as u64,
+            "the regression fixture must exercise projection above the exact usage cap"
         );
     }
 
@@ -8592,6 +8696,55 @@ mod tests {
             r#""provider/model"={}"#,
             HOSTED_ADMISSION_PROJECTION_CAP_MICROS + 1
         )));
+    }
+
+    #[test]
+    fn hosted_token_projection_is_distinct_from_reported_usage() {
+        let mut client = LlmClient::build(
+            &Config::default(),
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        client.request_decorations.hosted_price_bounds = Some(Arc::new(HashMap::new()));
+
+        let planned = PlannedExposure {
+            attempts: 190,
+            input_bytes: 17_961_194,
+            output_tokens: 2_091_456,
+            projected_cost_micros: 0,
+            model_costs_micros: BTreeMap::new(),
+        };
+        let admission = client
+            .validate_hosted_exposure("review", &planned)
+            .expect("the bounded hosted schedule must clear projection admission");
+        assert_eq!(admission.provider_attempts, 190);
+        assert_eq!(admission.serialized_input_bytes, 17_961_194);
+        assert_eq!(admission.output_tokens, 2_091_456);
+        assert!(
+            admission.serialized_input_bytes + admission.output_tokens
+                > MAX_REPORTED_TOKEN_SPEND as u64
+        );
+
+        client
+            .record_reported_usage(Usage {
+                prompt_tokens: MAX_REPORTED_TOKEN_SPEND as u64,
+                ..Usage::default()
+            })
+            .expect("the exact reported-usage boundary is admitted");
+        let error = client
+            .record_reported_usage(Usage {
+                prompt_tokens: 1,
+                ..Usage::default()
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("token hard cap"));
+        assert_eq!(
+            client.admission.lock().unwrap().reported_token_spend,
+            MAX_REPORTED_TOKEN_SPEND
+        );
     }
 
     #[test]
@@ -8909,7 +9062,7 @@ mod tests {
     #[test]
     fn scorer_scores_use_array_order_and_validate_kind() {
         let scores = parse_scores(
-            r#"[{"confidence":0.8,"kind":"humanEscalation","reason":"This needs an owner decision."},{"confidence":0.6,"kind":"risk","reason":"This follows the second input."}]"#,
+            r#"{"scores":[{"confidence":0.8,"kind":"humanEscalation","reason":"This needs an owner decision."},{"confidence":0.6,"kind":"risk","reason":"This follows the second input."}]}"#,
             2,
         )
         .unwrap();
@@ -8924,15 +9077,30 @@ mod tests {
     #[test]
     fn scorer_rejects_unknown_fields_and_invalid_confidence() {
         let unknown = parse_scores(
-            r#"[{"index":0,"confidence":0.8,"kind":"risk","reason":"This field is not admitted."}]"#,
+            r#"{"scores":[{"index":0,"confidence":0.8,"kind":"risk","reason":"This field is not admitted."}]}"#,
             1,
         )
         .unwrap_err();
         assert!(unknown.contains("unknown field `index`"));
 
+        let unknown_root = parse_scores(
+            r#"{"scores":[{"confidence":0.8,"kind":"risk","reason":"This score is valid."}],"extra":true}"#,
+            1,
+        )
+        .unwrap_err();
+        assert!(unknown_root.contains("unknown field `extra`"));
+        assert!(parse_scores(r#"{"items":[]}"#, 0).is_err());
+        assert!(
+            parse_scores(
+                r#"[{"confidence":0.8,"kind":"risk","reason":"Arrays are no longer the root."}]"#,
+                1
+            )
+            .is_err()
+        );
+
         for confidence in ["-1", "5", "1e999", "\"NaN\""] {
             let input = format!(
-                r#"[{{"confidence":{confidence},"kind":"risk","reason":"This confidence is invalid."}}]"#
+                r#"{{"scores":[{{"confidence":{confidence},"kind":"risk","reason":"This confidence is invalid."}}]}}"#
             );
             assert!(
                 parse_scores(&input, 1).is_err(),
@@ -8944,7 +9112,7 @@ mod tests {
     #[test]
     fn scorer_rejects_severity_label_as_kind() {
         let error = parse_scores(
-            r#"[{"confidence":0.7,"kind":"warn","reason":"The response used the wrong field."}]"#,
+            r#"{"scores":[{"confidence":0.7,"kind":"warn","reason":"The response used the wrong field."}]}"#,
             1,
         )
         .unwrap_err();
@@ -8955,7 +9123,7 @@ mod tests {
     fn scorer_rejects_missing_entries() {
         assert!(
             parse_scores(
-                r#"[{"confidence":0.5,"kind":"risk","reason":"Only one score is present."}]"#,
+                r#"{"scores":[{"confidence":0.5,"kind":"risk","reason":"Only one score is present."}]}"#,
                 2
             )
             .is_err()
@@ -8973,17 +9141,18 @@ mod tests {
     #[test]
     fn scorer_rejects_incomplete_and_overlength_reasons() {
         let incomplete = parse_scores(
-            r#"[{"confidence":0.7,"kind":"risk","reason":"This has no sentence terminator"}]"#,
+            r#"{"scores":[{"confidence":0.7,"kind":"risk","reason":"This has no sentence terminator"}]}"#,
             1,
         )
         .unwrap_err();
         assert!(incomplete.contains("sentence punctuation"));
 
-        let overlength = serde_json::json!([{
-            "confidence": 0.7,
-            "kind": "risk",
-            "reason": format!("{}.", "x".repeat(SCORER_REASON_MAX_BYTES)),
-        }]);
+        let overlength = serde_json::json!({"scores": [{
+                "confidence": 0.7,
+                "kind": "risk",
+                "reason": format!("{}.", "x".repeat(SCORER_REASON_MAX_BYTES)),
+            }]
+        });
         let error = parse_scores(&overlength.to_string(), 1).unwrap_err();
         assert!(error.contains("exceeds 240 UTF-8 bytes"));
 
@@ -8993,11 +9162,12 @@ mod tests {
             "A tab\tis invalid.",
             "A line\u{2028}separator is invalid.",
         ] {
-            let input = serde_json::json!([{
-                "confidence": 0.7,
-                "kind": "risk",
-                "reason": reason,
-            }]);
+            let input = serde_json::json!({"scores": [{
+                    "confidence": 0.7,
+                    "kind": "risk",
+                    "reason": reason,
+                }]
+            });
             assert!(
                 parse_scores(&input.to_string(), 1).is_err(),
                 "accepted malformed reason {reason:?}"
@@ -9008,20 +9178,22 @@ mod tests {
     #[test]
     fn scorer_reason_limits_match_json_schema_unicode_length() {
         let reason = format!("{}.", "x".repeat(SCORER_REASON_MAX_BYTES - 1));
-        let input = serde_json::json!([{
-            "confidence": 0.7,
-            "kind": "risk",
-            "reason": reason,
-        }]);
+        let input = serde_json::json!({"scores": [{
+                "confidence": 0.7,
+                "kind": "risk",
+                "reason": reason,
+            }]
+        });
         let scores = parse_scores(&input.to_string(), 1).unwrap();
         assert_eq!(scores[0].reason.len(), SCORER_REASON_MAX_BYTES);
 
         let multibyte = format!("{}。", "界".repeat((SCORER_REASON_MAX_BYTES / 3) - 1));
-        let input = serde_json::json!([{
-            "confidence": 0.7,
-            "kind": "risk",
-            "reason": multibyte,
-        }]);
+        let input = serde_json::json!({"scores": [{
+                "confidence": 0.7,
+                "kind": "risk",
+                "reason": multibyte,
+            }]
+        });
         let scores = parse_scores(&input.to_string(), 1).unwrap();
         assert_eq!(scores[0].reason.len(), SCORER_REASON_MAX_BYTES);
     }
@@ -9029,14 +9201,14 @@ mod tests {
     #[test]
     fn scorer_reason_accepts_bounded_single_line_text() {
         let scores = parse_scores(
-            r#"[{"confidence":0.7,"kind":"risk","reason":"The U.S. retry path is not idempotent, e.g. on timeout."}]"#,
+            r#"{"scores":[{"confidence":0.7,"kind":"risk","reason":"The U.S. retry path is not idempotent, e.g. on timeout."}]}"#,
             1,
         )
         .unwrap();
         assert_eq!(scores.len(), 1);
 
         let multiple_sentences = parse_scores(
-            r#"[{"confidence":0.7,"kind":"risk","reason":"The first condition fails. The second condition also fails."}]"#,
+            r#"{"scores":[{"confidence":0.7,"kind":"risk","reason":"The first condition fails. The second condition also fails."}]}"#,
             1,
         )
         .unwrap();
@@ -9045,29 +9217,30 @@ mod tests {
         let natural_long_reason =
             "The authorization check is bypassed when the cached administrator flag is stale.";
         assert!(natural_long_reason.chars().count() > 60);
-        let input = serde_json::json!([{
-            "confidence": 0.7,
-            "kind": "risk",
-            "reason": natural_long_reason,
-        }]);
+        let input = serde_json::json!({"scores": [{
+                "confidence": 0.7,
+                "kind": "risk",
+                "reason": natural_long_reason,
+            }]
+        });
         assert_eq!(parse_scores(&input.to_string(), 1).unwrap().len(), 1);
 
         let lowercase = parse_scores(
-            r#"[{"confidence":0.7,"kind":"risk","reason":"The first condition fails. the second condition also fails."}]"#,
+            r#"{"scores":[{"confidence":0.7,"kind":"risk","reason":"The first condition fails. the second condition also fails."}]}"#,
             1,
         )
         .unwrap();
         assert_eq!(lowercase.len(), 1);
 
         let no_space = parse_scores(
-            r#"[{"confidence":0.7,"kind":"risk","reason":"The first condition fails.The second condition also fails."}]"#,
+            r#"{"scores":[{"confidence":0.7,"kind":"risk","reason":"The first condition fails.The second condition also fails."}]}"#,
             1,
         )
         .unwrap();
         assert_eq!(no_space.len(), 1);
 
         let file_and_version = parse_scores(
-            r#"[{"confidence":0.7,"kind":"risk","reason":"The src/lib.rs behavior changed in version 4.2."}]"#,
+            r#"{"scores":[{"confidence":0.7,"kind":"risk","reason":"The src/lib.rs behavior changed in version 4.2."}]}"#,
             1,
         )
         .unwrap();
@@ -9542,7 +9715,10 @@ mod tests {
     #[test]
     fn canonical_openrouter_uses_role_defaults_and_scorer_strict_schema() {
         let client = LlmClient::build(
-            &Config::default(),
+            &Config {
+                api_base: "https://openrouter.ai:443/api/v1".into(),
+                ..Config::default()
+            },
             "test-key".into(),
             Duration::from_secs(1),
             None,
@@ -9561,30 +9737,86 @@ mod tests {
             scorer["reasoning"],
             json!({"effort": "low", "exclude": true})
         );
+        assert!(scorer.get("temperature").is_none());
+        assert!(scorer.get("max_tokens").is_none());
+        assert_eq!(scorer["max_completion_tokens"], 400);
         assert!(scorer["reasoning"].get("enabled").is_none());
         assert_eq!(scorer["provider"]["require_parameters"], true);
         assert_eq!(scorer["response_format"]["type"], "json_schema");
         assert_eq!(scorer["response_format"]["json_schema"]["strict"], true);
         assert_eq!(
-            scorer["response_format"]["json_schema"]["schema"]["items"]["additionalProperties"],
+            scorer["response_format"]["json_schema"]["schema"]["additionalProperties"],
             false
         );
         let schema = &scorer["response_format"]["json_schema"]["schema"];
-        assert_eq!(schema["minItems"], 1);
-        assert_eq!(schema["maxItems"], 1);
-        assert!(schema["items"]["properties"].get("index").is_none());
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["required"], json!(["scores"]));
+        let scores = &schema["properties"]["scores"];
+        assert_eq!(scores["minItems"], 1);
+        assert_eq!(scores["maxItems"], 1);
+        assert!(scores["items"]["properties"].get("index").is_none());
+        assert_eq!(scores["items"]["additionalProperties"], false);
         assert_eq!(
-            schema["items"]["required"],
+            scores["items"]["required"],
             json!(["confidence", "kind", "reason"])
         );
-        assert_eq!(schema["items"]["properties"]["reason"]["minLength"], 1);
+        assert_eq!(scores["items"]["properties"]["reason"]["minLength"], 1);
         assert_eq!(
-            schema["items"]["properties"]["reason"]["maxLength"],
+            scores["items"]["properties"]["reason"]["maxLength"],
             SCORER_REASON_SCHEMA_MAX_CHARS
         );
         assert_eq!(
-            schema["items"]["properties"]["reason"]["pattern"],
+            scores["items"]["properties"]["reason"]["pattern"],
             SCORER_REASON_JSON_PATTERN
+        );
+        let adjudication = client.request_body(
+            "provider/scorer",
+            "system",
+            "user",
+            8_000,
+            0.0,
+            LlmPhase::Adjudication,
+        );
+        assert!(adjudication.get("temperature").is_none());
+        assert!(adjudication.get("max_tokens").is_none());
+        assert_eq!(adjudication["max_completion_tokens"], 8_000);
+        assert_eq!(adjudication["provider"]["require_parameters"], true);
+        assert_eq!(
+            adjudication["reasoning"],
+            json!({"effort": "low", "exclude": true})
+        );
+        assert!(adjudication.get("response_format").is_none());
+
+        let mut openai_client = client.clone();
+        openai_client.request_decorations.pinned_upstream_provider = Some("OpenAI".into());
+        let openai_scorer = openai_client.request_body(
+            "provider/scorer",
+            "system",
+            "user",
+            400,
+            0.0,
+            LlmPhase::Scorer { expected_len: 1 },
+        );
+        assert_eq!(openai_scorer["max_tokens"], 400);
+        assert!(openai_scorer.get("max_completion_tokens").is_none());
+        assert!(openai_scorer.get("temperature").is_none());
+        assert_eq!(openai_scorer["provider"]["require_parameters"], true);
+
+        let openai_adjudication = openai_client.request_body(
+            "provider/scorer",
+            "system",
+            "user",
+            8_000,
+            0.0,
+            LlmPhase::Adjudication,
+        );
+        assert_eq!(openai_adjudication["max_tokens"], 8_000);
+        assert!(openai_adjudication.get("max_completion_tokens").is_none());
+        assert!(openai_adjudication.get("temperature").is_none());
+        assert_eq!(openai_adjudication["provider"]["require_parameters"], true);
+        assert_eq!(
+            openai_adjudication["reasoning"],
+            json!({"effort": "low", "exclude": true})
         );
 
         let multiple = client.request_body(
@@ -9596,10 +9828,11 @@ mod tests {
             LlmPhase::Scorer { expected_len: 7 },
         );
         let multiple_schema = &multiple["response_format"]["json_schema"]["schema"];
-        assert_eq!(multiple_schema["minItems"], 7);
-        assert_eq!(multiple_schema["maxItems"], 7);
+        let multiple_scores = &multiple_schema["properties"]["scores"];
+        assert_eq!(multiple_scores["minItems"], 7);
+        assert_eq!(multiple_scores["maxItems"], 7);
         assert!(
-            multiple_schema["items"]["properties"]
+            multiple_scores["items"]["properties"]
                 .get("index")
                 .is_none()
         );
@@ -10096,7 +10329,7 @@ mod tests {
             0.0,
             LlmPhase::Review,
         );
-        assert_eq!(body["provider"]["order"], json!(["Azure"]));
+        assert_eq!(body["provider"]["order"], json!(["azure/eu"]));
         assert_eq!(body["provider"]["allow_fallbacks"], false);
         assert_eq!(body["provider"]["data_collection"], "deny");
         assert_eq!(body["provider"]["zdr"], true);
@@ -10133,6 +10366,7 @@ mod tests {
         )
         .unwrap();
         client.request_decorations.pinned_upstream_provider = Some("PinnedProvider".into());
+        client.request_decorations.pinned_upstream_provider_route = Some("pinned/route".into());
         client.request_decorations.hosted_price_bounds = Some(Arc::new(HashMap::from([(
             "provider/model".into(),
             ModelPriceBound {
@@ -10155,7 +10389,7 @@ mod tests {
                 phase,
                 matches!(phase, LlmPhase::Attribution).then_some("PinnedProvider"),
             );
-            assert_eq!(body["provider"]["order"], json!(["PinnedProvider"]));
+            assert_eq!(body["provider"]["order"], json!(["pinned/route"]));
             assert_eq!(body["provider"]["allow_fallbacks"], false);
             assert_eq!(
                 body["provider"]["max_price"],

@@ -256,11 +256,12 @@ pub fn scorer_system_prompt(cfg: &Config, current_utc_date: Date) -> String {
     p.push_str(&format!(
         "--- END POSTIL REVIEW CONTRACT ---\n\
          \n\
-         Return ONLY a JSON array, no markdown fences, no prose. The array MUST contain \
-         exactly one object per supplied finding, in the same order as the input:\n\
-         [{{\"confidence\": <0..1>, \
+         Return ONLY a JSON object, no markdown fences, no prose. The root object MUST \
+         contain exactly one field, `scores`, whose array contains exactly one object per \
+         supplied finding, in the same order as the input:\n\
+         {{\"scores\": [{{\"confidence\": <0..1>, \
          \"kind\": \"risk|humanEscalation|guardrail|uncertainty|contentPolicy\", \
-         \"reason\": \"concise single-line text of at most {SCORER_REASON_PROMPT_MAX_BYTES} UTF-8 bytes\"}}]\n\
+         \"reason\": \"concise single-line text of at most {SCORER_REASON_PROMPT_MAX_BYTES} UTF-8 bytes\"}}]}}\n\
          \n\
          Array position is the finding index. Do not emit an `index` field. The `kind` \
          value is a finding category. `info`, `warn`, and `error` are \
@@ -567,6 +568,10 @@ mod tests {
     #[test]
     fn scorer_prompt_states_the_exact_reason_limits() {
         let prompt = scorer_system_prompt(&Config::default(), trusted_date());
+        assert!(prompt.contains("Return ONLY a JSON object"));
+        assert!(prompt.contains("exactly one field, `scores`"));
+        assert!(prompt.contains("{\"scores\": [{\"confidence\": <0..1>"));
+        assert!(!prompt.contains("Return ONLY a JSON array"));
         assert!(prompt.contains(&format!(
             "at most {SCORER_REASON_PROMPT_MAX_BYTES} UTF-8 bytes"
         )));
