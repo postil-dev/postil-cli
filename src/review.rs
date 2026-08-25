@@ -470,6 +470,19 @@ enum ReviewFailureKind {
     InvalidOutput,
 }
 
+#[derive(Debug)]
+struct LocalIncrementalFullComparisonUnavailable;
+
+impl std::fmt::Display for LocalIncrementalFullComparisonUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "local incremental input cannot reconstruct the complete comparison required to re-adjudicate a carried error finding",
+        )
+    }
+}
+
+impl std::error::Error for LocalIncrementalFullComparisonUnavailable {}
+
 fn classify_exhausted_scorer_failure(
     incidents: &[ModelIncident],
     final_error_is_provider: bool,
@@ -627,10 +640,20 @@ async fn run_local(args: &ReviewArgs, cfg: &Config, repo_root: &Path) -> Result<
     let head_sha = local::head_sha().await;
     let local_snapshot = local::acquire(&source, head_sha.as_deref(), repo_root).await?;
     let baseline = load_baseline(args)?;
+    let touched_carried_error = cfg.enabled
+        && args.since_sha.is_some()
+        && carried_error_outside_anchor_file_is_touched(&baseline, &local_snapshot.diff);
+    let supports_full_fallback = matches!(&source, LocalSource::Base(_));
+    let fail_closed_baseline =
+        (touched_carried_error && !supports_full_fallback).then(|| baseline.clone());
     // This is a fail-closed placeholder, not the completed review's trust.
     // review_diff replaces it with Failed, Bounded, or Exhaustive after the
     // selected requests finish; an early model failure deliberately keeps it.
-    let scope = if args.since_sha.is_some() {
+    let scope = if touched_carried_error && supports_full_fallback {
+        filter::ReconcileScope::Full {
+            trust: filter::ReviewTrust::Failed,
+        }
+    } else if args.since_sha.is_some() {
         filter::ReconcileScope::Incremental {
             trust: filter::ReviewTrust::Failed,
         }
@@ -640,34 +663,45 @@ async fn run_local(args: &ReviewArgs, cfg: &Config, repo_root: &Path) -> Result<
         }
     };
     let review_started = std::time::Instant::now();
-    let result = review_diff(
-        cfg,
-        args,
-        ReviewInput {
-            diff_snapshot: &local_snapshot.diff,
-            meta: None,
-            head_sha: head_sha.clone(),
-            repository_revision: local_snapshot.repository_revision.clone(),
-            repo: None,
-            baseline,
-            scope,
-            force_model: false,
-            llm_budget_started_at: None,
-            repository_source: if local_snapshot.repository_revision.is_some() {
-                RepositorySource::Local(repo_root)
-            } else {
-                RepositorySource::Unavailable
+    let result = if touched_carried_error && !supports_full_fallback {
+        Err(anyhow::Error::new(
+            LocalIncrementalFullComparisonUnavailable,
+        ))
+    } else {
+        review_diff(
+            cfg,
+            args,
+            ReviewInput {
+                diff_snapshot: &local_snapshot.diff,
+                meta: None,
+                head_sha: head_sha.clone(),
+                repository_revision: local_snapshot.repository_revision.clone(),
+                repo: None,
+                baseline,
+                scope,
+                force_model: touched_carried_error,
+                llm_budget_started_at: None,
+                repository_source: if local_snapshot.repository_revision.is_some() {
+                    RepositorySource::Local(repo_root)
+                } else {
+                    RepositorySource::Unavailable
+                },
             },
-        },
-    )
-    .await;
-    let envelope = match result {
+        )
+        .await
+    };
+    let mut envelope = match result {
         Ok(envelope) => envelope,
         // Only a completed review that failed operationally has enough
         // review state to produce a truthful error envelope. Input,
         // planning, registration, and client-construction failures occur
         // before provider access and retain the CLI error contract (exit 2).
-        Err(error) if error.downcast_ref::<ReviewFailure>().is_some() => {
+        Err(error)
+            if error.downcast_ref::<ReviewFailure>().is_some()
+                || error
+                    .downcast_ref::<LocalIncrementalFullComparisonUnavailable>()
+                    .is_some() =>
+        {
             eprintln!("postil: review failed before completion ({error:#})");
             error_envelope(
                 cfg,
@@ -679,6 +713,20 @@ async fn run_local(args: &ReviewArgs, cfg: &Config, repo_root: &Path) -> Result<
         }
         Err(error) => return Err(error),
     };
+    if let Some(baseline) = fail_closed_baseline {
+        let index = diff::DiffIndex::build(&diff::parse(local_snapshot.diff.as_str()));
+        let reconciliation = filter::reconcile(
+            &baseline,
+            &index,
+            &[],
+            filter::ReconcileScope::Full {
+                trust: filter::ReviewTrust::Failed,
+            },
+        );
+        envelope.findings.extend(reconciliation.carried);
+        envelope.counts = Envelope::counts_of(&envelope.findings, 0);
+        envelope.confidence_buckets = Envelope::buckets_of(&envelope.findings);
+    }
     finish(args, cfg, envelope, None::<&GitHub>, None, None, false).await
 }
 
@@ -1076,7 +1124,8 @@ async fn remote_review<F: Forge>(
     let (diff_snapshot, scope, force_model) = if cfg.enabled
         && has_carryable_baseline
         && matches!(scope, filter::ReconcileScope::Incremental { .. })
-        && diff_snapshot.as_str().trim().is_empty()
+        && (diff_snapshot.as_str().trim().is_empty()
+            || carried_error_outside_anchor_file_is_touched(&baseline, &diff_snapshot))
     {
         (
             run_with_hosted_budget(
@@ -3103,6 +3152,27 @@ fn baseline_has_carryable_findings(findings: &[Finding]) -> bool {
         .any(|finding| !crate::envelope::is_ephemeral_anchor(&finding.path))
 }
 
+/// A carried repository Error can be fixed away from its original anchor. When
+/// the incremental change touches that file but not the anchor itself, only the
+/// complete comparison can provide enough evidence to adjudicate the prior
+/// finding without treating incremental model silence as a resolution.
+fn carried_error_outside_anchor_file_is_touched(
+    baseline: &[Finding],
+    snapshot: &diff::DiffSnapshot,
+) -> bool {
+    let changed = diff::parse(snapshot.as_str());
+    let index = diff::DiffIndex::build(&changed);
+    baseline.iter().any(|finding| {
+        finding.severity == crate::envelope::Severity::Error
+            && !crate::envelope::is_reserved_anchor(&finding.path)
+            && changed
+                .files
+                .iter()
+                .any(|file| file.path == finding.path || file.old_path == finding.path)
+            && !index.contains_old(&finding.path, finding.line)
+    })
+}
+
 /// Reserve every baseline finding that could enter full re-review adjudication
 /// before generating fresh findings. The later candidate set can be smaller
 /// when a fresh finding supersedes a baseline entry, but it must never be
@@ -3351,6 +3421,12 @@ fn error_envelope(
     duration_ms: u64,
 ) -> Envelope {
     let incomplete_input = crate::forge::is_incomplete_review_input(err);
+    let incomplete_reason = err
+        .downcast_ref::<LocalIncrementalFullComparisonUnavailable>()
+        .map(|_| crate::envelope::IncompleteReviewReason::LocalIncrementalFullComparisonUnavailable)
+        .or_else(|| {
+            incomplete_input.then_some(crate::envelope::IncompleteReviewReason::IncompleteInput)
+        });
     let review_failure = err.downcast_ref::<ReviewFailure>();
     let invalid_output =
         review_failure.is_some_and(|failure| failure.kind == ReviewFailureKind::InvalidOutput);
@@ -3367,10 +3443,8 @@ fn error_envelope(
                 .downcast_ref::<reqwest::Error>()
                 .is_some_and(|error| error.is_connect() || error.is_timeout())
         });
-    let findings = vec![if incomplete_input {
-        crate::envelope::incomplete_review_finding(
-            crate::envelope::IncompleteReviewReason::IncompleteInput,
-        )
+    let findings = vec![if let Some(reason) = incomplete_reason {
+        crate::envelope::incomplete_review_finding(reason)
     } else if invalid_output || !advisory_operational_error {
         // Only a recorded scorer error is genuinely about model output. Every
         // other failure here reaches this branch with its cause in `err`, so
@@ -4219,6 +4293,44 @@ mod tests {
         assert!(!baseline_has_carryable_findings(&[
             crate::envelope::provider_error_finding("fixture provider failure"),
         ]));
+    }
+
+    #[test]
+    fn carried_error_escalation_excludes_anchor_warnings_synthetic_and_untouched_findings() {
+        let snapshot = diff::DiffSnapshot::from_bytes(
+            b"diff --git a/src/auth.rs b/src/auth.rs\n--- a/src/auth.rs\n+++ b/src/auth.rs\n@@ -40 +40 @@\n-old authorization\n+new authorization\n",
+        )
+        .unwrap();
+        let error = finding("src/auth.rs", 10, "prior blocker");
+        assert!(carried_error_outside_anchor_file_is_touched(
+            std::slice::from_ref(&error),
+            &snapshot
+        ));
+
+        let anchored = finding("src/auth.rs", 40, "anchored blocker");
+        assert!(!carried_error_outside_anchor_file_is_touched(
+            &[anchored],
+            &snapshot
+        ));
+
+        let mut warning = error.clone();
+        warning.severity = Severity::Warn;
+        assert!(!carried_error_outside_anchor_file_is_touched(
+            &[warning],
+            &snapshot
+        ));
+
+        let synthetic = finding(crate::envelope::CHANGE_METADATA_PATH, 1, "metadata blocker");
+        assert!(!carried_error_outside_anchor_file_is_touched(
+            &[synthetic],
+            &snapshot
+        ));
+
+        let untouched = finding("src/db.rs", 10, "database blocker");
+        assert!(!carried_error_outside_anchor_file_is_touched(
+            &[untouched],
+            &snapshot
+        ));
     }
 
     #[test]

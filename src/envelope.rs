@@ -1823,6 +1823,7 @@ pub fn is_ephemeral_anchor(path: &str) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IncompleteReviewReason {
     IncompleteInput,
+    LocalIncrementalFullComparisonUnavailable,
     ReservedInput,
     InsufficientContextBudget,
     InvalidModelFanOut,
@@ -1832,6 +1833,9 @@ pub(crate) fn incomplete_review_finding(reason: IncompleteReviewReason) -> Findi
     let body = match reason {
         IncompleteReviewReason::IncompleteInput => {
             "Postil could not acquire the complete immutable change from the forge, so no clean verdict was issued. Retry after the forge can supply it."
+        }
+        IncompleteReviewReason::LocalIncrementalFullComparisonUnavailable => {
+            "An incremental local review touched the file of a carried error finding, but this input cannot reconstruct the complete comparison needed to re-adjudicate it. No clean verdict was issued. Review the pull request or rerun locally with `--base <ref>` without `--since-sha`."
         }
         IncompleteReviewReason::ReservedInput => {
             "The change uses a path reserved for Postil's synthetic review evidence, so repository content cannot be separated safely from operational findings. No clean verdict was issued. Rename the conflicting path before retrying."
@@ -2007,6 +2011,10 @@ mod tests {
             (
                 IncompleteReviewReason::IncompleteInput,
                 "complete immutable change",
+            ),
+            (
+                IncompleteReviewReason::LocalIncrementalFullComparisonUnavailable,
+                "complete comparison",
             ),
             (IncompleteReviewReason::ReservedInput, "path reserved"),
             (

@@ -12488,6 +12488,227 @@ async fn stale_incremental_baseline_falls_back_to_full_review() {
 }
 
 #[tokio::test]
+async fn incremental_touched_carried_error_falls_back_to_full_review() {
+    let server = MockServer::start().await;
+    mount_github_complete_diff(&server, 7).await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/compare/cccccccc...aaaaaaaa"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "merge_base_commit": {"sha": "cccccccc"},
+            "files": [{"filename": "src/auth.rs", "status": "modified", "changes": 2}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title": "t", "body": null,
+            "state": "open", "merged": false,
+            "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"}, "changed_files": 1
+        })))
+        .mount(&server)
+        .await;
+
+    let baseline = json!({
+        "version": 1, "summary": "", "silent": false,
+        "findings": [{
+            "path": "src/auth.rs", "line": 10, "severity": "error", "kind": "risk",
+            "confidence": 0.9, "title": "Prior authorization blocker",
+            "body": "The authorization path remains unsafe."
+        }],
+        "resolved": [], "counts": {"info": 0, "warn": 0, "error": 1, "suppressed": 0},
+        "confidenceBuckets": [0,0,0,0,1],
+        "gate": {"failOn": "error", "failing": true},
+        "modelUsed": "m", "usage": {"promptTokens": 0, "completionTokens": 0},
+        "baseSha": "bbbbbbbb", "headSha": "cccccccc", "sinceSha": null
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let baseline_path = dir.path().join("baseline.json");
+    std::fs::write(&baseline_path, baseline.to_string()).unwrap();
+
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", "gh-test-token")
+        .args([
+            "review",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--sha",
+            "aaaaaaaa",
+            "--since-sha",
+            "cccccccc",
+            "--baseline",
+        ])
+        .arg(&baseline_path)
+        .args(["--no-post", "--output-json"])
+        .assert()
+        .code(1);
+    let env: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(env["sinceSha"], Value::Null);
+
+    let requests = server.received_requests().await.unwrap();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.url.path() == "/repos/acme/api/pulls/7/files"),
+        "a touched carried Error must fetch the complete change"
+    );
+    let source_request = requests
+        .iter()
+        .find(|request| request.url.path() == "/chat/completions")
+        .unwrap();
+    let body: Value = source_request.body_json().unwrap();
+    assert!(
+        !body["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("This is an INCREMENTAL review"),
+        "full fallback must happen before model review and adjudication"
+    );
+}
+
+#[tokio::test]
+async fn local_incremental_diff_file_with_touched_carried_error_fails_closed_actionably() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    let baseline = json!({
+        "version": 1, "summary": "", "silent": false,
+        "findings": [{
+            "path": "src/auth.rs", "line": 10, "severity": "error", "kind": "risk",
+            "confidence": 0.9, "title": "Prior authorization blocker",
+            "body": "The authorization path remains unsafe."
+        }],
+        "resolved": [], "counts": {"info": 0, "warn": 0, "error": 1, "suppressed": 0},
+        "confidenceBuckets": [0,0,0,0,1],
+        "gate": {"failOn": "error", "failing": true},
+        "modelUsed": "m", "usage": {"promptTokens": 0, "completionTokens": 0},
+        "baseSha": null, "headSha": null, "sinceSha": null
+    });
+    let baseline_path = dir.path().join("baseline.json");
+    std::fs::write(&baseline_path, baseline.to_string()).unwrap();
+
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--since-sha", "previous", "--baseline"])
+        .arg(&baseline_path)
+        .args(["--output", "json"])
+        .assert()
+        .code(1);
+    let env: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    let stderr = String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(stderr.contains("cannot reconstruct the complete comparison"));
+    let incomplete = env["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["path"] == ".postil/model-output")
+        .unwrap();
+    assert_eq!(incomplete["title"], "Review incomplete");
+    assert!(
+        incomplete["body"]
+            .as_str()
+            .unwrap()
+            .contains("complete comparison")
+    );
+    let carried = env["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Prior authorization blocker")
+        .expect("the prior blocker must remain in the next baseline");
+    assert!(
+        carried["body"]
+            .as_str()
+            .unwrap()
+            .starts_with("[carried from previous review]")
+    );
+    assert_eq!(env["resolved"], json!([]));
+    assert_eq!(env["gate"]["failing"], true);
+}
+
+#[tokio::test]
+async fn local_incremental_staged_review_with_touched_carried_error_fails_closed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    initialize_staged_repository(dir.path());
+    std::fs::write(dir.path().join(".postil.yaml"), "enabled: true\n").unwrap();
+    let baseline = json!({
+        "version": 1, "summary": "", "silent": false,
+        "findings": [{
+            "path": "src/auth.rs", "line": 10, "severity": "error", "kind": "risk",
+            "confidence": 0.9, "title": "Prior authorization blocker",
+            "body": "The authorization path remains unsafe."
+        }],
+        "resolved": [], "counts": {"info": 0, "warn": 0, "error": 1, "suppressed": 0},
+        "confidenceBuckets": [0,0,0,0,1],
+        "gate": {"failOn": "error", "failing": true},
+        "modelUsed": "m", "usage": {"promptTokens": 0, "completionTokens": 0},
+        "baseSha": null, "headSha": null, "sinceSha": null
+    });
+    let baseline_path = dir.path().join("baseline.json");
+    std::fs::write(&baseline_path, baseline.to_string()).unwrap();
+
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .args([
+            "review",
+            "--staged",
+            "--since-sha",
+            "previous",
+            "--baseline",
+        ])
+        .arg(&baseline_path)
+        .args(["--output", "json"])
+        .assert()
+        .code(1);
+    let env: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert!(
+        env["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["path"] == ".postil/model-output"
+                && finding["title"] == "Review incomplete")
+    );
+    assert!(env["findings"].as_array().unwrap().iter().any(|finding| {
+        finding["title"] == "Prior authorization blocker"
+            && finding["body"]
+                .as_str()
+                .is_some_and(|body| body.starts_with("[carried from previous review]"))
+    }));
+    assert_eq!(env["resolved"], json!([]));
+    assert_eq!(env["gate"]["failing"], true);
+}
+
+#[tokio::test]
 async fn incremental_forge_outage_still_fails_the_review() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
