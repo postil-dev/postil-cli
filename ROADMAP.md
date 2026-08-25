@@ -23,7 +23,8 @@
   semantic batches for low-risk hunks, a 24-request quality ceiling lowered by hosted
   model and scorer fan-out, four-way concurrency, format-specific lockfile summaries,
   oversized-line segmentation, a hosted ceiling that reserves every enabled
-  post-processing call, and fail-closed incomplete coverage.
+  post-processing call, and fail-closed partial review that preserves findings from the
+  selected schedule when normalized hunks remain unreviewed.
 - `.coderabbit.yaml` translation for zero-cost migration.
 - Model cascade + concurrent multi-model consensus over any OpenAI-compatible endpoint;
   bounded retry with jittered backoff on transient provider errors.

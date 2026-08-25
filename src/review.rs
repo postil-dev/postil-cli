@@ -1711,6 +1711,7 @@ async fn review_diff_at(
     let mut findings: Vec<Finding> = Vec::new();
     let mut suppressed_findings = Vec::new();
     let mut review_trust = filter::ReviewTrust::Failed;
+    let mut incomplete_large_review_hunks = 0u32;
     let mut scorer_model: Option<String> = None;
     let mut scorer_error: Option<String> = None;
     let mut scorer_disagreements: Option<u32> = None;
@@ -1837,11 +1838,6 @@ async fn review_diff_at(
                     .then(|| batches.deterministic_bounded_receipt(large_diff_selected_limit))
                     .transpose()?;
                 if let Some(receipt) = &large_diff_receipt {
-                    anyhow::ensure!(
-                        receipt.unreviewed_hunks() == 0,
-                        "deterministic large-review plan leaves {} normalized hunks unreviewed within its {large_diff_selected_limit}-request limit; no provider request was made",
-                        receipt.unreviewed_hunks()
-                    );
                     eprintln!(
                         "postil: deterministic large-review plan={} direct_hunks={} semantic_hunks={} unreviewed_hunks={} selected_batches={}/{} concurrency={} request_timeout={}s review_budget={}s",
                         receipt.plan_sha256,
@@ -1871,6 +1867,9 @@ async fn review_diff_at(
                         })
                     })
                     .transpose()?;
+                incomplete_large_review_hunks = large_receipt_summary
+                    .as_ref()
+                    .map_or(0, |receipt| receipt.unreviewed_hunks);
                 let deterministic_large_review = large_diff_receipt.is_some();
                 let mut durable_plan_registration =
                     if let Some(registrar) = DurablePlanRegistrar::from_env()? {
@@ -2392,7 +2391,7 @@ async fn review_diff_at(
                         // carries baseline evidence outside the selected input.
                         // A changed citation expires only when a completed model
                         // request covered its coordinate and did not reproduce it.
-                        review_trust = if batch_failed {
+                        review_trust = if batch_failed || incomplete_large_review_hunks > 0 {
                             filter::ReviewTrust::Failed
                         } else if risk_selected_review {
                             filter::ReviewTrust::Bounded
@@ -2439,7 +2438,7 @@ async fn review_diff_at(
                         let mut all_adjudication_candidates = kept.clone();
                         let fresh_candidate_count = all_adjudication_candidates.len();
                         let mut baseline_candidate_indices = Vec::new();
-                        if full_rereview {
+                        if full_rereview && incomplete_large_review_hunks == 0 {
                             for (baseline_index, previous) in baseline.iter().enumerate() {
                                 // The complete direct diff may prove an exact citation was
                                 // deleted even when bounded source selection omitted its batch.
@@ -2532,6 +2531,7 @@ async fn review_diff_at(
                                     None
                                 }
                             };
+                            let mut lockfile_platform_policy_allowed = false;
                             let mut application = match adjudicated {
                                 Some(Ok(adjudicated)) => {
                                     add_usage(&mut usage, adjudicated.usage);
@@ -2548,7 +2548,10 @@ async fn review_diff_at(
                                         &diff_receipt,
                                         receipt,
                                     ) {
-                                        Ok(application) => application,
+                                        Ok(application) => {
+                                            lockfile_platform_policy_allowed = true;
+                                            application
+                                        }
                                         Err(error) => {
                                             adjudication_incomplete = true;
                                             review_trust = filter::ReviewTrust::Failed;
@@ -2599,6 +2602,13 @@ async fn review_diff_at(
                                 &mut application,
                                 fresh_candidate_count,
                             );
+                            if lockfile_platform_policy_allowed {
+                                suppress_fresh_lockfile_platform_claims(
+                                    &mut application,
+                                    fresh_candidate_count,
+                                    &index,
+                                );
+                            }
                             for (candidate_index, finding) in application
                                 .kept_indices
                                 .iter()
@@ -2781,6 +2791,12 @@ async fn review_diff_at(
                 if let Some(failure) = batch_failure {
                     findings.push(failure);
                 }
+                if incomplete_large_review_hunks > 0 {
+                    review_trust = filter::ReviewTrust::Failed;
+                    findings.push(crate::envelope::incomplete_large_review_finding(
+                        incomplete_large_review_hunks,
+                    ));
+                }
             }
         }
     }
@@ -2832,13 +2848,18 @@ async fn review_diff_at(
     suppressed = suppressed.saturating_add(repository_suppressed.len() as u32);
     suppressed_findings.extend(repository_suppressed);
 
-    let machine_application = apply_machine_claim_policy(
+    let mut machine_application = apply_machine_claim_policy(
         &mut findings,
         &mut baseline,
         &adjudication_preserved_baseline,
         claim_verification.as_ref(),
         repository_revision.as_deref(),
     );
+    if incomplete_large_review_hunks > 0 {
+        // Exact-head verification remains useful for fresh findings, but an
+        // incomplete review cannot close any carried baseline entry.
+        baseline.append(&mut machine_application.resolved);
+    }
     suppressed = suppressed.saturating_add(machine_application.suppressed.len() as u32);
     suppressed_findings.extend(machine_application.suppressed);
 
@@ -2911,17 +2932,18 @@ async fn review_diff_at(
         .iter()
         .map(|kind| kind.as_str().to_string())
         .collect();
-    let gate_failing = findings.iter().any(|f| {
-        if gate_disabled {
-            false
-        } else if f.path == crate::envelope::OPERATIONAL_PATH {
-            true
-        } else if f.path == crate::envelope::PROVIDER_PATH {
-            !advisory_on_error
-        } else {
-            crate::envelope::finding_blocks_gate(f, gate_fail_on, &gate_block_on_kinds, false)
-        }
-    });
+    let gate_failing = incomplete_large_review_hunks > 0
+        || findings.iter().any(|f| {
+            if gate_disabled {
+                false
+            } else if f.path == crate::envelope::OPERATIONAL_PATH {
+                true
+            } else if f.path == crate::envelope::PROVIDER_PATH {
+                !advisory_on_error
+            } else {
+                crate::envelope::finding_blocks_gate(f, gate_fail_on, &gate_block_on_kinds, false)
+            }
+        });
     let silent = findings.is_empty();
     // Raw summaries are validated for agreement with raw structured output,
     // then discarded. Presentation is derived from the final reconciled set so
@@ -3525,6 +3547,190 @@ fn suppress_fresh_unresolved_repository_claims(
         .retain(|index| application.kept_indices.contains(index));
 }
 
+fn suppress_fresh_lockfile_platform_claims(
+    application: &mut crate::adjudication::AdjudicationApplication,
+    fresh_candidate_count: usize,
+    index: &diff::DiffIndex,
+) {
+    let mut kept = Vec::with_capacity(application.kept.len());
+    let mut kept_indices = Vec::with_capacity(application.kept_indices.len());
+    for (candidate_index, finding) in application
+        .kept_indices
+        .drain(..)
+        .zip(application.kept.drain(..))
+    {
+        if candidate_index < fresh_candidate_count
+            && is_unverifiable_lockfile_platform_claim(index, &finding)
+        {
+            application.suppressed.push(SuppressedFinding {
+                finding,
+                reason: SuppressionReason::LockfilePlatformEvidenceInsufficient,
+            });
+        } else {
+            kept_indices.push(candidate_index);
+            kept.push(finding);
+        }
+    }
+    application.kept = kept;
+    application.kept_indices = kept_indices;
+    application
+        .unresolved_indices
+        .retain(|index| application.kept_indices.contains(index));
+}
+
+fn is_unverifiable_lockfile_platform_claim(index: &diff::DiffIndex, finding: &Finding) -> bool {
+    index.contains_exact_evidence(finding)
+        && is_compact_lockfile_metadata(finding)
+        && is_platform_support_claim(finding)
+}
+
+fn is_compact_lockfile_metadata(finding: &Finding) -> bool {
+    if finding.path != crate::envelope::CHANGE_METADATA_PATH {
+        return false;
+    }
+    let Some(evidence) = finding.evidence.as_deref() else {
+        return false;
+    };
+    let evidence = evidence.trim();
+    if let Some(path) = evidence
+        .strip_prefix("- ")
+        .and_then(|path| path.strip_suffix(" [lockfile summary]"))
+    {
+        return diff::canonical_prompt_path(path)
+            .is_some_and(|path| diff::is_known_lockfile(&path));
+    }
+
+    const DELIMITER: &str = ": lockfile changed, ";
+    evidence.match_indices(DELIMITER).any(|(delimiter, _)| {
+        is_compact_lockfile_change_details(
+            &evidence[..delimiter],
+            &evidence[delimiter + DELIMITER.len()..],
+        )
+    })
+}
+
+fn is_compact_lockfile_change_details(path: &str, details: &str) -> bool {
+    let Some((additions, details)) = details.split_once(" additions, ") else {
+        return false;
+    };
+    let Some((deletions, changes)) = details.split_once(" deletions; ") else {
+        return false;
+    };
+    additions.parse::<usize>().is_ok()
+        && deletions.parse::<usize>().is_ok()
+        && !changes.trim().is_empty()
+        && diff::canonical_prompt_path(path).is_some_and(|path| diff::is_known_lockfile(&path))
+}
+
+fn is_platform_support_claim(finding: &Finding) -> bool {
+    let prose = normalize_classifier_prose(&format!("{} {}", finding.title, finding.body));
+    if [
+        "security",
+        "vulnerab",
+        "cve",
+        "checksum",
+        "integrity",
+        "malware",
+        "install script",
+        "preinstall",
+        "postinstall",
+        "prepare script",
+        "lifecycle script",
+    ]
+    .iter()
+    .any(|term| prose.contains(term))
+    {
+        return false;
+    }
+
+    let has_platform_term = [
+        "platform",
+        "operating system",
+        "architecture",
+        "arch",
+        "cpu",
+        "abi",
+        "runtime",
+        "ia32",
+        "i386",
+        "x86",
+        "amd64",
+        "x86_64",
+        "arm64",
+        "aarch64",
+        "armv5",
+        "armv6",
+        "armv7",
+        "armv8",
+        "armel",
+        "armhf",
+        "x64",
+        "ppc64le",
+        "loong64",
+        "mips64",
+        "ppc64",
+        "s390x",
+        "riscv",
+        "win32",
+        "windows",
+        "linux",
+        "darwin",
+        "macos",
+        "freebsd",
+        "android",
+        "musl",
+        "glibc",
+    ]
+    .iter()
+    .any(|term| prose_contains_term(&prose, term));
+    if !has_platform_term {
+        return false;
+    }
+
+    ["support", "compatib", "regress"]
+        .iter()
+        .any(|prefix| prose_contains_word_prefix(&prose, prefix))
+        || ["break", "breaks", "breaking", "broken"]
+            .iter()
+            .any(|term| prose_contains_term(&prose, term))
+        || ["works on", "runs on", "available on"]
+            .iter()
+            .any(|phrase| prose.contains(phrase))
+}
+
+fn prose_contains_term(prose: &str, term: &str) -> bool {
+    if term.contains(' ') {
+        prose.contains(term)
+    } else {
+        prose
+            .split(|character: char| !character.is_alphanumeric())
+            .any(|word| word == term)
+    }
+}
+
+fn prose_contains_word_prefix(prose: &str, prefix: &str) -> bool {
+    prose
+        .split(|character: char| !character.is_alphanumeric())
+        .any(|word| word.starts_with(prefix))
+}
+
+fn normalize_classifier_prose(prose: &str) -> String {
+    let mut normalized = String::with_capacity(prose.len());
+    for character in prose.chars() {
+        let compatible = if ('\u{ff01}'..='\u{ff5e}').contains(&character) {
+            char::from_u32(character as u32 - 0xfee0).unwrap_or(character)
+        } else {
+            character
+        };
+        for lowercase in compatible.to_lowercase() {
+            if lowercase != '\u{0307}' {
+                normalized.push(lowercase);
+            }
+        }
+    }
+    normalized
+}
+
 fn error_envelope(
     cfg: &Config,
     err: &anyhow::Error,
@@ -3540,6 +3746,10 @@ fn error_envelope(
             incomplete_input.then_some(crate::envelope::IncompleteReviewReason::IncompleteInput)
         });
     let review_failure = err.downcast_ref::<ReviewFailure>();
+    let incomplete_large_review_hunks = review_failure
+        .and_then(|failure| failure.review_coverage.as_ref())
+        .and_then(|coverage| coverage.receipt.as_ref())
+        .map_or(0, |receipt| receipt.unreviewed_hunks);
     let invalid_output =
         review_failure.is_some_and(|failure| failure.kind == ReviewFailureKind::InvalidOutput);
     let advisory_operational_error = review_failure
@@ -3555,7 +3765,7 @@ fn error_envelope(
                 .downcast_ref::<reqwest::Error>()
                 .is_some_and(|error| error.is_connect() || error.is_timeout())
         });
-    let findings = vec![if let Some(reason) = incomplete_reason {
+    let mut findings = vec![if let Some(reason) = incomplete_reason {
         crate::envelope::incomplete_review_finding(reason)
     } else if invalid_output || !advisory_operational_error {
         // Only a recorded scorer error is genuinely about model output. Every
@@ -3569,11 +3779,16 @@ fn error_envelope(
     } else {
         crate::envelope::provider_error_finding(&format!("{err:#}"))
     }];
+    if incomplete_large_review_hunks > 0 {
+        findings.push(crate::envelope::incomplete_large_review_finding(
+            incomplete_large_review_hunks,
+        ));
+    }
     let counts = Envelope::counts_of(&findings, 0);
     let buckets = Envelope::buckets_of(&findings);
     let gate_disabled = cfg.gate_fail_on.as_str().eq_ignore_ascii_case("never");
-    let blocking =
-        !gate_disabled && (!advisory_operational_error || cfg.gate_on_error == OnError::Block);
+    let blocking = incomplete_large_review_hunks > 0
+        || (!gate_disabled && (!advisory_operational_error || cfg.gate_on_error == OnError::Block));
     let mut model_usage = review_failure
         .map(|failure| failure.model_usage.clone())
         .unwrap_or_default();
@@ -3817,6 +4032,13 @@ mod tests {
     }
 
     fn rich_scorer_failure(kind: ReviewFailureKind) -> anyhow::Error {
+        rich_scorer_failure_with_receipt(kind, None)
+    }
+
+    fn rich_scorer_failure_with_receipt(
+        kind: ReviewFailureKind,
+        receipt: Option<ReviewCoverageReceipt>,
+    ) -> anyhow::Error {
         ReviewFailure {
             kind,
             detail: "hosted scorer could not complete the admitted profile".to_string(),
@@ -3874,7 +4096,7 @@ mod tests {
                 selected_batches: 5,
                 total_batches: 9,
                 planner_fallback: false,
-                receipt: None,
+                receipt,
             }),
             review_admission: Some(ReviewAdmission {
                 provider_attempts: 12,
@@ -3937,6 +4159,44 @@ mod tests {
         );
         assert_eq!(envelope.model_usage.len(), 2);
         assert_eq!(envelope.review_admission.unwrap().provider_attempts, 12);
+    }
+
+    #[test]
+    fn incomplete_coverage_stays_blocking_when_the_provider_also_fails() {
+        let cfg = Config {
+            gate_fail_on: crate::config::GateLevel::Never,
+            gate_on_error: OnError::Advisory,
+            ..Config::default()
+        };
+        let error = rich_scorer_failure_with_receipt(
+            ReviewFailureKind::Provider,
+            Some(ReviewCoverageReceipt {
+                plan_sha256: "a".repeat(64),
+                total_hunks: 1,
+                direct_hunks: 0,
+                semantic_hunks: 0,
+                unreviewed_hunks: 1,
+            }),
+        );
+        let envelope = error_envelope(&cfg, &error, "head", Some(&pr_meta()), 99);
+
+        assert!(envelope.gate.failing);
+        assert!(envelope.findings.iter().any(|finding| {
+            finding.path == crate::envelope::PROVIDER_PATH
+                && finding.title == "Model provider unavailable"
+        }));
+        assert!(envelope.findings.iter().any(|finding| {
+            finding.path == crate::envelope::OPERATIONAL_PATH
+                && finding.title == "Large review coverage is incomplete"
+        }));
+        assert_eq!(
+            envelope
+                .review_coverage
+                .as_ref()
+                .and_then(|coverage| coverage.receipt.as_ref())
+                .map(|receipt| receipt.unreviewed_hunks),
+            Some(1)
+        );
     }
 
     #[test]
@@ -4550,6 +4810,109 @@ mod tests {
             application.suppressed[0].reason,
             SuppressionReason::RepositoryClaimUnsupported
         );
+    }
+
+    #[test]
+    fn only_fresh_unverifiable_lockfile_platform_claims_are_suppressed() {
+        let evidence =
+            "pnpm-lock.yaml: lockfile changed, 1 additions, 1 deletions; optional packages changed";
+        let mut index = diff::DiffIndex::default();
+        index.add_change_metadata(1);
+        index.add_rendered_evidence(&format!(
+            "### {}\n1 + {evidence}\n",
+            crate::envelope::CHANGE_METADATA_PATH
+        ));
+
+        let mut fresh_platform = finding_with_title(
+            crate::envelope::CHANGE_METADATA_PATH,
+            1,
+            "Preserve Windows IA32 support",
+            "The lockfile change breaks Windows IA32 runtime support.",
+        );
+        fresh_platform.evidence = Some(evidence.into());
+        let mut direct_removal = finding_with_title(
+            crate::envelope::CHANGE_METADATA_PATH,
+            1,
+            "The lockfile removes an optional dependency",
+            "The dependency resolution no longer contains the package.",
+        );
+        direct_removal.evidence = Some(evidence.into());
+        let mut security_finding = finding_with_title(
+            crate::envelope::CHANGE_METADATA_PATH,
+            1,
+            "Windows IA32 checksum verification regresses",
+            "The lockfile change breaks checksum verification for this package.",
+        );
+        security_finding.evidence = Some(evidence.into());
+        let baseline_platform = fresh_platform.clone();
+        let mut application = crate::adjudication::AdjudicationApplication {
+            kept: vec![
+                fresh_platform.clone(),
+                direct_removal.clone(),
+                security_finding.clone(),
+                baseline_platform.clone(),
+            ],
+            kept_indices: vec![0, 1, 2, 3],
+            unresolved_indices: vec![0, 1, 2, 3],
+            resolved_indices: Vec::new(),
+            suppressed: Vec::new(),
+        };
+
+        suppress_fresh_lockfile_platform_claims(&mut application, 3, &index);
+
+        assert_eq!(application.kept_indices, vec![1, 2, 3]);
+        assert_eq!(application.unresolved_indices, vec![1, 2, 3]);
+        assert_eq!(application.kept.len(), 3);
+        assert!(same_visible_finding(&application.kept[0], &direct_removal));
+        assert!(same_visible_finding(
+            &application.kept[1],
+            &security_finding
+        ));
+        assert!(same_visible_finding(
+            &application.kept[2],
+            &baseline_platform
+        ));
+        assert_eq!(application.suppressed.len(), 1);
+        assert!(same_visible_finding(
+            &application.suppressed[0].finding,
+            &fresh_platform
+        ));
+        assert_eq!(
+            application.suppressed[0].reason,
+            SuppressionReason::LockfilePlatformEvidenceInsufficient
+        );
+
+        let breakpoint = finding_with_title(
+            crate::envelope::CHANGE_METADATA_PATH,
+            1,
+            "Keep the Linux breakpoint package",
+            "The lockfile removes the Linux breakpoint package required by diagnostics.",
+        );
+        assert!(!is_platform_support_claim(&breakpoint));
+
+        for body in [
+            "The lockfile removes the armv8 package and breaks ARMv8 support.",
+            "The lockfile removes arm64_support and breaks arm64_support builds.",
+            "The lockfile change breaks Ｗindows support.",
+            "The lockfile change breaks WİNDOWS support.",
+        ] {
+            assert!(is_platform_support_claim(&finding(
+                crate::envelope::CHANGE_METADATA_PATH,
+                1,
+                body,
+            )));
+        }
+
+        let mut quoted_path = finding(
+            crate::envelope::CHANGE_METADATA_PATH,
+            1,
+            "The lockfile change breaks Windows support.",
+        );
+        quoted_path.evidence = Some(
+            "\"deps/a: lockfile changed, x/pnpm-lock.yaml\": lockfile changed, 1 additions, 1 deletions; optional packages changed"
+                .into(),
+        );
+        assert!(is_compact_lockfile_metadata(&quoted_path));
     }
 
     #[test]

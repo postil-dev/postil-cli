@@ -1382,11 +1382,37 @@ describe("managed admission workflow", () => {
     expect(release.indexOf("bun run scorer-eval --json-out")).toBeLessThan(
       release.indexOf("bun run bench:live --"),
     );
-    expect(release).toContain("bun run bench:live --");
-    expect(release).toMatch(
-      /name: Upload the diff-file live report\n\s+if: always\(\)[\s\S]*bench-live-report\.json[\s\S]*retention-days: 30/u,
+    expect([...release.matchAll(/bun run bench:live --/gu)]).toHaveLength(3);
+    for (const sample of [1, 2, 3]) {
+      expect(release).toContain(`name: Run diff-file live benchmark sample ${sample}`);
+      expect(release).toContain(`id: live-sample-${sample}`);
+      expect(release).toContain(`--run-id "release-\${{ github.ref_name }}-sample-${sample}"`);
+      expect(release).toContain(
+        `--expected-run-id "release-\${{ github.ref_name }}-sample-${sample}"`,
+      );
+      expect(release).toContain(`--json-out "\${{ runner.temp }}/bench-live-report-${sample}.json"`);
+    }
+    expect(release.indexOf("Run diff-file live benchmark sample 1")).toBeLessThan(
+      release.indexOf("Run diff-file live benchmark sample 2"),
     );
-    expect(release).toContain("bun run bench:compare --");
+    expect(release.indexOf("Run diff-file live benchmark sample 2")).toBeLessThan(
+      release.indexOf("Run diff-file live benchmark sample 3"),
+    );
+    expect(release).toMatch(
+      /name: Upload the diff-file live reports\n\s+if: always\(\)[\s\S]*bench-live-report-1\.json[\s\S]*bench-live-report-2\.json[\s\S]*bench-live-report-3\.json[\s\S]*retention-days: 30/u,
+    );
+    expect(release).toMatch(
+      /bun run bench:compare --[\s\S]*--binary "\$\{\{ github\.workspace \}\}\/target\/release\/postil"[\s\S]*--screen-profile \.\.\/provisional-models\.json[\s\S]*--result "\$\{\{ runner\.temp \}\}\/bench-live-report-1\.json"[\s\S]*--result "\$\{\{ runner\.temp \}\}\/bench-live-report-2\.json"[\s\S]*--result "\$\{\{ runner\.temp \}\}\/bench-live-report-3\.json"/u,
+    );
+    expect([...release.matchAll(/continue-on-error: true/gu)]).toHaveLength(3);
+    expect(release).toContain("SAMPLE_1_OUTCOME: ${{ steps.live-sample-1.outcome }}");
+    expect(release).toContain("SAMPLE_2_OUTCOME: ${{ steps.live-sample-2.outcome }}");
+    expect(release).toContain("SAMPLE_3_OUTCOME: ${{ steps.live-sample-3.outcome }}");
+    expect(release).not.toContain("bench-live-report-1.json.partial");
+    expect(release).not.toContain("bench-live-report-2.json.partial");
+    expect(release).not.toContain("bench-live-report-3.json.partial");
+    expect(release).not.toContain("bench_live_override_reason");
+    expect(release).not.toContain("OVERRIDE_REASON");
     expect(release).toMatch(/build:\n\s+needs: \[validate-tag, bench-live\]/u);
     let checkedReferences = 0;
     const workflowGlob = new Bun.Glob("*.yml");

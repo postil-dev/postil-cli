@@ -43,7 +43,7 @@ import {
 } from "./livemodels-score";
 
 const execFile = promisify(execFileCb);
-const ADMISSION_API_BASE = "https://openrouter.ai:443/api/v1";
+export const ADMISSION_API_BASE = "https://openrouter.ai:443/api/v1";
 const REQUEST_TIMEOUT_ENV = "POSTIL_LLM_REQUEST_TIMEOUT_SECS";
 const TOTAL_TIMEOUT_ENV = "POSTIL_LLM_TOTAL_TIMEOUT_SECS";
 const DEFAULT_CASE_TIMEOUT_MS = 180_000;
@@ -163,6 +163,7 @@ export interface LiveCaseResult {
 }
 
 export interface LiveSummary {
+  runId: string;
   model: string;
   binary: string;
   binarySha256: string;
@@ -367,7 +368,7 @@ async function writeLiveRunContract(
   });
 }
 
-async function screeningProfileMetadata(path: string): Promise<{
+export async function screeningProfileMetadata(path: string): Promise<{
   sha256: string;
   upstreamProviderIdentity: string;
   upstreamProviderRoute: string;
@@ -982,6 +983,7 @@ function summarize(
       : [parseCanonicalDecimal(result.observedProviderCostUsdDecimal)]));
 
   return {
+    runId: options.runId,
     model: options.model,
     binary: options.binary,
     binarySha256,
