@@ -5958,6 +5958,183 @@ async fn malformed_known_lockfile_uses_bounded_source_review() {
     assert!(body.contains(r#"source = \"new-four\""#));
 }
 
+#[tokio::test]
+async fn compact_pnpm_lockfile_ia32_platform_claim_is_suppressed_but_dependency_removal_survives() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(|request: &Request| {
+            let request_body: Value = request.body_json().unwrap();
+            let system = request_body["messages"][0]["content"]
+                .as_str()
+                .unwrap_or_default();
+            if system.contains("single finding adjudicator") {
+                let user = request_body["messages"][1]["content"].as_str().unwrap();
+                let adjudication: Value = serde_json::from_str(user).unwrap();
+                let results = adjudication["candidates"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|candidate| {
+                        json!({
+                            "candidateId": candidate["candidateId"],
+                            "status": "confirmed",
+                            "revisedTitle": candidate["title"],
+                            "revisedBody": candidate["body"],
+                            "evidence": candidate["citedEvidence"],
+                            "duplicateOf": null
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                return ResponseTemplate::new(200)
+                    .set_body_json(scorer_text(&Value::Array(results).to_string()));
+            }
+            let evidence = prompt_evidence(
+                request,
+                ".postil/change-metadata",
+                1,
+                "pnpm-lock.yaml: lockfile changed",
+            );
+            ResponseTemplate::new(200).set_body_json(llm_content(json!([
+                {
+                    "path": ".postil/change-metadata",
+                    "line": 1,
+                    "severity": "error",
+                    "kind": "risk",
+                    "confidence": 0.99,
+                    "title": "Preserve Windows IA32 support",
+                    "body": "The lockfile change removes the IA32 package and breaks Windows IA32 runtime support; preserve the package so 32-bit Windows remains supported.",
+                    "evidence": evidence
+                },
+                {
+                    "path": ".postil/change-metadata",
+                    "line": 1,
+                    "severity": "error",
+                    "kind": "risk",
+                    "confidence": 0.98,
+                    "title": "The lockfile removes the IA32 optional dependency",
+                    "body": "The lockfile removes `@rollup/rollup-win32-ia32-msvc@4.34.8`, so the dependency resolution no longer contains that package.",
+                    "evidence": evidence
+                }
+            ])))
+        })
+        .with_priority(1)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = dir.path().join("pnpm-ia32-regression.diff");
+    std::fs::write(
+        &diff,
+        "diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml\n--- a/pnpm-lock.yaml\n+++ b/pnpm-lock.yaml\n@@ -1,3 +1,3 @@\n lockfileVersion: '9.0'\n packages:\n-  '@rollup/rollup-win32-ia32-msvc@4.34.8':\n+  '@rollup/rollup-win32-x64-msvc@4.34.8':\n",
+    )
+    .unwrap();
+
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .code(1);
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(envelope["findings"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        envelope["findings"][0]["title"],
+        "The lockfile removes the IA32 optional dependency"
+    );
+    assert_eq!(envelope["suppressedFindings"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        envelope["suppressedFindings"][0]["reason"],
+        "lockfilePlatformEvidenceInsufficient"
+    );
+    assert_eq!(
+        envelope["suppressedFindings"][0]["finding"]["title"],
+        "Preserve Windows IA32 support"
+    );
+    assert_eq!(envelope["gate"]["failing"], true);
+}
+
+#[tokio::test]
+async fn compact_lockfile_platform_claim_survives_failed_adjudication() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("single finding adjudicator"))
+        .respond_with(ResponseTemplate::new(503))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(|request: &Request| {
+            let evidence = prompt_evidence(
+                request,
+                ".postil/change-metadata",
+                1,
+                "pnpm-lock.yaml: lockfile changed",
+            );
+            ResponseTemplate::new(200).set_body_json(llm_content(json!([{
+                "path": ".postil/change-metadata",
+                "line": 1,
+                "severity": "error",
+                "kind": "risk",
+                "confidence": 0.99,
+                "title": "Preserve Windows IA32 support",
+                "body": "The lockfile change removes the IA32 package and breaks Windows IA32 runtime support.",
+                "evidence": evidence
+            }])))
+        })
+        .with_priority(10)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let diff = dir.path().join("pnpm-ia32-adjudication-failure.diff");
+    std::fs::write(
+        &diff,
+        "diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml\n--- a/pnpm-lock.yaml\n+++ b/pnpm-lock.yaml\n@@ -1,3 +1,3 @@\n lockfileVersion: '9.0'\n packages:\n-  '@rollup/rollup-win32-ia32-msvc@4.34.8':\n+  '@rollup/rollup-win32-x64-msvc@4.34.8':\n",
+    )
+    .unwrap();
+
+    let out = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .code(1);
+    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert!(
+        envelope["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| { finding["title"] == "Preserve Windows IA32 support" })
+    );
+    assert!(
+        envelope["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| { finding["path"] == ".postil/provider" })
+    );
+    assert!(
+        envelope["suppressedFindings"]
+            .as_array()
+            .is_none_or(|findings| {
+                !findings
+                    .iter()
+                    .any(|finding| finding["reason"] == "lockfilePlatformEvidenceInsufficient")
+            })
+    );
+    assert_eq!(envelope["gate"]["failing"], true);
+}
+
 async fn mock_review_model(server: &MockServer, model: &str, findings: Value) {
     Mock::given(method("POST"))
         .and(path("/chat/completions"))

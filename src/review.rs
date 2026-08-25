@@ -2532,6 +2532,7 @@ async fn review_diff_at(
                                     None
                                 }
                             };
+                            let mut lockfile_platform_policy_allowed = false;
                             let mut application = match adjudicated {
                                 Some(Ok(adjudicated)) => {
                                     add_usage(&mut usage, adjudicated.usage);
@@ -2548,7 +2549,10 @@ async fn review_diff_at(
                                         &diff_receipt,
                                         receipt,
                                     ) {
-                                        Ok(application) => application,
+                                        Ok(application) => {
+                                            lockfile_platform_policy_allowed = true;
+                                            application
+                                        }
                                         Err(error) => {
                                             adjudication_incomplete = true;
                                             review_trust = filter::ReviewTrust::Failed;
@@ -2599,6 +2603,13 @@ async fn review_diff_at(
                                 &mut application,
                                 fresh_candidate_count,
                             );
+                            if lockfile_platform_policy_allowed {
+                                suppress_fresh_lockfile_platform_claims(
+                                    &mut application,
+                                    fresh_candidate_count,
+                                    &index,
+                                );
+                            }
                             for (candidate_index, finding) in application
                                 .kept_indices
                                 .iter()
@@ -3523,6 +3534,190 @@ fn suppress_fresh_unresolved_repository_claims(
     application
         .unresolved_indices
         .retain(|index| application.kept_indices.contains(index));
+}
+
+fn suppress_fresh_lockfile_platform_claims(
+    application: &mut crate::adjudication::AdjudicationApplication,
+    fresh_candidate_count: usize,
+    index: &diff::DiffIndex,
+) {
+    let mut kept = Vec::with_capacity(application.kept.len());
+    let mut kept_indices = Vec::with_capacity(application.kept_indices.len());
+    for (candidate_index, finding) in application
+        .kept_indices
+        .drain(..)
+        .zip(application.kept.drain(..))
+    {
+        if candidate_index < fresh_candidate_count
+            && is_unverifiable_lockfile_platform_claim(index, &finding)
+        {
+            application.suppressed.push(SuppressedFinding {
+                finding,
+                reason: SuppressionReason::LockfilePlatformEvidenceInsufficient,
+            });
+        } else {
+            kept_indices.push(candidate_index);
+            kept.push(finding);
+        }
+    }
+    application.kept = kept;
+    application.kept_indices = kept_indices;
+    application
+        .unresolved_indices
+        .retain(|index| application.kept_indices.contains(index));
+}
+
+fn is_unverifiable_lockfile_platform_claim(index: &diff::DiffIndex, finding: &Finding) -> bool {
+    index.contains_exact_evidence(finding)
+        && is_compact_lockfile_metadata(finding)
+        && is_platform_support_claim(finding)
+}
+
+fn is_compact_lockfile_metadata(finding: &Finding) -> bool {
+    if finding.path != crate::envelope::CHANGE_METADATA_PATH {
+        return false;
+    }
+    let Some(evidence) = finding.evidence.as_deref() else {
+        return false;
+    };
+    let evidence = evidence.trim();
+    if let Some(path) = evidence
+        .strip_prefix("- ")
+        .and_then(|path| path.strip_suffix(" [lockfile summary]"))
+    {
+        return diff::canonical_prompt_path(path)
+            .is_some_and(|path| diff::is_known_lockfile(&path));
+    }
+
+    const DELIMITER: &str = ": lockfile changed, ";
+    evidence.match_indices(DELIMITER).any(|(delimiter, _)| {
+        is_compact_lockfile_change_details(
+            &evidence[..delimiter],
+            &evidence[delimiter + DELIMITER.len()..],
+        )
+    })
+}
+
+fn is_compact_lockfile_change_details(path: &str, details: &str) -> bool {
+    let Some((additions, details)) = details.split_once(" additions, ") else {
+        return false;
+    };
+    let Some((deletions, changes)) = details.split_once(" deletions; ") else {
+        return false;
+    };
+    additions.parse::<usize>().is_ok()
+        && deletions.parse::<usize>().is_ok()
+        && !changes.trim().is_empty()
+        && diff::canonical_prompt_path(path).is_some_and(|path| diff::is_known_lockfile(&path))
+}
+
+fn is_platform_support_claim(finding: &Finding) -> bool {
+    let prose = normalize_classifier_prose(&format!("{} {}", finding.title, finding.body));
+    if [
+        "security",
+        "vulnerab",
+        "cve",
+        "checksum",
+        "integrity",
+        "malware",
+        "install script",
+        "preinstall",
+        "postinstall",
+        "prepare script",
+        "lifecycle script",
+    ]
+    .iter()
+    .any(|term| prose.contains(term))
+    {
+        return false;
+    }
+
+    let has_platform_term = [
+        "platform",
+        "operating system",
+        "architecture",
+        "arch",
+        "cpu",
+        "abi",
+        "runtime",
+        "ia32",
+        "i386",
+        "x86",
+        "amd64",
+        "x86_64",
+        "arm64",
+        "aarch64",
+        "armv5",
+        "armv6",
+        "armv7",
+        "armv8",
+        "armel",
+        "armhf",
+        "x64",
+        "ppc64le",
+        "loong64",
+        "mips64",
+        "ppc64",
+        "s390x",
+        "riscv",
+        "win32",
+        "windows",
+        "linux",
+        "darwin",
+        "macos",
+        "freebsd",
+        "android",
+        "musl",
+        "glibc",
+    ]
+    .iter()
+    .any(|term| prose_contains_term(&prose, term));
+    if !has_platform_term {
+        return false;
+    }
+
+    ["support", "compatib", "regress"]
+        .iter()
+        .any(|prefix| prose_contains_word_prefix(&prose, prefix))
+        || ["break", "breaks", "breaking", "broken"]
+            .iter()
+            .any(|term| prose_contains_term(&prose, term))
+        || ["works on", "runs on", "available on"]
+            .iter()
+            .any(|phrase| prose.contains(phrase))
+}
+
+fn prose_contains_term(prose: &str, term: &str) -> bool {
+    if term.contains(' ') {
+        prose.contains(term)
+    } else {
+        prose
+            .split(|character: char| !character.is_alphanumeric())
+            .any(|word| word == term)
+    }
+}
+
+fn prose_contains_word_prefix(prose: &str, prefix: &str) -> bool {
+    prose
+        .split(|character: char| !character.is_alphanumeric())
+        .any(|word| word.starts_with(prefix))
+}
+
+fn normalize_classifier_prose(prose: &str) -> String {
+    let mut normalized = String::with_capacity(prose.len());
+    for character in prose.chars() {
+        let compatible = if ('\u{ff01}'..='\u{ff5e}').contains(&character) {
+            char::from_u32(character as u32 - 0xfee0).unwrap_or(character)
+        } else {
+            character
+        };
+        for lowercase in compatible.to_lowercase() {
+            if lowercase != '\u{0307}' {
+                normalized.push(lowercase);
+            }
+        }
+    }
+    normalized
 }
 
 fn error_envelope(
@@ -4550,6 +4745,109 @@ mod tests {
             application.suppressed[0].reason,
             SuppressionReason::RepositoryClaimUnsupported
         );
+    }
+
+    #[test]
+    fn only_fresh_unverifiable_lockfile_platform_claims_are_suppressed() {
+        let evidence =
+            "pnpm-lock.yaml: lockfile changed, 1 additions, 1 deletions; optional packages changed";
+        let mut index = diff::DiffIndex::default();
+        index.add_change_metadata(1);
+        index.add_rendered_evidence(&format!(
+            "### {}\n1 + {evidence}\n",
+            crate::envelope::CHANGE_METADATA_PATH
+        ));
+
+        let mut fresh_platform = finding_with_title(
+            crate::envelope::CHANGE_METADATA_PATH,
+            1,
+            "Preserve Windows IA32 support",
+            "The lockfile change breaks Windows IA32 runtime support.",
+        );
+        fresh_platform.evidence = Some(evidence.into());
+        let mut direct_removal = finding_with_title(
+            crate::envelope::CHANGE_METADATA_PATH,
+            1,
+            "The lockfile removes an optional dependency",
+            "The dependency resolution no longer contains the package.",
+        );
+        direct_removal.evidence = Some(evidence.into());
+        let mut security_finding = finding_with_title(
+            crate::envelope::CHANGE_METADATA_PATH,
+            1,
+            "Windows IA32 checksum verification regresses",
+            "The lockfile change breaks checksum verification for this package.",
+        );
+        security_finding.evidence = Some(evidence.into());
+        let baseline_platform = fresh_platform.clone();
+        let mut application = crate::adjudication::AdjudicationApplication {
+            kept: vec![
+                fresh_platform.clone(),
+                direct_removal.clone(),
+                security_finding.clone(),
+                baseline_platform.clone(),
+            ],
+            kept_indices: vec![0, 1, 2, 3],
+            unresolved_indices: vec![0, 1, 2, 3],
+            resolved_indices: Vec::new(),
+            suppressed: Vec::new(),
+        };
+
+        suppress_fresh_lockfile_platform_claims(&mut application, 3, &index);
+
+        assert_eq!(application.kept_indices, vec![1, 2, 3]);
+        assert_eq!(application.unresolved_indices, vec![1, 2, 3]);
+        assert_eq!(application.kept.len(), 3);
+        assert!(same_visible_finding(&application.kept[0], &direct_removal));
+        assert!(same_visible_finding(
+            &application.kept[1],
+            &security_finding
+        ));
+        assert!(same_visible_finding(
+            &application.kept[2],
+            &baseline_platform
+        ));
+        assert_eq!(application.suppressed.len(), 1);
+        assert!(same_visible_finding(
+            &application.suppressed[0].finding,
+            &fresh_platform
+        ));
+        assert_eq!(
+            application.suppressed[0].reason,
+            SuppressionReason::LockfilePlatformEvidenceInsufficient
+        );
+
+        let breakpoint = finding_with_title(
+            crate::envelope::CHANGE_METADATA_PATH,
+            1,
+            "Keep the Linux breakpoint package",
+            "The lockfile removes the Linux breakpoint package required by diagnostics.",
+        );
+        assert!(!is_platform_support_claim(&breakpoint));
+
+        for body in [
+            "The lockfile removes the armv8 package and breaks ARMv8 support.",
+            "The lockfile removes arm64_support and breaks arm64_support builds.",
+            "The lockfile change breaks Ｗindows support.",
+            "The lockfile change breaks WİNDOWS support.",
+        ] {
+            assert!(is_platform_support_claim(&finding(
+                crate::envelope::CHANGE_METADATA_PATH,
+                1,
+                body,
+            )));
+        }
+
+        let mut quoted_path = finding(
+            crate::envelope::CHANGE_METADATA_PATH,
+            1,
+            "The lockfile change breaks Windows support.",
+        );
+        quoted_path.evidence = Some(
+            "\"deps/a: lockfile changed, x/pnpm-lock.yaml\": lockfile changed, 1 additions, 1 deletions; optional packages changed"
+                .into(),
+        );
+        assert!(is_compact_lockfile_metadata(&quoted_path));
     }
 
     #[test]
