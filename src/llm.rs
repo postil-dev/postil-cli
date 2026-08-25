@@ -641,11 +641,14 @@ struct LlmTimeouts {
 
 /// Retries per model on transient provider errors before the cascade moves on.
 pub(crate) const TRANSIENT_RETRIES: u32 = 2;
-/// A fresh request can recover when the caller's request timeout, rather than
-/// the provider's response, ended an otherwise viable routed completion. The
-/// shared total deadline remains authoritative, so this cannot extend a hosted
-/// review beyond its worker budget.
-const TIMEOUT_RETRIES: u32 = 1;
+/// Maximum total transient retries available to a budgeted review.
+/// The fixed allowance uses the first two, leaving ten budget-funded retries
+/// and at most thirteen attempts for one logical review call.
+pub(crate) const MAX_BUDGETED_TRANSIENT_RETRIES: u32 = 12;
+const MIN_BUDGETED_RETRY_WAIT: Duration = Duration::from_secs(1);
+const MAX_SYNTHESIZED_RETRY_BACKOFF: Duration = Duration::from_secs(20);
+/// The minimum time reserved for the request funded by a budgeted wait.
+const RETRY_ATTEMPT_RESERVE: Duration = Duration::from_secs(15);
 const EMPTY_RESPONSE_RETRIES: u32 = 1;
 const EXHAUSTED_OUTPUT_RETRIES: u32 = 1;
 const TIMEOUT_RETRY_CAP_SECS: u64 = 90;
@@ -654,7 +657,6 @@ pub(crate) const REVIEW_MAX_OUTPUT_TOKENS: u32 = 16_000;
 const EXHAUSTED_OUTPUT_RETRY_MAX_TOKENS: u32 = REVIEW_MAX_OUTPUT_TOKENS;
 const MAX_REVIEW_RETRY_PREVIOUS_BYTES: usize = 16_384;
 const MAX_REVIEW_RETRY_REASON_BYTES: usize = 16_384;
-const PROVIDER_RETRY_DELAY_CAP_SECS: u64 = 30;
 
 /// Unqualified models receive a bounded review budget. A larger bound belongs
 /// in explicit admitted-model metadata after that model proves it needs one.
@@ -687,11 +689,13 @@ pub(crate) struct ReviewPlanSchedule<'a> {
     pub planner: Option<(&'a str, usize)>,
     pub batch_concurrency: usize,
 }
-pub(crate) const MAX_PROVIDER_ATTEMPTS: usize = 216;
 pub(crate) const MAX_REPORTED_TOKEN_SPEND: usize = 20_000_000;
 const MAX_PROVIDER_INPUT_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_PROVIDER_REQUEST_BYTES: usize = 256 * 1024;
-pub(crate) const MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE: usize = 2_000_000;
+// Review admission includes the full thirteen-attempt transport path for each
+// logical review call. Keep the output ceiling above the five-batch hosted
+// plan while the aggregate token and cost caps remain authoritative.
+pub(crate) const MAX_PROVIDER_OUTPUT_TOKEN_EXPOSURE: usize = 10_000_000;
 // Hosted planning reserves one initial and one correction call for every
 // selected model request plus the maximum enabled resolution and compression
 // passes. The selected-batch limit is derived after all model fan-out is known.
@@ -701,8 +705,12 @@ const MAX_LOGICAL_CALLS_PER_SCORER_MODEL: usize = 2;
 const MAX_LOGICAL_CALLS_PER_RESOLUTION_MODEL: usize = 2;
 const MAX_LOGICAL_CALLS_PER_BREVITY_MODEL: usize = 1;
 const MAX_TRANSPORT_ATTEMPTS_PER_CALL: usize = TRANSIENT_RETRIES as usize + 1;
+const MAX_REVIEW_TRANSPORT_ATTEMPTS_PER_CALL: usize = MAX_BUDGETED_TRANSIENT_RETRIES as usize + 1;
+pub(crate) const MAX_PROVIDER_ATTEMPTS: usize =
+    MAX_HOSTED_PLANNED_CALLS_BY_WATCHDOG * MAX_REVIEW_TRANSPORT_ATTEMPTS_PER_CALL;
 const _: () = assert!(
-    MAX_HOSTED_PLANNED_CALLS_BY_WATCHDOG * MAX_TRANSPORT_ATTEMPTS_PER_CALL <= MAX_PROVIDER_ATTEMPTS
+    MAX_HOSTED_PLANNED_CALLS_BY_WATCHDOG * MAX_REVIEW_TRANSPORT_ATTEMPTS_PER_CALL
+        <= MAX_PROVIDER_ATTEMPTS
 );
 const MAX_MODEL_RESPONSE_BYTES: usize = 512 * 1024;
 const SCORER_BASE_MAX_TOKENS: u32 = 256;
@@ -1523,10 +1531,63 @@ fn provider_retry_delay(retry: u32) -> Duration {
 }
 
 fn provider_retry_delay_with_sample(retry: u32, sample: u64) -> Duration {
-    let ceiling_ms = 2_000_u64.saturating_mul(u64::from(retry.max(1)));
+    let ceiling_ms = if retry <= TRANSIENT_RETRIES {
+        2_000_u64.saturating_mul(u64::from(retry.max(1)))
+    } else {
+        let doublings = retry - TRANSIENT_RETRIES;
+        2_000_u64
+            .saturating_mul(u64::from(TRANSIENT_RETRIES))
+            .saturating_mul(1_u64 << doublings.min(6))
+    }
+    .min(MAX_SYNTHESIZED_RETRY_BACKOFF.as_millis() as u64);
     let floor_ms = ceiling_ms / 2;
     let jitter_ms = sample % (ceiling_ms - floor_ms + 1);
     Duration::from_millis(floor_ms + jitter_ms)
+}
+
+fn budgeted_review_retry(phase: LlmPhase) -> bool {
+    matches!(phase, LlmPhase::Review)
+}
+
+fn max_transport_attempts(phase: LlmPhase) -> u32 {
+    if budgeted_review_retry(phase) {
+        MAX_REVIEW_TRANSPORT_ATTEMPTS_PER_CALL as u32
+    } else {
+        MAX_TRANSPORT_ATTEMPTS_PER_CALL as u32
+    }
+}
+
+fn budgeted_retry_wait(retry_after: Option<Duration>, retry: u32) -> Duration {
+    retry_after
+        .unwrap_or_else(|| provider_retry_delay(retry))
+        .max(MIN_BUDGETED_RETRY_WAIT)
+}
+
+fn transient_retry_wait(retry_after: Option<Duration>, phase: LlmPhase, retries: u32) -> Duration {
+    if budgeted_review_retry(phase) && retries >= TRANSIENT_RETRIES {
+        budgeted_retry_wait(retry_after, retries + 1)
+    } else {
+        retry_after.unwrap_or_else(|| provider_retry_delay(retries + 1))
+    }
+}
+
+/// Whether the next transient retry can be funded without consuming the time
+/// needed to issue the request it is intended to recover.
+fn transient_retry_affordable(
+    phase: LlmPhase,
+    retries: u32,
+    wait: Duration,
+    remaining: Option<Duration>,
+) -> bool {
+    if retries < TRANSIENT_RETRIES {
+        return true;
+    }
+    budgeted_review_retry(phase)
+        && retries < MAX_BUDGETED_TRANSIENT_RETRIES
+        && remaining.is_some_and(|left| {
+            wait.checked_add(RETRY_ATTEMPT_RESERVE)
+                .is_some_and(|required| required <= left)
+        })
 }
 
 fn timeout_status(status: u16) -> bool {
@@ -1836,6 +1897,7 @@ impl LlmClient {
         temperature: f64,
         phase: LlmPhase,
     ) -> Result<PlannedRequestPath> {
+        let max_attempts = max_transport_attempts(phase) as usize;
         let initial_body =
             self.request_body(model, system, user, initial_max_tokens, temperature, phase);
         let initial_bytes = serialized_provider_request_bytes(
@@ -1849,10 +1911,7 @@ impl LlmClient {
         let expanded_tokens = phase.exhausted_output_retry_max_tokens(initial_max_tokens);
         if expanded_tokens == initial_max_tokens {
             return Ok(PlannedRequestPath {
-                attempts: vec![
-                    (initial_bytes, initial_max_tokens as usize);
-                    MAX_TRANSPORT_ATTEMPTS_PER_CALL
-                ],
+                attempts: vec![(initial_bytes, initial_max_tokens as usize); max_attempts],
             });
         }
         let expanded_body =
@@ -1868,11 +1927,11 @@ impl LlmClient {
             expanded_bytes >= initial_bytes,
             "expanded output request serialized smaller than its initial request"
         );
-        let mut attempts = Vec::with_capacity(MAX_TRANSPORT_ATTEMPTS_PER_CALL);
+        let mut attempts = Vec::with_capacity(max_attempts);
         attempts.push((initial_bytes, initial_max_tokens as usize));
         attempts.extend(std::iter::repeat_n(
             (expanded_bytes, expanded_tokens as usize),
-            MAX_TRANSPORT_ATTEMPTS_PER_CALL.saturating_sub(1),
+            max_attempts.saturating_sub(1),
         ));
         Ok(PlannedRequestPath { attempts })
     }
@@ -2422,9 +2481,10 @@ impl LlmClient {
             logical_calls <= MAX_HOSTED_PLANNED_CALLS_BY_WATCHDOG,
             "complete hosted review needs {logical_calls} logical model calls, exceeding the {MAX_HOSTED_PLANNED_CALLS_BY_WATCHDOG}-call watchdog plan"
         );
-        // Admission includes every executable logical call and the exact
-        // three-attempt transport path. Output expansion replaces a retry; it
-        // does not add a fourth request.
+        // Admission includes every executable logical call and its exact
+        // phase-specific transport path. Review calls can use thirteen
+        // attempts; non-Review paths use three. Output expansion replaces a
+        // retry; it does not add another request.
         let mut exposure = PlannedExposure::default();
         for model in &review_models {
             let price = bounds
@@ -4243,10 +4303,16 @@ impl LlmClient {
             Self::ensure_atomic_attribution_request_size(&body)?;
         }
         let mut retries = 0u32;
-        let mut timeout_retries = 0u32;
         let mut empty_response_retries = 0u32;
         let mut exhausted_output_retries = 0u32;
         let mut attempt_timeout = self.request_timeout;
+        let attempt_limit = if budgeted_review_retry(phase)
+            && (self.review_deadline.is_some() || self.review_model_deadline.is_some())
+        {
+            MAX_REVIEW_TRANSPORT_ATTEMPTS_PER_CALL as u32
+        } else {
+            MAX_TRANSPORT_ATTEMPTS_PER_CALL as u32
+        };
         loop {
             if matches!(phase, LlmPhase::Review | LlmPhase::Adjudication) {
                 self.ensure_review_request_fits_context(model, &body, request_max_tokens)?;
@@ -4261,7 +4327,7 @@ impl LlmClient {
                 phase.as_str(),
                 log_text(model),
                 retries + 1,
-                TRANSIENT_RETRIES + 1,
+                attempt_limit,
                 elapsed_text(timeout),
                 remaining
                     .map(elapsed_text)
@@ -4284,18 +4350,22 @@ impl LlmClient {
                     *usage_accounting_complete = false;
                     call_usage
                         .push(self.model_usage_event(model, phase, call_phase, attempt, None));
-                    if timeout_retries < TIMEOUT_RETRIES && retries < TRANSIENT_RETRIES {
+                    let wait = transient_retry_wait(None, phase, retries);
+                    let remaining = self.remaining_budget(phase)?;
+                    if transient_retry_affordable(phase, retries, wait, remaining) {
                         retries += 1;
-                        timeout_retries += 1;
-                        let wait = provider_retry_delay(retries);
                         eprintln!(
                             "postil: model {} hit a request timeout after {}, retrying in {} \
-                             (timeout retry {timeout_retries}/{TIMEOUT_RETRIES}; retry {retries}/{TRANSIENT_RETRIES})",
+                             (retry {retries}/{attempt_limit}; budget_remaining={})",
                             log_text(model),
                             elapsed_text(attempt_started_at.elapsed()),
-                            elapsed_text(wait)
+                            elapsed_text(wait),
+                            remaining
+                                .map(elapsed_text)
+                                .unwrap_or_else(|| "unbounded".to_string())
                         );
-                        self.sleep_with_budget(phase, wait).await?;
+                        self.sleep_with_captured_budget(phase, wait, remaining)
+                            .await?;
                         attempt_timeout = self.timeout_retry_timeout;
                         continue;
                     }
@@ -4516,25 +4586,26 @@ impl LlmClient {
                         *usage_accounting_complete = false;
                     }
                     let status = response.status;
-                    if timeout_status(status.as_u16())
-                        && timeout_retries < TIMEOUT_RETRIES
-                        && retries < TRANSIENT_RETRIES
-                    {
-                        retries += 1;
-                        timeout_retries += 1;
-                        let wait = response
-                            .retry_after
-                            .unwrap_or_else(|| provider_retry_delay(retries));
-                        eprintln!(
-                            "postil: model {} returned timeout HTTP {status} after {}, retrying in {} \
-                             (timeout retry {timeout_retries}/{TIMEOUT_RETRIES}; retry {retries}/{TRANSIENT_RETRIES})",
-                            log_text(model),
-                            elapsed_text(attempt_started_at.elapsed()),
-                            elapsed_text(wait)
-                        );
-                        self.sleep_with_budget(phase, wait).await?;
-                        attempt_timeout = self.timeout_retry_timeout;
-                        continue;
+                    if timeout_status(status.as_u16()) {
+                        let wait = transient_retry_wait(response.retry_after, phase, retries);
+                        let remaining = self.remaining_budget(phase)?;
+                        if transient_retry_affordable(phase, retries, wait, remaining) {
+                            retries += 1;
+                            eprintln!(
+                                "postil: model {} returned timeout HTTP {status} after {}, retrying in {} \
+                                 (retry {retries}/{attempt_limit}; budget_remaining={})",
+                                log_text(model),
+                                elapsed_text(attempt_started_at.elapsed()),
+                                elapsed_text(wait),
+                                remaining
+                                    .map(elapsed_text)
+                                    .unwrap_or_else(|| "unbounded".to_string())
+                            );
+                            self.sleep_with_captured_budget(phase, wait, remaining)
+                                .await?;
+                            attempt_timeout = self.timeout_retry_timeout;
+                            continue;
+                        }
                     }
                     if timeout_status(status.as_u16()) {
                         let detail = provider_http_status_detail(
@@ -4544,21 +4615,26 @@ impl LlmClient {
                         );
                         return Err(anyhow::Error::new(ProviderHttpFailure(status)).context(detail));
                     }
-                    if retryable_status(status.as_u16()) && retries < TRANSIENT_RETRIES {
-                        retries += 1;
-                        let wait = response
-                            .retry_after
-                            .unwrap_or_else(|| provider_retry_delay(retries));
-                        eprintln!(
-                            "postil: model {} returned retryable HTTP {status} after {}, retrying in {} \
-                             (retry {retries}/{TRANSIENT_RETRIES})",
-                            log_text(model),
-                            elapsed_text(attempt_started_at.elapsed()),
-                            elapsed_text(wait)
-                        );
-                        self.sleep_with_budget(phase, wait).await?;
-                        attempt_timeout = self.request_timeout;
-                        continue;
+                    if retryable_status(status.as_u16()) {
+                        let wait = transient_retry_wait(response.retry_after, phase, retries);
+                        let remaining = self.remaining_budget(phase)?;
+                        if transient_retry_affordable(phase, retries, wait, remaining) {
+                            retries += 1;
+                            eprintln!(
+                                "postil: model {} returned retryable HTTP {status} after {}, retrying in {} \
+                                 (retry {retries}/{attempt_limit}; budget_remaining={})",
+                                log_text(model),
+                                elapsed_text(attempt_started_at.elapsed()),
+                                elapsed_text(wait),
+                                remaining
+                                    .map(elapsed_text)
+                                    .unwrap_or_else(|| "unbounded".to_string())
+                            );
+                            self.sleep_with_captured_budget(phase, wait, remaining)
+                                .await?;
+                            attempt_timeout = self.request_timeout;
+                            continue;
+                        }
                     }
                     return Err(anyhow::Error::new(ProviderHttpFailure(status)).context(
                         provider_http_status_detail(
@@ -4568,45 +4644,55 @@ impl LlmClient {
                         ),
                     ));
                 }
-                Err(error)
-                    if reqwest_error(&error).is_some_and(reqwest::Error::is_timeout)
-                        && timeout_retries < TIMEOUT_RETRIES
-                        && retries < TRANSIENT_RETRIES =>
-                {
+                Err(error) if reqwest_error(&error).is_some_and(reqwest::Error::is_timeout) => {
                     *usage_accounting_complete = false;
                     call_usage
                         .push(self.model_usage_event(model, phase, call_phase, attempt, None));
-                    retries += 1;
-                    timeout_retries += 1;
-                    let wait = provider_retry_delay(retries);
-                    eprintln!(
-                        "postil: model {} hit a request timeout after {}, retrying in {} \
-                         (timeout retry {timeout_retries}/{TIMEOUT_RETRIES}; retry {retries}/{TRANSIENT_RETRIES})",
-                        log_text(model),
-                        elapsed_text(attempt_started_at.elapsed()),
-                        elapsed_text(wait)
-                    );
-                    self.sleep_with_budget(phase, wait).await?;
-                    attempt_timeout = self.timeout_retry_timeout;
+                    let wait = transient_retry_wait(None, phase, retries);
+                    let remaining = self.remaining_budget(phase)?;
+                    if transient_retry_affordable(phase, retries, wait, remaining) {
+                        retries += 1;
+                        eprintln!(
+                            "postil: model {} hit a request timeout after {}, retrying in {} \
+                             (retry {retries}/{attempt_limit}; budget_remaining={})",
+                            log_text(model),
+                            elapsed_text(attempt_started_at.elapsed()),
+                            elapsed_text(wait),
+                            remaining
+                                .map(elapsed_text)
+                                .unwrap_or_else(|| "unbounded".to_string())
+                        );
+                        self.sleep_with_captured_budget(phase, wait, remaining)
+                            .await?;
+                        attempt_timeout = self.timeout_retry_timeout;
+                        continue;
+                    }
+                    return Err(RequestTimedOut.into());
                 }
-                Err(error)
-                    if reqwest_error(&error).is_some_and(reqwest::Error::is_connect)
-                        && retries < TRANSIENT_RETRIES =>
-                {
+                Err(error) if reqwest_error(&error).is_some_and(reqwest::Error::is_connect) => {
                     *usage_accounting_complete = false;
                     call_usage
                         .push(self.model_usage_event(model, phase, call_phase, attempt, None));
-                    retries += 1;
-                    let wait = provider_retry_delay(retries);
-                    eprintln!(
-                        "postil: model {} hit a retryable connection error after {}, retrying in {} \
-                         (retry {retries}/{TRANSIENT_RETRIES})",
-                        log_text(model),
-                        elapsed_text(attempt_started_at.elapsed()),
-                        elapsed_text(wait)
-                    );
-                    self.sleep_with_budget(phase, wait).await?;
-                    attempt_timeout = self.request_timeout;
+                    let wait = transient_retry_wait(None, phase, retries);
+                    let remaining = self.remaining_budget(phase)?;
+                    if transient_retry_affordable(phase, retries, wait, remaining) {
+                        retries += 1;
+                        eprintln!(
+                            "postil: model {} hit a retryable connection error after {}, retrying in {} \
+                             (retry {retries}/{attempt_limit}; budget_remaining={})",
+                            log_text(model),
+                            elapsed_text(attempt_started_at.elapsed()),
+                            elapsed_text(wait),
+                            remaining
+                                .map(elapsed_text)
+                                .unwrap_or_else(|| "unbounded".to_string())
+                        );
+                        self.sleep_with_captured_budget(phase, wait, remaining)
+                            .await?;
+                        attempt_timeout = self.request_timeout;
+                        continue;
+                    }
+                    return Err(error.context("request to model endpoint failed"));
                 }
                 Err(error) => {
                     *usage_accounting_complete = false;
@@ -5052,7 +5138,18 @@ impl LlmClient {
     }
 
     async fn sleep_with_budget(&self, phase: LlmPhase, duration: Duration) -> Result<()> {
-        let Some(remaining) = self.remaining_budget(phase)? else {
+        let remaining = self.remaining_budget(phase)?;
+        self.sleep_with_captured_budget(phase, duration, remaining)
+            .await
+    }
+
+    async fn sleep_with_captured_budget(
+        &self,
+        phase: LlmPhase,
+        duration: Duration,
+        remaining: Option<Duration>,
+    ) -> Result<()> {
+        let Some(remaining) = remaining else {
             tokio::time::sleep(duration).await;
             return Ok(());
         };
@@ -5327,7 +5424,7 @@ fn retry_after_duration_at(headers: &HeaderMap, now: std::time::SystemTime) -> O
             .unwrap_or_default()
     };
 
-    Some(duration.min(Duration::from_secs(PROVIDER_RETRY_DELAY_CAP_SECS)))
+    Some(duration)
 }
 
 fn safe_header_value(value: Option<&HeaderValue>) -> Option<String> {
@@ -6475,6 +6572,110 @@ mod tests {
             Duration::from_secs(4)
         );
     }
+
+    #[test]
+    fn retry_attempt_limits_are_phase_specific() {
+        let fixed_phases = [
+            LlmPhase::Planner,
+            LlmPhase::Resolution,
+            LlmPhase::Brevity,
+            LlmPhase::Scorer { expected_len: 1 },
+            LlmPhase::Adjudication,
+            LlmPhase::Attribution,
+            LlmPhase::Respond,
+        ];
+        for phase in fixed_phases {
+            assert_eq!(max_transport_attempts(phase), 3, "phase={phase:?}");
+        }
+        assert_eq!(max_transport_attempts(LlmPhase::Review), 13);
+    }
+
+    #[test]
+    fn budgeted_waits_have_a_floor_and_provider_hints_remain_authoritative() {
+        assert_eq!(
+            budgeted_retry_wait(Some(Duration::ZERO), TRANSIENT_RETRIES + 1),
+            MIN_BUDGETED_RETRY_WAIT
+        );
+        assert_eq!(
+            budgeted_retry_wait(Some(Duration::from_secs(37)), TRANSIENT_RETRIES + 1),
+            Duration::from_secs(37)
+        );
+        assert_eq!(
+            provider_retry_delay_with_sample(MAX_BUDGETED_TRANSIENT_RETRIES, 10_000),
+            MAX_SYNTHESIZED_RETRY_BACKOFF
+        );
+    }
+
+    #[test]
+    fn budgeted_retry_reserves_the_next_attempt_and_unbudgeted_review_stops_at_three() {
+        let phase = LlmPhase::Review;
+        assert!(transient_retry_affordable(
+            phase,
+            TRANSIENT_RETRIES,
+            Duration::from_secs(1),
+            Some(RETRY_ATTEMPT_RESERVE + Duration::from_secs(1)),
+        ));
+        assert!(!transient_retry_affordable(
+            phase,
+            TRANSIENT_RETRIES,
+            Duration::from_secs(2),
+            Some(RETRY_ATTEMPT_RESERVE + Duration::from_secs(1)),
+        ));
+        assert!(!transient_retry_affordable(
+            phase,
+            TRANSIENT_RETRIES,
+            Duration::from_secs(1),
+            None,
+        ));
+        assert!(!transient_retry_affordable(
+            phase,
+            MAX_BUDGETED_TRANSIENT_RETRIES,
+            Duration::from_secs(1),
+            Some(Duration::from_secs(86_400)),
+        ));
+    }
+
+    #[test]
+    fn hosted_exposure_prices_review_and_non_review_phases() {
+        let config = Config {
+            model: "provider/model".into(),
+            scorer_enabled: false,
+            uncertainty_resolution: false,
+            concise_findings: false,
+            ..Config::default()
+        };
+        let client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        let price = ModelPriceBound {
+            model: config.model.clone(),
+            input_micros_per_million_tokens: 1,
+            output_micros_per_million_tokens: 1,
+        };
+        let review = client
+            .planned_review_request_paths(&config.model, "system", "user", REVIEW_MAX_TOKENS)
+            .unwrap();
+        let resolution = client
+            .planned_request_path(
+                &config.model,
+                "system",
+                "user",
+                1_024,
+                0.0,
+                LlmPhase::Resolution,
+            )
+            .unwrap();
+        assert_eq!(
+            request_paths_exposure(&review, &price).unwrap().attempts,
+            26
+        );
+        assert_eq!(resolution.attempts.len(), 3);
+    }
     use crate::config::Config;
     use crate::envelope::{Kind, Severity};
     use crate::test_env_lock as env_lock;
@@ -7073,12 +7274,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             admission.output_tokens,
-            u64::from(REVIEW_MAX_TOKENS + 2 * REVIEW_MAX_OUTPUT_TOKENS)
+            (u64::from(REVIEW_MAX_TOKENS)
+                + (MAX_REVIEW_TRANSPORT_ATTEMPTS_PER_CALL as u64 - 1)
+                    * u64::from(REVIEW_MAX_OUTPUT_TOKENS))
                 * MAX_LOGICAL_CALLS_PER_REVIEW_MODEL as u64
                 + u64::from(MAX_ADJUDICATION_OUTPUT_TOKENS)
                     * MAX_TRANSPORT_ATTEMPTS_PER_CALL as u64
         );
-        assert_eq!(admission.provider_attempts, 9);
+        assert_eq!(admission.provider_attempts, 29);
         let plan = client
             .plan_review_batches(
                 &config,
@@ -7862,7 +8065,9 @@ mod tests {
                 },
             )
             .unwrap();
-        let review_per_model = u64::from(REVIEW_MAX_TOKENS + 2 * REVIEW_MAX_OUTPUT_TOKENS)
+        let review_per_model = (u64::from(REVIEW_MAX_TOKENS)
+            + (MAX_REVIEW_TRANSPORT_ATTEMPTS_PER_CALL as u64 - 1)
+                * u64::from(REVIEW_MAX_OUTPUT_TOKENS))
             * MAX_LOGICAL_CALLS_PER_REVIEW_MODEL as u64;
         let scorer_per_model = u64::from(scorer_max_tokens(SCORER_MAX_FINDINGS).unwrap())
             * MAX_TRANSPORT_ATTEMPTS_PER_CALL as u64
@@ -7884,8 +8089,8 @@ mod tests {
                 + u64::from(MAX_ADJUDICATION_OUTPUT_TOKENS)
                     * MAX_TRANSPORT_ATTEMPTS_PER_CALL as u64
         );
-        assert_eq!(admission.provider_attempts, 117);
-        assert_eq!(admission.projected_cost_micros, 234);
+        assert_eq!(admission.provider_attempts, 157);
+        assert_eq!(admission.projected_cost_micros, 314);
     }
 
     #[test]
@@ -7938,12 +8143,12 @@ mod tests {
         assert_eq!(
             admission.output_tokens,
             u64::from(REVIEW_MAX_OUTPUT_TOKENS)
-                * MAX_TRANSPORT_ATTEMPTS_PER_CALL as u64
+                * MAX_REVIEW_TRANSPORT_ATTEMPTS_PER_CALL as u64
                 * MAX_LOGICAL_CALLS_PER_REVIEW_MODEL as u64
                 + u64::from(MAX_ADJUDICATION_OUTPUT_TOKENS)
                     * MAX_TRANSPORT_ATTEMPTS_PER_CALL as u64
         );
-        assert_eq!(admission.provider_attempts, 9);
+        assert_eq!(admission.provider_attempts, 29);
     }
 
     #[test]
@@ -8039,7 +8244,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             admission.output_tokens,
-            u64::from(REVIEW_MAX_TOKENS + 2 * REVIEW_MAX_OUTPUT_TOKENS)
+            (u64::from(REVIEW_MAX_TOKENS)
+                + (MAX_REVIEW_TRANSPORT_ATTEMPTS_PER_CALL as u64 - 1)
+                    * u64::from(REVIEW_MAX_OUTPUT_TOKENS))
                 * MAX_LOGICAL_CALLS_PER_REVIEW_MODEL as u64
                 * crate::review::MAX_HOSTED_SELECTED_BATCHES as u64
                 + u64::from(PLANNER_MAX_TOKENS + 2 * PLANNER_MAX_TOKENS * 2)
@@ -8055,7 +8262,7 @@ mod tests {
                 + u64::from(MAX_ADJUDICATION_OUTPUT_TOKENS)
                     * MAX_TRANSPORT_ATTEMPTS_PER_CALL as u64
         );
-        assert_eq!(admission.provider_attempts, 84);
+        assert_eq!(admission.provider_attempts, 184);
         assert_eq!(client.admission.lock().unwrap().attempts, 0);
     }
 
@@ -8147,8 +8354,8 @@ mod tests {
         assert!(logical_calls <= MAX_HOSTED_PLANNED_CALLS_BY_WATCHDOG);
         assert!(logical_calls * MAX_TRANSPORT_ATTEMPTS_PER_CALL <= MAX_PROVIDER_ATTEMPTS);
         assert_eq!(
-            MAX_HOSTED_PLANNED_CALLS_BY_WATCHDOG * MAX_TRANSPORT_ATTEMPTS_PER_CALL,
-            192
+            MAX_HOSTED_PLANNED_CALLS_BY_WATCHDOG * MAX_REVIEW_TRANSPORT_ATTEMPTS_PER_CALL,
+            MAX_PROVIDER_ATTEMPTS
         );
     }
 
@@ -8304,13 +8511,13 @@ mod tests {
                 output_micros_per_million_tokens: 1,
             },
         )])));
-        let prompts = vec!["candidate".to_string(); 25];
+        let prompts = vec!["candidate".to_string(); 7];
         let output_tokens = vec![REVIEW_MAX_TOKENS; prompts.len()];
 
         client
             .preflight_review_plan_with_output_limits(
                 &config,
-                24,
+                6,
                 "system",
                 ReviewPreflightPrompts {
                     first_users: &prompts,
@@ -8321,14 +8528,14 @@ mod tests {
                 },
                 ReviewPlanSchedule {
                     planner: None,
-                    batch_concurrency: 4,
+                    batch_concurrency: 1,
                 },
             )
             .unwrap();
         let error = client
             .preflight_review_plan_with_output_limits(
                 &config,
-                25,
+                7,
                 "system",
                 ReviewPreflightPrompts {
                     first_users: &prompts,
@@ -8339,7 +8546,7 @@ mod tests {
                 },
                 ReviewPlanSchedule {
                     planner: None,
-                    batch_concurrency: 4,
+                    batch_concurrency: 1,
                 },
             )
             .unwrap_err();
@@ -8865,7 +9072,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_retry_after_parses_delta_seconds_and_caps_local_waits() {
+    fn provider_retry_after_preserves_provider_delta_seconds() {
         let mut headers = HeaderMap::new();
         headers.insert(reqwest::header::RETRY_AFTER, HeaderValue::from_static("0"));
         assert_eq!(retry_after_duration(&headers), Some(Duration::ZERO));
@@ -8882,7 +9089,7 @@ mod tests {
         );
         assert_eq!(
             retry_after_duration(&headers),
-            Some(Duration::from_secs(PROVIDER_RETRY_DELAY_CAP_SECS))
+            Some(Duration::from_secs(999))
         );
     }
 
@@ -8913,14 +9120,12 @@ mod tests {
 
         headers.insert(
             reqwest::header::RETRY_AFTER,
-            HeaderValue::from_str(&httpdate::fmt_http_date(
-                now + Duration::from_secs(PROVIDER_RETRY_DELAY_CAP_SECS),
-            ))
-            .unwrap(),
+            HeaderValue::from_str(&httpdate::fmt_http_date(now + Duration::from_secs(999)))
+                .unwrap(),
         );
         assert_eq!(
             retry_after_duration_at(&headers, now),
-            Some(Duration::from_secs(PROVIDER_RETRY_DELAY_CAP_SECS))
+            Some(Duration::from_secs(999))
         );
 
         headers.insert(
@@ -9597,6 +9802,118 @@ mod tests {
         assert!(usage_accounting_complete);
         assert_eq!(client.admission.lock().unwrap().attempts, 2);
         assert_eq!(client.admission.lock().unwrap().reported_token_spend, 27);
+    }
+
+    #[tokio::test]
+    async fn budgeted_review_retries_source_and_synthesis_past_the_fixed_allowance() {
+        for route in [ReviewRequestRoute::Source, ReviewRequestRoute::Synthesis] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "0"))
+                .with_priority(1)
+                .up_to_n_times(3)
+                .expect(3)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "choices": [{
+                        "finish_reason": "stop",
+                        "message": {"content": "{\"summary\":\"\",\"findings\":[]}"}
+                    }],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+                })))
+                .with_priority(2)
+                .expect(1)
+                .mount(&server)
+                .await;
+            let config = Config {
+                api_base: server.uri(),
+                api_format: ApiFormat::OpenaiCompatible,
+                model: "provider/model".into(),
+                scorer_enabled: false,
+                uncertainty_resolution: false,
+                concise_findings: false,
+                ..Config::default()
+            };
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let client = LlmClient::build(
+                &config,
+                "test-key".into(),
+                Duration::from_secs(1),
+                Some(deadline),
+                Some(deadline),
+            )
+            .unwrap();
+            *client.http.lock().unwrap() = Some(reqwest::Client::new());
+
+            let result = client
+                .review_validated_with_safe_output_limit(
+                    &config,
+                    "system",
+                    "user",
+                    REVIEW_MAX_TOKENS,
+                    route,
+                    |_| Ok(()),
+                )
+                .await
+                .unwrap();
+            assert!(result.findings.is_empty());
+            assert_eq!(server.received_requests().await.unwrap().len(), 4);
+            assert_eq!(
+                result
+                    .model_usage
+                    .iter()
+                    .map(|event| event.attempt)
+                    .collect::<Vec<_>>(),
+                vec![Some(1), Some(2), Some(3), Some(4)]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unbudgeted_source_review_keeps_three_transient_attempts() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "0"))
+            .expect(3)
+            .mount(&server)
+            .await;
+        let config = Config {
+            api_base: server.uri(),
+            api_format: ApiFormat::OpenaiCompatible,
+            model: "provider/model".into(),
+            scorer_enabled: false,
+            uncertainty_resolution: false,
+            concise_findings: false,
+            ..Config::default()
+        };
+        let client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        *client.http.lock().unwrap() = Some(reqwest::Client::new());
+
+        let error = client
+            .review_validated_with_safe_output_limit(
+                &config,
+                "system",
+                "user",
+                REVIEW_MAX_TOKENS,
+                ReviewRequestRoute::Source,
+                |_| Ok(()),
+            )
+            .await
+            .unwrap_err();
+        assert!(!error.is_timeout());
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
     }
 
     #[tokio::test]

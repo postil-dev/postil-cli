@@ -10311,7 +10311,7 @@ async fn slow_model_request_retries_same_model_then_succeeds() {
     assert_eq!(env["usageAccountingComplete"], false);
     let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
     assert!(stderr.contains("postil: model primary-model hit a request timeout after"));
-    assert!(stderr.contains("timeout retry 1/1"));
+    assert!(stderr.contains("retry 1/13"));
     assert!(stderr.contains("postil: model primary-model responded in"));
     assert!(!stderr.contains("postil: attempting model: backup-model"));
 
@@ -10940,10 +10940,10 @@ fn connection_failure_after_exhausted_output_uses_the_remaining_third_request() 
 
     let stderr = String::from_utf8_lossy(&out.get_output().stderr);
     assert!(
-        stderr.contains("model=primary-model attempt=2/3"),
+        stderr.contains("model=primary-model attempt=2/13"),
         "unexpected log: {stderr}"
     );
-    assert!(stderr.contains("model=primary-model attempt=3/3"));
+    assert!(stderr.contains("model=primary-model attempt=3/13"));
     assert!(!stderr.contains("127.0.0.1"));
 }
 
@@ -10984,7 +10984,7 @@ async fn timeout_http_status_retries_same_model_then_succeeds() {
     assert_eq!(envelope["usageAccountingComplete"], false);
     let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
     assert!(stderr.contains("returned timeout HTTP 408 Request Timeout"));
-    assert!(stderr.contains("timeout retry 1/1"));
+    assert!(stderr.contains("retry 1/13"));
 
     let requests = server.received_requests().await.unwrap();
     assert_eq!(requests.len(), 2);
@@ -11034,7 +11034,7 @@ async fn exhausted_timeout_retry_falls_back_to_next_model() {
     assert_eq!(envelope["modelUsed"], "backup-model");
     let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
     assert!(stderr.contains("model primary-model hit a request timeout after"));
-    assert!(stderr.contains("timeout retry 1/1"));
+    assert!(stderr.contains("retry 1/13"));
     let attempts = envelope["modelUsage"]
         .as_array()
         .unwrap()
@@ -11051,6 +11051,7 @@ async fn exhausted_timeout_retry_falls_back_to_next_model() {
         vec![
             ("primary-model", 1),
             ("primary-model", 2),
+            ("primary-model", 3),
             ("backup-model", 1)
         ]
     );
@@ -11066,7 +11067,7 @@ async fn exhausted_timeout_retry_falls_back_to_next_model() {
         })
         .collect::<Vec<_>>();
     assert_eq!(models.last().map(String::as_str), Some("backup-model"));
-    assert!(models.len() <= 3);
+    assert!(models.len() <= 4);
     assert_eq!(
         models
             .iter()
