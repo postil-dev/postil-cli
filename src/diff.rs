@@ -1499,12 +1499,7 @@ impl ModelBatchSpool {
                 .then_with(|| left.hunk.digest.cmp(&right.hunk.digest))
         });
 
-        let mut selected = self
-            .metadata_batch_ids
-            .iter()
-            .take(selected_limit)
-            .copied()
-            .collect::<BTreeSet<_>>();
+        let mut selected = BTreeSet::new();
         for candidate in ranked.iter().filter(|candidate| candidate.mandatory) {
             anyhow::ensure!(
                 !candidate.direct_batch_ids.is_empty(),
@@ -1512,12 +1507,16 @@ impl ModelBatchSpool {
                 candidate.hunk.path,
                 candidate.hunk.new_start
             );
-            for id in &candidate.direct_batch_ids {
-                if selected.len() >= selected_limit {
-                    break;
-                }
-                selected.insert(*id);
+            let additional = candidate.direct_batch_ids.difference(&selected).count();
+            if selected.len().saturating_add(additional) <= selected_limit {
+                selected.extend(candidate.direct_batch_ids.iter().copied());
             }
+        }
+        for id in &self.metadata_batch_ids {
+            if selected.len() >= selected_limit {
+                break;
+            }
+            selected.insert(*id);
         }
         for candidate in ranked.iter().filter(|candidate| !candidate.mandatory) {
             let direct_additional = candidate.direct_batch_ids.difference(&selected).count();
@@ -8277,7 +8276,7 @@ diff --git a/two.rs b/two.rs
     }
 
     #[test]
-    fn deterministic_large_plan_bounds_excess_metadata_and_mandatory_source() {
+    fn deterministic_large_plan_prioritizes_mandatory_source_over_excess_metadata() {
         use std::fmt::Write as _;
 
         let mut source = String::new();
@@ -8308,12 +8307,13 @@ diff --git a/two.rs b/two.rs
 
         assert_eq!(receipt.selected_batch_ids.len(), 5);
         assert!(
-            receipt
+            !receipt
                 .selected_batch_ids
                 .is_subset(&batches.metadata_batch_ids)
         );
         assert_eq!(receipt.entries.len(), 8);
-        assert_eq!(receipt.unreviewed_hunks(), 8);
+        assert!(receipt.direct_hunks() > 0);
+        assert!(receipt.unreviewed_hunks() < 8);
     }
 
     #[test]

@@ -4072,7 +4072,7 @@ async fn oversized_security_hunk_runs_bounded_review_and_fails_closed() {
     use std::fmt::Write as _;
 
     let server = MockServer::start().await;
-    let registration_token = "oversized-security-plan-token";
+    let registration_token = "TEST_FIXTURE_NOT_A_SECRET";
     Mock::given(method("POST"))
         .and(path("/durable-plan"))
         .and(header(
