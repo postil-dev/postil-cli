@@ -152,16 +152,18 @@ fn csv_field(field: String) -> String {
     }
 }
 
-pub fn print_pretty(envelope: &Envelope) {
+pub fn print_pretty(envelope: &Envelope, compact: bool) {
     let color = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     let mut out = String::new();
 
     if envelope.silent {
-        out.push_str(&paint(
-            color,
-            "✓ postil: no merge-relevant findings. Staying silent.\n",
-            Paint::Green,
-        ));
+        if !compact {
+            out.push_str(&paint(
+                color,
+                "✓ postil: no merge-relevant findings. Staying silent.\n",
+                Paint::Green,
+            ));
+        }
     } else {
         if !envelope.summary.is_empty() {
             out.push_str(&format!("{}\n\n", sanitize(&envelope.summary)));
@@ -210,19 +212,21 @@ pub fn print_pretty(envelope: &Envelope) {
             envelope.counts.suppressed
         ));
     }
-    if let Some(coverage) = &envelope.review_coverage {
-        out.push_str(&render_review_coverage(coverage));
+    if !compact {
+        if let Some(coverage) = &envelope.review_coverage {
+            out.push_str(&render_review_coverage(coverage));
+        }
+        out.push_str(&render_repository_search(&envelope.repository_search));
+        let gate = if envelope.gate.failing {
+            paint(color, "gate: failing", Paint::Red)
+        } else {
+            paint(color, "gate: passing", Paint::Green)
+        };
+        out.push_str(&format!(
+            "{gate} (fail-on: {})  model: {}\n",
+            envelope.gate.fail_on, envelope.model_used
+        ));
     }
-    out.push_str(&render_repository_search(&envelope.repository_search));
-    let gate = if envelope.gate.failing {
-        paint(color, "gate: failing", Paint::Red)
-    } else {
-        paint(color, "gate: passing", Paint::Green)
-    };
-    out.push_str(&format!(
-        "{gate} (fail-on: {})  model: {}\n",
-        envelope.gate.fail_on, envelope.model_used
-    ));
     eprint!("{out}");
 }
 

@@ -23,6 +23,8 @@ pub const CREDENTIALS_VERSION: u32 = 3;
 pub const LEGACY_CREDENTIALS_VERSION: u32 = 1;
 pub const LEGACY_REFRESH_CREDENTIALS_VERSION: u32 = 2;
 const PENDING_REVOCATIONS_VERSION: u32 = 1;
+const ALERT_CURSOR_VERSION: u32 = 1;
+const POSTGRES_MAX_SEQUENCE: u64 = i64::MAX as u64;
 // The refresh exchange has separately bounded send and body-read phases. A
 // second local process waits long enough for both before asking the caller to
 // retry, so concurrent agent runs converge on one token rotation.
@@ -77,6 +79,14 @@ pub struct Credentials {
 struct PendingRevocations {
     version: u32,
     revocations: Vec<PendingRevocation>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AlertCursor {
+    version: u32,
+    issuer: String,
+    sequence: u64,
 }
 
 impl Credentials {
@@ -221,11 +231,97 @@ pub fn write_pending(credentials_path: &Path, revocations: &[PendingRevocation])
     )
 }
 
+pub fn read_alert_cursor(credentials_path: &Path, issuer: &str) -> Result<Option<u64>> {
+    let path = alert_cursor_path(credentials_path)?;
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    let cursor: AlertCursor =
+        serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+    anyhow::ensure!(
+        cursor.version == ALERT_CURSOR_VERSION,
+        "unsupported operator alert cursor version {}",
+        cursor.version
+    );
+    anyhow::ensure!(
+        cursor.sequence <= POSTGRES_MAX_SEQUENCE,
+        "operator alert cursor sequence is out of range"
+    );
+    if cursor.issuer != issuer {
+        return Ok(None);
+    }
+    Ok(Some(cursor.sequence))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlertCursorDelivery {
+    Delivered(u64),
+    AlreadyRecorded(u64),
+    SessionChanged,
+}
+
+/// Delivers one alert and advances its cursor while holding the stored-login
+/// lock. Delivery is intentionally at-least-once: a crash after the callback
+/// flushes but before the cursor rename can replay the alert, while advancing
+/// first could silently lose it.
+pub async fn deliver_alert_with_cursor<F>(
+    credentials_path: &Path,
+    issuer: &str,
+    expected_token: &str,
+    sequence: u64,
+    deliver: F,
+) -> Result<AlertCursorDelivery>
+where
+    F: FnOnce() -> Result<()>,
+{
+    anyhow::ensure!(
+        sequence <= POSTGRES_MAX_SEQUENCE,
+        "operator alert cursor sequence is out of range"
+    );
+    let _lock = CredentialLock::acquire(credentials_path).await?;
+    let Some(active) = read(credentials_path)? else {
+        return Ok(AlertCursorDelivery::SessionChanged);
+    };
+    if active.version != CREDENTIALS_VERSION
+        || active.issuer.as_deref() != Some(issuer)
+        || active.token != expected_token
+        || !active.can_refresh()
+    {
+        return Ok(AlertCursorDelivery::SessionChanged);
+    }
+    if let Some(current) = read_alert_cursor(credentials_path, issuer)?
+        && current >= sequence
+    {
+        return Ok(AlertCursorDelivery::AlreadyRecorded(current));
+    }
+    deliver()?;
+    let path = alert_cursor_path(credentials_path)?;
+    write_private_json(
+        &path,
+        &AlertCursor {
+            version: ALERT_CURSOR_VERSION,
+            issuer: issuer.to_string(),
+            sequence,
+        },
+        "operator alert cursor",
+    )?;
+    Ok(AlertCursorDelivery::Delivered(sequence))
+}
+
 fn pending_path(credentials_path: &Path) -> Result<PathBuf> {
     let parent = credentials_path
         .parent()
         .context("credentials path must have a parent directory")?;
     Ok(parent.join("pending-revocations.json"))
+}
+
+fn alert_cursor_path(credentials_path: &Path) -> Result<PathBuf> {
+    let parent = credentials_path
+        .parent()
+        .context("credentials path must have a parent directory")?;
+    Ok(parent.join("operator-alert-cursor.json"))
 }
 
 fn write_private_json<T: Serialize>(path: &Path, value: &T, description: &str) -> Result<()> {
@@ -280,6 +376,29 @@ fn sync_parent_dir(_parent: &Path) -> Result<()> {
 /// exits.
 pub struct CredentialLock {
     _file: File,
+}
+
+/// A singleton lock held for the lifetime of one operator alert watcher.
+pub struct AlertWatchLock {
+    _file: File,
+}
+
+impl AlertWatchLock {
+    pub fn acquire(credentials_path: &Path) -> Result<Self> {
+        let parent = credentials_path
+            .parent()
+            .context("credentials path must have a parent directory")?;
+        create_private_dir(parent)?;
+        let path = parent.join(".operator-alert-watch.lock");
+        let file = open_private_lock_file(&path)?;
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(Self { _file: file }),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                anyhow::bail!("another postil operator alert watcher is already running")
+            }
+            Err(error) => Err(error).context("locking operator alert watcher"),
+        }
+    }
 }
 
 impl CredentialLock {
@@ -582,5 +701,185 @@ mod tests {
         );
         let temp_name = format!(".pending-revocations.json.{}.tmp", std::process::id());
         assert!(!pending_path.parent().unwrap().join(temp_name).exists());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn operator_alert_cursor_is_private_atomic_monotonic_and_issuer_bound() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let credentials_path = dir.path().join("postil").join("credentials.json");
+        let stored = sample("2999-01-01T00:00:00.000Z");
+        let token = stored.token.clone();
+        write(&credentials_path, &stored).unwrap();
+        let deliveries = std::cell::Cell::new(0_u32);
+        assert_eq!(
+            deliver_alert_with_cursor(&credentials_path, "https://postil.dev", &token, 41, || {
+                deliveries.set(deliveries.get() + 1);
+                Ok(())
+            })
+            .await
+            .unwrap(),
+            AlertCursorDelivery::Delivered(41)
+        );
+        assert_eq!(
+            deliver_alert_with_cursor(&credentials_path, "https://postil.dev", &token, 42, || {
+                deliveries.set(deliveries.get() + 1);
+                Ok(())
+            })
+            .await
+            .unwrap(),
+            AlertCursorDelivery::Delivered(42)
+        );
+        assert_eq!(
+            deliver_alert_with_cursor(&credentials_path, "https://postil.dev", &token, 40, || {
+                deliveries.set(deliveries.get() + 1);
+                Ok(())
+            })
+            .await
+            .unwrap(),
+            AlertCursorDelivery::AlreadyRecorded(42)
+        );
+        assert_eq!(
+            deliver_alert_with_cursor(
+                &credentials_path,
+                "https://other.example.test",
+                &token,
+                43,
+                || {
+                    deliveries.set(deliveries.get() + 1);
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap(),
+            AlertCursorDelivery::SessionChanged
+        );
+        let mut replacement = stored.clone();
+        replacement.token = "pcli_replacement-access-not-a-real-secret".to_string();
+        write(&credentials_path, &replacement).unwrap();
+        assert_eq!(
+            deliver_alert_with_cursor(&credentials_path, "https://postil.dev", &token, 43, || {
+                deliveries.set(deliveries.get() + 1);
+                Ok(())
+            })
+            .await
+            .unwrap(),
+            AlertCursorDelivery::SessionChanged
+        );
+        assert_eq!(deliveries.get(), 2);
+
+        assert_eq!(
+            read_alert_cursor(&credentials_path, "https://postil.dev").unwrap(),
+            Some(42)
+        );
+        assert_eq!(
+            read_alert_cursor(&credentials_path, "https://other.example.test").unwrap(),
+            None
+        );
+        let cursor_path = credentials_path
+            .parent()
+            .unwrap()
+            .join("operator-alert-cursor.json");
+        let mode = fs::metadata(&cursor_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let temp_name = format!(".operator-alert-cursor.json.{}.tmp", std::process::id());
+        assert!(!cursor_path.parent().unwrap().join(temp_name).exists());
+    }
+
+    #[tokio::test]
+    async fn operator_alert_cursor_rejects_out_of_range_sequences() {
+        let dir = tempfile::tempdir().unwrap();
+        let credentials_path = dir.path().join("postil").join("credentials.json");
+        assert!(
+            deliver_alert_with_cursor(
+                &credentials_path,
+                "https://postil.dev",
+                "unused",
+                i64::MAX as u64 + 1,
+                || Ok(())
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_alert_cursor_compares_and_writes_while_holding_the_login_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let credentials_path = dir.path().join("postil").join("credentials.json");
+        let stored = sample("2999-01-01T00:00:00.000Z");
+        let token = stored.token.clone();
+        write(&credentials_path, &stored).unwrap();
+        deliver_alert_with_cursor(&credentials_path, "https://postil.dev", &token, 41, || {
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let held_lock = CredentialLock::acquire(&credentials_path).await.unwrap();
+        let waiting_path = credentials_path.clone();
+        let waiting_token = token.clone();
+        let deliveries = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let waiting_deliveries = deliveries.clone();
+        let waiting_write = tokio::spawn(async move {
+            deliver_alert_with_cursor(
+                &waiting_path,
+                "https://postil.dev",
+                &waiting_token,
+                42,
+                move || {
+                    waiting_deliveries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Ok(())
+                },
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+        assert!(!waiting_write.is_finished());
+
+        write_private_json(
+            &alert_cursor_path(&credentials_path).unwrap(),
+            &AlertCursor {
+                version: ALERT_CURSOR_VERSION,
+                issuer: "https://postil.dev".to_string(),
+                sequence: 43,
+            },
+            "operator alert cursor",
+        )
+        .unwrap();
+        drop(held_lock);
+        assert_eq!(
+            waiting_write.await.unwrap().unwrap(),
+            AlertCursorDelivery::AlreadyRecorded(43)
+        );
+        assert_eq!(deliveries.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        assert_eq!(
+            read_alert_cursor(&credentials_path, "https://postil.dev").unwrap(),
+            Some(43)
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn operator_alert_watcher_lock_is_private_and_singleton() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let credentials_path = dir.path().join("postil").join("credentials.json");
+        let first = AlertWatchLock::acquire(&credentials_path).unwrap();
+        assert!(AlertWatchLock::acquire(&credentials_path).is_err());
+        let path = credentials_path
+            .parent()
+            .unwrap()
+            .join(".operator-alert-watch.lock");
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(first);
+        AlertWatchLock::acquire(&credentials_path).unwrap();
     }
 }

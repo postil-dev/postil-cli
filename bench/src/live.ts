@@ -14,7 +14,7 @@
 // so no GitHub server, mock or real, is needed. MODEL_API_KEY, LLM_API_KEY,
 // OPENROUTER_API_KEY, or POSTIL_API_KEY is required and is read from the
 // caller's environment; it is never logged or printed.
-// REVIEW_MODEL or --model is required.
+// The shipped default model is used unless REVIEW_MODEL or --model overrides it.
 //
 // Scoring uses fixture ground truth: a defect counts as detected when a finding
 // matches the authored ground-truth region; severity match is tracked
@@ -28,11 +28,11 @@
 import { execFile as execFileCb } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { API_KEY_ENV_NAMES_TEXT, forwardApiKey, resolveApiKeyName } from "./api-key";
 import { benchmarkCase, type BenchmarkCaseInput, envelopeV1, type Envelope } from "./harness";
+import evaluatorContractSourcePaths from "../evaluator-contract-sources.json";
 import {
   formatCanonicalDecimal,
   parseCanonicalDecimal,
@@ -41,6 +41,7 @@ import {
   sumCanonicalDecimals,
   type ProviderContractEvidence,
 } from "./livemodels-score";
+import { startManagedRequestWindowProxy } from "./request-window";
 
 const execFile = promisify(execFileCb);
 export const ADMISSION_API_BASE = "https://openrouter.ai:443/api/v1";
@@ -208,6 +209,7 @@ export interface LiveSummary {
   totalTokens: { prompt: number; completion: number; total: number };
   observedProviderCostUsdDecimal: string;
   costAccountingComplete: boolean;
+  providerGenerationIds: string[];
   errors: number;
 }
 
@@ -239,66 +241,81 @@ export async function runLive(
   const timeoutOverrides = resolveLiveTimeoutOverrides(options.timeoutMs);
   const cases = inputs.map((input) => benchmarkCase.parse(input));
   const provider = liveProvider();
-  const screeningProfile = options.screenProfilePath === undefined
-    ? null
-    : await screeningProfileMetadata(options.screenProfilePath);
-  await assertBinary(options.binary);
-  const binarySha256 = createHash("sha256")
-    .update(await readFile(options.binary))
-    .digest("hex");
-  const fixtureCorpusSha256 = createHash("sha256")
-    .update(JSON.stringify(cases))
-    .digest("hex");
-  const evaluatorSha256 = await evaluatorSourceSha256();
+  const providerGenerationIds: string[] = [];
+  let requestProxy: ReturnType<typeof startManagedRequestWindowProxy> | undefined;
+  try {
+    requestProxy = provider.identity === "openrouter:managed-routing"
+      ? startManagedRequestWindowProxy(provider.apiBase, {
+          requireGenerationId: true,
+          onGenerationId: (generationId) => providerGenerationIds.push(generationId),
+        })
+      : undefined;
+    const screeningProfile = options.screenProfilePath === undefined
+      ? null
+      : await screeningProfileMetadata(options.screenProfilePath);
+    await assertBinary(options.binary);
+    const binarySha256 = createHash("sha256")
+      .update(await readFile(options.binary))
+      .digest("hex");
+    const fixtureCorpusSha256 = createHash("sha256")
+      .update(JSON.stringify(cases))
+      .digest("hex");
+    const evaluatorSha256 = await evaluatorSourceSha256();
 
-  const rootDir = options.rootDir ?? resolve(import.meta.dir, "..", ".runs");
-  const runRoot = await reserveLiveRunRoot(rootDir, options.runId);
-  await writeLiveRunContract(runRoot, options, timeoutOverrides);
+    const rootDir = options.rootDir ?? resolve(import.meta.dir, "..", ".runs");
+    const runRoot = await reserveLiveRunRoot(rootDir, options.runId);
+    await writeLiveRunContract(runRoot, options, timeoutOverrides);
 
-  // Bounded worker pool: a small fixed number of workers pull case indices off a
-  // shared cursor until the queue drains. Each case writes its result into the
-  // slot for its original index, so completion order never affects the report.
-  const results = new Array<LiveCaseResult>(cases.length);
-  const concurrency = Math.max(1, Math.min(options.concurrency ?? DEFAULT_LIVE_CONCURRENCY, cases.length || 1));
-  let cursor = 0;
-  const worker = async (): Promise<void> => {
-    for (;;) {
-      const index = cursor++;
-      if (index >= cases.length) return;
-      results[index] = await runLiveCaseWithRetry(
-        cases[index]!,
-        index,
-        runRoot,
+    // Bounded worker pool: a small fixed number of workers pull case indices off a
+    // shared cursor until the queue drains. Each case writes its result into the
+    // slot for its original index, so completion order never affects the report.
+    const results = new Array<LiveCaseResult>(cases.length);
+    const concurrency = Math.max(1, Math.min(options.concurrency ?? DEFAULT_LIVE_CONCURRENCY, cases.length || 1));
+    let cursor = 0;
+    const worker = async (): Promise<void> => {
+      for (;;) {
+        const index = cursor++;
+        if (index >= cases.length) return;
+        results[index] = await runLiveCaseWithRetry(
+          cases[index]!,
+          index,
+          runRoot,
+          options,
+          timeoutOverrides,
+          provider,
+          requestProxy?.apiBase,
+        );
+      }
+    };
+    await Promise.all(Array.from({ length: concurrency }, () => worker()));
+
+    // Results are already index-aligned; sorting by case index is belt-and-braces
+    // so the written report is deterministically ordered regardless of the pool.
+    // Strip the internal `stderr` field so the persisted report schema is intact.
+    const ordered = results
+      .map((result, index) => ({ result, index }))
+      .sort((a, b) => a.index - b.index)
+      .map(({ result }) => {
+        const { stderr: _stderr, ...rest } = result;
+        return rest;
+      });
+    return {
+      summary: summarize(
+        ordered,
         options,
+        binarySha256,
+        fixtureCorpusSha256,
+        evaluatorSha256,
+        provider,
+        screeningProfile,
         timeoutOverrides,
-      );
-    }
-  };
-  await Promise.all(Array.from({ length: concurrency }, () => worker()));
-
-  // Results are already index-aligned; sorting by case index is belt-and-braces
-  // so the written report is deterministically ordered regardless of the pool.
-  // Strip the internal `stderr` field so the persisted report schema is intact.
-  const ordered = results
-    .map((result, index) => ({ result, index }))
-    .sort((a, b) => a.index - b.index)
-    .map(({ result }) => {
-      const { stderr: _stderr, ...rest } = result;
-      return rest;
-    });
-  return {
-    summary: summarize(
-      ordered,
-      options,
-      binarySha256,
-      fixtureCorpusSha256,
-      evaluatorSha256,
-      provider,
-      screeningProfile,
-      timeoutOverrides,
-    ),
-    results: ordered,
-  };
+        providerGenerationIds,
+      ),
+      results: ordered,
+    };
+  } finally {
+    requestProxy?.stop();
+  }
 }
 
 const CANONICAL_POSITIVE_SECONDS = /^[1-9][0-9]*$/u;
@@ -444,19 +461,23 @@ export async function screeningProfileMetadata(path: string): Promise<{
 }
 
 export async function evaluatorSourceSha256(): Promise<string> {
-  const benchRoot = resolve(fileURLToPath(import.meta.url), "..", "..");
-  const sources = [
-    "fixtures/cases.ts",
-    "src/api-key.ts",
-    "src/harness.ts",
-    "src/live.ts",
-    "src/livemodels-score.ts",
-  ];
+  const repositoryRoot = resolve(import.meta.dir, "..", "..");
+  const sources = evaluatorContractSourcePaths as readonly unknown[];
+  if (sources.length === 0 || sources.some((source) => typeof source !== "string" || source.length === 0)) {
+    throw new Error("evaluator contract source list must contain nonempty repository-relative paths");
+  }
   const hash = createHash("sha256");
   for (const source of sources) {
-    hash.update(`${source}\0`);
-    hash.update(await readFile(join(benchRoot, source)));
-    hash.update("\0");
+    const path = source as string;
+    const absolutePath = resolve(repositoryRoot, path);
+    const relativePath = relative(repositoryRoot, absolutePath);
+    if (relativePath === "" || relativePath === ".." || relativePath.startsWith(`..${sep}`)) {
+      throw new Error(`evaluator contract source is outside the repository: ${path}`);
+    }
+    hash.update(path, "utf8");
+    hash.update(Buffer.from([0]));
+    hash.update(await readFile(absolutePath));
+    hash.update(Buffer.from([0]));
   }
   return hash.digest("hex");
 }
@@ -475,11 +496,22 @@ async function runLiveCaseWithRetry(
   runRoot: string,
   options: LiveOptions,
   timeoutOverrides: LiveTimeoutOverrides,
+  provider: LiveProvider,
+  captureApiBase: string | undefined,
 ): Promise<LiveCaseResult> {
   const maxRetries = options.retries ?? DEFAULT_LIVE_RETRIES;
   let last: LiveCaseResult | undefined;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    last = await runLiveCase(c, index, attempt + 1, runRoot, options, timeoutOverrides);
+    last = await runLiveCase(
+      c,
+      index,
+      attempt + 1,
+      runRoot,
+      options,
+      timeoutOverrides,
+      provider,
+      captureApiBase,
+    );
     // Scored => a valid envelope was produced; that is a normal result (even if
     // it has findings or false positives), so never retry it.
     if (last.scored) return last;
@@ -584,6 +616,8 @@ async function runLiveCase(
   runRoot: string,
   options: LiveOptions,
   timeoutOverrides: LiveTimeoutOverrides,
+  provider: LiveProvider,
+  captureApiBase: string | undefined,
 ): Promise<LiveCaseResult> {
   const truth = groundTruthOf(c);
   const base: LiveCaseResult = {
@@ -633,8 +667,9 @@ async function runLiveCase(
           options.screenProfilePath,
           homeDir,
           tmpDir,
-          liveProvider(),
+          provider,
           timeoutOverrides,
+          captureApiBase,
         ),
         timeout: timeoutOverrides.caseProcessMilliseconds,
         maxBuffer: 8 * 1024 * 1024,
@@ -769,7 +804,7 @@ export function scorerOperationalFailure(
   return null;
 }
 
-interface LiveProvider {
+export interface LiveProvider {
   identity: "openrouter:managed-routing" | "custom";
   apiBase: string;
   apiFormat: string;
@@ -784,7 +819,7 @@ function liveProvider(): LiveProvider {
   };
 }
 
-function liveEnv(
+export function liveEnv(
   model: string,
   scorerModel: string | undefined,
   screenProfilePath: string | undefined,
@@ -792,6 +827,7 @@ function liveEnv(
   tmpDir: string,
   provider: LiveProvider,
   timeoutOverrides: LiveTimeoutOverrides,
+  captureApiBase?: string,
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     PATH: process.env.PATH,
@@ -821,6 +857,12 @@ function liveEnv(
       : {
           POSTIL_BENCH_SCREEN_PROFILE: resolve(screenProfilePath),
           POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY: "1",
+          ...(captureApiBase === undefined
+            ? {}
+            : {
+                POSTIL_QUALIFICATION_CAPTURE_API_BASE: captureApiBase,
+                POSTIL_ALLOW_PRIVATE_API_BASE: "1",
+              }),
         }),
   };
   forwardApiKey(env);
@@ -955,6 +997,7 @@ function summarize(
     providerContract: ProviderContractEvidence;
   } | null,
   timeoutOverrides: LiveTimeoutOverrides,
+  providerGenerationIds: string[],
 ): LiveSummary {
   const defects = results.filter((r) => r.type === "defect");
   const cleans = results.filter((r) => r.type === "clean");
@@ -1034,6 +1077,7 @@ function summarize(
     },
     observedProviderCostUsdDecimal: formatCanonicalDecimal(observedProviderCost),
     costAccountingComplete: liveCostAccountingComplete(results),
+    providerGenerationIds,
     errors: results.filter((r) => r.error !== undefined).length,
   };
 }

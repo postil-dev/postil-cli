@@ -1,6 +1,7 @@
 //! Postil review engine. See README for the product doctrine.
 
 pub(crate) mod adjudication;
+pub mod alerts;
 pub(crate) mod api_key;
 #[cfg(feature = "qualification-candidate")]
 pub mod attribution;

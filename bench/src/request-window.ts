@@ -12,6 +12,8 @@ export interface RequestWindowOptions {
   retryAfterCapMs?: number;
   now?: Clock;
   sleep?: Sleep;
+  requireGenerationId?: boolean;
+  onGenerationId?: (generationId: string) => void;
 }
 
 /**
@@ -161,6 +163,18 @@ export function startManagedRequestWindowProxy(
         return Response.json({ error: "managed provider request failed" }, { status: 502 });
       }
       await governor.observeRetryAfter(response.headers.get("retry-after"));
+      if (response.ok) {
+        const generationId = response.headers.get("x-generation-id")?.trim();
+        if (options.requireGenerationId === true &&
+            (generationId === undefined || !/^gen-[A-Za-z0-9_-]+$/u.test(generationId))) {
+          return Response.json({ error: "managed provider response omitted its generation identity" }, {
+            status: 502,
+          });
+        }
+        if (generationId !== undefined && /^gen-[A-Za-z0-9_-]+$/u.test(generationId)) {
+          options.onGenerationId?.(generationId);
+        }
+      }
       return new Response(response.body, {
         status: response.status,
         headers: selectedHeaders(response.headers, [
@@ -168,6 +182,7 @@ export function startManagedRequestWindowProxy(
           "retry-after",
           "x-request-id",
           "x-openrouter-request-id",
+          "x-generation-id",
         ]),
       });
     },
@@ -183,8 +198,9 @@ export function startManagedRequestWindowProxy(
 export async function withManagedRequestWindowProxy<T>(
   upstreamApiBase: string,
   work: (proxy: ManagedRequestWindowProxy) => Promise<T>,
+  options: RequestWindowOptions & { fetchImpl?: typeof fetch } = {},
 ): Promise<T> {
-  const proxy = startManagedRequestWindowProxy(upstreamApiBase);
+  const proxy = startManagedRequestWindowProxy(upstreamApiBase, options);
   try {
     return await work(proxy);
   } finally {

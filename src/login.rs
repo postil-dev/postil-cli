@@ -6,6 +6,7 @@
 //! when no explicit key environment variable is set, so a first-time user gets
 //! working hosted inference with zero configuration.
 
+use std::fmt;
 use std::path::Path;
 use std::time::Duration;
 
@@ -15,7 +16,7 @@ use serde::de::DeserializeOwned;
 
 use crate::config::normalize_api_base;
 use crate::credentials::{self, Credentials, PendingRevocation};
-use crate::llm::secure_http_client;
+use crate::llm::secure_http_client_async;
 
 /// Overrides the Postil web app the device-flow calls target. Distinct from
 /// `POSTIL_API_BASE`, which (once a token is in hand) points at the
@@ -32,6 +33,37 @@ const ACCESS_REFRESH_MARGIN: Duration = Duration::from_secs(5 * 60);
 const REFRESH_RESPONSE_MAX_BYTES: usize = 16 * 1024;
 const REFRESH_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const REVOCATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+#[derive(Debug)]
+enum TransientRefreshError {
+    Retry,
+    RetryAfter(u64),
+}
+
+impl fmt::Display for TransientRefreshError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Retry => {
+                formatter.write_str("could not refresh the stored postil login; try again")
+            }
+            Self::RetryAfter(seconds) => write!(
+                formatter,
+                "could not refresh the stored postil login; retry after {seconds} seconds"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TransientRefreshError {}
+
+pub(crate) fn token_resolution_retry_delay(error: &anyhow::Error) -> Option<Duration> {
+    error
+        .downcast_ref::<TransientRefreshError>()
+        .map(|error| match error {
+            TransientRefreshError::Retry => Duration::ZERO,
+            TransientRefreshError::RetryAfter(seconds) => Duration::from_secs(*seconds),
+        })
+}
 
 fn canonicalize_issuer(value: &str) -> Result<String> {
     anyhow::ensure!(
@@ -76,7 +108,7 @@ fn login_server() -> Result<String> {
     login_server_override()?.map_or_else(|| canonicalize_issuer(DEFAULT_LOGIN_SERVER), Ok)
 }
 
-fn stored_issuer(credentials: &Credentials) -> Result<String> {
+pub(crate) fn stored_issuer(credentials: &Credentials) -> Result<String> {
     if let Some(issuer) = credentials.issuer.as_deref() {
         return canonicalize_issuer(issuer)
             .context("the stored login issuer is invalid; run `postil login` again");
@@ -128,7 +160,9 @@ fn require_matching_api_base(credentials: &Credentials, resolved_api_base: &str)
 
 pub async fn run_login(org: Option<String>) -> Result<i32> {
     let server = login_server()?;
-    let client = secure_http_client(&server).context("building the postil login HTTP client")?;
+    let client = secure_http_client_async(&server)
+        .await
+        .context("building the postil login HTTP client")?;
     let path = credentials::default_path()?;
     login_with(&client, &server, org.as_deref(), &path).await
 }
@@ -151,7 +185,7 @@ enum ClientMode<'a> {
 }
 
 impl ClientMode<'_> {
-    fn for_issuer(self, issuer: &str) -> Result<reqwest::Client> {
+    async fn for_issuer(self, issuer: &str) -> Result<reqwest::Client> {
         match self {
             #[cfg(test)]
             Self::Provided(client) => Ok(client.clone()),
@@ -159,7 +193,8 @@ impl ClientMode<'_> {
                 client,
                 issuer: client_issuer,
             } if client_issuer == issuer => Ok(client.clone()),
-            Self::Secure | Self::Reuse { .. } => secure_http_client(issuer)
+            Self::Secure | Self::Reuse { .. } => secure_http_client_async(issuer)
+                .await
                 .context("building an HTTP client for stored login issuer"),
         }
     }
@@ -464,6 +499,45 @@ pub(crate) async fn resolve_stored_token(
     result
 }
 
+#[derive(Debug)]
+pub(crate) struct StoredAlertSession {
+    pub issuer: String,
+    pub token: String,
+}
+
+/// Returns an issuer and renewable access token from one coherent stored-login
+/// generation. A concurrent login replacement retries instead of pairing the
+/// replacement token with the prior issuer.
+pub(crate) async fn resolve_stored_alert_session(
+    credentials_path: &Path,
+) -> Result<Option<StoredAlertSession>> {
+    for _ in 0..3 {
+        let Some(snapshot) = credentials::read(credentials_path)? else {
+            return Ok(None);
+        };
+        let Some(token) = resolve_stored_token(credentials_path, &snapshot.api_base).await? else {
+            return Ok(None);
+        };
+        let Some(current) = credentials::read(credentials_path)? else {
+            continue;
+        };
+        if current.api_base != snapshot.api_base || current.token != token {
+            continue;
+        }
+        anyhow::ensure!(
+            current.version == credentials::CREDENTIALS_VERSION
+                && current.issuer.is_some()
+                && current.can_refresh(),
+            "operator alert notifications require a renewable login; run `postil login` again"
+        );
+        return Ok(Some(StoredAlertSession {
+            issuer: stored_issuer(&current)?,
+            token,
+        }));
+    }
+    anyhow::bail!("the stored postil login changed while connecting; try again")
+}
+
 #[cfg(test)]
 async fn resolve_stored_token_with(
     client: &reqwest::Client,
@@ -522,7 +596,7 @@ async fn resolve_stored_token_with_mode(
         anyhow::bail!("the stored postil login credential expired; run `postil login` again");
     };
 
-    let client = client_mode.for_issuer(&issuer)?;
+    let client = client_mode.for_issuer(&issuer).await?;
     let refreshed = refresh_token_with(&client, &issuer, refresh_token).await?;
     let replacement = Credentials {
         version: credentials::CREDENTIALS_VERSION,
@@ -626,7 +700,7 @@ async fn revoke(client_mode: ClientMode<'_>, revocation: &PendingRevocation) -> 
     let Ok(issuer) = canonicalize_issuer(&revocation.issuer) else {
         return false;
     };
-    let Ok(client) = client_mode.for_issuer(&issuer) else {
+    let Ok(client) = client_mode.for_issuer(&issuer).await else {
         return false;
     };
     let logout_url = format!("{issuer}/api/cli/logout");
@@ -733,8 +807,8 @@ async fn refresh_token_with(
             .send(),
     )
     .await
-    .map_err(|_| anyhow!("could not refresh the stored postil login; try again"))?
-    .map_err(|_| anyhow!("could not refresh the stored postil login; try again"))?;
+    .map_err(|_| TransientRefreshError::Retry)?
+    .map_err(|_| TransientRefreshError::Retry)?;
     let status = response.status();
     if status.as_u16() == 429 {
         if let Some(retry_after) = response
@@ -747,14 +821,17 @@ async fn refresh_token_with(
                     && value.parse::<u64>().is_ok()
             })
         {
-            anyhow::bail!(
-                "could not refresh the stored postil login; retry after {retry_after} seconds"
-            );
+            return Err(TransientRefreshError::RetryAfter(
+                retry_after
+                    .parse()
+                    .expect("numeric Retry-After was validated above"),
+            )
+            .into());
         }
-        anyhow::bail!("could not refresh the stored postil login; try again");
+        return Err(TransientRefreshError::Retry.into());
     }
     if status.is_server_error() || status.as_u16() == 408 {
-        anyhow::bail!("could not refresh the stored postil login; try again");
+        return Err(TransientRefreshError::Retry.into());
     }
     if !status.is_success() {
         anyhow::bail!("the stored postil login can no longer be renewed; run `postil login` again");
@@ -765,7 +842,7 @@ async fn refresh_token_with(
             anyhow::bail!("the postil refresh response was invalid; run `postil login` again")
         }
         Ok(Err(RefreshResponseError::Transport)) | Err(_) => {
-            anyhow::bail!("could not refresh the stored postil login; try again")
+            Err(TransientRefreshError::Retry.into())
         }
     }
 }
@@ -1441,6 +1518,38 @@ mod tests {
         credentials
     }
 
+    #[tokio::test]
+    async fn alert_session_returns_one_renewable_issuer_token_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let credentials_path = dir.path().join("postil").join("credentials.json");
+        let stored = stored_credentials("2999-01-01T00:00:00.000Z");
+        credentials::write(&credentials_path, &stored).unwrap();
+
+        let session = resolve_stored_alert_session(&credentials_path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.issuer, DEFAULT_LOGIN_SERVER);
+        assert_eq!(session.token, stored.token);
+    }
+
+    #[tokio::test]
+    async fn alert_session_rejects_an_access_only_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let credentials_path = dir.path().join("postil").join("credentials.json");
+        let mut stored = stored_credentials("2999-01-01T00:00:00.000Z");
+        stored.version = credentials::LEGACY_CREDENTIALS_VERSION;
+        stored.issuer = None;
+        stored.refresh_token = None;
+        stored.refresh_expires_at = None;
+        credentials::write(&credentials_path, &stored).unwrap();
+
+        let error = resolve_stored_alert_session(&credentials_path)
+            .await
+            .expect_err("operator notifications require renewable credentials");
+        assert!(error.to_string().contains("renewable login"));
+    }
+
     fn write_legacy_credentials(path: &Path, credentials: &Credentials) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, serde_json::to_string(credentials).unwrap()).unwrap();
@@ -1586,6 +1695,7 @@ mod tests {
                 .await
                 .expect_err("a failed refresh must fail closed");
         assert!(error.to_string().contains("try again"));
+        assert_eq!(token_resolution_retry_delay(&error), Some(Duration::ZERO));
         assert_eq!(
             credentials::read(&credentials_path).unwrap().unwrap(),
             original
@@ -1637,6 +1747,7 @@ mod tests {
                 .await
                 .expect_err("a replayed refresh token must require login");
         assert!(error.to_string().contains("postil login"));
+        assert_eq!(token_resolution_retry_delay(&error), None);
         assert!(!error.to_string().contains("refresh replay details"));
         assert_eq!(
             credentials::read(&credentials_path).unwrap().unwrap(),
@@ -1887,6 +1998,10 @@ mod tests {
         assert!(error.to_string().contains("retry after 3527 seconds"));
         assert!(!error.to_string().contains("run `postil login` again"));
         assert_eq!(
+            token_resolution_retry_delay(&error),
+            Some(Duration::from_secs(3527))
+        );
+        assert_eq!(
             credentials::read(&credentials_path).unwrap().unwrap(),
             original
         );
@@ -1919,6 +2034,7 @@ mod tests {
             .await
             .expect_err("an unusable Retry-After must fail safely");
             assert!(error.to_string().contains("try again"));
+            assert_eq!(token_resolution_retry_delay(&error), Some(Duration::ZERO));
             assert!(!error.to_string().contains("retry after"));
             assert_eq!(
                 credentials::read(&credentials_path).unwrap().unwrap(),

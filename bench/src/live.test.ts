@@ -10,6 +10,7 @@ import {
   envelopeOperationalFailure,
   exactProviderCost,
   liveCostAccountingComplete,
+  liveEnv,
   liveReviewArguments,
   runLive,
   resolveLiveTimeoutOverrides,
@@ -50,6 +51,30 @@ async function onlyCaseAttempt(runRoot: string): Promise<string> {
 }
 
 describe("live benchmark review mode", () => {
+  test("opts the managed generation capture proxy into loopback transport", () => {
+    const env = liveEnv(
+      "openai/gpt-5.6-luna",
+      undefined,
+      "/tmp/screen-profile.json",
+      "/tmp/home",
+      "/tmp/runtime",
+      {
+        identity: "openrouter:managed-routing",
+        apiBase: "https://openrouter.ai/api/v1",
+        apiFormat: "openai-compatible",
+      },
+      {
+        requestSeconds: null,
+        totalSeconds: null,
+        caseProcessMilliseconds: 1_000,
+      },
+      "http://127.0.0.1:4321/api/v1",
+    );
+
+    expect(env.POSTIL_QUALIFICATION_CAPTURE_API_BASE).toBe("http://127.0.0.1:4321/api/v1");
+    expect(env.POSTIL_ALLOW_PRIVATE_API_BASE).toBe("1");
+  });
+
   test("reports why an authored target was suppressed", () => {
     const truth = {
       clean: false,

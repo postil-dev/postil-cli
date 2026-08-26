@@ -65,6 +65,7 @@ import {
   type LiveModelCaseResult,
   type QualificationPair,
 } from "./livemodels-score";
+import { evaluatorSourceSha256 } from "./live";
 
 const pair: QualificationPair = { generatorModel: "test/generator", scorerModel: "test/scorer" };
 
@@ -1362,8 +1363,40 @@ describe("managed admission workflow", () => {
     const release = await Bun.file(
       resolve(import.meta.dir, "..", "..", ".github", "workflows", "release.yml"),
     ).text();
-    expect(release).toMatch(/validate-tag:\n[\s\S]*?fetch-depth: 0[\s\S]*?bun-version: 1\.3\.14[\s\S]*?bun install --frozen-lockfile[\s\S]*?bun run verify-admission[\s\S]*?\n  bench-live:\n/u);
-    expect(release).toMatch(/bench-live:\n\s+needs: validate-tag\n/u);
+    const calibration = await Bun.file(
+      resolve(import.meta.dir, "..", "..", ".github", "workflows", "benchmark-calibration.yml"),
+    ).text();
+    expect(calibration).toContain("name: Reserve the current main calibration source");
+    expect(calibration).toContain('refs/tags/postil-calibration-${GITHUB_SHA}');
+    expect(calibration).not.toContain("actions/workflows/benchmark-calibration.yml/runs");
+    expect(calibration).toContain("max-parallel: 1");
+    expect(calibration).toContain("--mode reserve");
+    expect(calibration).toContain("name: Attest benchmark sample reservation");
+    expect(calibration).toContain("--mode execute");
+    expect(calibration).toContain("name: Attest benchmark sample result");
+    expect(calibration).toContain("name: Record the attested baseline");
+    expect(calibration).toContain("name: Attest the populated baseline");
+    expect(calibration).toContain("name: Verify independent calibration generations");
+    expect(calibration).toContain("bun run bench:verify-generations --");
+    expect(calibration).toContain("--record");
+    expect(release).not.toContain("workflow_dispatch");
+    expect(release).toContain("name: Require the unique first release run for this tag");
+    expect(release).toContain('if [[ "${GITHUB_RUN_ATTEMPT}" != "1" ]]');
+    expect(release).toContain('"repos/${GITHUB_REPOSITORY}/actions/workflows/release.yml/runs"');
+    expect(release).toContain("This version tag already has another release run.");
+    expect(release).toContain("group: release-${{ github.ref_name }}");
+    expect(release).toContain('gh release view "${GITHUB_REF_NAME}"');
+    expect(release).toContain("name: Verify the attested Luna calibration baseline");
+    expect(release).toContain("bench/baseline.attestation.json");
+    expect(release).toContain('git/ref/tags/postil-calibration-${source_sha}');
+    expect(release).toContain(
+      "--signer-workflow postil-dev/postil-cli/.github/workflows/benchmark-calibration.yml",
+    );
+    expect(release).toContain('--signer-digest "$source_sha"');
+    expect(release).toContain('--source-digest "$source_sha"');
+    expect(release).toContain("--source-ref refs/heads/main");
+    expect(release).toMatch(/validate-tag:\n[\s\S]*?permissions:\n\s+contents: read\n\s+actions: read/u);
+    expect(release).toMatch(/validate-tag:\n[\s\S]*?fetch-depth: 0[\s\S]*?bun-version: 1\.3\.14[\s\S]*?bun install --frozen-lockfile[\s\S]*?bun run verify-admission[\s\S]*?name: Verify the attested Luna calibration baseline[\s\S]*?\n  bench-live-prepare:\n/u);
     // The gate derives its model from the binary's embedded configuration so
     // caller drift cannot benchmark a model absent from the release.
     expect(release).not.toContain("REVIEW_MODEL:");
@@ -1380,40 +1413,114 @@ describe("managed admission workflow", () => {
       /name: Upload the scorer gate report\n\s+if: always\(\)[\s\S]*if-no-files-found: warn[\s\S]*retention-days: 30/u,
     );
     expect(release.indexOf("bun run scorer-eval --json-out")).toBeLessThan(
-      release.indexOf("bun run bench:live --"),
+      release.indexOf("bun run bench:cohort-run --"),
     );
-    expect([...release.matchAll(/bun run bench:live --/gu)]).toHaveLength(3);
-    for (const sample of [1, 2, 3]) {
-      expect(release).toContain(`name: Run diff-file live benchmark sample ${sample}`);
-      expect(release).toContain(`id: live-sample-${sample}`);
-      expect(release).toContain(`--run-id "release-\${{ github.ref_name }}-sample-${sample}"`);
-      expect(release).toContain(
-        `--expected-run-id "release-\${{ github.ref_name }}-sample-${sample}"`,
+    const prepareStart = release.indexOf("\n  bench-live-prepare:\n");
+    const sampleStart = release.indexOf("\n  bench-live-sample:\n");
+    const finalStart = release.indexOf("\n  bench-live:\n");
+    const buildStart = release.indexOf("\n  build:\n");
+    expect(prepareStart).toBeGreaterThan(-1);
+    expect(sampleStart).toBeGreaterThan(prepareStart);
+    expect(finalStart).toBeGreaterThan(sampleStart);
+    expect(buildStart).toBeGreaterThan(finalStart);
+    const prepare = release.slice(prepareStart, sampleStart);
+    const sample = release.slice(sampleStart, finalStart);
+    const final = release.slice(finalStart, buildStart);
+    const build = release.slice(buildStart);
+
+    expect(prepare).toMatch(/bench-live-prepare:\n\s+needs: validate-tag\n/u);
+    expect(prepare).toContain("name: benchmarked-x86_64-unknown-linux-gnu-${{ github.run_attempt }}");
+    expect(prepare).toContain("path: target/release/postil");
+    expect(prepare).toContain("bun run bench:cohort-create --");
+    expect(prepare).toContain("--purpose release");
+    expect(prepare).toContain("--out \"${{ runner.temp }}/bench-live-cohort.json\"");
+    expect(prepare).toContain("uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4");
+    expect(prepare).toContain("id-token: write");
+    expect(prepare).toContain("attestations: write");
+    expect(prepare).toContain("artifact-metadata: write");
+    expect(prepare).toContain("bench-live-cohort.attestation.json");
+    expect(prepare).toContain("name: bench-live-cohort-${{ github.run_attempt }}");
+
+    expect(sample).toMatch(
+      /bench-live-sample:\n\s+needs: \[validate-tag, bench-live-prepare\][\s\S]*?strategy:\n\s+fail-fast: false\n\s+max-parallel: 1\n\s+matrix:\n\s+sample: \[1, 2, 3, 4, 5\]/u,
+    );
+    expect(sample).toContain("name: benchmarked-x86_64-unknown-linux-gnu-${{ github.run_attempt }}");
+    expect(sample).toContain("path: target/release");
+    expect(sample).toContain("chmod 0755 target/release/postil");
+    expect(sample).toContain(
+      "POSTIL_BIN: ${{ github.workspace }}/target/release/postil",
+    );
+    expect([...sample.matchAll(/bun run bench:cohort-run --/gu)]).toHaveLength(2);
+    expect(sample).toContain("--mode reserve");
+    expect(sample).toContain("--mode execute");
+    expect(sample).toContain("name: Attest benchmark sample reservation");
+    expect(sample).toContain("reservation.attestation.json");
+    expect(sample).toContain("name: Run diff-file live benchmark sample ${{ matrix.sample }}");
+    expect(sample).toContain(
+      '--manifest "${{ runner.temp }}/bench-live-cohort.json"',
+    );
+    expect(sample).toContain("--screen-profile ../provisional-models.json");
+    expect(sample).not.toContain("--report-out");
+    expect(sample).not.toContain("--receipt-out");
+    expect(sample).toContain("uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4");
+    expect(sample).toContain("gh attestation verify");
+    expect(sample).toContain("--signer-workflow postil-dev/postil-cli/.github/workflows/release.yml");
+    expect(sample).toContain("--signer-digest \"${GITHUB_SHA}\"");
+    expect(sample).toContain("--source-digest \"${GITHUB_SHA}\"");
+    expect(sample).toContain("--source-ref \"${GITHUB_REF}\"");
+    expect(sample).toContain("--deny-self-hosted-runners");
+    expect(sample).toMatch(
+      /name: Upload diff-file live benchmark sample \$\{\{ matrix\.sample \}\}\n\s+if: always\(\)[\s\S]*?name: bench-live-sample-\$\{\{ github\.run_attempt \}\}-\$\{\{ matrix\.sample \}\}[\s\S]*?path: \$\{\{ runner\.temp \}\}\/bench-live-sample-\$\{\{ github\.run_attempt \}\}-\$\{\{ matrix\.sample \}\}[\s\S]*?retention-days: 30/u,
+    );
+
+    expect(final).toMatch(
+      /bench-live:\n\s+if: always\(\)\n\s+needs: \[bench-live-prepare, bench-live-sample\]/u,
+    );
+    expect(final).toMatch(
+      /name: benchmarked-x86_64-unknown-linux-gnu-\$\{\{ github\.run_attempt \}\}\n\s+path: target\/release/u,
+    );
+    expect(final).toContain("pattern: bench-live-sample-${{ github.run_attempt }}-*");
+    expect(final).toContain("path: ${{ runner.temp }}/bench-live-reports-download");
+    expect(final).toContain("merge-multiple: false");
+    expect(final).toContain("name: Verify signed release benchmark evidence");
+    expect(final).toContain("name: Verify independent release generations");
+    expect(final).toContain("bun run bench:verify-generations --");
+    expect(final).toContain("gh attestation verify");
+    expect(final).toContain("--deny-self-hosted-runners");
+    expect(final).toContain("name: bench-live-cohort-${{ github.run_attempt }}");
+    expect(final).toContain('--cohort-manifest "${{ runner.temp }}/bench-live-cohort.json"');
+    for (const sample of [1, 2, 3, 4, 5]) {
+      expect(final).toContain(
+        `--expected-run-id "release-\${{ github.ref_name }}-\${{ github.run_id }}-\${{ github.run_attempt }}-0${sample}"`,
       );
-      expect(release).toContain(`--json-out "\${{ runner.temp }}/bench-live-report-${sample}.json"`);
+      expect(final).toContain(
+        `--result "\${{ runner.temp }}/bench-live-reports/slots/0${sample}/report.json"`,
+      );
+      expect(final).toContain(
+        `--receipt "\${{ runner.temp }}/bench-live-reports/slots/0${sample}/receipt.json"`,
+      );
     }
-    expect(release.indexOf("Run diff-file live benchmark sample 1")).toBeLessThan(
-      release.indexOf("Run diff-file live benchmark sample 2"),
+    expect([...final.matchAll(/--expected-run-id /gu)]).toHaveLength(5);
+    expect([...final.matchAll(/--result /gu)]).toHaveLength(10);
+    expect([...final.matchAll(/--receipt /gu)]).toHaveLength(10);
+    expect(final).toMatch(
+      /bun run bench:compare --[\s\S]*--binary "\$\{\{ github\.workspace \}\}\/target\/release\/postil"[\s\S]*--screen-profile \.\.\/provisional-models\.json/u,
     );
-    expect(release.indexOf("Run diff-file live benchmark sample 2")).toBeLessThan(
-      release.indexOf("Run diff-file live benchmark sample 3"),
-    );
-    expect(release).toMatch(
-      /name: Upload the diff-file live reports\n\s+if: always\(\)[\s\S]*bench-live-report-1\.json[\s\S]*bench-live-report-2\.json[\s\S]*bench-live-report-3\.json[\s\S]*retention-days: 30/u,
-    );
-    expect(release).toMatch(
-      /bun run bench:compare --[\s\S]*--binary "\$\{\{ github\.workspace \}\}\/target\/release\/postil"[\s\S]*--screen-profile \.\.\/provisional-models\.json[\s\S]*--result "\$\{\{ runner\.temp \}\}\/bench-live-report-1\.json"[\s\S]*--result "\$\{\{ runner\.temp \}\}\/bench-live-report-2\.json"[\s\S]*--result "\$\{\{ runner\.temp \}\}\/bench-live-report-3\.json"/u,
-    );
-    expect([...release.matchAll(/continue-on-error: true/gu)]).toHaveLength(3);
-    expect(release).toContain("SAMPLE_1_OUTCOME: ${{ steps.live-sample-1.outcome }}");
-    expect(release).toContain("SAMPLE_2_OUTCOME: ${{ steps.live-sample-2.outcome }}");
-    expect(release).toContain("SAMPLE_3_OUTCOME: ${{ steps.live-sample-3.outcome }}");
+    expect(final).toContain("SAMPLE_JOB_RESULT: ${{ needs.bench-live-sample.result }}");
+    expect(final).toContain('if [[ "${SAMPLE_JOB_RESULT}" != "success" ]]');
+    expect(final).toContain("At least one live benchmark sample failed before comparison.");
+    expect(release).toContain("OPENROUTER_API_KEY has insufficient credit for the release benchmark reserve.");
+    expect(release).toContain('echo "OpenRouter credential accepted."');
+    expect(release).not.toContain("remaining=\"$(jq -r '.data.limit_remaining");
+    expect(release).not.toMatch(/credential accepted.*remaining/iu);
     expect(release).not.toContain("bench-live-report-1.json.partial");
     expect(release).not.toContain("bench-live-report-2.json.partial");
     expect(release).not.toContain("bench-live-report-3.json.partial");
+    expect(release).not.toContain("bench-live-report-4.json.partial");
+    expect(release).not.toContain("bench-live-report-5.json.partial");
     expect(release).not.toContain("bench_live_override_reason");
     expect(release).not.toContain("OVERRIDE_REASON");
-    expect(release).toMatch(/build:\n\s+needs: \[validate-tag, bench-live\]/u);
+    expect(build).toMatch(/build:\n\s+needs: \[validate-tag, bench-live\]/u);
     let checkedReferences = 0;
     const workflowGlob = new Bun.Glob("*.yml");
     for await (const workflowName of workflowGlob.scan(resolve(import.meta.dir, "..", "..", ".github", "workflows"))) {
@@ -1470,6 +1577,39 @@ describe("qualification report", () => {
     expect(() => assertExactQualificationFixtures(changed)).toThrow("exact embedded fixture matrix");
     expect(EVALUATOR_CONTRACT_SOURCE_PATHS).toContain("bench/package.json");
     expect(EVALUATOR_CONTRACT_SOURCE_PATHS).toContain("bench/bun.lock");
+  });
+
+  test("covers every evaluator authority source and changes when a listed source changes", async () => {
+    const required = [
+      ".github/workflows/benchmark-calibration.yml",
+      ".github/workflows/release.yml",
+      "bench/evaluator-contract-sources.json",
+      "bench/src/cohort.ts",
+      "bench/src/cohort-run.ts",
+      "bench/src/compare-baseline.ts",
+      "bench/src/live.ts",
+      "bench/src/run.ts",
+    ];
+    for (const source of required) expect(EVALUATOR_CONTRACT_SOURCE_PATHS).toContain(source);
+    expect(new Set(EVALUATOR_CONTRACT_SOURCE_PATHS).size).toBe(EVALUATOR_CONTRACT_SOURCE_PATHS.length);
+    const repositoryRoot = resolve(import.meta.dir, "../..");
+    for (const source of EVALUATOR_CONTRACT_SOURCE_PATHS) {
+      expect((await readFile(resolve(repositoryRoot, source))).byteLength).toBeGreaterThan(0);
+    }
+    expect(await evaluatorSourceSha256()).toMatch(/^[0-9a-f]{64}$/u);
+
+    const root = await mkdtemp(resolve(tmpdir(), "postil-evaluator-source-"));
+    const source = resolve(root, "source.ts");
+    try {
+      const listedPath = "bench/src/live.ts";
+      await writeFile(source, "authority source one");
+      const before = hashNamedSources([[listedPath, await readFile(source)]]);
+      await writeFile(source, "authority source two");
+      const after = hashNamedSources([[listedPath, await readFile(source)]]);
+      expect(after).not.toBe(before);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
   test("matches the runtime named-source framing vector", () => {
     expect(hashNamedSources([

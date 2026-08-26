@@ -4,24 +4,35 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { cases } from "../fixtures/cases";
 import {
-  DETECTION_RATE_MAX_DROP_PP,
   aggregateObservedMetrics,
+  assertCompleteCohortEvidence,
   assertDistinctRunIdentities,
   assertDistinctRawReportDigests,
   assertExpectedRunIdentities,
+  assertBaselineCalibrationIntegrity,
   assertReportsBoundToInputs,
   assertValidReleaseReport,
   compareMetrics,
+  comparisonCohortSha256,
+  buildCalibrationEvidence,
   exactMeanCostWithinTolerance,
   extractObservedMetrics,
   formatComparisonTable,
   formatRebaselineGuidance,
+  isCalibratedBaselineProfile,
+  meanDetectionCountWithinMargin,
   median,
+  parseBaselineFile,
   parseCliArguments,
   percentile,
   type BaselineProfile,
   type LiveReportForComparison,
 } from "./compare-baseline";
+import {
+  sha256,
+  type CohortManifest,
+  type CohortReceipt,
+} from "./cohort";
 import { benchmarkCase } from "./harness";
 import {
   ADMISSION_API_BASE,
@@ -37,17 +48,35 @@ import {
 } from "./livemodels-score";
 
 test("committed baseline authority matches the current benchmark sources", async () => {
-  const baseline = JSON.parse(
+  const baseline = parseBaselineFile(JSON.parse(
     await readFile(resolve(import.meta.dir, "..", "baseline.json"), "utf8"),
-  ) as {
-    corpus: { fixtureCorpusSha256: string; evaluatorSha256: string };
-  };
+  ));
   const fixtureCorpusSha256 = createHash("sha256")
     .update(JSON.stringify(cases.map((input) => benchmarkCase.parse(input))))
     .digest("hex");
 
   expect(baseline.corpus.fixtureCorpusSha256).toBe(fixtureCorpusSha256);
   expect(baseline.corpus.evaluatorSha256).toBe(await evaluatorSourceSha256());
+});
+
+test("committed Luna baseline is either fail-closed or has a valid ten-report calibration", async () => {
+  const baseline = parseBaselineFile(JSON.parse(
+    await readFile(resolve(import.meta.dir, "..", "baseline.json"), "utf8"),
+  ));
+  const profile = baseline.profiles["openai/gpt-5.6-luna"];
+
+  expect(baseline.schemaVersion).toBe(2);
+  if (profile === undefined) throw new Error("committed Luna baseline profile must exist");
+  if (!profile.populated) {
+    expect(profile.instructions).toContain("predeclared ten-slot calibration cohort");
+    return;
+  }
+  expect(isCalibratedBaselineProfile(profile)).toBe(true);
+  if (!isCalibratedBaselineProfile(profile)) {
+    throw new Error("committed Luna baseline must contain calibration evidence");
+  }
+  expect(profile.calibration.reportCount).toBe(10);
+  expect(() => assertBaselineCalibrationIntegrity(profile)).not.toThrow();
 });
 
 const PROVIDER_CONTRACT: ProviderContractEvidence = {
@@ -151,6 +180,7 @@ function fakeReport(options: FakeReportOptions = {}): LiveReportForComparison {
       detectionRate: `${detected}/57`,
       observedProviderCostUsdDecimal,
       costAccountingComplete: true,
+      providerGenerationIds: [`gen-fixture-${fakeRunSequence}`],
       errors: 0,
       ranAt: options.ranAt ?? new Date(Date.UTC(2026, 7, 25, 0, 0, fakeRunSequence)).toISOString(),
     },
@@ -220,12 +250,13 @@ const populatedBaseline: Extract<BaselineProfile, { populated: true }> = {
   populated: true,
   generatedAt: "2026-08-25T00:00:00.000Z",
   reviewMode: "exhaustive",
-  sourceRunAt: "2026-08-25T00:00:00.000Z",
+  sourceRunAt: "2026-08-25T00:00:06.000Z",
   providerContractEnforced: true,
   screeningProfileSha256: HASHES.profile,
   upstreamProviderIdentity: "Azure",
   totalCases: 70,
   scoredCases: 70,
+  defectCases: 57,
   detectionRate: 54 / 57,
   falsePositives: 0,
   gateVerdictCorrectness: 1,
@@ -233,7 +264,315 @@ const populatedBaseline: Extract<BaselineProfile, { populated: true }> = {
   maximumRunCostUsdDecimal: "0.07",
   costCaseCount: 70,
   latencyMs: { p50: 3500, p95: 6700 },
+  calibration: {
+    reportCount: 10,
+    cohortId: "00000000-0000-4000-8000-000000000001",
+    manifestSha256: "9".repeat(64),
+    sourceSha: "a".repeat(40),
+    workflowRunId: "456",
+    binarySha256: HASHES.binary,
+    providerContractSha256: HASHES.contract,
+    comparisonCohortSha256: comparisonCohortSha256(fakeReport().summary),
+    reports: Array.from({ length: 10 }, (_, index) => ({
+      slot: index + 1,
+      nonce: `00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+      runId: `calibration-${index + 1}`,
+      ranAt: `2026-08-25T00:00:${String(index + 1).padStart(2, "0")}.000Z`,
+      rawSha256: String(index + 1).padStart(64, "0"),
+      semanticSha256: String(index + 11).padStart(64, "0"),
+      receiptRawSha256: String(index + 21).padStart(64, "0"),
+      binarySha256: HASHES.binary,
+      detected: 54,
+      falsePositives: 0,
+      gateVerdictCorrect: 70,
+      totalCostUsdDecimal: "0.07",
+      p50LatencyMs: 3500,
+      p95LatencyMs: 6700,
+    })),
+  },
 };
+
+test("calibration baseline is internally consistent and uses exact count arithmetic", () => {
+  expect(() => assertBaselineCalibrationIntegrity(populatedBaseline)).not.toThrow();
+  expect(meanDetectionCountWithinMargin(540, 10, 260, 5)).toBe(true);
+  expect(meanDetectionCountWithinMargin(540, 10, 259, 5)).toBe(false);
+
+  const tamperedDetection = structuredClone(populatedBaseline);
+  tamperedDetection.detectionRate = 53 / 57;
+  expect(() => assertBaselineCalibrationIntegrity(tamperedDetection)).toThrow(
+    "detection rate does not match",
+  );
+
+  const tamperedLatency = structuredClone(populatedBaseline);
+  tamperedLatency.latencyMs.p95 += 1;
+  expect(() => assertBaselineCalibrationIntegrity(tamperedLatency)).toThrow(
+    "latency does not match",
+  );
+
+  const tamperedFalseFindings = structuredClone(populatedBaseline);
+  tamperedFalseFindings.falsePositives = 1;
+  expect(() => assertBaselineCalibrationIntegrity(tamperedFalseFindings)).toThrow(
+    "false finding count does not match",
+  );
+
+  const tamperedGateCorrectness = structuredClone(populatedBaseline);
+  tamperedGateCorrectness.gateVerdictCorrectness = 0.9;
+  expect(() => assertBaselineCalibrationIntegrity(tamperedGateCorrectness)).toThrow(
+    "gate verdict correctness does not match",
+  );
+
+  const tamperedMaximumCost = structuredClone(populatedBaseline);
+  tamperedMaximumCost.maximumRunCostUsdDecimal = "0.071";
+  expect(() => assertBaselineCalibrationIntegrity(tamperedMaximumCost)).toThrow(
+    "maximum run cost does not match",
+  );
+
+  const tamperedCostCases = structuredClone(populatedBaseline);
+  tamperedCostCases.costCaseCount = 69;
+  expect(() => assertBaselineCalibrationIntegrity(tamperedCostCases)).toThrow(
+    "cost case count does not match",
+  );
+
+  const tamperedMeanCost = structuredClone(populatedBaseline);
+  tamperedMeanCost.meanCostUsdPerCase = 0.002;
+  expect(() => assertBaselineCalibrationIntegrity(tamperedMeanCost)).toThrow(
+    "mean cost does not match",
+  );
+
+  const tamperedSourceTimestamp = structuredClone(populatedBaseline);
+  tamperedSourceTimestamp.sourceRunAt = "2026-08-25T00:00:01.000Z";
+  expect(() => assertBaselineCalibrationIntegrity(tamperedSourceTimestamp)).toThrow(
+    "source timestamp does not match",
+  );
+
+  const tamperedDetectionBounds = structuredClone(populatedBaseline);
+  tamperedDetectionBounds.calibration.reports[0]!.detected = 58;
+  tamperedDetectionBounds.calibration.reports[1]!.detected = 50;
+  expect(() => assertBaselineCalibrationIntegrity(tamperedDetectionBounds)).toThrow(
+    "exceeds the defect count",
+  );
+
+  const tamperedGateBounds = structuredClone(populatedBaseline);
+  tamperedGateBounds.calibration.reports[0]!.gateVerdictCorrect = 71;
+  tamperedGateBounds.calibration.reports[1]!.gateVerdictCorrect = 69;
+  expect(() => assertBaselineCalibrationIntegrity(tamperedGateBounds)).toThrow(
+    "exceeds the total case count",
+  );
+
+  const tamperedBinaryDigest = structuredClone(populatedBaseline);
+  tamperedBinaryDigest.calibration.binarySha256 = "a".repeat(64);
+  expect(() => assertBaselineCalibrationIntegrity(tamperedBinaryDigest)).toThrow(
+    "different binary digest",
+  );
+
+  const fractionalFalseFindingMedian = structuredClone(populatedBaseline);
+  fractionalFalseFindingMedian.calibration.reports.forEach((report, index) => {
+    report.falsePositives = index < 5 ? 0 : 1;
+  });
+  fractionalFalseFindingMedian.falsePositives = 0.5;
+  expect(() => assertBaselineCalibrationIntegrity(fractionalFalseFindingMedian)).not.toThrow();
+  const parsed = parseBaselineFile({
+    schemaVersion: 2,
+    corpus: {
+      fixtureCorpusSha256: HASHES.corpus,
+      evaluatorSha256: HASHES.evaluator,
+    },
+    profiles: { "openai/gpt-5.6-luna": fractionalFalseFindingMedian },
+  });
+  expect(parsed.profiles["openai/gpt-5.6-luna"]?.falsePositives).toBe(0.5);
+});
+
+test("buildCalibrationEvidence preserves ten-run provenance and rejects incomplete identity", () => {
+  const observed = aggregateObservedMetrics(
+    Array.from({ length: 10 }, () => fakeReport({ detected: 54 })),
+  );
+  const rawReports = observed.perRun.map((run, index) => ({
+    slot: index + 1,
+    nonce: `00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+    runId: run.runId,
+    startedAt: `2026-08-25T00:01:${String(index + 1).padStart(2, "0")}.000Z`,
+    rawSha256: String(index + 1).padStart(64, "0"),
+    semanticSha256: String(index + 11).padStart(64, "0"),
+    receiptRawSha256: String(index + 21).padStart(64, "0"),
+  }));
+  const manifest = {
+    cohortId: "00000000-0000-4000-8000-000000000001",
+    manifestSha256: "9".repeat(64),
+    sourceSha: "a".repeat(40),
+    workflowRunId: "456",
+  };
+  const evidence = buildCalibrationEvidence(observed, rawReports, manifest);
+  expect(evidence.reportCount).toBe(10);
+  expect(evidence.binarySha256).toBe(HASHES.binary);
+  expect(evidence.providerContractSha256).toBe(HASHES.contract);
+  expect(evidence.comparisonCohortSha256).toBe(observed.comparisonCohortSha256);
+  expect(evidence.reports).toHaveLength(10);
+  expect(evidence.reports.every((report) => report.detected === 54)).toBe(true);
+  expect(evidence.reports.every((report) => report.binarySha256 === HASHES.binary)).toBe(true);
+  expect(evidence.reports.map((report) => report.runId)).toEqual(
+    observed.perRun.map((run) => run.runId),
+  );
+  expect(evidence.reports.map((report) => report.rawSha256)).toEqual(
+    rawReports.map((report) => report.rawSha256),
+  );
+  expect(() => buildCalibrationEvidence(observed, rawReports.slice(0, 9), manifest)).toThrow(
+    "one raw digest per report",
+  );
+  const duplicateRunIds = [...rawReports];
+  duplicateRunIds[9] = { ...duplicateRunIds[9]!, runId: duplicateRunIds[0]!.runId };
+  expect(() => buildCalibrationEvidence(observed, duplicateRunIds, manifest)).toThrow(
+    "raw report run IDs must be unique",
+  );
+  const releaseObserved = aggregateObservedMetrics(
+    Array.from({ length: 5 }, () => fakeReport({ detected: 54 })),
+  );
+  expect(() => buildCalibrationEvidence(releaseObserved, [], manifest)).toThrow(
+    "requires exactly 10 observed reports",
+  );
+});
+
+function fakeReleaseCohort(reports: readonly LiveReportForComparison[]): {
+  manifest: CohortManifest;
+  receipts: Array<{ receipt: CohortReceipt; rawSha256: string }>;
+  rawReportSha256: string[];
+  parsedReports: unknown[];
+  expectedRunIds: string[];
+} {
+  const createdAt = "2026-08-25T00:00:00.000Z";
+  const slots = reports.map((report, index) => ({
+    slot: index + 1,
+    runId: report.summary.runId,
+    nonce: `00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+  }));
+  const manifest: CohortManifest = {
+    schemaVersion: 2,
+    purpose: reports.length === 10 ? "calibration" : "release",
+    cohortId: "00000000-0000-4000-8000-000000000099",
+    createdAt,
+    reportCount: reports.length as 5 | 10,
+    binarySha256: HASHES.binary,
+    evaluatorSha256: HASHES.evaluator,
+    fixtureCorpusSha256: HASHES.corpus,
+    screeningProfileSha256: HASHES.profile,
+    providerContractSha256: HASHES.contract,
+    execution: reports.length === 10
+      ? {
+          kind: "github-sigstore-v1",
+          repository: "postil-dev/postil-cli",
+          signerWorkflow: ".github/workflows/benchmark-calibration.yml",
+          sourceSha: "b".repeat(40),
+          sourceRef: "refs/heads/main",
+          runId: "456",
+          runAttempt: "1",
+        }
+      : {
+          kind: "github-sigstore-v1",
+          repository: "postil-dev/postil-cli",
+          signerWorkflow: ".github/workflows/release.yml",
+          sourceSha: "a".repeat(40),
+          sourceRef: "refs/tags/v0.0.0",
+          runId: "123",
+          runAttempt: "1",
+        },
+    slots,
+  };
+  const parsedReports = reports.map((report) => structuredClone(report));
+  const rawReportSha256 = parsedReports.map((report) => sha256(JSON.stringify(report)));
+  const receipts = reports.map((report, index) => ({
+    receipt: {
+      schemaVersion: 2,
+      state: "completed",
+      manifestSha256: "9".repeat(64),
+      cohortId: manifest.cohortId,
+      purpose: manifest.purpose,
+      slot: index + 1,
+      nonce: slots[index]!.nonce,
+      runId: report.summary.runId,
+      startedAt: "2026-08-25T00:00:00.000Z",
+      finishedAt: "2026-08-25T23:59:59.999Z",
+      exitCode: 0,
+      reportRawSha256: rawReportSha256[index]!,
+    } as CohortReceipt,
+    rawSha256: String(index + 31).padStart(64, "0"),
+  }));
+  return {
+    manifest,
+    receipts,
+    rawReportSha256,
+    parsedReports,
+    expectedRunIds: slots.map((slot) => slot.runId),
+  };
+}
+
+describe("predeclared cohort evidence", () => {
+  test("accepts every completed immutable slot", () => {
+    const reports = Array.from({ length: 5 }, (_, index) => fakeReport({
+      durationMultiplier: index + 1,
+    }));
+    const cohort = fakeReleaseCohort(reports);
+    expect(() => assertCompleteCohortEvidence({
+      ...cohort,
+      manifestSha256: "9".repeat(64),
+      reports,
+      record: false,
+    })).not.toThrow();
+  });
+
+  test("allows identical semantic outcomes when every raw artifact is separately authenticated", () => {
+    const original = fakeReport({ durationMultiplier: 7 });
+    const reports = Array.from({ length: 5 }, (_, index) => {
+      const report = cloneReport(original);
+      report.summary.runId = `cloned-${index + 1}`;
+      report.summary.ranAt = `2026-08-25T00:10:0${index}.000Z`;
+      report.summary.providerGenerationIds = [`gen-cloned-${index + 1}`];
+      return report;
+    });
+    const cohort = fakeReleaseCohort(reports);
+    expect(() => assertCompleteCohortEvidence({
+      ...cohort,
+      manifestSha256: "9".repeat(64),
+      reports,
+      record: false,
+    })).not.toThrow();
+  });
+
+  test("rejects missing, failed, and mismatched slots", () => {
+    const reports = Array.from({ length: 5 }, (_, index) => fakeReport({
+      durationMultiplier: index + 1,
+    }));
+    const cohort = fakeReleaseCohort(reports);
+    expect(() => assertCompleteCohortEvidence({
+      ...cohort,
+      receipts: cohort.receipts.slice(0, 4),
+      manifestSha256: "9".repeat(64),
+      reports,
+      record: false,
+    })).toThrow("every declared report and receipt slot");
+
+    const failed = structuredClone(cohort.receipts);
+    failed[2]!.receipt = {
+      ...failed[2]!.receipt,
+      state: "failed",
+      exitCode: 1,
+      failure: "benchmark-exit",
+    } as CohortReceipt;
+    expect(() => assertCompleteCohortEvidence({
+      ...cohort,
+      receipts: failed,
+      manifestSha256: "9".repeat(64),
+      reports,
+      record: false,
+    })).toThrow("slot 3 is failed");
+
+    expect(() => assertCompleteCohortEvidence({
+      ...cohort,
+      expectedRunIds: [...cohort.expectedRunIds.slice(0, 4), "substituted"],
+      manifestSha256: "9".repeat(64),
+      reports,
+      record: false,
+    })).toThrow("exactly match the predeclared cohort slots");
+  });
+});
 
 describe("sample math", () => {
   test("uses nearest-rank percentiles", () => {
@@ -266,6 +605,27 @@ describe("sample math", () => {
         (row) => row.metric === "maximum mean cost per case",
       )?.verdict,
     ).toBe("FAIL");
+  });
+
+  test("binds scorer and timeout settings to the calibration execution identity", () => {
+    const report = fakeReport();
+    const scorerChanged = cloneReport(report);
+    scorerChanged.summary.scorerMode = "enabled";
+    scorerChanged.summary.scorerModel = "openai/gpt-5.6-luna";
+    const timeoutChanged = cloneReport(report);
+    timeoutChanged.summary.timeoutOverrides.requestSeconds = "120";
+
+    expect(comparisonCohortSha256(scorerChanged.summary)).not.toBe(
+      comparisonCohortSha256(report.summary),
+    );
+    expect(comparisonCohortSha256(timeoutChanged.summary)).not.toBe(
+      comparisonCohortSha256(report.summary),
+    );
+    const observed = extractObservedMetrics(report);
+    expect(() => compareMetrics(populatedBaseline, {
+      ...observed,
+      comparisonCohortSha256: "f".repeat(64),
+    })).toThrow("execution identity does not match");
   });
 });
 
@@ -407,7 +767,7 @@ describe("release report validation", () => {
   });
 });
 
-describe("three-report aggregation", () => {
+describe("three-report aggregation compatibility", () => {
   test("52/54/53 passes the detection floor", () => {
     const observed = aggregateObservedMetrics([
       fakeReport({ detected: 52 }),
@@ -415,23 +775,20 @@ describe("three-report aggregation", () => {
       fakeReport({ detected: 53 }),
     ]);
     expect(observed.detectionRate).toBe(53 / 57);
-    expect(populatedBaseline.detectionRate - observed.detectionRate).toBeLessThan(
-      DETECTION_RATE_MAX_DROP_PP / 100,
-    );
     const comparison = compareMetrics(populatedBaseline, observed);
-    expect(comparison.rows.find((row) => row.metric === "median detection rate")?.verdict).toBe("PASS");
+    expect(comparison.rows.find((row) => row.metric.includes("detection rate"))?.verdict).toBe("PASS");
     expect(comparison.ok).toBe(true);
   });
 
-  test("52/54/52 fails the detection floor", () => {
+  test("51/52/52 fails the two-defect non-inferiority floor", () => {
     const observed = aggregateObservedMetrics([
+      fakeReport({ detected: 51 }),
       fakeReport({ detected: 52 }),
-      fakeReport({ detected: 54 }),
       fakeReport({ detected: 52 }),
     ]);
-    expect(observed.detectionRate).toBe(52 / 57);
+    expect(observed.detectionRate).toBe(155 / (57 * 3));
     const comparison = compareMetrics(populatedBaseline, observed);
-    expect(comparison.rows.find((row) => row.metric === "median detection rate")?.verdict).toBe("FAIL");
+    expect(comparison.rows.find((row) => row.metric.includes("detection rate"))?.verdict).toBe("FAIL");
     expect(comparison.ok).toBe(false);
   });
 
@@ -458,6 +815,8 @@ describe("three-report aggregation", () => {
     const first = fakeReport();
     const reformatted = cloneReport(first);
     const rewritten = cloneReport(first);
+    reformatted.summary.providerGenerationIds = ["gen-reformatted"];
+    rewritten.summary.providerGenerationIds = ["gen-rewritten"];
     expect(() => assertDistinctRunIdentities([first, reformatted, rewritten])).toThrow(
       "distinct benchmark run IDs",
     );
@@ -477,10 +836,10 @@ describe("three-report aggregation", () => {
     ]);
     const comparison = compareMetrics(populatedBaseline, observed);
     const falseFindingRow = comparison.rows.find(
-      (row) => row.metric === "median false/unrelated findings",
+      (row) => row.metric.includes("false/unrelated findings"),
     );
     const gateRow = comparison.rows.find(
-      (row) => row.metric === "median gate verdict correctness",
+      (row) => row.metric.includes("gate verdict correctness"),
     );
     expect(falseFindingRow?.verdict).toBe("FAIL");
     expect(falseFindingRow?.informational).toBe(true);
@@ -513,13 +872,75 @@ describe("three-report aggregation", () => {
   });
 });
 
+describe("five-report release aggregation", () => {
+  test("uses exact count arithmetic at the two-defect non-inferiority boundary", () => {
+    const observed = aggregateObservedMetrics([
+      fakeReport({ detected: 51 }),
+      fakeReport({ detected: 52 }),
+      fakeReport({ detected: 52 }),
+      fakeReport({ detected: 52 }),
+      fakeReport({ detected: 53 }),
+    ]);
+    expect(observed.reportCount).toBe(5);
+    expect(observed.detectionRate).toBe(260 / (57 * 5));
+    expect(compareMetrics(populatedBaseline, observed).rows.find(
+      (row) => row.metric.includes("detection rate"),
+    )?.verdict).toBe("PASS");
+  });
+
+  test("fails when the five-report cohort mean is one defect below the boundary", () => {
+    const observed = aggregateObservedMetrics([
+      fakeReport({ detected: 51 }),
+      fakeReport({ detected: 52 }),
+      fakeReport({ detected: 52 }),
+      fakeReport({ detected: 52 }),
+      fakeReport({ detected: 52 }),
+    ]);
+    expect(observed.detectionRate).toBe(259 / (57 * 5));
+    expect(compareMetrics(populatedBaseline, observed).rows.find(
+      (row) => row.metric.includes("detection rate"),
+    )?.verdict).toBe("FAIL");
+  });
+
+  test("requires all five reports to share the cohort while retaining full ranges", () => {
+    const reports = [
+      fakeReport({ detected: 49, falsePositives: 0, durationMultiplier: 1 }),
+      fakeReport({ detected: 50, falsePositives: 1, durationMultiplier: 2 }),
+      fakeReport({ detected: 51, falsePositives: 0, durationMultiplier: 3 }),
+      fakeReport({ detected: 52, falsePositives: 2, durationMultiplier: 4 }),
+      fakeReport({ detected: 53, falsePositives: 1, durationMultiplier: 5 }),
+    ];
+    const observed = aggregateObservedMetrics(reports);
+    expect(observed.ranges.falsePositives).toEqual({ min: 0, max: 2 });
+    expect(observed.ranges.p95LatencyMs).toEqual({ min: 67, max: 335 });
+    const mismatched = cloneReport(reports[4]!);
+    mismatched.summary.binarySha256 = "6".repeat(64);
+    expect(() => aggregateObservedMetrics([...reports.slice(0, 4), mismatched])).toThrow(
+      "cohort mismatch for summary.binarySha256",
+    );
+  });
+
+  test("accepts the ten-report cohort used by baseline recording", () => {
+    const reports = Array.from({ length: 10 }, () => fakeReport({ detected: 52 }));
+    const observed = aggregateObservedMetrics(reports);
+    expect(observed.reportCount).toBe(10);
+    expect(observed.detectionRate).toBe(52 / 57);
+  });
+});
+
 describe("CLI report selection", () => {
   const releaseInputs = [
     "--binary", "target/release/postil",
     "--screen-profile", "provisional-models.json",
   ];
+  const fiveCohortInputs = [
+    "--cohort-manifest", "release-cohort.json",
+    ...["one", "two", "three", "four", "five"].flatMap((path) => [
+      "--receipt", `${path}.receipt.json`,
+    ]),
+  ];
 
-  test("accepts exactly one or three distinct --result paths", () => {
+  test("accepts exactly one, three, or five distinct --result paths", () => {
     expect(parseCliArguments([
       ...releaseInputs,
       "--expected-run-id", "one",
@@ -534,19 +955,39 @@ describe("CLI report selection", () => {
       "--result", "two.json",
       "--result", "three.json",
     ]).resultPaths).toEqual(["one.json", "two.json", "three.json"]);
+    expect(parseCliArguments([
+      ...releaseInputs,
+      ...["one", "two", "three", "four", "five"].flatMap((runId) => [
+        "--expected-run-id", runId,
+      ]),
+      ...["one", "two", "three", "four", "five"].flatMap((path) => [
+        "--result", `${path}.json`,
+      ]),
+      ...fiveCohortInputs,
+    ]).resultPaths).toEqual([
+      "one.json", "two.json", "three.json", "four.json", "five.json",
+    ]);
   });
 
   test("rejects every other report count", () => {
-    expect(() => parseCliArguments([])).toThrow("exactly 1 or 3");
+    expect(() => parseCliArguments([])).toThrow("exactly 1, 3, or 5");
     expect(() => parseCliArguments(["--result", "one", "--result", "two"])).toThrow(
-      "exactly 1 or 3",
+      "exactly 1, 3, or 5",
     );
     expect(() => parseCliArguments([
       "--result", "one",
       "--result", "two",
       "--result", "three",
       "--result", "four",
-    ])).toThrow("exactly 1 or 3");
+    ])).toThrow("exactly 1, 3, or 5");
+    expect(() => parseCliArguments([
+      "--result", "one",
+      "--result", "two",
+      "--result", "three",
+      "--result", "four",
+      "--result", "five",
+      "--result", "six",
+    ])).toThrow("exactly 1, 3, or 5");
   });
 
   test("rejects duplicate paths and duplicate raw reports", () => {
@@ -566,23 +1007,52 @@ describe("CLI report selection", () => {
     ])).toThrow("distinct raw SHA-256 digests");
   });
 
-  test("requires the same three-sample estimator for rebaselining", () => {
+  test("requires exactly ten reports for baseline recording", () => {
     expect(() => parseCliArguments([
       ...releaseInputs,
       "--expected-run-id", "one",
       "--result", "one.json",
       "--record",
-    ])).toThrow("--record requires exactly three --result reports");
+    ])).toThrow("--record requires exactly ten --result reports");
     expect(parseCliArguments([
       ...releaseInputs,
       "--expected-run-id", "one",
       "--expected-run-id", "two",
       "--expected-run-id", "three",
+      "--expected-run-id", "four",
+      "--expected-run-id", "five",
+      "--expected-run-id", "six",
+      "--expected-run-id", "seven",
+      "--expected-run-id", "eight",
+      "--expected-run-id", "nine",
+      "--expected-run-id", "ten",
       "--result", "one.json",
       "--result", "two.json",
       "--result", "three.json",
+      "--result", "four.json",
+      "--result", "five.json",
+      "--result", "six.json",
+      "--result", "seven.json",
+      "--result", "eight.json",
+      "--result", "nine.json",
+      "--result", "ten.json",
+      "--cohort-manifest", "calibration-cohort.json",
+      ...["one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"].flatMap(
+        (path) => ["--receipt", `${path}.receipt.json`],
+      ),
       "--record",
     ]).record).toBe(true);
+    expect(() => parseCliArguments([
+      ...releaseInputs,
+      ...["one", "two", "three", "four", "five"].flatMap((runId) => [
+        "--expected-run-id", runId,
+      ]),
+      ...["one", "two", "three", "four", "five"].flatMap((path) => [
+        "--result", `${path}.json`,
+      ]),
+      ...fiveCohortInputs,
+      "--record",
+    ])).toThrow("--record requires exactly ten --result reports");
   });
 
   test("requires explicit release binary and screening profile inputs", () => {
@@ -603,22 +1073,60 @@ describe("CLI report selection", () => {
     ])).toThrow("one --expected-run-id per --result report");
   });
 
-  test("prints an executable three-report rebaseline command only for a complete cohort", () => {
+  test("prints an executable ten-report calibration command only for a complete cohort", () => {
     expect(formatRebaselineGuidance({
       binaryPath: "target/release/postil",
       screeningProfilePath: "provisional models.json",
-      expectedRunIds: ["one", "two", "three"],
-      resultPaths: ["one.json", "two report.json", "three.json"],
+      expectedRunIds: [
+        "one", "two", "three", "four", "five",
+        "six", "seven", "eight", "nine", "ten",
+      ],
+      resultPaths: [
+        "one.json", "two report.json", "three.json", "four.json", "five.json",
+        "six.json", "seven.json", "eight.json", "nine.json", "ten.json",
+      ],
+      cohortManifestPath: "calibration cohort.json",
+      receiptPaths: [
+        "one.receipt.json", "two receipt.json", "three.receipt.json",
+        "four.receipt.json", "five.receipt.json", "six.receipt.json",
+        "seven.receipt.json", "eight.receipt.json", "nine.receipt.json",
+        "ten.receipt.json",
+      ],
     })).toBe([
       "  bun run bench:compare -- \\",
       "    --binary 'target/release/postil' \\",
       "    --screen-profile 'provisional models.json' \\",
+      "    --cohort-manifest 'calibration cohort.json' \\",
       "    --expected-run-id 'one' \\",
       "    --expected-run-id 'two' \\",
       "    --expected-run-id 'three' \\",
+      "    --expected-run-id 'four' \\",
+      "    --expected-run-id 'five' \\",
+      "    --expected-run-id 'six' \\",
+      "    --expected-run-id 'seven' \\",
+      "    --expected-run-id 'eight' \\",
+      "    --expected-run-id 'nine' \\",
+      "    --expected-run-id 'ten' \\",
       "    --result 'one.json' \\",
       "    --result 'two report.json' \\",
       "    --result 'three.json' \\",
+      "    --result 'four.json' \\",
+      "    --result 'five.json' \\",
+      "    --result 'six.json' \\",
+      "    --result 'seven.json' \\",
+      "    --result 'eight.json' \\",
+      "    --result 'nine.json' \\",
+      "    --result 'ten.json' \\",
+      "    --receipt 'one.receipt.json' \\",
+      "    --receipt 'two receipt.json' \\",
+      "    --receipt 'three.receipt.json' \\",
+      "    --receipt 'four.receipt.json' \\",
+      "    --receipt 'five.receipt.json' \\",
+      "    --receipt 'six.receipt.json' \\",
+      "    --receipt 'seven.receipt.json' \\",
+      "    --receipt 'eight.receipt.json' \\",
+      "    --receipt 'nine.receipt.json' \\",
+      "    --receipt 'ten.receipt.json' \\",
       "    --record",
     ].join("\n"));
 
@@ -627,6 +1135,7 @@ describe("CLI report selection", () => {
       screeningProfilePath: "provisional-models.json",
       expectedRunIds: ["one"],
       resultPaths: ["one.json"],
-    })).toContain("collect three independent complete reports");
+      receiptPaths: [],
+    })).toContain("predeclared ten-report calibration cohort");
   });
 });

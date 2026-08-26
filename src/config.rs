@@ -45,6 +45,14 @@ const EVALUATOR_CONTRACT_PATHS_JSON: &str =
     include_str!("../bench/evaluator-contract-sources.json");
 const EVALUATOR_CONTRACT_SOURCES: &[(&str, &str)] = &[
     (
+        ".github/workflows/benchmark-calibration.yml",
+        include_str!("../.github/workflows/benchmark-calibration.yml"),
+    ),
+    (
+        ".github/workflows/release.yml",
+        include_str!("../.github/workflows/release.yml"),
+    ),
+    (
         "bench/admission-manifest-candidate-vector.json",
         include_str!("../bench/admission-manifest-candidate-vector.json"),
     ),
@@ -68,9 +76,26 @@ const EVALUATOR_CONTRACT_SOURCES: &[(&str, &str)] = &[
         include_str!("../bench/src/attribution.ts"),
     ),
     (
+        "bench/src/cohort.ts",
+        include_str!("../bench/src/cohort.ts"),
+    ),
+    (
+        "bench/src/cohort-run.ts",
+        include_str!("../bench/src/cohort-run.ts"),
+    ),
+    (
+        "bench/src/compare-baseline.ts",
+        include_str!("../bench/src/compare-baseline.ts"),
+    ),
+    (
+        "bench/src/generation-evidence.ts",
+        include_str!("../bench/src/generation-evidence.ts"),
+    ),
+    (
         "bench/src/harness.ts",
         include_str!("../bench/src/harness.ts"),
     ),
+    ("bench/src/live.ts", include_str!("../bench/src/live.ts")),
     (
         "bench/src/livemodels-score.ts",
         include_str!("../bench/src/livemodels-score.ts"),
