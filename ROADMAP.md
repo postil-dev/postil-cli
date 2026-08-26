@@ -39,9 +39,8 @@
 
 - Validate the Bitbucket and Azure DevOps incremental (`--since-sha`) diff paths against
   live instances. The full-PR-diff paths are exercised by tests; the incremental ones
-  depend on API conventions (Bitbucket's `diff/{spec}` two-dot order — which may also
-  apply merge-base semantics on Cloud; Azure's changed-file reconstruction) that we
-  have not yet confirmed end to end.
+  depend on unverified API conventions (Bitbucket's `diff/{spec}` two-dot order, which
+  may also apply merge-base semantics on Cloud; Azure's changed-file reconstruction).
 - Bitbucket inline-comment threading and Azure DevOps iteration-aware diffs for very
   large PRs.
 - Learning from dismissals: feed comment-resolution outcomes from the hosted platform
@@ -52,8 +51,8 @@
 ## Benchmarking status
 
 The hermetic PR-review benchmark harness lives in `bench/`: isolated run dirs,
-mock forge and model endpoints, prompt-leakage guardrails, and 40 fixtures. The
-set contains 33 seeded defects across languages and change classes plus 7 clean
+mock forge and model endpoints, prompt-leakage guardrails, and 70 fixtures. The
+set contains 57 seeded defects across languages and change classes plus 13 clean
 PRs where correct behavior is silence.
 
 Mock mode runs in CI against a release build and measures pipeline fidelity:
@@ -61,11 +60,21 @@ grounding, gating, statusline correctness, and prompt-leakage controls. It does
 not measure detection ability because the mock model returns recorded findings
 generated from fixture specs.
 
-Live-model mode is manual because it spends real model tokens. It runs the same
-40 fixtures against selected OpenRouter-compatible models while keeping forge I/O
-mocked, then reports detection rate, false positives, catalog-priced token-cost
-estimates, and per-case detail. Diff-file live mode is available for single-model
-local checks with no mock forge.
+Live-model mode runs the same 70 fixtures against selected OpenRouter-compatible
+models while keeping forge I/O mocked, then reports detection rate, false
+positives, cost with provider or catalog-estimate provenance, latency, and
+per-case detail. Local runs are explicit because they spend real model tokens.
+Tagged releases run five sequential complete samples and compare their cohort
+against a signed, predeclared ten-report calibration baseline. Durable slot
+reservations, receipts, reports, cohort manifests, and binaries are
+authenticated by GitHub OIDC attestations for release and calibration runs.
+OpenRouter generation records independently bind each cohort to distinct
+provider calls with matching model, provider, token, and cost totals.
+Calibration runs once on the current `main` commit, with each reservation
+attested before its GitHub-hosted job starts inference. Failed, interrupted,
+missing, substituted, and copied samples invalidate the whole cohort rather
+than becoming replaceable observations. Diff-file live mode is
+available for single-model local checks with no mock forge.
 
 Comparative claims require peer runs on the identical fixture set; site
 comparisons stay qualitative and sourced until then.

@@ -56,6 +56,16 @@ pub enum ForgeArg {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)] // Review carries the full flag set by design.
 pub enum Command {
+    /// Follow operator iLert alerts through the authenticated event stream.
+    #[command(hide = true)]
+    AlertWatch {
+        /// Exit after the first delivered notification.
+        #[arg(long, hide = true, conflicts_with = "probe")]
+        once: bool,
+        /// Exit after an authenticated stream connection is established.
+        #[arg(long, hide = true, conflicts_with = "once")]
+        probe: bool,
+    },
     /// Probe machine-readable CLI capabilities without external access.
     Capabilities {
         /// Require and print an exact publication-plan contract identifier.
@@ -691,5 +701,39 @@ mod tests {
         let parsed = Cli::try_parse_from(["postil", "logout"]).unwrap();
         assert!(matches!(parsed.command, Command::Logout));
         assert!(Cli::try_parse_from(["postil", "logout", "--org", "runatlas-is"]).is_err());
+    }
+
+    #[test]
+    fn operator_alert_watch_is_hidden_but_parseable() {
+        let parsed = Cli::try_parse_from(["postil", "alert-watch"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::AlertWatch {
+                once: false,
+                probe: false
+            }
+        ));
+        let parsed = Cli::try_parse_from(["postil", "alert-watch", "--once"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::AlertWatch {
+                once: true,
+                probe: false
+            }
+        ));
+        let parsed = Cli::try_parse_from(["postil", "alert-watch", "--probe"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::AlertWatch {
+                once: false,
+                probe: true
+            }
+        ));
+        assert!(Cli::try_parse_from(["postil", "alert-watch", "--once", "--probe"]).is_err());
+        let help = Cli::try_parse_from(["postil", "--help"])
+            .err()
+            .expect("help should exit without parsing a command")
+            .to_string();
+        assert!(!help.contains("alert-watch"));
     }
 }

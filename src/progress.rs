@@ -66,6 +66,10 @@ pub fn telemetry(message: Arguments<'_>) {
     }
 }
 
+pub fn compact_human_output() -> bool {
+    SUPPRESS_TELEMETRY.load(Ordering::Relaxed)
+}
+
 /// Keep safety-relevant notices visible even while detailed telemetry is
 /// collapsed into an interactive progress line.
 pub fn notice(message: Arguments<'_>) {

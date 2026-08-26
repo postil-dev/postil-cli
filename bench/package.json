@@ -9,6 +9,9 @@
     "bench:live": "bun run src/run.ts --live",
     "bench:live-models": "POSTIL_BENCH_MODE=live bun run src/run.ts",
     "bench:compare": "bun run src/compare-baseline.ts",
+    "bench:cohort-create": "bun run src/cohort.ts",
+    "bench:cohort-run": "bun run src/cohort-run.ts",
+    "bench:verify-generations": "bun run src/generation-evidence.ts",
     "verify-admission": "bun run src/verify-admission.ts",
     "scorer-eval": "bun run src/scorer-eval.ts"
   },

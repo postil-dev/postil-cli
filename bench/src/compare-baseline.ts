@@ -1,10 +1,11 @@
 #!/usr/bin/env bun
 // Release-gate regression check for the diff-file live benchmark (see live.ts).
 //
-// Consumes one or three LiveReport JSON artifacts written by `bun run
-// bench:live --json-out <path>` and compares their metrics against the committed
-// `bench/baseline.json`. Every report must be complete full-corpus evidence. A
-// three-report comparison additionally requires one identical benchmark cohort
+// Compare mode consumes one, three, or five LiveReport JSON artifacts written by
+// `bun run bench:live --json-out <path>` and compares their metrics against the
+// committed `bench/baseline.json`. Record mode requires a predeclared ten-report
+// calibration cohort. Every report must be complete full-corpus evidence. A
+// multi-report operation additionally requires one identical benchmark cohort
 // and distinct raw artifacts. Exits non-zero on invalid evidence or a material
 // regression, so the release pipeline can refuse to ship a CLI that reviews
 // worse than the last recorded baseline.
@@ -14,16 +15,16 @@
 //   bun run bench:compare -- --binary <binary> --screen-profile <profile>
 //     --expected-run-id <id> --result <path>
 //   bun run bench:compare -- --binary <binary> --screen-profile <profile>
-//     --expected-run-id <id-1> --expected-run-id <id-2> --expected-run-id <id-3>
-//     --result <path-1> --result <path-2> --result <path-3>
+//     --expected-run-id <id-1> ... --expected-run-id <id-5>
+//     --result <path-1> ... --result <path-5>
 //
-// Record mode writes the three-sample aggregate into baseline.json as the new
+// Record mode writes the ten-sample calibration cohort into baseline.json as the new
 // baseline for the reports' model. This is the deliberate re-baseline path:
 // nothing updates baseline.json except an explicit --record invocation.
 //
 //   bun run bench:compare -- --binary <binary> --screen-profile <profile>
-//     --expected-run-id <id-1> --expected-run-id <id-2> --expected-run-id <id-3>
-//     --result <path-1> --result <path-2> --result <path-3> --record
+//     --expected-run-id <id-1> ... --expected-run-id <id-10>
+//     --result <path-1> ... --result <path-10> --record
 
 import { createHash } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
@@ -32,6 +33,14 @@ import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
 import { cases } from "../fixtures/cases";
 import { benchmarkCase } from "./harness";
+import {
+  assertManifestBoundToInputs,
+  readCohortManifest,
+  readCohortReceipt,
+  reportSemanticSha256,
+  type CohortManifest,
+  type CohortReceipt,
+} from "./cohort";
 import {
   ADMISSION_API_BASE,
   evaluatorSourceSha256,
@@ -52,48 +61,20 @@ import {
 // inference variance (live mode is a single nondeterministic model run per
 // case) while still catching a real behavioral or cost regression.
 
-/** Detection rate may drop at most this many percentage points below baseline
- * before the gate fails. */
-export const DETECTION_RATE_MAX_DROP_PP = 2;
+/** The release cohort's mean detections may trail calibration by at most this
+ * many defect fixtures before the gate fails. */
+export const DETECTION_COUNT_NON_INFERIORITY_MARGIN = 2;
 
 /** The false/unrelated finding count above baseline that is reported as a
- * concern. Not blocking: see MEASURED_RUN_TO_RUN_SPREAD. An absolute count,
- * not a rate, since the corpus size is fixed. */
+ * concern. This remains informational because no stable blocking threshold is
+ * established. An absolute count, not a rate, since the corpus size is fixed. */
 export const FALSE_FINDINGS_MAX_INCREASE = 2;
 
 /** Gate-verdict correctness (does the CLI's exit code agree with the
  * authored classification: block must-block, pass everything else) below
- * baseline that is reported as a concern. Not blocking: see
- * MEASURED_RUN_TO_RUN_SPREAD. */
+ * baseline that is reported as a concern. This remains informational because
+ * no stable blocking threshold is established. */
 export const GATE_VERDICT_MAX_DROP_PP = 2;
-
-/**
- * Measured run-to-run spread for the informational metrics.
- *
- * Six runs of a single unchanged binary against this corpus, four on
- * OpenRouter managed routing and two pinned to the qualified upstream
- * provider, produced:
- *
- *   detection rate            96.5% - 100.0%   (3.5pp spread)
- *   false/unrelated findings  4 - 7
- *   gate verdict correctness  71.4% - 84.3%    (12.9pp spread)
- *
- * Every request is issued at temperature 0, so this is not sampling noise. It
- * is the provider's own nondeterminism, and pinning the upstream provider did
- * not remove it: the widest false-finding count came from a pinned run.
- *
- * The release gate compares three-run medians for quality and latency, and the
- * maximum per-run mean cost. False findings and gate-verdict correctness remain
- * informational because this measured sample does not establish sufficiently
- * narrow blocking thresholds for those metrics. Their median and complete
- * observed range stay visible in the comparison output.
- */
-export const MEASURED_RUN_TO_RUN_SPREAD = {
-  runs: 6,
-  detectionRatePp: 3.5,
-  falseFindingsCount: 3,
-  gateVerdictPp: 12.9,
-} as const;
 
 /** Maximum per-run mean provider cost per case may rise at most this fraction
  * above a baseline recorded under the same enforced provider profile. */
@@ -206,6 +187,7 @@ const liveReportSchema = z.object({
     detectionRate: nonemptyStringSchema,
     observedProviderCostUsdDecimal: canonicalCostSchema,
     costAccountingComplete: z.boolean(),
+    providerGenerationIds: z.array(z.string().regex(/^gen-[A-Za-z0-9_-]+$/u)).min(1),
     errors: z.number().int().nonnegative(),
     ranAt: nonemptyStringSchema,
   }),
@@ -216,6 +198,53 @@ export type LiveReportForComparison = z.infer<typeof liveReportSchema>;
 
 // ---------------------------------------------------------------------------
 // Baseline file shape.
+
+const calibrationReportSchema = z.object({
+  slot: z.number().int().positive(),
+  nonce: z.string().uuid(),
+  runId: nonemptyStringSchema,
+  ranAt: nonemptyStringSchema,
+  rawSha256: sha256Schema,
+  semanticSha256: sha256Schema,
+  receiptRawSha256: sha256Schema,
+  binarySha256: sha256Schema,
+  detected: z.number().int().nonnegative(),
+  falsePositives: z.number().int().nonnegative(),
+  gateVerdictCorrect: z.number().int().nonnegative(),
+  totalCostUsdDecimal: canonicalCostSchema,
+  p50LatencyMs: z.number().nonnegative(),
+  p95LatencyMs: z.number().nonnegative(),
+});
+
+const calibrationSchema = z.object({
+  reportCount: z.literal(10),
+  cohortId: z.string().uuid(),
+  manifestSha256: sha256Schema,
+  sourceSha: z.string().regex(/^[0-9a-f]{40,64}$/u),
+  workflowRunId: nonemptyStringSchema,
+  binarySha256: sha256Schema,
+  providerContractSha256: sha256Schema,
+  comparisonCohortSha256: sha256Schema,
+  reports: z.array(calibrationReportSchema).length(10),
+}).superRefine((calibration, context) => {
+  const runIds = calibration.reports.map((report) => report.runId);
+  if (new Set(runIds).size !== runIds.length) {
+    context.addIssue({ code: "custom", message: "calibration report run IDs must be unique" });
+  }
+  const rawDigests = calibration.reports.map((report) => report.rawSha256);
+  if (new Set(rawDigests).size !== rawDigests.length) {
+    context.addIssue({ code: "custom", message: "calibration report digests must be unique" });
+  }
+  const receiptDigests = calibration.reports.map((report) => report.receiptRawSha256);
+  if (new Set(receiptDigests).size !== receiptDigests.length) {
+    context.addIssue({ code: "custom", message: "calibration receipt digests must be unique" });
+  }
+  if (calibration.reports.some((report, index) => report.slot !== index + 1)) {
+    context.addIssue({ code: "custom", message: "calibration report slots must be complete and ordered" });
+  }
+});
+
+export type CalibrationEvidence = z.infer<typeof calibrationSchema>;
 
 const baselineProfileSchema = z.discriminatedUnion("populated", [
   z.object({
@@ -230,10 +259,12 @@ const baselineProfileSchema = z.discriminatedUnion("populated", [
     providerContractEnforced: z.boolean(),
     screeningProfileSha256: sha256Schema.nullable(),
     upstreamProviderIdentity: nonemptyStringSchema.nullable(),
+    calibration: calibrationSchema.optional(),
     totalCases: z.number().int().positive(),
     scoredCases: z.number().int().positive(),
+    defectCases: z.number().int().positive().optional(),
     detectionRate: z.number().min(0).max(1),
-    falsePositives: z.number().int().nonnegative(),
+    falsePositives: z.number().finite().nonnegative(),
     gateVerdictCorrectness: z.number().min(0).max(1),
     meanCostUsdPerCase: z.number().nonnegative(),
     maximumRunCostUsdDecimal: canonicalCostSchema.optional(),
@@ -246,7 +277,7 @@ const baselineProfileSchema = z.discriminatedUnion("populated", [
 ]);
 
 const baselineFileSchema = z.object({
-  schemaVersion: z.literal(1),
+  schemaVersion: z.literal(2),
   corpus: z.object({
     fixtureCorpusSha256: sha256Schema,
     evaluatorSha256: sha256Schema,
@@ -257,21 +288,32 @@ const baselineFileSchema = z.object({
 export type BaselineFile = z.infer<typeof baselineFileSchema>;
 export type BaselineProfile = z.infer<typeof baselineProfileSchema>;
 
+export function parseBaselineFile(value: unknown): BaselineFile {
+  return baselineFileSchema.parse(value);
+}
+
 // ---------------------------------------------------------------------------
 // Metric extraction from a live report.
 
+type SupportedReportCount = 1 | 3 | 5 | 10;
+
 export interface ObservedMetrics {
-  reportCount: 1 | 3;
+  reportCount: SupportedReportCount;
   model: string;
   reviewMode: "exhaustive" | "bounded";
   providerContractEnforced: boolean;
   screeningProfileSha256: string | null;
   upstreamProviderIdentity: string | null;
+  providerContractSha256: string;
+  comparisonCohortSha256: string;
+  binarySha256: string;
   fixtureCorpusSha256: string;
   evaluatorSha256: string;
   ranAt: string;
   totalCases: number;
   scoredCases: number;
+  defectCases: number;
+  detectedTotal: number;
   detectionRate: number;
   falsePositives: number;
   gateVerdictCorrectness: number;
@@ -287,6 +329,16 @@ export interface ObservedMetrics {
     p50LatencyMs: MetricRange;
     p95LatencyMs: MetricRange;
   };
+  perRun: Array<{
+    runId: string;
+    ranAt: string;
+    detected: number;
+    falsePositives: number;
+    gateVerdictCorrect: number;
+    totalCostUsdDecimal: string;
+    p50LatencyMs: number;
+    p95LatencyMs: number;
+  }>;
 }
 
 export interface MetricRange {
@@ -419,6 +471,9 @@ export function assertValidReleaseReport(report: LiveReportForComparison): void 
 
   const ids = report.results.map((result) => result.id);
   if (new Set(ids).size !== ids.length) invalidReport("result IDs must be unique");
+  if (new Set(s.providerGenerationIds).size !== s.providerGenerationIds.length) {
+    invalidReport("provider generation IDs must be unique");
+  }
 
   const defectResults = report.results.filter((result) => result.type === "defect");
   const cleanResults = report.results.filter((result) => result.type === "clean");
@@ -496,6 +551,17 @@ const COHORT_SUMMARY_FIELDS = [
   "scoredCases",
 ] as const satisfies readonly (keyof LiveReportForComparison["summary"])[];
 
+export function comparisonCohortSha256(
+  summary: LiveReportForComparison["summary"],
+): string {
+  const identity = Object.fromEntries(
+    COHORT_SUMMARY_FIELDS
+      .filter((field) => field !== "binarySha256")
+      .map((field) => [field, summary[field]]),
+  );
+  return createHash("sha256").update(JSON.stringify(identity)).digest("hex");
+}
+
 function resultCohort(report: LiveReportForComparison) {
   return report.results
     .map(({ id, type, truthSeverity }) => ({ id, type, truthSeverity }))
@@ -503,6 +569,10 @@ function resultCohort(report: LiveReportForComparison) {
 }
 
 export function assertMatchingCohort(reports: readonly LiveReportForComparison[]): void {
+  const providerGenerationIds = reports.flatMap((report) => report.summary.providerGenerationIds);
+  if (new Set(providerGenerationIds).size !== providerGenerationIds.length) {
+    throw new Error("live report cohort requires globally distinct provider generation IDs");
+  }
   if (reports.length < 2) return;
   const reference = reports[0]!;
   for (let index = 1; index < reports.length; index += 1) {
@@ -524,17 +594,21 @@ export function assertDistinctRunIdentities(
   if (reports.length < 2) return;
   const runIds = reports.map((report) => report.summary.runId);
   if (new Set(runIds).size !== runIds.length) {
-    throw new Error("three-report comparison requires distinct benchmark run IDs");
+    throw new Error("multi-report comparison requires distinct benchmark run IDs");
   }
   const runTimes = reports.map((report) => report.summary.ranAt);
   if (new Set(runTimes).size !== runTimes.length) {
-    throw new Error("three-report comparison requires distinct benchmark run timestamps");
+    throw new Error("multi-report comparison requires distinct benchmark run timestamps");
   }
 }
 
 interface PerRunMetrics {
+  runId: string;
+  ranAt: string;
+  detected: number;
   detectionRate: number;
   falsePositives: number;
+  gateVerdictCorrect: number;
   gateVerdictCorrectness: number;
   totalCostUsdDecimal: string;
   meanCostUsdPerCase: number;
@@ -553,8 +627,12 @@ function extractPerRunMetrics(report: LiveReportForComparison): PerRunMetrics {
     .sort((a, b) => a - b);
 
   return {
+    runId: s.runId,
+    ranAt: s.ranAt,
+    detected: s.detected,
     detectionRate: s.detected / s.defectCases,
     falsePositives: s.falsePositives,
+    gateVerdictCorrect: gateCorrect,
     gateVerdictCorrectness: gateCorrect / s.totalCases,
     totalCostUsdDecimal: s.observedProviderCostUsdDecimal,
     meanCostUsdPerCase: Number(s.observedProviderCostUsdDecimal) / s.totalCases,
@@ -566,14 +644,18 @@ function extractPerRunMetrics(report: LiveReportForComparison): PerRunMetrics {
 export function aggregateObservedMetrics(
   reports: readonly LiveReportForComparison[],
 ): ObservedMetrics {
-  if (reports.length !== 1 && reports.length !== 3) {
-    throw new Error(`comparison requires exactly 1 or 3 reports, received ${reports.length}`);
+  if (reports.length !== 1 && reports.length !== 3 && reports.length !== 5 && reports.length !== 10) {
+    throw new Error(`aggregation requires exactly 1, 3, 5, or 10 reports, received ${reports.length}`);
   }
   reports.forEach(assertValidReleaseReport);
   assertMatchingCohort(reports);
   assertDistinctRunIdentities(reports);
 
-  const perRun = reports.map(extractPerRunMetrics);
+  const orderedReports = [...reports].sort((left, right) =>
+    left.summary.runId.localeCompare(right.summary.runId) ||
+    left.summary.ranAt.localeCompare(right.summary.ranAt));
+  const perRun = orderedReports.map(extractPerRunMetrics);
+  const detectedTotal = perRun.reduce((sum, run) => sum + run.detected, 0);
   const detectionRates = perRun.map((run) => run.detectionRate);
   const falsePositives = perRun.map((run) => run.falsePositives);
   const gateCorrectness = perRun.map((run) => run.gateVerdictCorrectness);
@@ -589,18 +671,23 @@ export function aggregateObservedMetrics(
   const ranAt = reports.map((report) => report.summary.ranAt).sort()[Math.floor(reports.length / 2)]!;
 
   return {
-    reportCount: reports.length as 1 | 3,
+    reportCount: reports.length as SupportedReportCount,
     model: s.model,
     reviewMode: s.reviewMode,
     providerContractEnforced: s.providerContractEnforced,
     screeningProfileSha256: s.screeningProfileSha256,
     upstreamProviderIdentity: s.upstreamProviderIdentity,
+    providerContractSha256: s.providerContractSha256,
+    comparisonCohortSha256: comparisonCohortSha256(s),
+    binarySha256: s.binarySha256,
     fixtureCorpusSha256: s.fixtureCorpusSha256,
     evaluatorSha256: s.evaluatorSha256,
     ranAt,
     totalCases: s.totalCases,
     scoredCases: s.scoredCases,
-    detectionRate: median(detectionRates),
+    defectCases: s.defectCases,
+    detectedTotal,
+    detectionRate: detectedTotal / (s.defectCases * reports.length),
     falsePositives: median(falsePositives),
     gateVerdictCorrectness: median(gateCorrectness),
     maximumRunCostUsdDecimal: maximumCostRun.totalCostUsdDecimal,
@@ -618,11 +705,70 @@ export function aggregateObservedMetrics(
       p50LatencyMs: metricRange(p50Latencies),
       p95LatencyMs: metricRange(p95Latencies),
     },
+    perRun: perRun.map((run) => ({
+      runId: run.runId,
+      ranAt: run.ranAt,
+      detected: run.detected,
+      falsePositives: run.falsePositives,
+      gateVerdictCorrect: run.gateVerdictCorrect,
+      totalCostUsdDecimal: run.totalCostUsdDecimal,
+      p50LatencyMs: run.p50LatencyMs,
+      p95LatencyMs: run.p95LatencyMs,
+    })),
   };
 }
 
 export function extractObservedMetrics(report: LiveReportForComparison): ObservedMetrics {
   return aggregateObservedMetrics([report]);
+}
+
+export interface RawReportProvenance {
+  slot: number;
+  nonce: string;
+  runId: string;
+  startedAt: string;
+  rawSha256: string;
+  semanticSha256: string;
+  receiptRawSha256: string;
+}
+
+export interface CalibrationManifestProvenance {
+  cohortId: string;
+  manifestSha256: string;
+  sourceSha: string;
+  workflowRunId: string;
+}
+
+export function buildCalibrationEvidence(
+  observed: ObservedMetrics,
+  rawReports: readonly RawReportProvenance[],
+  manifest: CalibrationManifestProvenance,
+): CalibrationEvidence {
+  if (observed.reportCount !== 10) {
+    throw new Error(`baseline calibration requires exactly 10 observed reports, received ${observed.reportCount}`);
+  }
+  if (rawReports.length !== observed.reportCount) {
+    throw new Error(
+      `baseline calibration requires one raw digest per report, received ${rawReports.length}/${observed.reportCount}`,
+    );
+  }
+  const rawProvenanceByRunId = new Map(rawReports.map((report) => [report.runId, report]));
+  if (rawProvenanceByRunId.size !== rawReports.length) {
+    throw new Error("baseline calibration raw report run IDs must be unique");
+  }
+  const metricsByRunId = new Map(observed.perRun.map((run) => [run.runId, run]));
+  return calibrationSchema.parse({
+    reportCount: 10,
+    ...manifest,
+    binarySha256: observed.binarySha256,
+    providerContractSha256: observed.providerContractSha256,
+    comparisonCohortSha256: observed.comparisonCohortSha256,
+    reports: [...rawReports].sort((left, right) => left.slot - right.slot).map((provenance) => ({
+      ...metricsByRunId.get(provenance.runId),
+      binarySha256: observed.binarySha256,
+      ...provenance,
+    })),
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -634,13 +780,84 @@ interface MetricVerdict {
   observed: string;
   verdict: "PASS" | "FAIL";
   detail?: string;
-  /** Reported, but never blocks a release. See MEASURED_RUN_TO_RUN_SPREAD. */
+  /** Reported, but never blocks a release. */
   informational?: boolean;
 }
 
 export interface ComparisonResult {
   ok: boolean;
   rows: MetricVerdict[];
+}
+
+export type CalibratedBaselineProfile = Extract<BaselineProfile, { populated: true }> & {
+  calibration: NonNullable<Extract<BaselineProfile, { populated: true }>["calibration"]>;
+  defectCases: number;
+};
+
+export function isCalibratedBaselineProfile(
+  profile: Extract<BaselineProfile, { populated: true }>,
+): profile is CalibratedBaselineProfile {
+  return profile.calibration !== undefined && profile.defectCases !== undefined;
+}
+
+export function assertBaselineCalibrationIntegrity(profile: CalibratedBaselineProfile): void {
+  const reports = profile.calibration.reports;
+  const detectedTotal = profile.calibration.reports.reduce(
+    (sum, report) => sum + report.detected,
+    0,
+  );
+  const expectedDetectionRate = detectedTotal /
+    (profile.calibration.reportCount * profile.defectCases);
+  if (profile.detectionRate !== expectedDetectionRate) {
+    throw new Error("baseline detection rate does not match its calibration reports");
+  }
+  for (const report of profile.calibration.reports) {
+    if (report.binarySha256 !== profile.calibration.binarySha256) {
+      throw new Error(`baseline calibration report ${report.runId} has a different binary digest`);
+    }
+    if (report.detected > profile.defectCases) {
+      throw new Error(`baseline calibration report ${report.runId} exceeds the defect count`);
+    }
+    if (report.gateVerdictCorrect > profile.totalCases) {
+      throw new Error(`baseline calibration report ${report.runId} exceeds the total case count`);
+    }
+  }
+  const expectedFalsePositives = median(reports.map((report) => report.falsePositives));
+  if (profile.falsePositives !== expectedFalsePositives) {
+    throw new Error("baseline false finding count does not match its calibration reports");
+  }
+  const expectedGateVerdictCorrectness = median(
+    reports.map((report) => report.gateVerdictCorrect / profile.totalCases),
+  );
+  if (profile.gateVerdictCorrectness !== expectedGateVerdictCorrectness) {
+    throw new Error("baseline gate verdict correctness does not match its calibration reports");
+  }
+  const maximumCostReport = reports.reduce((maximum, candidate) =>
+    compareCanonicalDecimals(
+      parseCanonicalDecimal(candidate.totalCostUsdDecimal),
+      parseCanonicalDecimal(maximum.totalCostUsdDecimal),
+    ) > 0 ? candidate : maximum);
+  if (profile.maximumRunCostUsdDecimal !== maximumCostReport.totalCostUsdDecimal) {
+    throw new Error("baseline maximum run cost does not match its calibration reports");
+  }
+  if (profile.costCaseCount !== profile.totalCases) {
+    throw new Error("baseline cost case count does not match its complete case count");
+  }
+  const expectedMeanCost = Number(maximumCostReport.totalCostUsdDecimal) / profile.totalCases;
+  if (profile.meanCostUsdPerCase !== expectedMeanCost) {
+    throw new Error("baseline mean cost does not match its maximum calibration run");
+  }
+  const expectedP50 = median(reports.map((report) => report.p50LatencyMs));
+  const expectedP95 = median(reports.map((report) => report.p95LatencyMs));
+  if (profile.latencyMs.p50 !== expectedP50 || profile.latencyMs.p95 !== expectedP95) {
+    throw new Error("baseline latency does not match its calibration reports");
+  }
+  const expectedSourceRunAt = reports
+    .map((report) => report.ranAt)
+    .sort()[Math.floor(reports.length / 2)]!;
+  if (profile.sourceRunAt !== expectedSourceRunAt) {
+    throw new Error("baseline source timestamp does not match its calibration reports");
+  }
 }
 
 function pct(v: number): string {
@@ -678,18 +895,59 @@ export function exactMeanCostWithinTolerance(
   return compareCanonicalDecimals(left, right) <= 0;
 }
 
-export function compareMetrics(baseline: Extract<BaselineProfile, { populated: true }>, observed: ObservedMetrics): ComparisonResult {
+export function meanDetectionCountWithinMargin(
+  baselineDetectedTotal: number,
+  baselineReportCount: number,
+  observedDetectedTotal: number,
+  observedReportCount: number,
+): boolean {
+  for (const [label, value] of [
+    ["baseline detected total", baselineDetectedTotal],
+    ["baseline report count", baselineReportCount],
+    ["observed detected total", observedDetectedTotal],
+    ["observed report count", observedReportCount],
+  ] as const) {
+    if (!Number.isSafeInteger(value) || value < (label.endsWith("count") ? 1 : 0)) {
+      throw new Error(`${label} must be a ${label.endsWith("count") ? "positive" : "nonnegative"} safe integer`);
+    }
+  }
+  const baselineTotal = BigInt(baselineDetectedTotal);
+  const baselineCount = BigInt(baselineReportCount);
+  const observedTotal = BigInt(observedDetectedTotal);
+  const observedCount = BigInt(observedReportCount);
+  const margin = BigInt(DETECTION_COUNT_NON_INFERIORITY_MARGIN);
+  return observedTotal * baselineCount + margin * observedCount * baselineCount >=
+    baselineTotal * observedCount;
+}
+
+export function compareMetrics(baseline: CalibratedBaselineProfile, observed: ObservedMetrics): ComparisonResult {
+  if (baseline.calibration.comparisonCohortSha256 !== observed.comparisonCohortSha256) {
+    throw new Error("baseline calibration execution identity does not match the candidate cohort");
+  }
   const rows: MetricVerdict[] = [];
   const sampleLabel = observed.reportCount === 1 ? "1 run" : `${observed.reportCount} runs`;
 
-  const detectionFloor = baseline.detectionRate - DETECTION_RATE_MAX_DROP_PP / 100;
+  const calibrationDetectedTotal = baseline.calibration.reports.reduce(
+    (sum, report) => sum + report.detected,
+    0,
+  );
+  const detectionFloor = Math.max(
+    0,
+    baseline.detectionRate - DETECTION_COUNT_NON_INFERIORITY_MARGIN / observed.defectCases,
+  );
+  const detectionWithinMargin = meanDetectionCountWithinMargin(
+    calibrationDetectedTotal,
+    baseline.calibration.reportCount,
+    observed.detectedTotal,
+    observed.reportCount,
+  );
   rows.push({
-    metric: "median detection rate",
+    metric: "mean detection rate",
     baseline: pct(baseline.detectionRate),
     observed: pct(observed.detectionRate),
-    verdict: observed.detectionRate >= detectionFloor ? "PASS" : "FAIL",
+    verdict: detectionWithinMargin ? "PASS" : "FAIL",
     detail:
-      `floor ${pct(detectionFloor)} (baseline - ${DETECTION_RATE_MAX_DROP_PP}pp); ` +
+      `floor ${pct(detectionFloor)} (baseline mean - ${DETECTION_COUNT_NON_INFERIORITY_MARGIN} defect fixtures); ` +
       `${sampleLabel} range ${pct(observed.ranges.detectionRate.min)}-${pct(observed.ranges.detectionRate.max)}`,
   });
 
@@ -811,6 +1069,8 @@ export interface CompareCliOptions {
   baselinePath: string;
   binaryPath: string;
   screeningProfilePath: string;
+  cohortManifestPath?: string;
+  receiptPaths: string[];
   expectedRunIds: string[];
   resultPaths: string[];
   record: boolean;
@@ -837,10 +1097,12 @@ export function assertDistinctResultPaths(paths: readonly string[]): void {
 
 export function parseCliArguments(args: readonly string[]): CompareCliOptions {
   const resultPaths: string[] = [];
+  const receiptPaths: string[] = [];
   const expectedRunIds: string[] = [];
   let baselinePath = defaultBaselinePath();
   let binaryPath: string | undefined;
   let screeningProfilePath: string | undefined;
+  let cohortManifestPath: string | undefined;
   let baselineSeen = false;
   let record = false;
 
@@ -848,6 +1110,17 @@ export function parseCliArguments(args: readonly string[]): CompareCliOptions {
     const argument = args[index]!;
     if (argument === "--result") {
       resultPaths.push(requiredFlagValue(args, index, argument));
+      index += 1;
+      continue;
+    }
+    if (argument === "--receipt") {
+      receiptPaths.push(requiredFlagValue(args, index, argument));
+      index += 1;
+      continue;
+    }
+    if (argument === "--cohort-manifest") {
+      if (cohortManifestPath !== undefined) throw new Error("--cohort-manifest may be specified only once");
+      cohortManifestPath = requiredFlagValue(args, index, argument);
       index += 1;
       continue;
     }
@@ -885,11 +1158,16 @@ export function parseCliArguments(args: readonly string[]): CompareCliOptions {
     throw new Error(`unknown bench:compare argument ${argument}`);
   }
 
-  if (record && resultPaths.length !== 3) {
-    throw new Error(`--record requires exactly three --result reports, received ${resultPaths.length}`);
+  if (record && resultPaths.length !== 10) {
+    throw new Error(`--record requires exactly ten --result reports, received ${resultPaths.length}`);
   }
-  if (!record && resultPaths.length !== 1 && resultPaths.length !== 3) {
-    throw new Error(`bench:compare requires exactly 1 or 3 --result reports, received ${resultPaths.length}`);
+  if (
+    !record &&
+    resultPaths.length !== 1 &&
+    resultPaths.length !== 3 &&
+    resultPaths.length !== 5
+  ) {
+    throw new Error(`bench:compare requires exactly 1, 3, or 5 --result reports, received ${resultPaths.length}`);
   }
   if (binaryPath === undefined) throw new Error("bench:compare requires --binary");
   if (screeningProfilePath === undefined) {
@@ -904,10 +1182,25 @@ export function parseCliArguments(args: readonly string[]): CompareCliOptions {
     throw new Error("every --expected-run-id must be distinct");
   }
   assertDistinctResultPaths(resultPaths);
+  assertDistinctResultPaths(receiptPaths);
+  const requiresCohort = record || resultPaths.length === 5;
+  if (requiresCohort && cohortManifestPath === undefined) {
+    throw new Error("five-report release and ten-report record operations require --cohort-manifest");
+  }
+  if (requiresCohort && receiptPaths.length !== resultPaths.length) {
+    throw new Error(
+      `cohort comparison requires one --receipt per --result report, received ${receiptPaths.length}/${resultPaths.length}`,
+    );
+  }
+  if (!requiresCohort && (cohortManifestPath !== undefined || receiptPaths.length !== 0)) {
+    throw new Error("cohort evidence is accepted only for five-report release or ten-report record operations");
+  }
   return {
     baselinePath,
     binaryPath,
     screeningProfilePath,
+    cohortManifestPath,
+    receiptPaths,
     expectedRunIds,
     resultPaths,
     record,
@@ -916,7 +1209,7 @@ export function parseCliArguments(args: readonly string[]): CompareCliOptions {
 
 export function assertDistinctRawReportDigests(digests: readonly string[]): void {
   if (new Set(digests).size !== digests.length) {
-    throw new Error("three-report comparison requires distinct raw SHA-256 digests");
+    throw new Error("multi-report comparison requires distinct raw SHA-256 digests");
   }
 }
 
@@ -936,7 +1229,14 @@ export function assertExpectedRunIdentities(
   }
 }
 
-async function loadReports(paths: readonly string[]): Promise<LiveReportForComparison[]> {
+interface LoadedReports {
+  reports: LiveReportForComparison[];
+  raw: Uint8Array[];
+  rawSha256: string[];
+  parsed: unknown[];
+}
+
+async function loadReports(paths: readonly string[]): Promise<LoadedReports> {
   const rawReports = await Promise.all(paths.map(async (path) => {
     const raw = await readFile(path).catch((error) => {
       throw new Error(`could not read live report at ${path}: ${error instanceof Error ? error.message : String(error)}`);
@@ -947,11 +1247,11 @@ async function loadReports(paths: readonly string[]): Promise<LiveReportForCompa
       sha256: createHash("sha256").update(raw).digest("hex"),
     };
   }));
-  if (rawReports.length === 3) {
+  if (rawReports.length > 1) {
     assertDistinctRawReportDigests(rawReports.map((report) => report.sha256));
   }
 
-  return rawReports.map(({ path, raw }) => {
+  const reports = rawReports.map(({ path, raw }) => {
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw.toString("utf8"));
@@ -969,6 +1269,114 @@ async function loadReports(paths: readonly string[]): Promise<LiveReportForCompa
     }
     return report.data;
   });
+  return {
+    reports,
+    raw: rawReports.map((report) => report.raw),
+    rawSha256: rawReports.map((report) => report.sha256),
+    parsed: rawReports.map((report) => JSON.parse(report.raw.toString("utf8")) as unknown),
+  };
+}
+
+export interface VerifiedCohortEvidence {
+  manifest: CohortManifest;
+  manifestSha256: string;
+  reports: RawReportProvenance[];
+}
+
+export function assertCompleteCohortEvidence(options: {
+  manifest: CohortManifest;
+  manifestSha256: string;
+  receipts: Array<{ receipt: CohortReceipt; rawSha256: string }>;
+  reports: readonly LiveReportForComparison[];
+  rawReportSha256: readonly string[];
+  parsedReports: readonly unknown[];
+  expectedRunIds: readonly string[];
+  record: boolean;
+}): VerifiedCohortEvidence {
+  const { manifest } = options;
+  const expectedPurpose = options.record ? "calibration" : "release";
+  if (manifest.purpose !== expectedPurpose) {
+    throw new Error(`benchmark cohort purpose must be ${expectedPurpose}`);
+  }
+  if (
+    options.receipts.length !== manifest.reportCount ||
+    options.reports.length !== manifest.reportCount ||
+    options.rawReportSha256.length !== manifest.reportCount ||
+    options.parsedReports.length !== manifest.reportCount
+  ) {
+    throw new Error("benchmark cohort requires every declared report and receipt slot");
+  }
+  const manifestRunIds = manifest.slots.map((slot) => slot.runId);
+  if (!isDeepStrictEqual(options.expectedRunIds, manifestRunIds)) {
+    throw new Error("expected run IDs must exactly match the predeclared cohort slots");
+  }
+  const receiptBySlot = new Map(options.receipts.map((entry) => [entry.receipt.slot, entry]));
+  if (receiptBySlot.size !== options.receipts.length) {
+    throw new Error("benchmark cohort receipt slots must be unique");
+  }
+
+  const provenance = manifest.slots.map((slot, index): RawReportProvenance => {
+    const entry = receiptBySlot.get(slot.slot);
+    if (entry === undefined) throw new Error(`benchmark cohort is missing receipt slot ${slot.slot}`);
+    const { receipt } = entry;
+    if (receipt.state !== "completed") {
+      throw new Error(`benchmark cohort slot ${slot.slot} is ${receipt.state}; the whole cohort is invalid`);
+    }
+    const bindings: Array<[string, unknown, unknown]> = [
+      ["manifestSha256", receipt.manifestSha256, options.manifestSha256],
+      ["cohortId", receipt.cohortId, manifest.cohortId],
+      ["purpose", receipt.purpose, manifest.purpose],
+      ["slot", receipt.slot, slot.slot],
+      ["nonce", receipt.nonce, slot.nonce],
+      ["runId", receipt.runId, slot.runId],
+    ];
+    for (const [field, actual, expected] of bindings) {
+      if (actual !== expected) {
+        throw new Error(`benchmark cohort receipt slot ${slot.slot} ${field} does not match its manifest`);
+      }
+    }
+    const report = options.reports[index]!;
+    if (report.summary.runId !== slot.runId) {
+      throw new Error(`benchmark report slot ${slot.slot} does not match its predeclared run ID`);
+    }
+    if (receipt.reportRawSha256 !== options.rawReportSha256[index]) {
+      throw new Error(`benchmark report slot ${slot.slot} raw digest does not match its receipt`);
+    }
+    const semanticSha256 = reportSemanticSha256(options.parsedReports[index]);
+    if (Date.parse(receipt.startedAt) < Date.parse(manifest.createdAt)) {
+      throw new Error(`benchmark cohort slot ${slot.slot} started before its manifest was created`);
+    }
+    if (Date.parse(receipt.finishedAt) < Date.parse(receipt.startedAt)) {
+      throw new Error(`benchmark cohort slot ${slot.slot} finished before it started`);
+    }
+    const reportRanAt = Date.parse(report.summary.ranAt);
+    if (
+      !Number.isFinite(reportRanAt) ||
+      reportRanAt < Date.parse(receipt.startedAt) ||
+      reportRanAt > Date.parse(receipt.finishedAt)
+    ) {
+      throw new Error(`benchmark report slot ${slot.slot} ranAt is outside its receipt interval`);
+    }
+    return {
+      slot: slot.slot,
+      nonce: slot.nonce,
+      runId: slot.runId,
+      startedAt: receipt.startedAt,
+      rawSha256: options.rawReportSha256[index]!,
+      semanticSha256,
+      receiptRawSha256: entry.rawSha256,
+    };
+  });
+
+  for (const [label, values] of [
+    ["receipt", provenance.map((report) => report.receiptRawSha256)],
+    ["raw report", provenance.map((report) => report.rawSha256)],
+  ] as const) {
+    if (new Set(values).size !== values.length) {
+      throw new Error(`benchmark cohort requires distinct ${label} SHA-256 digests`);
+    }
+  }
+  return { manifest, manifestSha256: options.manifestSha256, reports: provenance };
 }
 
 export async function assertReportsBoundToInputs(
@@ -1039,18 +1447,24 @@ function shellQuote(value: string): string {
 
 export function formatRebaselineGuidance(options: Pick<
   CompareCliOptions,
-  "binaryPath" | "screeningProfilePath" | "expectedRunIds" | "resultPaths"
+  "binaryPath" | "screeningProfilePath" | "cohortManifestPath" | "receiptPaths" |
+  "expectedRunIds" | "resultPaths"
 >): string {
-  if (options.resultPaths.length !== 3 || options.expectedRunIds.length !== 3) {
-    return "  collect three independent complete reports, then use the three-report --record command documented in bench/README.md";
+  if (
+    options.resultPaths.length !== 10 || options.expectedRunIds.length !== 10 ||
+    options.receiptPaths.length !== 10 || options.cohortManifestPath === undefined
+  ) {
+    return "  collect a predeclared ten-report calibration cohort, then use the ten-report --record command documented in bench/README.md";
   }
   return [
     "  bun run bench:compare -- \\",
     `    --binary ${shellQuote(options.binaryPath)} \\`,
     `    --screen-profile ${shellQuote(options.screeningProfilePath)} \\`,
+    `    --cohort-manifest ${shellQuote(options.cohortManifestPath)} \\`,
     ...options.expectedRunIds.map((runId) =>
       `    --expected-run-id ${shellQuote(runId)} \\`),
     ...options.resultPaths.map((path) => `    --result ${shellQuote(path)} \\`),
+    ...options.receiptPaths.map((path) => `    --receipt ${shellQuote(path)} \\`),
     "    --record",
   ].join("\n");
 }
@@ -1060,17 +1474,48 @@ async function main() {
     baselinePath,
     binaryPath,
     screeningProfilePath,
+    cohortManifestPath,
+    receiptPaths,
     expectedRunIds,
     resultPaths,
     record,
   } = parseCliArguments(process.argv.slice(2));
-  const reports = await loadReports(resultPaths);
+  const loadedReports = await loadReports(resultPaths);
+  const { reports, rawSha256 } = loadedReports;
   assertExpectedRunIdentities(reports, expectedRunIds);
   await assertReportsBoundToInputs(reports, binaryPath, screeningProfilePath);
+  let cohortEvidence: VerifiedCohortEvidence | undefined;
+  if (cohortManifestPath !== undefined) {
+    const manifestFile = await readCohortManifest(cohortManifestPath);
+    await assertManifestBoundToInputs(
+      manifestFile.manifest,
+      binaryPath,
+      screeningProfilePath,
+    );
+    const receipts = await Promise.all(receiptPaths.map(async (path) => {
+      try {
+        return await readCohortReceipt(path);
+      } catch (error) {
+        throw new Error(`could not read cohort receipt at ${path}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }));
+    cohortEvidence = assertCompleteCohortEvidence({
+      manifest: manifestFile.manifest,
+      manifestSha256: manifestFile.rawSha256,
+      receipts: receipts.map((receipt) => ({ receipt: receipt.receipt, rawSha256: receipt.rawSha256 })),
+      reports,
+      rawReportSha256: rawSha256,
+      parsedReports: loadedReports.parsed,
+      expectedRunIds,
+      record,
+    });
+  }
   const observed = aggregateObservedMetrics(reports);
   const rebaselineGuidance = formatRebaselineGuidance({
     binaryPath,
     screeningProfilePath,
+    cohortManifestPath,
+    receiptPaths,
     expectedRunIds,
     resultPaths,
   });
@@ -1078,9 +1523,22 @@ async function main() {
   const baselineRaw = await readJson(baselinePath).catch((error) => {
     throw new Error(`could not read baseline at ${baselinePath}: ${error instanceof Error ? error.message : String(error)}`);
   });
-  const baselineFile = baselineFileSchema.parse(baselineRaw);
+  const baselineFile = parseBaselineFile(baselineRaw);
 
   if (record) {
+    if (cohortEvidence === undefined || cohortManifestPath === undefined) {
+      throw new Error("baseline recording requires verified pre-execution cohort evidence");
+    }
+    const calibration = buildCalibrationEvidence(
+      observed,
+      cohortEvidence.reports,
+      {
+        cohortId: cohortEvidence.manifest.cohortId,
+        manifestSha256: cohortEvidence.manifestSha256,
+        sourceSha: cohortEvidence.manifest.execution.sourceSha,
+        workflowRunId: cohortEvidence.manifest.execution.runId,
+      },
+    );
     baselineFile.profiles[observed.model] = {
       populated: true,
       generatedAt: new Date().toISOString(),
@@ -1089,8 +1547,10 @@ async function main() {
       providerContractEnforced: observed.providerContractEnforced,
       screeningProfileSha256: observed.screeningProfileSha256,
       upstreamProviderIdentity: observed.upstreamProviderIdentity,
+      calibration,
       totalCases: observed.totalCases,
       scoredCases: observed.scoredCases,
+      defectCases: observed.defectCases,
       detectionRate: observed.detectionRate,
       falsePositives: observed.falsePositives,
       gateVerdictCorrectness: observed.gateVerdictCorrectness,
@@ -1144,10 +1604,29 @@ async function main() {
     return;
   }
 
+  if (!isCalibratedBaselineProfile(profile)) {
+    console.error(
+      `The baseline for ${observed.model} lacks the required ten-report calibration evidence.\n` +
+        rebaselineGuidance,
+    );
+    process.exitCode = 1;
+    return;
+  }
+  try {
+    assertBaselineCalibrationIntegrity(profile);
+  } catch (error) {
+    console.error(
+      `INVALID BASELINE CALIBRATION: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+
   if (
     !profile.providerContractEnforced ||
     profile.screeningProfileSha256 !== observed.screeningProfileSha256 ||
     profile.upstreamProviderIdentity !== observed.upstreamProviderIdentity ||
+    profile.calibration.providerContractSha256 !== observed.providerContractSha256 ||
     profile.maximumRunCostUsdDecimal === undefined ||
     profile.costCaseCount === undefined ||
     profile.costCaseCount !== profile.totalCases
@@ -1163,9 +1642,18 @@ async function main() {
     return;
   }
 
+  if (profile.calibration.comparisonCohortSha256 !== observed.comparisonCohortSha256) {
+    console.error(
+      "BASELINE EXECUTION MISMATCH: the candidate scorer, timeout, provider, or other execution identity differs from calibration.",
+    );
+    process.exitCode = 1;
+    return;
+  }
+
   if (
     profile.reviewMode !== observed.reviewMode ||
     profile.totalCases !== observed.totalCases ||
+    profile.defectCases !== observed.defectCases ||
     profile.scoredCases !== profile.totalCases ||
     profile.scoredCases !== observed.scoredCases
   ) {
@@ -1173,6 +1661,7 @@ async function main() {
       "BASELINE COHORT MISMATCH: the validated report does not match the baseline execution mode or complete case count.\n" +
         `  baseline reviewMode ${profile.reviewMode}; observed ${observed.reviewMode}\n` +
         `  baseline totalCases ${profile.totalCases}; observed ${observed.totalCases}\n` +
+        `  baseline defectCases ${profile.defectCases}; observed ${observed.defectCases}\n` +
         `  baseline scoredCases ${profile.scoredCases}; observed ${observed.scoredCases}`,
     );
     process.exitCode = 1;

@@ -3,6 +3,7 @@
   "Cargo.toml",
   "build.rs",
   "src/adjudication.rs",
+  "src/alerts.rs",
   "src/api_key.rs",
   "src/attribution.rs",
   "src/brevity.rs",

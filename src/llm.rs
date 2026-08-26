@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, ensure};
+use hickory_resolver::Resolver;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use serde_json::json;
@@ -844,7 +845,6 @@ const ENDPOINT_AUTH_HEADER_ENV: &str = "POSTIL_ENDPOINT_AUTH_HEADER";
 const ENDPOINT_AUTH_VALUE_ENV: &str = "POSTIL_ENDPOINT_AUTH_VALUE";
 const ALLOW_PRIVATE_API_BASE_ENV: &str = "POSTIL_ALLOW_PRIVATE_API_BASE";
 static PROVIDER_RETRY_JITTER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "qualification-candidate")]
 const QUALIFICATION_CAPTURE_API_BASE_ENV: &str = "POSTIL_QUALIFICATION_CAPTURE_API_BASE";
 const ALWAYS_MANAGED_HEADERS: &[&str] = &[
     "x-api-key",
@@ -5213,15 +5213,27 @@ fn env_flag(name: &str) -> bool {
 }
 
 fn qualification_request_api_base(canonical_api_base: &str) -> Result<String> {
-    #[cfg(feature = "qualification-candidate")]
-    if crate::config::qualification_candidate_mode()
+    let qualification_candidate = {
+        #[cfg(feature = "qualification-candidate")]
+        {
+            crate::config::qualification_candidate_mode()
+        }
+        #[cfg(not(feature = "qualification-candidate"))]
+        {
+            false
+        }
+    };
+    let release_screen = is_canonical_openrouter_base(canonical_api_base)
+        && std::env::var_os("POSTIL_BENCH_SCREEN_PROFILE").is_some()
+        && env_flag("POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY");
+    if (qualification_candidate || release_screen)
         && let Some(raw) = std::env::var_os(QUALIFICATION_CAPTURE_API_BASE_ENV)
     {
         let raw = raw
             .into_string()
-            .map_err(|_| anyhow!("qualification capture API base must be UTF-8"))?;
+            .map_err(|_| anyhow!("benchmark capture API base must be UTF-8"))?;
         let url = reqwest::Url::parse(&raw)
-            .context("qualification capture API base must be an absolute URL")?;
+            .context("benchmark capture API base must be an absolute URL")?;
         let loopback = url
             .host_str()
             .and_then(|host| host.parse::<std::net::IpAddr>().ok())
@@ -5233,7 +5245,7 @@ fn qualification_request_api_base(canonical_api_base: &str) -> Result<String> {
                 && url.password().is_none()
                 && url.query().is_none()
                 && url.fragment().is_none(),
-            "qualification capture API base must be an HTTP loopback URL without credentials, query, or fragment"
+            "benchmark capture API base must be an HTTP loopback URL without credentials, query, or fragment"
         );
         return Ok(raw.trim_end_matches('/').to_string());
     }
@@ -5834,6 +5846,34 @@ struct AnthropicUsage {
 
 pub(crate) fn secure_http_client(api_base: &str) -> Result<reqwest::Client> {
     let (hostname, addresses) = resolve_api_endpoint(api_base)?;
+    build_secure_http_client(&hostname, &addresses)
+}
+
+/// Builds the same DNS-pinned client through Hickory's asynchronous resolver.
+/// Alert streams and renewable-login operations use this path so cancellation
+/// and their outer deadlines are not defeated by libc `getaddrinfo`.
+pub(crate) async fn secure_http_client_async(api_base: &str) -> Result<reqwest::Client> {
+    let (url, hostname, port) = parse_api_endpoint(api_base)?;
+    let addresses = if let Ok(address) = hostname.parse::<IpAddr>() {
+        vec![SocketAddr::new(address, port)]
+    } else {
+        let resolver = Resolver::builder_tokio()
+            .context("reading system DNS configuration")?
+            .build()
+            .context("building asynchronous DNS resolver")?;
+        resolver
+            .lookup_ip(hostname.as_str())
+            .await
+            .with_context(|| format!("model API hostname {hostname:?} could not be resolved"))?
+            .iter()
+            .map(|address| SocketAddr::new(address, port))
+            .collect()
+    };
+    validate_api_endpoint_addresses(&url, &hostname, &addresses)?;
+    build_secure_http_client(&hostname, &addresses)
+}
+
+fn build_secure_http_client(hostname: &str, addresses: &[SocketAddr]) -> Result<reqwest::Client> {
     reqwest::Client::builder()
         // A system proxy resolves the destination itself and would bypass the
         // validated, pinned DNS result below while carrying provider secrets.
@@ -5844,7 +5884,7 @@ pub(crate) fn secure_http_client(api_base: &str) -> Result<reqwest::Client> {
         // Connect only to the addresses approved by the single resolution
         // above. Reqwest retains the URL hostname for TLS SNI/certificate
         // verification while replacing DNS lookup results with this set.
-        .resolve_to_addrs(&hostname, &addresses)
+        .resolve_to_addrs(hostname, addresses)
         .build()
         .context("build model provider HTTP client")
 }
@@ -5861,6 +5901,14 @@ fn resolve_api_endpoint_with<F>(api_base: &str, resolver: F) -> Result<(String, 
 where
     F: FnOnce(&str, u16) -> std::io::Result<Vec<SocketAddr>>,
 {
+    let (url, hostname, port) = parse_api_endpoint(api_base)?;
+    let addresses = resolver(&hostname, port)
+        .with_context(|| format!("model API hostname {hostname:?} could not be resolved"))?;
+    validate_api_endpoint_addresses(&url, &hostname, &addresses)?;
+    Ok((hostname, addresses))
+}
+
+fn parse_api_endpoint(api_base: &str) -> Result<(reqwest::Url, String, u16)> {
     let url = reqwest::Url::parse(api_base).context("model API base must be an absolute URL")?;
     anyhow::ensure!(
         matches!(url.scheme(), "http" | "https"),
@@ -5878,8 +5926,14 @@ where
     let port = url
         .port_or_known_default()
         .context("model API base must include a port for its URL scheme")?;
-    let addresses = resolver(&hostname, port)
-        .with_context(|| format!("model API hostname {hostname:?} could not be resolved"))?;
+    Ok((url, hostname, port))
+}
+
+fn validate_api_endpoint_addresses(
+    url: &reqwest::Url,
+    hostname: &str,
+    addresses: &[SocketAddr],
+) -> Result<()> {
     anyhow::ensure!(
         !addresses.is_empty(),
         "model API hostname {hostname:?} did not resolve to any addresses"
@@ -5894,14 +5948,14 @@ where
         );
     }
     if !allow_private {
-        for address in &addresses {
+        for address in addresses {
             anyhow::ensure!(
                 is_public_ip(address.ip()),
                 "model API hostname {hostname:?} resolved to a private, loopback, link-local, or non-public address"
             );
         }
     }
-    Ok((hostname, addresses))
+    Ok(())
 }
 
 fn is_public_ip(address: IpAddr) -> bool {
@@ -6894,6 +6948,35 @@ mod tests {
         })
         .expect_err("a mixed public/private DNS answer must fail closed");
         assert!(error.to_string().contains("non-public address"));
+    }
+
+    #[test]
+    fn release_screen_capture_preserves_canonical_identity_and_requires_loopback() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvRestore::capture(&[
+            QUALIFICATION_CAPTURE_API_BASE_ENV,
+            "POSTIL_BENCH_SCREEN_PROFILE",
+            "POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY",
+        ]);
+        EnvRestore::set("POSTIL_BENCH_SCREEN_PROFILE", "/tmp/profile.json");
+        EnvRestore::set("POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY", "1");
+        EnvRestore::set(QUALIFICATION_CAPTURE_API_BASE_ENV, "http://127.0.0.1:4321");
+        assert_eq!(
+            qualification_request_api_base(crate::config::MANAGED_OPENROUTER_API_BASE).unwrap(),
+            "http://127.0.0.1:4321"
+        );
+        assert_eq!(
+            qualification_request_api_base("https://models.example/v1").unwrap(),
+            "https://models.example/v1"
+        );
+
+        EnvRestore::set(
+            QUALIFICATION_CAPTURE_API_BASE_ENV,
+            "https://models.example/v1",
+        );
+        let error = qualification_request_api_base(crate::config::MANAGED_OPENROUTER_API_BASE)
+            .expect_err("non-loopback capture must fail closed");
+        assert!(error.to_string().contains("HTTP loopback URL"));
     }
 
     #[test]

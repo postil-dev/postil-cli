@@ -3,14 +3,48 @@ name: Release
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch: {}
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   validate-tag:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      actions: read
     steps:
+      - name: Require the unique first release run for this tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_RUN_ATTEMPT}" != "1" ]]; then
+            echo "::error::Release workflow retries are not authoritative. Create a new version instead."
+            exit 1
+          fi
+          gh api --method GET \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/release.yml/runs" \
+            -f event=push \
+            -f branch="${GITHUB_REF_NAME}" \
+            -f per_page=100 \
+            | jq -e \
+              --arg id "${GITHUB_RUN_ID}" \
+              --arg tag "${GITHUB_REF_NAME}" \
+              '[.workflow_runs[] | select(
+                .event == "push" and
+                .head_branch == $tag
+              )] as $runs |
+              ($runs | length) == 1 and (($runs[0].id | tostring) == $id)' \
+              >/dev/null || {
+                echo "::error::This version tag already has another release run."
+                exit 1
+              }
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "::error::A GitHub release already exists for this version tag."
+            exit 1
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -31,6 +65,42 @@ jobs:
       - name: Verify embedded model admission
         working-directory: bench
         run: bun run verify-admission --allow-provisional
+      - name: Verify the attested Luna calibration baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          profile="openai/gpt-5.6-luna"
+          test -s bench/baseline.attestation.json || {
+            echo "::error::The populated Luna baseline has no committed calibration attestation."
+            exit 1
+          }
+          source_sha="$(jq -er --arg profile "$profile" \
+            '.profiles[$profile] | select(.populated == true) | .calibration.sourceSha' \
+            bench/baseline.json)"
+          [[ "$source_sha" =~ ^[0-9a-f]{40,64}$ ]] || {
+            echo "::error::The Luna baseline has an invalid calibration source digest."
+            exit 1
+          }
+          registry_sha="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/git/ref/tags/postil-calibration-${source_sha}" \
+            --jq .object.sha)"
+          test "$registry_sha" = "$source_sha" || {
+            echo "::error::The Luna baseline source is not protected by the calibration registry."
+            exit 1
+          }
+          gh attestation verify bench/baseline.json \
+            --bundle bench/baseline.attestation.json \
+            --repo postil-dev/postil-cli \
+            --signer-repo postil-dev/postil-cli \
+            --signer-workflow postil-dev/postil-cli/.github/workflows/benchmark-calibration.yml \
+            --signer-digest "$source_sha" \
+            --source-digest "$source_sha" \
+            --source-ref refs/heads/main \
+            --cert-oidc-issuer https://token.actions.githubusercontent.com \
+            --predicate-type https://slsa.dev/provenance/v1 \
+            --deny-self-hosted-runners \
+            --format json >/dev/null
       - name: Match release tag to package version
         env:
           RELEASE_TAG: ${{ github.ref_name }}
@@ -41,12 +111,15 @@ jobs:
             exit 1
           }
 
-  bench-live:
+  bench-live-prepare:
     needs: validate-tag
     runs-on: ubuntu-latest
     timeout-minutes: 270
     permissions:
       contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -83,12 +156,10 @@ jobs:
           fi
           if jq -e '.data.limit_remaining != null and .data.limit_remaining < 1' \
             /tmp/openrouter-key.json >/dev/null; then
-            remaining="$(jq -r '.data.limit_remaining' /tmp/openrouter-key.json)"
-            echo "::error::OPENROUTER_API_KEY has ${remaining} credit remaining, below the release benchmark reserve."
+            echo "::error::OPENROUTER_API_KEY has insufficient credit for the release benchmark reserve."
             exit 1
           fi
-          remaining="$(jq -r '.data.limit_remaining // "unlimited"' /tmp/openrouter-key.json)"
-          echo "OpenRouter credential accepted (remaining: ${remaining})."
+          echo "OpenRouter credential accepted."
 
       # Plain release profile: the same build the release job ships, so the
       # gate measures the binary users will actually get.
@@ -96,13 +167,45 @@ jobs:
       - name: Preserve benchmarked Linux binary
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: benchmarked-x86_64-unknown-linux-gnu
+          name: benchmarked-x86_64-unknown-linux-gnu-${{ github.run_attempt }}
           path: target/release/postil
           if-no-files-found: error
           retention-days: 1
       - name: Install benchmark dependencies
         working-directory: bench
         run: bun install --frozen-lockfile
+
+      - name: Predeclare the release benchmark cohort
+        working-directory: bench
+        run: >-
+          bun run bench:cohort-create --
+          --purpose release
+          --binary "${{ github.workspace }}/target/release/postil"
+          --screen-profile ../provisional-models.json
+          --run-prefix "release-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}"
+          --out "${{ runner.temp }}/bench-live-cohort.json"
+
+      - name: Attest the release benchmark cohort
+        id: attest-cohort
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/bench-live-cohort.json
+
+      - name: Stage the release benchmark cohort evidence
+        run: |
+          set -euo pipefail
+          evidence_dir="${RUNNER_TEMP}/bench-live-cohort-evidence"
+          mkdir -p "$evidence_dir"
+          cp "${RUNNER_TEMP}/bench-live-cohort.json" "$evidence_dir/bench-live-cohort.json"
+          cp "${{ steps.attest-cohort.outputs.bundle-path }}" "$evidence_dir/bench-live-cohort.attestation.json"
+
+      - name: Upload the release benchmark cohort and attestation
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bench-live-cohort-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bench-live-cohort-evidence
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Run the embedded hosted scorer gate
         working-directory: bench
@@ -121,83 +224,335 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: scorer-eval-report
+          name: scorer-eval-report-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/scorer-eval-report.json
             ${{ runner.temp }}/scorer-eval-report.json.partial
           if-no-files-found: warn
           retention-days: 30
 
-      - name: Run diff-file live benchmark sample 1
-        id: live-sample-1
-        continue-on-error: true
+  bench-live-sample:
+    needs: [validate-tag, bench-live-prepare]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        sample: [1, 2, 3, 4, 5]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+      - name: Download benchmarked Linux binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: benchmarked-x86_64-unknown-linux-gnu-${{ github.run_attempt }}
+          path: target/release
+      - name: Download predeclared release benchmark cohort
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bench-live-cohort-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bench-live-cohort-download
+      - name: Normalize and verify the predeclared release benchmark cohort
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          source="${RUNNER_TEMP}/bench-live-cohort-download"
+          expected_inventory=$'bench-live-cohort.attestation.json\nbench-live-cohort.json'
+          actual_inventory="$(find "$source" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)"
+          if [[ "$actual_inventory" != "$expected_inventory" ]] ||
+             [[ ! -f "$source/bench-live-cohort.json" ]] ||
+             [[ -L "$source/bench-live-cohort.json" ]] ||
+             [[ ! -f "$source/bench-live-cohort.attestation.json" ]] ||
+             [[ -L "$source/bench-live-cohort.attestation.json" ]]; then
+            echo "::error::Expected exactly one release cohort manifest and attestation bundle."
+            exit 1
+          fi
+          cp "$source/bench-live-cohort.json" "${RUNNER_TEMP}/bench-live-cohort.json"
+          cp "$source/bench-live-cohort.attestation.json" "${RUNNER_TEMP}/bench-live-cohort.attestation.json"
+          echo "COHORT_MANIFEST=${RUNNER_TEMP}/bench-live-cohort.json" >> "$GITHUB_ENV"
+          echo "COHORT_BUNDLE=${RUNNER_TEMP}/bench-live-cohort.attestation.json" >> "$GITHUB_ENV"
+          gh attestation verify "${RUNNER_TEMP}/bench-live-cohort.json" \
+            --bundle "${RUNNER_TEMP}/bench-live-cohort.attestation.json" \
+            --repo postil-dev/postil-cli \
+            --signer-repo postil-dev/postil-cli \
+            --signer-workflow postil-dev/postil-cli/.github/workflows/release.yml \
+            --signer-digest "${GITHUB_SHA}" \
+            --source-digest "${GITHUB_SHA}" \
+            --source-ref "${GITHUB_REF}" \
+            --cert-oidc-issuer https://token.actions.githubusercontent.com \
+            --predicate-type https://slsa.dev/provenance/v1 \
+            --deny-self-hosted-runners \
+            --format json > /dev/null
+      - run: chmod 0755 target/release/postil
+      - name: Install benchmark dependencies
+        working-directory: bench
+        run: bun install --frozen-lockfile
+      - name: Resolve canonical release sample slot
+        run: echo "RELEASE_SLOT=$(printf '%02d' '${{ matrix.sample }}')" >> "$GITHUB_ENV"
+      - name: Reserve diff-file live benchmark sample ${{ matrix.sample }}
+        working-directory: bench
+        run: >-
+          bun run bench:cohort-run --
+          --mode reserve
+          --manifest "${{ runner.temp }}/bench-live-cohort.json"
+          --slot "${{ matrix.sample }}"
+          --binary "${{ github.workspace }}/target/release/postil"
+          --screen-profile ../provisional-models.json
+      - name: Attest benchmark sample reservation
+        id: attest-reservation
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/slots/${{ env.RELEASE_SLOT }}/receipt.json
+      - name: Preserve benchmark sample reservation
+        run: |
+          cp "${{ runner.temp }}/slots/${{ env.RELEASE_SLOT }}/receipt.json" \
+            "${{ runner.temp }}/reservation.receipt.json"
+          cp "${{ steps.attest-reservation.outputs.bundle-path }}" \
+            "${{ runner.temp }}/reservation.attestation.json"
+      - name: Run diff-file live benchmark sample ${{ matrix.sample }}
         working-directory: bench
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           POSTIL_BIN: ${{ github.workspace }}/target/release/postil
         run: >-
-          bun run bench:live -- --screen-profile ../provisional-models.json
-          --run-id "release-${{ github.ref_name }}-sample-1"
-          --json-out "${{ runner.temp }}/bench-live-report-1.json"
-
-      - name: Run diff-file live benchmark sample 2
-        id: live-sample-2
-        continue-on-error: true
-        working-directory: bench
-        env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          POSTIL_BIN: ${{ github.workspace }}/target/release/postil
-        run: >-
-          bun run bench:live -- --screen-profile ../provisional-models.json
-          --run-id "release-${{ github.ref_name }}-sample-2"
-          --json-out "${{ runner.temp }}/bench-live-report-2.json"
-
-      - name: Run diff-file live benchmark sample 3
-        id: live-sample-3
-        continue-on-error: true
-        working-directory: bench
-        env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          POSTIL_BIN: ${{ github.workspace }}/target/release/postil
-        run: >-
-          bun run bench:live -- --screen-profile ../provisional-models.json
-          --run-id "release-${{ github.ref_name }}-sample-3"
-          --json-out "${{ runner.temp }}/bench-live-report-3.json"
-
-      - name: Upload the diff-file live reports
+          bun run bench:cohort-run --
+          --mode execute
+          --manifest "${{ runner.temp }}/bench-live-cohort.json"
+          --slot "${{ matrix.sample }}"
+          --binary "${{ github.workspace }}/target/release/postil"
+          --screen-profile ../provisional-models.json
+      - name: Verify successful benchmark sample evidence
+        if: success()
+        run: |
+          set -euo pipefail
+          slot_dir="${RUNNER_TEMP}/slots/$(printf '%02d' '${{ matrix.sample }}')"
+          test -s "$slot_dir/report.json"
+          test -s "$slot_dir/receipt.json"
+          jq -e '.state == "completed"' "$slot_dir/receipt.json" >/dev/null
+      - name: Attest benchmark sample report and receipt
+        id: attest-sample
+        if: success()
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: |
+            ${{ runner.temp }}/slots/${{ env.RELEASE_SLOT }}/report.json
+            ${{ runner.temp }}/slots/${{ env.RELEASE_SLOT }}/receipt.json
+      - name: Stage benchmark sample evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          slot="${RELEASE_SLOT}"
+          slot_dir="${RUNNER_TEMP}/slots/${slot}"
+          evidence_dir="${RUNNER_TEMP}/bench-live-sample-${{ github.run_attempt }}-${{ matrix.sample }}"
+          mkdir -p "${evidence_dir}/slots/${slot}"
+          if [[ -f "${slot_dir}/report.json" ]]; then cp "${slot_dir}/report.json" "${evidence_dir}/slots/${slot}/report.json"; fi
+          if [[ -f "${slot_dir}/receipt.json" ]]; then cp "${slot_dir}/receipt.json" "${evidence_dir}/slots/${slot}/receipt.json"; fi
+          cp "${RUNNER_TEMP}/reservation.receipt.json" "${evidence_dir}/slots/${slot}/reservation.receipt.json"
+          cp "${RUNNER_TEMP}/reservation.attestation.json" "${evidence_dir}/slots/${slot}/reservation.attestation.json"
+          if [[ -n "${{ steps.attest-sample.outputs.bundle-path }}" && -f "${{ steps.attest-sample.outputs.bundle-path }}" ]]; then
+            cp "${{ steps.attest-sample.outputs.bundle-path }}" "${evidence_dir}/slots/${slot}/attestation.bundle.json"
+          fi
+      - name: Upload diff-file live benchmark sample ${{ matrix.sample }}
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: bench-live-reports
-          path: |
-            ${{ runner.temp }}/bench-live-report-1.json
-            ${{ runner.temp }}/bench-live-report-2.json
-            ${{ runner.temp }}/bench-live-report-3.json
+          name: bench-live-sample-${{ github.run_attempt }}-${{ matrix.sample }}
+          path: ${{ runner.temp }}/bench-live-sample-${{ github.run_attempt }}-${{ matrix.sample }}
           if-no-files-found: warn
           retention-days: 30
 
-      - name: Compare against the recorded baseline
-        if: always()
+  bench-live:
+    if: always()
+    needs: [bench-live-prepare, bench-live-sample]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+      - name: Download benchmarked Linux binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: benchmarked-x86_64-unknown-linux-gnu-${{ github.run_attempt }}
+          path: target/release
+      - run: chmod 0755 target/release/postil
+      - name: Download diff-file live reports
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: bench-live-sample-${{ github.run_attempt }}-*
+          path: ${{ runner.temp }}/bench-live-reports-download
+          merge-multiple: false
+      - name: Download predeclared release benchmark cohort
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bench-live-cohort-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bench-live-cohort-download
+      - name: Normalize release benchmark evidence paths
+        run: |
+          set -euo pipefail
+          cohort_source="${RUNNER_TEMP}/bench-live-cohort-download"
+          cohort_expected=$'bench-live-cohort.attestation.json\nbench-live-cohort.json'
+          cohort_actual="$(find "$cohort_source" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)"
+          if [[ "$cohort_actual" != "$cohort_expected" ]] ||
+             [[ ! -f "$cohort_source/bench-live-cohort.json" ]] ||
+             [[ -L "$cohort_source/bench-live-cohort.json" ]] ||
+             [[ ! -f "$cohort_source/bench-live-cohort.attestation.json" ]] ||
+             [[ -L "$cohort_source/bench-live-cohort.attestation.json" ]]; then
+            echo "::error::Expected exactly one release cohort manifest and attestation bundle."
+            exit 1
+          fi
+          mkdir -p "${RUNNER_TEMP}/bench-live-reports"
+          cp "$cohort_source/bench-live-cohort.json" "${RUNNER_TEMP}/bench-live-cohort.json"
+          cp "$cohort_source/bench-live-cohort.attestation.json" "${RUNNER_TEMP}/bench-live-cohort.attestation.json"
+          for sample in 1 2 3 4 5; do
+            slot="$(printf '%02d' "$sample")"
+            source="${RUNNER_TEMP}/bench-live-reports-download/bench-live-sample-${GITHUB_RUN_ATTEMPT}-${sample}/slots/${slot}"
+            expected_inventory=$'attestation.bundle.json\nreceipt.json\nreport.json\nreservation.attestation.json\nreservation.receipt.json'
+            actual_inventory="$(find "$source" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)"
+            test "$actual_inventory" = "$expected_inventory" || {
+              echo "::error::Release slot ${slot} has an unexpected artifact inventory."
+              exit 1
+            }
+            mkdir -p "${RUNNER_TEMP}/bench-live-reports/slots/${slot}"
+            for name in report.json receipt.json reservation.receipt.json reservation.attestation.json attestation.bundle.json; do
+              test -f "$source/$name" && test ! -L "$source/$name" && test -s "$source/$name" || {
+                echo "::error::Missing ${name} for release slot ${slot}."
+                exit 1
+              }
+              cp "$source/$name" "${RUNNER_TEMP}/bench-live-reports/slots/${slot}/${name}"
+            done
+          done
+      - name: Verify signed release benchmark evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ "${{ needs.bench-live-sample.result }}" != "success" ]]; then
+            echo "::error::At least one live benchmark sample failed before attestation verification."
+            exit 1
+          fi
+          gh attestation verify "${RUNNER_TEMP}/bench-live-cohort.json" \
+            --bundle "${RUNNER_TEMP}/bench-live-cohort.attestation.json" \
+            --repo postil-dev/postil-cli \
+            --signer-repo postil-dev/postil-cli \
+            --signer-workflow postil-dev/postil-cli/.github/workflows/release.yml \
+            --signer-digest "${GITHUB_SHA}" \
+            --source-digest "${GITHUB_SHA}" \
+            --source-ref "${GITHUB_REF}" \
+            --cert-oidc-issuer https://token.actions.githubusercontent.com \
+            --predicate-type https://slsa.dev/provenance/v1 \
+            --deny-self-hosted-runners \
+            --format json > /dev/null
+          for slot in 01 02 03 04 05; do
+            report="${RUNNER_TEMP}/bench-live-reports/slots/${slot}/report.json"
+            receipt="${RUNNER_TEMP}/bench-live-reports/slots/${slot}/receipt.json"
+            reservation="${RUNNER_TEMP}/bench-live-reports/slots/${slot}/reservation.receipt.json"
+            reservation_bundle="${RUNNER_TEMP}/bench-live-reports/slots/${slot}/reservation.attestation.json"
+            bundle="${RUNNER_TEMP}/bench-live-reports/slots/${slot}/attestation.bundle.json"
+            test -s "$report"
+            test -s "$receipt"
+            test -s "$reservation"
+            test -s "$reservation_bundle"
+            test -s "$bundle"
+            gh attestation verify "$reservation" \
+              --bundle "$reservation_bundle" \
+              --repo postil-dev/postil-cli \
+              --signer-repo postil-dev/postil-cli \
+              --signer-workflow postil-dev/postil-cli/.github/workflows/release.yml \
+              --signer-digest "${GITHUB_SHA}" \
+              --source-digest "${GITHUB_SHA}" \
+              --source-ref "${GITHUB_REF}" \
+              --cert-oidc-issuer https://token.actions.githubusercontent.com \
+              --predicate-type https://slsa.dev/provenance/v1 \
+              --deny-self-hosted-runners \
+              --format json > /dev/null
+            jq -e -s '
+              .[0].state == "running" and
+              .[1].state == "completed" and
+              .[0].manifestSha256 == .[1].manifestSha256 and
+              .[0].cohortId == .[1].cohortId and
+              .[0].purpose == .[1].purpose and
+              .[0].slot == .[1].slot and
+              .[0].nonce == .[1].nonce and
+              .[0].runId == .[1].runId and
+              .[0].startedAt == .[1].startedAt
+            ' "$reservation" "$receipt" >/dev/null || {
+              echo "::error::Release slot ${slot} terminal receipt is not bound to its reservation."
+              exit 1
+            }
+            for subject in "$report" "$receipt"; do
+              gh attestation verify "$subject" \
+                --bundle "$bundle" \
+                --repo postil-dev/postil-cli \
+                --signer-repo postil-dev/postil-cli \
+                --signer-workflow postil-dev/postil-cli/.github/workflows/release.yml \
+                --signer-digest "${GITHUB_SHA}" \
+                --source-digest "${GITHUB_SHA}" \
+                --source-ref "${GITHUB_REF}" \
+                --cert-oidc-issuer https://token.actions.githubusercontent.com \
+                --predicate-type https://slsa.dev/provenance/v1 \
+                --deny-self-hosted-runners \
+                --format json > /dev/null
+            done
+          done
+      - name: Install benchmark dependencies
+        working-directory: bench
+        run: bun install --frozen-lockfile
+      - name: Verify independent release generations
         working-directory: bench
         env:
-          SAMPLE_1_OUTCOME: ${{ steps.live-sample-1.outcome }}
-          SAMPLE_2_OUTCOME: ${{ steps.live-sample-2.outcome }}
-          SAMPLE_3_OUTCOME: ${{ steps.live-sample-3.outcome }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          bun run bench:verify-generations -- \
+            --result "${RUNNER_TEMP}/bench-live-reports/slots/01/report.json" \
+            --receipt "${RUNNER_TEMP}/bench-live-reports/slots/01/receipt.json" \
+            --result "${RUNNER_TEMP}/bench-live-reports/slots/02/report.json" \
+            --receipt "${RUNNER_TEMP}/bench-live-reports/slots/02/receipt.json" \
+            --result "${RUNNER_TEMP}/bench-live-reports/slots/03/report.json" \
+            --receipt "${RUNNER_TEMP}/bench-live-reports/slots/03/receipt.json" \
+            --result "${RUNNER_TEMP}/bench-live-reports/slots/04/report.json" \
+            --receipt "${RUNNER_TEMP}/bench-live-reports/slots/04/receipt.json" \
+            --result "${RUNNER_TEMP}/bench-live-reports/slots/05/report.json" \
+            --receipt "${RUNNER_TEMP}/bench-live-reports/slots/05/receipt.json"
+      - name: Compare against the recorded baseline
+        working-directory: bench
+        env:
+          SAMPLE_JOB_RESULT: ${{ needs.bench-live-sample.result }}
         run: |
           set -euo pipefail
           comparison=0
           bun run bench:compare -- \
             --binary "${{ github.workspace }}/target/release/postil" \
             --screen-profile ../provisional-models.json \
-            --expected-run-id "release-${{ github.ref_name }}-sample-1" \
-            --expected-run-id "release-${{ github.ref_name }}-sample-2" \
-            --expected-run-id "release-${{ github.ref_name }}-sample-3" \
-            --result "${{ runner.temp }}/bench-live-report-1.json" \
-            --result "${{ runner.temp }}/bench-live-report-2.json" \
-            --result "${{ runner.temp }}/bench-live-report-3.json" || comparison=$?
-          if [[ "${SAMPLE_1_OUTCOME}" != "success" || \
-                "${SAMPLE_2_OUTCOME}" != "success" || \
-                "${SAMPLE_3_OUTCOME}" != "success" ]]; then
+            --cohort-manifest "${{ runner.temp }}/bench-live-cohort.json" \
+            --expected-run-id "release-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}-01" \
+            --expected-run-id "release-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}-02" \
+            --expected-run-id "release-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}-03" \
+            --expected-run-id "release-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}-04" \
+            --expected-run-id "release-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}-05" \
+            --result "${{ runner.temp }}/bench-live-reports/slots/01/report.json" \
+            --result "${{ runner.temp }}/bench-live-reports/slots/02/report.json" \
+            --result "${{ runner.temp }}/bench-live-reports/slots/03/report.json" \
+            --result "${{ runner.temp }}/bench-live-reports/slots/04/report.json" \
+            --result "${{ runner.temp }}/bench-live-reports/slots/05/report.json" \
+            --receipt "${{ runner.temp }}/bench-live-reports/slots/01/receipt.json" \
+            --receipt "${{ runner.temp }}/bench-live-reports/slots/02/receipt.json" \
+            --receipt "${{ runner.temp }}/bench-live-reports/slots/03/receipt.json" \
+            --receipt "${{ runner.temp }}/bench-live-reports/slots/04/receipt.json" \
+            --receipt "${{ runner.temp }}/bench-live-reports/slots/05/receipt.json" || comparison=$?
+          if [[ "${SAMPLE_JOB_RESULT}" != "success" ]]; then
             echo "::error::At least one live benchmark sample failed before comparison."
             exit 1
           fi
@@ -248,7 +603,7 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: benchmarked-x86_64-unknown-linux-gnu
+          name: benchmarked-x86_64-unknown-linux-gnu-${{ github.run_attempt }}
           path: target/${{ matrix.target }}/release
       - name: Restore benchmarked binary mode
         if: matrix.target == 'x86_64-unknown-linux-gnu'
@@ -271,9 +626,11 @@ jobs:
           fi
           # Keyless Sigstore signature + certificate (provenance / authenticity).
           # Verify later with:
+          #   RELEASE_TAG=v0.x.y
+          #   RELEASE_COMMIT=<full-tag-commit-sha>
           #   cosign verify-blob "$art" --signature "$art.sig" --certificate "$art.pem" \
-          #     --certificate-identity "https://github.com/postil-dev/postil-cli/.github/workflows/release.yml@refs/tags/$RELEASE" \
-          #     --certificate-github-workflow-sha "$CLI_REF" \
+          #     --certificate-identity "https://github.com/postil-dev/postil-cli/.github/workflows/release.yml@refs/tags/${RELEASE_TAG}" \
+          #     --certificate-github-workflow-sha "${RELEASE_COMMIT}" \
           #     --certificate-oidc-issuer https://token.actions.githubusercontent.com
           cosign sign-blob --yes \
             --output-signature "$art.sig" \

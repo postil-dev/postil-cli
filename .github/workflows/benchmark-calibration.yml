@@ -1,0 +1,430 @@
+name: Benchmark calibration
+
+on:
+  workflow_dispatch: {}
+
+concurrency:
+  group: benchmark-calibration-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Reserve the current main calibration source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "${GITHUB_REF}" = "refs/heads/main" || {
+            echo "::error::Benchmark calibration runs only from main."
+            exit 1
+          }
+          test "${GITHUB_RUN_ATTEMPT}" = "1" || {
+            echo "::error::Calibration retries are not authoritative. Fix the source and start a new run."
+            exit 1
+          }
+          main_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)"
+          test "${GITHUB_SHA}" = "$main_sha" || {
+            echo "::error::Calibration source is not the current main commit."
+            exit 1
+          }
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f ref="refs/tags/postil-calibration-${GITHUB_SHA}" \
+            -f sha="${GITHUB_SHA}" \
+            --silent
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+      - name: Install benchmark dependencies
+        working-directory: bench
+        run: bun install --frozen-lockfile
+      - name: Verify embedded model admission
+        working-directory: bench
+        run: bun run verify-admission --allow-provisional
+      - name: Require an unpopulated Luna baseline
+        run: >-
+          jq -e '.profiles["openai/gpt-5.6-luna"].populated == false'
+          bench/baseline.json >/dev/null
+
+  prepare:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 270
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+      - name: Require a working OpenRouter credential
+        env:
+          COMPLETION_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${COMPLETION_API_KEY}" ]]; then
+            echo "::error::OPENROUTER_API_KEY is not set."
+            exit 1
+          fi
+          status="$(curl --fail-with-body --silent --show-error \
+            --output /tmp/openrouter-key.json --write-out '%{http_code}' \
+            --connect-timeout 10 --max-time 30 \
+            -H "Authorization: Bearer ${COMPLETION_API_KEY}" \
+            https://openrouter.ai/api/v1/key)" || {
+            echo "::error::OPENROUTER_API_KEY was rejected by OpenRouter (HTTP ${status:-none})."
+            exit 1
+          }
+          jq -e '.data.limit_remaining == null or .data.limit_remaining >= 1' \
+            /tmp/openrouter-key.json >/dev/null || {
+              echo "::error::OPENROUTER_API_KEY has insufficient calibration credit."
+              exit 1
+            }
+      - run: cargo build --quiet --release
+      - name: Install benchmark dependencies
+        working-directory: bench
+        run: bun install --frozen-lockfile
+      - name: Predeclare the calibration cohort
+        working-directory: bench
+        run: >-
+          bun run bench:cohort-create --
+          --purpose calibration
+          --binary "${{ github.workspace }}/target/release/postil"
+          --screen-profile ../provisional-models.json
+          --run-prefix "calibration-${{ github.run_id }}"
+          --out "${{ runner.temp }}/benchmark-calibration-cohort.json"
+      - name: Attest the calibration binary and cohort
+        id: attest-prepared
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: |
+            ${{ github.workspace }}/target/release/postil
+            ${{ runner.temp }}/benchmark-calibration-cohort.json
+      - name: Stage prepared calibration evidence
+        run: |
+          set -euo pipefail
+          evidence="${RUNNER_TEMP}/benchmark-calibration-prepared"
+          mkdir -p "$evidence"
+          cp target/release/postil "$evidence/postil"
+          cp "${RUNNER_TEMP}/benchmark-calibration-cohort.json" "$evidence/cohort.json"
+          cp "${{ steps.attest-prepared.outputs.bundle-path }}" "$evidence/prepared.attestation.json"
+      - name: Upload prepared calibration evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: benchmark-calibration-prepared-${{ github.run_id }}
+          path: ${{ runner.temp }}/benchmark-calibration-prepared
+          if-no-files-found: error
+          retention-days: 90
+
+  sample:
+    needs: [validate, prepare]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        sample: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+      - name: Download prepared calibration evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: benchmark-calibration-prepared-${{ github.run_id }}
+          path: ${{ runner.temp }}/prepared
+      - name: Verify prepared calibration provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          chmod 0755 "${RUNNER_TEMP}/prepared/postil"
+          for subject in postil cohort.json; do
+            gh attestation verify "${RUNNER_TEMP}/prepared/${subject}" \
+              --bundle "${RUNNER_TEMP}/prepared/prepared.attestation.json" \
+              --repo postil-dev/postil-cli \
+              --signer-repo postil-dev/postil-cli \
+              --signer-workflow postil-dev/postil-cli/.github/workflows/benchmark-calibration.yml \
+              --signer-digest "${GITHUB_SHA}" \
+              --source-digest "${GITHUB_SHA}" \
+              --source-ref refs/heads/main \
+              --cert-oidc-issuer https://token.actions.githubusercontent.com \
+              --predicate-type https://slsa.dev/provenance/v1 \
+              --deny-self-hosted-runners \
+              --format json >/dev/null
+          done
+      - name: Install benchmark dependencies
+        working-directory: bench
+        run: bun install --frozen-lockfile
+      - name: Resolve canonical sample slot
+        run: echo "CALIBRATION_SLOT=$(printf '%02d' '${{ matrix.sample }}')" >> "$GITHUB_ENV"
+      - name: Reserve benchmark sample ${{ matrix.sample }}
+        working-directory: bench
+        run: >-
+          bun run bench:cohort-run --
+          --mode reserve
+          --manifest "${{ runner.temp }}/prepared/cohort.json"
+          --slot "${{ matrix.sample }}"
+          --binary "${{ runner.temp }}/prepared/postil"
+          --screen-profile ../provisional-models.json
+      - name: Attest benchmark sample reservation
+        id: attest-reservation
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ runner.temp }}/prepared/slots/${{ env.CALIBRATION_SLOT }}/receipt.json
+      - name: Preserve reservation attestation
+        run: |
+          cp "${{ steps.attest-reservation.outputs.bundle-path }}" \
+            "${RUNNER_TEMP}/reservation.attestation.json"
+          cp "${RUNNER_TEMP}/prepared/slots/${CALIBRATION_SLOT}/receipt.json" \
+            "${RUNNER_TEMP}/reservation.receipt.json"
+      - name: Execute benchmark sample ${{ matrix.sample }}
+        working-directory: bench
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          POSTIL_BIN: ${{ runner.temp }}/prepared/postil
+        run: >-
+          bun run bench:cohort-run --
+          --mode execute
+          --manifest "${{ runner.temp }}/prepared/cohort.json"
+          --slot "${{ matrix.sample }}"
+          --binary "${{ runner.temp }}/prepared/postil"
+          --screen-profile ../provisional-models.json
+      - name: Attest benchmark sample result
+        id: attest-result
+        if: success()
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: |
+            ${{ runner.temp }}/prepared/slots/${{ env.CALIBRATION_SLOT }}/report.json
+            ${{ runner.temp }}/prepared/slots/${{ env.CALIBRATION_SLOT }}/receipt.json
+      - name: Stage benchmark sample evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          slot="$(printf '%02d' '${{ matrix.sample }}')"
+          source="${RUNNER_TEMP}/prepared/slots/${slot}"
+          evidence="${RUNNER_TEMP}/benchmark-calibration-sample-${slot}"
+          mkdir -p "$evidence"
+          cp "$source/receipt.json" "$evidence/receipt.json"
+          cp "${RUNNER_TEMP}/reservation.receipt.json" "$evidence/reservation.receipt.json"
+          cp "${RUNNER_TEMP}/reservation.attestation.json" "$evidence/reservation.attestation.json"
+          if [[ -f "$source/report.json" ]]; then cp "$source/report.json" "$evidence/report.json"; fi
+          if [[ -n "${{ steps.attest-result.outputs.bundle-path }}" && -f "${{ steps.attest-result.outputs.bundle-path }}" ]]; then
+            cp "${{ steps.attest-result.outputs.bundle-path }}" "$evidence/result.attestation.json"
+          fi
+      - name: Upload benchmark sample evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: benchmark-calibration-sample-${{ github.run_id }}-${{ matrix.sample }}
+          path: ${{ runner.temp }}/benchmark-calibration-sample-${{ env.CALIBRATION_SLOT }}
+          if-no-files-found: error
+          retention-days: 90
+
+  record:
+    needs: [validate, prepare, sample]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+      - name: Download prepared calibration evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: benchmark-calibration-prepared-${{ github.run_id }}
+          path: ${{ runner.temp }}/prepared
+      - name: Download calibration sample evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: benchmark-calibration-sample-${{ github.run_id }}-*
+          path: ${{ runner.temp }}/samples
+          merge-multiple: false
+      - name: Normalize and verify all calibration evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          chmod 0755 "${RUNNER_TEMP}/prepared/postil"
+          for subject in postil cohort.json; do
+            gh attestation verify "${RUNNER_TEMP}/prepared/${subject}" \
+              --bundle "${RUNNER_TEMP}/prepared/prepared.attestation.json" \
+              --repo postil-dev/postil-cli \
+              --signer-repo postil-dev/postil-cli \
+              --signer-workflow postil-dev/postil-cli/.github/workflows/benchmark-calibration.yml \
+              --signer-digest "${GITHUB_SHA}" \
+              --source-digest "${GITHUB_SHA}" \
+              --source-ref refs/heads/main \
+              --cert-oidc-issuer https://token.actions.githubusercontent.com \
+              --predicate-type https://slsa.dev/provenance/v1 \
+              --deny-self-hosted-runners \
+              --format json >/dev/null
+          done
+          mkdir -p "${RUNNER_TEMP}/verified-slots"
+          for sample in 1 2 3 4 5 6 7 8 9 10; do
+            slot="$(printf '%02d' "$sample")"
+            destination="${RUNNER_TEMP}/verified-slots/${slot}"
+            source="${RUNNER_TEMP}/samples/benchmark-calibration-sample-${GITHUB_RUN_ID}-${sample}"
+            expected_inventory=$'receipt.json\nreport.json\nreservation.attestation.json\nreservation.receipt.json\nresult.attestation.json'
+            actual_inventory="$(find "$source" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)"
+            test "$actual_inventory" = "$expected_inventory" || {
+              echo "::error::Calibration slot ${slot} has an unexpected artifact inventory."
+              exit 1
+            }
+            mkdir -p "$destination"
+            for name in report.json receipt.json reservation.receipt.json reservation.attestation.json result.attestation.json; do
+              test -f "$source/$name" && test ! -L "$source/$name" && test -s "$source/$name" || {
+                echo "::error::Missing ${name} for calibration slot ${slot}."
+                exit 1
+              }
+              cp "$source/$name" "$destination/$name"
+            done
+            gh attestation verify "$destination/reservation.receipt.json" \
+              --bundle "$destination/reservation.attestation.json" \
+              --repo postil-dev/postil-cli \
+              --signer-repo postil-dev/postil-cli \
+              --signer-workflow postil-dev/postil-cli/.github/workflows/benchmark-calibration.yml \
+              --signer-digest "${GITHUB_SHA}" \
+              --source-digest "${GITHUB_SHA}" \
+              --source-ref refs/heads/main \
+              --cert-oidc-issuer https://token.actions.githubusercontent.com \
+              --predicate-type https://slsa.dev/provenance/v1 \
+              --deny-self-hosted-runners \
+              --format json >/dev/null
+            jq -e -s '
+              .[0].state == "running" and
+              .[1].state == "completed" and
+              .[0].manifestSha256 == .[1].manifestSha256 and
+              .[0].cohortId == .[1].cohortId and
+              .[0].purpose == .[1].purpose and
+              .[0].slot == .[1].slot and
+              .[0].nonce == .[1].nonce and
+              .[0].runId == .[1].runId and
+              .[0].startedAt == .[1].startedAt
+            ' "$destination/reservation.receipt.json" "$destination/receipt.json" >/dev/null || {
+              echo "::error::Calibration slot ${slot} terminal receipt is not bound to its reservation."
+              exit 1
+            }
+            for subject in report.json receipt.json; do
+              gh attestation verify "$destination/${subject}" \
+                --bundle "$destination/result.attestation.json" \
+                --repo postil-dev/postil-cli \
+                --signer-repo postil-dev/postil-cli \
+                --signer-workflow postil-dev/postil-cli/.github/workflows/benchmark-calibration.yml \
+                --signer-digest "${GITHUB_SHA}" \
+                --source-digest "${GITHUB_SHA}" \
+                --source-ref refs/heads/main \
+                --cert-oidc-issuer https://token.actions.githubusercontent.com \
+                --predicate-type https://slsa.dev/provenance/v1 \
+                --deny-self-hosted-runners \
+                --format json >/dev/null
+            done
+          done
+      - name: Install benchmark dependencies
+        working-directory: bench
+        run: bun install --frozen-lockfile
+      - name: Verify independent calibration generations
+        working-directory: bench
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          bun run bench:verify-generations -- \
+            --result "${RUNNER_TEMP}/verified-slots/01/report.json" \
+            --receipt "${RUNNER_TEMP}/verified-slots/01/receipt.json" \
+            --result "${RUNNER_TEMP}/verified-slots/02/report.json" \
+            --receipt "${RUNNER_TEMP}/verified-slots/02/receipt.json" \
+            --result "${RUNNER_TEMP}/verified-slots/03/report.json" \
+            --receipt "${RUNNER_TEMP}/verified-slots/03/receipt.json" \
+            --result "${RUNNER_TEMP}/verified-slots/04/report.json" \
+            --receipt "${RUNNER_TEMP}/verified-slots/04/receipt.json" \
+            --result "${RUNNER_TEMP}/verified-slots/05/report.json" \
+            --receipt "${RUNNER_TEMP}/verified-slots/05/receipt.json" \
+            --result "${RUNNER_TEMP}/verified-slots/06/report.json" \
+            --receipt "${RUNNER_TEMP}/verified-slots/06/receipt.json" \
+            --result "${RUNNER_TEMP}/verified-slots/07/report.json" \
+            --receipt "${RUNNER_TEMP}/verified-slots/07/receipt.json" \
+            --result "${RUNNER_TEMP}/verified-slots/08/report.json" \
+            --receipt "${RUNNER_TEMP}/verified-slots/08/receipt.json" \
+            --result "${RUNNER_TEMP}/verified-slots/09/report.json" \
+            --receipt "${RUNNER_TEMP}/verified-slots/09/receipt.json" \
+            --result "${RUNNER_TEMP}/verified-slots/10/report.json" \
+            --receipt "${RUNNER_TEMP}/verified-slots/10/receipt.json"
+      - name: Record the attested baseline
+        working-directory: bench
+        run: |
+          set -euo pipefail
+          bun run bench:compare -- \
+            --binary "${RUNNER_TEMP}/prepared/postil" \
+            --screen-profile ../provisional-models.json \
+            --cohort-manifest "${RUNNER_TEMP}/prepared/cohort.json" \
+            --expected-run-id "calibration-${GITHUB_RUN_ID}-01" \
+            --expected-run-id "calibration-${GITHUB_RUN_ID}-02" \
+            --expected-run-id "calibration-${GITHUB_RUN_ID}-03" \
+            --expected-run-id "calibration-${GITHUB_RUN_ID}-04" \
+            --expected-run-id "calibration-${GITHUB_RUN_ID}-05" \
+            --expected-run-id "calibration-${GITHUB_RUN_ID}-06" \
+            --expected-run-id "calibration-${GITHUB_RUN_ID}-07" \
+            --expected-run-id "calibration-${GITHUB_RUN_ID}-08" \
+            --expected-run-id "calibration-${GITHUB_RUN_ID}-09" \
+            --expected-run-id "calibration-${GITHUB_RUN_ID}-10" \
+            --result "${RUNNER_TEMP}/verified-slots/01/report.json" \
+            --result "${RUNNER_TEMP}/verified-slots/02/report.json" \
+            --result "${RUNNER_TEMP}/verified-slots/03/report.json" \
+            --result "${RUNNER_TEMP}/verified-slots/04/report.json" \
+            --result "${RUNNER_TEMP}/verified-slots/05/report.json" \
+            --result "${RUNNER_TEMP}/verified-slots/06/report.json" \
+            --result "${RUNNER_TEMP}/verified-slots/07/report.json" \
+            --result "${RUNNER_TEMP}/verified-slots/08/report.json" \
+            --result "${RUNNER_TEMP}/verified-slots/09/report.json" \
+            --result "${RUNNER_TEMP}/verified-slots/10/report.json" \
+            --receipt "${RUNNER_TEMP}/verified-slots/01/receipt.json" \
+            --receipt "${RUNNER_TEMP}/verified-slots/02/receipt.json" \
+            --receipt "${RUNNER_TEMP}/verified-slots/03/receipt.json" \
+            --receipt "${RUNNER_TEMP}/verified-slots/04/receipt.json" \
+            --receipt "${RUNNER_TEMP}/verified-slots/05/receipt.json" \
+            --receipt "${RUNNER_TEMP}/verified-slots/06/receipt.json" \
+            --receipt "${RUNNER_TEMP}/verified-slots/07/receipt.json" \
+            --receipt "${RUNNER_TEMP}/verified-slots/08/receipt.json" \
+            --receipt "${RUNNER_TEMP}/verified-slots/09/receipt.json" \
+            --receipt "${RUNNER_TEMP}/verified-slots/10/receipt.json" \
+            --record
+      - name: Attest the populated baseline
+        id: attest-baseline
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: ${{ github.workspace }}/bench/baseline.json
+      - name: Stage populated baseline evidence
+        run: |
+          mkdir -p "${RUNNER_TEMP}/populated-baseline"
+          cp bench/baseline.json "${RUNNER_TEMP}/populated-baseline/baseline.json"
+          cp "${{ steps.attest-baseline.outputs.bundle-path }}" \
+            "${RUNNER_TEMP}/populated-baseline/baseline.attestation.json"
+      - name: Upload populated baseline
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: benchmark-calibration-baseline-${{ github.run_id }}
+          path: ${{ runner.temp }}/populated-baseline
+          if-no-files-found: error
+          retention-days: 90

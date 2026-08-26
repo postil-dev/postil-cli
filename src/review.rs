@@ -235,17 +235,6 @@ fn review_batch_validation_reason(
             ),
         });
     }
-    if crate::repository_search::prose_requires_repository_search(finding)
-        && finding.repository_claim.is_none()
-    {
-        return Some(ReviewBatchValidationReason {
-            category: "repositoryClaim",
-            repair_detail: format!(
-                "finding at {}:{} makes a repository-wide absence or mismatch claim without a bounded repositoryContext declaration",
-                finding.path, finding.line
-            ),
-        });
-    }
     if let Some(claim) = finding.repository_claim.as_ref()
         && !crate::repository_search::claim_is_valid(claim)
     {
@@ -3078,7 +3067,7 @@ async fn finish<F: Forge>(
         && (args.resolved_output_format().is_none() || args.output_file.is_some())
     {
         let _progress_suspension = crate::progress::suspend_for_output();
-        output::print_pretty(&envelope);
+        output::print_pretty(&envelope, crate::progress::compact_human_output());
     }
 
     let duplicate_of_baseline = load_baseline(args)
@@ -5289,7 +5278,7 @@ mod tests {
     }
 
     #[test]
-    fn batch_validation_requires_typed_queries_for_universal_repository_claims() {
+    fn batch_validation_defers_unstructured_repository_claims_to_suppression() {
         let annotated = "### src/lib.rs\n@@ fixture @@\n    7 + changed();\n";
         let mut finding = finding(
             "src/lib.rs",
@@ -5298,8 +5287,10 @@ mod tests {
         );
         finding.evidence = Some("changed();".to_string());
 
-        let reason = review_batch_validation_reason(&finding, annotated, None).unwrap();
-        assert_eq!(reason.category, "repositoryClaim");
+        assert_eq!(
+            review_batch_validation_reason(&finding, annotated, None),
+            None
+        );
 
         finding.repository_claim = Some(crate::envelope::RepositoryClaim {
             kind: crate::envelope::RepositoryClaimKind::Absence,
@@ -5312,6 +5303,17 @@ mod tests {
         assert_eq!(
             review_batch_validation_reason(&finding, annotated, None),
             None
+        );
+
+        finding
+            .repository_claim
+            .as_mut()
+            .unwrap()
+            .identifiers
+            .clear();
+        assert_eq!(
+            review_batch_validation_reason(&finding, annotated, None).map(|reason| reason.category),
+            Some("repositoryClaim")
         );
     }
 

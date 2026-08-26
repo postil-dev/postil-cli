@@ -10,7 +10,7 @@ use postil_cli::config::{
     default_scorer_reasoning_effort, qualification_metadata, starter_config,
 };
 use postil_cli::review::{ForgeKind, ReviewArgs};
-use postil_cli::{doctor, hook, login, plan, review};
+use postil_cli::{alerts, doctor, hook, login, plan, review};
 
 #[tokio::main]
 async fn main() {
@@ -27,6 +27,7 @@ async fn main() {
 
 async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
     match cli.command {
+        Command::AlertWatch { once, probe } => alerts::run_watch(once, probe).await,
         Command::Capabilities {
             publication_plan_contract,
         } => {
@@ -153,6 +154,10 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
                 "  OpenAI-compatible endpoints accept any non-empty endpoint model ID and pass it unchanged; OpenRouter commonly uses provider/model."
             );
             println!(
+                "  Recommended OpenRouter starting point: {} (the embedded default); `postil doctor` verifies current provider availability.",
+                postil_cli::config::default_model()
+            );
+            println!(
                 "  Native Anthropic endpoints accept any non-empty Anthropic endpoint model ID and pass it unchanged, such as claude-* IDs."
             );
             println!(
@@ -174,7 +179,10 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
                     }
                 );
             } else {
-                println!("  Hosted qualified model IDs: none (no embedded qualified profile)");
+                println!(
+                    "  Hosted model selection is service-controlled; `postil login` does not require a model setting."
+                );
+                println!("  This binary contains no standalone hosted qualification profile.");
             }
             println!("\nCheck the configured endpoint and model: postil doctor");
             println!("Override once: postil review --model provider/model");

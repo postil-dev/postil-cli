@@ -143,4 +143,39 @@ describe("managed request-window governor", () => {
     expect(accepted.status).toBe(200);
     expect(starts[1]! - starts[0]!).toBeGreaterThanOrEqual(40);
   });
+
+  test("captures required OpenRouter generation identities and rejects their absence", async () => {
+    let includeIdentity = true;
+    const upstream = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch() {
+        return Response.json({ accepted: true }, {
+          headers: includeIdentity ? { "X-Generation-Id": "gen-fixture-1" } : {},
+        });
+      },
+    });
+    servers.push(upstream);
+    const generationIds: string[] = [];
+    const proxy = startManagedRequestWindowProxy(`${new URL(upstream.url).origin}/api/v1`, {
+      requireGenerationId: true,
+      onGenerationId: (generationId) => generationIds.push(generationId),
+    });
+    proxies.push(proxy);
+    const send = () => fetch(`${proxy.apiBase}/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+
+    const accepted = await send();
+    expect(accepted.status).toBe(200);
+    expect(accepted.headers.get("x-generation-id")).toBe("gen-fixture-1");
+    expect(generationIds).toEqual(["gen-fixture-1"]);
+
+    includeIdentity = false;
+    const rejected = await send();
+    expect(rejected.status).toBe(502);
+    expect(generationIds).toEqual(["gen-fixture-1"]);
+  });
 });

@@ -376,7 +376,7 @@ exercise the scorer and must retain its exact identity and usage record.
 It refuses to run without `POSTIL_API_KEY`, `OPENROUTER_API_KEY`, `MODEL_API_KEY`,
 or `LLM_API_KEY` and never logs or prints the key value. Live mode spends real
 tokens and depends on an external provider, so it is **not run on ordinary
-pushes or pull requests**. The release pipeline runs three sequential
+pushes or pull requests**. The release pipeline runs five sequential
 full-corpus live samples against `bench/baseline.json` before every tagged
 release (see "Release gate" below). Every live run writes its JSON report under
 `.runs/live/<run-id>/` (gitignored), beside raw per-attempt stdout and stderr.
@@ -427,7 +427,7 @@ produced no valid v1 envelope at all (empty/garbled output, typically a dropped
 response). A valid envelope is always treated as a normal result and is never
 retried, including a gate-failing exit (exit 1 with a scored envelope) or one
 that merely reports findings unrelated to the authored target. A case that fails on both
-attempts is recorded as an error and excluded from scoring, exactly as before.
+attempts is recorded as an operational error and excluded from scoring.
 
 ### What live mode scores
 
@@ -458,16 +458,40 @@ nondeterministic. Treat them as internal evidence, not a published benchmark.
 
 ## Release gate
 
-The `Release` workflow runs three uniquely named, sequential full-corpus
+The `Release` workflow runs five uniquely named, sequential full-corpus
 diff-file samples against the Luna profile in `provisional-models.json`. Every
-sample uses the same preserved release binary. All three samples are attempted
-even when one fails, and the workflow uploads every completed raw report before
-comparison. A failed sample, missing report, or failed comparison blocks the
-release because `build` depends on the `bench-live` job.
+sample uses the same preserved release binary. All five samples are attempted
+even when one fails. The prepare job writes one five-slot cohort manifest bound
+to the source commit, tag ref, workflow run, and attempt. GitHub OIDC attests the
+exact manifest with public Sigstore provenance. Each sample reserves one
+canonical slot directory and attests the running receipt before inference,
+then attests its completed report and receipt together. Every accepted provider
+response contributes its OpenRouter generation ID to the report. The fan-in job
+verifies globally distinct generation IDs against OpenRouter's authenticated
+generation API, including the exact model, provider, token totals, and cost,
+then verifies every subject against the exact repository, release workflow,
+source commit, tag ref, OIDC issuer, and GitHub-hosted runner before parsing it.
+Only the unique first workflow run for
+the version tag is authoritative. Tag-scoped concurrency, an existing-release
+check, and duplicate-run rejection prevent a second publisher path. A failed
+sample retains its terminal receipt but has no successful attestation. A
+failed sample, missing or unverifiable subject, incomplete slot, or failed
+comparison blocks the release because `build` depends on the `bench-live` job.
 
-The comparator accepts exactly one or three distinct `--result` paths. Three
-paths must also contain byte-distinct reports with distinct immutable run IDs
-and timestamps. Byte identity is established by SHA-256 over each raw file.
+The comparator accepts exactly one, three, or five distinct `--result` paths for
+comparison. One- and three-report comparisons support smaller local checks; the
+release workflow always supplies five. Multi-report paths must contain
+byte-distinct reports with distinct immutable run IDs and timestamps. Byte
+identity is established by SHA-256 over each raw file and authenticated by the
+release attestations.
+Five-report comparisons additionally require the original manifest and one
+completed receipt for every slot. The comparator verifies the manifest against
+the supplied binary, evaluator, corpus, profile, provider contract, workflow
+run, and workflow attempt. It verifies every receipt's slot, nonce, run ID,
+report digest, and timestamp interval. Semantically identical outcomes are
+valid when their raw subjects have independent authenticated provenance.
+Running, failed, missing, substituted, duplicate, and extra slots invalidate
+the whole cohort.
 Every report must be exhaustive full-corpus evidence with an empty
 `selectedCaseIds`, an enforced provider contract, no operational errors, and
 all cases scored. Summary and per-result cost accounting must be complete.
@@ -480,28 +504,53 @@ binary and screening-profile paths, then recomputes the binary, fixture corpus,
 evaluator source, screening profile, provider contract, and exact case cohort
 instead of trusting hashes asserted by the reports.
 
-A three-report comparison also requires identical binary, corpus, evaluator,
+A five-report comparison also requires identical binary, corpus, evaluator,
 model, provider, API, scorer, route, profile, contract, timeout, fixture
-identity, and case-count fields across the cohort. Structural, operational,
-digest, and cohort failures block before metric comparison. The one-report
-mode applies the same fail-closed report validation.
+identity, and case-count fields across the release cohort. Structural,
+operational, digest, and cohort failures block before metric comparison. Every
+report count applies the same fail-closed report validation.
 
-`compare-baseline.ts` compares five aggregate metrics against the matching
-model entry in `bench/baseline.json`: median authored-target detection rate,
-median false/unrelated finding count, median gate-verdict correctness, maximum
-per-run mean provider cost per case, and median per-run nearest-rank p95 review
-latency. Each metric has its own tolerance in the exported `*_MAX_*` constants.
-Detection rate and p95 latency block when they cross their tolerances. Maximum
-mean cost always blocks and is compared as an exact decimal ratio; a provider
-profile mismatch invalidates the comparison instead of making cost
-informational. False/unrelated findings and gate-verdict correctness remain
-informational; their medians and complete observed ranges appear in the table.
-The CLI's per-operation cost cap remains the deterministic spending boundary.
+`compare-baseline.ts` compares five aggregate metrics against the matching model
+entry in `bench/baseline.json`: mean authored-target detection, median false or
+unrelated finding count, median gate-verdict correctness, maximum per-run mean
+provider cost per case, and median per-run nearest-rank p95 review latency.
+Detection uses exact count arithmetic over the 57 defect fixtures. A five-report
+release candidate passes the detection non-inferiority check when its cohort
+mean is no more than two defect detections below the recorded calibration mean.
+The two-defect margin is applied to counts, not a rounded percentage. Detection,
+p95 latency, and cost are blocking checks; false findings and gate-verdict
+correctness remain informational with their medians and complete observed
+ranges. The CLI's per-operation cost cap remains the deterministic spending
+boundary.
 
-The baseline records fixture-corpus and evaluator-source SHA-256 digests, the
-expected complete case count, exact provider profile, and the maximum sampled
-run cost as a canonical decimal with its case count. A mismatch blocks
-comparison across unrelated or incomplete evidence.
+Baseline recording uses a predeclared calibration cohort of exactly ten
+independent complete reports from one frozen binary, corpus, evaluator, provider
+profile, and case cohort. A calibration report is not replaced because its
+outcome is inconvenient: the ten-report cohort is fixed before execution, and
+missing, duplicate, failed, interrupted, or incomplete evidence fails closed.
+The `Benchmark calibration` workflow runs only once for the current `main`
+commit. Before model execution it creates an immutable, server-protected
+`postil-calibration-<source SHA>` registry tag; a failed source cannot be
+rerun. It builds and attests one release binary and the ten-slot manifest.
+Each slot runs in a separate GitHub-hosted job. The job attests its running
+receipt before inference starts, executes the full corpus, and attests the
+terminal report and receipt. The fan-in job verifies every offline Sigstore
+bundle against the exact repository, workflow, source commit, branch, OIDC
+issuer, and GitHub-hosted runner. It also verifies the running-to-completed
+receipt transition and independently audits every globally distinct provider
+generation before recording the baseline as a workflow artifact. The
+baseline records the manifest and source digests, workflow run identity,
+each slot and nonce, report and receipt SHA-256 values, normalized outcome
+digests, per-run metric distribution, fixture-corpus and evaluator-source
+digests, complete case counts, exact provider profile, and the maximum sampled
+run cost as a canonical decimal with its case count. Checksums bind content;
+GitHub attestations authenticate build and execution provenance. A release
+candidate requires the populated baseline and its attestation bundle committed
+together. The release verifies that bundle against the calibration workflow,
+the recorded source commit, and the immutable calibration registry tag before
+using any threshold. The candidate must match the recorded corpus, evaluator,
+provider profile, and case cohort. Its five reports must share one candidate
+binary. A mismatch blocks comparison across unrelated or incomplete evidence.
 
 ```sh
 # Compare one complete report for a local check.
@@ -511,32 +560,88 @@ bun run bench:compare -- \
   --expected-run-id <report-run-id> \
   --result <path-to-report.json>
 
-# Run the release comparison over three complete reports.
-bun run bench:compare -- \
+# Inside the release workflow, create and attest a run-bound manifest before
+# any candidate sample starts, then execute each canonical slot once.
+bun run bench:cohort-create -- \
+  --purpose release \
   --binary <path-to-release-binary> \
   --screen-profile ../provisional-models.json \
-  --expected-run-id <report-run-id-1> \
-  --expected-run-id <report-run-id-2> \
-  --expected-run-id <report-run-id-3> \
-  --result <path-to-report-1.json> \
-  --result <path-to-report-2.json> \
-  --result <path-to-report-3.json>
+  --run-prefix <workflow-bound-prefix> \
+  --out <path-to-release-cohort.json>
+bun run bench:cohort-run -- \
+  --mode reserve \
+  --manifest <path-to-release-cohort.json> \
+  --slot <1-through-5> \
+  --binary <path-to-release-binary> \
+  --screen-profile ../provisional-models.json
+bun run bench:cohort-run -- \
+  --mode execute \
+  --manifest <path-to-release-cohort.json> \
+  --slot <1-through-5> \
+  --binary <path-to-release-binary> \
+  --screen-profile ../provisional-models.json
 
-# Re-baseline explicitly from three independent complete reports with the same
-# binary, profile, and corpus.
+# Run the release comparison over five complete candidate reports and receipts.
 bun run bench:compare -- \
   --binary <path-to-release-binary> \
   --screen-profile ../provisional-models.json \
+  --cohort-manifest <path-to-release-cohort.json> \
   --expected-run-id <report-run-id-1> \
   --expected-run-id <report-run-id-2> \
   --expected-run-id <report-run-id-3> \
+  --expected-run-id <report-run-id-4> \
+  --expected-run-id <report-run-id-5> \
   --result <path-to-report-1.json> \
   --result <path-to-report-2.json> \
   --result <path-to-report-3.json> \
+  --result <path-to-report-4.json> \
+  --result <path-to-report-5.json> \
+  --receipt <path-to-receipt-1.json> \
+  --receipt <path-to-receipt-2.json> \
+  --receipt <path-to-receipt-3.json> \
+  --receipt <path-to-receipt-4.json> \
+  --receipt <path-to-receipt-5.json>
+
+# The Benchmark calibration workflow invokes the record operation after it
+# verifies the attested binary, manifest, reservations, reports, and receipts.
+bun run bench:compare -- \
+  --binary <path-to-release-binary> \
+  --screen-profile ../provisional-models.json \
+  --cohort-manifest <path-to-calibration-cohort.json> \
+  --expected-run-id <report-run-id-1> \
+  --expected-run-id <report-run-id-2> \
+  --expected-run-id <report-run-id-3> \
+  --expected-run-id <report-run-id-4> \
+  --expected-run-id <report-run-id-5> \
+  --expected-run-id <report-run-id-6> \
+  --expected-run-id <report-run-id-7> \
+  --expected-run-id <report-run-id-8> \
+  --expected-run-id <report-run-id-9> \
+  --expected-run-id <report-run-id-10> \
+  --result <path-to-report-1.json> \
+  --result <path-to-report-2.json> \
+  --result <path-to-report-3.json> \
+  --result <path-to-report-4.json> \
+  --result <path-to-report-5.json> \
+  --result <path-to-report-6.json> \
+  --result <path-to-report-7.json> \
+  --result <path-to-report-8.json> \
+  --result <path-to-report-9.json> \
+  --result <path-to-report-10.json> \
+  --receipt <path-to-receipt-1.json> \
+  --receipt <path-to-receipt-2.json> \
+  --receipt <path-to-receipt-3.json> \
+  --receipt <path-to-receipt-4.json> \
+  --receipt <path-to-receipt-5.json> \
+  --receipt <path-to-receipt-6.json> \
+  --receipt <path-to-receipt-7.json> \
+  --receipt <path-to-receipt-8.json> \
+  --receipt <path-to-receipt-9.json> \
+  --receipt <path-to-receipt-10.json> \
   --record
 ```
 
-`--record` accepts exactly three reports and is the only operation that writes
+`--record` accepts exactly ten reports and is the only operation that writes
 `bench/baseline.json`. The release workflow never records a baseline. The
-comparison table shows baseline, aggregate observation, verdict, and sample
-range directly in the job log.
+comparison table shows the calibration baseline, candidate cohort observation,
+verdict, and complete sample range directly in the job log.

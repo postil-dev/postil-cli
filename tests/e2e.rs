@@ -6535,8 +6535,33 @@ async fn local_review_reports_grounded_finding_and_gates() {
     );
 }
 
+#[tokio::test]
+async fn bare_review_selects_a_nonempty_local_change_and_reaches_the_provider() {
+    let server = MockServer::start().await;
+    mock_review(&server, json!([])).await;
+    let directory = tempfile::tempdir().unwrap();
+    initialize_staged_repository(directory.path());
+
+    let output = postil()
+        .current_dir(directory.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .env_remove("REVIEW_MODEL")
+        .env_remove("REVIEW_MODEL_CASCADE")
+        .args(["review", "--output", "json"])
+        .assert()
+        .success();
+    let envelope: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    assert_eq!(envelope["silent"], true);
+    assert_eq!(envelope["modelUsed"], "openai/gpt-5.6-luna");
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(String::from_utf8_lossy(&requests[0].body).contains("exec_query(&token)"));
+}
+
 #[test]
-fn review_without_an_explicit_model_exits_before_provider_access() {
+fn review_with_the_embedded_model_reports_a_missing_provider_credential() {
     let dir = tempfile::tempdir().unwrap();
     let diff = write_diff(dir.path());
     let out = postil()
@@ -6613,8 +6638,8 @@ fn bare_review_clears_progress_before_pretty_output_in_a_pty() {
     assert!(output.status.success());
     let rendered = String::from_utf8_lossy(&output.stdout);
     let summary = rendered
-        .find("✓ postil: no merge-relevant findings")
-        .expect("pretty output was not rendered");
+        .find("postil: review complete; no findings")
+        .expect("completion output was not rendered");
     let before_summary = &rendered[..summary];
     let spinner = before_summary
         .rfind("Reviewing changes...")
@@ -6626,6 +6651,8 @@ fn bare_review_clears_progress_before_pretty_output_in_a_pty() {
         clear > spinner,
         "pretty output began before the progress line was cleared: {rendered:?}"
     );
+    assert!(!rendered.contains("repository search:"), "{rendered:?}");
+    assert!(!rendered.contains("gate: passing"), "{rendered:?}");
 }
 
 #[cfg(unix)]
@@ -6677,9 +6704,11 @@ fn file_artifacts_keep_human_progress_and_pretty_output_in_a_pty() {
         let rendered = String::from_utf8_lossy(&output.stdout);
         assert!(rendered.contains("Reviewing changes"), "{rendered:?}");
         assert!(
-            rendered.contains("✓ postil: no merge-relevant findings"),
+            rendered.contains("postil: review complete; no findings"),
             "{rendered:?}"
         );
+        assert!(!rendered.contains("repository search:"), "{rendered:?}");
+        assert!(!rendered.contains("gate: passing"), "{rendered:?}");
     }
 
     serde_json::from_slice::<Value>(&std::fs::read(envelope).unwrap()).unwrap();
@@ -6745,6 +6774,35 @@ async fn interactive_progress_controls_animation_separately_from_telemetry() {
         telemetry.contains("postil: github operation="),
         "machine review omitted GitHub telemetry: {telemetry:?}"
     );
+
+    let ci = isolated_script(
+        &binary,
+        &[
+            "review".to_string(),
+            "--repo".to_string(),
+            "acme/api".to_string(),
+            "--pr".to_string(),
+            "7".to_string(),
+        ],
+    )
+    .current_dir(dir.path())
+    .env("TERM", "xterm")
+    .env("CI", "true")
+    .env("GITHUB_API_URL", server.uri())
+    .env("GITHUB_TOKEN", "gh-test-token")
+    .env_remove("POSTIL_HOSTED_MODE")
+    .env_remove("RUST_LOG")
+    .env_remove("POSTIL_DEBUG")
+    .env_remove("NO_COLOR")
+    .output()
+    .unwrap();
+    assert!(ci.status.success());
+    let ci = String::from_utf8_lossy(&ci.stdout);
+    assert!(
+        ci.contains("postil: github operation="),
+        "CI review omitted operational telemetry: {ci:?}"
+    );
+    assert!(!ci.contains("Reviewing changes"), "{ci:?}");
 
     for (arguments, no_progress_environment) in [
         (
@@ -7030,13 +7088,17 @@ fn models_and_config_explain_the_embedded_default() {
     assert!(models.contains("does not maintain a fixed local model-ID allowlist"));
     assert!(models.contains("OpenAI-compatible endpoints accept any non-empty endpoint model ID"));
     assert!(models.contains("OpenRouter commonly uses provider/model"));
+    assert!(models.contains("Recommended OpenRouter starting point: openai/gpt-5.6-luna"));
+    assert!(models.contains("postil doctor` verifies current provider availability"));
     assert!(
         models.contains(
             "Native Anthropic endpoints accept any non-empty Anthropic endpoint model ID"
         )
     );
     assert!(models.contains("does not mean the model is hosted-qualified"));
-    assert!(models.contains("Hosted qualified model IDs: none (no embedded qualified profile)"));
+    assert!(models.contains("Hosted model selection is service-controlled"));
+    assert!(models.contains("postil login` does not require a model setting"));
+    assert!(models.contains("no standalone hosted qualification profile"));
     assert!(models.contains("max|xhigh|high|medium|low|minimal|none"));
     assert!(models.contains("postil doctor"));
     assert!(models.contains("postil review --model provider/model"));
@@ -13368,6 +13430,69 @@ async fn fresh_unresolved_repository_claims_are_suppressed() {
         assert_eq!(envelope["findings"], json!([]), "{name}");
         assert_eq!(envelope["gate"]["failing"], false, "{name}");
     }
+}
+
+#[tokio::test]
+async fn unstructured_repository_claim_is_suppressed_without_discarding_the_review() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("single finding adjudicator"))
+        .respond_with(AllUnresolvedAdjudicator)
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    mock_review(
+        &server,
+        json!([{
+            "path": "src/auth.rs", "line": 42, "severity": "error", "kind": "risk",
+            "confidence": 0.99, "title": "Caller support is absent",
+            "body": "No other caller accepts this value.",
+            "evidence": "exec_query(&token);"
+        }]),
+    )
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let diff = write_diff(directory.path());
+
+    let output = postil()
+        .current_dir(directory.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+    let envelope: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+
+    assert_eq!(envelope["findings"], json!([]));
+    assert_eq!(envelope["counts"]["suppressed"], 1);
+    assert_eq!(
+        envelope["suppressedFindings"][0]["reason"],
+        "repositoryClaimUnsupported"
+    );
+    assert_eq!(envelope["gate"]["failing"], false);
+    assert!(
+        envelope["modelIncidents"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+    );
+    assert!(
+        envelope["modelUsage"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|usage| usage["phase"] == "initial")
+    );
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests
+            .iter()
+            .all(|request| { !String::from_utf8_lossy(&request.body).contains("[Correction]") })
+    );
 }
 
 #[tokio::test]
