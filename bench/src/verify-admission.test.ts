@@ -269,6 +269,7 @@ describe("admission attestation verification", () => {
       nowUnixSeconds: issued + 60,
     })).toBe("verified");
     expect(actualArguments).toEqual(attestationVerificationArguments(manifest, bundle, sourceSha));
+    expect(actualArguments).not.toContain("--signer-repo");
     expect(actualArguments).toContain("postil-dev/postil-cli/.github/workflows/bench-live.yml");
     expect(actualArguments.filter((argument) => argument === sourceSha)).toHaveLength(2);
     expect(actualArguments).toContain("https://token.actions.githubusercontent.com");
