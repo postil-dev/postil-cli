@@ -1659,8 +1659,10 @@ impl Config {
     }
 
     /// A stored `postil login` credential supplies a local fallback API base
-    /// and model. Project configuration and environment variables are applied
-    /// after this method and therefore retain their documented precedence.
+    /// and, when present, a model. Legacy credentials with an empty model keep
+    /// the embedded default. Project configuration and environment variables
+    /// are applied after this method and therefore retain their documented
+    /// precedence.
     /// Runtime credential resolution rejects an endpoint override when no
     /// explicit API key is set. The cascade is cleared with the model because
     /// a BYOK fallback chain does not describe the hosted gateway.
@@ -1683,9 +1685,11 @@ impl Config {
             return false;
         };
         self.api_base = creds.api_base;
-        self.model = creds.model;
         self.cascade.clear();
-        self.model_source = "stored login".to_string();
+        if !creds.model.trim().is_empty() {
+            self.model = creds.model;
+            self.model_source = "stored login".to_string();
+        }
         true
     }
 
@@ -3108,6 +3112,48 @@ scorer = { enabled = true, default_model = "provider/scorer", reasoning_effort =
         config.apply_file(file).unwrap();
         assert_eq!(config.model, "project/model");
         assert_eq!(config.model_source, "trusted project config");
+
+        drop(saved_keys);
+        drop(xdg);
+    }
+
+    #[test]
+    fn empty_stored_login_model_uses_the_embedded_default() {
+        let _lock = env_lock().lock().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let xdg = EnvRestore::capture("XDG_CONFIG_HOME");
+        let saved_keys = crate::api_key::API_KEY_ENV_VARS.map(EnvRestore::capture);
+        EnvRestore::set("XDG_CONFIG_HOME", directory.path().to_str().unwrap());
+        for name in crate::api_key::API_KEY_ENV_VARS {
+            unsafe { std::env::remove_var(name) };
+        }
+
+        for stored_model in ["", "   "] {
+            credentials::write(
+                &credentials::default_path().unwrap(),
+                &credentials::Credentials {
+                    version: credentials::CREDENTIALS_VERSION,
+                    issuer: Some("https://postil.dev".into()),
+                    token: "pcli_fixture-not-a-real-secret".into(),
+                    expires_at: "2999-01-01T00:00:00.000Z".into(),
+                    refresh_token: None,
+                    refresh_expires_at: None,
+                    api_base: "https://postil.dev/api/inference/v1".into(),
+                    org: "fixture".into(),
+                    model: stored_model.into(),
+                    pending_revocations: Vec::new(),
+                },
+            )
+            .unwrap();
+            let mut config = Config::default();
+
+            assert!(config.apply_stored_login_credential());
+            assert_eq!(config.api_base, "https://postil.dev/api/inference/v1");
+            assert_eq!(config.model, model_defaults().default_model);
+            assert_eq!(config.model_source, "embedded default");
+            assert!(config.cascade.is_empty());
+            config.require_model_for(false, false).unwrap();
+        }
 
         drop(saved_keys);
         drop(xdg);
