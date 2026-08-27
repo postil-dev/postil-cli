@@ -128,7 +128,7 @@ if have cosign && [ "${POSTIL_SKIP_SIG:-0}" != "1" ]; then
     if cosign verify-blob "$tmp/$archive" \
         --signature "$tmp/$archive.sig" \
         --certificate "$tmp/$archive.pem" \
-        --certificate-identity-regexp "https://github.com/${REPO}/\.github/workflows/release\.yml@refs/tags/.*" \
+        --certificate-identity "https://github.com/${REPO}/.github/workflows/release.yml@refs/tags/${VERSION}" \
         --certificate-oidc-issuer https://token.actions.githubusercontent.com \
         >/dev/null 2>&1; then
         echo "Signature verified (Sigstore keyless)."
@@ -165,4 +165,4 @@ case ":$PATH:" in
     *) echo "Add ${BIN_DIR} to your PATH to run 'postil' directly." ;;
 esac
 "${BIN_DIR}/postil" --version || true
-echo "Next: export your key (POSTIL_API_KEY=...) and run 'postil doctor'."
+echo "Next: run 'postil login', then run 'postil review' in a repository."
