@@ -64,6 +64,7 @@ struct InstallerFixture {
     tools: PathBuf,
     artifacts: PathBuf,
     bin: PathBuf,
+    cosign_arguments: PathBuf,
 }
 
 impl InstallerFixture {
@@ -77,6 +78,7 @@ impl InstallerFixture {
         let artifacts = root.path().join("artifacts");
         let payload = root.path().join("payload");
         let bin = root.path().join("bin");
+        let cosign_arguments = root.path().join("cosign-arguments");
         for directory in [&tools, &artifacts, &payload, &bin] {
             fs::create_dir(directory).unwrap();
         }
@@ -116,7 +118,10 @@ impl InstallerFixture {
             ),
         );
         if with_cosign {
-            write_executable(&tools.join("cosign"), "#!/bin/sh\nexit 0\n");
+            write_executable(
+                &tools.join("cosign"),
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$POSTIL_TEST_COSIGN_ARGS\"\n",
+            );
         }
 
         Self {
@@ -124,6 +129,7 @@ impl InstallerFixture {
             tools,
             artifacts,
             bin,
+            cosign_arguments,
         }
     }
 
@@ -136,6 +142,7 @@ impl InstallerFixture {
             .args(extra_arguments)
             .env("PATH", &self.tools)
             .env("POSTIL_TEST_ARTIFACTS", &self.artifacts)
+            .env("POSTIL_TEST_COSIGN_ARGS", &self.cosign_arguments)
             .env_remove("POSTIL_SKIP_SIG");
         command.output().unwrap()
     }
@@ -192,6 +199,13 @@ fn require_cosign_verifies_the_signature_before_installing() {
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("Signature verified (Sigstore keyless)."));
+    assert!(stdout.contains("Next: run 'postil login', then run 'postil review' in a repository."));
+    assert!(!stdout.contains("POSTIL_API_KEY"));
+    let cosign_arguments = fs::read_to_string(&fixture.cosign_arguments).unwrap();
+    assert!(cosign_arguments.contains(
+        "--certificate-identity\nhttps://github.com/postil-dev/postil-cli/.github/workflows/release.yml@refs/tags/v-test\n"
+    ));
+    assert!(!cosign_arguments.contains("--certificate-identity-regexp"));
     assert!(
         !String::from_utf8(output.stderr)
             .unwrap()
