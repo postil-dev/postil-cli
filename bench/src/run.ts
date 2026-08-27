@@ -19,7 +19,7 @@
 // no mock GitHub at all. Selected by --live / BENCH_LIVE.
 //
 //   bun run bench:live              # or: BENCH_LIVE=1 bun run src/run.ts
-//   bun run bench --live [--json] [--json-out <path>] [--model <id>] [--concurrency <n>]
+//   bun run bench --live [--json] [--json-out <path>] [--model <id>] [--concurrency <n>] [--retries <n>]
 //
 // Environment:
 //   POSTIL_BIN              path to the postil binary (default ../target/release/postil)
@@ -48,6 +48,7 @@
 //   --screen-profile <path> exact provider and price contract for selected cases
 //   --scorer-model <id>     optional scorer for non-admission diff-file screening
 //   --run-id <id>           optional live-screen artifact namespace
+//   --retries <n>           outer case retries after the first attempt (default 1)
 
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -188,7 +189,7 @@ export function validateModeSpecificFlags(
   args: readonly string[],
   mode: "mock" | "live-screen" | "live-admission",
 ): void {
-  for (const flag of ["--case", "--scorer-model", "--screen-profile", "--run-id"]) {
+  for (const flag of ["--case", "--scorer-model", "--screen-profile", "--run-id", "--retries"]) {
     if (!args.includes(flag)) continue;
     if (mode === "live-admission") {
       throw new Error(`${flag} is a non-admission diff-file screen option and is unavailable in live-models admission mode`);
@@ -197,6 +198,29 @@ export function validateModeSpecificFlags(
       throw new Error(`${flag} is available only with --live diff-file screening`);
     }
   }
+}
+
+export function parseLiveRetries(args: readonly string[]): number | undefined {
+  let raw: string | undefined;
+  for (let index = 0; index < args.length; index += 1) {
+    if (args[index] !== "--retries") continue;
+    if (raw !== undefined) throw new Error("--retries may be specified only once");
+    const value = args[index + 1];
+    if (value === undefined || value.startsWith("--")) {
+      throw new Error("--retries requires a value");
+    }
+    raw = value;
+    index += 1;
+  }
+  if (raw === undefined) return undefined;
+  if (!/^(?:0|[1-9][0-9]*)$/u.test(raw)) {
+    throw new Error("--retries must be a nonnegative integer");
+  }
+  const retries = Number(raw);
+  if (!Number.isSafeInteger(retries)) {
+    throw new Error("--retries must be a nonnegative safe integer");
+  }
+  return retries;
 }
 
 export function validateRunIdentityEnvironment(
@@ -351,6 +375,7 @@ async function main() {
       throw new Error("live benchmark needs an explicit model: set REVIEW_MODEL or --model");
     }
     const concurrency = liveConcurrency(args);
+    const retries = parseLiveRetries(args);
     const scorerModel = flagValue(args, "--scorer-model");
     if (args.includes("--scorer-model") && scorerModel === undefined) {
       throw new Error("--scorer-model requires a value");
@@ -375,6 +400,7 @@ async function main() {
       scorerModel,
       screenProfilePath,
       concurrency,
+      retries,
       bounded,
       selectedCaseIds,
       runId,

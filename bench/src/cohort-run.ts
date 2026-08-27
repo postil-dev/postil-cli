@@ -30,6 +30,31 @@ interface SlotContext {
   paths: ReturnType<typeof cohortSlotPaths>;
 }
 
+export function cohortBenchmarkArguments(options: {
+  screeningProfilePath: string;
+  runId: string;
+  reportPath: string;
+  caseRetries: number;
+}): string[] {
+  if (options.caseRetries !== 0) {
+    throw new Error("formal cohort case retries must be zero");
+  }
+  return [
+    process.execPath,
+    "run",
+    "src/run.ts",
+    "--live",
+    "--screen-profile",
+    options.screeningProfilePath,
+    "--run-id",
+    options.runId,
+    "--retries",
+    String(options.caseRetries),
+    "--json-out",
+    options.reportPath,
+  ];
+}
+
 async function slotContext(options: SlotOptions): Promise<SlotContext> {
   const { manifest, rawSha256: manifestSha256 } = await readCohortManifest(options.manifestPath);
   const cohortSlot = manifest.slots.find((candidate) => candidate.slot === options.slot);
@@ -123,7 +148,11 @@ export async function reserveCohortSlot(options: SlotOptions): Promise<CohortRec
 }
 
 export async function executeReservedCohortSlot(options: SlotOptions & {
-  executeBenchmark?: (options: { reportPath: string; runId: string }) => Promise<number>;
+  executeBenchmark?: (options: {
+    reportPath: string;
+    runId: string;
+    caseRetries: number;
+  }) => Promise<number>;
 }): Promise<number> {
   const context = await slotContext(options);
   const receiptRaw = await readFile(context.paths.receiptPath).catch((error) => {
@@ -146,20 +175,15 @@ export async function executeReservedCohortSlot(options: SlotOptions & {
       exitCode = await options.executeBenchmark({
         reportPath: context.paths.reportPath,
         runId: context.cohortSlot.runId,
+        caseRetries: context.manifest.caseRetries,
       });
     } else {
-      const child = Bun.spawn([
-        process.execPath,
-        "run",
-        "src/run.ts",
-        "--live",
-        "--screen-profile",
-        options.screeningProfilePath,
-        "--run-id",
-        context.cohortSlot.runId,
-        "--json-out",
-        context.paths.reportPath,
-      ], {
+      const child = Bun.spawn(cohortBenchmarkArguments({
+        screeningProfilePath: options.screeningProfilePath,
+        runId: context.cohortSlot.runId,
+        reportPath: context.paths.reportPath,
+        caseRetries: context.manifest.caseRetries,
+      }), {
         cwd: resolve(import.meta.dir, ".."),
         env: { ...process.env, POSTIL_BIN: options.binaryPath },
         stdin: "inherit",
@@ -234,7 +258,11 @@ export async function executeReservedCohortSlot(options: SlotOptions & {
 }
 
 export async function runCohortSlot(options: SlotOptions & {
-  executeBenchmark?: (options: { reportPath: string; runId: string }) => Promise<number>;
+  executeBenchmark?: (options: {
+    reportPath: string;
+    runId: string;
+    caseRetries: number;
+  }) => Promise<number>;
 }): Promise<number> {
   await reserveCohortSlot(options);
   return executeReservedCohortSlot(options);

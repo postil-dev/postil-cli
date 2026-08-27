@@ -92,6 +92,8 @@ const generationSchema = z.object({
     provider_name: z.string().trim().min(1),
     tokens_prompt: z.number().int().nonnegative(),
     tokens_completion: z.number().int().nonnegative(),
+    native_tokens_prompt: z.number().int().nonnegative(),
+    native_tokens_completion: z.number().int().nonnegative(),
     total_cost: z.number().finite().nonnegative(),
   }),
 });
@@ -269,9 +271,14 @@ export async function verifyGenerationEvidence(
     )) {
       throw new Error(`benchmark report ${reportIndex + 1} contains a generation from another provider`);
     }
-    const promptTokens = reportGenerations.reduce((sum, generation) => sum + generation.tokens_prompt, 0);
+    // OpenRouter response usage uses the routed model's native tokenizer.
+    // Generation-level normalized token fields can differ for the same calls.
+    const promptTokens = reportGenerations.reduce(
+      (sum, generation) => sum + generation.native_tokens_prompt,
+      0,
+    );
     const completionTokens = reportGenerations.reduce(
-      (sum, generation) => sum + generation.tokens_completion,
+      (sum, generation) => sum + generation.native_tokens_completion,
       0,
     );
     if (promptTokens !== report.summary.totalTokens.prompt ||
