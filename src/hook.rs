@@ -174,7 +174,11 @@ mod tests {
             fake_bin.display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        let mut child = Command::new(hook)
+        // Executable permissions are asserted separately. Invoking the script
+        // through its interpreter avoids a transient ETXTBSY race on filesystems
+        // that delay releasing a newly written script for direct execution.
+        let mut child = Command::new("sh")
+            .arg(hook)
             .args(["origin", &remote.to_string_lossy()])
             .current_dir(repo)
             .env("PATH", path)
@@ -217,6 +221,7 @@ mod tests {
         install(dir.path(), false).unwrap();
         let hook = dir.path().join(".git/hooks/pre-push");
         let script = std::fs::read_to_string(&hook).unwrap();
+        assert!(script.starts_with("#!/bin/sh\n"));
         assert!(script.contains("while read -r local_ref local_oid"));
         assert!(script.contains("git diff --find-renames \"$remote_oid\" \"$local_oid\""));
         assert!(script.contains("postil review --bounded --diff-file \"$tmp\""));
@@ -280,7 +285,7 @@ mod tests {
     }
 
     #[test]
-    fn executable_hook_reviews_exact_refs_and_skips_non_branches() {
+    fn installed_hook_reviews_exact_refs_and_skips_non_branches() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
         let remote = dir.path().join("remote.git");
