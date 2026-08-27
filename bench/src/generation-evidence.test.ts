@@ -60,8 +60,10 @@ const records = {
     created_at: "2026-08-26T12:00:10.000Z",
     model: "openai/gpt-5.6-luna-20260709",
     provider_name: "Azure",
-    tokens_prompt: 10,
-    tokens_completion: 5,
+    tokens_prompt: 12,
+    tokens_completion: 4,
+    native_tokens_prompt: 10,
+    native_tokens_completion: 5,
     total_cost: 0.0015,
   },
   "gen-two": {
@@ -69,8 +71,10 @@ const records = {
     created_at: "2026-08-26T12:00:20.000Z",
     model: "openai/gpt-5.6-luna-20260709",
     provider_name: "Azure",
-    tokens_prompt: 20,
-    tokens_completion: 7,
+    tokens_prompt: 21,
+    tokens_completion: 6,
+    native_tokens_prompt: 20,
+    native_tokens_completion: 7,
     total_cost: 0.0027,
   },
 };
@@ -83,7 +87,7 @@ const profile = {
 };
 
 describe("provider generation evidence", () => {
-  test("verifies distinct generation identity, route, tokens, and cost", async () => {
+  test("verifies distinct generation identity, route, native tokens, and cost", async () => {
     await expect(verifyGenerationEvidence([sample(["gen-one", "gen-two"])], {
       apiKey: "fixture",
       profile,

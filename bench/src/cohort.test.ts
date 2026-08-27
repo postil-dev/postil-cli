@@ -11,7 +11,11 @@ import {
   reportSemanticSha256,
   type CohortManifest,
 } from "./cohort";
-import { executeReservedCohortSlot, reserveCohortSlot } from "./cohort-run";
+import {
+  cohortBenchmarkArguments,
+  executeReservedCohortSlot,
+  reserveCohortSlot,
+} from "./cohort-run";
 
 const temporaryDirectories: string[] = [];
 
@@ -63,6 +67,7 @@ describe("cohort manifests", () => {
       uuid: () => `00000000-0000-4000-8000-${String(++sequence).padStart(12, "0")}`,
     });
     expect(manifest.reportCount).toBe(10);
+    expect(manifest.caseRetries).toBe(0);
     expect(manifest.slots.map((slot) => slot.slot)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     expect(manifest.slots.map((slot) => slot.runId)).toEqual([
       "calibration-e-01", "calibration-e-02", "calibration-e-03", "calibration-e-04",
@@ -109,6 +114,14 @@ describe("cohort manifests", () => {
       ...calibration,
       slots: [calibration.slots[1], calibration.slots[0], ...calibration.slots.slice(2)],
     })).toThrow("ordered and contiguous");
+    expect(() => cohortManifestSchema.parse({
+      ...calibration,
+      caseRetries: 1,
+    })).toThrow();
+    expect(() => cohortManifestSchema.parse({
+      ...calibration,
+      schemaVersion: 2,
+    })).toThrow();
   });
 
   test("binds GitHub release execution to the first run attempt", async () => {
@@ -154,6 +167,22 @@ describe("cohort manifests", () => {
       },
     )).rejects.toThrow("not bound to this GitHub Actions source, run, and attempt");
   });
+});
+
+test("formal cohorts pass their immutable zero-retry contract to live screening", () => {
+  const arguments_ = cohortBenchmarkArguments({
+    screeningProfilePath: "/profiles/luna.json",
+    runId: "calibration-01",
+    reportPath: "/reports/01.json",
+    caseRetries: 0,
+  });
+  expect(arguments_[arguments_.indexOf("--retries") + 1]).toBe("0");
+  expect(() => cohortBenchmarkArguments({
+    screeningProfilePath: "/profiles/luna.json",
+    runId: "calibration-01",
+    reportPath: "/reports/01.json",
+    caseRetries: 1,
+  })).toThrow("must be zero");
 });
 
 test("semantic digest excludes execution noise", () => {
@@ -234,7 +263,8 @@ test("an authenticated reservation is required before slot execution", async () 
     binaryPath: process.execPath,
     screeningProfilePath,
     environment,
-    executeBenchmark: async ({ reportPath, runId }) => {
+    executeBenchmark: async ({ reportPath, runId, caseRetries }) => {
+      expect(caseRetries).toBe(0);
       await writeFile(reportPath, JSON.stringify({
         summary: { runId, ranAt: new Date().toISOString() },
       }));

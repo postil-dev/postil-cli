@@ -420,14 +420,19 @@ case index before the report is written, so the output is byte-for-byte
 deterministic in ordering regardless of completion order. Set `--concurrency 1`
 to fall back to fully sequential execution.
 
-Each case is retried **once** (after a short backoff) when its first attempt
-fails with a transient provider error: a non-zero exit whose stderr carries an
-HTTP 5xx/429, rate-limit, timeout, or connection signature, or a run that
-produced no valid v1 envelope at all (empty/garbled output, typically a dropped
-response). A valid envelope is always treated as a normal result and is never
-retried, including a gate-failing exit (exit 1 with a scored envelope) or one
-that merely reports findings unrelated to the authored target. A case that fails on both
-attempts is recorded as an operational error and excluded from scoring.
+Exploratory live screens retry each case **once** by default (after a short
+backoff) when its first attempt fails with a transient provider error:
+a non-zero exit whose stderr carries an HTTP 5xx/429, rate-limit, timeout, or
+connection signature, or a run that produced no valid v1 envelope at all
+(empty/garbled output, typically a dropped response). `--retries <n>` changes
+that outer retry count. A valid envelope is always treated as a normal result
+and is never retried, including a gate-failing exit (exit 1 with a scored
+envelope) or one that merely reports findings unrelated to the authored target.
+
+Formal calibration and release cohort manifests pin the outer retry count to
+zero. The CLI under test retains its own provider retries, while every accepted
+provider generation remains represented in the attested benchmark report and
+cost evidence.
 
 ### What live mode scores
 
@@ -469,7 +474,7 @@ then attests its completed report and receipt together. Every accepted provider
 response contributes its OpenRouter generation ID to the report. The fan-in job
 verifies globally distinct generation IDs against OpenRouter's authenticated
 generation API, including the exact canonical provider model pinned for each
-logical profile model, provider, token totals, and cost. It also verifies every
+logical profile model, provider, native token totals, and cost. It also verifies every
 subject against the exact repository, release workflow, source commit, tag ref,
 OIDC issuer, and GitHub-hosted runner before parsing it.
 Only the unique first workflow run for

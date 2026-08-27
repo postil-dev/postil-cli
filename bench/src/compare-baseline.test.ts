@@ -445,11 +445,12 @@ function fakeReleaseCohort(reports: readonly LiveReportForComparison[]): {
     nonce: `00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
   }));
   const manifest: CohortManifest = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     purpose: reports.length === 10 ? "calibration" : "release",
     cohortId: "00000000-0000-4000-8000-000000000099",
     createdAt,
     reportCount: reports.length as 5 | 10,
+    caseRetries: 0,
     binarySha256: HASHES.binary,
     evaluatorSha256: HASHES.evaluator,
     fixtureCorpusSha256: HASHES.corpus,

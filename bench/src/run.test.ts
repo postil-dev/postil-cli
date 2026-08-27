@@ -17,6 +17,7 @@ import {
   createLiveModelsFailureReport,
   generatedLiveScreenRunId,
   invalidateExplicitOutputs,
+  parseLiveRetries,
   parseLiveModelsFailureReport,
   prepareExplicitOutputs,
   qualificationProviderInputs,
@@ -71,7 +72,7 @@ describe("diff-file live screening selection", () => {
   });
 
   test("keeps screen-only flags outside formal admission", () => {
-    for (const flag of ["--case", "--scorer-model", "--screen-profile", "--run-id"]) {
+    for (const flag of ["--case", "--scorer-model", "--screen-profile", "--run-id", "--retries"]) {
       expect(() => validateModeSpecificFlags([flag, "value"], "live-admission"))
         .toThrow("non-admission");
       expect(() => validateModeSpecificFlags([flag, "value"], "mock"))
@@ -79,6 +80,19 @@ describe("diff-file live screening selection", () => {
       expect(() => validateModeSpecificFlags([flag, "value"], "live-screen"))
         .not.toThrow();
     }
+  });
+
+  test("accepts an explicit zero outer-retry count and rejects ambiguous values", () => {
+    expect(parseLiveRetries([])).toBeUndefined();
+    expect(parseLiveRetries(["--retries", "0"])).toBe(0);
+    expect(parseLiveRetries(["--retries", "2"])).toBe(2);
+    expect(() => parseLiveRetries(["--retries"])).toThrow("requires a value");
+    expect(() => parseLiveRetries(["--retries", "-1"])).toThrow("nonnegative integer");
+    expect(() => parseLiveRetries(["--retries", "1.5"])).toThrow("nonnegative integer");
+    expect(() => parseLiveRetries(["--retries", "9007199254740992"]))
+      .toThrow("safe integer");
+    expect(() => parseLiveRetries(["--retries", "1", "--retries", "2"]))
+      .toThrow("only once");
   });
 
   test("generates path-safe unique screen identities and scopes the environment override", () => {
