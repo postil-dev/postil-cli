@@ -36,8 +36,8 @@ export function cohortBenchmarkArguments(options: {
   reportPath: string;
   caseRetries: number;
 }): string[] {
-  if (options.caseRetries !== 0) {
-    throw new Error("formal cohort case retries must be zero");
+  if (options.caseRetries !== 1) {
+    throw new Error("formal cohort case retries must be exactly one");
   }
   return [
     process.execPath,

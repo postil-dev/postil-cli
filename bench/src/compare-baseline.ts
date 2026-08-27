@@ -149,6 +149,8 @@ const liveCaseResultSchema = z.object({
   durationMs: z.number().finite().nonnegative().nullable(),
   observedProviderCostUsdDecimal: canonicalCostSchema.nullable(),
   costAccountingComplete: z.boolean(),
+  attemptCount: z.number().int().positive(),
+  recoveredErrors: z.array(nonemptyStringSchema),
   exitCode: z.union([z.literal(0), z.literal(1)]),
 });
 
@@ -188,6 +190,14 @@ const liveReportSchema = z.object({
     observedProviderCostUsdDecimal: canonicalCostSchema,
     costAccountingComplete: z.boolean(),
     providerGenerationIds: z.array(z.string().regex(/^gen-[A-Za-z0-9_-]+$/u)).min(1),
+    retryAccounting: z.object({
+      totalAttempts: z.number().int().positive(),
+      retriedCases: z.number().int().nonnegative(),
+      recoveredErrors: z.array(z.object({
+        error: nonemptyStringSchema,
+        count: z.number().int().positive(),
+      })),
+    }),
     errors: z.number().int().nonnegative(),
     ranAt: nonemptyStringSchema,
   }),
@@ -467,6 +477,23 @@ export function assertValidReleaseReport(report: LiveReportForComparison): void 
   }
   if (report.results.some((result) => result.observedProviderCostUsdDecimal === null)) {
     invalidReport("every result must have canonical observed provider cost");
+  }
+  if (report.results.some((result) => result.attemptCount !== result.recoveredErrors.length + 1)) {
+    invalidReport("every result must expose one recovered error for each prior outer attempt");
+  }
+  const totalAttempts = report.results.reduce((sum, result) => sum + result.attemptCount, 0);
+  const retriedCases = report.results.filter((result) => result.attemptCount > 1).length;
+  const recoveredErrorCounts = new Map<string, number>();
+  for (const error of report.results.flatMap((result) => result.recoveredErrors)) {
+    recoveredErrorCounts.set(error, (recoveredErrorCounts.get(error) ?? 0) + 1);
+  }
+  const recoveredErrors = Array.from(recoveredErrorCounts, ([error, count]) => ({ error, count }));
+  if (
+    s.retryAccounting.totalAttempts !== totalAttempts ||
+    s.retryAccounting.retriedCases !== retriedCases ||
+    !isDeepStrictEqual(s.retryAccounting.recoveredErrors, recoveredErrors)
+  ) {
+    invalidReport("summary retry accounting does not match result attempts");
   }
 
   const ids = report.results.map((result) => result.id);
@@ -1338,6 +1365,11 @@ export function assertCompleteCohortEvidence(options: {
     const report = options.reports[index]!;
     if (report.summary.runId !== slot.runId) {
       throw new Error(`benchmark report slot ${slot.slot} does not match its predeclared run ID`);
+    }
+    if (report.results.some((result) => result.attemptCount > manifest.caseRetries + 1)) {
+      throw new Error(
+        `benchmark report slot ${slot.slot} exceeds its manifest outer retry allowance`,
+      );
     }
     if (receipt.reportRawSha256 !== options.rawReportSha256[index]) {
       throw new Error(`benchmark report slot ${slot.slot} raw digest does not match its receipt`);

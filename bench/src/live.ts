@@ -54,11 +54,11 @@ const DEFAULT_CASE_TIMEOUT_MS = 180_000;
  * Override with --concurrency <n> or BENCH_CONCURRENCY. */
 export const DEFAULT_LIVE_CONCURRENCY = 6;
 
-/** Each case that fails with a transient/provider error is retried this many
- * extra times (so one retry total). A second failure is recorded as an error. */
+/** Each case that fails with a transient/provider error or unrecovered invalid
+ * output is retried this many extra times. A second failure is recorded. */
 const DEFAULT_LIVE_RETRIES = 1;
 
-/** Backoff before the single retry of a transiently-failed case. */
+/** Backoff before the single retry of a retryable failed case. */
 const RETRY_BACKOFF_MS = 2_000;
 
 /** Severity tiers, ordered low to high (mirrors src/envelope.rs: info < warn <
@@ -101,7 +101,7 @@ export interface LiveOptions {
   timeoutMs?: number;
   /** Cases run concurrently (default DEFAULT_LIVE_CONCURRENCY). */
   concurrency?: number;
-  /** Extra attempts on a transient/provider failure (default 1 = one retry). */
+  /** Extra attempts on a retryable operational failure (default 1). */
   retries?: number;
   /** Exercise deterministic risk selection and synthesis for large reviews. */
   bounded?: boolean;
@@ -152,6 +152,10 @@ export interface LiveCaseResult {
   completionTokens: number;
   observedProviderCostUsdDecimal: string | null;
   costAccountingComplete: boolean;
+  /** Total outer benchmark attempts used for this final result. */
+  attemptCount: number;
+  /** Failed outer attempts recovered before the final result, in order. */
+  recoveredErrors: string[];
   reviewCoverage: Envelope["reviewCoverage"] | null;
   /** Suppression reasons for findings that overlapped the authored target.
    * Diagnostic only: suppressed findings never count as detections. */
@@ -210,6 +214,11 @@ export interface LiveSummary {
   observedProviderCostUsdDecimal: string;
   costAccountingComplete: boolean;
   providerGenerationIds: string[];
+  retryAccounting: {
+    totalAttempts: number;
+    retriedCases: number;
+    recoveredErrors: Array<{ error: string; count: number }>;
+  };
   errors: number;
 }
 
@@ -484,11 +493,10 @@ export async function evaluatorSourceSha256(): Promise<string> {
 
 /**
  * Runs a case, retrying once (by default) after a short backoff if the first
- * attempt fails with a transient/provider error: a non-zero exit whose stderr
- * carries an HTTP-5xx/429/timeout/connection signature, or no valid v1 envelope
- * at all (empty/garbled output). A valid envelope with findings is a normal
- * result and is never retried. A case that fails every attempt is returned as
- * the last attempt's error result, which summarize() already counts as an error.
+ * attempt fails with a transient/provider error or an unrecovered invalid model
+ * output. A scored envelope is a final result and is never retried. Tokens,
+ * provider cost, and duration from every attempt are retained in the returned
+ * result so a successful retry cannot hide billed generations.
  */
 async function runLiveCaseWithRetry(
   c: ReturnType<typeof benchmarkCase.parse>,
@@ -501,6 +509,7 @@ async function runLiveCaseWithRetry(
 ): Promise<LiveCaseResult> {
   const maxRetries = options.retries ?? DEFAULT_LIVE_RETRIES;
   let last: LiveCaseResult | undefined;
+  const attempts: LiveCaseResult[] = [];
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     last = await runLiveCase(
       c,
@@ -512,16 +521,51 @@ async function runLiveCaseWithRetry(
       provider,
       captureApiBase,
     );
+    attempts.push(last);
     // Scored => a valid envelope was produced; that is a normal result (even if
     // it has findings or false positives), so never retry it.
-    if (last.scored) return last;
+    if (last.scored) return aggregateAttemptAccounting(last, attempts);
     if (attempt < maxRetries && isTransientFailure(last)) {
       await sleep(RETRY_BACKOFF_MS);
       continue;
     }
-    return last;
+    return aggregateAttemptAccounting(last, attempts);
   }
-  return last!;
+  return aggregateAttemptAccounting(last!, attempts);
+}
+
+/** Keeps the final attempt's review verdict while accounting for all work used
+ * to obtain it. Incomplete accounting on any attempt remains incomplete after
+ * a retry, which prevents formal evidence from silently dropping unknown cost. */
+export function aggregateAttemptAccounting(
+  finalAttempt: LiveCaseResult,
+  attempts: readonly LiveCaseResult[],
+): LiveCaseResult {
+  if (attempts.length === 0 || attempts[attempts.length - 1] !== finalAttempt) {
+    throw new Error("attempt accounting requires the final attempt last");
+  }
+  const costAccountingComplete = attempts.every((attempt) =>
+    attempt.costAccountingComplete && attempt.observedProviderCostUsdDecimal !== null
+  );
+  const durationComplete = attempts.every((attempt) => attempt.durationMs !== null);
+  return {
+    ...finalAttempt,
+    durationMs: durationComplete
+      ? attempts.reduce((sum, attempt) => sum + attempt.durationMs!, 0)
+      : null,
+    promptTokens: attempts.reduce((sum, attempt) => sum + attempt.promptTokens, 0),
+    completionTokens: attempts.reduce((sum, attempt) => sum + attempt.completionTokens, 0),
+    observedProviderCostUsdDecimal: costAccountingComplete
+      ? formatCanonicalDecimal(sumCanonicalDecimals(attempts.map((attempt) =>
+          parseCanonicalDecimal(attempt.observedProviderCostUsdDecimal!)
+        )))
+      : null,
+    costAccountingComplete,
+    attemptCount: attempts.length,
+    recoveredErrors: attempts.slice(0, -1).flatMap((attempt) =>
+      attempt.error === undefined ? [] : [attempt.error]
+    ),
+  };
 }
 
 /** Signatures of a transient provider/transport failure in stderr: HTTP 5xx and
@@ -549,14 +593,13 @@ const TRANSIENT_STDERR = new RegExp(
   "i",
 );
 
-/** True when an unscored case looks like a transient provider failure: either
- * the binary emitted a recognizable transient signature on stderr, or it
- * produced no valid envelope at all (empty/garbled output, e.g. a dropped
- * response). Both are worth one retry; a deterministic parse-shaped failure that
- * is not provider-side will just fail again and be recorded as an error. */
+/** True when an unscored case is worth one outer retry: the binary emitted a
+ * transient signature, produced no valid envelope, or explicitly reported an
+ * unrecovered review/invalidOutput incident. */
 function isTransientFailure(result: LiveCaseResult): boolean {
   if (result.scored) return false;
   if (result.stderr && TRANSIENT_STDERR.test(result.stderr)) return true;
+  if (result.error === "operational envelope: review/invalidOutput") return true;
   // No valid envelope (empty/invalid output), typically a dropped or truncated
   // provider response; retry once.
   return result.error?.startsWith("no valid v1 envelope") ?? false;
@@ -638,6 +681,8 @@ async function runLiveCase(
     completionTokens: 0,
     observedProviderCostUsdDecimal: null,
     costAccountingComplete: false,
+    attemptCount: 1,
+    recoveredErrors: [],
     reviewCoverage: null,
     suppressedTargetReasons: [],
     exitCode: undefined,
@@ -1024,6 +1069,10 @@ function summarize(
     result.observedProviderCostUsdDecimal === null
       ? []
       : [parseCanonicalDecimal(result.observedProviderCostUsdDecimal)]));
+  const recoveredErrorCounts = new Map<string, number>();
+  for (const error of results.flatMap((result) => result.recoveredErrors)) {
+    recoveredErrorCounts.set(error, (recoveredErrorCounts.get(error) ?? 0) + 1);
+  }
 
   return {
     runId: options.runId,
@@ -1078,6 +1127,11 @@ function summarize(
     observedProviderCostUsdDecimal: formatCanonicalDecimal(observedProviderCost),
     costAccountingComplete: liveCostAccountingComplete(results),
     providerGenerationIds,
+    retryAccounting: {
+      totalAttempts: results.reduce((sum, result) => sum + result.attemptCount, 0),
+      retriedCases: results.filter((result) => result.attemptCount > 1).length,
+      recoveredErrors: Array.from(recoveredErrorCounts, ([error, count]) => ({ error, count })),
+    },
     errors: results.filter((r) => r.error !== undefined).length,
   };
 }

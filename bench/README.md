@@ -421,18 +421,18 @@ deterministic in ordering regardless of completion order. Set `--concurrency 1`
 to fall back to fully sequential execution.
 
 Exploratory live screens retry each case **once** by default (after a short
-backoff) when its first attempt fails with a transient provider error:
+backoff) when its first attempt fails with a retryable operational error:
 a non-zero exit whose stderr carries an HTTP 5xx/429, rate-limit, timeout, or
 connection signature, or a run that produced no valid v1 envelope at all
-(empty/garbled output, typically a dropped response). `--retries <n>` changes
-that outer retry count. A valid envelope is always treated as a normal result
-and is never retried, including a gate-failing exit (exit 1 with a scored
-envelope) or one that merely reports findings unrelated to the authored target.
+(empty/garbled output, typically a dropped response). An envelope with an
+unrecovered `review/invalidOutput` incident is also retried. `--retries <n>`
+changes that outer retry count. A scored envelope is always a final result,
+including a gate-failing exit or findings unrelated to the authored target.
 
 Formal calibration and release cohort manifests pin the outer retry count to
-zero. The CLI under test retains its own provider retries, while every accepted
-provider generation remains represented in the attested benchmark report and
-cost evidence.
+one. Reports preserve each case's attempt count, recovered failure categories,
+and aggregate duration, token, and exact provider-cost accounting. Every
+accepted provider generation remains represented in the attested evidence.
 
 ### What live mode scores
 

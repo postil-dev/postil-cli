@@ -138,6 +138,8 @@ function fakeReport(options: FakeReportOptions = {}): LiveReportForComparison {
       durationMs: (index + 1) * durationMultiplier,
       observedProviderCostUsdDecimal: costPerCase,
       costAccountingComplete: true,
+      attemptCount: 1,
+      recoveredErrors: [],
       exitCode: truthSeverity === "error" && caseDetected === true ? 1 : 0,
     };
   });
@@ -181,6 +183,7 @@ function fakeReport(options: FakeReportOptions = {}): LiveReportForComparison {
       observedProviderCostUsdDecimal,
       costAccountingComplete: true,
       providerGenerationIds: [`gen-fixture-${fakeRunSequence}`],
+      retryAccounting: { totalAttempts: 70, retriedCases: 0, recoveredErrors: [] },
       errors: 0,
       ranAt: options.ranAt ?? new Date(Date.UTC(2026, 7, 25, 0, 0, fakeRunSequence)).toISOString(),
     },
@@ -211,6 +214,8 @@ async function inputBoundReport(): Promise<LiveReportForComparison> {
       durationMs: (index + 1) * 100,
       observedProviderCostUsdDecimal: "0.001",
       costAccountingComplete: true,
+      attemptCount: 1,
+      recoveredErrors: [],
       exitCode: caseDetected && finding?.severity === "error" ? 1 : 0,
     };
   });
@@ -445,12 +450,12 @@ function fakeReleaseCohort(reports: readonly LiveReportForComparison[]): {
     nonce: `00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
   }));
   const manifest: CohortManifest = {
-    schemaVersion: 3,
+    schemaVersion: 4,
     purpose: reports.length === 10 ? "calibration" : "release",
     cohortId: "00000000-0000-4000-8000-000000000099",
     createdAt,
     reportCount: reports.length as 5 | 10,
-    caseRetries: 0,
+    caseRetries: 1,
     binarySha256: HASHES.binary,
     evaluatorSha256: HASHES.evaluator,
     fixtureCorpusSha256: HASHES.corpus,
@@ -535,6 +540,29 @@ describe("predeclared cohort evidence", () => {
       reports,
       record: false,
     })).not.toThrow();
+  });
+
+  test("rejects attempts beyond the formal manifest retry allowance", () => {
+    const reports = Array.from({ length: 5 }, (_, index) => fakeReport({
+      durationMultiplier: index + 1,
+    }));
+    reports[0]!.results[12]!.attemptCount = 3;
+    reports[0]!.results[12]!.recoveredErrors = [
+      "operational envelope: review/invalidOutput",
+      "operational envelope: review/invalidOutput",
+    ];
+    reports[0]!.summary.retryAccounting = {
+      totalAttempts: 72,
+      retriedCases: 1,
+      recoveredErrors: [{ error: "operational envelope: review/invalidOutput", count: 2 }],
+    };
+    const cohort = fakeReleaseCohort(reports);
+    expect(() => assertCompleteCohortEvidence({
+      ...cohort,
+      manifestSha256: "9".repeat(64),
+      reports,
+      record: false,
+    })).toThrow("exceeds its manifest outer retry allowance");
   });
 
   test("rejects missing, failed, and mismatched slots", () => {
@@ -648,6 +676,38 @@ describe("release report validation", () => {
     const report = cloneReport(fakeReport());
     report.summary.errors = 1;
     expect(() => assertValidReleaseReport(report)).toThrow("errors must be 0");
+  });
+
+  test("accepts exposed recovered retries and rejects inconsistent retry accounting", () => {
+    const report = cloneReport(fakeReport());
+    report.results[12]!.attemptCount = 2;
+    report.results[12]!.recoveredErrors = ["operational envelope: review/invalidOutput"];
+    report.summary.retryAccounting = {
+      totalAttempts: 71,
+      retriedCases: 1,
+      recoveredErrors: [{ error: "operational envelope: review/invalidOutput", count: 1 }],
+    };
+    expect(() => assertValidReleaseReport(report)).not.toThrow();
+
+    report.summary.retryAccounting.totalAttempts = 70;
+    expect(() => assertValidReleaseReport(report)).toThrow(
+      "summary retry accounting does not match result attempts",
+    );
+  });
+
+  test("allows exploratory reports to expose more than one outer retry", () => {
+    const report = cloneReport(fakeReport());
+    report.results[12]!.attemptCount = 3;
+    report.results[12]!.recoveredErrors = [
+      "operational envelope: review/invalidOutput",
+      "operational envelope: review/invalidOutput",
+    ];
+    report.summary.retryAccounting = {
+      totalAttempts: 72,
+      retriedCases: 1,
+      recoveredErrors: [{ error: "operational envelope: review/invalidOutput", count: 2 }],
+    };
+    expect(() => assertValidReleaseReport(report)).not.toThrow();
   });
 
   test("rejects a missing scored-case exit code", () => {

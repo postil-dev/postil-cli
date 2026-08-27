@@ -67,7 +67,7 @@ describe("cohort manifests", () => {
       uuid: () => `00000000-0000-4000-8000-${String(++sequence).padStart(12, "0")}`,
     });
     expect(manifest.reportCount).toBe(10);
-    expect(manifest.caseRetries).toBe(0);
+    expect(manifest.caseRetries).toBe(1);
     expect(manifest.slots.map((slot) => slot.slot)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     expect(manifest.slots.map((slot) => slot.runId)).toEqual([
       "calibration-e-01", "calibration-e-02", "calibration-e-03", "calibration-e-04",
@@ -116,7 +116,7 @@ describe("cohort manifests", () => {
     })).toThrow("ordered and contiguous");
     expect(() => cohortManifestSchema.parse({
       ...calibration,
-      caseRetries: 1,
+      caseRetries: 0,
     })).toThrow();
     expect(() => cohortManifestSchema.parse({
       ...calibration,
@@ -169,20 +169,20 @@ describe("cohort manifests", () => {
   });
 });
 
-test("formal cohorts pass their immutable zero-retry contract to live screening", () => {
+test("formal cohorts pass their immutable one-retry contract to live screening", () => {
   const arguments_ = cohortBenchmarkArguments({
     screeningProfilePath: "/profiles/luna.json",
     runId: "calibration-01",
     reportPath: "/reports/01.json",
-    caseRetries: 0,
+    caseRetries: 1,
   });
-  expect(arguments_[arguments_.indexOf("--retries") + 1]).toBe("0");
+  expect(arguments_[arguments_.indexOf("--retries") + 1]).toBe("1");
   expect(() => cohortBenchmarkArguments({
     screeningProfilePath: "/profiles/luna.json",
     runId: "calibration-01",
     reportPath: "/reports/01.json",
-    caseRetries: 1,
-  })).toThrow("must be zero");
+    caseRetries: 0,
+  })).toThrow("exactly one");
 });
 
 test("semantic digest excludes execution noise", () => {
@@ -264,7 +264,7 @@ test("an authenticated reservation is required before slot execution", async () 
     screeningProfilePath,
     environment,
     executeBenchmark: async ({ reportPath, runId, caseRetries }) => {
-      expect(caseRetries).toBe(0);
+      expect(caseRetries).toBe(1);
       await writeFile(reportPath, JSON.stringify({
         summary: { runId, ranAt: new Date().toISOString() },
       }));
