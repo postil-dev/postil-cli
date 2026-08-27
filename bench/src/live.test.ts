@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { cases } from "../fixtures/cases";
 import type { Envelope } from "./harness";
 import {
+  aggregateAttemptAccounting,
   boundedCoverageFailure,
   envelopeOperationalFailure,
   exactProviderCost,
@@ -426,6 +427,138 @@ describe("live benchmark operational envelopes", () => {
       ...exact,
       modelUsage: [{ ...exact.modelUsage![0]!, costProviderDecimal: "01" }],
     })).toEqual({ costUsdDecimal: null, complete: false });
+  });
+
+  test("retains every billed attempt when invalid model output is retried", async () => {
+    const root = await mkdtemp(join(tmpdir(), "postil-live-retry-accounting-"));
+    const marker = join(root, "attempt-count");
+    const previousKey = process.env.MODEL_API_KEY;
+    process.env.MODEL_API_KEY = "test-key-not-sent-anywhere";
+    try {
+      const envelope = (
+        promptTokens: number,
+        completionTokens: number,
+        cost: string,
+        durationMs: number,
+      ): Envelope => ({
+        version: 1,
+        summary: "No findings.",
+        silent: true,
+        findings: [],
+        suppressedFindings: [],
+        resolved: [],
+        counts: { info: 0, warn: 0, error: 0, suppressed: 0, ungrounded: 0 },
+        confidenceBuckets: [0, 0, 0, 0, 0],
+        gate: { failOn: "error", failing: false, blockOnKinds: [] },
+        modelUsed: "test/model",
+        usage: { promptTokens, completionTokens },
+        modelUsage: [{
+          model: "test/model",
+          role: "reviewGenerator",
+          promptTokens,
+          completionTokens,
+          costProviderDecimal: cost,
+          costSource: "providerReported",
+          accountingComplete: true,
+        }],
+        modelIncidents: [],
+        reviewCoverage: {
+          mode: "exhaustive",
+          selectedBatches: 1,
+          totalBatches: 1,
+          plannerFallback: false,
+        },
+        usageAccountingComplete: true,
+        durationMs,
+        baseSha: null,
+        headSha: null,
+        sinceSha: null,
+      });
+      const first: Envelope = {
+        ...envelope(10, 2, "0.00012", 110),
+        modelIncidents: [{ phase: "review", category: "invalidOutput", recovered: false }],
+      };
+      const second = envelope(20, 3, "0.00018", 90);
+      const binary = join(root, "fake-postil");
+      await writeFile(binary, `#!/bin/sh
+if [ -f '${marker}' ]; then
+  printf 2 > '${marker}'
+  printf '%s\\n' '${JSON.stringify(second)}'
+else
+  printf 1 > '${marker}'
+  printf '%s\\n' '${JSON.stringify(first)}'
+fi
+`, { mode: 0o700 });
+      await chmod(binary, 0o700);
+
+      const report = await runLive([cases[0]!], {
+        binary,
+        model: "test/model",
+        rootDir: root,
+        runId: "invalid-output-retry",
+        concurrency: 1,
+        retries: 1,
+      });
+
+      expect(await readFile(marker, "utf8")).toBe("2");
+      expect(report.results[0]).toMatchObject({
+        scored: true,
+        durationMs: 200,
+        promptTokens: 30,
+        completionTokens: 5,
+        observedProviderCostUsdDecimal: "0.0003",
+        costAccountingComplete: true,
+        attemptCount: 2,
+        recoveredErrors: ["operational envelope: review/invalidOutput"],
+      });
+      expect(report.summary.totalTokens).toEqual({ prompt: 30, completion: 5, total: 35 });
+      expect(report.summary.observedProviderCostUsdDecimal).toBe("0.0003");
+      expect(report.summary.costAccountingComplete).toBe(true);
+      expect(report.summary.retryAccounting).toEqual({
+        totalAttempts: 2,
+        retriedCases: 1,
+        recoveredErrors: [{ error: "operational envelope: review/invalidOutput", count: 1 }],
+      });
+    } finally {
+      if (previousKey === undefined) delete process.env.MODEL_API_KEY;
+      else process.env.MODEL_API_KEY = previousKey;
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("keeps unknown attempt cost incomplete after a retry", () => {
+    const finalAttempt = {
+      scored: true,
+      durationMs: 90,
+      promptTokens: 20,
+      completionTokens: 3,
+      observedProviderCostUsdDecimal: "0.00018",
+      costAccountingComplete: true,
+      attemptCount: 1,
+      recoveredErrors: [],
+    } as Parameters<typeof aggregateAttemptAccounting>[0];
+    const unknownAttempt = {
+      ...finalAttempt,
+      scored: false,
+      durationMs: null,
+      promptTokens: 0,
+      completionTokens: 0,
+      observedProviderCostUsdDecimal: null,
+      costAccountingComplete: false,
+      attemptCount: 1,
+      recoveredErrors: [],
+      error: "unknown accounting",
+    };
+
+    expect(aggregateAttemptAccounting(finalAttempt, [unknownAttempt, finalAttempt])).toMatchObject({
+      durationMs: null,
+      promptTokens: 20,
+      completionTokens: 3,
+      observedProviderCostUsdDecimal: null,
+      costAccountingComplete: false,
+      attemptCount: 2,
+      recoveredErrors: ["unknown accounting"],
+    });
   });
 
   test("requires an exercised exact scorer identity when screening a scorer", () => {

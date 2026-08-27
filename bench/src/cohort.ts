@@ -33,12 +33,12 @@ const executionBindingSchema = z.object({
 }).strict();
 
 export const cohortManifestSchema = z.object({
-  schemaVersion: z.literal(3),
+  schemaVersion: z.literal(4),
   purpose: z.enum(["calibration", "release"]),
   cohortId: z.string().uuid(),
   createdAt: z.string().datetime({ offset: true }),
   reportCount: z.union([z.literal(5), z.literal(10)]),
-  caseRetries: z.literal(0),
+  caseRetries: z.literal(1),
   binarySha256: sha256Schema,
   evaluatorSha256: sha256Schema,
   fixtureCorpusSha256: sha256Schema,
@@ -308,12 +308,12 @@ export async function createCohortManifest(options: {
     runAttempt: process.env.GITHUB_RUN_ATTEMPT ?? "",
   } as CohortManifest["execution"];
   return cohortManifestSchema.parse({
-    schemaVersion: 3,
+    schemaVersion: 4,
     purpose: options.purpose,
     cohortId,
     createdAt: (options.now ?? new Date()).toISOString(),
     reportCount: count,
-    caseRetries: 0,
+    caseRetries: 1,
     ...bindings,
     execution,
     slots: Array.from({ length: count }, (_, index) => ({
