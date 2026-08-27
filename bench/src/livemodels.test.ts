@@ -1377,7 +1377,21 @@ describe("managed admission workflow", () => {
     expect(calibration).toContain("name: Record the attested baseline");
     expect(calibration).toContain("name: Attest the populated baseline");
     expect(calibration).toContain("name: Verify independent calibration generations");
-    expect(calibration).toContain("bun run bench:verify-generations --");
+    const generationVerificationCommand = (workflow: string): string => {
+      const commandStart = workflow.indexOf("bun run bench:verify-generations --");
+      expect(commandStart).toBeGreaterThanOrEqual(0);
+      const commandLines: string[] = [];
+      for (const line of workflow.slice(commandStart).split("\n")) {
+        commandLines.push(line);
+        if (!line.trimEnd().endsWith("\\")) break;
+      }
+      return commandLines.join("\n");
+    };
+    const calibrationGenerationVerification = generationVerificationCommand(calibration);
+    expect(calibrationGenerationVerification).toMatch(
+      /bun run bench:verify-generations -- \\\n\s+--screen-profile \.\.\/provisional-models\.json \\\n\s+--result /u,
+    );
+    expect([...calibrationGenerationVerification.matchAll(/--screen-profile \.\.\/provisional-models\.json/gu)]).toHaveLength(1);
     expect(calibration).toContain("--record");
     expect(release).not.toContain("workflow_dispatch");
     expect(release).toContain("name: Require the unique first release run for this tag");
@@ -1484,7 +1498,11 @@ describe("managed admission workflow", () => {
     expect(final).toContain("merge-multiple: false");
     expect(final).toContain("name: Verify signed release benchmark evidence");
     expect(final).toContain("name: Verify independent release generations");
-    expect(final).toContain("bun run bench:verify-generations --");
+    const releaseGenerationVerification = generationVerificationCommand(final);
+    expect(releaseGenerationVerification).toMatch(
+      /bun run bench:verify-generations -- \\\n\s+--screen-profile \.\.\/provisional-models\.json \\\n\s+--result /u,
+    );
+    expect([...releaseGenerationVerification.matchAll(/--screen-profile \.\.\/provisional-models\.json/gu)]).toHaveLength(1);
     expect(final).toContain("gh attestation verify");
     expect(final).toContain("--deny-self-hosted-runners");
     expect(final).toContain("name: bench-live-cohort-${{ github.run_attempt }}");

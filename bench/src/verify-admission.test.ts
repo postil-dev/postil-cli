@@ -49,10 +49,14 @@ describe("admission attestation verification", () => {
     const profile = JSON.parse(await readFile(join(repositoryRoot, "provisional-models.json"), "utf8")) as {
       generatorChain: string[];
       scorerChain: string[];
+      providerGenerationModels: Record<string, string>;
       modelPriceBounds: Array<{ model: string }>;
     };
     expect(profile.generatorChain).toEqual(["openai/gpt-5.6-luna"]);
     expect(profile.scorerChain).toEqual(["openai/gpt-5.6-luna"]);
+    expect(profile.providerGenerationModels).toEqual({
+      "openai/gpt-5.6-luna": "openai/gpt-5.6-luna-20260709",
+    });
     expect(profile.modelPriceBounds.map((bound) => bound.model)).toEqual(["openai/gpt-5.6-luna"]);
     expect(await verifyProvisionalRelease(
       join(repositoryRoot, "qualified-models.json"),
@@ -110,6 +114,44 @@ describe("admission attestation verification", () => {
     }
   });
 
+  test("requires one pinned provider generation identity per provisional model", async () => {
+    const repositoryRoot = join(import.meta.dir, "..", "..");
+    const directory = await temporaryDirectory();
+    const manifest = join(directory, "qualified-models.json");
+    const config = join(directory, "config.toml");
+    const profilePath = join(directory, "provisional-models.json");
+    await writeFile(manifest, await readFile(join(repositoryRoot, "qualified-models.json")));
+    await writeFile(config, await readFile(join(repositoryRoot, "config.toml")));
+    const profile = JSON.parse(
+      await readFile(join(repositoryRoot, "provisional-models.json"), "utf8"),
+    ) as { providerGenerationModels: Record<string, string> };
+
+    profile.providerGenerationModels = {};
+    await writeFile(profilePath, JSON.stringify(profile));
+    await expect(verifyProvisionalRelease(manifest, config, profilePath)).rejects.toThrow(
+      "generation identities must exactly cover sorted model chains",
+    );
+  });
+
+  test("rejects logical aliases as provider generation identities", async () => {
+    const repositoryRoot = join(import.meta.dir, "..", "..");
+    const directory = await temporaryDirectory();
+    const manifest = join(directory, "qualified-models.json");
+    const config = join(directory, "config.toml");
+    const profilePath = join(directory, "provisional-models.json");
+    await writeFile(manifest, await readFile(join(repositoryRoot, "qualified-models.json")));
+    await writeFile(config, await readFile(join(repositoryRoot, "config.toml")));
+    const profile = JSON.parse(
+      await readFile(join(repositoryRoot, "provisional-models.json"), "utf8"),
+    ) as { providerGenerationModels: Record<string, string> };
+
+    profile.providerGenerationModels["openai/gpt-5.6-luna"] = "openai/gpt-5.6-luna";
+    await writeFile(profilePath, JSON.stringify(profile));
+    await expect(verifyProvisionalRelease(manifest, config, profilePath)).rejects.toThrow(
+      "generation identities must be distinct from logical model IDs",
+    );
+  });
+
   test("keeps attestation verification active after a profile is formally admitted", async () => {
     const directory = await temporaryDirectory();
     const manifest = join(directory, "qualified-models.json");
@@ -150,6 +192,7 @@ describe("admission attestation verification", () => {
       await readFile(join(repositoryRoot, "provisional-models.json"), "utf8"),
     ) as {
       generatorChain: string[];
+      providerGenerationModels: Record<string, string>;
       modelPriceBounds: Array<{
         model: string;
         inputMicrosPerMillionTokens: number;
@@ -157,6 +200,7 @@ describe("admission attestation verification", () => {
       }>;
     };
     altered.generatorChain = ["other/model"];
+    altered.providerGenerationModels["other/model"] = "other/model-20260801";
     // Keep both role models fully priced so the assertion reaches the exact
     // embedded-default comparison instead of failing an earlier bound check.
     altered.modelPriceBounds.push({ ...altered.modelPriceBounds[0]!, model: "other/model" });

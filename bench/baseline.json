@@ -2,7 +2,7 @@
   "schemaVersion": 2,
   "corpus": {
     "fixtureCorpusSha256": "8e4c2cb9ad5a7efdfe6a875566d20133e905155b6f693a873595adf6c069e065",
-    "evaluatorSha256": "00b424fcc4fb13a1c4bd4010ef79a992d0692d59ceb70eae0669ea9823e6645e"
+    "evaluatorSha256": "b3c6d4085f173ef3abf280b38d4e4221bd39b7752cfbe210e5c19706b700b7e2"
   },
   "profiles": {
     "z-ai/glm-5.2": {

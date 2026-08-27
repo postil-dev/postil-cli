@@ -7,6 +7,9 @@
   "generatorChain": ["openai/gpt-5.6-luna"],
   "consensus": 1,
   "scorerChain": ["openai/gpt-5.6-luna"],
+  "providerGenerationModels": {
+    "openai/gpt-5.6-luna": "openai/gpt-5.6-luna-20260709"
+  },
   "modelPriceBounds": [
     {
       "model": "openai/gpt-5.6-luna",
