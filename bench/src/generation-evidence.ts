@@ -11,12 +11,20 @@ const GENERATION_API = "https://openrouter.ai/api/v1/generation";
 const MAX_ATTEMPTS = 5;
 const MAX_RETRY_MS = 5_000;
 const generationIdSchema = z.string().regex(/^gen-[A-Za-z0-9_-]+$/u);
+const sha256Schema = z.string().regex(/^[0-9a-f]{64}$/u);
+const modelIdSchema = z.string().trim().min(1).refine(
+  (value) => !/[\r\n]/u.test(value),
+  "model ID must not contain line breaks",
+);
 
 const reportSchema = z.object({
   summary: z.object({
     runId: z.string().trim().min(1),
     ranAt: z.string().datetime({ offset: true }),
     model: z.string().trim().min(1),
+    scorerMode: z.enum(["disabled", "enabled"]),
+    scorerModel: z.string().trim().min(1).nullable(),
+    screeningProfileSha256: sha256Schema,
     upstreamProviderIdentity: z.string().trim().min(1),
     totalTokens: z.object({
       prompt: z.number().int().nonnegative(),
@@ -25,7 +33,55 @@ const reportSchema = z.object({
     }),
     observedProviderCostUsdDecimal: z.string().regex(/^(?:0|[1-9][0-9]*|(?:0|[1-9][0-9]*)\.[0-9]*[1-9])$/u),
     providerGenerationIds: z.array(generationIdSchema).min(1),
+  }).superRefine((summary, context) => {
+    if (
+      (summary.scorerMode === "disabled" && summary.scorerModel !== null) ||
+      (summary.scorerMode === "enabled" && summary.scorerModel === null)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "scorerMode and scorerModel must agree",
+        path: ["scorerModel"],
+      });
+    }
   }),
+});
+
+const screeningProfileSchema = z.object({
+  generatorChain: z.array(modelIdSchema).min(1),
+  scorerChain: z.array(modelIdSchema),
+  providerGenerationModels: z.record(modelIdSchema, modelIdSchema).refine(
+    (models) => Object.keys(models).length > 0,
+    "providerGenerationModels must not be empty",
+  ),
+}).passthrough().superRefine((profile, context) => {
+  const chainModels = [...new Set([...profile.generatorChain, ...profile.scorerChain])].sort();
+  const mappedModels = Object.keys(profile.providerGenerationModels).sort();
+  if (
+    chainModels.length !== mappedModels.length ||
+    chainModels.some((model, index) => model !== mappedModels[index])
+  ) {
+    context.addIssue({
+      code: "custom",
+      message: "providerGenerationModels must exactly cover the screening model chains",
+      path: ["providerGenerationModels"],
+    });
+  }
+  const providerModels = Object.values(profile.providerGenerationModels);
+  if (new Set(providerModels).size !== providerModels.length) {
+    context.addIssue({
+      code: "custom",
+      message: "providerGenerationModels must not repeat canonical models",
+      path: ["providerGenerationModels"],
+    });
+  }
+  if (providerModels.some((model) => chainModels.includes(model))) {
+    context.addIssue({
+      code: "custom",
+      message: "providerGenerationModels must be distinct from logical screening model IDs",
+      path: ["providerGenerationModels"],
+    });
+  }
 });
 
 const generationSchema = z.object({
@@ -47,6 +103,20 @@ export interface GenerationEvidenceSample {
   report: unknown;
   receipt: unknown;
   reportRawSha256: string;
+}
+
+export interface GenerationEvidenceProfile {
+  sha256: string;
+  providerGenerationModels: Readonly<Record<string, string>>;
+}
+
+async function readGenerationEvidenceProfile(path: string): Promise<GenerationEvidenceProfile> {
+  const raw = await readFile(resolve(path));
+  const profile = screeningProfileSchema.parse(JSON.parse(raw.toString("utf8")));
+  return {
+    sha256: sha256(raw),
+    providerGenerationModels: profile.providerGenerationModels,
+  };
 }
 
 function retryDelay(response: Response, attempt: number): number {
@@ -98,8 +168,21 @@ async function fetchGeneration(
 
 export async function verifyGenerationEvidence(
   samples: readonly GenerationEvidenceSample[],
-  options: { apiKey: string; fetchImpl?: typeof fetch; concurrency?: number },
+  options: {
+    apiKey: string;
+    profile: GenerationEvidenceProfile;
+    fetchImpl?: typeof fetch;
+    concurrency?: number;
+  },
 ): Promise<number> {
+  const logicalModels = Object.keys(options.profile.providerGenerationModels);
+  const providerModels = Object.values(options.profile.providerGenerationModels);
+  if (new Set(providerModels).size !== providerModels.length) {
+    throw new Error("provider generation identities must not repeat canonical models");
+  }
+  if (providerModels.some((model) => logicalModels.includes(model))) {
+    throw new Error("provider generation identities must be distinct from logical model IDs");
+  }
   const parsed = samples.map((sample, sampleIndex) => {
     const report = reportSchema.parse(sample.report);
     const receipt = cohortReceiptSchema.parse(sample.receipt);
@@ -111,6 +194,18 @@ export async function verifyGenerationEvidence(
     }
     if (report.summary.runId !== receipt.runId) {
       throw new Error(`benchmark report ${sampleIndex + 1} does not match its receipt run identity`);
+    }
+    if (report.summary.screeningProfileSha256 !== options.profile.sha256) {
+      throw new Error(`benchmark report ${sampleIndex + 1} does not match its screening profile`);
+    }
+    if (options.profile.providerGenerationModels[report.summary.model] === undefined) {
+      throw new Error(`benchmark report ${sampleIndex + 1} model has no pinned provider generation identity`);
+    }
+    if (
+      report.summary.scorerModel !== null &&
+      options.profile.providerGenerationModels[report.summary.scorerModel] === undefined
+    ) {
+      throw new Error(`benchmark report ${sampleIndex + 1} scorer has no pinned provider generation identity`);
     }
     const startedAt = Date.parse(receipt.startedAt);
     const finishedAt = Date.parse(receipt.finishedAt);
@@ -160,7 +255,13 @@ export async function verifyGenerationEvidence(
     const reportGenerations = generations.filter((_, generationIndex) =>
       expected[generationIndex]!.reportIndex === reportIndex
     );
-    if (reportGenerations.some((generation) => generation.model !== report.summary.model)) {
+    const expectedGenerationModels = new Set([
+      options.profile.providerGenerationModels[report.summary.model]!,
+      ...(report.summary.scorerModel === null
+        ? []
+        : [options.profile.providerGenerationModels[report.summary.scorerModel]!]),
+    ]);
+    if (reportGenerations.some((generation) => !expectedGenerationModels.has(generation.model))) {
       throw new Error(`benchmark report ${reportIndex + 1} contains a generation for another model`);
     }
     if (reportGenerations.some((generation) =>
@@ -195,10 +296,15 @@ function requiredValue(args: readonly string[], index: number, flag: string): st
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
+  if (args[0] !== "--screen-profile") {
+    throw new Error("generation-evidence verification requires --screen-profile first");
+  }
+  const profilePath = requiredValue(args, 0, "--screen-profile");
+  const sampleArgs = args.slice(2);
   const samplePaths: Array<{ reportPath: string; receiptPath: string }> = [];
-  for (let index = 0; index < args.length; index += 4) {
-    const resultFlag = args[index];
-    const receiptFlag = args[index + 2];
+  for (let index = 0; index < sampleArgs.length; index += 4) {
+    const resultFlag = sampleArgs[index];
+    const receiptFlag = sampleArgs[index + 2];
     if (resultFlag !== "--result") {
       throw new Error(`expected --result, received ${resultFlag ?? "end of arguments"}`);
     }
@@ -206,8 +312,8 @@ async function main(): Promise<void> {
       throw new Error(`each --result must be followed by --receipt`);
     }
     samplePaths.push({
-      reportPath: resolve(requiredValue(args, index, resultFlag)),
-      receiptPath: resolve(requiredValue(args, index + 2, receiptFlag)),
+      reportPath: resolve(requiredValue(sampleArgs, index, resultFlag)),
+      receiptPath: resolve(requiredValue(sampleArgs, index + 2, receiptFlag)),
     });
   }
   if (samplePaths.length === 0) {
@@ -218,18 +324,21 @@ async function main(): Promise<void> {
     throw new Error(`generation-evidence verification requires ${API_KEY_ENV_NAMES_TEXT}`);
   }
   const apiKey = process.env[keyName]!;
-  const samples = await Promise.all(samplePaths.map(async ({ reportPath, receiptPath }) => {
-    const [reportRaw, receiptRaw] = await Promise.all([
-      readFile(reportPath),
-      readFile(receiptPath, "utf8"),
-    ]);
-    return {
-      report: JSON.parse(reportRaw.toString("utf8")) as unknown,
-      receipt: JSON.parse(receiptRaw) as unknown,
-      reportRawSha256: sha256(reportRaw),
-    };
-  }));
-  const count = await verifyGenerationEvidence(samples, { apiKey });
+  const [profile, samples] = await Promise.all([
+    readGenerationEvidenceProfile(profilePath),
+    Promise.all(samplePaths.map(async ({ reportPath, receiptPath }) => {
+      const [reportRaw, receiptRaw] = await Promise.all([
+        readFile(reportPath),
+        readFile(receiptPath, "utf8"),
+      ]);
+      return {
+        report: JSON.parse(reportRaw.toString("utf8")) as unknown,
+        receipt: JSON.parse(receiptRaw) as unknown,
+        reportRawSha256: sha256(reportRaw),
+      };
+    })),
+  ]);
+  const count = await verifyGenerationEvidence(samples, { apiKey, profile });
   console.log(`Verified ${count} distinct OpenRouter generations.`);
 }
 

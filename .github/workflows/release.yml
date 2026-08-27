@@ -511,6 +511,7 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
           bun run bench:verify-generations -- \
+            --screen-profile ../provisional-models.json \
             --result "${RUNNER_TEMP}/bench-live-reports/slots/01/report.json" \
             --receipt "${RUNNER_TEMP}/bench-live-reports/slots/01/receipt.json" \
             --result "${RUNNER_TEMP}/bench-live-reports/slots/02/report.json" \

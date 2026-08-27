@@ -12,6 +12,9 @@ function sample(
       runId: "fixture-run",
       ranAt: "2026-08-26T12:00:30.000Z",
       model: "openai/gpt-5.6-luna",
+      scorerMode: "disabled",
+      scorerModel: null,
+      screeningProfileSha256: "c".repeat(64),
       upstreamProviderIdentity: "Azure",
       totalTokens: { prompt: 30, completion: 12, total: 42 },
       observedProviderCostUsdDecimal: "0.0042",
@@ -55,7 +58,7 @@ const records = {
   "gen-one": {
     id: "gen-one",
     created_at: "2026-08-26T12:00:10.000Z",
-    model: "openai/gpt-5.6-luna",
+    model: "openai/gpt-5.6-luna-20260709",
     provider_name: "Azure",
     tokens_prompt: 10,
     tokens_completion: 5,
@@ -64,7 +67,7 @@ const records = {
   "gen-two": {
     id: "gen-two",
     created_at: "2026-08-26T12:00:20.000Z",
-    model: "openai/gpt-5.6-luna",
+    model: "openai/gpt-5.6-luna-20260709",
     provider_name: "Azure",
     tokens_prompt: 20,
     tokens_completion: 7,
@@ -72,10 +75,18 @@ const records = {
   },
 };
 
+const profile = {
+  sha256: "c".repeat(64),
+  providerGenerationModels: {
+    "openai/gpt-5.6-luna": "openai/gpt-5.6-luna-20260709",
+  },
+};
+
 describe("provider generation evidence", () => {
   test("verifies distinct generation identity, route, tokens, and cost", async () => {
     await expect(verifyGenerationEvidence([sample(["gen-one", "gen-two"])], {
       apiKey: "fixture",
+      profile,
       fetchImpl: generationFetch(records),
     })).resolves.toBe(2);
   });
@@ -86,6 +97,7 @@ describe("provider generation evidence", () => {
       sample(["gen-one", "gen-two"]),
     ], {
       apiKey: "fixture",
+      profile,
       fetchImpl: generationFetch(records),
     })).rejects.toThrow("duplicate provider generation IDs");
   });
@@ -95,10 +107,12 @@ describe("provider generation evidence", () => {
       sample(["gen-one", "gen-two"], { totalTokens: { prompt: 31, completion: 12, total: 43 } }),
     ], {
       apiKey: "fixture",
+      profile,
       fetchImpl: generationFetch(records),
     })).rejects.toThrow("token totals do not match provider generations");
     await expect(verifyGenerationEvidence([sample(["gen-one", "gen-two"])], {
       apiKey: "fixture",
+      profile,
       fetchImpl: generationFetch({
         ...records,
         "gen-two": { ...records["gen-two"], provider_name: "Other" },
@@ -106,9 +120,103 @@ describe("provider generation evidence", () => {
     })).rejects.toThrow("generation from another provider");
   });
 
+  test("binds the logical alias to the exact provider generation model", async () => {
+    await expect(verifyGenerationEvidence([sample(["gen-one", "gen-two"])], {
+      apiKey: "fixture",
+      profile,
+      fetchImpl: generationFetch({
+        ...records,
+        "gen-two": { ...records["gen-two"], model: "openai/gpt-5.6-luna-20260801" },
+      }),
+    })).rejects.toThrow("generation for another model");
+
+    await expect(verifyGenerationEvidence([
+      sample(["gen-one", "gen-two"], { screeningProfileSha256: "d".repeat(64) }),
+    ], {
+      apiKey: "fixture",
+      profile,
+      fetchImpl: generationFetch(records),
+    })).rejects.toThrow("does not match its screening profile");
+  });
+
+  test("binds each report to only its generator and scorer identities", async () => {
+    const multipleModels = {
+      sha256: "c".repeat(64),
+      providerGenerationModels: {
+        "logical/generator": "provider/generator-20260801",
+        "logical/other": "provider/other-20260801",
+        "logical/scorer": "provider/scorer-20260801",
+      },
+    };
+    const generatorRecord = {
+      ...records["gen-one"],
+      model: "provider/generator-20260801",
+    };
+    const otherRecord = {
+      ...records["gen-two"],
+      model: "provider/other-20260801",
+    };
+    const generatorReport = sample(["gen-one", "gen-two"], {
+      model: "logical/generator",
+    });
+    await expect(verifyGenerationEvidence([generatorReport], {
+      apiKey: "fixture",
+      profile: multipleModels,
+      fetchImpl: generationFetch({
+        "gen-one": generatorRecord,
+        "gen-two": otherRecord,
+      }),
+    })).rejects.toThrow("generation for another model");
+
+    const scorerRecord = {
+      ...records["gen-two"],
+      model: "provider/scorer-20260801",
+    };
+    await expect(verifyGenerationEvidence([
+      sample(["gen-one", "gen-two"], {
+        model: "logical/generator",
+        scorerMode: "enabled",
+        scorerModel: "logical/scorer",
+      }),
+    ], {
+      apiKey: "fixture",
+      profile: multipleModels,
+      fetchImpl: generationFetch({
+        "gen-one": generatorRecord,
+        "gen-two": scorerRecord,
+      }),
+    })).resolves.toBe(2);
+  });
+
+  test("rejects ambiguous provider identity maps", async () => {
+    await expect(verifyGenerationEvidence([sample(["gen-one", "gen-two"])], {
+      apiKey: "fixture",
+      profile: {
+        sha256: "c".repeat(64),
+        providerGenerationModels: {
+          "logical/one": "provider/shared-20260801",
+          "logical/two": "provider/shared-20260801",
+        },
+      },
+      fetchImpl: generationFetch(records),
+    })).rejects.toThrow("must not repeat canonical models");
+
+    await expect(verifyGenerationEvidence([sample(["gen-one", "gen-two"])], {
+      apiKey: "fixture",
+      profile: {
+        sha256: "c".repeat(64),
+        providerGenerationModels: {
+          "openai/gpt-5.6-luna": "openai/gpt-5.6-luna",
+        },
+      },
+      fetchImpl: generationFetch(records),
+    })).rejects.toThrow("must be distinct from logical model IDs");
+  });
+
   test("rejects a lookup whose returned generation identity differs", async () => {
     await expect(verifyGenerationEvidence([sample(["gen-one", "gen-two"])], {
       apiKey: "fixture",
+      profile,
       fetchImpl: generationFetch({
         ...records,
         "gen-two": { ...records["gen-two"], id: "gen-one" },
@@ -119,6 +227,7 @@ describe("provider generation evidence", () => {
   test("binds every generation to the attested receipt interval", async () => {
     await expect(verifyGenerationEvidence([sample(["gen-one", "gen-two"])], {
       apiKey: "fixture",
+      profile,
       fetchImpl: generationFetch({
         ...records,
         "gen-two": { ...records["gen-two"], created_at: "2024-01-01T00:00:00.000Z" },
@@ -131,6 +240,7 @@ describe("provider generation evidence", () => {
       sample(["gen-one", "gen-two"], {}, { reportRawSha256: "b".repeat(64) }),
     ], {
       apiKey: "fixture",
+      profile,
       fetchImpl: generationFetch(records),
     })).rejects.toThrow("does not match its receipt digest");
 
@@ -138,6 +248,7 @@ describe("provider generation evidence", () => {
       sample(["gen-one", "gen-two"], {}, { runId: "another-run" }),
     ], {
       apiKey: "fixture",
+      profile,
       fetchImpl: generationFetch(records),
     })).rejects.toThrow("does not match its receipt run identity");
   });

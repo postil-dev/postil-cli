@@ -260,6 +260,8 @@ pub(crate) struct QualificationCandidateProfile {
     pub generator_chain: Vec<String>,
     pub consensus: usize,
     pub scorer_chain: Vec<String>,
+    #[serde(default)]
+    pub provider_generation_models: std::collections::BTreeMap<String, String>,
     pub model_price_bounds: Vec<ModelPriceBound>,
 }
 
@@ -614,6 +616,40 @@ fn validate_profile_model_price_bounds(
         bounded_models == expected_models,
         "{label} model price bounds must exactly cover the generator and scorer models"
     );
+    Ok(())
+}
+
+fn validate_profile_generation_models(
+    label: &str,
+    generator_chain: &[String],
+    scorer_chain: &[String],
+    provider_generation_models: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    let expected_models = generator_chain
+        .iter()
+        .chain(scorer_chain)
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mapped_models = provider_generation_models
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    anyhow::ensure!(
+        mapped_models == expected_models,
+        "{label} provider generation identities must exactly cover the generator and scorer models"
+    );
+    let mut canonical_models = std::collections::BTreeSet::new();
+    for model in provider_generation_models.values() {
+        validate_model_id(&format!("{label} provider generation identity"), model)?;
+        anyhow::ensure!(
+            !expected_models.contains(model),
+            "{label} provider generation identities must be distinct from logical model IDs"
+        );
+        anyhow::ensure!(
+            canonical_models.insert(model),
+            "{label} provider generation identities must not repeat canonical models"
+        );
+    }
     Ok(())
 }
 
@@ -1901,6 +1937,12 @@ fn benchmark_screening_profile() -> Result<Option<QualificationCandidateProfile>
         profile.scorer_chain.len() <= 2,
         "benchmark screening scorer chain supports at most two models"
     );
+    validate_profile_generation_models(
+        "benchmark screening profile",
+        &profile.generator_chain,
+        &profile.scorer_chain,
+        &profile.provider_generation_models,
+    )?;
     validate_profile_model_price_bounds(
         "benchmark screening profile",
         &profile.generator_chain,
@@ -2171,6 +2213,12 @@ fn parse_provisional_hosted_profile(raw: &str) -> Result<QualificationCandidateP
         profile.scorer_chain.len() <= 2,
         "provisional hosted scorer chain supports at most two models"
     );
+    validate_profile_generation_models(
+        "provisional hosted profile",
+        &profile.generator_chain,
+        &profile.scorer_chain,
+        &profile.provider_generation_models,
+    )?;
     validate_profile_model_price_bounds(
         "provisional hosted profile",
         &profile.generator_chain,
@@ -3863,6 +3911,13 @@ scorer = { enabled = true, default_model = "provider/scorer", reasoning_effort =
         assert_eq!(profile.upstream_provider_route, "azure/eu");
         assert_eq!(profile.generator_chain, vec!["openai/gpt-5.6-luna"]);
         assert_eq!(profile.scorer_chain, vec!["openai/gpt-5.6-luna"]);
+        assert_eq!(
+            profile.provider_generation_models,
+            std::collections::BTreeMap::from([(
+                "openai/gpt-5.6-luna".to_string(),
+                "openai/gpt-5.6-luna-20260709".to_string(),
+            )])
+        );
         let drifted = Config {
             reasoning_effort: ReasoningEffort::High,
             ..config.clone()
@@ -3943,6 +3998,7 @@ scorer = { enabled = true, default_model = "provider/scorer", reasoning_effort =
                 "generatorChain": ["provider/shared"],
                 "consensus": 1,
                 "scorerChain": ["provider/shared"],
+                "providerGenerationModels": {"provider/shared": "provider/shared-20260801"},
                 "modelPriceBounds": [{
                     "model": "provider/shared",
                     "inputMicrosPerMillionTokens": 1,
@@ -3967,6 +4023,10 @@ scorer = { enabled = true, default_model = "provider/scorer", reasoning_effort =
             "generatorChain": ["provider/generator"],
             "consensus": 1,
             "scorerChain": ["provider/scorer"],
+            "providerGenerationModels": {
+                "provider/generator": "provider/generator-20260801",
+                "provider/scorer": "provider/scorer-20260801"
+            },
             "modelPriceBounds": [
                 {"model": "provider/generator", "inputMicrosPerMillionTokens": 1, "outputMicrosPerMillionTokens": 1},
                 {"model": "provider/scorer", "inputMicrosPerMillionTokens": 1, "outputMicrosPerMillionTokens": 1}
@@ -3989,6 +4049,32 @@ scorer = { enabled = true, default_model = "provider/scorer", reasoning_effort =
                     .contains(expected)
             );
         }
+    }
+
+    #[test]
+    fn provisional_hosted_profile_requires_pinned_provider_generation_models() {
+        let mut profile: serde_json::Value = serde_json::from_str(PROVISIONAL_MODELS_JSON).unwrap();
+        profile["providerGenerationModels"] = serde_json::json!({});
+        assert!(
+            parse_provisional_hosted_profile(&profile.to_string())
+                .unwrap_err()
+                .to_string()
+                .contains("provider generation identities must exactly cover")
+        );
+    }
+
+    #[test]
+    fn provisional_hosted_profile_rejects_logical_provider_generation_aliases() {
+        let mut profile: serde_json::Value = serde_json::from_str(PROVISIONAL_MODELS_JSON).unwrap();
+        profile["providerGenerationModels"] = serde_json::json!({
+            "openai/gpt-5.6-luna": "openai/gpt-5.6-luna"
+        });
+        assert!(
+            parse_provisional_hosted_profile(&profile.to_string())
+                .unwrap_err()
+                .to_string()
+                .contains("generation identities must be distinct from logical model IDs")
+        );
     }
 
     #[test]

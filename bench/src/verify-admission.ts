@@ -72,6 +72,7 @@ const provisionalProfileSchema = z.object({
   generatorChain: z.array(boundedIdentifierSchema).min(1),
   consensus: z.number().int().positive(),
   scorerChain: z.array(boundedIdentifierSchema).max(2),
+  providerGenerationModels: z.record(boundedIdentifierSchema, boundedIdentifierSchema),
   modelPriceBounds: z.array(z.object({
     model: boundedIdentifierSchema,
     inputMicrosPerMillionTokens: z.number().int().positive().safe(),
@@ -235,6 +236,21 @@ export async function verifyProvisionalRelease(
     throw new Error("provisional hosted scorer chain must not repeat models");
   }
   const expectedModels = [...new Set([...profile.generatorChain, ...profile.scorerChain])].sort();
+  const generationModels = Object.keys(profile.providerGenerationModels).sort();
+  if (
+    generationModels.length !== expectedModels.length ||
+    generationModels.some((model, index) => model !== expectedModels[index])
+  ) {
+    throw new Error("provisional hosted generation identities must exactly cover sorted model chains");
+  }
+  if (new Set(Object.values(profile.providerGenerationModels)).size !== generationModels.length) {
+    throw new Error("provisional hosted generation identities must not repeat canonical models");
+  }
+  if (Object.values(profile.providerGenerationModels).some((model) => expectedModels.includes(model))) {
+    throw new Error(
+      "provisional hosted generation identities must be distinct from logical model IDs",
+    );
+  }
   const boundedModels = profile.modelPriceBounds.map((bound) => bound.model);
   if (
     boundedModels.length !== expectedModels.length ||

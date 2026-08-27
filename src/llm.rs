@@ -5332,7 +5332,10 @@ fn apply_openrouter_scorer_contract(
     // Strict scorer routing requires every request parameter to be supported
     // by the selected endpoint. Reasoning endpoints expose their output limit
     // through `reasoning.effort`. Azure names the output limit
-    // `max_completion_tokens`; OpenAI names the same limit `max_tokens`.
+    // `max_completion_tokens`; portable OpenRouter routes and OpenAI use
+    // `max_tokens`. Only rewrite the field for an explicitly pinned Azure
+    // route, because `require_parameters` otherwise removes endpoints that
+    // correctly advertise only the portable parameter.
     // A redundant temperature would disqualify both endpoint families.
     apply_openrouter_strict_output_limit(body, "scorer", pinned_provider);
     let provider = body
@@ -5426,7 +5429,7 @@ fn apply_openrouter_strict_output_limit(
         .as_object_mut()
         .expect("model request body is an object");
     request.remove("temperature");
-    if pinned_provider != Some("OpenAI") {
+    if pinned_provider == Some("Azure") {
         let max_tokens = request.remove("max_tokens").unwrap_or_else(|| {
             panic!("OpenRouter {phase} request has a bounded output token limit")
         });
@@ -9821,8 +9824,8 @@ mod tests {
             json!({"effort": "low", "exclude": true})
         );
         assert!(scorer.get("temperature").is_none());
-        assert!(scorer.get("max_tokens").is_none());
-        assert_eq!(scorer["max_completion_tokens"], 400);
+        assert_eq!(scorer["max_tokens"], 400);
+        assert!(scorer.get("max_completion_tokens").is_none());
         assert!(scorer["reasoning"].get("enabled").is_none());
         assert_eq!(scorer["provider"]["require_parameters"], true);
         assert_eq!(scorer["response_format"]["type"], "json_schema");
@@ -9861,14 +9864,37 @@ mod tests {
             LlmPhase::Adjudication,
         );
         assert!(adjudication.get("temperature").is_none());
-        assert!(adjudication.get("max_tokens").is_none());
-        assert_eq!(adjudication["max_completion_tokens"], 8_000);
+        assert_eq!(adjudication["max_tokens"], 8_000);
+        assert!(adjudication.get("max_completion_tokens").is_none());
         assert_eq!(adjudication["provider"]["require_parameters"], true);
         assert_eq!(
             adjudication["reasoning"],
             json!({"effort": "low", "exclude": true})
         );
         assert!(adjudication.get("response_format").is_none());
+
+        let mut azure_client = client.clone();
+        azure_client.request_decorations.pinned_upstream_provider = Some("Azure".into());
+        let azure_scorer = azure_client.request_body(
+            "provider/scorer",
+            "system",
+            "user",
+            400,
+            0.0,
+            LlmPhase::Scorer { expected_len: 1 },
+        );
+        assert!(azure_scorer.get("max_tokens").is_none());
+        assert_eq!(azure_scorer["max_completion_tokens"], 400);
+        let azure_adjudication = azure_client.request_body(
+            "provider/scorer",
+            "system",
+            "user",
+            8_000,
+            0.0,
+            LlmPhase::Adjudication,
+        );
+        assert!(azure_adjudication.get("max_tokens").is_none());
+        assert_eq!(azure_adjudication["max_completion_tokens"], 8_000);
 
         let mut openai_client = client.clone();
         openai_client.request_decorations.pinned_upstream_provider = Some("OpenAI".into());

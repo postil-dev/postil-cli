@@ -468,9 +468,10 @@ canonical slot directory and attests the running receipt before inference,
 then attests its completed report and receipt together. Every accepted provider
 response contributes its OpenRouter generation ID to the report. The fan-in job
 verifies globally distinct generation IDs against OpenRouter's authenticated
-generation API, including the exact model, provider, token totals, and cost,
-then verifies every subject against the exact repository, release workflow,
-source commit, tag ref, OIDC issuer, and GitHub-hosted runner before parsing it.
+generation API, including the exact canonical provider model pinned for each
+logical profile model, provider, token totals, and cost. It also verifies every
+subject against the exact repository, release workflow, source commit, tag ref,
+OIDC issuer, and GitHub-hosted runner before parsing it.
 Only the unique first workflow run for
 the version tag is authoritative. Tag-scoped concurrency, an existing-release
 check, and duplicate-run rejection prevent a second publisher path. A failed
