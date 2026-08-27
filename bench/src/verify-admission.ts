@@ -92,8 +92,6 @@ export function attestationVerificationArguments(
     bundlePath,
     "--repo",
     REPOSITORY,
-    "--signer-repo",
-    REPOSITORY,
     "--signer-workflow",
     SIGNER_WORKFLOW,
     "--signer-digest",

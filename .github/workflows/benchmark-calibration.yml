@@ -158,7 +158,6 @@ jobs:
             gh attestation verify "${RUNNER_TEMP}/prepared/${subject}" \
               --bundle "${RUNNER_TEMP}/prepared/prepared.attestation.json" \
               --repo postil-dev/postil-cli \
-              --signer-repo postil-dev/postil-cli \
               --signer-workflow postil-dev/postil-cli/.github/workflows/benchmark-calibration.yml \
               --signer-digest "${GITHUB_SHA}" \
               --source-digest "${GITHUB_SHA}" \
@@ -272,7 +271,6 @@ jobs:
             gh attestation verify "${RUNNER_TEMP}/prepared/${subject}" \
               --bundle "${RUNNER_TEMP}/prepared/prepared.attestation.json" \
               --repo postil-dev/postil-cli \
-              --signer-repo postil-dev/postil-cli \
               --signer-workflow postil-dev/postil-cli/.github/workflows/benchmark-calibration.yml \
               --signer-digest "${GITHUB_SHA}" \
               --source-digest "${GITHUB_SHA}" \
@@ -304,7 +302,6 @@ jobs:
             gh attestation verify "$destination/reservation.receipt.json" \
               --bundle "$destination/reservation.attestation.json" \
               --repo postil-dev/postil-cli \
-              --signer-repo postil-dev/postil-cli \
               --signer-workflow postil-dev/postil-cli/.github/workflows/benchmark-calibration.yml \
               --signer-digest "${GITHUB_SHA}" \
               --source-digest "${GITHUB_SHA}" \
@@ -331,7 +328,6 @@ jobs:
               gh attestation verify "$destination/${subject}" \
                 --bundle "$destination/result.attestation.json" \
                 --repo postil-dev/postil-cli \
-                --signer-repo postil-dev/postil-cli \
                 --signer-workflow postil-dev/postil-cli/.github/workflows/benchmark-calibration.yml \
                 --signer-digest "${GITHUB_SHA}" \
                 --source-digest "${GITHUB_SHA}" \

@@ -1535,6 +1535,22 @@ describe("managed admission workflow", () => {
         workflowName,
         unlabelled: actionReferences.filter((match) => (match[2] ?? "").length === 0),
       }).toEqual({ workflowName, unlabelled: [] });
+      const lines = source.split("\n");
+      const attestationCommands: string[] = [];
+      for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+        if (!/^[ \t]*gh attestation verify\b/u.test(lines[lineIndex] ?? "")) continue;
+        const commandLines = [lines[lineIndex] ?? ""];
+        while (commandLines.at(-1)?.trimEnd().endsWith("\\")) {
+          lineIndex += 1;
+          commandLines.push(lines[lineIndex] ?? "");
+        }
+        attestationCommands.push(commandLines.join("\n"));
+      }
+      expect({
+        workflowName,
+        incompatibleSignerFlags: attestationCommands.filter((command) =>
+          command.includes("--signer-repo") && command.includes("--signer-workflow")),
+      }).toEqual({ workflowName, incompatibleSignerFlags: [] });
     }
     expect(checkedReferences).toBeGreaterThan(0);
   });

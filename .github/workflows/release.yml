@@ -92,7 +92,6 @@ jobs:
           gh attestation verify bench/baseline.json \
             --bundle bench/baseline.attestation.json \
             --repo postil-dev/postil-cli \
-            --signer-repo postil-dev/postil-cli \
             --signer-workflow postil-dev/postil-cli/.github/workflows/benchmark-calibration.yml \
             --signer-digest "$source_sha" \
             --source-digest "$source_sha" \
@@ -283,7 +282,6 @@ jobs:
           gh attestation verify "${RUNNER_TEMP}/bench-live-cohort.json" \
             --bundle "${RUNNER_TEMP}/bench-live-cohort.attestation.json" \
             --repo postil-dev/postil-cli \
-            --signer-repo postil-dev/postil-cli \
             --signer-workflow postil-dev/postil-cli/.github/workflows/release.yml \
             --signer-digest "${GITHUB_SHA}" \
             --source-digest "${GITHUB_SHA}" \
@@ -446,7 +444,6 @@ jobs:
           gh attestation verify "${RUNNER_TEMP}/bench-live-cohort.json" \
             --bundle "${RUNNER_TEMP}/bench-live-cohort.attestation.json" \
             --repo postil-dev/postil-cli \
-            --signer-repo postil-dev/postil-cli \
             --signer-workflow postil-dev/postil-cli/.github/workflows/release.yml \
             --signer-digest "${GITHUB_SHA}" \
             --source-digest "${GITHUB_SHA}" \
@@ -469,7 +466,6 @@ jobs:
             gh attestation verify "$reservation" \
               --bundle "$reservation_bundle" \
               --repo postil-dev/postil-cli \
-              --signer-repo postil-dev/postil-cli \
               --signer-workflow postil-dev/postil-cli/.github/workflows/release.yml \
               --signer-digest "${GITHUB_SHA}" \
               --source-digest "${GITHUB_SHA}" \
@@ -496,7 +492,6 @@ jobs:
               gh attestation verify "$subject" \
                 --bundle "$bundle" \
                 --repo postil-dev/postil-cli \
-                --signer-repo postil-dev/postil-cli \
                 --signer-workflow postil-dev/postil-cli/.github/workflows/release.yml \
                 --signer-digest "${GITHUB_SHA}" \
                 --source-digest "${GITHUB_SHA}" \
