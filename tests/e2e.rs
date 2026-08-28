@@ -9825,7 +9825,7 @@ async fn diff_fetch_failure_advisory_emits_envelope_and_exits_zero() {
 
     // The review check failed, while the gate stood aside with success.
     let reqs = server.received_requests().await.unwrap();
-    let conclusions: Vec<String> = reqs
+    let mut conclusions: Vec<String> = reqs
         .iter()
         .filter(|r| r.method == wiremock::http::Method::PATCH)
         .map(|r| {
@@ -9835,6 +9835,7 @@ async fn diff_fetch_failure_advisory_emits_envelope_and_exits_zero() {
                 .to_string()
         })
         .collect();
+    conclusions.sort_unstable();
     assert_eq!(conclusions, vec!["failure", "success"]);
 }
 

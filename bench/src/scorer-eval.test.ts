@@ -1486,23 +1486,30 @@ describe("aggregate", () => {
     });
   });
 
-  test("fails a scorer with missing structured score fields", () => {
+  test("reports a timed-out scorer case without double-counting a structured failure", () => {
     const cases = qualificationCases(1);
     cases[0] = result({
       id: TRUE_FINDING_CASES[0],
       timedOut: true,
       scorerModel: null,
       scorerConfidence: null,
+      reasonContractValid: false,
     });
+    cases[1]!.passed = false;
 
     const aggregateResult = aggregate("scorer/model", cases, 1);
     expect(aggregateResult).toMatchObject({
       timedOutCases: 1,
-      structuredFailures: 1,
+      structuredFailures: 0,
+      reasonContractFailures: 0,
+      trueFindingHighConfidence: TRUE_FINDING_CASES.length - 2,
       trueFindingCases: TRUE_FINDING_CASES.length - 1,
       admissionFailures: expect.arrayContaining(["1 case timeout(s)"]),
       passed: false,
     });
+    expect(aggregateResult.admissionFailures).not.toEqual(
+      expect.arrayContaining([expect.stringContaining("structured-output failure")]),
+    );
     expect(aggregateResult.admissionFailures).not.toEqual(
       expect.arrayContaining([expect.stringContaining("true risk(s)")]),
     );
