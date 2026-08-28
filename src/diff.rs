@@ -5334,14 +5334,14 @@ fn render_line_segments_with_budget(
         return vec![whole];
     }
     let wrapper_bytes = json_string_content_bytes(&format!(
-        "{prefix}[columns {}..{}] \n",
+        "@@slice {}..{}@@\n{prefix}\n",
         usize::MAX,
         usize::MAX
     ));
-    let evidence_wrapper_bytes = format!("[columns {}..{}] ", usize::MAX, usize::MAX).len();
+    let slice_metadata_bytes = format!("@@slice {}..{}@@\n", usize::MAX, usize::MAX).len();
     let content_budget = LINE_CHUNK_BYTES
         .min(max_rendered_bytes.saturating_sub(wrapper_bytes))
-        .min(MAX_RENDERED_EVIDENCE_BYTES.saturating_sub(evidence_wrapper_bytes));
+        .min(MAX_RENDERED_EVIDENCE_BYTES.saturating_sub(slice_metadata_bytes));
     let mut rendered = Vec::new();
     let mut start = 0;
     while start < content.len() {
@@ -5356,7 +5356,7 @@ fn render_line_segments_with_budget(
             end = start + offset + character.len_utf8();
         }
         rendered.push(format!(
-            "{prefix}[columns {start}..{end}] {}\n",
+            "@@slice {start}..{end}@@\n{prefix}{}\n",
             &content[start..end]
         ));
         if end == content.len() {
@@ -7049,6 +7049,101 @@ diff --git a/src/multi.rs b/src/multi.rs
                 assert!(evidence.len() <= MAX_RENDERED_EVIDENCE_BYTES);
             }
         }
+    }
+
+    #[test]
+    fn oversized_source_line_keeps_slice_metadata_out_of_source_evidence() {
+        fn reconstruct_source_slices(
+            rendered: &[String],
+            source_line: &str,
+        ) -> Vec<(usize, usize)> {
+            let mut reconstructed = vec![0u8; source_line.len()];
+            let mut covered = vec![false; source_line.len()];
+            let mut ranges = Vec::new();
+            for segment in rendered {
+                let mut lines = segment.lines();
+                let header = lines.next().expect("slice metadata");
+                let range = header
+                    .strip_prefix("@@slice ")
+                    .and_then(|value| value.strip_suffix("@@"))
+                    .and_then(|value| value.split_once(".."))
+                    .and_then(|(start, end)| {
+                        Some((start.parse::<usize>().ok()?, end.parse::<usize>().ok()?))
+                    })
+                    .expect("byte range");
+                let evidence = lines
+                    .next()
+                    .and_then(|line| line.trim_start().split_once(' '))
+                    .and_then(|(_, marked)| marked.strip_prefix("+ "))
+                    .expect("literal source evidence");
+
+                assert_eq!(evidence, &source_line[range.0..range.1]);
+                for (offset, byte) in evidence.bytes().enumerate() {
+                    let index = range.0 + offset;
+                    if covered[index] {
+                        assert_eq!(reconstructed[index], byte);
+                    }
+                    reconstructed[index] = byte;
+                    covered[index] = true;
+                }
+                assert!(lines.next().is_none());
+                ranges.push(range);
+            }
+
+            assert!(covered.into_iter().all(|value| value));
+            assert_eq!(reconstructed, source_line.as_bytes());
+            ranges
+        }
+
+        let source_line = format!("{}TAIL", "x".repeat(1_191));
+        let rendered = render_line_segments("+", &source_line, 0, 476);
+
+        assert_eq!(rendered.len(), 2);
+        assert!(!rendered.concat().contains("[columns"));
+        let ranges = reconstruct_source_slices(&rendered, &source_line);
+        assert_eq!(ranges, vec![(0, 971), (715, 1_195)]);
+
+        let unicode_line = format!("{}TAIL", "界".repeat(500));
+        let unicode_rendered = render_line_segments("+", &unicode_line, 0, 477);
+        let unicode_ranges = reconstruct_source_slices(&unicode_rendered, &unicode_line);
+        assert!(unicode_ranges.len() > 1);
+        assert!(unicode_ranges.iter().all(|(start, end)| {
+            unicode_line.is_char_boundary(*start) && unicode_line.is_char_boundary(*end)
+        }));
+
+        let parsed = parse(&format!(
+            "diff --git a/docs/kubernetes.md b/docs/kubernetes.md\n--- a/docs/kubernetes.md\n+++ b/docs/kubernetes.md\n@@ -475,0 +476 @@\n+{source_line}\n"
+        ));
+        let plan = render_review_batches(&parsed, &[], &[], 24_000, 4_096);
+        assert!(!plan.incomplete);
+        assert!(plan.batches.iter().all(|batch| !batch.contains("[columns")));
+        let evidence = plan
+            .batches
+            .iter()
+            .flat_map(|batch| review_batch_evidence_payloads(batch, "docs/kubernetes.md", 476))
+            .collect::<Vec<_>>();
+        let expected_evidence = vec![
+            source_line[..971].to_string(),
+            source_line[715..].to_string(),
+        ];
+        assert_eq!(evidence, expected_evidence);
+        for expected in &expected_evidence {
+            assert!(plan.batches.iter().any(|batch| {
+                review_batch_canonical_evidence(batch, "docs/kubernetes.md", 476, Some(expected))
+                    .as_ref()
+                    == Some(expected)
+            }));
+        }
+        let mut index = DiffIndex::build(&parsed);
+        for batch in &plan.batches {
+            index.add_rendered_evidence(batch);
+        }
+        assert_eq!(
+            index
+                .rendered_evidence
+                .get(&("docs/kubernetes.md".to_string(), 476)),
+            Some(&expected_evidence)
+        );
     }
 
     #[test]
