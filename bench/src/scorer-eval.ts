@@ -2228,7 +2228,9 @@ export function aggregate(
   repeats = DEFAULT_QUALIFICATION_REPEATS,
 ): ScorerEvalAggregate {
   const timedOutCases = cases.filter((c) => c.timedOut).length;
-  const structuredFailures = cases.filter((c) => isAdmissionFatalStructuralResult(c, model)).length;
+  const structuredFailures = cases.filter((c) =>
+    !c.timedOut && isAdmissionFatalStructuralResult(c, model)
+  ).length;
   const trueCases = cases.filter((c) => c.scenario === "trueFinding");
   const falseCases = cases.filter((c) => c.scenario === "falseFinding");
   const eligibleTrueCases = trueCases.filter((c) =>
@@ -2245,7 +2247,9 @@ export function aggregate(
   const falseFindingDownscored = eligibleFalseCases.filter((c) => c.passed).length;
   const durations = cases.map((c) => c.durationMs).filter((value): value is number => value !== null);
   const costs = cases.map((c) => c.costUsd).filter((value): value is number => value !== null);
-  const reasonContractFailures = cases.filter((c) => !c.reasonContractValid).length;
+  const reasonContractFailures = cases.filter((c) =>
+    !c.timedOut && !c.reasonContractValid
+  ).length;
   const p50DurationMs = percentile(durations, 0.5);
   const p95DurationMs = percentile(durations, 0.95);
   const maxDurationMs = durations.length > 0 ? Math.max(...durations) : 0;
@@ -2261,7 +2265,7 @@ export function aggregate(
   }
   if (structuredFailures > 0) admissionFailures.push(`${structuredFailures} structured-output failure(s)`);
   if (timedOutCases > 0) admissionFailures.push(`${timedOutCases} case timeout(s)`);
-  const structuralPass = matrixComplete && structuredFailures === 0;
+  const structuralPass = matrixComplete && structuredFailures === 0 && timedOutCases === 0;
   if (structuralPass) {
     if (trueFindingHighConfidence !== eligibleTrueCases.length) {
       admissionFailures.push(
