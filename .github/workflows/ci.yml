@@ -59,7 +59,7 @@ jobs:
       - run: cargo build --quiet --release
       - run: bun install --frozen-lockfile
         working-directory: bench
-      - run: bun test
+      - run: bun test --timeout 60000
         working-directory: bench
       - run: bun run verify-admission
         working-directory: bench

@@ -655,6 +655,7 @@ pub(crate) const TRANSIENT_RETRIES: u32 = 2;
 pub(crate) const MAX_BUDGETED_TRANSIENT_RETRIES: u32 = 12;
 const MIN_BUDGETED_RETRY_WAIT: Duration = Duration::from_secs(1);
 const MAX_SYNTHESIZED_RETRY_BACKOFF: Duration = Duration::from_secs(20);
+const MAX_UNBOUNDED_RETRY_WAIT: Duration = Duration::from_secs(60);
 /// The minimum time reserved for the request funded by a budgeted wait.
 const RETRY_ATTEMPT_RESERVE: Duration = Duration::from_secs(15);
 const EMPTY_RESPONSE_RETRIES: u32 = 1;
@@ -1634,6 +1635,13 @@ fn transient_retry_affordable(
         })
 }
 
+fn provider_retry_after_affordable(wait: Duration, remaining: Option<Duration>) -> bool {
+    remaining.map_or(wait <= MAX_UNBOUNDED_RETRY_WAIT, |left| {
+        wait.checked_add(RETRY_ATTEMPT_RESERVE)
+            .is_some_and(|required| required <= left)
+    })
+}
+
 fn timeout_status(status: u16) -> bool {
     matches!(status, 408 | 504)
 }
@@ -1763,6 +1771,8 @@ struct ModelHttpResponse {
     text: String,
     retry_after: Option<Duration>,
     request_id: Option<String>,
+    failure_source: Option<&'static str>,
+    failure_reason: Option<&'static str>,
 }
 
 #[derive(Default)]
@@ -1775,6 +1785,8 @@ struct SafeResponseSummary {
     error_type: Option<String>,
     choices: Option<usize>,
     usage: Option<Usage>,
+    failure_source: Option<&'static str>,
+    failure_reason: Option<&'static str>,
 }
 
 #[cfg_attr(not(feature = "qualification-candidate"), allow(dead_code))]
@@ -2669,11 +2681,13 @@ impl LlmClient {
             .await
             .map_err(|_| RequestTimedOut)??;
         if !response.status.is_success() {
-            let summary = safe_response_summary(
+            let mut summary = safe_response_summary(
                 &response.text,
                 client.request_decorations.api_format,
                 is_canonical_openrouter_base(&client.request_decorations.api_base),
             );
+            summary.failure_source = response.failure_source;
+            summary.failure_reason = response.failure_reason;
             return Err(anyhow!(provider_http_status_detail(
                 response.status,
                 &summary,
@@ -4418,12 +4432,14 @@ impl LlmClient {
             };
             match response {
                 Ok(response) => {
-                    let summary = safe_response_summary(
+                    let mut summary = safe_response_summary(
                         &response.text,
                         self.request_decorations.api_format,
                         is_canonical_openrouter_base(&self.request_decorations.api_base)
                             || matches!(phase, LlmPhase::Attribution),
                     );
+                    summary.failure_source = response.failure_source;
+                    summary.failure_reason = response.failure_reason;
                     let elapsed = elapsed_text(attempt_started_at.elapsed());
                     call_usage.push(self.model_usage_event(
                         model,
@@ -4615,7 +4631,7 @@ impl LlmClient {
                         }
                     }
                     eprintln!(
-                        "postil: llm response phase={} model={} attempt={} status={} elapsed={} request_id={} category={}",
+                        "postil: llm response phase={} model={} attempt={} status={} elapsed={} request_id={} category={} failure_source={} failure_reason={}",
                         phase.as_str(),
                         log_text(model),
                         retries + 1,
@@ -4623,6 +4639,8 @@ impl LlmClient {
                         elapsed,
                         response.request_id.as_deref().unwrap_or("none"),
                         summary.error_type.as_deref().unwrap_or("unclassified"),
+                        summary.failure_source.unwrap_or("unattributed"),
+                        summary.failure_reason.unwrap_or("none"),
                     );
                     if let Some(response_usage) = summary.usage {
                         add_usage(usage, response_usage);
@@ -4631,9 +4649,13 @@ impl LlmClient {
                     }
                     let status = response.status;
                     if timeout_status(status.as_u16()) {
-                        let wait = transient_retry_wait(response.retry_after, phase, retries);
+                        let retry_after = response.retry_after;
+                        let wait = transient_retry_wait(retry_after, phase, retries);
                         let remaining = self.remaining_budget(phase)?;
-                        if transient_retry_affordable(phase, retries, wait, remaining) {
+                        if transient_retry_affordable(phase, retries, wait, remaining)
+                            && retry_after
+                                .is_none_or(|_| provider_retry_after_affordable(wait, remaining))
+                        {
                             retries += 1;
                             eprintln!(
                                 "postil: model {} returned timeout HTTP {status} after {}, retrying in {} \
@@ -4660,9 +4682,13 @@ impl LlmClient {
                         return Err(anyhow::Error::new(ProviderHttpFailure(status)).context(detail));
                     }
                     if retryable_status(status.as_u16()) {
-                        let wait = transient_retry_wait(response.retry_after, phase, retries);
+                        let retry_after = response.retry_after;
+                        let wait = transient_retry_wait(retry_after, phase, retries);
                         let remaining = self.remaining_budget(phase)?;
-                        if transient_retry_affordable(phase, retries, wait, remaining) {
+                        if transient_retry_affordable(phase, retries, wait, remaining)
+                            && retry_after
+                                .is_none_or(|_| provider_retry_after_affordable(wait, remaining))
+                        {
                             retries += 1;
                             eprintln!(
                                 "postil: model {} returned retryable HTTP {status} after {}, retrying in {} \
@@ -4896,7 +4922,7 @@ impl LlmClient {
         }
         let canonical_openrouter = is_canonical_openrouter_base(&self.request_decorations.api_base);
         if canonical_openrouter {
-            request = request.header("X-OpenRouter-Experimental-Metadata", "enabled");
+            request = request.header("X-OpenRouter-Metadata", "enabled");
         }
         if let Some(route) = review_route {
             request = request
@@ -4907,6 +4933,8 @@ impl LlmClient {
         let status = response.status();
         let retry_after = retry_after_duration(response.headers());
         let request_id = safe_request_id(response.headers(), canonical_openrouter);
+        let failure_source = safe_postil_failure_source(response.headers());
+        let failure_reason = safe_postil_failure_reason(response.headers());
         let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await? {
             ensure!(
@@ -4921,6 +4949,8 @@ impl LlmClient {
             text,
             retry_after,
             request_id,
+            failure_source,
+            failure_reason,
         })
     }
 
@@ -5261,6 +5291,7 @@ fn apply_openrouter_privacy(body: &mut serde_json::Value, required: bool) {
         body["provider"] = json!({
             "data_collection": "deny",
             "zdr": true,
+            "allow_fallbacks": true,
         });
     }
 }
@@ -5562,6 +5593,31 @@ fn safe_request_id(headers: &HeaderMap, expose_identifier: bool) -> Option<Strin
     }
 }
 
+fn safe_postil_failure_source(headers: &HeaderMap) -> Option<&'static str> {
+    match headers
+        .get("x-postil-failure-source")
+        .and_then(|value| value.to_str().ok())
+    {
+        Some("postil-preflight") => Some("postil-preflight"),
+        Some("router") => Some("router"),
+        Some("upstream") => Some("upstream"),
+        _ => None,
+    }
+}
+
+fn safe_postil_failure_reason(headers: &HeaderMap) -> Option<&'static str> {
+    match headers
+        .get("x-postil-failure-reason")
+        .and_then(|value| value.to_str().ok())
+    {
+        Some("release-dark") => Some("release-dark"),
+        Some("misconfigured") => Some("misconfigured"),
+        Some("credential-missing") => Some("credential-missing"),
+        Some("roster-empty") => Some("roster-empty"),
+        _ => None,
+    }
+}
+
 fn safe_response_identifier(value: &str) -> Option<String> {
     let value = value.trim();
     if value.is_empty() {
@@ -5654,14 +5710,21 @@ fn provider_http_status_detail(
     request_id: Option<&str>,
 ) -> String {
     let category = summary.error_type.as_deref().unwrap_or("unclassified");
-    match request_id {
+    let mut detail = match request_id {
         Some(request_id) => {
             format!(
                 "model endpoint returned {status} (category {category}, request id {request_id})"
             )
         }
         None => format!("model endpoint returned {status} (category {category})"),
+    };
+    if let Some(source) = summary.failure_source {
+        detail.push_str(&format!(" [failure source {source}]"));
     }
+    if let Some(reason) = summary.failure_reason {
+        detail.push_str(&format!(" [failure reason {reason}]"));
+    }
+    detail
 }
 
 fn safe_response_summary(
@@ -5744,6 +5807,8 @@ fn safe_response_summary(
             .and_then(serde_json::Value::as_array)
             .map(Vec::len),
         usage,
+        failure_source: None,
+        failure_reason: None,
     }
 }
 
@@ -6786,6 +6851,23 @@ mod tests {
             MAX_BUDGETED_TRANSIENT_RETRIES,
             Duration::from_secs(1),
             Some(Duration::from_secs(86_400)),
+        ));
+
+        assert!(provider_retry_after_affordable(
+            Duration::from_secs(37),
+            None,
+        ));
+        assert!(!provider_retry_after_affordable(
+            Duration::from_secs(999),
+            None,
+        ));
+        assert!(!provider_retry_after_affordable(
+            Duration::from_secs(37),
+            Some(Duration::from_secs(40)),
+        ));
+        assert!(provider_retry_after_affordable(
+            Duration::from_secs(37),
+            Some(Duration::from_secs(52)),
         ));
     }
 
@@ -9392,9 +9474,64 @@ mod tests {
 
         headers.insert(
             reqwest::header::RETRY_AFTER,
+            HeaderValue::from_str(&httpdate::fmt_http_date(
+                now + Duration::from_secs(365 * 24 * 60 * 60),
+            ))
+            .unwrap(),
+        );
+        assert_eq!(
+            retry_after_duration_at(&headers, now),
+            Some(Duration::from_secs(365 * 24 * 60 * 60))
+        );
+
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
             HeaderValue::from_static("not a delay or HTTP date"),
         );
         assert_eq!(retry_after_duration_at(&headers, now), None);
+    }
+
+    #[test]
+    fn postil_gateway_failure_headers_accept_only_fixed_diagnostic_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-postil-failure-source",
+            HeaderValue::from_static("postil-preflight"),
+        );
+        headers.insert(
+            "x-postil-failure-reason",
+            HeaderValue::from_static("roster-empty"),
+        );
+        assert_eq!(
+            safe_postil_failure_source(&headers),
+            Some("postil-preflight")
+        );
+        assert_eq!(safe_postil_failure_reason(&headers), Some("roster-empty"));
+
+        headers.insert(
+            "x-postil-failure-source",
+            HeaderValue::from_static("https://private.example"),
+        );
+        headers.insert(
+            "x-postil-failure-reason",
+            HeaderValue::from_static("secret-token-value"),
+        );
+        assert_eq!(safe_postil_failure_source(&headers), None);
+        assert_eq!(safe_postil_failure_reason(&headers), None);
+    }
+
+    #[test]
+    fn provider_status_detail_names_safe_postil_failure_provenance() {
+        let summary = SafeResponseSummary {
+            error_type: Some("reported".into()),
+            failure_source: Some("postil-preflight"),
+            failure_reason: Some("roster-empty"),
+            ..SafeResponseSummary::default()
+        };
+        let detail =
+            provider_http_status_detail(reqwest::StatusCode::SERVICE_UNAVAILABLE, &summary, None);
+        assert!(detail.contains("failure source postil-preflight"));
+        assert!(detail.contains("failure reason roster-empty"));
     }
 
     #[test]
@@ -9792,6 +9929,7 @@ mod tests {
         apply_openrouter_privacy(&mut body, true);
         assert_eq!(body["provider"]["data_collection"], "deny");
         assert_eq!(body["provider"]["zdr"], true);
+        assert_eq!(body["provider"]["allow_fallbacks"], true);
 
         let mut byok = json!({"model": "provider/model"});
         apply_openrouter_privacy(&mut byok, false);
@@ -10020,6 +10158,7 @@ mod tests {
             json!({
                 "data_collection": "deny",
                 "zdr": true,
+                "allow_fallbacks": true,
                 "max_price": { "prompt": 0.435, "completion": 0.87 },
             })
         );

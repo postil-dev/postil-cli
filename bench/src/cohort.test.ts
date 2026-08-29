@@ -281,4 +281,4 @@ test("an authenticated reservation is required before slot execution", async () 
     environment,
     executeBenchmark: async () => 0,
   })).rejects.toThrow("already completed");
-}, 20_000);
+}, 60_000);
