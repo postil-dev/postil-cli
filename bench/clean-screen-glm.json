@@ -1,0 +1,22 @@
+{
+  "benchmarkProviderIdentity": "openrouter:managed-routing",
+  "upstreamProviderIdentity": "Z.AI",
+  "upstreamProviderRoute": "z-ai/fp8",
+  "apiBase": "https://openrouter.ai:443/api/v1",
+  "apiFormat": "openai-compatible",
+  "generatorChain": [
+    "z-ai/glm-5.2"
+  ],
+  "consensus": 1,
+  "scorerChain": [],
+  "providerGenerationModels": {
+    "z-ai/glm-5.2": "z-ai/glm-5.2-20260616"
+  },
+  "modelPriceBounds": [
+    {
+      "model": "z-ai/glm-5.2",
+      "inputMicrosPerMillionTokens": 1400000,
+      "outputMicrosPerMillionTokens": 4400000
+    }
+  ]
+}
