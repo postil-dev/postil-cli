@@ -44,6 +44,35 @@ This screen runs every fixture in local diff-file mode. It does no forge I/O. Th
 
 Inspect the fixture IDs and source before a live run in [`fixtures/cases.ts`](fixtures/cases.ts). A selected-case screen requires `--case <fixture-id>` together with `--screen-profile <path>`, which supplies the exact provider and price contract. A live screen is development evidence, not a hosted admission or a comparison with another model.
 
+## Expanded clean bank
+
+The 25-case clean bank combines the 13 admission clean cases with 12 supplemental cases in [`fixtures/cases.ts`](fixtures/cases.ts). Default screens and admission retain the 70-case corpus. The supplemental cases cover authorization, expiry, asynchronous ordering, cancellation, retry limits, pagination, integer precision, defaults, lock release, SQL parameters, array ownership, and partial updates. Behavioral tests exercise both versions of each executable module, including rejection paths and boundary values.
+
+Live diff-file screening sends the diff. Supplemental source comments therefore contain the argument and behavior contracts; the `Object.hasOwn` case also supplies package metadata declaring Node.js 22 or later. Metadata outside the diff is not evidence available to this screen.
+
+After the build and dependency setup above, export `REVIEW_MODEL` and `SCREEN_PROFILE`. The profile uses the structure in [`provisional-models.json`](../provisional-models.json): one generator matching `REVIEW_MODEL`, an empty `scorerChain` for a generator-only screen, the provider's canonical generation identity, and an explicit provider route and price bounds. With the model credential in the environment and GNU `timeout` installed, run from `bench/`:
+
+```sh
+POSTIL_LLM_REQUEST_TIMEOUT_SECS=30 POSTIL_LLM_TOTAL_TIMEOUT_SECS=60 \
+timeout 780s bun -e '
+import { cases, supplementalCleanCases } from "./fixtures/cases";
+const model = process.env.REVIEW_MODEL;
+const profile = process.env.SCREEN_PROFILE;
+if (!model || !profile) throw new Error("Set REVIEW_MODEL and SCREEN_PROFILE");
+const clean = [...cases.filter(c => c.admission?.classification === "clean"), ...supplementalCleanCases];
+const runId = `clean-bank-${crypto.randomUUID()}`;
+const result = Bun.spawnSync([
+  "bun", "run", "src/run.ts", "--live", "--model", model,
+  "--screen-profile", profile, "--concurrency", "3", "--retries", "0",
+  "--run-id", runId, "--json-out", `.runs/${runId}.json`,
+  ...clean.flatMap(c => ["--case", c.id]),
+], { stdin: "inherit", stdout: "inherit", stderr: "inherit" });
+process.exit(result.exitCode);
+'
+```
+
+Each invocation retains a separate report and per-case evidence. Report silence, findings, and unavailable cases separately, with the 13 legacy and 12 supplemental cases identified. Compare models only when the selected cases, fixture hash, evaluator hash, binary hash, retry settings, and concurrency match. Provider routes remain explicit. One observation per fixture does not establish a stable false-positive rate.
+
 ## Managed qualification
 
 Managed qualification exercises an ordered generator and scorer pair through the mock forge and a real provider. It requires an exact pair, provider identity and route, three complete repeats, and a release build whose embedded profile matches the worktree. Run the manual [managed admission workflow](../.github/workflows/bench-live.yml) for the attested hosted path. `bun run verify-admission` validates checked-in admission evidence.

@@ -30,11 +30,18 @@ import {
   writePrivateEvidenceBundle,
 } from "./run";
 import { AtomicAttributionTransportError } from "./attribution";
-import { cases } from "../fixtures/cases";
+import { cases, supplementalCleanCases } from "../fixtures/cases";
 
 const temporaryDirectories: string[] = [];
 
 describe("diff-file live screening selection", () => {
+  test("supplemental clean cases require explicit selection and preserve admission denominators", () => {
+    expect(selectLiveScreeningCases(cases, [], supplementalCleanCases)).toEqual(cases);
+    expect(cases).toHaveLength(70);
+    expect(cases.filter((input) => input.admission?.classification === "clean")).toHaveLength(13);
+    const requested = [supplementalCleanCases[0].id, "near-duplicate-auth-clean"];
+    expect(selectLiveScreeningCases(cases, requested, supplementalCleanCases).map((input) => input.id)).toEqual(requested);
+  });
   test("normalizes provider inputs once for execution and evidence", () => {
     expect(qualificationProviderInputs([], {
       POSTIL_BENCH_UPSTREAM_PROVIDER: "  Azure  ",
