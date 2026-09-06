@@ -1273,7 +1273,7 @@ impl Config {
         let mut cfg = Config::default();
         // Resolve credential origin before applying local model configuration.
         // A stored login delegates inference policy to its issuing service.
-        cfg.apply_stored_login_credential();
+        cfg.stored_login_authority = cfg.apply_stored_login_credential();
         if let Some(path) = explicit {
             let file = Self::read_postil_file(path)
                 .with_context(|| format!("reading config {}", path.display()))?;
@@ -1730,7 +1730,6 @@ impl Config {
         };
         self.api_base = creds.api_base;
         self.cascade.clear();
-        self.stored_login_authority = true;
         if !creds.model.trim().is_empty() {
             self.model = creds.model;
             self.model_source = "stored login".to_string();
@@ -3115,9 +3114,13 @@ scorer = { enabled = true, default_model = "provider/scorer", reasoning_effort =
                 unsafe { std::env::remove_var(other) };
             }
             EnvRestore::set(name, "provider-fixture-key");
-            let mut cfg = Config::default();
+            let mut cfg = Config {
+                stored_login_authority: true,
+                ..Config::default()
+            };
+            cfg.stored_login_authority = cfg.apply_stored_login_credential();
             assert!(
-                !cfg.apply_stored_login_credential(),
+                !cfg.uses_stored_login(),
                 "{name} must suppress login routing"
             );
             assert_eq!(cfg.api_base, model_defaults().api_base, "{name}");
@@ -3155,7 +3158,8 @@ scorer = { enabled = true, default_model = "provider/scorer", reasoning_effort =
         .unwrap();
         let mut config = Config::default();
 
-        assert!(config.apply_stored_login_credential());
+        config.stored_login_authority = config.apply_stored_login_credential();
+        assert!(config.uses_stored_login());
         assert_eq!(config.model_source, "stored login");
         let file: FileConfig = yaml_serde::from_str("model:\n  name: project/model\n").unwrap();
         config.apply_file(file).unwrap();
@@ -3196,7 +3200,8 @@ scorer = { enabled = true, default_model = "provider/scorer", reasoning_effort =
             .unwrap();
             let mut config = Config::default();
 
-            assert!(config.apply_stored_login_credential());
+            config.stored_login_authority = config.apply_stored_login_credential();
+            assert!(config.uses_stored_login());
             assert_eq!(config.api_base, "https://postil.dev/api/inference/v1");
             assert_eq!(config.model, model_defaults().default_model);
             assert_eq!(config.model_source, "embedded default");

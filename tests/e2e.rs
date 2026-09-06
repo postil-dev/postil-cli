@@ -1399,7 +1399,7 @@ async fn explicit_byok_key_remains_valid_with_an_api_base_override() {
         serde_json::to_vec(&json!({
             "version": 3,
             "issuer": "https://postil.dev",
-            "token": "pcli_e2e-access-not-a-real-secret",
+            "token": "fixture-stored-login-token",
             "expiresAt": "2999-01-01T00:00:00.000Z",
             "refreshToken": "fixture-e2e-refresh-not-a-credential",
             "refreshExpiresAt": "2999-12-01T00:00:00.000Z",
