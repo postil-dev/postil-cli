@@ -1418,11 +1418,148 @@ async fn explicit_byok_key_remains_valid_with_an_api_base_override() {
         .env("POSTIL_API_BASE", server.uri())
         .env("MODEL_API_KEY", provider_key)
         .env("POSTIL_DISABLE_SCORER", "1")
-        .args(["review", "--diff-file"])
+        .args([
+            "review",
+            "--model",
+            "byok/model",
+            "--reasoning-effort",
+            "high",
+            "--diff-file",
+        ])
         .arg(&diff)
         .args(["--output", "json"])
         .assert()
         .success();
+
+    let requests = server.received_requests().await.unwrap();
+    let body: Value = requests[0].body_json().unwrap();
+    assert_eq!(body["model"], "byok/model");
+    assert_eq!(body["reasoning"], json!({"effort": "high"}));
+}
+
+#[test]
+fn stored_login_ignores_repository_and_environment_model_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_home = dir.path().join("config");
+    let credentials_dir = config_home.join("postil");
+    std::fs::create_dir_all(&credentials_dir).unwrap();
+    std::fs::write(
+        credentials_dir.join("credentials.json"),
+        serde_json::to_vec(&json!({
+            "version": 3,
+            "issuer": "https://postil.dev",
+            "token": "pcli_e2e-access-not-a-real-secret",
+            "expiresAt": "2999-01-01T00:00:00.000Z",
+            "apiBase": "https://postil.dev/api/inference/v1",
+            "org": "example",
+            "model": "hosted/model"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join(".postil.yaml"),
+        "model:\n  name: repository/model\n  reasoningEffort: max\n  cascade: [repository/fallback]\n  scorer: repository/scorer\n  scorerReasoningEffort: high\n  apiFormat: anthropic\n  consensus: 3\n",
+    )
+    .unwrap();
+
+    let assertion = isolated_postil()
+        .current_dir(dir.path())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("REVIEW_MODEL", "environment/model")
+        .env("REVIEW_REASONING_EFFORT", "turbo")
+        .env("REVIEW_SCORER_MODEL", "environment/scorer")
+        .env("POSTIL_API_FORMAT", "anthropic")
+        .env("POSTIL_ENDPOINT_AUTH_HEADER", "x-provider-auth")
+        .env("POSTIL_ENDPOINT_AUTH_VALUE", "fixture-value")
+        .arg("config")
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assertion.get_output().stdout.clone()).unwrap();
+    let stderr = String::from_utf8(assertion.get_output().stderr.clone()).unwrap();
+
+    assert!(stdout.contains("model.name: hosted/model"));
+    assert!(stdout.contains("model.source: stored login"));
+    assert!(stdout.contains("model.reasoningEffort: low"));
+    assert!(stdout.contains("model.reasoningEffort.source: embedded default"));
+    assert!(stdout.contains("model.cascade: []"));
+    assert!(stdout.contains("model.apiFormat: openai-compatible"));
+    assert!(!stdout.contains("repository/"));
+    assert!(!stdout.contains("environment/"));
+    assert!(stderr.contains("ignoring repository model configuration"));
+    assert!(stderr.contains("ignoring local hosted-inference settings"));
+    assert!(stderr.contains("REVIEW_MODEL"));
+    assert!(stderr.contains("REVIEW_REASONING_EFFORT"));
+    assert!(stderr.contains("POSTIL_API_FORMAT"));
+    assert!(stderr.contains("POSTIL_ENDPOINT_AUTH_HEADER"));
+}
+
+#[tokio::test]
+async fn stored_login_ignores_command_line_model_and_reasoning_policy() {
+    let server = MockServer::start().await;
+    let mut response = llm_content(json!([]));
+    response["model"] = json!("cloud/current-model");
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(response))
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let config_home = dir.path().join("config");
+    let credentials_dir = config_home.join("postil");
+    std::fs::create_dir_all(&credentials_dir).unwrap();
+    std::fs::write(
+        credentials_dir.join("credentials.json"),
+        serde_json::to_vec(&json!({
+            "version": 3,
+            "issuer": server.uri(),
+            "token": "pcli_e2e-access-not-a-real-secret",
+            "expiresAt": "2999-01-01T00:00:00.000Z",
+            "apiBase": server.uri(),
+            "org": "example",
+            "model": "hosted/model"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let diff = write_diff(dir.path());
+
+    let assertion = isolated_postil()
+        .current_dir(dir.path())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("POSTIL_ALLOW_PRIVATE_API_BASE", "1")
+        .env("POSTIL_ENDPOINT_AUTH_HEADER", "x-provider-auth")
+        .env("POSTIL_ENDPOINT_AUTH_VALUE", "fixture-value")
+        .args([
+            "review",
+            "--model",
+            "command/model",
+            "--reasoning-effort",
+            "turbo",
+            "--scorer-reasoning-effort",
+            "max",
+            "--diff-file",
+        ])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+
+    let requests = server.received_requests().await.unwrap();
+    let body: Value = requests[0].body_json().unwrap();
+    assert_eq!(body["model"], "hosted/model");
+    assert_eq!(body["reasoning"], json!({"effort": "low"}));
+    assert_eq!(body["max_tokens"], 8_000);
+    assert_eq!(body["temperature"], 0.1);
+    assert!(body.get("provider").is_none());
+    assert!(body.get("response_format").is_none());
+    assert!(requests[0].headers.get("x-provider-auth").is_none());
+    let envelope: Value = serde_json::from_slice(&assertion.get_output().stdout).unwrap();
+    assert_eq!(envelope["modelUsed"], "cloud/current-model");
+    assert_eq!(envelope["modelUsage"][0]["model"], "cloud/current-model");
+    let stderr = String::from_utf8(assertion.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("ignoring --model, --reasoning-effort, --scorer-reasoning-effort"));
+    assert!(stderr.contains("hosted service selects model and reasoning settings"));
 }
 
 #[tokio::test]

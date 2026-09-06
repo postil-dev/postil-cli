@@ -594,6 +594,7 @@ pub struct LlmClient {
     request_api_base: String,
     api_key: String,
     endpoint_auth: Option<EndpointAuth>,
+    stored_login_authority: bool,
     request_decorations: RequestDecorations,
     request_timeout: Duration,
     timeout_retry_timeout: Duration,
@@ -2754,7 +2755,11 @@ impl LlmClient {
         review_deadline: Option<Instant>,
         total_deadline: Option<Instant>,
     ) -> Result<Self> {
-        let endpoint_auth = endpoint_auth_from_env(cfg.api_format)?;
+        let endpoint_auth = if cfg.uses_stored_login() {
+            None
+        } else {
+            endpoint_auth_from_env(cfg.api_format)?
+        };
         let request_decorations = RequestDecorations::from_config(cfg)?;
         let request_api_base = qualification_request_api_base(&cfg.api_base)?;
         Ok(LlmClient {
@@ -2765,6 +2770,7 @@ impl LlmClient {
             request_api_base,
             api_key,
             endpoint_auth,
+            stored_login_authority: cfg.uses_stored_login(),
             request_decorations,
             request_timeout,
             timeout_retry_timeout: request_timeout.min(Duration::from_secs(TIMEOUT_RETRY_CAP_SECS)),
@@ -2777,6 +2783,14 @@ impl LlmClient {
             admission: Arc::new(Mutex::new(ProviderAdmission::default())),
             call_ordinal: Arc::new(AtomicU32::new(0)),
         })
+    }
+
+    fn completed_call_model<'a>(&self, requested: &'a str, calls: &'a [ModelUsage]) -> &'a str {
+        if self.stored_login_authority {
+            calls.last().map_or(requested, |call| call.model.as_str())
+        } else {
+            requested
+        }
     }
 
     fn model_usage_event(
@@ -3681,7 +3695,7 @@ impl LlmClient {
                 parsed
             }
         };
-        let mut review = into_review(raw, model, usage);
+        let mut review = into_review(raw, self.completed_call_model(model, &call_usage), usage);
         review.model_usage = call_usage.clone();
         review.model_incidents.append(&mut model_incidents);
         review.usage_accounting_complete = usage_accounting_complete;
@@ -3743,7 +3757,11 @@ impl LlmClient {
                     review.model_usage = call_usage.clone();
                     review.usage_accounting_complete = usage_accounting_complete;
                     if let Ok(retried_raw) = parse_review(&retried) {
-                        let mut candidate = into_review(retried_raw, model, retry_usage);
+                        let mut candidate = into_review(
+                            retried_raw,
+                            self.completed_call_model(model, &call_usage),
+                            retry_usage,
+                        );
                         candidate.model_usage = call_usage.clone();
                         candidate.usage_accounting_complete = usage_accounting_complete;
                         let still_contradictory =
@@ -3849,7 +3867,11 @@ impl LlmClient {
             match retry {
                 Ok(content) => match parse_review(&content) {
                     Ok(raw) => {
-                        let mut candidate = into_review(raw, model, retry_usage);
+                        let mut candidate = into_review(
+                            raw,
+                            self.completed_call_model(model, &call_usage),
+                            retry_usage,
+                        );
                         candidate.model_usage = call_usage.clone();
                         candidate.model_incidents = review.model_incidents.clone();
                         candidate.usage_accounting_complete = retry_accounting_complete;
@@ -4009,7 +4031,7 @@ impl LlmClient {
             },
             revised_body: resolution.revised_body,
             evidence: resolution.evidence,
-            model_used: model.to_string(),
+            model_used: self.completed_call_model(model, &call_usage).to_string(),
             usage,
             model_usage: call_usage,
             model_incidents,
@@ -4059,7 +4081,7 @@ impl LlmClient {
         })?;
         Ok(FindingCompressionReview {
             body: compression.body,
-            model_used: model.to_string(),
+            model_used: self.completed_call_model(model, &call_usage).to_string(),
             usage,
             model_usage: call_usage,
             model_incidents: Vec::new(),
@@ -4168,7 +4190,7 @@ impl LlmClient {
         };
         Ok(ScorerReview {
             scores,
-            model_used: model.to_string(),
+            model_used: self.completed_call_model(model, &call_usage).to_string(),
             usage,
             model_usage: call_usage,
             model_incidents,
@@ -4441,8 +4463,14 @@ impl LlmClient {
                     summary.failure_source = response.failure_source;
                     summary.failure_reason = response.failure_reason;
                     let elapsed = elapsed_text(attempt_started_at.elapsed());
+                    // The authenticated gateway owns the model choice. Read its
+                    // actual identifier separately from the redacted log summary.
+                    let hosted_response_model = self
+                        .stored_login_authority
+                        .then(|| actual_response_identity(&response.text).0)
+                        .flatten();
                     call_usage.push(self.model_usage_event(
-                        model,
+                        hosted_response_model.as_deref().unwrap_or(model),
                         phase,
                         call_phase,
                         attempt,
@@ -7898,6 +7926,67 @@ mod tests {
                         == Some("initial")
             }));
         }
+    }
+
+    #[tokio::test]
+    async fn stored_login_schema_repair_reports_each_returned_model() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("You repair malformed JSON"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "cloud/repair-model",
+                "choices": [{"finish_reason": "stop", "message": {"content": "{\"summary\":\"\",\"findings\":[]}"}}],
+                "usage": {"prompt_tokens": 20, "completion_tokens": 3}
+            })))
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "cloud/initial-model",
+                "choices": [{"finish_reason": "stop", "message": {"content": "malformed"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+            })))
+            .with_priority(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let config = Config {
+            api_base: server.uri(),
+            model: "stored/stale-model".into(),
+            stored_login_authority: true,
+            scorer_enabled: false,
+            ..Config::default()
+        };
+        let client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(2),
+            None,
+            None,
+        )
+        .unwrap();
+        *client.http.lock().unwrap() = Some(reqwest::Client::new());
+        let result = client
+            .review_validated_with_safe_output_limit(
+                &config,
+                "system",
+                "user",
+                4_000,
+                ReviewRequestRoute::Source,
+                |_| Ok(()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.model_used, "cloud/repair-model");
+        assert_eq!(result.model_usage.len(), 2);
+        assert_eq!(result.model_usage[0].model, "cloud/initial-model");
+        assert_eq!(result.model_usage[1].model, "cloud/repair-model");
+        assert_eq!(result.usage.prompt_tokens, 30);
+        assert_eq!(result.usage.completion_tokens, 5);
     }
 
     #[tokio::test]
