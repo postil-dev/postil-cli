@@ -50,7 +50,14 @@ The 25-case clean bank combines the 13 admission clean cases with 12 supplementa
 
 Live diff-file screening sends the diff. Supplemental source comments therefore contain the argument and behavior contracts; the `Object.hasOwn` case also supplies package metadata declaring Node.js 22 or later. Metadata outside the diff is not evidence available to this screen.
 
-After the build and dependency setup above, export `REVIEW_MODEL` and `SCREEN_PROFILE`. The profile uses the structure in [`provisional-models.json`](../provisional-models.json): one generator matching `REVIEW_MODEL`, an empty `scorerChain` for a generator-only screen, the provider's canonical generation identity, and an explicit provider route and price bounds. With the model credential in the environment and GNU `timeout` installed, run from `bench/`:
+After the build and dependency setup above, select a checked-in profile:
+
+| `REVIEW_MODEL` | `SCREEN_PROFILE` |
+| --- | --- |
+| `openai/gpt-5.6-luna` | [clean-screen-luna.json](clean-screen-luna.json) |
+| `z-ai/glm-5.2` | [clean-screen-glm.json](clean-screen-glm.json) |
+
+Each profile contains one generator, an empty `scorerChain`, the canonical `providerGenerationModels` identity, and explicit provider route and price bounds. The screen disables the scorer when `--scorer-model` is omitted. For Luna, set `export REVIEW_MODEL=openai/gpt-5.6-luna SCREEN_PROFILE=clean-screen-luna.json`; use the GLM row for its run. With the model credential in the environment and GNU `timeout` installed, run from `bench/`:
 
 ```sh
 POSTIL_LLM_REQUEST_TIMEOUT_SECS=30 POSTIL_LLM_TOTAL_TIMEOUT_SECS=60 \
@@ -71,7 +78,9 @@ process.exit(result.exitCode);
 '
 ```
 
-Each invocation retains a separate report and per-case evidence. Report silence, findings, and unavailable cases separately, with the 13 legacy and 12 supplemental cases identified. Compare models only when the selected cases, fixture hash, evaluator hash, binary hash, retry settings, and concurrency match. Provider routes remain explicit. One observation per fixture does not establish a stable false-positive rate.
+Each invocation retains a separate report and per-case evidence. The CLI safety cap is 180 seconds per case. Report final review silence, final findings, suppressed findings with reasons, and unavailable cases separately, with the 13 legacy and 12 supplemental cases identified. A silent final review can contain suppressed model findings.
+
+Compare models only when the selected cases, fixture hash, evaluator hash, binary hash, retry settings, and concurrency match. Provider routes remain explicit. Evidence identifies the fixture/evaluator source by immutable commit and the measured executable by SHA-256; use `POSTIL_BIN` to select that executable. A different build produces separate evidence. This authored bank is not held-out validation, and one observation per fixture does not establish a stable false-positive rate.
 
 ## Managed qualification
 
