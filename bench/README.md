@@ -46,7 +46,7 @@ Inspect the fixture IDs and source before a live run in [`fixtures/cases.ts`](fi
 
 ## Expanded clean bank
 
-The 25-case clean bank combines the 13 admission clean cases with 12 supplemental cases in [`fixtures/cases.ts`](fixtures/cases.ts). Default screens and admission retain the 70-case corpus. The supplemental cases cover authorization, expiry, asynchronous ordering, cancellation, retry limits, pagination, integer precision, defaults, lock release, SQL parameters, array ownership, and partial updates. Behavioral tests exercise both versions of each executable module, including rejection paths and boundary values.
+The 25-case clean bank combines the 13 admission clean cases with 12 supplemental cases in [`fixtures/clean-screen.ts`](fixtures/clean-screen.ts). The [clean-screen entrypoint](src/clean-screen.ts) passes the exported `cleanScreenCases` to the existing `runLive` API. Default screens and admission retain the 70-case corpus and its attested evaluator inputs. The supplemental cases cover authorization, expiry, asynchronous ordering, cancellation, retry limits, pagination, integer precision, defaults, lock release, SQL parameters, array ownership, and partial updates. Behavioral tests exercise both versions of each executable module, including rejection paths and boundary values.
 
 Live diff-file screening sends the diff. Supplemental source comments therefore contain the argument and behavior contracts; the `Object.hasOwn` case also supplies package metadata declaring Node.js 22 or later. Metadata outside the diff is not evidence available to this screen.
 
@@ -57,28 +57,16 @@ After the build and dependency setup above, select a checked-in profile:
 | `openai/gpt-5.6-luna` | [clean-screen-luna.json](clean-screen-luna.json) |
 | `z-ai/glm-5.2` | [clean-screen-glm.json](clean-screen-glm.json) |
 
-Each profile contains one generator, an empty `scorerChain`, the canonical `providerGenerationModels` identity, and explicit provider route and price bounds. The screen disables the scorer when `--scorer-model` is omitted. For Luna, set `export REVIEW_MODEL=openai/gpt-5.6-luna SCREEN_PROFILE=clean-screen-luna.json`; use the GLM row for its run. With the model credential in the environment and GNU `timeout` installed, run from `bench/`:
+Each profile contains one generator, an empty `scorerChain`, the canonical `providerGenerationModels` identity, and explicit provider route and price bounds. The screen disables the scorer when the `scorerModel` option is absent. For Luna, set `export REVIEW_MODEL=openai/gpt-5.6-luna SCREEN_PROFILE=clean-screen-luna.json`; use the GLM row for its run. With the model credential in the environment and GNU `timeout` installed, run from `bench/`:
 
 ```sh
 POSTIL_LLM_REQUEST_TIMEOUT_SECS=30 POSTIL_LLM_TOTAL_TIMEOUT_SECS=60 \
-timeout 780s bun -e '
-import { cases, supplementalCleanCases } from "./fixtures/cases";
-const model = process.env.REVIEW_MODEL;
-const profile = process.env.SCREEN_PROFILE;
-if (!model || !profile) throw new Error("Set REVIEW_MODEL and SCREEN_PROFILE");
-const clean = [...cases.filter(c => c.admission?.classification === "clean"), ...supplementalCleanCases];
-const runId = `clean-bank-${crypto.randomUUID()}`;
-const result = Bun.spawnSync([
-  "bun", "run", "src/run.ts", "--live", "--model", model,
-  "--screen-profile", profile, "--concurrency", "3", "--retries", "0",
-  "--run-id", runId, "--json-out", `.runs/${runId}.json`,
-  ...clean.flatMap(c => ["--case", c.id]),
-], { stdin: "inherit", stdout: "inherit", stderr: "inherit" });
-process.exit(result.exitCode);
-'
+timeout 780s bun run src/clean-screen.ts
 ```
 
-Each invocation retains a separate report and per-case evidence. The CLI safety cap is 180 seconds per case. Report final review silence, final findings, suppressed findings with reasons, and unavailable cases separately, with the 13 legacy and 12 supplemental cases identified. A silent final review can contain suppressed model findings.
+Each invocation retains a separate report and per-case evidence. Its `supplementalScreen` field records a separate framed SHA-256 digest of the supplemental fixture module and entrypoint; `summary.evaluatorSha256` identifies the default evaluator. The process fails if every case is unavailable; partial reports retain unavailable cases for inspection. The CLI safety cap is 180 seconds per case. Report final review silence, final findings, suppressed findings with reasons, and unavailable cases separately, with the 13 legacy and 12 supplemental cases identified. A silent final review can contain suppressed model findings.
+
+The clean-bank-v2 evidence identifies the [measured fixture and evaluator source](https://github.com/postil-dev/postil-cli/tree/a7e7c67235519fff79c6e82c44550ac29255dcdc) and its [exact invocation](https://github.com/postil-dev/postil-cli/blob/a7e7c67235519fff79c6e82c44550ac29255dcdc/bench/README.md#expanded-clean-bank). The command above uses the same 25 fixture payloads with the default evaluator source digest; its reports are separate evidence.
 
 Compare models only when the selected cases, fixture hash, evaluator hash, binary hash, retry settings, and concurrency match. Provider routes remain explicit. Evidence identifies the fixture/evaluator source by immutable commit and the measured executable by SHA-256; use `POSTIL_BIN` to select that executable. A different build produces separate evidence. This authored bank is not held-out validation, and one observation per fixture does not establish a stable false-positive rate.
 

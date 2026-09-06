@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { cases, makeDiff, supplementalCleanCases, supplementalCleanSpecs } from "./cases";
+import { cases, makeDiff } from "./cases";
+import { supplementalCleanCases, supplementalCleanSpecs } from "./clean-screen";
 import { benchmarkCase, parseUnifiedDiffFiles } from "../src/harness";
 
 test("supplemental modules supply complete evidence and unique clean targets", () => {

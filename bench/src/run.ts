@@ -54,7 +54,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
-import { cases, supplementalCleanCases } from "../fixtures/cases";
+import { cases } from "../fixtures/cases";
 import { formatReport, runBenchmark, type BenchmarkCaseInput } from "./harness";
 import { DEFAULT_LIVE_CONCURRENCY, formatLiveReport, runLive } from "./live";
 import {
@@ -172,13 +172,12 @@ function repeatedFlagValues(args: string[], flag: string): string[] {
 export function selectLiveScreeningCases(
   inputs: readonly BenchmarkCaseInput[],
   requestedIds: readonly string[],
-  supplementalInputs: readonly BenchmarkCaseInput[] = [],
 ): BenchmarkCaseInput[] {
   if (requestedIds.length === 0) return [...inputs];
   if (new Set(requestedIds).size !== requestedIds.length) {
     throw new Error("--case fixture IDs must not repeat");
   }
-  const byId = new Map([...inputs, ...supplementalInputs].map((input) => [input.id, input]));
+  const byId = new Map(inputs.map((input) => [input.id, input]));
   const unknown = requestedIds.filter((id) => !byId.has(id));
   if (unknown.length > 0) {
     throw new Error(`unknown --case fixture ID(s): ${unknown.join(", ")}`);
@@ -395,7 +394,7 @@ async function main() {
     const runId = runIdFlag ?? process.env.POSTIL_BENCH_SCREEN_RUN_ID ??
       generatedLiveScreenRunId();
     validateLiveScreenContract(selectedCaseIds, scorerModel, screenProfilePath);
-    const report = await runLive(selectLiveScreeningCases(cases, selectedCaseIds, supplementalCleanCases), {
+    const report = await runLive(selectLiveScreeningCases(cases, selectedCaseIds), {
       binary,
       model,
       scorerModel,
