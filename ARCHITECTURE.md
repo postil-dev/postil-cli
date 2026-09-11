@@ -130,6 +130,8 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   and duplicate primaries. Later and cross-file evidence can refute stale claims. Fresh
   unresolved repository claims are suppressed, ordinary grounded unresolved findings and
   prior-ledger claims remain open, and provider or contract failure preserves every candidate.
+  Unsupported refutations of eligible fresh candidates recover only after validated scoring covers
+  every affected candidate; otherwise the invalid-output blocker remains.
   Semantic duplicates collapse across files and kinds only when one established defect remains;
   distinct defects sharing a line remain separate.
 - `forge/`: trait + GitHub, GitLab, Bitbucket Cloud, and Azure DevOps implementations,

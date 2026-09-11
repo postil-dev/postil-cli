@@ -1395,6 +1395,19 @@ fn scorer_inputs(
         .collect()
 }
 
+fn scorer_covers_refutation_recovery(
+    pending: &[usize],
+    inputs: &[prompt::ScorerPromptFinding],
+    scores: &[FindingScore],
+) -> bool {
+    pending.iter().all(|index| {
+        inputs
+            .get(*index)
+            .is_some_and(|input| input.index == *index)
+            && scores.iter().any(|score| score.index == *index)
+    })
+}
+
 fn apply_scorer_scores(cfg: &Config, findings: &mut [Finding], scores: Vec<FindingScore>) -> u32 {
     let mut disagreements = 0u32;
     for score in scores {
@@ -2393,6 +2406,9 @@ async fn review_diff_at(
                         };
                         let mut kept = outcome.kept;
                         let mut preserved_baseline_publications = Vec::new();
+                        let mut pending_refutation_recovery = Vec::new();
+                        let mut staged_adjudication = None;
+                        let mut scorer_suppressions = Vec::new();
 
                         let resolution = crate::resolve::resolve_uncertainties(
                             cfg,
@@ -2455,6 +2471,9 @@ async fn review_diff_at(
                                 "complete finding adjudication needs {} candidates, exceeding its {}-candidate bound; no adjudication request was made",
                                 all_adjudication_candidates.len(),
                                 crate::adjudication::MAX_ADJUDICATION_CANDIDATES,
+                            );
+                            let mut fallback_application = preserve_unadjudicated_findings(
+                                all_adjudication_candidates.clone(),
                             );
                             let snapshot_id = crate::adjudication::reviewed_snapshot_identity(
                                 repository_revision.as_deref(),
@@ -2524,7 +2543,6 @@ async fn review_diff_at(
                                     None
                                 }
                             };
-                            let mut lockfile_platform_policy_allowed = false;
                             let mut application = match adjudicated {
                                 Some(Ok(adjudicated)) => {
                                     add_usage(&mut usage, adjudicated.usage);
@@ -2540,17 +2558,27 @@ async fn review_diff_at(
                                         diff_snapshot.as_str(),
                                         &diff_receipt,
                                         receipt,
-                                    ).and_then(|application| {
+                                    ).and_then(|mut application| {
+                                        suppress_fresh_unresolved_repository_claims(
+                                            &mut application,
+                                            fresh_candidate_count,
+                                        );
+                                        suppress_fresh_lockfile_platform_claims(
+                                            &mut application,
+                                            fresh_candidate_count,
+                                            &index,
+                                        );
                                         anyhow::ensure!(
-                                            application.invalid_refutation_indices.is_empty(),
+                                            application.invalid_refutation_indices.iter().all(|candidate_index| {
+                                                cfg.scorer_enabled()
+                                                    && *candidate_index < fresh_candidate_count
+                                                    && application.kept_indices.contains(candidate_index)
+                                            }),
                                             "refuted adjudication must cite candidate-specific contradictory evidence"
                                         );
                                         Ok(application)
                                     }) {
-                                        Ok(application) => {
-                                            lockfile_platform_policy_allowed = true;
-                                            application
-                                        }
+                                        Ok(application) => application,
                                         Err(error) => {
                                             adjudication_incomplete = true;
                                             review_trust = filter::ReviewTrust::Failed;
@@ -2597,46 +2625,18 @@ async fn review_diff_at(
                                     preserve_unadjudicated_findings(all_adjudication_candidates)
                                 }
                             };
-                            suppress_fresh_unresolved_repository_claims(
+                            promote_incomplete_adjudication_receipts(
                                 &mut application,
-                                fresh_candidate_count,
+                                &candidate_ids,
+                                &diff_receipt,
                             );
-                            if lockfile_platform_policy_allowed {
-                                suppress_fresh_lockfile_platform_claims(
-                                    &mut application,
-                                    fresh_candidate_count,
-                                    &index,
-                                );
-                            }
-                            for (candidate_index, finding) in application
-                                .kept_indices
-                                .iter()
-                                .copied()
-                                .zip(&mut application.kept)
-                            {
-                                let Some(candidate_id) = candidate_ids.get(candidate_index) else {
-                                    continue;
-                                };
-                                let receipt_incomplete = diff_receipt
-                                    .candidate_citations
-                                    .iter()
-                                    .find(|receipt| &receipt.candidate_id == candidate_id)
-                                    .is_none_or(|receipt| !receipt.queries_complete);
-                                if receipt_incomplete {
-                                    finding.severity = crate::envelope::Severity::Error;
-                                }
-                            }
+                            promote_incomplete_adjudication_receipts(
+                                &mut fallback_application,
+                                &candidate_ids,
+                                &diff_receipt,
+                            );
                             debug_assert!(application.kept_indices.iter().all(|index| *index
                                 < fresh_candidate_count + baseline_candidate_indices.len()));
-                            for candidate_index in &application.resolved_indices {
-                                let Some(baseline_offset) =
-                                    candidate_index.checked_sub(fresh_candidate_count)
-                                else {
-                                    continue;
-                                };
-                                let baseline_index = baseline_candidate_indices[baseline_offset];
-                                adjudication_resolved.push(baseline[baseline_index].clone());
-                            }
                             // A baseline finding leaves the ledger only through
                             // an adjudicator's explicit refutation or duplicate
                             // disposition. Deterministic evidence checks can
@@ -2660,31 +2660,28 @@ async fn review_diff_at(
                                     )
                                 });
                             }
-                            suppressed += application.suppressed.len() as u32;
-                            suppressed_findings.extend(application.suppressed);
                             kept.clear();
-                            for (candidate_index, finding) in
-                                application.kept_indices.into_iter().zip(application.kept)
+                            for (candidate_index, finding) in application
+                                .kept_indices
+                                .iter()
+                                .copied()
+                                .zip(&application.kept)
                             {
-                                if candidate_index >= fresh_candidate_count {
-                                    adjudication_preserved_baseline.push(finding.clone());
-                                    preserved_baseline_publications.push(finding);
-                                } else {
-                                    kept.push(finding);
+                                if candidate_index < fresh_candidate_count {
+                                    if application
+                                        .invalid_refutation_indices
+                                        .contains(&candidate_index)
+                                    {
+                                        pending_refutation_recovery.push(kept.len());
+                                    }
+                                    kept.push(finding.clone());
                                 }
                             }
-                            if !baseline_candidate_indices.is_empty() {
-                                let removed = baseline_candidate_indices
-                                    .into_iter()
-                                    .collect::<std::collections::BTreeSet<_>>();
-                                baseline = baseline
-                                    .into_iter()
-                                    .enumerate()
-                                    .filter_map(|(index, finding)| {
-                                        (!removed.contains(&index)).then_some(finding)
-                                    })
-                                    .collect();
-                            }
+                            staged_adjudication = Some((
+                                application,
+                                baseline_candidate_indices,
+                                fallback_application,
+                            ));
                         }
                         if !kept.is_empty() && cfg.scorer_enabled() && !adjudication_incomplete {
                             let scorer_system = prompt::scorer_system_prompt(cfg, current_utc_date);
@@ -2726,26 +2723,37 @@ async fn review_diff_at(
                                     .await;
                                 match scored {
                                     Ok(scored) => {
-                                        let disagreements =
-                                            apply_scorer_scores(cfg, &mut kept, scored.scores);
-                                        let scorer_suppressed =
-                                            suppress_below_min_confidence(cfg, &mut kept);
-                                        suppressed += scorer_suppressed.len() as u32;
-                                        suppressed_findings.extend(scorer_suppressed);
+                                        if scorer_covers_refutation_recovery(
+                                            &pending_refutation_recovery,
+                                            &inputs,
+                                            &scored.scores,
+                                        ) {
+                                            pending_refutation_recovery.clear();
+                                            let disagreements =
+                                                apply_scorer_scores(cfg, &mut kept, scored.scores);
+                                            scorer_suppressions =
+                                                suppress_below_min_confidence(cfg, &mut kept);
+                                            scorer_disagreements = Some(disagreements);
+                                            sort_findings_for_display(&mut kept);
+                                        }
                                         scorer_model = Some(scored.model_used);
                                         add_usage(&mut usage, scored.usage);
                                         model_usage.extend(scored.model_usage);
                                         model_incidents.extend(scored.model_incidents);
                                         usage_accounting_complete &=
                                             scored.usage_accounting_complete;
-                                        scorer_disagreements = Some(disagreements);
-                                        sort_findings_for_display(&mut kept);
                                     }
                                     Err(e) => {
                                         let detail = format!("{e:#}");
-                                        eprintln!(
-                                            "postil: scorer failed open after all scorer models failed"
-                                        );
+                                        if pending_refutation_recovery.is_empty() {
+                                            eprintln!(
+                                                "postil: scorer failed open after all scorer models failed"
+                                            );
+                                        } else {
+                                            eprintln!(
+                                                "postil: scorer failed before unsupported refutation recovery completed"
+                                            );
+                                        }
                                         let scorer_usage = e.usage();
                                         add_usage(&mut usage, scorer_usage);
                                         model_usage.extend_from_slice(e.model_usage());
@@ -2760,10 +2768,12 @@ async fn review_diff_at(
                                     }
                                 }
                             }
-                            if scorer_failure_blocks_hosted(
-                                crate::config::hosted_runtime_mode(),
-                                scorer_error.is_some(),
-                            ) {
+                            if pending_refutation_recovery.is_empty()
+                                && scorer_failure_blocks_hosted(
+                                    crate::config::hosted_runtime_mode(),
+                                    scorer_error.is_some(),
+                                )
+                            {
                                 return Err(ReviewFailure {
                                     kind: scorer_failure_kind
                                         .unwrap_or(ReviewFailureKind::InvalidOutput),
@@ -2781,6 +2791,69 @@ async fn review_diff_at(
                                 }
                                 .into());
                             }
+                        }
+                        if !pending_refutation_recovery.is_empty() {
+                            eprintln!(
+                                "postil: unsupported refutation recovery requires complete validated scoring; preserving the invalid-output blocker"
+                            );
+                            review_trust = filter::ReviewTrust::Failed;
+                            model_incidents.push(ModelIncident {
+                                phase: ModelIncidentPhase::Scorer,
+                                category: ModelIncidentCategory::InvalidOutput,
+                                recovered: false,
+                                recovery: None,
+                            });
+                            adjudication_failure = Some(fail_closed_finding(
+                                "finding adjudication output did not satisfy its admitted contract",
+                            ));
+                        }
+                        if let Some((
+                            mut application,
+                            baseline_candidate_indices,
+                            fallback_application,
+                        )) = staged_adjudication
+                        {
+                            let fresh_candidate_count =
+                                fallback_application.kept.len() - baseline_candidate_indices.len();
+                            if !pending_refutation_recovery.is_empty() {
+                                application = fallback_application;
+                                kept = application.kept[..fresh_candidate_count].to_vec();
+                            }
+                            for candidate_index in &application.resolved_indices {
+                                let Some(baseline_offset) =
+                                    candidate_index.checked_sub(fresh_candidate_count)
+                                else {
+                                    continue;
+                                };
+                                let baseline_index = baseline_candidate_indices[baseline_offset];
+                                adjudication_resolved.push(baseline[baseline_index].clone());
+                            }
+                            suppressed += application.suppressed.len() as u32;
+                            suppressed_findings.extend(application.suppressed);
+                            for (candidate_index, finding) in
+                                application.kept_indices.into_iter().zip(application.kept)
+                            {
+                                if candidate_index >= fresh_candidate_count {
+                                    adjudication_preserved_baseline.push(finding.clone());
+                                    preserved_baseline_publications.push(finding);
+                                }
+                            }
+                            if !baseline_candidate_indices.is_empty() {
+                                let removed = baseline_candidate_indices
+                                    .into_iter()
+                                    .collect::<std::collections::BTreeSet<_>>();
+                                baseline = baseline
+                                    .into_iter()
+                                    .enumerate()
+                                    .filter_map(|(index, finding)| {
+                                        (!removed.contains(&index)).then_some(finding)
+                                    })
+                                    .collect();
+                            }
+                        }
+                        if pending_refutation_recovery.is_empty() {
+                            suppressed += scorer_suppressions.len() as u32;
+                            suppressed_findings.extend(scorer_suppressions);
                         }
                         kept.extend(preserved_baseline_publications);
                         sort_findings_for_display(&mut kept);
@@ -3503,6 +3576,31 @@ fn ungrounded_findings_failure(count: u32) -> Finding {
     ))
 }
 
+fn promote_incomplete_adjudication_receipts(
+    application: &mut crate::adjudication::AdjudicationApplication,
+    candidate_ids: &[String],
+    receipt: &crate::adjudication::DiffCorpusReceipt,
+) {
+    for (candidate_index, finding) in application
+        .kept_indices
+        .iter()
+        .copied()
+        .zip(&mut application.kept)
+    {
+        let Some(candidate_id) = candidate_ids.get(candidate_index) else {
+            continue;
+        };
+        let receipt_incomplete = receipt
+            .candidate_citations
+            .iter()
+            .find(|receipt| &receipt.candidate_id == candidate_id)
+            .is_none_or(|receipt| !receipt.queries_complete);
+        if receipt_incomplete {
+            finding.severity = crate::envelope::Severity::Error;
+        }
+    }
+}
+
 fn preserve_unadjudicated_findings(
     findings: Vec<Finding>,
 ) -> crate::adjudication::AdjudicationApplication {
@@ -3848,6 +3946,44 @@ fn error_envelope(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refutation_recovery_requires_scores_for_every_pending_input() {
+        let findings = vec![finding("a.rs", 1, "first"), finding("b.rs", 2, "second")];
+        let inputs = scorer_inputs(&[], &[], &findings, 0);
+        let score = |index| FindingScore {
+            index,
+            confidence: 0.99,
+            kind: crate::envelope::Kind::Risk,
+            reason: "The cited operation remains unsafe.".into(),
+        };
+        assert!(!scorer_covers_refutation_recovery(&[1], &inputs, &[]));
+        assert!(!scorer_covers_refutation_recovery(
+            &[1],
+            &inputs,
+            &[score(0)]
+        ));
+        assert!(!scorer_covers_refutation_recovery(
+            &[0, 1],
+            &inputs,
+            &[score(1)]
+        ));
+        assert!(!scorer_covers_refutation_recovery(
+            &[1],
+            &inputs[..1],
+            &[score(1)]
+        ));
+        assert!(scorer_covers_refutation_recovery(
+            &[1],
+            &inputs,
+            &[score(0), score(1)]
+        ));
+        assert!(scorer_covers_refutation_recovery(
+            &[0, 1],
+            &inputs,
+            &[score(0), score(1)]
+        ));
+    }
 
     #[test]
     fn exact_serialized_shared_context_admits_local_and_ci_batch_edges() {
