@@ -4457,6 +4457,34 @@ impl LlmClient {
                         return Err(error);
                     }
                     if response.status.is_success() {
+                        eprintln!(
+                            "postil: llm response phase={} model={} attempt={} status={} elapsed={} bytes={} request_id={} response_id={} returned_model={} provider={} choices={} finish={} usage={} prompt_tokens={} completion_tokens={} reasoning_tokens={} category={}",
+                            phase.as_str(),
+                            log_text(model),
+                            retries + 1,
+                            response.status.as_u16(),
+                            elapsed,
+                            response.text.len(),
+                            response.request_id.as_deref().unwrap_or("none"),
+                            summary.response_id.as_deref().unwrap_or("none"),
+                            summary.returned_model.as_deref().unwrap_or("none"),
+                            summary.provider.as_deref().unwrap_or("none"),
+                            summary
+                                .choices
+                                .map_or_else(|| "unknown".to_string(), |count| count.to_string()),
+                            summary.finish_reason.as_deref().unwrap_or("none"),
+                            if summary.usage.is_some() {
+                                "present"
+                            } else {
+                                "missing"
+                            },
+                            summary.usage.map_or(0, |value| value.prompt_tokens),
+                            summary.usage.map_or(0, |value| value.completion_tokens),
+                            summary
+                                .reasoning_tokens
+                                .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+                            summary.error_type.as_deref().unwrap_or("none"),
+                        );
                         let actual_identity =
                             route_provider.map(|_| actual_response_identity(&response.text));
                         // A pinned route that answers without echoing its
@@ -4503,34 +4531,6 @@ impl LlmClient {
                             }
                             return Err(error);
                         }
-                        eprintln!(
-                            "postil: llm response phase={} model={} attempt={} status={} elapsed={} bytes={} request_id={} response_id={} returned_model={} provider={} choices={} finish={} usage={} prompt_tokens={} completion_tokens={} reasoning_tokens={} category={}",
-                            phase.as_str(),
-                            log_text(model),
-                            retries + 1,
-                            response.status.as_u16(),
-                            elapsed,
-                            response.text.len(),
-                            response.request_id.as_deref().unwrap_or("none"),
-                            summary.response_id.as_deref().unwrap_or("none"),
-                            summary.returned_model.as_deref().unwrap_or("none"),
-                            summary.provider.as_deref().unwrap_or("none"),
-                            summary
-                                .choices
-                                .map_or_else(|| "unknown".to_string(), |count| count.to_string()),
-                            summary.finish_reason.as_deref().unwrap_or("none"),
-                            if summary.usage.is_some() {
-                                "present"
-                            } else {
-                                "missing"
-                            },
-                            summary.usage.map_or(0, |value| value.prompt_tokens),
-                            summary.usage.map_or(0, |value| value.completion_tokens),
-                            summary
-                                .reasoning_tokens
-                                .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
-                            summary.error_type.as_deref().unwrap_or("none"),
-                        );
                         let usage_before_parse = *usage;
                         match self.parse_response(&response.text, usage) {
                             Ok(content) => {
