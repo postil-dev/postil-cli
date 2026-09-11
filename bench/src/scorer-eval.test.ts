@@ -500,6 +500,24 @@ describe("scorer case diagnostics", () => {
     }).failureSignals).toEqual([]);
   });
 
+  test("counts proxy failures without assuming a transport cause", () => {
+    const diagnostics = scorerCaseDiagnostics({
+      ...diagnosticInput, child: { ...diagnosticInput.child, stderr: "" },
+      attempts: [{
+        ...accountedAttempt, outcome: "failed", durationMs: 0,
+        promptTokens: 0, completionTokens: 0, costUsd: null, costProviderDecimal: null,
+        usageValid: false, httpStatus: null, modelIdentityPresent: false,
+        providerIdentityPresent: false, usagePresent: false, errorPresent: false,
+      }],
+    });
+    expect(diagnostics.failureSignals).toEqual(["upstreamFailure"]);
+    expect(diagnostics.adjudication).toEqual({
+      attempts: 1, collectedResponses: 0, validUsageAttempts: 0, exactCostAttempts: 0,
+      modelIdentityPresentAttempts: 0, providerIdentityPresentAttempts: 0,
+    });
+    expect(diagnostics.scorer.attempts).toBe(0);
+  });
+
   test("emits bounded deduplicated codes without copying arbitrary messages or payload properties", () => {
     const marker = "credential=PRIVATE_MARKER Authorization: Bearer PRIVATE_MARKER";
     const diagnostics = scorerCaseDiagnostics({

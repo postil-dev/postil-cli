@@ -126,7 +126,7 @@ export interface ScorerEvalCase {
 type ScorerFailureSignal = "childTimeout" | "invalidEnvelope" |
   "unsupportedRefutation" | "adjudicationValidation" | "adjudicationInvalidOutput" |
   "adjudicationProvider" | "adjudicationUnavailable" | "upstreamTimeout" |
-  "upstreamTransport" | "upstreamHttp" | "unknown";
+  "upstreamFailure" | "upstreamHttp" | "unknown";
 
 interface ScorerPhaseDiagnostics {
   attempts: number;
@@ -183,7 +183,7 @@ export function scorerCaseDiagnostics(input: {
   if (input.envelope === undefined) signals.add("invalidEnvelope");
   for (const attempt of input.attempts) {
     if (attempt.outcome === "timedOut") signals.add("upstreamTimeout");
-    if (attempt.outcome === "failed") signals.add("upstreamTransport");
+    if (attempt.outcome === "failed") signals.add("upstreamFailure");
     if (attempt.httpStatus !== null && attempt.httpStatus >= 400) signals.add("upstreamHttp");
   }
   if (!input.passed && signals.size === 0) signals.add("unknown");
