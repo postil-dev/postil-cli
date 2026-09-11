@@ -6444,15 +6444,28 @@ async fn compact_pnpm_lockfile_ia32_platform_claim_is_suppressed_but_dependency_
 
 #[tokio::test]
 async fn compact_lockfile_platform_claim_survives_failed_adjudication() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .and(body_string_contains("single finding adjudicator"))
-        .respond_with(ResponseTemplate::new(503))
-        .with_priority(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
+    for refuted in [false, true] {
+        let server = MockServer::start().await;
+        if !refuted {
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .and(body_string_contains("single finding adjudicator"))
+                .respond_with(ResponseTemplate::new(503))
+                .with_priority(1)
+                .mount(&server)
+                .await;
+        }
+        if refuted {
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .and(body_string_contains("single finding adjudicator"))
+                .respond_with(AllRefutedAdjudicator)
+                .with_priority(1)
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .respond_with(|request: &Request| {
             let evidence = prompt_evidence(
@@ -6476,48 +6489,63 @@ async fn compact_lockfile_platform_claim_survives_failed_adjudication() {
         .mount(&server)
         .await;
 
-    let dir = tempfile::tempdir().unwrap();
-    let diff = dir.path().join("pnpm-ia32-adjudication-failure.diff");
-    std::fs::write(
+        let dir = tempfile::tempdir().unwrap();
+        let diff = dir.path().join("pnpm-ia32-adjudication-failure.diff");
+        std::fs::write(
         &diff,
         "diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml\n--- a/pnpm-lock.yaml\n+++ b/pnpm-lock.yaml\n@@ -1,3 +1,3 @@\n lockfileVersion: '9.0'\n packages:\n-  '@rollup/rollup-win32-ia32-msvc@4.34.8':\n+  '@rollup/rollup-win32-x64-msvc@4.34.8':\n",
     )
     .unwrap();
 
-    let out = postil()
-        .current_dir(dir.path())
-        .env("POSTIL_API_BASE", server.uri())
-        .env("POSTIL_DISABLE_SCORER", "1")
-        .args(["review", "--diff-file"])
-        .arg(&diff)
-        .args(["--output", "json"])
-        .assert()
-        .code(1);
-    let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
-    assert!(
-        envelope["findings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|finding| { finding["title"] == "Preserve Windows IA32 support" })
-    );
-    assert!(
-        envelope["findings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|finding| { finding["path"] == ".postil/provider" })
-    );
-    assert!(
-        envelope["suppressedFindings"]
-            .as_array()
-            .is_none_or(|findings| {
-                !findings
-                    .iter()
-                    .any(|finding| finding["reason"] == "lockfilePlatformEvidenceInsufficient")
-            })
-    );
-    assert_eq!(envelope["gate"]["failing"], true);
+        let out = postil()
+            .current_dir(dir.path())
+            .env("POSTIL_API_BASE", server.uri())
+            .env("REVIEW_SCORER_MODEL", "scorer-model")
+            .args(["review", "--diff-file"])
+            .arg(&diff)
+            .args(["--output", "json"])
+            .assert()
+            .code(1);
+        let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+        assert!(
+            envelope["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|finding| { finding["title"] == "Preserve Windows IA32 support" })
+        );
+        assert!(
+            envelope["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|finding| {
+                    finding["path"]
+                        == if refuted {
+                            ".postil/model-output"
+                        } else {
+                            ".postil/provider"
+                        }
+                })
+        );
+        assert!(
+            envelope["suppressedFindings"]
+                .as_array()
+                .is_none_or(|findings| {
+                    !findings
+                        .iter()
+                        .any(|finding| finding["reason"] == "lockfilePlatformEvidenceInsufficient")
+                })
+        );
+        assert_eq!(envelope["gate"]["failing"], true);
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests.iter().all(|request| !request_system_contains(
+                request,
+                "independent second-model scorer"
+            ))
+        );
+    }
 }
 
 async fn mock_review_model(server: &MockServer, model: &str, findings: Value) {
@@ -13562,50 +13590,97 @@ async fn cross_file_package_existence_refutes_false_absence_claim() {
 
 #[tokio::test]
 async fn fresh_unresolved_repository_claims_are_suppressed() {
-    for (name, repository, resources, state) in [
-        (
-            "unavailable",
-            false,
-            vec!["widget".to_string()],
-            "unavailable",
-        ),
-        ("exhausted", true, vec!["widget".to_string()], "exhausted"),
-    ] {
-        let server = MockServer::start().await;
-        mock_review(
-            &server,
-            json!([{
-                "path": "src/auth.rs", "line": 42, "severity": "error", "kind": "risk",
-                "confidence": 0.99, "title": "Widget dependency is absent",
-                "body": "The repository does not contain the required widget dependency.",
-                "evidence": "exec_query(&token);",
-                "repositoryContext": {"claim": "absence", "resources": resources}
-            }]),
-        )
-        .await;
-        let dir = tempfile::tempdir().unwrap();
-        if repository {
-            initialize_staged_repository(dir.path());
+    for refuted in [false, true] {
+        for (name, repository, resources, state) in [
+            (
+                "unavailable",
+                false,
+                vec!["widget".to_string()],
+                "unavailable",
+            ),
+            ("exhausted", true, vec!["widget".to_string()], "exhausted"),
+        ] {
+            let server = MockServer::start().await;
+            mock_review(
+                &server,
+                json!([{
+                    "path": "src/auth.rs", "line": 42, "severity": "error", "kind": "risk",
+                    "confidence": 0.99, "title": "Widget dependency is absent",
+                    "body": "The repository does not contain the required widget dependency.",
+                    "evidence": "exec_query(&token);",
+                    "repositoryContext": {"claim": "absence", "resources": resources}
+                }]),
+            )
+            .await;
+            if refuted {
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .and(body_string_contains("single finding adjudicator"))
+                    .respond_with(AllRefutedAdjudicator)
+                    .with_priority(1)
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            if repository {
+                initialize_staged_repository(dir.path());
+            }
+            let diff = write_diff(dir.path());
+            let mut command = postil();
+            command
+                .current_dir(dir.path())
+                .env("POSTIL_API_BASE", server.uri())
+                .env("REVIEW_SCORER_MODEL", "scorer-model")
+                .arg("review");
+            if repository {
+                command.arg("--staged");
+            } else {
+                command.arg("--diff-file").arg(&diff);
+            }
+            command.args(["--output", "json"]);
+            let out = command.assert().code(if refuted { 1 } else { 0 });
+            let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+            assert_eq!(envelope["repositorySearch"]["state"], state, "{name}");
+            if refuted {
+                let findings = envelope["findings"].as_array().unwrap();
+                assert!(
+                    findings
+                        .iter()
+                        .any(|finding| finding["path"] == ".postil/model-output")
+                );
+                assert!(
+                    findings
+                        .iter()
+                        .any(|finding| finding["title"] == "Widget dependency is absent")
+                );
+                assert_eq!(envelope["counts"]["suppressed"], 0);
+                assert_eq!(envelope["gate"]["failing"], true);
+                assert!(
+                    envelope["modelIncidents"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|incident| incident["category"] == "invalidOutput"
+                            && incident["recovered"] == false)
+                );
+            } else {
+                assert_eq!(envelope["counts"]["suppressed"], 1, "{name}");
+                assert_eq!(envelope["findings"], json!([]), "{name}");
+                assert_eq!(envelope["gate"]["failing"], false, "{name}");
+                assert!(
+                    envelope["modelIncidents"]
+                        .as_array()
+                        .is_none_or(Vec::is_empty)
+                );
+            }
+            let requests = server.received_requests().await.unwrap();
+            assert!(requests.iter().all(|request| !request_system_contains(
+                request,
+                "independent second-model scorer"
+            )));
+            assert_eq!(envelope["resolved"], json!([]));
         }
-        let diff = write_diff(dir.path());
-        let mut command = postil();
-        command
-            .current_dir(dir.path())
-            .env("POSTIL_API_BASE", server.uri())
-            .env("POSTIL_DISABLE_SCORER", "1")
-            .arg("review");
-        if repository {
-            command.arg("--staged");
-        } else {
-            command.arg("--diff-file").arg(&diff);
-        }
-        command.args(["--output", "json"]);
-        let out = command.assert().code(0);
-        let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
-        assert_eq!(envelope["repositorySearch"]["state"], state, "{name}");
-        assert_eq!(envelope["counts"]["suppressed"], 1, "{name}");
-        assert_eq!(envelope["findings"], json!([]), "{name}");
-        assert_eq!(envelope["gate"]["failing"], false, "{name}");
     }
 }
 
@@ -13801,50 +13876,114 @@ async fn oversized_adjudication_payload_preserves_findings_without_aborting_revi
 
 #[tokio::test]
 async fn scorer_cannot_suppress_an_unresolved_full_rereview_baseline() {
-    let server = MockServer::start().await;
-    mock_review(&server, json!([])).await;
-    let directory = tempfile::tempdir().unwrap();
-    let diff = write_diff(directory.path());
-    let baseline = json!({
-        "version": 1, "summary": "", "silent": false,
-        "findings": [{
-            "path": "src/auth.rs", "line": 42, "severity": "error", "kind": "risk",
-            "confidence": 0.9, "title": "Authorization guard remains bypassed",
-            "body": "The authorization guard remains bypassed before query execution.",
-            "evidence": "exec_query(&token);"
-        }],
-        "resolved": [], "counts": {"info": 0, "warn": 0, "error": 1, "suppressed": 0},
-        "confidenceBuckets": [0,0,0,0,1],
-        "gate": {"failOn": "error", "failing": true},
-        "modelUsed": "model", "usage": {"promptTokens": 0, "completionTokens": 0},
-        "baseSha": null, "headSha": null, "sinceSha": null
-    });
-    let baseline_path = directory.path().join("scorer-baseline.json");
-    std::fs::write(&baseline_path, baseline.to_string()).unwrap();
+    for status in ["unresolved", "refuted"] {
+        for claim in ["none", "absence"] {
+            let server = MockServer::start().await;
+            mock_review(&server, json!([])).await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .and(body_string_contains("single finding adjudicator"))
+                .respond_with(move |request: &Request| {
+                    let request: Value = request.body_json().unwrap();
+                    let payload: Value = serde_json::from_str(
+                        request["messages"].as_array().unwrap().last().unwrap()["content"]
+                            .as_str()
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    let results = payload["candidates"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|candidate| {
+                            json!({
+                                "candidateId": candidate["candidateId"], "status": status,
+                                "revisedTitle": "", "revisedBody": "",
+                                "evidence": if status == "refuted" { "+exec_query(&token);" } else { "" }, "duplicateOf": null
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    ResponseTemplate::new(200).set_body_json(scorer_content(json!(results)))
+                })
+                .with_priority(1)
+                .expect(1)
+                .mount(&server)
+                .await;
+            let directory = tempfile::tempdir().unwrap();
+            let diff = write_diff(directory.path());
+            let baseline = json!({
+                "version": 1, "summary": "", "silent": false,
+                "findings": [{
+                    "path": "src/auth.rs", "line": 42, "severity": "error", "kind": "risk",
+                    "confidence": 0.9, "title": "Authorization guard remains bypassed",
+                    "body": "The authorization guard remains bypassed before query execution.",
+                    "evidence": "exec_query(&token);",
+                    "repositoryContext": if claim == "none" { Value::Null } else { json!({"claim": claim, "identifiers": ["validate_token"]}) }
+                }],
+                "resolved": [], "counts": {"info": 0, "warn": 0, "error": 1, "suppressed": 0},
+                "confidenceBuckets": [0,0,0,0,1],
+                "gate": {"failOn": "error", "failing": true},
+                "modelUsed": "model", "usage": {"promptTokens": 0, "completionTokens": 0},
+                "baseSha": null, "headSha": null, "sinceSha": null
+            });
+            let baseline_path = directory.path().join("scorer-baseline.json");
+            std::fs::write(&baseline_path, baseline.to_string()).unwrap();
 
-    let output = postil()
-        .current_dir(directory.path())
-        .env("POSTIL_API_BASE", server.uri())
-        .env("REVIEW_SCORER_MODEL", "scorer-model")
-        .args(["review", "--diff-file"])
-        .arg(&diff)
-        .arg("--baseline")
-        .arg(&baseline_path)
-        .args(["--output", "json"])
-        .assert()
-        .code(1);
-    let envelope: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
-    assert_eq!(
-        envelope["findings"][0]["title"],
-        "Authorization guard remains bypassed"
-    );
-    assert_eq!(envelope["findings"][0]["confidence"], 0.9);
-    assert_eq!(envelope["resolved"], json!([]));
-    assert_eq!(envelope["gate"]["failing"], true);
-    let requests = server.received_requests().await.unwrap();
-    assert!(requests.iter().all(|request| {
-        !String::from_utf8_lossy(&request.body).contains("independent second-model scorer")
-    }));
+            let output = postil()
+                .current_dir(directory.path())
+                .env("POSTIL_API_BASE", server.uri())
+                .env("REVIEW_SCORER_MODEL", "scorer-model")
+                .args(["review", "--diff-file"])
+                .arg(&diff)
+                .arg("--baseline")
+                .arg(&baseline_path)
+                .args(["--output", "json"])
+                .assert()
+                .code(1);
+            let envelope: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+            assert_eq!(
+                envelope["findings"][0]["title"],
+                "Authorization guard remains bypassed"
+            );
+            assert_eq!(envelope["findings"][0]["confidence"], 0.9);
+            assert_eq!(envelope["resolved"], json!([]));
+            assert_eq!(envelope["gate"]["failing"], true);
+            assert_eq!(
+                envelope["findings"].as_array().unwrap().len(),
+                if status == "refuted" { 2 } else { 1 }
+            );
+            assert_eq!(envelope["counts"]["suppressed"], 0);
+            if status == "refuted" {
+                assert!(
+                    envelope["findings"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|finding| finding["path"] == ".postil/model-output")
+                );
+                assert!(
+                    envelope["modelIncidents"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|incident| incident["category"] == "invalidOutput"
+                            && incident["recovered"] == false)
+                );
+            } else {
+                assert!(
+                    envelope["modelIncidents"]
+                        .as_array()
+                        .is_none_or(Vec::is_empty)
+                );
+            }
+            assert_eq!(envelope["usageAccountingComplete"], true);
+            assert_model_usage_matches_aggregate(&envelope);
+            let requests = server.received_requests().await.unwrap();
+            assert!(requests.iter().all(|request| {
+                !String::from_utf8_lossy(&request.body).contains("independent second-model scorer")
+            }));
+        }
+    }
 }
 
 #[tokio::test]
