@@ -2492,6 +2492,90 @@ async fn provider_403_redacts_key_management_url_from_cli_and_finding() {
     );
 }
 
+#[cfg(feature = "qualification-candidate")]
+#[tokio::test]
+async fn routed_http_200_errors_log_each_attempt_without_exposing_response_content() {
+    for recover in [false, true] {
+        let server = MockServer::start().await;
+        let secret = "fixture-private-provider-error-content";
+        let failures = if recover { 2 } else { 3 };
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "error": {
+                    "message": secret,
+                    "metadata": {
+                        "error_type": "provider_error",
+                        "provider_code": secret
+                    }
+                }
+            })))
+            .up_to_n_times(failures)
+            .with_priority(1)
+            .expect(failures)
+            .mount(&server)
+            .await;
+        if recover {
+            let mut response = llm_content(json!([]));
+            response["model"] = json!("openai/gpt-5.6-luna");
+            response["provider"] = json!("Azure");
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(response))
+                .with_priority(2)
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let profile = directory.path().join("profile.json");
+        std::fs::write(&profile, include_str!("../provisional-models.json")).unwrap();
+        let diff = write_diff(directory.path());
+        let output = postil()
+            .current_dir(directory.path())
+            .env("CI", "true")
+            .env("GITHUB_API_URL", "http://127.0.0.1:9")
+            .env("POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY", "1")
+            .env("POSTIL_QUALIFICATION_CANDIDATE_PROFILE", &profile)
+            .env("POSTIL_QUALIFICATION_CAPTURE_API_BASE", server.uri())
+            .args(["review", "--diff-file"])
+            .arg(&diff)
+            .args(["--output", "json"])
+            .assert()
+            .code(if recover { 0 } else { 1 });
+        let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+        let stdout = String::from_utf8_lossy(&output.get_output().stdout);
+        assert!(!stderr.contains(secret));
+        assert!(!stdout.contains(secret));
+        let responses = stderr
+            .lines()
+            .filter(|line| line.starts_with("postil: llm response "))
+            .collect::<Vec<_>>();
+        assert_eq!(responses.len(), 3, "{stderr}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+        for (index, line) in responses.iter().enumerate() {
+            assert!(line.contains(&format!("attempt={} ", index + 1)));
+            assert!(line.contains("status=200 "));
+            if index < failures as usize {
+                assert!(line.contains("category=provider_error"));
+                assert!(line.contains("returned_model=none provider=none "));
+                assert!(line.contains("usage=missing "));
+            } else {
+                assert!(line.contains("category=none"));
+                assert!(line.contains("usage=present "));
+            }
+        }
+        assert_eq!(stderr.matches("identity echo is missing").count(), 2);
+        let envelope: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(envelope["usageAccountingComplete"], false);
+        if recover {
+            assert!(envelope["findings"].as_array().unwrap().is_empty());
+        } else {
+            assert!(!envelope["findings"].as_array().unwrap().is_empty());
+        }
+    }
+}
+
 #[tokio::test]
 async fn byok_reported_spend_is_not_subject_to_the_hosted_operation_cap() {
     let server = MockServer::start().await;
