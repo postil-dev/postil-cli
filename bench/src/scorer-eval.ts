@@ -124,7 +124,7 @@ export interface ScorerEvalCase {
 }
 
 type ScorerFailureSignal = "childTimeout" | "invalidEnvelope" |
-  "unsupportedRefutation" | "adjudicationValidation" | "adjudicationParser" |
+  "unsupportedRefutation" | "adjudicationValidation" | "adjudicationInvalidOutput" |
   "adjudicationProvider" | "adjudicationUnavailable" | "upstreamTimeout" |
   "upstreamTransport" | "upstreamHttp" | "unknown";
 
@@ -174,7 +174,7 @@ export function scorerCaseDiagnostics(input: {
     } else if (input.envelope?.modelIncidents?.some((incident) =>
       incident.phase === "scorer" && incident.category === "invalidOutput" && !incident.recovered
     )) {
-      signals.add("adjudicationParser");
+      signals.add("adjudicationInvalidOutput");
     } else {
       signals.add("adjudicationUnavailable");
     }

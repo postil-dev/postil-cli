@@ -469,11 +469,11 @@ describe("scorer case diagnostics", () => {
     expect(aggregate(original.model, [observed], 3).passed).toBe(false);
   });
 
-  test("separates native parser and provider failures from unclassified unavailability", () => {
+  test("separates native invalid-output and provider failures from unclassified unavailability", () => {
     const input = { ...diagnosticInput, child: { ...diagnosticInput.child, stderr: unavailable } };
     expect(scorerCaseDiagnostics({ ...input, envelope: {
       findings: [], modelIncidents: [{ phase: "scorer", category: "invalidOutput", recovered: false }],
-    } }).failureSignals).toEqual(["adjudicationParser"]);
+    } }).failureSignals).toEqual(["adjudicationInvalidOutput"]);
     expect(scorerCaseDiagnostics({ ...input, envelope: {
       findings: [{ path: ".postil/provider", title: "Model provider unavailable" }],
     } }).failureSignals).toEqual(["adjudicationProvider"]);
