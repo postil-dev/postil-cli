@@ -3734,6 +3734,452 @@ async fn adjudication_provider_failure_preserves_findings_and_baseline_blocker()
 }
 
 #[tokio::test]
+async fn ungrounded_refutation_keeps_candidates_for_the_existing_scorer() {
+    for (label, true_candidate, malformed) in [
+        ("comment", false, false),
+        ("query", true, false),
+        ("malformed-publication", false, true),
+        ("scorer-invalid", false, false),
+        ("scorer-disabled", false, false),
+    ] {
+        let scorer_failure = label == "scorer-invalid";
+        let scorer_disabled = label == "scorer-disabled";
+        let server = MockServer::start().await;
+        let (before, after, title, body) = if true_candidate {
+            (
+                "validate(input);",
+                "exec_query(input);",
+                "Validate query input",
+                "The query executes attacker-controlled input without validation.",
+            )
+        } else {
+            (
+                " // keep the log prefix stable",
+                " // keep the log prefix stable for tests",
+                "Clean change breaks runtime behavior",
+                "This change removes required runtime behavior and will break callers after merge.",
+            )
+        };
+        mock_review_model(
+            &server,
+            "generator-model",
+            json!([{
+                "path": "src/lib/logger.ts", "line": 11, "severity": if true_candidate { "error" } else { "warn" },
+                "kind": "risk", "confidence": 0.95, "title": title, "body": body,
+                "evidence": after, "repositoryContext": {"claim": "none"}
+            }]),
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("single finding adjudicator"))
+            .respond_with(move |request: &Request| {
+                let request: Value = request.body_json().unwrap();
+                let payload: Value = serde_json::from_str(
+                    request["messages"].as_array().unwrap().last().unwrap()["content"]
+                        .as_str()
+                        .unwrap(),
+                )
+                .unwrap();
+                let candidate = &payload["candidates"][0];
+                ResponseTemplate::new(200).set_body_json(scorer_text(
+                    &json!([{
+                        "candidateId": candidate["candidateId"], "status": "refuted",
+                        "revisedTitle": if malformed { "invalid publication" } else { "" },
+                        "revisedBody": "", "evidence": format!("+{after}"), "duplicateOf": null
+                    }])
+                    .to_string(),
+                ))
+            })
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("independent second-model scorer"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(scorer_content(if scorer_failure { json!([]) } else { json!([{
+                "confidence": if true_candidate { 0.99 } else { 0.01 },
+                "kind": "risk",
+                "reason": if true_candidate { "The query executes unvalidated input." } else { "The diff only changes a comment." }
+            }]) })))
+            .with_priority(1)
+            .expect(if malformed || scorer_disabled { 0 } else if scorer_failure { 2 } else { 1 })
+            .mount(&server).await;
+        let directory = tempfile::tempdir().unwrap();
+        let diff = directory.path().join("review.diff");
+        std::fs::write(&diff, format!(
+            "diff --git a/src/lib/logger.ts b/src/lib/logger.ts\n--- a/src/lib/logger.ts\n+++ b/src/lib/logger.ts\n@@ -11 +11 @@\n-{before}\n+{after}\n"
+        )).unwrap();
+        let mut command = postil();
+        if scorer_disabled {
+            command.env("POSTIL_DISABLE_SCORER", "1");
+        }
+        let output = command
+            .current_dir(directory.path())
+            .env("POSTIL_API_BASE", server.uri())
+            .env("REVIEW_MODEL", "generator-model")
+            .env("REVIEW_SCORER_MODEL", "scorer-model")
+            .args(["review", "--diff-file"])
+            .arg(&diff)
+            .args(["--output", "json"])
+            .assert()
+            .code(
+                if true_candidate || malformed || scorer_failure || scorer_disabled {
+                    1
+                } else {
+                    0
+                },
+            );
+        let envelope: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+        let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+        assert_eq!(
+            envelope["usageAccountingComplete"], true,
+            "{label}: {stderr}"
+        );
+        let requests = server.received_requests().await.unwrap();
+        let scorers = requests
+            .iter()
+            .filter(|request| request_system_contains(request, "independent second-model scorer"))
+            .collect::<Vec<_>>();
+        if malformed || scorer_failure || scorer_disabled {
+            assert_eq!(scorers.len(), if scorer_failure { 2 } else { 0 });
+            let incidents = envelope["modelIncidents"].as_array().unwrap();
+            assert!(
+                incidents
+                    .iter()
+                    .any(|incident| incident["category"] == "invalidOutput"
+                        && incident["recovered"] == false
+                        && incident.get("recovery").is_none())
+            );
+            if malformed {
+                assert!(
+                    stderr.contains("refuted adjudication cannot publish revised finding text")
+                );
+            }
+            if scorer_failure {
+                assert!(
+                    envelope["scorerError"]
+                        .as_str()
+                        .unwrap()
+                        .contains("scorer output invalid")
+                );
+            }
+            let findings = envelope["findings"].as_array().unwrap();
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding["path"] == ".postil/model-output")
+            );
+            let original = findings
+                .iter()
+                .find(|finding| finding["path"] == "src/lib/logger.ts")
+                .unwrap();
+            assert_eq!(original["confidence"], 0.95);
+            assert_eq!(original["evidence"], after);
+            assert_eq!(envelope["counts"]["suppressed"], 0);
+            assert_eq!(envelope["resolved"], json!([]));
+            assert_eq!(envelope["gate"]["failing"], true);
+        } else {
+            assert!(
+                envelope["modelIncidents"]
+                    .as_array()
+                    .is_none_or(Vec::is_empty)
+            );
+            assert_eq!(scorers.len(), 1, "{label}: {stderr}");
+            assert_eq!(requests.len(), 3);
+            assert_eq!(envelope["scorerModel"], "scorer-model");
+            assert!(!stderr.contains("finding adjudication validation failed"));
+            let scorer: Value = scorers[0].body_json().unwrap();
+            let input = scorer["messages"].as_array().unwrap().last().unwrap()["content"]
+                .as_str()
+                .unwrap();
+            assert!(input.contains(title));
+            assert!(input.contains(after));
+            assert_eq!(envelope["gate"]["failing"], true_candidate);
+            if true_candidate {
+                assert_eq!(envelope["findings"].as_array().unwrap().len(), 1);
+                assert_eq!(envelope["findings"][0]["evidence"], after);
+                assert_eq!(envelope["findings"][0]["scorerConfidence"], 0.99);
+            } else {
+                assert!(envelope["findings"].as_array().unwrap().is_empty());
+                assert_eq!(envelope["counts"]["suppressed"], 1);
+            }
+        }
+        assert_model_usage_matches_aggregate(&envelope);
+    }
+}
+
+#[tokio::test]
+async fn pending_refutation_recovery_survives_skipped_or_partial_scoring() {
+    for budget_exceeded in [false, true] {
+        let server = MockServer::start().await;
+        let evidence = if budget_exceeded {
+            format!(
+                "const payload = \"{}\";",
+                (0..75)
+                    .map(|index| format!("{index:08x}"))
+                    .collect::<String>()
+            )
+        } else {
+            "exec_query(input);".to_string()
+        };
+        let findings = if budget_exceeded {
+            json!((0..18).map(|index| json!({
+                "path": format!("src/input-{index}.rs"), "line": 1, "severity": "warn", "kind": "risk", "confidence": 0.95,
+                "title": if index == 0 { "Validate query input".to_string() } else { format!("Validate query input variant {}", char::from(b'a' + index as u8)) },
+                "body": format!("Operation {} accepts unvalidated input. {}", char::from(b'a' + index as u8), "Validation must precede use. ".repeat(40).trim_end()),
+                "evidence": evidence
+            })).collect::<Vec<_>>())
+        } else {
+            json!([
+                {"path": "src/auth.rs", "line": 41, "severity": "warn", "kind": "risk", "confidence": 0.95,
+                 "title": "Check operation status", "body": "The status check ignores failed operations.", "evidence": "check_status();"},
+                {"path": "src/auth.rs", "line": 42, "severity": "warn", "kind": "risk", "confidence": 0.95,
+                 "title": "Validate query input", "body": "The operation accepts unvalidated input.", "evidence": evidence}
+            ])
+        };
+        // Each source request receives only findings grounded in its own input.
+        // Short evidence lines remain whole at the generator admission boundary.
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(move |request: &Request| {
+                let request: Value = request.body_json().unwrap();
+                let input = request["messages"].as_array().unwrap().last().unwrap()["content"]
+                    .as_str()
+                    .unwrap();
+                let visible = findings
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|finding| {
+                        input.contains(finding["path"].as_str().unwrap())
+                            && input.contains(finding["evidence"].as_str().unwrap())
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                ResponseTemplate::new(200).set_body_json(llm_content(json!(visible)))
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("single finding adjudicator"))
+            .respond_with(|request: &Request| {
+                let request: Value = request.body_json().unwrap();
+                let payload: Value = serde_json::from_str(request["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap()).unwrap();
+                let results = payload["candidates"].as_array().unwrap().iter().map(|candidate| {
+                    let refuted = candidate["title"] != "Check operation status";
+                    json!({"candidateId": candidate["candidateId"],
+                        "status": if refuted { "refuted" } else { "unresolved" },
+                        "revisedTitle": "", "revisedBody": "",
+                        "evidence": if refuted { candidate["citedEvidence"].clone() } else { json!("") },
+                        "duplicateOf": null})
+                }).collect::<Vec<_>>();
+                ResponseTemplate::new(200).set_body_json(scorer_text(&json!(results).to_string()))
+            })
+            .with_priority(1).expect(1).mount(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("independent second-model scorer"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(scorer_content(json!([
+                    {"confidence": 0.01, "kind": "risk", "reason": "The status check is valid."}
+                ]))),
+            )
+            .with_priority(1)
+            .expect(if budget_exceeded { 0 } else { 2 })
+            .mount(&server)
+            .await;
+        let directory = tempfile::tempdir().unwrap();
+        if budget_exceeded {
+            std::fs::create_dir(directory.path().join(".postil")).unwrap();
+            std::fs::write(
+                directory.path().join(".postil/guardrails.md"),
+                "Validate input before use.\n".repeat(500),
+            )
+            .unwrap();
+            std::fs::write(
+                directory.path().join(".postil/content-policy.md"),
+                "State concrete defects.\n".repeat(500),
+            )
+            .unwrap();
+        }
+        let diff = directory.path().join("review.diff");
+        let source = if budget_exceeded {
+            (0..18).map(|index| format!("diff --git a/src/input-{index}.rs b/src/input-{index}.rs\n--- a/src/input-{index}.rs\n+++ b/src/input-{index}.rs\n@@ -1 +1 @@\n-old();\n+{evidence}\n")).collect::<String>()
+        } else {
+            format!(
+                "diff --git a/src/auth.rs b/src/auth.rs\n--- a/src/auth.rs\n+++ b/src/auth.rs\n@@ -40,2 +40,3 @@\n context\n-old();\n+check_status();\n+{evidence}\n"
+            )
+        };
+        std::fs::write(&diff, source).unwrap();
+        let output = postil()
+            .current_dir(directory.path())
+            .env("POSTIL_API_BASE", server.uri())
+            .env("REVIEW_MODEL", "openai/gpt-5.6-luna")
+            .env("REVIEW_SCORER_MODEL", "openai/gpt-5.6-luna")
+            .env("POSTIL_CONCISE_FINDINGS", "false")
+            .args(["review", "--diff-file"])
+            .arg(&diff)
+            .args(["--output", "json"])
+            .assert()
+            .code(1);
+        let envelope: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+        let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+        assert!(
+            stderr.contains("unsupported refutation recovery requires complete validated scoring"),
+            "budget_exceeded={budget_exceeded}: {stderr}"
+        );
+        let error = envelope["scorerError"].as_str().unwrap();
+        assert!(
+            error.contains(if budget_exceeded {
+                "bounded input budget was exceeded"
+            } else {
+                "expected 2 score(s), got 1"
+            }),
+            "budget_exceeded={budget_exceeded}: {error}"
+        );
+        let findings = envelope["findings"].as_array().unwrap();
+        assert_eq!(findings.len(), if budget_exceeded { 19 } else { 3 });
+        let original = findings
+            .iter()
+            .find(|finding| finding["title"] == "Validate query input")
+            .unwrap();
+        assert_eq!(original["confidence"], 0.95);
+        assert_eq!(original["evidence"], evidence);
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding["path"] == ".postil/model-output")
+        );
+        assert_eq!(envelope["counts"]["suppressed"], 0);
+        assert_eq!(envelope["resolved"], json!([]));
+        assert_eq!(envelope["gate"]["failing"], true);
+        assert!(
+            envelope["modelIncidents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|incident| incident["category"] == "invalidOutput"
+                    && incident["recovered"] == false)
+        );
+        assert_eq!(envelope["usageAccountingComplete"], true);
+        assert_model_usage_matches_aggregate(&envelope);
+    }
+}
+
+#[cfg(feature = "qualification-candidate")]
+#[tokio::test]
+async fn hosted_pending_refutation_failure_preserves_the_strict_blocker() {
+    for refuted in [false, true] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/chat/completions"))
+            .respond_with(move |request: &Request| {
+                let mut response = if request_system_contains(request, "single finding adjudicator") {
+                    let body: Value = request.body_json().unwrap();
+                    let payload: Value = serde_json::from_str(body["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap()).unwrap();
+                    scorer_text(&json!([{
+                        "candidateId": payload["candidates"][0]["candidateId"],
+                        "status": if refuted { "refuted" } else { "unresolved" },
+                        "revisedTitle": "", "revisedBody": "",
+                        "evidence": if refuted { "exec_query(&token);" } else { "" }, "duplicateOf": null
+                    }]).to_string())
+                } else if request_system_contains(request, "independent second-model scorer") {
+                    scorer_content(json!([]))
+                } else {
+                    llm_content(json!([{
+                        "path": "src/auth.rs", "line": 42, "severity": "warn", "kind": "risk", "confidence": 0.95,
+                        "title": "Validate query input", "body": "The query executes unvalidated input.", "evidence": "exec_query(&token);"
+                    }]))
+                };
+                response["model"] = json!("openai/gpt-5.6-luna");
+                response["provider"] = json!("Azure");
+                ResponseTemplate::new(200).set_body_json(response)
+            }).with_priority(1).mount(&server).await;
+        let directory = tempfile::tempdir().unwrap();
+        let profile = directory.path().join("profile.json");
+        std::fs::write(&profile, include_str!("../provisional-models.json")).unwrap();
+        let diff = write_diff(directory.path());
+        let output = postil()
+            .current_dir(directory.path())
+            .env("CI", "true")
+            .env("GITHUB_API_URL", "http://127.0.0.1:9")
+            .env("POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY", "1")
+            .env("POSTIL_QUALIFICATION_CANDIDATE_PROFILE", &profile)
+            .env("POSTIL_QUALIFICATION_CAPTURE_API_BASE", server.uri())
+            .args(["review", "--diff-file"])
+            .arg(&diff)
+            .args(["--output", "json"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if refuted {
+            assert_eq!(output.status.code(), Some(1), "{stderr}");
+            let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(envelope["gate"]["failing"], true);
+            assert!(
+                envelope["findings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|finding| finding["title"] == "Validate query input"
+                        && finding["confidence"] == 0.95)
+            );
+            assert!(
+                envelope["findings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|finding| finding["path"] == ".postil/model-output")
+            );
+            assert!(
+                envelope["modelIncidents"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|incident| incident["category"] == "invalidOutput"
+                        && incident["recovered"] == false)
+            );
+            assert!(
+                stderr.contains(
+                    "unsupported refutation recovery requires complete validated scoring"
+                )
+            );
+            assert_eq!(envelope["usageAccountingComplete"], true);
+            assert_model_usage_matches_aggregate(&envelope);
+        } else {
+            assert_eq!(output.status.code(), Some(1), "{stderr}");
+            let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert!(
+                !envelope["findings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|finding| finding["title"] == "Validate query input")
+            );
+            assert!(
+                !stderr.contains(
+                    "unsupported refutation recovery requires complete validated scoring"
+                )
+            );
+            assert!(stderr.contains("hosted scorer could not complete the admitted profile"));
+        }
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request_system_contains(
+                    request,
+                    "independent second-model scorer"
+                ))
+                .count(),
+            2
+        );
+    }
+}
+
+#[tokio::test]
 async fn malformed_adjudication_output_blocks_under_advisory_provider_policy() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -13340,6 +13786,116 @@ async fn full_rereview_preserves_unresolved_baseline_for_unavailable_and_exhaust
             "{name}"
         );
         assert_eq!(envelope["gate"]["failing"], true, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn pending_refutation_recovery_commits_baseline_resolution_only_after_scoring() {
+    for scorer_succeeds in [false, true] {
+        let server = MockServer::start().await;
+        mock_review_model(&server, "generator-model", json!([{
+            "path": "src/auth.rs", "line": 1, "severity": "warn", "kind": "risk", "confidence": 0.95,
+            "title": "Preserve login audit", "body": "The login path omits the required audit event.",
+            "evidence": "fn login() { authenticate(); }"
+        }])).await;
+        Mock::given(method("POST")).and(path("/chat/completions"))
+            .and(body_string_contains("single finding adjudicator"))
+            .respond_with(|request: &Request| {
+                let body: Value = request.body_json().unwrap();
+                let payload: Value = serde_json::from_str(body["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap()).unwrap();
+                let evidence = payload["repositoryEvidence"].as_array().unwrap().first().unwrap()["source"].as_str().unwrap();
+                let results = payload["candidates"].as_array().unwrap().iter().map(|candidate| json!({
+                    "candidateId": candidate["candidateId"], "status": "refuted",
+                    "revisedTitle": "", "revisedBody": "", "duplicateOf": null,
+                    "evidence": if candidate["repositoryContext"].is_object() { json!(evidence) } else { candidate["citedEvidence"].clone() }
+                })).collect::<Vec<_>>();
+                ResponseTemplate::new(200).set_body_json(scorer_text(&json!(results).to_string()))
+            }).with_priority(1).expect(1).mount(&server).await;
+        Mock::given(method("POST")).and(path("/chat/completions"))
+            .and(body_string_contains("independent second-model scorer"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(scorer_content(if scorer_succeeds {
+                json!([{"confidence": 0.01, "kind": "risk", "reason": "The audit finding is unsupported."}])
+            } else { json!([]) })))
+            .with_priority(1).expect(if scorer_succeeds { 1 } else { 2 }).mount(&server).await;
+        let directory = tempfile::tempdir().unwrap();
+        initialize_staged_repository_with_unchanged_caller(directory.path());
+        let baseline = json!({
+            "version": 1, "summary": "", "silent": false,
+            "findings": [{"path": "src/auth.rs", "line": 1, "severity": "warn", "kind": "risk",
+                "confidence": 0.95, "title": "Legacy API has no callers",
+                "body": format!("The repository has no caller for `legacy_api`; remove it or restore its caller. {}.", (0..180).map(|index| format!("q{index:03}")).collect::<Vec<_>>().join(" ")),
+                "evidence": "fn login() {}", "repositoryContext": {"claim": "absence", "identifiers": ["legacy_api"]}}],
+            "resolved": [], "counts": {"info": 0, "warn": 1, "error": 0, "suppressed": 0},
+            "confidenceBuckets": [0,0,0,0,1], "gate": {"failOn": "error", "failing": true},
+            "modelUsed": "model", "usage": {"promptTokens": 0, "completionTokens": 0},
+            "baseSha": null, "headSha": null, "sinceSha": null
+        });
+        let baseline_path = directory.path().join("baseline.json");
+        std::fs::write(&baseline_path, baseline.to_string()).unwrap();
+        let output = postil()
+            .current_dir(directory.path())
+            .env("POSTIL_API_BASE", server.uri())
+            .env("REVIEW_MODEL", "generator-model")
+            .env("REVIEW_SCORER_MODEL", "scorer-model")
+            .args(["review", "--staged", "--baseline"])
+            .arg(&baseline_path)
+            .args(["--output", "json"])
+            .assert()
+            .code(if scorer_succeeds { 0 } else { 1 });
+        let envelope: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+        assert_eq!(envelope["usageAccountingComplete"], true);
+        assert_model_usage_matches_aggregate(&envelope);
+        if scorer_succeeds {
+            assert_eq!(envelope["resolved"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                envelope["resolved"][0]["title"],
+                "Legacy API has no callers"
+            );
+            assert_eq!(envelope["counts"]["suppressed"], 2);
+            assert_eq!(
+                envelope["suppressedFindings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|entry| entry["finding"]["title"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                vec!["Legacy API has no callers", "Preserve login audit"]
+            );
+        } else {
+            assert_eq!(envelope["resolved"], json!([]));
+            assert_eq!(envelope["counts"]["suppressed"], 0);
+            let findings = envelope["findings"].as_array().unwrap();
+            assert_eq!(findings.len(), 3);
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding["title"] == "Legacy API has no callers"
+                        && finding["severity"] == "error")
+            );
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding["title"] == "Preserve login audit"
+                        && finding["confidence"] == 0.95)
+            );
+            assert!(
+                findings
+                    .iter()
+                    .any(|finding| finding["path"] == ".postil/model-output")
+            );
+        }
+        let requests = server.received_requests().await.unwrap();
+        for request in requests
+            .iter()
+            .filter(|request| request_system_contains(request, "independent second-model scorer"))
+        {
+            let body: Value = request.body_json().unwrap();
+            let input = body["messages"].as_array().unwrap().last().unwrap()["content"]
+                .as_str()
+                .unwrap();
+            assert!(input.contains("Preserve login audit"));
+            assert!(!input.contains("Legacy API has no callers"));
+        }
     }
 }
 
