@@ -120,6 +120,94 @@ export interface ScorerEvalCase {
   completionTokens: number;
   costUsd: number | null;
   costProviderDecimal?: string | null;
+  diagnostics?: ScorerCaseDiagnostics;
+}
+
+type ScorerFailureSignal = "childTimeout" | "invalidEnvelope" |
+  "unsupportedRefutation" | "adjudicationValidation" | "adjudicationInvalidOutput" |
+  "adjudicationProvider" | "adjudicationUnavailable" | "upstreamTimeout" |
+  "upstreamFailure" | "upstreamHttp" | "unknown";
+
+interface ScorerPhaseDiagnostics {
+  attempts: number;
+  collectedResponses: number;
+  validUsageAttempts: number;
+  exactCostAttempts: number;
+  modelIdentityPresentAttempts: number;
+  providerIdentityPresentAttempts: number;
+}
+
+export interface ScorerCaseDiagnostics {
+  childExitCode: number | null;
+  requiredUpstreamAttempts: 2;
+  adjudication: ScorerPhaseDiagnostics;
+  scorer: ScorerPhaseDiagnostics;
+  failureSignals: ScorerFailureSignal[];
+  publicationFailureCodes: string[];
+}
+
+// Diagnostics observe native results and never participate in qualification.
+// Output contains only fixed codes and counts, including in partial reports.
+export function scorerCaseDiagnostics(input: {
+  child: Pick<BoundedChildResult, "exitCode" | "stderr" | "timedOut">;
+  attempts: readonly ScorerAttempt[];
+  envelope?: {
+    findings: readonly { path: string; title: string }[];
+    modelIncidents?: readonly { phase: string; category: string; recovered: boolean }[];
+  };
+  publicationFailureCodes?: readonly string[];
+  passed: boolean;
+}): ScorerCaseDiagnostics {
+  const signals = new Set<ScorerFailureSignal>();
+  const lines = new Set(input.child.stderr.split(/\r?\n/u));
+  const validationPrefix = "postil: finding adjudication validation failed; preserving all generated findings: ";
+  if (lines.has(`${validationPrefix}refuted adjudication must cite candidate-specific contradictory evidence`)) {
+    signals.add("unsupportedRefutation");
+  } else if ([...lines].some((line) => line.startsWith(validationPrefix))) {
+    signals.add("adjudicationValidation");
+  }
+  if (lines.has("postil: finding adjudication unavailable; preserving all generated findings")) {
+    if (input.envelope?.findings.some((finding) =>
+      finding.path === ".postil/provider" && finding.title === "Model provider unavailable"
+    )) {
+      signals.add("adjudicationProvider");
+    } else if (input.envelope?.modelIncidents?.some((incident) =>
+      incident.phase === "scorer" && incident.category === "invalidOutput" && !incident.recovered
+    )) {
+      signals.add("adjudicationInvalidOutput");
+    } else {
+      signals.add("adjudicationUnavailable");
+    }
+  }
+  if (input.child.timedOut) signals.add("childTimeout");
+  if (input.envelope === undefined) signals.add("invalidEnvelope");
+  for (const attempt of input.attempts) {
+    if (attempt.outcome === "timedOut") signals.add("upstreamTimeout");
+    if (attempt.outcome === "failed") signals.add("upstreamFailure");
+    if (attempt.httpStatus !== null && attempt.httpStatus >= 400) signals.add("upstreamHttp");
+  }
+  if (!input.passed && signals.size === 0) signals.add("unknown");
+  const phaseCounts = (phase: ScorerAttempt["phase"]): ScorerPhaseDiagnostics => {
+    const attempts = input.attempts.filter((attempt) => attempt.phase === phase);
+    return {
+      attempts: attempts.length,
+      // Completed means the proxy collected a response, not that it was valid.
+      collectedResponses: attempts.filter((attempt) => attempt.outcome === "completed").length,
+      validUsageAttempts: attempts.filter((attempt) => attempt.usageValid).length,
+      exactCostAttempts: attempts.filter((attempt) => typeof attempt.costProviderDecimal === "string").length,
+      modelIdentityPresentAttempts: attempts.filter((attempt) => attempt.modelIdentityPresent === true).length,
+      providerIdentityPresentAttempts: attempts.filter((attempt) => attempt.providerIdentityPresent === true).length,
+    };
+  };
+  return {
+    childExitCode: input.child.exitCode ?? null,
+    requiredUpstreamAttempts: 2,
+    adjudication: phaseCounts("adjudication"),
+    scorer: phaseCounts("scorer"),
+    failureSignals: [...signals],
+    publicationFailureCodes: ["check-run-state", "review-count", "comment-count", "missing-anchor"]
+      .filter((code) => input.publicationFailureCodes?.includes(code)),
+  };
 }
 
 export interface ScorerEvalAggregate {
@@ -895,6 +983,7 @@ export async function runScorerEvalCase(
         caseTimedOut,
       ),
       ...telemetry,
+      diagnostics: scorerCaseDiagnostics({ child, attempts: proxy.attempts, passed: false }),
     };
   }
   const parsed = parsedEnvelope.data;
@@ -1057,6 +1146,9 @@ export async function runScorerEvalCase(
     publicationValid,
     ...telemetry,
     costProviderDecimal,
+    diagnostics: scorerCaseDiagnostics({
+      child, attempts: proxy.attempts, envelope: parsed, publicationFailureCodes, passed,
+    }),
   };
 }
 
