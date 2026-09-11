@@ -2738,6 +2738,98 @@ fn qualification_candidate_reports_incomplete_bounded_coverage_without_provider_
 }
 
 #[cfg(feature = "qualification-candidate")]
+#[tokio::test]
+async fn hosted_source_coverage_extends_beyond_three_waves_without_raising_hard_bounds() {
+    use std::fmt::Write as _;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(|_: &Request| {
+            let mut response = llm_content(json!([]));
+            response["model"] = json!("openai/gpt-5.6-luna");
+            response["provider"] = json!("Azure");
+            ResponseTemplate::new(200).set_body_json(response)
+        })
+        .mount(&server)
+        .await;
+
+    let directory = tempfile::tempdir().unwrap();
+    let profile = directory.path().join("profile.json");
+    std::fs::write(&profile, include_str!("../provisional-models.json")).unwrap();
+    let mut source = String::new();
+    for file in 0..14 {
+        let path = format!("src/auth/permission-{file}.ts");
+        writeln!(
+            source,
+            "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1,80 @@\n-if (!actor.can('admin')) throw new Error('Forbidden');",
+        )
+        .unwrap();
+        for line in 0..80 {
+            writeln!(
+                source,
+                "+const permission_{file}_{line} = '{}';",
+                "x".repeat(250)
+            )
+            .unwrap();
+        }
+    }
+    let diff = directory.path().join("source.diff");
+    std::fs::write(&diff, source).unwrap();
+    let output = postil()
+        .current_dir(directory.path())
+        .env("CI", "true")
+        .env("GITHUB_API_URL", "http://127.0.0.1:9")
+        .env("POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY", "1")
+        .env("POSTIL_QUALIFICATION_CANDIDATE_PROFILE", &profile)
+        .env("POSTIL_QUALIFICATION_CAPTURE_API_BASE", server.uri())
+        .env("POSTIL_ALLOW_PRIVATE_API_BASE", "1")
+        .args(["review", "--diff-file"])
+        .arg(&diff)
+        .args(["--output", "json"])
+        .assert()
+        .success();
+    let envelope: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    let coverage = &envelope["reviewCoverage"];
+    assert_eq!(coverage["mode"], "bounded");
+    assert_eq!(
+        coverage["selectedBatches"],
+        14,
+        "{coverage}; stderr={}",
+        String::from_utf8_lossy(&output.get_output().stderr)
+    );
+    assert_eq!(coverage["totalBatches"], 14);
+    assert_eq!(coverage["receipt"]["directHunks"], 14);
+    assert_eq!(coverage["receipt"]["unreviewedHunks"], 0);
+    assert_eq!(envelope["gate"]["failing"], false);
+    assert!(envelope["findings"].as_array().unwrap().is_empty());
+    assert!(
+        envelope["reviewAdmission"]["projectedCostMicros"]
+            .as_u64()
+            .unwrap()
+            <= 25_000_000
+    );
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 14);
+    for file in 0..14 {
+        let marker = format!("permission_{file}_79");
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| String::from_utf8_lossy(&request.body).contains(&marker))
+                .count(),
+            1,
+            "each source file must reach exactly one model request: {marker}"
+        );
+    }
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.body.len() <= 256 * 1024)
+    );
+}
+
+#[cfg(feature = "qualification-candidate")]
 #[test]
 fn qualification_candidate_splits_json_escaped_batches_within_model_context() {
     let dir = tempfile::tempdir().unwrap();
@@ -2784,12 +2876,12 @@ fn qualification_candidate_splits_json_escaped_batches_within_model_context() {
         .success();
     let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     assert_eq!(envelope["reviewCoverage"]["mode"], "bounded");
-    assert!(
-        envelope["reviewCoverage"]["selectedBatches"]
-            .as_u64()
-            .unwrap()
-            < envelope["reviewCoverage"]["totalBatches"].as_u64().unwrap()
+    assert!(envelope["reviewCoverage"]["totalBatches"].as_u64().unwrap() > 1);
+    assert_eq!(
+        envelope["reviewCoverage"]["selectedBatches"],
+        envelope["reviewCoverage"]["totalBatches"]
     );
+    assert_eq!(envelope["reviewCoverage"]["receipt"]["unreviewedHunks"], 0);
     assert!(
         envelope["reviewAdmission"]["serializedInputBytes"]
             .as_u64()
