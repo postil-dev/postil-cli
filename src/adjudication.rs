@@ -118,6 +118,7 @@ pub(crate) struct AdjudicationApplication {
     pub kept: Vec<Finding>,
     pub kept_indices: Vec<usize>,
     pub unresolved_indices: Vec<usize>,
+    pub invalid_refutation_indices: Vec<usize>,
     pub resolved_indices: Vec<usize>,
     pub suppressed: Vec<SuppressedFinding>,
 }
@@ -127,6 +128,7 @@ enum DeterministicDemotionReason {
     RepositoryReceipt,
     CitationFragment,
     InvalidConfirmation,
+    InvalidRefutation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1165,27 +1167,14 @@ pub(crate) fn validate_results(
         let claim_verdict = finding.repository_claim.as_ref().map(|claim| {
             crate::repository_search::claim_verdict(claim, repository_receipt, snapshot_id)
         });
-        let direct_refutation_grounded = evidence_is_refutation_grounded(
-            &result.evidence,
-            &result.candidate_id,
-            corpus,
-            diff_receipt,
-        ) || evidence_is_complete_matching_window_refutation(
-            &result.evidence,
+        let refutation_grounded = result_has_grounded_refutation(
+            snapshot_id,
             finding,
-            &result.candidate_id,
+            result,
             corpus,
             diff_receipt,
+            repository_receipt,
         );
-        let repository_refutation_grounded =
-            finding.repository_claim.as_ref().is_some_and(|claim| {
-                crate::repository_search::refutation_evidence_is_grounded(
-                    claim,
-                    repository_receipt,
-                    snapshot_id,
-                    &result.evidence,
-                )
-            });
         match result.status {
             AdjudicationStatus::Confirmed => {
                 ensure!(
@@ -1228,15 +1217,9 @@ pub(crate) fn validate_results(
                     "refuted adjudication cannot publish revised finding text"
                 );
                 ensure!(
-                    direct_refutation_grounded || repository_refutation_grounded,
+                    refutation_grounded,
                     "refuted adjudication must cite candidate-specific contradictory evidence"
                 );
-                if claim_verdict.is_some() {
-                    ensure!(
-                        direct_refutation_grounded || repository_refutation_grounded,
-                        "repository-dependent finding lacks exact candidate-specific refutation evidence"
-                    );
-                }
             }
             AdjudicationStatus::Unresolved => ensure!(
                 result.revised_title.is_empty()
@@ -1290,12 +1273,20 @@ pub(crate) fn apply_results(
     let mut kept = Vec::new();
     let mut kept_indices = Vec::new();
     let mut unresolved_indices = Vec::new();
+    let mut invalid_refutation_indices = Vec::new();
     let mut resolved_indices = Vec::new();
     let mut suppressed = Vec::new();
     for (index, (mut finding, id)) in findings.into_iter().zip(candidate_ids).enumerate() {
         let outcome = by_id
             .get(&id)
             .ok_or_else(|| anyhow!("validated adjudication result disappeared"))?;
+        if outcome.provenance
+            == AdjudicationProvenance::DeterministicEvidenceReceipt(
+                DeterministicDemotionReason::InvalidRefutation,
+            )
+        {
+            invalid_refutation_indices.push(index);
+        }
         match (outcome.provenance, outcome.disposition) {
             (AdjudicationProvenance::Model, AdjudicationDisposition::RetainConfirmed) => {
                 finding
@@ -1342,6 +1333,7 @@ pub(crate) fn apply_results(
         kept,
         kept_indices,
         unresolved_indices,
+        invalid_refutation_indices,
         resolved_indices,
         suppressed,
     })
@@ -1509,9 +1501,48 @@ fn deterministic_demotion_reason(
             })
     {
         Some(DeterministicDemotionReason::InvalidConfirmation)
+    } else if matches!(result.status, AdjudicationStatus::Refuted)
+        && result.revised_title.is_empty()
+        && result.revised_body.is_empty()
+        && !result_has_grounded_refutation(
+            snapshot_id,
+            finding,
+            result,
+            corpus,
+            receipt,
+            repository_receipt,
+        )
+    {
+        Some(DeterministicDemotionReason::InvalidRefutation)
     } else {
         None
     }
+}
+
+fn result_has_grounded_refutation(
+    snapshot_id: &str,
+    finding: &Finding,
+    result: &AdjudicationResult,
+    corpus: &str,
+    receipt: &DiffCorpusReceipt,
+    repository_receipt: &RepositorySearchReceipt,
+) -> bool {
+    evidence_is_refutation_grounded(&result.evidence, &result.candidate_id, corpus, receipt)
+        || evidence_is_complete_matching_window_refutation(
+            &result.evidence,
+            finding,
+            &result.candidate_id,
+            corpus,
+            receipt,
+        )
+        || finding.repository_claim.as_ref().is_some_and(|claim| {
+            crate::repository_search::refutation_evidence_is_grounded(
+                claim,
+                repository_receipt,
+                snapshot_id,
+                &result.evidence,
+            )
+        })
 }
 
 fn result_is_bounded_citation_fragment(result: &AdjudicationResult, finding: &Finding) -> bool {
@@ -1757,7 +1788,7 @@ mod tests {
         let corpus = "@@ -3 +3 @@\n- uses: action@old\n@@ -69 +74 @@\n+ uses: action@new\n";
         let direct = direct_receipt(&snapshot, corpus, &findings, &ids);
         assert!(direct.rendered_evidence.contains("uses: action@new"));
-        let error = apply_results(
+        let applied = apply_results(
             &snapshot,
             findings,
             ids,
@@ -1766,12 +1797,10 @@ mod tests {
             &direct,
             &unavailable_receipt(),
         )
-        .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("candidate-specific contradictory evidence")
-        );
+        .unwrap();
+        assert_eq!(applied.kept.len(), 2);
+        assert_eq!(applied.unresolved_indices, vec![0, 1]);
+        assert!(applied.suppressed.is_empty());
     }
 
     #[test]
@@ -2024,6 +2053,137 @@ mod tests {
     }
 
     #[test]
+    fn ungrounded_refutation_preserves_the_original_candidate_for_scoring() {
+        let snapshot = "a".repeat(40);
+        let mut candidate = finding(
+            Kind::Risk,
+            "Clean change breaks runtime behavior",
+            "This change removes required runtime behavior and will break callers after merge.",
+        );
+        candidate.path = "src/lib/logger.ts".into();
+        candidate.line = 11;
+        candidate.confidence = 0.95;
+        candidate.evidence = Some(" // keep the log prefix stable for tests".into());
+        let findings = vec![candidate];
+        let ids = stable_candidate_ids(&snapshot, &findings);
+        let corpus = "--- a/src/lib/logger.ts\n+++ b/src/lib/logger.ts\n@@ -11 +11 @@\n- // keep the log prefix stable\n+ // keep the log prefix stable for tests\n";
+        let receipt = direct_receipt(&snapshot, corpus, &findings, &ids);
+        for evidence in [
+            "+ // keep the log prefix stable for tests",
+            " // keep the log prefix stable for tests",
+            "unsupported evidence",
+            "",
+        ] {
+            let result = AdjudicationResult {
+                candidate_id: ids[0].clone(),
+                status: AdjudicationStatus::Refuted,
+                revised_title: String::new(),
+                revised_body: String::new(),
+                evidence: evidence.into(),
+                duplicate_of: None,
+            };
+            assert!(
+                validate_results(
+                    &snapshot,
+                    &findings,
+                    &ids,
+                    std::slice::from_ref(&result),
+                    corpus,
+                    &receipt,
+                    &unavailable_receipt(),
+                )
+                .is_err()
+            );
+            let applied = apply_results(
+                &snapshot,
+                findings.clone(),
+                ids.clone(),
+                vec![result],
+                corpus,
+                &receipt,
+                &unavailable_receipt(),
+            )
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(&applied.kept).unwrap(),
+                serde_json::to_value(&findings).unwrap()
+            );
+            assert_eq!(applied.kept_indices, vec![0]);
+            assert_eq!(applied.unresolved_indices, vec![0]);
+            assert!(applied.resolved_indices.is_empty());
+            assert!(applied.suppressed.is_empty());
+        }
+    }
+
+    #[test]
+    fn ungrounded_refutation_does_not_repair_invalid_structure_or_snapshot() {
+        let snapshot = "a".repeat(40);
+        let findings = vec![finding(
+            Kind::Risk,
+            "Preserve validation",
+            "The change removes validation.",
+        )];
+        let ids = stable_candidate_ids(&snapshot, &findings);
+        let corpus = "+ perform_write(input);\n";
+        let receipt = direct_receipt(&snapshot, corpus, &findings, &ids);
+        let result = AdjudicationResult {
+            candidate_id: ids[0].clone(),
+            status: AdjudicationStatus::Refuted,
+            revised_title: String::new(),
+            revised_body: String::new(),
+            evidence: "unsupported evidence".into(),
+            duplicate_of: None,
+        };
+        for results in [
+            vec![],
+            vec![result.clone(), result.clone()],
+            vec![AdjudicationResult {
+                candidate_id: "unknown".into(),
+                ..result.clone()
+            }],
+            vec![AdjudicationResult {
+                duplicate_of: Some(ids[0].clone()),
+                ..result.clone()
+            }],
+            vec![AdjudicationResult {
+                revised_title: "invalid publication".into(),
+                ..result.clone()
+            }],
+            vec![AdjudicationResult {
+                revised_body: " ".into(),
+                ..result.clone()
+            }],
+        ] {
+            assert!(
+                apply_results(
+                    &snapshot,
+                    findings.clone(),
+                    ids.clone(),
+                    results,
+                    corpus,
+                    &receipt,
+                    &unavailable_receipt(),
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            apply_results(
+                &"b".repeat(40),
+                findings,
+                ids,
+                vec![result],
+                corpus,
+                &receipt,
+                &unavailable_receipt(),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("snapshot mismatch")
+        );
+    }
+
+    #[test]
     fn candidate_location_cannot_refute_its_own_finding() {
         let snapshot = "a".repeat(40);
         let mut candidate = finding(
@@ -2055,18 +2215,19 @@ mod tests {
             duplicate_of: None,
         };
 
-        assert!(
-            apply_results(
-                &snapshot,
-                findings,
-                ids,
-                vec![result],
-                corpus,
-                &receipt,
-                &unavailable_receipt(),
-            )
-            .is_err()
-        );
+        let applied = apply_results(
+            &snapshot,
+            findings,
+            ids,
+            vec![result],
+            corpus,
+            &receipt,
+            &unavailable_receipt(),
+        )
+        .unwrap();
+        assert_eq!(applied.kept.len(), 1);
+        assert_eq!(applied.unresolved_indices, vec![0]);
+        assert!(applied.suppressed.is_empty());
     }
 
     #[test]
@@ -2099,18 +2260,19 @@ mod tests {
             &ids[0],
             &receipt,
         ));
-        assert!(
-            apply_results(
-                &snapshot,
-                findings,
-                ids,
-                vec![result],
-                corpus,
-                &receipt,
-                &unavailable_receipt(),
-            )
-            .is_err()
-        );
+        let applied = apply_results(
+            &snapshot,
+            findings,
+            ids,
+            vec![result],
+            corpus,
+            &receipt,
+            &unavailable_receipt(),
+        )
+        .unwrap();
+        assert_eq!(applied.kept.len(), 1);
+        assert_eq!(applied.unresolved_indices, vec![0]);
+        assert!(applied.suppressed.is_empty());
     }
 
     #[test]
@@ -3078,17 +3240,30 @@ mod tests {
             ..result
         };
         assert!(
-            apply_results(
+            validate_results(
                 &snapshot,
-                findings,
-                ids,
-                vec![lexical_refutation],
+                &findings,
+                &ids,
+                std::slice::from_ref(&lexical_refutation),
                 corpus,
                 &direct,
                 &lexical_match,
             )
             .is_err()
         );
+        let applied = apply_results(
+            &snapshot,
+            findings,
+            ids,
+            vec![lexical_refutation],
+            corpus,
+            &direct,
+            &lexical_match,
+        )
+        .unwrap();
+        assert_eq!(applied.kept.len(), 1);
+        assert_eq!(applied.unresolved_indices, vec![0]);
+        assert!(applied.suppressed.is_empty());
     }
 
     #[test]
@@ -3168,7 +3343,7 @@ mod tests {
         let corpus = "+ image: old-image\n";
         let direct = direct_receipt(&snapshot, corpus, &findings, &ids);
 
-        let error = apply_results(
+        let applied = apply_results(
             &snapshot,
             findings,
             ids,
@@ -3177,12 +3352,10 @@ mod tests {
             &direct,
             &receipt,
         )
-        .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("candidate-specific contradictory evidence")
-        );
+        .unwrap();
+        assert_eq!(applied.kept.len(), 1);
+        assert_eq!(applied.unresolved_indices, vec![0]);
+        assert!(applied.suppressed.is_empty());
     }
 
     #[test]
@@ -3465,12 +3638,11 @@ mod tests {
                     &receipt,
                     &unavailable_receipt(),
                 );
-                if confirmed {
-                    let applied = applied.unwrap();
-                    assert_eq!(applied.kept.len(), 1);
-                    assert!(applied.suppressed.is_empty());
-                } else {
-                    assert!(applied.is_err());
+                let applied = applied.unwrap();
+                assert_eq!(applied.kept.len(), 1);
+                assert!(applied.suppressed.is_empty());
+                if !confirmed {
+                    assert_eq!(applied.unresolved_indices, vec![0]);
                 }
             }
         }

@@ -2540,7 +2540,13 @@ async fn review_diff_at(
                                         diff_snapshot.as_str(),
                                         &diff_receipt,
                                         receipt,
-                                    ) {
+                                    ).and_then(|application| {
+                                        anyhow::ensure!(
+                                            application.invalid_refutation_indices.is_empty(),
+                                            "refuted adjudication must cite candidate-specific contradictory evidence"
+                                        );
+                                        Ok(application)
+                                    }) {
                                         Ok(application) => {
                                             lockfile_platform_policy_allowed = true;
                                             application
@@ -3504,6 +3510,7 @@ fn preserve_unadjudicated_findings(
         kept_indices: (0..findings.len()).collect(),
         kept: findings,
         unresolved_indices: Vec::new(),
+        invalid_refutation_indices: Vec::new(),
         resolved_indices: Vec::new(),
         suppressed: Vec::new(),
     }
@@ -4777,6 +4784,7 @@ mod tests {
             ],
             kept_indices: vec![0, 1, 2],
             unresolved_indices: vec![0, 1, 2],
+            invalid_refutation_indices: Vec::new(),
             resolved_indices: vec![],
             suppressed: vec![],
         };
@@ -4847,6 +4855,7 @@ mod tests {
             ],
             kept_indices: vec![0, 1, 2, 3],
             unresolved_indices: vec![0, 1, 2, 3],
+            invalid_refutation_indices: Vec::new(),
             resolved_indices: Vec::new(),
             suppressed: Vec::new(),
         };
@@ -5008,6 +5017,7 @@ mod tests {
             kept: vec![ordinary.clone()],
             kept_indices: vec![1],
             unresolved_indices: Vec::new(),
+            invalid_refutation_indices: Vec::new(),
             resolved_indices: vec![0],
             suppressed: vec![SuppressedFinding {
                 finding: rejected.clone(),
