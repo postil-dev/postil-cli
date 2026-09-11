@@ -446,6 +446,28 @@ describe("scorer case diagnostics", () => {
     attempts: [accountedAttempt], envelope: { findings: [] }, passed: false,
   };
 
+  test("counts only present string costs at an untyped input boundary", () => {
+    const missingCost: typeof accountedAttempt = JSON.parse(JSON.stringify({
+      ...accountedAttempt, costProviderDecimal: undefined,
+    }));
+    expect(missingCost.costProviderDecimal).toBeUndefined();
+    for (const phase of ["adjudication", "scorer"] as const) {
+      const diagnostics = scorerCaseDiagnostics({
+        ...diagnosticInput,
+        attempts: [
+          accountedAttempt,
+          { ...accountedAttempt, costProviderDecimal: "0" },
+          { ...accountedAttempt, costProviderDecimal: null },
+          missingCost,
+        ].map((attempt) => ({ ...attempt, phase })),
+      });
+      expect(diagnostics[phase]).toEqual({
+        attempts: 4, collectedResponses: 4, validUsageAttempts: 4, exactCostAttempts: 2,
+        modelIdentityPresentAttempts: 4, providerIdentityPresentAttempts: 4,
+      });
+    }
+  });
+
   test("identifies the captured unsupported refutation without treating its accounted call as qualification", () => {
     const diagnostics = scorerCaseDiagnostics(diagnosticInput);
     expect(diagnostics.failureSignals).toEqual(["unsupportedRefutation"]);

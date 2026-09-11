@@ -194,7 +194,7 @@ export function scorerCaseDiagnostics(input: {
       // Completed means the proxy collected a response, not that it was valid.
       collectedResponses: attempts.filter((attempt) => attempt.outcome === "completed").length,
       validUsageAttempts: attempts.filter((attempt) => attempt.usageValid).length,
-      exactCostAttempts: attempts.filter((attempt) => attempt.costProviderDecimal !== null).length,
+      exactCostAttempts: attempts.filter((attempt) => typeof attempt.costProviderDecimal === "string").length,
       modelIdentityPresentAttempts: attempts.filter((attempt) => attempt.modelIdentityPresent === true).length,
       providerIdentityPresentAttempts: attempts.filter((attempt) => attempt.providerIdentityPresent === true).length,
     };
