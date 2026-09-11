@@ -68,11 +68,15 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   provider-attempt, output-token, and worst-case token-exposure budgets before calls;
   one UTF-8 byte counts as one projected token rather than using an optimistic ratio.
   A diff that exceeds its selected-request capacity enters a deterministic large-review
-  route on every surface, including `--diff-file`. Non-hosted execution selects at most
-  24 requests. Hosted execution lowers that ceiling when the configured generator,
+  route on every surface, including `--diff-file`. Hosted reviews also use that route
+  above five source batches unless explicit bounded selection is requested.
+  Non-hosted execution selects at most 24 requests. Hosted execution lowers that ceiling when the configured generator,
   consensus, scorer, uncertainty-resolution, and finding-compression fan-out needs
-  fewer requests to stay inside the 64-call watchdog plan. The route uses at most four
-  concurrent provider calls; consensus reduces batch concurrency so combined model
+  fewer requests to stay inside the 64-call watchdog plan. Admission divides the
+  remaining generation budget across the selected batch waves, reserving time for
+  at least one bounded attempt per operation. Retries and corrections share each
+  operation's slot; completed waves do not reset the deadline or spend counters.
+  The route uses at most four concurrent provider calls; consensus reduces batch concurrency so combined model
   fan-out stays within that limit. It commits an exact hunk receipt by SHA-256 before provider
   contact. Security,
   authorization, configuration, policy, billing, migration, release-control, and

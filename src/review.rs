@@ -68,9 +68,9 @@ pub(crate) const HOSTED_LLM_TOTAL_TIMEOUT_SECS: u64 = 540;
 /// operation. Hosted review generation applies the shorter operation slot
 /// below across the primary attempt, retries, and correction call together.
 pub(crate) const HOSTED_LLM_REQUEST_TIMEOUT_SECS: u64 = 240;
-/// Every hosted review-model operation, including retries and correction, is
-/// bounded by this slot. Admission prices complete batch waves and sequential
-/// cascades against the review-phase deadline.
+/// Default hosted review-model slot before preflight. Admission divides the
+/// remaining phase budget across complete batch waves and sequential cascades;
+/// each operation shares its assigned slot with retries and correction.
 pub(crate) const LARGE_DIFF_LLM_REQUEST_TIMEOUT_SECS: u64 = 60;
 pub(crate) const HOSTED_LLM_REVIEW_TIMEOUT_SECS: u64 = 420;
 pub(crate) const HOSTED_REVIEW_SCHEDULING_RESERVE_SECS: u64 = 30;
@@ -1823,7 +1823,11 @@ async fn review_diff_at(
                 model_used = "none (empty diff)".to_string();
                 review_trust = filter::ReviewTrust::Exhaustive;
             } else {
-                let large_diff_receipt = (batches.count > large_diff_selected_limit)
+                let hosted_source_schedule = crate::config::hosted_runtime_mode()
+                    && !args.bounded
+                    && batches.source_count > MAX_HOSTED_SELECTED_BATCHES;
+                let large_diff_receipt = (batches.count > large_diff_selected_limit
+                    || hosted_source_schedule)
                     .then(|| batches.deterministic_bounded_receipt(large_diff_selected_limit))
                     .transpose()?;
                 if let Some(receipt) = &large_diff_receipt {
@@ -4462,7 +4466,7 @@ mod tests {
         assert_eq!(hosted_review_timeout_secs(&scorer_disabled), 360);
         assert_eq!(
             crate::llm::max_hosted_review_batches(&scorer_disabled, false).unwrap(),
-            20
+            24
         );
 
         let scorer_enabled_budgets = hosted_review_phase_budgets(&scorer_enabled);
@@ -4483,7 +4487,7 @@ mod tests {
         assert_eq!(hosted_review_timeout_secs(&scorer_enabled), 240);
         assert_eq!(
             crate::llm::max_hosted_review_batches(&scorer_enabled, false).unwrap(),
-            12
+            23
         );
     }
 

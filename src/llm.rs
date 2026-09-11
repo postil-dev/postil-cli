@@ -804,7 +804,11 @@ pub(crate) fn max_hosted_review_batches(cfg: &Config, planner: bool) -> Result<u
     } else {
         review_model_count
     };
-    let wave_secs = crate::review::LARGE_DIFF_LLM_REQUEST_TIMEOUT_SECS
+    // Reserve one viable attempt per operation. Preflight divides the actual
+    // phase budget across the selected waves; the request timeout is a ceiling,
+    // not a minimum allocation that excludes otherwise affordable evidence.
+    let wave_secs = RETRY_ATTEMPT_RESERVE
+        .as_secs()
         .checked_mul(
             u64::try_from(sequential_models)
                 .context("planned sequential review model count exceeds duration range")?,
@@ -2737,10 +2741,8 @@ impl LlmClient {
             review_deadline,
             total_deadline,
         )?;
-        // The wave slot every hosted plan is priced against. It is a floor, not
-        // the slot a review ends up running under: `ensure_hosted_review_schedule`
-        // widens it once the real operation count is known. This value stands
-        // only for a review that never reaches preflight.
+        // Preflight assigns a slot from the real operation count and remaining
+        // phase budget. This default applies before a schedule is admitted.
         client.review_model_timeout = Some(timeouts.request.min(Duration::from_secs(
             crate::review::LARGE_DIFF_LLM_REQUEST_TIMEOUT_SECS,
         )));
@@ -5105,16 +5107,14 @@ impl LlmClient {
 
     /// The slot one model operation may run for.
     ///
-    /// Preflight prices the plan against the wave slot and then records what
-    /// the operations it actually scheduled leave for each of them, which for a
-    /// review that fits in one wave is most of the generator phase rather than
-    /// one wave's worth of it. Before preflight, and outside hosted review, the
-    /// priced slot stands.
+    /// Preflight divides the remaining phase budget across the admitted waves.
+    /// Each operation shares its slot with retries and correction calls.
+    /// Before preflight, the configured default slot applies.
     fn scheduled_review_model_slot(&self) -> Option<Duration> {
         let base = self.review_model_timeout?;
         match self.review_model_slot_secs.load(Ordering::Relaxed) {
             0 => Some(base),
-            seconds => Some(Duration::from_secs(seconds).max(base)),
+            seconds => Some(Duration::from_secs(seconds)),
         }
     }
 
@@ -5142,7 +5142,12 @@ impl LlmClient {
             .context("hosted review schedule operation count overflowed")?;
         let operations = u32::try_from(review_model_operations)
             .context("hosted review schedule operation count exceeds duration range")?;
-        let required = slot
+        ensure!(
+            operations > 0,
+            "hosted review schedule has no model operations"
+        );
+        let minimum_slot = slot.min(RETRY_ATTEMPT_RESERVE);
+        let required = minimum_slot
             .checked_mul(operations)
             .context("hosted review schedule duration overflowed")?;
         let remaining = self
@@ -5160,15 +5165,10 @@ impl LlmClient {
             elapsed_text(required),
             elapsed_text(available),
         );
-        // The plan is priced per wave, but it is admitted as a whole, so what
-        // the phase leaves each of these operations is what each may run for.
-        // Holding them to the wave slot when the schedule is one operation wide
-        // spends a fraction of the phase and calls the rest a provider failure.
-        let widened = Duration::from_secs(available.as_secs() / u64::from(operations))
-            .min(self.request_timeout)
-            .max(slot);
+        let scheduled = Duration::from_secs(available.as_secs() / u64::from(operations))
+            .min(self.request_timeout);
         self.review_model_slot_secs
-            .store(widened.as_secs(), Ordering::Relaxed);
+            .store(scheduled.as_secs(), Ordering::Relaxed);
         Ok(())
     }
 
@@ -7223,8 +7223,8 @@ mod tests {
             .expect("a four-batch review must schedule");
         let many_slot = many.scheduled_review_model_slot().unwrap();
         assert!(
-            many_slot >= wave_slot,
-            "a scheduled slot may never fall below the slot the plan was priced at"
+            many_slot >= RETRY_ATTEMPT_RESERVE,
+            "a scheduled slot must leave time for one bounded attempt"
         );
         assert!(
             many_slot
@@ -7260,6 +7260,49 @@ mod tests {
         assert!(
             deadline.saturating_duration_since(Instant::now()) > wave_slot,
             "the operation must run under the scheduled slot, not the priced wave slot"
+        );
+    }
+
+    #[test]
+    fn complete_hosted_source_schedule_shares_the_existing_phase_budget() {
+        let _lock = env_lock().lock().unwrap();
+        let config = Config {
+            scorer_enabled: true,
+            scorer: "openai/gpt-5.6-luna".into(),
+            ..Config::default()
+        };
+        let budget = crate::review::hosted_review_timeout_secs(&config);
+        assert_eq!(budget, 240);
+        let mut client = LlmClient::build(
+            &config,
+            "test-key".into(),
+            Duration::from_secs(420),
+            Some(Instant::now() + Duration::from_secs(budget)),
+            Some(Instant::now() + Duration::from_secs(540)),
+        )
+        .unwrap();
+        client.review_model_timeout = Some(Duration::from_secs(60));
+        assert!(max_hosted_review_batches(&config, false).unwrap() >= 14);
+        client
+            .ensure_hosted_review_schedule(&config, 14, false, 4)
+            .expect("four source waves must share the existing generation budget");
+        let slot = client.scheduled_review_model_slot().unwrap();
+        assert!(slot < Duration::from_secs(60));
+        assert!(slot >= RETRY_ATTEMPT_RESERVE);
+        assert!(slot * 4 <= Duration::from_secs(budget - 30));
+        let operation = client.for_review_model_operation();
+        assert!(
+            operation
+                .remaining_budget(LlmPhase::Review)
+                .unwrap()
+                .unwrap()
+                <= slot
+        );
+        client.review_deadline = Some(Instant::now() + Duration::from_secs(45));
+        assert!(
+            client
+                .ensure_hosted_review_schedule(&config, 14, false, 4)
+                .is_err()
         );
     }
 
@@ -8619,7 +8662,7 @@ mod tests {
             ..Config::default()
         };
         let capacity = max_hosted_review_batches(&config, true).unwrap();
-        assert_eq!(capacity, 4);
+        assert_eq!(capacity, 13);
         let review_model_count = planned_review_models(&config).len();
         let review_calls = capacity * review_model_count * MAX_LOGICAL_CALLS_PER_REVIEW_MODEL;
         let planner_calls = review_model_count * MAX_LOGICAL_CALLS_PER_REVIEW_MODEL;
@@ -8656,15 +8699,15 @@ mod tests {
             ..Config::default()
         };
         for (generator_count, scorer_count, without_planner, with_planner) in [
-            (1, 0, Some(20), Some(16)),
-            (1, 1, Some(12), Some(8)),
-            (1, 2, Some(12), Some(8)),
-            (2, 0, Some(8), Some(6)),
-            (2, 1, Some(6), Some(2)),
-            (2, 2, Some(6), Some(2)),
+            (1, 0, Some(24), Some(23)),
+            (1, 1, Some(23), Some(22)),
+            (1, 2, Some(22), Some(21)),
+            (2, 0, Some(8), Some(7)),
+            (2, 1, Some(7), Some(6)),
+            (2, 2, Some(7), Some(6)),
             (3, 0, Some(3), Some(2)),
-            (3, 1, Some(2), None),
-            (3, 2, Some(2), None),
+            (3, 1, Some(2), Some(1)),
+            (3, 2, Some(2), Some(1)),
         ] {
             let config = config(generator_count, scorer_count);
             assert_eq!(
@@ -8692,8 +8735,8 @@ mod tests {
             ..Config::default()
         };
 
-        assert_eq!(max_hosted_review_batches(&config, false).unwrap(), 8);
-        assert_eq!(max_hosted_review_batches(&config, true).unwrap(), 4);
+        assert_eq!(max_hosted_review_batches(&config, false).unwrap(), 10);
+        assert_eq!(max_hosted_review_batches(&config, true).unwrap(), 9);
     }
 
     #[tokio::test]
@@ -8755,7 +8798,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hosted_schedule_boundary_rejects_a_seventh_batch_wave_before_provider_contact() {
+    async fn hosted_schedule_rejects_a_wave_without_one_attempt_budget_before_provider_contact() {
         let server = wiremock::MockServer::start().await;
         let config = Config {
             api_base: server.uri(),
@@ -8766,7 +8809,7 @@ mod tests {
             ..Config::default()
         };
         let deadline = Instant::now()
-            + Duration::from_secs(crate::review::HOSTED_REVIEW_SCHEDULING_RESERVE_SECS + 361);
+            + Duration::from_secs(crate::review::HOSTED_REVIEW_SCHEDULING_RESERVE_SECS + 91);
         let mut client = LlmClient::build(
             &config,
             "test-key".into(),
