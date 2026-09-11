@@ -46,6 +46,7 @@ import {
   reviewCoverageFailure,
   safeSegment,
   scorerCasePasses,
+  scorerCaseDiagnostics,
   scorerCostProviderDecimal,
   scorerEvalRootDir,
   scorerEvaluatorDigest,
@@ -427,6 +428,95 @@ describe("parseRepeatCount", () => {
     expect(parseRepeatCount("3")).toBe(3);
     expect(() => parseRepeatCount("0")).toThrow("1..10");
     expect(() => parseRepeatCount("11")).toThrow("1..10");
+  });
+});
+
+describe("scorer case diagnostics", () => {
+  const accountedAttempt: Parameters<typeof scorerCaseDiagnostics>[0]["attempts"][number] = {
+    phase: "adjudication", outcome: "completed", durationMs: 100,
+    promptTokens: 1125, completionTokens: 396, costUsd: 0.000548064,
+    costProviderDecimal: "0.000548064", usageValid: true, httpStatus: 200,
+    modelIdentityPresent: true, providerIdentityPresent: true, usagePresent: true,
+    errorPresent: false,
+  };
+  const semanticFailure = "postil: finding adjudication validation failed; preserving all generated findings: refuted adjudication must cite candidate-specific contradictory evidence";
+  const unavailable = "postil: finding adjudication unavailable; preserving all generated findings";
+  const diagnosticInput = {
+    child: { exitCode: 1, stderr: `${semanticFailure}\n`, timedOut: false },
+    attempts: [accountedAttempt], envelope: { findings: [] }, passed: false,
+  };
+
+  test("identifies the captured unsupported refutation without treating its accounted call as qualification", () => {
+    const diagnostics = scorerCaseDiagnostics(diagnosticInput);
+    expect(diagnostics.failureSignals).toEqual(["unsupportedRefutation"]);
+    expect(diagnostics.requiredUpstreamAttempts).toBe(2);
+    expect(diagnostics.adjudication).toEqual({
+      attempts: 1, collectedResponses: 1, validUsageAttempts: 1, exactCostAttempts: 1,
+      modelIdentityPresentAttempts: 1, providerIdentityPresentAttempts: 1,
+    });
+    expect(diagnostics.scorer.attempts).toBe(0);
+    const original = result({
+      id: "clean-comment-only", repeat: 2, scenario: "falseFinding",
+      scorerModel: null, scorerConfidence: null, scorerKind: null,
+      upstreamRequests: 1, usageAccountingComplete: true, usageValid: false,
+      reasonContractValid: false, publicationValid: false, passed: false,
+    });
+    const observed = { ...original, diagnostics };
+    const { diagnostics: _diagnostics, ...priorFields } = observed;
+    expect(priorFields).toEqual(original);
+    expect(isAdmissionFatalStructuralResult(observed, original.model)).toBe(true);
+    expect(aggregate(original.model, [observed], 3)).toEqual(aggregate(original.model, [original], 3));
+    expect(aggregate(original.model, [observed], 3).passed).toBe(false);
+  });
+
+  test("separates native parser and provider failures from unclassified unavailability", () => {
+    const input = { ...diagnosticInput, child: { ...diagnosticInput.child, stderr: unavailable } };
+    expect(scorerCaseDiagnostics({ ...input, envelope: {
+      findings: [], modelIncidents: [{ phase: "scorer", category: "invalidOutput", recovered: false }],
+    } }).failureSignals).toEqual(["adjudicationParser"]);
+    expect(scorerCaseDiagnostics({ ...input, envelope: {
+      findings: [{ path: ".postil/provider", title: "Model provider unavailable" }],
+    } }).failureSignals).toEqual(["adjudicationProvider"]);
+    expect(scorerCaseDiagnostics(input).failureSignals).toEqual(["adjudicationUnavailable"]);
+  });
+
+  test("retains timeout and invalid-envelope observations without conflating response collection with success", () => {
+    const diagnostics = scorerCaseDiagnostics({
+      ...diagnosticInput, envelope: undefined,
+      child: { exitCode: undefined, timedOut: true, stderr: "" },
+      attempts: [
+        { ...accountedAttempt, outcome: "timedOut", usageValid: false, costProviderDecimal: null, httpStatus: null },
+        { ...accountedAttempt, phase: "scorer", httpStatus: 503, errorPresent: true },
+      ],
+    });
+    expect(diagnostics.childExitCode).toBeNull();
+    expect(diagnostics.failureSignals).toEqual(["childTimeout", "invalidEnvelope", "upstreamTimeout", "upstreamHttp"]);
+    expect(diagnostics.adjudication.validUsageAttempts).toBe(0);
+    expect(diagnostics.adjudication.exactCostAttempts).toBe(0);
+    expect(diagnostics.scorer.collectedResponses).toBe(1);
+    expect(scorerCaseDiagnostics({
+      ...diagnosticInput, child: { exitCode: 0, timedOut: false, stderr: "" },
+      attempts: [{ ...accountedAttempt, errorPresent: true }], passed: true,
+    }).failureSignals).toEqual([]);
+  });
+
+  test("emits bounded deduplicated codes without copying arbitrary messages or payload properties", () => {
+    const marker = "credential=PRIVATE_MARKER Authorization: Bearer PRIVATE_MARKER";
+    const diagnostics = scorerCaseDiagnostics({
+      ...diagnosticInput,
+      child: { ...diagnosticInput.child, stderr: `${semanticFailure} ${marker}\n${marker}\n`.repeat(1000) },
+      publicationFailureCodes: ["check-run-state", "check-run-state", marker],
+    });
+    expect(diagnostics.failureSignals).toEqual(["adjudicationValidation"]);
+    expect(diagnostics.publicationFailureCodes).toEqual(["check-run-state"]);
+    expect(JSON.stringify(diagnostics)).not.toContain("PRIVATE_MARKER");
+    expect(JSON.stringify(diagnostics).length).toBeLessThan(1024);
+    expect(scorerCaseDiagnostics({ ...diagnosticInput,
+      child: { ...diagnosticInput.child, stderr: marker },
+    }).failureSignals).toEqual(["unknown"]);
+    expect(scorerCaseDiagnostics({ ...diagnosticInput,
+      child: { ...diagnosticInput.child, stderr: `${semanticFailure}\n`.repeat(1000) },
+    }).failureSignals).toEqual(["unsupportedRefutation"]);
   });
 });
 
@@ -948,6 +1038,11 @@ describe("scorer proxy and isolated runtime", () => {
         passed: true,
         findingPublished: false,
         gateFailing: false,
+        diagnostics: {
+          childExitCode: 0, requiredUpstreamAttempts: 2, failureSignals: [], publicationFailureCodes: [],
+          adjudication: { attempts: 1, collectedResponses: 1, validUsageAttempts: 1, exactCostAttempts: 1 },
+          scorer: { attempts: 1, collectedResponses: 1, validUsageAttempts: 1, exactCostAttempts: 1 },
+        },
       });
       expect(scorerRequests).toHaveLength(1);
       const scorerRequest = JSON.parse(scorerRequests[0]!) as {
@@ -1253,6 +1348,10 @@ describe("scorer evaluation checkpoints", () => {
       name: "MODEL_BODY_MARKER",
       reason: "API_SECRET_MARKER",
       scorerError: "UPSTREAM_RESPONSE_MARKER",
+      diagnostics: scorerCaseDiagnostics({
+        child: { exitCode: undefined, stderr: "API_SECRET_MARKER", timedOut: true },
+        attempts: [], passed: false,
+      }),
     });
     try {
       await writeScorerEvalCheckpoint(jsonOut, ["scorer/model"], 1, 2, [sensitive]);
@@ -1268,6 +1367,7 @@ describe("scorer evaluation checkpoints", () => {
       });
       expect(first.cases).toHaveLength(1);
       expect(first.cases[0]?.publicationValid).toBe(true);
+      expect(first.cases[0]?.diagnostics).toEqual(sensitive.diagnostics);
       expect(firstRaw).not.toContain("MODEL_BODY_MARKER");
       expect(firstRaw).not.toContain("API_SECRET_MARKER");
       expect(firstRaw).not.toContain("UPSTREAM_RESPONSE_MARKER");
@@ -1646,6 +1746,13 @@ describe("qualification utilities", () => {
       cases: [],
     });
     expect(qualificationExitCode(report([passing]))).toBe(0);
+    const observedCases = qualificationCases(1).map((entry) => ({
+      ...entry,
+      diagnostics: scorerCaseDiagnostics({ child: { exitCode: 0, stderr: "", timedOut: false },
+        attempts: [], envelope: { findings: [] }, passed: entry.passed }),
+    }));
+    expect(aggregate("scorer/model", observedCases, 1)).toEqual(passing);
+    expect(qualificationExitCode({ ...report([passing]), cases: observedCases })).toBe(0);
     expect(qualificationExitCode(report([{ ...passing, passed: false }]))).toBe(1);
     expect(qualificationExitCode({ ...report([passing]), completedCases: 1, matrixComplete: false })).toBe(1);
     expect(qualificationExitCode(report([]))).toBe(1);
