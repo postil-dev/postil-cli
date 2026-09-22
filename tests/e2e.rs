@@ -16113,6 +16113,7 @@ async fn causal_scope_contract_prevents_context_relabeling_before_scoring() {
         "pre-existing-zero",
         "pre-existing-missing",
         "pre-existing-failed",
+        "pre-existing-hosted-failed",
         "pre-existing-unaccounted",
         "pre-existing-disabled",
         "carried-full",
@@ -16123,6 +16124,9 @@ async fn causal_scope_contract_prevents_context_relabeling_before_scoring() {
         "long-context",
         "long-cause",
     ] {
+        if mode == "pre-existing-hosted-failed" && !cfg!(feature = "qualification-candidate") {
+            continue;
+        }
         let carried = mode.starts_with("carried-");
         let pre_existing = mode.starts_with("pre-existing");
         let excluded = pre_existing || carried;
@@ -16144,7 +16148,7 @@ async fn causal_scope_contract_prevents_context_relabeling_before_scoring() {
         let expected_cause = cause.clone();
         Mock::given(method("POST")).and(path("/chat/completions"))
             .respond_with(move |request: &Request| {
-                let response = if request_system_contains(request, "single finding adjudicator") {
+                let mut response = if request_system_contains(request, "single finding adjudicator") {
                     let body: Value = request.body_json().unwrap();
                     assert!(body["messages"][0]["content"].as_str().unwrap().starts_with("You are Postil's single finding adjudicator. "));
                     let payload: Value = serde_json::from_str(body["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap()).unwrap();
@@ -16166,7 +16170,7 @@ async fn causal_scope_contract_prevents_context_relabeling_before_scoring() {
                     }).collect::<Vec<_>>();
                     scorer_text(&json!(result).to_string())
                 } else if request_system_contains(request, "independent second-model scorer") {
-                    if mode == "pre-existing-failed" {
+                    if matches!(mode, "pre-existing-failed" | "pre-existing-hosted-failed") {
                         return ResponseTemplate::new(400).set_body_json(json!({"error":{"message":"The scorer request cannot be completed."}}));
                     }
                     let confidence = match mode {
@@ -16195,6 +16199,10 @@ async fn causal_scope_contract_prevents_context_relabeling_before_scoring() {
                     }
                     llm_content(if carried { json!([]) } else { json!([generated]) })
                 };
+                if mode == "pre-existing-hosted-failed" {
+                    response["model"] = json!("openai/gpt-5.6-luna");
+                    response["provider"] = json!("Azure");
+                }
                 ResponseTemplate::new(200).set_body_json(response)
             }).with_priority(1).mount(&server).await;
         let directory = tempfile::tempdir().unwrap();
@@ -16219,6 +16227,20 @@ async fn causal_scope_contract_prevents_context_relabeling_before_scoring() {
             .args(["--output", "json"]);
         if mode == "pre-existing-disabled" {
             command.env_remove("REVIEW_SCORER_MODEL");
+        }
+        if mode == "pre-existing-hosted-failed" {
+            let profile = directory.path().join("profile.json");
+            std::fs::write(&profile, include_str!("../provisional-models.json")).unwrap();
+            command
+                .env_remove("POSTIL_API_BASE")
+                .env_remove("REVIEW_MODEL")
+                .env_remove("REVIEW_SCORER_MODEL")
+                .env("CI", "true")
+                .env("POSTIL_HOSTED_MODE", "1")
+                .env("POSTIL_PROVISIONAL_HOSTED_ROSTER", "1")
+                .env("POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY", "1")
+                .env("POSTIL_QUALIFICATION_CANDIDATE_PROFILE", profile)
+                .env("POSTIL_QUALIFICATION_CAPTURE_API_BASE", server.uri());
         }
         if carried {
             let baseline = directory.path().join("baseline.json");
@@ -16250,6 +16272,10 @@ async fn causal_scope_contract_prevents_context_relabeling_before_scoring() {
             .filter(|request| request_system_contains(request, "independent second-model scorer"))
             .collect::<Vec<_>>();
         if scope_failure {
+            assert!(
+                !stderr.contains("hosted scorer could not complete the admitted profile"),
+                "{mode}: {stderr}"
+            );
             assert!(!scorer_requests.is_empty(), "{mode}");
             assert!(
                 envelope["findings"]

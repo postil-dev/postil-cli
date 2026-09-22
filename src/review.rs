@@ -2945,6 +2945,7 @@ async fn review_diff_at(
                                 }
                             }
                             if pending_refutation_recovery.is_empty()
+                                && pending_scope_exclusions.is_empty()
                                 && scorer_failure_blocks_hosted(
                                     crate::config::hosted_runtime_mode(),
                                     scorer_error.is_some(),
@@ -2971,9 +2972,15 @@ async fn review_diff_at(
                         if !pending_refutation_recovery.is_empty()
                             || !pending_scope_exclusions.is_empty()
                         {
-                            eprintln!(
-                                "postil: adjudication recovery or scope exclusion requires complete supporting scoring; preserving the invalid-output blocker"
-                            );
+                            if !pending_refutation_recovery.is_empty() {
+                                eprintln!(
+                                    "postil: unsupported refutation recovery requires complete validated scoring; preserving the invalid-output blocker"
+                                );
+                            } else {
+                                eprintln!(
+                                    "postil: scope exclusion requires complete supporting scoring; preserving the invalid-output blocker"
+                                );
+                            }
                             review_trust = filter::ReviewTrust::Failed;
                             model_incidents.push(ModelIncident {
                                 phase: ModelIncidentPhase::Scorer,
