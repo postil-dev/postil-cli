@@ -144,6 +144,96 @@ export interface ScorerCaseDiagnostics {
   scorer: ScorerPhaseDiagnostics;
   failureSignals: ScorerFailureSignal[];
   publicationFailureCodes: string[];
+  responses: ScorerResponseDiagnostics[];
+  responsesOmitted: number;
+}
+
+export const SCORER_DIAGNOSTIC_RESPONSE_LIMIT = 32;
+const SCORER_DIAGNOSTIC_ERROR_CODE_LIMIT = 8;
+
+interface ScorerResponseMetadata {
+  jsonShape: "object" | "other" | "invalid" | "unobserved";
+  errorLocations: Array<"topLevel" | "choice">;
+  numericErrorCodes: number[];
+  errorCodesOmitted: number;
+  malformedError: boolean;
+  conflictingErrorCodes: boolean;
+}
+
+interface ScorerResponseDiagnostics extends ScorerResponseMetadata {
+  ordinal: number;
+  phase: ScorerAttempt["phase"];
+  outcome: ScorerAttempt["outcome"];
+  httpStatus: number | null;
+  modelIdentityPresent: boolean;
+  providerIdentityPresent: boolean;
+  exactCost: "unavailable" | "zero" | "positive";
+  accountingIssues: Array<"responseUnavailable" | "usageMissing" | "usageInvalid" | "costUnavailable">;
+}
+
+export function scorerResponseMetadata(text?: string): ScorerResponseMetadata {
+  const result: ScorerResponseMetadata = {
+    jsonShape: "unobserved", errorLocations: [], numericErrorCodes: [], errorCodesOmitted: 0,
+    malformedError: false, conflictingErrorCodes: false,
+  };
+  if (text === undefined) return result;
+  let value: unknown;
+  try { value = JSON.parse(text); } catch { return { ...result, jsonShape: "invalid" }; }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return { ...result, jsonShape: "other" };
+  }
+  result.jsonShape = "object";
+  const body = value as Record<string, unknown>;
+  const codes = new Set<number>();
+  let finishErrorWithoutCode = false;
+  const observeError = (error: unknown, location: "topLevel" | "choice") => {
+    if (error === undefined || error === null) return;
+    if (!result.errorLocations.includes(location)) result.errorLocations.push(location);
+    const object = typeof error === "object" && !Array.isArray(error)
+      ? error as Record<string, unknown> : undefined;
+    const code = object?.code;
+    const numericCode = typeof code === "number" && Number.isInteger(code) && code >= 400 && code <= 599;
+    if (numericCode) codes.add(code);
+    if (!numericCode || typeof object?.message !== "string") result.malformedError = true;
+  };
+  observeError(body.error, "topLevel");
+  if (Array.isArray(body.choices)) {
+    for (const choice of body.choices) {
+      if (typeof choice !== "object" || choice === null || Array.isArray(choice)) continue;
+      observeError(choice.error, "choice");
+      if (choice.finish_reason === "error" && (choice.error === undefined || choice.error === null)) {
+        if (!result.errorLocations.includes("choice")) result.errorLocations.push("choice");
+        finishErrorWithoutCode = true;
+      }
+    }
+  }
+  result.numericErrorCodes = [...codes].slice(0, SCORER_DIAGNOSTIC_ERROR_CODE_LIMIT);
+  if (finishErrorWithoutCode && codes.size === 0) result.malformedError = true;
+  result.errorCodesOmitted = Math.max(0, codes.size - result.numericErrorCodes.length);
+  result.conflictingErrorCodes = codes.size > 1;
+  return result;
+}
+
+function scorerResponseDiagnostics(attempt: ScorerAttempt, ordinal: number): ScorerResponseDiagnostics {
+  const metadata = attempt.responseMetadata ?? scorerResponseMetadata();
+  const cost = typeof attempt.costProviderDecimal === "string"
+    ? canonicalProviderCost(attempt.costProviderDecimal) : null;
+  const accountingIssues: ScorerResponseDiagnostics["accountingIssues"] = [];
+  if (attempt.outcome !== "completed") accountingIssues.push("responseUnavailable");
+  else {
+    if (!attempt.usagePresent) accountingIssues.push("usageMissing");
+    else if (!attempt.usageValid) accountingIssues.push("usageInvalid");
+    if (cost === null) accountingIssues.push("costUnavailable");
+  }
+  return {
+    ordinal, phase: attempt.phase, outcome: attempt.outcome, httpStatus: attempt.httpStatus,
+    modelIdentityPresent: attempt.modelIdentityPresent, providerIdentityPresent: attempt.providerIdentityPresent,
+    exactCost: cost === null ? "unavailable" : cost === "0" ? "zero" : "positive",
+    accountingIssues,
+    jsonShape: metadata.jsonShape, errorLocations: metadata.errorLocations,
+    numericErrorCodes: metadata.numericErrorCodes, errorCodesOmitted: metadata.errorCodesOmitted,
+    malformedError: metadata.malformedError, conflictingErrorCodes: metadata.conflictingErrorCodes,
+  };
 }
 
 // Diagnostics observe native results and never participate in qualification.
@@ -207,6 +297,12 @@ export function scorerCaseDiagnostics(input: {
     failureSignals: [...signals],
     publicationFailureCodes: ["check-run-state", "review-count", "comment-count", "missing-anchor"]
       .filter((code) => input.publicationFailureCodes?.includes(code)),
+    responses: input.attempts
+      .map((attempt, index) => ({ attempt, ordinal: attempt.ordinal ?? index + 1 }))
+      .sort((left, right) => left.ordinal - right.ordinal)
+      .slice(0, SCORER_DIAGNOSTIC_RESPONSE_LIMIT)
+      .map(({ attempt, ordinal }) => scorerResponseDiagnostics(attempt, ordinal)),
+    responsesOmitted: Math.max(0, input.attempts.length - SCORER_DIAGNOSTIC_RESPONSE_LIMIT),
   };
 }
 
@@ -253,6 +349,8 @@ export interface ScorerEvalReport {
 }
 
 interface ScorerAttempt {
+  ordinal?: number;
+  responseMetadata?: ScorerResponseMetadata;
   phase: "adjudication" | "scorer";
   outcome: "completed" | "failed" | "timedOut" | "teardownAborted";
   durationMs: number;
@@ -1683,6 +1781,7 @@ export async function startScorerProxy(
     returnedBatchIds: number[];
   }> = [];
   const upstreamControllers = new Set<AbortController>();
+  let upstreamOrdinal = 0;
   let closing = false;
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     if (req.method !== "POST" || req.url !== "/chat/completions") {
@@ -1849,6 +1948,7 @@ export async function startScorerProxy(
       return;
     }
 
+    const ordinal = ++upstreamOrdinal;
     const controller = new AbortController();
     upstreamControllers.add(controller);
     let deadlineExceeded = false;
@@ -1878,6 +1978,7 @@ export async function startScorerProxy(
       } | undefined;
       const usageValid = isValidUsage(response?.usage);
       attempts.push({
+        ordinal,
         phase: isAdjudication ? "adjudication" : "scorer",
         outcome: "completed",
         durationMs: performance.now() - startedAt,
@@ -1894,11 +1995,13 @@ export async function startScorerProxy(
         providerIdentityPresent: typeof response?.provider === "string" && response.provider.length > 0,
         usagePresent: typeof response?.usage === "object" && response.usage !== null,
         errorPresent: response?.error !== undefined,
+        responseMetadata: scorerResponseMetadata(text),
       });
       res.writeHead(upstream.status, { "content-type": upstream.headers.get("content-type") ?? "application/json" });
       res.end(text);
     } catch {
       attempts.push({
+        ordinal,
         phase: isAdjudication ? "adjudication" : "scorer",
         outcome: closing ? "teardownAborted" : deadlineExceeded ? "timedOut" : "failed",
         durationMs: performance.now() - startedAt,
