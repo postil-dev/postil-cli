@@ -676,6 +676,7 @@ pub(crate) fn conservative_context_tokens(model: &str) -> usize {
     // Prefixes and substrings are configuration data, not an attestation.
     match model.trim().to_ascii_lowercase().as_str() {
         "z-ai/glm-5.2"
+        | "google/gemini-3.8-flash"
         | "moonshotai/kimi-k2.7-code"
         | "openai/gpt-5-mini"
         | "openai/gpt-5.6-luna"
@@ -6795,12 +6796,35 @@ mod tests {
             128_000
         );
         assert_eq!(conservative_context_tokens(" Z-AI/GLM-5.2 "), 128_000);
+        assert_eq!(
+            conservative_context_tokens(" GOOGLE/GEMINI-3.8-FLASH "),
+            128_000
+        );
+        assert_eq!(
+            conservative_context_tokens("google/gemini-3.8-flash-spoof"),
+            32_000
+        );
+        assert_eq!(
+            conservative_context_tokens("example/gemini-3.8-flash"),
+            32_000
+        );
         assert_eq!(conservative_context_tokens("example/glm-5.2"), 32_000);
         assert_eq!(conservative_context_tokens("z-ai/glm-5.2-spoof"), 32_000);
         assert_eq!(
             conservative_context_tokens("example/unknown-context"),
             32_000
         );
+    }
+
+    #[test]
+    fn pinned_local_review_cascade_has_explicit_context_metadata() {
+        for model in [
+            "z-ai/glm-5.2",
+            "google/gemini-3.8-flash",
+            "moonshotai/kimi-k2.7-code",
+        ] {
+            assert_eq!(conservative_context_tokens(model), 128_000, "{model}");
+        }
     }
 
     #[test]

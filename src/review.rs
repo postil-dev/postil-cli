@@ -4093,6 +4093,77 @@ mod tests {
     }
 
     #[test]
+    fn pinned_local_cascade_preserves_source_coverage_within_the_request_limit() {
+        let cfg = Config {
+            model: "z-ai/glm-5.2".into(),
+            cascade: vec![
+                "google/gemini-3.8-flash".into(),
+                "moonshotai/kimi-k2.7-code".into(),
+            ],
+            ..Config::default()
+        };
+        let models = cfg.model_chain();
+        let system = prompt::system_prompt(
+            &cfg,
+            Date::from_calendar_date(2026, time::Month::August, 10).unwrap(),
+        );
+        let budgets = serialized_review_batch_budgets(
+            &cfg,
+            cfg.max_findings,
+            &models,
+            &system,
+            &PrContext {
+                repo: None,
+                title: None,
+                body: None,
+                incremental: false,
+                content_policy: false,
+            },
+            None,
+        )
+        .unwrap()
+        .stabilized_for_rendering();
+        assert_eq!(budgets.source, MAX_REVIEW_BATCH_BYTES);
+        assert_eq!(budgets.synthesis, MAX_REVIEW_BATCH_BYTES);
+
+        let mut input = String::new();
+        for file in 0..8 {
+            input.push_str(&format!(
+                "diff --git a/src/file_{file}.rs b/src/file_{file}.rs\n--- a/src/file_{file}.rs\n+++ b/src/file_{file}.rs\n"
+            ));
+            for hunk in (file..105).step_by(8) {
+                input.push_str(&format!(
+                    "@@ -{},0 +{},20 @@\n",
+                    hunk * 50 + 1,
+                    hunk * 50 + 1
+                ));
+                for line in 0..20 {
+                    input.push_str(&format!(
+                        "+pub fn change_{hunk}_{line}() {{ enforce_policy({hunk}, {line}); }}\n"
+                    ));
+                }
+            }
+        }
+        let snapshot = diff::DiffSnapshot::from_bytes(input.as_bytes()).unwrap();
+        let mut prepared = diff::prepare_review(&snapshot).unwrap();
+        let mut batches = diff::spool_model_batches_with_synthesis_budget(
+            &mut prepared,
+            budgets.source,
+            budgets.synthesis,
+            MAX_REVIEW_MANIFEST_BYTES.min(budgets.source / 3),
+            false,
+            MAX_LARGE_DIFF_SELECTED_BATCHES,
+        )
+        .unwrap();
+        assert!(batches.count <= MAX_LARGE_DIFF_SELECTED_BATCHES);
+        let receipt = batches
+            .deterministic_bounded_receipt(MAX_LARGE_DIFF_SELECTED_BATCHES)
+            .unwrap();
+        assert_eq!(receipt.direct_hunks(), 105);
+        assert_eq!(receipt.unreviewed_hunks(), 0);
+    }
+
+    #[test]
     fn exact_serialized_shared_context_admits_local_and_ci_batch_edges() {
         let cfg = Config {
             model: "postil-bench/recorded".to_string(),
