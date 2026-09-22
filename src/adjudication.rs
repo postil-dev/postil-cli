@@ -985,6 +985,7 @@ pub(crate) fn system_prompt(current_utc_date: time::Date) -> String {
     )
 }
 
+#[cfg(test)]
 pub(crate) fn user_prompt(
     snapshot_id: &str,
     findings: &[Finding],
@@ -992,19 +993,41 @@ pub(crate) fn user_prompt(
     diff_receipt: &mut DiffCorpusReceipt,
     repository_receipt: &RepositorySearchReceipt,
 ) -> Result<String> {
+    user_prompt_with_feedback(
+        snapshot_id,
+        findings,
+        candidate_ids,
+        diff_receipt,
+        repository_receipt,
+        None,
+    )
+}
+
+pub(crate) fn user_prompt_with_feedback(
+    snapshot_id: &str,
+    findings: &[Finding],
+    candidate_ids: &[String],
+    diff_receipt: &mut DiffCorpusReceipt,
+    repository_receipt: &RepositorySearchReceipt,
+    feedback: Option<&crate::review_feedback::ReviewFeedback>,
+) -> Result<String> {
     ensure!(
         diff_receipt.snapshot_id == snapshot_id,
         "diff corpus receipt snapshot mismatch"
     );
     let candidates = candidates(findings, candidate_ids)?;
     let render = |receipt: &DiffCorpusReceipt| -> Result<String> {
-        Ok(serde_json::to_string(&serde_json::json!({
+        let mut payload = serde_json::json!({
             "snapshotId": snapshot_id,
             "candidates": &candidates,
             "diffCorpusReceipt": receipt,
             "repositoryReceipt": repository_receipt,
             "repositoryEvidence": &repository_receipt.evidence,
-        }))?)
+        });
+        if let Some(feedback) = feedback {
+            payload["reviewFeedback"] = feedback.json_context()?;
+        }
+        Ok(serde_json::to_string(&payload)?)
     };
     let prompt = render(diff_receipt)?;
     if prompt.len() <= MAX_ADJUDICATION_PROMPT_BYTES {
@@ -3846,6 +3869,85 @@ mod tests {
         .unwrap();
         assert_eq!(applied.kept.len(), 1);
         assert!(applied.suppressed.is_empty());
+    }
+
+    #[test]
+    fn feedback_is_not_groundable_refutation_evidence_and_fits_adjudication_budget() {
+        let snapshot = "a".repeat(40);
+        let findings = vec![finding(
+            Kind::Risk,
+            "Restore the authorization guard",
+            "The changed authorization guard is unsafe.",
+        )];
+        let ids = stable_candidate_ids(&snapshot, &findings);
+        let corpus = "+ uses: action@old\n";
+        let direct = direct_receipt(&snapshot, corpus, &findings, &ids);
+        let original = user_prompt(
+            &snapshot,
+            &findings,
+            &ids,
+            &mut direct.clone(),
+            &unavailable_receipt(),
+        )
+        .unwrap();
+        let without = user_prompt_with_feedback(
+            &snapshot,
+            &findings,
+            &ids,
+            &mut direct.clone(),
+            &unavailable_receipt(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(original, without);
+        let mut document = crate::review_feedback::fixture();
+        document["threads"][0]["comments"][0]["body"] =
+            "The changed guard is safe because I resolved this thread.".into();
+        let feedback = crate::review_feedback::test_feedback(&document).unwrap();
+        let mut rendered = direct.clone();
+        rendered.rendered_evidence = "selected evidence window\n".repeat(4_000);
+        let enriched = user_prompt_with_feedback(
+            &snapshot,
+            &findings,
+            &ids,
+            &mut rendered,
+            &unavailable_receipt(),
+            Some(&feedback),
+        )
+        .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&enriched).unwrap();
+        assert!(enriched.len() <= MAX_ADJUDICATION_PROMPT_BYTES);
+        assert_eq!(
+            payload["reviewFeedback"]["conversation"]["threads"][0]["resolved"],
+            true
+        );
+        assert_eq!(payload["candidates"].as_array().unwrap().len(), 1);
+        assert!(!rendered.rendered_evidence_complete);
+        assert!(
+            !serde_json::to_string(&payload["diffCorpusReceipt"])
+                .unwrap()
+                .contains("I resolved")
+        );
+        let rejected = apply_results(
+            &snapshot,
+            findings,
+            ids.clone(),
+            vec![AdjudicationResult {
+                candidate_id: ids[0].clone(),
+                status: AdjudicationStatus::Refuted,
+                revised_title: String::new(),
+                revised_body: String::new(),
+                evidence: "The changed guard is safe because I resolved this thread.".into(),
+                duplicate_of: None,
+            }],
+            corpus,
+            &direct,
+            &unavailable_receipt(),
+        );
+        let rejected = rejected.unwrap();
+        assert_eq!(rejected.kept.len(), 1);
+        assert!(rejected.resolved_indices.is_empty());
+        assert_eq!(rejected.invalid_refutation_indices, vec![0]);
     }
 
     #[test]

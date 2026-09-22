@@ -134,6 +134,15 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   every affected candidate; otherwise the invalid-output blocker remains.
   Semantic duplicates collapse across files and kinds only when one established defect remains;
   distinct defects sharing a line remain separate.
+- `prompt.rs`: optional `POSTIL_REVIEW_FEEDBACK_PATH` input binds version-1
+  conversation JSON to the exact repository, pull-request number and reviewed head.
+  Numeric actor IDs and containing-thread root IDs preserve attribution and thread binding;
+  display names do not establish authority. Bounded conversation text reaches the
+  generator, adjudicator and scorer as untrusted context, outside numbered repository
+  and PR-description evidence. Resolution and replies do not automatically dismiss
+  findings or substitute for repository-grounded refutation. Admission accounts for
+  the serialized context, and durable plan identities include its canonical bytes.
+  Reviews without feedback retain their existing prompts and plan identities.
 - `forge/`: trait + GitHub, GitLab, Bitbucket Cloud, and Azure DevOps implementations,
   with self-managed base URLs where the same API contract applies. Paginated forge
   metadata has aggregate byte and changed-file bounds. Source responses stream to

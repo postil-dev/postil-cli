@@ -27,6 +27,7 @@ pub mod prompt;
 pub(crate) mod repository_search;
 pub(crate) mod resolve;
 pub mod review;
+pub(crate) use prompt::review_feedback;
 pub mod sarif;
 
 #[cfg(test)]
