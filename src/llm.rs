@@ -9802,6 +9802,7 @@ mod tests {
             cited_evidence: Some("e".into()),
             diff_hunk: "h".into(),
             related_evidence: Some("r".into()),
+            scope_evidence: None,
         }]);
         assert!(prompt.contains("\"severity\": \"warn\""));
         assert!(!prompt.contains("\"kind\":"));
