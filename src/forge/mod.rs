@@ -1963,19 +1963,45 @@ pub fn check_summary(envelope: &Envelope, rich: bool, context: SummaryContext) -
                 },
             ));
         }
-        for suppressed in disclosed {
-            let publication =
-                crate::envelope::forge_safe_finding_publication_text(&suppressed.finding);
-            s.push_str(&format!(
-                "- **{}** at `{}`:{}: {}; severity {}, confidence {}. {}\n",
-                publication.title,
-                safe_code_text(&suppressed.finding.path),
-                suppressed.finding.line,
-                suppression_reason(suppressed.reason),
-                suppressed.finding.severity.as_str(),
-                format_confidence(suppressed.finding.confidence),
-                publication.body,
-            ));
+        let has_duplicates = disclosed
+            .iter()
+            .any(|entry| entry.reason == SuppressionReason::DuplicateRootCause);
+        for duplicates in [true, false] {
+            let group: Vec<_> = disclosed
+                .iter()
+                .filter(|entry| {
+                    (entry.reason == SuppressionReason::DuplicateRootCause) == duplicates
+                })
+                .collect();
+            if group.is_empty() {
+                continue;
+            }
+            if has_duplicates {
+                s.push_str(if duplicates {
+                    "**Duplicate copies**\n\n"
+                } else {
+                    "**Other suppressed candidates**\n\n"
+                });
+            }
+            for suppressed in group {
+                let publication =
+                    crate::envelope::forge_safe_finding_publication_text(&suppressed.finding);
+                s.push_str(&format!(
+                    "**{}**\n\n`{}:{}`\n\nSuppressed: {}.\n\n",
+                    publication.title,
+                    safe_code_text(&suppressed.finding.path),
+                    suppressed.finding.line,
+                    suppression_reason(suppressed.reason),
+                ));
+                if !duplicates {
+                    s.push_str(&format!(
+                        "Severity {}, confidence {}.\n\n{}\n\n",
+                        suppressed.finding.severity.as_str(),
+                        format_confidence(suppressed.finding.confidence),
+                        publication.body,
+                    ));
+                }
+            }
         }
         if rich {
             s.push_str("\n</details>\n");
@@ -2019,9 +2045,7 @@ fn suppression_reason(reason: SuppressionReason) -> &'static str {
         SuppressionReason::BelowConfidence => "below the configured confidence threshold",
         SuppressionReason::MaxFindings => "outside the configured finding cap",
         SuppressionReason::AnchorMismatch => "cites a line the named construct does not sit on",
-        SuppressionReason::DuplicateRootCause => {
-            "restates a retained finding about another location"
-        }
+        SuppressionReason::DuplicateRootCause => "duplicates the same underlying concern",
         SuppressionReason::DerivedFromSuppressed => "built on a finding suppressed as mis-anchored",
         SuppressionReason::RepositoryClaimUnsupported => "repository-wide claim is not publishable",
         SuppressionReason::MachineClaimRefuted => "source premise was deterministically refuted",
@@ -3143,6 +3167,62 @@ mod tests {
     }
 
     #[test]
+    fn suppressed_summary_separates_duplicate_copies_without_changing_evidence() {
+        let duplicate = Finding {
+            title: "Backup recovery is unverified".into(),
+            body: "Repeated backup evidence stays in the original envelope.".into(),
+            ..finding()
+        };
+        let other = Finding {
+            title: "Backup restore needs validation".into(),
+            body: "The restore command has no observed successful result.\n\nValidate a restore before relying on the backup.".into(),
+            ..finding()
+        };
+        let mut env = envelope_with_findings(vec![]);
+        env.suppressed_findings = vec![
+            crate::envelope::SuppressedFinding {
+                finding: duplicate.clone(),
+                reason: SuppressionReason::DuplicateRootCause,
+            },
+            crate::envelope::SuppressedFinding {
+                finding: other,
+                reason: SuppressionReason::BelowConfidence,
+            },
+        ];
+        let original = serde_json::to_value(&env).unwrap();
+        for rich in [true, false] {
+            let summary = check_summary(&env, rich, Default::default());
+            assert!(summary.contains(
+                "**Duplicate copies**\n\n**Backup recovery is unverified**\n\n`src/auth.rs:41`"
+            ));
+            assert!(summary.contains("Suppressed: duplicates the same underlying concern.\n\n"));
+            assert!(summary.contains("**Other suppressed candidates**\n\n"));
+            assert!(summary.contains("Suppressed: below the configured confidence threshold.\n\nSeverity error, confidence 0.91.\n\nThe restore command"));
+            assert!(summary.contains("\n\nValidate a restore"));
+            assert!(!summary.contains(&duplicate.body));
+            assert!(!summary.contains("another location"));
+            assert!(!summary.contains("retained finding"));
+            assert!(!summary.contains("- **Backup"));
+        }
+        assert_eq!(serde_json::to_value(&env).unwrap(), original);
+    }
+
+    #[test]
+    fn duplicate_only_summary_does_not_imply_an_active_original() {
+        let mut env = envelope_with_findings(vec![]);
+        env.suppressed_findings = vec![crate::envelope::SuppressedFinding {
+            finding: finding(),
+            reason: SuppressionReason::DuplicateRootCause,
+        }];
+        let summary = check_summary(&env, true, Default::default());
+        assert!(summary.contains("1 suppressed</summary>"));
+        assert!(summary.contains("**Duplicate copies**"));
+        assert!(!summary.contains("Other suppressed candidates"));
+        assert!(!summary.contains("retained finding"));
+        assert!(!summary.contains(&finding().body));
+    }
+
+    #[test]
     fn only_exact_virtual_anchors_are_synthetic() {
         assert!(is_synthetic_path(crate::envelope::PROVIDER_PATH));
         assert!(is_synthetic_path(crate::envelope::OPERATIONAL_PATH));
@@ -3225,7 +3305,7 @@ mod tests {
         assert!(summary.starts_with(&format!("{} **1 advisory finding open**", icon_md("info"))));
         assert!(!summary.contains("does not block"));
         assert!(!summary.contains("Unsanitized input reaches query"));
-        assert!(!summary.contains("src/auth.rs:41"));
+        assert!(summary.contains("`src/auth.rs:41`"));
         assert!(!summary.contains("Review metadata"));
         assert!(!summary.contains("abcdef1"));
         assert!(summary.contains(&format!(
@@ -3233,7 +3313,7 @@ mod tests {
             icon_md("info")
         )));
         assert!(summary.contains("Lower confidence concern 0"));
-        assert!(summary.contains("severity error, confidence 0.91"));
+        assert!(summary.contains("Severity error, confidence 0.91."));
         assert!(summary.contains("Evidence from the changed branch"));
         assert!(!summary.contains("Ignored generated file"));
         assert!(summary.contains("postil review --staged"));
