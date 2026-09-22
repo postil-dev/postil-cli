@@ -19,6 +19,7 @@ import {
   SCORER_CASE_HARNESS_ALLOWANCE_MS,
   SCORER_MAX_CASE_MS,
   SCORER_REASON_SCHEMA_PATTERN,
+  SCORER_DIAGNOSTIC_RESPONSE_LIMIT,
   TRUE_FINDING_CASES,
   aggregate,
   assertCleanScorerEvaluatorStatus,
@@ -47,6 +48,7 @@ import {
   safeSegment,
   scorerCasePasses,
   scorerCaseDiagnostics,
+  scorerResponseMetadata,
   scorerCostProviderDecimal,
   scorerEvalRootDir,
   scorerEvaluatorDigest,
@@ -446,6 +448,95 @@ describe("scorer case diagnostics", () => {
     attempts: [accountedAttempt], envelope: { findings: [] }, passed: false,
   };
 
+  test("retains error then recovery in dispatch order without changing qualification", () => {
+    const failed = {
+      ...accountedAttempt, ordinal: 1, usagePresent: false, usageValid: false,
+      costProviderDecimal: null, modelIdentityPresent: false, providerIdentityPresent: false,
+      responseMetadata: scorerResponseMetadata(JSON.stringify({ error: { code: 503, message: crypto.randomUUID() } })),
+    };
+    const recovered = { ...accountedAttempt, ordinal: 2, responseMetadata: scorerResponseMetadata("{}") };
+    const diagnostics = scorerCaseDiagnostics({ ...diagnosticInput, attempts: [recovered, failed] });
+    expect(diagnostics.responses.map((item) => item.ordinal)).toEqual([1, 2]);
+    expect(diagnostics.responses[0]).toMatchObject({
+      phase: "adjudication", httpStatus: 200, outcome: "completed", numericErrorCodes: [503],
+      errorLocations: ["topLevel"], exactCost: "unavailable",
+      accountingIssues: ["usageMissing", "costUnavailable"],
+    });
+    expect(diagnostics.responses[1]).toMatchObject({ exactCost: "positive", accountingIssues: [] });
+    const original = result({ upstreamRequests: 4, usageAccountingComplete: false, usageValid: false, passed: false });
+    const observed = { ...original, diagnostics };
+    expect(aggregate(original.model, [observed], 1)).toEqual(aggregate(original.model, [original], 1));
+    expect(isAdmissionFatalStructuralResult(observed, original.model)).toBe(true);
+  });
+
+  test("distinguishes explicit zero cost, missing cost, invalid usage and absent responses", () => {
+    const diagnostics = scorerCaseDiagnostics({ ...diagnosticInput, attempts: [
+      { ...accountedAttempt, costProviderDecimal: "0", promptTokens: 0, completionTokens: 0, usageValid: false },
+      { ...accountedAttempt, costProviderDecimal: null },
+      { ...accountedAttempt, costProviderDecimal: "not-a-cost" },
+      { ...accountedAttempt, outcome: "timedOut", httpStatus: null, costProviderDecimal: null, usagePresent: false },
+    ] });
+    expect(diagnostics.responses.map(({ exactCost, accountingIssues }) => ({ exactCost, accountingIssues }))).toEqual([
+      { exactCost: "zero", accountingIssues: ["usageInvalid"] },
+      { exactCost: "unavailable", accountingIssues: ["costUnavailable"] },
+      { exactCost: "unavailable", accountingIssues: ["costUnavailable"] },
+      { exactCost: "unavailable", accountingIssues: ["responseUnavailable"] },
+    ]);
+    expect(diagnostics.responses[3]?.httpStatus).toBeNull();
+  });
+
+  test("projects partial choice errors, conflicts, malformed codes and null absence safely", () => {
+    const privateValue = crypto.randomUUID();
+    const partial = scorerResponseMetadata(JSON.stringify({
+      error: { code: 429, message: privateValue },
+      choices: [
+        { message: { content: privateValue } },
+        { error: { code: 503, message: privateValue }, finish_reason: "error" },
+        { error: { code: "503", message: privateValue } },
+      ],
+      usage: { prompt_tokens: 10, completion_tokens: 2, cost: 0.000003 },
+      [privateValue]: privateValue,
+    }));
+    expect(partial).toMatchObject({ jsonShape: "object", errorLocations: ["topLevel", "choice"],
+      numericErrorCodes: [429, 503], malformedError: true, conflictingErrorCodes: true });
+    expect(JSON.stringify(partial)).not.toContain(privateValue);
+    expect(scorerResponseMetadata('{"error":null,"choices":[{"error":null}]}')).toMatchObject({
+      errorLocations: [], numericErrorCodes: [], malformedError: false, conflictingErrorCodes: false,
+    });
+    expect(scorerResponseMetadata('{"choices":[{"finish_reason":"error"}]}')).toMatchObject({
+      errorLocations: ["choice"], numericErrorCodes: [], malformedError: true,
+    });
+    expect(scorerResponseMetadata(JSON.stringify({ error: { code: 503, message: privateValue },
+      choices: [{ finish_reason: "error" }] }))).toMatchObject({
+      numericErrorCodes: [503], malformedError: false,
+    });
+    for (const error of [false, [], { code: 503 }, { code: 200, message: privateValue }]) {
+      expect(scorerResponseMetadata(JSON.stringify({ error })).malformedError).toBe(true);
+    }
+    expect(scorerResponseMetadata("{").jsonShape).toBe("invalid");
+    expect(scorerResponseMetadata("null").jsonShape).toBe("other");
+    expect(scorerResponseMetadata().jsonShape).toBe("unobserved");
+  });
+
+  test("bounds retained responses and error codes with explicit omitted counts", () => {
+    const metadata = scorerResponseMetadata(JSON.stringify({ choices: Array.from({ length: 200 }, (_, n) => ({
+      error: { code: 400 + n, message: crypto.randomUUID() },
+    })) }));
+    expect(metadata.numericErrorCodes).toEqual([400, 401, 402, 403, 404, 405, 406, 407]);
+    expect(metadata.errorCodesOmitted).toBe(192);
+    expect(metadata.conflictingErrorCodes).toBe(true);
+    const diagnostics = scorerCaseDiagnostics({ ...diagnosticInput,
+      attempts: Array.from({ length: SCORER_DIAGNOSTIC_RESPONSE_LIMIT + 3 }, (_, index) => ({
+        ...accountedAttempt, ordinal: index + 1, responseMetadata: metadata,
+      })).reverse(),
+    });
+    expect(diagnostics.responses).toHaveLength(SCORER_DIAGNOSTIC_RESPONSE_LIMIT);
+    expect(diagnostics.responses[0]?.ordinal).toBe(1);
+    expect(diagnostics.responses.at(-1)?.ordinal).toBe(SCORER_DIAGNOSTIC_RESPONSE_LIMIT);
+    expect(diagnostics.responsesOmitted).toBe(3);
+    expect(diagnostics.adjudication.attempts).toBe(SCORER_DIAGNOSTIC_RESPONSE_LIMIT + 3);
+  });
+
   test("counts only present string costs at an untyped input boundary", () => {
     const missingCost: typeof accountedAttempt = JSON.parse(JSON.stringify({
       ...accountedAttempt, costProviderDecimal: undefined,
@@ -702,6 +793,66 @@ describe("scorer calibration findings", () => {
 });
 
 describe("scorer proxy and isolated runtime", () => {
+  test("retains safe error and recovery metadata through the proxy, checkpoint and final report", async () => {
+    const marker = crypto.randomUUID();
+    const replies = [
+      { status: 429, text: JSON.stringify({ error: { code: 429, message: marker } }) },
+      { status: 200, text: JSON.stringify({ choices: [{ error: { code: 503, message: marker } }],
+        usage: { prompt_tokens: 10, completion_tokens: 2, cost: 0 } }) },
+      { status: 200, text: JSON.stringify({ model: "scorer/model", provider: "Azure",
+        choices: [{ finish_reason: "stop", message: { content: marker } }],
+        usage: { prompt_tokens: 10, completion_tokens: 2, cost: 0.000003 } }) },
+    ];
+    let requestIndex = 0;
+    const upstream = createServer(async (req, res) => {
+      await requestBody(req);
+      const reply = replies[requestIndex++]!;
+      res.writeHead(reply.status, { "content-type": "application/json" });
+      res.end(reply.text);
+    });
+    const upstreamBase = await listen(upstream);
+    const proxy = await startScorerProxy(fixture("clean-comment-only"), "falseFinding", upstreamBase, crypto.randomUUID());
+    const root = await mkdtemp(join(tmpdir(), "postil-scorer-response-metadata-"));
+    try {
+      for (const expected of replies) {
+        const response = await fetch(`${proxy.baseUrl}/chat/completions`, {
+          method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(scorerRequest()),
+        });
+        expect(response.status).toBe(expected.status);
+        expect(await response.text()).toBe(expected.text);
+      }
+      expect(requestIndex).toBe(3);
+      const diagnostics = scorerCaseDiagnostics({
+        child: { exitCode: 0, timedOut: false, stderr: "" }, attempts: proxy.attempts,
+        envelope: { findings: [] }, passed: false,
+      });
+      expect(diagnostics.responses.map(({ ordinal, httpStatus, numericErrorCodes, exactCost, accountingIssues }) =>
+        ({ ordinal, httpStatus, numericErrorCodes, exactCost, accountingIssues }))).toEqual([
+        { ordinal: 1, httpStatus: 429, numericErrorCodes: [429], exactCost: "unavailable", accountingIssues: ["usageMissing", "costUnavailable"] },
+        { ordinal: 2, httpStatus: 200, numericErrorCodes: [503], exactCost: "zero", accountingIssues: [] },
+        { ordinal: 3, httpStatus: 200, numericErrorCodes: [], exactCost: "positive", accountingIssues: [] },
+      ]);
+      expect(diagnostics.responses.every((response) => response.phase === "scorer")).toBe(true);
+      expect(diagnostics.responses[1]?.errorLocations).toEqual(["choice"]);
+      expect(diagnostics.responses[1]?.malformedError).toBe(false);
+      expect(diagnostics.responses[2]?.modelIdentityPresent).toBe(true);
+      expect(diagnostics.responses[2]?.providerIdentityPresent).toBe(true);
+      const observed = result({ diagnostics, passed: false, upstreamRequests: 3, usageValid: false });
+      const jsonOut = join(root, "report.json");
+      await writeScorerEvalCheckpoint(jsonOut, ["scorer/model"], 1, 1, [observed]);
+      const partial = await readFile(scorerCheckpointPath(jsonOut), "utf8");
+      expect(JSON.parse(partial).cases[0].diagnostics).toEqual(diagnostics);
+      expect(partial).not.toContain(marker);
+      await finalizeScorerEvalReport(jsonOut, JSON.stringify({ cases: [observed] }));
+      const final = await readFile(jsonOut, "utf8");
+      expect(JSON.parse(final).cases[0].diagnostics).toEqual(diagnostics);
+      expect(final).not.toContain(marker);
+    } finally {
+      await proxy.close(); await close(upstream);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("routes only trusted model and request-shape combinations", () => {
     const azureContract = proxyContract();
     expect(scorerProxyRequestPhase({ model: GENERATOR_MODEL }, azureContract)).toBe("generator");
