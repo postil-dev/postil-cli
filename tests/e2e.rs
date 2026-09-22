@@ -1160,6 +1160,7 @@ const ISOLATED_POSTIL_ENV: &[&str] = &[
     "POSTIL_ENDPOINT_AUTH_VALUE",
     "POSTIL_LARGE_REVIEW_PLAN_ENDPOINT",
     "POSTIL_LARGE_REVIEW_PLAN_TOKEN",
+    "POSTIL_REVIEW_FEEDBACK_PATH",
     "POSTIL_ALLOW_PRIVATE_API_BASE",
     "POSTIL_DETAILS_URL",
     "POSTIL_PREVENTION_HINT",
@@ -10603,6 +10604,112 @@ async fn error_default_fails_closed_and_blocks() {
     assert_eq!(env["gate"]["failing"], true);
     // An HTTP-level model failure is provider-class, not unusable output.
     assert_eq!(env["findings"][0]["path"], ".postil/provider");
+}
+
+#[tokio::test]
+async fn feedback_reaches_all_review_stages_without_dismissing_a_resolved_thread() {
+    let server = MockServer::start().await;
+    mount_github_complete_diff(&server, 7).await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .and(header("Accept", "application/vnd.github.v3.diff"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(DIFF))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/api/pulls/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "title":"Add login","body":"Review the login change.","state":"open","merged":false,
+            "head":{"sha":"a".repeat(40)},"base":{"sha":"b".repeat(40)},"changed_files":1
+        })))
+        .mount(&server)
+        .await;
+    mock_review(&server, json!([finding_at(41, "error", 0.99)])).await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("independent second-model scorer"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(scorer_content(json!([
+            {"confidence":0.99,"kind":"risk","reason":"The source still passes unchecked input to the query."}
+        ])))).with_priority(1).expect(1).mount(&server).await;
+    let directory = tempfile::tempdir().unwrap();
+    let feedback_path = directory.path().join("feedback.json");
+    std::fs::write(&feedback_path, json!({
+        "version":1,"repository":"acme/api","prNumber":7,"headSha":"a".repeat(40),
+        "threads":[{"findingId":"previous-finding","rootCommentId":11,"resolved":true,"comments":[
+            {"commentId":12,"author":{"id":13,"login":"maintainer"},
+             "body":"FEEDBACK_ONLY: The recovery procedure is documented in the component guide.","updatedAt":"2026-09-21T00:00:00Z"}
+        ]}]
+    }).to_string()).unwrap();
+    let output = postil()
+        .current_dir(directory.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("GITHUB_API_URL", server.uri())
+        .env("GITHUB_TOKEN", fixture_credential("github"))
+        .env("REVIEW_SCORER_MODEL", "provider/scorer")
+        .env("POSTIL_REVIEW_FEEDBACK_PATH", &feedback_path)
+        .args([
+            "review",
+            "--repo",
+            "acme/api",
+            "--pr",
+            "7",
+            "--no-post",
+            "--output-json",
+        ])
+        .assert()
+        .code(1);
+    let envelope: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    assert_eq!(envelope["gate"]["failing"], true);
+    assert_eq!(envelope["findings"].as_array().unwrap().len(), 1);
+    let requests = server.received_requests().await.unwrap();
+    let model_requests = requests
+        .iter()
+        .filter(|request| request.url.path() == "/chat/completions")
+        .collect::<Vec<_>>();
+    assert_eq!(model_requests.len(), 3);
+    for request in model_requests {
+        let body: Value = request.body_json().unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        assert!(
+            !messages
+                .iter()
+                .filter(|message| message["role"] == "system")
+                .any(|message| message["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("FEEDBACK_ONLY"))
+        );
+        let user = messages.last().unwrap()["content"].as_str().unwrap();
+        assert!(user.contains("FEEDBACK_ONLY"));
+        assert!(user.contains("UNTRUSTED JSON data"));
+    }
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.url.path().ends_with("/reviews"))
+    );
+}
+
+#[tokio::test]
+async fn feedback_for_an_unbound_local_review_fails_before_provider_contact() {
+    let server = MockServer::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let diff = write_diff(directory.path());
+    let feedback = directory.path().join("feedback.json");
+    std::fs::write(&feedback, json!({"version":1,"repository":"acme/api","prNumber":7,"headSha":"a".repeat(40),"threads":[]}).to_string()).unwrap();
+    let output = postil()
+        .current_dir(directory.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_REVIEW_FEEDBACK_PATH", feedback)
+        .args(["review", "--diff-file"])
+        .arg(diff)
+        .arg("--output-json")
+        .assert()
+        .failure();
+    assert!(
+        String::from_utf8_lossy(&output.get_output().stderr).contains("does not match this review")
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]

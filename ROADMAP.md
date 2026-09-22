@@ -7,6 +7,8 @@
 - Two-check semantics (postil/review advisory, postil/gate blocking); `gate.onError:
   block|advisory` for fail-open on provider outages.
 - Incremental re-review with resolved/carried reconciliation.
+- Repository, pull-request and head-bound conversation context for generation,
+  adjudication and scoring, with bounded inputs and source-grounded refutation.
 - SARIF 2.1.0 output (`--sarif`) for code-scanning ingestion.
 - Repo guardrails file (`.postil/guardrails.md`) injected into the prompt; violations
   surface as `kind: guardrail` findings that quote the rule.

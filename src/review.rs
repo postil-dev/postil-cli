@@ -1575,6 +1575,7 @@ struct ReviewBatchPromptContext<'a> {
     content_policy_active: bool,
     bounded_selection: bool,
     multiple: bool,
+    feedback: Option<&'a crate::review_feedback::ReviewFeedback>,
 }
 
 const BOUNDED_SOURCE_BATCH_CONTEXT: &str = "This source batch is one bounded view of a larger diff. Review only supplied evidence; do not claim examination of omitted lines. Other boundary, risk, and synthesis batches are reviewed separately.\n\n";
@@ -1614,7 +1615,12 @@ fn review_batch_prompt(
         incremental: context.incremental,
         content_policy: first && context.content_policy_active,
     };
-    let mut user = prompt::user_prompt(&prompt_context, &annotated, context.max_findings);
+    let mut user = prompt::user_prompt_with_feedback(
+        &prompt_context,
+        &annotated,
+        context.max_findings,
+        context.feedback,
+    );
     if exact_semantic {
         user.push_str(
             "\n\nThis bounded semantic proof batch contains exact low-risk hunk evidence. Each credited hunk retains its repository path, stable identity, and a non-empty added line. Cite only the exact numbered path and line displayed in this request.",
@@ -1654,6 +1660,7 @@ impl ReviewBatchBudgets {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serialized_review_batch_budget_for_shape(
     cfg: &Config,
     max_findings: usize,
@@ -1662,9 +1669,11 @@ fn serialized_review_batch_budget_for_shape(
     context: &PrContext<'_>,
     batch_context: &str,
     suffix: &str,
+    feedback: Option<&crate::review_feedback::ReviewFeedback>,
 ) -> Result<usize> {
     let review_output_tokens = crate::llm::REVIEW_MAX_OUTPUT_TOKENS as usize;
-    let mut admission_user = prompt::user_prompt(context, batch_context, max_findings);
+    let mut admission_user =
+        prompt::user_prompt_with_feedback(context, batch_context, max_findings, feedback);
     admission_user.push_str(suffix);
     models
         .iter()
@@ -1700,6 +1709,7 @@ fn serialized_review_batch_budgets(
     models: &[String],
     system: &str,
     context: &PrContext<'_>,
+    feedback: Option<&crate::review_feedback::ReviewFeedback>,
 ) -> Result<ReviewBatchBudgets> {
     Ok(ReviewBatchBudgets {
         source: serialized_review_batch_budget_for_shape(
@@ -1710,6 +1720,7 @@ fn serialized_review_batch_budgets(
             context,
             BOUNDED_SOURCE_BATCH_CONTEXT,
             MULTIPLE_BATCH_CONTEXT,
+            feedback,
         )?,
         synthesis: serialized_review_batch_budget_for_shape(
             cfg,
@@ -1719,6 +1730,7 @@ fn serialized_review_batch_budgets(
             context,
             BOUNDED_SYNTHESIS_BATCH_CONTEXT,
             SYNTHESIS_BATCH_CONTEXT,
+            feedback,
         )?,
     })
 }
@@ -1749,6 +1761,8 @@ async fn review_diff_at(
         llm_budget_started_at,
         repository_source,
     } = input;
+    let feedback =
+        crate::review_feedback::ReviewFeedback::from_env(repo, args.pr, head_sha.as_deref())?;
     let review_started = std::time::Instant::now();
     let mut prepared = diff::prepare_review_with_ignore(diff_snapshot, &cfg.ignore)?;
     let input_incomplete = prepared.reserved_anchor;
@@ -1863,6 +1877,7 @@ async fn review_diff_at(
                 &chain[..active_model_count],
                 &system,
                 &admission_context,
+                feedback.as_ref(),
             )?
         };
         let invalid_input = if let Some(invalid_input) = preliminary_invalid_input {
@@ -1911,10 +1926,16 @@ async fn review_diff_at(
                 let hosted_source_schedule = crate::config::hosted_runtime_mode()
                     && !args.bounded
                     && batches.source_count > MAX_HOSTED_SELECTED_BATCHES;
-                let large_diff_receipt = (batches.count > large_diff_selected_limit
+                let mut large_diff_receipt = (batches.count > large_diff_selected_limit
                     || hosted_source_schedule)
                     .then(|| batches.deterministic_bounded_receipt(large_diff_selected_limit))
                     .transpose()?;
+                if let Some(receipt) = &mut large_diff_receipt {
+                    receipt.plan_sha256 = crate::review_feedback::bind_plan_identity(
+                        receipt.plan_sha256.clone(),
+                        feedback.as_ref(),
+                    );
+                }
                 if let Some(receipt) = &large_diff_receipt {
                     eprintln!(
                         "postil: deterministic large-review plan={} direct_hunks={} semantic_hunks={} unreviewed_hunks={} selected_batches={}/{} concurrency={} request_timeout={}s review_budget={}s",
@@ -1974,7 +1995,10 @@ async fn review_diff_at(
                         } else {
                             let inventory = batches.durable_request_plan()?;
                             DurableReviewPlan::new(
-                                inventory.plan_sha256,
+                                crate::review_feedback::bind_plan_identity(
+                                    inventory.plan_sha256,
+                                    feedback.as_ref(),
+                                ),
                                 u32::try_from(inventory.direct_hunks)
                                     .context("direct hunk count exceeds durable plan range")?,
                                 0,
@@ -2036,6 +2060,7 @@ async fn review_diff_at(
                     content_policy_active,
                     bounded_selection: bounded_candidates.is_some() || deterministic_large_review,
                     multiple: planned_batch_count > 1,
+                    feedback: feedback.as_ref(),
                 };
                 if crate::config::hosted_runtime_mode() {
                     let preflight_ids = if let Some(receipt) = &large_diff_receipt {
@@ -2584,12 +2609,13 @@ async fn review_diff_at(
                                 .expect("repository search receipt was just assigned");
                             let adjudication_system =
                                 crate::adjudication::system_prompt(current_utc_date);
-                            let adjudication_user = crate::adjudication::user_prompt(
+                            let adjudication_user = crate::adjudication::user_prompt_with_feedback(
                                 &snapshot_id,
                                 &all_adjudication_candidates,
                                 &candidate_ids,
                                 &mut diff_receipt,
                                 receipt,
+                                feedback.as_ref(),
                             );
                             let adjudicated = match adjudication_user {
                                 Ok(adjudication_user) => Some(
@@ -2765,7 +2791,10 @@ async fn review_diff_at(
                                     &kept,
                                     evidence_budget,
                                 );
-                                let scorer_user = prompt::scorer_user_prompt(&inputs);
+                                let scorer_user = prompt::scorer_user_prompt_with_feedback(
+                                    &inputs,
+                                    feedback.as_ref(),
+                                );
                                 let prompt_bytes =
                                     scorer_system.len().saturating_add(scorer_user.len());
                                 if prompt_bytes <= MAX_SCORER_PROMPT_BYTES || evidence_budget == 0 {
@@ -4088,6 +4117,7 @@ mod tests {
                     incremental: false,
                     content_policy: true,
                 },
+                None,
             )
             .unwrap()
         };
@@ -4117,6 +4147,85 @@ mod tests {
             diff::MIN_REVIEW_BATCH_BYTES - 380
         );
         assert!(!review_batch_budgets_are_usable(below_floor_budgets));
+    }
+
+    #[test]
+    fn feedback_is_charged_to_serialized_admission_and_every_generator_batch() {
+        let cfg = Config {
+            model: "postil-bench/recorded".into(),
+            api_base: "http://127.0.0.1:1".into(),
+            ..Config::default()
+        };
+        let context = PrContext {
+            repo: Some("example/project"),
+            title: None,
+            body: None,
+            incremental: false,
+            content_policy: false,
+        };
+        let system = prompt::system_prompt(
+            &cfg,
+            Date::from_calendar_date(2026, time::Month::September, 21).unwrap(),
+        );
+        let feedback =
+            crate::review_feedback::test_feedback(&crate::review_feedback::fixture()).unwrap();
+        let models = [cfg.model.clone()];
+        let original = serialized_review_batch_budgets(
+            &cfg,
+            cfg.max_findings,
+            &models,
+            &system,
+            &context,
+            None,
+        )
+        .unwrap();
+        let enriched = serialized_review_batch_budgets(
+            &cfg,
+            cfg.max_findings,
+            &models,
+            &system,
+            &context,
+            Some(&feedback),
+        )
+        .unwrap();
+        let request_bytes = |feedback| {
+            let mut user = prompt::user_prompt_with_feedback(
+                &context,
+                BOUNDED_SOURCE_BATCH_CONTEXT,
+                cfg.max_findings,
+                feedback,
+            );
+            user.push_str(MULTIPLE_BATCH_CONTEXT);
+            crate::llm::serialized_review_request_bytes(
+                &cfg,
+                &cfg.model,
+                &system,
+                &user,
+                crate::llm::REVIEW_MAX_OUTPUT_TOKENS,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            original.source - enriched.source,
+            request_bytes(Some(&feedback)) - request_bytes(None)
+        );
+        assert!(enriched.synthesis < original.synthesis);
+        let batch_context = ReviewBatchPromptContext {
+            max_findings: 5,
+            repo: Some("example/project"),
+            meta: None,
+            incremental: false,
+            content_policy_active: true,
+            bounded_selection: false,
+            multiple: true,
+            feedback: Some(&feedback),
+        };
+        for first in [true, false] {
+            let (evidence, user, _) =
+                review_batch_prompt(&batch_context, "src/a.rs\n1 + check();".into(), first);
+            assert!(!evidence.contains("caller verifies"));
+            assert!(user.contains("The caller verifies this condition."));
+        }
     }
 
     #[test]
