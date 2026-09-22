@@ -1572,25 +1572,47 @@ fn openai_response_error_status(text: &str) -> Result<Option<reqwest::StatusCode
         // Invalid JSON remains subject to the existing response validation.
         return Ok(None);
     };
-    let Some(error) = value.get("error") else {
-        return Ok(None);
-    };
-    let status = error
-        .get("code")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|code| u16::try_from(code).ok())
-        .and_then(|code| reqwest::StatusCode::from_u16(code).ok())
-        .filter(|status| status.is_client_error() || status.is_server_error());
-    match status {
-        Some(status)
-            if error
-                .get("message")
-                .is_some_and(serde_json::Value::is_string) =>
-        {
-            Ok(Some(status))
+    let choices = value.get("choices").and_then(serde_json::Value::as_array);
+    let errors = value.get("error").into_iter().chain(
+        choices
+            .into_iter()
+            .flatten()
+            .filter_map(|choice| choice.get("error")),
+    );
+    let mut selected_status = None;
+    for error in errors.filter(|error| !error.is_null()) {
+        let status = error
+            .get("code")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|code| u16::try_from(code).ok())
+            .and_then(|code| reqwest::StatusCode::from_u16(code).ok())
+            .filter(|status| status.is_client_error() || status.is_server_error())
+            .filter(|_| {
+                error
+                    .get("message")
+                    .is_some_and(serde_json::Value::is_string)
+            });
+        let Some(status) = status else {
+            return Err(anyhow::Error::new(ModelContentFailure::Malformed));
+        };
+        if selected_status.is_some_and(|previous| previous != status) {
+            return Err(anyhow::Error::new(ModelContentFailure::Malformed));
         }
-        _ => Err(anyhow::Error::new(ModelContentFailure::Malformed)),
+        selected_status = Some(status);
     }
+    if selected_status.is_none()
+        && choices.into_iter().flatten().any(|choice| {
+            choice
+                .get("finish_reason")
+                .and_then(serde_json::Value::as_str)
+                == Some("error")
+        })
+    {
+        return Err(anyhow::Error::new(ModelContentFailure::NonTerminal {
+            reason: "error".to_string(),
+        }));
+    }
+    Ok(selected_status)
 }
 
 fn provider_retry_delay(retry: u32) -> Duration {
@@ -10342,7 +10364,12 @@ mod tests {
 
     #[tokio::test]
     async fn http_200_upstream_errors_share_retry_budget_and_account_every_attempt() {
-        for (code, reported_usage) in [(429, true), (503, false)] {
+        for (code, reported_usage, error_choice) in [
+            (429, true, None),
+            (503, false, None),
+            (503, true, Some(0)),
+            (503, false, Some(1)),
+        ] {
             let server = MockServer::start().await;
             let mut body = json!({"error": {"code": code, "message": "Unavailable"}});
             if reported_usage {
@@ -10353,6 +10380,17 @@ mod tests {
                 body["provider"] = json!("Fireworks");
                 body["choices"] =
                     json!([{"finish_reason": "stop", "message": {"content": "partial"}}]);
+            }
+            if let Some(index) = error_choice {
+                let error = body.as_object_mut().unwrap().remove("error").unwrap();
+                body["model"] = json!("provider/model");
+                body["provider"] = json!("Fireworks");
+                let partial = json!({"finish_reason": "error", "message": {"content": "partial"}, "error": error});
+                body["choices"] = if index == 0 {
+                    json!([partial])
+                } else {
+                    json!([{"finish_reason": "stop", "message": {"content": "partial"}}, partial])
+                };
             }
             Mock::given(method("POST"))
                 .respond_with(
@@ -10478,7 +10516,6 @@ mod tests {
     #[tokio::test]
     async fn http_200_malformed_error_never_accepts_complete_looking_content() {
         for error in [
-            json!(null),
             json!({}),
             json!({"code": 200, "message": "Invalid"}),
             json!({"code": "429", "message": "Invalid"}),
@@ -10525,11 +10562,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pinned_route_retries_a_dropped_identity_echo_and_accepts_the_matching_retry() {
+    async fn pinned_route_null_error_preserves_identity_checks_and_matching_retry() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "error": null,
                 "choices": [{"finish_reason": "stop", "message": {"content": "unattributed"}}],
                 "usage": {"prompt_tokens": 10, "completion_tokens": 2}
             })))
@@ -10541,6 +10579,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "error": null,
                 "model": "provider/model",
                 "provider": "Fireworks",
                 "choices": [{"finish_reason": "stop", "message": {"content": "attributed"}}],
@@ -11217,6 +11256,48 @@ mod tests {
     }
 
     #[test]
+    fn http_200_error_classification_rejects_conflicting_and_malformed_choice_errors() {
+        let clean =
+            json!({"finish_reason": "stop", "message": {"content": "complete"}, "error": null});
+        let failure = json!({"finish_reason": "error", "message": {"content": "partial"},
+            "error": {"code": 503, "message": "Unavailable"}});
+        let clean_body = json!({"error": null, "choices": [clean.clone()]});
+        assert_eq!(
+            openai_response_error_status(&clean_body.to_string()).unwrap(),
+            None
+        );
+        let same_errors = json!({"error": {"code": 503, "message": "Unavailable"},
+            "choices": [failure.clone(), failure.clone()]});
+        assert_eq!(
+            openai_response_error_status(&same_errors.to_string()).unwrap(),
+            Some(reqwest::StatusCode::SERVICE_UNAVAILABLE)
+        );
+        for body in [
+            json!({"error": {"code": 401, "message": "Denied"}, "choices": [failure.clone()]}),
+            json!({"choices": [failure, {"error": {"code": 429, "message": "Limited"}}]}),
+            json!({"choices": [clean.clone(), {"error": {"code": 503}}]}),
+            json!({"error": null, "choices": [clean.clone(), {"error": "invalid"}]}),
+        ] {
+            let error = openai_response_error_status(&body.to_string()).unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<ModelContentFailure>(),
+                Some(ModelContentFailure::Malformed)
+            ));
+        }
+        let bare_failure = json!({"error": null, "choices": [clean,
+            {"finish_reason": "error", "message": {"content": "partial"}, "error": null}]});
+        let error = openai_response_error_status(&bare_failure.to_string()).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<ModelContentFailure>()
+                .unwrap()
+                .nonterminal_reason(),
+            Some("error")
+        );
+        assert!(error.downcast_ref::<ProviderHttpFailure>().is_none());
+    }
+
+    #[test]
     fn openai_nonterminal_finish_reason_rejects_complete_looking_partial_content() {
         let config = Config {
             api_base: "http://127.0.0.1:1".into(),
@@ -11232,10 +11313,6 @@ mod tests {
         )
         .unwrap();
         for (body, expected) in [
-            (
-                r#"{"choices":[{"finish_reason":"error","message":{"content":"{\"summary\":\"\",\"findings\":[]}"},"error":{"code":502,"message":"Provider disconnected"}}]}"#,
-                "error",
-            ),
             (
                 r#"{"choices":[{"finish_reason":"length","message":{"content":"{\"summary\":\"\",\"findings\":[]}"}}]}"#,
                 "length",
