@@ -1337,6 +1337,78 @@ fn generate_finding_ids(findings: &mut [Finding], head_sha: Option<&str>) {
     }
 }
 
+/// A publication identity has one lifecycle state. Active evidence takes
+/// precedence over retirement of another adjudication candidate for that ID.
+fn reconcile_finding_identities(
+    cfg: &Config,
+    head_sha: Option<&str>,
+    findings: &mut Vec<Finding>,
+    resolved: &mut Vec<Finding>,
+    suppressed: &mut Vec<SuppressedFinding>,
+) -> usize {
+    generate_finding_ids(findings, head_sha);
+    generate_finding_ids(resolved, head_sha);
+    for entry in suppressed.iter_mut() {
+        generate_finding_ids(std::slice::from_mut(&mut entry.finding), head_sha);
+    }
+    let blocking_kinds = cfg
+        .block_on_kinds
+        .iter()
+        .map(|kind| kind.as_str().to_string())
+        .collect::<Vec<_>>();
+    let priority = |finding: &Finding| {
+        (
+            crate::envelope::finding_blocks_gate(
+                finding,
+                cfg.gate_fail_on.as_str(),
+                &blocking_kinds,
+                finding.path == crate::envelope::PROVIDER_PATH
+                    && cfg.gate_on_error == OnError::Advisory,
+            ),
+            !finding.machine_claim_deferred,
+            finding.severity,
+        )
+    };
+    let mut positions = HashMap::<String, usize>::new();
+    let mut active = Vec::<Finding>::new();
+    for finding in findings.drain(..) {
+        if let Some(id) = finding.id.as_ref() {
+            if let Some(&position) = positions.get(id) {
+                let previous = &active[position];
+                // Keep an intact candidate, including its evidence and scorer
+                // provenance. Selecting by severity alone can erase a kind
+                // blocker or promote a deferred machine claim.
+                let order = priority(&finding)
+                    .cmp(&priority(previous))
+                    .then(finding.confidence.total_cmp(&previous.confidence))
+                    .then_with(|| filter::is_carried(previous).cmp(&filter::is_carried(&finding)));
+                if order.is_gt() {
+                    active[position] = finding;
+                }
+                continue;
+            }
+            positions.insert(id.clone(), active.len());
+        }
+        active.push(finding);
+    }
+    *findings = active;
+    let mut seen = positions
+        .into_keys()
+        .collect::<std::collections::HashSet<_>>();
+    // Adjudication emits a suppression alongside each retired baseline.
+    // Retain the resolution for its thread lifecycle and count it only there.
+    resolved.retain(|finding| finding.id.as_ref().is_none_or(|id| seen.insert(id.clone())));
+    let previous_suppressed = suppressed.len();
+    suppressed.retain(|entry| {
+        entry
+            .finding
+            .id
+            .as_ref()
+            .is_none_or(|id| seen.insert(id.clone()))
+    });
+    previous_suppressed - suppressed.len()
+}
+
 fn scorer_inputs(
     finding_batches: &[String],
     evidence_corpus: &[String],
@@ -2983,6 +3055,18 @@ async fn review_diff_at(
         findings.push(failure);
     }
 
+    let mut resolved = rec.resolved;
+    resolved.extend(adjudication_resolved);
+    resolved.extend(machine_application.resolved);
+    let removed_suppressions = reconcile_finding_identities(
+        cfg,
+        head_sha.as_deref(),
+        &mut findings,
+        &mut resolved,
+        &mut suppressed_findings,
+    );
+    suppressed = suppressed.saturating_sub(removed_suppressions as u32);
+
     for finding in findings
         .iter()
         .filter(|finding| crate::envelope::is_ephemeral_anchor(&finding.path))
@@ -3026,13 +3110,7 @@ async fn review_diff_at(
     counts.ungrounded = ungrounded;
     let buckets = Envelope::buckets_of(&findings);
 
-    // Generate stable IDs for findings
-    generate_finding_ids(&mut findings, head_sha.as_deref());
     model_usage.sort_by_key(|entry| entry.call_ordinal.unwrap_or(u32::MAX));
-
-    let mut resolved = rec.resolved;
-    resolved.extend(adjudication_resolved);
-    resolved.extend(machine_application.resolved);
 
     Ok(Envelope {
         version: 1,
@@ -4666,6 +4744,147 @@ mod tests {
                 .to_string()
                 .contains("required hosted check publication failed")
         );
+    }
+
+    #[test]
+    fn lifecycle_identity_keeps_blocking_evidence_and_excludes_terminal_copies() {
+        let cfg = Config::default();
+        let mut blocker = finding("src/auth.rs", 7, "The guard is bypassed.");
+        blocker.evidence = Some("execute();".into());
+        blocker.scorer_reason = Some("The guard is absent before execution.".into());
+        let mut weaker = blocker.clone();
+        weaker.severity = Severity::Warn;
+        weaker.confidence = 0.99;
+        weaker.body = "A weaker assessment of the guard.".into();
+        for reverse in [false, true] {
+            let mut findings = vec![weaker.clone(), blocker.clone()];
+            if reverse {
+                findings.reverse();
+            }
+            let mut resolved = vec![blocker.clone()];
+            let mut suppressed = vec![SuppressedFinding {
+                finding: blocker.clone(),
+                reason: SuppressionReason::DuplicateRootCause,
+            }];
+            assert_eq!(
+                reconcile_finding_identities(
+                    &cfg,
+                    None,
+                    &mut findings,
+                    &mut resolved,
+                    &mut suppressed,
+                ),
+                1
+            );
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].body, blocker.body);
+            assert_eq!(findings[0].scorer_reason, blocker.scorer_reason);
+            assert_eq!(findings[0].evidence, blocker.evidence);
+            assert!(crate::envelope::finding_blocks_gate(
+                &findings[0],
+                "error",
+                &[],
+                false
+            ));
+            assert!(resolved.is_empty());
+            assert!(suppressed.is_empty());
+        }
+    }
+
+    #[test]
+    fn lifecycle_identity_preserves_kind_and_supported_machine_claim_blockers() {
+        let cfg = Config {
+            block_on_kinds: vec![Kind::HumanEscalation],
+            ..Config::default()
+        };
+        let mut blocker = finding("src/auth.rs", 7, "The supported concern needs review.");
+        blocker.id = Some("same-lifecycle".into());
+        blocker.kind = Kind::HumanEscalation;
+        blocker.severity = Severity::Warn;
+        blocker.confidence = 0.4;
+        for deferred in [false, true] {
+            let mut nonblocking = blocker.clone();
+            nonblocking.severity = Severity::Error;
+            nonblocking.confidence = if deferred { 0.99 } else { 0.2 };
+            nonblocking.machine_claim_deferred = deferred;
+            let mut findings = vec![nonblocking, blocker.clone()];
+            reconcile_finding_identities(
+                &cfg,
+                None,
+                &mut findings,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            );
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].severity, Severity::Warn);
+            assert!(!findings[0].machine_claim_deferred);
+            assert!(crate::envelope::finding_blocks_gate(
+                &findings[0],
+                "error",
+                &["humanEscalation".into()],
+                false,
+            ));
+        }
+    }
+
+    #[test]
+    fn lifecycle_identity_keeps_distinct_duplicate_suppressions_separate_from_active_evidence() {
+        let mut active = finding("src/auth.rs", 7, "The guard is bypassed.");
+        active.id = Some("active-concern".into());
+        let mut duplicate = active.clone();
+        duplicate.id = Some("duplicate-candidate".into());
+        let mut findings = vec![active];
+        let mut resolved = Vec::new();
+        let mut suppressed = vec![SuppressedFinding {
+            finding: duplicate,
+            reason: SuppressionReason::DuplicateRootCause,
+        }];
+        assert_eq!(
+            reconcile_finding_identities(
+                &Config::default(),
+                None,
+                &mut findings,
+                &mut resolved,
+                &mut suppressed,
+            ),
+            0
+        );
+        assert_eq!(findings.len(), 1);
+        assert_eq!(suppressed.len(), 1);
+        assert_eq!(suppressed[0].reason, SuppressionReason::DuplicateRootCause);
+        assert!(resolved.is_empty());
+        assert!(crate::envelope::finding_blocks_gate(
+            &findings[0],
+            "error",
+            &[],
+            false
+        ));
+    }
+
+    #[test]
+    fn lifecycle_identity_deduplicates_terminal_states_without_merging_distinct_evidence() {
+        let mut first = finding("src/auth.rs", 7, "First source operation.");
+        first.evidence = Some("first();".into());
+        let mut second = first.clone();
+        second.evidence = Some("second();".into());
+        let mut findings = vec![first.clone(), second];
+        let retired = finding("src/retired.rs", 9, "Retired concern.");
+        let mut resolved = vec![retired.clone(), retired.clone()];
+        let mut suppressed = vec![SuppressedFinding {
+            finding: retired,
+            reason: SuppressionReason::NonActionable,
+        }];
+        reconcile_finding_identities(
+            &Config::default(),
+            Some("head"),
+            &mut findings,
+            &mut resolved,
+            &mut suppressed,
+        );
+        assert_eq!(findings.len(), 2);
+        assert_ne!(findings[0].id, findings[1].id);
+        assert_eq!(resolved.len(), 1);
+        assert!(suppressed.is_empty());
     }
 
     #[test]
