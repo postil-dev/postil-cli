@@ -4122,9 +4122,14 @@ mod tests {
             .unwrap()
         };
 
-        let local_edge = format!("Benchmark pull request{}", "x".repeat(13));
-        let ci_edge = format!("Benchmark pull request{}", "x".repeat(29));
-        let below_floor = format!("Benchmark pull request{}", "x".repeat(413));
+        let title = "Benchmark pull request";
+        let padding = batch_budgets_for_title(title)
+            .synthesis
+            .checked_sub(diff::MIN_REVIEW_BATCH_BYTES + 20)
+            .expect("the complete review contract must leave room for a minimum batch");
+        let local_edge = format!("{title}{}", "x".repeat(padding));
+        let ci_edge = format!("{title}{}", "x".repeat(padding + 16));
+        let below_floor = format!("{title}{}", "x".repeat(padding + 400));
 
         let local_budgets = batch_budgets_for_title(&local_edge);
         assert_eq!(local_budgets.synthesis, 4_116);
