@@ -448,6 +448,75 @@ describe("scorer case diagnostics", () => {
     attempts: [accountedAttempt], envelope: { findings: [] }, passed: false,
   };
 
+  const validationPrefix = "postil: finding adjudication validation failed; preserving all generated findings: ";
+  const validationCases = [
+    ["causal change is not exact changed-source evidence", "causalChangeNotExact"],
+    ["causal change source evidence is ambiguous without an exact position", "causalPositionAmbiguous"],
+    ["refuted adjudication must cite candidate-specific contradictory evidence", "refutationUnsupported"],
+    ["publication anchor has no verified source role", "anchorSourceRoleMissing"],
+    ["added anchor evidence is not an exact source slice", "addedAnchorEvidenceNotExact"],
+    ["scope evidence has an incomplete diff hunk", "incompleteScopeHunk"],
+    ["scope assessment requires a bounded reason", "scopeReasonInvalid"],
+    ["context-anchored confirmation requires a causal change reference", "causalChangeMissing"],
+    ["adjudication returned an unknown candidate identity", "unknownCandidateIdentity"],
+    ["adjudication returned a duplicate candidate identity", "duplicateCandidateIdentity"],
+  ] as const;
+
+  test("maps only complete static validation lines and preserves existing failure signals", () => {
+    for (const [message, code] of validationCases) {
+      for (const ending of ["\n", "\r\n"]) {
+        const diagnostics = scorerCaseDiagnostics({ ...diagnosticInput,
+          child: { ...diagnosticInput.child, stderr: `${validationPrefix}${message}${ending}` },
+        });
+        expect(diagnostics.adjudicationValidationCodes).toEqual([code]);
+        expect(diagnostics.adjudicationValidationCodesOmitted).toBe(0);
+        expect(diagnostics.failureSignals).toEqual([
+          code === "refutationUnsupported" ? "unsupportedRefutation" : "adjudicationValidation",
+        ]);
+      }
+    }
+  });
+
+  test("redacts unknown, suffixed, embedded and control-modified validation text", () => {
+    const marker = crypto.randomUUID();
+    const known = validationCases[0][0];
+    for (const message of ["", marker, `${known} ${marker}`, `${known}: ${marker}`, ` ${known}`, `${known}\r`, `\u001b[31m${known}`, `${known}\0${marker}`]) {
+      const diagnostics = scorerCaseDiagnostics({ ...diagnosticInput,
+        child: { ...diagnosticInput.child, stderr: `${validationPrefix}${message}` },
+      });
+      expect(diagnostics.adjudicationValidationCodes).toEqual(["unknownValidationReason"]);
+      expect(JSON.stringify(diagnostics)).not.toContain(marker);
+      expect(JSON.stringify(diagnostics)).not.toContain(known);
+    }
+    for (const line of [marker, `prefix ${validationPrefix}${known}`, `\u001b[31m${validationPrefix}${known}`, known, ""]) {
+      const diagnostics = scorerCaseDiagnostics({ ...diagnosticInput,
+        child: { ...diagnosticInput.child, stderr: line },
+      });
+      expect(diagnostics.adjudicationValidationCodes).toEqual([]);
+      expect(diagnostics.adjudicationValidationCodesOmitted).toBe(0);
+      expect(JSON.stringify(diagnostics)).not.toContain(marker);
+    }
+  });
+
+  test("deduplicates and bounds validation codes independently of stderr order", () => {
+    const lines = validationCases.map(([message]) => `${validationPrefix}${message}`);
+    lines.push(`${validationPrefix}${crypto.randomUUID()}`);
+    const expected = [...validationCases.map(([, code]) => code), "unknownValidationReason"].sort();
+    const build = (stderr: string) => scorerCaseDiagnostics({ ...diagnosticInput,
+      child: { ...diagnosticInput.child, stderr },
+    });
+    const first = build(lines.join("\n"));
+    const reversed = build([...lines, ...lines].reverse().join("\r\n"));
+    expect(first.adjudicationValidationCodes).toEqual(expected.slice(0, 8));
+    expect(first.adjudicationValidationCodesOmitted).toBe(expected.length - 8);
+    expect(reversed.adjudicationValidationCodes).toEqual(first.adjudicationValidationCodes);
+    expect(reversed.adjudicationValidationCodesOmitted).toBe(first.adjudicationValidationCodesOmitted);
+    const original = result({ usageAccountingComplete: true, usageValid: false, upstreamRequests: 1, passed: false });
+    const observed = { ...original, diagnostics: first };
+    expect(aggregate(original.model, [observed], 1)).toEqual(aggregate(original.model, [original], 1));
+    expect(isAdmissionFatalStructuralResult(observed, original.model)).toBe(isAdmissionFatalStructuralResult(original, original.model));
+  });
+
   test("retains error then recovery in dispatch order without changing qualification", () => {
     const failed = {
       ...accountedAttempt, ordinal: 1, usagePresent: false, usageValid: false,
@@ -823,9 +892,14 @@ describe("scorer proxy and isolated runtime", () => {
       }
       expect(requestIndex).toBe(3);
       const diagnostics = scorerCaseDiagnostics({
-        child: { exitCode: 0, timedOut: false, stderr: "" }, attempts: proxy.attempts,
+        child: { exitCode: 0, timedOut: false, stderr: [
+          "postil: finding adjudication validation failed; preserving all generated findings: causal change is not exact changed-source evidence",
+          `postil: finding adjudication validation failed; preserving all generated findings: ${marker}`,
+        ].join("\r\n") }, attempts: proxy.attempts,
         envelope: { findings: [] }, passed: false,
       });
+      expect(diagnostics.adjudicationValidationCodes).toEqual(["causalChangeNotExact", "unknownValidationReason"]);
+      expect(diagnostics.adjudicationValidationCodesOmitted).toBe(0);
       expect(diagnostics.responses.map(({ ordinal, httpStatus, numericErrorCodes, exactCost, accountingIssues }) =>
         ({ ordinal, httpStatus, numericErrorCodes, exactCost, accountingIssues }))).toEqual([
         { ordinal: 1, httpStatus: 429, numericErrorCodes: [429], exactCost: "unavailable", accountingIssues: ["usageMissing", "costUnavailable"] },

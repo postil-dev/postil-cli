@@ -128,6 +128,57 @@ type ScorerFailureSignal = "childTimeout" | "invalidEnvelope" |
   "adjudicationProvider" | "adjudicationUnavailable" | "upstreamTimeout" |
   "upstreamFailure" | "upstreamHttp" | "unknown";
 
+const ADJUDICATION_VALIDATION_CODES = new Map<string, string>([
+  ["adjudication candidate count exceeds its hard bound", "candidateCountExceeded"],
+  ["adjudication must return exactly one result per candidate", "resultCountMismatch"],
+  ["adjudication candidate identity count mismatch", "candidateIdentityCountMismatch"],
+  ["adjudication candidate identities are not unique", "candidateIdentitiesNotUnique"],
+  ["adjudication returned an unknown candidate identity", "unknownCandidateIdentity"],
+  ["adjudication returned a duplicate candidate identity", "duplicateCandidateIdentity"],
+  ["factual refutation cannot carry a scope assessment", "refutationHasScope"],
+  ["pre-existing scope cannot declare a duplicate", "preExistingDuplicate"],
+  ["pre-existing scope requires an explicit factual assessment", "preExistingAssessmentMissing"],
+  ["adjudication candidate cannot duplicate itself", "selfDuplicate"],
+  ["adjudication duplicate references an unknown candidate identity", "unknownDuplicateIdentity"],
+  ["only a confirmed candidate can be collapsed as a duplicate", "unconfirmedDuplicate"],
+  ["adjudication omitted a candidate identity", "candidateIdentityMissing"],
+  ["duplicate primary disappeared", "duplicatePrimaryMissing"],
+  ["duplicate primary must be a retained confirmed candidate", "duplicatePrimaryInvalid"],
+  ["semantic duplicates must establish one identical canonical defect", "duplicateCanonicalMismatch"],
+  ["semantic duplicate must retain the more concrete primary kind", "duplicatePrimaryKindInvalid"],
+  ["adjudication direct-source receipt snapshot mismatch", "snapshotMismatch"],
+  ["adjudication candidate origin receipt mismatch", "candidateOriginMismatch"],
+  ["confirmed adjudication must include revised publication text and evidence", "confirmationTextMissing"],
+  ["confirmed adjudication evidence is not in a supplied evidence window or structured receipt", "confirmationEvidenceMissing"],
+  ["repository-dependent finding is not supported by an exact complete receipt", "repositoryClaimUnsupported"],
+  ["confirmed adjudication describes evidence boundaries", "publicationEvidenceBoundary"],
+  ["confirmed adjudication makes an undeclared repository-wide claim", "undeclaredRepositoryClaim"],
+  ["refuted adjudication cannot publish revised finding text", "refutationHasPublicationText"],
+  ["refuted adjudication must cite candidate-specific contradictory evidence", "refutationUnsupported"],
+  ["unresolved adjudication cannot publish text, evidence, or duplicate identity", "unresolvedPublication"],
+  ["scope coordinate overflow", "scopeCoordinateOverflow"],
+  ["scope evidence has an incomplete diff hunk", "incompleteScopeHunk"],
+  ["scope source coordinate is ambiguous", "ambiguousScopeCoordinate"],
+  ["scope evidence has an invalid diff hunk", "invalidScopeHunk"],
+  ["scope evidence corpus identity mismatch", "scopeCorpusMismatch"],
+  ["scope assessment requires a bounded reason", "scopeReasonInvalid"],
+  ["causal change reference exceeds its bounds", "causalReferenceBounds"],
+  ["causal change must reference an addition or deletion", "causalRoleInvalid"],
+  ["publication anchor has conflicting source roles", "anchorSourceRoleConflict"],
+  ["publication anchor has no verified source role", "anchorSourceRoleMissing"],
+  ["pre-existing scope requires an unchanged anchor and no causal change", "preExistingAnchorInvalid"],
+  ["pre-existing scope requires exact unchanged-anchor evidence", "preExistingEvidenceMissing"],
+  ["pre-existing scope requires complete candidate evidence", "preExistingEvidenceIncomplete"],
+  ["causal change is not exact changed-source evidence", "causalChangeNotExact"],
+  ["causal change source evidence is ambiguous without an exact position", "causalPositionAmbiguous"],
+  ["long added anchor requires a bounded exact causal source slice", "causalSliceMissing"],
+  ["added anchor evidence is not an exact source slice", "addedAnchorEvidenceNotExact"],
+  ["metadata cause exceeds its evidence bound", "metadataCauseBounds"],
+  ["context-anchored confirmation requires a causal change reference", "causalChangeMissing"],
+  ["validated adjudication result disappeared", "validatedResultMissing"],
+]);
+const ADJUDICATION_VALIDATION_CODE_LIMIT = 8;
+
 interface ScorerPhaseDiagnostics {
   attempts: number;
   collectedResponses: number;
@@ -143,6 +194,8 @@ export interface ScorerCaseDiagnostics {
   adjudication: ScorerPhaseDiagnostics;
   scorer: ScorerPhaseDiagnostics;
   failureSignals: ScorerFailureSignal[];
+  adjudicationValidationCodes: string[];
+  adjudicationValidationCodesOmitted: number;
   publicationFailureCodes: string[];
   responses: ScorerResponseDiagnostics[];
   responsesOmitted: number;
@@ -251,6 +304,10 @@ export function scorerCaseDiagnostics(input: {
   const signals = new Set<ScorerFailureSignal>();
   const lines = new Set(input.child.stderr.split(/\r?\n/u));
   const validationPrefix = "postil: finding adjudication validation failed; preserving all generated findings: ";
+  const validationCodes = [...new Set([...lines]
+    .filter((line) => line.startsWith(validationPrefix))
+    .map((line) => ADJUDICATION_VALIDATION_CODES.get(line.slice(validationPrefix.length))
+      ?? "unknownValidationReason"))].sort();
   if (lines.has(`${validationPrefix}refuted adjudication must cite candidate-specific contradictory evidence`)) {
     signals.add("unsupportedRefutation");
   } else if ([...lines].some((line) => line.startsWith(validationPrefix))) {
@@ -295,6 +352,8 @@ export function scorerCaseDiagnostics(input: {
     adjudication: phaseCounts("adjudication"),
     scorer: phaseCounts("scorer"),
     failureSignals: [...signals],
+    adjudicationValidationCodes: validationCodes.slice(0, ADJUDICATION_VALIDATION_CODE_LIMIT),
+    adjudicationValidationCodesOmitted: Math.max(0, validationCodes.length - ADJUDICATION_VALIDATION_CODE_LIMIT),
     publicationFailureCodes: ["check-run-state", "review-count", "comment-count", "missing-anchor"]
       .filter((code) => input.publicationFailureCodes?.includes(code)),
     responses: input.attempts
