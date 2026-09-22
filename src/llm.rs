@@ -5831,7 +5831,7 @@ fn safe_response_summary(
         })
     };
     let usage_value = value.get("usage").filter(|usage| usage.is_object());
-    let exact_cost = serde_json::from_str::<ChatResponse>(text)
+    let exact_cost = serde_json::from_str::<UsageResponse>(text)
         .ok()
         .and_then(|response| response.usage)
         .and_then(|usage| usage.cost)
@@ -5940,6 +5940,11 @@ fn duration_from_env(name: &str, default_secs: Option<u64>) -> Result<Option<Dur
         return Err(anyhow!("{name} must be greater than zero"));
     }
     Ok(Some(Duration::from_secs(seconds)))
+}
+
+#[derive(Debug, Deserialize)]
+struct UsageResponse {
+    usage: Option<ChatUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -10369,6 +10374,7 @@ mod tests {
             (503, false, None),
             (503, true, Some(0)),
             (503, false, Some(1)),
+            (503, true, Some(2)),
         ] {
             let server = MockServer::start().await;
             let mut body = json!({"error": {"code": code, "message": "Unavailable"}});
@@ -10388,6 +10394,8 @@ mod tests {
                 let partial = json!({"finish_reason": "error", "message": {"content": "partial"}, "error": error});
                 body["choices"] = if index == 0 {
                     json!([partial])
+                } else if index == 2 {
+                    json!([{"error": error}])
                 } else {
                     json!([{"finish_reason": "stop", "message": {"content": "partial"}}, partial])
                 };
@@ -10443,8 +10451,37 @@ mod tests {
             assert_eq!(usage.prompt_tokens, if reported_usage { 42 } else { 12 });
             assert_eq!(usage.completion_tokens, if reported_usage { 9 } else { 3 });
             assert_eq!(usage.cost_micros, Some(if reported_usage { 13 } else { 4 }));
+            assert_eq!(
+                usage.provider_cost.map(|cost| cost.to_string()),
+                Some(
+                    if reported_usage {
+                        "0.000013"
+                    } else {
+                        "0.000004"
+                    }
+                    .to_string()
+                )
+            );
+            if reported_usage {
+                assert_eq!(
+                    calls
+                        .iter()
+                        .map(|call| call.cost_provider_decimal.as_deref())
+                        .collect::<Vec<_>>(),
+                    vec![
+                        Some("0.000003"),
+                        Some("0.000003"),
+                        Some("0.000003"),
+                        Some("0.000004")
+                    ]
+                );
+            }
             assert_eq!(complete, reported_usage);
             assert_eq!(client.admission.lock().unwrap().attempts, 4);
+            assert_eq!(
+                client.admission.lock().unwrap().reported_cost_micros,
+                if reported_usage { 13 } else { 4 }
+            );
             assert_eq!(
                 client.admission.lock().unwrap().reported_token_spend,
                 if reported_usage { 51 } else { 15 }
@@ -11253,6 +11290,20 @@ mod tests {
                 .to_string()
                 .contains(&(MAX_PROVIDER_REQUEST_BYTES + 1).to_string())
         );
+    }
+
+    #[test]
+    fn response_usage_preserves_exact_cost_without_success_choices() {
+        let body = r#"{"choices":[{"error":{"code":503,"message":"Unavailable"}}],"usage":{"prompt_tokens":10,"completion_tokens":2,"cost":0.123456789012345678}}"#;
+        let usage = safe_response_summary(body, ApiFormat::OpenaiCompatible, false)
+            .usage
+            .unwrap();
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens), (10, 2));
+        assert_eq!(
+            usage.provider_cost.unwrap().to_string(),
+            "0.123456789012345678"
+        );
+        assert_eq!(usage.cost_micros, Some(123_457));
     }
 
     #[test]
