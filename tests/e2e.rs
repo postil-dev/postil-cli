@@ -16357,3 +16357,112 @@ async fn causal_scope_follows_original_identity_after_reordering_and_suppression
         "renderHtml(input);"
     );
 }
+
+#[tokio::test]
+async fn causal_scope_preserves_historical_findings_without_current_anchors() {
+    for mode in [
+        "incremental-absent",
+        "full-absent",
+        "deleted-unresolved",
+        "deleted-demoted",
+    ] {
+        let deleted = mode.starts_with("deleted-");
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/chat/completions"))
+            .respond_with(move |request: &Request| {
+                let response = if request_system_contains(request, "single finding adjudicator") {
+                    let request: Value = request.body_json().unwrap();
+                    let payload: Value = serde_json::from_str(request["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap()).unwrap();
+                    let candidates = payload["candidates"].as_array().unwrap();
+                    assert_eq!(candidates.len(), if deleted {2} else {1}, "{mode}");
+                    let results = candidates.iter().map(|candidate| {
+                        let historical = candidate["path"] == "src/legacy.js";
+                        assert!(!historical || deleted, "baseline outside corpus entered adjudication");
+                        let unresolved = historical && mode == "deleted-unresolved";
+                        json!({"candidateId":candidate["candidateId"], "status":if unresolved {"unresolved"} else {"confirmed"},
+                            "revisedTitle":if unresolved {json!("")} else {candidate["title"].clone()},
+                            "revisedBody":if unresolved {json!("")} else {candidate["body"].clone()},
+                            "evidence":if unresolved {json!("")} else {candidate["citedEvidence"].clone()}, "duplicateOf":null})
+                    }).collect::<Vec<_>>();
+                    scorer_text(&json!(results).to_string())
+                } else if request_system_contains(request, "independent second-model scorer") {
+                    let request: Value = request.body_json().unwrap();
+                    let text = request["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap();
+                    let scored: Value = serde_json::from_str(&text[text.find('[').unwrap()..]).unwrap();
+                    assert_eq!(scored.as_array().unwrap().len(), 1, "{mode}");
+                    assert_eq!(scored[0]["path"], "src/new.js", "historical finding reached fresh scorer");
+                    scorer_content(json!([{"confidence":0.99,"kind":"risk","reason":"The new dispatch bypasses authorization."}]))
+                } else {
+                    llm_content(json!([{"path":"src/new.js","line":1,"severity":"error","kind":"risk","confidence":0.99,"title":"Authorize new dispatch","body":"The new dispatch accepts untrusted input without authorization.","evidence":"dispatch(request.body);"}]))
+                };
+                ResponseTemplate::new(200).set_body_json(response)
+            }).with_priority(1).mount(&server).await;
+        let directory = tempfile::tempdir().unwrap();
+        let diff = directory.path().join("review.diff");
+        let mut corpus = "diff --git a/src/new.js b/src/new.js\n--- /dev/null\n+++ b/src/new.js\n@@ -0,0 +1 @@\n+dispatch(request.body);\n".to_string();
+        if deleted {
+            corpus.push_str("diff --git a/src/legacy.js b/src/legacy.js\ndeleted file mode 100644\n--- a/src/legacy.js\n+++ /dev/null\n@@ -1 +0,0 @@\n-legacyDispatch(user);\n");
+        }
+        std::fs::write(&diff, corpus).unwrap();
+        let baseline = directory.path().join("baseline.json");
+        std::fs::write(&baseline, json!({"version":1,"summary":"","silent":false,"findings":[{"id":"historical-guard","path":"src/legacy.js","line":1,"severity":"error","kind":"risk","confidence":0.95,"title":"Preserve the historical authorization boundary","body":"The legacy dispatch requires an authorization guard.","evidence":"legacyDispatch(user);"}],"resolved":[],"counts":{"info":0,"warn":0,"error":1,"suppressed":0},"confidenceBuckets":[0,0,0,0,1],"gate":{"failOn":"error","failing":true},"modelUsed":"model","usage":{"promptTokens":0,"completionTokens":0},"baseSha":null,"headSha":null,"sinceSha":null}).to_string()).unwrap();
+        let mut command = postil();
+        command
+            .current_dir(directory.path())
+            .env("POSTIL_API_BASE", server.uri())
+            .env("REVIEW_SCORER_MODEL", "scorer-model")
+            .args(["review", "--diff-file"])
+            .arg(diff)
+            .arg("--baseline")
+            .arg(baseline)
+            .args(["--output", "json"]);
+        if mode == "incremental-absent" {
+            command.args(["--since-sha", "previous"]);
+        }
+        let output = command.output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(1), "{mode}: {stderr}");
+        assert!(
+            !stderr.contains("finding adjudication validation failed"),
+            "{mode}: {stderr}"
+        );
+        assert_eq!(
+            envelope["findings"].as_array().unwrap().len(),
+            2,
+            "{mode}: {envelope}"
+        );
+        assert_eq!(envelope["resolved"], json!([]), "{mode}");
+        assert_eq!(envelope["counts"]["suppressed"], 0, "{mode}");
+        assert!(
+            envelope["modelIncidents"]
+                .as_array()
+                .is_none_or(Vec::is_empty),
+            "{mode}"
+        );
+        let historical = envelope["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["id"] == "historical-guard")
+            .unwrap();
+        assert_eq!(historical["evidence"], "legacyDispatch(user);");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| request_system_contains(r, "single finding adjudicator"))
+                .count(),
+            1,
+            "{mode}"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| request_system_contains(r, "independent second-model scorer"))
+                .count(),
+            1,
+            "{mode}"
+        );
+    }
+}

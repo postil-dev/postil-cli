@@ -24,6 +24,8 @@ const REFUTATION_WINDOW_RADIUS: usize = 6;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DiffCorpusReceipt {
+    #[serde(skip)]
+    fresh_candidate_count: usize,
     pub snapshot_id: String,
     pub corpus_sha256: String,
     pub source_bytes: usize,
@@ -729,6 +731,7 @@ pub(crate) fn build_diff_corpus_receipt(
     }
     debug_assert_eq!(findings.len(), candidate_ids.len());
     DiffCorpusReceipt {
+        fresh_candidate_count: reviewed_citation_count,
         snapshot_id: snapshot_id.to_string(),
         corpus_sha256,
         source_bytes: diff.len(),
@@ -1244,6 +1247,15 @@ pub(crate) fn validate_results(
         diff_receipt.snapshot_id == snapshot_id,
         "adjudication direct-source receipt snapshot mismatch"
     );
+    ensure!(
+        diff_receipt.fresh_candidate_count <= candidate_ids.len()
+            && diff_receipt
+                .candidate_citations
+                .iter()
+                .map(|citation| &citation.candidate_id)
+                .eq(candidate_ids.iter()),
+        "adjudication candidate origin receipt mismatch"
+    );
     let scopes = validate_scopes(findings, candidate_ids, results, corpus, diff_receipt)?;
     let finding_by_id = candidate_ids
         .iter()
@@ -1423,9 +1435,17 @@ fn validate_scopes(
         .iter()
         .zip(findings)
         .collect::<BTreeMap<_, _>>();
+    let historical_ids = candidate_ids
+        .iter()
+        .skip(receipt.fresh_candidate_count)
+        .collect::<BTreeSet<_>>();
     let eligible = results
         .iter()
-        .filter(|r| r.status != AdjudicationStatus::Refuted)
+        .filter(|result| {
+            result.status != AdjudicationStatus::Refuted
+                && !(result.status == AdjudicationStatus::Unresolved
+                    && historical_ids.contains(&result.candidate_id))
+        })
         .collect::<Vec<_>>();
     if eligible.is_empty() {
         return Ok(BTreeMap::new());
@@ -2171,6 +2191,57 @@ mod tests {
                 )
                 .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn historical_unresolved_scope_uses_immutable_candidate_origin() {
+        let corpus = "diff --git a/src/access.js b/src/access.js\ndeleted file mode 100644\n--- a/src/access.js\n+++ /dev/null\n@@ -1 +0,0 @@\n-const ALLOW_ALL_USERS = true;\n";
+        for fresh_count in [0, 1] {
+            for demoted in [false, true] {
+                let (finding, id, _, mut result) = scoped_fixture(None);
+                if !demoted {
+                    result = unresolved_result(result);
+                }
+                let receipt = build_diff_corpus_receipt(
+                    "scope-snapshot",
+                    corpus,
+                    std::slice::from_ref(&finding),
+                    std::slice::from_ref(&id),
+                    fresh_count,
+                );
+                assert!(
+                    serde_json::to_value(&receipt)
+                        .unwrap()
+                        .get("freshCandidateCount")
+                        .is_none()
+                );
+                let applied = apply_results(
+                    "scope-snapshot",
+                    vec![finding.clone()],
+                    vec![id],
+                    vec![result],
+                    corpus,
+                    &receipt,
+                    &unavailable_receipt(),
+                );
+                if fresh_count == 1 {
+                    assert!(
+                        applied.is_err(),
+                        "fresh findings cannot use the historical preservation path"
+                    );
+                } else {
+                    let applied = applied.unwrap();
+                    assert_eq!(applied.kept[0].title, finding.title);
+                    assert_eq!(applied.kept[0].body, finding.body);
+                    assert_eq!(applied.kept[0].evidence, finding.evidence);
+                    assert_eq!(applied.kept_indices, vec![0]);
+                    assert_eq!(applied.unresolved_indices, vec![0]);
+                    assert!(applied.resolved_indices.is_empty());
+                    assert!(applied.suppressed.is_empty());
+                    assert!(applied.scopes.is_empty());
+                }
+            }
         }
     }
 
@@ -3680,6 +3751,7 @@ mod tests {
         );
         let receipt = build_diff_corpus_receipt(&snapshot, corpus, &findings, &ids, 0);
 
+        let original = findings[0].clone();
         let applied = apply_results(
             &snapshot,
             findings,
@@ -3689,12 +3761,14 @@ mod tests {
             &receipt,
             &unavailable_receipt(),
         )
-        .unwrap_err();
-        assert!(
-            applied
-                .to_string()
-                .contains("context-anchored confirmation requires a causal change reference")
-        );
+        .unwrap();
+        assert_eq!(applied.kept[0].title, original.title);
+        assert_eq!(applied.kept[0].body, original.body);
+        assert_eq!(applied.kept[0].evidence, original.evidence);
+        assert_eq!(applied.unresolved_indices, vec![0]);
+        assert!(applied.resolved_indices.is_empty());
+        assert!(applied.suppressed.is_empty());
+        assert!(applied.scopes.is_empty());
     }
 
     #[test]
