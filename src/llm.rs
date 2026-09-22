@@ -1567,6 +1567,54 @@ fn retryable_status(status: u16) -> bool {
     matches!(status, 429 | 500 | 502 | 503 | 529)
 }
 
+fn openai_response_error_status(text: &str) -> Result<Option<reqwest::StatusCode>> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        // Invalid JSON remains subject to the existing response validation.
+        return Ok(None);
+    };
+    let choices = value.get("choices").and_then(serde_json::Value::as_array);
+    let errors = value.get("error").into_iter().chain(
+        choices
+            .into_iter()
+            .flatten()
+            .filter_map(|choice| choice.get("error")),
+    );
+    let mut selected_status = None;
+    for error in errors.filter(|error| !error.is_null()) {
+        let status = error
+            .get("code")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|code| u16::try_from(code).ok())
+            .and_then(|code| reqwest::StatusCode::from_u16(code).ok())
+            .filter(|status| status.is_client_error() || status.is_server_error())
+            .filter(|_| {
+                error
+                    .get("message")
+                    .is_some_and(serde_json::Value::is_string)
+            });
+        let Some(status) = status else {
+            return Err(anyhow::Error::new(ModelContentFailure::Malformed));
+        };
+        if selected_status.is_some_and(|previous| previous != status) {
+            return Err(anyhow::Error::new(ModelContentFailure::Malformed));
+        }
+        selected_status = Some(status);
+    }
+    if selected_status.is_none()
+        && choices.into_iter().flatten().any(|choice| {
+            choice
+                .get("finish_reason")
+                .and_then(serde_json::Value::as_str)
+                == Some("error")
+        })
+    {
+        return Err(anyhow::Error::new(ModelContentFailure::NonTerminal {
+            reason: "error".to_string(),
+        }));
+    }
+    Ok(selected_status)
+}
+
 fn provider_retry_delay(retry: u32) -> Duration {
     let elapsed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -4456,7 +4504,27 @@ impl LlmClient {
                         add_usage(usage, response_usage);
                         return Err(error);
                     }
-                    if response.status.is_success() {
+                    // OpenRouter can commit HTTP 200 before generation fails.
+                    // Error envelopes use the existing HTTP retry and accounting
+                    // path; only successful completions require an identity echo.
+                    let status = if response.status.is_success()
+                        && self.request_decorations.api_format == ApiFormat::OpenaiCompatible
+                    {
+                        match openai_response_error_status(&response.text) {
+                            Ok(status) => status.unwrap_or(response.status),
+                            Err(error) => {
+                                if let Some(response_usage) = summary.usage {
+                                    add_usage(usage, response_usage);
+                                } else {
+                                    *usage_accounting_complete = false;
+                                }
+                                return Err(error);
+                            }
+                        }
+                    } else {
+                        response.status
+                    };
+                    if status.is_success() {
                         eprintln!(
                             "postil: llm response phase={} model={} attempt={} status={} elapsed={} bytes={} request_id={} response_id={} returned_model={} provider={} choices={} finish={} usage={} prompt_tokens={} completion_tokens={} reasoning_tokens={} category={}",
                             phase.as_str(),
@@ -4633,23 +4701,28 @@ impl LlmClient {
                         }
                     }
                     eprintln!(
-                        "postil: llm response phase={} model={} attempt={} status={} elapsed={} request_id={} category={} failure_source={} failure_reason={}",
+                        "postil: llm response phase={} model={} attempt={} status={} upstream_status={} elapsed={} request_id={} category={} failure_source={} failure_reason={} usage={}",
                         phase.as_str(),
                         log_text(model),
                         retries + 1,
                         response.status.as_u16(),
+                        status.as_u16(),
                         elapsed,
                         response.request_id.as_deref().unwrap_or("none"),
                         summary.error_type.as_deref().unwrap_or("unclassified"),
                         summary.failure_source.unwrap_or("unattributed"),
                         summary.failure_reason.unwrap_or("none"),
+                        if summary.usage.is_some() {
+                            "present"
+                        } else {
+                            "missing"
+                        },
                     );
                     if let Some(response_usage) = summary.usage {
                         add_usage(usage, response_usage);
                     } else {
                         *usage_accounting_complete = false;
                     }
-                    let status = response.status;
                     if timeout_status(status.as_u16()) {
                         let retry_after = response.retry_after;
                         let wait = transient_retry_wait(retry_after, phase, retries);
@@ -4832,6 +4905,9 @@ impl LlmClient {
                         u.completion_tokens.unwrap_or(0),
                         u.cost.and_then(|raw| ProviderCost::parse(raw.get())),
                     );
+                }
+                if let Some(status) = openai_response_error_status(text)? {
+                    return Err(anyhow::Error::new(ProviderHttpFailure(status)));
                 }
                 let choice = parsed
                     .choices
@@ -5755,7 +5831,7 @@ fn safe_response_summary(
         })
     };
     let usage_value = value.get("usage").filter(|usage| usage.is_object());
-    let exact_cost = serde_json::from_str::<ChatResponse>(text)
+    let exact_cost = serde_json::from_str::<UsageResponse>(text)
         .ok()
         .and_then(|response| response.usage)
         .and_then(|usage| usage.cost)
@@ -5864,6 +5940,11 @@ fn duration_from_env(name: &str, default_secs: Option<u64>) -> Result<Option<Dur
         return Err(anyhow!("{name} must be greater than zero"));
     }
     Ok(Some(Duration::from_secs(seconds)))
+}
+
+#[derive(Debug, Deserialize)]
+struct UsageResponse {
+    usage: Option<ChatUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -10263,6 +10344,7 @@ mod tests {
     }
 
     fn pinned_route_client(server: &MockServer) -> LlmClient {
+        let _lock = env_lock().lock().unwrap();
         let config = Config {
             api_base: server.uri(),
             api_format: ApiFormat::OpenaiCompatible,
@@ -10286,11 +10368,243 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pinned_route_retries_a_dropped_identity_echo_and_accepts_the_matching_retry() {
+    async fn http_200_upstream_errors_share_retry_budget_and_account_every_attempt() {
+        for (code, reported_usage, error_choice) in [
+            (429, true, None),
+            (503, false, None),
+            (503, true, Some(0)),
+            (503, false, Some(1)),
+            (503, true, Some(2)),
+        ] {
+            let server = MockServer::start().await;
+            let mut body = json!({"error": {"code": code, "message": "Unavailable"}});
+            if reported_usage {
+                body["usage"] =
+                    json!({"prompt_tokens": 10, "completion_tokens": 2, "cost": 0.000003});
+            } else {
+                body["model"] = json!("provider/model");
+                body["provider"] = json!("Fireworks");
+                body["choices"] =
+                    json!([{"finish_reason": "stop", "message": {"content": "partial"}}]);
+            }
+            if let Some(index) = error_choice {
+                let error = body.as_object_mut().unwrap().remove("error").unwrap();
+                body["model"] = json!("provider/model");
+                body["provider"] = json!("Fireworks");
+                let partial = json!({"finish_reason": "error", "message": {"content": "partial"}, "error": error});
+                body["choices"] = if index == 0 {
+                    json!([partial])
+                } else if index == 2 {
+                    json!([{"error": error}])
+                } else {
+                    json!([{"finish_reason": "stop", "message": {"content": "partial"}}, partial])
+                };
+            }
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("Retry-After", "0")
+                        .set_body_json(body),
+                )
+                .up_to_n_times(3)
+                .with_priority(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "model": "provider/model", "provider": "Fireworks",
+                    "choices": [{"finish_reason": "stop", "message": {"content": "complete"}}],
+                    "usage": {"prompt_tokens": 12, "completion_tokens": 3, "cost": 0.000004}
+                })))
+                .with_priority(2)
+                .mount(&server)
+                .await;
+            let mut client = pinned_route_client(&server);
+            client.review_deadline = Some(Instant::now() + Duration::from_secs(20));
+            let mut usage = Usage::default();
+            let mut calls = Vec::new();
+            let mut complete = true;
+            let result = client
+                .chat_inner(
+                    "provider/model",
+                    None,
+                    "system",
+                    "user",
+                    &mut usage,
+                    &mut calls,
+                    &mut complete,
+                    180,
+                    0.0,
+                    LlmPhase::Review,
+                    LlmCallPhase::Initial,
+                    Some(ReviewRequestRoute::Source),
+                )
+                .await;
+            let success =
+                result.expect("upstream errors use the HTTP retry path before identity validation");
+            assert_eq!(success.content, "complete");
+            assert_eq!(server.received_requests().await.unwrap().len(), 4);
+            assert_eq!(
+                calls.iter().map(|event| event.attempt).collect::<Vec<_>>(),
+                vec![Some(1), Some(2), Some(3), Some(4)]
+            );
+            assert_eq!(usage.prompt_tokens, if reported_usage { 42 } else { 12 });
+            assert_eq!(usage.completion_tokens, if reported_usage { 9 } else { 3 });
+            assert_eq!(usage.cost_micros, Some(if reported_usage { 13 } else { 4 }));
+            assert_eq!(
+                usage.provider_cost.map(|cost| cost.to_string()),
+                Some(
+                    if reported_usage {
+                        "0.000013"
+                    } else {
+                        "0.000004"
+                    }
+                    .to_string()
+                )
+            );
+            if reported_usage {
+                assert_eq!(
+                    calls
+                        .iter()
+                        .map(|call| call.cost_provider_decimal.as_deref())
+                        .collect::<Vec<_>>(),
+                    vec![
+                        Some("0.000003"),
+                        Some("0.000003"),
+                        Some("0.000003"),
+                        Some("0.000004")
+                    ]
+                );
+            }
+            assert_eq!(complete, reported_usage);
+            assert_eq!(client.admission.lock().unwrap().attempts, 4);
+            assert_eq!(
+                client.admission.lock().unwrap().reported_cost_micros,
+                if reported_usage { 13 } else { 4 }
+            );
+            assert_eq!(
+                client.admission.lock().unwrap().reported_token_spend,
+                if reported_usage { 51 } else { 15 }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn http_200_upstream_terminal_errors_do_not_retry_missing_identity() {
+        for code in [400, 401, 503] {
+            let server = MockServer::start().await;
+            let private_message =
+                format!("private-{}", tempfile::tempdir().unwrap().path().display());
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("Retry-After", "60")
+                        .set_body_json(json!({
+                            "error": {"code": code, "message": private_message,
+                                "metadata": {"provider_code": private_message}},
+                            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "cost": 0.000003}
+                        })),
+                )
+                .mount(&server)
+                .await;
+            let mut client = pinned_route_client(&server);
+            client.review_deadline = Some(Instant::now() + Duration::from_secs(5));
+            let mut usage = Usage::default();
+            let mut calls = Vec::new();
+            let mut complete = true;
+            let result = client
+                .chat_inner(
+                    "provider/model",
+                    None,
+                    "system",
+                    "user",
+                    &mut usage,
+                    &mut calls,
+                    &mut complete,
+                    180,
+                    0.0,
+                    LlmPhase::Review,
+                    LlmCallPhase::Initial,
+                    None,
+                )
+                .await;
+            let error = result.err().expect("error envelope cannot be accepted");
+            assert_eq!(
+                error
+                    .downcast_ref::<ProviderHttpFailure>()
+                    .map(|error| error.0.as_u16()),
+                Some(code)
+            );
+            assert!(!format!("{error:#}").contains(&private_message));
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            assert_eq!(calls.len(), 1);
+            assert_eq!(
+                (
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
+                    usage.cost_micros
+                ),
+                (10, 2, Some(3))
+            );
+            assert!(complete);
+        }
+    }
+
+    #[tokio::test]
+    async fn http_200_malformed_error_never_accepts_complete_looking_content() {
+        for error in [
+            json!({}),
+            json!({"code": 200, "message": "Invalid"}),
+            json!({"code": "429", "message": "Invalid"}),
+            json!({"code": 503}),
+            json!({"code": 700, "message": "Invalid"}),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "model": "provider/model", "provider": "Fireworks", "error": error,
+                    "choices": [{"finish_reason": "stop", "message": {"content": "complete"}}]
+                })))
+                .mount(&server)
+                .await;
+            let client = pinned_route_client(&server);
+            let mut usage = Usage::default();
+            let mut calls = Vec::new();
+            let mut complete = true;
+            let result = client
+                .chat_inner(
+                    "provider/model",
+                    None,
+                    "system",
+                    "user",
+                    &mut usage,
+                    &mut calls,
+                    &mut complete,
+                    180,
+                    0.0,
+                    LlmPhase::Review,
+                    LlmCallPhase::Initial,
+                    None,
+                )
+                .await;
+            let error = result.err().expect("malformed error cannot be accepted");
+            assert!(matches!(
+                error.downcast_ref::<ModelContentFailure>(),
+                Some(ModelContentFailure::Malformed)
+            ));
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            assert_eq!(calls.len(), 1);
+            assert!(!complete);
+        }
+    }
+
+    #[tokio::test]
+    async fn pinned_route_null_error_preserves_identity_checks_and_matching_retry() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "error": null,
                 "choices": [{"finish_reason": "stop", "message": {"content": "unattributed"}}],
                 "usage": {"prompt_tokens": 10, "completion_tokens": 2}
             })))
@@ -10302,6 +10616,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "error": null,
                 "model": "provider/model",
                 "provider": "Fireworks",
                 "choices": [{"finish_reason": "stop", "message": {"content": "attributed"}}],
@@ -10978,7 +11293,63 @@ mod tests {
     }
 
     #[test]
-    fn openai_length_finish_reason_rejects_complete_looking_partial_content() {
+    fn response_usage_preserves_exact_cost_without_success_choices() {
+        let body = r#"{"choices":[{"error":{"code":503,"message":"Unavailable"}}],"usage":{"prompt_tokens":10,"completion_tokens":2,"cost":0.123456789012345678}}"#;
+        let usage = safe_response_summary(body, ApiFormat::OpenaiCompatible, false)
+            .usage
+            .unwrap();
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens), (10, 2));
+        assert_eq!(
+            usage.provider_cost.unwrap().to_string(),
+            "0.123456789012345678"
+        );
+        assert_eq!(usage.cost_micros, Some(123_457));
+    }
+
+    #[test]
+    fn http_200_error_classification_rejects_conflicting_and_malformed_choice_errors() {
+        let clean =
+            json!({"finish_reason": "stop", "message": {"content": "complete"}, "error": null});
+        let failure = json!({"finish_reason": "error", "message": {"content": "partial"},
+            "error": {"code": 503, "message": "Unavailable"}});
+        let clean_body = json!({"error": null, "choices": [clean.clone()]});
+        assert_eq!(
+            openai_response_error_status(&clean_body.to_string()).unwrap(),
+            None
+        );
+        let same_errors = json!({"error": {"code": 503, "message": "Unavailable"},
+            "choices": [failure.clone(), failure.clone()]});
+        assert_eq!(
+            openai_response_error_status(&same_errors.to_string()).unwrap(),
+            Some(reqwest::StatusCode::SERVICE_UNAVAILABLE)
+        );
+        for body in [
+            json!({"error": {"code": 401, "message": "Denied"}, "choices": [failure.clone()]}),
+            json!({"choices": [failure, {"error": {"code": 429, "message": "Limited"}}]}),
+            json!({"choices": [clean.clone(), {"error": {"code": 503}}]}),
+            json!({"error": null, "choices": [clean.clone(), {"error": "invalid"}]}),
+        ] {
+            let error = openai_response_error_status(&body.to_string()).unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<ModelContentFailure>(),
+                Some(ModelContentFailure::Malformed)
+            ));
+        }
+        let bare_failure = json!({"error": null, "choices": [clean,
+            {"finish_reason": "error", "message": {"content": "partial"}, "error": null}]});
+        let error = openai_response_error_status(&bare_failure.to_string()).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<ModelContentFailure>()
+                .unwrap()
+                .nonterminal_reason(),
+            Some("error")
+        );
+        assert!(error.downcast_ref::<ProviderHttpFailure>().is_none());
+    }
+
+    #[test]
+    fn openai_nonterminal_finish_reason_rejects_complete_looking_partial_content() {
         let config = Config {
             api_base: "http://127.0.0.1:1".into(),
             api_format: ApiFormat::OpenaiCompatible,

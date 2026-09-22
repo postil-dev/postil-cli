@@ -2498,12 +2498,14 @@ async fn provider_403_redacts_key_management_url_from_cli_and_finding() {
 async fn routed_http_200_errors_log_each_attempt_without_exposing_response_content() {
     for recover in [false, true] {
         let server = MockServer::start().await;
-        let secret = "fixture-private-provider-error-content";
+        let private_content = tempfile::tempdir().unwrap();
+        let secret = private_content.path().to_str().unwrap();
         let failures = if recover { 2 } else { 3 };
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "error": {
+                    "code": 503,
                     "message": secret,
                     "metadata": {
                         "error_type": "provider_error",
@@ -2559,14 +2561,15 @@ async fn routed_http_200_errors_log_each_attempt_without_exposing_response_conte
             assert!(line.contains("status=200 "));
             if index < failures as usize {
                 assert!(line.contains("category=provider_error"));
-                assert!(line.contains("returned_model=none provider=none "));
-                assert!(line.contains("usage=missing "));
+                assert!(line.contains("upstream_status=503 "));
+                assert!(line.contains("usage=missing"));
             } else {
                 assert!(line.contains("category=none"));
                 assert!(line.contains("usage=present "));
             }
         }
-        assert_eq!(stderr.matches("identity echo is missing").count(), 2);
+        assert_eq!(stderr.matches("identity echo is missing").count(), 0);
+        assert_eq!(stderr.matches("returned retryable HTTP 503").count(), 2);
         let envelope: Value = serde_json::from_str(&stdout).unwrap();
         assert_eq!(envelope["usageAccountingComplete"], false);
         if recover {
