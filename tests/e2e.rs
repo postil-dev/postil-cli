@@ -16108,6 +16108,13 @@ async fn causal_scope_contract_prevents_context_relabeling_before_scoring() {
         "unresolved",
         "demoted",
         "pre-existing",
+        "pre-existing-high",
+        "pre-existing-boundary",
+        "pre-existing-zero",
+        "pre-existing-missing",
+        "pre-existing-failed",
+        "pre-existing-unaccounted",
+        "pre-existing-disabled",
         "carried-full",
         "carried-incremental",
         "added",
@@ -16117,7 +16124,10 @@ async fn causal_scope_contract_prevents_context_relabeling_before_scoring() {
         "long-cause",
     ] {
         let carried = mode.starts_with("carried-");
-        let excluded = mode == "pre-existing" || carried;
+        let pre_existing = mode.starts_with("pre-existing");
+        let excluded = pre_existing || carried;
+        let scope_failure =
+            pre_existing && !matches!(mode, "pre-existing" | "pre-existing-disabled");
         let invalid = matches!(mode, "missing" | "forged" | "unresolved" | "demoted");
         let long = "é".repeat(900);
         let (hunk, line, evidence, cause) = match mode {
@@ -16156,7 +16166,25 @@ async fn causal_scope_contract_prevents_context_relabeling_before_scoring() {
                     }).collect::<Vec<_>>();
                     scorer_text(&json!(result).to_string())
                 } else if request_system_contains(request, "independent second-model scorer") {
-                    scorer_content(json!([{"confidence":0.99,"kind":"risk","reason":"The changed input or removed guard introduces the unsafe behavior."}]))
+                    if mode == "pre-existing-failed" {
+                        return ResponseTemplate::new(400).set_body_json(json!({"error":{"message":"The scorer request cannot be completed."}}));
+                    }
+                    let confidence = match mode {
+                        "pre-existing-high" => 0.99,
+                        "pre-existing-boundary" => 0.7,
+                        "pre-existing-zero" => 0.0,
+                        _ if pre_existing => 0.1,
+                        _ => 0.99,
+                    };
+                    let mut response = if mode == "pre-existing-missing" {
+                        scorer_content(json!([]))
+                    } else {
+                        scorer_content(json!([{"confidence":confidence,"kind":"risk","reason":if pre_existing {"The authorization defect predates the unrelated timeout edit."} else {"The changed input or removed guard introduces the unsafe behavior."}}]))
+                    };
+                    if mode == "pre-existing-unaccounted" {
+                        response["usage"] = json!({"prompt_tokens":0,"completion_tokens":0});
+                    }
+                    response
                 } else {
                     let mut generated = generated.clone();
                     if mode == "long-context" {
@@ -16170,6 +16198,15 @@ async fn causal_scope_contract_prevents_context_relabeling_before_scoring() {
                 ResponseTemplate::new(200).set_body_json(response)
             }).with_priority(1).mount(&server).await;
         let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join(".postil.yaml"),
+            if mode == "pre-existing-zero" {
+                "minConfidence: 0\n"
+            } else {
+                "minConfidence: 0.7\n"
+            },
+        )
+        .unwrap();
         let diff = directory.path().join("review.diff");
         std::fs::write(&diff, format!("diff --git a/src/access.js b/src/access.js\n--- a/src/access.js\n+++ b/src/access.js\n{hunk}")).unwrap();
         let mut command = postil();
@@ -16180,6 +16217,9 @@ async fn causal_scope_contract_prevents_context_relabeling_before_scoring() {
             .args(["review", "--diff-file"])
             .arg(&diff)
             .args(["--output", "json"]);
+        if mode == "pre-existing-disabled" {
+            command.env_remove("REVIEW_SCORER_MODEL");
+        }
         if carried {
             let baseline = directory.path().join("baseline.json");
             std::fs::write(&baseline, json!({"version":1,"summary":"","silent":false,"findings":[finding],"resolved":[],"counts":{"info":0,"warn":0,"error":1,"suppressed":0},"confidenceBuckets":[0,0,0,0,1],"gate":{"failOn":"error","failing":true},"modelUsed":"model","usage":{"promptTokens":0,"completionTokens":0},"baseSha":null,"headSha":null,"sinceSha":null}).to_string()).unwrap();
@@ -16194,7 +16234,13 @@ async fn causal_scope_contract_prevents_context_relabeling_before_scoring() {
             .unwrap_or_else(|error| panic!("{mode}: {error}: {stderr}"));
         assert_eq!(
             output.status.code(),
-            Some(if mode == "pre-existing" { 0 } else { 1 }),
+            Some(
+                if matches!(mode, "pre-existing" | "pre-existing-disabled") {
+                    0
+                } else {
+                    1
+                }
+            ),
             "{mode}: {stderr}"
         );
         assert_eq!(envelope["resolved"], json!([]), "{mode}");
@@ -16203,7 +16249,29 @@ async fn causal_scope_contract_prevents_context_relabeling_before_scoring() {
             .iter()
             .filter(|request| request_system_contains(request, "independent second-model scorer"))
             .collect::<Vec<_>>();
-        if invalid {
+        if scope_failure {
+            assert!(!scorer_requests.is_empty(), "{mode}");
+            assert!(
+                envelope["findings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|f| f["path"] == ".postil/model-output"),
+                "{mode}: {envelope}"
+            );
+            assert_eq!(envelope["counts"]["suppressed"], 0, "{mode}");
+            assert!(
+                envelope["findings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|f| f["path"] == "src/access.js" && f.get("scorerConfidence").is_none()),
+                "original finding must be preserved: {mode}"
+            );
+            if mode == "pre-existing-unaccounted" {
+                assert_eq!(envelope["usageAccountingComplete"], false);
+            }
+        } else if invalid {
             assert!(
                 stderr.contains("finding adjudication validation failed"),
                 "{mode}: {stderr}"
@@ -16222,8 +16290,8 @@ async fn causal_scope_contract_prevents_context_relabeling_before_scoring() {
                 !stderr.contains("finding adjudication validation failed"),
                 "{mode}: {stderr}"
             );
-            assert!(scorer_requests.is_empty(), "{mode}");
             if carried {
+                assert!(scorer_requests.is_empty(), "{mode}");
                 assert!(
                     envelope["findings"]
                         .as_array()
@@ -16234,6 +16302,31 @@ async fn causal_scope_contract_prevents_context_relabeling_before_scoring() {
                 );
                 assert_eq!(envelope["counts"]["suppressed"], 0, "{mode}");
             } else {
+                if mode == "pre-existing-disabled" {
+                    assert!(scorer_requests.is_empty());
+                    assert!(envelope.get("scorerModel").is_none());
+                    assert!(
+                        envelope["suppressedFindings"][0]["finding"]
+                            .get("scorerConfidence")
+                            .is_none()
+                    );
+                } else {
+                    assert_eq!(scorer_requests.len(), 1);
+                    assert_eq!(envelope["scorerModel"], "scorer-model");
+                    assert_eq!(
+                        envelope["suppressedFindings"][0]["finding"]["scorerConfidence"],
+                        0.1
+                    );
+                    let request: Value = scorer_requests[0].body_json().unwrap();
+                    let text = request["messages"].as_array().unwrap().last().unwrap()["content"]
+                        .as_str()
+                        .unwrap();
+                    let scored: Value =
+                        serde_json::from_str(&text[text.find('[').unwrap()..]).unwrap();
+                    assert_eq!(scored[0]["scopeEvidence"]["disposition"], "preExisting");
+                    assert_eq!(scored[0]["scopeEvidence"]["anchorRole"], "context");
+                    assert!(scored[0]["scopeEvidence"]["cause"].is_null());
+                }
                 assert_eq!(envelope["findings"], json!([]));
                 assert_eq!(envelope["counts"]["suppressed"], 1);
                 assert_eq!(envelope["suppressedFindings"][0]["reason"], "nonActionable");
@@ -16295,6 +16388,7 @@ async fn causal_scope_follows_original_identity_after_reordering_and_suppression
                 scorer_text(&json!(results).to_string())
             } else if request_system_contains(request, "independent second-model scorer") {
                 scorer_content(json!([
+                    {"confidence":0.1,"kind":"risk","reason":"The logging setting predates the unrelated edits."},
                     {"confidence":0.99,"kind":"risk","reason":"The added authorization bypass removes the boundary."},
                     {"confidence":0.99,"kind":"risk","reason":"The added HTML sink uses unescaped input."}
                 ]))
@@ -16344,16 +16438,19 @@ async fn causal_scope_follows_original_identity_after_reordering_and_suppression
         .as_str()
         .unwrap();
     let scored: Value = serde_json::from_str(&text[text.find('[').unwrap()..]).unwrap();
-    assert_eq!(scored[0]["title"], "Restore authorization before dispatch");
-    assert_eq!(scored[0]["scopeEvidence"]["cause"]["line"], 2);
-    assert_eq!(
-        scored[0]["scopeEvidence"]["cause"]["evidence"],
-        "const ALLOW_ALL_USERS = true;"
-    );
-    assert_eq!(scored[1]["title"], "Escape the HTML input");
-    assert_eq!(scored[1]["scopeEvidence"]["cause"]["line"], 3);
+    assert_eq!(scored.as_array().unwrap().len(), 3);
+    assert_eq!(scored[0]["title"], "Logging exposes user data");
+    assert_eq!(scored[0]["scopeEvidence"]["disposition"], "preExisting");
+    assert_eq!(scored[1]["title"], "Restore authorization before dispatch");
+    assert_eq!(scored[1]["scopeEvidence"]["cause"]["line"], 2);
     assert_eq!(
         scored[1]["scopeEvidence"]["cause"]["evidence"],
+        "const ALLOW_ALL_USERS = true;"
+    );
+    assert_eq!(scored[2]["title"], "Escape the HTML input");
+    assert_eq!(scored[2]["scopeEvidence"]["cause"]["line"], 3);
+    assert_eq!(
+        scored[2]["scopeEvidence"]["cause"]["evidence"],
         "renderHtml(input);"
     );
 }

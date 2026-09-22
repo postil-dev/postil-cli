@@ -1521,6 +1521,43 @@ fn apply_scorer_scores(cfg: &Config, findings: &mut [Finding], scores: Vec<Findi
     disagreements
 }
 
+fn scorer_supports_scope_exclusions(
+    cfg: &Config,
+    pending: &[usize],
+    scores: &[FindingScore],
+    accounting_complete: bool,
+) -> bool {
+    pending.is_empty()
+        || (accounting_complete
+            && pending.iter().all(|index| {
+                scores
+                    .iter()
+                    .find(|score| score.index == *index)
+                    .is_some_and(|score| score.confidence < cfg.min_confidence)
+            }))
+}
+
+fn suppress_scope_exclusions(
+    findings: &mut Vec<Finding>,
+    pending: &mut Vec<usize>,
+) -> Vec<crate::envelope::SuppressedFinding> {
+    let mut suppressed = Vec::new();
+    let mut index = 0;
+    findings.retain(|finding| {
+        let exclude = pending.contains(&index);
+        index += 1;
+        if exclude {
+            suppressed.push(crate::envelope::SuppressedFinding {
+                finding: finding.clone(),
+                reason: crate::envelope::SuppressionReason::NonActionable,
+            });
+        }
+        !exclude
+    });
+    pending.clear();
+    suppressed
+}
+
 fn suppress_below_min_confidence(
     cfg: &Config,
     findings: &mut Vec<Finding>,
@@ -2510,6 +2547,7 @@ async fn review_diff_at(
                         let mut kept_scopes = Vec::new();
                         let mut preserved_baseline_publications = Vec::new();
                         let mut pending_refutation_recovery = Vec::new();
+                        let mut pending_scope_exclusions = Vec::new();
                         let mut staged_adjudication = None;
                         let mut scorer_suppressions = Vec::new();
 
@@ -2772,6 +2810,11 @@ async fn review_diff_at(
                                 .zip(&application.kept)
                             {
                                 if candidate_index < fresh_candidate_count {
+                                    if application.scopes.get(&candidate_ids[candidate_index])
+                                        .is_some_and(|scope| scope.disposition == crate::adjudication::ScopeDisposition::PreExisting)
+                                    {
+                                        pending_scope_exclusions.push(kept.len());
+                                    }
                                     if application
                                         .invalid_refutation_indices
                                         .contains(&candidate_index)
@@ -2792,6 +2835,12 @@ async fn review_diff_at(
                                 baseline_candidate_indices,
                                 fallback_application,
                             ));
+                        }
+                        if !cfg.scorer_enabled() && !adjudication_incomplete {
+                            // Local scoring is opt-in. An adjudication-only exclusion
+                            // carries no independent scorer identity or assessment.
+                            scorer_suppressions =
+                                suppress_scope_exclusions(&mut kept, &mut pending_scope_exclusions);
                         }
                         if !kept.is_empty() && cfg.scorer_enabled() && !adjudication_incomplete {
                             let scorer_system = prompt::scorer_system_prompt(cfg, current_utc_date);
@@ -2841,12 +2890,23 @@ async fn review_diff_at(
                                             &pending_refutation_recovery,
                                             &inputs,
                                             &scored.scores,
+                                        ) && scorer_supports_scope_exclusions(
+                                            cfg,
+                                            &pending_scope_exclusions,
+                                            &scored.scores,
+                                            usage_accounting_complete
+                                                && scored.usage_accounting_complete,
                                         ) {
                                             pending_refutation_recovery.clear();
                                             let disagreements =
                                                 apply_scorer_scores(cfg, &mut kept, scored.scores);
-                                            scorer_suppressions =
-                                                suppress_below_min_confidence(cfg, &mut kept);
+                                            scorer_suppressions = suppress_scope_exclusions(
+                                                &mut kept,
+                                                &mut pending_scope_exclusions,
+                                            );
+                                            scorer_suppressions.extend(
+                                                suppress_below_min_confidence(cfg, &mut kept),
+                                            );
                                             scorer_disagreements = Some(disagreements);
                                             sort_findings_for_display(&mut kept);
                                         }
@@ -2859,7 +2919,9 @@ async fn review_diff_at(
                                     }
                                     Err(e) => {
                                         let detail = format!("{e:#}");
-                                        if pending_refutation_recovery.is_empty() {
+                                        if pending_refutation_recovery.is_empty()
+                                            && pending_scope_exclusions.is_empty()
+                                        {
                                             eprintln!(
                                                 "postil: scorer failed open after all scorer models failed"
                                             );
@@ -2906,9 +2968,11 @@ async fn review_diff_at(
                                 .into());
                             }
                         }
-                        if !pending_refutation_recovery.is_empty() {
+                        if !pending_refutation_recovery.is_empty()
+                            || !pending_scope_exclusions.is_empty()
+                        {
                             eprintln!(
-                                "postil: unsupported refutation recovery requires complete validated scoring; preserving the invalid-output blocker"
+                                "postil: adjudication recovery or scope exclusion requires complete supporting scoring; preserving the invalid-output blocker"
                             );
                             review_trust = filter::ReviewTrust::Failed;
                             model_incidents.push(ModelIncident {
@@ -2929,7 +2993,9 @@ async fn review_diff_at(
                         {
                             let fresh_candidate_count =
                                 fallback_application.kept.len() - baseline_candidate_indices.len();
-                            if !pending_refutation_recovery.is_empty() {
+                            if !pending_refutation_recovery.is_empty()
+                                || !pending_scope_exclusions.is_empty()
+                            {
                                 application = fallback_application;
                                 kept = application.kept[..fresh_candidate_count].to_vec();
                             }
@@ -2965,7 +3031,9 @@ async fn review_diff_at(
                                     .collect();
                             }
                         }
-                        if pending_refutation_recovery.is_empty() {
+                        if pending_refutation_recovery.is_empty()
+                            && pending_scope_exclusions.is_empty()
+                        {
                             suppressed += scorer_suppressions.len() as u32;
                             suppressed_findings.extend(scorer_suppressions);
                         }

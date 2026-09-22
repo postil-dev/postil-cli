@@ -191,7 +191,7 @@ enum AdjudicationProvenance {
 enum AdjudicationDisposition {
     RetainConfirmed,
     SuppressRefuted,
-    SuppressPreExisting,
+    DeferPreExisting,
     SuppressDuplicate,
     PreserveUnresolved,
 }
@@ -1687,11 +1687,9 @@ pub(crate) fn apply_results(
                     reason: SuppressionReason::NonActionable,
                 });
             }
-            (AdjudicationProvenance::Model, AdjudicationDisposition::SuppressPreExisting) => {
-                suppressed.push(SuppressedFinding {
-                    finding,
-                    reason: SuppressionReason::NonActionable,
-                });
+            (AdjudicationProvenance::Model, AdjudicationDisposition::DeferPreExisting) => {
+                kept_indices.push(index);
+                kept.push(finding);
             }
             (AdjudicationProvenance::Model, AdjudicationDisposition::SuppressDuplicate) => {
                 resolved_indices.push(index);
@@ -1818,7 +1816,7 @@ fn model_applied_result(result: AdjudicationResult) -> AppliedAdjudicationResult
                     .as_ref()
                     .is_some_and(|s| s.disposition == ScopeDisposition::PreExisting) =>
             {
-                AdjudicationDisposition::SuppressPreExisting
+                AdjudicationDisposition::DeferPreExisting
             }
             AdjudicationStatus::Confirmed => AdjudicationDisposition::RetainConfirmed,
             AdjudicationStatus::Refuted => AdjudicationDisposition::SuppressRefuted,
@@ -2246,7 +2244,7 @@ mod tests {
     }
 
     #[test]
-    fn scope_exclusion_is_non_actionable_without_factual_refutation_or_resolution() {
+    fn scope_exclusion_is_deferred_without_factual_refutation_or_resolution() {
         let (f, id, receipt, result) = scoped_fixture(Some(ScopeAssessment {
             disposition: ScopeDisposition::PreExisting,
             cause: None,
@@ -2263,13 +2261,10 @@ mod tests {
             &unavailable_receipt(),
         )
         .unwrap();
-        assert!(application.kept.is_empty());
+        assert_eq!(application.kept_indices, vec![0]);
+        assert_eq!(application.kept.len(), 1);
         assert!(application.resolved_indices.is_empty());
-        assert_eq!(application.suppressed.len(), 1);
-        assert_eq!(
-            application.suppressed[0].reason,
-            SuppressionReason::NonActionable
-        );
+        assert!(application.suppressed.is_empty());
         assert_eq!(
             application.scopes[&id].disposition,
             ScopeDisposition::PreExisting
