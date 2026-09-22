@@ -13851,7 +13851,7 @@ async fn pending_refutation_recovery_commits_baseline_resolution_only_after_scor
                 envelope["resolved"][0]["title"],
                 "Legacy API has no callers"
             );
-            assert_eq!(envelope["counts"]["suppressed"], 2);
+            assert_eq!(envelope["counts"]["suppressed"], 1);
             assert_eq!(
                 envelope["suppressedFindings"]
                     .as_array()
@@ -13859,7 +13859,7 @@ async fn pending_refutation_recovery_commits_baseline_resolution_only_after_scor
                     .iter()
                     .map(|entry| entry["finding"]["title"].as_str().unwrap())
                     .collect::<Vec<_>>(),
-                vec!["Legacy API has no callers", "Preserve login audit"]
+                vec!["Preserve login audit"]
             );
         } else {
             assert_eq!(envelope["resolved"], json!([]));
@@ -14428,6 +14428,153 @@ async fn oversized_adjudication_payload_preserves_findings_without_aborting_revi
         stderr.contains("adjudication input exceeded its admitted bound"),
         "{stderr}"
     );
+}
+
+#[tokio::test]
+async fn lifecycle_identity_reconciles_duplicate_baseline_adjudication() {
+    use sha2::{Digest, Sha256};
+
+    for duplicate_baseline in [true, false] {
+        let server = MockServer::start().await;
+        mount_github_complete_diff(&server, 7).await;
+        mount_static_github_pr(&server).await;
+        mount_successful_hosted_check_patches(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/api/pulls/7"))
+            .and(header("Accept", "application/vnd.github.v3.diff"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(DIFF))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/api/pulls/7/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&server)
+            .await;
+        let (published_review, published_comments) = published_review_responders();
+        Mock::given(method("POST"))
+            .and(path("/repos/acme/api/pulls/7/reviews"))
+            .respond_with(published_review)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/api/pulls/7/reviews/77/comments"))
+            .respond_with(published_comments)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/repos/acme/api/pulls/7/reviews/77"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+        let title = "Authorization guard remains bypassed";
+        let body = "The authorization guard is bypassed before query execution.";
+        let fresh = json!({
+            "path": "src/auth.rs", "line": 42, "severity": "error", "kind": "risk",
+            "confidence": 0.95, "title": title, "body": body,
+            "evidence": "exec_query(&token);"
+        });
+        mock_review(&server, json!([fresh.clone()])).await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_string_contains("single finding adjudicator"))
+            .respond_with(move |request: &Request| {
+                let request: Value = request.body_json().unwrap();
+                let payload: Value = serde_json::from_str(
+                    request["messages"].as_array().unwrap().last().unwrap()["content"]
+                        .as_str()
+                        .unwrap(),
+                )
+                .unwrap();
+                let candidates = payload["candidates"].as_array().unwrap();
+                assert_eq!(candidates.len(), 2);
+                let results = candidates
+                    .iter()
+                    .enumerate()
+                    .map(|(index, candidate)| {
+                        json!({
+                            "candidateId": candidate["candidateId"],
+                            "status": "confirmed",
+                            "revisedTitle": title, "revisedBody": body,
+                            "evidence": "exec_query(&token);",
+                            "duplicateOf": if index == 1 && duplicate_baseline {
+                                candidates[0]["candidateId"].clone()
+                            } else { Value::Null }
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                ResponseTemplate::new(200).set_body_json(scorer_text(&json!(results).to_string()))
+            })
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let identity = format!(
+            "evidence\0risk\0src/auth.rs\0{}\0exec_query(&token);",
+            title.to_lowercase()
+        );
+        let id = Sha256::digest(identity.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let mut previous = fresh;
+        previous["id"] = json!(id);
+        previous["confidence"] = json!(0.9);
+        previous["body"] = json!("The same query bypasses the authorization guard.");
+        let baseline = json!({
+            "version": 1, "summary": "", "silent": false, "findings": [previous],
+            "resolved": [], "counts": {"info": 0, "warn": 0, "error": 1, "suppressed": 0},
+            "confidenceBuckets": [0,0,0,0,1], "gate": {"failOn": "error", "failing": true},
+            "modelUsed": "model", "usage": {"promptTokens": 0, "completionTokens": 0},
+            "baseSha": null, "headSha": null, "sinceSha": null
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let baseline_path = directory.path().join("baseline.json");
+        let receipt_path = directory.path().join("receipt.json");
+        std::fs::write(&baseline_path, baseline.to_string()).unwrap();
+        let output = postil()
+            .current_dir(directory.path())
+            .env("POSTIL_API_BASE", server.uri())
+            .env("POSTIL_DISABLE_SCORER", "1")
+            .env("GITHUB_API_URL", server.uri())
+            .env("GITHUB_TOKEN", format!("fixture-{}", std::process::id()))
+            .env("POSTIL_PUBLICATION_RECEIPT_PATH", &receipt_path)
+            .args([
+                "review",
+                "--publish",
+                "--repo",
+                "acme/api",
+                "--pr",
+                "7",
+                "--check-run-id",
+                "901",
+                "--gate-check-run-id",
+                "902",
+            ])
+            .arg("--baseline")
+            .arg(baseline_path)
+            .args(["--output", "json"])
+            .assert()
+            .code(1);
+        let envelope: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+        assert_eq!(envelope["findings"].as_array().unwrap().len(), 1);
+        assert_eq!(envelope["findings"][0]["id"], id);
+        assert_eq!(envelope["findings"][0]["body"], body);
+        assert_eq!(envelope["findings"][0]["confidence"], 0.95);
+        assert_eq!(envelope["resolved"], json!([]));
+        assert!(envelope.get("suppressedFindings").is_none());
+        assert_eq!(envelope["counts"]["error"], 1);
+        assert_eq!(envelope["counts"]["suppressed"], 0);
+        assert_eq!(envelope["confidenceBuckets"], json!([0, 0, 0, 0, 1]));
+        assert_eq!(envelope["gate"]["failing"], true);
+        assert_model_usage_matches_aggregate(&envelope);
+        let receipt: Value = serde_json::from_slice(&std::fs::read(receipt_path).unwrap()).unwrap();
+        assert_eq!(receipt["findings"].as_array().unwrap().len(), 1);
+        assert_eq!(receipt["findings"][0]["findingId"], id);
+        assert_eq!(receipt["findings"][0]["initialOutcome"], "inline");
+        assert_eq!(receipt["findings"][0]["commentId"], "500");
+    }
 }
 
 #[tokio::test]
