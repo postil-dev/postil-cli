@@ -309,6 +309,12 @@ impl GitHub {
     ) -> std::collections::HashMap<String, PublishedReviewComment> {
         let published = self.published_finding_comments(head_sha).await;
         for publication in &mut receipt.findings {
+            if matches!(
+                publication.initial_outcome,
+                FindingPublicationOutcome::Resolved | FindingPublicationOutcome::Suppressed
+            ) {
+                continue;
+            }
             let Ok(finding) = publication_plan_finding(envelope, &publication.finding_id) else {
                 continue;
             };
@@ -8588,6 +8594,66 @@ mod tests {
 
         assert!(error.to_string().contains("PR snapshot changed"));
         assert_eq!(pr_reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_identity_receipts_keep_active_and_terminal_states_exclusive() {
+        let active = publication_finding("active", "src/lib.rs", "An active concern remains.");
+        let retired = publication_finding("retired", "src/lib.rs", "A retired concern.");
+        let suppressed = publication_finding("suppressed", "src/lib.rs", "A suppressed concern.");
+        let mut envelope =
+            delivery_envelope_with_findings("aaaaaaaaaaaa", "cccccccccccc", vec![active]);
+        envelope.resolved = vec![retired];
+        envelope.suppressed_findings = vec![crate::envelope::SuppressedFinding {
+            finding: suppressed,
+            reason: crate::envelope::SuppressionReason::DuplicateRootCause,
+        }];
+        let mut receipt = super::planned_review_receipt(&envelope, "aaaaaaaaaaaa");
+        assert_eq!(receipt.findings.len(), 3);
+        assert_eq!(
+            receipt.findings[0].initial_outcome,
+            FindingPublicationOutcome::Inline
+        );
+        assert_eq!(
+            receipt.findings[1].initial_outcome,
+            FindingPublicationOutcome::Resolved
+        );
+        assert_eq!(
+            crate::forge::untracked_review_publication_receipt("gitlab", &envelope, "aaaaaaaaaaaa")
+                .findings
+                .len(),
+            3
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repo/pulls/1/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": 501, "commit_id": "aaaaaaaaaaaa", "body": super::finding_marker("active")},
+                {"id": 502, "commit_id": "aaaaaaaaaaaa", "body": super::finding_marker("retired")},
+                {"id": 503, "commit_id": "aaaaaaaaaaaa", "body": super::finding_marker("suppressed")}
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        dedup_github(&server)
+            .reconcile_published_finding_markers(&mut receipt, &envelope, "aaaaaaaaaaaa")
+            .await;
+        assert_eq!(
+            receipt.findings[0].initial_outcome,
+            FindingPublicationOutcome::Carried
+        );
+        assert_eq!(receipt.findings[0].comment_id.as_deref(), Some("501"));
+        assert_eq!(
+            receipt.findings[1].initial_outcome,
+            FindingPublicationOutcome::Resolved
+        );
+        assert!(receipt.findings[1].comment_id.is_none());
+        assert_eq!(
+            receipt.findings[2].initial_outcome,
+            FindingPublicationOutcome::Suppressed
+        );
+        assert!(receipt.findings[2].comment_id.is_none());
     }
 
     /// A second review of an unchanged head re-detects what the first found.
