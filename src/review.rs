@@ -1414,6 +1414,7 @@ fn scorer_inputs(
     evidence_corpus: &[String],
     findings: &[Finding],
     total_evidence_budget: usize,
+    scopes: &[Option<crate::adjudication::ValidatedScope>],
 ) -> Vec<prompt::ScorerPromptFinding> {
     let per_finding_budget = total_evidence_budget / findings.len().max(1);
     let local_budget = per_finding_budget.min(8_000) / 3;
@@ -1448,6 +1449,10 @@ fn scorer_inputs(
                 related_budget,
             );
             prompt::ScorerPromptFinding {
+                scope_evidence: scopes
+                    .get(index)
+                    .and_then(Option::as_ref)
+                    .map(|scope| serde_json::to_value(scope).expect("validated scope serializes")),
                 index,
                 path: prompt::sanitize_scorer_input(&finding.path),
                 line: finding.line,
@@ -2502,6 +2507,7 @@ async fn review_diff_at(
                             filter::ReviewTrust::Exhaustive
                         };
                         let mut kept = outcome.kept;
+                        let mut kept_scopes = Vec::new();
                         let mut preserved_baseline_publications = Vec::new();
                         let mut pending_refutation_recovery = Vec::new();
                         let mut staged_adjudication = None;
@@ -2773,6 +2779,12 @@ async fn review_diff_at(
                                         pending_refutation_recovery.push(kept.len());
                                     }
                                     kept.push(finding.clone());
+                                    kept_scopes.push(
+                                        application
+                                            .scopes
+                                            .get(&candidate_ids[candidate_index])
+                                            .cloned(),
+                                    );
                                 }
                             }
                             staged_adjudication = Some((
@@ -2790,6 +2802,7 @@ async fn review_diff_at(
                                     &scorer_evidence_corpus,
                                     &kept,
                                     evidence_budget,
+                                    &kept_scopes,
                                 );
                                 let scorer_user = prompt::scorer_user_prompt_with_feedback(
                                     &inputs,
@@ -3712,6 +3725,7 @@ fn preserve_unadjudicated_findings(
     findings: Vec<Finding>,
 ) -> crate::adjudication::AdjudicationApplication {
     crate::adjudication::AdjudicationApplication {
+        scopes: Default::default(),
         kept_indices: (0..findings.len()).collect(),
         kept: findings,
         unresolved_indices: Vec::new(),
@@ -4057,7 +4071,7 @@ mod tests {
     #[test]
     fn refutation_recovery_requires_scores_for_every_pending_input() {
         let findings = vec![finding("a.rs", 1, "first"), finding("b.rs", 2, "second")];
-        let inputs = scorer_inputs(&[], &[], &findings, 0);
+        let inputs = scorer_inputs(&[], &[], &findings, 0, &[]);
         let score = |index| FindingScore {
             index,
             confidence: 0.99,
@@ -5246,6 +5260,7 @@ mod tests {
         let mut baseline_repository_claim = finding("src/baseline.rs", 3, "widget is absent");
         baseline_repository_claim.repository_claim = Some(claim);
         let mut application = crate::adjudication::AdjudicationApplication {
+            scopes: Default::default(),
             kept: vec![
                 fresh_repository_claim.clone(),
                 fresh_local_finding.clone(),
@@ -5316,6 +5331,7 @@ mod tests {
         security_finding.evidence = Some(evidence.into());
         let baseline_platform = fresh_platform.clone();
         let mut application = crate::adjudication::AdjudicationApplication {
+            scopes: Default::default(),
             kept: vec![
                 fresh_platform.clone(),
                 direct_removal.clone(),
@@ -5483,6 +5499,7 @@ mod tests {
         rejected.machine_claim = Some(source_claim);
         let ordinary = finding("src/identity.rs", 3, "ordinary finding");
         let application = crate::adjudication::AdjudicationApplication {
+            scopes: Default::default(),
             kept: vec![ordinary.clone()],
             kept_indices: vec![1],
             unresolved_indices: Vec::new(),
