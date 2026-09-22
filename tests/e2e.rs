@@ -16236,8 +16236,6 @@ async fn causal_scope_contract_prevents_context_relabeling_before_scoring() {
                 .env_remove("REVIEW_MODEL")
                 .env_remove("REVIEW_SCORER_MODEL")
                 .env("CI", "true")
-                .env("POSTIL_HOSTED_MODE", "1")
-                .env("POSTIL_PROVISIONAL_HOSTED_ROSTER", "1")
                 .env("POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY", "1")
                 .env("POSTIL_QUALIFICATION_CANDIDATE_PROFILE", profile)
                 .env("POSTIL_QUALIFICATION_CAPTURE_API_BASE", server.uri());
