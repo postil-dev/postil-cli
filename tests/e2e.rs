@@ -16236,6 +16236,7 @@ async fn causal_scope_contract_prevents_context_relabeling_before_scoring() {
                 .env_remove("REVIEW_MODEL")
                 .env_remove("REVIEW_SCORER_MODEL")
                 .env("CI", "true")
+                .env("GITHUB_API_URL", "http://127.0.0.1:9")
                 .env("POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY", "1")
                 .env("POSTIL_QUALIFICATION_CANDIDATE_PROFILE", profile)
                 .env("POSTIL_QUALIFICATION_CAPTURE_API_BASE", server.uri());
