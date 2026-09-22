@@ -10317,6 +10317,7 @@ mod tests {
     }
 
     fn pinned_route_client(server: &MockServer) -> LlmClient {
+        let _lock = env_lock().lock().unwrap();
         let config = Config {
             api_base: server.uri(),
             api_format: ApiFormat::OpenaiCompatible,
