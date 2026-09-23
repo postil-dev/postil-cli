@@ -2578,7 +2578,9 @@ export function aggregate(
       }
     }
   }
-  const pricingKnown = costs.length === cases.length && cases.length > 0;
+  const pricingKnown = costs.length === cases.length && cases.length > 0 &&
+    cases.every((item) => item.usageAccountingComplete === true &&
+      typeof item.costProviderDecimal === "string");
   if (!pricingKnown) admissionFailures.push("pricing missing for one or more cases");
   if (structuralPass && p50DurationMs > SCORER_MAX_P50_MS) {
     admissionFailures.push(`p50 latency ${p50DurationMs.toFixed(0)}ms exceeds ${SCORER_MAX_P50_MS}ms`);
@@ -2646,6 +2648,7 @@ export function formatReport(report: ScorerEvalReport): string {
   const exactCosts = report.cases.map((item) => item.costProviderDecimal);
   if (
     exactCosts.length > 0 &&
+    report.cases.every((item) => item.usageAccountingComplete === true) &&
     exactCosts.every((cost): cost is string => typeof cost === "string")
   ) {
     lines.push(

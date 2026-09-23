@@ -2130,6 +2130,41 @@ describe("qualification utilities", () => {
 });
 
 describe("formatReport", () => {
+  test("reports estimated timeout cost as unknown until exact accounting is complete", () => {
+    const cases = qualificationCases(1);
+    const reportFor = (entries: ScorerEvalCase[]): ScorerEvalReport => ({
+      generatedAt: "2026-07-11T00:00:00.000Z",
+      qualificationSourceSha: "a".repeat(40), cliBinarySha256: "b".repeat(64),
+      apiBase: "https://example.test/v1", upstreamProvider: "test-provider",
+      upstreamProviderRoute: "test-provider/route", ...scorerReportContract(),
+      repeats: 1, completedCases: entries.length, totalCases: entries.length,
+      matrixComplete: true, passed: false,
+      models: [aggregate("scorer/model", entries, 1)], cases: entries,
+    });
+    const complete = reportFor(cases);
+    expect(complete.models[0]!.pricingKnown).toBe(true);
+    expect(complete.models[0]!.passed).toBe(true);
+    expect(formatReport(complete)).toContain("$0.000100");
+    expect(formatReport(complete)).toContain("Observed provider cost: $0.0012 (complete accounting)");
+    for (const accounting of [
+      { costProviderDecimal: null, usageAccountingComplete: false },
+      { costProviderDecimal: null, usageAccountingComplete: true },
+      { costProviderDecimal: "0.0001", usageAccountingComplete: false },
+    ]) {
+      const entries = [...cases];
+      entries[0] = { ...entries[0]!, ...accounting, timedOut: true, passed: false, costUsd: 0.001 };
+      const report = reportFor(entries);
+      expect(report.models[0]!.pricingKnown).toBe(false);
+      expect(report.models[0]!.admissionFailures).toContain("pricing missing for one or more cases");
+      expect(report.models[0]!.passed).toBe(false);
+      const text = formatReport(report);
+      expect(text.split("\n").find((line) => line.startsWith("scorer/model"))).toContain("unknown");
+      expect(text).toContain("Observed provider cost: incomplete accounting");
+      expect(text).not.toContain("(complete accounting)");
+    }
+  });
+
+
   test("prints comparable scorer metrics", () => {
     const report: ScorerEvalReport = {
       generatedAt: "2026-07-11T00:00:00.000Z",
