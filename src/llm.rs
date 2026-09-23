@@ -10908,7 +10908,7 @@ mod tests {
         const CHILD_ENV: &str = "POSTIL_TEST_BENCHMARK_SCREENING_CHILD";
         if std::env::var_os(CHILD_ENV).is_none() {
             for (route, profile) in [
-                ("azure/eu", include_str!("../provisional-models.json")),
+                ("azure/eu", include_str!("../provisional-models-eu.json")),
                 ("azure/us", include_str!("../provisional-models-us.json")),
             ] {
                 let directory = tempfile::tempdir().unwrap();

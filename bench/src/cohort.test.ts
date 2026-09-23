@@ -98,7 +98,7 @@ describe("cohort manifests", () => {
   test("US calibration receipts cannot be used with the preserved EU profile", async () => {
     const execution = calibrationExecution();
     const usProfile = resolve(import.meta.dir, "..", "..", "provisional-models-us.json");
-    const euProfile = resolve(import.meta.dir, "..", "..", "provisional-models.json");
+    const euProfile = resolve(import.meta.dir, "..", "..", "provisional-models-eu.json");
     const manifest = await createCohortManifest({
       purpose: "calibration",
       binaryPath: process.execPath,

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { cases } from "../fixtures/cases";
@@ -80,20 +80,59 @@ test("committed Luna baseline is either fail-closed or has a valid ten-report ca
   expect(() => assertBaselineCalibrationIntegrity(profile)).not.toThrow();
 });
 
-test("US calibration target binds the current evaluator separately from the embedded EU provider", async () => {
+test("release prerequisite rejects an unpopulated US baseline before attestation or model calls", async () => {
+  const workflow = await readFile(resolve(import.meta.dir, "..", "..", ".github/workflows/release.yml"), "utf8");
+  const start = workflow.indexOf('          jq -e --arg profile "$profile"');
+  const end = workflow.indexOf('          source_sha=', start);
+  expect(start).toBeGreaterThan(0);
+  expect(end).toBeGreaterThan(start);
+  const prerequisite = workflow.slice(start, end);
+  expect(prerequisite).toContain("main-branch first-attempt calibration attestation");
+  const directory = await mkdtemp(resolve(tmpdir(), "postil-calibration-prerequisite-"));
+  try {
+    await mkdir(resolve(directory, "bench"));
+    const check = async (): Promise<{ code: number; output: string }> => {
+      const child = Bun.spawn(["bash", "-c", 'set -euo pipefail\nprofile="openai/gpt-5.6-luna"\n' + prerequisite], {
+        cwd: directory, stdout: "pipe", stderr: "pipe", timeout: 10_000,
+      });
+      const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      return { code, output: stdout + stderr };
+    };
+    const baseline = (populated: boolean) => JSON.stringify({ profiles: { "openai/gpt-5.6-luna": { populated } } });
+    await writeFile(resolve(directory, "bench/baseline-us.json"), baseline(false));
+    const missing = await check();
+    expect(missing.code).toBe(1);
+    expect(missing.output).toContain("New releases require the populated Azure/US baseline");
+    await writeFile(resolve(directory, "bench/baseline-us.attestation.json"), JSON.stringify({ fixture: true }));
+    expect((await check()).code).toBe(1);
+    await writeFile(resolve(directory, "bench/baseline-us.json"), baseline(true));
+    expect((await check()).code).toBe(0);
+    await writeFile(resolve(directory, "bench/baseline-us.attestation.json"), "");
+    expect((await check()).code).toBe(1);
+    expect(workflow.indexOf("gh attestation verify", end)).toBeGreaterThan(end);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("US calibration target binds the final evaluator separately from the embedded EU provider", async () => {
   const root = resolve(import.meta.dir, "..", "..");
   const [usBytes, euBytes, us, eu] = await Promise.all([
     readFile(resolve(root, "bench/baseline-us.json"), "utf8"),
     readFile(resolve(root, "bench/baseline.json"), "utf8"),
     screeningProfileMetadata(resolve(root, "provisional-models-us.json")),
-    screeningProfileMetadata(resolve(root, "provisional-models.json")),
+    screeningProfileMetadata(resolve(root, "provisional-models-eu.json")),
   ]);
+
   const euBaseline = parseBaselineFile(JSON.parse(euBytes));
   const usBaseline = parseBaselineFile(JSON.parse(usBytes));
   expect(euBaseline.profiles["openai/gpt-5.6-luna"]?.populated).toBe(true);
   const usBaselineProfile = usBaseline.profiles["openai/gpt-5.6-luna"];
   expect(usBaselineProfile).toBeDefined();
+  const expectedEmbeddedProfile = usBaselineProfile?.populated ? "provisional-models-us.json" : "provisional-models-eu.json";
+  expect(await readFile(resolve(root, "provisional-models.json"), "utf8")).toBe(await readFile(resolve(root, expectedEmbeddedProfile), "utf8"));
   if (usBaselineProfile?.populated) {
+    expect((await readFile(resolve(root, "bench/baseline-us.attestation.json"))).length).toBeGreaterThan(0);
     expect(isCalibratedBaselineProfile(usBaselineProfile)).toBe(true);
     if (!isCalibratedBaselineProfile(usBaselineProfile)) throw new Error("US calibration evidence is missing");
     expect(() => assertBaselineCalibrationIntegrity(usBaselineProfile)).not.toThrow();

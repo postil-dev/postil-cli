@@ -87,7 +87,7 @@ bun run scorer-eval --json-out <report-path>
 
 It receives the scorer models, repeat count, provider identity, route, credential, and release binary from the [release workflow](../.github/workflows/release.yml). The scorer screen can reject a scorer but cannot admit a hosted profile.
 
-Release and calibration use an immutable cohort before model calls. Use `../provisional-models.json` for release and `../provisional-models-us.json` for calibration:
+Release and calibration use an immutable cohort before model calls. Both use `../provisional-models-us.json`:
 
 ```sh
 bun run bench:cohort-create -- \
@@ -102,7 +102,7 @@ bun run bench:cohort-run -- --mode execute --manifest <cohort-manifest> --slot <
 
 Use [the release workflow](../.github/workflows/release.yml) for the five-sample comparison and [the calibration workflow](../.github/workflows/benchmark-calibration.yml) for the ten-sample recorded baseline. Both verify attestations, receipts, and provider generation evidence before comparison or recording.
 
-Release and the embedded hosted profile use Azure/EU in `provisional-models.json` with `baseline.json` and its attestation. US calibration uses `provisional-models-us.json` and writes the separate `baseline-us.json` dataset. Calibration requires ten complete attested samples; its credential balance check is not a total spending cap. Changes to the evaluator invalidate comparison against an older baseline, including the preserved EU evidence.
+Release and calibration use Azure/US in `provisional-models-us.json`. The embedded hosted profile remains Azure/EU in `provisional-models.json` until authenticated US calibration evidence is imported. Calibration records `baseline-us.json`. New releases fail closed until the populated baseline and its attestation are committed. Calibration requires ten complete attested samples from the first attempt on main; its credential balance check is not a total spending cap. Baseline imports preserve the artifact bytes and every evaluator contract source, including both workflows. Any change to those sources requires calibration of the changed contract. The EU profile, baseline, and attestation remain separate evidence and cannot qualify the US route.
 
 </details>
 
