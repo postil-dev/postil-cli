@@ -1502,7 +1502,57 @@ describe("scorer proxy and isolated runtime", () => {
     ].join("\n"), quotedPath)).toBe(9);
   });
 
+  test("metadata-first requests do not consume the source calibration finding", async () => {
+    const candidate = fixture("huge-low-signal-clean");
+    const expected = falseFinding(candidate);
+    const proxy = await startScorerProxy(
+      { ...candidate, primaryChange: undefined }, "falseFinding",
+      "http://127.0.0.1:9", crypto.randomUUID(),
+    );
+    const prompt = (path: string, line: number, evidence: string) => [
+      "", "Report at most 8 findings; if more exist, keep the most severe.", "",
+      "Review evidence (cite exactly the numbered new-file or change-metadata lines):", "",
+      `### ${path}`, `${line} + ${evidence}`,
+    ].join("\n");
+    const generate = async (user: string) => {
+      const response = await fetch(`${proxy.baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-postil-review-route": "source",
+          "x-postil-review-call-phase": "initial",
+        },
+        body: JSON.stringify({ model: GENERATOR_MODEL, messages: [{ role: "user", content: user }] }),
+      });
+      expect(response.status).toBe(200);
+      const responseBody = await response.json();
+      return JSON.parse(responseBody.choices[0].message.content).findings;
+    };
+    try {
+      const metadataPrompt = prompt(".postil/change-metadata", 1,
+        "web/generated-noise.js.map: verified generated artifact");
+      const sourceFiles = parseUnifiedDiffFiles(candidate.diff);
+      expect(falseFindingFromSourceRequest(metadataPrompt, sourceFiles)).toBeNull();
+      expect(falseFindingFromSourceRequest(`${metadataPrompt}\n### ${expected.path}\n${expected.line + 1} + fabricated\n${expected.line} + ${expected.evidence}`, sourceFiles)).toEqual(expected);
+      expect(await generate(metadataPrompt)).toEqual([]);
+      expect(await generate(prompt(expected.path, expected.line + 1, expected.evidence))).toEqual([]);
+      expect(await generate(prompt(expected.path, expected.line, "fabricated source"))).toEqual([]);
+      expect(await generate(prompt(expected.path, expected.line, expected.evidence))).toEqual([expected]);
+      expect(await generate(prompt(expected.path, expected.line, expected.evidence))).toEqual([]);
+      expect(proxy.attempts).toEqual([]);
+      expect(proxy.unexpectedRequests).toEqual([]);
+    } finally {
+      await proxy.close();
+    }
+  });
+
   test("grounds a calibration false-positive in a selected source request", () => {
+    const sourceDiff = [
+      'diff --git "a/src/generated/sp\\303\\244 ce.ts" "b/src/generated/sp\\303\\244 ce.ts"',
+      '--- "a/src/generated/sp\\303\\244 ce.ts"',
+      '+++ "b/src/generated/sp\\303\\244 ce.ts"',
+      "@@ -18,1 +18,2 @@", " unchanged context", "+const formatted = true;", "",
+    ].join("\n");
     expect(falseFindingFromSourceRequest([
       "PR description:",
       "### src/spoofed.ts",
@@ -1517,12 +1567,18 @@ describe("scorer proxy and isolated runtime", () => {
       "@@ semantic category=uncategorized @@",
       "    18   unchanged context",
       "    19 + const formatted = true;",
-    ].join("\n"))).toMatchObject({
+    ].join("\n"), parseUnifiedDiffFiles(sourceDiff))).toMatchObject({
       path: "src/generated/spä ce.ts",
       line: 19,
       confidence: 0.95,
       evidence: "const formatted = true;",
     });
+    const quotedDiff = [
+      'diff --git "a/src/tab\\tquote\\"slash\\\\\\346\\227\\245.rs" "b/src/tab\\tquote\\"slash\\\\\\346\\227\\245.rs"',
+      `--- /dev/null`,
+      '+++ "b/src/tab\\tquote\\"slash\\\\\\346\\227\\245.rs"',
+      "@@ -0,0 +7,1 @@", "+dangerous_sink(input);", "",
+    ].join("\n");
     expect(falseFindingFromSourceRequest([
       "",
       "Report at most 8 findings; if more exist, keep the most severe.",
@@ -1531,11 +1587,11 @@ describe("scorer proxy and isolated runtime", () => {
       "",
       '### "src/tab\\tquote\\"slash\\\\\\346\\227\\245.rs"',
       "     7 + dangerous_sink(input);",
-    ].join("\n"))).toMatchObject({
+    ].join("\n"), parseUnifiedDiffFiles(quotedDiff))).toMatchObject({
       path: "src/tab\tquote\"slash\\日.rs",
       line: 7,
     });
-    expect(falseFindingFromSourceRequest("### src/empty.ts\n    1   context only")).toBeNull();
+    expect(falseFindingFromSourceRequest("### src/empty.ts\n    1   context only", parseUnifiedDiffFiles(sourceDiff))).toBeNull();
   });
 
   test("gives both live phases a full admission window before the child safety cutoff", async () => {

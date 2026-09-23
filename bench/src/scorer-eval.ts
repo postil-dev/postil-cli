@@ -24,6 +24,7 @@ import {
   parseUnifiedDiffFiles,
   plannerBatchIdForPath,
   reviewPromptFirstAddedCoordinate,
+  reviewEvidenceFromPrompt,
   reviewPromptContainsAddedCoordinate,
   safeJson,
   startMockGithub,
@@ -1989,7 +1990,9 @@ export async function startScorerProxy(
       ) {
         const finding = containsTarget
           ? falseFinding(c)
-          : falseFindingFromSourceRequest(user);
+          : falseFindingFromSourceRequest(
+              user, parseUnifiedDiffFiles(c.diff),
+            );
         if (finding !== null) {
           output = {
             summary: `${scenario} scorer calibration case for ${c.id}.`,
@@ -2395,11 +2398,30 @@ export function falseFinding(c: BenchmarkCase) {
   return falseFindingAt(path, line, evidence);
 }
 
-export function falseFindingFromSourceRequest(request: string) {
-  const coordinate = reviewPromptFirstAddedCoordinate(request);
-  return coordinate === null
-    ? null
-    : falseFindingAt(coordinate.path, coordinate.line, coordinate.evidence);
+export function falseFindingFromSourceRequest(
+  request: string,
+  sourceFiles: ReturnType<typeof parseUnifiedDiffFiles>,
+) {
+  const evidence = reviewEvidenceFromPrompt(request);
+  if (evidence === undefined) return null;
+  const framing = request.slice(0, request.length - evidence.length);
+  let header: string | undefined;
+  for (const row of evidence.split("\n")) {
+    if (row.startsWith("### ")) {
+      header = row;
+      continue;
+    }
+    if (header === undefined || !/^\s*\d+ \+ /u.test(row)) continue;
+    const coordinate = reviewPromptFirstAddedCoordinate(`${framing}${header}\n${row}`);
+    if (coordinate === null) continue;
+    const changedFile = sourceFiles.find((file) => file.path === coordinate.path);
+    if (
+      !changedFile?.addedLines.includes(coordinate.line) ||
+      changedFile.after.split("\n")[coordinate.line - 1] !== coordinate.evidence
+    ) continue;
+    return falseFindingAt(coordinate.path, coordinate.line, coordinate.evidence);
+  }
+  return null;
 }
 
 function falseFindingAt(path: string, line: number, evidence: string) {
