@@ -55,7 +55,7 @@ export const DEFAULT_QUALIFICATION_REPEATS = 5;
 export const SCORER_REASON_MAX_BYTES = 240;
 export const SCORER_MAX_P50_MS = 5_000;
 export const SCORER_MAX_P95_MS = 10_000;
-export const SCORER_MAX_CASE_MS = 20_000;
+export const SCORER_MAX_CASE_MS = 30_000;
 export const SCORER_CASE_HARNESS_ALLOWANCE_MS = 5_000;
 export const SCORER_CASE_EXEC_TIMEOUT_MS =
   2 * SCORER_MAX_CASE_MS + SCORER_CASE_HARNESS_ALLOWANCE_MS;
@@ -1846,6 +1846,7 @@ export async function startScorerProxy(
   }> = [];
   const upstreamControllers = new Set<AbortController>();
   let upstreamOrdinal = 0;
+  let admissionTimedOut = false;
   let closing = false;
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     if (req.method !== "POST" || req.url !== "/chat/completions") {
@@ -2014,12 +2015,18 @@ export async function startScorerProxy(
       return;
     }
 
+    if (admissionTimedOut) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "qualification admission already failed after an upstream timeout" }));
+      return;
+    }
     const ordinal = ++upstreamOrdinal;
     const controller = new AbortController();
     upstreamControllers.add(controller);
     let deadlineExceeded = false;
     const timeout = setTimeout(() => {
       deadlineExceeded = true;
+      admissionTimedOut = true;
       controller.abort();
     }, upstreamTimeoutMs);
     const startedAt = performance.now();
@@ -2571,7 +2578,9 @@ export function aggregate(
       }
     }
   }
-  const pricingKnown = costs.length === cases.length && cases.length > 0;
+  const pricingKnown = costs.length === cases.length && cases.length > 0 &&
+    cases.every((item) => item.usageAccountingComplete === true &&
+      typeof item.costProviderDecimal === "string");
   if (!pricingKnown) admissionFailures.push("pricing missing for one or more cases");
   if (structuralPass && p50DurationMs > SCORER_MAX_P50_MS) {
     admissionFailures.push(`p50 latency ${p50DurationMs.toFixed(0)}ms exceeds ${SCORER_MAX_P50_MS}ms`);
@@ -2639,6 +2648,7 @@ export function formatReport(report: ScorerEvalReport): string {
   const exactCosts = report.cases.map((item) => item.costProviderDecimal);
   if (
     exactCosts.length > 0 &&
+    report.cases.every((item) => item.usageAccountingComplete === true) &&
     exactCosts.every((cost): cost is string => typeof cost === "string")
   ) {
     lines.push(

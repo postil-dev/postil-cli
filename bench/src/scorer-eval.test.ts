@@ -18,6 +18,7 @@ import {
   SCORER_CASE_EXEC_TIMEOUT_MS,
   SCORER_CASE_HARNESS_ALLOWANCE_MS,
   SCORER_MAX_CASE_MS,
+  SCORER_PROXY_UPSTREAM_TIMEOUT_MS,
   SCORER_REASON_SCHEMA_PATTERN,
   SCORER_DIAGNOSTIC_RESPONSE_LIMIT,
   TRUE_FINDING_CASES,
@@ -1117,6 +1118,54 @@ describe("scorer proxy and isolated runtime", () => {
     }
   });
 
+  for (const phase of ["scorer", "adjudication"] as const) {
+    test(`latches ${phase} admission timeout before a retry can dispatch upstream`, async () => {
+      let dispatches = 0;
+      const upstream = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+        await requestBody(req);
+        dispatches++;
+        if (dispatches === 1) return;
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ usage: { prompt_tokens: 3, completion_tokens: 2, cost: 0.001 } }));
+      });
+      const upstreamBase = await listen(upstream);
+      const proxy = await startScorerProxy(
+        fixture("clean-docs-only"), "falseFinding", upstreamBase, crypto.randomUUID(), 100,
+      );
+      const request = (body: object) => fetch(`${proxy.baseUrl}/chat/completions`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      try {
+        const first = await request(phase === "scorer" ? scorerRequest() : adjudicationRequest());
+        expect(first.status).toBe(504);
+        await first.text();
+        for (const body of [scorerRequest(), adjudicationRequest()]) {
+          const retry = await request(body);
+          expect(retry.status).toBe(400);
+          expect(await retry.json()).toEqual({ error: "qualification admission already failed after an upstream timeout" });
+        }
+        expect(dispatches).toBe(1);
+        expect(proxy.attempts).toHaveLength(1);
+        expect(proxy.attempts[0]).toMatchObject({
+          phase, outcome: "timedOut", costUsd: null, costProviderDecimal: null,
+          usageValid: false, usagePresent: false, httpStatus: null,
+        });
+        const diagnostics = scorerCaseDiagnostics({
+          child: { exitCode: 1, stderr: "", timedOut: false }, attempts: proxy.attempts,
+        });
+        expect(diagnostics.failureSignals).toContain("upstreamTimeout");
+        expect(diagnostics.responses[0]).toMatchObject({
+          exactCost: "unavailable", accountingIssues: ["responseUnavailable"],
+        });
+      } finally {
+        await proxy.close();
+        upstream.closeAllConnections();
+        if (upstream.listening) await close(upstream);
+      }
+    });
+  }
+
   test("aborts an in-flight upstream request before proxy teardown waits", async () => {
     let markUpstreamStarted: (() => void) | undefined;
     const upstreamStarted = new Promise<void>((resolve) => {
@@ -1908,6 +1957,24 @@ describe("aggregate", () => {
     });
   });
 
+  test("admits a 30-second maximum without relaxing percentile limits", () => {
+    expect(SCORER_MAX_CASE_MS).toBe(30_000);
+    expect(SCORER_PROXY_UPSTREAM_TIMEOUT_MS).toBe(30_000);
+    expect(SCORER_CASE_EXEC_TIMEOUT_MS).toBe(65_000);
+    const cases = qualificationCases(3);
+    cases[0]!.durationMs = 30_000;
+    expect(aggregate("scorer/model", cases, 3)).toMatchObject({
+      passed: true, maxDurationMs: 30_000, p50DurationMs: 1000, p95DurationMs: 1000,
+    });
+    cases[0]!.durationMs = 30_001;
+    expect(aggregate("scorer/model", cases, 3).admissionFailures)
+      .toContain("max latency 30001ms exceeds 30000ms");
+    for (const entry of cases) entry.durationMs = 10_001;
+    const failures = aggregate("scorer/model", cases, 3).admissionFailures;
+    expect(failures).toContain("p50 latency 10001ms exceeds 5000ms");
+    expect(failures).toContain("p95 latency 10001ms exceeds 10000ms");
+  });
+
   test("reports a timed-out scorer case without double-counting a structured failure", () => {
     const cases = qualificationCases(1);
     cases[0] = result({
@@ -1957,7 +2024,7 @@ describe("aggregate", () => {
       c.findingPublished = true;
       c.passed = false;
     }
-    cases[0]!.durationMs = 20_001;
+    cases[0]!.durationMs = SCORER_MAX_CASE_MS + 1;
     cases[1]!.costUsd = null;
     const aggregateResult = aggregate("scorer/model", cases, 5);
     expect(aggregateResult.passed).toBe(false);
@@ -2082,6 +2149,41 @@ describe("qualification utilities", () => {
 });
 
 describe("formatReport", () => {
+  test("reports estimated timeout cost as unknown until exact accounting is complete", () => {
+    const cases = qualificationCases(1);
+    const reportFor = (entries: ScorerEvalCase[]): ScorerEvalReport => ({
+      generatedAt: "2026-07-11T00:00:00.000Z",
+      qualificationSourceSha: "a".repeat(40), cliBinarySha256: "b".repeat(64),
+      apiBase: "https://example.test/v1", upstreamProvider: "test-provider",
+      upstreamProviderRoute: "test-provider/route", ...scorerReportContract(),
+      repeats: 1, completedCases: entries.length, totalCases: entries.length,
+      matrixComplete: true, passed: false,
+      models: [aggregate("scorer/model", entries, 1)], cases: entries,
+    });
+    const complete = reportFor(cases);
+    expect(complete.models[0]!.pricingKnown).toBe(true);
+    expect(complete.models[0]!.passed).toBe(true);
+    expect(formatReport(complete)).toContain("$0.000100");
+    expect(formatReport(complete)).toContain("Observed provider cost: $0.0012 (complete accounting)");
+    for (const accounting of [
+      { costProviderDecimal: null, usageAccountingComplete: false },
+      { costProviderDecimal: null, usageAccountingComplete: true },
+      { costProviderDecimal: "0.0001", usageAccountingComplete: false },
+    ]) {
+      const entries = [...cases];
+      entries[0] = { ...entries[0]!, ...accounting, timedOut: true, passed: false, costUsd: 0.001 };
+      const report = reportFor(entries);
+      expect(report.models[0]!.pricingKnown).toBe(false);
+      expect(report.models[0]!.admissionFailures).toContain("pricing missing for one or more cases");
+      expect(report.models[0]!.passed).toBe(false);
+      const text = formatReport(report);
+      expect(text.split("\n").find((line) => line.startsWith("scorer/model"))).toContain("unknown");
+      expect(text).toContain("Observed provider cost: incomplete accounting");
+      expect(text).not.toContain("(complete accounting)");
+    }
+  });
+
+
   test("prints comparable scorer metrics", () => {
     const report: ScorerEvalReport = {
       generatedAt: "2026-07-11T00:00:00.000Z",
