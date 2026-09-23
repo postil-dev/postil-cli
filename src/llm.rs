@@ -10960,7 +10960,7 @@ mod tests {
             0.0,
             LlmPhase::Review,
         );
-        assert_eq!(body["provider"]["order"], json!(["azure/eu"]));
+        assert_eq!(body["provider"]["order"], json!(["azure/us"]));
         assert_eq!(body["provider"]["allow_fallbacks"], false);
         assert_eq!(body["provider"]["data_collection"], "deny");
         assert_eq!(body["provider"]["zdr"], true);

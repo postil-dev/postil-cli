@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { cases } from "../fixtures/cases";
 import {
@@ -47,7 +48,7 @@ import {
   type ProviderContractEvidence,
 } from "./livemodels-score";
 
-test("committed baseline authority matches the current benchmark sources", async () => {
+test("EU baseline preserves its fixture identity but is stale for the calibration evaluator", async () => {
   const baseline = parseBaselineFile(JSON.parse(
     await readFile(resolve(import.meta.dir, "..", "baseline.json"), "utf8"),
   ));
@@ -56,7 +57,7 @@ test("committed baseline authority matches the current benchmark sources", async
     .digest("hex");
 
   expect(baseline.corpus.fixtureCorpusSha256).toBe(fixtureCorpusSha256);
-  expect(baseline.corpus.evaluatorSha256).toBe(await evaluatorSourceSha256());
+  expect(baseline.corpus.evaluatorSha256).not.toBe(await evaluatorSourceSha256());
 });
 
 test("committed Luna baseline is either fail-closed or has a valid ten-report calibration", async () => {
@@ -77,6 +78,41 @@ test("committed Luna baseline is either fail-closed or has a valid ten-report ca
   }
   expect(profile.calibration.reportCount).toBe(10);
   expect(() => assertBaselineCalibrationIntegrity(profile)).not.toThrow();
+});
+
+test("US calibration target binds the current evaluator and active provider", async () => {
+  const root = resolve(import.meta.dir, "..", "..");
+  const [euBytes, usBytes, eu, us] = await Promise.all([
+    readFile(resolve(root, "bench/baseline.json"), "utf8"),
+    readFile(resolve(root, "bench/baseline-us.json"), "utf8"),
+    screeningProfileMetadata(resolve(root, "provisional-models-eu.json")),
+    screeningProfileMetadata(resolve(root, "provisional-models.json")),
+  ]);
+  const euBaseline = parseBaselineFile(JSON.parse(euBytes));
+  const usBaseline = parseBaselineFile(JSON.parse(usBytes));
+  expect(euBaseline.profiles["openai/gpt-5.6-luna"]?.populated).toBe(true);
+  const usBaselineProfile = usBaseline.profiles["openai/gpt-5.6-luna"];
+  expect(usBaselineProfile).toBeDefined();
+  if (usBaselineProfile?.populated) {
+    expect(isCalibratedBaselineProfile(usBaselineProfile)).toBe(true);
+    if (!isCalibratedBaselineProfile(usBaselineProfile)) throw new Error("US calibration evidence is missing");
+    expect(() => assertBaselineCalibrationIntegrity(usBaselineProfile)).not.toThrow();
+    expect(usBaselineProfile.screeningProfileSha256).toBe(us.sha256);
+    expect(usBaselineProfile.calibration.providerContractSha256).toBe(us.providerContractSha256);
+  } else {
+    expect(usBaselineProfile?.instructions).toContain("predeclared ten-slot calibration cohort");
+  }
+  expect(usBaseline.corpus.fixtureCorpusSha256).toBe(euBaseline.corpus.fixtureCorpusSha256);
+  expect(usBaseline.corpus.evaluatorSha256).not.toBe(euBaseline.corpus.evaluatorSha256);
+  expect(usBaseline.corpus.evaluatorSha256).toBe(await evaluatorSourceSha256());
+  expect(eu.upstreamProviderRoute).toBe("azure/eu");
+  expect(us.upstreamProviderRoute).toBe("azure/us");
+  expect(us.sha256).not.toBe(eu.sha256);
+  expect(us.providerContractSha256).not.toBe(eu.providerContractSha256);
+  expect(us.providerContract).toEqual({
+    ...eu.providerContract,
+    upstreamProviderRoute: "azure/us",
+  });
 });
 
 const PROVIDER_CONTRACT: ProviderContractEvidence = {
@@ -190,6 +226,33 @@ function fakeReport(options: FakeReportOptions = {}): LiveReportForComparison {
     results,
   };
 }
+
+test("comparison CLI rejects preserved EU evidence for the current evaluator", async () => {
+  const directory = await mkdtemp(resolve(tmpdir(), "postil-stale-baseline-"));
+  try {
+    const paths = await Promise.all(Array.from({ length: 1 }, async (_, index) => {
+      const report = await inputBoundReport();
+      const path = resolve(directory, `report-${index}.json`);
+      await writeFile(path, JSON.stringify(report));
+      return { path, runId: report.summary.runId };
+    }));
+    const child = Bun.spawn([
+      process.execPath, "--no-env-file", resolve(import.meta.dir, "compare-baseline.ts"),
+      "--binary", process.execPath,
+      "--baseline", resolve(import.meta.dir, "..", "baseline.json"),
+      "--screen-profile", resolve(import.meta.dir, "..", "..", "provisional-models.json"),
+      ...paths.flatMap(({ path, runId }) => ["--expected-run-id", runId, "--result", path]),
+    ], { stdout: "pipe", stderr: "pipe", timeout: 30_000 });
+    const [exitCode, stderr] = await Promise.all([
+      child.exited, new Response(child.stderr).text(), new Response(child.stdout).text(),
+    ]);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("FIXTURE CORPUS MISMATCH");
+    expect(stderr).toContain("evaluator source than the recorded baseline");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 function cloneReport(report: LiveReportForComparison): LiveReportForComparison {
   return structuredClone(report);
@@ -910,6 +973,27 @@ describe("three-report aggregation compatibility", () => {
     expect(comparison.ok).toBe(true);
     expect(formatComparisonTable(comparison.rows)).toContain(
       "Outside its usual range, but not blocking",
+    );
+  });
+
+  test("valid US reports cannot qualify against an EU calibration", async () => {
+    const us = await screeningProfileMetadata(
+      resolve(import.meta.dir, "..", "..", "provisional-models.json"),
+    );
+    const reports = Array.from({ length: 5 }, () => {
+      const report = fakeReport();
+      Object.assign(report.summary, {
+        screeningProfileSha256: us.sha256,
+        upstreamProviderRoute: us.upstreamProviderRoute,
+        providerContract: us.providerContract,
+        providerContractSha256: us.providerContractSha256,
+      });
+      expect(() => assertValidReleaseReport(report)).not.toThrow();
+      return report;
+    });
+    const observed = aggregateObservedMetrics(reports);
+    expect(() => compareMetrics(populatedBaseline, observed)).toThrow(
+      "baseline calibration execution identity does not match the candidate cohort",
     );
   });
 

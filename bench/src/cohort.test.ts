@@ -95,6 +95,26 @@ describe("cohort manifests", () => {
     ).rejects.toThrow("evaluatorSha256 is not bound");
   });
 
+  test("US calibration receipts cannot be used with the preserved EU profile", async () => {
+    const execution = calibrationExecution();
+    const usProfile = screeningProfilePath;
+    const euProfile = resolve(import.meta.dir, "..", "..", "provisional-models-eu.json");
+    const manifest = await createCohortManifest({
+      purpose: "calibration",
+      binaryPath: process.execPath,
+      screeningProfilePath: usProfile,
+      runPrefix: "calibration-us",
+      execution,
+    });
+    expect(manifest.slots).toHaveLength(10);
+    await expect(assertManifestBoundToInputs(
+      manifest, process.execPath, usProfile, githubEnvironment(execution),
+    )).resolves.toBeUndefined();
+    await expect(assertManifestBoundToInputs(
+      manifest, process.execPath, euProfile, githubEnvironment(execution),
+    )).rejects.toThrow("screeningProfileSha256 is not bound");
+  });
+
   test("rejects wrong counts, unordered slots, and unbound release execution", async () => {
     let sequence = 100;
     const execution = calibrationExecution();

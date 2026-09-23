@@ -3,7 +3,7 @@
 //
 // Compare mode consumes one, three, or five LiveReport JSON artifacts written by
 // `bun run bench:live --json-out <path>` and compares their metrics against the
-// committed `bench/baseline.json`. Record mode requires a predeclared ten-report
+// committed `bench/baseline-us.json`. Record mode requires a predeclared ten-report
 // calibration cohort. Every report must be complete full-corpus evidence. A
 // multi-report operation additionally requires one identical benchmark cohort
 // and distinct raw artifacts. Exits non-zero on invalid evidence or a material
@@ -18,9 +18,9 @@
 //     --expected-run-id <id-1> ... --expected-run-id <id-5>
 //     --result <path-1> ... --result <path-5>
 //
-// Record mode writes the ten-sample calibration cohort into baseline.json as the new
+// Record mode writes the ten-sample calibration cohort into baseline-us.json as the new
 // baseline for the reports' model. This is the deliberate re-baseline path:
-// nothing updates baseline.json except an explicit --record invocation.
+// nothing updates baseline-us.json except an explicit --record invocation.
 //
 //   bun run bench:compare -- --binary <binary> --screen-profile <profile>
 //     --expected-run-id <id-1> ... --expected-run-id <id-10>
@@ -1112,7 +1112,7 @@ function requiredFlagValue(args: readonly string[], index: number, flag: string)
 }
 
 function defaultBaselinePath(): string {
-  return resolve(import.meta.dir, "..", "baseline.json");
+  return resolve(import.meta.dir, "..", "baseline-us.json");
 }
 
 export function assertDistinctResultPaths(paths: readonly string[]): void {
@@ -1604,7 +1604,7 @@ async function main() {
       baselineFile.corpus.evaluatorSha256 !== observed.evaluatorSha256) {
     console.error(
       "FIXTURE CORPUS MISMATCH: this report was scored against a different fixture set or\n" +
-        "evaluator source than baseline.json was recorded against, so its metrics are not\n" +
+        "evaluator source than the recorded baseline, so its metrics are not\n" +
         "comparable.\n" +
         `  baseline fixtureCorpusSha256 ${baselineFile.corpus.fixtureCorpusSha256}\n` +
         `  observed fixtureCorpusSha256 ${observed.fixtureCorpusSha256}\n` +
@@ -1708,7 +1708,7 @@ async function main() {
   console.log(formatComparisonTable(comparison.rows));
   if (!comparison.ok) {
     console.error(
-      "\nRELEASE BLOCKED: the live benchmark regressed past tolerance against bench/baseline.json.\n" +
+      "\nRELEASE BLOCKED: the live benchmark regressed past tolerance against the recorded baseline.\n" +
         "Fix the regression, or if the new numbers are an accepted tradeoff, re-baseline\n" +
         "deliberately with:\n" +
         rebaselineGuidance,

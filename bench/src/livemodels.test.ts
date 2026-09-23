@@ -1393,6 +1393,18 @@ describe("managed admission workflow", () => {
     );
     expect([...calibrationGenerationVerification.matchAll(/--screen-profile \.\.\/provisional-models\.json/gu)]).toHaveLength(1);
     expect(calibration).toContain("--record");
+    expect(calibration).not.toContain("bench/baseline.json");
+    expect(calibration.match(/--screen-profile \.\.\/provisional-models\.json/gu)).toHaveLength(5);
+    expect(calibration).toContain("--baseline baseline-us.json");
+    expect(calibration).toContain("subject-path: ${{ github.workspace }}/bench/baseline-us.json");
+    expect(calibration).toContain('cp bench/baseline-us.json "${RUNNER_TEMP}/populated-baseline/baseline-us.json"');
+    expect(calibration).toContain("/populated-baseline/baseline-us.attestation.json");
+    expect(calibration).toContain("name: benchmark-calibration-us-baseline-${{ github.run_id }}");
+    expect(release).not.toContain("bench/baseline.json");
+    expect(release).toContain("bench/baseline-us.json");
+    expect(release).toContain("--baseline baseline-us.json");
+    expect(release).toContain("--bundle bench/baseline-us.attestation.json");
+    expect(release).toContain("--signer-workflow postil-dev/postil-cli/.github/workflows/benchmark-calibration.yml");
     expect(release).not.toContain("workflow_dispatch");
     expect(release).toContain("name: Require the unique first release run for this tag");
     expect(release).toContain('if [[ "${GITHUB_RUN_ATTEMPT}" != "1" ]]');
@@ -1401,7 +1413,7 @@ describe("managed admission workflow", () => {
     expect(release).toContain("group: release-${{ github.ref_name }}");
     expect(release).toContain('gh release view "${GITHUB_REF_NAME}"');
     expect(release).toContain("name: Verify the attested Luna calibration baseline");
-    expect(release).toContain("bench/baseline.attestation.json");
+    expect(release).toContain("bench/baseline-us.attestation.json");
     expect(release).toContain('git/ref/tags/postil-calibration-${source_sha}');
     expect(release).toContain(
       "--signer-workflow postil-dev/postil-cli/.github/workflows/benchmark-calibration.yml",
@@ -1418,7 +1430,7 @@ describe("managed admission workflow", () => {
     expect(release).not.toContain("POSTIL_SCORER_EVAL_MODELS:");
     expect(release).toContain('POSTIL_SCORER_EVAL_REPEATS: "3"');
     expect(release).toContain("POSTIL_SCORER_EVAL_UPSTREAM_PROVIDER: Azure");
-    expect(release).toContain("POSTIL_SCORER_EVAL_UPSTREAM_PROVIDER_ROUTE: azure/eu");
+    expect(release).toContain("POSTIL_SCORER_EVAL_UPSTREAM_PROVIDER_ROUTE: azure/us");
     expect(release).toContain("POSTIL_BIN: ${{ github.workspace }}/target/release/postil");
     expect(release).not.toContain("Build scorer qualification binary");
     expect(release).toContain("bun run scorer-eval --json-out");

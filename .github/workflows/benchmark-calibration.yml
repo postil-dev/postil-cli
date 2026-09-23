@@ -45,10 +45,10 @@ jobs:
       - name: Verify embedded model admission
         working-directory: bench
         run: bun run verify-admission --allow-provisional
-      - name: Require an unpopulated Luna baseline
+      - name: Require an unpopulated Azure/US Luna baseline
         run: >-
           jq -e '.profiles["openai/gpt-5.6-luna"].populated == false'
-          bench/baseline.json >/dev/null
+          bench/baseline-us.json >/dev/null
 
   prepare:
     needs: validate
@@ -373,6 +373,7 @@ jobs:
         run: |
           set -euo pipefail
           bun run bench:compare -- \
+            --baseline baseline-us.json \
             --binary "${RUNNER_TEMP}/prepared/postil" \
             --screen-profile ../provisional-models.json \
             --cohort-manifest "${RUNNER_TEMP}/prepared/cohort.json" \
@@ -411,17 +412,17 @@ jobs:
         id: attest-baseline
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
-          subject-path: ${{ github.workspace }}/bench/baseline.json
+          subject-path: ${{ github.workspace }}/bench/baseline-us.json
       - name: Stage populated baseline evidence
         run: |
           mkdir -p "${RUNNER_TEMP}/populated-baseline"
-          cp bench/baseline.json "${RUNNER_TEMP}/populated-baseline/baseline.json"
+          cp bench/baseline-us.json "${RUNNER_TEMP}/populated-baseline/baseline-us.json"
           cp "${{ steps.attest-baseline.outputs.bundle-path }}" \
-            "${RUNNER_TEMP}/populated-baseline/baseline.attestation.json"
+            "${RUNNER_TEMP}/populated-baseline/baseline-us.attestation.json"
       - name: Upload populated baseline
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: benchmark-calibration-baseline-${{ github.run_id }}
+          name: benchmark-calibration-us-baseline-${{ github.run_id }}
           path: ${{ runner.temp }}/populated-baseline
           if-no-files-found: error
           retention-days: 90

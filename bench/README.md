@@ -102,6 +102,8 @@ bun run bench:cohort-run -- --mode execute --manifest <cohort-manifest> --slot <
 
 Use [the release workflow](../.github/workflows/release.yml) for the five-sample comparison and [the calibration workflow](../.github/workflows/benchmark-calibration.yml) for the ten-sample recorded baseline. Both verify attestations, receipts, and provider generation evidence before comparison or recording.
 
+Calibration and release use the Azure/US route in `provisional-models.json` and the separate `baseline-us.json` dataset. Release requires a populated US baseline with its calibration attestation. The preserved Azure/EU baseline has a different evaluator digest and cannot qualify the US evaluator. Calibration requires ten complete attested samples; its credential balance check is not a total spending cap.
+
 </details>
 
 ## Boundaries and deeper reference
