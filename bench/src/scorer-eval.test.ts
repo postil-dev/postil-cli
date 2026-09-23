@@ -451,6 +451,7 @@ describe("scorer case diagnostics", () => {
   const validationPrefix = "postil: finding adjudication validation failed; preserving all generated findings: ";
   const validationCases = [
     ["causal change is not exact changed-source evidence", "causalChangeNotExact"],
+    ["causal diff reference is not exact visible source evidence", "causalDiffRowNotVisible"],
     ["causal change source evidence is ambiguous without an exact position", "causalPositionAmbiguous"],
     ["refuted adjudication must cite candidate-specific contradictory evidence", "refutationUnsupported"],
     ["publication anchor has no verified source role", "anchorSourceRoleMissing"],
