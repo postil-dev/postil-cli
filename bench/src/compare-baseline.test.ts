@@ -115,7 +115,7 @@ test("release prerequisite rejects an unpopulated US baseline before attestation
   }
 });
 
-test("US calibration target binds the final evaluator separately from the embedded EU provider", async () => {
+test("unpopulated US calibration target keeps the embedded provider on Azure/EU", async () => {
   const root = resolve(import.meta.dir, "..", "..");
   const [usBytes, euBytes, us, eu] = await Promise.all([
     readFile(resolve(root, "bench/baseline-us.json"), "utf8"),
@@ -129,18 +129,9 @@ test("US calibration target binds the final evaluator separately from the embedd
   expect(euBaseline.profiles["openai/gpt-5.6-luna"]?.populated).toBe(true);
   const usBaselineProfile = usBaseline.profiles["openai/gpt-5.6-luna"];
   expect(usBaselineProfile).toBeDefined();
-  const expectedEmbeddedProfile = usBaselineProfile?.populated ? "provisional-models-us.json" : "provisional-models-eu.json";
-  expect(await readFile(resolve(root, "provisional-models.json"), "utf8")).toBe(await readFile(resolve(root, expectedEmbeddedProfile), "utf8"));
-  if (usBaselineProfile?.populated) {
-    expect((await readFile(resolve(root, "bench/baseline-us.attestation.json"))).length).toBeGreaterThan(0);
-    expect(isCalibratedBaselineProfile(usBaselineProfile)).toBe(true);
-    if (!isCalibratedBaselineProfile(usBaselineProfile)) throw new Error("US calibration evidence is missing");
-    expect(() => assertBaselineCalibrationIntegrity(usBaselineProfile)).not.toThrow();
-    expect(usBaselineProfile.screeningProfileSha256).toBe(us.sha256);
-    expect(usBaselineProfile.calibration.providerContractSha256).toBe(us.providerContractSha256);
-  } else {
-    expect(usBaselineProfile?.instructions).toContain("predeclared ten-slot calibration cohort");
-  }
+  expect(usBaselineProfile?.populated).toBe(false);
+  expect(usBaselineProfile?.instructions).toContain("predeclared ten-slot calibration cohort");
+  expect(await readFile(resolve(root, "provisional-models.json"), "utf8")).toBe(await readFile(resolve(root, "provisional-models-eu.json"), "utf8"));
   expect(usBaseline.corpus.fixtureCorpusSha256).toBe(euBaseline.corpus.fixtureCorpusSha256);
   expect(usBaseline.corpus.evaluatorSha256).not.toBe(euBaseline.corpus.evaluatorSha256);
   expect(usBaseline.corpus.evaluatorSha256).toBe(await evaluatorSourceSha256());
