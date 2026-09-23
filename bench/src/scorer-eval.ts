@@ -1838,7 +1838,6 @@ export async function startScorerProxy(
     scorerReasonPatternMismatch?: ReturnType<typeof stringMismatchFact>;
   }> = [];
   let falseFindingOutputSent = false;
-  let fallbackSourceFiles: ReturnType<typeof parseUnifiedDiffFiles> | undefined;
   let plannedTargetAvailable = false;
   const plannerSelections: Array<{
     targetBatchId: number | null;
@@ -1992,7 +1991,7 @@ export async function startScorerProxy(
         const finding = containsTarget
           ? falseFinding(c)
           : falseFindingFromSourceRequest(
-              user, fallbackSourceFiles ??= parseUnifiedDiffFiles(c.diff),
+              user, parseUnifiedDiffFiles(c.diff),
             );
         if (finding !== null) {
           output = {
