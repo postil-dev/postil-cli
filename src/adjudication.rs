@@ -1606,6 +1606,11 @@ fn validate_scopes(
         for role in [SourceRole::Added, SourceRole::Context] {
             targets.insert((finding.path.clone(), role, finding.line));
         }
+    }
+    let (mut sources, _) = scope_sources(corpus, &targets, &BTreeSet::new())?;
+    targets.clear();
+    for result in &eligible {
+        let finding = by_id[&result.candidate_id];
         if let Some(scope) = &result.scope {
             ensure!(
                 !scope.reason.trim().is_empty()
@@ -1613,6 +1618,13 @@ fn validate_scopes(
                     && !scope.reason.chars().any(char::is_control),
                 "scope assessment requires a bounded reason"
             );
+            if scope.disposition == ScopeDisposition::IntroducedOrWorsened
+                && sources
+                    .get(&(finding.path.clone(), SourceRole::Added, finding.line))
+                    .is_some_and(|source| direct_added_cause(finding, source).is_ok())
+            {
+                continue;
+            }
             if let Some(CausalReference::Exact(cause)) = &scope.cause {
                 ensure!(
                     !cause.path.is_empty()
@@ -1642,7 +1654,13 @@ fn validate_scopes(
             }
         }
     }
-    let (sources, rows) = scope_sources(corpus, &targets, &diff_lines)?;
+    let rows = if targets.is_empty() && diff_lines.is_empty() {
+        BTreeMap::new()
+    } else {
+        let (causal_sources, rows) = scope_sources(corpus, &targets, &diff_lines)?;
+        sources.extend(causal_sources);
+        rows
+    };
     let mut scopes = BTreeMap::new();
     for result in eligible {
         let finding = by_id[&result.candidate_id];
@@ -2755,17 +2773,39 @@ mod tests {
             byte_offset: None,
             evidence: "export const noticeSeconds = 600;".into(),
         };
-        for mutation in 0..4 {
+        for mutation in 0..13 {
             let mut cause = base_cause.clone();
             match mutation {
                 0 => cause.path = "other.js".into(),
                 1 => cause.side = SourceRole::Removed,
                 2 => cause.line = 1,
-                _ => cause.evidence = "unmatched source".into(),
+                3 => cause.evidence = "unmatched source".into(),
+                4 => cause.path.clear(),
+                5 => cause.path = "x".repeat(1025),
+                6 => cause.line = 0,
+                7 => cause.evidence.clear(),
+                8 => cause.evidence = "x".repeat(MAX_CITED_EVIDENCE_BYTES + 1),
+                9 => cause.side = SourceRole::Context,
+                _ => {}
             }
+            let cause = match mutation {
+                10 => CausalReference::DiffLine(DiffLineReference {
+                    diff_line: 0,
+                    corpus_sha256: sha256(added),
+                }),
+                11 => CausalReference::DiffLine(DiffLineReference {
+                    diff_line: 6,
+                    corpus_sha256: String::new(),
+                }),
+                12 => CausalReference::DiffLine(DiffLineReference {
+                    diff_line: 6,
+                    corpus_sha256: "G".repeat(64),
+                }),
+                _ => CausalReference::Exact(cause),
+            };
             let (f, id, context_receipt, result) = scoped_fixture(Some(ScopeAssessment {
                 disposition: ScopeDisposition::IntroducedOrWorsened,
-                cause: Some(CausalReference::Exact(cause)),
+                cause: Some(cause),
                 reason: "The change permits unauthorized access.".into(),
             }));
             let added_receipt = build_diff_corpus_receipt(
@@ -2818,6 +2858,52 @@ mod tests {
     }
 
     #[test]
+    fn redundant_cause_exemption_is_per_candidate_and_preserves_anchor_integrity() {
+        let added =
+            added_fixture("src/added.js", "const ALLOW_ALL_USERS = true;").replace("+3,1", "+1,1");
+        let corpus = format!("{added}{SCOPE_DIFF}");
+        let invalid_scope = ScopeAssessment {
+            disposition: ScopeDisposition::IntroducedOrWorsened,
+            cause: Some(CausalReference::DiffLine(DiffLineReference {
+                diff_line: 0,
+                corpus_sha256: String::new(),
+            })),
+            reason: "The changed policy permits unauthorized access.".into(),
+        };
+        let (context, _, _, context_result) = scoped_fixture(Some(invalid_scope.clone()));
+        let mut added_finding = context.clone();
+        added_finding.path = "src/added.js".into();
+        let findings = vec![added_finding, context];
+        let ids = stable_candidate_ids("scope-snapshot", &findings);
+        let mut results = vec![context_result.clone(), context_result];
+        for (result, id) in results.iter_mut().zip(&ids) {
+            result.candidate_id.clone_from(id);
+        }
+        let receipt = build_diff_corpus_receipt("scope-snapshot", &corpus, &findings, &ids, 2);
+        assert!(validate_scopes(&findings, &ids, &results, &corpus, &receipt).is_err());
+        results[1].scope = Some(ScopeAssessment {
+            disposition: ScopeDisposition::PreExisting,
+            cause: None,
+            reason: "The unchanged policy exists before this change.".into(),
+        });
+        let scopes = validate_scopes(&findings, &ids, &results, &corpus, &receipt).unwrap();
+        assert_eq!(scopes[&ids[0]].anchor_role, SourceRole::Added);
+        assert_eq!(scopes[&ids[1]].anchor_role, SourceRole::Context);
+        results[0].scope.as_mut().unwrap().disposition = ScopeDisposition::PreExisting;
+        assert!(validate_scopes(&findings, &ids, &results, &corpus, &receipt).is_err());
+        results[0].scope = Some(invalid_scope);
+        let mut wrong_receipt = receipt.clone();
+        wrong_receipt.corpus_sha256 = sha256("other corpus");
+        assert!(validate_scopes(&findings, &ids, &results, &corpus, &wrong_receipt).is_err());
+        let ambiguous = format!("{corpus}{added}");
+        let ambiguous_receipt =
+            build_diff_corpus_receipt("scope-snapshot", &ambiguous, &findings, &ids, 2);
+        assert!(
+            validate_scopes(&findings, &ids, &results, &ambiguous, &ambiguous_receipt).is_err()
+        );
+    }
+
+    #[test]
     fn long_added_anchor_retains_valid_explicit_fallback_when_implicit_slice_is_unavailable() {
         let source = format!("{}charge(); charge();", "é".repeat(900));
         let corpus = format!(
@@ -2853,6 +2939,22 @@ mod tests {
             )
             .unwrap();
             assert_eq!(scopes[&id].cause.as_ref().unwrap().byte_offset, 1810);
+            let mut invalid_result = result.clone();
+            invalid_result.scope.as_mut().unwrap().cause =
+                Some(CausalReference::DiffLine(DiffLineReference {
+                    diff_line: 0,
+                    corpus_sha256: String::new(),
+                }));
+            assert!(
+                validate_scopes(
+                    std::slice::from_ref(&f),
+                    std::slice::from_ref(&id),
+                    &[invalid_result],
+                    &corpus,
+                    &receipt,
+                )
+                .is_err()
+            );
             let Some(CausalReference::Exact(cause)) = &mut result.scope.as_mut().unwrap().cause
             else {
                 unreachable!()
@@ -2974,6 +3076,7 @@ mod tests {
             unreachable!()
         };
         cause.byte_offset = Some(1810);
+        cause.evidence.clear();
         let scopes = validate_scopes(
             &[finding],
             std::slice::from_ref(&id),
