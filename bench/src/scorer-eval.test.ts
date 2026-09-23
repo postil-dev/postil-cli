@@ -18,6 +18,7 @@ import {
   SCORER_CASE_EXEC_TIMEOUT_MS,
   SCORER_CASE_HARNESS_ALLOWANCE_MS,
   SCORER_MAX_CASE_MS,
+  SCORER_PROXY_UPSTREAM_TIMEOUT_MS,
   SCORER_REASON_SCHEMA_PATTERN,
   SCORER_DIAGNOSTIC_RESPONSE_LIMIT,
   TRUE_FINDING_CASES,
@@ -1956,6 +1957,24 @@ describe("aggregate", () => {
     });
   });
 
+  test("admits a 30-second maximum without relaxing percentile limits", () => {
+    expect(SCORER_MAX_CASE_MS).toBe(30_000);
+    expect(SCORER_PROXY_UPSTREAM_TIMEOUT_MS).toBe(30_000);
+    expect(SCORER_CASE_EXEC_TIMEOUT_MS).toBe(65_000);
+    const cases = qualificationCases(3);
+    cases[0]!.durationMs = 30_000;
+    expect(aggregate("scorer/model", cases, 3)).toMatchObject({
+      passed: true, maxDurationMs: 30_000, p50DurationMs: 1000, p95DurationMs: 1000,
+    });
+    cases[0]!.durationMs = 30_001;
+    expect(aggregate("scorer/model", cases, 3).admissionFailures)
+      .toContain("max latency 30001ms exceeds 30000ms");
+    for (const entry of cases) entry.durationMs = 10_001;
+    const failures = aggregate("scorer/model", cases, 3).admissionFailures;
+    expect(failures).toContain("p50 latency 10001ms exceeds 5000ms");
+    expect(failures).toContain("p95 latency 10001ms exceeds 10000ms");
+  });
+
   test("reports a timed-out scorer case without double-counting a structured failure", () => {
     const cases = qualificationCases(1);
     cases[0] = result({
@@ -2005,7 +2024,7 @@ describe("aggregate", () => {
       c.findingPublished = true;
       c.passed = false;
     }
-    cases[0]!.durationMs = 20_001;
+    cases[0]!.durationMs = SCORER_MAX_CASE_MS + 1;
     cases[1]!.costUsd = null;
     const aggregateResult = aggregate("scorer/model", cases, 5);
     expect(aggregateResult.passed).toBe(false);
