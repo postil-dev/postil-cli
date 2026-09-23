@@ -82,11 +82,11 @@ test("committed Luna baseline is either fail-closed or has a valid ten-report ca
 
 test("US calibration target binds the current evaluator and active provider", async () => {
   const root = resolve(import.meta.dir, "..", "..");
-  const [euBytes, usBytes, eu, us] = await Promise.all([
-    readFile(resolve(root, "bench/baseline.json"), "utf8"),
+  const [usBytes, euBytes, us, eu] = await Promise.all([
     readFile(resolve(root, "bench/baseline-us.json"), "utf8"),
-    screeningProfileMetadata(resolve(root, "provisional-models-eu.json")),
+    readFile(resolve(root, "bench/baseline.json"), "utf8"),
     screeningProfileMetadata(resolve(root, "provisional-models.json")),
+    screeningProfileMetadata(resolve(root, "provisional-models-eu.json")),
   ]);
   const euBaseline = parseBaselineFile(JSON.parse(euBytes));
   const usBaseline = parseBaselineFile(JSON.parse(usBytes));
