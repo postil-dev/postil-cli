@@ -1846,6 +1846,7 @@ export async function startScorerProxy(
   }> = [];
   const upstreamControllers = new Set<AbortController>();
   let upstreamOrdinal = 0;
+  let admissionTimedOut = false;
   let closing = false;
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     if (req.method !== "POST" || req.url !== "/chat/completions") {
@@ -2014,12 +2015,18 @@ export async function startScorerProxy(
       return;
     }
 
+    if (admissionTimedOut) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "qualification admission already failed after an upstream timeout" }));
+      return;
+    }
     const ordinal = ++upstreamOrdinal;
     const controller = new AbortController();
     upstreamControllers.add(controller);
     let deadlineExceeded = false;
     const timeout = setTimeout(() => {
       deadlineExceeded = true;
+      admissionTimedOut = true;
       controller.abort();
     }, upstreamTimeoutMs);
     const startedAt = performance.now();

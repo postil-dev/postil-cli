@@ -1117,6 +1117,54 @@ describe("scorer proxy and isolated runtime", () => {
     }
   });
 
+  for (const phase of ["scorer", "adjudication"] as const) {
+    test(`latches ${phase} admission timeout before a retry can dispatch upstream`, async () => {
+      let dispatches = 0;
+      const upstream = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+        await requestBody(req);
+        dispatches++;
+        if (dispatches === 1) return;
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ usage: { prompt_tokens: 3, completion_tokens: 2, cost: 0.001 } }));
+      });
+      const upstreamBase = await listen(upstream);
+      const proxy = await startScorerProxy(
+        fixture("clean-docs-only"), "falseFinding", upstreamBase, crypto.randomUUID(), 100,
+      );
+      const request = (body: object) => fetch(`${proxy.baseUrl}/chat/completions`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      try {
+        const first = await request(phase === "scorer" ? scorerRequest() : adjudicationRequest());
+        expect(first.status).toBe(504);
+        await first.text();
+        for (const body of [scorerRequest(), adjudicationRequest()]) {
+          const retry = await request(body);
+          expect(retry.status).toBe(400);
+          expect(await retry.json()).toEqual({ error: "qualification admission already failed after an upstream timeout" });
+        }
+        expect(dispatches).toBe(1);
+        expect(proxy.attempts).toHaveLength(1);
+        expect(proxy.attempts[0]).toMatchObject({
+          phase, outcome: "timedOut", costUsd: null, costProviderDecimal: null,
+          usageValid: false, usagePresent: false, httpStatus: null,
+        });
+        const diagnostics = scorerCaseDiagnostics({
+          child: { exitCode: 1, stderr: "", timedOut: false }, attempts: proxy.attempts,
+        });
+        expect(diagnostics.failureSignals).toContain("upstreamTimeout");
+        expect(diagnostics.responses[0]).toMatchObject({
+          exactCost: "unavailable", accountingIssues: ["responseUnavailable"],
+        });
+      } finally {
+        await proxy.close();
+        upstream.closeAllConnections();
+        if (upstream.listening) await close(upstream);
+      }
+    });
+  }
+
   test("aborts an in-flight upstream request before proxy teardown waits", async () => {
     let markUpstreamStarted: (() => void) | undefined;
     const upstreamStarted = new Promise<void>((resolve) => {
