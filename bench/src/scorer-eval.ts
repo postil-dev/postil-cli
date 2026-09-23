@@ -218,7 +218,13 @@ interface ScorerResponseMetadata {
   conflictingErrorCodes: boolean;
 }
 
+interface ScorerTransportObservation {
+  transportPhase: "beforeHeaders" | "readingBody" | "bodyComplete";
+  headersReceivedMs: number | null;
+}
+
 interface ScorerResponseDiagnostics extends ScorerResponseMetadata {
+  transport?: ScorerTransportObservation;
   ordinal: number;
   phase: ScorerAttempt["phase"];
   outcome: ScorerAttempt["outcome"];
@@ -285,6 +291,7 @@ function scorerResponseDiagnostics(attempt: ScorerAttempt, ordinal: number): Sco
   }
   return {
     ordinal, phase: attempt.phase, outcome: attempt.outcome, httpStatus: attempt.httpStatus,
+    ...(attempt.transport === undefined ? {} : { transport: attempt.transport }),
     modelIdentityPresent: attempt.modelIdentityPresent, providerIdentityPresent: attempt.providerIdentityPresent,
     exactCost: cost === null ? "unavailable" : cost === "0" ? "zero" : "positive",
     accountingIssues,
@@ -413,6 +420,7 @@ export interface ScorerEvalReport {
 }
 
 interface ScorerAttempt {
+  transport?: ScorerTransportObservation;
   ordinal?: number;
   responseMetadata?: ScorerResponseMetadata;
   phase: "adjudication" | "scorer";
@@ -2030,6 +2038,10 @@ export async function startScorerProxy(
       controller.abort();
     }, upstreamTimeoutMs);
     const startedAt = performance.now();
+    const transport: ScorerTransportObservation = {
+      transportPhase: "beforeHeaders", headersReceivedMs: null,
+    };
+    let observedHttpStatus: number | null = null;
     try {
       const upstream = await fetch(`${apiBase.replace(/\/$/, "")}/chat/completions`, {
         method: "POST",
@@ -2042,7 +2054,11 @@ export async function startScorerProxy(
         body: bodyText,
         signal: controller.signal,
       });
+      observedHttpStatus = upstream.status;
+      transport.headersReceivedMs = Math.max(0, Math.round(performance.now() - startedAt));
+      transport.transportPhase = "readingBody";
       const text = await upstream.text();
+      transport.transportPhase = "bodyComplete";
       const response = safeJson(text) as {
         model?: unknown;
         provider?: unknown;
@@ -2052,6 +2068,7 @@ export async function startScorerProxy(
       const usageValid = isValidUsage(response?.usage);
       attempts.push({
         ordinal,
+        transport,
         phase: isAdjudication ? "adjudication" : "scorer",
         outcome: "completed",
         durationMs: performance.now() - startedAt,
@@ -2075,6 +2092,7 @@ export async function startScorerProxy(
     } catch {
       attempts.push({
         ordinal,
+        transport,
         phase: isAdjudication ? "adjudication" : "scorer",
         outcome: closing ? "teardownAborted" : deadlineExceeded ? "timedOut" : "failed",
         durationMs: performance.now() - startedAt,
@@ -2083,7 +2101,7 @@ export async function startScorerProxy(
         costUsd: null,
         costProviderDecimal: null,
         usageValid: false,
-        httpStatus: null,
+        httpStatus: observedHttpStatus,
         modelIdentityPresent: false,
         providerIdentityPresent: false,
         usagePresent: false,
