@@ -87,22 +87,22 @@ bun run scorer-eval --json-out <report-path>
 
 It receives the scorer models, repeat count, provider identity, route, credential, and release binary from the [release workflow](../.github/workflows/release.yml). The scorer screen can reject a scorer but cannot admit a hosted profile.
 
-Release and calibration use an immutable cohort before model calls:
+Release and calibration use an immutable cohort before model calls. Use `../provisional-models.json` for release and `../provisional-models-us.json` for calibration:
 
 ```sh
 bun run bench:cohort-create -- \
   --purpose <release-or-calibration> \
   --binary <release-binary> \
-  --screen-profile ../provisional-models.json \
+  --screen-profile <screen-profile> \
   --run-prefix <workflow-bound-prefix> \
   --out <cohort-manifest>
-bun run bench:cohort-run -- --mode reserve --manifest <cohort-manifest> --slot <slot> --binary <release-binary> --screen-profile ../provisional-models.json
-bun run bench:cohort-run -- --mode execute --manifest <cohort-manifest> --slot <slot> --binary <release-binary> --screen-profile ../provisional-models.json
+bun run bench:cohort-run -- --mode reserve --manifest <cohort-manifest> --slot <slot> --binary <release-binary> --screen-profile <screen-profile>
+bun run bench:cohort-run -- --mode execute --manifest <cohort-manifest> --slot <slot> --binary <release-binary> --screen-profile <screen-profile>
 ```
 
 Use [the release workflow](../.github/workflows/release.yml) for the five-sample comparison and [the calibration workflow](../.github/workflows/benchmark-calibration.yml) for the ten-sample recorded baseline. Both verify attestations, receipts, and provider generation evidence before comparison or recording.
 
-Calibration and release use the Azure/US route in `provisional-models.json` and the separate `baseline-us.json` dataset. Release requires a populated US baseline with its calibration attestation. The preserved Azure/EU baseline has a different evaluator digest and cannot qualify the US evaluator. Calibration requires ten complete attested samples; its credential balance check is not a total spending cap.
+Release and the embedded hosted profile use Azure/EU in `provisional-models.json` with `baseline.json` and its attestation. US calibration uses `provisional-models-us.json` and writes the separate `baseline-us.json` dataset. Calibration requires ten complete attested samples; its credential balance check is not a total spending cap. Changes to the evaluator invalidate comparison against an older baseline, including the preserved EU evidence.
 
 </details>
 

@@ -3954,7 +3954,7 @@ scorer = { enabled = true, default_model = "provider/scorer", reasoning_effort =
             Some(profile.clone())
         );
         assert_eq!(profile.upstream_provider_identity, "Azure");
-        assert_eq!(profile.upstream_provider_route, "azure/us");
+        assert_eq!(profile.upstream_provider_route, "azure/eu");
         assert_eq!(profile.generator_chain, vec!["openai/gpt-5.6-luna"]);
         assert_eq!(profile.scorer_chain, vec!["openai/gpt-5.6-luna"]);
         assert_eq!(

@@ -71,13 +71,13 @@ jobs:
         run: |
           set -euo pipefail
           profile="openai/gpt-5.6-luna"
-          test -s bench/baseline-us.attestation.json || {
+          test -s bench/baseline.attestation.json || {
             echo "::error::The populated Luna baseline has no committed calibration attestation."
             exit 1
           }
           source_sha="$(jq -er --arg profile "$profile" \
             '.profiles[$profile] | select(.populated == true) | .calibration.sourceSha' \
-            bench/baseline-us.json)"
+            bench/baseline.json)"
           [[ "$source_sha" =~ ^[0-9a-f]{40,64}$ ]] || {
             echo "::error::The Luna baseline has an invalid calibration source digest."
             exit 1
@@ -89,8 +89,8 @@ jobs:
             echo "::error::The Luna baseline source is not protected by the calibration registry."
             exit 1
           }
-          gh attestation verify bench/baseline-us.json \
-            --bundle bench/baseline-us.attestation.json \
+          gh attestation verify bench/baseline.json \
+            --bundle bench/baseline.attestation.json \
             --repo postil-dev/postil-cli \
             --signer-workflow postil-dev/postil-cli/.github/workflows/benchmark-calibration.yml \
             --signer-digest "$source_sha" \
@@ -213,7 +213,7 @@ jobs:
           POSTIL_BIN: ${{ github.workspace }}/target/release/postil
           POSTIL_SCORER_EVAL_REPEATS: "3"
           POSTIL_SCORER_EVAL_UPSTREAM_PROVIDER: Azure
-          POSTIL_SCORER_EVAL_UPSTREAM_PROVIDER_ROUTE: azure/us
+          POSTIL_SCORER_EVAL_UPSTREAM_PROVIDER_ROUTE: azure/eu
           POSTIL_QUALIFICATION_SOURCE_SHA: ${{ github.sha }}
         run: >-
           bun run scorer-eval --json-out
@@ -530,7 +530,7 @@ jobs:
           set -euo pipefail
           comparison=0
           bun run bench:compare -- \
-            --baseline baseline-us.json \
+            --baseline baseline.json \
             --binary "${{ github.workspace }}/target/release/postil" \
             --screen-profile ../provisional-models.json \
             --cohort-manifest "${{ runner.temp }}/bench-live-cohort.json" \
