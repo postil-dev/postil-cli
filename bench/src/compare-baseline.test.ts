@@ -115,11 +115,12 @@ test("release prerequisite rejects an unpopulated US baseline before attestation
   }
 });
 
-test("unpopulated US calibration target keeps the embedded provider on Azure/EU", async () => {
+test("attested US calibration binds its source and route while the embedded provider stays on Azure/EU", async () => {
   const root = resolve(import.meta.dir, "..", "..");
-  const [usBytes, euBytes, us, eu] = await Promise.all([
+  const [usBytes, euBytes, attestationBytes, us, eu] = await Promise.all([
     readFile(resolve(root, "bench/baseline-us.json"), "utf8"),
     readFile(resolve(root, "bench/baseline.json"), "utf8"),
+    readFile(resolve(root, "bench/baseline-us.attestation.json"), "utf8"),
     screeningProfileMetadata(resolve(root, "provisional-models-us.json")),
     screeningProfileMetadata(resolve(root, "provisional-models-eu.json")),
   ]);
@@ -129,8 +130,20 @@ test("unpopulated US calibration target keeps the embedded provider on Azure/EU"
   expect(euBaseline.profiles["openai/gpt-5.6-luna"]?.populated).toBe(true);
   const usBaselineProfile = usBaseline.profiles["openai/gpt-5.6-luna"];
   expect(usBaselineProfile).toBeDefined();
-  expect(usBaselineProfile?.populated).toBe(false);
-  expect(usBaselineProfile?.instructions).toContain("predeclared ten-slot calibration cohort");
+  expect(usBaselineProfile?.populated).toBe(true);
+  if (!usBaselineProfile?.populated || !isCalibratedBaselineProfile(usBaselineProfile)) {
+    throw new Error("US baseline must contain calibration evidence");
+  }
+  expect(usBaselineProfile.calibration.reportCount).toBe(10);
+  expect(() => assertBaselineCalibrationIntegrity(usBaselineProfile)).not.toThrow();
+  expect(usBaselineProfile.calibration.sourceSha).toBe("356ba691999c737551506039d2ad4bc26c6c1354");
+  expect(usBaselineProfile.screeningProfileSha256).toBe(us.sha256);
+  expect(usBaselineProfile.calibration.providerContractSha256).toBe(us.providerContractSha256);
+  expect(usBaselineProfile.upstreamProviderIdentity).toBe("Azure");
+  const attestation = JSON.parse(attestationBytes);
+  expect(attestation.mediaType).toBe("application/vnd.dev.sigstore.bundle.v0.3+json");
+  expect(attestation.dsseEnvelope).toBeDefined();
+  expect(attestation.verificationMaterial).toBeDefined();
   expect(await readFile(resolve(root, "provisional-models.json"), "utf8")).toBe(await readFile(resolve(root, "provisional-models-eu.json"), "utf8"));
   expect(usBaseline.corpus.fixtureCorpusSha256).toBe(euBaseline.corpus.fixtureCorpusSha256);
   expect(usBaseline.corpus.evaluatorSha256).not.toBe(euBaseline.corpus.evaluatorSha256);

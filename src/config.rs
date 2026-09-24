@@ -3958,7 +3958,19 @@ scorer = { enabled = true, default_model = "provider/scorer", reasoning_effort =
             serde_json::from_str(include_str!("../bench/baseline-us.json")).unwrap();
         assert_eq!(
             calibration["profiles"]["openai/gpt-5.6-luna"]["populated"],
-            false
+            true
+        );
+        assert_eq!(
+            calibration["profiles"]["openai/gpt-5.6-luna"]["upstreamProviderIdentity"],
+            "Azure"
+        );
+        assert_eq!(
+            calibration["profiles"]["openai/gpt-5.6-luna"]["calibration"]["reportCount"],
+            10
+        );
+        assert_eq!(
+            calibration["profiles"]["openai/gpt-5.6-luna"]["calibration"]["sourceSha"],
+            "356ba691999c737551506039d2ad4bc26c6c1354"
         );
         assert_eq!(profile.upstream_provider_route, "azure/eu");
         assert_eq!(profile.generator_chain, vec!["openai/gpt-5.6-luna"]);
