@@ -632,18 +632,37 @@ pub async fn run(args: ReviewArgs) -> Result<i32> {
             );
         }
         let mut cfg = Config::load(&cwd, args.config.as_deref())?;
-        if let Some(m) = &args.model {
-            cfg.model = m.clone();
-            cfg.model_source = "command line".to_string();
-        }
-        if let Some(effort) = &args.reasoning_effort {
-            cfg.reasoning_effort = ReasoningEffort::parse("--reasoning-effort", effort)?;
-            cfg.reasoning_effort_source = "command line".to_string();
-        }
-        if let Some(effort) = &args.scorer_reasoning_effort {
-            cfg.scorer_reasoning_effort =
-                ReasoningEffort::parse("--scorer-reasoning-effort", effort)?;
-            cfg.scorer_reasoning_effort_source = "command line".to_string();
+        if cfg.uses_stored_login() {
+            let ignored = [
+                args.model.as_ref().map(|_| "--model"),
+                args.reasoning_effort.as_ref().map(|_| "--reasoning-effort"),
+                args.scorer_reasoning_effort
+                    .as_ref()
+                    .map(|_| "--scorer-reasoning-effort"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+            if !ignored.is_empty() {
+                crate::progress::notice(format_args!(
+                    "postil: ignoring {} while using a stored login; the hosted service selects model and reasoning settings. Set an explicit provider API key to use these options",
+                    ignored.join(", ")
+                ));
+            }
+        } else {
+            if let Some(m) = &args.model {
+                cfg.model = m.clone();
+                cfg.model_source = "command line".to_string();
+            }
+            if let Some(effort) = &args.reasoning_effort {
+                cfg.reasoning_effort = ReasoningEffort::parse("--reasoning-effort", effort)?;
+                cfg.reasoning_effort_source = "command line".to_string();
+            }
+            if let Some(effort) = &args.scorer_reasoning_effort {
+                cfg.scorer_reasoning_effort =
+                    ReasoningEffort::parse("--scorer-reasoning-effort", effort)?;
+                cfg.scorer_reasoning_effort_source = "command line".to_string();
+            }
         }
         cfg.require_model()?;
         if let Some(fo) = &args.fail_on {

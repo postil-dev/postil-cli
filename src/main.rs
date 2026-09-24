@@ -185,19 +185,22 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
                 println!("  This binary contains no standalone hosted qualification profile.");
             }
             println!("\nCheck the configured endpoint and model: postil doctor");
-            println!("Override once: postil review --model provider/model");
+            println!("BYOK override once: postil review --model provider/model");
             println!(
-                "Override reasoning once: postil review --reasoning-effort high --scorer-reasoning-effort none"
+                "BYOK reasoning override once: postil review --reasoning-effort high --scorer-reasoning-effort none"
             );
-            println!("Override persistently: REVIEW_MODEL=provider/model postil review");
+            println!("BYOK persistent override: REVIEW_MODEL=provider/model postil review");
             println!(
-                "Persist reasoning: REVIEW_REASONING_EFFORT=high REVIEW_SCORER_REASONING_EFFORT=none postil review"
+                "BYOK persistent reasoning: REVIEW_REASONING_EFFORT=high REVIEW_SCORER_REASONING_EFFORT=none postil review"
             );
             println!(
                 "Native Anthropic config: set model.apiBase, model.apiFormat: anthropic, and model.name, then run postil doctor"
             );
             println!(
                 "Config keys: model.name, model.reasoningEffort, and model.scorerReasoningEffort"
+            );
+            println!(
+                "Hosted login: the Postil service selects model, reasoning, and provider settings"
             );
             Ok(0)
         }

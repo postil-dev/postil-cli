@@ -1,8 +1,9 @@
 //! Resolved review configuration.
 //!
-//! Model precedence: CLI flags > environment > `.postil.{yaml,yml,json}` >
-//! stored login routing > embedded defaults. Translated `.coderabbit.yaml`
-//! settings do not select a model.
+//! BYOK model precedence: CLI flags > environment >
+//! `.postil.{yaml,yml,json}` > embedded defaults. A stored login supplies the
+//! hosted endpoint and model hint; local model, reasoning, and provider settings
+//! are ignored. Translated `.coderabbit.yaml` settings do not select a model.
 //!
 //! Exception: `model.apiBase` from a config file is repo-controlled, and the
 //! resolved base URL receives the deployment's bearer key. It is ignored by
@@ -15,9 +16,10 @@
 //! valid, unexpired credential exists at
 //! `${XDG_CONFIG_HOME:-~/.config}/postil/credentials.json`,
 //! `login::resolve_stored_token` supplies its bearer key and its `apiBase`/
-//! `model` provide the baseline below trusted project configuration and
-//! environment overrides. A resolved endpoint override is accepted only with
-//! an explicit API key; a stored login remains bound to its issuing endpoint.
+//! `model` supply the hosted endpoint and model hint. The service selects the
+//! actual model. A resolved endpoint override is accepted
+//! only with an explicit API key; a stored login remains bound to its issuing
+//! endpoint.
 //! An expired or unreadable stored credential is left alone here;
 //! `resolve_api_key` reports it as one actionable "run `postil login` again"
 //! error, while `postil config` reports the stored-login state without needing
@@ -1151,6 +1153,9 @@ pub struct Config {
     pub source: String,
     /// Winning source for the generator chain, shown by `postil config`.
     pub model_source: String,
+    /// Whether the effective inference credential comes from `postil login`.
+    /// Explicit provider API keys leave this false even when a login is stored.
+    pub(crate) stored_login_authority: bool,
 }
 
 impl Default for Config {
@@ -1188,6 +1193,7 @@ impl Default for Config {
             content_policy_disabled: false,
             source: "defaults".to_string(),
             model_source: "embedded default".to_string(),
+            stored_login_authority: false,
         }
     }
 }
@@ -1265,9 +1271,9 @@ impl Config {
         #[cfg(test)]
         let _environment_guard = crate::test_env_lock().lock().unwrap();
         let mut cfg = Config::default();
-        // Login supplies a local baseline, below trusted project configuration
-        // and environment overrides but above the embedded provider defaults.
-        cfg.apply_stored_login_credential();
+        // Resolve credential origin before applying local model configuration.
+        // A stored login delegates inference policy to its issuing service.
+        cfg.stored_login_authority = cfg.apply_stored_login_credential();
         if let Some(path) = explicit {
             let file = Self::read_postil_file(path)
                 .with_context(|| format!("reading config {}", path.display()))?;
@@ -1328,7 +1334,11 @@ impl Config {
     }
 
     pub fn apply_file(&mut self, f: FileConfig) -> Result<()> {
-        self.apply_file_inner(f, allow_config_api_base(), repository_model_config_locked())
+        self.apply_file_inner(
+            f,
+            allow_config_api_base(),
+            repository_model_config_locked() || self.stored_login_authority,
+        )
     }
 
     /// Core of [`apply_file`]. `allow_api_base` decides whether a
@@ -1339,7 +1349,7 @@ impl Config {
         &mut self,
         f: FileConfig,
         allow_api_base: bool,
-        hosted_mode: bool,
+        model_config_locked: bool,
     ) -> Result<()> {
         if let Some(v) = f.enabled {
             self.enabled = v;
@@ -1404,9 +1414,9 @@ impl Config {
             }
         }
         if let Some(m) = f.model {
-            if hosted_mode {
+            if model_config_locked {
                 crate::progress::notice(format_args!(
-                    "postil: ignoring repository model configuration in hosted mode; hosted inference selects the provider and model roster"
+                    "postil: ignoring repository model configuration while using hosted inference; the hosted service selects model, reasoning effort, and provider settings"
                 ));
             } else {
                 if let Some(n) = m.name {
@@ -1542,13 +1552,15 @@ impl Config {
                 ),
             };
         }
-        if let Ok(value) = std::env::var("REVIEW_REASONING_EFFORT")
+        if !self.stored_login_authority
+            && let Ok(value) = std::env::var("REVIEW_REASONING_EFFORT")
             && !value.trim().is_empty()
         {
             self.reasoning_effort = ReasoningEffort::parse("REVIEW_REASONING_EFFORT", &value)?;
             self.reasoning_effort_source = "environment".to_string();
         }
-        if let Ok(value) = std::env::var("REVIEW_SCORER_REASONING_EFFORT")
+        if !self.stored_login_authority
+            && let Ok(value) = std::env::var("REVIEW_SCORER_REASONING_EFFORT")
             && !value.trim().is_empty()
         {
             self.scorer_reasoning_effort =
@@ -1593,6 +1605,39 @@ impl Config {
             self.api_base = profile.api_base;
             self.api_format = profile.api_format;
             self.model_source = "qualification candidate profile".to_string();
+            return Ok(());
+        }
+        if self.stored_login_authority {
+            let ignored = [
+                "REVIEW_MODEL",
+                "REVIEW_MODEL_CASCADE",
+                "REVIEW_MODEL_CONSENSUS",
+                "REVIEW_REASONING_EFFORT",
+                "REVIEW_SCORER_MODEL",
+                "REVIEW_SCORER_MODEL_CASCADE",
+                "REVIEW_SCORER_REASONING_EFFORT",
+                "POSTIL_DISABLE_SCORER",
+                "POSTIL_API_FORMAT",
+                "POSTIL_ENDPOINT_AUTH_HEADER",
+                "POSTIL_ENDPOINT_AUTH_VALUE",
+            ]
+            .into_iter()
+            .filter(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()))
+            .collect::<Vec<_>>();
+            if !ignored.is_empty() {
+                crate::progress::notice(format_args!(
+                    "postil: ignoring local hosted-inference settings {} while using a stored login; set an explicit provider API key to use local model settings",
+                    ignored.join(", ")
+                ));
+            }
+            // Preserve the existing endpoint-binding failure for a conflicting
+            // POSTIL_API_BASE. Runtime credential resolution compares this
+            // value with the endpoint recorded by the stored login.
+            if let Ok(base) = std::env::var("POSTIL_API_BASE")
+                && !base.is_empty()
+            {
+                self.api_base = base;
+            }
             return Ok(());
         }
         if let Ok(m) = std::env::var("REVIEW_MODEL")
@@ -1658,11 +1703,10 @@ impl Config {
         Ok(())
     }
 
-    /// A stored `postil login` credential supplies a local fallback API base
-    /// and, when present, a model. Legacy credentials with an empty model keep
-    /// the embedded default. Project configuration and environment variables
-    /// are applied after this method and therefore retain their documented
-    /// precedence.
+    /// A stored `postil login` credential supplies the hosted API base and,
+    /// when present, model. Legacy credentials with an empty model keep the
+    /// embedded default. Local model, reasoning, and provider settings are
+    /// ignored while this credential remains effective.
     /// Runtime credential resolution rejects an endpoint override when no
     /// explicit API key is set. The cascade is cleared with the model because
     /// a BYOK fallback chain does not describe the hosted gateway.
@@ -1691,6 +1735,10 @@ impl Config {
             self.model_source = "stored login".to_string();
         }
         true
+    }
+
+    pub(crate) fn uses_stored_login(&self) -> bool {
+        self.stored_login_authority
     }
 
     /// All models to try, in order, deduplicated.
@@ -3066,9 +3114,13 @@ scorer = { enabled = true, default_model = "provider/scorer", reasoning_effort =
                 unsafe { std::env::remove_var(other) };
             }
             EnvRestore::set(name, "provider-fixture-key");
-            let mut cfg = Config::default();
+            let mut cfg = Config {
+                stored_login_authority: true,
+                ..Config::default()
+            };
+            cfg.stored_login_authority = cfg.apply_stored_login_credential();
             assert!(
-                !cfg.apply_stored_login_credential(),
+                !cfg.uses_stored_login(),
                 "{name} must suppress login routing"
             );
             assert_eq!(cfg.api_base, model_defaults().api_base, "{name}");
@@ -3079,7 +3131,7 @@ scorer = { enabled = true, default_model = "provider/scorer", reasoning_effort =
     }
 
     #[test]
-    fn project_model_provenance_replaces_stored_login_provenance() {
+    fn stored_login_keeps_credential_model_authority_over_project_config() {
         let _lock = env_lock().lock().unwrap();
         let directory = tempfile::tempdir().unwrap();
         let xdg = EnvRestore::capture("XDG_CONFIG_HOME");
@@ -3106,12 +3158,13 @@ scorer = { enabled = true, default_model = "provider/scorer", reasoning_effort =
         .unwrap();
         let mut config = Config::default();
 
-        assert!(config.apply_stored_login_credential());
+        config.stored_login_authority = config.apply_stored_login_credential();
+        assert!(config.uses_stored_login());
         assert_eq!(config.model_source, "stored login");
         let file: FileConfig = yaml_serde::from_str("model:\n  name: project/model\n").unwrap();
         config.apply_file(file).unwrap();
-        assert_eq!(config.model, "project/model");
-        assert_eq!(config.model_source, "trusted project config");
+        assert_eq!(config.model, "hosted/model");
+        assert_eq!(config.model_source, "stored login");
 
         drop(saved_keys);
         drop(xdg);
@@ -3147,7 +3200,8 @@ scorer = { enabled = true, default_model = "provider/scorer", reasoning_effort =
             .unwrap();
             let mut config = Config::default();
 
-            assert!(config.apply_stored_login_credential());
+            config.stored_login_authority = config.apply_stored_login_credential();
+            assert!(config.uses_stored_login());
             assert_eq!(config.api_base, "https://postil.dev/api/inference/v1");
             assert_eq!(config.model, model_defaults().default_model);
             assert_eq!(config.model_source, "embedded default");

@@ -1,12 +1,13 @@
 # Configuration
 
-Postil resolves model settings in this order:
+With an explicit provider API key (BYOK), Postil resolves model settings in this order:
 
 1. Command-line flags
 2. Environment variables
 3. `.postil.yaml`, `.postil.yml`, or `.postil.json`
-4. Stored `postil login` routing
-5. Built-in defaults
+4. Built-in defaults
+
+With a stored `postil login` credential, the hosted service controls model, reasoning effort, and provider settings. Local model configuration, environment overrides, and model or effort flags are ignored with a warning. An explicit provider API key takes precedence over a stored login and enables local model settings.
 
 Translated `.coderabbit.yaml` settings can supply review policy but do not select a model.
 
@@ -83,7 +84,7 @@ postil logout
 
 `postil login` authenticates against the configured login server over a device-authorization flow (open the printed URL, enter the code) and stores a renewable credential at `${XDG_CONFIG_HOME:-~/.config}/postil/credentials.json`, mode `0600` in a `0700` directory. An ambiguous polling failure retries the same device code so the service can recover the already-issued pair during its 60-second recovery window. The credential records its canonical issuing server. Refresh and logout use that stored issuer; a conflicting explicit `POSTIL_LOGIN_SERVER` fails before any login credential is sent. Issuer-free credentials from older CLI versions infer `https://postil.dev` only when their normalized `apiBase` is the canonical Postil inference endpoint. An issuer-free credential for any custom endpoint requires `postil login` again before refresh or logout.
 
-The stored credential is a fallback used only when none of `POSTIL_API_KEY`, `OPENROUTER_API_KEY`, `MODEL_API_KEY`, or `LLM_API_KEY` is set. Postil rotates it before access expiry and persists the replacement; explicit API keys never trigger a refresh. Its `apiBase` is the only endpoint that may receive its bearer. A different `POSTIL_API_BASE` fails before network access unless an explicit API key is set. `REVIEW_MODEL` may still select a model at the stored endpoint. A legacy access-only login, an expired refresh inactivity window, or a rejected refresh instructs the user to run `postil login` again. A valid `Retry-After` value on a temporary refresh rate limit is reported in seconds. Missing or malformed values use a generic retry message, and all temporary refresh failures retain the credential.
+The stored credential is a fallback used only when none of `POSTIL_API_KEY`, `OPENROUTER_API_KEY`, `MODEL_API_KEY`, or `LLM_API_KEY` is set. Postil rotates it before access expiry and persists the replacement; explicit API keys never trigger a refresh. Its `apiBase` is the only endpoint that may receive its bearer. A different `POSTIL_API_BASE` fails before network access unless an explicit API key is set. Its stored model is a request hint; review output records the model returned by the service when available. A legacy access-only login, an expired refresh inactivity window, or a rejected refresh instructs the user to run `postil login` again. A valid `Retry-After` value on a temporary refresh rate limit is reported in seconds. Missing or malformed values use a generic retry message, and all temporary refresh failures retain the credential.
 
 `postil logout` removes the active local credential only after remote revocation succeeds. A failed revocation retains its sole retry handle and asks the user to run `postil logout` again. A new login stages the newly issued family and any overwritten family in a private pending-revocation queue before replacing the active credential. A local replacement failure therefore retains the new remote family's revocation handle. Pending retries never block normal review work and never follow `POSTIL_LOGIN_SERVER` overrides.
 
@@ -97,4 +98,4 @@ postil doctor
 
 `postil config` prints the resolved non-secret configuration and separate provenance for the model, reviewer reasoning effort, and scorer reasoning effort. `postil doctor` validates endpoint reachability, credential acceptance, and repository setup without printing credential values. Both commands identify renewable logins, access expiry, refresh inactivity expiry, and legacy access-only logins.
 
-Use `--reasoning-effort` and `--scorer-reasoning-effort` for one review. These flags override the matching environment variables, which override `model.reasoningEffort` and `model.scorerReasoningEffort`. The built-in reviewer and scorer defaults are both `low`. Every request carries the resolved value, including retries and repair calls.
+With BYOK, use `--reasoning-effort` and `--scorer-reasoning-effort` for one review. These flags override the matching environment variables, which override `model.reasoningEffort` and `model.scorerReasoningEffort`. The built-in reviewer and scorer defaults are both `low`. Every request carries the resolved value, including retries and repair calls. Stored-login reviews use the hosted service's reasoning policy.

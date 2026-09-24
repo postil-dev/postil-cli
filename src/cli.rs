@@ -145,13 +145,13 @@ pub enum Command {
         /// Explicit config file (bypasses discovery).
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Model override (else REVIEW_MODEL, else config, else default).
+        /// BYOK model override. Ignored when a stored login supplies hosted inference.
         #[arg(long)]
         model: Option<String>,
-        /// Reviewer reasoning effort: max|xhigh|high|medium|low|minimal|none (else REVIEW_REASONING_EFFORT, else config, else low).
+        /// BYOK reviewer effort: max|xhigh|high|medium|low|minimal|none. Ignored with a stored login.
         #[arg(long, value_name = "EFFORT")]
         reasoning_effort: Option<String>,
-        /// Scorer reasoning effort: max|xhigh|high|medium|low|minimal|none (else REVIEW_SCORER_REASONING_EFFORT, else config, else low).
+        /// BYOK scorer effort: max|xhigh|high|medium|low|minimal|none. Ignored with a stored login.
         #[arg(long, value_name = "EFFORT")]
         scorer_reasoning_effort: Option<String>,
         /// Keep detailed provider, retry, and batch telemetry in interactive terminals.
