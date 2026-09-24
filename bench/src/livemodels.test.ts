@@ -1389,10 +1389,24 @@ describe("managed admission workflow", () => {
     };
     const calibrationGenerationVerification = generationVerificationCommand(calibration);
     expect(calibrationGenerationVerification).toMatch(
-      /bun run bench:verify-generations -- \\\n\s+--screen-profile \.\.\/provisional-models\.json \\\n\s+--result /u,
+      /bun run bench:verify-generations -- \\\n\s+--screen-profile \.\.\/provisional-models-us\.json \\\n\s+--result /u,
     );
-    expect([...calibrationGenerationVerification.matchAll(/--screen-profile \.\.\/provisional-models\.json/gu)]).toHaveLength(1);
+    expect([...calibrationGenerationVerification.matchAll(/--screen-profile \.\.\/provisional-models-us\.json/gu)]).toHaveLength(1);
     expect(calibration).toContain("--record");
+    expect(calibration).not.toContain("bench/baseline.json");
+    expect(calibration.match(/--screen-profile \.\.\/provisional-models-us\.json/gu)).toHaveLength(5);
+    expect(calibration).toContain("--baseline baseline-us.json");
+    expect(calibration).toContain("subject-path: ${{ github.workspace }}/bench/baseline-us.json");
+    expect(calibration).toContain('cp bench/baseline-us.json "${RUNNER_TEMP}/populated-baseline/baseline-us.json"');
+    expect(calibration).toContain("/populated-baseline/baseline-us.attestation.json");
+    expect(calibration).toContain("name: benchmark-calibration-us-baseline-${{ github.run_id }}");
+    expect(release).toContain("New releases require the populated Azure/US baseline and its main-branch first-attempt calibration attestation.");
+    expect(release).not.toContain("provisional-models.json");
+    expect(release).toContain("--screen-profile ../provisional-models-us.json");
+    expect(release).not.toContain("bench/baseline.json");
+    expect(release).toContain("--baseline baseline-us.json");
+    expect(release).toContain("--bundle bench/baseline-us.attestation.json");
+    expect(release).toContain("--signer-workflow postil-dev/postil-cli/.github/workflows/benchmark-calibration.yml");
     expect(release).not.toContain("workflow_dispatch");
     expect(release).toContain("name: Require the unique first release run for this tag");
     expect(release).toContain('if [[ "${GITHUB_RUN_ATTEMPT}" != "1" ]]');
@@ -1400,8 +1414,8 @@ describe("managed admission workflow", () => {
     expect(release).toContain("This version tag already has another release run.");
     expect(release).toContain("group: release-${{ github.ref_name }}");
     expect(release).toContain('gh release view "${GITHUB_REF_NAME}"');
-    expect(release).toContain("name: Verify the attested Luna calibration baseline");
-    expect(release).toContain("bench/baseline.attestation.json");
+    expect(release).toContain("name: Verify the attested Azure/US Luna calibration baseline");
+    expect(release).toContain("bench/baseline-us.attestation.json");
     expect(release).toContain('git/ref/tags/postil-calibration-${source_sha}');
     expect(release).toContain(
       "--signer-workflow postil-dev/postil-cli/.github/workflows/benchmark-calibration.yml",
@@ -1410,7 +1424,7 @@ describe("managed admission workflow", () => {
     expect(release).toContain('--source-digest "$source_sha"');
     expect(release).toContain("--source-ref refs/heads/main");
     expect(release).toMatch(/validate-tag:\n[\s\S]*?permissions:\n\s+contents: read\n\s+actions: read/u);
-    expect(release).toMatch(/validate-tag:\n[\s\S]*?fetch-depth: 0[\s\S]*?bun-version: 1\.3\.14[\s\S]*?bun install --frozen-lockfile[\s\S]*?bun run verify-admission[\s\S]*?name: Verify the attested Luna calibration baseline[\s\S]*?\n  bench-live-prepare:\n/u);
+    expect(release).toMatch(/validate-tag:\n[\s\S]*?fetch-depth: 0[\s\S]*?bun-version: 1\.3\.14[\s\S]*?bun install --frozen-lockfile[\s\S]*?bun run verify-admission[\s\S]*?name: Verify the attested Azure\/US Luna calibration baseline[\s\S]*?\n  bench-live-prepare:\n/u);
     // The gate derives its model from the binary's embedded configuration so
     // caller drift cannot benchmark a model absent from the release.
     expect(release).not.toContain("REVIEW_MODEL:");
@@ -1418,7 +1432,7 @@ describe("managed admission workflow", () => {
     expect(release).not.toContain("POSTIL_SCORER_EVAL_MODELS:");
     expect(release).toContain('POSTIL_SCORER_EVAL_REPEATS: "3"');
     expect(release).toContain("POSTIL_SCORER_EVAL_UPSTREAM_PROVIDER: Azure");
-    expect(release).toContain("POSTIL_SCORER_EVAL_UPSTREAM_PROVIDER_ROUTE: azure/eu");
+    expect(release).toContain("POSTIL_SCORER_EVAL_UPSTREAM_PROVIDER_ROUTE: azure/us");
     expect(release).toContain("POSTIL_BIN: ${{ github.workspace }}/target/release/postil");
     expect(release).not.toContain("Build scorer qualification binary");
     expect(release).toContain("bun run scorer-eval --json-out");
@@ -1473,7 +1487,7 @@ describe("managed admission workflow", () => {
     expect(sample).toContain(
       '--manifest "${{ runner.temp }}/bench-live-cohort.json"',
     );
-    expect(sample).toContain("--screen-profile ../provisional-models.json");
+    expect(sample).toContain("--screen-profile ../provisional-models-us.json");
     expect(sample).not.toContain("--report-out");
     expect(sample).not.toContain("--receipt-out");
     expect(sample).toContain("uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4");
@@ -1500,9 +1514,9 @@ describe("managed admission workflow", () => {
     expect(final).toContain("name: Verify independent release generations");
     const releaseGenerationVerification = generationVerificationCommand(final);
     expect(releaseGenerationVerification).toMatch(
-      /bun run bench:verify-generations -- \\\n\s+--screen-profile \.\.\/provisional-models\.json \\\n\s+--result /u,
+      /bun run bench:verify-generations -- \\\n\s+--screen-profile \.\.\/provisional-models-us\.json \\\n\s+--result /u,
     );
-    expect([...releaseGenerationVerification.matchAll(/--screen-profile \.\.\/provisional-models\.json/gu)]).toHaveLength(1);
+    expect([...releaseGenerationVerification.matchAll(/--screen-profile \.\.\/provisional-models-us\.json/gu)]).toHaveLength(1);
     expect(final).toContain("gh attestation verify");
     expect(final).toContain("--deny-self-hosted-runners");
     expect(final).toContain("name: bench-live-cohort-${{ github.run_attempt }}");
@@ -1522,7 +1536,7 @@ describe("managed admission workflow", () => {
     expect([...final.matchAll(/--result /gu)]).toHaveLength(10);
     expect([...final.matchAll(/--receipt /gu)]).toHaveLength(10);
     expect(final).toMatch(
-      /bun run bench:compare --[\s\S]*--binary "\$\{\{ github\.workspace \}\}\/target\/release\/postil"[\s\S]*--screen-profile \.\.\/provisional-models\.json/u,
+      /bun run bench:compare --[\s\S]*--binary "\$\{\{ github\.workspace \}\}\/target\/release\/postil"[\s\S]*--screen-profile \.\.\/provisional-models-us\.json/u,
     );
     expect(final).toContain("SAMPLE_JOB_RESULT: ${{ needs.bench-live-sample.result }}");
     expect(final).toContain('if [[ "${SAMPLE_JOB_RESULT}" != "success" ]]');

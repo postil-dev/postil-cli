@@ -65,19 +65,20 @@ jobs:
       - name: Verify embedded model admission
         working-directory: bench
         run: bun run verify-admission --allow-provisional
-      - name: Verify the attested Luna calibration baseline
+      - name: Verify the attested Azure/US Luna calibration baseline
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           profile="openai/gpt-5.6-luna"
-          test -s bench/baseline.attestation.json || {
-            echo "::error::The populated Luna baseline has no committed calibration attestation."
+          jq -e --arg profile "$profile" '.profiles[$profile].populated == true' \
+            bench/baseline-us.json >/dev/null && test -s bench/baseline-us.attestation.json || {
+            echo "::error::New releases require the populated Azure/US baseline and its main-branch first-attempt calibration attestation."
             exit 1
           }
           source_sha="$(jq -er --arg profile "$profile" \
             '.profiles[$profile] | select(.populated == true) | .calibration.sourceSha' \
-            bench/baseline.json)"
+            bench/baseline-us.json)"
           [[ "$source_sha" =~ ^[0-9a-f]{40,64}$ ]] || {
             echo "::error::The Luna baseline has an invalid calibration source digest."
             exit 1
@@ -89,8 +90,8 @@ jobs:
             echo "::error::The Luna baseline source is not protected by the calibration registry."
             exit 1
           }
-          gh attestation verify bench/baseline.json \
-            --bundle bench/baseline.attestation.json \
+          gh attestation verify bench/baseline-us.json \
+            --bundle bench/baseline-us.attestation.json \
             --repo postil-dev/postil-cli \
             --signer-workflow postil-dev/postil-cli/.github/workflows/benchmark-calibration.yml \
             --signer-digest "$source_sha" \
@@ -180,7 +181,7 @@ jobs:
           bun run bench:cohort-create --
           --purpose release
           --binary "${{ github.workspace }}/target/release/postil"
-          --screen-profile ../provisional-models.json
+          --screen-profile ../provisional-models-us.json
           --run-prefix "release-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}"
           --out "${{ runner.temp }}/bench-live-cohort.json"
 
@@ -213,7 +214,7 @@ jobs:
           POSTIL_BIN: ${{ github.workspace }}/target/release/postil
           POSTIL_SCORER_EVAL_REPEATS: "3"
           POSTIL_SCORER_EVAL_UPSTREAM_PROVIDER: Azure
-          POSTIL_SCORER_EVAL_UPSTREAM_PROVIDER_ROUTE: azure/eu
+          POSTIL_SCORER_EVAL_UPSTREAM_PROVIDER_ROUTE: azure/us
           POSTIL_QUALIFICATION_SOURCE_SHA: ${{ github.sha }}
         run: >-
           bun run scorer-eval --json-out
@@ -304,7 +305,7 @@ jobs:
           --manifest "${{ runner.temp }}/bench-live-cohort.json"
           --slot "${{ matrix.sample }}"
           --binary "${{ github.workspace }}/target/release/postil"
-          --screen-profile ../provisional-models.json
+          --screen-profile ../provisional-models-us.json
       - name: Attest benchmark sample reservation
         id: attest-reservation
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
@@ -327,7 +328,7 @@ jobs:
           --manifest "${{ runner.temp }}/bench-live-cohort.json"
           --slot "${{ matrix.sample }}"
           --binary "${{ github.workspace }}/target/release/postil"
-          --screen-profile ../provisional-models.json
+          --screen-profile ../provisional-models-us.json
       - name: Verify successful benchmark sample evidence
         if: success()
         run: |
@@ -511,7 +512,7 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
           bun run bench:verify-generations -- \
-            --screen-profile ../provisional-models.json \
+            --screen-profile ../provisional-models-us.json \
             --result "${RUNNER_TEMP}/bench-live-reports/slots/01/report.json" \
             --receipt "${RUNNER_TEMP}/bench-live-reports/slots/01/receipt.json" \
             --result "${RUNNER_TEMP}/bench-live-reports/slots/02/report.json" \
@@ -530,8 +531,9 @@ jobs:
           set -euo pipefail
           comparison=0
           bun run bench:compare -- \
+            --baseline baseline-us.json \
             --binary "${{ github.workspace }}/target/release/postil" \
-            --screen-profile ../provisional-models.json \
+            --screen-profile ../provisional-models-us.json \
             --cohort-manifest "${{ runner.temp }}/bench-live-cohort.json" \
             --expected-run-id "release-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}-01" \
             --expected-run-id "release-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}-02" \

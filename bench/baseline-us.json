@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 2,
+  "corpus": {
+    "fixtureCorpusSha256": "8e4c2cb9ad5a7efdfe6a875566d20133e905155b6f693a873595adf6c069e065",
+    "evaluatorSha256": "962efe39771505e5d45428837e59a38dc6577a1821cba2c4a24358bdd581c71c"
+  },
+  "profiles": {
+    "openai/gpt-5.6-luna": {
+      "populated": false,
+      "instructions": "Record a predeclared ten-slot calibration cohort with provisional-models-us.json and exact Azure/US provider evidence."
+    }
+  }
+}

@@ -10907,28 +10907,33 @@ mod tests {
     fn benchmark_screening_enforces_the_exact_provisional_provider_contract() {
         const CHILD_ENV: &str = "POSTIL_TEST_BENCHMARK_SCREENING_CHILD";
         if std::env::var_os(CHILD_ENV).is_none() {
-            let directory = tempfile::tempdir().unwrap();
-            let profile_path = directory.path().join("screen-profile.json");
-            std::fs::write(&profile_path, include_str!("../provisional-models.json")).unwrap();
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
+            for (route, profile) in [
+                ("azure/eu", include_str!("../provisional-models-eu.json")),
+                ("azure/us", include_str!("../provisional-models-us.json")),
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let profile_path = directory.path().join("screen-profile.json");
+                std::fs::write(&profile_path, profile).unwrap();
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
                     "llm::tests::benchmark_screening_enforces_the_exact_provisional_provider_contract",
                     "--nocapture",
                 ])
-                .env(CHILD_ENV, "1")
+                .env(CHILD_ENV, route)
                 .env("POSTIL_BENCH_SCREEN_PROFILE", &profile_path)
                 .env("POSTIL_BENCH_REQUIRE_HOSTED_PROVIDER_PRIVACY", "1")
                 .env_remove("POSTIL_HOSTED_MODE")
                 .env_remove("POSTIL_QUALIFICATION_CANDIDATE_PROFILE")
                 .output()
                 .unwrap();
-            assert!(
-                output.status.success(),
-                "isolated screening test failed\nstdout:\n{}\nstderr:\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            );
+                assert!(
+                    output.status.success(),
+                    "isolated screening test failed\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+            }
             return;
         }
 
@@ -10960,7 +10965,10 @@ mod tests {
             0.0,
             LlmPhase::Review,
         );
-        assert_eq!(body["provider"]["order"], json!(["azure/eu"]));
+        assert_eq!(
+            body["provider"]["order"],
+            json!([std::env::var(CHILD_ENV).unwrap()])
+        );
         assert_eq!(body["provider"]["allow_fallbacks"], false);
         assert_eq!(body["provider"]["data_collection"], "deny");
         assert_eq!(body["provider"]["zdr"], true);
