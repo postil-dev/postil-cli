@@ -1670,10 +1670,18 @@ fn validate_scopes(
             added.is_none() || context.is_none(),
             "publication anchor has conflicting source roles"
         );
+        // The reviewed citation fixes a metadata anchor's role. Unresolved
+        // results carry no evidence, and confirmation must copy the anchor.
+        let metadata_evidence = finding.evidence.as_deref().filter(|evidence| {
+            !evidence.is_empty()
+                && (result.evidence == *evidence
+                    || (result.status == AdjudicationStatus::Unresolved
+                        && result.evidence.is_empty()))
+        });
         let metadata = matches!(
             finding.path.as_str(),
             crate::envelope::CHANGE_METADATA_PATH | crate::envelope::PR_DESCRIPTION_PATH
-        ) && finding.evidence.as_deref() == Some(result.evidence.as_str())
+        ) && metadata_evidence.is_some()
             && receipt
                 .candidate_citations
                 .iter()
@@ -1736,9 +1744,9 @@ fn validate_scopes(
             })
         } else if added.is_some() {
             added_cause?
-        } else if metadata {
+        } else if let Some(evidence) = metadata_evidence.filter(|_| metadata) {
             ensure!(
-                result.evidence.len() <= MAX_CITED_EVIDENCE_BYTES,
+                evidence.len() <= MAX_CITED_EVIDENCE_BYTES,
                 "metadata cause exceeds its evidence bound"
             );
             Some(CausalChange {
@@ -1746,7 +1754,7 @@ fn validate_scopes(
                 side: SourceRole::Metadata,
                 line: finding.line,
                 byte_offset: 0,
-                evidence: result.evidence.clone(),
+                evidence: evidence.to_string(),
             })
         } else {
             return Err(anyhow!(
@@ -2296,6 +2304,79 @@ mod tests {
             scope,
         };
         (f, id, receipt, result)
+    }
+
+    #[test]
+    fn unresolved_metadata_anchor_keeps_its_reviewed_source_role() {
+        let corpus = "diff --git a/src/export.ts b/src/export.ts\ndeleted file mode 100644\n--- a/src/export.ts\n+++ /dev/null\n@@ -1 +0,0 @@\n-export function exportCsv() {}\n";
+        let mut f = finding(
+            Kind::Risk,
+            "Preserve the export endpoint",
+            "Deleting the export breaks remaining callers. Keep the endpoint.",
+        );
+        f.path = crate::envelope::CHANGE_METADATA_PATH.into();
+        f.line = 1;
+        f.evidence = Some("src/export.ts: deleted".into());
+        let id = stable_candidate_ids("scope-snapshot", std::slice::from_ref(&f)).remove(0);
+        let unresolved = AdjudicationResult {
+            candidate_id: id.clone(),
+            status: AdjudicationStatus::Unresolved,
+            revised_title: String::new(),
+            revised_body: String::new(),
+            evidence: String::new(),
+            duplicate_of: None,
+            scope: None,
+        };
+        let receipt = build_diff_corpus_receipt(
+            "scope-snapshot",
+            corpus,
+            std::slice::from_ref(&f),
+            std::slice::from_ref(&id),
+            1,
+        );
+        let scopes = validate_scopes(
+            std::slice::from_ref(&f),
+            std::slice::from_ref(&id),
+            std::slice::from_ref(&unresolved),
+            corpus,
+            &receipt,
+        )
+        .unwrap();
+        assert_eq!(scopes[&id].anchor_role, SourceRole::Metadata);
+        assert_eq!(
+            scopes[&id]
+                .cause
+                .as_ref()
+                .map(|cause| cause.evidence.as_str()),
+            f.evidence.as_deref()
+        );
+        let mut confirmed = unresolved.clone();
+        confirmed.status = AdjudicationStatus::Confirmed;
+        confirmed.evidence = "export function exportCsv() {}".into();
+        assert!(
+            validate_scopes(
+                std::slice::from_ref(&f),
+                std::slice::from_ref(&id),
+                &[confirmed],
+                corpus,
+                &receipt,
+            )
+            .is_err(),
+            "confirmation must copy the anchored metadata evidence"
+        );
+        let mut unreviewed = receipt.clone();
+        unreviewed.candidate_citations[0].cited_evidence_reviewed = false;
+        assert!(
+            validate_scopes(
+                std::slice::from_ref(&f),
+                std::slice::from_ref(&id),
+                std::slice::from_ref(&unresolved),
+                corpus,
+                &unreviewed,
+            )
+            .is_err(),
+            "an unreviewed citation has no verified role"
+        );
     }
 
     #[test]
