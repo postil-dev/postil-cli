@@ -5238,6 +5238,61 @@ fn build_manifest(
     }
 }
 
+/// Non-citable views of a complete pull-request diff for an incremental
+/// review, in preference order: the raw diff when it fits `max_bytes`, then a
+/// per-file manifest. Raw diff lines carry no numbered margin or `### ` header,
+/// so review grounding cannot accept a citation into either view.
+pub fn pull_request_context_views(text: &str, max_bytes: usize) -> Vec<String> {
+    let text = text.trim_end();
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut views = Vec::new();
+    if text.len() < max_bytes {
+        views.push(crate::prompt::bounded_untrusted_prompt_text(
+            &format!("{text}\n"),
+            max_bytes,
+        ));
+    }
+    let diff = parse(text);
+    let mut manifest = String::from("Changed-file summary of the complete change:\n");
+    for (index, file) in diff.files.iter().enumerate() {
+        let (added, removed) = file.hunks.iter().flat_map(|hunk| &hunk.lines).fold(
+            (0usize, 0usize),
+            |(added, removed), line| match line.as_bytes().first() {
+                Some(b'+') => (added + 1, removed),
+                Some(b'-') => (added, removed + 1),
+                _ => (added, removed),
+            },
+        );
+        let status = if file.deleted {
+            "deleted".to_string()
+        } else if file.binary {
+            "binary".to_string()
+        } else if file.old_path != file.path {
+            format!("renamed from {}", manifest_path(&file.old_path))
+        } else if file.old_mode.is_none() && file.new_mode.is_some() && removed == 0 {
+            "added".to_string()
+        } else {
+            "modified".to_string()
+        };
+        let entry = format!(
+            "- {} [{status}] +{added} -{removed}\n",
+            manifest_path(&file.path)
+        );
+        let omitted = format!("- {} more files\n", diff.files.len() - index);
+        if manifest.len() + entry.len() + omitted.len() > max_bytes {
+            manifest.push_str(&omitted);
+            break;
+        }
+        manifest.push_str(&entry);
+    }
+    views.push(crate::prompt::bounded_untrusted_prompt_text(
+        &manifest, max_bytes,
+    ));
+    views
+}
+
 fn manifest_path(path: &str) -> String {
     display_path(path)
 }
@@ -6381,6 +6436,34 @@ diff --git a/src/multi.rs b/src/multi.rs
         let index = DiffIndex::build(&parse(MULTI_HUNK_SAMPLE));
 
         assert_eq!(index.nearest_new_side_line("src/missing.rs", 11), None);
+    }
+
+    #[test]
+    fn pull_request_context_views_prefer_the_raw_diff_and_degrade_to_a_manifest() {
+        let source = "diff --git a/k8s/routes.yaml b/k8s/routes.yaml\n--- a/k8s/routes.yaml\n+++ b/k8s/routes.yaml\n@@ -1,3 +1,1 @@\n name: kept\n-name: removed\n-### heading-like removed line\ndiff --git a/old.rs b/old.rs\ndeleted file mode 100644\n--- a/old.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-removed();\ndiff --git a/new.rs b/new.rs\nnew file mode 100644\n--- /dev/null\n+++ b/new.rs\n@@ -0,0 +1,2 @@\n+added();\n+added_again();\n";
+        let views = pull_request_context_views(source, 4096);
+        assert_eq!(views.len(), 2);
+        assert_eq!(views[0], source);
+        assert_eq!(
+            views[1],
+            "Changed-file summary of the complete change:\n- k8s/routes.yaml [modified] +0 -2\n- old.rs [deleted] +0 -1\n- new.rs [added] +2 -0\n"
+        );
+        for view in &views {
+            assert!(view.lines().all(|line| !line.starts_with("### ")));
+            assert!(!review_batch_has_evidence_anchor(view, "new.rs", 1));
+            assert!(!review_batch_has_evidence_anchor(
+                view,
+                "k8s/routes.yaml",
+                1
+            ));
+        }
+
+        let manifest_only = pull_request_context_views(source, 128);
+        assert_eq!(manifest_only.len(), 1);
+        assert!(manifest_only[0].starts_with("Changed-file summary"));
+        assert!(manifest_only[0].ends_with("more files\n"));
+        assert!(manifest_only[0].len() <= 128);
+        assert!(pull_request_context_views(" \n", 4096).is_empty());
     }
 
     #[test]

@@ -42,6 +42,8 @@ macro_rules! notice {
 // factors leaves fixed room for the system prompt and request shape across
 // OpenAI-compatible and native Anthropic providers.
 pub(crate) const MAX_REVIEW_BATCH_BYTES: usize = crate::llm::MAX_PROVIDER_REQUEST_BYTES / 8;
+/// Bound on the complete-change context repeated in each incremental request.
+const MAX_PULL_REQUEST_CONTEXT_BYTES: usize = 24 * 1024;
 #[cfg(test)]
 pub(crate) const MAX_HOSTED_REVIEW_BATCH_BYTES: usize = MAX_REVIEW_BATCH_BYTES;
 pub(crate) const MAX_REVIEW_MANIFEST_BYTES: usize = 24_000;
@@ -400,6 +402,7 @@ pub struct ReviewArgs {
     pub staged: bool,
     pub base: Option<String>,
     pub diff_file: Option<PathBuf>,
+    pub pull_request_diff_file: Option<PathBuf>,
     pub check_run_id: Option<String>,
     pub gate_check_run_id: Option<String>,
     pub since_sha: Option<String>,
@@ -449,6 +452,8 @@ struct ReviewInput<'a> {
     force_model: bool,
     llm_budget_started_at: Option<Instant>,
     repository_source: RepositorySource<'a>,
+    /// Complete pull-request diff that frames an incremental review.
+    pull_request_diff: Option<&'a diff::DiffSnapshot>,
 }
 
 struct RemoteReviewInput<'a> {
@@ -738,6 +743,11 @@ async fn run_local(args: &ReviewArgs, cfg: &Config, repo_root: &Path) -> Result<
         crate::progress::notice(format_args!("postil: {warning}"));
     }
     let local_snapshot = local::acquire(&selection.source, head_sha.as_deref(), repo_root).await?;
+    let pull_request_diff = args
+        .pull_request_diff_file
+        .as_deref()
+        .map(diff::DiffSnapshot::from_path)
+        .transpose()?;
     let baseline = load_baseline(args)?;
     let touched_carried_error = cfg.enabled
         && args.since_sha.is_some()
@@ -785,6 +795,7 @@ async fn run_local(args: &ReviewArgs, cfg: &Config, repo_root: &Path) -> Result<
                 } else {
                     RepositorySource::Unavailable
                 },
+                pull_request_diff: pull_request_diff.as_ref(),
             },
         )
         .await
@@ -1246,6 +1257,30 @@ async fn remote_review<F: Forge>(
     };
     let publication_diff = matches!(scope, filter::ReconcileScope::Full { .. })
         .then(|| diff::parse(diff_snapshot.as_str()));
+    // An incremental review judges the pushed commits against the complete
+    // change. The context is advisory, so an unavailable diff keeps the review.
+    let pull_request_diff = if matches!(scope, filter::ReconcileScope::Incremental { .. })
+        && !diff_snapshot.as_str().trim().is_empty()
+    {
+        match run_with_hosted_budget(
+            Some(review_started),
+            full_diff_timeout_secs(meta),
+            forge.fetch_diff(meta),
+            "fetching complete pull-request context diff",
+        )
+        .await
+        {
+            Ok(complete) => Some(complete),
+            Err(error) => {
+                eprintln!(
+                    "postil: complete pull-request context is unavailable ({error:#}); reviewing the increment without it"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     let envelope = review_diff(
         cfg,
         args,
@@ -1260,6 +1295,7 @@ async fn remote_review<F: Forge>(
             force_model,
             llm_budget_started_at: Some(review_started),
             repository_source,
+            pull_request_diff: pull_request_diff.as_ref(),
         },
     )
     .await?;
@@ -1618,6 +1654,7 @@ struct ReviewBatchPromptContext<'a> {
     bounded_selection: bool,
     multiple: bool,
     feedback: Option<&'a crate::review_feedback::ReviewFeedback>,
+    change_context: Option<&'a str>,
 }
 
 const BOUNDED_SOURCE_BATCH_CONTEXT: &str = "This source batch is one bounded view of a larger diff. Review only supplied evidence; do not claim examination of omitted lines. Other boundary, risk, and synthesis batches are reviewed separately.\n\n";
@@ -1656,6 +1693,7 @@ fn review_batch_prompt(
         },
         incremental: context.incremental,
         content_policy: first && context.content_policy_active,
+        change_context: context.change_context,
     };
     let mut user = prompt::user_prompt_with_feedback(
         &prompt_context,
@@ -1802,6 +1840,7 @@ async fn review_diff_at(
         force_model,
         llm_budget_started_at,
         repository_source,
+        pull_request_diff,
     } = input;
     let feedback =
         crate::review_feedback::ReviewFeedback::from_env(repo, args.pr, head_sha.as_deref())?;
@@ -1810,6 +1849,13 @@ async fn review_diff_at(
     let input_incomplete = prepared.reserved_anchor;
     let mut index = std::mem::take(&mut prepared.index);
     let incremental = matches!(scope, filter::ReconcileScope::Incremental { .. });
+    let change_context_views = pull_request_diff
+        .filter(|_| incremental)
+        .map(|complete| {
+            diff::pull_request_context_views(complete.as_str(), MAX_PULL_REQUEST_CONTEXT_BYTES)
+        })
+        .unwrap_or_default();
+    let mut change_context = None;
     let baseline_adjudication_reserve = baseline_adjudication_reserve(&baseline, &index, scope);
 
     // When content policy is active, render the PR title/description as a
@@ -1906,21 +1952,52 @@ async fn review_diff_at(
             // Admission serializes the complete request builder used for provider
             // contact. Remaining UTF-8 batch bytes conservatively upper-bound
             // input tokens without relying on a provider-specific tokenizer.
-            let admission_context = PrContext {
-                repo,
-                title: meta.map(|value| value.title.as_str()),
-                body: meta.map(|value| value.body.as_str()),
-                incremental,
-                content_policy: content_policy_active,
-            };
-            serialized_review_batch_budgets(
-                cfg,
-                generator_max_findings,
-                &chain[..active_model_count],
-                &system,
-                &admission_context,
-                feedback.as_ref(),
-            )?
+            // Complete-change context degrades from the raw diff to a
+            // manifest, then to none, before it can make a review unusable.
+            let mut admitted = None;
+            for view in change_context_views
+                .iter()
+                .map(|view| Some(view.as_str()))
+                .chain(std::iter::once(None))
+            {
+                let admission_context = PrContext {
+                    repo,
+                    title: meta.map(|value| value.title.as_str()),
+                    body: meta.map(|value| value.body.as_str()),
+                    incremental,
+                    content_policy: content_policy_active,
+                    change_context: view,
+                };
+                let budgets = serialized_review_batch_budgets(
+                    cfg,
+                    generator_max_findings,
+                    &chain[..active_model_count],
+                    &system,
+                    &admission_context,
+                    feedback.as_ref(),
+                )?;
+                if view.is_none() || review_batch_budgets_are_usable(budgets) {
+                    admitted = Some((view, budgets));
+                    break;
+                }
+            }
+            let (view, budgets) = admitted.expect("context-free admission is always evaluated");
+            change_context = view;
+            if !change_context_views.is_empty() {
+                eprintln!(
+                    "postil: incremental review context={} bytes={}",
+                    match view {
+                        None => "omitted",
+                        Some(view)
+                            if Some(view) == change_context_views.first().map(String::as_str)
+                                && change_context_views.len() > 1 =>
+                            "complete-diff",
+                        Some(_) => "changed-file-summary",
+                    },
+                    view.map_or(0, str::len),
+                );
+            }
+            budgets
         };
         let invalid_input = if let Some(invalid_input) = preliminary_invalid_input {
             Some(invalid_input)
@@ -2103,6 +2180,7 @@ async fn review_diff_at(
                     bounded_selection: bounded_candidates.is_some() || deterministic_large_review,
                     multiple: planned_batch_count > 1,
                     feedback: feedback.as_ref(),
+                    change_context,
                 };
                 if crate::config::hosted_runtime_mode() {
                     let preflight_ids = if let Some(receipt) = &large_diff_receipt {
@@ -2844,27 +2922,57 @@ async fn review_diff_at(
                         }
                         if !kept.is_empty() && cfg.scorer_enabled() && !adjudication_incomplete {
                             let scorer_system = prompt::scorer_system_prompt(cfg, current_utc_date);
+                            // The scorer sees the generator's complete-change view,
+                            // or the smaller summary, only while full evidence fits.
+                            let scorer_context = change_context
+                                .into_iter()
+                                .chain(change_context_views.last().map(String::as_str))
+                                .find_map(|view| {
+                                    let inputs = scorer_inputs(
+                                        &finding_contexts,
+                                        &scorer_evidence_corpus,
+                                        &kept,
+                                        MAX_SCORER_EVIDENCE_BYTES,
+                                        &kept_scopes,
+                                    );
+                                    let scorer_user = prompt::scorer_user_prompt_with_feedback(
+                                        &inputs,
+                                        Some(view),
+                                        feedback.as_ref(),
+                                    );
+                                    (scorer_system.len().saturating_add(scorer_user.len())
+                                        <= MAX_SCORER_PROMPT_BYTES)
+                                        .then_some((inputs, scorer_user))
+                                });
                             let mut evidence_budget = MAX_SCORER_EVIDENCE_BYTES;
-                            let (inputs, scorer_user) = loop {
-                                let inputs = scorer_inputs(
-                                    &finding_contexts,
-                                    &scorer_evidence_corpus,
-                                    &kept,
-                                    evidence_budget,
-                                    &kept_scopes,
-                                );
-                                let scorer_user = prompt::scorer_user_prompt_with_feedback(
-                                    &inputs,
-                                    feedback.as_ref(),
-                                );
-                                let prompt_bytes =
-                                    scorer_system.len().saturating_add(scorer_user.len());
-                                if prompt_bytes <= MAX_SCORER_PROMPT_BYTES || evidence_budget == 0 {
-                                    break (inputs, scorer_user);
+                            let (inputs, scorer_user) = if let Some(admitted) = scorer_context {
+                                admitted
+                            } else {
+                                loop {
+                                    let inputs = scorer_inputs(
+                                        &finding_contexts,
+                                        &scorer_evidence_corpus,
+                                        &kept,
+                                        evidence_budget,
+                                        &kept_scopes,
+                                    );
+                                    let scorer_user = prompt::scorer_user_prompt_with_feedback(
+                                        &inputs,
+                                        None,
+                                        feedback.as_ref(),
+                                    );
+                                    let prompt_bytes =
+                                        scorer_system.len().saturating_add(scorer_user.len());
+                                    if prompt_bytes <= MAX_SCORER_PROMPT_BYTES
+                                        || evidence_budget == 0
+                                    {
+                                        break (inputs, scorer_user);
+                                    }
+                                    let excess =
+                                        prompt_bytes.saturating_sub(MAX_SCORER_PROMPT_BYTES);
+                                    evidence_budget = evidence_budget
+                                        .saturating_sub(excess.max(evidence_budget / 4).max(1));
                                 }
-                                let excess = prompt_bytes.saturating_sub(MAX_SCORER_PROMPT_BYTES);
-                                evidence_budget = evidence_budget
-                                    .saturating_sub(excess.max(evidence_budget / 4).max(1));
                             };
                             if scorer_system.len().saturating_add(scorer_user.len())
                                 > MAX_SCORER_PROMPT_BYTES
@@ -4207,6 +4315,7 @@ mod tests {
                 body: None,
                 incremental: false,
                 content_policy: false,
+                change_context: None,
             },
             None,
         )
@@ -4276,6 +4385,7 @@ mod tests {
                     body: Some(""),
                     incremental: false,
                     content_policy: true,
+                    change_context: None,
                 },
                 None,
             )
@@ -4315,6 +4425,97 @@ mod tests {
     }
 
     #[test]
+    fn incremental_context_and_intent_reach_every_batch_and_are_charged_to_admission() {
+        let cfg = Config {
+            model: "postil-bench/recorded".into(),
+            api_base: "http://127.0.0.1:1".into(),
+            ..Config::default()
+        };
+        let system = prompt::system_prompt(
+            &cfg,
+            Date::from_calendar_date(2026, time::Month::September, 30).unwrap(),
+        );
+        let models = [cfg.model.clone()];
+        let complete = "diff --git a/k8s/routes.yaml b/k8s/routes.yaml\n--- a/k8s/routes.yaml\n+++ b/k8s/routes.yaml\n@@ -1,2 +1,1 @@\n name: kept\n-name: removed-route\n";
+        let views = diff::pull_request_context_views(complete, MAX_PULL_REQUEST_CONTEXT_BYTES);
+        let context = |change_context| PrContext {
+            repo: Some("example/project"),
+            title: Some("Remove the unused route"),
+            body: Some("The route receives no traffic."),
+            incremental: true,
+            content_policy: false,
+            change_context,
+        };
+        let budgets = |change_context| {
+            serialized_review_batch_budgets(
+                &cfg,
+                cfg.max_findings,
+                &models,
+                &system,
+                &context(change_context),
+                None,
+            )
+            .unwrap()
+        };
+        let without = budgets(None);
+        let with = budgets(Some(views[0].as_str()));
+        let request_bytes = |change_context| {
+            let mut user = prompt::user_prompt(
+                &context(change_context),
+                BOUNDED_SOURCE_BATCH_CONTEXT,
+                cfg.max_findings,
+            );
+            user.push_str(MULTIPLE_BATCH_CONTEXT);
+            crate::llm::serialized_review_request_bytes(
+                &cfg,
+                &cfg.model,
+                &system,
+                &user,
+                crate::llm::REVIEW_MAX_OUTPUT_TOKENS,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            without.source - with.source,
+            request_bytes(Some(views[0].as_str())) - request_bytes(None)
+        );
+        let meta = PrMeta {
+            title: "Remove the unused route".into(),
+            body: "The route receives no traffic.".into(),
+            head_sha: "head".into(),
+            base_sha: "base".into(),
+            target_sha: None,
+            changed_files: None,
+        };
+        let batch_context = ReviewBatchPromptContext {
+            max_findings: 5,
+            repo: Some("example/project"),
+            meta: Some(&meta),
+            incremental: true,
+            content_policy_active: false,
+            bounded_selection: false,
+            multiple: true,
+            feedback: None,
+            change_context: Some(views[0].as_str()),
+        };
+        for first in [true, false] {
+            let (evidence, user, _) = review_batch_prompt(
+                &batch_context,
+                "### k8s/alert.yaml\n     1 + router=~\"kept\"\n".into(),
+                first,
+            );
+            assert!(user.contains("PR title: Remove the unused route"));
+            assert!(user.contains("PR description:\nThe route receives no traffic."));
+            assert!(user.contains("-name: removed-route"));
+            assert!(!evidence.contains("removed-route"));
+            assert!(
+                !diff::review_batch_has_evidence_anchor(&evidence, "k8s/routes.yaml", 1),
+                "complete-change context is not review evidence"
+            );
+        }
+    }
+
+    #[test]
     fn feedback_is_charged_to_serialized_admission_and_every_generator_batch() {
         let cfg = Config {
             model: "postil-bench/recorded".into(),
@@ -4327,6 +4528,7 @@ mod tests {
             body: None,
             incremental: false,
             content_policy: false,
+            change_context: None,
         };
         let system = prompt::system_prompt(
             &cfg,
@@ -4384,6 +4586,7 @@ mod tests {
             bounded_selection: false,
             multiple: true,
             feedback: Some(&feedback),
+            change_context: None,
         };
         for first in [true, false] {
             let (evidence, user, _) =

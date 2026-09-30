@@ -22,6 +22,17 @@ postil review \
 
 Postil reviews new commits, carries unresolved findings forward, and marks findings as resolved when the relevant code changes.
 
+Findings cite only the new commits, but the model judges them against the complete pull-request change. A later commit that narrows an alert, rate limit, or caller for a target an earlier commit removed is therefore consistent cleanup, not a regression. Forge reviews fetch the complete change themselves. For a local increment, supply both diffs:
+
+```sh
+postil review \
+  --diff-file increment.diff \
+  --since-sha <last-reviewed-head> \
+  --pull-request-diff-file pull-request.diff
+```
+
+The complete change is context only and cannot be cited. Each request repeats at most 24 KiB of it; a larger change is summarized per file with its status and added and removed line counts. If the complete change cannot be fetched or does not fit the model's request budget, the increment is reviewed without it.
+
 When the baseline cannot describe the change, because a rebase or force-push left it off the head's ancestry or the forge truncated the compare, the run reviews the complete change at the same head instead of failing. Retrying such a run cannot help, so the recovery happens in-run. `sinceSha` names the baseline a review was measured against, so it is null on any run that reviewed the complete change.
 
 ## Preview policy changes

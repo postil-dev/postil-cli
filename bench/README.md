@@ -72,6 +72,21 @@ The clean-bank-v2 evidence identifies the [measured fixture and evaluator source
 
 Compare models only when the selected cases, fixture hash, evaluator hash, binary hash, retry settings, and concurrency match. Provider routes remain explicit. Evidence identifies the fixture/evaluator source by immutable commit and the measured executable by SHA-256; use `POSTIL_BIN` to select that executable. A different build produces separate evidence. This authored bank is not held-out validation, and one observation per fixture does not establish a stable false-positive rate.
 
+## Incremental screen
+
+An incremental review cites only the pushed commits but is judged against the complete pull-request change. [`fixtures/incremental-screen.ts`](fixtures/incremental-screen.ts) holds four such cases. In the two clean cases the increment contains only a dependent cleanup: an alert selector, or a rate-limit entry and alert selectors. An earlier push in the complete change deletes their targets. The two must-block contrasts narrow a target that the complete change keeps.
+
+The [incremental entrypoint](src/incremental-screen.ts) passes the cases to `runLive` through a generated launcher. The launcher recognizes each increment by content and adds `--since-sha` and `--pull-request-diff-file`. With `COMPLETE_CHANGE=omit` it leaves out the complete change, so the same cases also measure an increment reviewed alone. `REVIEW_SCORER_MODEL` optionally enables the scorer; the profile must then list it. From `bench/`:
+
+```sh
+REVIEW_MODEL=openai/gpt-5.6-luna REVIEW_SCORER_MODEL=openai/gpt-5.6-luna \
+SCREEN_PROFILE=../provisional-models.json \
+POSTIL_LLM_REQUEST_TIMEOUT_SECS=30 POSTIL_LLM_TOTAL_TIMEOUT_SECS=60 \
+timeout 780s bun run src/incremental-screen.ts
+```
+
+`summary.binary` names the launcher. The `incrementalScreen` field records the measured executable and its SHA-256, the launcher digest, the complete-change mode, and a framed digest of the fixture modules and entrypoint. Launcher inputs remain in `.runs/<run-id>-inputs/`.
+
 ## Managed qualification
 
 Managed qualification exercises an ordered generator and scorer pair through the mock forge and a real provider. It requires an exact pair, provider identity and route, three complete repeats, and a release build whose embedded profile matches the worktree. Run the manual [managed admission workflow](../.github/workflows/bench-live.yml) for the attested hosted path. `bun run verify-admission` validates checked-in admission evidence.
