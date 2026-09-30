@@ -4,7 +4,8 @@ import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { cases } from "../fixtures/cases";
-import { causalityScreenCases, causalitySource, causalitySpecs } from "../fixtures/causality-screen";
+import { causalityScreenCases, causalitySource, causalitySpecs, crossFileCausalityCases } from "../fixtures/causality-screen";
+import { markedSource } from "../fixtures/clean-screen";
 import { benchmarkCase, parseUnifiedDiffFiles } from "./harness";
 import { runLive } from "./live";
 
@@ -18,8 +19,9 @@ test("supplemental cases preserve context markers, source reconstruction and rel
   expect(manifest).not.toContain("bench/fixtures/causality-screen.ts");
   expect(manifest).not.toContain("bench/src/causality-screen.test.ts");
   expect(cases).toHaveLength(70);
-  expect(causalityScreenCases).toHaveLength(5);
-  for (const [index, input] of causalityScreenCases.entries()) {
+  expect(causalityScreenCases).toHaveLength(7);
+  expect(causalityScreenCases.slice(5)).toEqual(crossFileCausalityCases);
+  for (const [index, input] of causalityScreenCases.slice(0, 5).entries()) {
     benchmarkCase.parse(input);
     expect(cases.some((original) => original.id === input.id)).toBe(false);
     const [file] = parseUnifiedDiffFiles(input.diff);
@@ -29,6 +31,28 @@ test("supplemental cases preserve context markers, source reconstruction and rel
   expect(causalitySpecs[0].lines).toContain(" const ALLOW_ALL_USERS = true;");
   expect(causalitySpecs[3].lines).toContain("   return renderHtml(value);");
   expect(causalitySpecs[4].lines.some((line) => line.startsWith("+"))).toBe(false);
+});
+
+test("cross-file contrasts narrow a dependency on a target that the change keeps", () => {
+  for (const input of crossFileCausalityCases) {
+    benchmarkCase.parse(input);
+    expect(input.admission.classification).toBe("mustBlock");
+    const [truth] = input.groundTruth!.findings!;
+    const file = parseUnifiedDiffFiles(input.diff).find((candidate) => candidate.path === truth.path)!;
+    expect(file.addedLines).toContain(truth.line);
+    expect(file.addedLines).toContain(truth.endLine);
+  }
+  const [alert, route] = crossFileCausalityCases.map((input) => parseUnifiedDiffFiles(input.diff));
+  const kept = alert.find((file) => file.path === "k8s/edge-lb/README.md")!.after;
+  const selector = alert.find((file) => file.path.includes("prometheusrule"))!.after;
+  expect(kept).toContain("| portal-beta.edge.example.com | Beta portal |");
+  expect(crossFileCausalityCases[0].diff.split("\n").some((line) => line.startsWith("-") && line.includes("portal-beta-https"))).toBe(false);
+  expect(selector).not.toContain("portal-beta");
+  const routes = route.find((file) => file.path === "src/server/routes/reports.ts")!;
+  expect(routes.before).toContain("rateLimit('reports.exportPdf'), exportReportPdf");
+  expect(routes.after).toContain("reports.get('/reports/:id/export.pdf', exportReportPdf);");
+  expect(route.find((file) => file.path === "src/server/rate-limit.ts")!.after).toContain("'reports.exportPdf':");
+  expect(markedSource(["-a", "+b", " c"], "after")).toBe("b\nc");
 });
 
 test("unchanged intended policy and unrelated existing flaw do not acquire a changed cause", () => {

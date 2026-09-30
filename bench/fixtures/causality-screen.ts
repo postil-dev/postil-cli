@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { BenchmarkCaseInput } from "../src/harness";
+import { addedLine, crossFileCase, csvExportRemoval, edgeLbHostnameRemoval, type CrossFileSpec } from "./clean-screen";
 
 // Supplemental contrasts keep the release corpus and evaluator identity intact.
 export const causalitySpecs = [
@@ -74,7 +75,27 @@ export function causalitySource(spec: typeof causalitySpecs[number], side: "befo
     .map((line) => line.slice(1)).join("\n");
 }
 
-export const causalityScreenCases: BenchmarkCaseInput[] = causalitySpecs.map((spec, index) => {
+// Cross-file contrasts: the change removes one target but also narrows a
+// dependency on a target that the same change keeps.
+function overreach(spec: CrossFileSpec, id: string, pullNumber: number, path: string, body: string): CrossFileSpec {
+  const file = spec.files.find((candidate) => candidate.path === path)!;
+  const added = file.lines.filter((line) => line.startsWith("+")).map((line) => addedLine(file, line.slice(1)));
+  const line = Math.min(...added);
+  return { ...spec, id, pullNumber, primaryChange: { path, line },
+    labels: [...spec.labels, "supplemental-causality"],
+    defect: { path, line, endLine: Math.max(...added), body } };
+}
+
+export const crossFileCausalityCases: BenchmarkCaseInput[] = [
+  overreach(edgeLbHostnameRemoval("edge|edge-legacy"), "causality-cross-file-alert-drops-kept-router", 206,
+    "k8s/monitoring/prometheusrule-edge-lb-traefik.yaml",
+    "The 429 alert also drops the portal-beta router, whose IngressRoute this change keeps. Restore portal-beta to the router selectors."),
+  overreach(csvExportRemoval("reports.get('/reports/:id/export.pdf', exportReportPdf);"),
+    "causality-cross-file-limit-dropped-from-kept-route", 207, "src/server/routes/reports.ts",
+    "The PDF export route loses its rate limit although only CSV export is removed. Restore rateLimit('reports.exportPdf') on the PDF route."),
+].map(crossFileCase);
+
+const singleFileCausalityCases: BenchmarkCaseInput[] = causalitySpecs.map((spec, index) => {
   const before = causalitySource(spec, "before");
   const after = causalitySource(spec, "after");
   const expected = spec.defect === null ? [] : [{
@@ -101,3 +122,5 @@ export const causalityScreenCases: BenchmarkCaseInput[] = causalitySpecs.map((sp
     expectations: { minFindings: expected.length, maxFindings: expected.length, requiredFindings: expected },
   };
 });
+
+export const causalityScreenCases: BenchmarkCaseInput[] = [...singleFileCausalityCases, ...crossFileCausalityCases];
