@@ -115,6 +115,9 @@ pub enum Command {
         /// Review a unified diff from a file.
         #[arg(long, conflicts_with_all = ["staged", "base"])]
         diff_file: Option<PathBuf>,
+        /// Complete pull-request diff that an incremental --diff-file review is judged against; its lines are context and are never cited.
+        #[arg(long, value_name = "PATH", requires_all = ["diff_file", "since_sha"])]
+        pull_request_diff_file: Option<PathBuf>,
         /// Existing advisory check-run id to complete (hosted callers).
         #[arg(long)]
         check_run_id: Option<String>,

@@ -32,6 +32,9 @@ acquire diff --> parse supported lockfiles --> parse + index --> bounded evidenc
   binary, rename, mode, and dependency evidence under `.postil/change-metadata`.
   Git C-quoted paths are decoded to canonical identities, then reversibly C-quoted
   for prompt display; model citations decode back to the same forge path.
+  Incremental reviews also carry an uncitable view of the complete pull-request
+  change, without margin numbers: the raw diff up to 24 KiB, else a per-file
+  summary, dropped only when it does not fit the request budget.
 - `filter.rs`: grounding (uncited findings dropped; all-uncited = untrusted run),
   policy suppression (ignore globs, severityThreshold, minConfidence, maxFindings),
   structured retention of suppressed grounded findings, and

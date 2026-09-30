@@ -13772,6 +13772,103 @@ async fn incremental_review_resolves_and_carries_baseline_findings() {
 }
 
 #[tokio::test]
+async fn incremental_review_judges_the_increment_against_uncitable_complete_change() {
+    let server = MockServer::start().await;
+    let context_only = json!({
+        "path": "k8s/routes.yaml",
+        "line": 1,
+        "severity": "error",
+        "kind": "risk",
+        "confidence": 0.95,
+        "title": "Keep the removed route",
+        "body": "The route is removed while its alert remains. Restore the route.",
+        "evidence": "name: kept"
+    });
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([context_only]))))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let increment = write_diff(dir.path());
+    let complete = dir.path().join("pull-request.diff");
+    let route_deletion = "diff --git a/k8s/routes.yaml b/k8s/routes.yaml\n--- a/k8s/routes.yaml\n+++ b/k8s/routes.yaml\n@@ -1,2 +1,1 @@\n name: kept\n-name: removed-route\n";
+    std::fs::write(&complete, format!("{route_deletion}{DIFF}")).unwrap();
+
+    let output = postil()
+        .current_dir(dir.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("POSTIL_DISABLE_SCORER", "1")
+        .args(["review", "--diff-file"])
+        .arg(&increment)
+        .args(["--since-sha", "abc123", "--pull-request-diff-file"])
+        .arg(&complete)
+        .args(["--output", "json"])
+        .assert();
+    let envelope: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
+    let requests = server.received_requests().await.unwrap();
+    let review = requests
+        .iter()
+        .find(|request| is_source_review_request(request))
+        .expect("the increment is reviewed");
+    let body: Value = review.body_json().unwrap();
+    let user = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "user")
+        .and_then(|message| message["content"].as_str())
+        .unwrap()
+        .to_string();
+    let context_start = user.find("--- COMPLETE CHANGE ---").unwrap();
+    let context_end = user.find("--- END COMPLETE CHANGE ---").unwrap();
+    let evidence_start = user.find("Review evidence").unwrap();
+    assert!(context_start < context_end && context_end < evidence_start);
+    assert!(user[context_start..context_end].contains("-name: removed-route"));
+    assert!(user.contains("INCREMENTAL review"));
+    assert!(!user[evidence_start..].contains("k8s/routes.yaml"));
+    assert!(
+        envelope["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|finding| finding["path"] != "k8s/routes.yaml"),
+        "a context-only line is never a publishable citation"
+    );
+}
+
+#[test]
+fn pull_request_diff_file_requires_an_incremental_diff_file_review() {
+    let dir = tempfile::tempdir().unwrap();
+    let diff = write_diff(dir.path());
+    for arguments in [
+        vec![
+            "--diff-file",
+            "change.diff",
+            "--pull-request-diff-file",
+            "change.diff",
+        ],
+        vec![
+            "--since-sha",
+            "abc123",
+            "--pull-request-diff-file",
+            "change.diff",
+        ],
+    ] {
+        let output = postil()
+            .current_dir(dir.path())
+            .arg("review")
+            .args(&arguments)
+            .assert()
+            .code(2);
+        let stderr = String::from_utf8_lossy(&output.get_output().stderr).into_owned();
+        assert!(stderr.contains("--pull-request-diff-file"), "{stderr}");
+    }
+    assert!(diff.exists());
+}
+
+#[tokio::test]
 async fn incremental_unavailable_repository_receipt_carries_baseline_claim() {
     let server = MockServer::start().await;
     mock_review(&server, json!([])).await;
@@ -15044,6 +15141,110 @@ async fn stale_incremental_baseline_falls_back_to_full_review() {
             .contains("This is an INCREMENTAL review"),
         "fallback reviewed the change as incremental"
     );
+}
+
+#[tokio::test]
+async fn forge_incremental_review_fetches_the_complete_change_as_context() {
+    for complete_available in [true, false] {
+        let server = MockServer::start().await;
+        if complete_available {
+            mount_github_complete_diff(&server, 7).await;
+        } else {
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/repos/acme/api/compare/b+\.\.\.a+$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "merge_base_commit": {"sha": "bbbbbbbb"},
+                    "files": []
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/repos/acme/api/pulls/7/files"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/repos/acme/api/contents/src/auth.rs"))
+                .respond_with(GitHubSourceResponder)
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/api/compare/cccccccc...aaaaaaaa"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "merge_base_commit": {"sha": "cccccccc"},
+                "files": [{"filename": "src/auth.rs", "status": "modified", "changes": 2}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(llm_content(json!([]))))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/api/pulls/7"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "title": "Remove the unused login path", "body": "The path has no callers.",
+                "state": "open", "merged": false,
+                "head": {"sha": "aaaaaaaa"}, "base": {"sha": "bbbbbbbb"}, "changed_files": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = postil()
+            .current_dir(dir.path())
+            .env("POSTIL_API_BASE", server.uri())
+            .env("GITHUB_API_URL", server.uri())
+            .env("GITHUB_TOKEN", "gh-test-token")
+            .env("POSTIL_DISABLE_SCORER", "1")
+            .args([
+                "review",
+                "--repo",
+                "acme/api",
+                "--pr",
+                "7",
+                "--sha",
+                "aaaaaaaa",
+                "--since-sha",
+                "cccccccc",
+                "--no-post",
+                "--output-json",
+            ])
+            .assert()
+            .code(0);
+        let env: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+        assert_eq!(env["sinceSha"], "cccccccc");
+        assert_eq!(env["findings"], json!([]));
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.url.path() == "/repos/acme/api/pulls/7/files")
+        );
+        let body: Value = requests
+            .iter()
+            .find(|request| is_source_review_request(request))
+            .unwrap()
+            .body_json()
+            .unwrap();
+        let user = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "user")
+            .and_then(|message| message["content"].as_str())
+            .unwrap()
+            .to_string();
+        assert!(user.contains("INCREMENTAL review"));
+        assert!(user.contains("PR title: Remove the unused login path"));
+        assert!(user.contains("PR description:\nThe path has no callers."));
+        assert_eq!(
+            user.contains("--- COMPLETE CHANGE ---\ndiff --git a/src/auth.rs b/src/auth.rs"),
+            complete_available
+        );
+    }
 }
 
 #[tokio::test]

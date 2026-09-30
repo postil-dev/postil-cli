@@ -46,9 +46,11 @@ Inspect the fixture IDs and source before a live run in [`fixtures/cases.ts`](fi
 
 ## Expanded clean bank
 
-The 25-case clean bank combines the 13 admission clean cases with 12 supplemental cases in [`fixtures/clean-screen.ts`](fixtures/clean-screen.ts). The [clean-screen entrypoint](src/clean-screen.ts) passes the exported `cleanScreenCases` to the existing `runLive` API. Default screens and admission retain the 70-case corpus and its attested evaluator inputs. The supplemental cases cover authorization, expiry, asynchronous ordering, cancellation, retry limits, pagination, integer precision, defaults, lock release, SQL parameters, array ownership, and partial updates. Behavioral tests exercise both versions of each executable module, including rejection paths and boundary values.
+The 27-case clean bank combines the 13 admission clean cases with 12 single-file and 2 cross-file supplemental cases in [`fixtures/clean-screen.ts`](fixtures/clean-screen.ts). The [clean-screen entrypoint](src/clean-screen.ts) passes the exported `cleanScreenCases` to the existing `runLive` API. Default screens and admission retain the 70-case corpus and its attested evaluator inputs. The supplemental cases cover authorization, expiry, asynchronous ordering, cancellation, retry limits, pagination, integer precision, defaults, lock release, SQL parameters, array ownership, and partial updates. Behavioral tests exercise both versions of each executable module, including rejection paths and boundary values.
 
-Live diff-file screening sends the diff. Supplemental source comments therefore contain the argument and behavior contracts; the `Object.hasOwn` case also supplies package metadata declaring Node.js 22 or later. Metadata outside the diff is not evidence available to this screen.
+The cross-file cases remove a target in some files and narrow a dependent alert selector, rate-limit entry, or caller in another: an infrastructure change that deletes test edge hostnames with their Traefik routes, and an application change that deletes a disabled export feature. Each hunk looks like lost coverage in isolation; the rest of the diff shows the target is gone. [`fixtures/causality-screen.ts`](fixtures/causality-screen.ts) pairs each with a must-block contrast whose narrowing also drops a target the change keeps. Tests check that every dropped selector target is deleted by the same diff, and that each contrast drops a target that remains.
+
+Live diff-file screening sends the diff without a pull-request title or description. Supplemental source comments therefore contain the argument and behavior contracts; the `Object.hasOwn` case also supplies package metadata declaring Node.js 22 or later. Metadata outside the diff is not evidence available to this screen.
 
 After the build and dependency setup above, select a checked-in profile:
 
@@ -64,11 +66,26 @@ POSTIL_LLM_REQUEST_TIMEOUT_SECS=30 POSTIL_LLM_TOTAL_TIMEOUT_SECS=60 \
 timeout 780s bun run src/clean-screen.ts
 ```
 
-Each invocation retains a separate report and per-case evidence. Its `supplementalScreen` field records a separate framed SHA-256 digest of the supplemental fixture module and entrypoint; `summary.evaluatorSha256` identifies the default evaluator. The process fails if every case is unavailable; partial reports retain unavailable cases for inspection. The CLI safety cap is 180 seconds per case. Report final review silence, final findings, suppressed findings with reasons, and unavailable cases separately, with the 13 legacy and 12 supplemental cases identified. A silent final review can contain suppressed model findings.
+Each invocation retains a separate report and per-case evidence. Its `supplementalScreen` field records a separate framed SHA-256 digest of the supplemental fixture module and entrypoint; `summary.evaluatorSha256` identifies the default evaluator. The process fails if every case is unavailable; partial reports retain unavailable cases for inspection. The CLI safety cap is 180 seconds per case. Report final review silence, final findings, suppressed findings with reasons, and unavailable cases separately, with the 13 legacy, 12 single-file, and 2 cross-file supplemental cases identified. A silent final review can contain suppressed model findings.
 
-The clean-bank-v2 evidence identifies the [measured fixture and evaluator source](https://github.com/postil-dev/postil-cli/tree/a7e7c67235519fff79c6e82c44550ac29255dcdc) and its [exact invocation](https://github.com/postil-dev/postil-cli/blob/a7e7c67235519fff79c6e82c44550ac29255dcdc/bench/README.md#expanded-clean-bank). The command above uses the same 25 fixture payloads with the default evaluator source digest; its reports are separate evidence.
+The clean-bank-v2 evidence identifies the [measured fixture and evaluator source](https://github.com/postil-dev/postil-cli/tree/a7e7c67235519fff79c6e82c44550ac29255dcdc) and its [exact invocation](https://github.com/postil-dev/postil-cli/blob/a7e7c67235519fff79c6e82c44550ac29255dcdc/bench/README.md#expanded-clean-bank). The command above runs those 25 fixture payloads unchanged plus the 2 cross-file cases, with the default evaluator source digest; its reports are separate evidence.
 
 Compare models only when the selected cases, fixture hash, evaluator hash, binary hash, retry settings, and concurrency match. Provider routes remain explicit. Evidence identifies the fixture/evaluator source by immutable commit and the measured executable by SHA-256; use `POSTIL_BIN` to select that executable. A different build produces separate evidence. This authored bank is not held-out validation, and one observation per fixture does not establish a stable false-positive rate.
+
+## Incremental screen
+
+An incremental review cites only the pushed commits but is judged against the complete pull-request change. [`fixtures/incremental-screen.ts`](fixtures/incremental-screen.ts) holds four such cases. In the two clean cases the increment contains only a dependent cleanup: an alert selector, or a rate-limit entry and alert selectors. An earlier push in the complete change deletes their targets. The two must-block contrasts narrow a target that the complete change keeps.
+
+The [incremental entrypoint](src/incremental-screen.ts) passes the cases to `runLive` through a generated launcher. The launcher recognizes each increment by content and adds `--since-sha` and `--pull-request-diff-file`. With `COMPLETE_CHANGE=omit` it leaves out the complete change, so the same cases also measure an increment reviewed alone. `REVIEW_SCORER_MODEL` optionally enables the scorer; the profile must then list it. From `bench/`:
+
+```sh
+REVIEW_MODEL=openai/gpt-5.6-luna REVIEW_SCORER_MODEL=openai/gpt-5.6-luna \
+SCREEN_PROFILE=../provisional-models.json \
+POSTIL_LLM_REQUEST_TIMEOUT_SECS=30 POSTIL_LLM_TOTAL_TIMEOUT_SECS=60 \
+timeout 780s bun run src/incremental-screen.ts
+```
+
+`summary.binary` names the launcher. The `incrementalScreen` field records the measured executable and its SHA-256, the launcher digest, the complete-change mode, and a framed digest of the fixture modules and entrypoint. Launcher inputs remain in `.runs/<run-id>-inputs/`.
 
 ## Managed qualification
 
