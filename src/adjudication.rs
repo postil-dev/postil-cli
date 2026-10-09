@@ -194,6 +194,7 @@ pub(crate) struct AdjudicationApplication {
     pub kept_indices: Vec<usize>,
     pub unresolved_indices: Vec<usize>,
     pub invalid_refutation_indices: Vec<usize>,
+    pub recovered_duplicate_indices: Vec<usize>,
     pub resolved_indices: Vec<usize>,
     pub suppressed: Vec<SuppressedFinding>,
 }
@@ -1783,6 +1784,25 @@ pub(crate) fn apply_results(
     diff_receipt: &DiffCorpusReceipt,
     repository_receipt: &RepositorySearchReceipt,
 ) -> Result<AdjudicationApplication> {
+    let expected = candidate_ids.iter().collect::<HashSet<_>>();
+    let recovered_duplicate_indices = results
+        .iter_mut()
+        .filter_map(|result| {
+            let primary = result.duplicate_of.as_ref()?;
+            if result.status == AdjudicationStatus::Confirmed
+                || (result.status == AdjudicationStatus::Refuted && result.scope.is_some())
+                || primary == &result.candidate_id
+                || !expected.contains(primary)
+            {
+                return None;
+            }
+            let index = candidate_ids
+                .iter()
+                .position(|id| id == &result.candidate_id)?;
+            *result = unresolved_result(result.clone());
+            Some(index)
+        })
+        .collect::<Vec<_>>();
     validate_result_structure(&findings, &candidate_ids, &results)?;
     normalize_confirmed_publication(&findings, &candidate_ids, &mut results);
     let outcomes = applied_adjudication_results(
@@ -1880,6 +1900,7 @@ pub(crate) fn apply_results(
         kept_indices,
         unresolved_indices,
         invalid_refutation_indices,
+        recovered_duplicate_indices,
         resolved_indices,
         suppressed,
     })
@@ -4371,6 +4392,367 @@ mod tests {
         }
         assert!(applied.resolved_indices.is_empty());
         assert!(applied.suppressed.is_empty());
+    }
+
+    #[test]
+    fn non_confirmed_known_duplicates_preserve_exact_candidates() {
+        let snapshot = "a".repeat(40);
+        let findings = vec![
+            finding(
+                Kind::Risk,
+                "Keep the first guard",
+                "The first guard is required.",
+            ),
+            finding(
+                Kind::Guardrail,
+                "Keep the second guard",
+                "The second guard is required.",
+            ),
+        ];
+        let ids = stable_candidate_ids(&snapshot, &findings);
+        let corpus = added_fixture("workflow.yml", "+uses: action@old\n");
+        for status in [AdjudicationStatus::Refuted, AdjudicationStatus::Unresolved] {
+            let receipt = direct_receipt(&snapshot, &corpus, &findings, &ids);
+            let results = ids
+                .iter()
+                .enumerate()
+                .map(|(index, id)| AdjudicationResult {
+                    candidate_id: id.clone(),
+                    status: if index == 0 {
+                        status
+                    } else {
+                        AdjudicationStatus::Unresolved
+                    },
+                    revised_title: if index == 0 {
+                        "contradictory title".into()
+                    } else {
+                        String::new()
+                    },
+                    revised_body: if index == 0 {
+                        "contradictory body".into()
+                    } else {
+                        String::new()
+                    },
+                    evidence: if index == 0 {
+                        "untrusted evidence".into()
+                    } else {
+                        String::new()
+                    },
+                    duplicate_of: (index == 0).then(|| ids[1].clone()),
+                    scope: None,
+                })
+                .collect();
+            let applied = apply_results(
+                &snapshot,
+                findings.clone(),
+                ids.clone(),
+                results,
+                &corpus,
+                &receipt,
+                &unavailable_receipt(),
+            )
+            .unwrap();
+            assert_eq!(applied.recovered_duplicate_indices, vec![0]);
+            assert_eq!(applied.kept_indices, vec![0, 1]);
+            assert_eq!(applied.unresolved_indices, vec![0, 1]);
+            assert_eq!(
+                serde_json::to_value(&applied.kept).unwrap(),
+                serde_json::to_value(&findings).unwrap()
+            );
+            assert!(applied.resolved_indices.is_empty());
+            assert!(applied.suppressed.is_empty());
+        }
+    }
+
+    #[test]
+    fn non_confirmed_duplicate_recovery_keeps_identity_and_scope_guards() {
+        let snapshot = "a".repeat(40);
+        let mut first = finding(
+            Kind::Risk,
+            "Keep the first guard",
+            "The first guard is required.",
+        );
+        first.repository_claim = Some(RepositoryClaim {
+            kind: RepositoryClaimKind::Mismatch,
+            resources: vec!["guard".into()],
+            values: vec![],
+            versions: vec![],
+            paths: vec![],
+            identifiers: vec![],
+        });
+        let findings = vec![
+            first,
+            finding(
+                Kind::Guardrail,
+                "Keep the second guard",
+                "The second guard is required.",
+            ),
+        ];
+        let ids = stable_candidate_ids(&snapshot, &findings);
+        let corpus = added_fixture("workflow.yml", "+uses: action@old\n");
+        let receipt = direct_receipt(&snapshot, &corpus, &findings, &ids);
+        for reference in [ids[0].clone(), "unknown-candidate".into()] {
+            let results = vec![
+                AdjudicationResult {
+                    candidate_id: ids[0].clone(),
+                    status: AdjudicationStatus::Refuted,
+                    revised_title: String::new(),
+                    revised_body: String::new(),
+                    evidence: String::new(),
+                    duplicate_of: Some(reference),
+                    scope: None,
+                },
+                AdjudicationResult {
+                    candidate_id: ids[1].clone(),
+                    status: AdjudicationStatus::Unresolved,
+                    revised_title: String::new(),
+                    revised_body: String::new(),
+                    evidence: String::new(),
+                    duplicate_of: None,
+                    scope: None,
+                },
+            ];
+            assert!(
+                apply_results(
+                    &snapshot,
+                    findings.clone(),
+                    ids.clone(),
+                    results,
+                    &corpus,
+                    &receipt,
+                    &unavailable_receipt()
+                )
+                .is_err()
+            );
+        }
+        let mut results = vec![
+            AdjudicationResult {
+                candidate_id: ids[0].clone(),
+                status: AdjudicationStatus::Refuted,
+                revised_title: String::new(),
+                revised_body: String::new(),
+                evidence: String::new(),
+                duplicate_of: Some(ids[1].clone()),
+                scope: Some(ScopeAssessment {
+                    disposition: ScopeDisposition::PreExisting,
+                    cause: None,
+                    reason: "The guard predates the change.".into(),
+                }),
+            },
+            AdjudicationResult {
+                candidate_id: ids[1].clone(),
+                status: AdjudicationStatus::Unresolved,
+                revised_title: String::new(),
+                revised_body: String::new(),
+                evidence: String::new(),
+                duplicate_of: None,
+                scope: None,
+            },
+        ];
+        assert!(
+            apply_results(
+                &snapshot,
+                findings.clone(),
+                ids.clone(),
+                results.clone(),
+                &corpus,
+                &receipt,
+                &unavailable_receipt()
+            )
+            .is_err()
+        );
+        results[0].scope = None;
+        let applied = apply_results(
+            &snapshot,
+            findings.clone(),
+            ids.clone(),
+            results,
+            &corpus,
+            &receipt,
+            &unavailable_receipt(),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&applied.kept[0]).unwrap(),
+            serde_json::to_value(&findings[0]).unwrap()
+        );
+        assert_eq!(applied.unresolved_indices, vec![0, 1]);
+        assert_eq!(applied.recovered_duplicate_indices, vec![0]);
+    }
+
+    #[test]
+    fn recovered_context_candidate_requires_fresh_cause_but_preserves_baseline() {
+        let (first, _, _, _) = scoped_fixture(None);
+        let mut second = first.clone();
+        second.title = "Check the separate guard".into();
+        let findings = vec![first, second];
+        let snapshot = "scope-snapshot";
+        let ids = stable_candidate_ids(snapshot, &findings);
+        let results = vec![
+            AdjudicationResult {
+                candidate_id: ids[0].clone(),
+                status: AdjudicationStatus::Refuted,
+                revised_title: String::new(),
+                revised_body: String::new(),
+                evidence: String::new(),
+                duplicate_of: Some(ids[1].clone()),
+                scope: None,
+            },
+            AdjudicationResult {
+                candidate_id: ids[1].clone(),
+                status: AdjudicationStatus::Unresolved,
+                revised_title: String::new(),
+                revised_body: String::new(),
+                evidence: String::new(),
+                duplicate_of: None,
+                scope: None,
+            },
+        ];
+        for fresh_count in [0, 2] {
+            let receipt =
+                build_diff_corpus_receipt(snapshot, SCOPE_DIFF, &findings, &ids, fresh_count);
+            let applied = apply_results(
+                snapshot,
+                findings.clone(),
+                ids.clone(),
+                results.clone(),
+                SCOPE_DIFF,
+                &receipt,
+                &unavailable_receipt(),
+            );
+            if fresh_count == 0 {
+                let applied = applied.unwrap();
+                assert_eq!(applied.kept_indices, vec![0, 1]);
+                assert_eq!(applied.unresolved_indices, vec![0, 1]);
+                assert_eq!(applied.recovered_duplicate_indices, vec![0]);
+            } else {
+                assert!(applied.unwrap_err().to_string().contains("causal change"));
+            }
+        }
+    }
+
+    #[test]
+    fn refuted_duplicate_with_valid_introduced_scope_remains_invalid() {
+        let (first, _, _, _) = scoped_fixture(None);
+        let mut second = first.clone();
+        second.title = "Check the separate guard".into();
+        let findings = vec![first, second];
+        let snapshot = "scope-snapshot";
+        let ids = stable_candidate_ids(snapshot, &findings);
+        let receipt = build_diff_corpus_receipt(snapshot, SCOPE_DIFF, &findings, &ids, 2);
+        let results = vec![
+            AdjudicationResult {
+                candidate_id: ids[0].clone(),
+                status: AdjudicationStatus::Refuted,
+                revised_title: String::new(),
+                revised_body: String::new(),
+                evidence: String::new(),
+                duplicate_of: Some(ids[1].clone()),
+                scope: Some(ScopeAssessment {
+                    disposition: ScopeDisposition::IntroducedOrWorsened,
+                    cause: Some(CausalReference::DiffLine(DiffLineReference {
+                        diff_line: 7,
+                        corpus_sha256: sha256(SCOPE_DIFF),
+                    })),
+                    reason: "The changed timeout alters the guard path.".into(),
+                }),
+            },
+            AdjudicationResult {
+                candidate_id: ids[1].clone(),
+                status: AdjudicationStatus::Unresolved,
+                revised_title: String::new(),
+                revised_body: String::new(),
+                evidence: String::new(),
+                duplicate_of: None,
+                scope: None,
+            },
+        ];
+        let error = apply_results(
+            snapshot,
+            findings,
+            ids,
+            results,
+            SCOPE_DIFF,
+            &receipt,
+            &unavailable_receipt(),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("factual refutation cannot carry a scope assessment"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn confirmed_duplicate_of_recovered_primary_remains_invalid() {
+        let snapshot = "a".repeat(40);
+        let findings = vec![
+            finding(
+                Kind::Risk,
+                "Keep first guard",
+                "The first guard is required.",
+            ),
+            finding(
+                Kind::Guardrail,
+                "Keep second guard",
+                "The second guard is required.",
+            ),
+            finding(
+                Kind::Uncertainty,
+                "Check first guard",
+                "The first guard may be required.",
+            ),
+        ];
+        let ids = stable_candidate_ids(&snapshot, &findings);
+        let corpus = added_fixture("workflow.yml", "+uses: action@old\n");
+        let receipt = direct_receipt(&snapshot, &corpus, &findings, &ids);
+        let results = ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| AdjudicationResult {
+                candidate_id: id.clone(),
+                status: if index == 2 {
+                    AdjudicationStatus::Confirmed
+                } else {
+                    AdjudicationStatus::Unresolved
+                },
+                revised_title: if index == 2 {
+                    "Keep first guard".into()
+                } else {
+                    String::new()
+                },
+                revised_body: if index == 2 {
+                    "The first guard is required.".into()
+                } else {
+                    String::new()
+                },
+                evidence: if index == 2 {
+                    "uses: action@old".into()
+                } else {
+                    String::new()
+                },
+                duplicate_of: match index {
+                    0 => Some(ids[1].clone()),
+                    2 => Some(ids[0].clone()),
+                    _ => None,
+                },
+                scope: None,
+            })
+            .collect();
+        assert!(
+            apply_results(
+                &snapshot,
+                findings,
+                ids,
+                results,
+                &corpus,
+                &receipt,
+                &unavailable_receipt()
+            )
+            .is_err()
+        );
     }
 
     #[test]
