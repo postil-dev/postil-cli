@@ -1,6 +1,6 @@
 # Model providers
 
-Postil speaks either an OpenAI-compatible chat-completions interface or the native Anthropic Messages API. Provider requests do not follow redirects, credentials are never written to logs, and private-network endpoints require an explicit opt-in.
+With BYOK, Postil speaks either an OpenAI-compatible chat-completions interface or the native Anthropic Messages API. Provider requests do not follow redirects, credentials are never written to logs, and private-network endpoints require an explicit opt-in. A stored hosted login delegates model, reasoning, and provider selection to the service; the local overrides described here require an explicit provider API key.
 
 ## Model admission
 
