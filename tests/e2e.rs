@@ -16682,6 +16682,97 @@ async fn causal_scope_follows_original_identity_after_reordering_and_suppression
 }
 
 #[tokio::test]
+async fn non_confirmed_duplicate_is_normalized_without_hiding_candidates() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(|request: &Request| {
+            let response = if request_system_contains(request, "single finding adjudicator") {
+                let body: Value = request.body_json().unwrap();
+                let payload: Value = serde_json::from_str(
+                    body["messages"].as_array().unwrap().last().unwrap()["content"]
+                        .as_str().unwrap(),
+                ).unwrap();
+                let candidates = payload["candidates"].as_array().unwrap();
+                assert_eq!(candidates.len(), 2);
+                scorer_text(&json!([
+                    {"candidateId": candidates[0]["candidateId"], "status": "refuted",
+                     "revisedTitle": "", "revisedBody": "", "evidence": "",
+                     "duplicateOf": candidates[1]["candidateId"]},
+                    {"candidateId": candidates[1]["candidateId"], "status": "unresolved",
+                     "revisedTitle": "", "revisedBody": "", "evidence": "", "duplicateOf": null}
+                ]).to_string())
+            } else if request_system_contains(request, "independent second-model scorer") {
+                scorer_content(json!([
+                    {"confidence": 0.99, "kind": "risk", "reason": "The first guard remains required."},
+                    {"confidence": 0.99, "kind": "guardrail", "reason": "The second guard remains required."}
+                ]))
+            } else {
+                llm_content(json!([
+                    {"path":"src/access.js","line":1,"severity":"error","kind":"risk",
+                     "confidence":0.99,"title":"Keep the first guard",
+                     "body":"The changed flag bypasses the first guard.","evidence":"const ALLOW_ALL_USERS = true;"},
+                    {"path":"src/access.js","line":1,"severity":"error","kind":"guardrail",
+                     "confidence":0.99,"title":"Keep the second guard",
+                     "body":"The changed flag bypasses the second guard.","evidence":"const ALLOW_ALL_USERS = true;"}
+                ]))
+            };
+            ResponseTemplate::new(200).set_body_json(response)
+        })
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let directory = tempfile::tempdir().unwrap();
+    let diff = directory.path().join("review.diff");
+    std::fs::write(&diff, "diff --git a/src/access.js b/src/access.js\n--- a/src/access.js\n+++ b/src/access.js\n@@ -1 +1 @@\n-const ALLOW_ALL_USERS = false;\n+const ALLOW_ALL_USERS = true;\n").unwrap();
+    let output = postil()
+        .current_dir(directory.path())
+        .env("POSTIL_API_BASE", server.uri())
+        .env("REVIEW_SCORER_MODEL", "scorer-model")
+        .args(["review", "--diff-file"])
+        .arg(diff)
+        .args(["--output", "json"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        !stderr.contains("finding adjudication validation failed"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("repaired 1 non-confirmed adjudication duplicate reference"),
+        "{stderr}"
+    );
+    assert_eq!(envelope["modelIncidents"][0]["category"], "invalidOutput");
+    assert_eq!(envelope["modelIncidents"][0]["recovered"], true);
+    assert_eq!(envelope["modelIncidents"][0]["recovery"], "repair");
+    assert_eq!(
+        envelope["findings"].as_array().unwrap().len(),
+        2,
+        "{envelope}"
+    );
+    assert_eq!(envelope["counts"]["suppressed"], 0);
+    assert_eq!(envelope["findings"][0]["scorerConfidence"], 0.99);
+    assert_eq!(envelope["findings"][1]["scorerConfidence"], 0.99);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request_system_contains(request, "single finding adjudicator"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request_system_contains(request, "independent second-model scorer"))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn causal_scope_preserves_historical_findings_without_current_anchors() {
     for mode in [
         "incremental-absent",

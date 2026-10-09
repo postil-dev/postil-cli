@@ -2798,7 +2798,21 @@ async fn review_diff_at(
                                         );
                                         Ok(application)
                                     }) {
-                                        Ok(application) => application,
+                                        Ok(application) => {
+                                            if !application.recovered_duplicate_indices.is_empty() {
+                                                eprintln!(
+                                                    "postil: repaired {} non-confirmed adjudication duplicate reference(s) to unresolved; applying candidate publication policy",
+                                                    application.recovered_duplicate_indices.len()
+                                                );
+                                                model_incidents.push(ModelIncident {
+                                                    phase: ModelIncidentPhase::Scorer,
+                                                    category: ModelIncidentCategory::InvalidOutput,
+                                                    recovered: true,
+                                                    recovery: Some(crate::envelope::ModelIncidentRecovery::Repair),
+                                                });
+                                            }
+                                            application
+                                        },
                                         Err(error) => {
                                             adjudication_incomplete = true;
                                             review_trust = filter::ReviewTrust::Failed;
@@ -3913,6 +3927,7 @@ fn preserve_unadjudicated_findings(
         kept: findings,
         unresolved_indices: Vec::new(),
         invalid_refutation_indices: Vec::new(),
+        recovered_duplicate_indices: Vec::new(),
         resolved_indices: Vec::new(),
         suppressed: Vec::new(),
     }
@@ -5618,6 +5633,7 @@ mod tests {
             kept_indices: vec![0, 1, 2],
             unresolved_indices: vec![0, 1, 2],
             invalid_refutation_indices: Vec::new(),
+            recovered_duplicate_indices: Vec::new(),
             resolved_indices: vec![],
             suppressed: vec![],
         };
@@ -5690,6 +5706,7 @@ mod tests {
             kept_indices: vec![0, 1, 2, 3],
             unresolved_indices: vec![0, 1, 2, 3],
             invalid_refutation_indices: Vec::new(),
+            recovered_duplicate_indices: Vec::new(),
             resolved_indices: Vec::new(),
             suppressed: Vec::new(),
         };
@@ -5853,6 +5870,7 @@ mod tests {
             kept_indices: vec![1],
             unresolved_indices: Vec::new(),
             invalid_refutation_indices: Vec::new(),
+            recovered_duplicate_indices: Vec::new(),
             resolved_indices: vec![0],
             suppressed: vec![SuppressedFinding {
                 finding: rejected.clone(),
