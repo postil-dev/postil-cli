@@ -1123,7 +1123,8 @@ export async function runScorerDiagnostic(input: {
   if (!process.env[input.keyName]) throw new Error("diagnostic credential is unavailable");
   const provider = "Azure";
   const route = "azure/us";
-  const pricing = await fetchQualificationPricing(DEFAULT_API_BASE, "openai-compatible",
+  const apiBase = normalizeApiBase(DEFAULT_API_BASE);
+  const pricing = await fetchQualificationPricing(apiBase, "openai-compatible",
     scorerQualificationModels([model]), provider, scorerQualificationRequiredParameters([model], provider), route);
   assertQualificationPreflight([model], 1, pricing);
   const providerContract = providerContractEvidence(provider, route, pricing, [GENERATOR_MODEL], [model]);
@@ -1131,7 +1132,7 @@ export async function runScorerDiagnostic(input: {
   const root = await mkdtemp(join(tmpdir(), "postil-scorer-diagnostic-"));
   try {
     const result = await runScorerEvalCase(c, "falseFinding", model, 1, input.binary, root,
-      DEFAULT_API_BASE, input.keyName, pricing.get(model) ?? null, SCORER_CASE_EXEC_TIMEOUT_MS,
+      apiBase, input.keyName, pricing.get(model) ?? null, SCORER_CASE_EXEC_TIMEOUT_MS,
       provider, pricing.get(GENERATOR_MODEL) ?? null, route);
     await assertScorerDiagnosticCustody(custodyInput);
     return {

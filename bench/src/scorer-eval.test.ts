@@ -2456,6 +2456,7 @@ describe("finite adjudication provenance", () => {
           expect(evaluation.findingPublished).toBe(!success);
           expect(evaluation.finalConfidence).toBe(success ? 0.2 : 0.95);
           expect(evaluation.diagnostics?.scorer.attempts).toBe(success ? 1 : 0);
+          expect(evaluation.diagnostics?.childExitCode).toBe(success ? 0 : 1);
           const projection = evaluation.diagnostics?.adjudicationOutput;
           if (baseBinary && index === 0) expect(projection).toBeUndefined();
           else {
